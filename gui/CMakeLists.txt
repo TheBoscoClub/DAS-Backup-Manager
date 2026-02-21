@@ -32,6 +32,7 @@ add_executable(btrdasd-gui)
 target_sources(btrdasd-gui PRIVATE
     src/main.cpp
     src/mainwindow.cpp
+    src/database.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -53,3 +54,14 @@ install(TARGETS btrdasd-gui ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
 install(FILES src/btrdasd-gui.rc DESTINATION ${KDE_INSTALL_KXMLGUIDIR}/btrdasd-gui)
 
 feature_summary(WHAT ALL INCLUDE_QUIET_PACKAGES FATAL_ON_MISSING_REQUIRED_PACKAGES)
+
+# Tests
+if(BUILD_TESTING)
+    find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS Test)
+    include(ECMAddTests)
+
+    ecm_add_test(tests/databasetest.cpp src/database.cpp
+        TEST_NAME databasetest
+        LINK_LIBRARIES Qt6::Test Qt6::Sql
+    )
+endif()
