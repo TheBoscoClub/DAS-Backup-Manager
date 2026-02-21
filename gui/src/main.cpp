@@ -35,11 +35,19 @@ int main(int argc, char *argv[])
     KCrash::initialize();
 
     QCommandLineParser parser;
+    QCommandLineOption dbOption(
+        QStringLiteral("db"),
+        i18n("Path to SQLite database"),
+        QStringLiteral("path"),
+        QStringLiteral("/var/lib/das-backup/backup-index.db"));
+    parser.addOption(dbOption);
     aboutData.setupCommandLine(&parser);
     parser.process(app);
     aboutData.processCommandLine(&parser);
 
-    auto *window = new MainWindow();
+    const QString dbPath = parser.value(dbOption);
+
+    auto *window = new MainWindow(dbPath);
     window->show();
 
     return app.exec();
