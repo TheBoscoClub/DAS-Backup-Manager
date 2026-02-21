@@ -76,6 +76,14 @@ pub struct FileRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct DbStats {
+    pub snapshot_count: i64,
+    pub file_count: i64,
+    pub span_count: i64,
+    pub db_size: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: String,
     pub name: String,
@@ -244,6 +252,27 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn get_stats(&self) -> SqlResult<DbStats> {
+        Ok(DbStats {
+            snapshot_count: self.conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?,
+            file_count: self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?,
+            span_count: self.conn.query_row("SELECT COUNT(*) FROM spans", [], |r| r.get(0))?,
+            db_size: self.conn.query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [], |r| r.get(0)
+            )?,
+        })
+    }
+
+    pub fn list_files_in_snapshot(&self, snapshot_pattern: &str) -> SqlResult<Vec<FileRecord>> {
+        let snap_id: i64 = self.conn.query_row(
+            "SELECT id FROM snapshots WHERE path = ?1 OR (name || '.' || ts) = ?1",
+            [snapshot_pattern],
+            |row| row.get(0),
+        )?;
+        self.get_files_in_snapshot(snap_id)
     }
 
     pub fn search(&self, query: &str, limit: i64) -> SqlResult<Vec<SearchResult>> {
