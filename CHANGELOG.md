@@ -7,15 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-21
+
+### Added
+- Migrated backup scripts from CachyOS-Kernel project
+  - `scripts/backup-run.sh` v3.1.0 — btrbk orchestrator with triple-target architecture, throughput logging, email reports
+  - `scripts/backup-verify.sh` v2.0.0 — DAS drive health (SMART) + btrbk status verification
+  - `scripts/das-partition-drives.sh` v1.0.0 — DAS drive partitioning with serial verification
+  - `scripts/install-backup-timer.sh` — systemd timer installer (updated for new project structure)
+  - `scripts/boot-archive-cleanup.sh` v1.0.0 — NEW: prune boot subvolume archives older than retention period
+- Migrated btrbk reference config to `config/btrbk.conf`
+- Created `config/das-backup-email.conf.example` — email config template (redacted credentials)
+- Migrated systemd units to `systemd/` (paths updated for DAS-Backup-Manager)
+  - `das-backup.service` + `das-backup.timer` — nightly incremental at 03:00
+  - `das-backup-full.service` + `das-backup-full.timer` — weekly full on Sundays at 04:00
+- Migrated documentation to `docs/`
+  - `OFFLINE-BACKUP-PLAN.md` — capacity planning, drive allocation, backup strategy
+  - `DISASTER-RECOVERY-GUIDE.md` — step-by-step recovery procedures
+  - `STORAGE-ARCHITECTURE-AND-RECOVERY.md` — full system storage reference
+  - `DAS-BAY-MAPPING.md` — physical drive locations and serial numbers
+- CMakeLists.txt with install targets for scripts, config, and systemd units
+
+## [0.1.0] - 2026-02-21
+
 ### Added
 - Project scaffolding with CMake build system (ECM + Qt6 + KF6)
-- Migrated backup scripts from CachyOS-Kernel project
-  - `backup-run.sh` v3.1.0 — btrbk backup with throughput logging + email report
-  - `backup-verify.sh` v2.0.0 — DAS drive health + btrbk status verification
-  - `btrbk.conf` — reference btrbk configuration
-  - `das-partition-drives.sh` — DAS drive partitioning utility
-  - `install-backup-timer.sh` — systemd timer installer
-- Migrated systemd units: das-backup.service/timer, das-backup-full.service/timer
-- Migrated documentation: OFFLINE-BACKUP-PLAN.md, DISASTER-RECOVERY-GUIDE.md, STORAGE-ARCHITECTURE-AND-RECOVERY.md, DAS-BAY-MAPPING.md
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license

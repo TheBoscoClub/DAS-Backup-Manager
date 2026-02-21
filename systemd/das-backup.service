@@ -1,0 +1,20 @@
+[Unit]
+Description=DAS Backup - BTRFS incremental backup to TerraMaster D6-320
+Documentation=file:///hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/docs/OFFLINE-BACKUP-PLAN.md
+After=local-fs.target
+# Only run if DAS is likely connected (won't fail hard if not)
+ConditionPathExistsGlob=/dev/disk/by-id/usb-TerraMas_TDAS*
+
+[Service]
+Type=oneshot
+ExecStart=/hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/scripts/backup-run.sh
+StandardOutput=journal
+StandardError=journal
+# Nice and ionice for background operation
+Nice=19
+IOSchedulingClass=idle
+# Timeout after 6 hours (initial backup can take 3+ hours)
+TimeoutStartSec=21600
+
+[Install]
+WantedBy=multi-user.target
