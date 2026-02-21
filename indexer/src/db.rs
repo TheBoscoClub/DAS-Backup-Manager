@@ -293,7 +293,7 @@ impl Database {
 
     pub fn list_files_in_snapshot(&self, snapshot_pattern: &str) -> SqlResult<Vec<FileRecord>> {
         let snap_id: i64 = self.conn.query_row(
-            "SELECT id FROM snapshots WHERE path = ?1 OR (name || '.' || ts) = ?1",
+            "SELECT id FROM snapshots WHERE path = ?1 OR (name || '.' || ts) = ?1 OR path LIKE '%/' || ?1",
             [snapshot_pattern],
             |row| row.get(0),
         )?;
