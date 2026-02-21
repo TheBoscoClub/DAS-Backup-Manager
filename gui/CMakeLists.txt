@@ -36,6 +36,8 @@ target_sources(btrdasd-gui PRIVATE
     src/snapshotmodel.cpp
     src/filemodel.cpp
     src/searchmodel.cpp
+    src/snapshottimeline.cpp
+    src/indexrunner.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
