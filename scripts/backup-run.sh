@@ -591,6 +591,31 @@ get_smart_summary() {
 }
 
 # ============================================================================
+# CONTENT INDEXER
+# ============================================================================
+
+run_indexer() {
+    local indexer="/hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/indexer/target/release/btrdasd"
+    local db="/var/lib/das-backup/backup-index.db"
+
+    if [[ ! -x "$indexer" ]]; then
+        log_warn "Content indexer not built -- skipping (build with: cargo build --release --manifest-path indexer/Cargo.toml)"
+        record_op "indexer" "SKIP" "binary not found"
+        return
+    fi
+
+    log_info "Running content indexer..."
+    local indexer_output
+    if indexer_output=$("$indexer" walk "$MOUNT_BACKUP" --db "$db" 2>&1); then
+        record_op "indexer" "OK"
+        log_info "  $indexer_output"
+    else
+        log_warn "Content indexer failed (non-fatal)"
+        record_op "indexer" "FAIL" "exit code $?"
+    fi
+}
+
+# ============================================================================
 # EMAIL REPORT
 # ============================================================================
 
@@ -624,6 +649,7 @@ BACKUP OPERATIONS
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
   ESP mirror            ${OP_STATUS[esp_sync]:-N/A}  (${OP_STATUS[esp_sync_detail]:-n/a})
+  Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
 
 THROUGHPUT
 ───────────────────────────────────────────────────────────────
@@ -880,6 +906,7 @@ main() {
         update_boot_subvolumes "$force_full"
         sync_das_esp
         show_stats
+        run_indexer
 
         # Record growth data and generate email report
         record_growth
