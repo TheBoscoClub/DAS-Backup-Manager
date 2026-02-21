@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-02-21
+
+### Added
+- **ButteredDASD content indexer** (`btrdasd`) — Rust CLI for indexing DAS backup snapshots
+  - SQLite FTS5 full-text search across all indexed file paths and names
+  - Span-based deduplication: unchanged files across consecutive snapshots stored as single row
+  - Incremental indexing: only walks newly-created snapshots
+  - 4 CLI subcommands: `walk` (index), `search` (FTS5), `list` (snapshot contents), `info` (stats)
+  - WAL journal mode for concurrent read/write
+  - Performance indexes on snapshots, files, and spans tables
+  - 37 unit tests, zero clippy warnings, cargo audit clean
+- Integrated `btrdasd` into `scripts/backup-run.sh` with soft-fail (indexing errors don't abort backup)
+- Content indexer status line in email backup reports
+
+### Changed
+- Indexer built in Rust (edition 2024) instead of planned C++ for memory safety
+- Application named ButteredDASD with CLI binary `btrdasd`
+
 ## [0.2.0] - 2026-02-21
 
 ### Added

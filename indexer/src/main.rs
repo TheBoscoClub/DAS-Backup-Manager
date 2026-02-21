@@ -1,12 +1,15 @@
-use clap::{Parser, Subcommand};
 use buttered_dasd::db::Database;
 use buttered_dasd::indexer;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 const DEFAULT_DB: &str = "/var/lib/das-backup/backup-index.db";
 
 #[derive(Parser)]
-#[command(name = "btrdasd", about = "ButteredDASD — content indexer for DAS backup snapshots")]
+#[command(
+    name = "btrdasd",
+    about = "ButteredDASD — content indexer for DAS backup snapshots"
+)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -61,8 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Indexed:    {} new", result.snapshots_indexed);
             println!("Skipped:    {} already indexed", result.snapshots_skipped);
             for r in &result.results {
-                println!("  {} files ({} new, {} extended, {} changed, {} errors)",
-                    r.files_total, r.files_new, r.files_extended, r.files_changed, r.scan_errors);
+                println!(
+                    "  {} files ({} new, {} extended, {} changed, {} errors)",
+                    r.files_total, r.files_new, r.files_extended, r.files_changed, r.scan_errors
+                );
             }
         }
         Commands::Search { query, db, limit } => {
@@ -72,7 +77,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("No matches for '{}'", query);
             } else {
                 for r in &results {
-                    println!("{}\t{}\t{}\t{}\t{}", r.path, r.size, r.mtime, r.first_snap, r.last_snap);
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        r.path, r.size, r.mtime, r.first_snap, r.last_snap
+                    );
                 }
                 println!("({} results)", results.len());
             }

@@ -5,7 +5,8 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 ## Project Rules
 
 - **PUBLIC REPO** — TheBoscoClub/DAS-Backup-Manager on GitHub. Push allowed.
-- **C++20** — Qt6 6.10.2, KF6 6.23.0, CMake 4.2.3, SQLite 3.51.2 FTS5
+- **Rust** — Indexer (btrdasd): Rust 2024 edition, rusqlite 0.38 (bundled FTS5), clap 4.5, walkdir 2.5
+- **C++20** — Future GUI: Qt6 6.10.2, KF6 6.23.0, CMake 4.2.3
 - **Scripts use zsh** — All scripts `#!/usr/bin/env zsh`
 - **systemd-boot** — CachyOS uses systemd-boot, NOT grub
 - **BTRFS RAID-1** — Backup targets on HDD RAID-1 and DAS enclosure
@@ -20,6 +21,10 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 ## Build
 
 ```bash
+# Indexer (Rust)
+cd indexer && cargo build --release && cargo test
+
+# Scripts/systemd (CMake)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```

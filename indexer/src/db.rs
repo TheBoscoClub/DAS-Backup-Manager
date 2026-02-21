@@ -106,7 +106,13 @@ impl Database {
         Ok(Database { conn })
     }
 
-    pub fn insert_snapshot(&self, name: &str, ts: &str, source: &str, path: &str) -> SqlResult<i64> {
+    pub fn insert_snapshot(
+        &self,
+        name: &str,
+        ts: &str,
+        source: &str,
+        path: &str,
+    ) -> SqlResult<i64> {
         let indexed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -129,7 +135,7 @@ impl Database {
 
     pub fn get_snapshot(&self, path: &str) -> SqlResult<Option<Snapshot>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, ts, source, path, indexed_at FROM snapshots WHERE path = ?1"
+            "SELECT id, name, ts, source, path, indexed_at FROM snapshots WHERE path = ?1",
         )?;
         let mut rows = stmt.query_map([path], |row| {
             Ok(Snapshot {
@@ -165,9 +171,9 @@ impl Database {
     }
 
     pub fn list_snapshots(&self) -> SqlResult<Vec<Snapshot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, ts, source, path, indexed_at FROM snapshots ORDER BY ts"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, ts, source, path, indexed_at FROM snapshots ORDER BY ts")?;
         let rows = stmt.query_map([], |row| {
             Ok(Snapshot {
                 id: row.get(0)?,
@@ -181,7 +187,14 @@ impl Database {
         rows.collect()
     }
 
-    pub fn upsert_file(&self, path: &str, name: &str, size: i64, mtime: i64, file_type: i32) -> SqlResult<i64> {
+    pub fn upsert_file(
+        &self,
+        path: &str,
+        name: &str,
+        size: i64,
+        mtime: i64,
+        file_type: i32,
+    ) -> SqlResult<i64> {
         if let Some(existing) = self.get_file(path)? {
             if existing.size != size || existing.mtime != mtime {
                 self.conn.execute(
@@ -199,9 +212,9 @@ impl Database {
     }
 
     pub fn get_file(&self, path: &str) -> SqlResult<Option<FileRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, size, mtime, type FROM files WHERE path = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, name, size, mtime, type FROM files WHERE path = ?1")?;
         let mut rows = stmt.query_map([path], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
@@ -226,7 +239,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn extend_span(&self, file_id: i64, prev_snap_id: i64, new_snap_id: i64) -> SqlResult<bool> {
+    pub fn extend_span(
+        &self,
+        file_id: i64,
+        prev_snap_id: i64,
+        new_snap_id: i64,
+    ) -> SqlResult<bool> {
         let rows = self.conn.execute(
             "UPDATE spans SET last_snap = ?1 WHERE file_id = ?2 AND last_snap = ?3",
             rusqlite::params![new_snap_id, file_id, prev_snap_id],
@@ -256,12 +274,19 @@ impl Database {
 
     pub fn get_stats(&self) -> SqlResult<DbStats> {
         Ok(DbStats {
-            snapshot_count: self.conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?,
-            file_count: self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?,
-            span_count: self.conn.query_row("SELECT COUNT(*) FROM spans", [], |r| r.get(0))?,
+            snapshot_count: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?,
+            file_count: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?,
+            span_count: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM spans", [], |r| r.get(0))?,
             db_size: self.conn.query_row(
                 "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
-                [], |r| r.get(0)
+                [],
+                |r| r.get(0),
             )?,
         })
     }
@@ -294,7 +319,7 @@ impl Database {
              JOIN snapshots s2 ON s2.id = sp.last_snap
              WHERE files_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![fts_query, limit], |row| {
             Ok(SearchResult {
@@ -329,7 +354,8 @@ mod tests {
     #[test]
     fn creates_schema() {
         let db = Database::open(":memory:").unwrap();
-        let tables: Vec<String> = db.conn
+        let tables: Vec<String> = db
+            .conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
             .query_map([], |row| row.get(0))
@@ -345,7 +371,8 @@ mod tests {
     #[test]
     fn wal_mode() {
         let db = Database::open(":memory:").unwrap();
-        let mode: String = db.conn
+        let mode: String = db
+            .conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         // :memory: databases may report "memory" instead of "wal"
@@ -357,7 +384,8 @@ mod tests {
     #[test]
     fn foreign_keys_enabled() {
         let db = Database::open(":memory:").unwrap();
-        let fk: i64 = db.conn
+        let fk: i64 = db
+            .conn
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert_eq!(fk, 1);
@@ -366,15 +394,31 @@ mod tests {
     #[test]
     fn insert_snapshot() {
         let db = Database::open(":memory:").unwrap();
-        let id = db.insert_snapshot("root", "20260221T0304", "nvme", "/mnt/backup/nvme/root.20260221T0304").unwrap();
+        let id = db
+            .insert_snapshot(
+                "root",
+                "20260221T0304",
+                "nvme",
+                "/mnt/backup/nvme/root.20260221T0304",
+            )
+            .unwrap();
         assert!(id > 0);
     }
 
     #[test]
     fn get_snapshot_by_path() {
         let db = Database::open(":memory:").unwrap();
-        db.insert_snapshot("root", "20260221T0304", "nvme", "/mnt/backup/nvme/root.20260221T0304").unwrap();
-        let snap = db.get_snapshot("/mnt/backup/nvme/root.20260221T0304").unwrap().unwrap();
+        db.insert_snapshot(
+            "root",
+            "20260221T0304",
+            "nvme",
+            "/mnt/backup/nvme/root.20260221T0304",
+        )
+        .unwrap();
+        let snap = db
+            .get_snapshot("/mnt/backup/nvme/root.20260221T0304")
+            .unwrap()
+            .unwrap();
         assert_eq!(snap.name, "root");
         assert_eq!(snap.ts, "20260221T0304");
         assert_eq!(snap.source, "nvme");
@@ -383,17 +427,44 @@ mod tests {
     #[test]
     fn snapshot_exists() {
         let db = Database::open(":memory:").unwrap();
-        db.insert_snapshot("root", "20260221T0304", "nvme", "/mnt/backup/nvme/root.20260221T0304").unwrap();
-        assert!(db.snapshot_exists("/mnt/backup/nvme/root.20260221T0304").unwrap());
+        db.insert_snapshot(
+            "root",
+            "20260221T0304",
+            "nvme",
+            "/mnt/backup/nvme/root.20260221T0304",
+        )
+        .unwrap();
+        assert!(
+            db.snapshot_exists("/mnt/backup/nvme/root.20260221T0304")
+                .unwrap()
+        );
         assert!(!db.snapshot_exists("/mnt/backup/nvme/nonexistent").unwrap());
     }
 
     #[test]
     fn list_snapshots() {
         let db = Database::open(":memory:").unwrap();
-        db.insert_snapshot("root", "20260220T0300", "nvme", "/mnt/backup/nvme/root.20260220T0300").unwrap();
-        db.insert_snapshot("root", "20260221T0300", "nvme", "/mnt/backup/nvme/root.20260221T0300").unwrap();
-        db.insert_snapshot("home", "20260221T0300", "nvme", "/mnt/backup/nvme/home.20260221T0300").unwrap();
+        db.insert_snapshot(
+            "root",
+            "20260220T0300",
+            "nvme",
+            "/mnt/backup/nvme/root.20260220T0300",
+        )
+        .unwrap();
+        db.insert_snapshot(
+            "root",
+            "20260221T0300",
+            "nvme",
+            "/mnt/backup/nvme/root.20260221T0300",
+        )
+        .unwrap();
+        db.insert_snapshot(
+            "home",
+            "20260221T0300",
+            "nvme",
+            "/mnt/backup/nvme/home.20260221T0300",
+        )
+        .unwrap();
         let snaps = db.list_snapshots().unwrap();
         assert_eq!(snaps.len(), 3);
         assert_eq!(snaps[0].ts, "20260220T0300"); // ordered by ts
@@ -402,14 +473,17 @@ mod tests {
     #[test]
     fn upsert_file_new() {
         let db = Database::open(":memory:").unwrap();
-        let id = db.upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0).unwrap();
+        let id = db
+            .upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0)
+            .unwrap();
         assert!(id > 0);
     }
 
     #[test]
     fn get_file_by_path() {
         let db = Database::open(":memory:").unwrap();
-        db.upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0).unwrap();
+        db.upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0)
+            .unwrap();
         let f = db.get_file("home/bosco/.zshrc").unwrap().unwrap();
         assert_eq!(f.name, ".zshrc");
         assert_eq!(f.size, 1024);
@@ -437,36 +511,55 @@ mod tests {
     #[test]
     fn insert_span() {
         let db = Database::open(":memory:").unwrap();
-        let snap_id = db.insert_snapshot("root", "20260221T0304", "nvme", "/snap1").unwrap();
+        let snap_id = db
+            .insert_snapshot("root", "20260221T0304", "nvme", "/snap1")
+            .unwrap();
         let file_id = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
         db.insert_span(file_id, snap_id, snap_id).unwrap();
-        let count: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM spans WHERE file_id = ?1", [file_id], |r| r.get(0)
-        ).unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM spans WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
     #[test]
     fn extend_span() {
         let db = Database::open(":memory:").unwrap();
-        let s1 = db.insert_snapshot("root", "20260220T0300", "nvme", "/snap1").unwrap();
-        let s2 = db.insert_snapshot("root", "20260221T0300", "nvme", "/snap2").unwrap();
+        let s1 = db
+            .insert_snapshot("root", "20260220T0300", "nvme", "/snap1")
+            .unwrap();
+        let s2 = db
+            .insert_snapshot("root", "20260221T0300", "nvme", "/snap2")
+            .unwrap();
         let fid = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
         db.insert_span(fid, s1, s1).unwrap();
         let extended = db.extend_span(fid, s1, s2).unwrap();
         assert!(extended);
-        let last: i64 = db.conn.query_row(
-            "SELECT last_snap FROM spans WHERE file_id = ?1 AND first_snap = ?2",
-            rusqlite::params![fid, s1], |r| r.get(0)
-        ).unwrap();
+        let last: i64 = db
+            .conn
+            .query_row(
+                "SELECT last_snap FROM spans WHERE file_id = ?1 AND first_snap = ?2",
+                rusqlite::params![fid, s1],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(last, s2);
     }
 
     #[test]
     fn extend_span_fails_when_no_match() {
         let db = Database::open(":memory:").unwrap();
-        let s1 = db.insert_snapshot("root", "20260220T0300", "nvme", "/snap1").unwrap();
-        let s3 = db.insert_snapshot("root", "20260222T0300", "nvme", "/snap3").unwrap();
+        let s1 = db
+            .insert_snapshot("root", "20260220T0300", "nvme", "/snap1")
+            .unwrap();
+        let s3 = db
+            .insert_snapshot("root", "20260222T0300", "nvme", "/snap3")
+            .unwrap();
         let fid = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
         db.insert_span(fid, s1, s1).unwrap();
         let extended = db.extend_span(fid, s3, s3).unwrap();
@@ -475,10 +568,24 @@ mod tests {
 
     fn setup_search_db() -> Database {
         let db = Database::open(":memory:").unwrap();
-        let s1 = db.insert_snapshot("root", "20260220T0300", "nvme", "/snap1").unwrap();
-        let f1 = db.upsert_file("docs/report.pdf", "report.pdf", 1000, 100, 0).unwrap();
-        let f2 = db.upsert_file("photos/photo.jpg", "photo.jpg", 2000, 200, 0).unwrap();
-        let f3 = db.upsert_file("docs/annual-report.docx", "annual-report.docx", 3000, 300, 0).unwrap();
+        let s1 = db
+            .insert_snapshot("root", "20260220T0300", "nvme", "/snap1")
+            .unwrap();
+        let f1 = db
+            .upsert_file("docs/report.pdf", "report.pdf", 1000, 100, 0)
+            .unwrap();
+        let f2 = db
+            .upsert_file("photos/photo.jpg", "photo.jpg", 2000, 200, 0)
+            .unwrap();
+        let f3 = db
+            .upsert_file(
+                "docs/annual-report.docx",
+                "annual-report.docx",
+                3000,
+                300,
+                0,
+            )
+            .unwrap();
         db.insert_span(f1, s1, s1).unwrap();
         db.insert_span(f2, s1, s1).unwrap();
         db.insert_span(f3, s1, s1).unwrap();
