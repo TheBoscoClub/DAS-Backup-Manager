@@ -203,6 +203,26 @@ impl Database {
         Ok(rows > 0)
     }
 
+    pub fn get_files_in_snapshot(&self, snap_id: i64) -> SqlResult<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.path, f.name, f.size, f.mtime, f.type
+             FROM files f
+             JOIN spans s ON s.file_id = f.id
+             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1",
+        )?;
+        let rows = stmt.query_map([snap_id], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                size: row.get(3)?,
+                mtime: row.get(4)?,
+                file_type: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn search(&self, query: &str, limit: i64) -> SqlResult<Vec<SearchResult>> {
         // Wrap bare terms in quotes so FTS5 treats punctuation (dots, hyphens) as literals.
         // Preserve explicit FTS5 syntax: prefix wildcard (*), column filters (:), boolean ops.
