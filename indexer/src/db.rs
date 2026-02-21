@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS spans (
 
 CREATE INDEX IF NOT EXISTS idx_spans_last ON spans(last_snap);
 
+-- Performance indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_snapshots_source_name ON snapshots(source, name);
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_spans_file_id ON spans(file_id);
+CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
     name, path, content=files, content_rowid=id
 );

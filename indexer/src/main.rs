@@ -1,3 +1,3 @@
 fn main() {
-    println!("das-index: content indexer for DAS backup snapshots");
+    println!("btrdasd: content indexer for DAS backup snapshots");
 }
