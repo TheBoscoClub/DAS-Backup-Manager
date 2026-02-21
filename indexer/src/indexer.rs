@@ -15,6 +15,14 @@ pub struct DiscoveredSnapshot {
 }
 
 #[derive(Debug)]
+pub struct WalkResult {
+    pub snapshots_discovered: usize,
+    pub snapshots_indexed: usize,
+    pub snapshots_skipped: usize,
+    pub results: Vec<IndexResult>,
+}
+
+#[derive(Debug)]
 pub struct IndexResult {
     pub snapshot_id: i64,
     pub files_total: usize,
@@ -151,6 +159,61 @@ pub fn index_snapshot(
         files_extended,
         files_changed,
         scan_errors: scan.errors,
+    })
+}
+
+/// Walk a backup target, discover all new (unindexed) snapshots, and index them
+/// in chronological order so span extension works correctly.
+///
+/// Pre-populates a HashMap with the latest indexed snapshot per (source, name)
+/// pair from the database, then iterates through newly discovered snapshots,
+/// passing the predecessor snapshot ID to `index_snapshot()` for span extension.
+pub fn walk(
+    target_root: &std::path::Path,
+    db: &Database,
+) -> Result<WalkResult, Box<dyn std::error::Error>> {
+    let discovered = discover_snapshots(target_root, db)?;
+    let discovered_count = discovered.len();
+
+    let mut results = Vec::new();
+
+    // Track latest indexed snapshot ID per (source, name) for predecessor lookup
+    let mut latest_snap_id: HashMap<(String, String), i64> = HashMap::new();
+
+    // Pre-populate from already-indexed snapshots in DB
+    for snap in db.list_snapshots()? {
+        let key = (snap.source.clone(), snap.name.clone());
+        match latest_snap_id.get(&key) {
+            Some(&existing_id) => {
+                let existing = db.get_snapshot_by_id(existing_id)?;
+                if snap.ts > existing.ts {
+                    latest_snap_id.insert(key, snap.id);
+                }
+            }
+            None => {
+                latest_snap_id.insert(key, snap.id);
+            }
+        }
+    }
+
+    // discovered is already sorted by (source, name, ts) from discover_snapshots
+    for snap in &discovered {
+        let key = (snap.source.clone(), snap.name.clone());
+        let prev_id = latest_snap_id.get(&key).copied();
+
+        let result = index_snapshot(db, snap, prev_id)?;
+        latest_snap_id.insert(key, result.snapshot_id);
+        results.push(result);
+    }
+
+    let total_in_db = db.list_snapshots()?.len();
+    let skipped = total_in_db - discovered_count;
+
+    Ok(WalkResult {
+        snapshots_discovered: total_in_db,
+        snapshots_indexed: discovered_count,
+        snapshots_skipped: skipped,
+        results,
     })
 }
 
@@ -343,5 +406,59 @@ mod tests {
         assert!(sources.contains(&"nvme"));
         assert!(sources.contains(&"ssd"));
         assert!(sources.contains(&"projects"));
+    }
+
+    #[test]
+    fn walk_indexes_all_new_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        make_snap_dirs(&tmp, &["nvme/root.20260220T0300", "ssd/opt.20260220T0300"]);
+        write_file(&tmp.path().join("nvme/root.20260220T0300/a.txt"), b"a");
+        write_file(&tmp.path().join("ssd/opt.20260220T0300/b.txt"), b"b");
+
+        let db = Database::open(":memory:").unwrap();
+        let result = walk(tmp.path(), &db).unwrap();
+        assert_eq!(result.snapshots_indexed, 2);
+        assert_eq!(result.snapshots_skipped, 0);
+    }
+
+    #[test]
+    fn walk_skips_already_indexed() {
+        let tmp = TempDir::new().unwrap();
+        make_snap_dirs(&tmp, &["nvme/root.20260220T0300", "nvme/root.20260221T0300"]);
+        write_file(&tmp.path().join("nvme/root.20260220T0300/a.txt"), b"a");
+        write_file(&tmp.path().join("nvme/root.20260221T0300/a.txt"), b"a");
+
+        let db = Database::open(":memory:").unwrap();
+        let r1 = walk(tmp.path(), &db).unwrap();
+        assert_eq!(r1.snapshots_indexed, 2);
+        let r2 = walk(tmp.path(), &db).unwrap();
+        assert_eq!(r2.snapshots_indexed, 0);
+    }
+
+    #[test]
+    fn walk_orders_by_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        // Create in reverse order to verify sorting
+        make_snap_dirs(
+            &tmp,
+            &[
+                "nvme/root.20260222T0300",
+                "nvme/root.20260220T0300",
+                "nvme/root.20260221T0300",
+            ],
+        );
+        for d in &["20260220T0300", "20260221T0300", "20260222T0300"] {
+            write_file(
+                &tmp.path().join(format!("nvme/root.{}/a.txt", d)),
+                b"a",
+            );
+        }
+
+        let db = Database::open(":memory:").unwrap();
+        let result = walk(tmp.path(), &db).unwrap();
+        assert_eq!(result.snapshots_indexed, 3);
+        let snaps = db.list_snapshots().unwrap();
+        assert!(snaps[0].ts < snaps[1].ts);
+        assert!(snaps[1].ts < snaps[2].ts);
     }
 }
