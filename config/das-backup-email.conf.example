@@ -1,0 +1,21 @@
+# DAS Backup Email Configuration
+# Used by backup-run.sh to send nightly reports via Proton Bridge
+#
+# INSTALL: Copy to /etc/das-backup-email.conf and set mode 600
+#   sudo cp config/das-backup-email.conf.example /etc/das-backup-email.conf
+#   sudo chmod 600 /etc/das-backup-email.conf
+#
+# SETUP: Get the Bridge password from:
+#   Proton Bridge GUI → Account → IMAP/SMTP → Password
+#   (This is NOT your Proton account password — Bridge generates its own)
+
+REPORT_TO="your-email@example.com"
+REPORT_FROM="your-email@example.com"
+
+# Proton Bridge SMTP (STARTTLS on localhost)
+SMTP_URL="smtp://127.0.0.1:1025"
+SMTP_AUTH_USER="your-email@example.com"
+SMTP_AUTH_PASS=""  # ← Paste Bridge password here
+
+# Accept Bridge's self-signed TLS cert for localhost
+SMTP_SSL_VERIFY="ignore"
