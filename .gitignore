@@ -1,0 +1,227 @@
+# =============================================================================
+# DAS-Backup-Manager .gitignore
+# =============================================================================
+
+# Build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.o
+*.a
+*.so
+
+# =============================================================================
+# Claude Code - Universal .gitignore Template
+# =============================================================================
+
+# SECURITY & CREDENTIALS
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+credentials.json
+secrets.json
+secrets/
+.secrets/
+*_credentials.json
+*_secret.json
+*.secret
+api_key*
+apikey*
+*_api_key*
+*.token
+auth_token*
+access_token*
+authcode.txt
+*.authcode
+oauth_tokens*
+.oauth/
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.ppk
+*.gpg
+*.asc
+secring.*
+*.password
+*.passwd
+passwords.txt
+htpasswd
+.aws/
+aws_credentials
+aws_config
+.gcloud/
+.azure/
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+
+# DATABASES
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+
+# LOGS
+*.log
+logs/
+log/
+*.log.*
+nohup.out
+
+# LOCAL/IDENTIFYING INFORMATION
+SESSION_RECORD*.md
+*-session-record.md
+vm-credentials*
+*-vm-config*
+*.vm-credentials
+*-token
+*_token
+*.token.txt
+kde-invent-token
+local-ips.txt
+vm-ips.txt
+*-local-config*
+INSTALL_NOTES.md
+
+# CLAUDE CODE WORKFLOW FILES
+.backport-skip
+.claude.local
+.claude-session
+.claude-session-exit
+.claude-exit
+.claude-state
+.claude-tmp/
+.claude-checkpoint
+.claude-checkpoint.md
+.claude-recovery-plan.md
+.session-count
+exit.*
+# CLAUDE.md — tracked in this repo (public project)
+.claude-md-history/
+.claudeignore
+.snapshots/
+.test-vm-state
+.test-mcp-enabled
+.test-skill.md
+test-*-[0-9][0-9].md
+
+# Local tool configs
+.bandit
+pyproject.toml
+.ruff.toml
+.prettierrc
+.prettierrc.*
+.eslintrc.*
+.editorconfig
+.stylua.toml
+.yamllint
+.yamllint.yml
+.markdownlint.*
+setup.cfg
+
+# PYTHON
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+*.egg-info/
+dist/
+*.egg
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# NODE.JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+.yarn/
+package-lock.json
+yarn.lock
+.pnpm-store/
+
+# IDE & EDITORS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+.spyderproject
+.spyproject
+
+# OS GENERATED
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# CODEQL LOCAL SCAN DATA
+.codeql-db/
+
+# TESTING & COVERAGE
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+nosetests.xml
+test-results/
+junit*.xml
+
+# TEMPORARY & CACHE
+*.tmp
+*.temp
+.cache/
+.temp/
+tmp/
+temp/
+*.cache
+
+# BUILD ARTIFACTS (general)
+*.lib
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+target/
+out/
+
+# RELEASE ARTIFACTS
+releases/*.tar.gz
+releases/*.tar.gz.sha256
