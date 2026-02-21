@@ -15,6 +15,7 @@ class SnapshotTimeline;
 class FileModel;
 class SearchModel;
 class IndexRunner;
+class SnapshotWatcher;
 
 class MainWindow : public KXmlGuiWindow
 {
@@ -43,6 +44,7 @@ private:
     FileModel *m_fileModel = nullptr;
     SearchModel *m_searchModel = nullptr;
     IndexRunner *m_indexRunner = nullptr;
+    SnapshotWatcher *m_snapshotWatcher = nullptr;
 
     QTableView *m_fileView = nullptr;
     QTableView *m_searchView = nullptr;
