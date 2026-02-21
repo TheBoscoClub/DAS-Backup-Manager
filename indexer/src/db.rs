@@ -133,6 +133,23 @@ impl Database {
         }
     }
 
+    pub fn get_snapshot_by_id(&self, id: i64) -> SqlResult<Snapshot> {
+        self.conn.query_row(
+            "SELECT id, name, ts, source, path, indexed_at FROM snapshots WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(Snapshot {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    ts: row.get(2)?,
+                    source: row.get(3)?,
+                    path: row.get(4)?,
+                    indexed_at: row.get(5)?,
+                })
+            },
+        )
+    }
+
     pub fn list_snapshots(&self) -> SqlResult<Vec<Snapshot>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, ts, source, path, indexed_at FROM snapshots ORDER BY ts"
