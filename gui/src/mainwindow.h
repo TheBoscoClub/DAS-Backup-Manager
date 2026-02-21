@@ -16,6 +16,7 @@ class FileModel;
 class SearchModel;
 class IndexRunner;
 class RestoreAction;
+class SettingsDialog;
 class SnapshotWatcher;
 
 class MainWindow : public KXmlGuiWindow
@@ -34,6 +35,7 @@ private Q_SLOTS:
     void showStats();
     void updateStatusBar();
     void restoreSelectedFiles();
+    void showSettings();
 
 private:
     void setupActions();

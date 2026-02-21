@@ -4,13 +4,16 @@
 #include "indexrunner.h"
 #include "restoreaction.h"
 #include "searchmodel.h"
+#include "settingsdialog.h"
 #include "snapshotmodel.h"
 #include "snapshotwatcher.h"
 #include "snapshottimeline.h"
 
 #include <KActionCollection>
+#include <KConfigSkeleton>
 #include <KLocalizedString>
 #include <KMessageBox>
+#include <KStandardAction>
 
 #include <QAction>
 #include <QFileDialog>
@@ -155,6 +158,9 @@ void MainWindow::setupActions()
     restoreAction->setToolTip(i18n("Restore selected files to a destination"));
     actionCollection()->addAction(QStringLiteral("restore"), restoreAction);
     connect(restoreAction, &QAction::triggered, this, &MainWindow::restoreSelectedFiles);
+
+    auto *settingsAction = KStandardAction::preferences(this, &MainWindow::showSettings, actionCollection());
+    Q_UNUSED(settingsAction);
 }
 
 void MainWindow::openDatabase(const QString &path)
@@ -272,4 +278,17 @@ void MainWindow::restoreSelectedFiles()
         // For now just show what would be restored
         statusBar()->showMessage(i18n("Restoring %1...", filePath));
     }
+}
+
+void MainWindow::showSettings()
+{
+    if (KConfigDialog::showDialog(QStringLiteral("settings"))) {
+        return;
+    }
+
+    auto *config = new KConfigSkeleton(QString(), this);
+    config->addItemString(QStringLiteral("DatabasePath"), m_dbPath, m_dbPath);
+
+    auto *dialog = new SettingsDialog(this, QStringLiteral("settings"), config);
+    dialog->show();
 }
