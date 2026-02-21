@@ -45,4 +45,4 @@ install(FILES
 # =============================================================================
 
 # add_subdirectory(indexer)  # C++ SQLite FTS5 content indexer
-# add_subdirectory(gui)      # Qt6/KDE Plasma backup browser
+add_subdirectory(gui)
