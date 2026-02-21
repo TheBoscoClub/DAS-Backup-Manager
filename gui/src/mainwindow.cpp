@@ -4,6 +4,7 @@
 #include "indexrunner.h"
 #include "searchmodel.h"
 #include "snapshotmodel.h"
+#include "snapshotwatcher.h"
 #include "snapshottimeline.h"
 
 #include <KActionCollection>
@@ -28,6 +29,8 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
 {
     m_database = new Database();
     m_indexRunner = new IndexRunner(this);
+    m_snapshotWatcher = new SnapshotWatcher(m_indexRunner, this);
+    m_snapshotWatcher->setDbPath(m_dbPath);
 
     setupUi();
     setupActions();
@@ -147,6 +150,19 @@ void MainWindow::openDatabase(const QString &path)
 
     m_snapshotModel->reload();
     updateStatusBar();
+
+    // Set watcher to backup target root derived from snapshot paths
+    auto snapshots = m_database->listSnapshots();
+    if (!snapshots.isEmpty()) {
+        QString snapPath = snapshots.first().path;
+        int lastSlash = snapPath.lastIndexOf(QLatin1Char('/'));
+        if (lastSlash > 0) {
+            int secondLastSlash = snapPath.lastIndexOf(QLatin1Char('/'), lastSlash - 1);
+            if (secondLastSlash > 0) {
+                m_snapshotWatcher->setWatchPath(snapPath.left(secondLastSlash));
+            }
+        }
+    }
 }
 
 void MainWindow::onSnapshotSelected(qint64 snapshotId)
