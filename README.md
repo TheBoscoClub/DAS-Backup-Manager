@@ -79,6 +79,8 @@ sudo systemctl start das-backup.timer
 
 ## Documentation
 
+- [ButteredDASD Indexer](docs/BUTTERED-DASD.md) — Architecture, schema, CLI usage, span logic, installation
+- [Dependencies](docs/DEPENDENCIES.md) — All Rust, system, and build dependencies
 - [Offline Backup Plan](docs/OFFLINE-BACKUP-PLAN.md) — Capacity planning, drive allocation, backup strategy
 - [Disaster Recovery Guide](docs/DISASTER-RECOVERY-GUIDE.md) — Step-by-step recovery for NVMe/SSD/HDD failure
 - [Storage Architecture](docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md) — Full system storage reference
