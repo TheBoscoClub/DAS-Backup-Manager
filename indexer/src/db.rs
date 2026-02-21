@@ -69,6 +69,16 @@ pub struct FileRecord {
     pub file_type: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub path: String,
+    pub name: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub first_snap: String,
+    pub last_snap: String,
+}
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -191,6 +201,40 @@ impl Database {
             rusqlite::params![new_snap_id, file_id, prev_snap_id],
         )?;
         Ok(rows > 0)
+    }
+
+    pub fn search(&self, query: &str, limit: i64) -> SqlResult<Vec<SearchResult>> {
+        // Wrap bare terms in quotes so FTS5 treats punctuation (dots, hyphens) as literals.
+        // Preserve explicit FTS5 syntax: prefix wildcard (*), column filters (:), boolean ops.
+        let fts_query = if query.contains('*') || query.contains(':') || query.contains('"') {
+            query.to_string()
+        } else {
+            format!("\"{}\"", query)
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, f.name, f.size, f.mtime,
+                    s1.name || '.' || s1.ts AS first_snap,
+                    s2.name || '.' || s2.ts AS last_snap
+             FROM files_fts
+             JOIN files f ON f.id = files_fts.rowid
+             JOIN spans sp ON sp.file_id = f.id
+             JOIN snapshots s1 ON s1.id = sp.first_snap
+             JOIN snapshots s2 ON s2.id = sp.last_snap
+             WHERE files_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![fts_query, limit], |row| {
+            Ok(SearchResult {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                size: row.get(2)?,
+                mtime: row.get(3)?,
+                first_snap: row.get(4)?,
+                last_snap: row.get(5)?,
+            })
+        })?;
+        rows.collect()
     }
 }
 
@@ -355,5 +399,55 @@ mod tests {
         db.insert_span(fid, s1, s1).unwrap();
         let extended = db.extend_span(fid, s3, s3).unwrap();
         assert!(!extended);
+    }
+
+    fn setup_search_db() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        let s1 = db.insert_snapshot("root", "20260220T0300", "nvme", "/snap1").unwrap();
+        let f1 = db.upsert_file("docs/report.pdf", "report.pdf", 1000, 100, 0).unwrap();
+        let f2 = db.upsert_file("photos/photo.jpg", "photo.jpg", 2000, 200, 0).unwrap();
+        let f3 = db.upsert_file("docs/annual-report.docx", "annual-report.docx", 3000, 300, 0).unwrap();
+        db.insert_span(f1, s1, s1).unwrap();
+        db.insert_span(f2, s1, s1).unwrap();
+        db.insert_span(f3, s1, s1).unwrap();
+        db
+    }
+
+    #[test]
+    fn fts5_search_by_name() {
+        let db = setup_search_db();
+        let results = db.search("report", 50).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn fts5_search_by_path() {
+        let db = setup_search_db();
+        let results = db.search("photos", 50).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "photo.jpg");
+    }
+
+    #[test]
+    fn fts5_prefix_search() {
+        let db = setup_search_db();
+        let results = db.search("rep*", 50).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn fts5_no_results() {
+        let db = setup_search_db();
+        let results = db.search("nonexistent", 50).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_with_snapshot_info() {
+        let db = setup_search_db();
+        let results = db.search("report.pdf", 50).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].first_snap, "root.20260220T0300");
+        assert_eq!(results[0].last_snap, "root.20260220T0300");
     }
 }
