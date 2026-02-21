@@ -4,8 +4,8 @@ use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
-    pub path: String,   // relative path within snapshot
-    pub name: String,   // basename
+    pub path: String, // relative path within snapshot
+    pub name: String, // basename
     pub size: i64,
     pub mtime: i64,
     pub file_type: i32, // 0=regular, 1=directory, 2=symlink, 3=other
@@ -94,7 +94,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("test.txt"), "12345").unwrap();
         let result = scan_directory(tmp.path());
-        let entry = result.entries.iter().find(|e| e.name == "test.txt").unwrap();
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.name == "test.txt")
+            .unwrap();
         assert_eq!(entry.size, 5);
         assert_eq!(entry.path, "test.txt");
         assert_eq!(entry.file_type, 0);
@@ -104,13 +108,14 @@ mod tests {
     fn identifies_symlinks() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("real.txt"), "content").unwrap();
-        std::os::unix::fs::symlink(
-            tmp.path().join("real.txt"),
-            tmp.path().join("link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real.txt"), tmp.path().join("link.txt"))
+            .unwrap();
         let result = scan_directory(tmp.path());
-        let link = result.entries.iter().find(|e| e.name == "link.txt").unwrap();
+        let link = result
+            .entries
+            .iter()
+            .find(|e| e.name == "link.txt")
+            .unwrap();
         assert_eq!(link.file_type, 2);
     }
 
@@ -120,7 +125,11 @@ mod tests {
         fs::create_dir_all(tmp.path().join("a/b")).unwrap();
         fs::write(tmp.path().join("a/b/deep.txt"), "deep").unwrap();
         let result = scan_directory(tmp.path());
-        let deep = result.entries.iter().find(|e| e.name == "deep.txt").unwrap();
+        let deep = result
+            .entries
+            .iter()
+            .find(|e| e.name == "deep.txt")
+            .unwrap();
         assert_eq!(deep.path, "a/b/deep.txt");
     }
 }

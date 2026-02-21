@@ -109,8 +109,12 @@ pub fn index_snapshot(
     // Use unchecked_transaction since Database holds a non-mut reference
     let tx = db.conn.unchecked_transaction()?;
 
-    let snap_id =
-        db.insert_snapshot(&snap.name, &snap.ts, &snap.source, &snap.path.to_string_lossy())?;
+    let snap_id = db.insert_snapshot(
+        &snap.name,
+        &snap.ts,
+        &snap.source,
+        &snap.path.to_string_lossy(),
+    )?;
 
     // Pre-fetch previous snapshot's files for O(1) comparison
     let prev_files: HashMap<String, crate::db::FileRecord> = if let Some(prev_id) = prev_snap_id {
@@ -127,8 +131,13 @@ pub fn index_snapshot(
     let mut files_changed = 0usize;
 
     for entry in &scan.entries {
-        let file_id =
-            db.upsert_file(&entry.path, &entry.name, entry.size, entry.mtime, entry.file_type)?;
+        let file_id = db.upsert_file(
+            &entry.path,
+            &entry.name,
+            entry.size,
+            entry.mtime,
+            entry.file_type,
+        )?;
 
         if let Some(prev_file) = prev_files.get(&entry.path) {
             if prev_file.size == entry.size && prev_file.mtime == entry.mtime {
@@ -232,7 +241,10 @@ mod tests {
     #[test]
     fn discovers_snapshots() {
         let tmp = TempDir::new().unwrap();
-        make_snap_dirs(&tmp, &["nvme/root.20260220T0300", "nvme/root.20260221T0300"]);
+        make_snap_dirs(
+            &tmp,
+            &["nvme/root.20260220T0300", "nvme/root.20260221T0300"],
+        );
         let db = Database::open(":memory:").unwrap();
         let snaps = discover_snapshots(tmp.path(), &db).unwrap();
         assert_eq!(snaps.len(), 2);
@@ -257,7 +269,10 @@ mod tests {
     #[test]
     fn skips_already_indexed() {
         let tmp = TempDir::new().unwrap();
-        make_snap_dirs(&tmp, &["nvme/root.20260220T0300", "nvme/root.20260221T0300"]);
+        make_snap_dirs(
+            &tmp,
+            &["nvme/root.20260220T0300", "nvme/root.20260221T0300"],
+        );
         let db = Database::open(":memory:").unwrap();
         let path1 = tmp.path().join("nvme/root.20260220T0300");
         db.insert_snapshot("root", "20260220T0300", "nvme", &path1.to_string_lossy())
@@ -424,7 +439,10 @@ mod tests {
     #[test]
     fn walk_skips_already_indexed() {
         let tmp = TempDir::new().unwrap();
-        make_snap_dirs(&tmp, &["nvme/root.20260220T0300", "nvme/root.20260221T0300"]);
+        make_snap_dirs(
+            &tmp,
+            &["nvme/root.20260220T0300", "nvme/root.20260221T0300"],
+        );
         write_file(&tmp.path().join("nvme/root.20260220T0300/a.txt"), b"a");
         write_file(&tmp.path().join("nvme/root.20260221T0300/a.txt"), b"a");
 
@@ -448,10 +466,7 @@ mod tests {
             ],
         );
         for d in &["20260220T0300", "20260221T0300", "20260222T0300"] {
-            write_file(
-                &tmp.path().join(format!("nvme/root.{}/a.txt", d)),
-                b"a",
-            );
+            write_file(&tmp.path().join(format!("nvme/root.{}/a.txt", d)), b"a");
         }
 
         let db = Database::open(":memory:").unwrap();

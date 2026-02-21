@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.2.0
+**Version**: 0.3.0
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and a KDE Plasma GUI for browsing and restoring files from BTRFS snapshots.
 
@@ -12,7 +12,7 @@ DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and a K
 - **Triple-Target Architecture** — 22TB primary backup + 2x 2TB bootable recovery drives
 - **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps instead of deleting them (1-year retention)
 - **Email Reports** — Automated backup status reports with throughput metrics, growth analysis, and SMART status
-- **Content Indexer** — SQLite FTS5 database tracking every file across all snapshots (planned)
+- **ButteredDASD Content Indexer** (`btrdasd`) — Rust CLI with SQLite FTS5 database tracking every file across all snapshots
 - **KDE Plasma GUI** — Native Qt6/C++ application for searching, browsing, and restoring files (planned)
 
 ## Components
@@ -27,7 +27,7 @@ DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and a K
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `systemd/` | systemd service and timer units | Active |
 | `docs/` | Architecture, recovery guides, bay mapping | Active |
-| `indexer/` | C++ SQLite FTS5 content indexer CLI | Planned |
+| `indexer/` | ButteredDASD (`btrdasd`) — Rust SQLite FTS5 content indexer CLI | Active (v0.1.0) |
 | `gui/` | Qt6/KDE Plasma backup browser and restore app | Planned |
 
 ## Project Structure
@@ -38,7 +38,7 @@ DAS-Backup-Manager/
 ├── config/            # btrbk.conf, email config template
 ├── systemd/           # systemd service and timer units
 ├── docs/              # Architecture docs, disaster recovery guide
-├── indexer/           # (planned) C++ SQLite FTS5 content indexer
+├── indexer/           # ButteredDASD (btrdasd) — Rust content indexer
 ├── gui/               # (planned) Qt6/KDE Plasma GUI
 └── CMakeLists.txt     # Build system
 ```
@@ -48,12 +48,19 @@ DAS-Backup-Manager/
 - CachyOS (or Arch-based) Linux with BTRFS
 - btrbk 0.32+, smartmontools, s-nail (mailx)
 - TerraMaster D6-320 DAS (or compatible USB JBOD enclosure)
-- For future C++ components: Qt6 6.10+, KDE Frameworks 6.23+, CMake 3.25+, SQLite 3.51+ with FTS5
+- Rust 1.85+ with Cargo (for ButteredDASD content indexer)
+- For future C++ GUI: Qt6 6.10+, KDE Frameworks 6.23+, CMake 3.25+
 
 ## Installation
 
 ```bash
-# Build and install
+# Build content indexer (Rust)
+cd indexer
+cargo build --release
+# Binary at indexer/target/release/btrdasd
+
+# Build and install scripts/systemd units (CMake)
+cd ..
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 sudo cmake --install build
