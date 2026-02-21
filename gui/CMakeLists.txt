@@ -40,6 +40,7 @@ target_sources(btrdasd-gui PRIVATE
     src/indexrunner.cpp
     src/snapshotwatcher.cpp
     src/restoreaction.cpp
+    src/settingsdialog.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
