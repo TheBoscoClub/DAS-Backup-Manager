@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
 ## [0.3.0] - 2026-02-21
 
 ### Added
@@ -24,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Indexer built in Rust (edition 2024) instead of planned C++ for memory safety
 - Application named ButteredDASD with CLI binary `btrdasd`
+- Indexer binary path in backup-run.sh uses `BTRDASD_BIN` env var with `/usr/local/bin/btrdasd` default
 
 ## [0.2.0] - 2026-02-21
 
@@ -52,3 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Project scaffolding with CMake build system (ECM + Qt6 + KF6)
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license
+
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/releases/tag/v0.1.0

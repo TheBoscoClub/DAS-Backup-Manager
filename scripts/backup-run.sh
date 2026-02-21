@@ -595,7 +595,7 @@ get_smart_summary() {
 # ============================================================================
 
 run_indexer() {
-    local indexer="/hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/indexer/target/release/btrdasd"
+    local indexer="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
     local db="/var/lib/das-backup/backup-index.db"
 
     if [[ ! -x "$indexer" ]]; then
