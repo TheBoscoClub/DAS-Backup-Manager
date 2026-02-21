@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gui name="btrdasd-gui"
-     version="2"
+     version="3"
      xmlns="http://www.kde.org/standards/kxmlgui/1.0"
      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
      xsi:schemaLocation="http://www.kde.org/standards/kxmlgui/1.0
@@ -10,11 +10,13 @@
       <text>&amp;File</text>
       <Action name="reindex" />
       <Action name="stats" />
+      <Action name="restore" />
     </Menu>
   </MenuBar>
   <ToolBar name="mainToolBar" >
     <text>Main Toolbar</text>
     <Action name="reindex" />
     <Action name="stats" />
+    <Action name="restore" />
   </ToolBar>
 </gui>

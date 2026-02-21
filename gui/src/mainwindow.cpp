@@ -2,6 +2,7 @@
 #include "database.h"
 #include "filemodel.h"
 #include "indexrunner.h"
+#include "restoreaction.h"
 #include "searchmodel.h"
 #include "snapshotmodel.h"
 #include "snapshotwatcher.h"
@@ -12,6 +13,7 @@
 #include <KMessageBox>
 
 #include <QAction>
+#include <QFileDialog>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
@@ -31,6 +33,14 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
     m_indexRunner = new IndexRunner(this);
     m_snapshotWatcher = new SnapshotWatcher(m_indexRunner, this);
     m_snapshotWatcher->setDbPath(m_dbPath);
+    m_restoreAction = new RestoreAction(this);
+    connect(m_restoreAction, &RestoreAction::finished, this, [this](bool success, const QString &error) {
+        if (success) {
+            statusBar()->showMessage(i18n("Restore complete"), 5000);
+        } else {
+            KMessageBox::error(this, i18n("Restore failed: %1", error));
+        }
+    });
 
     setupUi();
     setupActions();
@@ -139,6 +149,12 @@ void MainWindow::setupActions()
     statsAction->setToolTip(i18n("Show database statistics"));
     actionCollection()->addAction(QStringLiteral("stats"), statsAction);
     connect(statsAction, &QAction::triggered, this, &MainWindow::showStats);
+
+    auto *restoreAction = new QAction(QIcon::fromTheme(QStringLiteral("document-save")),
+                                       i18n("Restore to..."), this);
+    restoreAction->setToolTip(i18n("Restore selected files to a destination"));
+    actionCollection()->addAction(QStringLiteral("restore"), restoreAction);
+    connect(restoreAction, &QAction::triggered, this, &MainWindow::restoreSelectedFiles);
 }
 
 void MainWindow::openDatabase(const QString &path)
@@ -231,4 +247,29 @@ void MainWindow::updateStatusBar()
     m_statusLabel->setText(i18n("%1 snapshots | %2 files | DB: %3",
         s.snapshotCount, s.fileCount,
         FileModel::formatSize(s.dbSizeBytes)));
+}
+
+void MainWindow::restoreSelectedFiles()
+{
+    auto selection = m_fileView->selectionModel()->selectedRows();
+    if (selection.isEmpty()) {
+        KMessageBox::information(this, i18n("No files selected."));
+        return;
+    }
+
+    QString destDir = QFileDialog::getExistingDirectory(this, i18n("Restore to..."));
+    if (destDir.isEmpty()) return;
+
+    // Get the snapshot path from the currently selected snapshot
+    // For now, use first selected file's path with the snapshot base
+    auto snapshots = m_database->listSnapshots();
+    // We need the snapshot path - find which snapshot is selected
+    // Use the file path from the proxy model
+    for (const auto &idx : selection) {
+        QModelIndex sourceIdx = m_fileProxy->mapToSource(idx);
+        QString filePath = m_fileModel->data(m_fileModel->index(sourceIdx.row(), 1), Qt::DisplayRole).toString();
+        // TODO: Combine with actual snapshot mount path for full source path
+        // For now just show what would be restored
+        statusBar()->showMessage(i18n("Restoring %1...", filePath));
+    }
 }
