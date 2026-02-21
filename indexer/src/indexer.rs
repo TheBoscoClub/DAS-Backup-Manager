@@ -1,8 +1,10 @@
 use regex::Regex;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use crate::db::Database;
+use crate::scanner::scan_directory;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredSnapshot {
@@ -10,6 +12,16 @@ pub struct DiscoveredSnapshot {
     pub ts: String,     // "20260221T0304"
     pub source: String, // "nvme"
     pub path: PathBuf,  // full path to snapshot dir
+}
+
+#[derive(Debug)]
+pub struct IndexResult {
+    pub snapshot_id: i64,
+    pub files_total: usize,
+    pub files_new: usize,
+    pub files_extended: usize,
+    pub files_changed: usize,
+    pub scan_errors: usize,
 }
 
 /// Parse a btrbk snapshot directory name like `root.20260221T0304` into (name, timestamp).
@@ -71,6 +83,77 @@ pub fn discover_snapshots(
     Ok(discovered)
 }
 
+/// Index a single snapshot directory into the database.
+///
+/// Walks the snapshot's filesystem, upserts each file into the `files` table,
+/// and creates or extends spans. If `prev_snap_id` is provided, unchanged files
+/// (same size + mtime) have their existing span extended rather than creating a
+/// new one, achieving span-based deduplication.
+///
+/// The entire operation is wrapped in a transaction for atomicity and performance.
+pub fn index_snapshot(
+    db: &Database,
+    snap: &DiscoveredSnapshot,
+    prev_snap_id: Option<i64>,
+) -> Result<IndexResult, Box<dyn std::error::Error>> {
+    let scan = scan_directory(&snap.path);
+
+    // Use unchecked_transaction since Database holds a non-mut reference
+    let tx = db.conn.unchecked_transaction()?;
+
+    let snap_id =
+        db.insert_snapshot(&snap.name, &snap.ts, &snap.source, &snap.path.to_string_lossy())?;
+
+    // Pre-fetch previous snapshot's files for O(1) comparison
+    let prev_files: HashMap<String, crate::db::FileRecord> = if let Some(prev_id) = prev_snap_id {
+        db.get_files_in_snapshot(prev_id)?
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let mut files_new = 0usize;
+    let mut files_extended = 0usize;
+    let mut files_changed = 0usize;
+
+    for entry in &scan.entries {
+        let file_id =
+            db.upsert_file(&entry.path, &entry.name, entry.size, entry.mtime, entry.file_type)?;
+
+        if let Some(prev_file) = prev_files.get(&entry.path) {
+            if prev_file.size == entry.size && prev_file.mtime == entry.mtime {
+                // File unchanged -- try to extend span
+                if let Some(prev_id) = prev_snap_id
+                    && db.extend_span(file_id, prev_id, snap_id)?
+                {
+                    files_extended += 1;
+                    continue;
+                }
+            } else {
+                files_changed += 1;
+            }
+        } else {
+            files_new += 1;
+        }
+
+        // New file, changed file, or failed extension -- create new span
+        db.insert_span(file_id, snap_id, snap_id)?;
+    }
+
+    tx.commit()?;
+
+    Ok(IndexResult {
+        snapshot_id: snap_id,
+        files_total: scan.entries.len(),
+        files_new,
+        files_extended,
+        files_changed,
+        scan_errors: scan.errors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +202,128 @@ mod tests {
         let snaps = discover_snapshots(tmp.path(), &db).unwrap();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].ts, "20260221T0300");
+    }
+
+    fn write_file(path: &std::path::Path, content: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn index_first_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let snap_dir = tmp.path().join("nvme/root.20260220T0300");
+        write_file(&snap_dir.join("a.txt"), b"aaa");
+        write_file(&snap_dir.join("b.txt"), b"bbb");
+        write_file(&snap_dir.join("dir/c.txt"), b"ccc");
+
+        let db = Database::open(":memory:").unwrap();
+        let snap = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260220T0300".into(),
+            source: "nvme".into(),
+            path: snap_dir,
+        };
+        let result = index_snapshot(&db, &snap, None).unwrap();
+        assert_eq!(result.files_new, result.files_total); // all files are new
+        assert_eq!(result.files_extended, 0);
+        assert!(result.files_total >= 3); // at least 3 files (may include dir entry)
+    }
+
+    #[test]
+    fn index_extends_spans_for_unchanged_files() {
+        let tmp = TempDir::new().unwrap();
+        let snap1 = tmp.path().join("nvme/root.20260220T0300");
+        let snap2 = tmp.path().join("nvme/root.20260221T0300");
+        write_file(&snap1.join("a.txt"), b"same");
+        fs::create_dir_all(&snap2).unwrap();
+        fs::copy(snap1.join("a.txt"), snap2.join("a.txt")).unwrap();
+        // Preserve mtime by using filetime crate
+        let meta = fs::metadata(snap1.join("a.txt")).unwrap();
+        filetime::set_file_mtime(
+            snap2.join("a.txt"),
+            filetime::FileTime::from_last_modification_time(&meta),
+        )
+        .unwrap();
+
+        let db = Database::open(":memory:").unwrap();
+        let ds1 = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260220T0300".into(),
+            source: "nvme".into(),
+            path: snap1,
+        };
+        let r1 = index_snapshot(&db, &ds1, None).unwrap();
+        let ds2 = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260221T0300".into(),
+            source: "nvme".into(),
+            path: snap2,
+        };
+        let r2 = index_snapshot(&db, &ds2, Some(r1.snapshot_id)).unwrap();
+        assert!(r2.files_extended > 0);
+        assert_eq!(r2.files_new, 0);
+    }
+
+    #[test]
+    fn index_detects_new_files() {
+        let tmp = TempDir::new().unwrap();
+        let snap1 = tmp.path().join("nvme/root.20260220T0300");
+        let snap2 = tmp.path().join("nvme/root.20260221T0300");
+        write_file(&snap1.join("a.txt"), b"aaa");
+        write_file(&snap2.join("a.txt"), b"aaa");
+        write_file(&snap2.join("b.txt"), b"new");
+        // Preserve mtime on a.txt
+        let meta = fs::metadata(snap1.join("a.txt")).unwrap();
+        filetime::set_file_mtime(
+            snap2.join("a.txt"),
+            filetime::FileTime::from_last_modification_time(&meta),
+        )
+        .unwrap();
+
+        let db = Database::open(":memory:").unwrap();
+        let ds1 = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260220T0300".into(),
+            source: "nvme".into(),
+            path: snap1,
+        };
+        let r1 = index_snapshot(&db, &ds1, None).unwrap();
+        let ds2 = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260221T0300".into(),
+            source: "nvme".into(),
+            path: snap2,
+        };
+        let r2 = index_snapshot(&db, &ds2, Some(r1.snapshot_id)).unwrap();
+        assert!(r2.files_new >= 1); // b.txt is new
+        assert!(r2.files_extended >= 1); // a.txt extended
+    }
+
+    #[test]
+    fn index_detects_changed_files() {
+        let tmp = TempDir::new().unwrap();
+        let snap1 = tmp.path().join("nvme/root.20260220T0300");
+        let snap2 = tmp.path().join("nvme/root.20260221T0300");
+        write_file(&snap1.join("a.txt"), b"old content");
+        write_file(&snap2.join("a.txt"), b"new longer content here");
+
+        let db = Database::open(":memory:").unwrap();
+        let ds1 = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260220T0300".into(),
+            source: "nvme".into(),
+            path: snap1,
+        };
+        let r1 = index_snapshot(&db, &ds1, None).unwrap();
+        let ds2 = DiscoveredSnapshot {
+            name: "root".into(),
+            ts: "20260221T0300".into(),
+            source: "nvme".into(),
+            path: snap2,
+        };
+        let r2 = index_snapshot(&db, &ds2, Some(r1.snapshot_id)).unwrap();
+        assert!(r2.files_changed >= 1);
     }
 
     #[test]
