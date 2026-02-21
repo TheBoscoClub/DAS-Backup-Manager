@@ -45,7 +45,7 @@ CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
     INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
-    INSERT INTO files_fts(files_fts, rowid, name, path) VALUES (new.id, new.name, new.path);
+    INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
 END;
 "#;
 
@@ -57,6 +57,16 @@ pub struct Snapshot {
     pub source: String,
     pub path: String,
     pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileRecord {
+    pub id: i64,
+    pub path: String,
+    pub name: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub file_type: i32,
 }
 
 pub struct Database {
@@ -128,6 +138,59 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn upsert_file(&self, path: &str, name: &str, size: i64, mtime: i64, file_type: i32) -> SqlResult<i64> {
+        if let Some(existing) = self.get_file(path)? {
+            if existing.size != size || existing.mtime != mtime {
+                self.conn.execute(
+                    "UPDATE files SET size = ?1, mtime = ?2 WHERE id = ?3",
+                    rusqlite::params![size, mtime, existing.id],
+                )?;
+            }
+            return Ok(existing.id);
+        }
+        self.conn.execute(
+            "INSERT INTO files (path, name, size, mtime, type) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![path, name, size, mtime, file_type],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_file(&self, path: &str) -> SqlResult<Option<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, name, size, mtime, type FROM files WHERE path = ?1"
+        )?;
+        let mut rows = stmt.query_map([path], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                size: row.get(3)?,
+                mtime: row.get(4)?,
+                file_type: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn insert_span(&self, file_id: i64, first_snap: i64, last_snap: i64) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO spans (file_id, first_snap, last_snap) VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, first_snap, last_snap],
+        )?;
+        Ok(())
+    }
+
+    pub fn extend_span(&self, file_id: i64, prev_snap_id: i64, new_snap_id: i64) -> SqlResult<bool> {
+        let rows = self.conn.execute(
+            "UPDATE spans SET last_snap = ?1 WHERE file_id = ?2 AND last_snap = ?3",
+            rusqlite::params![new_snap_id, file_id, prev_snap_id],
+        )?;
+        Ok(rows > 0)
     }
 }
 
@@ -218,5 +281,79 @@ mod tests {
         let snaps = db.list_snapshots().unwrap();
         assert_eq!(snaps.len(), 3);
         assert_eq!(snaps[0].ts, "20260220T0300"); // ordered by ts
+    }
+
+    #[test]
+    fn upsert_file_new() {
+        let db = Database::open(":memory:").unwrap();
+        let id = db.upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn get_file_by_path() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0).unwrap();
+        let f = db.get_file("home/bosco/.zshrc").unwrap().unwrap();
+        assert_eq!(f.name, ".zshrc");
+        assert_eq!(f.size, 1024);
+    }
+
+    #[test]
+    fn upsert_file_unchanged() {
+        let db = Database::open(":memory:").unwrap();
+        let id1 = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        let id2 = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn upsert_file_changed() {
+        let db = Database::open(":memory:").unwrap();
+        let id1 = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        let id2 = db.upsert_file("a.txt", "a.txt", 200, 2000, 0).unwrap();
+        assert_eq!(id1, id2);
+        let f = db.get_file("a.txt").unwrap().unwrap();
+        assert_eq!(f.size, 200);
+        assert_eq!(f.mtime, 2000);
+    }
+
+    #[test]
+    fn insert_span() {
+        let db = Database::open(":memory:").unwrap();
+        let snap_id = db.insert_snapshot("root", "20260221T0304", "nvme", "/snap1").unwrap();
+        let file_id = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        db.insert_span(file_id, snap_id, snap_id).unwrap();
+        let count: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM spans WHERE file_id = ?1", [file_id], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn extend_span() {
+        let db = Database::open(":memory:").unwrap();
+        let s1 = db.insert_snapshot("root", "20260220T0300", "nvme", "/snap1").unwrap();
+        let s2 = db.insert_snapshot("root", "20260221T0300", "nvme", "/snap2").unwrap();
+        let fid = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        db.insert_span(fid, s1, s1).unwrap();
+        let extended = db.extend_span(fid, s1, s2).unwrap();
+        assert!(extended);
+        let last: i64 = db.conn.query_row(
+            "SELECT last_snap FROM spans WHERE file_id = ?1 AND first_snap = ?2",
+            rusqlite::params![fid, s1], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(last, s2);
+    }
+
+    #[test]
+    fn extend_span_fails_when_no_match() {
+        let db = Database::open(":memory:").unwrap();
+        let s1 = db.insert_snapshot("root", "20260220T0300", "nvme", "/snap1").unwrap();
+        let s3 = db.insert_snapshot("root", "20260222T0300", "nvme", "/snap3").unwrap();
+        let fid = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        db.insert_span(fid, s1, s1).unwrap();
+        let extended = db.extend_span(fid, s3, s3).unwrap();
+        assert!(!extended);
     }
 }
