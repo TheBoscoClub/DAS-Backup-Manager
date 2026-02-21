@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ButteredDASD
+GenericName=Backup Browser
+Comment=Search, browse, and restore files from BTRFS backup snapshots
+Exec=btrdasd-gui
+Icon=drive-harddisk
+Terminal=false
+Categories=Qt;KDE;System;Archiving;Utility;
+Keywords=backup;btrfs;snapshot;restore;search;
