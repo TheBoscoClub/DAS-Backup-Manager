@@ -34,6 +34,7 @@ target_sources(btrdasd-gui PRIVATE
     src/mainwindow.cpp
     src/database.cpp
     src/snapshotmodel.cpp
+    src/filemodel.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -68,6 +69,11 @@ if(BUILD_TESTING)
 
     ecm_add_test(tests/snapshotmodeltest.cpp src/snapshotmodel.cpp src/database.cpp
         TEST_NAME snapshotmodeltest
+        LINK_LIBRARIES Qt6::Test Qt6::Sql
+    )
+
+    ecm_add_test(tests/filemodeltest.cpp src/filemodel.cpp src/database.cpp
+        TEST_NAME filemodeltest
         LINK_LIBRARIES Qt6::Test Qt6::Sql
     )
 endif()
