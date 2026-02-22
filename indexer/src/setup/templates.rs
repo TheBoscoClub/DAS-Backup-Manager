@@ -16,8 +16,7 @@ const GENERATED_HEADER: &str = "\
 // Production scripts embedded in binary (installed to ${prefix}/lib/das-backup/scripts/)
 const SCRIPT_BACKUP_RUN: &str = include_str!("../../../scripts/backup-run.sh");
 const SCRIPT_BACKUP_VERIFY: &str = include_str!("../../../scripts/backup-verify.sh");
-const SCRIPT_BOOT_ARCHIVE_CLEANUP: &str =
-    include_str!("../../../scripts/boot-archive-cleanup.sh");
+const SCRIPT_BOOT_ARCHIVE_CLEANUP: &str = include_str!("../../../scripts/boot-archive-cleanup.sh");
 
 // ---------------------------------------------------------------------------
 // Render functions

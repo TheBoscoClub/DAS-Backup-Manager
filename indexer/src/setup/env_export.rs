@@ -23,7 +23,10 @@ pub fn dump_env(config: &Config) -> String {
     out.push_str(&kv("DAS_INIT_SYSTEM", init_str));
 
     // Schedule
-    out.push_str(&kv("DAS_SCHEDULE_INCREMENTAL", &config.schedule.incremental));
+    out.push_str(&kv(
+        "DAS_SCHEDULE_INCREMENTAL",
+        &config.schedule.incremental,
+    ));
     out.push_str(&kv("DAS_SCHEDULE_FULL", &config.schedule.full));
     out.push_str(&format!(
         "DAS_SCHEDULE_DELAY_MIN={}\n",
@@ -56,10 +59,7 @@ pub fn dump_env(config: &Config) -> String {
         out.push_str(&kv(&format!("{p}_LABEL"), &src.label));
         out.push_str(&kv(&format!("{p}_VOLUME"), &src.volume));
         out.push_str(&kv(&format!("{p}_DEVICE"), &src.device));
-        out.push_str(&kv(
-            &format!("{p}_SUBVOLUMES"),
-            &src.subvolumes.join(" "),
-        ));
+        out.push_str(&kv(&format!("{p}_SUBVOLUMES"), &src.subvolumes.join(" ")));
         out.push_str(&kv(&format!("{p}_SNAPSHOT_DIR"), &src.snapshot_dir));
         if !src.target_subdirs.is_empty() {
             out.push_str(&kv(
@@ -119,10 +119,7 @@ pub fn dump_env(config: &Config) -> String {
             "DAS_ESP_MIRROR={}\n",
             if config.esp.mirror { "true" } else { "false" }
         ));
-        out.push_str(&kv(
-            "DAS_ESP_PARTITIONS",
-            &config.esp.partitions.join(" "),
-        ));
+        out.push_str(&kv("DAS_ESP_PARTITIONS", &config.esp.partitions.join(" ")));
         out.push_str(&kv(
             "DAS_ESP_MOUNT_POINTS",
             &config.esp.mount_points.join(" "),
@@ -132,14 +129,15 @@ pub fn dump_env(config: &Config) -> String {
     // Email
     out.push_str(&format!(
         "DAS_EMAIL_ENABLED={}\n",
-        if config.email.enabled { "true" } else { "false" }
+        if config.email.enabled {
+            "true"
+        } else {
+            "false"
+        }
     ));
     if config.email.enabled {
         out.push_str(&kv("DAS_EMAIL_SMTP_HOST", &config.email.smtp_host));
-        out.push_str(&format!(
-            "DAS_EMAIL_SMTP_PORT={}\n",
-            config.email.smtp_port
-        ));
+        out.push_str(&format!("DAS_EMAIL_SMTP_PORT={}\n", config.email.smtp_port));
         out.push_str(&kv("DAS_EMAIL_FROM", &config.email.from));
         out.push_str(&kv("DAS_EMAIL_TO", &config.email.to));
     }
@@ -271,14 +269,10 @@ mod tests {
             if line.is_empty() {
                 continue;
             }
-            assert!(
-                line.contains('='),
-                "line missing assignment: {line}"
-            );
+            assert!(line.contains('='), "line missing assignment: {line}");
             let key = line.split('=').next().unwrap();
             assert!(
-                key.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "invalid key chars: {key}"
             );
         }

@@ -452,10 +452,7 @@ mod tests {
         assert_eq!(parsed.das.io_scheduler, "none");
         assert_eq!(parsed.das.mount_opts, "noatime,compress=zstd");
         assert_eq!(parsed.boot.archive_retention_days, 180);
-        assert_eq!(
-            parsed.boot.subvolumes,
-            vec!["@", "@home", "@log"]
-        );
+        assert_eq!(parsed.boot.subvolumes, vec!["@", "@home", "@log"]);
         assert!(parsed.esp.enabled);
         assert!(parsed.esp.mirror);
         assert_eq!(parsed.esp.hooks.hook_type, HookType::Pacman);
