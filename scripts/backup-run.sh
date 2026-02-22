@@ -1,20 +1,21 @@
 #!/usr/bin/env zsh
-# backup-run.sh - Run btrbk backup to DAS 22TB drive
-# Version: 3.1.0
-# Date: 2026-02-19
+# backup-run.sh - Run btrbk backup to DAS drives (config-driven)
+# Version: 4.0.0
+# Date: 2026-02-21
 #
 # Features:
-#   - Incremental BTRFS backups via btrbk to 22TB Exos primary drive
+#   - Incremental BTRFS backups via btrbk to configured targets
 #   - Maintains stable boot subvolumes (@ and @home) for disaster recovery
-#   - Syncs ESP to 2TB bootable recovery drives (Bay 1 + Bay 6)
+#   - Syncs ESP to bootable recovery drives (config-driven)
 #   - Detects DAS drives by serial number (stable across reboots)
 #   - Logs per-target throughput (data written + MB/s rate)
 #   - Designed for unattended nightly execution
+#   - All configuration loaded from config.toml via btrdasd
 #
 # Prerequisites:
 #   - DAS connected and powered on
-#   - btrbk.conf installed at /etc/btrbk/btrbk.conf
-#   - 22TB drive partitioned (p1: whole-disk BTRFS, no ESP)
+#   - btrdasd built and installed
+#   - config.toml installed at /etc/das-backup/config.toml
 #
 # Usage:
 #   sudo ./backup-run.sh              # Incremental backup
@@ -25,38 +26,69 @@ set -euo pipefail
 zmodload zsh/datetime  # provides $EPOCHSECONDS for throughput timing
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
 
-# DAS drive identification by serial number (stable across reboots)
-declare -A DAS_SERIALS=(
-    ["primary"]="ZXA0LMAE"        # 22TB Exos - primary backup target (Bay 2)
-    ["system_2tb"]="ZFL41DNY"     # 2TB old system backup (Bay 6) - ESP sync only
-    ["system_mirror"]="ZK208Q77"  # 2TB system mirror (Bay 1) - ESP sync only
-)
+# Load configuration from config.toml via btrdasd
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
+DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+if [[ -x "$BTRDASD_BIN" ]]; then
+    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
+else
+    echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
+    exit 1
+fi
 
-# Mount points for source top-level volumes
-MOUNT_NVME="/.btrfs-nvme"
-MOUNT_SSD="/.btrfs-ssd"
-MOUNT_HDD="/.btrfs-hdd"
+# Build associative arrays from config
+declare -A DAS_SERIALS=()
+declare -A TARGET_MOUNTS=()
+declare -A TARGET_NAMES=()
+declare -A TARGET_ROLES=()
+for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+    label_var="DAS_TARGET_${i}_LABEL"
+    serial_var="DAS_TARGET_${i}_SERIAL"
+    mount_var="DAS_TARGET_${i}_MOUNT"
+    name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+    role_var="DAS_TARGET_${i}_ROLE"
+    DAS_SERIALS[${(P)label_var}]="${(P)serial_var}"
+    TARGET_MOUNTS[${(P)label_var}]="${(P)mount_var}"
+    TARGET_ROLES[${(P)label_var}]="${(P)role_var}"
+    if [[ -n "${(P)name_var:-}" ]]; then
+        TARGET_NAMES[${(P)mount_var}]="${(P)name_var}"
+    else
+        TARGET_NAMES[${(P)mount_var}]="${(P)label_var}"
+    fi
+done
 
-# Mount point for 22TB backup target (unified — all btrbk targets live here)
-MOUNT_BACKUP="/mnt/backup-22tb"
+# Source volumes and devices from config
+declare -A SOURCE_VOLUMES=()
+declare -A SOURCE_DEVICES=()
+declare -A SOURCE_SNAPSHOT_DIRS=()
+for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
+    label_var="DAS_SOURCE_${i}_LABEL"
+    vol_var="DAS_SOURCE_${i}_VOLUME"
+    dev_var="DAS_SOURCE_${i}_DEVICE"
+    snap_var="DAS_SOURCE_${i}_SNAPSHOT_DIR"
+    SOURCE_VOLUMES[${(P)label_var}]="${(P)vol_var}"
+    SOURCE_DEVICES[${(P)label_var}]="${(P)dev_var}"
+    if [[ -n "${(P)snap_var:-}" ]]; then
+        SOURCE_SNAPSHOT_DIRS[${(P)label_var}]="${(P)snap_var}"
+    fi
+done
 
-# Mount points for 2TB bootable recovery drives (secondary btrbk targets for NVMe+SSD)
-MOUNT_BACKUP_SYSTEM="/mnt/backup-system"
-MOUNT_BACKUP_SYSTEM_MIRROR="/mnt/backup-system-mirror"
+# Logging (now from config)
+LOG_FILE="$DAS_LOG_FILE"
 
-# DAS ESP mount points (up to 3 ESPs to sync)
-MOUNT_DAS_ESP=("/mnt/das-esp-1" "/mnt/das-esp-2" "/mnt/das-esp-3")
+# Email and growth tracking (now from config)
+EMAIL_CONF="/etc/das-backup-email.conf"
+GROWTH_LOG="$DAS_GROWTH_LOG"
+LAST_REPORT="$DAS_LAST_REPORT"
 
-# Source devices
-DEV_NVME="/dev/nvme0n1p2"
-DEV_SSD="/dev/sdb"
-DEV_HDD="/dev/sda"
+# ESP mount points from config
+MOUNT_DAS_ESP=(${(s: :)DAS_ESP_MOUNT_POINTS})
 
-# Logging
-LOG_FILE="/var/log/das-backup.log"
+# All target mount points (space-separated string from config -> array)
+ALL_TARGET_MOUNTS=(${(s: :)DAS_ALL_TARGET_MOUNTS})
 
 # Throughput tracking (populated at runtime)
 declare -A USAGE_BEFORE=()
@@ -66,14 +98,6 @@ BTRBK_END_TIME=0
 
 # Operation status tracking (for email report)
 declare -A OP_STATUS=()
-
-# Email and growth tracking
-EMAIL_CONF="/etc/das-backup-email.conf"
-GROWTH_LOG="/var/lib/das-backup/growth.log"
-LAST_REPORT="/var/lib/das-backup/last-report.txt"
-
-# Target display names (populated after mount_targets)
-declare -A TARGET_NAMES=()
 
 # Colors for interactive output
 RED='\033[0;31m'
@@ -136,33 +160,44 @@ find_device_by_serial() {
 check_das_connected() {
     log_info "Detecting DAS drives by serial number..."
 
-    DRIVE_PRIMARY=$(find_device_by_serial "${DAS_SERIALS[primary]}") || {
-        log_error "22TB primary backup drive (${DAS_SERIALS[primary]}) not found"
-        log_error "Is the DAS connected and powered on?"
+    # Detect all target drives by serial, storing discovered device paths
+    declare -gA DISCOVERED_DEVICES=()
+    local required_found=true
+
+    for label in "${(@k)DAS_SERIALS}"; do
+        local serial="${DAS_SERIALS[$label]}"
+        local role="${TARGET_ROLES[$label]}"
+        local dev
+        dev=$(find_device_by_serial "$serial") || dev=""
+
+        if [[ -n "$dev" ]]; then
+            DISCOVERED_DEVICES[$label]="$dev"
+            log_info "  $label: $dev ($serial) — $role"
+        else
+            if [[ "$role" == "primary" ]]; then
+                log_error "Primary backup drive ($label, $serial) not found"
+                log_error "Is the DAS connected and powered on?"
+                required_found=false
+            else
+                log_warn "  $label ($serial) not found — will skip"
+            fi
+        fi
+    done
+
+    if [[ "$required_found" == "false" ]]; then
         exit 1
-    }
-    log_info "  Primary (22TB): $DRIVE_PRIMARY (${DAS_SERIALS[primary]})"
-
-    # Optional: detect ESP-only drives for sync
-    DRIVE_SYSTEM_2TB=$(find_device_by_serial "${DAS_SERIALS[system_2tb]}") || DRIVE_SYSTEM_2TB=""
-    DRIVE_SYSTEM_MIRROR=$(find_device_by_serial "${DAS_SERIALS[system_mirror]}") || DRIVE_SYSTEM_MIRROR=""
-
-    if [[ -n "$DRIVE_SYSTEM_2TB" ]]; then
-        log_info "  System 2TB: $DRIVE_SYSTEM_2TB (${DAS_SERIALS[system_2tb]}) — ESP sync"
-    fi
-    if [[ -n "$DRIVE_SYSTEM_MIRROR" ]]; then
-        log_info "  System mirror: $DRIVE_SYSTEM_MIRROR (${DAS_SERIALS[system_mirror]}) — ESP sync"
     fi
 }
 
 set_io_scheduler() {
-    log_info "Setting I/O scheduler to mq-deadline for DAS drives..."
+    log_info "Setting I/O scheduler to $DAS_IO_SCHEDULER for DAS drives..."
 
-    for drive in "$DRIVE_PRIMARY" "$DRIVE_SYSTEM_2TB" "$DRIVE_SYSTEM_MIRROR"; do
+    for label in "${(@k)DISCOVERED_DEVICES}"; do
+        local drive="${DISCOVERED_DEVICES[$label]}"
         if [[ -n "$drive" && -b "$drive" ]]; then
             local dev="${drive#/dev/}"
             if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
-                echo mq-deadline > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
+                echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
             fi
         fi
     done
@@ -170,8 +205,12 @@ set_io_scheduler() {
 
 create_mount_points() {
     log_info "Creating mount points..."
-    mkdir -p "$MOUNT_NVME" "$MOUNT_SSD" "$MOUNT_HDD"
-    mkdir -p "$MOUNT_BACKUP"
+    for label in "${(@k)SOURCE_VOLUMES}"; do
+        mkdir -p "${SOURCE_VOLUMES[$label]}"
+    done
+    for label in "${(@k)TARGET_MOUNTS}"; do
+        mkdir -p "${TARGET_MOUNTS[$label]}"
+    done
     for esp in "${MOUNT_DAS_ESP[@]}"; do
         mkdir -p "$esp"
     done
@@ -180,79 +219,78 @@ create_mount_points() {
 mount_sources() {
     log_info "Mounting source top-level volumes..."
 
-    if ! mountpoint -q "$MOUNT_NVME"; then
-        mount -o subvolid=5 "$DEV_NVME" "$MOUNT_NVME"
-        log_info "  Mounted NVMe at $MOUNT_NVME"
-    fi
-
-    if ! mountpoint -q "$MOUNT_SSD"; then
-        mount -o subvolid=5 "$DEV_SSD" "$MOUNT_SSD"
-        log_info "  Mounted SSD at $MOUNT_SSD"
-    fi
-
-    if ! mountpoint -q "$MOUNT_HDD"; then
-        mount -o subvolid=5 "$DEV_HDD" "$MOUNT_HDD"
-        log_info "  Mounted HDD at $MOUNT_HDD"
-    fi
+    for label in "${(@k)SOURCE_VOLUMES}"; do
+        local mnt="${SOURCE_VOLUMES[$label]}"
+        local dev="${SOURCE_DEVICES[$label]}"
+        if ! mountpoint -q "$mnt"; then
+            mount -o subvolid=5 "$dev" "$mnt"
+            log_info "  Mounted $label at $mnt"
+        fi
+    done
 }
 
 mount_targets() {
     log_info "Mounting backup targets..."
 
-    # HDD-optimized options for USB 3.2
-    local mount_opts="nossd,noatime,space_cache=v2,commit=120"
+    for label in "${(@k)TARGET_MOUNTS}"; do
+        local mnt="${TARGET_MOUNTS[$label]}"
+        local dev="${DISCOVERED_DEVICES[$label]:-}"
 
-    # Primary: 22TB Exos (required)
-    if ! mountpoint -q "$MOUNT_BACKUP"; then
-        if [[ ! -b "${DRIVE_PRIMARY}1" ]]; then
-            log_error "Partition ${DRIVE_PRIMARY}1 not found — is the 22TB drive partitioned?"
-            exit 1
+        if [[ -z "$dev" ]]; then
+            continue
         fi
-        mount -o "$mount_opts" "${DRIVE_PRIMARY}1" "$MOUNT_BACKUP"
-        log_info "  Mounted 22TB backup at $MOUNT_BACKUP"
-    fi
 
-    # Secondary: 2TB bootable recovery drives (optional — keeps recovery OS current)
-    if [[ -n "$DRIVE_SYSTEM_2TB" ]]; then
-        mkdir -p "$MOUNT_BACKUP_SYSTEM"
-        if [[ -b "${DRIVE_SYSTEM_2TB}2" ]] && ! mountpoint -q "$MOUNT_BACKUP_SYSTEM"; then
-            mount -o "$mount_opts" "${DRIVE_SYSTEM_2TB}2" "$MOUNT_BACKUP_SYSTEM" && \
-                log_info "  Mounted 2TB system backup at $MOUNT_BACKUP_SYSTEM" || \
-                log_warn "  Could not mount 2TB system backup — btrbk will skip it"
-        fi
-    fi
+        local role="${TARGET_ROLES[$label]}"
 
-    if [[ -n "$DRIVE_SYSTEM_MIRROR" ]]; then
-        mkdir -p "$MOUNT_BACKUP_SYSTEM_MIRROR"
-        if [[ -b "${DRIVE_SYSTEM_MIRROR}2" ]] && ! mountpoint -q "$MOUNT_BACKUP_SYSTEM_MIRROR"; then
-            mount -o "$mount_opts" "${DRIVE_SYSTEM_MIRROR}2" "$MOUNT_BACKUP_SYSTEM_MIRROR" && \
-                log_info "  Mounted 2TB system mirror at $MOUNT_BACKUP_SYSTEM_MIRROR" || \
-                log_warn "  Could not mount 2TB system mirror — btrbk will skip it"
+        if ! mountpoint -q "$mnt"; then
+            # Determine the right partition suffix based on role
+            local part_dev
+            if [[ "$role" == "primary" ]]; then
+                part_dev="${dev}1"  # Single partition, whole-disk BTRFS
+            else
+                part_dev="${dev}2"  # Partition 2 for bootable drives (partition 1 = ESP)
+            fi
+
+            if [[ ! -b "$part_dev" ]]; then
+                log_warn "Partition $part_dev not found — skipping $label"
+                continue
+            fi
+
+            if mount -o "$DAS_MOUNT_OPTS" "$part_dev" "$mnt"; then
+                log_info "  Mounted $label at $mnt"
+            else
+                log_warn "  Could not mount $label at $mnt — btrbk will skip it"
+            fi
         fi
-    fi
+    done
 }
 
 create_snapshot_dirs() {
     log_info "Creating btrbk snapshot directories..."
-    mkdir -p "$MOUNT_NVME/.btrbk-snapshots"
-    mkdir -p "$MOUNT_SSD/.btrbk-snapshots"
-    mkdir -p "$MOUNT_HDD/ClaudeCodeProjects/.btrbk-snapshots"
-    mkdir -p "$MOUNT_HDD/Audiobooks/.btrbk-snapshots"
+    for label in "${(@k)SOURCE_SNAPSHOT_DIRS}"; do
+        local snap_dir="${SOURCE_SNAPSHOT_DIRS[$label]}"
+        if [[ -n "$snap_dir" ]]; then
+            mkdir -p "$snap_dir"
+        fi
+    done
 }
 
 create_target_dirs() {
     log_info "Creating target directory structure..."
-    mkdir -p "$MOUNT_BACKUP/nvme"
-    mkdir -p "$MOUNT_BACKUP/ssd"
-    mkdir -p "$MOUNT_BACKUP/projects"
-    mkdir -p "$MOUNT_BACKUP/audiobooks"
-    mkdir -p "$MOUNT_BACKUP/storage"
 
-    # 2TB bootable recovery drives get NVMe + SSD targets only
-    for mnt in "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
-        if mountpoint -q "$mnt" 2>/dev/null; then
-            mkdir -p "$mnt/nvme"
-            mkdir -p "$mnt/ssd"
+    for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+        local mount_var="DAS_TARGET_${i}_MOUNT"
+        local subdirs_var="DAS_TARGET_${i}_TARGET_SUBDIRS"
+        local mnt="${(P)mount_var}"
+
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+
+        if [[ -n "${(P)subdirs_var:-}" ]]; then
+            for subdir in ${(s: :)${(P)subdirs_var}}; do
+                mkdir -p "$mnt/$subdir"
+            done
         fi
     done
 }
@@ -263,10 +301,10 @@ run_btrbk() {
     log_info "Running btrbk ($mode)..."
 
     if [[ "$mode" == "dryrun" ]]; then
-        btrbk -c /etc/btrbk/btrbk.conf dryrun
+        btrbk -c "$DAS_BTRBK_CONF" dryrun
         record_op "btrbk" "OK" "dryrun"
     else
-        if btrbk -c /etc/btrbk/btrbk.conf run; then
+        if btrbk -c "$DAS_BTRBK_CONF" run; then
             record_op "btrbk" "OK"
             log_info "btrbk completed"
         else
@@ -283,7 +321,7 @@ update_boot_subvolumes() {
     log_info "Updating stable boot subvolumes..."
 
     # Update boot subvolumes on each mounted backup target that has NVMe snapshots
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if ! mountpoint -q "$mnt" 2>/dev/null; then
             continue
         fi
@@ -361,23 +399,31 @@ update_boot_subvolumes() {
 }
 
 sync_das_esp() {
+    if [[ "$DAS_ESP_ENABLED" != "true" ]]; then
+        log_info "ESP sync disabled in config — skipping"
+        record_op "esp_sync" "SKIP" "disabled"
+        return
+    fi
+
     log_info "Syncing ESP to DAS backup drives..."
 
     local esp_source="/boot"
     local esp_idx=0
     local esp_ok=0 esp_fail=0
 
-    # Build list of ESP partitions to sync (2TB bootable recovery drives only)
-    # 22TB has no ESP — it's a pure backup/storage drive
-    local esp_parts=()
-    [[ -n "$DRIVE_SYSTEM_2TB" && -b "${DRIVE_SYSTEM_2TB}1" ]] && esp_parts+=("${DRIVE_SYSTEM_2TB}1")
-    [[ -n "$DRIVE_SYSTEM_MIRROR" && -b "${DRIVE_SYSTEM_MIRROR}1" ]] && esp_parts+=("${DRIVE_SYSTEM_MIRROR}1")
-
+    # Build list of ESP partitions from config
+    local esp_parts=(${(s: :)DAS_ESP_PARTITIONS})
     local esp_total=${#esp_parts[@]}
 
     for esp_part in "${esp_parts[@]}"; do
         local mount_point="${MOUNT_DAS_ESP[$((esp_idx + 1))]}"
         esp_idx=$((esp_idx + 1))
+
+        if [[ ! -b "$esp_part" ]]; then
+            log_warn "ESP partition $esp_part not found — skipping"
+            (( esp_fail += 1 ))
+            continue
+        fi
 
         if ! mountpoint -q "$mount_point"; then
             mount "$esp_part" "$mount_point" 2>/dev/null || {
@@ -413,22 +459,28 @@ unmount_all() {
     for esp in "${MOUNT_DAS_ESP[@]}"; do
         umount "$esp" 2>/dev/null || true
     done
-    umount "$MOUNT_BACKUP_SYSTEM_MIRROR" 2>/dev/null || true
-    umount "$MOUNT_BACKUP_SYSTEM" 2>/dev/null || true
-    umount "$MOUNT_BACKUP" 2>/dev/null || true
-    umount "$MOUNT_HDD" 2>/dev/null || true
-    umount "$MOUNT_SSD" 2>/dev/null || true
-    umount "$MOUNT_NVME" 2>/dev/null || true
+    # Unmount targets in reverse order
+    for (( i=${#ALL_TARGET_MOUNTS[@]}; i>=1; i-- )); do
+        umount "${ALL_TARGET_MOUNTS[$i]}" 2>/dev/null || true
+    done
+    # Unmount sources
+    for label in "${(@k)SOURCE_VOLUMES}"; do
+        umount "${SOURCE_VOLUMES[$label]}" 2>/dev/null || true
+    done
 
     log_info "All volumes unmounted"
 }
 
 show_stats() {
     log_info "Backup statistics:"
-    btrbk -c /etc/btrbk/btrbk.conf list latest 2>/dev/null || true
+    btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null || true
 
     log_info "Target disk usage:"
-    df -h "$MOUNT_BACKUP" 2>/dev/null || true
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            df -h "$mnt" 2>/dev/null || true
+        fi
+    done
 }
 
 # Get used bytes on a mounted filesystem
@@ -454,7 +506,7 @@ format_bytes() {
 capture_usage() {
     local phase="$1"  # "before" or "after"
 
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null; then
             local used=$(get_used_bytes "$mnt")
             if [[ "$phase" == "before" ]]; then
@@ -483,8 +535,8 @@ log_throughput() {
 
     local total_written=0
 
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
-        local name="${TARGET_NAMES[$mnt]}"
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
         local before="${USAGE_BEFORE[$mnt]:-}"
         local after="${USAGE_AFTER[$mnt]:-}"
 
@@ -521,7 +573,7 @@ record_growth() {
     mkdir -p "$(dirname "$GROWTH_LOG")"
     local ts=$(date '+%Y-%m-%dT%H:%M:%S')
 
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null; then
             local used=$(get_used_bytes "$mnt")
             echo "$ts $mnt $used" >> "$GROWTH_LOG"
@@ -595,18 +647,30 @@ get_smart_summary() {
 # ============================================================================
 
 run_indexer() {
-    local indexer="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
-    local db="/var/lib/das-backup/backup-index.db"
-
-    if [[ ! -x "$indexer" ]]; then
+    if [[ ! -x "$BTRDASD_BIN" ]]; then
         log_warn "Content indexer not built -- skipping (build with: cargo build --release --manifest-path indexer/Cargo.toml)"
         record_op "indexer" "SKIP" "binary not found"
         return
     fi
 
+    # Find the primary target mount for indexing
+    local primary_mount=""
+    for label in "${(@k)TARGET_ROLES}"; do
+        if [[ "${TARGET_ROLES[$label]}" == "primary" ]]; then
+            primary_mount="${TARGET_MOUNTS[$label]}"
+            break
+        fi
+    done
+
+    if [[ -z "$primary_mount" ]] || ! mountpoint -q "$primary_mount" 2>/dev/null; then
+        log_warn "Primary target not mounted — skipping indexer"
+        record_op "indexer" "SKIP" "primary target not mounted"
+        return
+    fi
+
     log_info "Running content indexer..."
     local indexer_output
-    if indexer_output=$("$indexer" walk "$MOUNT_BACKUP" --db "$db" 2>&1); then
+    if indexer_output=$("$BTRDASD_BIN" walk "$primary_mount" --db "$DAS_DB_PATH" 2>&1); then
         record_op "indexer" "OK"
         log_info "  $indexer_output"
     else
@@ -669,10 +733,10 @@ $(generate_smart_section)
 
 LATEST SNAPSHOTS
 ───────────────────────────────────────────────────────────────
-$(btrbk -c /etc/btrbk/btrbk.conf list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
+$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
 
 ===============================================================
-  backup-run.sh v3.1.0
+  backup-run.sh v4.0.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -682,8 +746,8 @@ generate_throughput_section() {
     local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
     local total_written=0
 
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
-        local name="${TARGET_NAMES[$mnt]}"
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
         local before="${USAGE_BEFORE[$mnt]:-}"
         local after="${USAGE_AFTER[$mnt]:-}"
 
@@ -712,9 +776,9 @@ generate_throughput_section() {
 generate_capacity_section() {
     printf "  %-24s %-10s %-10s %s\n" "Target" "Used" "Avail" "Use%"
 
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if ! mountpoint -q "$mnt" 2>/dev/null; then continue; fi
-        local name="${TARGET_NAMES[$mnt]}"
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
         local df_line=$(df -h "$mnt" 2>/dev/null | tail -1)
         local used=$(echo "$df_line" | awk '{print $3}')
         local avail=$(echo "$df_line" | awk '{print $4}')
@@ -724,9 +788,9 @@ generate_capacity_section() {
 }
 
 generate_growth_section() {
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if ! mountpoint -q "$mnt" 2>/dev/null; then continue; fi
-        local name="${TARGET_NAMES[$mnt]}"
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
         local current="${USAGE_AFTER[$mnt]:-0}"
         local today_delta=$(( ${USAGE_AFTER[$mnt]:-0} - ${USAGE_BEFORE[$mnt]:-0} ))
 
@@ -761,21 +825,16 @@ generate_growth_section() {
 }
 
 generate_smart_section() {
-    local -A bay_names=(
-        ["$DRIVE_PRIMARY"]="Bay 2  22TB"
-        ["$DRIVE_SYSTEM_2TB"]="Bay 6  2TB "
-        ["$DRIVE_SYSTEM_MIRROR"]="Bay 1  2TB "
-    )
-
-    for drive in "$DRIVE_PRIMARY" "$DRIVE_SYSTEM_2TB" "$DRIVE_SYSTEM_MIRROR"; do
+    for label in "${(@k)DISCOVERED_DEVICES}"; do
+        local drive="${DISCOVERED_DEVICES[$label]}"
         if [[ -z "$drive" || ! -b "$drive" ]]; then continue; fi
-        local bay="${bay_names[$drive]}"
+        local name="${TARGET_NAMES[${TARGET_MOUNTS[$label]}]:-$label}"
         local smart_data=$(get_smart_summary "$drive")
         local health=${smart_data%%|*}; smart_data=${smart_data#*|}
         local temp=${smart_data%%|*}; smart_data=${smart_data#*|}
         local hours=${smart_data%%|*}; smart_data=${smart_data#*|}
         local serial=$smart_data
-        printf "  %-10s %-10s %-8s %s°C  %s hours\n" "$bay" "$serial" "$health" "$temp" "$hours"
+        printf "  %-24s %-10s %-8s %s°C  %s hours\n" "$name" "$serial" "$health" "$temp" "$hours"
     done
 }
 
@@ -868,7 +927,7 @@ main() {
     mkdir -p "$(dirname "$LOG_FILE")"
 
     echo "========================================"
-    echo "  DAS Backup (22TB Primary)"
+    echo "  DAS Backup (config-driven)"
     echo "  Mode: $mode"
     echo "  Date: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "========================================"
@@ -886,13 +945,6 @@ main() {
     create_snapshot_dirs
     mount_targets
     create_target_dirs
-
-    # Populate target display names (used by throughput and report functions)
-    TARGET_NAMES=(
-        ["$MOUNT_BACKUP"]="22TB Primary (Bay 2)"
-        ["$MOUNT_BACKUP_SYSTEM"]="2TB System (Bay 6)"
-        ["$MOUNT_BACKUP_SYSTEM_MIRROR"]="2TB Mirror (Bay 1)"
-    )
 
     if [[ "$mode" != "dryrun" ]]; then
         capture_usage "before"

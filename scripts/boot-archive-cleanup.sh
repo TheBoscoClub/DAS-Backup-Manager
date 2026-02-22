@@ -1,31 +1,40 @@
 #!/usr/bin/env zsh
-# boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets
-# Version: 1.0.0
+# boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
+# Version: 2.0.0
 # Date: 2026-02-21
 #
 # When backup-run.sh --full recreates @ and @home, it snapshots the old ones
 # as @.archive.YYYYMMDDTHHMMSS before deletion. This script prunes archives
-# older than the retention period (default: 365 days).
+# older than the retention period (from config.toml, default: 365 days).
+# All configuration loaded from config.toml via btrdasd.
 #
 # Usage:
-#   sudo ./boot-archive-cleanup.sh              # Prune archives > 365 days old
+#   sudo ./boot-archive-cleanup.sh              # Prune archives past retention
 #   sudo ./boot-archive-cleanup.sh --dryrun     # Preview only
-#   sudo ./boot-archive-cleanup.sh --days 180   # Custom retention (180 days)
+#   sudo ./boot-archive-cleanup.sh --days 180   # Override retention (180 days)
 
 set -euo pipefail
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
 
-RETENTION_DAYS=365
+# Load configuration from config.toml via btrdasd
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
+DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+if [[ -x "$BTRDASD_BIN" ]]; then
+    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
+else
+    echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
+    exit 1
+fi
+
+RETENTION_DAYS="$DAS_BOOT_ARCHIVE_RETENTION_DAYS"
 DRYRUN=false
 ARCHIVE_PATTERN="@*.archive.*"
 
-# Mount points for backup targets (same as backup-run.sh)
-MOUNT_BACKUP="/mnt/backup-22tb"
-MOUNT_BACKUP_SYSTEM="/mnt/backup-system"
-MOUNT_BACKUP_SYSTEM_MIRROR="/mnt/backup-system-mirror"
+# All target mount points from config
+ALL_TARGET_MOUNTS=(${(s: :)DAS_ALL_TARGET_MOUNTS})
 
 # Colors
 RED='\033[0;31m'
@@ -131,7 +140,7 @@ main() {
             *)
                 echo "Usage: $0 [--dryrun|-n] [--days|-d DAYS]"
                 echo "  --dryrun  Preview deletions without acting"
-                echo "  --days N  Retention period in days (default: 365)"
+                echo "  --days N  Override retention period (default from config: $DAS_BOOT_ARCHIVE_RETENTION_DAYS days)"
                 exit 1
                 ;;
         esac
@@ -148,7 +157,7 @@ main() {
 
     check_root
 
-    for mnt in "$MOUNT_BACKUP" "$MOUNT_BACKUP_SYSTEM" "$MOUNT_BACKUP_SYSTEM_MIRROR"; do
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         cleanup_target "$mnt"
     done
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env zsh
-# backup-verify.sh - Verify DAS drive health and backup status
-# Version: 2.0.0
-# Date: 2026-02-19
+# backup-verify.sh - Verify DAS drive health and backup status (config-driven)
+# Version: 3.0.0
+# Date: 2026-02-21
 #
 # Checks:
-#   - SMART health on all 6 DAS drives
+#   - SMART health on all DAS drives
 #   - btrbk snapshot status
 #   - Disk space usage
+#   - All configuration loaded from config.toml via btrdasd
 #
 # Usage:
 #   sudo ./backup-verify.sh          # Full verification
@@ -15,19 +16,36 @@
 set -euo pipefail
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
 
-# DAS drive mapping (serial → role)
-# These are detected dynamically, but we verify by serial
-declare -A DRIVE_MAP=(
-    ["ZXA0LMAE"]="Bay 2 — 22TB Primary Backup (Exos)"
-    ["ZFL41DNY"]="Bay 6 — 2TB System Backup (legacy)"
-    ["ZK208Q7J"]="Bay 5 — 2TB Data Backup (legacy)"
-    ["ZK208Q77"]="Bay 1 — 2TB System Mirror"
-    ["ZFL41DV0"]="Bay 4 — 2TB Data Mirror"
-    ["ZK208RH6"]="Bay 3 — 2TB Cold Spare"
-)
+# Load configuration from config.toml via btrdasd
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
+DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+if [[ -x "$BTRDASD_BIN" ]]; then
+    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
+else
+    echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
+    exit 1
+fi
+
+# Build drive map from config targets (serial -> display name)
+declare -A DRIVE_MAP=()
+declare -A TARGET_ROLES=()
+for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+    serial_var="DAS_TARGET_${i}_SERIAL"
+    name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+    label_var="DAS_TARGET_${i}_LABEL"
+    role_var="DAS_TARGET_${i}_ROLE"
+    mount_var="DAS_TARGET_${i}_MOUNT"
+    serial="${(P)serial_var}"
+    if [[ -n "${(P)name_var:-}" ]]; then
+        DRIVE_MAP[$serial]="${(P)name_var}"
+    else
+        DRIVE_MAP[$serial]="${(P)label_var}"
+    fi
+    TARGET_ROLES[$serial]="${(P)role_var}"
+done
 
 # Expected DAS drives (detected by USB transport)
 DAS_DEVICES=()
@@ -72,9 +90,9 @@ check_root() {
 detect_das_drives() {
     log_header "Detecting DAS Drives"
 
-    # Find all USB-attached SCSI disks behind the TerraMaster DAS enclosure.
-    # Note: The enclosure presents its own model ("TDAS") to sysfs, not the
-    # individual drive model (ST2000DM008). Specific drives are verified by
+    # Find all USB-attached SCSI disks behind the DAS enclosure.
+    # Note: The enclosure presents its own model to sysfs, not the
+    # individual drive model. Specific drives are verified by
     # serial number after detection.
     for dev in /sys/block/sd*; do
         local name
@@ -86,11 +104,11 @@ detect_das_drives() {
             transport=$(readlink -f "$dev/device" | grep -o "usb" || true)
 
             if [[ -n "$transport" ]]; then
-                # Filter for TerraMaster DAS enclosure
+                # Filter for DAS enclosure by model pattern from config
                 local model
                 model=$(cat "$dev/device/model" 2>/dev/null | tr -d ' ' || true)
 
-                if [[ "$model" == "TDAS" ]]; then
+                if [[ "$model" == "$DAS_MODEL_PATTERN" ]]; then
                     DAS_DEVICES+=("/dev/$name")
                 fi
             fi
@@ -99,7 +117,7 @@ detect_das_drives() {
 
     if [[ ${#DAS_DEVICES[@]} -eq 0 ]]; then
         log_error "No DAS drives detected!"
-        log_error "Is the TerraMaster D6-320 connected and powered on?"
+        log_error "Is the DAS enclosure connected and powered on?"
         exit 1
     fi
 
@@ -178,28 +196,40 @@ check_smart_health() {
 check_btrbk_status() {
     log_header "btrbk Backup Status"
 
-    if [[ ! -f /etc/btrbk/btrbk.conf ]]; then
-        log_warn "btrbk not configured (/etc/btrbk/btrbk.conf missing)"
+    if [[ ! -f "$DAS_BTRBK_CONF" ]]; then
+        log_warn "btrbk not configured ($DAS_BTRBK_CONF missing)"
         return
     fi
 
-    # Find 22TB primary backup drive by serial number
+    # Find primary backup drive by serial number from config
+    local primary_serial=""
+    local primary_mount=""
+    for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+        local role_var="DAS_TARGET_${i}_ROLE"
+        if [[ "${(P)role_var}" == "primary" ]]; then
+            local serial_var="DAS_TARGET_${i}_SERIAL"
+            local mount_var="DAS_TARGET_${i}_MOUNT"
+            primary_serial="${(P)serial_var}"
+            primary_mount="${(P)mount_var}"
+            break
+        fi
+    done
+
     local primary_dev=""
     for dev in "${DAS_DEVICES[@]}"; do
         local serial
         serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3; exit}' || echo "unknown")
-        if [[ "$serial" == "ZXA0LMAE" ]]; then
+        if [[ "$serial" == "$primary_serial" ]]; then
             primary_dev="${dev}1"  # Single partition, whole-disk BTRFS
         fi
     done
 
-    # Check if 22TB backup drive is mountable
-    local mount_backup="/mnt/backup-22tb"
+    # Check if primary backup drive is mountable
     local mounted=false
 
     if [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
-        mkdir -p "$mount_backup"
-        if mount -o ro,nossd,noatime "$primary_dev" "$mount_backup" 2>/dev/null; then
+        mkdir -p "$primary_mount"
+        if mount -o ro,nossd,noatime "$primary_dev" "$primary_mount" 2>/dev/null; then
             mounted=true
         fi
     fi
@@ -207,27 +237,27 @@ check_btrbk_status() {
     if $mounted; then
         echo ""
         echo "Latest snapshots:"
-        btrbk -c /etc/btrbk/btrbk.conf list latest 2>/dev/null || echo "  (no snapshots yet)"
+        btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null || echo "  (no snapshots yet)"
 
         echo ""
         echo "Disk usage:"
-        df -h "$mount_backup"
+        df -h "$primary_mount"
 
         echo ""
         echo "BTRFS usage:"
-        btrfs filesystem usage "$mount_backup" 2>/dev/null | head -8
+        btrfs filesystem usage "$primary_mount" 2>/dev/null | head -8
 
         # Cleanup
-        umount "$mount_backup" 2>/dev/null || log_warn "Failed to unmount $mount_backup"
+        umount "$primary_mount" 2>/dev/null || log_warn "Failed to unmount $primary_mount"
     else
-        log_warn "22TB primary backup drive not found or not formatted"
+        log_warn "Primary backup drive not found or not formatted"
     fi
 }
 
 show_summary() {
     log_header "Summary"
 
-    echo "DAS Drives Detected: ${#DAS_DEVICES[@]}/6"
+    echo "DAS Drives Detected: ${#DAS_DEVICES[@]}"
     echo ""
     echo "Next steps:"
     echo "  1. If SMART tests are still running, wait for completion"

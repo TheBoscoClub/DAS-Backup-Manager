@@ -1,8 +1,15 @@
 #!/usr/bin/env zsh
 # install-backup-timer.sh - Install DAS backup systemd service and timer
+# Version: 1.1.0 (DEPRECATED)
+# Date: 2026-02-21
 # Run as root: sudo ./install-backup-timer.sh
+#
+# DEPRECATED: Use 'sudo btrdasd setup' instead, which reads config.toml
+# and installs systemd units with the correct paths and schedules.
 
 set -euo pipefail
+
+echo "DEPRECATED: Use 'sudo btrdasd setup' instead" >&2
 
 if [[ $EUID -ne 0 ]]; then
     echo "ERROR: This script must be run as root"

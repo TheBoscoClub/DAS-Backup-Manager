@@ -1,23 +1,19 @@
 #!/usr/bin/env zsh
-# das-partition-drives.sh - Partition and format DAS backup drives
-# Version: 1.0.0
-# Date: 2026-02-03
+# das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
+# Version: 2.0.0
+# Date: 2026-02-21
 #
-# ⚠️  WARNING: This script DESTROYS ALL DATA on the target drives!
+# WARNING: This script DESTROYS ALL DATA on the target drives!
 #     Run ONLY after verifying SMART tests passed.
+#     All configuration loaded from config.toml via btrdasd.
 #
-# Drive Layout:
-#   Drive 1 (sde): Bootable system backup
+# Drive Layout (from config):
+#   Bootable targets (role with ESP):
 #     - Partition 1: 1.5G ESP (FAT32) - clone of /boot
-#     - Partition 2: ~1998G BTRFS - system subvolumes
+#     - Partition 2: remainder BTRFS - system subvolumes
 #
-#   Drive 2 (sdf): HDD critical data backup
+#   Primary/data targets (no ESP):
 #     - Whole disk BTRFS
-#
-#   Drive 3 (sdh): Mirror of Drive 1 (formatted same as Drive 1)
-#   Drive 4 (sdi): Mirror of Drive 2 (formatted same as Drive 2)
-#   Drive 5 (sdj): Cold spare (leave unformatted)
-#   Drive 6 (sdk): Cold spare / offsite (leave unformatted)
 #
 # Usage:
 #   sudo ./das-partition-drives.sh --check   # Verify drives, show plan
@@ -26,22 +22,42 @@
 set -euo pipefail
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
 
-# Drive assignments (verified by serial number)
-DRIVE1="/dev/sde"  # Serial: ZFL41DNY - System backup
-DRIVE2="/dev/sdf"  # Serial: ZK208Q7J - Data backup
-DRIVE3="/dev/sdh"  # Serial: ZK208Q77 - Mirror of Drive 1
-DRIVE4="/dev/sdi"  # Serial: ZFL41DV0 - Mirror of Drive 2
+# Load configuration from config.toml via btrdasd
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
+DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+if [[ -x "$BTRDASD_BIN" ]]; then
+    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
+else
+    echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
+    exit 1
+fi
 
-# Expected serials for verification
-declare -A EXPECTED_SERIALS=(
-    ["/dev/sde"]="ZFL41DNY"
-    ["/dev/sdf"]="ZK208Q7J"
-    ["/dev/sdh"]="ZK208Q77"
-    ["/dev/sdi"]="ZFL41DV0"
-)
+# Build device-to-serial mapping and target info from config
+declare -A EXPECTED_SERIALS=()
+declare -A TARGET_LABELS=()
+declare -A TARGET_ROLES=()
+declare -A TARGET_NAMES=()
+PARTITION_TARGETS=()
+
+for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+    label_var="DAS_TARGET_${i}_LABEL"
+    serial_var="DAS_TARGET_${i}_SERIAL"
+    role_var="DAS_TARGET_${i}_ROLE"
+    name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+    serial="${(P)serial_var}"
+    label="${(P)label_var}"
+    EXPECTED_SERIALS[$serial]="$label"
+    TARGET_LABELS[$serial]="$label"
+    TARGET_ROLES[$serial]="${(P)role_var}"
+    if [[ -n "${(P)name_var:-}" ]]; then
+        TARGET_NAMES[$serial]="${(P)name_var}"
+    else
+        TARGET_NAMES[$serial]="$label"
+    fi
+done
 
 # BTRFS label prefix
 BTRFS_LABEL_PREFIX="das-backup"
@@ -74,34 +90,43 @@ check_root() {
     fi
 }
 
+# Discover devices by serial number (returns associative array in DISCOVERED_DEVICES)
+declare -A DISCOVERED_DEVICES=()
+
+discover_devices() {
+    log_header "Discovering DAS Drives by Serial Number"
+
+    for dev in /dev/sd[a-z](N) /dev/sd[a-z][a-z](N); do
+        if [[ -b "$dev" ]]; then
+            local serial
+            serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
+            if [[ -n "$serial" && -n "${EXPECTED_SERIALS[$serial]:-}" ]]; then
+                DISCOVERED_DEVICES[$serial]="$dev"
+            fi
+        fi
+    done
+}
+
 verify_serials() {
     log_header "Verifying Drive Serial Numbers"
 
-    local all_match=true
+    local all_found=true
 
-    for dev in "${!EXPECTED_SERIALS[@]}"; do
-        local expected="${EXPECTED_SERIALS[$dev]}"
-        local actual
+    for serial in "${(@k)EXPECTED_SERIALS}"; do
+        local label="${EXPECTED_SERIALS[$serial]}"
+        local dev="${DISCOVERED_DEVICES[$serial]:-}"
 
-        if [[ ! -b "$dev" ]]; then
-            log_error "$dev not found!"
-            all_match=false
-            continue
-        fi
-
-        actual=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3; exit}' || echo "UNKNOWN")
-
-        if [[ "$actual" == "$expected" ]]; then
-            echo -e "  $dev: ${GREEN}$actual ✓${NC}"
+        if [[ -n "$dev" ]]; then
+            echo -e "  $serial ($label): ${GREEN}$dev${NC}"
         else
-            echo -e "  $dev: ${RED}$actual (expected $expected) ✗${NC}"
-            all_match=false
+            echo -e "  $serial ($label): ${RED}NOT FOUND${NC}"
+            all_found=false
         fi
     done
 
-    if ! $all_match; then
-        log_error "Serial number mismatch! Drives may have been reassigned."
-        log_error "Check 'lsblk' and update EXPECTED_SERIALS if needed."
+    if ! $all_found; then
+        log_error "Not all drives found! Check DAS connections."
+        log_error "Run 'lsblk' and verify drive serials."
         exit 1
     fi
 
@@ -113,17 +138,19 @@ check_smart_tests() {
 
     local all_complete=true
 
-    for dev in "$DRIVE1" "$DRIVE2" "$DRIVE3" "$DRIVE4"; do
+    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+        local dev="${DISCOVERED_DEVICES[$serial]}"
+        local label="${TARGET_LABELS[$serial]}"
         local status
         status=$(smartctl -l selftest "$dev" 2>/dev/null | grep -E "# 1" | head -1 || echo "No tests")
 
         if echo "$status" | grep -qE "in progress|Self-test routine in progress"; then
-            echo -e "  $dev: ${YELLOW}Test still running${NC}"
+            echo -e "  $dev ($label): ${YELLOW}Test still running${NC}"
             all_complete=false
         elif echo "$status" | grep -q "Completed without error"; then
-            echo -e "  $dev: ${GREEN}Test completed - PASSED${NC}"
+            echo -e "  $dev ($label): ${GREEN}Test completed - PASSED${NC}"
         else
-            echo -e "  $dev: ${YELLOW}$status${NC}"
+            echo -e "  $dev ($label): ${YELLOW}$status${NC}"
         fi
     done
 
@@ -140,34 +167,37 @@ show_plan() {
     log_header "Partitioning Plan"
 
     echo ""
-    echo "Drive 1 ($DRIVE1) - Bootable System Backup:"
-    echo "  Partition 1: 1.5G ESP (FAT32) - EFI System Partition"
-    echo "  Partition 2: remainder BTRFS - label: ${BTRFS_LABEL_PREFIX}-system"
-    echo ""
-    echo "Drive 2 ($DRIVE2) - Data Backup:"
-    echo "  Whole disk BTRFS - label: ${BTRFS_LABEL_PREFIX}-data"
-    echo ""
-    echo "Drive 3 ($DRIVE3) - Mirror of Drive 1:"
-    echo "  Partition 1: 1.5G ESP (FAT32)"
-    echo "  Partition 2: remainder BTRFS - label: ${BTRFS_LABEL_PREFIX}-system-mirror"
-    echo ""
-    echo "Drive 4 ($DRIVE4) - Mirror of Drive 2:"
-    echo "  Whole disk BTRFS - label: ${BTRFS_LABEL_PREFIX}-data-mirror"
-    echo ""
-    echo "Drive 5 & 6: Left unformatted (cold spares)"
+    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+        local dev="${DISCOVERED_DEVICES[$serial]}"
+        local label="${TARGET_LABELS[$serial]}"
+        local role="${TARGET_ROLES[$serial]}"
+        local name="${TARGET_NAMES[$serial]}"
+
+        echo "$name ($dev, serial: $serial):"
+        if [[ "$role" == "primary" ]]; then
+            echo "  Whole disk BTRFS (single partition) - label: ${BTRFS_LABEL_PREFIX}-${label}"
+        elif [[ "$role" == *"esp"* || "$role" == *"boot"* || "$role" == *"system"* || "$role" == *"mirror"* ]]; then
+            echo "  Partition 1: 1.5G ESP (FAT32) - EFI System Partition"
+            echo "  Partition 2: remainder BTRFS - label: ${BTRFS_LABEL_PREFIX}-${label}"
+        else
+            echo "  Whole disk BTRFS - label: ${BTRFS_LABEL_PREFIX}-${label}"
+        fi
+        echo ""
+    done
 }
 
 confirm_destruction() {
     echo ""
     echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║  ⚠️  WARNING: ALL DATA ON DRIVES 1-4 WILL BE DESTROYED!  ⚠️   ║${NC}"
+    echo -e "${RED}║  WARNING: ALL DATA ON TARGET DRIVES WILL BE DESTROYED!     ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo "Drives to be wiped:"
-    echo "  $DRIVE1 ($(lsblk -dn -o SIZE "$DRIVE1"))"
-    echo "  $DRIVE2 ($(lsblk -dn -o SIZE "$DRIVE2"))"
-    echo "  $DRIVE3 ($(lsblk -dn -o SIZE "$DRIVE3"))"
-    echo "  $DRIVE4 ($(lsblk -dn -o SIZE "$DRIVE4"))"
+    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+        local dev="${DISCOVERED_DEVICES[$serial]}"
+        local name="${TARGET_NAMES[$serial]}"
+        echo "  $dev — $name ($(lsblk -dn -o SIZE "$dev"))"
+    done
     echo ""
     read -p "Type 'YES-DESTROY' to proceed: " confirm
 
@@ -234,23 +264,27 @@ partition_data_drive() {
 run_partitioning() {
     log_header "Executing Partitioning"
 
-    # Drive 1: Bootable system backup
-    partition_bootable_drive "$DRIVE1" "${BTRFS_LABEL_PREFIX}-system"
+    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+        local dev="${DISCOVERED_DEVICES[$serial]}"
+        local label="${TARGET_LABELS[$serial]}"
+        local role="${TARGET_ROLES[$serial]}"
 
-    # Drive 2: Data backup
-    partition_data_drive "$DRIVE2" "${BTRFS_LABEL_PREFIX}-data"
-
-    # Drive 3: Mirror of Drive 1
-    partition_bootable_drive "$DRIVE3" "${BTRFS_LABEL_PREFIX}-system-mirror"
-
-    # Drive 4: Mirror of Drive 2
-    partition_data_drive "$DRIVE4" "${BTRFS_LABEL_PREFIX}-data-mirror"
+        if [[ "$role" == "primary" ]]; then
+            partition_data_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
+        elif [[ "$role" == *"esp"* || "$role" == *"boot"* || "$role" == *"system"* || "$role" == *"mirror"* ]]; then
+            partition_bootable_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
+        else
+            partition_data_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
+        fi
+    done
 
     log_header "Partitioning Complete"
 
     echo ""
     echo "Final layout:"
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL "$DRIVE1" "$DRIVE2" "$DRIVE3" "$DRIVE4"
+    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+        lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL "${DISCOVERED_DEVICES[$serial]}"
+    done
 }
 
 # ============================================================================
@@ -266,6 +300,7 @@ main() {
     echo "========================================"
 
     check_root
+    discover_devices
     verify_serials
 
     case "$mode" in
