@@ -14,6 +14,7 @@
 #   sudo ./backup-verify.sh --quick  # SMART only (no btrbk check)
 
 set -euo pipefail
+setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
