@@ -2,18 +2,21 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 
-DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and a KDE Plasma GUI for browsing and restoring files from BTRFS snapshots.
+DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI, and an interactive installer for the full backup pipeline.
 
 ## Features
 
-- **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to TerraMaster D6-320 DAS enclosure
+- **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure
 - **Triple-Target Architecture** — 22TB primary backup + 2x 2TB bootable recovery drives
-- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps instead of deleting them (1-year retention)
-- **Email Reports** — Automated backup status reports with throughput metrics, growth analysis, and SMART status
+- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (1-year retention)
+- **Email Reports** — Automated backup status reports with throughput metrics and SMART status
 - **ButteredDASD Content Indexer** (`btrdasd`) — Rust CLI with SQLite FTS5 database tracking every file across all snapshots
-- **KDE Plasma GUI** — Native Qt6/C++ application for searching, browsing, and restoring files (planned)
+- **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 application for searching, browsing, and restoring files from backup snapshots
+- **Interactive Installer** (`btrdasd setup`) — 10-step wizard with 5 modes: install, modify, upgrade, uninstall, check
+- **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
+- **Docker Support** — Headless `btrdasd` CLI in a container
 
 ## Components
 
@@ -25,10 +28,9 @@ DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and a K
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `systemd/` | systemd service and timer units | Active |
-| `docs/` | Architecture, recovery guides, bay mapping | Active |
-| `indexer/` | ButteredDASD (`btrdasd`) — Rust SQLite FTS5 content indexer CLI | Active (v0.1.0) |
-| `gui/` | Qt6/KDE Plasma backup browser and restore app | Planned |
+| `indexer/` | ButteredDASD (`btrdasd`) — Rust content indexer + setup wizard | Active (v0.4.0) |
+| `gui/` | Qt6/KDE Plasma backup browser and restore application | Active (v0.4.0) |
+| `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
 
 ## Project Structure
 
@@ -36,56 +38,66 @@ DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and a K
 DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf, email config template
-├── systemd/           # systemd service and timer units
-├── docs/              # Architecture docs, disaster recovery guide
-├── indexer/           # ButteredDASD (btrdasd) — Rust content indexer
-├── gui/               # (planned) Qt6/KDE Plasma GUI
-└── CMakeLists.txt     # Build system
+├── indexer/           # ButteredDASD (btrdasd) — Rust indexer + installer
+│   └── src/setup/     # Interactive installer (wizard, templates, detection)
+├── gui/               # Qt6/KDE Plasma GUI (12 C++ components)
+│   ├── src/           # MainWindow, Database, models, timeline, restore
+│   └── tests/         # QTest suites (database, snapshotmodel, filemodel, searchmodel)
+├── docs/              # Architecture, installation, dependencies, recovery
+├── Dockerfile         # Headless CLI container
+└── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER options)
 ```
 
 ## Requirements
 
-- CachyOS (or Arch-based) Linux with BTRFS
-- btrbk 0.32+, smartmontools, s-nail (mailx)
-- TerraMaster D6-320 DAS (or compatible USB JBOD enclosure)
-- Rust 1.85+ with Cargo (for ButteredDASD content indexer)
-- For future C++ GUI: Qt6 6.10+, KDE Frameworks 6.23+, CMake 3.25+
+- Linux with BTRFS filesystem support
+- btrbk 0.32+, smartmontools, zsh 5.9+
+- Rust 1.87+ with Cargo (for building the indexer and installer)
+- **Optional**: Qt6 6.6+, KDE Frameworks 6.0+, CMake 3.25+ (for the GUI)
 
 ## Installation
 
+### Recommended: Interactive Setup
+
 ```bash
-# Build content indexer (Rust)
-cd indexer
-cargo build --release
-# Binary at indexer/target/release/btrdasd
+# Build and install the binary
+cd indexer && cargo build --release
+sudo cp target/release/btrdasd /usr/local/bin/
 
-# Build and install scripts/systemd units (CMake)
-cd ..
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-sudo cmake --install build
-
-# Install systemd timers
-sudo scripts/install-backup-timer.sh
-
-# Copy and configure email settings
-sudo cp config/das-backup-email.conf.example /etc/das-backup-email.conf
-sudo chmod 600 /etc/das-backup-email.conf
-# Edit /etc/das-backup-email.conf with your Proton Bridge credentials
-
-# Start nightly backups
-sudo systemctl start das-backup.timer
+# Run the interactive setup wizard
+sudo btrdasd setup
 ```
+
+The wizard configures backup sources, targets, retention, scheduling, email, and ESP mirroring — then generates all configuration files and enables timers.
+
+See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including manual setup, Docker, and CMake build options.
+
+### Quick Docker
+
+```bash
+docker build -t btrdasd .
+docker run --rm btrdasd --version
+```
+
+## Design Philosophy
+
+- **Security-first**: Rust for the data pipeline (no buffer overflows, use-after-free, or data races). C++20 RAII with `-Werror` for the GUI. Exclusive prepared statements for all SQL.
+- **Memory safety**: Single `unsafe` call in the entire Rust codebase (`libc::geteuid`). No raw pointers in C++ GUI code.
+- **Efficiency**: Span-based deduplication compresses file presence across snapshots. Incremental indexing skips already-processed snapshots. Six targeted performance indexes.
+- **Stability**: Indexing errors never abort backups (soft-fail). GUI gracefully handles missing or locked databases.
+- **Privacy**: File metadata only — no file contents are ever read or stored. No telemetry or network connections.
 
 ## Documentation
 
-- [ButteredDASD Indexer](docs/BUTTERED-DASD.md) — Architecture, schema, CLI usage, span logic, installation
-- [Dependencies](docs/DEPENDENCIES.md) — All Rust, system, and build dependencies
-- [Offline Backup Plan](docs/OFFLINE-BACKUP-PLAN.md) — Capacity planning, drive allocation, backup strategy
-- [Disaster Recovery Guide](docs/DISASTER-RECOVERY-GUIDE.md) — Step-by-step recovery for NVMe/SSD/HDD failure
+- [Architecture](docs/ARCHITECTURE.md) — System design, data flow, security decisions, encryption assessment
+- [Installation Guide](docs/INSTALL.md) — All installation methods, config reference, Docker
+- [ButteredDASD Indexer](docs/BUTTERED-DASD.md) — CLI usage, schema, span logic, development
+- [Dependencies](docs/DEPENDENCIES.md) — Rust crates, system deps, build deps, GUI deps
+- [Offline Backup Plan](docs/OFFLINE-BACKUP-PLAN.md) — Capacity planning, drive allocation
+- [Disaster Recovery Guide](docs/DISASTER-RECOVERY-GUIDE.md) — Step-by-step recovery procedures
 - [Storage Architecture](docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md) — Full system storage reference
 - [DAS Bay Mapping](docs/DAS-BAY-MAPPING.md) — Physical drive locations and serial numbers
 
 ## License
 
-GPL-3.0 — See [LICENSE](LICENSE) for details.
+MIT — See [LICENSE](LICENSE) for details.

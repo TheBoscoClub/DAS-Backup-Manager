@@ -1,39 +1,41 @@
 # ButteredDASD — Content Indexer for DAS Backup Snapshots
 
-**Binary**: `btrdasd` | **Version**: 0.1.0 | **Language**: Rust (edition 2024)
+**Binary**: `btrdasd` | **Version**: 0.4.0 | **Language**: Rust (edition 2024)
 
 ## Overview
 
-ButteredDASD is a content indexer that builds a searchable SQLite FTS5 database of every file across all BTRFS snapshots on backup targets. It enables instant full-text search across hundreds of snapshots without mounting or traversing filesystem trees.
+ButteredDASD is a content indexer that builds a searchable SQLite FTS5 database of every file across all BTRFS snapshots on backup targets. It enables instant full-text search across hundreds of snapshots without mounting or traversing filesystem trees. It also includes an interactive installer for configuring the full backup pipeline.
 
 ## Architecture
 
 ```
 backup-run.sh                   btrdasd CLI
      │                              │
-     └──── run_indexer() ───────────┘
+     └──── run_indexer() ───────────┤
                                     │
-                          ┌─────────┴─────────┐
-                          │   walk command     │
-                          │                    │
-                          ▼                    ▼
-                    discover_snapshots()  index_snapshot()
-                          │                    │
-                          │              ┌─────┴─────┐
-                          │              ▼           ▼
-                          │        scan_directory  db.upsert_file
-                          │              │         db.insert_span
-                          │              │         db.extend_span
-                          ▼              ▼           │
-                    ┌─────────────────────────────┐  │
-                    │   SQLite Database            │◄─┘
-                    │   backup-index.db            │
-                    │   ┌──────────────────────┐  │
-                    │   │ snapshots             │  │
-                    │   │ files + files_fts     │  │
-                    │   │ spans                 │  │
-                    │   └──────────────────────┘  │
-                    └─────────────────────────────┘
+                          ┌─────────┴──────────────────┐
+                          │         │                   │
+                          ▼         ▼                   ▼
+                      walk     search/list/info      setup
+                          │         │                   │
+                    ┌─────┴─────┐   │        ┌──────────┴──────────┐
+                    ▼           ▼   │        ▼         ▼           ▼
+              discover      index   │     wizard   templates  installer
+              snapshots   snapshot  │        │         │           │
+                    │         │     │        ▼         ▼           ▼
+                    │    scan │     │     Config   btrbk.conf  write files
+                    │    dir  │     │     (.toml)  systemd     manifest
+                    │         │     │              cron/script
+                    ▼         ▼     ▼
+              ┌─────────────────────────────┐
+              │   SQLite Database            │
+              │   backup-index.db            │
+              │   ┌──────────────────────┐  │
+              │   │ snapshots             │  │
+              │   │ files + files_fts     │  │
+              │   │ spans                 │  │
+              │   └──────────────────────┘  │
+              └─────────────────────────────┘
 ```
 
 ### Modules
@@ -44,6 +46,12 @@ backup-run.sh                   btrdasd CLI
 | `scanner` | `src/scanner.rs` | Filesystem traversal with walkdir |
 | `indexer` | `src/indexer.rs` | Snapshot discovery, span logic, walk orchestration |
 | `main` | `src/main.rs` | CLI with clap subcommands |
+| `setup/mod` | `src/setup/mod.rs` | Setup subcommand routing and root check |
+| `setup/config` | `src/setup/config.rs` | TOML config types with serde serialization |
+| `setup/detect` | `src/setup/detect.rs` | System detection (devices, subvols, init, packages) |
+| `setup/templates` | `src/setup/templates.rs` | Template engine for btrbk.conf, systemd, cron, scripts |
+| `setup/installer` | `src/setup/installer.rs` | Install/uninstall/upgrade/check with manifest tracking |
+| `setup/wizard` | `src/setup/wizard.rs` | 10-step interactive dialoguer wizard |
 
 ## Database Schema
 
@@ -114,6 +122,7 @@ btrdasd walk /mnt/backup-hdd --db /custom/path/backup-index.db
 ```
 
 Expected directory structure on the backup target:
+
 ```
 /mnt/backup-hdd/
   nvme/                         # source directory
@@ -125,6 +134,7 @@ Expected directory structure on the backup target:
 ```
 
 Output:
+
 ```
 Discovered: 6 snapshots
 Indexed:    4 new
@@ -142,6 +152,7 @@ btrdasd search "report*"           # FTS5 prefix search
 ```
 
 Output (tab-separated):
+
 ```
 path/to/report.pdf  15234  1708534800  nvme/root.20260221  nvme/root.20260225
 ```
@@ -160,12 +171,25 @@ btrdasd info
 ```
 
 Output:
+
 ```
 Snapshots:  42
 Files:      158234
 Spans:      23456
 DB size:    12845056 bytes
 ```
+
+### Interactive setup
+
+```bash
+sudo btrdasd setup                  # Fresh install (10-step wizard)
+sudo btrdasd setup --modify         # Re-open wizard with existing config
+sudo btrdasd setup --upgrade        # Regenerate files after binary update
+sudo btrdasd setup --uninstall      # Remove all generated files
+sudo btrdasd setup --check          # Validate config and dependencies
+```
+
+See [INSTALL.md](INSTALL.md) for full installer documentation.
 
 ### Default database path
 
@@ -188,30 +212,26 @@ run_indexer() {
 
 ## Installation
 
-```bash
-cd indexer
-cargo build --release
-sudo cp target/release/btrdasd /usr/local/bin/
-
-# Create database directory
-sudo mkdir -p /var/lib/das-backup
-sudo chown root:root /var/lib/das-backup
-```
+See [INSTALL.md](INSTALL.md) for comprehensive installation instructions including:
+- Quick start with `btrdasd setup` wizard
+- Manual installation
+- Docker deployment
+- CMake build options
 
 ## Development
 
 ```bash
 cd indexer
-cargo test              # 37 unit tests
+cargo test              # 62 tests (37 unit + 16 setup + 9 integration)
 cargo clippy            # Lint check
 cargo fmt --check       # Format check
 cargo audit             # Security audit
-cargo build --release   # Release build (5.5MB binary)
+cargo build --release   # Release build (~6.6MB binary)
 ```
 
 ## Design Decisions
 
-1. **Rust over C++**: Chosen for memory safety in the data-intensive indexing pipeline. The future KDE Plasma GUI will remain C++/Qt6 since KF6 classes require native C++ integration.
+1. **Rust over C++**: Chosen for memory safety in the data-intensive indexing pipeline. The KDE Plasma GUI remains C++/Qt6 since KF6 classes require native C++ integration.
 
 2. **Bundled SQLite**: The `rusqlite` crate uses the `bundled` feature to compile SQLite from source, guaranteeing FTS5 availability regardless of system SQLite configuration.
 
@@ -220,3 +240,7 @@ cargo build --release   # Release build (5.5MB binary)
 4. **WAL journal mode**: Enables concurrent reads during writes, important when the GUI reads the database while the indexer is running.
 
 5. **FTS5 with triggers**: The FTS5 virtual table is synced automatically via INSERT/UPDATE/DELETE triggers, ensuring the search index is always consistent.
+
+6. **Config-driven installer**: The TOML configuration is the single source of truth. All generated files (btrbk.conf, systemd units, scripts) are reproducible from the config, enabling clean upgrades and uninstalls via manifest tracking.
+
+7. **Distro-agnostic design**: The installer detects the init system (systemd/sysvinit/OpenRC) and package manager at runtime, generating appropriate service files or cron entries for the host platform.
