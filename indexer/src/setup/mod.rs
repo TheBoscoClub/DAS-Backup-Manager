@@ -1,5 +1,6 @@
 pub mod config;
 pub mod detect;
+pub mod installer;
 pub mod templates;
 pub mod wizard;
 
@@ -25,7 +26,6 @@ pub struct SetupArgs {
 }
 
 pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Root check
     if !nix_is_root() {
         eprintln!("Error: btrdasd setup requires root privileges.");
         eprintln!("Run: sudo btrdasd setup");
@@ -33,15 +33,28 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.check {
-        println!("setup --check: not yet implemented");
+        installer::check()?;
     } else if args.uninstall {
-        println!("setup --uninstall: not yet implemented");
+        let remove_db = dialoguer::Confirm::new()
+            .with_prompt("Also remove the backup database?")
+            .default(false)
+            .interact()?;
+        installer::uninstall(remove_db)?;
     } else if args.upgrade {
-        println!("setup --upgrade: not yet implemented");
+        installer::upgrade()?;
     } else {
         // Fresh install or --modify
-        println!("setup wizard: not yet implemented");
+        let existing = if args.modify {
+            config::Config::load(&std::path::PathBuf::from("/etc/das-backup/config.toml")).ok()
+        } else {
+            None
+        };
+
+        let sys = detect::SystemInfo::detect();
+        let config = wizard::run_wizard(&sys, existing)?;
+        installer::install(&config)?;
     }
+
     Ok(())
 }
 
