@@ -60,6 +60,23 @@ install(FILES
 )
 
 # =============================================================================
+# Systemd units (templated for prefix flexibility)
+# =============================================================================
+
+configure_file(systemd/das-backup.service.in
+    ${CMAKE_BINARY_DIR}/das-backup.service @ONLY)
+configure_file(systemd/das-backup-full.service.in
+    ${CMAKE_BINARY_DIR}/das-backup-full.service @ONLY)
+
+install(FILES
+    ${CMAKE_BINARY_DIR}/das-backup.service
+    ${CMAKE_BINARY_DIR}/das-backup-full.service
+    systemd/das-backup.timer
+    systemd/das-backup-full.timer
+    DESTINATION lib/systemd/system
+)
+
+# =============================================================================
 # KDE Plasma GUI (optional)
 # =============================================================================
 

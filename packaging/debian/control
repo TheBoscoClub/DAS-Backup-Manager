@@ -1,0 +1,20 @@
+Source: das-backup-manager
+Section: admin
+Priority: optional
+Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.25), cargo, rustc,
+ extra-cmake-modules, qt6-base-dev, libkf6coreaddons-dev, libkf6i18n-dev,
+ libkf6xmlgui-dev, libkf6configwidgets-dev, libkf6iconthemes-dev,
+ libkf6crash-dev, libkf6kio-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/TheBoscoClub/DAS-Backup-Manager
+
+Package: das-backup-manager
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, btrbk, btrfs-progs,
+ smartmontools, zsh, util-linux
+Description: DAS backup manager with btrbk, SQLite FTS5 indexing, KDE GUI
+ ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)
+ enclosures. Features config-driven backup orchestration via btrbk, full-text
+ content indexing with SQLite FTS5, and a KDE Plasma 6 GUI for browsing and
+ restoring files from backup snapshots.

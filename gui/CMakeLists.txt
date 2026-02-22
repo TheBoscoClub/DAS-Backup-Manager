@@ -61,6 +61,7 @@ target_link_libraries(btrdasd-gui PRIVATE
 install(TARGETS btrdasd-gui ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
 install(FILES src/btrdasd-gui.rc DESTINATION ${KDE_INSTALL_KXMLGUIDIR}/btrdasd-gui)
 install(FILES org.theboscoclub.btrdasd-gui.desktop DESTINATION ${KDE_INSTALL_APPDIR})
+install(FILES icons/btrdasd-gui.svg DESTINATION ${KDE_INSTALL_ICONDIR}/hicolor/scalable/apps)
 
 feature_summary(WHAT ALL INCLUDE_QUIET_PACKAGES FATAL_ON_MISSING_REQUIRED_PACKAGES)
 

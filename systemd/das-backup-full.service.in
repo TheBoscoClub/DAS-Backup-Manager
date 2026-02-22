@@ -6,7 +6,7 @@ ConditionPathExistsGlob=/dev/disk/by-id/usb-*
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/lib/das-backup/backup-run.sh --full
+ExecStart=@DAS_SCRIPT_DIR@/backup-run.sh --full
 StandardOutput=journal
 StandardError=journal
 Nice=19
