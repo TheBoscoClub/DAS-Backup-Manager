@@ -20,7 +20,7 @@ int main(int argc, char *argv[])
         i18n("ButteredDASD"),
         u"0.1.0"_s,
         i18n("Search, browse, and restore files from BTRFS backup snapshots"),
-        KAboutLicense::GPL_V3,
+        KAboutLicense::MIT,
         i18n("(c) 2026 TheBoscoClub"),
         QString(),
         u"https://github.com/TheBoscoClub/DAS-Backup-Manager"_s);
