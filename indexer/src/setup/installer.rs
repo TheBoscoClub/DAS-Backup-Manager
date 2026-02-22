@@ -18,7 +18,22 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = PathBuf::from(CONFIG_FILE);
     let manifest_path = PathBuf::from(MANIFEST_FILE);
     let root = PathBuf::from("/");
-    install_to_prefix(config, &root, &config_path, &manifest_path)
+    install_to_prefix(config, &root, &config_path, &manifest_path)?;
+
+    // Enable systemd timers (only in real installs, not in install_to_prefix tests)
+    if config.init.system == crate::setup::config::InitSystem::Systemd {
+        let _ = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["enable", "--now", "das-backup.timer"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["enable", "--now", "das-backup-full.timer"])
+            .status();
+    }
+
+    Ok(())
 }
 
 /// Install with a custom root prefix (for testing and packaging).
@@ -70,19 +85,6 @@ pub fn install_to_prefix(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(manifest_path, manifest_entries.join("\n"))?;
-
-    // Enable systemd timers if applicable
-    if config.init.system == crate::setup::config::InitSystem::Systemd {
-        let _ = std::process::Command::new("systemctl")
-            .args(["daemon-reload"])
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args(["enable", "--now", "das-backup.timer"])
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args(["enable", "--now", "das-backup-full.timer"])
-            .status();
-    }
 
     // Create DB directory
     if let Some(parent) = Path::new(&config.general.db_path).parent() {
