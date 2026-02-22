@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.4.0
+**Version**: 0.5.0
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI, and an interactive installer for the full backup pipeline.
 
@@ -43,8 +43,8 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `indexer/` | ButteredDASD (`btrdasd`) — Rust content indexer + setup wizard | Active (v0.4.0) |
-| `gui/` | Qt6/KDE Plasma backup browser and restore application | Active (v0.4.0) |
+| `indexer/` | ButteredDASD (`btrdasd`) — Rust content indexer + setup wizard | Active (v0.5.0) |
+| `gui/` | Qt6/KDE Plasma backup browser and restore application | Active (v0.5.0) |
 | `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
 
 ## Project Structure
