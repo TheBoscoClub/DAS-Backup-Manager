@@ -15,6 +15,10 @@ pub struct Config {
     pub general: General,
     pub init: Init,
     pub schedule: Schedule,
+    #[serde(default)]
+    pub das: Das,
+    #[serde(default)]
+    pub boot: Boot,
     #[serde(default, rename = "source")]
     pub sources: Vec<Source>,
     #[serde(default, rename = "target")]
@@ -33,6 +37,27 @@ pub struct General {
     pub version: String,
     pub install_prefix: String,
     pub db_path: String,
+    #[serde(default = "default_log_file")]
+    pub log_file: String,
+    #[serde(default = "default_growth_log")]
+    pub growth_log: String,
+    #[serde(default = "default_last_report")]
+    pub last_report: String,
+    #[serde(default = "default_btrbk_conf")]
+    pub btrbk_conf: String,
+}
+
+fn default_log_file() -> String {
+    "/var/log/das-backup.log".into()
+}
+fn default_growth_log() -> String {
+    "/var/lib/das-backup/growth.log".into()
+}
+fn default_last_report() -> String {
+    "/var/lib/das-backup/last-report.txt".into()
+}
+fn default_btrbk_conf() -> String {
+    "/etc/das-backup/btrbk.conf".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,11 +81,76 @@ pub struct Schedule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Das {
+    #[serde(default = "default_model_pattern")]
+    pub model_pattern: String,
+    #[serde(default = "default_io_scheduler")]
+    pub io_scheduler: String,
+    #[serde(default)]
+    pub mount_opts: String,
+}
+
+impl Default for Das {
+    fn default() -> Self {
+        Self {
+            model_pattern: default_model_pattern(),
+            io_scheduler: default_io_scheduler(),
+            mount_opts: String::new(),
+        }
+    }
+}
+
+fn default_model_pattern() -> String {
+    "TDAS".into()
+}
+fn default_io_scheduler() -> String {
+    "mq-deadline".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Boot {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_boot_subvolumes")]
+    pub subvolumes: Vec<String>,
+    #[serde(default = "default_archive_retention_days")]
+    pub archive_retention_days: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_boot_subvolumes() -> Vec<String> {
+    vec!["@".into(), "@home".into()]
+}
+fn default_archive_retention_days() -> u32 {
+    365
+}
+
+impl Default for Boot {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            subvolumes: default_boot_subvolumes(),
+            archive_retention_days: 365,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub label: String,
     pub volume: String,
     pub subvolumes: Vec<String>,
     pub device: String,
+    #[serde(default = "default_snapshot_dir")]
+    pub snapshot_dir: String,
+    #[serde(default)]
+    pub target_subdirs: Vec<String>,
+}
+
+fn default_snapshot_dir() -> String {
+    ".btrbk-snapshots".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +160,8 @@ pub struct Target {
     pub mount: String,
     pub role: TargetRole,
     pub retention: Retention,
+    #[serde(default)]
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +176,10 @@ pub enum TargetRole {
 pub struct Retention {
     pub weekly: u32,
     pub monthly: u32,
+    #[serde(default)]
+    pub daily: u32,
+    #[serde(default)]
+    pub yearly: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -160,6 +256,10 @@ impl Default for Config {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 install_prefix: "/usr/local".into(),
                 db_path: "/var/lib/das-backup/backup-index.db".into(),
+                log_file: default_log_file(),
+                growth_log: default_growth_log(),
+                last_report: default_last_report(),
+                btrbk_conf: default_btrbk_conf(),
             },
             init: Init {
                 system: InitSystem::Systemd,
@@ -169,6 +269,8 @@ impl Default for Config {
                 full: "Sun 04:00".into(),
                 randomized_delay_min: 30,
             },
+            das: Das::default(),
+            boot: Boot::default(),
             sources: Vec::new(),
             targets: Vec::new(),
             esp: Esp::default(),
@@ -279,16 +381,31 @@ mod tests {
         assert_eq!(parsed.schedule.incremental, "03:00");
         assert_eq!(parsed.schedule.full, "Sun 04:00");
         assert_eq!(parsed.schedule.randomized_delay_min, 30);
+        // New fields have defaults
+        assert_eq!(parsed.general.log_file, "/var/log/das-backup.log");
+        assert_eq!(parsed.general.btrbk_conf, "/etc/das-backup/btrbk.conf");
+        assert_eq!(parsed.das.model_pattern, "TDAS");
+        assert_eq!(parsed.das.io_scheduler, "mq-deadline");
+        assert!(parsed.boot.enabled);
+        assert_eq!(parsed.boot.subvolumes, vec!["@", "@home"]);
+        assert_eq!(parsed.boot.archive_retention_days, 365);
     }
 
     #[test]
     fn roundtrip_full_config() {
         let mut cfg = Config::default();
+        cfg.das.model_pattern = "MyDAS".into();
+        cfg.das.io_scheduler = "none".into();
+        cfg.das.mount_opts = "noatime,compress=zstd".into();
+        cfg.boot.archive_retention_days = 180;
+        cfg.boot.subvolumes = vec!["@".into(), "@home".into(), "@log".into()];
         cfg.sources.push(Source {
             label: "nvme-root".into(),
             volume: "/.btrfs-nvme".into(),
             subvolumes: vec!["@".into(), "@home".into()],
             device: "/dev/nvme0n1p2".into(),
+            snapshot_dir: ".snapshots".into(),
+            target_subdirs: vec!["nvme".into()],
         });
         cfg.targets.push(Target {
             label: "primary-22tb".into(),
@@ -298,7 +415,10 @@ mod tests {
             retention: Retention {
                 weekly: 4,
                 monthly: 2,
+                daily: 365,
+                yearly: 4,
             },
+            display_name: "22TB Primary (Bay 2)".into(),
         });
         cfg.esp.enabled = true;
         cfg.esp.mirror = true;
@@ -319,16 +439,86 @@ mod tests {
         assert_eq!(parsed.sources.len(), 1);
         assert_eq!(parsed.sources[0].label, "nvme-root");
         assert_eq!(parsed.sources[0].subvolumes, vec!["@", "@home"]);
+        assert_eq!(parsed.sources[0].snapshot_dir, ".snapshots");
+        assert_eq!(parsed.sources[0].target_subdirs, vec!["nvme"]);
         assert_eq!(parsed.targets.len(), 1);
         assert_eq!(parsed.targets[0].serial, "ZXA0LMAE");
         assert_eq!(parsed.targets[0].role, TargetRole::Primary);
         assert_eq!(parsed.targets[0].retention.weekly, 4);
+        assert_eq!(parsed.targets[0].retention.daily, 365);
+        assert_eq!(parsed.targets[0].retention.yearly, 4);
+        assert_eq!(parsed.targets[0].display_name, "22TB Primary (Bay 2)");
+        assert_eq!(parsed.das.model_pattern, "MyDAS");
+        assert_eq!(parsed.das.io_scheduler, "none");
+        assert_eq!(parsed.das.mount_opts, "noatime,compress=zstd");
+        assert_eq!(parsed.boot.archive_retention_days, 180);
+        assert_eq!(
+            parsed.boot.subvolumes,
+            vec!["@", "@home", "@log"]
+        );
         assert!(parsed.esp.enabled);
         assert!(parsed.esp.mirror);
         assert_eq!(parsed.esp.hooks.hook_type, HookType::Pacman);
         assert!(parsed.email.enabled);
         assert_eq!(parsed.email.smtp_port, 1025);
         assert_eq!(parsed.email.auth, AuthMethod::Plain);
+    }
+
+    #[test]
+    fn backward_compat_old_config_without_new_fields() {
+        // A config.toml from v0.4.0 that lacks das, boot, snapshot_dir, etc.
+        let old_toml = r#"
+[general]
+version = "0.4.0"
+install_prefix = "/usr/local"
+db_path = "/var/lib/das-backup/backup-index.db"
+
+[init]
+system = "systemd"
+
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+
+[[source]]
+label = "nvme"
+volume = "/.btrfs-nvme"
+subvolumes = ["@", "@home"]
+device = "/dev/nvme0n1p2"
+
+[[target]]
+label = "primary"
+serial = "ABC123"
+mount = "/mnt/backup"
+role = "primary"
+
+[target.retention]
+weekly = 4
+monthly = 2
+
+[esp]
+enabled = false
+
+[email]
+enabled = false
+
+[gui]
+enabled = false
+"#;
+        let cfg = Config::from_toml(old_toml).expect("old config should parse with defaults");
+        // New fields get sane defaults
+        assert_eq!(cfg.general.log_file, "/var/log/das-backup.log");
+        assert_eq!(cfg.general.btrbk_conf, "/etc/das-backup/btrbk.conf");
+        assert_eq!(cfg.das.model_pattern, "TDAS");
+        assert_eq!(cfg.das.io_scheduler, "mq-deadline");
+        assert!(cfg.boot.enabled);
+        assert_eq!(cfg.boot.archive_retention_days, 365);
+        assert_eq!(cfg.sources[0].snapshot_dir, ".btrbk-snapshots");
+        assert!(cfg.sources[0].target_subdirs.is_empty());
+        assert_eq!(cfg.targets[0].retention.daily, 0);
+        assert_eq!(cfg.targets[0].retention.yearly, 0);
+        assert!(cfg.targets[0].display_name.is_empty());
     }
 
     #[test]
@@ -349,6 +539,8 @@ mod tests {
             volume: "/vol".into(),
             subvolumes: vec!["@".into()],
             device: "/dev/sda".into(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![],
         });
         let errors = cfg.validate();
         assert!(

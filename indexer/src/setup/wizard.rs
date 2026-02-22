@@ -209,6 +209,8 @@ fn step_subvolumes(
                 volume,
                 subvolumes,
                 device,
+                snapshot_dir: ".btrbk-snapshots".into(),
+                target_subdirs: vec![],
             });
 
             let add_more = Confirm::new()
@@ -302,6 +304,8 @@ fn step_subvolumes(
                 volume,
                 subvolumes: chosen_subvols,
                 device,
+                snapshot_dir: ".btrbk-snapshots".into(),
+                target_subdirs: vec![],
             });
         }
 
@@ -330,6 +334,8 @@ fn step_subvolumes(
                 volume,
                 subvolumes,
                 device,
+                snapshot_dir: ".btrbk-snapshots".into(),
+                target_subdirs: vec![],
             });
         }
     }
@@ -424,7 +430,13 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
             serial,
             mount,
             role,
-            retention: Retention { weekly, monthly },
+            retention: Retention {
+                weekly,
+                monthly,
+                daily: 0,
+                yearly: 0,
+            },
+            display_name: String::new(),
         });
     }
 
