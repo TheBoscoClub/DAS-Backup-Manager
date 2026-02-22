@@ -222,6 +222,9 @@ temp/
 target/
 out/
 
+# WORKTREES
+.worktrees/
+
 # RELEASE ARTIFACTS
 releases/*.tar.gz
 releases/*.tar.gz.sha256
