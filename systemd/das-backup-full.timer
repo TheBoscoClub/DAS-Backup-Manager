@@ -1,6 +1,6 @@
 [Unit]
 Description=DAS Full Backup Timer - Weekly full boot subvolume refresh
-Documentation=file:///hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/docs/OFFLINE-BACKUP-PLAN.md
+Documentation=https://github.com/TheBoscoClub/DAS-Backup-Manager
 
 [Timer]
 # Run every Sunday at 4 AM

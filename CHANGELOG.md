@@ -13,6 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.5.0] - 2026-02-22
+
+### Added
+- **Config-driven pipeline** (`btrdasd config dump-env`) — Reads `config.toml` and prints shell-sourceable `DAS_*` key=value pairs; scripts source config at runtime via `eval`
+- **Config subcommands** — `btrdasd config dump-env`, `btrdasd config show`, `btrdasd config validate`
+- **Extended config.toml schema** — New `[das]`, `[boot]` sections; per-source `snapshot_dir`; per-target `display_name`, `retention.daily`, `retention.yearly`
+- **Hardware-agnostic documentation** — All docs describe the system generically; author's hardware moved to `docs/examples/` as reference examples
+- **Planning worksheet** — Capacity estimation, drive selection, retention planning guide in `docs/OFFLINE-BACKUP-PLAN.md`
+- **Generic bay mapping guide** — LED identification, serial mapping, config.toml integration in `docs/DAS-BAY-MAPPING.md`
+- **Reference examples directory** — `docs/examples/` with author's bay mapping, storage topology, and index
+
+### Changed
+- **Scripts refactored** — `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh`, `das-partition-drives.sh` now use `eval "$(btrdasd config dump-env)"` instead of hardcoded values
+- **Template engine** — Generated backup script replaced with thin `exec` wrapper; production scripts embedded via `include_str!` and copied during install
+- **systemd units** — Use production paths (`/usr/local/lib/das-backup/`) and generic DAS detection instead of hardcoded dev paths
+- **Documentation** — `STORAGE-ARCHITECTURE-AND-RECOVERY.md`, `DISASTER-RECOVERY-GUIDE.md`, `DAS-BAY-MAPPING.md`, `OFFLINE-BACKUP-PLAN.md` all parameterized with `<your-uuid>` placeholders
+
+### Fixed
+- **GUI restore action** — Implemented `Database::snapshotPathById()` and `m_currentSnapshotId` tracking; restore now correctly combines snapshot path with file path for `KIO::copy`
+
 ## [0.4.0] - 2026-02-21
 
 ### Added
@@ -97,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.1.0...v0.2.0

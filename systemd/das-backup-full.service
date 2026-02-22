@@ -1,12 +1,12 @@
 [Unit]
 Description=DAS Full Backup - Recreate boot subvolumes from latest snapshots
-Documentation=file:///hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/docs/OFFLINE-BACKUP-PLAN.md
+Documentation=https://github.com/TheBoscoClub/DAS-Backup-Manager
 After=local-fs.target
-ConditionPathExistsGlob=/dev/disk/by-id/usb-TerraMas_TDAS*
+ConditionPathExistsGlob=/dev/disk/by-id/usb-*
 
 [Service]
 Type=oneshot
-ExecStart=/hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/scripts/backup-run.sh --full
+ExecStart=/usr/local/lib/das-backup/backup-run.sh --full
 StandardOutput=journal
 StandardError=journal
 Nice=19

@@ -1,6 +1,6 @@
 [Unit]
 Description=DAS Backup Timer - Nightly incremental backup at 3 AM
-Documentation=file:///hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/docs/OFFLINE-BACKUP-PLAN.md
+Documentation=https://github.com/TheBoscoClub/DAS-Backup-Manager
 
 [Timer]
 # Run at 3 AM daily
