@@ -52,6 +52,7 @@ public:
     [[nodiscard]] QVector<FileInfo> filesInSnapshot(qint64 snapshotId) const;
     [[nodiscard]] QVector<SearchResult> search(const QString &query, qint64 limit) const;
     [[nodiscard]] DbStats stats() const;
+    [[nodiscard]] QString snapshotPathById(qint64 snapshotId) const;
 
 private:
     QSqlDatabase m_db;

@@ -59,4 +59,5 @@ private:
     QLabel *m_statusLabel = nullptr;
 
     QString m_dbPath;
+    qint64 m_currentSnapshotId = -1;
 };

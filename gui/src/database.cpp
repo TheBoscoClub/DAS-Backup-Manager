@@ -143,6 +143,17 @@ QVector<SearchResult> Database::search(const QString &query, qint64 limit) const
     return result;
 }
 
+QString Database::snapshotPathById(qint64 snapshotId) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT path FROM snapshots WHERE id = :id"));
+    q.bindValue(QStringLiteral(":id"), snapshotId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toString();
+    }
+    return {};
+}
+
 DbStats Database::stats() const
 {
     DbStats s;
