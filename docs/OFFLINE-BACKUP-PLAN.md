@@ -1,347 +1,301 @@
-# Offline Bootable Backup Plan
-## Emergency Recovery for NVMe RAID-1, SSD RAID-1, and HDD RAID-1
+# Planning Your DAS Backup
 
-**Date**: 2026-01-31
-**Updated**: 2026-02-19
-**Status**: ACTIVE — 22TB Exos primary backup drive installed, nightly btrbk running
+This guide covers capacity estimation, drive selection, retention planning, and DAS enclosure requirements for a BTRFS backup system using btrbk.
 
 ---
 
-## Current Storage Inventory
+## Core Concepts
 
-| Array | Devices | BTRFS Profile | Used | Total Raw |
-|-------|---------|---------------|------|-----------|
-| NVMe RAID-1 | 2x WD SN850X 1TB | Data/Meta/Sys RAID-1 | 377G | 1.81 TiB |
-| SATA SSD RAID-1 | Samsung 860 PRO 1TB + 850 EVO mSATA 1TB | Data/Meta RAID-1 | 151G | 1.84 TiB |
-| HDD RAID-1 | 2x Seagate ST24000DM001 24TB | Data RAID-0→RAID-1 (converting) | 9.03T | 43.66 TiB |
+### Why DAS for Backups?
 
-**Irreplaceable data to protect**: ~1 TiB (see Capacity Budget below)
+Direct-Attached Storage (DAS) provides:
 
-## Backup Hardware (in TerraMaster D6-320 DAS)
+- **Offline capability** -- unplug the DAS and your backups are air-gapped from ransomware, accidental deletion, and network-based attacks
+- **No network dependency** -- transfers happen over USB/Thunderbolt/eSATA at local bus speeds
+- **Simple JBOD** -- each drive appears independently to the OS, no hardware RAID controller to fail
+- **Portability** -- take your backups offsite by carrying the enclosure
 
-- **1x Seagate ST22000NM000C** (Exos X22 22TB, 7200RPM, CMR, 256MB cache)
-  - Factory recertified, installed 2026-02-19 in Bay 2
-  - Serial: ZXA0LMAE, SMART clean, extended test completing 2026-02-21
-  - Role: PRIMARY BACKUP — all btrbk targets, 20 TiB usable BTRFS
-- **5x Seagate ST2000DM008** (Barracuda 2TB, 7200RPM, SMR, 256MB cache)
-  - Same Thailand manufacturing batch: March 16, 2021
-  - Age: ~4.9 years (warranty expired — was 2-year limited)
-  - SMART: All healthy, within MTBF tolerance
-  - Roles: 2x bootable recovery, 3x RAID0 general storage
-- **Total raw capacity: ~32 TB** (22TB + 5x 2TB)
+### BTRFS Send/Receive with btrbk
 
----
-
-## Critical Risk Assessment
-
-### Same-Batch Correlated Failure
-All 6 drives share identical manufacturing conditions (same factory, same date, same component lot). This creates **correlated failure risk** — if one drive fails due to a systematic defect (bad batch of heads, platter coating issue), the others have elevated probability of similar failure within a close timeframe. This is well-documented in large-scale studies (Google, Backblaze).
-
-**Mitigation**: The 22TB Exos enterprise drive (different manufacturer batch, CMR technology) now serves as the primary backup target, addressing this risk. The 2TB drives serve as bootable recovery systems and legacy archives — they are no longer the sole backup tier.
-
-### SMR Technology
-The ST2000DM008 uses Shingled Magnetic Recording (SMR). This means:
-- Sequential writes are fine (BTRFS send streams are sequential — good match)
-- Random write performance degrades severely when the drive's CMR cache fills
-- Large initial backups may be slow; incremental backups will be fast
-- Avoid RAID configurations that require random write patterns (no BTRFS RAID-5/6)
-
-### Renewed Exos X14 12TB — Evaluated and Rejected
-Considered adding 2x Seagate Exos X14 ST12000NM0008 12TB (renewed, ~$250 each from Amazon). Rejected because:
-- Backblaze data shows Exos X14 12TB failure rates climbing to 8-9% AFR at 5+ years
-- Renewed units are 6-7 years old — squarely in the elevated failure window
-- Only 90-day Amazon Renewed warranty
-- $500 for two aging drives with documented reliability issues is poor value for a backup role
-
----
-
-## Decisions Made
-
-| Question | Decision |
-|----------|----------|
-| Audiobooks | Back up **source files only** (aaxc originals, ~509G). Skip converted opus in Library/ (~450G) — re-derivable |
-| VMs | **Do not back up**. All test VMs (cachyos-kwallet-dev, test-vm-cachyos, debian13, fedora43, kubuntu24.04, mxlinux-2025) are recreatable from ISOs |
-| Snapper snapshots | **Do not back up**. btrbk maintains its own retention history on backup drives. Snapper snapshots are for local rollback only |
-| Exos X14 12TB upgrade | **Rejected** (2026-01). Renewed units too old, high AFR. Stick with 6x ST2000DM008 only |
-| Exos X22 22TB upgrade | **Accepted** (2026-02-19). Factory recertified ST22000NM000C ~$250 — excellent value for 20 TiB backup. Replaces one 2TB cold spare in DAS Bay 2 |
-
----
-
-## Capacity Budget
-
-### Back Up (irreplaceable)
-
-| What | Size | Source |
-|------|------|--------|
-| NVMe: OS + /home + /root + /var/log | ~377G | `@`, `@home`, `@root`, `@log` |
-| SSD: /opt + /srv | ~50-60G | `@opt`, `@srv` (no VMs, no cache) |
-| HDD: ClaudeCodeProjects | ~50-100G | All project subvolumes |
-| HDD: Audiobook sources (aaxc) | ~509G | `Sources/`, `Sources-GooglePlay/`, `Sources-Librivox/`, `failed-sources/`, `data/`, `scripts/` |
-| **Total** | **~1 TiB** | |
-
-### Do NOT Back Up
-
-| What | Size | Reason |
-|------|------|--------|
-| Audiobooks/Library/ (opus) | ~450G | Re-derivable from source aaxc files |
-| VirtualMachines | ~100G+ | Recreatable from ISOs with documented setup |
-| SteamLibrary + SteamLibrary-local | ~1.4T | Re-downloadable from Steam |
-| ai-models-* | ~2T+ | Re-downloadable from HuggingFace |
-| ISOs | Variable | Re-downloadable |
-| /var/cache | Variable | Rebuilt automatically |
-| Snap packages | Variable | Reinstallable |
-| Snapper snapshot history | Variable | btrbk manages its own retention on backup drives |
-
----
-
-## Recommended Plan: Tiered Backup with DAS
-
-### Hardware: TerraMaster D6-320
-
-- **Price**: ~$300 (diskless)
-- **Interface**: USB 3.2 Gen2 (10 Gbps) Type-C
-- **Bays**: 6x 3.5" SATA, hot-swappable, JBOD mode (each drive appears individually)
-- **Cooling**: Dual rear fans, quiet operation
-- **Compatibility**: Linux plug-and-play, no drivers needed
-- **Total cost**: $300 for enclosure + $0 for drives (already owned) = **$300**
-
-### Drive Allocation Strategy (revised 2026-02-19)
-
-With the addition of a 22TB Exos enterprise drive, all backups target a single
-high-capacity drive. The two 2TB bootable recovery drives continue to receive
-NVMe/SSD snapshots to keep the emergency OS current.
-
-```
-Bay 2 — 22TB Exos ST22000NM000C (ZXA0LMAE): PRIMARY BACKUP
-  └── Partition 1: 20 TiB BTRFS (whole disk, no ESP)
-      ├── nvme/ — @, @home, @root, @log snapshots
-      ├── ssd/  — @opt, @srv snapshots
-      ├── projects/ — ClaudeCodeProjects snapshots
-      ├── audiobooks/ — Audiobook source snapshots
-      └── storage/ — general low-I/O storage
-      Retention: 4 weekly + 12 monthly + 4 yearly
-
-Bay 6 — 2TB ST2000DM008 (ZFL41DNY): BOOTABLE RECOVERY #1
-  ├── Partition 1: 1.5G ESP (FAT32, bootable clone of /boot)
-  └── Partition 2: ~1998G BTRFS
-      ├── nvme/ — NVMe snapshot history (btrbk secondary target)
-      ├── ssd/  — SSD snapshot history (btrbk secondary target)
-      └── @ @home — stable boot subvolumes (refreshed each backup run)
-
-Bay 1 — 2TB ST2000DM008 (ZK208Q77): BOOTABLE RECOVERY #2
-  ├── Partition 1: 1.5G ESP (FAT32, bootable clone of /boot)
-  └── Partition 2: ~1998G BTRFS
-      ├── nvme/ — NVMe snapshot history (btrbk tertiary target)
-      ├── ssd/  — SSD snapshot history (btrbk tertiary target)
-      └── @ @home — stable boot subvolumes (refreshed each backup run)
-
-Bays 3,4,5 — 3x 2TB ST2000DM008: BTRFS RAID0 GENERAL STORAGE
-  Bay 3: ZK208RH6, Bay 4: ZFL41DV0, Bay 5: ZK208Q7J
-  └── BTRFS label: dasRaid0, mount: /dasRaid0
-      ├── Data: RAID0 (~5.5 TiB striped)
-      ├── Metadata: RAID1 (mirrored, survives single drive loss)
-      └── @data subvolume → backed up nightly to 22TB via btrbk
-```
-
-**Rationale**: The 22TB enterprise CMR drive provides 20 TiB for deep retention
-of ~1.8 TiB of source data — enough for years of backup history. The two 2TB
-bootable recovery drives receive NVMe/SSD snapshots to keep the emergency
-CachyOS install current. The remaining three 2TB drives (formerly cold spare
-and legacy archives) are repurposed as a BTRFS RAID0 general storage array
-(~5.5 TiB), backed up nightly to the 22TB.
-
-### Why Not BTRFS RAID on the Backup Drives?
-
-- RAID-1 across backup drives would require all drives online simultaneously — defeats offline/rotation model
-- RAID-5/6 is unstable on BTRFS and terrible on SMR drives
-- **Backup drives remain JBOD**: 22TB (single drive, btrbk targets), 2x 2TB bootable (independent, per-drive BTRFS)
-- **RAID0 is used only for general storage** (Bays 3/4/5) — expendable data, backed up to 22TB nightly. Not used for backup targets themselves
-
----
-
-## Backup Strategy: BTRFS Send/Receive with btrbk
-
-### Software (installed)
-
-- **btrbk** 0.32.6 — snapshot-based incremental BTRFS backup tool
-- **mbuffer** — rate limiting and progress bars for send/receive streams
-- **s-nail** (mailx) 14.9.25 — email delivery for nightly backup reports
-- **Proton Bridge** 3.22.0 — localhost SMTP relay to Proton Mail
-
-### How btrbk Works
+btrbk orchestrates BTRFS snapshot-based backups:
 
 1. Creates read-only snapshots of source subvolumes
 2. Uses `btrfs send` to stream snapshot data to target drives
-3. Incremental sends only transmit changed blocks since last backup
-4. Manages retention policy on both source and target (e.g., keep 4 weekly + 2 monthly)
+3. Incremental sends only transmit changed blocks since the last backup
+4. Manages retention policy on both source and target (e.g., keep 4 weekly + 12 monthly)
 5. Uses mbuffer for buffered transfers with progress monitoring
+
+**Key advantage**: Incremental sends are extremely efficient. After the initial full send, nightly backups transfer only changed data -- typically completing in minutes.
 
 ### No Snapper Snapshot Transfer
 
-Snapper snapshots on the live system are **not transferred** to backup drives. Rationale:
-- Snapper is for local rollback ("undo the last 2 hours")
+If you use Snapper for local rollback, those snapshots are **not** transferred to backup drives:
+
+- Snapper is for local undo ("revert the last 2 hours")
 - btrbk creates and manages its own snapshot retention on the backup drives
-- Transferring snapper history would multiply backup time and space for no disaster recovery benefit
-- The current live state is what matters for recovery — btrbk's own retention provides historical depth
+- Transferring Snapper history would multiply backup time and space for no disaster recovery benefit
+- The current live state is what matters for recovery -- btrbk provides historical depth on the targets
 
-### Workflow (revised 2026-02-19)
+### Bootable Recovery Drives
 
-The backup architecture uses three target tiers:
+You can designate one or more DAS drives as bootable recovery systems:
 
-1. **22TB Exos (Bay 2)** — receives ALL subvolumes (NVMe, SSD, HDD projects, audiobooks)
-2. **2TB Bootable Recovery #1 (Bay 6)** — receives NVMe + SSD snapshots only (keeps emergency OS current)
-3. **2TB Bootable Recovery #2 (Bay 1)** — receives NVMe + SSD snapshots only (mirror of #1)
+- Partition with an ESP (EFI System Partition) + BTRFS root
+- The ESP contains a bootloader (systemd-boot, GRUB, etc.) with kernel and initramfs
+- BTRFS partition holds a bootable OS installation plus btrbk snapshot history
+- To recover: plug in DAS, select it from UEFI boot menu, boot into a working system
+- From the recovery OS, repair or reinstall to production drives
 
-#### Nightly Automated Backup
-The `das-backup.timer` systemd unit runs nightly at 03:00:
+**ESP mirroring**: If you have multiple bootable recovery drives, `btrdasd setup` can configure package manager hooks to automatically sync the ESP across all of them whenever the kernel or bootloader updates.
+
+### Tiered Backup Architecture
+
+A tiered approach separates concerns:
+
+- **Primary backup target** -- large-capacity drive receiving ALL subvolumes with deep retention
+- **Recovery drives** (optional) -- smaller drives that receive only OS-critical subvolumes (boot, root, home) and maintain a bootable system
+- **General storage** (optional) -- expendable data on additional drives, backed up to the primary target
+
+This means your most important data has the deepest retention on the largest drive, while recovery drives stay small and focused on getting you booted quickly.
+
+### Why Not BTRFS RAID on Backup Drives?
+
+- RAID-1 across backup drives requires all drives online simultaneously -- defeats the offline/rotation model
+- RAID-5/6 is unstable on BTRFS and performs poorly on SMR drives
+- **Backup drives should remain JBOD**: each drive is independent with its own BTRFS filesystem
+- RAID0 is acceptable only for expendable general storage (not backup targets)
+
+---
+
+## Deciding What to Back Up
+
+### Back Up (irreplaceable)
+
+- OS root, home directory, system configuration
+- Project source code and data
+- Application data that cannot be recreated
+- Original media files (before conversion/transcoding)
+
+### Do NOT Back Up (re-derivable or re-downloadable)
+
+- Converted/transcoded media (recreatable from originals)
+- Virtual machines (recreatable from ISOs and documented setup)
+- Game libraries (re-downloadable from storefronts)
+- AI models (re-downloadable from model hubs)
+- Package caches (rebuilt automatically)
+- ISO images (re-downloadable)
+- Snapper snapshot history (btrbk manages its own retention)
+
+---
+
+## DAS Backup Planning Worksheet
+
+### 1. IRREPLACEABLE DATA SIZE
+
+Inventory your BTRFS subvolumes and estimate sizes:
+
+| Subvolume | Mount Point | Size | Back Up? |
+|-----------|-------------|------|----------|
+| `<subvol>` | `<mount>` | `___` GB/TB | Yes / No |
+| `<subvol>` | `<mount>` | `___` GB/TB | Yes / No |
+| ... | ... | ... | ... |
+
+**Total data to back up**: _____ GB/TB
+
+### 2. RETENTION DEPTH
+
+How much history do you want to keep?
+
+| Retention Period | Count | Estimated Multiplier |
+|-----------------|-------|---------------------|
+| Weekly snapshots | _____ | 1.1x -- 1.3x (low churn data) |
+| Monthly snapshots | _____ | 1.5x -- 2.0x |
+| Yearly snapshots | _____ | 2.0x -- 3.0x |
+
+**Estimated space**: data_size x retention_factor = _____
+
+*Note*: btrbk uses incremental snapshots. The multiplier depends on your data's rate of change. Code repositories with frequent commits need more space than static media archives.
+
+### 3. TARGET CAPACITY
+
+| Target | Minimum Capacity |
+|--------|-----------------|
+| Primary backup drive | >= (data x retention_factor) |
+| Recovery drives (optional) | >= OS data size each |
+
+### 4. DAS ENCLOSURE
+
+| Requirement | Your Choice |
+|-------------|-------------|
+| Bays needed | _____ |
+| Interface | USB 3.x / eSATA / Thunderbolt / 10GbE |
+| Mode | **JBOD required** (drives must appear individually to the OS) |
+| Hot-swap | Recommended but not required |
+| Cooling | Verify adequate for your drive count |
+
+**Important**: The enclosure **must** operate in JBOD mode. Hardware RAID enclosures that present a single virtual disk are incompatible with per-drive BTRFS backup.
+
+### 5. DRIVE SELECTION
+
+| Consideration | Your Choice |
+|---------------|-------------|
+| Technology | HDD / SSD / NVMe |
+| Recording method (HDD only) | CMR preferred for random I/O; SMR acceptable for sequential workloads |
+| Capacity per drive | _____ |
+| Quantity | _____ |
+| Total raw capacity | _____ |
+
+**Drive technology notes**:
+- **HDD (CMR)**: Best cost-per-TB. Conventional Magnetic Recording handles all workloads well.
+- **HDD (SMR)**: Cheaper but sequential-write-only. Acceptable for BTRFS send streams (which are sequential) but avoid for RAID configurations requiring random writes.
+- **SSD**: Faster, silent, shock-resistant. Higher cost-per-TB. No SMR concerns.
+- **NVMe in USB enclosure**: Fastest option. Highest cost-per-TB.
+
+### 6. BUDGET
+
+| Item | Cost |
+|------|------|
+| DAS enclosure | $_____ |
+| Drives | $_____ |
+| Cables (if not included) | $_____ |
+| **Total** | **$_____** |
+
+---
+
+## Backup Workflow
+
+### Nightly Automated Backup
+
+The `das-backup.timer` systemd unit (or cron job on sysvinit/OpenRC) runs nightly:
+
 1. `backup-run.sh` detects DAS drives by serial number
-2. Mounts source top-level volumes (NVMe, SSD, HDD) and all three targets
+2. Mounts source top-level volumes and all target drives
 3. Records pre-backup disk usage for throughput measurement
-4. Runs `btrbk run` — creates snapshots and sends incremental deltas to all targets
-5. Records post-backup usage, logs per-target throughput (data written + MB/s)
-6. Updates stable boot subvolumes (@, @home) on bootable recovery drives
-7. Syncs ESP to both 2TB bootable drives (rsync of /boot)
+4. Runs `btrbk run` -- creates snapshots and sends incremental deltas to all targets
+5. Records post-backup usage, logs per-target throughput
+6. Updates stable boot subvolumes on bootable recovery drives (if configured)
+7. Syncs ESP to bootable drives (if configured)
 8. Records growth data point for trend analysis
-9. Generates and emails a comprehensive backup report (see Email Reports below)
+9. Generates and emails a backup report (if configured)
 10. Unmounts all volumes and cleans up
 
-#### Manual Backup
+### Manual Backup
+
 ```bash
-sudo /hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/scripts/backup-run.sh           # incremental
-sudo /hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/scripts/backup-run.sh --dryrun  # preview
-sudo /hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/scripts/backup-run.sh --full    # force full
+sudo backup-run.sh                # incremental
+sudo backup-run.sh --dryrun       # preview
+sudo backup-run.sh --full         # force full send
 ```
 
-#### Schedule
-- **Nightly**: Automated via systemd timer (03:00)
+### Recommended Schedule
+
+- **Nightly**: Automated incremental backup via systemd timer / cron
 - **Monthly**: Run SMART checks on all DAS drives (`backup-verify.sh`)
-- **Quarterly**: Test boot from DAS recovery drive, verify restore capability
-- **As needed**: Check SMART extended test results on 22TB
+- **Quarterly**: Test boot from DAS recovery drive (if applicable), verify restore capability
+- **As needed**: Check SMART extended test results on large drives
 
-### Bootable Recovery Drives (Bays 1 and 6)
+### Email Reports
 
-Two 2TB drives serve as emergency bootable CachyOS systems:
+After each backup, the report includes:
 
-```
-Each 2TB bootable drive:
-├── Partition 1: 1.5G ESP (FAT32) — synced clone of /boot
-└── Partition 2: ~1998G BTRFS
-    ├── nvme/ — btrbk NVMe snapshot history
-    ├── ssd/  — btrbk SSD snapshot history
-    └── @ @home — stable boot subvolumes (refreshed each backup run)
-```
-
-**Recovery procedure**:
-1. Connect DAS via USB
-2. Select "Emergency Backup" or "Emergency Backup Mirror" in UEFI boot menu
-3. System boots from the 2TB drive's ESP → systemd-boot
-4. Root mounts from the 2TB drive's BTRFS (@ subvolume)
-5. From there, repair or reinstall to production NVMe
-6. Full btrbk snapshot history available on the 22TB for data recovery
-
-**Note**: The 22TB primary backup drive has NO ESP and is NOT bootable — it stores
-btrbk snapshots only. The bootable recovery capability lives on the two 2TB drives.
-
-**Caveat**: The backup's systemd-boot entries must have their `root=` parameters pointing to the backup BTRFS UUID, not the NVMe UUID. `backup-run.sh` maintains separate loader entries on each backup ESP automatically.
-
-### Email Reports (added 2026-02-19)
-
-After each backup (nightly or manual), `backup-run.sh` generates and emails a
-comprehensive report to `gjbr@pm.me` via Proton Bridge SMTP.
-
-**Report contents**:
-- **Backup Operations** — btrbk success/fail + duration, boot subvolume update status, ESP sync status
-- **Throughput** — per-target data written and transfer rate (MB/s)
-- **Disk Capacity** — used/available/percentage for all backup targets
-- **Growth Analysis** — today's growth, 7-day avg, 30-day avg, capacity runway projection (years until full)
-- **SMART Status** — health, temperature, power-on hours for each DAS drive
-- **Latest Snapshots** — most recent btrbk snapshot per subvolume
-
-**Email delivery chain**: `backup-run.sh` → `mailx` (s-nail) → Proton Bridge (127.0.0.1:1025) → Proton Mail
-
-**Configuration files**:
-- `/etc/das-backup-email.conf` — SMTP credentials (mode 600, root-only)
-- `/var/lib/das-backup/growth.log` — append-only growth data for trend analysis
-- `/var/lib/das-backup/last-report.txt` — most recent report (always saved regardless of email success)
-
-**Subject line format**: `[DAS Backup] cachyos-bosco — SUCCESS — 2026-02-20 03:07`
+- **Backup Operations** -- btrbk success/fail + duration, boot subvolume update status, ESP sync status
+- **Throughput** -- per-target data written and transfer rate
+- **Disk Capacity** -- used/available/percentage for all backup targets
+- **Growth Analysis** -- daily growth, 7-day average, 30-day average, capacity runway projection
+- **SMART Status** -- health, temperature, power-on hours for each DAS drive
+- **Latest Snapshots** -- most recent btrbk snapshot per subvolume
 
 ---
 
-## Cost Analysis
+## Risk Considerations
 
-| Item | Cost | Notes |
-|------|------|-------|
-| TerraMaster D6-320 | $300 | 6-bay USB 3.2 Gen2 DAS enclosure |
-| 5x ST2000DM008 2TB | $0 | Already owned (same-batch March 2021) |
-| 1x ST22000NM000C 22TB Exos | ~$250 | Factory recertified, added 2026-02-19 |
-| USB-C cable | $0 | Included with D6-320 |
-| **Total** | **~$550** | |
+### Same-Batch Correlated Failure
+
+If all your DAS drives come from the same manufacturing batch, they share identical manufacturing conditions. This creates **correlated failure risk** -- if one drive fails due to a systematic defect, others from the same batch have elevated probability of similar failure. This is well-documented in large-scale studies (Google, Backblaze).
+
+**Mitigation**: Use drives from different batches or manufacturers for different tiers (e.g., enterprise CMR drive for primary backup, consumer drives for recovery).
+
+### SMR Write Performance
+
+Shingled Magnetic Recording (SMR) drives have poor random write performance once their CMR cache fills. For DAS backup use:
+
+- **Sequential writes are fine** -- BTRFS send streams are sequential, which is a good match
+- **Avoid BTRFS RAID-5/6** on SMR drives -- these require random write patterns
+- **Large initial backups may be slow** on SMR; incremental backups will be fast
 
 ---
 
-## Implementation Phases (all complete)
+## Reference Example: Author's Setup
 
-### Phase A: Acquire DAS — DONE (2026-02-01)
-- Purchased TerraMaster D6-320
-- Verified USB 3.2 Gen2 connectivity
+> **Disclaimer**: This documents the author's personal setup as one example. No endorsement of any manufacturer, enclosure model, or drive architecture. Your requirements will differ.
 
-### Phase B: Prepare Drives — DONE (2026-02-04)
-- SMART extended tests passed on all 6x ST2000DM008
-- Partitioned two bootable drives: p1 1.5G ESP + p2 BTRFS
-- Formatted data drives as whole-disk BTRFS
+### Hardware
 
-### Phase C: Configure btrbk — DONE (2026-02-04, revised 2026-02-19)
-- `/etc/btrbk/btrbk.conf` v2.0.0 — triple-target architecture
-- Source: NVMe (@, @home, @root, @log), SSD (@opt, @srv), HDD (projects, audiobooks)
-- 22TB primary target: all subvolumes, 4w 12m 4y retention
-- 2TB secondary/tertiary targets: NVMe + SSD only (keeps recovery OS current)
+- **Enclosure**: TerraMaster D6-320, 6-bay USB 3.2 Gen2 JBOD, ~$300
+- **Primary backup**: 1x Seagate Exos X22 22TB (ST22000NM000C), CMR, factory recertified ~$250
+- **Recovery + storage**: 5x Seagate Barracuda 2TB (ST2000DM008), SMR, same batch March 2021
+- **Total raw capacity**: ~32 TB (22TB + 5x 2TB)
+- **Total cost**: ~$550
 
-### Phase D: Initial Full Backup — DONE (2026-02-04 original, 2026-02-19 for 22TB)
-- Original 2TB targets: initial sends completed 2026-02-04
-- 22TB Exos: initial full send started 2026-02-19 (~1.8 TiB transfer)
-- Boot subvolumes created on both 2TB recovery drives
-- ESP synced to both bootable drives
-- Boot from DAS tested and verified
+### Drive Allocation
 
-### Phase E: Automate — DONE (2026-02-04, enhanced 2026-02-19)
-- `das-backup.service` + `das-backup.timer` — nightly at 03:00
-- `backup-verify.sh` v2.0.0 — SMART check, btrbk status, disk usage
-- `backup-run.sh` v3.1.0 — triple-target, throughput logging, email reports
-- `/etc/das-backup-email.conf` — SMTP config for Proton Bridge
-- `/var/lib/das-backup/` — growth tracking and report archive
+```
+Bay 2 -- 22TB Exos: PRIMARY BACKUP
+  All btrbk targets (NVMe, SSD, HDD projects, audiobooks, DAS storage)
+  Retention: 4 weekly + 12 monthly + 4 yearly
 
-### Phase F: 22TB Exos Integration — DONE (2026-02-19)
-- Replaced Bay 2 cold spare (ZFL416F6) with 22TB Exos (ZXA0LMAE)
-- Partitioned as single whole-disk BTRFS (no ESP — not a bootable drive)
-- SMART extended self-test started (completes ~2026-02-21 14:26)
-- btrbk reconfigured for triple-target architecture
-- Legacy 2TB data drives (Bays 4, 5) retained read-only until 22TB proven
+Bay 6 -- 2TB Barracuda: BOOTABLE RECOVERY #1
+  ESP + bootable OS + btrbk NVMe/SSD snapshots
 
-### Phase H: RAID0 General Storage — DONE (2026-02-19)
-- Repurposed Bays 3/4/5 (formerly cold spare + legacy archives) as BTRFS RAID0
-- 3x 2TB ST2000DM008: data RAID0 (~5.5 TiB), metadata RAID1
-- Label: dasRaid0, mount: /dasRaid0, subvolume: @data
-- Added to btrbk config: snapshots to /mnt/backup-22tb/das-storage
-- fstab entry with nofail (DAS may be off), nossd, autodefrag, compress=zstd:3
+Bay 1 -- 2TB Barracuda: BOOTABLE RECOVERY #2
+  ESP + bootable OS + btrbk NVMe/SSD snapshots (mirror of #1)
 
-### Phase G: Ongoing
-- **Nightly**: Automated incremental backup via systemd timer
-- **Monthly**: SMART checks on all DAS drives
-- **Quarterly**: Test boot from DAS recovery drive, verify restore capability
-- **2026-02-21**: Check 22TB SMART extended test results
+Bays 3,4,5 -- 3x 2TB Barracuda: BTRFS RAID0 GENERAL STORAGE
+  ~5.5 TiB striped array for expendable data, backed up to 22TB nightly
+```
+
+### Capacity Budget
+
+| Data Category | Size | Source |
+|---------------|------|--------|
+| NVMe: OS + /home + /root + /var/log | ~377G | `@`, `@home`, `@root`, `@log` |
+| SSD: /opt + /srv | ~50-60G | `@opt`, `@srv` |
+| HDD: Projects | ~50-100G | Project subvolumes |
+| HDD: Audiobook sources | ~509G | Original source files only |
+| **Total irreplaceable** | **~1 TiB** | |
+
+### What Is NOT Backed Up
+
+| Category | Size | Reason |
+|----------|------|--------|
+| Converted audiobooks | ~450G | Re-derivable from sources |
+| Virtual machines | ~100G+ | Recreatable from ISOs |
+| Game libraries | ~1.4T | Re-downloadable |
+| AI models | ~2T+ | Re-downloadable |
+| ISOs, caches, Snapper | Variable | Re-downloadable or auto-rebuilt |
+
+### Cost Analysis
+
+| Item | Cost |
+|------|------|
+| TerraMaster D6-320 | $300 |
+| 5x ST2000DM008 2TB (already owned) | $0 |
+| 1x ST22000NM000C 22TB Exos (recertified) | ~$250 |
+| **Total** | **~$550** |
+
+### Evaluated and Rejected: Renewed Exos X14 12TB
+
+Considered 2x Seagate Exos X14 12TB renewed (~$250 each). Rejected because:
+- Backblaze data shows Exos X14 12TB failure rates climbing to 8-9% AFR at 5+ years
+- Renewed units are 6-7 years old -- in the elevated failure window
+- Only 90-day warranty
+- Poor value for a backup role
 
 ---
 
 ## References
 
-- [TerraMaster D6-320 — Amazon](https://www.amazon.com/TERRAMASTER-D6-320-External-Drive-Enclosure/dp/B0BZHSK29B)
-- [TerraMaster D6-320 — TechRadar Review](https://www.techradar.com/pro/terramaster-d6-320-6-bay-review)
-- [TerraMaster D6-320 — The Gadgeteer Review](https://the-gadgeteer.com/2024/01/16/terramaster-d6-320-6-bay-external-hard-disk-enclosure-review-wonderfully-boring/)
-- [btrbk — GitHub](https://github.com/digint/btrbk)
-- [BTRFS Incremental Backup — Fedora Magazine](https://fedoramagazine.org/btrfs-snapshots-backup-incremental/)
-- [Seagate ST2000DM008 Product Manual (PDF)](https://www.seagate.com/files/www-content/product-content/barracuda-fam/barracuda-new/en-us/docs/100817550m.pdf)
-- [Seagate Exos X22 (ST22000NM000C) Product Page](https://www.seagate.com/products/enterprise-drives/exos-x/x22/)
+- [btrbk -- GitHub](https://github.com/digint/btrbk)
+- [BTRFS Incremental Backup -- Fedora Magazine](https://fedoramagazine.org/btrfs-snapshots-backup-incremental/)
+- [Backblaze Drive Stats](https://www.backblaze.com/cloud-storage/resources/hard-drive-test-data) -- Annual failure rate data by model
 - [Seagate HDD Reliability & MTBF](https://www.seagate.com/support/kb/hard-disk-drive-reliability-and-mtbf-afr-174791en/)
-- [Backblaze Drive Stats Q2 2025](https://www.backblaze.com/blog/backblaze-drive-stats-for-q2-2025/) — Exos X14 failure rate data
-- [Backblaze Drive Stats 2024](https://www.backblaze.com/blog/backblaze-drive-stats-for-2024/) — Exos X14 failure rate data

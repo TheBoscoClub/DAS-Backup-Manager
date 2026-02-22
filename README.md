@@ -24,8 +24,8 @@ That said, suggestions, recommendations, and requests that fall within this narr
 ## Features
 
 - **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure
-- **Triple-Target Architecture** — 22TB primary backup + 2x 2TB bootable recovery drives
-- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (1-year retention)
+- **Multi-Target Architecture** — Configurable primary, mirror, and ESP-sync roles across any number of DAS drives
+- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
 - **Email Reports** — Automated backup status reports with throughput metrics and SMART status
 - **ButteredDASD Content Indexer** (`btrdasd`) — Rust CLI with SQLite FTS5 database tracking every file across all snapshots
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 application for searching, browsing, and restoring files from backup snapshots
@@ -63,9 +63,11 @@ DAS-Backup-Manager/
 └── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER options)
 ```
 
-## Requirements
+## Minimum Requirements
 
-- Linux with BTRFS filesystem support
+- Linux with BTRFS support (kernel 5.15+)
+- DAS enclosure (any manufacturer, any interface -- USB, Thunderbolt, eSATA)
+- One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
 - btrbk 0.32+, smartmontools, zsh 5.9+
 - Rust 1.87+ with Cargo (for building the indexer and installer)
 - **Optional**: Qt6 6.6+, KDE Frameworks 6.0+, CMake 3.25+ (for the GUI)
@@ -108,10 +110,11 @@ docker run --rm btrdasd --version
 - [Installation Guide](docs/INSTALL.md) — All installation methods, config reference, Docker
 - [ButteredDASD Indexer](docs/BUTTERED-DASD.md) — CLI usage, schema, span logic, development
 - [Dependencies](docs/DEPENDENCIES.md) — Rust crates, system deps, build deps, GUI deps
-- [Offline Backup Plan](docs/OFFLINE-BACKUP-PLAN.md) — Capacity planning, drive allocation
+- [Backup Planning](docs/OFFLINE-BACKUP-PLAN.md) — Capacity planning, drive selection, retention worksheet
 - [Disaster Recovery Guide](docs/DISASTER-RECOVERY-GUIDE.md) — Step-by-step recovery procedures
-- [Storage Architecture](docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md) — Full system storage reference
-- [DAS Bay Mapping](docs/DAS-BAY-MAPPING.md) — Physical drive locations and serial numbers
+- [Storage Architecture & Recovery](docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md) — BTRFS RAID concepts, failure detection, recovery procedures
+- [DAS Bay Mapping](docs/DAS-BAY-MAPPING.md) — How to map and document physical drive locations
+- [Reference Examples](docs/examples/) — Author's hardware setup as a worked example
 
 ## License
 

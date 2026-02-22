@@ -2,6 +2,27 @@
 
 **Version**: 0.4.0
 
+## Before You Begin
+
+### Minimum Requirements
+
+- Linux with BTRFS support (kernel 5.15+)
+- DAS enclosure (any manufacturer, any interface -- USB, Thunderbolt, eSATA) in JBOD mode
+- One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
+- btrbk 0.32+, smartmontools, zsh 5.9+
+- Rust 1.87+ with Cargo (for building btrdasd)
+
+### Planning Your Backup
+
+Before installing, work through the [Backup Planning Guide](OFFLINE-BACKUP-PLAN.md) to determine:
+
+1. **What to back up** -- which BTRFS subvolumes contain irreplaceable data
+2. **Retention depth** -- how many weekly/monthly snapshots to keep
+3. **Target capacity** -- how much storage you need on your DAS drives
+4. **Drive roles** -- which drives serve as primary backup, bootable recovery, or general storage
+
+The planning worksheet in that guide helps you estimate capacity requirements before you buy hardware.
+
 ## Prerequisites
 
 ### Required

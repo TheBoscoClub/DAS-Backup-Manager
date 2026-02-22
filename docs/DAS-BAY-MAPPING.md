@@ -1,68 +1,119 @@
-# TerraMaster D6-320 Bay Mapping
+# DAS Bay Mapping Guide
 
-**Date mapped**: 2026-02-04
-**Updated**: 2026-02-19 (22TB Exos in Bay 2; Bays 3/4/5 repurposed as BTRFS RAID0)
-**Method**: I/O activity LED identification + serial number verification
+Bay mapping documents which physical bay in your DAS enclosure holds which drive. This is essential for:
 
-## Physical Bay Layout
+- **Identifying drives during failure** -- LED activity tells you which bay has the failing drive
+- **Matching serials to config** -- your `config.toml` target entries reference drives by serial number
+- **Safe hot-swap** -- knowing which bay to pull without disrupting the wrong drive
+- **Recovery procedures** -- disaster recovery steps reference bays and serials
 
-```
-┌───────────────────────────────────────────────────┐
-│ TerraMaster D6-320 (front view)                   │
-├──────────────┬──────────────┬─────────────────────┤
-│    Bay 1     │    Bay 2     │    Bay 3             │
-│   ZK208Q77   │   ZXA0LMAE   │   ZK208RH6           │
-│   2TB SMR    │ ★ 22TB CMR   │   2TB SMR             │
-│  Bootable    │  PRIMARY     │  ═══ RAID0 ═══       │
-│  Recovery    │  BACKUP      │  General Storage     │
-├──────────────┼──────────────┼─────────────────────┤
-│    Bay 4     │    Bay 5     │    Bay 6             │
-│   ZFL41DV0   │   ZK208Q7J   │   ZFL41DNY           │
-│   2TB SMR    │   2TB SMR    │   2TB SMR             │
-│ ═══ RAID0 ══ │ ═══ RAID0 ══ │  Bootable            │
-│ Gen. Storage │ Gen. Storage │  Recovery            │
-└──────────────┴──────────────┴─────────────────────┘
+## Why Device Letters Are Unreliable
+
+Linux assigns device letters (`/dev/sda`, `/dev/sdb`, etc.) based on detection order, which changes on every reboot, USB reconnect, or hotplug event. **Never** reference DAS drives by device letter in persistent configurations. Use serial numbers instead.
+
+## How to Map Your Bays
+
+### Step 1: Identify drives by I/O activity
+
+Generate sustained I/O on one drive at a time and watch which bay's LED blinks:
+
+```bash
+# Replace /dev/sdX with each DAS drive letter in turn
+sudo dd if=/dev/sdX of=/dev/null bs=1M count=2000 status=progress
 ```
 
-## Drive Details
+While this runs, one bay's activity LED will blink rapidly. Record which bay it is.
+
+### Step 2: Match serial numbers
+
+For each drive, retrieve the serial number:
+
+```bash
+# SATA drives
+sudo smartctl -i /dev/sdX | grep "Serial Number"
+
+# NVMe drives (if your DAS supports NVMe)
+sudo smartctl -i /dev/nvmeXn1 | grep "Serial Number"
+```
+
+You can also use `btrdasd config show` to display all detected target serials from your configuration.
+
+### Step 3: Record your mapping
+
+Use the template below. Adjust bay count and layout to match your enclosure.
+
+## Bay Mapping Template
+
+```
++------------------------------------------+
+| <Your Enclosure Model> (front view)      |
++------------+------------+----------------+
+|   Bay 1    |   Bay 2    |   Bay 3        |
+| <serial-1> | <serial-2> | <serial-3>     |
+| <capacity> | <capacity> | <capacity>     |
+| <role>     | <role>     | <role>         |
++------------+------------+----------------+
+|   Bay 4    |   Bay 5    |   Bay 6        |
+| <serial-4> | <serial-5> | <serial-6>     |
+| <capacity> | <capacity> | <capacity>     |
+| <role>     | <role>     | <role>         |
++------------+------------+----------------+
+```
+
+Adjust the grid to match your enclosure's bay count and physical arrangement (2-bay, 4-bay, 6-bay, 8-bay, etc.).
+
+## Drive Details Template
 
 | Bay | Serial | Model | Size | Partitions | Role | BTRFS Label |
 |-----|--------|-------|------|------------|------|-------------|
-| 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Bootable Recovery + btrbk NVMe/SSD target | das-backup-system-mirror |
-| 2 | ZXA0LMAE | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — all btrbk targets | das-backup-22tb |
-| 3 | ZK208RH6 | ST2000DM008 | 1.8T | whole disk (BTRFS RAID0) | RAID0 General Storage (member 1/3) | dasRaid0 |
-| 4 | ZFL41DV0 | ST2000DM008 | 1.8T | whole disk (BTRFS RAID0) | RAID0 General Storage (member 2/3) | dasRaid0 |
-| 5 | ZK208Q7J | ST2000DM008 | 1.8T | whole disk (BTRFS RAID0) | RAID0 General Storage (member 3/3) | dasRaid0 |
-| 6 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Bootable Recovery + btrbk NVMe/SSD target | das-backup-system |
+| 1 | `<serial>` | `<model>` | `<size>` | `<partition layout>` | `<role>` | `<label>` |
+| 2 | `<serial>` | `<model>` | `<size>` | `<partition layout>` | `<role>` | `<label>` |
+| ... | ... | ... | ... | ... | ... | ... |
 
-## RAID0 General Storage Array
+### Roles
 
-- **Label**: dasRaid0
-- **UUID**: d29fdda7-a1e5-4640-996e-2b78569cb65d
-- **Mount**: /dasRaid0
-- **Data profile**: RAID0 (striped, ~5.5 TiB usable)
-- **Metadata profile**: RAID1 (mirrored across 2 of 3 devices — survives single drive loss for file listing)
-- **Subvolume**: @data (backed up nightly to 22TB via btrbk)
-- **Use case**: Incidental/replaceable data. SMR drives are fine for large sequential writes but poor for small random I/O.
-- **Fault tolerance**: NONE for data (any single drive loss = array offline). Data backed up to 22TB nightly.
+Common drive roles in a DAS backup configuration:
 
-## Role Summary
+| Role | Description |
+|------|-------------|
+| **Primary Backup** | Main btrbk target -- receives all snapshot send/receive streams |
+| **Bootable Recovery** | Has an ESP partition + bootable OS -- can boot the system independently |
+| **Mirror** | Redundant copy of another backup target |
+| **General Storage** | Non-critical data (RAID0 or single-drive) |
+| **Cold Spare** | Unused drive kept ready as a replacement |
 
-- **Primary Backup** (Bay 2): 22TB Exos — all btrbk targets (NVMe, SSD, projects, audiobooks, DAS storage), deep retention (4w 12m 4y)
-- **Bootable Recovery** (Bays 1, 6): 2TB drives with ESP + CachyOS — also receive btrbk NVMe/SSD snapshots to keep recovery OS current
-- **RAID0 General Storage** (Bays 3, 4, 5): ~5.5 TiB striped array for expendable data, backed up to 22TB nightly
+### Partition Layouts
 
-## Removed Drive
+Typical partition schemes for DAS backup drives:
 
-| Serial | Model | Size | Former Role | Status |
-|--------|-------|------|-------------|--------|
-| ZFL416F6 | ST2000DM008 | 1.8T | Bay 2 Cold Spare | Removed 2026-02-19, stored offline |
+- **Whole-disk BTRFS** -- best for pure backup targets (no ESP needed)
+- **ESP + BTRFS** -- for bootable recovery drives (e.g., 1.5G FAT32 ESP + rest as BTRFS)
+- **Whole-disk BTRFS RAID0** -- for expendable general storage arrays
 
-## Notes
+## How Serials Map to config.toml
 
-- **Device letters change on every reboot/reconnect** — always identify by serial number
-- LED identification: `sudo dd if=/dev/sdX of=/dev/null bs=1M count=2000 status=progress`
-- 22TB Exos is CMR (conventional magnetic recording) — no SMR write penalties
-- 22TB SMART extended self-test started 2026-02-19, completes ~2026-02-21 14:26
-- 2TB drives: all ST2000DM008 (SMR), same batch March 2021, ~13,000 hours each
-- RAID0 array: all 3 drives on USB 3.2 Gen2 via DAS — all must be present to mount
+Each `[[target]]` entry in `/etc/das-backup/config.toml` identifies a drive by serial:
+
+```toml
+[[target]]
+label = "primary-backup"
+serial = "<your-drive-serial>"
+mount = "/mnt/backup-primary"
+role = "primary"
+
+[target.retention]
+weekly = 4
+monthly = 12
+```
+
+The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
+
+## Maintenance
+
+- **Update your mapping** whenever you add, remove, or rearrange drives
+- **Verify after firmware updates** -- some DAS enclosures may re-order ports
+- **Keep a printed copy** near the DAS for emergency reference
+
+## Reference Example
+
+See [examples/author-bay-mapping.md](examples/author-bay-mapping.md) for a fully documented 6-bay TerraMaster D6-320 configuration with specific drive models, serials, RAID0 arrays, and bootable recovery drives.
