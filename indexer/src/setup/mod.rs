@@ -1,5 +1,6 @@
 pub mod config;
 pub mod detect;
+pub mod templates;
 
 use clap::Args;
 
