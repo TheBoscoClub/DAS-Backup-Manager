@@ -1,3 +1,5 @@
+mod setup;
+
 use buttered_dasd::db::Database;
 use buttered_dasd::indexer;
 use clap::{Parser, Subcommand};
@@ -51,6 +53,8 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_DB)]
         db: String,
     },
+    /// Interactive setup wizard — configure backup sources, targets, and scheduling
+    Setup(setup::SetupArgs),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,6 +104,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Files:      {}", stats.file_count);
             println!("Spans:      {}", stats.span_count);
             println!("DB size:    {} bytes", stats.db_size);
+        }
+        Commands::Setup(args) => {
+            setup::run(args)?;
         }
     }
 
