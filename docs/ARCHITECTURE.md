@@ -4,6 +4,19 @@
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
+## Scope
+
+This project manages backups to **Direct-Attached Storage (DAS)** using the **BTRFS** filesystem. That's it. That's the scope.
+
+The following are permanently out of scope and will never be added:
+
+- **NAS** (Network-Attached Storage)
+- **SAN** (Storage Area Network)
+- **Cloud storage** (S3, Azure Blob, GCS, Backblaze, etc.)
+- **Any filesystem other than BTRFS** (ext4, XFS, ZFS, NTFS, etc.)
+
+Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
+
 ## Component Overview
 
 ```

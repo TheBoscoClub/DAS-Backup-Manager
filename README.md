@@ -6,6 +6,21 @@
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI, and an interactive installer for the full backup pipeline.
 
+## Scope
+
+This project manages backups to **Direct-Attached Storage (DAS)** using the **BTRFS** filesystem. That's it. That's the scope.
+
+The following are permanently out of scope and will never be added:
+
+- **NAS** (Network-Attached Storage)
+- **SAN** (Storage Area Network)
+- **Cloud storage** (S3, Azure Blob, GCS, Backblaze, etc.)
+- **Any filesystem other than BTRFS** (ext4, XFS, ZFS, NTFS, etc.)
+
+This is not a general-purpose backup tool. It is a DAS + BTRFS backup tool. If you need support for other storage architectures or filesystems, you are welcome to write your own application that covers whichever and however many storage backends your heart desires.
+
+That said, suggestions, recommendations, and requests that fall within this narrow scope are very welcome and will be happily entertained.
+
 ## Features
 
 - **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure

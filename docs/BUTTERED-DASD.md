@@ -4,7 +4,9 @@
 
 ## Overview
 
-ButteredDASD is a content indexer that builds a searchable SQLite FTS5 database of every file across all BTRFS snapshots on backup targets. It enables instant full-text search across hundreds of snapshots without mounting or traversing filesystem trees. It also includes an interactive installer for configuring the full backup pipeline.
+ButteredDASD is a content indexer that builds a searchable SQLite FTS5 database of every file across all BTRFS snapshots on DAS backup targets. It enables instant full-text search across hundreds of snapshots without mounting or traversing filesystem trees. It also includes an interactive installer for configuring the full DAS + BTRFS backup pipeline.
+
+**Scope**: ButteredDASD indexes BTRFS snapshots on Direct-Attached Storage. NAS, SAN, cloud storage, and non-BTRFS filesystems are permanently out of scope. Suggestions and contributions within this scope are very welcome.
 
 ## Architecture
 
