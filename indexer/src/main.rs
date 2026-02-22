@@ -55,6 +55,35 @@ enum Commands {
     },
     /// Interactive setup wizard — configure backup sources, targets, and scheduling
     Setup(setup::SetupArgs),
+    /// Config inspection and export commands
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+const DEFAULT_CONFIG: &str = "/etc/das-backup/config.toml";
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print shell-sourceable KEY=VALUE pairs from config
+    DumpEnv {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Pretty-print the current config
+    Show {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Validate config and report issues
+    Validate {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,6 +137,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Setup(args) => {
             setup::run(args)?;
         }
+        Commands::Config { action } => match action {
+            ConfigAction::DumpEnv { config } => {
+                let cfg = setup::config::Config::load(&config)?;
+                print!("{}", setup::env_export::dump_env(&cfg));
+            }
+            ConfigAction::Show { config } => {
+                let cfg = setup::config::Config::load(&config)?;
+                println!("{}", cfg.to_toml()?);
+            }
+            ConfigAction::Validate { config } => {
+                let cfg = setup::config::Config::load(&config)?;
+                let errors = cfg.validate();
+                if errors.is_empty() {
+                    println!("Config is valid.");
+                } else {
+                    for e in &errors {
+                        eprintln!("  - {e}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 
     Ok(())
