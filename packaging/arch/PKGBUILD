@@ -7,14 +7,21 @@ arch=('x86_64')
 url='https://github.com/TheBoscoClub/DAS-Backup-Manager'
 license=('MIT')
 depends=('btrbk' 'btrfs-progs' 'smartmontools' 'zsh' 'util-linux'
-         'qt6-base' 'kf6-kcoreaddons' 'kf6-ki18n' 'kf6-kxmlgui'
-         'kf6-kconfigwidgets' 'kf6-kiconthemes' 'kf6-kcrash' 'kf6-kio')
+         'qt6-base' 'kcoreaddons' 'ki18n' 'kxmlgui'
+         'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
     cd "DAS-Backup-Manager-$pkgver"
+
+    # Strip GCC LTO flags — GCC LTO bitcode is incompatible with LLVM's lld
+    # linker used by rustc, causing undefined sqlite3_* symbols when linking
+    # the bundled libsqlite3-sys static archive
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
 
     # Build Rust indexer binary
     cargo build --release --manifest-path indexer/Cargo.toml
