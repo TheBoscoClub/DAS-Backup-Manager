@@ -23,6 +23,7 @@
 #   sudo ./backup-run.sh --full       # Force full backup (recreate boot subvols)
 
 set -euo pipefail
+setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
 zmodload zsh/datetime  # provides $EPOCHSECONDS for throughput timing
 
 # ============================================================================

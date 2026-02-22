@@ -14,6 +14,7 @@
 #   sudo ./boot-archive-cleanup.sh --days 180   # Override retention (180 days)
 
 set -euo pipefail
+setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)

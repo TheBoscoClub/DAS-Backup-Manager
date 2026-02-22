@@ -20,6 +20,7 @@
 #   sudo ./das-partition-drives.sh --run     # Execute partitioning
 
 set -euo pipefail
+setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
