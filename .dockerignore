@@ -1,0 +1,13 @@
+build/
+build-cli/
+target/
+.git/
+.github/
+*.md
+!README.md
+SESSION_RECORD_*.md
+docs/
+gui/
+.claude/
+.codeql-db/
+.snapshots/
