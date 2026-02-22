@@ -514,6 +514,8 @@ mod tests {
             volume: "/.btrfs-nvme".to_string(),
             subvolumes: vec!["@".to_string(), "@home".to_string()],
             device: "/dev/nvme0n1p2".to_string(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec!["nvme".into()],
         });
         config.targets.push(Target {
             label: "primary-22tb".to_string(),
@@ -523,7 +525,10 @@ mod tests {
             retention: Retention {
                 weekly: 4,
                 monthly: 2,
+                daily: 0,
+                yearly: 0,
             },
+            display_name: String::new(),
         });
         config
     }

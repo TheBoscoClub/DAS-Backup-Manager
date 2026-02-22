@@ -257,6 +257,8 @@ mod tests {
             volume: "/test".to_string(),
             subvolumes: vec!["@".to_string()],
             device: "/dev/sda".to_string(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![],
         });
         config.targets.push(Target {
             label: "tgt".to_string(),
@@ -266,7 +268,10 @@ mod tests {
             retention: Retention {
                 weekly: 4,
                 monthly: 2,
+                daily: 0,
+                yearly: 0,
             },
+            display_name: String::new(),
         });
 
         let config_path = base.join("etc/das-backup/config.toml");
