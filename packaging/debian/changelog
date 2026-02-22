@@ -1,0 +1,9 @@
+das-backup-manager (0.5.0-1) unstable; urgency=medium
+
+  * Initial packaged release
+  * Rust indexer with SQLite FTS5 content indexing
+  * KDE Plasma 6 GUI for browsing/restoring backup snapshots
+  * 5 zsh orchestration scripts for btrbk-based backups
+  * systemd service and timer units
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 22 Feb 2026 00:00:00 +0000

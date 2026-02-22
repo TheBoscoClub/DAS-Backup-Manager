@@ -1,0 +1,205 @@
+name: Build Release Packages
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  # ===========================================================================
+  # Arch Linux (.pkg.tar.zst)
+  # ===========================================================================
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
+            qt6-base kf6-kcoreaddons kf6-ki18n kf6-kxmlgui kf6-kconfigwidgets \
+            kf6-kiconthemes kf6-kcrash kf6-kio qt6-tools
+
+      - name: Build package
+        run: |
+          # makepkg refuses to run as root — create a build user
+          useradd -m builder
+          chown -R builder: .
+          # Update PKGBUILD source to use local checkout
+          su builder -c '
+            cd packaging/arch
+            sed -i "s|source=.*|source=()|" PKGBUILD
+            sed -i "s|sha256sums=.*|sha256sums=()|" PKGBUILD
+            sed -i "s|cd \"DAS-Backup-Manager-\$pkgver\"|cd \"$GITHUB_WORKSPACE\"|g" PKGBUILD
+            makepkg -sf --noconfirm
+          '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: packaging/arch/*.pkg.tar.zst
+
+  # ===========================================================================
+  # Debian (.deb)
+  # ===========================================================================
+  debian:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cargo rustc cmake extra-cmake-modules debhelper \
+            qt6-base-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
+            libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev
+
+      - name: Build .deb
+        run: |
+          cp -r packaging/debian .
+          dpkg-buildpackage -us -uc -b
+          mkdir -p dist
+          cp ../*.deb dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-package
+          path: dist/*.deb
+
+  # ===========================================================================
+  # Fedora (.rpm)
+  # ===========================================================================
+  fedora:
+    runs-on: ubuntu-latest
+    container: fedora:43
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y rust cargo cmake extra-cmake-modules gcc-c++ rpm-build \
+            qt6-qtbase-devel kf6-kcoreaddons-devel kf6-ki18n-devel kf6-kxmlgui-devel \
+            kf6-kconfigwidgets-devel kf6-kiconthemes-devel kf6-kcrash-devel kf6-kio-devel
+
+      - name: Build RPM
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+        run: |
+          VERSION_NUM="${VERSION_TAG#v}"
+          mkdir -p ~/rpmbuild/{SOURCES,SPECS}
+          tar czf ~/rpmbuild/SOURCES/das-backup-manager-${VERSION_NUM}.tar.gz \
+            --transform "s,^\.,DAS-Backup-Manager-${VERSION_NUM}," .
+          cp packaging/fedora/das-backup-manager.spec ~/rpmbuild/SPECS/
+          sed -i "s/^Version:.*/Version:        ${VERSION_NUM}/" ~/rpmbuild/SPECS/das-backup-manager.spec
+          rpmbuild -ba ~/rpmbuild/SPECS/das-backup-manager.spec
+
+      - name: Collect RPMs
+        run: |
+          mkdir -p dist
+          find ~/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedora-package
+          path: dist/*.rpm
+
+  # ===========================================================================
+  # AppImage (GUI only)
+  # ===========================================================================
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake extra-cmake-modules fuse libfuse2 wget \
+            qt6-base-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
+            libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev
+
+      - name: Build AppImage
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+        run: packaging/appimage/build-appimage.sh "${VERSION_TAG#v}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: ButteredDASD-*.AppImage
+
+  # ===========================================================================
+  # Snap (.snap, classic confinement)
+  # ===========================================================================
+  snap:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare snapcraft source
+        run: |
+          # snapcraft expects snap/snapcraft.yaml at project root
+          mkdir -p snap
+          cp packaging/snap/snapcraft.yaml snap/
+
+      - uses: snapcore/action-build@v1
+        id: snap-build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap-package
+          path: ${{ steps.snap-build.outputs.snap }}
+
+  # ===========================================================================
+  # Flatpak (GUI only)
+  # ===========================================================================
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:kde-6.7
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: packaging/flatpak/org.theboscoclub.btrdasd-gui.yml
+          bundle: ButteredDASD-GUI.flatpak
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-bundle
+          path: ButteredDASD-GUI.flatpak
+
+  # ===========================================================================
+  # Collect all artifacts and attach to GitHub Release
+  # ===========================================================================
+  upload-release:
+    needs: [arch, debian, fedora, appimage, snap, flatpak]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: packages/
+
+      - name: List collected packages
+        run: ls -lhR packages/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*

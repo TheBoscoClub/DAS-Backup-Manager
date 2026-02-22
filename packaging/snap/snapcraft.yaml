@@ -1,0 +1,53 @@
+name: das-backup-manager
+version: '0.5.0'
+summary: DAS backup manager with btrbk, SQLite FTS5, KDE GUI
+description: |
+  ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)
+  enclosures. Config-driven backup orchestration via btrbk, full-text content
+  indexing with SQLite FTS5, and a KDE Plasma 6 GUI for browsing and restoring
+  files from backup snapshots.
+confinement: classic
+base: core24
+grade: stable
+
+parts:
+  btrdasd:
+    plugin: rust
+    source: .
+    source-subdir: indexer
+    build-packages:
+      - cargo
+      - rustc
+
+  gui-and-scripts:
+    plugin: cmake
+    source: .
+    cmake-parameters:
+      - -DCMAKE_INSTALL_PREFIX=/usr
+      - -DBUILD_INDEXER=OFF
+    build-packages:
+      - extra-cmake-modules
+      - g++
+      - qt6-base-dev
+      - libkf6coreaddons-dev
+      - libkf6i18n-dev
+      - libkf6xmlgui-dev
+      - libkf6configwidgets-dev
+      - libkf6iconthemes-dev
+      - libkf6crash-dev
+      - libkf6kio-dev
+    stage-packages:
+      - btrbk
+      - btrfs-progs
+      - smartmontools
+      - zsh
+      - libqt6core6t64
+      - libqt6widgets6t64
+      - libqt6sql6t64
+
+apps:
+  btrdasd:
+    command: usr/bin/btrdasd
+  btrdasd-gui:
+    command: usr/bin/btrdasd-gui
+    desktop: usr/share/applications/org.theboscoclub.btrdasd-gui.desktop

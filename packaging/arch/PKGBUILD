@@ -1,0 +1,40 @@
+# Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
+pkgname=das-backup-manager
+pkgver=0.5.0
+pkgrel=1
+pkgdesc='DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI'
+arch=('x86_64')
+url='https://github.com/TheBoscoClub/DAS-Backup-Manager'
+license=('MIT')
+depends=('btrbk' 'btrfs-progs' 'smartmontools' 'zsh' 'util-linux'
+         'qt6-base' 'kf6-kcoreaddons' 'kf6-ki18n' 'kf6-kxmlgui'
+         'kf6-kconfigwidgets' 'kf6-kiconthemes' 'kf6-kcrash' 'kf6-kio')
+makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "DAS-Backup-Manager-$pkgver"
+
+    # Build Rust indexer binary
+    cargo build --release --manifest-path indexer/Cargo.toml
+
+    # Build scripts, systemd units, and GUI via CMake
+    cmake -B build -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_INDEXER=OFF
+    cmake --build build
+}
+
+package() {
+    cd "DAS-Backup-Manager-$pkgver"
+
+    # Install CMake targets (scripts, systemd, GUI, icon, desktop entry)
+    DESTDIR="$pkgdir" cmake --install build
+
+    # Install Rust binary
+    install -Dm755 "indexer/target/release/btrdasd" "$pkgdir/usr/bin/btrdasd"
+
+    # License
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

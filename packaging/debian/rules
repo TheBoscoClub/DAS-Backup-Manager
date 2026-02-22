@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_configure:
+	cargo build --release --manifest-path indexer/Cargo.toml
+	dh_auto_configure -- -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_INDEXER=OFF
+
+override_dh_auto_install:
+	dh_auto_install
+	install -Dm755 indexer/target/release/btrdasd debian/das-backup-manager/usr/bin/btrdasd
