@@ -189,6 +189,7 @@ void MainWindow::openDatabase(const QString &path)
 
 void MainWindow::onSnapshotSelected(qint64 snapshotId)
 {
+    m_currentSnapshotId = snapshotId;
     m_fileModel->loadSnapshot(snapshotId);
 }
 
@@ -263,21 +264,31 @@ void MainWindow::restoreSelectedFiles()
         return;
     }
 
+    if (m_currentSnapshotId < 0) {
+        KMessageBox::information(this, i18n("No snapshot selected."));
+        return;
+    }
+
+    QString snapshotPath = m_database->snapshotPathById(m_currentSnapshotId);
+    if (snapshotPath.isEmpty()) {
+        KMessageBox::error(this, i18n("Could not resolve snapshot path."));
+        return;
+    }
+
     QString destDir = QFileDialog::getExistingDirectory(this, i18n("Restore to..."));
     if (destDir.isEmpty()) return;
 
-    // Get the snapshot path from the currently selected snapshot
-    // For now, use first selected file's path with the snapshot base
-    auto snapshots = m_database->listSnapshots();
-    // We need the snapshot path - find which snapshot is selected
-    // Use the file path from the proxy model
+    // Restore each selected file via KIO::copy
+    int fileCount = 0;
     for (const auto &idx : selection) {
         QModelIndex sourceIdx = m_fileProxy->mapToSource(idx);
-        QString filePath = m_fileModel->data(m_fileModel->index(sourceIdx.row(), 1), Qt::DisplayRole).toString();
-        // TODO: Combine with actual snapshot mount path for full source path
-        // For now just show what would be restored
-        statusBar()->showMessage(i18n("Restoring %1...", filePath));
+        QString filePath = m_fileModel->data(
+            m_fileModel->index(sourceIdx.row(), 1), Qt::DisplayRole).toString();
+        QString fullPath = snapshotPath + QLatin1Char('/') + filePath;
+        m_restoreAction->restore(fullPath, destDir);
+        ++fileCount;
     }
+    statusBar()->showMessage(i18n("Restoring %1 file(s)...", fileCount));
 }
 
 void MainWindow::showSettings()
