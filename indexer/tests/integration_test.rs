@@ -25,11 +25,7 @@ fn copy_with_mtime(src: &std::path::Path, dst: &std::path::Path) {
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
     fs::copy(src, dst).unwrap();
     let meta = fs::metadata(src).unwrap();
-    filetime::set_file_mtime(
-        dst,
-        filetime::FileTime::from_last_modification_time(&meta),
-    )
-    .unwrap();
+    filetime::set_file_mtime(dst, filetime::FileTime::from_last_modification_time(&meta)).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -49,17 +45,38 @@ fn test_full_walk_pipeline() {
     let root = tmp.path();
 
     // nvme source: two snapshots
-    write_file(&root.join("nvme/root.20260220T0300/etc/passwd"), b"root:x:0:0");
-    write_file(&root.join("nvme/root.20260220T0300/home/alice/.bashrc"), b"# bashrc");
+    write_file(
+        &root.join("nvme/root.20260220T0300/etc/passwd"),
+        b"root:x:0:0",
+    );
+    write_file(
+        &root.join("nvme/root.20260220T0300/home/alice/.bashrc"),
+        b"# bashrc",
+    );
     write_file(&root.join("nvme/root.20260220T0300/usr/bin/sh"), b"\x7fELF");
 
-    write_file(&root.join("nvme/root.20260221T0300/etc/passwd"), b"root:x:0:0");
-    write_file(&root.join("nvme/root.20260221T0300/home/alice/.bashrc"), b"# bashrc");
-    write_file(&root.join("nvme/root.20260221T0300/home/alice/notes.txt"), b"new note");
+    write_file(
+        &root.join("nvme/root.20260221T0300/etc/passwd"),
+        b"root:x:0:0",
+    );
+    write_file(
+        &root.join("nvme/root.20260221T0300/home/alice/.bashrc"),
+        b"# bashrc",
+    );
+    write_file(
+        &root.join("nvme/root.20260221T0300/home/alice/notes.txt"),
+        b"new note",
+    );
 
     // ssd source: one snapshot
-    write_file(&root.join("ssd/opt.20260220T0300/app/config.yaml"), b"key: val");
-    write_file(&root.join("ssd/opt.20260220T0300/app/data.bin"), b"\x00\x01\x02");
+    write_file(
+        &root.join("ssd/opt.20260220T0300/app/config.yaml"),
+        b"key: val",
+    );
+    write_file(
+        &root.join("ssd/opt.20260220T0300/app/data.bin"),
+        b"\x00\x01\x02",
+    );
 
     let db = Database::open(":memory:").unwrap();
     let result = indexer::walk(root, &db).unwrap();
@@ -69,7 +86,10 @@ fn test_full_walk_pipeline() {
         result.snapshots_indexed, 3,
         "expected 3 newly indexed snapshots"
     );
-    assert_eq!(result.snapshots_skipped, 0, "no snapshots should be skipped");
+    assert_eq!(
+        result.snapshots_skipped, 0,
+        "no snapshots should be skipped"
+    );
     assert_eq!(
         result.snapshots_discovered, 3,
         "total discovered (db count) must be 3"
@@ -94,7 +114,11 @@ fn test_full_walk_pipeline() {
         .conn
         .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
         .unwrap();
-    assert!(file_count >= 5, "expected at least 5 distinct files, got {}", file_count);
+    assert!(
+        file_count >= 5,
+        "expected at least 5 distinct files, got {}",
+        file_count
+    );
 
     // Every file must have at least one span
     let orphan_files: i64 = db
@@ -136,7 +160,10 @@ fn test_incremental_indexing() {
     let snap1_a = root.join("nvme/root.20260220T0300/a.txt");
     let snap2_a = root.join("nvme/root.20260221T0300/a.txt");
     copy_with_mtime(&snap1_a, &snap2_a);
-    write_file(&root.join("nvme/root.20260221T0300/c.txt"), b"gamma - new file");
+    write_file(
+        &root.join("nvme/root.20260221T0300/c.txt"),
+        b"gamma - new file",
+    );
 
     let r2 = indexer::walk(root, &db).unwrap();
     assert_eq!(r2.snapshots_indexed, 1, "second walk: only 1 new snapshot");
@@ -176,11 +203,26 @@ fn test_search_after_indexing() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
-    write_file(&root.join("nvme/root.20260220T0300/docs/annual-report.pdf"), b"PDF content");
-    write_file(&root.join("nvme/root.20260220T0300/docs/budget-2026.xlsx"), b"XLS content");
-    write_file(&root.join("nvme/root.20260220T0300/photos/vacation.jpg"), b"JPEG content");
-    write_file(&root.join("nvme/root.20260220T0300/photos/family.jpg"), b"JPEG content 2");
-    write_file(&root.join("nvme/root.20260220T0300/src/main.rs"), b"fn main() {}");
+    write_file(
+        &root.join("nvme/root.20260220T0300/docs/annual-report.pdf"),
+        b"PDF content",
+    );
+    write_file(
+        &root.join("nvme/root.20260220T0300/docs/budget-2026.xlsx"),
+        b"XLS content",
+    );
+    write_file(
+        &root.join("nvme/root.20260220T0300/photos/vacation.jpg"),
+        b"JPEG content",
+    );
+    write_file(
+        &root.join("nvme/root.20260220T0300/photos/family.jpg"),
+        b"JPEG content 2",
+    );
+    write_file(
+        &root.join("nvme/root.20260220T0300/src/main.rs"),
+        b"fn main() {}",
+    );
 
     let db = Database::open(":memory:").unwrap();
     indexer::walk(root, &db).unwrap();
@@ -227,7 +269,10 @@ fn test_search_after_indexing() {
 
     // Search for something that doesn't exist
     let empty = db.search("nonexistent_xyzzy", 50).unwrap();
-    assert!(empty.is_empty(), "search for gibberish must return no results");
+    assert!(
+        empty.is_empty(),
+        "search for gibberish must return no results"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -285,11 +330,9 @@ fn test_changed_file_detection() {
     // But spans: two rows — one per snapshot (no extension happened)
     let file_id: i64 = db
         .conn
-        .query_row(
-            "SELECT id FROM files WHERE name = 'file.txt'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT id FROM files WHERE name = 'file.txt'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let span_count: i64 = db
         .conn
@@ -321,8 +364,14 @@ fn test_cli_info_output() {
     // nvme: 4 files
     write_file(&root.join("nvme/root.20260220T0300/bin/sh"), b"\x7fELF");
     write_file(&root.join("nvme/root.20260220T0300/etc/fstab"), b"# fstab");
-    write_file(&root.join("nvme/root.20260220T0300/etc/hostname"), b"myhost");
-    write_file(&root.join("nvme/root.20260220T0300/home/user/.profile"), b"export PATH");
+    write_file(
+        &root.join("nvme/root.20260220T0300/etc/hostname"),
+        b"myhost",
+    );
+    write_file(
+        &root.join("nvme/root.20260220T0300/home/user/.profile"),
+        b"export PATH",
+    );
 
     // ssd: 2 files
     write_file(&root.join("ssd/opt.20260220T0300/app.jar"), b"PK\x03\x04");
@@ -426,23 +475,27 @@ fn test_incremental_extends_existing_spans() {
     copy_with_mtime(&snap1.join("stable.txt"), &snap2.join("stable.txt"));
     let r2 = indexer::walk(root, &db).unwrap();
     assert_eq!(r2.snapshots_indexed, 1);
-    assert!(r2.results[0].files_extended >= 1, "span must extend at snap2");
+    assert!(
+        r2.results[0].files_extended >= 1,
+        "span must extend at snap2"
+    );
 
     // Snapshot 3: copy stable.txt preserving mtime again
     let snap3 = root.join("nvme/root.20260222T0300");
     copy_with_mtime(&snap2.join("stable.txt"), &snap3.join("stable.txt"));
     let r3 = indexer::walk(root, &db).unwrap();
     assert_eq!(r3.snapshots_indexed, 1);
-    assert!(r3.results[0].files_extended >= 1, "span must extend at snap3");
+    assert!(
+        r3.results[0].files_extended >= 1,
+        "span must extend at snap3"
+    );
 
     // Verify the file has exactly ONE span in the database
     let file_id: i64 = db
         .conn
-        .query_row(
-            "SELECT id FROM files WHERE name = 'stable.txt'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT id FROM files WHERE name = 'stable.txt'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let span_count: i64 = db
         .conn
@@ -503,8 +556,7 @@ fn test_walk_result_counts_consistency() {
     // Since all files are unique, they must match.
     let stats = db.get_stats().unwrap();
     assert_eq!(
-        total_from_results as i64,
-        stats.file_count,
+        total_from_results as i64, stats.file_count,
         "sum of files_total in walk results must equal DB file count when all files unique"
     );
 
@@ -537,7 +589,10 @@ fn test_index_snapshot_directly() {
     write_file(&snap_a_path.join("data.bin"), b"\x00\x01\x02\x03");
 
     // snap_b: readme.txt unchanged, data.bin modified
-    copy_with_mtime(&snap_a_path.join("readme.txt"), &snap_b_path.join("readme.txt"));
+    copy_with_mtime(
+        &snap_a_path.join("readme.txt"),
+        &snap_b_path.join("readme.txt"),
+    );
     write_file(&snap_b_path.join("data.bin"), b"\xFF\xFE\xFD\xFC\xFB");
 
     let db = Database::open(":memory:").unwrap();
@@ -550,7 +605,10 @@ fn test_index_snapshot_directly() {
     };
     let ra = index_snapshot(&db, &ds_a, None).unwrap();
 
-    assert_eq!(ra.files_new, ra.files_total, "all files new in first snapshot");
+    assert_eq!(
+        ra.files_new, ra.files_total,
+        "all files new in first snapshot"
+    );
     assert_eq!(ra.files_extended, 0);
     assert_eq!(ra.files_changed, 0);
 
@@ -563,7 +621,10 @@ fn test_index_snapshot_directly() {
     let rb = index_snapshot(&db, &ds_b, Some(ra.snapshot_id)).unwrap();
 
     assert!(rb.files_extended >= 1, "readme.txt must be extended");
-    assert!(rb.files_changed >= 1, "data.bin must be detected as changed");
+    assert!(
+        rb.files_changed >= 1,
+        "data.bin must be detected as changed"
+    );
     assert_eq!(rb.files_new, 0, "no entirely new files in snap_b");
 
     // Snapshot IDs must be distinct positive integers
