@@ -191,7 +191,7 @@ jobs:
     needs: [arch, debian, fedora, appimage, snap, flatpak]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           merge-multiple: true
           path: packages/
