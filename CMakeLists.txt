@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Build options
 # =============================================================================
 
+include(CTest)
 option(BUILD_GUI "Build KDE Plasma GUI (requires Qt6/KF6)" ON)
 option(BUILD_INDEXER "Build btrdasd Rust binary via cargo" ON)
 
