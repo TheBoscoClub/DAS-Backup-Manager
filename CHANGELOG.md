@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Full management interface design** — Architecture for transforming GUI from read-only browser into full backup management system with CLI parity
+- **Design document** (`docs/plans/2026-02-24-full-management-interface-design.md`) — Complete architecture spec for v0.6.0
+- **Implementation plan** (`docs/plans/2026-02-24-full-management-implementation-plan.md`) — 41-task phased plan across 5 phases
+
+### Planned for v0.6.0
+- **Rust library refactoring** — Extract `libbuttered_dasd` library from CLI binary for shared consumption by CLI, FFI, and D-Bus helper
+- **SubvolConfig data model** — Replace `Vec<String>` subvolumes with `Vec<SubvolConfig>` supporting `manual_only` flag (backward-compatible deserialization)
+- **New CLI subcommands** — `backup` (run/snapshot/send/boot-archive/report), `restore` (file/snapshot/browse), `schedule` (show/set/enable/disable/next), `subvol` (list/add/remove/set-manual/set-auto), `health`, `config edit`
+- **D-Bus privileged helper** (`btrdasd-helper`) — polkit-authorized daemon for privileged operations (backup, restore, config write, schedule modify, SMART queries)
+- **GUI expansion** — Navigation sidebar, Dolphin-style snapshot file browser, backup operations panel, comprehensive config editor, first-run wizard, progress panel with structured progress + raw log, health monitoring dashboard, backup history view
+- **Comprehensive documentation** — Full man page, GNU info page, HTML docs, rich `--help` with examples, shell completions (bash/zsh/fish)
+- **Desktop integration** — KNotification, optional system tray, keyboard shortcuts
+- **`--json` flag** — Machine-readable JSON output on all read commands
 
 ### Changed
 

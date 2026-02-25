@@ -17,7 +17,7 @@ The following are permanently out of scope and will never be added:
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview
+## Component Overview (Current: v0.5.0)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -51,6 +51,40 @@ The system has four major components:
 | Content indexer | Rust 2024 | `btrdasd` | SQLite FTS5 database of all files across snapshots |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Visual browsing, searching, and restoring files |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven setup with template generation |
+
+## Planned Architecture (v0.6.0)
+
+See `docs/plans/2026-02-24-full-management-interface-design.md` for the complete v0.6.0 design.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    User Space                               │
+│  ┌──────────┐    ┌──────────────────────────────────────┐   │
+│  │ btrdasd  │    │         btrdasd-gui (Qt6/KF6)        │   │
+│  │  (CLI)   │    │  File Browser │ Config │ Monitor      │   │
+│  └────┬─────┘    └──────────┬───────────────────────────┘   │
+│       │    ┌────────────────┴──────────────┐                │
+│       │    │  libbuttered_dasd_ffi (C ABI) │                │
+│       │    └────────────────┬──────────────┘                │
+│  ┌────┴─────────────────────┴──────────────────────┐        │
+│  │          libbuttered_dasd (Rust library)         │        │
+│  │  indexer │ config │ backup │ restore │ schedule   │        │
+│  │  search  │ health │ subvol │ progress│ reporting  │        │
+│  └──────────────────────┬───────────────────────────┘        │
+│                         │ D-Bus (org.dasbackup.Helper1)      │
+│  ┌──────────────────────┴────────────────────────┐           │
+│  │  btrdasd-helper (privileged daemon, polkit)   │           │
+│  │  btrbk │ mount │ DB write │ config write      │           │
+│  │  SMART │ systemd-timer │ btrfs commands       │           │
+│  └───────────────────────────────────────────────┘           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Key changes in v0.6.0:
+- **Rust library** (`libbuttered_dasd`) as single source of truth for all business logic
+- **C-ABI FFI layer** for direct GUI consumption (no subprocess spawning for most operations)
+- **D-Bus helper** (`btrdasd-helper`) with polkit authorization for privileged operations
+- **GUI becomes full management interface** — backup execution, config editing, schedule control, health monitoring, Dolphin-style file browser
 
 ## Data Flow
 
