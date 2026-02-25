@@ -228,3 +228,4 @@ out/
 # RELEASE ARTIFACTS
 releases/*.tar.gz
 releases/*.tar.gz.sha256
+.staged-release
