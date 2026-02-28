@@ -142,7 +142,7 @@ impl Database {
     ) -> SqlResult<i64> {
         let indexed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs() as i64;
         self.conn.execute(
             "INSERT INTO snapshots (name, ts, source, path, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -448,7 +448,7 @@ impl Database {
     ) -> SqlResult<Vec<TargetUsageRecord>> {
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs() as i64
             - (days as i64 * 86400);
         let mut stmt = self.conn.prepare(
@@ -868,18 +868,39 @@ mod tests {
     fn backup_history_ordered_newest_first() {
         let db = Database::open(":memory:").unwrap();
         db.insert_backup_run(&NewBackupRun {
-            timestamp: 1709000000, success: true, mode: "incremental",
-            snaps_created: 1, snaps_sent: 1, bytes_sent: 100, duration_secs: 10, errors: &[],
-        }).unwrap();
+            timestamp: 1709000000,
+            success: true,
+            mode: "incremental",
+            snaps_created: 1,
+            snaps_sent: 1,
+            bytes_sent: 100,
+            duration_secs: 10,
+            errors: &[],
+        })
+        .unwrap();
         db.insert_backup_run(&NewBackupRun {
-            timestamp: 1709100000, success: true, mode: "full",
-            snaps_created: 5, snaps_sent: 5, bytes_sent: 500, duration_secs: 60, errors: &[],
-        }).unwrap();
+            timestamp: 1709100000,
+            success: true,
+            mode: "full",
+            snaps_created: 5,
+            snaps_sent: 5,
+            bytes_sent: 500,
+            duration_secs: 60,
+            errors: &[],
+        })
+        .unwrap();
         let errs = vec!["fail".to_string()];
         db.insert_backup_run(&NewBackupRun {
-            timestamp: 1709200000, success: false, mode: "incremental",
-            snaps_created: 0, snaps_sent: 0, bytes_sent: 0, duration_secs: 5, errors: &errs,
-        }).unwrap();
+            timestamp: 1709200000,
+            success: false,
+            mode: "incremental",
+            snaps_created: 0,
+            snaps_sent: 0,
+            bytes_sent: 0,
+            duration_secs: 5,
+            errors: &errs,
+        })
+        .unwrap();
 
         let history = db.get_backup_history(10).unwrap();
         assert_eq!(history.len(), 3);
@@ -893,9 +914,16 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         for i in 0..5 {
             db.insert_backup_run(&NewBackupRun {
-                timestamp: 1709000000 + i * 86400, success: true, mode: "incremental",
-                snaps_created: 1, snaps_sent: 1, bytes_sent: 100, duration_secs: 10, errors: &[],
-            }).unwrap();
+                timestamp: 1709000000 + i * 86400,
+                success: true,
+                mode: "incremental",
+                snaps_created: 1,
+                snaps_sent: 1,
+                bytes_sent: 100,
+                duration_secs: 10,
+                errors: &[],
+            })
+            .unwrap();
         }
         let history = db.get_backup_history(3).unwrap();
         assert_eq!(history.len(), 3);
@@ -914,7 +942,13 @@ mod tests {
             .as_secs() as i64;
 
         let id = db
-            .insert_target_usage(now, "primary-22tb", 22_000_000_000_000, 5_000_000_000_000, 150)
+            .insert_target_usage(
+                now,
+                "primary-22tb",
+                22_000_000_000_000,
+                5_000_000_000_000,
+                150,
+            )
             .unwrap();
         assert!(id > 0);
 
@@ -934,8 +968,14 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
 
-        db.insert_target_usage(now, "primary-22tb", 22_000_000_000_000, 5_000_000_000_000, 150)
-            .unwrap();
+        db.insert_target_usage(
+            now,
+            "primary-22tb",
+            22_000_000_000_000,
+            5_000_000_000_000,
+            150,
+        )
+        .unwrap();
         db.insert_target_usage(now, "system-2tb", 2_000_000_000_000, 500_000_000_000, 7)
             .unwrap();
 
@@ -956,9 +996,11 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
 
-        db.insert_target_usage(now - 86400, "test", 100, 50, 5).unwrap();
+        db.insert_target_usage(now - 86400, "test", 100, 50, 5)
+            .unwrap();
         db.insert_target_usage(now, "test", 100, 60, 6).unwrap();
-        db.insert_target_usage(now - 172800, "test", 100, 40, 4).unwrap();
+        db.insert_target_usage(now - 172800, "test", 100, 40, 4)
+            .unwrap();
 
         let usage = db.get_target_usage_history("test", 30).unwrap();
         assert_eq!(usage.len(), 3);

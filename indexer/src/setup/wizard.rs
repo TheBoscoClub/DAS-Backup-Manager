@@ -198,7 +198,10 @@ fn step_subvolumes(
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .map(|name| SubvolConfig { name, manual_only: false })
+                .map(|name| SubvolConfig {
+                    name,
+                    manual_only: false,
+                })
                 .collect();
 
             let device: String = Input::new()
@@ -303,8 +306,12 @@ fn step_subvolumes(
             config.sources.push(Source {
                 label,
                 volume,
-                subvolumes: chosen_subvols.into_iter()
-                    .map(|name| SubvolConfig { name, manual_only: false })
+                subvolumes: chosen_subvols
+                    .into_iter()
+                    .map(|name| SubvolConfig {
+                        name,
+                        manual_only: false,
+                    })
                     .collect(),
                 device,
                 snapshot_dir: ".btrbk-snapshots".into(),
@@ -329,7 +336,10 @@ fn step_subvolumes(
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .map(|name| SubvolConfig { name, manual_only: false })
+                .map(|name| SubvolConfig {
+                    name,
+                    manual_only: false,
+                })
                 .collect();
             let device: String = Input::new().with_prompt("Device path").interact_text()?;
 
@@ -888,7 +898,11 @@ fn step_review(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "      volume: {}, subvols: {}",
             src.volume,
-            src.subvolumes.iter().map(|sv| sv.name.as_str()).collect::<Vec<_>>().join(", ")
+            src.subvolumes
+                .iter()
+                .map(|sv| sv.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 

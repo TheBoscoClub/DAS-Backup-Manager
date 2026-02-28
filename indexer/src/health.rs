@@ -49,9 +49,7 @@ pub struct HealthReport {
 }
 
 /// Query health status of all configured targets.
-pub fn get_health(
-    _config: &Config,
-) -> Result<HealthReport, Box<dyn std::error::Error>> {
+pub fn get_health(_config: &Config) -> Result<HealthReport, Box<dyn std::error::Error>> {
     todo!("Full implementation in Phase 2")
 }
 

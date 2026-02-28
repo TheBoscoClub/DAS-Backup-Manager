@@ -414,8 +414,14 @@ mod tests {
             label: "nvme-root".to_string(),
             volume: "/.btrfs-nvme".to_string(),
             subvolumes: vec![
-                SubvolConfig { name: "@".to_string(), manual_only: false },
-                SubvolConfig { name: "@home".to_string(), manual_only: false },
+                SubvolConfig {
+                    name: "@".to_string(),
+                    manual_only: false,
+                },
+                SubvolConfig {
+                    name: "@home".to_string(),
+                    manual_only: false,
+                },
             ],
             device: "/dev/nvme0n1p2".to_string(),
             snapshot_dir: ".btrbk-snapshots".into(),

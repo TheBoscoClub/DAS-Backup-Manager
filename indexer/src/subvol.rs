@@ -49,11 +49,7 @@ pub fn add_subvolume(
 }
 
 /// Remove a subvolume from a source.
-pub fn remove_subvolume(
-    config: &mut Config,
-    source_label: &str,
-    name: &str,
-) -> Result<(), String> {
+pub fn remove_subvolume(config: &mut Config, source_label: &str, name: &str) -> Result<(), String> {
     let src = config
         .sources
         .iter_mut()
