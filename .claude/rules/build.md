@@ -18,6 +18,14 @@
 - Use KIO for file operations (restore)
 - Signal/slot connections: use new-style `connect(&obj, &Class::signal, ...)`
 
+## Rust (buttered_dasd library + btrdasd CLI)
+- Rust 2024 edition, `cargo clippy` and `cargo fmt` before committing
+- Library crate `buttered_dasd` exports 11 public modules; `setup/` is binary-only
+- Use `LazyLock<Regex>` for compile-once regex patterns (not per-call `Regex::new()`)
+- Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
+- All database access through `db::Database` with prepared statements
+- Use `NewBackupRun` struct pattern for functions with >7 parameters
+
 ## SQLite
 - SQLite 3.51.2 with FTS5 extension
 - Use prepared statements exclusively (no string concatenation)

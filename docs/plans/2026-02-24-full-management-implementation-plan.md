@@ -740,7 +740,7 @@ Commit: `docs: update README, CHANGELOG, and ARCHITECTURE for v0.6.0`
 
 ### Task 5.6: Version Bump
 
-Bump version in Cargo.toml, CMakeLists.txt, and config defaults from 0.5.0 to 0.6.0.
+Bump version in Cargo.toml, CMakeLists.txt, and config defaults from 0.5.1 to 0.6.0.
 
 Commit: `chore: bump version to 0.6.0`
 

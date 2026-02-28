@@ -8,8 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`buttered_dasd` library crate** — Extracted 11 public modules from CLI binary into reusable library (`backup`, `config`, `db`, `health`, `indexer`, `progress`, `report`, `restore`, `scanner`, `schedule`, `subvol`)
+- **`SubvolConfig` data model** — Replaced `Vec<String>` subvolumes with `Vec<SubvolConfig>` supporting `manual_only` flag (backward-compatible `#[serde(untagged)]` deserialization)
+- **New CLI subcommands** — `backup` (run/snapshot/send/boot-archive/report), `restore` (file/snapshot/browse), `schedule` (show/set/enable/disable/next), `subvol` (list/add/remove/set-manual/set-auto), `health`, `config edit`
+- **`NewBackupRun` struct** — Structured input for backup run recording (replaces positional parameters)
+- **Database tables** — `backup_runs` and `target_usage` tables for backup history and disk usage tracking
 
 ### Changed
+- **Crate architecture** — Split from CLI-only binary into library (`buttered_dasd`) + binary (`btrdasd`) with `[lib]` and `[[bin]]` sections in Cargo.toml
+- **Regex performance** — `LazyLock<Regex>` for compile-once snapshot dirname parsing (replaces per-call `Regex::new()`)
+- **Release profile** — Added `[profile.release]` with `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 
 ### Fixed
 
@@ -21,9 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Implementation plan** (`docs/plans/2026-02-24-full-management-implementation-plan.md`) — 41-task phased plan across 5 phases
 
 ### Planned for v0.6.0
-- **Rust library refactoring** — Extract `libbuttered_dasd` library from CLI binary for shared consumption by CLI, FFI, and D-Bus helper
-- **SubvolConfig data model** — Replace `Vec<String>` subvolumes with `Vec<SubvolConfig>` supporting `manual_only` flag (backward-compatible deserialization)
-- **New CLI subcommands** — `backup` (run/snapshot/send/boot-archive/report), `restore` (file/snapshot/browse), `schedule` (show/set/enable/disable/next), `subvol` (list/add/remove/set-manual/set-auto), `health`, `config edit`
 - **D-Bus privileged helper** (`btrdasd-helper`) — polkit-authorized daemon for privileged operations (backup, restore, config write, schedule modify, SMART queries)
 - **GUI expansion** — Navigation sidebar, Dolphin-style snapshot file browser, backup operations panel, comprehensive config editor, first-run wizard, progress panel with structured progress + raw log, health monitoring dashboard, backup history view
 - **Comprehensive documentation** — Full man page, GNU info page, HTML docs, rich `--help` with examples, shell completions (bash/zsh/fish)
