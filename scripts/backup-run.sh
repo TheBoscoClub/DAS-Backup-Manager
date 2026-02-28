@@ -432,11 +432,11 @@ sync_das_esp() {
         [[ -n "$dev" ]] || continue
 
         local esp_part="${dev}1"
-        (( esp_total++ ))
+        (( esp_total += 1 ))
 
         if [[ ! -b "$esp_part" ]]; then
             log_warn "ESP partition $esp_part not found for $label — skipping"
-            (( esp_fail++ ))
+            (( esp_fail += 1 ))
             continue
         fi
 
@@ -446,7 +446,7 @@ sync_das_esp() {
         if ! mountpoint -q "$mount_point"; then
             mount "$esp_part" "$mount_point" 2>/dev/null || {
                 log_warn "Could not mount ESP $esp_part at $mount_point"
-                (( esp_fail++ ))
+                (( esp_fail += 1 ))
                 continue
             }
         fi
@@ -455,10 +455,10 @@ sync_das_esp() {
             --exclude='loader/random-seed' \
             "$esp_source/" "$mount_point/" 2>/dev/null; then
             log_info "  Synced ESP to $esp_part ($label)"
-            (( esp_ok++ ))
+            (( esp_ok += 1 ))
         else
             log_warn "  ESP sync to $esp_part failed"
-            (( esp_fail++ ))
+            (( esp_fail += 1 ))
         fi
 
         umount "$mount_point" 2>/dev/null || true
