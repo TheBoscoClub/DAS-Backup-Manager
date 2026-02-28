@@ -27,7 +27,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Multi-Target Architecture** — Configurable primary, mirror, and ESP-sync roles across any number of DAS drives
 - **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
 - **Email Reports** — Automated backup status reports with throughput metrics and SMART status
-- **ButteredDASD Content Indexer** (`btrdasd`) — Rust CLI with SQLite FTS5 database tracking every file across all snapshots
+- **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 application for searching, browsing, and restoring files from backup snapshots
 - **Interactive Installer** (`btrdasd setup`) — 10-step wizard with 5 modes: install, modify, upgrade, uninstall, check
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
@@ -43,7 +43,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `indexer/` | ButteredDASD (`btrdasd`) — Rust content indexer + setup wizard | Active (v0.5.1) |
+| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI) — Rust content indexer, library, and setup wizard | Active (v0.5.1) |
 | `gui/` | Qt6/KDE Plasma backup browser and restore application | Active (v0.5.1) |
 | `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
 
@@ -53,8 +53,9 @@ That said, suggestions, recommendations, and requests that fall within this narr
 DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf, email config template
-├── indexer/           # ButteredDASD (btrdasd) — Rust indexer + installer
-│   └── src/setup/     # Interactive installer (wizard, templates, detection)
+├── indexer/           # ButteredDASD — Rust library (buttered_dasd) + CLI (btrdasd)
+│   ├── src/           # Library modules (11): backup, config, db, health, indexer, progress, report, restore, scanner, schedule, subvol
+│   └── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 ├── gui/               # Qt6/KDE Plasma GUI (12 C++ components)
 │   ├── src/           # MainWindow, Database, models, timeline, restore
 │   └── tests/         # QTest suites (database, snapshotmodel, filemodel, searchmodel)
