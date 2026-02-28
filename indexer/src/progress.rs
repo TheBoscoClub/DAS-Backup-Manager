@@ -46,13 +46,20 @@ pub struct TestProgress {
 }
 
 #[cfg(test)]
-impl TestProgress {
-    pub fn new() -> Self {
+impl Default for TestProgress {
+    fn default() -> Self {
         Self {
             stages: std::sync::Mutex::new(Vec::new()),
             logs: std::sync::Mutex::new(Vec::new()),
             completed: std::sync::Mutex::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+impl TestProgress {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -69,10 +76,7 @@ impl ProgressCallback for TestProgress {
     fn on_throughput(&self, _: u64) {}
 
     fn on_log(&self, level: LogLevel, message: &str) {
-        self.logs
-            .lock()
-            .unwrap()
-            .push((level, message.to_string()));
+        self.logs.lock().unwrap().push((level, message.to_string()));
     }
 
     fn on_complete(&self, success: bool, summary: &str) {

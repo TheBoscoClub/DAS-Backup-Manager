@@ -27,10 +27,7 @@ pub fn set_schedule(
 }
 
 /// Enable or disable scheduled backups.
-pub fn set_enabled(
-    _config: &Config,
-    _enabled: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn set_enabled(_config: &Config, _enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
     todo!("Full implementation in Phase 2")
 }
 

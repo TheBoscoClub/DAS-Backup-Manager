@@ -2,6 +2,10 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+static SNAP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+)\.(\d{8}T\d{4,6})$").expect("valid snapshot regex"));
 
 use crate::db::Database;
 use crate::scanner::scan_directory;
@@ -35,8 +39,8 @@ pub struct IndexResult {
 /// Parse a btrbk snapshot directory name like `root.20260221T0304` into (name, timestamp).
 /// Returns `None` if the dirname doesn't match the expected pattern.
 pub fn parse_snapshot_dirname(dirname: &str) -> Option<(String, String)> {
-    let re = Regex::new(r"^(.+)\.(\d{8}T\d{4,6})$").unwrap();
-    re.captures(dirname)
+    SNAP_RE
+        .captures(dirname)
         .map(|caps| (caps[1].to_string(), caps[2].to_string()))
 }
 

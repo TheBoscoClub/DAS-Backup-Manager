@@ -440,8 +440,14 @@ mod tests {
             label: "nvme-root".into(),
             volume: "/.btrfs-nvme".into(),
             subvolumes: vec![
-                SubvolConfig { name: "@".into(), manual_only: false },
-                SubvolConfig { name: "@home".into(), manual_only: false },
+                SubvolConfig {
+                    name: "@".into(),
+                    manual_only: false,
+                },
+                SubvolConfig {
+                    name: "@home".into(),
+                    manual_only: false,
+                },
             ],
             device: "/dev/nvme0n1p2".into(),
             snapshot_dir: ".snapshots".into(),
@@ -577,7 +583,10 @@ enabled = false
         cfg.sources.push(Source {
             label: "test".into(),
             volume: "/vol".into(),
-            subvolumes: vec![SubvolConfig { name: "@".into(), manual_only: false }],
+            subvolumes: vec![SubvolConfig {
+                name: "@".into(),
+                manual_only: false,
+            }],
             device: "/dev/sda".into(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
