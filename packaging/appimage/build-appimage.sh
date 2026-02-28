@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 set -euo pipefail
 
 # Build a GUI-only AppImage for ButteredDASD

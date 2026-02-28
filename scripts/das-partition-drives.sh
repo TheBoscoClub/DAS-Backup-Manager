@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
 # Version: 2.0.0
 # Date: 2026-02-21
@@ -20,8 +20,6 @@
 #   sudo ./das-partition-drives.sh --run     # Execute partitioning
 
 set -euo pipefail
-setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
-
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
@@ -48,13 +46,13 @@ for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     serial_var="DAS_TARGET_${i}_SERIAL"
     role_var="DAS_TARGET_${i}_ROLE"
     name_var="DAS_TARGET_${i}_DISPLAY_NAME"
-    serial="${(P)serial_var}"
-    label="${(P)label_var}"
+    serial="${!serial_var}"
+    label="${!label_var}"
     EXPECTED_SERIALS[$serial]="$label"
     TARGET_LABELS[$serial]="$label"
-    TARGET_ROLES[$serial]="${(P)role_var}"
-    if [[ -n "${(P)name_var:-}" ]]; then
-        TARGET_NAMES[$serial]="${(P)name_var}"
+    TARGET_ROLES[$serial]="${!role_var}"
+    if [[ -n "${!name_var:-}" ]]; then
+        TARGET_NAMES[$serial]="${!name_var}"
     else
         TARGET_NAMES[$serial]="$label"
     fi
@@ -97,7 +95,7 @@ declare -A DISCOVERED_DEVICES=()
 discover_devices() {
     log_header "Discovering DAS Drives by Serial Number"
 
-    for dev in /dev/sd[a-z](N) /dev/sd[a-z][a-z](N); do
+    for dev in /dev/sd[a-z] /dev/sd[a-z][a-z]; do
         if [[ -b "$dev" ]]; then
             local serial
             serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
@@ -113,7 +111,7 @@ verify_serials() {
 
     local all_found=true
 
-    for serial in "${(@k)EXPECTED_SERIALS}"; do
+    for serial in "${!EXPECTED_SERIALS[@]}"; do
         local label="${EXPECTED_SERIALS[$serial]}"
         local dev="${DISCOVERED_DEVICES[$serial]:-}"
 
@@ -139,7 +137,7 @@ check_smart_tests() {
 
     local all_complete=true
 
-    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+    for serial in "${!DISCOVERED_DEVICES[@]}"; do
         local dev="${DISCOVERED_DEVICES[$serial]}"
         local label="${TARGET_LABELS[$serial]}"
         local status
@@ -168,7 +166,7 @@ show_plan() {
     log_header "Partitioning Plan"
 
     echo ""
-    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+    for serial in "${!DISCOVERED_DEVICES[@]}"; do
         local dev="${DISCOVERED_DEVICES[$serial]}"
         local label="${TARGET_LABELS[$serial]}"
         local role="${TARGET_ROLES[$serial]}"
@@ -194,7 +192,7 @@ confirm_destruction() {
     echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo "Drives to be wiped:"
-    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+    for serial in "${!DISCOVERED_DEVICES[@]}"; do
         local dev="${DISCOVERED_DEVICES[$serial]}"
         local name="${TARGET_NAMES[$serial]}"
         echo "  $dev — $name ($(lsblk -dn -o SIZE "$dev"))"
@@ -265,7 +263,7 @@ partition_data_drive() {
 run_partitioning() {
     log_header "Executing Partitioning"
 
-    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+    for serial in "${!DISCOVERED_DEVICES[@]}"; do
         local dev="${DISCOVERED_DEVICES[$serial]}"
         local label="${TARGET_LABELS[$serial]}"
         local role="${TARGET_ROLES[$serial]}"
@@ -283,7 +281,7 @@ run_partitioning() {
 
     echo ""
     echo "Final layout:"
-    for serial in "${(@k)DISCOVERED_DEVICES}"; do
+    for serial in "${!DISCOVERED_DEVICES[@]}"; do
         lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL "${DISCOVERED_DEVICES[$serial]}"
     done
 }

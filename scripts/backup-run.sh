@@ -1,12 +1,12 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.0.0
-# Date: 2026-02-21
+# Version: 4.1.0
+# Date: 2026-02-28
 #
 # Features:
 #   - Incremental BTRFS backups via btrbk to configured targets
 #   - Maintains stable boot subvolumes (@ and @home) for disaster recovery
-#   - Syncs ESP to bootable recovery drives (config-driven)
+#   - Syncs ESP to bootable recovery drives (serial-based discovery)
 #   - Detects DAS drives by serial number (stable across reboots)
 #   - Logs per-target throughput (data written + MB/s rate)
 #   - Designed for unattended nightly execution
@@ -23,8 +23,6 @@
 #   sudo ./backup-run.sh --full       # Force full backup (recreate boot subvols)
 
 set -euo pipefail
-setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
-zmodload zsh/datetime  # provides $EPOCHSECONDS for throughput timing
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
@@ -51,13 +49,14 @@ for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     mount_var="DAS_TARGET_${i}_MOUNT"
     name_var="DAS_TARGET_${i}_DISPLAY_NAME"
     role_var="DAS_TARGET_${i}_ROLE"
-    DAS_SERIALS[${(P)label_var}]="${(P)serial_var}"
-    TARGET_MOUNTS[${(P)label_var}]="${(P)mount_var}"
-    TARGET_ROLES[${(P)label_var}]="${(P)role_var}"
-    if [[ -n "${(P)name_var:-}" ]]; then
-        TARGET_NAMES[${(P)mount_var}]="${(P)name_var}"
+    DAS_SERIALS[${!label_var}]="${!serial_var}"
+    TARGET_MOUNTS[${!label_var}]="${!mount_var}"
+    TARGET_ROLES[${!label_var}]="${!role_var}"
+    name_val="${!name_var}"
+    if [[ -n "${name_val:-}" ]]; then
+        TARGET_NAMES[${!mount_var}]="$name_val"
     else
-        TARGET_NAMES[${(P)mount_var}]="${(P)label_var}"
+        TARGET_NAMES[${!mount_var}]="${!label_var}"
     fi
 done
 
@@ -70,10 +69,11 @@ for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
     vol_var="DAS_SOURCE_${i}_VOLUME"
     dev_var="DAS_SOURCE_${i}_DEVICE"
     snap_var="DAS_SOURCE_${i}_SNAPSHOT_DIR"
-    SOURCE_VOLUMES[${(P)label_var}]="${(P)vol_var}"
-    SOURCE_DEVICES[${(P)label_var}]="${(P)dev_var}"
-    if [[ -n "${(P)snap_var:-}" ]]; then
-        SOURCE_SNAPSHOT_DIRS[${(P)label_var}]="${(P)snap_var}"
+    SOURCE_VOLUMES[${!label_var}]="${!vol_var}"
+    SOURCE_DEVICES[${!label_var}]="${!dev_var}"
+    snap_val="${!snap_var}"
+    if [[ -n "${snap_val:-}" ]]; then
+        SOURCE_SNAPSHOT_DIRS[${!label_var}]="$snap_val"
     fi
 done
 
@@ -86,10 +86,10 @@ GROWTH_LOG="$DAS_GROWTH_LOG"
 LAST_REPORT="$DAS_LAST_REPORT"
 
 # ESP mount points from config
-MOUNT_DAS_ESP=(${(s: :)DAS_ESP_MOUNT_POINTS})
+IFS=' ' read -ra MOUNT_DAS_ESP <<< "$DAS_ESP_MOUNT_POINTS"
 
 # All target mount points (space-separated string from config -> array)
-ALL_TARGET_MOUNTS=(${(s: :)DAS_ALL_TARGET_MOUNTS})
+IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
 
 # Throughput tracking (populated at runtime)
 declare -A USAGE_BEFORE=()
@@ -113,7 +113,8 @@ NC='\033[0m'
 log() {
     local level="$1"
     local msg="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
 
     case "$level" in
@@ -146,9 +147,10 @@ check_root() {
 # Find device by serial number
 find_device_by_serial() {
     local serial="$1"
-    for dev in /dev/sd[a-z](N) /dev/sd[a-z][a-z](N); do
+    local dev dev_serial
+    for dev in /dev/sd[a-z] /dev/sd[a-z][a-z]; do
         if [[ -b "$dev" ]]; then
-            local dev_serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}')
+            dev_serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}')
             if [[ "$dev_serial" == "$serial" ]]; then
                 echo "$dev"
                 return 0
@@ -165,7 +167,7 @@ check_das_connected() {
     declare -gA DISCOVERED_DEVICES=()
     local required_found=true
 
-    for label in "${(@k)DAS_SERIALS}"; do
+    for label in "${!DAS_SERIALS[@]}"; do
         local serial="${DAS_SERIALS[$label]}"
         local role="${TARGET_ROLES[$label]}"
         local dev
@@ -193,7 +195,7 @@ check_das_connected() {
 set_io_scheduler() {
     log_info "Setting I/O scheduler to $DAS_IO_SCHEDULER for DAS drives..."
 
-    for label in "${(@k)DISCOVERED_DEVICES}"; do
+    for label in "${!DISCOVERED_DEVICES[@]}"; do
         local drive="${DISCOVERED_DEVICES[$label]}"
         if [[ -n "$drive" && -b "$drive" ]]; then
             local dev="${drive#/dev/}"
@@ -206,10 +208,10 @@ set_io_scheduler() {
 
 create_mount_points() {
     log_info "Creating mount points..."
-    for label in "${(@k)SOURCE_VOLUMES}"; do
+    for label in "${!SOURCE_VOLUMES[@]}"; do
         mkdir -p "${SOURCE_VOLUMES[$label]}"
     done
-    for label in "${(@k)TARGET_MOUNTS}"; do
+    for label in "${!TARGET_MOUNTS[@]}"; do
         mkdir -p "${TARGET_MOUNTS[$label]}"
     done
     for esp in "${MOUNT_DAS_ESP[@]}"; do
@@ -220,7 +222,7 @@ create_mount_points() {
 mount_sources() {
     log_info "Mounting source top-level volumes..."
 
-    for label in "${(@k)SOURCE_VOLUMES}"; do
+    for label in "${!SOURCE_VOLUMES[@]}"; do
         local mnt="${SOURCE_VOLUMES[$label]}"
         local dev="${SOURCE_DEVICES[$label]}"
         if ! mountpoint -q "$mnt"; then
@@ -233,7 +235,7 @@ mount_sources() {
 mount_targets() {
     log_info "Mounting backup targets..."
 
-    for label in "${(@k)TARGET_MOUNTS}"; do
+    for label in "${!TARGET_MOUNTS[@]}"; do
         local mnt="${TARGET_MOUNTS[$label]}"
         local dev="${DISCOVERED_DEVICES[$label]:-}"
 
@@ -268,7 +270,7 @@ mount_targets() {
 
 create_snapshot_dirs() {
     log_info "Creating btrbk snapshot directories..."
-    for label in "${(@k)SOURCE_SNAPSHOT_DIRS}"; do
+    for label in "${!SOURCE_SNAPSHOT_DIRS[@]}"; do
         local snap_dir="${SOURCE_SNAPSHOT_DIRS[$label]}"
         if [[ -n "$snap_dir" ]]; then
             mkdir -p "$snap_dir"
@@ -279,20 +281,29 @@ create_snapshot_dirs() {
 create_target_dirs() {
     log_info "Creating target directory structure..."
 
+    # Collect all target subdirs from sources
+    local -a all_subdirs=()
+    for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
+        local subdirs_var="DAS_SOURCE_${i}_TARGET_SUBDIRS"
+        local subdirs="${!subdirs_var:-}"
+        if [[ -n "$subdirs" ]]; then
+            IFS=' ' read -ra parts <<< "$subdirs"
+            all_subdirs+=("${parts[@]}")
+        fi
+    done
+
+    # Create subdirs on every mounted target
     for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
         local mount_var="DAS_TARGET_${i}_MOUNT"
-        local subdirs_var="DAS_TARGET_${i}_TARGET_SUBDIRS"
-        local mnt="${(P)mount_var}"
+        local mnt="${!mount_var}"
 
         if ! mountpoint -q "$mnt" 2>/dev/null; then
             continue
         fi
 
-        if [[ -n "${(P)subdirs_var:-}" ]]; then
-            for subdir in ${(s: :)${(P)subdirs_var}}; do
-                mkdir -p "$mnt/$subdir"
-            done
-        fi
+        for subdir in "${all_subdirs[@]}"; do
+            mkdir -p "$mnt/$subdir"
+        done
     done
 }
 
@@ -327,9 +338,12 @@ update_boot_subvolumes() {
             continue
         fi
 
-        local label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
-        local latest_root=$(btrfs subvolume list "$mnt" | grep "nvme/root\." | awk '{print $NF}' | sort | tail -1)
-        local latest_home=$(btrfs subvolume list "$mnt" | grep "nvme/home\." | awk '{print $NF}' | sort | tail -1)
+        local label
+        label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
+        local latest_root
+        latest_root=$(btrfs subvolume list "$mnt" | grep "nvme/root\." | awk '{print $NF}' | sort | tail -1)
+        local latest_home
+        latest_home=$(btrfs subvolume list "$mnt" | grep "nvme/home\." | awk '{print $NF}' | sort | tail -1)
 
         if [[ -z "$latest_root" || -z "$latest_home" ]]; then
             log_warn "  [$label] No btrbk snapshots found, skipping"
@@ -409,27 +423,30 @@ sync_das_esp() {
     log_info "Syncing ESP to DAS backup drives..."
 
     local esp_source="/boot"
-    local esp_idx=0
-    local esp_ok=0 esp_fail=0
+    local esp_ok=0 esp_fail=0 esp_total=0
 
-    # Build list of ESP partitions from config
-    local esp_parts=(${(s: :)DAS_ESP_PARTITIONS})
-    local esp_total=${#esp_parts[@]}
+    # Discover ESP partitions from mirror targets (partition 1 of each discovered device)
+    for label in "${!TARGET_ROLES[@]}"; do
+        [[ "${TARGET_ROLES[$label]}" == "mirror" ]] || continue
+        local dev="${DISCOVERED_DEVICES[$label]:-}"
+        [[ -n "$dev" ]] || continue
 
-    for esp_part in "${esp_parts[@]}"; do
-        local mount_point="${MOUNT_DAS_ESP[$((esp_idx + 1))]}"
-        esp_idx=$((esp_idx + 1))
+        local esp_part="${dev}1"
+        (( esp_total++ ))
 
         if [[ ! -b "$esp_part" ]]; then
-            log_warn "ESP partition $esp_part not found — skipping"
-            (( esp_fail += 1 ))
+            log_warn "ESP partition $esp_part not found for $label — skipping"
+            (( esp_fail++ ))
             continue
         fi
 
+        local mount_point="/mnt/das-esp-${label}"
+        mkdir -p "$mount_point"
+
         if ! mountpoint -q "$mount_point"; then
             mount "$esp_part" "$mount_point" 2>/dev/null || {
-                log_warn "Could not mount ESP $esp_part"
-                (( esp_fail += 1 ))
+                log_warn "Could not mount ESP $esp_part at $mount_point"
+                (( esp_fail++ ))
                 continue
             }
         fi
@@ -437,17 +454,20 @@ sync_das_esp() {
         if rsync -aHAX --delete \
             --exclude='loader/random-seed' \
             "$esp_source/" "$mount_point/" 2>/dev/null; then
-            log_info "  Synced ESP to $esp_part"
-            (( esp_ok += 1 ))
+            log_info "  Synced ESP to $esp_part ($label)"
+            (( esp_ok++ ))
         else
             log_warn "  ESP sync to $esp_part failed"
-            (( esp_fail += 1 ))
+            (( esp_fail++ ))
         fi
 
         umount "$mount_point" 2>/dev/null || true
     done
 
-    if (( esp_fail > 0 )); then
+    if (( esp_total == 0 )); then
+        log_info "  No mirror targets discovered — no ESP sync needed"
+        record_op "esp_sync" "SKIP" "no mirror targets"
+    elif (( esp_fail > 0 )); then
         record_op "esp_sync" "FAIL" "$esp_ok of $esp_total synced, $esp_fail failed"
     else
         record_op "esp_sync" "OK" "$esp_ok of $esp_total ESPs synced"
@@ -460,12 +480,12 @@ unmount_all() {
     for esp in "${MOUNT_DAS_ESP[@]}"; do
         umount "$esp" 2>/dev/null || true
     done
-    # Unmount targets in reverse order
-    for (( i=${#ALL_TARGET_MOUNTS[@]}; i>=1; i-- )); do
+    # Unmount targets in reverse order (0-based indexing)
+    for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
         umount "${ALL_TARGET_MOUNTS[$i]}" 2>/dev/null || true
     done
     # Unmount sources
-    for label in "${(@k)SOURCE_VOLUMES}"; do
+    for label in "${!SOURCE_VOLUMES[@]}"; do
         umount "${SOURCE_VOLUMES[$label]}" 2>/dev/null || true
     done
 
@@ -493,11 +513,11 @@ get_used_bytes() {
 format_bytes() {
     local bytes=$1
     if (( bytes >= 1073741824 )); then
-        printf "%.2f GiB" "$(( bytes / 1073741824.0 ))"
+        awk "BEGIN {printf \"%.2f GiB\", $bytes / 1073741824}"
     elif (( bytes >= 1048576 )); then
-        printf "%.2f MiB" "$(( bytes / 1048576.0 ))"
+        awk "BEGIN {printf \"%.2f MiB\", $bytes / 1048576}"
     elif (( bytes >= 1024 )); then
-        printf "%.2f KiB" "$(( bytes / 1024.0 ))"
+        awk "BEGIN {printf \"%.2f KiB\", $bytes / 1024}"
     else
         printf "%d B" "$bytes"
     fi
@@ -509,7 +529,8 @@ capture_usage() {
 
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null; then
-            local used=$(get_used_bytes "$mnt")
+            local used
+            used=$(get_used_bytes "$mnt")
             if [[ "$phase" == "before" ]]; then
                 USAGE_BEFORE[$mnt]=$used
             else
@@ -519,9 +540,9 @@ capture_usage() {
     done
 
     if [[ "$phase" == "before" ]]; then
-        BTRBK_START_TIME=$EPOCHSECONDS
+        BTRBK_START_TIME=$(date +%s)
     else
-        BTRBK_END_TIME=$EPOCHSECONDS
+        BTRBK_END_TIME=$(date +%s)
     fi
 }
 
@@ -572,11 +593,13 @@ log_throughput() {
 # Append current usage to the growth log for trend analysis
 record_growth() {
     mkdir -p "$(dirname "$GROWTH_LOG")"
-    local ts=$(date '+%Y-%m-%dT%H:%M:%S')
+    local ts
+    ts=$(date '+%Y-%m-%dT%H:%M:%S')
 
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null; then
-            local used=$(get_used_bytes "$mnt")
+            local used
+            used=$(get_used_bytes "$mnt")
             echo "$ts $mnt $used" >> "$GROWTH_LOG"
         fi
     done
@@ -593,15 +616,17 @@ compute_growth_stats() {
         return
     fi
 
-    local now=$EPOCHSECONDS
+    local now
+    now=$(date +%s)
     local cutoff=$(( now - (lookback_days * 86400) ))
 
     # Find the oldest entry for this mount within the lookback window
     local oldest_epoch=0 oldest_used=0
+    local ts entry_mnt entry_used entry_epoch
     while IFS=' ' read -r ts entry_mnt entry_used; do
         [[ "$entry_mnt" != "$mnt" ]] && continue
         # Parse ISO timestamp to epoch
-        local entry_epoch=$(date -d "$ts" '+%s' 2>/dev/null || echo 0)
+        entry_epoch=$(date -d "$ts" '+%s' 2>/dev/null || echo 0)
         if (( entry_epoch >= cutoff && oldest_epoch == 0 )); then
             oldest_epoch=$entry_epoch
             oldest_used=$entry_used
@@ -656,7 +681,7 @@ run_indexer() {
 
     # Find the primary target mount for indexing
     local primary_mount=""
-    for label in "${(@k)TARGET_ROLES}"; do
+    for label in "${!TARGET_ROLES[@]}"; do
         if [[ "${TARGET_ROLES[$label]}" == "primary" ]]; then
             primary_mount="${TARGET_MOUNTS[$label]}"
             break
@@ -685,12 +710,14 @@ run_indexer() {
 # ============================================================================
 
 generate_report() {
-    local hostname=$(hostname)
-    local timestamp=$(date '+%Y-%m-%d %H:%M')
+    local hostname
+    hostname=$(hostname)
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M')
     local overall_status="ALL OPERATIONS SUCCESSFUL"
 
     # Check for any failures
-    for op in "${(@k)OP_STATUS}"; do
+    for op in "${!OP_STATUS[@]}"; do
         if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
             overall_status="FAILURES DETECTED"
             break
@@ -737,7 +764,7 @@ LATEST SNAPSHOTS
 $(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
 
 ===============================================================
-  backup-run.sh v4.0.0
+  backup-run.sh v4.1.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -780,10 +807,12 @@ generate_capacity_section() {
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if ! mountpoint -q "$mnt" 2>/dev/null; then continue; fi
         local name="${TARGET_NAMES[$mnt]:-$mnt}"
-        local df_line=$(df -h "$mnt" 2>/dev/null | tail -1)
-        local used=$(echo "$df_line" | awk '{print $3}')
-        local avail=$(echo "$df_line" | awk '{print $4}')
-        local pct=$(echo "$df_line" | awk '{print $5}')
+        local df_line
+        df_line=$(df -h "$mnt" 2>/dev/null | tail -1)
+        local used avail pct
+        used=$(echo "$df_line" | awk '{print $3}')
+        avail=$(echo "$df_line" | awk '{print $4}')
+        pct=$(echo "$df_line" | awk '{print $5}')
         printf "  %-24s %-10s %-10s %s\n" "$name" "$used" "$avail" "$pct"
     done
 }
@@ -798,25 +827,28 @@ generate_growth_section() {
         printf "  %s:\n" "$name"
         printf "    Today:              +%s\n" "$(format_bytes $today_delta)"
 
-        local avg_7d=$(compute_growth_stats "$mnt" "$current" 7)
-        local avg_30d=$(compute_growth_stats "$mnt" "$current" 30)
+        local avg_7d avg_30d
+        avg_7d=$(compute_growth_stats "$mnt" "$current" 7)
+        avg_30d=$(compute_growth_stats "$mnt" "$current" 30)
 
         if (( avg_7d > 0 )); then
-            printf "    7-day avg:          %s/day\n" "$(format_bytes $avg_7d)"
+            printf "    7-day avg:          %s/day\n" "$(format_bytes "$avg_7d")"
         fi
         if (( avg_30d > 0 )); then
-            printf "    30-day avg:         %s/day\n" "$(format_bytes $avg_30d)"
+            printf "    30-day avg:         %s/day\n" "$(format_bytes "$avg_30d")"
         fi
 
         # Capacity runway projection
-        local avail_bytes=$(df --output=avail -B1 "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
+        local avail_bytes
+        avail_bytes=$(df --output=avail -B1 "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
         local growth_rate=$avg_30d
         if (( growth_rate <= 0 )); then growth_rate=$avg_7d; fi
         if (( growth_rate <= 0 && today_delta > 0 )); then growth_rate=$today_delta; fi
 
         if (( growth_rate > 0 && avail_bytes > 0 )); then
             local days_left=$(( avail_bytes / growth_rate ))
-            local years_left=$(printf "%.1f" "$(( days_left / 365.0 ))")
+            local years_left
+            years_left=$(awk "BEGIN {printf \"%.1f\", $days_left / 365}")
             printf "    Capacity runway:    ~%s days (~%s years)\n" "$days_left" "$years_left"
         else
             printf "    Capacity runway:    no growth trend yet\n"
@@ -826,11 +858,12 @@ generate_growth_section() {
 }
 
 generate_smart_section() {
-    for label in "${(@k)DISCOVERED_DEVICES}"; do
+    for label in "${!DISCOVERED_DEVICES[@]}"; do
         local drive="${DISCOVERED_DEVICES[$label]}"
         if [[ -z "$drive" || ! -b "$drive" ]]; then continue; fi
         local name="${TARGET_NAMES[${TARGET_MOUNTS[$label]}]:-$label}"
-        local smart_data=$(get_smart_summary "$drive")
+        local smart_data
+        smart_data=$(get_smart_summary "$drive")
         local health=${smart_data%%|*}; smart_data=${smart_data#*|}
         local temp=${smart_data%%|*}; smart_data=${smart_data#*|}
         local hours=${smart_data%%|*}; smart_data=${smart_data#*|}
@@ -965,14 +998,15 @@ main() {
         record_growth
 
         local overall_status="SUCCESS"
-        for op in "${(@k)OP_STATUS}"; do
+        for op in "${!OP_STATUS[@]}"; do
             if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
                 overall_status="FAILURE"
                 break
             fi
         done
 
-        local report=$(generate_report)
+        local report
+        report=$(generate_report)
         echo ""
         echo "$report"
         send_report "$report" "$overall_status"
