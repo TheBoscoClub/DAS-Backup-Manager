@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 # boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
 # Version: 2.0.0
 # Date: 2026-02-21
@@ -14,8 +14,6 @@
 #   sudo ./boot-archive-cleanup.sh --days 180   # Override retention (180 days)
 
 set -euo pipefail
-setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
-
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
@@ -35,7 +33,7 @@ DRYRUN=false
 ARCHIVE_PATTERN="@*.archive.*"
 
 # All target mount points from config
-ALL_TARGET_MOUNTS=(${(s: :)DAS_ALL_TARGET_MOUNTS})
+IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
 
 # Colors
 RED='\033[0;31m'

@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
 # Version: 3.0.0
 # Date: 2026-02-21
@@ -14,8 +14,6 @@
 #   sudo ./backup-verify.sh --quick  # SMART only (no btrbk check)
 
 set -euo pipefail
-setopt typeset_silent  # prevent local/typeset from printing on re-declare in loops
-
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
@@ -39,13 +37,13 @@ for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     label_var="DAS_TARGET_${i}_LABEL"
     role_var="DAS_TARGET_${i}_ROLE"
     mount_var="DAS_TARGET_${i}_MOUNT"
-    serial="${(P)serial_var}"
-    if [[ -n "${(P)name_var:-}" ]]; then
-        DRIVE_MAP[$serial]="${(P)name_var}"
+    serial="${!serial_var}"
+    if [[ -n "${!name_var:-}" ]]; then
+        DRIVE_MAP[$serial]="${!name_var}"
     else
-        DRIVE_MAP[$serial]="${(P)label_var}"
+        DRIVE_MAP[$serial]="${!label_var}"
     fi
-    TARGET_ROLES[$serial]="${(P)role_var}"
+    TARGET_ROLES[$serial]="${!role_var}"
 done
 
 # Expected DAS drives (detected by USB transport)
@@ -207,11 +205,11 @@ check_btrbk_status() {
     local primary_mount=""
     for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
         local role_var="DAS_TARGET_${i}_ROLE"
-        if [[ "${(P)role_var}" == "primary" ]]; then
+        if [[ "${!role_var}" == "primary" ]]; then
             local serial_var="DAS_TARGET_${i}_SERIAL"
             local mount_var="DAS_TARGET_${i}_MOUNT"
-            primary_serial="${(P)serial_var}"
-            primary_mount="${(P)mount_var}"
+            primary_serial="${!serial_var}"
+            primary_mount="${!mount_var}"
             break
         fi
     done

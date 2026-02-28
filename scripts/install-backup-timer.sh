@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 # install-backup-timer.sh - Install DAS backup systemd service and timer
 # Version: 1.1.0 (DEPRECATED)
 # Date: 2026-02-21
@@ -16,7 +16,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-SCRIPT_DIR="${0:A:h}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 echo "Installing DAS backup systemd units..."
 
