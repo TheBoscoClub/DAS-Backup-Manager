@@ -1,5 +1,6 @@
 mod setup;
 
+use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::indexer;
 use clap::{Parser, Subcommand};
@@ -139,15 +140,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Config { action } => match action {
             ConfigAction::DumpEnv { config } => {
-                let cfg = setup::config::Config::load(&config)?;
+                let cfg = Config::load(&config)?;
                 print!("{}", setup::env_export::dump_env(&cfg));
             }
             ConfigAction::Show { config } => {
-                let cfg = setup::config::Config::load(&config)?;
+                let cfg = Config::load(&config)?;
                 println!("{}", cfg.to_toml()?);
             }
             ConfigAction::Validate { config } => {
-                let cfg = setup::config::Config::load(&config)?;
+                let cfg = Config::load(&config)?;
                 let errors = cfg.validate();
                 if errors.is_empty() {
                     println!("Config is valid.");

@@ -1,3 +1,11 @@
+pub mod backup;
+pub mod config;
 pub mod db;
+pub mod health;
 pub mod indexer;
+pub mod progress;
+pub mod report;
+pub mod restore;
 pub mod scanner;
+pub mod schedule;
+pub mod subvol;

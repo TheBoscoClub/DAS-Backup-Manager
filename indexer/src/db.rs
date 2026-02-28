@@ -53,6 +53,33 @@ CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
     INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
     INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
 END;
+
+-- Backup run history
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id              INTEGER PRIMARY KEY,
+    timestamp       INTEGER NOT NULL,
+    success         INTEGER NOT NULL DEFAULT 0,
+    mode            TEXT NOT NULL DEFAULT 'incremental',
+    snaps_created   INTEGER NOT NULL DEFAULT 0,
+    snaps_sent      INTEGER NOT NULL DEFAULT 0,
+    bytes_sent      INTEGER NOT NULL DEFAULT 0,
+    duration_secs   INTEGER NOT NULL DEFAULT 0,
+    errors          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_runs_ts ON backup_runs(timestamp);
+
+-- Target disk usage tracking
+CREATE TABLE IF NOT EXISTS target_usage (
+    id              INTEGER PRIMARY KEY,
+    timestamp       INTEGER NOT NULL,
+    target_label    TEXT NOT NULL,
+    total_bytes     INTEGER NOT NULL DEFAULT 0,
+    used_bytes      INTEGER NOT NULL DEFAULT 0,
+    snapshot_count  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_target_usage_label_ts ON target_usage(target_label, timestamp);
 "#;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -333,6 +360,152 @@ impl Database {
         })?;
         rows.collect()
     }
+
+    // -----------------------------------------------------------------
+    // Backup run history
+    // -----------------------------------------------------------------
+
+    /// Record a completed backup run. Returns the new row ID.
+    pub fn insert_backup_run(&self, run: &NewBackupRun<'_>) -> SqlResult<i64> {
+        let errors_str = run.errors.join("\n");
+        self.conn.execute(
+            "INSERT INTO backup_runs (timestamp, success, mode, snaps_created, snaps_sent, bytes_sent, duration_secs, errors)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                run.timestamp,
+                run.success as i32,
+                run.mode,
+                run.snaps_created as i64,
+                run.snaps_sent as i64,
+                run.bytes_sent as i64,
+                run.duration_secs as i64,
+                errors_str,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get the most recent backup runs, ordered newest first.
+    pub fn get_backup_history(&self, limit: usize) -> SqlResult<Vec<BackupRunRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent, duration_secs, errors
+             FROM backup_runs ORDER BY timestamp DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let errors_str: String = row.get(8)?;
+            let errors: Vec<String> = if errors_str.is_empty() {
+                Vec::new()
+            } else {
+                errors_str.split('\n').map(|s| s.to_string()).collect()
+            };
+            Ok(BackupRunRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                success: row.get::<_, i32>(2)? != 0,
+                mode: row.get(3)?,
+                snaps_created: row.get::<_, i64>(4)? as usize,
+                snaps_sent: row.get::<_, i64>(5)? as usize,
+                bytes_sent: row.get::<_, i64>(6)? as u64,
+                duration_secs: row.get::<_, i64>(7)? as u64,
+                errors,
+            })
+        })?;
+        rows.collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Target usage tracking
+    // -----------------------------------------------------------------
+
+    /// Record a target disk usage snapshot.
+    pub fn insert_target_usage(
+        &self,
+        timestamp: i64,
+        target_label: &str,
+        total_bytes: u64,
+        used_bytes: u64,
+        snapshot_count: usize,
+    ) -> SqlResult<i64> {
+        self.conn.execute(
+            "INSERT INTO target_usage (timestamp, target_label, total_bytes, used_bytes, snapshot_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                timestamp,
+                target_label,
+                total_bytes as i64,
+                used_bytes as i64,
+                snapshot_count as i64,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get usage history for a specific target over the last N days.
+    pub fn get_target_usage_history(
+        &self,
+        target_label: &str,
+        days: u32,
+    ) -> SqlResult<Vec<TargetUsageRecord>> {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - (days as i64 * 86400);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, target_label, total_bytes, used_bytes, snapshot_count
+             FROM target_usage
+             WHERE target_label = ?1 AND timestamp >= ?2
+             ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![target_label, cutoff], |row| {
+            Ok(TargetUsageRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                target_label: row.get(2)?,
+                total_bytes: row.get::<_, i64>(3)? as u64,
+                used_bytes: row.get::<_, i64>(4)? as u64,
+                snapshot_count: row.get::<_, i64>(5)? as usize,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+/// Input for recording a new backup run.
+pub struct NewBackupRun<'a> {
+    pub timestamp: i64,
+    pub success: bool,
+    pub mode: &'a str,
+    pub snaps_created: usize,
+    pub snaps_sent: usize,
+    pub bytes_sent: u64,
+    pub duration_secs: u64,
+    pub errors: &'a [String],
+}
+
+/// A backup run record from the database.
+#[derive(Debug, Clone)]
+pub struct BackupRunRecord {
+    pub id: i64,
+    pub timestamp: i64,
+    pub success: bool,
+    pub mode: String,
+    pub snaps_created: usize,
+    pub snaps_sent: usize,
+    pub bytes_sent: u64,
+    pub duration_secs: u64,
+    pub errors: Vec<String>,
+}
+
+/// A target usage record from the database.
+#[derive(Debug, Clone)]
+pub struct TargetUsageRecord {
+    pub id: i64,
+    pub timestamp: i64,
+    pub target_label: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub snapshot_count: usize,
 }
 
 impl Drop for Database {
@@ -628,5 +801,169 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].first_snap, "root.20260220T0300");
         assert_eq!(results[0].last_snap, "root.20260220T0300");
+    }
+
+    // -----------------------------------------------------------------
+    // backup_runs table tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn insert_and_get_backup_run() {
+        let db = Database::open(":memory:").unwrap();
+        let ts = 1709000000_i64;
+        let id = db
+            .insert_backup_run(&NewBackupRun {
+                timestamp: ts,
+                success: true,
+                mode: "incremental",
+                snaps_created: 5,
+                snaps_sent: 5,
+                bytes_sent: 1_073_741_824,
+                duration_secs: 3600,
+                errors: &[],
+            })
+            .unwrap();
+        assert!(id > 0);
+
+        let history = db.get_backup_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, id);
+        assert_eq!(history[0].timestamp, ts);
+        assert!(history[0].success);
+        assert_eq!(history[0].mode, "incremental");
+        assert_eq!(history[0].snaps_created, 5);
+        assert_eq!(history[0].snaps_sent, 5);
+        assert_eq!(history[0].bytes_sent, 1_073_741_824);
+        assert_eq!(history[0].duration_secs, 3600);
+        assert!(history[0].errors.is_empty());
+    }
+
+    #[test]
+    fn backup_run_with_errors() {
+        let db = Database::open(":memory:").unwrap();
+        let errors = vec!["btrbk failed".to_string(), "target offline".to_string()];
+        let id = db
+            .insert_backup_run(&NewBackupRun {
+                timestamp: 1709000000,
+                success: false,
+                mode: "full",
+                snaps_created: 2,
+                snaps_sent: 0,
+                bytes_sent: 0,
+                duration_secs: 60,
+                errors: &errors,
+            })
+            .unwrap();
+
+        let history = db.get_backup_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].success);
+        assert_eq!(history[0].errors.len(), 2);
+        assert_eq!(history[0].errors[0], "btrbk failed");
+        assert_eq!(history[0].errors[1], "target offline");
+        assert_eq!(history[0].id, id);
+    }
+
+    #[test]
+    fn backup_history_ordered_newest_first() {
+        let db = Database::open(":memory:").unwrap();
+        db.insert_backup_run(&NewBackupRun {
+            timestamp: 1709000000, success: true, mode: "incremental",
+            snaps_created: 1, snaps_sent: 1, bytes_sent: 100, duration_secs: 10, errors: &[],
+        }).unwrap();
+        db.insert_backup_run(&NewBackupRun {
+            timestamp: 1709100000, success: true, mode: "full",
+            snaps_created: 5, snaps_sent: 5, bytes_sent: 500, duration_secs: 60, errors: &[],
+        }).unwrap();
+        let errs = vec!["fail".to_string()];
+        db.insert_backup_run(&NewBackupRun {
+            timestamp: 1709200000, success: false, mode: "incremental",
+            snaps_created: 0, snaps_sent: 0, bytes_sent: 0, duration_secs: 5, errors: &errs,
+        }).unwrap();
+
+        let history = db.get_backup_history(10).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].timestamp, 1709200000); // newest first
+        assert_eq!(history[1].timestamp, 1709100000);
+        assert_eq!(history[2].timestamp, 1709000000);
+    }
+
+    #[test]
+    fn backup_history_respects_limit() {
+        let db = Database::open(":memory:").unwrap();
+        for i in 0..5 {
+            db.insert_backup_run(&NewBackupRun {
+                timestamp: 1709000000 + i * 86400, success: true, mode: "incremental",
+                snaps_created: 1, snaps_sent: 1, bytes_sent: 100, duration_secs: 10, errors: &[],
+            }).unwrap();
+        }
+        let history = db.get_backup_history(3).unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // target_usage table tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn insert_and_get_target_usage() {
+        let db = Database::open(":memory:").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let id = db
+            .insert_target_usage(now, "primary-22tb", 22_000_000_000_000, 5_000_000_000_000, 150)
+            .unwrap();
+        assert!(id > 0);
+
+        let usage = db.get_target_usage_history("primary-22tb", 30).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].target_label, "primary-22tb");
+        assert_eq!(usage[0].total_bytes, 22_000_000_000_000);
+        assert_eq!(usage[0].used_bytes, 5_000_000_000_000);
+        assert_eq!(usage[0].snapshot_count, 150);
+    }
+
+    #[test]
+    fn target_usage_filters_by_label() {
+        let db = Database::open(":memory:").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        db.insert_target_usage(now, "primary-22tb", 22_000_000_000_000, 5_000_000_000_000, 150)
+            .unwrap();
+        db.insert_target_usage(now, "system-2tb", 2_000_000_000_000, 500_000_000_000, 7)
+            .unwrap();
+
+        let primary = db.get_target_usage_history("primary-22tb", 30).unwrap();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].target_label, "primary-22tb");
+
+        let system = db.get_target_usage_history("system-2tb", 30).unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].target_label, "system-2tb");
+    }
+
+    #[test]
+    fn target_usage_ordered_by_timestamp() {
+        let db = Database::open(":memory:").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        db.insert_target_usage(now - 86400, "test", 100, 50, 5).unwrap();
+        db.insert_target_usage(now, "test", 100, 60, 6).unwrap();
+        db.insert_target_usage(now - 172800, "test", 100, 40, 4).unwrap();
+
+        let usage = db.get_target_usage_history("test", 30).unwrap();
+        assert_eq!(usage.len(), 3);
+        // Should be ordered oldest first (ASC)
+        assert!(usage[0].timestamp < usage[1].timestamp);
+        assert!(usage[1].timestamp < usage[2].timestamp);
     }
 }

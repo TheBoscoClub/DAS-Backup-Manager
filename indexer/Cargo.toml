@@ -5,6 +5,10 @@ edition = "2024"
 description = "ButteredDASD — content indexer for DAS backup snapshots with SQLite FTS5 span-based storage"
 license = "MIT"
 
+[lib]
+name = "buttered_dasd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "btrdasd"
 path = "src/main.rs"
