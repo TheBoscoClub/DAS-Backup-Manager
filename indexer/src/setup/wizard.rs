@@ -194,10 +194,11 @@ fn step_subvolumes(
             let subvols_str: String = Input::new()
                 .with_prompt("Subvolumes (comma-separated, e.g. @,@home)")
                 .interact_text()?;
-            let subvolumes: Vec<String> = subvols_str
+            let subvolumes: Vec<SubvolConfig> = subvols_str
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
+                .map(|name| SubvolConfig { name, manual_only: false })
                 .collect();
 
             let device: String = Input::new()
@@ -302,7 +303,9 @@ fn step_subvolumes(
             config.sources.push(Source {
                 label,
                 volume,
-                subvolumes: chosen_subvols,
+                subvolumes: chosen_subvols.into_iter()
+                    .map(|name| SubvolConfig { name, manual_only: false })
+                    .collect(),
                 device,
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
@@ -322,10 +325,11 @@ fn step_subvolumes(
             let subvols_str: String = Input::new()
                 .with_prompt("Subvolumes (comma-separated)")
                 .interact_text()?;
-            let subvolumes: Vec<String> = subvols_str
+            let subvolumes: Vec<SubvolConfig> = subvols_str
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
+                .map(|name| SubvolConfig { name, manual_only: false })
                 .collect();
             let device: String = Input::new().with_prompt("Device path").interact_text()?;
 
@@ -884,7 +888,7 @@ fn step_review(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "      volume: {}, subvols: {}",
             src.volume,
-            src.subvolumes.join(", ")
+            src.subvolumes.iter().map(|sv| sv.name.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
 

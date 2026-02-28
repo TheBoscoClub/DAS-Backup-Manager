@@ -64,9 +64,9 @@ pub fn render_btrbk_conf(config: &Config) -> String {
             ));
 
             for subvol in &source.subvolumes {
-                out.push_str(&format!("  subvolume             {subvol}\n"));
+                out.push_str(&format!("  subvolume             {}\n", subvol.name));
                 // Generate a safe snapshot name from subvolume
-                let snap_name = subvol.replace('@', "").replace('/', "-");
+                let snap_name = subvol.name.replace('@', "").replace('/', "-");
                 let snap_name = if snap_name.is_empty() {
                     "root"
                 } else {
@@ -413,7 +413,10 @@ mod tests {
         config.sources.push(Source {
             label: "nvme-root".to_string(),
             volume: "/.btrfs-nvme".to_string(),
-            subvolumes: vec!["@".to_string(), "@home".to_string()],
+            subvolumes: vec![
+                SubvolConfig { name: "@".to_string(), manual_only: false },
+                SubvolConfig { name: "@home".to_string(), manual_only: false },
+            ],
             device: "/dev/nvme0n1p2".to_string(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["nvme".into()],

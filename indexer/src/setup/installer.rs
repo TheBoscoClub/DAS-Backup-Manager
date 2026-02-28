@@ -255,7 +255,7 @@ mod tests {
         config.sources.push(Source {
             label: "test".to_string(),
             volume: "/test".to_string(),
-            subvolumes: vec!["@".to_string()],
+            subvolumes: vec![SubvolConfig { name: "@".to_string(), manual_only: false }],
             device: "/dev/sda".to_string(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],

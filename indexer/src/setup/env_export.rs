@@ -59,7 +59,8 @@ pub fn dump_env(config: &Config) -> String {
         out.push_str(&kv(&format!("{p}_LABEL"), &src.label));
         out.push_str(&kv(&format!("{p}_VOLUME"), &src.volume));
         out.push_str(&kv(&format!("{p}_DEVICE"), &src.device));
-        out.push_str(&kv(&format!("{p}_SUBVOLUMES"), &src.subvolumes.join(" ")));
+        let subvol_names: Vec<&str> = src.subvolumes.iter().map(|sv| sv.name.as_str()).collect();
+        out.push_str(&kv(&format!("{p}_SUBVOLUMES"), &subvol_names.join(" ")));
         out.push_str(&kv(&format!("{p}_SNAPSHOT_DIR"), &src.snapshot_dir));
         if !src.target_subdirs.is_empty() {
             out.push_str(&kv(
@@ -168,7 +169,10 @@ mod tests {
         config.sources.push(Source {
             label: "nvme".to_string(),
             volume: "/.btrfs-nvme".to_string(),
-            subvolumes: vec!["@".to_string(), "@home".to_string()],
+            subvolumes: vec![
+                SubvolConfig { name: "@".to_string(), manual_only: false },
+                SubvolConfig { name: "@home".to_string(), manual_only: false },
+            ],
             device: "/dev/nvme0n1p2".to_string(),
             snapshot_dir: ".btrbk-snapshots".to_string(),
             target_subdirs: vec!["nvme".to_string()],
