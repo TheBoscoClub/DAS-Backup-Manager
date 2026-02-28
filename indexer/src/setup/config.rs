@@ -172,9 +172,11 @@ pub enum TargetRole {
     EspSync,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Retention {
+    #[serde(default)]
     pub weekly: u32,
+    #[serde(default)]
     pub monthly: u32,
     #[serde(default)]
     pub daily: u32,
