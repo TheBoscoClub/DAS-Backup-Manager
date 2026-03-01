@@ -449,7 +449,7 @@ void MainWindow::updateStatusBar()
     const QString healthJson = m_dbusClient->healthQuery(QStringLiteral("/etc/das-backup/config.toml"));
     if (!healthJson.isEmpty()) {
         const QJsonDocument doc = QJsonDocument::fromJson(healthJson.toUtf8());
-        const QJsonArray drives = doc.object().value(QLatin1String("drives")).toArray();
+        const QJsonArray drives = doc.object().value(QLatin1String("targets")).toArray();
         int mounted = 0;
         for (const QJsonValue &v : drives) {
             if (v.toObject().value(QLatin1String("mounted")).toBool())
