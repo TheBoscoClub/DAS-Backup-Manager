@@ -150,6 +150,36 @@ if(BUILD_HELPER)
 endif()
 
 # =============================================================================
+# Man page
+# =============================================================================
+
+install(FILES docs/btrdasd.1 DESTINATION "${CMAKE_INSTALL_PREFIX}/share/man/man1")
+
+# =============================================================================
+# Shell completions (generated at install time)
+# =============================================================================
+
+if(BUILD_INDEXER)
+    install(CODE "
+        execute_process(
+            COMMAND \${CMAKE_INSTALL_PREFIX}/bin/btrdasd completions bash
+            OUTPUT_FILE \${CMAKE_INSTALL_PREFIX}/share/bash-completion/completions/btrdasd
+            ERROR_QUIET
+        )
+        execute_process(
+            COMMAND \${CMAKE_INSTALL_PREFIX}/bin/btrdasd completions zsh
+            OUTPUT_FILE \${CMAKE_INSTALL_PREFIX}/share/zsh/site-functions/_btrdasd
+            ERROR_QUIET
+        )
+        execute_process(
+            COMMAND \${CMAKE_INSTALL_PREFIX}/bin/btrdasd completions fish
+            OUTPUT_FILE \${CMAKE_INSTALL_PREFIX}/share/fish/vendor_completions.d/btrdasd.fish
+            ERROR_QUIET
+        )
+    ")
+endif()
+
+# =============================================================================
 # KDE Plasma GUI (optional)
 # =============================================================================
 
