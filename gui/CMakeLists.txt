@@ -15,6 +15,7 @@ find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS
     Core
     Widgets
     Sql
+    DBus
 )
 
 find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS
@@ -41,6 +42,9 @@ target_sources(btrdasd-gui PRIVATE
     src/snapshotwatcher.cpp
     src/restoreaction.cpp
     src/settingsdialog.cpp
+    src/dbusclient.cpp
+    src/sidebar.cpp
+    src/progresspanel.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -49,6 +53,7 @@ target_link_libraries(btrdasd-gui PRIVATE
     Qt6::Core
     Qt6::Widgets
     Qt6::Sql
+    Qt6::DBus
     KF6::CoreAddons
     KF6::I18n
     KF6::XmlGui

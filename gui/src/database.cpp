@@ -1,5 +1,6 @@
 #include "database.h"
 
+#include <QDateTime>
 #include <QFile>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -169,4 +170,65 @@ DbStats Database::stats() const
         s.dbSizeBytes = q.value(0).toLongLong();
 
     return s;
+}
+
+QVector<BackupRunInfo> Database::getBackupHistory(int limit) const
+{
+    QVector<BackupRunInfo> result;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT id, timestamp, mode, success, duration_secs, "
+        "snaps_created, snaps_sent, bytes_sent, errors "
+        "FROM backup_runs ORDER BY timestamp DESC LIMIT :limit"));
+    q.bindValue(QStringLiteral(":limit"), limit);
+    if (!q.exec()) {
+        return result;
+    }
+    while (q.next()) {
+        const QString errStr = q.value(8).toString();
+        BackupRunInfo info{
+            .id = q.value(0).toLongLong(),
+            .timestamp = q.value(1).toLongLong(),
+            .mode = q.value(2).toString(),
+            .success = q.value(3).toBool(),
+            .durationSecs = q.value(4).toLongLong(),
+            .snapsCreated = q.value(5).toLongLong(),
+            .snapsSent = q.value(6).toLongLong(),
+            .bytesSent = q.value(7).toLongLong(),
+            .errors = errStr.isEmpty()
+                ? QStringList{}
+                : errStr.split(QLatin1Char('\n'), Qt::SkipEmptyParts),
+        };
+        result.append(info);
+    }
+    return result;
+}
+
+QVector<TargetUsageInfo> Database::getTargetUsageHistory(
+    const QString &label, int days) const
+{
+    QVector<TargetUsageInfo> result;
+    const qint64 threshold = QDateTime::currentSecsSinceEpoch()
+        - (static_cast<qint64>(days) * 86400);
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT id, timestamp, label, total_bytes, used_bytes, snapshot_count "
+        "FROM target_usage WHERE label = :label AND timestamp >= :threshold "
+        "ORDER BY timestamp ASC"));
+    q.bindValue(QStringLiteral(":label"), label);
+    q.bindValue(QStringLiteral(":threshold"), threshold);
+    if (!q.exec()) {
+        return result;
+    }
+    while (q.next()) {
+        result.append({
+            .id = q.value(0).toLongLong(),
+            .timestamp = q.value(1).toLongLong(),
+            .label = q.value(2).toString(),
+            .totalBytes = static_cast<quint64>(q.value(3).toLongLong()),
+            .usedBytes = static_cast<quint64>(q.value(4).toLongLong()),
+            .snapshotCount = static_cast<quint64>(q.value(5).toLongLong()),
+        });
+    }
+    return result;
 }

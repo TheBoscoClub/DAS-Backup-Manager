@@ -1,10 +1,13 @@
 #include "mainwindow.h"
 #include "database.h"
+#include "dbusclient.h"
 #include "filemodel.h"
 #include "indexrunner.h"
+#include "progresspanel.h"
 #include "restoreaction.h"
 #include "searchmodel.h"
 #include "settingsdialog.h"
+#include "sidebar.h"
 #include "snapshotmodel.h"
 #include "snapshotwatcher.h"
 #include "snapshottimeline.h"
@@ -23,6 +26,7 @@
 #include <QScrollArea>
 #include <QSortFilterProxyModel>
 #include <QSplitter>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QTableView>
 #include <QTimer>
@@ -33,6 +37,7 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
     , m_dbPath(dbPath)
 {
     m_database = new Database();
+    m_dbusClient = new DBusClient(this);
     m_indexRunner = new IndexRunner(this);
     m_snapshotWatcher = new SnapshotWatcher(m_indexRunner, this);
     m_snapshotWatcher->setDbPath(m_dbPath);
@@ -59,71 +64,81 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
-    m_snapshotModel = new SnapshotModel(m_database, this);
-    m_fileModel = new FileModel(m_database, this);
-    m_searchModel = new SearchModel(m_database, this);
+    // --- Sidebar ---
+    m_sidebar = new Sidebar(this);
+    connect(m_sidebar, &Sidebar::sectionChanged,
+            this, &MainWindow::onSectionChanged);
 
-    // Search bar with debounce
-    m_searchBar = new QLineEdit(this);
-    m_searchBar->setPlaceholderText(i18n("Search files (FTS5)..."));
-    m_searchBar->setClearButtonEnabled(true);
+    // --- Stacked widget for main content area ---
+    m_stack = new QStackedWidget(this);
 
-    m_searchTimer = new QTimer(this);
-    m_searchTimer->setSingleShot(true);
-    m_searchTimer->setInterval(300);
-    connect(m_searchBar, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
-    connect(m_searchTimer, &QTimer::timeout, this, &MainWindow::executeSearch);
+    // Page 0: Browse (snapshots + files + search — existing functionality)
+    setupBrowsePage();
+    m_stack->addWidget(m_browsePage);    // index 0
 
-    // Timeline in scroll area
-    m_timeline = new SnapshotTimeline(m_snapshotModel, this);
-    connect(m_timeline, &SnapshotTimeline::snapshotSelected, this, &MainWindow::onSnapshotSelected);
+    // Page 1: Backup Run Now (placeholder — M5 will implement)
+    m_backupRunPage = new QWidget(this);
+    auto *runLayout = new QVBoxLayout(m_backupRunPage);
+    auto *runLabel = new QLabel(i18n("Backup operations will appear here."), m_backupRunPage);
+    runLabel->setAlignment(Qt::AlignCenter);
+    runLayout->addWidget(runLabel);
+    m_stack->addWidget(m_backupRunPage); // index 1
 
-    auto *scrollArea = new QScrollArea(this);
-    scrollArea->setWidget(m_timeline);
-    scrollArea->setWidgetResizable(true);
-    scrollArea->setMinimumWidth(200);
+    // Page 2: Backup History (placeholder)
+    m_backupHistoryPage = new QWidget(this);
+    auto *histLayout = new QVBoxLayout(m_backupHistoryPage);
+    auto *histLabel = new QLabel(i18n("Backup history will appear here."), m_backupHistoryPage);
+    histLabel->setAlignment(Qt::AlignCenter);
+    histLayout->addWidget(histLabel);
+    m_stack->addWidget(m_backupHistoryPage); // index 2
 
-    // File list
-    m_fileProxy = new QSortFilterProxyModel(this);
-    m_fileProxy->setSourceModel(m_fileModel);
-    m_fileView = new QTableView(this);
-    m_fileView->setModel(m_fileProxy);
-    m_fileView->setSortingEnabled(true);
-    m_fileView->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_fileView->setAlternatingRowColors(true);
-    m_fileView->horizontalHeader()->setStretchLastSection(true);
+    // Page 3: Config (placeholder)
+    m_configPage = new QWidget(this);
+    auto *cfgLayout = new QVBoxLayout(m_configPage);
+    auto *cfgLabel = new QLabel(i18n("Configuration editor will appear here."), m_configPage);
+    cfgLabel->setAlignment(Qt::AlignCenter);
+    cfgLayout->addWidget(cfgLabel);
+    m_stack->addWidget(m_configPage); // index 3
 
-    // Search results
-    m_searchView = new QTableView(this);
-    m_searchView->setModel(m_searchModel);
-    m_searchView->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_searchView->setAlternatingRowColors(true);
-    m_searchView->horizontalHeader()->setStretchLastSection(true);
-    m_searchView->setVisible(false);
+    // Page 4: Health — Drives (placeholder)
+    m_healthDrivesPage = new QWidget(this);
+    auto *drvLayout = new QVBoxLayout(m_healthDrivesPage);
+    auto *drvLabel = new QLabel(i18n("Drive health information will appear here."), m_healthDrivesPage);
+    drvLabel->setAlignment(Qt::AlignCenter);
+    drvLayout->addWidget(drvLabel);
+    m_stack->addWidget(m_healthDrivesPage); // index 4
 
-    // Right splitter
-    auto *rightSplitter = new QSplitter(Qt::Vertical, this);
-    rightSplitter->addWidget(m_fileView);
-    rightSplitter->addWidget(m_searchView);
-    rightSplitter->setStretchFactor(0, 3);
-    rightSplitter->setStretchFactor(1, 1);
+    // Page 5: Health — Growth (placeholder)
+    m_healthGrowthPage = new QWidget(this);
+    auto *growLayout = new QVBoxLayout(m_healthGrowthPage);
+    auto *growLabel = new QLabel(i18n("Disk usage growth charts will appear here."), m_healthGrowthPage);
+    growLabel->setAlignment(Qt::AlignCenter);
+    growLayout->addWidget(growLabel);
+    m_stack->addWidget(m_healthGrowthPage); // index 5
 
-    // Main splitter
+    // Page 6: Health — Status (placeholder)
+    m_healthStatusPage = new QWidget(this);
+    auto *stLayout = new QVBoxLayout(m_healthStatusPage);
+    auto *stLabel = new QLabel(i18n("System status overview will appear here."), m_healthStatusPage);
+    stLabel->setAlignment(Qt::AlignCenter);
+    stLayout->addWidget(stLabel);
+    m_stack->addWidget(m_healthStatusPage); // index 6
+
+    // --- Main layout: sidebar | stack ---
     auto *mainSplitter = new QSplitter(Qt::Horizontal, this);
-    mainSplitter->addWidget(scrollArea);
-    mainSplitter->addWidget(rightSplitter);
-    mainSplitter->setStretchFactor(0, 1);
-    mainSplitter->setStretchFactor(1, 3);
+    mainSplitter->addWidget(m_sidebar);
+    mainSplitter->addWidget(m_stack);
+    mainSplitter->setStretchFactor(0, 0); // sidebar: fixed width
+    mainSplitter->setStretchFactor(1, 1); // stack: expands
+    mainSplitter->setChildrenCollapsible(false);
 
-    // Central layout
-    auto *centralWidget = new QWidget(this);
-    auto *layout = new QVBoxLayout(centralWidget);
-    layout->setContentsMargins(4, 4, 4, 4);
-    layout->addWidget(m_searchBar);
-    layout->addWidget(mainSplitter, 1);
-    setCentralWidget(centralWidget);
+    setCentralWidget(mainSplitter);
 
-    // Status bar
+    // --- Progress dock panel ---
+    m_progressPanel = new ProgressPanel(m_dbusClient, this);
+    addDockWidget(Qt::BottomDockWidgetArea, m_progressPanel);
+
+    // --- Status bar ---
     m_statusLabel = new QLabel(this);
     statusBar()->addPermanentWidget(m_statusLabel);
 
@@ -137,6 +152,76 @@ void MainWindow::setupUi()
             KMessageBox::error(this, i18n("Indexing failed: %1", error));
         }
     });
+
+    // Start on Browse > Snapshots
+    m_stack->setCurrentIndex(0);
+}
+
+void MainWindow::setupBrowsePage()
+{
+    m_browsePage = new QWidget(this);
+
+    m_snapshotModel = new SnapshotModel(m_database, this);
+    m_fileModel = new FileModel(m_database, this);
+    m_searchModel = new SearchModel(m_database, this);
+
+    // Search bar with debounce
+    m_searchBar = new QLineEdit(m_browsePage);
+    m_searchBar->setPlaceholderText(i18n("Search files (FTS5)..."));
+    m_searchBar->setClearButtonEnabled(true);
+
+    m_searchTimer = new QTimer(this);
+    m_searchTimer->setSingleShot(true);
+    m_searchTimer->setInterval(300);
+    connect(m_searchBar, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
+    connect(m_searchTimer, &QTimer::timeout, this, &MainWindow::executeSearch);
+
+    // Timeline in scroll area
+    m_timeline = new SnapshotTimeline(m_snapshotModel, this);
+    connect(m_timeline, &SnapshotTimeline::snapshotSelected, this, &MainWindow::onSnapshotSelected);
+
+    auto *scrollArea = new QScrollArea(m_browsePage);
+    scrollArea->setWidget(m_timeline);
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setMinimumWidth(200);
+
+    // File list
+    m_fileProxy = new QSortFilterProxyModel(this);
+    m_fileProxy->setSourceModel(m_fileModel);
+    m_fileView = new QTableView(m_browsePage);
+    m_fileView->setModel(m_fileProxy);
+    m_fileView->setSortingEnabled(true);
+    m_fileView->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_fileView->setAlternatingRowColors(true);
+    m_fileView->horizontalHeader()->setStretchLastSection(true);
+
+    // Search results
+    m_searchView = new QTableView(m_browsePage);
+    m_searchView->setModel(m_searchModel);
+    m_searchView->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_searchView->setAlternatingRowColors(true);
+    m_searchView->horizontalHeader()->setStretchLastSection(true);
+    m_searchView->setVisible(false);
+
+    // Right splitter (files above, search below)
+    auto *rightSplitter = new QSplitter(Qt::Vertical, m_browsePage);
+    rightSplitter->addWidget(m_fileView);
+    rightSplitter->addWidget(m_searchView);
+    rightSplitter->setStretchFactor(0, 3);
+    rightSplitter->setStretchFactor(1, 1);
+
+    // Browse content splitter (timeline left, files right)
+    auto *browseSplitter = new QSplitter(Qt::Horizontal, m_browsePage);
+    browseSplitter->addWidget(scrollArea);
+    browseSplitter->addWidget(rightSplitter);
+    browseSplitter->setStretchFactor(0, 1);
+    browseSplitter->setStretchFactor(1, 3);
+
+    // Page layout
+    auto *layout = new QVBoxLayout(m_browsePage);
+    layout->setContentsMargins(4, 4, 4, 4);
+    layout->addWidget(m_searchBar);
+    layout->addWidget(browseSplitter, 1);
 }
 
 void MainWindow::setupActions()
@@ -159,8 +244,74 @@ void MainWindow::setupActions()
     actionCollection()->addAction(QStringLiteral("restore"), restoreAction);
     connect(restoreAction, &QAction::triggered, this, &MainWindow::restoreSelectedFiles);
 
+    auto *backupRunAction = new QAction(QIcon::fromTheme(QStringLiteral("media-playback-start")),
+                                          i18n("Run Backup"), this);
+    backupRunAction->setToolTip(i18n("Open backup operations panel"));
+    actionCollection()->addAction(QStringLiteral("backup_run"), backupRunAction);
+    connect(backupRunAction, &QAction::triggered, this, [this]() {
+        m_sidebar->setCurrentSection(SidebarSection::BackupRunNow);
+    });
+
+    auto *backupHistAction = new QAction(QIcon::fromTheme(QStringLiteral("view-history")),
+                                           i18n("Backup History"), this);
+    backupHistAction->setToolTip(i18n("View backup run history"));
+    actionCollection()->addAction(QStringLiteral("backup_history"), backupHistAction);
+    connect(backupHistAction, &QAction::triggered, this, [this]() {
+        m_sidebar->setCurrentSection(SidebarSection::BackupHistory);
+    });
+
+    auto *healthAction = new QAction(QIcon::fromTheme(QStringLiteral("dialog-information")),
+                                       i18n("Health"), this);
+    healthAction->setToolTip(i18n("View drive health and system status"));
+    actionCollection()->addAction(QStringLiteral("health"), healthAction);
+    connect(healthAction, &QAction::triggered, this, [this]() {
+        m_sidebar->setCurrentSection(SidebarSection::HealthStatus);
+    });
+
+    auto *configAction = new QAction(QIcon::fromTheme(QStringLiteral("configure")),
+                                       i18n("Config Editor"), this);
+    configAction->setToolTip(i18n("Edit backup configuration"));
+    actionCollection()->addAction(QStringLiteral("config_editor"), configAction);
+    connect(configAction, &QAction::triggered, this, [this]() {
+        m_sidebar->setCurrentSection(SidebarSection::Config);
+    });
+
     auto *settingsAction = KStandardAction::preferences(this, &MainWindow::showSettings, actionCollection());
     Q_UNUSED(settingsAction);
+}
+
+void MainWindow::onSectionChanged(SidebarSection section)
+{
+    switch (section) {
+    case SidebarSection::BrowseSnapshots:
+        m_stack->setCurrentIndex(0);
+        m_searchBar->setVisible(false);
+        m_searchView->setVisible(false);
+        break;
+    case SidebarSection::BrowseSearch:
+        m_stack->setCurrentIndex(0);
+        m_searchBar->setVisible(true);
+        m_searchBar->setFocus();
+        break;
+    case SidebarSection::BackupRunNow:
+        m_stack->setCurrentIndex(1);
+        break;
+    case SidebarSection::BackupHistory:
+        m_stack->setCurrentIndex(2);
+        break;
+    case SidebarSection::Config:
+        m_stack->setCurrentIndex(3);
+        break;
+    case SidebarSection::HealthDrives:
+        m_stack->setCurrentIndex(4);
+        break;
+    case SidebarSection::HealthGrowth:
+        m_stack->setCurrentIndex(5);
+        break;
+    case SidebarSection::HealthStatus:
+        m_stack->setCurrentIndex(6);
+        break;
+    }
 }
 
 void MainWindow::openDatabase(const QString &path)
