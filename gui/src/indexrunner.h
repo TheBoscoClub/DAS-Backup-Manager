@@ -1,15 +1,16 @@
 #pragma once
 
 #include <QObject>
-#include <QProcess>
 #include <QString>
+
+class DBusClient;
 
 class IndexRunner : public QObject
 {
     Q_OBJECT
 
 public:
-    explicit IndexRunner(QObject *parent = nullptr);
+    explicit IndexRunner(DBusClient *client, QObject *parent = nullptr);
 
     void run(const QString &targetPath, const QString &dbPath);
     void abort();
@@ -19,13 +20,8 @@ Q_SIGNALS:
     void outputLine(const QString &line);
     void finished(bool success, const QString &errorMessage);
 
-private Q_SLOTS:
-    void onReadyReadStdout();
-    void onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus);
-
 private:
-    QProcess *m_process = nullptr;
-    QString m_binaryPath;
-
-    static QString findBtrdasd();
+    DBusClient *m_client;
+    QString m_currentJobId;
+    bool m_running = false;
 };
