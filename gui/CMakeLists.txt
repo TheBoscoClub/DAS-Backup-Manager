@@ -45,6 +45,10 @@ target_sources(btrdasd-gui PRIVATE
     src/dbusclient.cpp
     src/sidebar.cpp
     src/progresspanel.cpp
+    src/backuphistory.cpp
+    src/backuppanel.cpp
+    src/healthdashboard.cpp
+    src/configdialog.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)

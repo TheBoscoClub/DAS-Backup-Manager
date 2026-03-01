@@ -23,6 +23,10 @@ class SettingsDialog;
 class SnapshotWatcher;
 class DBusClient;
 class ProgressPanel;
+class BackupHistoryView;
+class BackupPanel;
+class HealthDashboard;
+class ConfigDialog;
 
 class MainWindow : public KXmlGuiWindow
 {
@@ -75,14 +79,12 @@ private:
     // Status bar
     QLabel *m_statusLabel = nullptr;
 
-    // Placeholder pages (M5 will implement these fully)
+    // Pages
     QWidget *m_browsePage = nullptr;
-    QWidget *m_backupRunPage = nullptr;
-    QWidget *m_backupHistoryPage = nullptr;
+    BackupPanel *m_backupRunPage = nullptr;
+    BackupHistoryView *m_backupHistoryPage = nullptr;
     QWidget *m_configPage = nullptr;
-    QWidget *m_healthDrivesPage = nullptr;
-    QWidget *m_healthGrowthPage = nullptr;
-    QWidget *m_healthStatusPage = nullptr;
+    HealthDashboard *m_healthDashboard = nullptr;
 
     QString m_dbPath;
     qint64 m_currentSnapshotId = -1;
