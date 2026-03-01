@@ -7,17 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-28
+
 ### Added
+
+#### Rust Library & CLI (Milestone 1)
 - **`buttered_dasd` library crate** — Extracted 11 public modules from CLI binary into reusable library (`backup`, `config`, `db`, `health`, `indexer`, `progress`, `report`, `restore`, `scanner`, `schedule`, `subvol`)
 - **`SubvolConfig` data model** — Replaced `Vec<String>` subvolumes with `Vec<SubvolConfig>` supporting `manual_only` flag (backward-compatible `#[serde(untagged)]` deserialization)
-- **New CLI subcommands** — `backup` (run/snapshot/send/boot-archive/report), `restore` (file/snapshot/browse), `schedule` (show/set/enable/disable/next), `subvol` (list/add/remove/set-manual/set-auto), `health`, `config edit`
+- **New CLI subcommands** — `backup` (run/snapshot/send/boot-archive/report), `restore` (file/snapshot/browse), `schedule` (show/set/enable/disable/next), `subvol` (list/add/remove/set-manual/set-auto), `health`, `config edit`, `completions`
 - **`NewBackupRun` struct** — Structured input for backup run recording (replaces positional parameters)
 - **Database tables** — `backup_runs` and `target_usage` tables for backup history and disk usage tracking
+- **Shell completions** — `btrdasd completions <shell>` generates completions for bash, zsh, fish, elvish, and PowerShell via `clap_complete`
+- **Man page** — `docs/btrdasd.1` with all subcommands, options, examples, and file paths
+
+#### D-Bus Helper Daemon (Milestone 2)
+- **`btrdasd-helper`** — Privileged D-Bus daemon on system bus (`org.dasbackup.Helper1`) with polkit authorization
+- **D-Bus methods** — BackupRun, BackupSnapshot, BackupSend, BackupBootArchive, IndexWalk, RestoreFiles, RestoreSnapshot, ConfigGet, ConfigSet, ScheduleGet, ScheduleSet, ScheduleEnable, SubvolAdd, SubvolRemove, SubvolSetManual, HealthQuery, JobCancel
+- **D-Bus signals** — JobProgress (stage/percent/message/throughput/ETA), JobLog (level/message), JobFinished (success/summary)
+- **Job management** — Tokio-based async job execution with cancellation tokens and job ID tracking
+- **Polkit policy** (`polkit/org.dasbackup.policy`) — 5 actions: backup, restore, config, index, health
+- **D-Bus activation** (`dbus/org.dasbackup.Helper1.service`) — Automatic daemon startup on first method call
+- **Bus access rules** (`dbus/org.dasbackup.Helper1.conf`) — System bus ownership and method access control
+
+#### FFI Bridge (Milestone 3)
+- **`libbuttered_dasd_ffi.so`** — C-ABI shared library (feature-gated `ffi` flag) for GUI access to Rust library
+- **FFI functions** — Config load/get/validate/free, subvol list, health parse growth log, DB open/history/usage/free, format bytes, string free
+- **C header** (`indexer/include/btrdasd_ffi.h`) — Opaque pointer types and function declarations
+- **JSON interchange** — Complex data returned as JSON strings, parsed by GUI with `QJsonDocument`
+
+#### GUI Infrastructure (Milestone 4)
+- **Navigation sidebar** (`Sidebar`) — QTreeWidget with sections: Browse (Snapshots, Search), Backup (Run Now, History), Config, Health (Drives, Growth, Status)
+- **D-Bus client** (`DBusClient`) — QDBusInterface wrapper with async method calls and signal connections for JobProgress/JobLog/JobFinished
+- **Progress panel** (`ProgressPanel`) — Collapsible QDockWidget with progress bar, throughput, ETA, cancel button, and raw log viewer
+- **Extended database** — `getBackupHistory()` and `getTargetUsageHistory()` methods with `BackupRunInfo` and `TargetUsageInfo` data structs
+
+#### GUI Panels (Milestone 5)
+- **Backup operations panel** (`BackupPanel`) — Mode selection (incremental/full), operation checkboxes (snapshot, send, boot archive, index, email), source/target selection, dry run support
+- **Backup history view** (`BackupHistoryView`) — QTableView with timestamp, mode, duration, status, bytes sent, errors columns; auto-refresh on JobFinished
+- **Health dashboard** (`HealthDashboard`) — Tabbed widget with Drives (QTableView from D-Bus), Growth (QChartView with QLineSeries per target), Status (btrbk/timer/mount status)
+- **Config editor** (`ConfigDialog`) — KPageDialog with TOML editor, reload/diff/save toolbar, change confirmation dialog
+
+#### Advanced GUI Features (Milestone 6)
+- **Dolphin-style file browser** (`SnapshotBrowser`) — Breadcrumb navigation, switchable detail/icon views, QFileSystemModel, multi-select context menu (restore, copy path, properties), inline filter bar
+- **First-run wizard** (`SetupWizard`) — QWizard with 5 pages: Welcome, Source Selection, Target Selection, Schedule, Summary; auto-launches when no config found
+- **Desktop notifications** — KNotification on backup complete/fail with summary details
+- **System tray** — KStatusNotifierItem with tooltip showing last backup status
+- **Rich status bar** — "Next: Sun 04:00 | 3 targets online | DB: 2.1 GB | 42 snapshots" with 60-second auto-refresh
+- **Keyboard shortcuts** — Ctrl+B (backup), Ctrl+R (restore), Ctrl+F (search), F5 (refresh)
 
 ### Changed
-- **Crate architecture** — Split from CLI-only binary into library (`buttered_dasd`) + binary (`btrdasd`) with `[lib]` and `[[bin]]` sections in Cargo.toml
+- **Crate architecture** — Split from CLI-only binary into library (`buttered_dasd`) + binary (`btrdasd`) + D-Bus helper (`btrdasd-helper`) + FFI cdylib with `[lib]`, `[[bin]]`, and feature flags in Cargo.toml
 - **Regex performance** — `LazyLock<Regex>` for compile-once snapshot dirname parsing (replaces per-call `Regex::new()`)
 - **Release profile** — Added `[profile.release]` with `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
+- **GUI architecture** — Refactored from flat splitter layout to sidebar + QStackedWidget central area (19 C++ components, up from 12)
+- **CMake build system** — Added `BUILD_HELPER` and `BUILD_FFI` options alongside existing `BUILD_GUI` and `BUILD_INDEXER`
+- **GUI dependencies** — Added Qt6::DBus, Qt6::Charts, KF6::Notifications, KF6::StatusNotifierItem
+- **XML GUI** — Version 4 → 5 with Backup and Tools menus, find_files action
 
 ### Fixed
 
@@ -27,13 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Full management interface design** — Architecture for transforming GUI from read-only browser into full backup management system with CLI parity
 - **Design document** (`docs/plans/2026-02-24-full-management-interface-design.md`) — Complete architecture spec for v0.6.0
 - **Implementation plan** (`docs/plans/2026-02-24-full-management-implementation-plan.md`) — 41-task phased plan across 5 phases
-
-### Planned for v0.6.0
-- **D-Bus privileged helper** (`btrdasd-helper`) — polkit-authorized daemon for privileged operations (backup, restore, config write, schedule modify, SMART queries)
-- **GUI expansion** — Navigation sidebar, Dolphin-style snapshot file browser, backup operations panel, comprehensive config editor, first-run wizard, progress panel with structured progress + raw log, health monitoring dashboard, backup history view
-- **Comprehensive documentation** — Full man page, GNU info page, HTML docs, rich `--help` with examples, shell completions (bash/zsh/fish)
-- **Desktop integration** — KNotification, optional system tray, keyboard shortcuts
-- **`--json` flag** — Machine-readable JSON output on all read commands
 
 ## [0.5.0] - 2026-02-22
 
@@ -139,7 +177,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.3.0...v0.4.0

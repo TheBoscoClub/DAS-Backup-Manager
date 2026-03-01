@@ -1,6 +1,6 @@
 [package]
 name = "buttered-dasd"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "ButteredDASD — content indexer for DAS backup snapshots with SQLite FTS5 span-based storage"
 license = "MIT"
@@ -27,6 +27,7 @@ ffi = []
 [dependencies]
 rusqlite = { version = "0.38", features = ["bundled"] }
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4"
 walkdir = "2.5"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

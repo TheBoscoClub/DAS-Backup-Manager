@@ -2,9 +2,9 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.5.1
+**Version**: 0.6.0
 
-DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI, and an interactive installer for the full backup pipeline.
+DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
 ## Scope
 
@@ -28,8 +28,11 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
 - **Email Reports** — Automated backup status reports with throughput metrics and SMART status
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
-- **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 application for searching, browsing, and restoring files from backup snapshots
+- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon for privilege-escalated operations (backup, restore, config, schedule, health)
+- **FFI Bridge** (`libbuttered_dasd_ffi.so`) — C-ABI shared library for GUI access to Rust library functions
+- **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 full backup management application with sidebar navigation, Dolphin-style file browser, backup operations, health dashboard, config editor, first-run wizard, desktop notifications, and system tray
 - **Interactive Installer** (`btrdasd setup`) — 10-step wizard with 5 modes: install, modify, upgrade, uninstall, check
+- **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
 - **Docker Support** — Headless `btrdasd` CLI in a container
 
@@ -43,8 +46,10 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI) — Rust content indexer, library, and setup wizard | Active (v0.5.1) |
-| `gui/` | Qt6/KDE Plasma backup browser and restore application | Active (v0.5.1) |
+| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.6.0) |
+| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components, 4 test suites) | Active (v0.6.0) |
+| `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.6.0) |
+| `polkit/` | Polkit policy for privilege escalation (backup, restore, config, health) | Active (v0.6.0) |
 | `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
 
 ## Project Structure
@@ -53,15 +58,21 @@ That said, suggestions, recommendations, and requests that fall within this narr
 DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf, email config template
-├── indexer/           # ButteredDASD — Rust library (buttered_dasd) + CLI (btrdasd)
+├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper + FFI
 │   ├── src/           # Library modules (11): backup, config, db, health, indexer, progress, report, restore, scanner, schedule, subvol
-│   └── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
-├── gui/               # Qt6/KDE Plasma GUI (12 C++ components)
-│   ├── src/           # MainWindow, Database, models, timeline, restore
+│   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
+│   ├── src/bin/       # btrdasd-helper D-Bus daemon
+│   ├── src/ffi.rs     # C-ABI FFI bridge (extern "C" functions)
+│   ├── include/       # C header (btrdasd_ffi.h)
+│   └── completions/   # Shell completion installation instructions
+├── gui/               # Qt6/KDE Plasma GUI (19 C++ components)
+│   ├── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
 │   └── tests/         # QTest suites (database, snapshotmodel, filemodel, searchmodel)
-├── docs/              # Architecture, installation, dependencies, recovery
+├── dbus/              # D-Bus bus config and service activation
+├── polkit/            # Polkit privilege escalation policy
+├── docs/              # Architecture, installation, dependencies, recovery, man page
 ├── Dockerfile         # Headless CLI container
-└── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER options)
+└── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER, BUILD_FFI)
 ```
 
 ## Minimum Requirements
@@ -71,7 +82,7 @@ DAS-Backup-Manager/
 - One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
 - btrbk 0.32+, smartmontools, zsh 5.9+
 - Rust 1.87+ with Cargo (for building the indexer and installer)
-- **Optional**: Qt6 6.6+, KDE Frameworks 6.0+, CMake 3.25+ (for the GUI)
+- **Optional**: Qt6 6.6+ (with Qt6::DBus, Qt6::Charts), KDE Frameworks 6.0+ (with KNotifications, KStatusNotifierItem), CMake 3.25+ (for the GUI)
 
 ## Installation
 
@@ -100,7 +111,7 @@ docker run --rm btrdasd --version
 ## Design Philosophy
 
 - **Security-first**: Rust for the data pipeline (no buffer overflows, use-after-free, or data races). C++20 RAII with `-Werror` for the GUI. Exclusive prepared statements for all SQL.
-- **Memory safety**: Single `unsafe` call in the entire Rust codebase (`libc::geteuid`). No raw pointers in C++ GUI code.
+- **Memory safety**: Minimal `unsafe` in Rust (libc calls and FFI boundary). No raw pointers in C++ GUI code. Smart pointers exclusively.
 - **Efficiency**: Span-based deduplication compresses file presence across snapshots. Incremental indexing skips already-processed snapshots. Six targeted performance indexes.
 - **Stability**: Indexing errors never abort backups (soft-fail). GUI gracefully handles missing or locked databases.
 - **Privacy**: File metadata only — no file contents are ever read or stored. No telemetry or network connections.
