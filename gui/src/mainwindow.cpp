@@ -20,11 +20,18 @@
 #include <KConfigSkeleton>
 #include <KLocalizedString>
 #include <KMessageBox>
+#include <KNotification>
 #include <KStandardAction>
+#include <KStatusNotifierItem>
 
 #include <QAction>
 #include <QFileDialog>
+#include <QAction>
 #include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -55,11 +62,22 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
         }
     });
 
+    // Backup finished notifications
+    connect(m_dbusClient, &DBusClient::jobFinished,
+            this, &MainWindow::onBackupFinished);
+
     setupUi();
     setupActions();
+    setupTrayIcon();
     setupGUI(Default, QStringLiteral("btrdasd-gui.rc"));
 
     openDatabase(m_dbPath);
+
+    // Status bar auto-refresh every 60 seconds
+    m_statusTimer = new QTimer(this);
+    m_statusTimer->setInterval(60000);
+    connect(m_statusTimer, &QTimer::timeout, this, &MainWindow::updateStatusBar);
+    m_statusTimer->start();
 }
 
 MainWindow::~MainWindow()
@@ -271,6 +289,15 @@ void MainWindow::setupActions()
         m_sidebar->setCurrentSection(SidebarSection::Config);
     });
 
+    auto *searchAction = new QAction(QIcon::fromTheme(QStringLiteral("edit-find")),
+                                      i18n("Find Files"), this);
+    searchAction->setToolTip(i18n("Search for files across all snapshots"));
+    actionCollection()->addAction(QStringLiteral("find_files"), searchAction);
+    actionCollection()->setDefaultShortcut(searchAction, QKeySequence::Find);
+    connect(searchAction, &QAction::triggered, this, [this]() {
+        m_sidebar->setCurrentSection(SidebarSection::BrowseSearch);
+    });
+
     auto *settingsAction = KStandardAction::preferences(this, &MainWindow::showSettings, actionCollection());
     Q_UNUSED(settingsAction);
 }
@@ -402,9 +429,39 @@ void MainWindow::showStats()
 void MainWindow::updateStatusBar()
 {
     const auto s = m_database->stats();
-    m_statusLabel->setText(i18n("%1 snapshots | %2 files | DB: %3",
-        s.snapshotCount, s.fileCount,
-        FileModel::formatSize(s.dbSizeBytes)));
+
+    // Build rich status: schedule + targets + DB size
+    QStringList parts;
+
+    // Next backup schedule (from D-Bus)
+    const QString scheduleJson = m_dbusClient->scheduleGet(
+        QStringLiteral("/etc/btrbk/btrbk.conf"));
+    if (!scheduleJson.isEmpty()) {
+        const QJsonDocument doc = QJsonDocument::fromJson(scheduleJson.toUtf8());
+        const QJsonObject obj = doc.object();
+        const QString next = obj.value(QLatin1String("next_run")).toString();
+        if (!next.isEmpty()) {
+            parts.append(i18n("Next: %1", next));
+        }
+    }
+
+    // Targets online (from health)
+    const QString healthJson = m_dbusClient->healthQuery(QStringLiteral("/etc/btrbk/btrbk.conf"));
+    if (!healthJson.isEmpty()) {
+        const QJsonDocument doc = QJsonDocument::fromJson(healthJson.toUtf8());
+        const QJsonArray drives = doc.object().value(QLatin1String("drives")).toArray();
+        int mounted = 0;
+        for (const QJsonValue &v : drives) {
+            if (v.toObject().value(QLatin1String("mounted")).toBool())
+                ++mounted;
+        }
+        parts.append(i18n("%1 targets online", mounted));
+    }
+
+    parts.append(i18n("DB: %1", FileModel::formatSize(s.dbSizeBytes)));
+    parts.append(i18n("%1 snapshots", s.snapshotCount));
+
+    m_statusLabel->setText(parts.join(QStringLiteral(" | ")));
 }
 
 void MainWindow::restoreSelectedFiles()
@@ -440,6 +497,40 @@ void MainWindow::restoreSelectedFiles()
         ++fileCount;
     }
     statusBar()->showMessage(i18n("Restoring %1 file(s)...", fileCount));
+}
+
+void MainWindow::setupTrayIcon()
+{
+    m_trayIcon = new KStatusNotifierItem(this);
+    m_trayIcon->setIconByName(QStringLiteral("btrdasd-gui"));
+    m_trayIcon->setToolTipTitle(i18n("DAS Backup Manager"));
+    m_trayIcon->setToolTipSubTitle(i18n("Backup management and monitoring"));
+    m_trayIcon->setCategory(KStatusNotifierItem::SystemServices);
+    m_trayIcon->setStandardActionsEnabled(true);
+}
+
+void MainWindow::onBackupFinished(const QString &jobId, bool success, const QString &summary)
+{
+    Q_UNUSED(jobId);
+
+    auto *notification = new KNotification(
+        success ? QStringLiteral("backupComplete") : QStringLiteral("backupFailed"),
+        KNotification::CloseOnTimeout, this);
+    notification->setTitle(success ? i18n("Backup Complete") : i18n("Backup Failed"));
+    notification->setText(summary);
+    notification->setIconName(success
+        ? QStringLiteral("dialog-positive")
+        : QStringLiteral("dialog-error"));
+    notification->sendEvent();
+
+    // Update tray tooltip with result
+    if (m_trayIcon) {
+        m_trayIcon->setToolTipSubTitle(
+            success ? i18n("Last backup: success") : i18n("Last backup: FAILED"));
+    }
+
+    // Refresh status bar to pick up new schedule info
+    updateStatusBar();
 }
 
 void MainWindow::showSettings()

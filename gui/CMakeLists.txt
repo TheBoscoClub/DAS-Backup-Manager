@@ -26,6 +26,8 @@ find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS
     IconThemes
     Crash
     KIO
+    Notifications
+    StatusNotifierItem
 )
 
 add_executable(btrdasd-gui)
@@ -49,6 +51,8 @@ target_sources(btrdasd-gui PRIVATE
     src/backuppanel.cpp
     src/healthdashboard.cpp
     src/configdialog.cpp
+    src/snapshotbrowser.cpp
+    src/setupwizard.cpp
 )
 
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -65,6 +69,8 @@ target_link_libraries(btrdasd-gui PRIVATE
     KF6::IconThemes
     KF6::Crash
     KF6::KIOWidgets
+    KF6::Notifications
+    KF6::StatusNotifierItem
 )
 
 install(TARGETS btrdasd-gui ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
