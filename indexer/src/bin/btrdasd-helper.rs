@@ -118,7 +118,7 @@ impl ProgressCallback for DbusProgress {
             return;
         }
         let percent = if total > 0 {
-            ((current * 100) / total).min(100) as u8
+            ((current * 100) / total).min(100) as i32
         } else {
             0u8
         };
@@ -273,7 +273,7 @@ impl HelperInterface {
         emitter: &SignalEmitter<'_>,
         job_id: &str,
         stage: &str,
-        percent: u8,
+        percent: i32,
         message: &str,
     ) -> zbus::Result<()>;
 
