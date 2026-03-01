@@ -27,6 +27,9 @@ pub struct TargetHealth {
     pub used_bytes: u64,
     pub snapshot_count: usize,
     pub smart_status: Option<String>,
+    pub temperature_c: Option<i32>,
+    pub power_on_hours: Option<u64>,
+    pub errors: Option<u64>,
 }
 
 impl TargetHealth {
@@ -135,6 +138,45 @@ pub fn parse_smartctl_json(json_str: &str) -> Option<String> {
         "PASSED".to_string()
     } else {
         "FAILED".to_string()
+    })
+}
+
+/// Detailed SMART information parsed from `smartctl --json --all` output.
+pub struct SmartDetails {
+    pub status: String,
+    pub temperature_c: Option<i32>,
+    pub power_on_hours: Option<u64>,
+    pub errors: Option<u64>,
+}
+
+/// Parse the JSON output of `smartctl --json --all <device>` and return detailed
+/// SMART information including temperature, power-on hours, and error counts.
+pub fn parse_smartctl_details(json_str: &str) -> Option<SmartDetails> {
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let passed = v.get("smart_status")?.get("passed")?.as_bool()?;
+    let temperature_c = v
+        .get("temperature")
+        .and_then(|t| t.get("current"))
+        .and_then(|c| c.as_i64())
+        .map(|t| t as i32);
+    let power_on_hours = v
+        .get("power_on_time")
+        .and_then(|p| p.get("hours"))
+        .and_then(|h| h.as_u64());
+    let errors = v
+        .get("ata_smart_error_log")
+        .and_then(|e| e.get("summary"))
+        .and_then(|s| s.get("count"))
+        .and_then(|c| c.as_u64());
+    Some(SmartDetails {
+        status: if passed {
+            "PASSED".to_string()
+        } else {
+            "FAILED".to_string()
+        },
+        temperature_c,
+        power_on_hours,
+        errors,
     })
 }
 
@@ -275,7 +317,7 @@ fn latest_snapshot_time(targets: &[TargetHealth], mounts: &[String]) -> Option<S
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
 /// Uses the proleptic Gregorian calendar algorithm from civil.h (Howard Hinnant).
-fn days_to_ymd(z: i64) -> (i32, u32, u32) {
+pub fn days_to_ymd(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -365,8 +407,8 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             0
         };
 
-        // 4. Get SMART status
-        let smart_status = if !target.serial.is_empty() {
+        // 4. Get SMART details
+        let smart_details = if !target.serial.is_empty() {
             device_from_serial(&target.serial)
                 .and_then(|dev| {
                     std::process::Command::new("smartctl")
@@ -375,10 +417,15 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
                         .ok()
                 })
                 .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|json| parse_smartctl_json(&json))
+                .and_then(|json| parse_smartctl_details(&json))
         } else {
             None
         };
+
+        let smart_status = smart_details.as_ref().map(|d| d.status.clone());
+        let temperature_c = smart_details.as_ref().and_then(|d| d.temperature_c);
+        let power_on_hours = smart_details.as_ref().and_then(|d| d.power_on_hours);
+        let errors = smart_details.as_ref().and_then(|d| d.errors);
 
         // 5. Build warnings for this target
         if mounted {
@@ -421,6 +468,9 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             used_bytes,
             snapshot_count,
             smart_status,
+            temperature_c,
+            power_on_hours,
+            errors,
         });
     }
 
@@ -482,6 +532,9 @@ mod tests {
             used_bytes: 250_000,
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
+            temperature_c: Some(32),
+            power_on_hours: Some(12345),
+            errors: None,
         };
         let pct = th.usage_percent();
         assert!((pct - 25.0).abs() < 0.01);
@@ -497,6 +550,9 @@ mod tests {
             used_bytes: 0,
             snapshot_count: 0,
             smart_status: None,
+            temperature_c: None,
+            power_on_hours: None,
+            errors: None,
         };
         assert_eq!(th.usage_percent(), 0.0);
     }
@@ -640,6 +696,9 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 used_bytes: 500_000_000, // 50%
                 snapshot_count: 10,
                 smart_status: Some("PASSED".into()),
+                temperature_c: None,
+                power_on_hours: None,
+                errors: None,
             },
             TargetHealth {
                 label: "t2".into(),
@@ -649,6 +708,9 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 used_bytes: 800_000_000, // 40%
                 snapshot_count: 5,
                 smart_status: Some("PASSED".into()),
+                temperature_c: None,
+                power_on_hours: None,
+                errors: None,
             },
         ];
         let warnings: Vec<String> = vec![];
@@ -665,6 +727,9 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             used_bytes: 900_000_000, // 90% — warning threshold
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
+            temperature_c: None,
+            power_on_hours: None,
+            errors: None,
         }];
         let warnings = vec!["Target 't1' is nearly full: 90.0% used".to_string()];
         assert_eq!(determine_status(&targets, &warnings), HealthStatus::Warning);
@@ -680,6 +745,9 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             used_bytes: 300_000_000, // 30% — usage fine
             snapshot_count: 10,
             smart_status: Some("FAILED".into()), // SMART failure → Critical
+            temperature_c: None,
+            power_on_hours: None,
+            errors: None,
         }];
         let warnings = vec!["Target 't1': SMART status FAILED".to_string()];
         assert_eq!(
@@ -698,6 +766,9 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             used_bytes: 970_000_000, // 97% — critical threshold
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
+            temperature_c: None,
+            power_on_hours: None,
+            errors: None,
         }];
         let warnings = vec!["Target 't1' is critically full: 97.0% used".to_string()];
         assert_eq!(
@@ -729,5 +800,31 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         assert_eq!(y, 2024);
         assert_eq!(m, 2);
         assert_eq!(d, 29);
+    }
+
+    #[test]
+    fn test_parse_smartctl_details() {
+        let json = r#"{"smart_status":{"passed":true},"temperature":{"current":35},"power_on_time":{"hours":54321},"ata_smart_error_log":{"summary":{"count":2}}}"#;
+        let d = parse_smartctl_details(json).unwrap();
+        assert_eq!(d.status, "PASSED");
+        assert_eq!(d.temperature_c, Some(35));
+        assert_eq!(d.power_on_hours, Some(54321));
+        assert_eq!(d.errors, Some(2));
+    }
+
+    #[test]
+    fn test_parse_smartctl_details_failed() {
+        let json = r#"{"smart_status":{"passed":false}}"#;
+        let d = parse_smartctl_details(json).unwrap();
+        assert_eq!(d.status, "FAILED");
+        assert_eq!(d.temperature_c, None);
+        assert_eq!(d.power_on_hours, None);
+        assert_eq!(d.errors, None);
+    }
+
+    #[test]
+    fn test_parse_smartctl_details_invalid() {
+        assert!(parse_smartctl_details("not json").is_none());
+        assert!(parse_smartctl_details("{}").is_none());
     }
 }
