@@ -1,17 +1,38 @@
 #include "filemodel.h"
+#include "dbusclient.h"
 
 #include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
-FileModel::FileModel(Database *database, QObject *parent)
+FileModel::FileModel(DBusClient *client, const QString &dbPath, QObject *parent)
     : QAbstractTableModel(parent)
-    , m_database(database)
+    , m_client(client)
+    , m_dbPath(dbPath)
 {
 }
 
 void FileModel::loadSnapshot(qint64 snapshotId)
 {
     beginResetModel();
-    m_files = m_database->filesInSnapshot(snapshotId);
+    m_files.clear();
+
+    const QString json = m_client->indexListFiles(m_dbPath, snapshotId);
+    if (!json.isEmpty()) {
+        const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+        for (const QJsonValue &v : arr) {
+            const QJsonObject obj = v.toObject();
+            m_files.append({
+                .id = obj.value(QLatin1String("id")).toInteger(),
+                .path = obj.value(QLatin1String("path")).toString(),
+                .name = obj.value(QLatin1String("name")).toString(),
+                .size = obj.value(QLatin1String("size")).toInteger(),
+                .mtime = obj.value(QLatin1String("mtime")).toInteger(),
+                .type = obj.value(QLatin1String("type")).toInt(),
+            });
+        }
+    }
     endResetModel();
 }
 

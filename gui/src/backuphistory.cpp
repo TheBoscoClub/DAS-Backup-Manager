@@ -1,5 +1,4 @@
 #include "backuphistory.h"
-#include "database.h"
 #include "dbusclient.h"
 #include "filemodel.h"
 
@@ -9,6 +8,9 @@
 #include <QDateTime>
 #include <QHeaderView>
 #include <QIcon>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QSortFilterProxyModel>
 #include <QTableView>
@@ -16,7 +18,23 @@
 #include <QVector>
 
 // ---------------------------------------------------------------------------
-// BackupHistoryModel — private table model backed by Database::getBackupHistory
+// BackupRunInfo — local struct for parsed JSON backup history entries
+// ---------------------------------------------------------------------------
+
+struct BackupRunInfo {
+    qint64 id = 0;
+    qint64 timestamp = 0;
+    QString mode;
+    bool success = false;
+    qint64 durationSecs = 0;
+    qint64 snapsCreated = 0;
+    qint64 snapsSent = 0;
+    qint64 bytesSent = 0;
+    QStringList errors;
+};
+
+// ---------------------------------------------------------------------------
+// BackupHistoryModel — private table model backed by D-Bus indexBackupHistory
 // ---------------------------------------------------------------------------
 
 class BackupHistoryModel : public QAbstractTableModel
@@ -35,16 +53,41 @@ public:
         ColumnCount
     };
 
-    explicit BackupHistoryModel(Database *database, QObject *parent = nullptr)
+    explicit BackupHistoryModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr)
         : QAbstractTableModel(parent)
-        , m_database(database)
+        , m_client(client)
+        , m_dbPath(dbPath)
     {
     }
 
     void reload()
     {
         beginResetModel();
-        m_runs = m_database->getBackupHistory(50);
+        m_runs.clear();
+
+        const QString json = m_client->indexBackupHistory(m_dbPath, 50);
+        if (!json.isEmpty()) {
+            const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+            for (const QJsonValue &v : arr) {
+                const QJsonObject obj = v.toObject();
+                QStringList errors;
+                const QJsonArray errArr = obj.value(QLatin1String("errors")).toArray();
+                for (const QJsonValue &e : errArr) {
+                    errors.append(e.toString());
+                }
+                m_runs.append({
+                    .id = obj.value(QLatin1String("id")).toInteger(),
+                    .timestamp = obj.value(QLatin1String("timestamp")).toInteger(),
+                    .mode = obj.value(QLatin1String("mode")).toString(),
+                    .success = obj.value(QLatin1String("success")).toBool(),
+                    .durationSecs = obj.value(QLatin1String("duration_secs")).toInteger(),
+                    .snapsCreated = obj.value(QLatin1String("snaps_created")).toInteger(),
+                    .snapsSent = obj.value(QLatin1String("snaps_sent")).toInteger(),
+                    .bytesSent = obj.value(QLatin1String("bytes_sent")).toInteger(),
+                    .errors = errors,
+                });
+            }
+        }
         endResetModel();
     }
 
@@ -148,7 +191,8 @@ private:
         return QStringLiteral("%1s").arg(seconds);
     }
 
-    Database *m_database;
+    DBusClient *m_client;
+    QString m_dbPath;
     QVector<BackupRunInfo> m_runs;
 };
 
@@ -160,10 +204,10 @@ private:
 // BackupHistoryView
 // ---------------------------------------------------------------------------
 
-BackupHistoryView::BackupHistoryView(Database *db, DBusClient *client, QWidget *parent)
+BackupHistoryView::BackupHistoryView(DBusClient *client, const QString &dbPath, QWidget *parent)
     : QWidget(parent)
-    , m_database(db)
     , m_client(client)
+    , m_dbPath(dbPath)
 {
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
@@ -176,7 +220,7 @@ BackupHistoryView::BackupHistoryView(Database *db, DBusClient *client, QWidget *
     title->setFont(titleFont);
     layout->addWidget(title);
 
-    m_model = new BackupHistoryModel(m_database, this);
+    m_model = new BackupHistoryModel(m_client, m_dbPath, this);
     m_model->reload();
 
     m_proxy = new QSortFilterProxyModel(this);

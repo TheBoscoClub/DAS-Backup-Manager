@@ -5,13 +5,12 @@ class QTabWidget;
 class QTableView;
 class QLabel;
 class DBusClient;
-class Database;
 
 class HealthDashboard : public QWidget
 {
     Q_OBJECT
 public:
-    explicit HealthDashboard(Database *db, DBusClient *client, QWidget *parent = nullptr);
+    explicit HealthDashboard(DBusClient *client, QWidget *parent = nullptr);
 
     void setActiveTab(int index);
 
@@ -26,7 +25,6 @@ private:
     void updateGrowth(const QString &json);
     void updateStatus(const QString &json);
 
-    Database *m_database;
     DBusClient *m_client;
     QString m_configPath;
     QTabWidget *m_tabs = nullptr;

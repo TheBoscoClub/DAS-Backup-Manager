@@ -1,5 +1,4 @@
 #include "healthdashboard.h"
-#include "database.h"
 #include "dbusclient.h"
 #include "filemodel.h"
 
@@ -55,9 +54,8 @@ namespace GrowthCol {
 // HealthDashboard
 // ---------------------------------------------------------------------------
 
-HealthDashboard::HealthDashboard(Database *db, DBusClient *client, QWidget *parent)
+HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
     : QWidget(parent)
-    , m_database(db)
     , m_client(client)
     , m_configPath(QStringLiteral("/etc/das-backup/config.toml"))
 {

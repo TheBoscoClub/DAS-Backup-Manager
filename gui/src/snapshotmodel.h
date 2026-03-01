@@ -2,7 +2,17 @@
 
 #include <QAbstractItemModel>
 #include <QVector>
-#include "database.h"
+
+class DBusClient;
+
+struct SnapshotInfo {
+    qint64 id = 0;
+    QString name;
+    QString ts;
+    QString source;
+    QString path;
+    qint64 indexedAt = 0;
+};
 
 class SnapshotModel : public QAbstractItemModel
 {
@@ -16,7 +26,7 @@ public:
         IsDateGroupRole,
     };
 
-    explicit SnapshotModel(Database *database, QObject *parent = nullptr);
+    explicit SnapshotModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
 
     void reload();
 
@@ -33,7 +43,8 @@ private:
         QVector<int> snapIndices;
     };
 
-    Database *m_database;
+    DBusClient *m_client;
+    QString m_dbPath;
     QVector<SnapshotInfo> m_snapshots;
     QVector<DateGroup> m_groups;
 

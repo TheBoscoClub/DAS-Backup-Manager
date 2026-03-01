@@ -1,18 +1,39 @@
 #include "searchmodel.h"
+#include "dbusclient.h"
 #include "filemodel.h"
 
 #include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
-SearchModel::SearchModel(Database *database, QObject *parent)
+SearchModel::SearchModel(DBusClient *client, const QString &dbPath, QObject *parent)
     : QAbstractTableModel(parent)
-    , m_database(database)
+    , m_client(client)
+    , m_dbPath(dbPath)
 {
 }
 
 void SearchModel::executeSearch(const QString &query, qint64 limit)
 {
     beginResetModel();
-    m_results = m_database->search(query, limit);
+    m_results.clear();
+
+    const QString json = m_client->indexSearch(m_dbPath, query, limit);
+    if (!json.isEmpty()) {
+        const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+        for (const QJsonValue &v : arr) {
+            const QJsonObject obj = v.toObject();
+            m_results.append({
+                .path = obj.value(QLatin1String("path")).toString(),
+                .name = obj.value(QLatin1String("name")).toString(),
+                .size = obj.value(QLatin1String("size")).toInteger(),
+                .mtime = obj.value(QLatin1String("mtime")).toInteger(),
+                .firstSnap = obj.value(QLatin1String("first_snap")).toString(),
+                .lastSnap = obj.value(QLatin1String("last_snap")).toString(),
+            });
+        }
+    }
     endResetModel();
 }
 

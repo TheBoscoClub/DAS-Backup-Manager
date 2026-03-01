@@ -2,7 +2,17 @@
 
 #include <QAbstractTableModel>
 #include <QVector>
-#include "database.h"
+
+class DBusClient;
+
+struct SearchResult {
+    QString path;
+    QString name;
+    qint64 size = 0;
+    qint64 mtime = 0;
+    QString firstSnap;
+    QString lastSnap;
+};
 
 class SearchModel : public QAbstractTableModel
 {
@@ -11,7 +21,7 @@ class SearchModel : public QAbstractTableModel
 public:
     enum Column { Path = 0, Name, Size, Modified, FirstSnapshot, LastSnapshot, ColumnCount };
 
-    explicit SearchModel(Database *database, QObject *parent = nullptr);
+    explicit SearchModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
 
     void executeSearch(const QString &query, qint64 limit);
     void clear();
@@ -23,6 +33,7 @@ public:
                                        int role = Qt::DisplayRole) const override;
 
 private:
-    Database *m_database;
+    DBusClient *m_client;
+    QString m_dbPath;
     QVector<SearchResult> m_results;
 };
