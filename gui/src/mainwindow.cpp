@@ -435,7 +435,7 @@ void MainWindow::updateStatusBar()
 
     // Next backup schedule (from D-Bus)
     const QString scheduleJson = m_dbusClient->scheduleGet(
-        QStringLiteral("/etc/btrbk/btrbk.conf"));
+        QStringLiteral("/etc/das-backup/config.toml"));
     if (!scheduleJson.isEmpty()) {
         const QJsonDocument doc = QJsonDocument::fromJson(scheduleJson.toUtf8());
         const QJsonObject obj = doc.object();
@@ -446,7 +446,7 @@ void MainWindow::updateStatusBar()
     }
 
     // Targets online (from health)
-    const QString healthJson = m_dbusClient->healthQuery(QStringLiteral("/etc/btrbk/btrbk.conf"));
+    const QString healthJson = m_dbusClient->healthQuery(QStringLiteral("/etc/das-backup/config.toml"));
     if (!healthJson.isEmpty()) {
         const QJsonDocument doc = QJsonDocument::fromJson(healthJson.toUtf8());
         const QJsonArray drives = doc.object().value(QLatin1String("drives")).toArray();

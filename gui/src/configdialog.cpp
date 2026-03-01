@@ -23,7 +23,7 @@
 ConfigDialog::ConfigDialog(DBusClient *client, QWidget *parent)
     : KPageDialog(parent)
     , m_client(client)
-    , m_configPath(QStringLiteral("/etc/btrbk/btrbk.conf"))
+    , m_configPath(QStringLiteral("/etc/das-backup/config.toml"))
 {
     setWindowTitle(i18n("Configuration Editor"));
     resize(800, 600);
@@ -89,7 +89,7 @@ ConfigDialog::ConfigDialog(DBusClient *client, QWidget *parent)
     // -----------------------------------------------------------------------
     // Register the page with KPageDialog
     // -----------------------------------------------------------------------
-    addPage(page, i18n("btrbk Configuration"));
+    addPage(page, i18n("DAS Backup Configuration"));
 
     // -----------------------------------------------------------------------
     // Signal connections
