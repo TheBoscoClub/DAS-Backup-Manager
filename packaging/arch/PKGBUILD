@@ -1,6 +1,6 @@
 # Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
 pkgname=das-backup-manager
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI'
 arch=('x86_64')
@@ -24,7 +24,7 @@ build() {
     export LDFLAGS="${LDFLAGS//-flto=auto/}"
 
     # Build Rust indexer binary
-    cargo build --release --manifest-path indexer/Cargo.toml
+    cargo build --release --features dbus --manifest-path indexer/Cargo.toml
 
     # Build scripts, systemd units, and GUI via CMake
     cmake -B build -DCMAKE_INSTALL_PREFIX=/usr \
@@ -39,8 +39,15 @@ package() {
     # Install CMake targets (scripts, systemd, GUI, icon, desktop entry)
     DESTDIR="$pkgdir" cmake --install build
 
-    # Install Rust binary
+    # Install Rust binaries
     install -Dm755 "indexer/target/release/btrdasd" "$pkgdir/usr/bin/btrdasd"
+    install -Dm755 "indexer/target/release/btrdasd-helper" "$pkgdir/usr/libexec/btrdasd-helper"
+
+    # D-Bus and polkit integration
+    install -Dm644 "dbus/org.dasbackup.Helper1.conf" "$pkgdir/usr/share/dbus-1/system.d/org.dasbackup.Helper1.conf"
+    install -Dm644 "dbus/org.dasbackup.Helper1.service" "$pkgdir/usr/share/dbus-1/system-services/org.dasbackup.Helper1.service"
+    install -Dm644 "polkit/org.dasbackup.policy" "$pkgdir/usr/share/polkit-1/actions/org.dasbackup.policy"
+    install -Dm644 "systemd/btrdasd-helper.service" "$pkgdir/usr/lib/systemd/system/btrdasd-helper.service"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

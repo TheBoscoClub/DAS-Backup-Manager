@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.5.1
+**Version**: 0.6.0
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -17,44 +17,7 @@ The following are permanently out of scope and will never be added:
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (Current: v0.5.1)
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        DAS-Backup-Manager                           │
-│                                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  ┌───────────┐ │
-│  │   Scripts    │  │   Indexer    │  │    GUI     │  │ Installer │ │
-│  │   (zsh)     │  │   (Rust)    │  │ (C++/Qt6)  │  │  (Rust)   │ │
-│  ├─────────────┤  ├──────────────┤  ├────────────┤  ├───────────┤ │
-│  │backup-run   │  │ btrdasd CLI  │  │btrdasd-gui │  │btrdasd    │ │
-│  │backup-verify│  │  walk        │  │ MainWindow │  │ setup     │ │
-│  │boot-archive │  │  search      │  │ Timeline   │  │ --modify  │ │
-│  │das-partition│  │  list        │  │ Search     │  │ --upgrade │ │
-│  │             │  │  info        │  │ Restore    │  │ --uninstall│
-│  │             │  │  setup       │  │ Settings   │  │ --check   │ │
-│  └──────┬──────┘  └──────┬───────┘  └─────┬──────┘  └─────┬─────┘ │
-│         │                │                 │               │       │
-│         ▼                ▼                 ▼               ▼       │
-│  ┌──────────┐   ┌────────────────┐  ┌──────────┐  ┌────────────┐  │
-│  │  btrbk   │   │   SQLite DB    │  │ SQLite DB│  │   TOML     │  │
-│  │          │   │ (read/write)   │  │(read-only)│ │  config    │  │
-│  └──────────┘   └────────────────┘  └──────────┘  └────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-The system has four major components:
-
-| Component | Language | Binary | Purpose |
-|-----------|----------|--------|---------|
-| Backup scripts | zsh | N/A | btrbk orchestration, verification, boot archival |
-| Content indexer | Rust 2024 | `btrdasd` | SQLite FTS5 database of all files across snapshots |
-| KDE Plasma GUI | C++20 | `btrdasd-gui` | Visual browsing, searching, and restoring files |
-| Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven setup with template generation |
-
-## Planned Architecture (v0.6.0)
-
-See `docs/plans/2026-02-24-full-management-interface-design.md` for the complete v0.6.0 design.
+## Component Overview (v0.6.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -80,11 +43,17 @@ See `docs/plans/2026-02-24-full-management-interface-design.md` for the complete
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Key changes in v0.6.0:
-- **Rust library** (`libbuttered_dasd`) as single source of truth for all business logic
-- **C-ABI FFI layer** for direct GUI consumption (no subprocess spawning for most operations)
-- **D-Bus helper** (`btrdasd-helper`) with polkit authorization for privileged operations
-- **GUI becomes full management interface** — backup execution, config editing, schedule control, health monitoring, Dolphin-style file browser
+The system has six major components:
+
+| Component | Language | Binary | Purpose |
+|-----------|----------|--------|---------|
+| Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 11 modules: single source of truth for all business logic |
+| Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
+| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon for privileged operations |
+| FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |
+| KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
+| Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 10-step setup wizard with template generation |
 
 ## Data Flow
 
@@ -276,9 +245,13 @@ The root `CMakeLists.txt` orchestrates both C++ and Rust builds:
 ```cmake
 option(BUILD_GUI     "Build KDE Plasma GUI (requires Qt6/KF6)" ON)
 option(BUILD_INDEXER "Build btrdasd Rust binary via cargo"      ON)
+option(BUILD_HELPER  "Build btrdasd-helper D-Bus daemon"        ON)
+option(BUILD_FFI     "Build libbuttered_dasd_ffi shared library" OFF)
 ```
 
-- `BUILD_INDEXER=ON`: Uses `ExternalProject_Add` to invoke `cargo build --release`
+- `BUILD_INDEXER=ON`: Uses `ExternalProject_Add` to invoke `cargo build --release` for all Rust targets
+- `BUILD_HELPER=ON`: Builds `btrdasd-helper` D-Bus daemon and installs polkit/D-Bus configuration
+- `BUILD_FFI=ON`: Builds `libbuttered_dasd_ffi.so` C-ABI shared library (used by GUI)
 - `BUILD_GUI=ON`: Uses `add_subdirectory(gui)` with standard KDE/Qt6 CMake modules
 - `BUILD_GUI=OFF`: Skips Qt6/KF6 dependency entirely (headless CLI-only build)
 
@@ -301,7 +274,7 @@ The `Dockerfile` provides a headless CLI build:
 - RAII database connections with UUID-based connection names
 - Compiled with `-Wall -Wextra -Wpedantic -Werror` — zero warnings policy
 
-**zsh scripts**: All scripts use `set -euo pipefail` equivalent (`setopt ERR_EXIT NO_UNSET PIPE_FAIL`) for fail-fast behavior.
+**Bash scripts**: All scripts use `set -euo pipefail` for fail-fast behavior.
 
 ### SQL Injection Prevention
 
@@ -405,14 +378,25 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 ### KDE Plasma GUI (`gui/src/`)
 
+19 C++ components implementing full backup management:
+
 | Component | Files | Purpose |
 |-----------|-------|---------|
-| MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with splitters, toolbar, status bar |
-| Database | `database.h/cpp` | Read-only QSqlDatabase wrapper with UUID connections |
+| MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with sidebar + QStackedWidget, rich status bar, keyboard shortcuts |
+| Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health sections) |
+| DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
+| ProgressPanel | `progresspanel.h/cpp` | Collapsible QDockWidget with progress bar, throughput, ETA, cancel, raw log |
+| Database | `database.h/cpp` | Read-only QSqlDatabase wrapper with UUID connections, backup history/usage queries |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
 | FileModel | `filemodel.h/cpp` | QAbstractTableModel for file listings |
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |
-| SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual navigation |
+| SnapshotBrowser | `snapshotbrowser.h/cpp` | Dolphin-style file browser; breadcrumb nav, detail/icon views, context menu, filter bar |
+| BackupPanel | `backuppanel.h/cpp` | Mode selection, operation checkboxes, source/target selection, dry-run support |
+| BackupHistoryView | `backuphistoryview.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
+| HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
+| ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
+| SetupWizard | `setupwizard.h/cpp` | QWizard first-run wizard: Welcome, Sources, Targets, Schedule, Summary |
+| SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
 | IndexRunner | `indexrunner.h/cpp` | QProcess wrapper for btrdasd walk |
 | SnapshotWatcher | `snapshotwatcher.h/cpp` | QFileSystemWatcher with 30s debounce |
 | RestoreAction | `restoreaction.h/cpp` | KIO::copy with file dialog destination |

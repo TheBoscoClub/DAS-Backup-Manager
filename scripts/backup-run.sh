@@ -887,6 +887,7 @@ send_report() {
         return 1
     fi
 
+    # shellcheck source=/dev/null
     source "$EMAIL_CONF"
 
     if [[ -z "${REPORT_TO:-}" ]]; then
@@ -901,7 +902,8 @@ send_report() {
     fi
 
     # Build subject line
-    local subject="[DAS Backup] $(hostname) — $overall_status — $(date '+%Y-%m-%d %H:%M')"
+    local subject
+    subject="[DAS Backup] $(hostname) — $overall_status — $(date '+%Y-%m-%d %H:%M')"
 
     # Send via s-nail (mailx) with Proton Bridge SMTP
     # stderr suppressed to hide s-nail v14 deprecation warnings

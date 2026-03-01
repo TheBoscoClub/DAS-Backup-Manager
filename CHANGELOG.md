@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release profile** — Added `[profile.release]` with `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - **GUI architecture** — Refactored from flat splitter layout to sidebar + QStackedWidget central area (19 C++ components, up from 12)
 - **CMake build system** — Added `BUILD_HELPER` and `BUILD_FFI` options alongside existing `BUILD_GUI` and `BUILD_INDEXER`
-- **GUI dependencies** — Added Qt6::DBus, Qt6::Charts, KF6::Notifications, KF6::StatusNotifierItem
+- **GUI dependencies** — Added Qt6::DBus, KF6::Notifications, KF6::StatusNotifierItem
 - **XML GUI** — Version 4 → 5 with Backup and Tools menus, find_files action
 
 ### Fixed

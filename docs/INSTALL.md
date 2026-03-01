@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.5.1
+**Version**: 0.6.0
 
 ## Before You Begin
 
@@ -9,7 +9,7 @@
 - Linux with BTRFS support (kernel 5.15+)
 - DAS enclosure (any manufacturer, any interface -- USB, Thunderbolt, eSATA) in JBOD mode
 - One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
-- btrbk 0.32+, smartmontools, zsh 5.9+
+- btrbk 0.32+, smartmontools
 - Rust 1.87+ with Cargo (for building btrdasd)
 
 ### Planning Your Backup
@@ -34,7 +34,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | btrbk | 0.32+ | BTRFS snapshot creation and send/receive |
 | btrfs-progs | system | BTRFS subvolume operations |
 | smartmontools | system | Drive health and serial number detection |
-| zsh | 5.9+ | Runtime shell for backup scripts |
+| bash | 4.0+ | Runtime shell for backup scripts |
 
 ### Optional (for GUI)
 
@@ -179,6 +179,8 @@ The GUI binary installs to `${CMAKE_INSTALL_PREFIX}/bin/btrdasd-gui` with a desk
 |--------|---------|-------------|
 | `BUILD_GUI` | `ON` | Build the KDE Plasma GUI (requires Qt6/KF6) |
 | `BUILD_INDEXER` | `ON` | Build the `btrdasd` Rust binary via cargo |
+| `BUILD_HELPER` | `ON` | Build the `btrdasd-helper` D-Bus daemon and install polkit/D-Bus config |
+| `BUILD_FFI` | `OFF` | Build `libbuttered_dasd_ffi.so` C-ABI shared library (for GUI) |
 | `CMAKE_INSTALL_PREFIX` | `/usr/local` | Installation prefix for binaries and scripts |
 | `CMAKE_BUILD_TYPE` | (unset) | `Release`, `RelWithDebInfo`, or `Debug` |
 
@@ -235,7 +237,7 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `version` | string | `"0.5.1"` | Config format version |
+| `version` | string | `"0.6.0"` | Config format version |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 

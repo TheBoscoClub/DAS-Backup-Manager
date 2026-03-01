@@ -201,7 +201,7 @@ All commands use `--db /var/lib/das-backup/backup-index.db` by default. Override
 
 The backup script calls `btrdasd` after btrbk creates snapshots:
 
-```zsh
+```bash
 run_indexer() {
     local indexer="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
     # ... soft-fail if binary missing or indexer errors

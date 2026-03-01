@@ -1,3 +1,15 @@
+das-backup-manager (0.6.0-1) unstable; urgency=medium
+
+  * Full management GUI with D-Bus privilege escalation
+  * D-Bus helper daemon (btrdasd-helper) with polkit authorization
+  * FFI shared library for GUI access to Rust library
+  * Sidebar navigation, backup operations panel, health dashboard
+  * Dolphin-style file browser, first-run wizard, desktop notifications
+  * Shell completions for bash, zsh, fish, elvish, PowerShell
+  * Man page (btrdasd.1)
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Fri, 28 Feb 2026 00:00:00 +0000
+
 das-backup-manager (0.5.0-1) unstable; urgency=medium
 
   * Initial packaged release

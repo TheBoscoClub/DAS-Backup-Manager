@@ -80,9 +80,9 @@ DAS-Backup-Manager/
 - Linux with BTRFS support (kernel 5.15+)
 - DAS enclosure (any manufacturer, any interface -- USB, Thunderbolt, eSATA)
 - One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
-- btrbk 0.32+, smartmontools, zsh 5.9+
+- btrbk 0.32+, smartmontools
 - Rust 1.87+ with Cargo (for building the indexer and installer)
-- **Optional**: Qt6 6.6+ (with Qt6::DBus, Qt6::Charts), KDE Frameworks 6.0+ (with KNotifications, KStatusNotifierItem), CMake 3.25+ (for the GUI)
+- **Optional**: Qt6 6.6+ (with Qt6::DBus), KDE Frameworks 6.0+ (with KNotifications, KStatusNotifierItem), CMake 3.25+ (for the GUI)
 
 ## Installation
 

@@ -1,11 +1,11 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.5.1
+**Version**: 0.6.0
 
 ## 1. Rust Crate Dependencies
 
 These are the direct dependencies declared in `indexer/Cargo.toml` for the
-`buttered-dasd` crate (binary: `btrdasd`).
+`buttered_dasd` library, `btrdasd` CLI, `btrdasd-helper` daemon, and `libbuttered_dasd_ffi` shared library.
 
 ### Runtime Dependencies
 
@@ -20,7 +20,10 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 | `dialoguer` | 0.11.0 | Interactive terminal prompts with `fuzzy-select` feature for setup wizard | MIT |
 | `console` | 0.15.11 | Terminal styling and interaction (used by dialoguer) | MIT |
 | `libc` | 0.2.182 | Low-level C bindings for `geteuid()` root detection in setup module | MIT / Apache-2.0 |
-| `serde_json` | 1.0.149 | JSON parsing for `lsblk --json` output in system detection | MIT / Apache-2.0 |
+| `serde_json` | 1.0.149 | JSON parsing for `lsblk --json` output in system detection and FFI interchange | MIT / Apache-2.0 |
+| `clap_complete` | 4.5.x | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
+| `tokio` | 1.x | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation | MIT |
+| `zbus` | 5.x | D-Bus implementation for `btrdasd-helper` system bus daemon | MIT |
 
 ### Dev Dependencies (test only)
 
@@ -59,7 +62,7 @@ are automatically installed; they must be present before running the scripts.
 | `df` | system (coreutils) | `backup-run.sh` | Disk space reporting and throughput calculation |
 | `date` | system (coreutils) | All scripts | Timestamp generation and ISO 8601 epoch arithmetic |
 | `awk` | system (gawk) | All scripts | Parsing smartctl and df output |
-| `zsh` | >= 5.9 | All scripts | Runtime shell; scripts use `#!/usr/bin/env zsh` and zsh-specific features (`zsh/datetime`, `declare -A`, `(N)` glob qualifier) |
+| `bash` | >= 4.0 | All scripts | Runtime shell; scripts use `#!/bin/bash` with `set -euo pipefail` |
 | `parted` / `mkfs.btrfs` / `mkfs.fat` | system | `das-partition-drives.sh` | Initial drive partitioning and formatting (one-time setup only) |
 | `lsblk` | system (util-linux) | `btrdasd setup` | Block device detection via JSON output |
 
@@ -128,9 +131,11 @@ needed when building with `BUILD_GUI=ON` (the default).
 | IconThemes | KDE icon theme integration |
 | Crash | KCrash for crash reporting |
 | KIO | KIO::copy for file restore operations |
+| Notifications | KNotification for backup complete/fail desktop notifications |
+| StatusNotifierItem | KStatusNotifierItem for system tray integration |
 
-The GUI links against `Qt6::Sql` to read the same SQLite database written
-by `btrdasd`. The GUI opens the database read-only.
+The GUI links against `Qt6::Sql` for database access and `Qt6::DBus` for communication with
+`btrdasd-helper`. The GUI opens the database read-only; all write operations go through D-Bus.
 
 ---
 

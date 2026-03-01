@@ -19,7 +19,7 @@ set -euo pipefail
 # ============================================================================
 
 # Load configuration from config.toml via btrdasd
-BTRDASD_BIN="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
 DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
 if [[ -x "$BTRDASD_BIN" ]]; then
     eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
@@ -30,12 +30,10 @@ fi
 
 # Build drive map from config targets (serial -> display name)
 declare -A DRIVE_MAP=()
-declare -A TARGET_ROLES=()
 for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     serial_var="DAS_TARGET_${i}_SERIAL"
     name_var="DAS_TARGET_${i}_DISPLAY_NAME"
     label_var="DAS_TARGET_${i}_LABEL"
-    role_var="DAS_TARGET_${i}_ROLE"
     mount_var="DAS_TARGET_${i}_MOUNT"
     serial="${!serial_var}"
     if [[ -n "${!name_var:-}" ]]; then
@@ -43,7 +41,6 @@ for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     else
         DRIVE_MAP[$serial]="${!label_var}"
     fi
-    TARGET_ROLES[$serial]="${!role_var}"
 done
 
 # Expected DAS drives (detected by USB transport)

@@ -225,6 +225,9 @@ out/
 # WORKTREES
 .worktrees/
 
+# TEST SANDBOX
+sandbox-*/
+
 # RELEASE ARTIFACTS
 releases/*.tar.gz
 releases/*.tar.gz.sha256
