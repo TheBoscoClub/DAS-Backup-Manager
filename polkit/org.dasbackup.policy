@@ -55,4 +55,13 @@
       <allow_active>yes</allow_active>
     </defaults>
   </action>
+  <action id="org.dasbackup.index.read">
+    <description>Read backup index data</description>
+    <message>Authentication is required to read backup index data</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
 </policyconfig>
