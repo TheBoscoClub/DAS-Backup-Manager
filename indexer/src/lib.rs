@@ -1,6 +1,8 @@
 pub mod backup;
 pub mod config;
 pub mod db;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 pub mod health;
 pub mod indexer;
 pub mod progress;

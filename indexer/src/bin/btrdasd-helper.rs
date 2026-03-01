@@ -1,0 +1,961 @@
+//! D-Bus helper daemon for the DAS Backup Manager.
+//!
+//! Provides a system D-Bus service at `org.dasbackup.Helper1` that the KDE
+//! Plasma GUI (and other unprivileged clients) can call to perform privileged
+//! backup operations.  Polkit authorization is checked before each method
+//! invocation.
+//!
+//! Build: `cargo build --release --features dbus`
+//! Run:   activated on-demand by D-Bus (see `org.dasbackup.Helper1.service`)
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+
+use zbus::connection::Builder;
+use zbus::fdo;
+use zbus::object_server::SignalEmitter;
+use zbus::{Connection, interface};
+
+use buttered_dasd::backup::{self, BackupMode, BackupOptions};
+use buttered_dasd::config::Config;
+use buttered_dasd::db::Database;
+use buttered_dasd::health;
+use buttered_dasd::indexer;
+use buttered_dasd::progress::{LogLevel, ProgressCallback};
+use buttered_dasd::restore;
+use buttered_dasd::schedule;
+use buttered_dasd::subvol;
+
+// ---------------------------------------------------------------------------
+// Cancellation token (simple AtomicBool-based, avoids tokio-util dependency)
+// ---------------------------------------------------------------------------
+
+/// A simple cancellation flag shared between the job spawner and the worker.
+#[derive(Clone)]
+struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job tracking
+// ---------------------------------------------------------------------------
+
+type JobMap = Arc<Mutex<HashMap<String, (JoinHandle<()>, CancelFlag)>>>;
+
+/// Generate a unique job ID.
+fn new_job_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos();
+    format!("job-{ts}")
+}
+
+// ---------------------------------------------------------------------------
+// D-Bus progress bridge
+// ---------------------------------------------------------------------------
+
+/// A `ProgressCallback` implementation that emits D-Bus signals for each
+/// progress event.  Holds a connection and job_id so it can send signals
+/// without access to the interface object.
+struct DbusProgress {
+    conn: Connection,
+    job_id: String,
+    cancel: CancelFlag,
+}
+
+impl DbusProgress {
+    fn new(conn: Connection, job_id: String, cancel: CancelFlag) -> Self {
+        Self {
+            conn,
+            job_id,
+            cancel,
+        }
+    }
+}
+
+impl ProgressCallback for DbusProgress {
+    fn on_stage(&self, stage: &str, _total_steps: u64) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let conn = self.conn.clone();
+        let job_id = self.job_id.clone();
+        let stage = stage.to_owned();
+        tokio::spawn(async move {
+            let iface_ref = conn
+                .object_server()
+                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+                .await;
+            if let Ok(iface) = iface_ref {
+                let ctxt = iface.signal_emitter();
+                let _ = HelperInterface::job_progress(ctxt, &job_id, &stage, 0, "").await;
+            }
+        });
+    }
+
+    fn on_progress(&self, current: u64, total: u64, message: &str) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let percent = if total > 0 {
+            ((current * 100) / total).min(100) as u8
+        } else {
+            0u8
+        };
+        let conn = self.conn.clone();
+        let job_id = self.job_id.clone();
+        let msg = message.to_owned();
+        tokio::spawn(async move {
+            let iface_ref = conn
+                .object_server()
+                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+                .await;
+            if let Ok(iface) = iface_ref {
+                let ctxt = iface.signal_emitter();
+                let _ =
+                    HelperInterface::job_progress(ctxt, &job_id, "progress", percent, &msg).await;
+            }
+        });
+    }
+
+    fn on_throughput(&self, _bytes_per_sec: u64) {
+        // Throughput is informational; folded into progress messages if needed.
+    }
+
+    fn on_log(&self, level: LogLevel, message: &str) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let level_str = match level {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warning => "warn",
+            LogLevel::Error => "error",
+        };
+        let conn = self.conn.clone();
+        let job_id = self.job_id.clone();
+        let lvl = level_str.to_owned();
+        let msg = message.to_owned();
+        tokio::spawn(async move {
+            let iface_ref = conn
+                .object_server()
+                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+                .await;
+            if let Ok(iface) = iface_ref {
+                let ctxt = iface.signal_emitter();
+                let _ = HelperInterface::job_log(ctxt, &job_id, &lvl, &msg).await;
+            }
+        });
+    }
+
+    fn on_complete(&self, success: bool, summary: &str) {
+        let conn = self.conn.clone();
+        let job_id = self.job_id.clone();
+        let summ = summary.to_owned();
+        tokio::spawn(async move {
+            let iface_ref = conn
+                .object_server()
+                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+                .await;
+            if let Ok(iface) = iface_ref {
+                let ctxt = iface.signal_emitter();
+                let _ = HelperInterface::job_finished(ctxt, &job_id, success, &summ).await;
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Polkit authorization
+// ---------------------------------------------------------------------------
+
+/// Check Polkit authorization for the caller of a D-Bus method.
+///
+/// Calls `org.freedesktop.PolicyKit1.Authority.CheckAuthorization` with the
+/// caller's bus name as the subject.  Returns `Ok(())` if authorized, or an
+/// `fdo::Error::AccessDenied` otherwise.
+async fn check_polkit(conn: &Connection, sender: &str, action_id: &str) -> Result<(), fdo::Error> {
+    // Subject: ("system-bus-name", { "name" => sender })
+    let subject_kind = "system-bus-name";
+    let subject_details: HashMap<&str, zbus::zvariant::Value<'_>> =
+        HashMap::from([("name", zbus::zvariant::Value::from(sender))]);
+
+    // Empty details dict for the action.
+    let details: HashMap<&str, &str> = HashMap::new();
+
+    // flags = 1 -> AllowUserInteraction (show polkit dialog if needed)
+    let flags: u32 = 1;
+    // cancellation_id: empty string (no cancellation support)
+    let cancel_id = "";
+
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.PolicyKit1"),
+            "/org/freedesktop/PolicyKit1/Authority",
+            Some("org.freedesktop.PolicyKit1.Authority"),
+            "CheckAuthorization",
+            &(
+                (subject_kind, subject_details),
+                action_id,
+                details,
+                flags,
+                cancel_id,
+            ),
+        )
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Polkit CheckAuthorization call failed: {e}")))?;
+
+    // The reply body is (is_authorized: bool, is_challenge: bool, details: dict).
+    let body = reply.body();
+    let (is_authorized, _is_challenge, _details): (bool, bool, HashMap<String, String>) = body
+        .deserialize()
+        .map_err(|e| fdo::Error::Failed(format!("Cannot parse polkit reply: {e}")))?;
+
+    if is_authorized {
+        Ok(())
+    } else {
+        Err(fdo::Error::AccessDenied(format!(
+            "Polkit denied action '{action_id}' for caller '{sender}'"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: load/save config with error mapping
+// ---------------------------------------------------------------------------
+
+fn load_config(config_path: &str) -> Result<Config, fdo::Error> {
+    Config::load(Path::new(config_path))
+        .map_err(|e| fdo::Error::Failed(format!("Failed to load config '{config_path}': {e}")))
+}
+
+fn save_config(config: &Config, path: &str) -> Result<(), fdo::Error> {
+    config
+        .save(Path::new(path))
+        .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{path}': {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// D-Bus interface
+// ---------------------------------------------------------------------------
+
+struct HelperInterface {
+    jobs: JobMap,
+    conn: Connection,
+}
+
+#[interface(name = "org.dasbackup.Helper1")]
+impl HelperInterface {
+    // ---- Signals ----
+
+    #[zbus(signal)]
+    async fn job_progress(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        stage: &str,
+        percent: u8,
+        message: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn job_log(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        level: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn job_finished(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        success: bool,
+        summary: &str,
+    ) -> zbus::Result<()>;
+
+    // ---- Async (job-returning) methods ----
+
+    /// Run a full backup pipeline.
+    async fn backup_run(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        mode: &str,
+        sources: Vec<String>,
+        targets: Vec<String>,
+        dry_run: bool,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
+        let config = load_config(config_path)?;
+        let backup_mode = match mode.to_lowercase().as_str() {
+            "full" => Some(BackupMode::Full),
+            "incremental" => Some(BackupMode::Incremental),
+            _ => None,
+        };
+        let options = BackupOptions {
+            mode: backup_mode,
+            sources,
+            targets,
+            dry_run,
+            boot_archive: config.boot.enabled,
+            index_after: true,
+            send_report: config.email.enabled,
+            ..Default::default()
+        };
+
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                match backup::run_backup(&config, &options, &progress) {
+                    Ok(r) => Ok((
+                        r.success,
+                        format!(
+                            "Backup complete: {} snapshots created, {} sent",
+                            r.snapshots_created, r.snapshots_sent
+                        ),
+                    )),
+                    Err(e) => Err(format!("Backup failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Backup task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok((s, msg)) => (s, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    /// Create snapshots only.
+    async fn backup_snapshot(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        sources: Vec<String>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
+        let config = load_config(config_path)?;
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                match backup::create_snapshots(&config, &sources, &progress) {
+                    Ok(n) => Ok(format!("{n} snapshots created")),
+                    Err(e) => Err(format!("Snapshot failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Snapshot task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok(msg) => (true, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    /// Send existing snapshots to targets.
+    async fn backup_send(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        targets: Vec<String>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
+        let config = load_config(config_path)?;
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+        // Send from all sources to the specified targets.
+        let sources: Vec<String> = Vec::new();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                match backup::send_snapshots(&config, &sources, &targets, &progress) {
+                    Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
+                    Err(e) => Err(format!("Send failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Send task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok(msg) => (true, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    /// Archive boot subvolumes.
+    async fn backup_boot_archive(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
+        let config = load_config(config_path)?;
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                match backup::archive_boot(&config, &progress) {
+                    Ok(archived) => {
+                        let msg = if archived {
+                            "Boot subvolumes archived"
+                        } else {
+                            "No boot subvolumes to archive"
+                        };
+                        Ok(msg.to_string())
+                    }
+                    Err(e) => Err(format!("Boot archive failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Boot archive task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok(msg) => (true, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    /// Walk a backup target and index new snapshots.
+    async fn index_walk(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        target_path: &str,
+        db_path: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.index").await?;
+
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+        let target_path = target_path.to_owned();
+        let db_path = db_path.to_owned();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
+                match indexer::walk(Path::new(&target_path), &db) {
+                    Ok(r) => Ok(format!(
+                        "Indexed {} new snapshots ({} total discovered, {} skipped)",
+                        r.snapshots_indexed, r.snapshots_discovered, r.snapshots_skipped
+                    )),
+                    Err(e) => Err(format!("Indexing failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok(msg) => (true, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    /// Restore specific files from a snapshot.
+    async fn restore_files(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        snapshot: &str,
+        dest: &str,
+        files: Vec<String>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
+
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+        let snapshot = snapshot.to_owned();
+        let dest = dest.to_owned();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+                match restore::restore_files(
+                    Path::new(&snapshot),
+                    &file_refs,
+                    Path::new(&dest),
+                    &progress,
+                ) {
+                    Ok(r) => Ok((
+                        r.errors.is_empty(),
+                        format!(
+                            "Restored {} files ({} bytes), {} errors",
+                            r.files_restored,
+                            r.bytes_restored,
+                            r.errors.len()
+                        ),
+                    )),
+                    Err(e) => Err(format!("Restore failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Restore task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok((s, msg)) => (s, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    /// Restore an entire snapshot to a destination.
+    async fn restore_snapshot(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        snapshot: &str,
+        dest: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
+
+        let job_id = new_job_id();
+        let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+        let conn = self.conn.clone();
+        let snapshot = snapshot.to_owned();
+        let dest = dest.to_owned();
+
+        let handle = tokio::spawn(async move {
+            let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                match restore::restore_snapshot(Path::new(&snapshot), Path::new(&dest), &progress) {
+                    Ok(r) => Ok((
+                        r.errors.is_empty(),
+                        format!(
+                            "Snapshot restored: {} files ({} bytes), {} errors",
+                            r.files_restored,
+                            r.bytes_restored,
+                            r.errors.len()
+                        ),
+                    )),
+                    Err(e) => Err(format!("Snapshot restore failed: {e}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Snapshot restore task panicked: {e}")));
+
+            let (success, summary) = match result {
+                Ok((s, msg)) => (s, msg),
+                Err(msg) => (false, msg),
+            };
+
+            emit_job_finished(&conn, &jid, success, &summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), (handle, cancel));
+        Ok(job_id)
+    }
+
+    // ---- Synchronous methods ----
+
+    /// Get the raw TOML config as a string.
+    async fn config_get(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let config = load_config(config_path)?;
+        config
+            .to_toml()
+            .map_err(|e| fdo::Error::Failed(format!("Failed to serialize config: {e}")))
+    }
+
+    /// Write a TOML config string to disk (validates first).
+    async fn config_set(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        toml_content: &str,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let config = Config::from_toml(toml_content)
+            .map_err(|e| fdo::Error::Failed(format!("Invalid TOML: {e}")))?;
+
+        let errors = config.validate();
+        if !errors.is_empty() {
+            return Err(fdo::Error::Failed(format!(
+                "Config validation failed: {}",
+                errors.join("; ")
+            )));
+        }
+
+        save_config(&config, config_path)
+    }
+
+    /// Get the current backup schedule as JSON.
+    async fn schedule_get(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let config = load_config(config_path)?;
+        let info = schedule::get_schedule(&config)
+            .map_err(|e| fdo::Error::Failed(format!("Failed to get schedule: {e}")))?;
+
+        // Serialize to JSON manually since ScheduleInfo doesn't derive Serialize.
+        let json = serde_json::json!({
+            "incremental_time": info.incremental_time,
+            "full_schedule": info.full_schedule,
+            "delay_min": info.delay_min,
+            "enabled": info.enabled,
+            "next_incremental": info.next_incremental,
+            "next_full": info.next_full,
+        });
+
+        Ok(json.to_string())
+    }
+
+    /// Set the backup schedule parameters.
+    async fn schedule_set(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        incremental: &str,
+        full: &str,
+        delay: u32,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let mut config = load_config(config_path)?;
+
+        let inc = if incremental.is_empty() {
+            None
+        } else {
+            Some(incremental)
+        };
+        let f = if full.is_empty() { None } else { Some(full) };
+        let d = if delay == 0 { None } else { Some(delay) };
+
+        schedule::set_schedule(&mut config, inc, f, d)
+            .map_err(|e| fdo::Error::Failed(format!("Failed to set schedule: {e}")))?;
+
+        save_config(&config, config_path)
+    }
+
+    /// Enable or disable scheduled backups.
+    async fn schedule_enable(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let config = load_config(config_path)?;
+        schedule::set_enabled(&config, enabled)
+            .map_err(|e| fdo::Error::Failed(format!("Failed to set schedule enabled: {e}")))
+    }
+
+    /// Add a subvolume to a source.
+    async fn subvol_add(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        source: &str,
+        name: &str,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let mut config = load_config(config_path)?;
+        subvol::add_subvolume(&mut config, source, name, false).map_err(fdo::Error::Failed)?;
+        save_config(&config, config_path)
+    }
+
+    /// Remove a subvolume from a source.
+    async fn subvol_remove(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        source: &str,
+        name: &str,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let mut config = load_config(config_path)?;
+        subvol::remove_subvolume(&mut config, source, name).map_err(fdo::Error::Failed)?;
+        save_config(&config, config_path)
+    }
+
+    /// Set the manual_only flag on a subvolume.
+    async fn subvol_set_manual(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+        source: &str,
+        name: &str,
+        manual: bool,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+
+        let mut config = load_config(config_path)?;
+        subvol::set_manual(&mut config, source, name, manual).map_err(fdo::Error::Failed)?;
+        save_config(&config, config_path)
+    }
+
+    /// Query system health and return a JSON report.
+    async fn health_query(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
+
+        let config = load_config(config_path)?;
+        let report = health::get_health(&config)
+            .map_err(|e| fdo::Error::Failed(format!("Health query failed: {e}")))?;
+
+        let status_str = match report.status {
+            health::HealthStatus::Healthy => "healthy",
+            health::HealthStatus::Warning => "warning",
+            health::HealthStatus::Critical => "critical",
+        };
+
+        let targets_json: Vec<serde_json::Value> = report
+            .targets
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "label": t.label,
+                    "serial": t.serial,
+                    "mounted": t.mounted,
+                    "total_bytes": t.total_bytes,
+                    "used_bytes": t.used_bytes,
+                    "usage_percent": t.usage_percent(),
+                    "snapshot_count": t.snapshot_count,
+                    "smart_status": t.smart_status,
+                })
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "status": status_str,
+            "targets": targets_json,
+            "last_backup": report.last_backup,
+            "warnings": report.warnings,
+        });
+
+        Ok(json.to_string())
+    }
+
+    /// Cancel a running job.
+    async fn job_cancel(&self, job_id: &str) -> fdo::Result<bool> {
+        let mut jobs = self.jobs.lock().await;
+        if let Some((handle, cancel)) = jobs.remove(job_id) {
+            cancel.cancel();
+            handle.abort();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Extract the sender bus name from a D-Bus message header.
+fn sender_from_header(header: &zbus::message::Header<'_>) -> Result<String, fdo::Error> {
+    header
+        .sender()
+        .map(|s| s.to_string())
+        .ok_or_else(|| fdo::Error::Failed("Missing sender in D-Bus message header".to_string()))
+}
+
+/// Emit a JobFinished signal from outside the interface method context.
+async fn emit_job_finished(conn: &Connection, job_id: &str, success: bool, summary: &str) {
+    let iface_ref = conn
+        .object_server()
+        .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+        .await;
+    if let Ok(iface) = iface_ref {
+        let ctxt = iface.signal_emitter();
+        let _ = HelperInterface::job_finished(ctxt, job_id, success, summary).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
+
+    // Build the system D-Bus connection and serve the interface.
+    let conn = Builder::system()?
+        .name("org.dasbackup.Helper1")?
+        .build()
+        .await?;
+
+    let iface = HelperInterface {
+        jobs: jobs.clone(),
+        conn: conn.clone(),
+    };
+
+    conn.object_server()
+        .at("/org/dasbackup/Helper1", iface)
+        .await?;
+
+    eprintln!("btrdasd-helper: listening on system bus as org.dasbackup.Helper1");
+
+    // Wait for SIGTERM or SIGINT for graceful shutdown.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            eprintln!("btrdasd-helper: received SIGTERM, shutting down");
+        }
+        _ = sigint.recv() => {
+            eprintln!("btrdasd-helper: received SIGINT, shutting down");
+        }
+    }
+
+    // Cancel all running jobs.
+    {
+        let mut active_jobs = jobs.lock().await;
+        let entries: Vec<(String, (JoinHandle<()>, CancelFlag))> = active_jobs.drain().collect();
+        for (id, (handle, cancel)) in entries {
+            eprintln!("btrdasd-helper: cancelling job {id}");
+            cancel.cancel();
+            handle.abort();
+        }
+    }
+
+    eprintln!("btrdasd-helper: shutdown complete");
+    Ok(())
+}
