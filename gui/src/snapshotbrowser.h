@@ -10,7 +10,6 @@ class QMenu;
 class QStackedWidget;
 class QToolButton;
 class QTreeView;
-class Database;
 class DBusClient;
 
 class SnapshotBrowser : public QWidget
@@ -18,7 +17,7 @@ class SnapshotBrowser : public QWidget
     Q_OBJECT
 
 public:
-    explicit SnapshotBrowser(Database *db, DBusClient *client, QWidget *parent = nullptr);
+    explicit SnapshotBrowser(DBusClient *client, QWidget *parent = nullptr);
 
     void setSnapshotPath(const QString &path);
     void navigateToPath(const QString &path);
@@ -48,7 +47,6 @@ private:
     void updateNavigationButtons();
     QStringList selectedPaths() const;
 
-    Database *m_database;
     DBusClient *m_client;
 
     // Navigation
