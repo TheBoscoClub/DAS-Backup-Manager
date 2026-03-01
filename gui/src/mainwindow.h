@@ -12,6 +12,8 @@ class QSortFilterProxyModel;
 class QLabel;
 class QTimer;
 
+class KStatusNotifierItem;
+
 class Database;
 class SnapshotModel;
 class SnapshotTimeline;
@@ -46,11 +48,13 @@ private Q_SLOTS:
     void updateStatusBar();
     void restoreSelectedFiles();
     void showSettings();
+    void onBackupFinished(const QString &jobId, bool success, const QString &summary);
 
 private:
     void setupActions();
     void setupUi();
     void setupBrowsePage();
+    void setupTrayIcon();
     void openDatabase(const QString &path);
 
     // Core services
@@ -78,6 +82,10 @@ private:
 
     // Status bar
     QLabel *m_statusLabel = nullptr;
+    QTimer *m_statusTimer = nullptr;
+
+    // Tray icon
+    KStatusNotifierItem *m_trayIcon = nullptr;
 
     // Pages
     QWidget *m_browsePage = nullptr;
