@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqlResult};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
 const SCHEMA_SQL: &str = r#"
@@ -195,6 +195,15 @@ impl Database {
                 })
             },
         )
+    }
+
+    /// Get just the filesystem path for a snapshot by ID.
+    pub fn snapshot_path_by_id(&self, id: i64) -> SqlResult<Option<String>> {
+        self.conn
+            .query_row("SELECT path FROM snapshots WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
     }
 
     pub fn list_snapshots(&self) -> SqlResult<Vec<Snapshot>> {
