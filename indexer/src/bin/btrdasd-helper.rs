@@ -563,26 +563,19 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
-        let db_path = db_path.to_owned();
-        let json = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-            let stats = db
-                .get_stats()
-                .map_err(|e| format!("Stats query failed: {e}"))?;
-            let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-            let json = serde_json::json!({
-                "snapshots": stats.snapshot_count,
-                "files": stats.file_count,
-                "spans": stats.span_count,
-                "db_size_bytes": db_size_bytes,
-            });
-            Ok(json.to_string())
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task panicked: {e}")))
-        .map_err(fdo::Error::Failed)?;
-
-        Ok(json)
+        let db = Database::open(db_path)
+            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+        let stats = db
+            .get_stats()
+            .map_err(|e| fdo::Error::Failed(format!("Stats query failed: {e}")))?;
+        let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let json = serde_json::json!({
+            "snapshots": stats.snapshot_count,
+            "files": stats.file_count,
+            "spans": stats.span_count,
+            "db_size_bytes": db_size_bytes,
+        });
+        Ok(json.to_string())
     }
 
     /// Return JSON array of all snapshots.
@@ -594,32 +587,25 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
-        let db_path = db_path.to_owned();
-        let json = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-            let snapshots = db
-                .list_snapshots()
-                .map_err(|e| format!("List snapshots failed: {e}"))?;
-            let arr: Vec<serde_json::Value> = snapshots
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "id": s.id,
-                        "name": s.name,
-                        "ts": s.ts,
-                        "source": s.source,
-                        "path": s.path,
-                        "indexed_at": s.indexed_at,
-                    })
+        let db = Database::open(db_path)
+            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+        let snapshots = db
+            .list_snapshots()
+            .map_err(|e| fdo::Error::Failed(format!("List snapshots failed: {e}")))?;
+        let arr: Vec<serde_json::Value> = snapshots
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "ts": s.ts,
+                    "source": s.source,
+                    "path": s.path,
+                    "indexed_at": s.indexed_at,
                 })
-                .collect();
-            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task panicked: {e}")))
-        .map_err(fdo::Error::Failed)?;
-
-        Ok(json)
+            })
+            .collect();
+        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
     }
 
     /// Return JSON array of files in a given snapshot.
@@ -632,32 +618,25 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
-        let db_path = db_path.to_owned();
-        let json = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-            let files = db
-                .get_files_in_snapshot(snapshot_id)
-                .map_err(|e| format!("List files failed: {e}"))?;
-            let arr: Vec<serde_json::Value> = files
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "id": f.id,
-                        "path": f.path,
-                        "name": f.name,
-                        "size": f.size,
-                        "mtime": f.mtime,
-                        "type": f.file_type,
-                    })
+        let db = Database::open(db_path)
+            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+        let files = db
+            .get_files_in_snapshot(snapshot_id)
+            .map_err(|e| fdo::Error::Failed(format!("List files failed: {e}")))?;
+        let arr: Vec<serde_json::Value> = files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id,
+                    "path": f.path,
+                    "name": f.name,
+                    "size": f.size,
+                    "mtime": f.mtime,
+                    "type": f.file_type,
                 })
-                .collect();
-            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task panicked: {e}")))
-        .map_err(fdo::Error::Failed)?;
-
-        Ok(json)
+            })
+            .collect();
+        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
     }
 
     /// FTS5 search returning JSON array of matches.
@@ -671,33 +650,25 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
-        let db_path = db_path.to_owned();
-        let query = query.to_owned();
-        let json = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-            let results = db
-                .search(&query, limit)
-                .map_err(|e| format!("Search failed: {e}"))?;
-            let arr: Vec<serde_json::Value> = results
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "path": r.path,
-                        "name": r.name,
-                        "size": r.size,
-                        "mtime": r.mtime,
-                        "first_snap": r.first_snap,
-                        "last_snap": r.last_snap,
-                    })
+        let db = Database::open(db_path)
+            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+        let results = db
+            .search(query, limit)
+            .map_err(|e| fdo::Error::Failed(format!("Search failed: {e}")))?;
+        let arr: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "path": r.path,
+                    "name": r.name,
+                    "size": r.size,
+                    "mtime": r.mtime,
+                    "first_snap": r.first_snap,
+                    "last_snap": r.last_snap,
                 })
-                .collect();
-            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task panicked: {e}")))
-        .map_err(fdo::Error::Failed)?;
-
-        Ok(json)
+            })
+            .collect();
+        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
     }
 
     /// Return JSON array of recent backup history.
@@ -710,35 +681,28 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
-        let db_path = db_path.to_owned();
-        let json = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-            let runs = db
-                .get_backup_history(limit as usize)
-                .map_err(|e| format!("History query failed: {e}"))?;
-            let arr: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "id": r.id,
-                        "timestamp": r.timestamp,
-                        "mode": r.mode,
-                        "success": r.success,
-                        "duration_secs": r.duration_secs,
-                        "snaps_created": r.snaps_created,
-                        "snaps_sent": r.snaps_sent,
-                        "bytes_sent": r.bytes_sent,
-                        "errors": r.errors.join("\n"),
-                    })
+        let db = Database::open(db_path)
+            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+        let runs = db
+            .get_backup_history(limit as usize)
+            .map_err(|e| fdo::Error::Failed(format!("History query failed: {e}")))?;
+        let arr: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "timestamp": r.timestamp,
+                    "mode": r.mode,
+                    "success": r.success,
+                    "duration_secs": r.duration_secs,
+                    "snaps_created": r.snaps_created,
+                    "snaps_sent": r.snaps_sent,
+                    "bytes_sent": r.bytes_sent,
+                    "errors": r.errors.join("\n"),
                 })
-                .collect();
-            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task panicked: {e}")))
-        .map_err(fdo::Error::Failed)?;
-
-        Ok(json)
+            })
+            .collect();
+        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
     }
 
     /// Return the filesystem path for a snapshot by ID.
@@ -751,17 +715,12 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
-        let db_path = db_path.to_owned();
-        let path = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-            db.snapshot_path_by_id(snapshot_id)
-                .map_err(|e| format!("Path query failed: {e}"))?
-                .ok_or_else(|| format!("No snapshot with id {snapshot_id}"))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task panicked: {e}")))
-        .map_err(fdo::Error::Failed)?;
-
+        let db = Database::open(db_path)
+            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+        let path = db
+            .snapshot_path_by_id(snapshot_id)
+            .map_err(|e| fdo::Error::Failed(format!("Path query failed: {e}")))?
+            .ok_or_else(|| fdo::Error::Failed(format!("No snapshot with id {snapshot_id}")))?;
         Ok(path)
     }
 
