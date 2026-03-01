@@ -154,14 +154,20 @@ void BackupPanel::loadConfig()
         return;
     }
 
-    // Simple line-by-line config parser:
-    //   volume /path        -> source volume (context for subvolumes below it)
-    //   subvolume @name     -> subvolume under the current volume
-    //   target /path        -> backup target
-    //   # manual-only       -> comment immediately after a subvolume marks it manual
+    // Parse TOML config to extract sources and targets.
     //
-    // A subvolume entry is a source; its display label is "volume/subvolume".
-    // If no subvolumes are found under a volume, the volume itself is a source.
+    // Expected structure:
+    //   [[source]]
+    //   label = "nvme"
+    //   path = "/mnt/nvme"
+    //
+    //   [[source.subvolumes]]
+    //   name = "@home"
+    //   manual_only = false
+    //
+    //   [[target]]
+    //   label = "primary-22tb"
+    //   mount = "/mnt/backup-hdd"
 
     struct SourceEntry {
         QString label;
@@ -171,57 +177,82 @@ void BackupPanel::loadConfig()
     QList<SourceEntry> sources;
     QStringList targets;
 
-    QString currentVolume;
-    bool lastWasSubvolume = false;
-    QString lastSubvolumeLabel;
-    int lastSubvolumeIndex = -1;
+    enum class Section { None, Source, SourceSubvol, Target };
+    Section currentSection = Section::None;
+    QString currentSourceLabel;
 
     const QStringList lines = toml.split(QLatin1Char('\n'));
     for (const QString &rawLine : lines) {
         const QString line = rawLine.trimmed();
 
-        if (line.startsWith(QLatin1String("volume "))) {
-            currentVolume = line.mid(7).trimmed();  // text after "volume "
-            lastWasSubvolume = false;
+        // Detect section headers
+        if (line == QLatin1String("[[source]]")) {
+            currentSection = Section::Source;
+            currentSourceLabel.clear();
+            continue;
+        }
+        if (line == QLatin1String("[[source.subvolumes]]")) {
+            currentSection = Section::SourceSubvol;
+            continue;
+        }
+        if (line == QLatin1String("[[target]]")) {
+            currentSection = Section::Target;
+            continue;
+        }
+        // Any other [[...]] header resets context
+        if (line.startsWith(QLatin1String("[["))) {
+            currentSection = Section::None;
+            continue;
+        }
+        // Single [...] header also resets
+        if (line.startsWith(QLatin1Char('[')) && !line.startsWith(QLatin1String("[["))) {
+            currentSection = Section::None;
             continue;
         }
 
-        if (line.startsWith(QLatin1String("subvolume "))) {
-            const QString subName = line.mid(10).trimmed();  // text after "subvolume "
-            lastSubvolumeLabel = currentVolume.isEmpty()
-                ? subName
-                : currentVolume + QLatin1Char('/') + subName;
-            lastSubvolumeIndex = static_cast<int>(sources.size());
-            sources.append({lastSubvolumeLabel, false});
-            lastWasSubvolume = true;
+        // Skip comments and empty lines
+        if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
             continue;
+
+        // Parse key = value (handles quoted and unquoted values)
+        const int eqPos = line.indexOf(QLatin1Char('='));
+        if (eqPos < 0)
+            continue;
+
+        const QString key = line.left(eqPos).trimmed();
+        QString value = line.mid(eqPos + 1).trimmed();
+        // Strip surrounding quotes
+        if (value.length() >= 2 && value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"'))) {
+            value = value.mid(1, value.length() - 2);
         }
 
-        if (line.startsWith(QLatin1String("target "))) {
-            targets.append(line.mid(7).trimmed());  // text after "target "
-            lastWasSubvolume = false;
-            continue;
-        }
+        switch (currentSection) {
+        case Section::Source:
+            if (key == QLatin1String("label"))
+                currentSourceLabel = value;
+            break;
 
-        if (line.startsWith(QLatin1Char('#')) && lastWasSubvolume) {
-            // Check for the manual-only flag marker anywhere in the comment
-            if (line.contains(QLatin1String("manual-only")) && lastSubvolumeIndex >= 0) {
-                sources[lastSubvolumeIndex].manualOnly = true;
+        case Section::SourceSubvol: {
+            if (key == QLatin1String("name")) {
+                const QString fullLabel = currentSourceLabel.isEmpty()
+                    ? value
+                    : currentSourceLabel + QLatin1Char('/') + value;
+                sources.append({fullLabel, false});
+            } else if (key == QLatin1String("manual_only")) {
+                if (!sources.isEmpty() && (value == QLatin1String("true")))
+                    sources.last().manualOnly = true;
             }
-            // A comment does not clear the lastWasSubvolume state so that
-            // multiple comment lines after a subvolume all see it.
-            continue;
+            break;
         }
 
-        // Any non-comment, non-blank line clears the subvolume context
-        if (!line.isEmpty()) {
-            lastWasSubvolume = false;
-        }
-    }
+        case Section::Target:
+            if (key == QLatin1String("label"))
+                targets.append(value);
+            break;
 
-    // If no subvolumes were parsed but we have volumes, fall back to volumes as sources
-    if (sources.isEmpty() && !currentVolume.isEmpty()) {
-        sources.append({currentVolume, false});
+        case Section::None:
+            break;
+        }
     }
 
     auto *srcLayout = qobject_cast<QVBoxLayout *>(m_sourcesGroup->layout());
