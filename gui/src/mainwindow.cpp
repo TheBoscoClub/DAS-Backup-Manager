@@ -2,7 +2,6 @@
 #include "backuphistory.h"
 #include "backuppanel.h"
 #include "configdialog.h"
-#include "database.h"
 #include "dbusclient.h"
 #include "filemodel.h"
 #include "healthdashboard.h"
@@ -48,9 +47,8 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
     : KXmlGuiWindow(parent)
     , m_dbPath(dbPath)
 {
-    m_database = new Database();
     m_dbusClient = new DBusClient(this);
-    m_indexRunner = new IndexRunner(this);
+    m_indexRunner = new IndexRunner(m_dbusClient, this);
     m_snapshotWatcher = new SnapshotWatcher(m_indexRunner, this);
     m_snapshotWatcher->setDbPath(m_dbPath);
     m_restoreAction = new RestoreAction(this);
@@ -71,7 +69,9 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
     setupTrayIcon();
     setupGUI(Default, QStringLiteral("btrdasd-gui.rc"));
 
-    openDatabase(m_dbPath);
+    // Load initial data via D-Bus
+    m_snapshotModel->reload();
+    updateStatusBar();
 
     // Status bar auto-refresh every 60 seconds
     m_statusTimer = new QTimer(this);
@@ -80,10 +80,7 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
     m_statusTimer->start();
 }
 
-MainWindow::~MainWindow()
-{
-    delete m_database;
-}
+MainWindow::~MainWindow() = default;
 
 void MainWindow::setupUi()
 {
@@ -104,7 +101,7 @@ void MainWindow::setupUi()
     m_stack->addWidget(m_backupRunPage); // index 1
 
     // Page 2: Backup History
-    m_backupHistoryPage = new BackupHistoryView(m_database, m_dbusClient, this);
+    m_backupHistoryPage = new BackupHistoryView(m_dbusClient, m_dbPath, this);
     m_stack->addWidget(m_backupHistoryPage); // index 2
 
     // Page 3: Config (opens ConfigDialog on selection)
@@ -121,7 +118,7 @@ void MainWindow::setupUi()
         auto *cfgButton = new QPushButton(
             QIcon::fromTheme(QStringLiteral("configure")),
             i18n("Open Config Editor"), m_configPage);
-        cfgButton->setToolTip(i18n("Edit btrbk backup configuration"));
+        cfgButton->setToolTip(i18n("Edit DAS backup configuration"));
         cfgButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
         cfgLayout->addWidget(cfgButton, 0, Qt::AlignCenter);
 
@@ -134,7 +131,7 @@ void MainWindow::setupUi()
     m_stack->addWidget(m_configPage); // index 3
 
     // Page 4: Health Dashboard (tabs: Drives, Growth, Status)
-    m_healthDashboard = new HealthDashboard(m_database, m_dbusClient, this);
+    m_healthDashboard = new HealthDashboard(m_dbusClient, this);
     m_stack->addWidget(m_healthDashboard); // index 4
 
     // --- Main layout: sidebar | stack ---
@@ -174,9 +171,9 @@ void MainWindow::setupBrowsePage()
 {
     m_browsePage = new QWidget(this);
 
-    m_snapshotModel = new SnapshotModel(m_database, this);
-    m_fileModel = new FileModel(m_database, this);
-    m_searchModel = new SearchModel(m_database, this);
+    m_snapshotModel = new SnapshotModel(m_dbusClient, m_dbPath, this);
+    m_fileModel = new FileModel(m_dbusClient, m_dbPath, this);
+    m_searchModel = new SearchModel(m_dbusClient, m_dbPath, this);
 
     // Search bar with debounce
     m_searchBar = new QLineEdit(m_browsePage);
@@ -341,30 +338,6 @@ void MainWindow::onSectionChanged(SidebarSection section)
     }
 }
 
-void MainWindow::openDatabase(const QString &path)
-{
-    if (!m_database->open(path)) {
-        KMessageBox::error(this, i18n("Failed to open database: %1", path));
-        return;
-    }
-
-    m_snapshotModel->reload();
-    updateStatusBar();
-
-    // Set watcher to backup target root derived from snapshot paths
-    auto snapshots = m_database->listSnapshots();
-    if (!snapshots.isEmpty()) {
-        QString snapPath = snapshots.first().path;
-        int lastSlash = snapPath.lastIndexOf(QLatin1Char('/'));
-        if (lastSlash > 0) {
-            int secondLastSlash = snapPath.lastIndexOf(QLatin1Char('/'), lastSlash - 1);
-            if (secondLastSlash > 0) {
-                m_snapshotWatcher->setWatchPath(snapPath.left(secondLastSlash));
-            }
-        }
-    }
-}
-
 void MainWindow::onSnapshotSelected(qint64 snapshotId)
 {
     m_currentSnapshotId = snapshotId;
@@ -401,18 +374,8 @@ void MainWindow::triggerReindex()
         return;
     }
 
-    auto snapshots = m_database->listSnapshots();
+    // Default target path — the config specifies actual targets
     QString targetPath = QStringLiteral("/mnt/backup-hdd");
-    if (!snapshots.isEmpty()) {
-        const QString &snapPath = snapshots.first().path;
-        const int lastSlash = snapPath.lastIndexOf(QLatin1Char('/'));
-        if (lastSlash > 0) {
-            const int secondLastSlash = snapPath.lastIndexOf(QLatin1Char('/'), lastSlash - 1);
-            if (secondLastSlash > 0) {
-                targetPath = snapPath.left(secondLastSlash);
-            }
-        }
-    }
 
     statusBar()->showMessage(i18n("Re-indexing %1...", targetPath));
     m_indexRunner->run(targetPath, m_dbPath);
@@ -420,18 +383,34 @@ void MainWindow::triggerReindex()
 
 void MainWindow::showStats()
 {
-    const auto s = m_database->stats();
+    const QString json = m_dbusClient->indexStats(m_dbPath);
+    if (json.isEmpty()) {
+        KMessageBox::error(this, i18n("Failed to load statistics."));
+        return;
+    }
+
+    const QJsonObject s = QJsonDocument::fromJson(json.toUtf8()).object();
     KMessageBox::information(this, i18n(
-        "Snapshots: %1\nFiles: %2\nSpans: %3\nDatabase size: %4 bytes",
-        s.snapshotCount, s.fileCount, s.spanCount, s.dbSizeBytes));
+        "Snapshots: %1\nFiles: %2\nSpans: %3\nDatabase size: %4",
+        s.value(QLatin1String("snapshots")).toInteger(),
+        s.value(QLatin1String("files")).toInteger(),
+        s.value(QLatin1String("spans")).toInteger(),
+        FileModel::formatSize(s.value(QLatin1String("db_size_bytes")).toInteger())));
 }
 
 void MainWindow::updateStatusBar()
 {
-    const auto s = m_database->stats();
-
-    // Build rich status: schedule + targets + DB size
     QStringList parts;
+
+    // DB stats via D-Bus
+    const QString statsJson = m_dbusClient->indexStats(m_dbPath);
+    qint64 dbSize = 0;
+    qint64 snapshotCount = 0;
+    if (!statsJson.isEmpty()) {
+        const QJsonObject s = QJsonDocument::fromJson(statsJson.toUtf8()).object();
+        dbSize = s.value(QLatin1String("db_size_bytes")).toInteger();
+        snapshotCount = s.value(QLatin1String("snapshots")).toInteger();
+    }
 
     // Next backup schedule (from D-Bus)
     const QString scheduleJson = m_dbusClient->scheduleGet(
@@ -446,20 +425,21 @@ void MainWindow::updateStatusBar()
     }
 
     // Targets online (from health)
-    const QString healthJson = m_dbusClient->healthQuery(QStringLiteral("/etc/das-backup/config.toml"));
+    const QString healthJson = m_dbusClient->healthQuery(
+        QStringLiteral("/etc/das-backup/config.toml"));
     if (!healthJson.isEmpty()) {
         const QJsonDocument doc = QJsonDocument::fromJson(healthJson.toUtf8());
-        const QJsonArray drives = doc.object().value(QLatin1String("targets")).toArray();
+        const QJsonArray targets = doc.object().value(QLatin1String("targets")).toArray();
         int mounted = 0;
-        for (const QJsonValue &v : drives) {
+        for (const QJsonValue &v : targets) {
             if (v.toObject().value(QLatin1String("mounted")).toBool())
                 ++mounted;
         }
         parts.append(i18n("%1 targets online", mounted));
     }
 
-    parts.append(i18n("DB: %1", FileModel::formatSize(s.dbSizeBytes)));
-    parts.append(i18n("%1 snapshots", s.snapshotCount));
+    parts.append(i18n("DB: %1", FileModel::formatSize(dbSize)));
+    parts.append(i18n("%1 snapshots", snapshotCount));
 
     m_statusLabel->setText(parts.join(QStringLiteral(" | ")));
 }
@@ -477,7 +457,7 @@ void MainWindow::restoreSelectedFiles()
         return;
     }
 
-    QString snapshotPath = m_database->snapshotPathById(m_currentSnapshotId);
+    QString snapshotPath = m_dbusClient->indexSnapshotPath(m_dbPath, m_currentSnapshotId);
     if (snapshotPath.isEmpty()) {
         KMessageBox::error(this, i18n("Could not resolve snapshot path."));
         return;
