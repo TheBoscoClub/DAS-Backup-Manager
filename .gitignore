@@ -84,6 +84,7 @@ nohup.out
 
 # LOCAL/IDENTIFYING INFORMATION
 SESSION_RECORD*.md
+SESSION_RECORD*.md.lock
 *-session-record.md
 vm-credentials*
 *-vm-config*

@@ -695,7 +695,7 @@ mod tests {
     fn make_test_config() -> Config {
         Config {
             general: General {
-                version: "0.5.1".into(),
+                version: "0.6.0".into(),
                 install_prefix: "/usr".into(),
                 db_path: "/tmp/test.db".into(),
                 log_file: "/tmp/test.log".into(),

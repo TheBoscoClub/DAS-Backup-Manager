@@ -224,19 +224,9 @@ fn timestamp_to_date(timestamp: i64) -> String {
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-/// Uses the proleptic Gregorian calendar algorithm from civil.h (Howard Hinnant).
+/// Delegates to [`crate::health::days_to_ymd`].
 fn days_to_ymd(z: i64) -> (i32, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
+    crate::health::days_to_ymd(z)
 }
 
 // ---------------------------------------------------------------------------
