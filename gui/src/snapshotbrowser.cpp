@@ -1,5 +1,4 @@
 #include "snapshotbrowser.h"
-#include "database.h"
 #include "dbusclient.h"
 
 #include <KLocalizedString>
@@ -31,9 +30,8 @@
 // SnapshotBrowser
 // ---------------------------------------------------------------------------
 
-SnapshotBrowser::SnapshotBrowser(Database *db, DBusClient *client, QWidget *parent)
+SnapshotBrowser::SnapshotBrowser(DBusClient *client, QWidget *parent)
     : QWidget(parent)
-    , m_database(db)
     , m_client(client)
 {
     auto *layout = new QVBoxLayout(this);
