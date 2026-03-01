@@ -3,7 +3,6 @@
 
 class QTableView;
 class QSortFilterProxyModel;
-class Database;
 class DBusClient;
 class BackupHistoryModel;
 
@@ -11,14 +10,14 @@ class BackupHistoryView : public QWidget
 {
     Q_OBJECT
 public:
-    explicit BackupHistoryView(Database *db, DBusClient *client, QWidget *parent = nullptr);
+    explicit BackupHistoryView(DBusClient *client, const QString &dbPath, QWidget *parent = nullptr);
 
 public Q_SLOTS:
     void refresh();
 
 private:
-    Database *m_database;
     DBusClient *m_client;
+    QString m_dbPath;
     BackupHistoryModel *m_model = nullptr;
     QSortFilterProxyModel *m_proxy = nullptr;
     QTableView *m_view = nullptr;

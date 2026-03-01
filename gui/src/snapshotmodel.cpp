@@ -1,8 +1,14 @@
 #include "snapshotmodel.h"
+#include "dbusclient.h"
 
-SnapshotModel::SnapshotModel(Database *database, QObject *parent)
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+
+SnapshotModel::SnapshotModel(DBusClient *client, const QString &dbPath, QObject *parent)
     : QAbstractItemModel(parent)
-    , m_database(database)
+    , m_client(client)
+    , m_dbPath(dbPath)
 {
 }
 
@@ -16,8 +22,24 @@ QString SnapshotModel::tsToDate(const QString &ts)
 void SnapshotModel::reload()
 {
     beginResetModel();
-    m_snapshots = m_database->listSnapshots();
+    m_snapshots.clear();
     m_groups.clear();
+
+    const QString json = m_client->indexListSnapshots(m_dbPath);
+    if (!json.isEmpty()) {
+        const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+        for (const QJsonValue &v : arr) {
+            const QJsonObject obj = v.toObject();
+            m_snapshots.append({
+                .id = obj.value(QLatin1String("id")).toInteger(),
+                .name = obj.value(QLatin1String("name")).toString(),
+                .ts = obj.value(QLatin1String("ts")).toString(),
+                .source = obj.value(QLatin1String("source")).toString(),
+                .path = obj.value(QLatin1String("path")).toString(),
+                .indexedAt = obj.value(QLatin1String("indexed_at")).toInteger(),
+            });
+        }
+    }
 
     for (int i = 0; i < m_snapshots.size(); ++i) {
         QString date = tsToDate(m_snapshots[i].ts);

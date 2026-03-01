@@ -2,7 +2,17 @@
 
 #include <QAbstractTableModel>
 #include <QVector>
-#include "database.h"
+
+class DBusClient;
+
+struct FileInfo {
+    qint64 id = 0;
+    QString path;
+    QString name;
+    qint64 size = 0;
+    qint64 mtime = 0;
+    int type = 0; // 0=regular, 1=dir, 2=symlink, 3=other
+};
 
 class FileModel : public QAbstractTableModel
 {
@@ -12,7 +22,7 @@ public:
     enum Column { Name = 0, Path, Size, Modified, Type, ColumnCount };
     enum Roles { FileIdRole = Qt::UserRole + 1, FilePathRole };
 
-    explicit FileModel(Database *database, QObject *parent = nullptr);
+    explicit FileModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
 
     void loadSnapshot(qint64 snapshotId);
     void clear();
@@ -26,6 +36,7 @@ public:
     static QString formatSize(qint64 bytes);
 
 private:
-    Database *m_database;
+    DBusClient *m_client;
+    QString m_dbPath;
     QVector<FileInfo> m_files;
 };
