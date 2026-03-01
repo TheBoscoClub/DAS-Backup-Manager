@@ -1,7 +1,9 @@
 #pragma once
 
+#include <QDateTime>
 #include <QSqlDatabase>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 struct SnapshotInfo {
@@ -38,6 +40,27 @@ struct DbStats {
     qint64 dbSizeBytes = 0;
 };
 
+struct BackupRunInfo {
+    qint64 id = 0;
+    qint64 timestamp = 0;
+    QString mode;
+    bool success = false;
+    qint64 durationSecs = 0;
+    qint64 snapsCreated = 0;
+    qint64 snapsSent = 0;
+    qint64 bytesSent = 0;
+    QStringList errors;
+};
+
+struct TargetUsageInfo {
+    qint64 id = 0;
+    qint64 timestamp = 0;
+    QString label;
+    quint64 totalBytes = 0;
+    quint64 usedBytes = 0;
+    quint64 snapshotCount = 0;
+};
+
 class Database
 {
 public:
@@ -53,6 +76,9 @@ public:
     [[nodiscard]] QVector<SearchResult> search(const QString &query, qint64 limit) const;
     [[nodiscard]] DbStats stats() const;
     [[nodiscard]] QString snapshotPathById(qint64 snapshotId) const;
+    [[nodiscard]] QVector<BackupRunInfo> getBackupHistory(int limit = 20) const;
+    [[nodiscard]] QVector<TargetUsageInfo> getTargetUsageHistory(
+        const QString &label, int days = 30) const;
 
 private:
     QSqlDatabase m_db;

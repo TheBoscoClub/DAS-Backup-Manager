@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gui name="btrdasd-gui"
-     version="3"
+     version="4"
      xmlns="http://www.kde.org/standards/kxmlgui/1.0"
      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
      xsi:schemaLocation="http://www.kde.org/standards/kxmlgui/1.0
@@ -12,11 +12,29 @@
       <Action name="stats" />
       <Action name="restore" />
     </Menu>
+    <Menu name="backup" >
+      <text>&amp;Backup</text>
+      <Action name="backup_run" />
+      <Action name="backup_history" />
+    </Menu>
+    <Menu name="tools" >
+      <text>&amp;Tools</text>
+      <Action name="health" />
+      <Action name="config_editor" />
+    </Menu>
   </MenuBar>
   <ToolBar name="mainToolBar" >
     <text>Main Toolbar</text>
     <Action name="reindex" />
     <Action name="stats" />
     <Action name="restore" />
+    <Separator/>
+    <Action name="backup_run" />
+    <Action name="health" />
   </ToolBar>
+  <ActionProperties>
+    <Action name="backup_run" shortcut="Ctrl+B" />
+    <Action name="restore" shortcut="Ctrl+R" />
+    <Action name="reindex" shortcut="F5" />
+  </ActionProperties>
 </gui>

@@ -1,4 +1,5 @@
 #include <QTest>
+#include <QDateTime>
 #include <QTemporaryFile>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -15,6 +16,8 @@ private Q_SLOTS:
     void listsSnapshotsFromPopulatedDb();
     void searchesFts5();
     void listFilesInSnapshot();
+    void testBackupHistory();
+    void testTargetUsageHistory();
     void cleanupTestCase();
 
 private:
@@ -173,6 +176,107 @@ void DatabaseTest::listFilesInSnapshot()
 
     auto files = database.filesInSnapshot(2);
     QCOMPARE(files.size(), 3);
+}
+
+void DatabaseTest::testBackupHistory()
+{
+    // Add backup_runs table to existing test database
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("history_setup"));
+        db.setDatabaseName(m_dbPath);
+        QVERIFY(db.open());
+
+        QSqlQuery q(db);
+        QVERIFY(q.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS backup_runs ("
+            "id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, "
+            "success INTEGER NOT NULL, mode TEXT NOT NULL, "
+            "snaps_created INTEGER DEFAULT 0, snaps_sent INTEGER DEFAULT 0, "
+            "bytes_sent INTEGER DEFAULT 0, duration_secs INTEGER DEFAULT 0, "
+            "errors TEXT DEFAULT '')")));
+
+        QVERIFY(q.exec(QStringLiteral(
+            "INSERT INTO backup_runs "
+            "(timestamp, success, mode, snaps_created, snaps_sent, "
+            "bytes_sent, duration_secs, errors) VALUES "
+            "(1709000000, 1, 'incremental', 5, 5, 1073741824, 3600, '')")));
+        QVERIFY(q.exec(QStringLiteral(
+            "INSERT INTO backup_runs "
+            "(timestamp, success, mode, snaps_created, snaps_sent, "
+            "bytes_sent, duration_secs, errors) VALUES "
+            "(1709100000, 0, 'full', 2, 0, 0, 60, "
+            "'target not mounted\nbtrbk failed')")));
+
+        db.close();
+        QSqlDatabase::removeDatabase(QStringLiteral("history_setup"));
+    }
+
+    Database database;
+    QVERIFY(database.open(m_dbPath));
+
+    auto history = database.getBackupHistory(10);
+    QCOMPARE(history.size(), 2);
+
+    // Most recent first
+    QCOMPARE(history[0].timestamp, 1709100000LL);
+    QVERIFY(!history[0].success);
+    QCOMPARE(history[0].mode, QStringLiteral("full"));
+    QCOMPARE(history[0].errors.size(), 2);
+    QCOMPARE(history[0].errors[0], QStringLiteral("target not mounted"));
+
+    QCOMPARE(history[1].timestamp, 1709000000LL);
+    QVERIFY(history[1].success);
+    QCOMPARE(history[1].bytesSent, 1073741824LL);
+}
+
+void DatabaseTest::testTargetUsageHistory()
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("usage_setup"));
+        db.setDatabaseName(m_dbPath);
+        QVERIFY(db.open());
+
+        QSqlQuery q(db);
+        QVERIFY(q.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS target_usage ("
+            "id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, "
+            "label TEXT NOT NULL, total_bytes INTEGER DEFAULT 0, "
+            "used_bytes INTEGER DEFAULT 0, snapshot_count INTEGER DEFAULT 0)")));
+
+        q.prepare(QStringLiteral(
+            "INSERT INTO target_usage "
+            "(timestamp, label, total_bytes, used_bytes, snapshot_count) "
+            "VALUES (:ts, :label, :total, :used, :count)"));
+
+        q.bindValue(QStringLiteral(":ts"), now - 86400);
+        q.bindValue(QStringLiteral(":label"), QStringLiteral("backup-22tb"));
+        q.bindValue(QStringLiteral(":total"), 22000000000000LL);
+        q.bindValue(QStringLiteral(":used"), 15000000000000LL);
+        q.bindValue(QStringLiteral(":count"), 365);
+        QVERIFY(q.exec());
+
+        q.bindValue(QStringLiteral(":ts"), now - 3600);
+        q.bindValue(QStringLiteral(":label"), QStringLiteral("backup-22tb"));
+        q.bindValue(QStringLiteral(":total"), 22000000000000LL);
+        q.bindValue(QStringLiteral(":used"), 15100000000000LL);
+        q.bindValue(QStringLiteral(":count"), 366);
+        QVERIFY(q.exec());
+
+        db.close();
+        QSqlDatabase::removeDatabase(QStringLiteral("usage_setup"));
+    }
+
+    Database database;
+    QVERIFY(database.open(m_dbPath));
+
+    auto usage = database.getTargetUsageHistory(QStringLiteral("backup-22tb"), 7);
+    QCOMPARE(usage.size(), 2);
+    QCOMPARE(usage[0].label, QStringLiteral("backup-22tb"));
+    QVERIFY(usage[1].usedBytes > usage[0].usedBytes);
 }
 
 void DatabaseTest::cleanupTestCase()
