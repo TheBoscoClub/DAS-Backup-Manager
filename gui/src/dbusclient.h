@@ -45,6 +45,14 @@ public:
     QString healthQuery(const QString &configPath);
     bool jobCancel(const QString &jobId);
 
+    // Index read methods (read-only, no polkit auth for active sessions)
+    QString indexStats(const QString &dbPath);
+    QString indexListSnapshots(const QString &dbPath);
+    QString indexListFiles(const QString &dbPath, qint64 snapshotId);
+    QString indexSearch(const QString &dbPath, const QString &query, qint64 limit);
+    QString indexBackupHistory(const QString &dbPath, qint64 limit);
+    QString indexSnapshotPath(const QString &dbPath, qint64 snapshotId);
+
 Q_SIGNALS:
     void jobStarted(const QString &jobId, const QString &operation);
     void jobProgress(const QString &jobId, const QString &stage,

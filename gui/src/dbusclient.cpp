@@ -221,6 +221,79 @@ bool DBusClient::jobCancel(const QString &jobId)
     return true;
 }
 
+// --- Index read methods ---
+
+QString DBusClient::indexStats(const QString &dbPath)
+{
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("IndexStats"), dbPath);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("IndexStats"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
+QString DBusClient::indexListSnapshots(const QString &dbPath)
+{
+    QDBusReply<QString> reply = m_interface->call(
+        QStringLiteral("IndexListSnapshots"), dbPath);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("IndexListSnapshots"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
+QString DBusClient::indexListFiles(const QString &dbPath, qint64 snapshotId)
+{
+    QDBusReply<QString> reply = m_interface->call(
+        QStringLiteral("IndexListFiles"), dbPath, snapshotId);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("IndexListFiles"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
+QString DBusClient::indexSearch(const QString &dbPath, const QString &query, qint64 limit)
+{
+    QDBusReply<QString> reply = m_interface->call(
+        QStringLiteral("IndexSearch"), dbPath, query, limit);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("IndexSearch"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
+QString DBusClient::indexBackupHistory(const QString &dbPath, qint64 limit)
+{
+    QDBusReply<QString> reply = m_interface->call(
+        QStringLiteral("IndexBackupHistory"), dbPath, limit);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("IndexBackupHistory"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
+QString DBusClient::indexSnapshotPath(const QString &dbPath, qint64 snapshotId)
+{
+    QDBusReply<QString> reply = m_interface->call(
+        QStringLiteral("IndexSnapshotPath"), dbPath, snapshotId);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("IndexSnapshotPath"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
 // --- Private slots ---
 
 void DBusClient::onJobProgress(const QString &jobId, const QString &stage,
