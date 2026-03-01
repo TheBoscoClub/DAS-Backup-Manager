@@ -1069,15 +1069,107 @@ impl HelperInterface {
                     "usage_percent": t.usage_percent(),
                     "snapshot_count": t.snapshot_count,
                     "smart_status": t.smart_status,
+                    "temperature_c": t.temperature_c,
+                    "power_on_hours": t.power_on_hours,
+                    "errors": t.errors,
                 })
             })
             .collect();
+
+        // Build growth data grouped by target label
+        let mut growth_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+            std::collections::BTreeMap::new();
+        for gp in &report.growth_points {
+            let (y, m, d) = health::days_to_ymd(gp.timestamp / 86400);
+            let date_str = format!("{y:04}-{m:02}-{d:02}");
+            growth_map
+                .entry(gp.target_label.clone())
+                .or_default()
+                .push(serde_json::json!({
+                    "date": date_str,
+                    "used_bytes": gp.used_bytes,
+                }));
+        }
+        let growth_json: Vec<serde_json::Value> = growth_map
+            .into_iter()
+            .map(|(label, entries)| serde_json::json!({"label": label, "entries": entries}))
+            .collect();
+
+        // Service status
+        let btrbk_available = std::process::Command::new("which")
+            .arg("btrbk")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let timer_output = std::process::Command::new("systemctl")
+            .args([
+                "show",
+                "das-backup.timer",
+                "--property=ActiveState,NextElapseUSecRealtime",
+            ])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let timer_enabled = timer_output.contains("ActiveState=active");
+        let timer_next = timer_output
+            .lines()
+            .find(|l| l.starts_with("NextElapseUSecRealtime="))
+            .and_then(|l| l.strip_prefix("NextElapseUSecRealtime="))
+            .filter(|v| !v.is_empty() && *v != "n/a")
+            .map(String::from);
+        let drives_mounted = report.targets.iter().filter(|t| t.mounted).count();
+
+        // Compute last_backup_age_secs from report.last_backup
+        // Format is "YYYY-MM-DD HH:MM"
+        let last_backup_age_secs: Option<i64> = report.last_backup.as_ref().and_then(|lb| {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let parts: Vec<&str> = lb.split_whitespace().collect();
+            if parts.len() != 2 {
+                return None;
+            }
+            let date_parts: Vec<&str> = parts[0].split('-').collect();
+            let time_parts: Vec<&str> = parts[1].split(':').collect();
+            if date_parts.len() != 3 || time_parts.len() != 2 {
+                return None;
+            }
+            let year: i32 = date_parts[0].parse().ok()?;
+            let month: u32 = date_parts[1].parse().ok()?;
+            let day: u32 = date_parts[2].parse().ok()?;
+            let hour: u64 = time_parts[0].parse().ok()?;
+            let minute: u64 = time_parts[1].parse().ok()?;
+
+            // Convert date to days since epoch using inverse of days_to_ymd
+            // Approximate: compute days from year/month/day
+            let y = if month <= 2 { year - 1 } else { year } as i64;
+            let m = if month <= 2 { month + 9 } else { month - 3 } as i64;
+            let era = if y >= 0 { y } else { y - 399 } / 400;
+            let yoe = y - era * 400;
+            let doy = (153 * m + 2) / 5 + day as i64 - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            let days = era * 146_097 + doe - 719_468;
+            let backup_secs = days * 86400 + hour as i64 * 3600 + minute as i64 * 60;
+
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            Some(now_secs - backup_secs)
+        });
 
         let json = serde_json::json!({
             "status": status_str,
             "targets": targets_json,
             "last_backup": report.last_backup,
             "warnings": report.warnings,
+            "growth": growth_json,
+            "services": {
+                "btrbk_available": btrbk_available,
+                "timer_enabled": timer_enabled,
+                "timer_next": timer_next,
+                "last_backup": report.last_backup,
+                "last_backup_age_secs": last_backup_age_secs,
+                "drives_mounted": drives_mounted,
+            },
         });
 
         Ok(json.to_string())
