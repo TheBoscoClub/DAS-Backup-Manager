@@ -1,7 +1,11 @@
 #include "mainwindow.h"
+#include "backuphistory.h"
+#include "backuppanel.h"
+#include "configdialog.h"
 #include "database.h"
 #include "dbusclient.h"
 #include "filemodel.h"
+#include "healthdashboard.h"
 #include "indexrunner.h"
 #include "progresspanel.h"
 #include "restoreaction.h"
@@ -23,6 +27,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QScrollArea>
 #include <QSortFilterProxyModel>
 #include <QSplitter>
@@ -76,53 +81,43 @@ void MainWindow::setupUi()
     setupBrowsePage();
     m_stack->addWidget(m_browsePage);    // index 0
 
-    // Page 1: Backup Run Now (placeholder — M5 will implement)
-    m_backupRunPage = new QWidget(this);
-    auto *runLayout = new QVBoxLayout(m_backupRunPage);
-    auto *runLabel = new QLabel(i18n("Backup operations will appear here."), m_backupRunPage);
-    runLabel->setAlignment(Qt::AlignCenter);
-    runLayout->addWidget(runLabel);
+    // Page 1: Backup Run Now
+    m_backupRunPage = new BackupPanel(m_dbusClient, this);
     m_stack->addWidget(m_backupRunPage); // index 1
 
-    // Page 2: Backup History (placeholder)
-    m_backupHistoryPage = new QWidget(this);
-    auto *histLayout = new QVBoxLayout(m_backupHistoryPage);
-    auto *histLabel = new QLabel(i18n("Backup history will appear here."), m_backupHistoryPage);
-    histLabel->setAlignment(Qt::AlignCenter);
-    histLayout->addWidget(histLabel);
+    // Page 2: Backup History
+    m_backupHistoryPage = new BackupHistoryView(m_database, m_dbusClient, this);
     m_stack->addWidget(m_backupHistoryPage); // index 2
 
-    // Page 3: Config (placeholder)
+    // Page 3: Config (opens ConfigDialog on selection)
     m_configPage = new QWidget(this);
-    auto *cfgLayout = new QVBoxLayout(m_configPage);
-    auto *cfgLabel = new QLabel(i18n("Configuration editor will appear here."), m_configPage);
-    cfgLabel->setAlignment(Qt::AlignCenter);
-    cfgLayout->addWidget(cfgLabel);
+    {
+        auto *cfgLayout = new QVBoxLayout(m_configPage);
+        cfgLayout->setAlignment(Qt::AlignCenter);
+        auto *cfgLabel = new QLabel(i18n("Click the button below or use the menu to open "
+                                         "the configuration editor."), m_configPage);
+        cfgLabel->setAlignment(Qt::AlignCenter);
+        cfgLabel->setWordWrap(true);
+        cfgLayout->addWidget(cfgLabel);
+
+        auto *cfgButton = new QPushButton(
+            QIcon::fromTheme(QStringLiteral("configure")),
+            i18n("Open Config Editor"), m_configPage);
+        cfgButton->setToolTip(i18n("Edit btrbk backup configuration"));
+        cfgButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        cfgLayout->addWidget(cfgButton, 0, Qt::AlignCenter);
+
+        connect(cfgButton, &QPushButton::clicked, this, [this]() {
+            auto *dlg = new ConfigDialog(m_dbusClient, this);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->show();
+        });
+    }
     m_stack->addWidget(m_configPage); // index 3
 
-    // Page 4: Health — Drives (placeholder)
-    m_healthDrivesPage = new QWidget(this);
-    auto *drvLayout = new QVBoxLayout(m_healthDrivesPage);
-    auto *drvLabel = new QLabel(i18n("Drive health information will appear here."), m_healthDrivesPage);
-    drvLabel->setAlignment(Qt::AlignCenter);
-    drvLayout->addWidget(drvLabel);
-    m_stack->addWidget(m_healthDrivesPage); // index 4
-
-    // Page 5: Health — Growth (placeholder)
-    m_healthGrowthPage = new QWidget(this);
-    auto *growLayout = new QVBoxLayout(m_healthGrowthPage);
-    auto *growLabel = new QLabel(i18n("Disk usage growth charts will appear here."), m_healthGrowthPage);
-    growLabel->setAlignment(Qt::AlignCenter);
-    growLayout->addWidget(growLabel);
-    m_stack->addWidget(m_healthGrowthPage); // index 5
-
-    // Page 6: Health — Status (placeholder)
-    m_healthStatusPage = new QWidget(this);
-    auto *stLayout = new QVBoxLayout(m_healthStatusPage);
-    auto *stLabel = new QLabel(i18n("System status overview will appear here."), m_healthStatusPage);
-    stLabel->setAlignment(Qt::AlignCenter);
-    stLayout->addWidget(stLabel);
-    m_stack->addWidget(m_healthStatusPage); // index 6
+    // Page 4: Health Dashboard (tabs: Drives, Growth, Status)
+    m_healthDashboard = new HealthDashboard(m_database, m_dbusClient, this);
+    m_stack->addWidget(m_healthDashboard); // index 4
 
     // --- Main layout: sidebar | stack ---
     auto *mainSplitter = new QSplitter(Qt::Horizontal, this);
@@ -298,18 +293,23 @@ void MainWindow::onSectionChanged(SidebarSection section)
         break;
     case SidebarSection::BackupHistory:
         m_stack->setCurrentIndex(2);
+        m_backupHistoryPage->refresh();
         break;
     case SidebarSection::Config:
         m_stack->setCurrentIndex(3);
         break;
     case SidebarSection::HealthDrives:
         m_stack->setCurrentIndex(4);
+        m_healthDashboard->setActiveTab(0);
+        m_healthDashboard->refresh();
         break;
     case SidebarSection::HealthGrowth:
-        m_stack->setCurrentIndex(5);
+        m_stack->setCurrentIndex(4);
+        m_healthDashboard->setActiveTab(1);
         break;
     case SidebarSection::HealthStatus:
-        m_stack->setCurrentIndex(6);
+        m_stack->setCurrentIndex(4);
+        m_healthDashboard->setActiveTab(2);
         break;
     }
 }
