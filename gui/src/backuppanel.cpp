@@ -17,7 +17,7 @@
 BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     : QWidget(parent)
     , m_client(client)
-    , m_configPath(QStringLiteral("/etc/btrbk/btrbk.conf"))
+    , m_configPath(QStringLiteral("/etc/das-backup/config.toml"))
 {
     auto *outerLayout = new QVBoxLayout(this);
     outerLayout->setContentsMargins(12, 12, 12, 12);

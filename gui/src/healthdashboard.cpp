@@ -59,7 +59,7 @@ HealthDashboard::HealthDashboard(Database *db, DBusClient *client, QWidget *pare
     : QWidget(parent)
     , m_database(db)
     , m_client(client)
-    , m_configPath(QStringLiteral("/etc/btrbk/btrbk.conf"))
+    , m_configPath(QStringLiteral("/etc/das-backup/config.toml"))
 {
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
