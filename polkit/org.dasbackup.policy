@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+    "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>DAS Backup Manager</vendor>
+  <vendor_url>https://github.com/TheBoscoClub/DAS-Backup-Manager</vendor_url>
+  <icon_name>drive-harddisk</icon_name>
+
+  <action id="org.dasbackup.backup">
+    <description>Run backup operations</description>
+    <message>Authentication is required to run backup operations</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.dasbackup.restore">
+    <description>Restore files from backups</description>
+    <message>Authentication is required to restore files from backups</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.dasbackup.config">
+    <description>Modify backup configuration</description>
+    <message>Authentication is required to modify backup configuration</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.dasbackup.index">
+    <description>Index backup snapshots</description>
+    <message>Authentication is required to index backup snapshots</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.dasbackup.health">
+    <description>Query drive health</description>
+    <message>Authentication is required to query drive health information</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
