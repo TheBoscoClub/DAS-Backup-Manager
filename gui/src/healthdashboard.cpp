@@ -223,7 +223,7 @@ void HealthDashboard::refresh()
 void HealthDashboard::updateDrives(const QString &json)
 {
     const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
-    const QJsonArray drives = doc.object().value(QLatin1String("drives")).toArray();
+    const QJsonArray drives = doc.object().value(QLatin1String("targets")).toArray();
 
     auto *model = qobject_cast<QStandardItemModel *>(m_drivesView->model());
     if (!model)
@@ -234,7 +234,7 @@ void HealthDashboard::updateDrives(const QString &json)
     for (const QJsonValue &val : drives) {
         const QJsonObject drv = val.toObject();
 
-        const QString device   = drv.value(QLatin1String("device")).toString();
+        const QString device   = drv.value(QLatin1String("serial")).toString();
         const QString label    = drv.value(QLatin1String("label")).toString();
         const bool    mounted  = drv.value(QLatin1String("mounted")).toBool();
         const qint64  total    = drv.value(QLatin1String("total_bytes")).toInteger();
@@ -344,7 +344,7 @@ void HealthDashboard::updateStatus(const QString &json)
     const QJsonDocument doc      = QJsonDocument::fromJson(json.toUtf8());
     const QJsonObject   root     = doc.object();
     const QJsonObject   services = root.value(QLatin1String("services")).toObject();
-    const QJsonArray    drives   = root.value(QLatin1String("drives")).toArray();
+    const QJsonArray    drives   = root.value(QLatin1String("targets")).toArray();
 
     // btrbk availability
     const bool btrbkAvail = services.value(QLatin1String("btrbk_available")).toBool();
