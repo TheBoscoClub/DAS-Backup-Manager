@@ -144,6 +144,9 @@ if(BUILD_HELPER)
 
     install(FILES polkit/org.dasbackup.policy
         DESTINATION "${CMAKE_INSTALL_PREFIX}/share/polkit-1/actions")
+
+    install(FILES systemd/btrdasd-helper.service
+        DESTINATION lib/systemd/system)
 endif()
 
 # =============================================================================

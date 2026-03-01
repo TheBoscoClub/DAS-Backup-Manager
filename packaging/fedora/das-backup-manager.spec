@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -25,17 +25,23 @@ restoring files from backup snapshots.
 %autosetup -n DAS-Backup-Manager-%{version}
 
 %build
-cargo build --release --manifest-path indexer/Cargo.toml
+cargo build --release --features dbus --manifest-path indexer/Cargo.toml
 %cmake -DBUILD_INDEXER=OFF
 %cmake_build
 
 %install
 %cmake_install
 install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
+install -Dm755 indexer/target/release/btrdasd-helper %{buildroot}%{_libexecdir}/btrdasd-helper
+install -Dm644 dbus/org.dasbackup.Helper1.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.dasbackup.Helper1.conf
+install -Dm644 dbus/org.dasbackup.Helper1.service %{buildroot}%{_datadir}/dbus-1/system-services/org.dasbackup.Helper1.service
+install -Dm644 polkit/org.dasbackup.policy %{buildroot}%{_datadir}/polkit-1/actions/org.dasbackup.policy
+install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-helper.service
 
 %files
 %license LICENSE
 %{_bindir}/btrdasd
+%{_libexecdir}/btrdasd-helper
 %{_bindir}/btrdasd-gui
 %{_prefix}/lib/das-backup/
 %{_unitdir}/das-backup.service
@@ -44,4 +50,8 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_unitdir}/das-backup-full.timer
 %{_datadir}/applications/org.theboscoclub.btrdasd-gui.desktop
 %{_datadir}/kxmlgui5/btrdasd-gui/
+%{_datadir}/dbus-1/system.d/org.dasbackup.Helper1.conf
+%{_datadir}/dbus-1/system-services/org.dasbackup.Helper1.service
+%{_datadir}/polkit-1/actions/org.dasbackup.policy
+%{_unitdir}/btrdasd-helper.service
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg

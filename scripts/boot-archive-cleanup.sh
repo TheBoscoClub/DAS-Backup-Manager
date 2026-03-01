@@ -30,8 +30,6 @@ fi
 
 RETENTION_DAYS="$DAS_BOOT_ARCHIVE_RETENTION_DAYS"
 DRYRUN=false
-ARCHIVE_PATTERN="@*.archive.*"
-
 # All target mount points from config
 IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
 
@@ -78,7 +76,8 @@ cleanup_target() {
         return
     fi
 
-    local label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
+    local label
+    label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
     log_info "Scanning [$label] for boot archives..."
 
     local cutoff_epoch=$(( $(date '+%s') - (RETENTION_DAYS * 86400) ))
@@ -91,7 +90,8 @@ cleanup_target() {
         # Only process archive subvolumes
         [[ "$subvol_name" != *.archive.* ]] && continue
 
-        local archive_epoch=$(parse_archive_timestamp "$subvol_name")
+        local archive_epoch
+        archive_epoch=$(parse_archive_timestamp "$subvol_name")
         if (( archive_epoch == 0 )); then
             log_warn "  Could not parse timestamp from: $subvol_name"
             continue

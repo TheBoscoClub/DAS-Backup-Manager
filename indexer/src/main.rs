@@ -9,7 +9,7 @@ use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::report;
 use buttered_dasd::{restore, schedule, subvol};
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use std::path::PathBuf;
 
 const DEFAULT_DB: &str = "/var/lib/das-backup/backup-index.db";

@@ -39,7 +39,6 @@ declare -A EXPECTED_SERIALS=()
 declare -A TARGET_LABELS=()
 declare -A TARGET_ROLES=()
 declare -A TARGET_NAMES=()
-PARTITION_TARGETS=()
 
 for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     label_var="DAS_TARGET_${i}_LABEL"
@@ -198,7 +197,7 @@ confirm_destruction() {
         echo "  $dev — $name ($(lsblk -dn -o SIZE "$dev"))"
     done
     echo ""
-    read -p "Type 'YES-DESTROY' to proceed: " confirm
+    read -rp "Type 'YES-DESTROY' to proceed: " confirm
 
     if [[ "$confirm" != "YES-DESTROY" ]]; then
         log_info "Aborted by user"

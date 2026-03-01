@@ -1,0 +1,14 @@
+[Unit]
+Description=ButteredDASD D-Bus Helper Daemon
+Documentation=man:btrdasd(1)
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.dasbackup.Helper1
+ExecStart=/usr/libexec/btrdasd-helper
+User=root
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -492,7 +492,7 @@ mod tests {
         // Create a minimal valid config as a temp file
         let toml = r#"
 [general]
-version = "0.5.1"
+version = "0.6.0"
 install_prefix = "/usr"
 db_path = "/tmp/test.db"
 [init]

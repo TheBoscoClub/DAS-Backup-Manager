@@ -3,6 +3,7 @@ FROM rust:1.93-bookworm AS builder
 
 WORKDIR /src
 COPY indexer/ indexer/
+COPY scripts/ scripts/
 RUN cargo build --release --manifest-path indexer/Cargo.toml
 
 # Stage 2: Runtime
