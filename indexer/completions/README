@@ -1,0 +1,28 @@
+Shell Completions for btrdasd
+=============================
+
+Generate and install shell completion scripts using the built-in
+`btrdasd completions` subcommand.
+
+Bash
+----
+  btrdasd completions bash > /usr/share/bash-completion/completions/btrdasd
+
+Zsh
+---
+  btrdasd completions zsh > /usr/local/share/zsh/site-functions/_btrdasd
+
+Fish
+----
+  btrdasd completions fish > ~/.config/fish/completions/btrdasd.fish
+
+Elvish
+------
+  btrdasd completions elvish > ~/.config/elvish/lib/btrdasd.elv
+
+PowerShell
+----------
+  btrdasd completions powershell > _btrdasd.ps1
+
+After installing, restart your shell or source the completion file
+for changes to take effect.

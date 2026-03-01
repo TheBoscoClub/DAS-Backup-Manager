@@ -1,0 +1,629 @@
+.\" btrdasd(1) man page
+.\" Generated from clap CLI definitions in indexer/src/main.rs
+.TH BTRDASD 1 "2026-02-28" "0.5.1" "DAS Backup Manager"
+.SH NAME
+btrdasd \- DAS Backup Manager indexer and orchestrator
+.SH SYNOPSIS
+.B btrdasd
+.RB [ \-\-json ]
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B btrdasd
+(ButteredDASD) manages BTRFS backups to Direct-Attached Storage (DAS).
+It provides btrbk orchestration, content indexing with FTS5 full-text search,
+health monitoring, schedule management, and backup history tracking.
+.PP
+Progress messages are printed to stderr so that stdout remains
+machine-parseable.
+When the global
+.B \-\-json
+flag is given, all read commands emit JSON output on stdout.
+.SH COMMANDS
+.SS walk
+Index all new snapshots on a backup target.
+.PP
+.B btrdasd walk
+.I TARGET
+.RB [ \-\-db
+.IR PATH ]
+.TP
+.I TARGET
+Path to backup target mount point.
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.\"
+.SS search
+Full-text search across indexed files using FTS5.
+.PP
+.B btrdasd search
+.I QUERY
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-limit
+.IR N ]
+.TP
+.I QUERY
+FTS5 search query.
+Supports prefix matching (e.g.,
+.BR report* ).
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-limit " N"
+Maximum number of results to return.
+Default: 50.
+.\"
+.SS list
+List files in a specific snapshot.
+.PP
+.B btrdasd list
+.I SNAPSHOT
+.RB [ \-\-db
+.IR PATH ]
+.TP
+.I SNAPSHOT
+Snapshot path or name.timestamp pattern.
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.\"
+.SS info
+Show database statistics (snapshot count, file count, span count, database size).
+.PP
+.B btrdasd info
+.RB [ \-\-db
+.IR PATH ]
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.\"
+.SS setup
+Interactive setup wizard \(em configure backup sources, targets, and scheduling.
+Requires root privileges.
+.PP
+.B btrdasd setup
+.RB [ \-\-modify ]
+.RB [ \-\-upgrade ]
+.RB [ \-\-uninstall ]
+.RB [ \-\-check ]
+.TP
+.B \-\-modify
+Re-open the wizard with the current configuration pre-filled.
+.TP
+.B \-\-upgrade
+Regenerate all managed files from the existing configuration
+(useful after a binary update).
+.TP
+.B \-\-uninstall
+Remove all generated files, disable timers, and optionally remove the database.
+.TP
+.B \-\-check
+Validate the configuration and dependencies, report issues,
+but change nothing.
+.\"
+.SS config dump\-env
+Print shell-sourceable KEY=VALUE pairs from the configuration.
+.PP
+.B btrdasd config dump\-env
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS config show
+Pretty-print the current configuration.
+.PP
+.B btrdasd config show
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS config validate
+Validate the configuration and report any issues.
+Exits with status 1 if validation errors are found.
+.PP
+.B btrdasd config validate
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS config edit
+Open the configuration file in
+.BR $EDITOR
+(defaults to
+.BR vi ).
+.PP
+.B btrdasd config edit
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS backup run
+Run the full backup pipeline: snapshot, send, boot archive, index, and email report.
+.PP
+.B btrdasd backup run
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-dry\-run ]
+.RB [ \-\-full ]
+.RB [ \-\-sources
+.IR LABELS ]
+.RB [ \-\-targets
+.IR LABELS ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-dry\-run
+Preview only \(em do not execute any operations.
+.TP
+.B \-\-full
+Run a full backup instead of incremental.
+.TP
+.BI \-\-sources " LABELS"
+Comma-separated source labels to back up.
+Default: all non-manual sources.
+.TP
+.BI \-\-targets " LABELS"
+Comma-separated target labels to send to.
+Default: all mounted targets.
+.\"
+.SS backup snapshot
+Create snapshots without sending them to targets.
+.PP
+.B btrdasd backup snapshot
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-sources
+.IR LABELS ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-sources " LABELS"
+Comma-separated source labels.
+Default: all.
+.\"
+.SS backup send
+Send existing snapshots to targets.
+.PP
+.B btrdasd backup send
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-targets
+.IR LABELS ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-targets " LABELS"
+Comma-separated target labels.
+Default: all mounted.
+.\"
+.SS backup boot\-archive
+Archive boot subvolumes on backup targets.
+.PP
+.B btrdasd backup boot\-archive
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS backup report
+Show the last backup reports from the database.
+.PP
+.B btrdasd backup report
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-limit
+.IR N ]
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-limit " N"
+Number of recent runs to show.
+Default: 10.
+.\"
+.SS restore file
+Restore specific files from a snapshot.
+.PP
+.B btrdasd restore file
+.I SNAPSHOT DEST FILE
+.RI [ FILE .\|.\|.]
+.TP
+.I SNAPSHOT
+Path to the snapshot directory.
+.TP
+.I DEST
+Destination directory for restored files.
+.TP
+.I FILE
+One or more file paths relative to the snapshot root (at least one required).
+.\"
+.SS restore snapshot
+Restore an entire snapshot using btrfs send/receive or recursive copy.
+.PP
+.B btrdasd restore snapshot
+.I SNAPSHOT DEST
+.TP
+.I SNAPSHOT
+Path to the snapshot directory.
+.TP
+.I DEST
+Destination directory.
+.\"
+.SS restore browse
+Browse files in a snapshot directory.
+.PP
+.B btrdasd restore browse
+.I SNAPSHOT
+.RB [ \-\-prefix
+.IR PATH ]
+.TP
+.I SNAPSHOT
+Path to the snapshot directory.
+.TP
+.BI \-\-prefix " PATH"
+Optional subdirectory prefix to browse within the snapshot.
+.\"
+.SS schedule show
+Show the current backup schedule, including next run times.
+.PP
+.B btrdasd schedule show
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS schedule set
+Update schedule settings.
+.PP
+.B btrdasd schedule set
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-incremental
+.IR TIME ]
+.RB [ \-\-full
+.IR SCHEDULE ]
+.RB [ \-\-delay
+.IR MINUTES ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-incremental " TIME"
+Incremental backup time in HH:MM format.
+.TP
+.BI \-\-full " SCHEDULE"
+Full backup schedule in systemd calendar format
+(e.g., "Sun *\-*\-* 04:00:00").
+.TP
+.BI \-\-delay " MINUTES"
+Randomized delay in minutes before starting.
+.\"
+.SS schedule enable
+Enable scheduled backups via systemd timers.
+.PP
+.B btrdasd schedule enable
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS schedule disable
+Disable scheduled backups.
+.PP
+.B btrdasd schedule disable
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS schedule next
+Show the next scheduled backup time.
+.PP
+.B btrdasd schedule next
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS subvol list
+List all configured subvolumes across all sources.
+.PP
+.B btrdasd subvol list
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS subvol add
+Add a subvolume to a source.
+.PP
+.B btrdasd subvol add
+.I SOURCE NAME
+.RB [ \-\-manual\-only ]
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.I SOURCE
+Source label to add the subvolume to.
+.TP
+.I NAME
+Subvolume name (e.g., "@home").
+.TP
+.B \-\-manual\-only
+Mark the subvolume as manual-only, excluding it from automatic backups.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS subvol remove
+Remove a subvolume from a source.
+.PP
+.B btrdasd subvol remove
+.I SOURCE NAME
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.I SOURCE
+Source label.
+.TP
+.I NAME
+Subvolume name.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS subvol set\-manual
+Mark a subvolume as manual-only, excluding it from automatic backups.
+.PP
+.B btrdasd subvol set\-manual
+.I SOURCE NAME
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.I SOURCE
+Source label.
+.TP
+.I NAME
+Subvolume name.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS subvol set\-auto
+Mark a subvolume for automatic backups, removing the manual-only flag.
+.PP
+.B btrdasd subvol set\-auto
+.I SOURCE NAME
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.I SOURCE
+Source label.
+.TP
+.I NAME
+Subvolume name.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS health
+Show backup system health \(em drive status, SMART diagnostics,
+disk usage, and growth trends.
+.PP
+.B btrdasd health
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.SH OPTIONS
+.TP
+.B \-\-json
+Produce machine-readable JSON output on all read commands.
+This flag is global and may be placed before any subcommand.
+.TP
+.B \-\-help
+Print help information and exit.
+.TP
+.B \-\-version
+Print version information and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Successful operation.
+.TP
+.B 1
+An error occurred (backup failure, validation error, missing configuration, etc.).
+.SH EXAMPLES
+Run a full backup pipeline:
+.PP
+.RS
+.nf
+btrdasd backup run
+.fi
+.RE
+.PP
+Preview a backup without making changes:
+.PP
+.RS
+.nf
+btrdasd backup run \-\-dry\-run
+.fi
+.RE
+.PP
+Run a full (non-incremental) backup of specific sources to specific targets:
+.PP
+.RS
+.nf
+btrdasd backup run \-\-full \-\-sources root,home \-\-targets das\-22tb
+.fi
+.RE
+.PP
+Search for files matching a prefix across all indexed snapshots:
+.PP
+.RS
+.nf
+btrdasd search 'report*'
+.fi
+.RE
+.PP
+Search with JSON output and limited results:
+.PP
+.RS
+.nf
+btrdasd \-\-json search 'config' \-\-limit 10
+.fi
+.RE
+.PP
+Browse a snapshot directory:
+.PP
+.RS
+.nf
+btrdasd restore browse /mnt/backup/root.20260228T030000
+.fi
+.RE
+.PP
+Restore specific files from a snapshot:
+.PP
+.RS
+.nf
+btrdasd restore file /mnt/backup/root.20260228T030000 /tmp/restored etc/fstab etc/btrbk/btrbk.conf
+.fi
+.RE
+.PP
+Show drive health and backup status:
+.PP
+.RS
+.nf
+btrdasd health
+.fi
+.RE
+.PP
+Show backup schedule and next run times:
+.PP
+.RS
+.nf
+btrdasd schedule show
+.fi
+.RE
+.PP
+List all configured subvolumes:
+.PP
+.RS
+.nf
+btrdasd subvol list
+.fi
+.RE
+.PP
+Index snapshots on a backup target:
+.PP
+.RS
+.nf
+btrdasd walk /mnt/backup
+.fi
+.RE
+.PP
+Run the interactive setup wizard:
+.PP
+.RS
+.nf
+sudo btrdasd setup
+.fi
+.RE
+.SH FILES
+.TP
+.I /var/lib/das\-backup/backup\-index.db
+SQLite database with FTS5 content index and backup history.
+.TP
+.I /etc/das\-backup/config.toml
+Main configuration file for sources, targets, schedule, and email settings.
+.TP
+.I /etc/btrbk/btrbk.conf
+btrbk configuration file (generated by
+.B btrdasd setup
+from config.toml).
+.TP
+.I /etc/das\-backup\-email.conf
+SMTP credentials for email reports (mode 600).
+.TP
+.I /var/lib/das\-backup/growth.log
+Disk usage growth log for trend monitoring.
+.SH SEE ALSO
+.BR btrbk (1),
+.BR btrfs (8),
+.BR btrfs\-send (8),
+.BR btrfs\-receive (8),
+.BR btrfs\-subvolume (8),
+.BR smartctl (8)
+.SH AUTHORS
+TheBoscoClub
+.UR https://github.com/TheBoscoClub/DAS-Backup-Manager
+.UE

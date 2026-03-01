@@ -8,7 +8,8 @@ use buttered_dasd::indexer;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::report;
 use buttered_dasd::{restore, schedule, subvol};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use std::path::PathBuf;
 
 const DEFAULT_DB: &str = "/var/lib/das-backup/backup-index.db";
@@ -148,6 +149,11 @@ enum Commands {
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
     },
 }
 
@@ -955,6 +961,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+
+        // ----- Completions command -----
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "btrdasd", &mut std::io::stdout());
         }
     }
 
