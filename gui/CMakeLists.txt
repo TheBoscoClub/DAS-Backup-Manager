@@ -14,7 +14,6 @@ include(FeatureSummary)
 find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS
     Core
     Widgets
-    Sql
     DBus
 )
 
@@ -35,7 +34,6 @@ add_executable(btrdasd-gui)
 target_sources(btrdasd-gui PRIVATE
     src/main.cpp
     src/mainwindow.cpp
-    src/database.cpp
     src/snapshotmodel.cpp
     src/filemodel.cpp
     src/searchmodel.cpp
@@ -60,7 +58,6 @@ target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
 target_link_libraries(btrdasd-gui PRIVATE
     Qt6::Core
     Qt6::Widgets
-    Qt6::Sql
     Qt6::DBus
     KF6::CoreAddons
     KF6::I18n
@@ -80,28 +77,9 @@ install(FILES icons/btrdasd-gui.svg DESTINATION ${KDE_INSTALL_ICONDIR}/hicolor/s
 
 feature_summary(WHAT ALL INCLUDE_QUIET_PACKAGES FATAL_ON_MISSING_REQUIRED_PACKAGES)
 
-# Tests
+# Tests — direct-DB tests removed; database logic is tested in Rust indexer.
+# TODO: Add D-Bus-based model tests with mock JSON data.
 if(BUILD_TESTING)
     find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS Test)
     include(ECMAddTests)
-
-    ecm_add_test(tests/databasetest.cpp src/database.cpp
-        TEST_NAME databasetest
-        LINK_LIBRARIES Qt6::Test Qt6::Sql
-    )
-
-    ecm_add_test(tests/snapshotmodeltest.cpp src/snapshotmodel.cpp src/database.cpp
-        TEST_NAME snapshotmodeltest
-        LINK_LIBRARIES Qt6::Test Qt6::Sql
-    )
-
-    ecm_add_test(tests/filemodeltest.cpp src/filemodel.cpp src/database.cpp
-        TEST_NAME filemodeltest
-        LINK_LIBRARIES Qt6::Test Qt6::Sql
-    )
-
-    ecm_add_test(tests/searchmodeltest.cpp src/searchmodel.cpp src/filemodel.cpp src/database.cpp
-        TEST_NAME searchmodeltest
-        LINK_LIBRARIES Qt6::Test Qt6::Sql
-    )
 endif()

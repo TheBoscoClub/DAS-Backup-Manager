@@ -14,7 +14,6 @@ class QTimer;
 
 class KStatusNotifierItem;
 
-class Database;
 class SnapshotModel;
 class SnapshotTimeline;
 class FileModel;
@@ -55,10 +54,8 @@ private:
     void setupUi();
     void setupBrowsePage();
     void setupTrayIcon();
-    void openDatabase(const QString &path);
 
     // Core services
-    Database *m_database = nullptr;
     DBusClient *m_dbusClient = nullptr;
     IndexRunner *m_indexRunner = nullptr;
     SnapshotWatcher *m_snapshotWatcher = nullptr;
