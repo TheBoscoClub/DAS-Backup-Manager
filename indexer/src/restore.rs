@@ -111,6 +111,14 @@ pub fn restore_files(
         let src = snapshot_path.join(file_path);
         let dest_file = dest.join(file_path);
 
+        // Path traversal guard: ensure resolved paths stay within boundaries
+        if let Ok(canonical_src) = src.canonicalize()
+            && !canonical_src.starts_with(snapshot_path)
+        {
+            errors.push(format!("Path traversal blocked: '{}'", file_path));
+            continue;
+        }
+
         // Create parent directories for this file
         if let Some(parent) = dest_file.parent()
             && let Err(e) = std::fs::create_dir_all(parent)

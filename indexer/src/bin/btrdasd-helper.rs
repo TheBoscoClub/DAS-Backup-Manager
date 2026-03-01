@@ -698,7 +698,7 @@ impl HelperInterface {
                     "snaps_created": r.snaps_created,
                     "snaps_sent": r.snaps_sent,
                     "bytes_sent": r.bytes_sent,
-                    "errors": r.errors.join("\n"),
+                    "errors": &r.errors,
                 })
             })
             .collect();
@@ -1135,7 +1135,14 @@ impl HelperInterface {
     }
 
     /// Cancel a running job.
-    async fn job_cancel(&self, job_id: &str) -> fdo::Result<bool> {
+    async fn job_cancel(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        job_id: &str,
+    ) -> fdo::Result<bool> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
         let mut jobs = self.jobs.lock().await;
         if let Some((handle, cancel)) = jobs.remove(job_id) {
             cancel.cancel();

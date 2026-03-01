@@ -418,7 +418,7 @@ void MainWindow::updateStatusBar()
     if (!scheduleJson.isEmpty()) {
         const QJsonDocument doc = QJsonDocument::fromJson(scheduleJson.toUtf8());
         const QJsonObject obj = doc.object();
-        const QString next = obj.value(QLatin1String("next_run")).toString();
+        const QString next = obj.value(QLatin1String("next_incremental")).toString();
         if (!next.isEmpty()) {
             parts.append(i18n("Next: %1", next));
         }

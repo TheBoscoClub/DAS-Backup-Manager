@@ -602,7 +602,7 @@ enabled = false
     fn subvol_config_from_string() {
         let toml = r#"
 [general]
-version = "0.5.1"
+version = "0.6.0"
 install_prefix = "/usr"
 db_path = "/tmp/test.db"
 [init]
@@ -641,7 +641,7 @@ enabled = false
     fn subvol_config_full_format() {
         let toml = r#"
 [general]
-version = "0.5.1"
+version = "0.6.0"
 install_prefix = "/usr"
 db_path = "/tmp/test.db"
 [init]

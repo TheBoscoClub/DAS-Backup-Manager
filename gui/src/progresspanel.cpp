@@ -166,10 +166,11 @@ void ProgressPanel::onJobLog(const QString &jobId, const QString &level,
     QString prefix;
     QString color;
 
-    if (level == QLatin1String("WARN") || level == QLatin1String("WARNING")) {
+    if (level.compare(QLatin1String("warn"), Qt::CaseInsensitive) == 0
+        || level.compare(QLatin1String("warning"), Qt::CaseInsensitive) == 0) {
         prefix = QStringLiteral("[WARN] ");
         color = QStringLiteral("#b8860b");  // dark goldenrod
-    } else if (level == QLatin1String("ERROR")) {
+    } else if (level.compare(QLatin1String("error"), Qt::CaseInsensitive) == 0) {
         prefix = QStringLiteral("[ERROR] ");
         color = QStringLiteral("#cc0000");  // red
     } else {
