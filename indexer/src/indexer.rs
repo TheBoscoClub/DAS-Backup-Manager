@@ -78,8 +78,9 @@ pub fn discover_snapshots(
             let dirname = snap_entry.file_name().to_string_lossy().to_string();
             if let Some((name, ts)) = parse_snapshot_dirname(&dirname) {
                 let path = snap_entry.path();
-                let path_str = path.to_string_lossy().to_string();
-                if !db.snapshot_exists(&path_str)? {
+                // Use (source, name, ts) for dedup — the same snapshot may
+                // appear under different mount paths (bind mount vs udisks2).
+                if !db.snapshot_exists_by_key(&source, &name, &ts)? {
                     discovered.push(DiscoveredSnapshot {
                         name,
                         ts,

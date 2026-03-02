@@ -162,6 +162,20 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Check if a snapshot with the given (source, name, ts) triple already
+    /// exists in the database.  This is mount-path-agnostic — it prevents
+    /// duplicate indexing when the same snapshot is accessed via different
+    /// mount points (e.g. bind mount `/mnt/backup-22tb` vs udisks2
+    /// `/run/media/bosco/das-backup-22tb`).
+    pub fn snapshot_exists_by_key(&self, source: &str, name: &str, ts: &str) -> SqlResult<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE source = ?1 AND name = ?2 AND ts = ?3",
+            rusqlite::params![source, name, ts],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn get_snapshot(&self, path: &str) -> SqlResult<Option<Snapshot>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, ts, source, path, indexed_at FROM snapshots WHERE path = ?1",

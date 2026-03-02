@@ -516,9 +516,10 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
 
 /// Best-effort parse of a size from a btrbk `>>>` or `***` output line.
 ///
-/// btrbk may emit lines like:
-///   `>>> /path/to/snapshot (full send, 1.2 GiB)`
-///   `*** /path/to/snapshot (incremental, 45.3 MiB)`
+/// btrbk v0.32 does NOT include size info in these lines (just paths).
+/// This parser is kept as a secondary source in case future btrbk versions
+/// add parenthetical sizes like `(incremental, 45.3 MiB)`.  The primary
+/// bytes_sent measurement uses target disk usage delta instead.
 ///
 /// Returns the size in bytes, or 0 if not parseable.
 fn parse_btrbk_size_field(line: &str) -> u64 {
@@ -546,6 +547,31 @@ fn parse_btrbk_size_field(line: &str) -> u64 {
         }
     }
     0
+}
+
+/// Measure total used bytes across all mounted backup targets.
+///
+/// Uses `statvfs(2)` to read filesystem usage directly (no child process).
+/// Returns the sum of used bytes across all target mount points. Used to
+/// calculate bytes_sent as the delta between before/after a backup, since
+/// btrbk doesn't report transfer sizes in its output.
+fn measure_target_usage(config: &Config) -> u64 {
+    config
+        .targets
+        .iter()
+        .filter_map(|tgt| {
+            let path = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role)?;
+            let c_path = std::ffi::CString::new(path).ok()?;
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+            if rc != 0 {
+                return None;
+            }
+            let total = stat.f_blocks * stat.f_frsize;
+            let avail = stat.f_bavail * stat.f_frsize;
+            Some(total.saturating_sub(avail))
+        })
+        .sum()
 }
 
 /// Archive boot subvolumes as read-only snapshots on backup targets.
@@ -822,6 +848,14 @@ pub fn run_backup(
     //   The complete backup lifecycle including housekeeping.  Deletes
     //   snapshots and backups outside the configured retention windows.
 
+    // Measure target disk usage before btrbk runs so we can calculate
+    // bytes_sent as the delta (btrbk doesn't report transfer sizes).
+    let usage_before = measure_target_usage(config);
+    progress.on_log(
+        LogLevel::Info,
+        &format!("Target usage before: {} bytes", usage_before),
+    );
+
     let mut snapshots_cleaned: usize = 0;
 
     match mode {
@@ -905,6 +939,24 @@ pub fn run_backup(
                 }
             }
         }
+    }
+
+    // Calculate bytes_sent from target disk usage delta. btrbk doesn't report
+    // transfer sizes in its output, so we measure before/after. For incremental
+    // mode (no cleanup) this is the actual bytes sent. For full mode (with
+    // cleanup) it's the net change, which may underestimate if old data was
+    // purged. Still better than reporting 0.
+    if bytes_sent == 0 && (snapshots_sent > 0 || snapshots_created > 0) {
+        let usage_after = measure_target_usage(config);
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "Target usage after: {} bytes (delta: {})",
+                usage_after,
+                usage_after.saturating_sub(usage_before)
+            ),
+        );
+        bytes_sent = usage_after.saturating_sub(usage_before);
     }
 
     // Step (c): Boot archive (both modes)

@@ -175,17 +175,53 @@ pub fn ensure_targets_mounted(
             continue;
         }
 
-        // Already mounted elsewhere (e.g. udisks2 at /run/media/) — use that
+        // Already mounted elsewhere (e.g. udisks2 at /run/media/) — bind-mount
+        // at the configured path so btrbk can find the target where it expects it.
         if let Some(actual) = health::find_mount_for_device(&target.serial, &target.role) {
-            any_available = true;
-            progress.on_progress(
-                (i + 1) as u64,
-                total,
-                &format!(
-                    "{} already mounted at {} (configured: {})",
-                    target.label, actual, target.mount
-                ),
-            );
+            // Create configured mount point directory if needed
+            if !mount_path.exists() {
+                let status = Command::new("mkdir").arg("-p").arg(&target.mount).status();
+                if status.is_err() || !status.unwrap().success() {
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!(
+                            "Failed to create mount point {} for bind mount",
+                            target.mount
+                        ),
+                    );
+                    any_available = true;
+                    continue;
+                }
+            }
+            let status = Command::new("mount")
+                .arg("--bind")
+                .arg(&actual)
+                .arg(&target.mount)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    guard.newly_mounted.push(target.mount.clone());
+                    any_available = true;
+                    progress.on_progress(
+                        (i + 1) as u64,
+                        total,
+                        &format!(
+                            "{} bind-mounted {} → {}",
+                            target.label, actual, target.mount
+                        ),
+                    );
+                }
+                _ => {
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!(
+                            "{}: bind mount {} → {} failed — btrbk may not find this target",
+                            target.label, actual, target.mount
+                        ),
+                    );
+                    any_available = true;
+                }
+            }
             continue;
         }
 
