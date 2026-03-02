@@ -1,6 +1,8 @@
 use crate::config::Config;
+use crate::health;
 use crate::progress::{LogLevel, ProgressCallback};
 use std::io::BufRead;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
@@ -52,15 +54,9 @@ pub struct BackupResult {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Check if a path is currently mounted by reading /proc/mounts.
+/// Check if a path is currently an active mount point.
 fn is_mounted(mount_path: &str) -> bool {
-    std::fs::read_to_string("/proc/mounts")
-        .map(|contents| {
-            contents
-                .lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(mount_path))
-        })
-        .unwrap_or(false)
+    health::is_mountpoint(Path::new(mount_path))
 }
 
 /// Build a timestamp string in YYYYMMDDTHHMMSS format using SystemTime.
