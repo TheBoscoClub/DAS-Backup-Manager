@@ -50,7 +50,8 @@ public:
     // Index read methods (read-only, no polkit auth for active sessions)
     QString indexStats(const QString &dbPath);
     QString indexListSnapshots(const QString &dbPath);
-    QString indexListFiles(const QString &dbPath, qint64 snapshotId);
+    QString indexListFiles(const QString &dbPath, qint64 snapshotId,
+                           qint64 limit = 10000, qint64 offset = 0);
     QString indexSearch(const QString &dbPath, const QString &query, qint64 limit);
     QString indexBackupHistory(const QString &dbPath, qint64 limit);
     QString indexSnapshotPath(const QString &dbPath, qint64 snapshotId);

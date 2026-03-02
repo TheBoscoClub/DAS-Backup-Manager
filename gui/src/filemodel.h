@@ -25,6 +25,7 @@ public:
     explicit FileModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
 
     void loadSnapshot(qint64 snapshotId);
+    void loadMore();
     void clear();
 
     [[nodiscard]] int rowCount(const QModelIndex &parent = {}) const override;
@@ -33,10 +34,17 @@ public:
     [[nodiscard]] QVariant headerData(int section, Qt::Orientation orientation,
                                        int role = Qt::DisplayRole) const override;
 
+    [[nodiscard]] qint64 totalFiles() const { return m_totalFiles; }
+    [[nodiscard]] bool hasMore() const { return m_files.size() < m_totalFiles; }
+
     static QString formatSize(qint64 bytes);
 
 private:
+    static constexpr qint64 PageSize = 10000;
+
     DBusClient *m_client;
     QString m_dbPath;
     QVector<FileInfo> m_files;
+    qint64 m_currentSnapshotId = -1;
+    qint64 m_totalFiles = 0;
 };

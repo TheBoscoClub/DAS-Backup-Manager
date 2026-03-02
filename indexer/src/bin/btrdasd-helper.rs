@@ -679,20 +679,33 @@ impl HelperInterface {
         Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
     }
 
-    /// Return JSON array of files in a given snapshot.
+    /// Return paginated JSON of files in a given snapshot.
+    ///
+    /// Returns a JSON object: `{"files": [...], "total": N, "limit": L, "offset": O}`
+    /// Use limit=0 to return all files (not recommended for large snapshots).
     async fn index_list_files(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         db_path: &str,
         snapshot_id: i64,
+        limit: i64,
+        offset: i64,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
 
         let db = Database::open(db_path)
             .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+
+        let total = db
+            .count_files_in_snapshot(snapshot_id)
+            .map_err(|e| fdo::Error::Failed(format!("Count files failed: {e}")))?;
+
+        // Default to 10000 if limit is 0 or negative (prevents giant responses)
+        let effective_limit = if limit <= 0 { 10_000 } else { limit };
+
         let files = db
-            .get_files_in_snapshot(snapshot_id)
+            .get_files_in_snapshot_paged(snapshot_id, effective_limit, offset)
             .map_err(|e| fdo::Error::Failed(format!("List files failed: {e}")))?;
         let arr: Vec<serde_json::Value> = files
             .iter()
@@ -707,7 +720,15 @@ impl HelperInterface {
                 })
             })
             .collect();
-        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+
+        let result = serde_json::json!({
+            "files": arr,
+            "total": total,
+            "limit": effective_limit,
+            "offset": offset,
+        });
+        Ok(serde_json::to_string(&result)
+            .unwrap_or_else(|_| r#"{"files":[],"total":0,"limit":0,"offset":0}"#.to_string()))
     }
 
     /// FTS5 search returning JSON array of matches.
@@ -931,13 +952,15 @@ impl HelperInterface {
     // ---- Synchronous methods ----
 
     /// Get the raw TOML config as a string.
+    /// Uses config.read polkit action (allow_active=yes) so the GUI can load
+    /// sources/targets on startup without prompting for admin credentials.
     async fn config_get(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         config_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
 
         let config = load_config(config_path)?;
         config
@@ -970,13 +993,14 @@ impl HelperInterface {
     }
 
     /// Get the current backup schedule as JSON.
+    /// Uses config.read polkit action (read-only, no admin auth for active sessions).
     async fn schedule_get(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         config_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
 
         let config = load_config(config_path)?;
         let info = schedule::get_schedule(&config)

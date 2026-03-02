@@ -248,10 +248,11 @@ QString DBusClient::indexListSnapshots(const QString &dbPath)
     return reply.value();
 }
 
-QString DBusClient::indexListFiles(const QString &dbPath, qint64 snapshotId)
+QString DBusClient::indexListFiles(const QString &dbPath, qint64 snapshotId,
+                                   qint64 limit, qint64 offset)
 {
     QDBusReply<QString> reply = m_interface->call(
-        QStringLiteral("IndexListFiles"), dbPath, snapshotId);
+        QStringLiteral("IndexListFiles"), dbPath, snapshotId, limit, offset);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("IndexListFiles"),
                              mapDBusError(reply.error().name(), reply.error().message()));

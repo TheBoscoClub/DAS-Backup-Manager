@@ -308,6 +308,46 @@ impl Database {
         rows.collect()
     }
 
+    /// Paginated version of `get_files_in_snapshot` with LIMIT and OFFSET.
+    pub fn get_files_in_snapshot_paged(
+        &self,
+        snap_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> SqlResult<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.path, f.name, f.size, f.mtime, f.type
+             FROM files f
+             JOIN spans s ON s.file_id = f.id
+             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1
+             ORDER BY f.path
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![snap_id, limit, offset], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                size: row.get(3)?,
+                mtime: row.get(4)?,
+                file_type: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Count files in a snapshot (for pagination metadata).
+    pub fn count_files_in_snapshot(&self, snap_id: i64) -> SqlResult<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(DISTINCT f.id)
+             FROM files f
+             JOIN spans s ON s.file_id = f.id
+             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1",
+            [snap_id],
+            |row| row.get(0),
+        )
+    }
+
     pub fn get_stats(&self) -> SqlResult<DbStats> {
         Ok(DbStats {
             snapshot_count: self
