@@ -387,17 +387,11 @@ pub fn archive_boot(
     let ts = format_timestamp();
     let mut any_archived = false;
 
-    // Identify which targets are mounted.
-    let mounted_targets: Vec<&crate::config::Target> = config
-        .targets
-        .iter()
-        .filter(|t| is_mounted(&t.mount))
-        .collect();
-
-    if mounted_targets.is_empty() {
+    // Use all configured targets — caller pre-mounted via MountGuard.
+    if config.targets.is_empty() {
         progress.on_log(
             LogLevel::Warning,
-            "No backup targets are mounted — skipping boot archive",
+            "No backup targets configured — skipping boot archive",
         );
         return Ok(false);
     }
@@ -413,7 +407,7 @@ pub fn archive_boot(
         // for "@home" -> "@home.archive.TIMESTAMP".
         let archive_name = format!("{subvol}.archive.{ts}");
 
-        for target in &mounted_targets {
+        for target in &config.targets {
             let tgt_mount = &target.mount;
 
             // Check if the boot subvolume exists on this target.
@@ -516,6 +510,10 @@ pub fn run_backup(
     };
 
     // ---------- Resolve effective targets ----------
+    //
+    // When targets are explicitly specified (D-Bus helper pre-mounts them),
+    // trust the caller — don't re-check mount status.  Only auto-detect
+    // mounted targets when the caller leaves the list empty (standalone CLI).
 
     let effective_targets: Vec<String> = if options.targets.is_empty() {
         config
@@ -525,7 +523,8 @@ pub fn run_backup(
             .map(|tgt| tgt.label.clone())
             .collect()
     } else {
-        // Caller-specified targets: only keep those that are mounted.
+        // Caller specified targets — validate they exist in config but don't
+        // re-check mount status (caller already ensured mount via MountGuard).
         options
             .targets
             .iter()
@@ -533,17 +532,15 @@ pub fn run_backup(
                 config
                     .targets
                     .iter()
-                    .find(|t| &&t.label == label)
-                    .map(|t| is_mounted(&t.mount))
-                    .unwrap_or(false)
+                    .any(|t| &&t.label == label)
             })
             .cloned()
             .collect()
     };
 
-    // Require at least one mounted target (unless dry-run).
+    // Require at least one target (unless dry-run).
     if effective_targets.is_empty() && !options.dry_run {
-        return Err("No backup targets are mounted. Connect the DAS enclosure and mount targets before running.".into());
+        return Err("No backup targets available. Connect the DAS enclosure and mount targets before running.".into());
     }
 
     // Count enabled pipeline steps for the top-level stage announcement.

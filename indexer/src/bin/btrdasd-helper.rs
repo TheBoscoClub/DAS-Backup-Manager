@@ -1126,14 +1126,10 @@ impl HelperInterface {
         let config = load_config(config_path)?;
 
         // Run the entire health query (blocking I/O: smartctl, btrfs, mount)
-        // inside spawn_blocking with auto-mount.
+        // inside spawn_blocking.  Do NOT auto-mount — the health report should
+        // reflect the actual mount state so the user sees which targets are
+        // available vs disconnected.
         let json_str = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let progress = buttered_dasd::progress::NullProgress;
-
-            // Auto-mount targets (only mounts what isn't already mounted)
-            let mut guard = mount::ensure_targets_mounted(&config, &progress)
-                .map_err(|e| format!("Mount failed: {e}"))?;
-
             let report =
                 health::get_health(&config).map_err(|e| format!("Health query failed: {e}"))?;
 
@@ -1255,9 +1251,6 @@ impl HelperInterface {
                     "drives_mounted": drives_mounted,
                 },
             });
-
-            // Unmount targets this call mounted
-            guard.unmount(&progress);
 
             Ok(json.to_string())
         })
