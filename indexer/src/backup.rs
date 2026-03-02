@@ -257,21 +257,28 @@ pub fn send_snapshots(
         }
     }
 
-    // Add target mount path filters if requested.
-    if !targets.is_empty() {
-        for label in targets {
-            if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
-                if is_mounted(&tgt.mount) {
-                    cmd.arg(&tgt.mount);
-                } else {
-                    progress.on_log(
-                        LogLevel::Warning,
-                        &format!(
-                            "Target '{}' at {} is not mounted — skipping",
-                            label, tgt.mount
-                        ),
-                    );
-                }
+    // Note: target mount paths (e.g. /mnt/backup-22tb) are NOT passed as
+    // btrbk filter arguments.  btrbk expects exact matches to the configured
+    // target *directories* (e.g. /mnt/backup-22tb/nvme), not the top-level
+    // mount point.  Source volume paths already limit which data is processed,
+    // and btrbk automatically skips targets whose paths don't exist.
+    //
+    // Log which targets are expected so the user knows the scope.
+    for label in targets {
+        if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
+            if is_mounted(&tgt.mount) {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("Target '{}' at {} is mounted — will receive", label, tgt.mount),
+                );
+            } else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "Target '{}' at {} is not mounted — btrbk will skip",
+                        label, tgt.mount
+                    ),
+                );
             }
         }
     }
