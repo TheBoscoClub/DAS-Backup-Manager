@@ -27,6 +27,7 @@ use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
+use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
@@ -334,7 +335,10 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                match backup::run_backup(&config, &options, &progress) {
+                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                    .map_err(|e| format!("Mount failed: {e}"))?;
+
+                let res = match backup::run_backup(&config, &options, &progress) {
                     Ok(r) => Ok((
                         r.success,
                         format!(
@@ -343,7 +347,10 @@ impl HelperInterface {
                         ),
                     )),
                     Err(e) => Err(format!("Backup failed: {e}")),
-                }
+                };
+
+                guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Backup task panicked: {e}")));
@@ -430,10 +437,16 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                match backup::send_snapshots(&config, &sources, &targets, &progress) {
+                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                    .map_err(|e| format!("Mount failed: {e}"))?;
+
+                let res = match backup::send_snapshots(&config, &sources, &targets, &progress) {
                     Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
                     Err(e) => Err(format!("Send failed: {e}")),
-                }
+                };
+
+                guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Send task panicked: {e}")));
@@ -473,7 +486,10 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                match backup::archive_boot(&config, &progress) {
+                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                    .map_err(|e| format!("Mount failed: {e}"))?;
+
+                let res = match backup::archive_boot(&config, &progress) {
                     Ok(archived) => {
                         let msg = if archived {
                             "Boot subvolumes archived"
@@ -483,7 +499,10 @@ impl HelperInterface {
                         Ok(msg.to_string())
                     }
                     Err(e) => Err(format!("Boot archive failed: {e}")),
-                }
+                };
+
+                guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Boot archive task panicked: {e}")));
@@ -508,14 +527,17 @@ impl HelperInterface {
     async fn index_walk(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
         target_path: &str,
         db_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index").await?;
 
+        let config = load_config(config_path)?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
+        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
         let conn = self.conn.clone();
@@ -524,14 +546,20 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                    .map_err(|e| format!("Mount failed: {e}"))?;
+
                 let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-                match indexer::walk(Path::new(&target_path), &db) {
+                let res = match indexer::walk(Path::new(&target_path), &db) {
                     Ok(r) => Ok(format!(
                         "Indexed {} new snapshots ({} total discovered, {} skipped)",
                         r.snapshots_indexed, r.snapshots_discovered, r.snapshots_skipped
                     )),
                     Err(e) => Err(format!("Indexing failed: {e}")),
-                }
+                };
+
+                guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));
@@ -728,6 +756,7 @@ impl HelperInterface {
     async fn restore_files(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
         snapshot: &str,
         dest: &str,
         files: Vec<String>,
@@ -735,6 +764,7 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
 
+        let config = load_config(config_path)?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -746,8 +776,11 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                    .map_err(|e| format!("Mount failed: {e}"))?;
+
                 let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-                match restore::restore_files(
+                let res = match restore::restore_files(
                     Path::new(&snapshot),
                     &file_refs,
                     Path::new(&dest),
@@ -763,7 +796,10 @@ impl HelperInterface {
                         ),
                     )),
                     Err(e) => Err(format!("Restore failed: {e}")),
-                }
+                };
+
+                guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Restore task panicked: {e}")));
@@ -788,12 +824,14 @@ impl HelperInterface {
     async fn restore_snapshot(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        config_path: &str,
         snapshot: &str,
         dest: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
 
+        let config = load_config(config_path)?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -805,7 +843,14 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                match restore::restore_snapshot(Path::new(&snapshot), Path::new(&dest), &progress) {
+                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                    .map_err(|e| format!("Mount failed: {e}"))?;
+
+                let res = match restore::restore_snapshot(
+                    Path::new(&snapshot),
+                    Path::new(&dest),
+                    &progress,
+                ) {
                     Ok(r) => Ok((
                         r.errors.is_empty(),
                         format!(
@@ -816,7 +861,10 @@ impl HelperInterface {
                         ),
                     )),
                     Err(e) => Err(format!("Snapshot restore failed: {e}")),
-                }
+                };
+
+                guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Snapshot restore task panicked: {e}")));

@@ -384,7 +384,7 @@ void MainWindow::triggerReindex()
     QString targetPath = QStringLiteral("/mnt/backup-hdd");
 
     statusBar()->showMessage(i18n("Re-indexing %1...", targetPath));
-    m_indexRunner->run(targetPath, m_dbPath);
+    m_indexRunner->run(QStringLiteral("/etc/das-backup/config.toml"), targetPath, m_dbPath);
 }
 
 void MainWindow::showStats()
