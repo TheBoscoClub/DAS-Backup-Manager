@@ -587,7 +587,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-                let result = buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, &progress);
+                let result =
+                    buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, false, &progress);
                 guard.unmount(&progress);
                 let (sent, bytes) = result?;
                 println!("Sent {sent} snapshots ({})", report::format_bytes(bytes));

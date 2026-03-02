@@ -73,18 +73,14 @@ pub fn record_backup_run(
     db: &Database,
     result: &BackupResult,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    let mode = if result.snapshots_created == 0 && result.snapshots_sent == 0 {
-        "none"
-    } else {
-        "incremental"
-    };
+    let mode_str = result.mode.to_string();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let id = db.insert_backup_run(&NewBackupRun {
         timestamp,
         success: result.success,
-        mode,
+        mode: &mode_str,
         snaps_created: result.snapshots_created,
         snaps_sent: result.snapshots_sent,
         bytes_sent: result.bytes_sent,
@@ -120,6 +116,7 @@ pub fn get_backup_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backup::BackupMode;
 
     #[test]
     fn format_bytes_units() {
@@ -141,8 +138,10 @@ mod tests {
     fn format_report_success() {
         let result = BackupResult {
             success: true,
+            mode: BackupMode::Full,
             snapshots_created: 5,
             snapshots_sent: 5,
+            snapshots_cleaned: 2,
             bytes_sent: 1_073_741_824,
             boot_archived: true,
             indexed: true,
@@ -165,8 +164,10 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         let result = BackupResult {
             success: true,
+            mode: BackupMode::Incremental,
             snapshots_created: 3,
             snapshots_sent: 3,
+            snapshots_cleaned: 0,
             bytes_sent: 500_000,
             boot_archived: false,
             indexed: true,
@@ -181,6 +182,7 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, id);
         assert!(history[0].success);
+        assert_eq!(history[0].mode, "incremental");
         assert_eq!(history[0].snapshots_created, 3);
         assert_eq!(history[0].snapshots_sent, 3);
         assert_eq!(history[0].bytes_sent, 500_000);
@@ -192,8 +194,10 @@ mod tests {
     fn format_report_with_errors() {
         let result = BackupResult {
             success: false,
+            mode: BackupMode::Full,
             snapshots_created: 2,
             snapshots_sent: 0,
+            snapshots_cleaned: 0,
             bytes_sent: 0,
             boot_archived: false,
             indexed: false,
