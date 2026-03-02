@@ -380,11 +380,9 @@ void MainWindow::triggerReindex()
         return;
     }
 
-    // Default target path — the config specifies actual targets
-    QString targetPath = QStringLiteral("/mnt/backup-hdd");
-
-    statusBar()->showMessage(i18n("Re-indexing %1...", targetPath));
-    m_indexRunner->run(QStringLiteral("/etc/das-backup/config.toml"), targetPath, m_dbPath);
+    // Empty target path → D-Bus helper walks ALL mounted config targets
+    statusBar()->showMessage(i18n("Re-indexing all targets..."));
+    m_indexRunner->run(QStringLiteral("/etc/das-backup/config.toml"), QString(), m_dbPath);
 }
 
 void MainWindow::showStats()

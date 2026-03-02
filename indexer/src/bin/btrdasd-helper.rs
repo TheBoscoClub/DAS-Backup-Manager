@@ -523,7 +523,10 @@ impl HelperInterface {
         Ok(job_id)
     }
 
-    /// Walk a backup target and index new snapshots.
+    /// Walk backup targets and index new snapshots.
+    ///
+    /// If `target_path` is empty, walks ALL mounted config targets.
+    /// Otherwise walks just the specified path (backwards compat).
     async fn index_walk(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -550,16 +553,56 @@ impl HelperInterface {
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-                let res = match indexer::walk(Path::new(&target_path), &db) {
-                    Ok(r) => Ok(format!(
-                        "Indexed {} new snapshots ({} total discovered, {} skipped)",
-                        r.snapshots_indexed, r.snapshots_discovered, r.snapshots_skipped
-                    )),
-                    Err(e) => Err(format!("Indexing failed: {e}")),
+
+                // Collect target paths to walk
+                let paths: Vec<String> = if target_path.is_empty() {
+                    config
+                        .targets
+                        .iter()
+                        .filter(|t| health::is_mountpoint(Path::new(&t.mount)))
+                        .map(|t| t.mount.clone())
+                        .collect()
+                } else {
+                    vec![target_path]
                 };
 
+                let mut total_discovered = 0usize;
+                let mut total_indexed = 0usize;
+                let mut total_skipped = 0usize;
+                let mut errors = Vec::new();
+
+                progress.on_stage("Indexing targets", paths.len() as u64);
+                for (i, path) in paths.iter().enumerate() {
+                    progress.on_progress(
+                        (i + 1) as u64,
+                        paths.len() as u64,
+                        &format!("Walking {path}"),
+                    );
+                    match indexer::walk(Path::new(path), &db) {
+                        Ok(r) => {
+                            total_discovered += r.snapshots_discovered;
+                            total_indexed += r.snapshots_indexed;
+                            total_skipped += r.snapshots_skipped;
+                        }
+                        Err(e) => {
+                            errors.push(format!("{path}: {e}"));
+                        }
+                    }
+                }
+
                 guard.unmount(&progress);
-                res
+
+                if !errors.is_empty() && total_indexed == 0 {
+                    Err(format!("Indexing failed: {}", errors.join("; ")))
+                } else {
+                    let mut msg = format!(
+                        "Indexed {total_indexed} new snapshots ({total_discovered} discovered, {total_skipped} skipped)"
+                    );
+                    if !errors.is_empty() {
+                        msg.push_str(&format!(" [warnings: {}]", errors.join("; ")));
+                    }
+                    Ok(msg)
+                }
             })
             .await
             .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));

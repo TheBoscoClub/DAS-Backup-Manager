@@ -474,9 +474,22 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
         });
     }
 
-    // 6. Parse growth log
+    // 6. Parse growth log — map mount paths to target labels
+    let mount_to_label: std::collections::HashMap<&str, &str> = config
+        .targets
+        .iter()
+        .map(|t| (t.mount.as_str(), t.label.as_str()))
+        .collect();
     let growth_points = fs::read_to_string(&config.general.growth_log)
-        .map(|content| parse_growth_log(&content))
+        .map(|content| {
+            let mut pts = parse_growth_log(&content);
+            for pt in &mut pts {
+                if let Some(label) = mount_to_label.get(pt.target_label.as_str()) {
+                    pt.target_label = (*label).to_string();
+                }
+            }
+            pts
+        })
         .unwrap_or_default();
 
     // 7. Determine overall status
@@ -494,13 +507,51 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
     })
 }
 
+/// Parse an ISO 8601 datetime string (`YYYY-MM-DDTHH:MM:SS`) into a Unix
+/// timestamp (seconds since epoch).  Returns `None` for malformed input.
+fn parse_iso_datetime(s: &str) -> Option<i64> {
+    // Try parsing as plain i64 first (backwards compat with raw Unix timestamps)
+    if let Ok(ts) = s.parse::<i64>() {
+        return Some(ts);
+    }
+
+    // Parse "YYYY-MM-DDTHH:MM:SS" — no timezone, assumed UTC-ish (good enough
+    // for day-granularity growth tracking).
+    let (date_part, time_part) = s.split_once('T')?;
+    let mut date_iter = date_part.split('-');
+    let year: i64 = date_iter.next()?.parse().ok()?;
+    let month: i64 = date_iter.next()?.parse().ok()?;
+    let day: i64 = date_iter.next()?.parse().ok()?;
+
+    let mut time_iter = time_part.split(':');
+    let hour: i64 = time_iter.next()?.parse().ok()?;
+    let min: i64 = time_iter.next()?.parse().ok()?;
+    let sec: i64 = time_iter.next()?.parse().ok()?;
+
+    // Convert to days since epoch, then to seconds.
+    // Inverse of days_to_ymd (civil_from_days algorithm, Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
 /// Parse a growth.log file into GrowthPoint entries.
+///
+/// Each line has the format: `<timestamp> <mount_path_or_label> <used_bytes>`
+/// where timestamp can be either a Unix epoch integer or an ISO 8601 datetime
+/// string (`YYYY-MM-DDTHH:MM:SS`).
 pub fn parse_growth_log(content: &str) -> Vec<GrowthPoint> {
     let mut points = Vec::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3
-            && let (Ok(ts), Ok(used)) = (parts[0].parse::<i64>(), parts[2].parse::<u64>())
+            && let (Some(ts), Ok(used)) = (parse_iso_datetime(parts[0]), parts[2].parse::<u64>())
         {
             points.push(GrowthPoint {
                 timestamp: ts,
@@ -558,6 +609,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_iso_datetime_valid() {
+        let ts = parse_iso_datetime("2026-02-20T07:39:42").unwrap();
+        // 2026-02-20 07:39:42 UTC ≈ day 20504 * 86400 + 7*3600 + 39*60 + 42
+        assert!(ts > 1_700_000_000, "timestamp should be recent: {ts}");
+        // Verify round-trip through days_to_ymd
+        let days = ts / 86400;
+        let (y, m, d) = days_to_ymd(days);
+        assert_eq!(y, 2026);
+        assert_eq!(m, 2);
+        assert_eq!(d, 20);
+    }
+
+    #[test]
+    fn parse_iso_datetime_unix_fallback() {
+        assert_eq!(parse_iso_datetime("1709000000"), Some(1709000000));
+    }
+
+    #[test]
+    fn parse_iso_datetime_invalid() {
+        assert!(parse_iso_datetime("not-a-date").is_none());
+        assert!(parse_iso_datetime("2026-13-01T00:00:00").is_some()); // month 13 parses, ymd handles
+        assert!(parse_iso_datetime("").is_none());
+    }
+
+    #[test]
     fn parse_growth_log_entries() {
         let log = "1709000000 primary-22tb 5368709120\n\
                     1709086400 primary-22tb 5905580032\n\
@@ -568,6 +644,18 @@ mod tests {
         assert_eq!(points[0].target_label, "primary-22tb");
         assert_eq!(points[0].used_bytes, 5368709120);
         assert_eq!(points[2].target_label, "system-2tb");
+    }
+
+    #[test]
+    fn parse_growth_log_iso_timestamps() {
+        let log = "2026-02-20T07:39:42 /mnt/backup-22tb 1861347422208\n\
+                   2026-02-20T07:39:42 /mnt/backup-system 871137460224\n";
+        let points = parse_growth_log(log);
+        assert_eq!(points.len(), 2);
+        assert!(points[0].timestamp > 1_700_000_000);
+        assert_eq!(points[0].target_label, "/mnt/backup-22tb");
+        assert_eq!(points[0].used_bytes, 1861347422208);
+        assert_eq!(points[1].target_label, "/mnt/backup-system");
     }
 
     #[test]
