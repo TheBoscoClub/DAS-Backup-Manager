@@ -525,22 +525,44 @@ pub fn run_backup(
     } else {
         // Caller specified targets — validate they exist in config but don't
         // re-check mount status (caller already ensured mount via MountGuard).
-        options
+        let matched: Vec<String> = options
             .targets
             .iter()
             .filter(|label| {
                 config
                     .targets
                     .iter()
-                    .any(|t| &&t.label == label)
+                    .any(|t| t.label.as_str() == label.as_str())
             })
             .cloned()
-            .collect()
+            .collect();
+
+        // If no requested targets matched config (e.g. stale label list),
+        // fall back to auto-detecting mounted targets so the backup can
+        // still proceed.
+        if matched.is_empty() {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Requested targets {:?} did not match config {:?} — auto-detecting mounted targets",
+                    options.targets,
+                    config.targets.iter().map(|t| &t.label).collect::<Vec<_>>()
+                ),
+            );
+            config
+                .targets
+                .iter()
+                .filter(|tgt| is_mounted(&tgt.mount))
+                .map(|tgt| tgt.label.clone())
+                .collect()
+        } else {
+            matched
+        }
     };
 
     // Require at least one target (unless dry-run).
     if effective_targets.is_empty() && !options.dry_run {
-        return Err("No backup targets available. Connect the DAS enclosure and mount targets before running.".into());
+        return Err("No backup targets are mounted. Connect the DAS enclosure and mount targets before running.".into());
     }
 
     // Count enabled pipeline steps for the top-level stage announcement.
