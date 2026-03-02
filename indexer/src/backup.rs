@@ -83,24 +83,25 @@ fn format_timestamp() -> String {
 }
 
 /// Parse btrbk snapshot output and count lines that indicate a snapshot was created.
-/// btrbk logs "snapshot" for each subvolume it snapshots.
+/// Count btrbk snapshot lines.  btrbk marks created snapshots with `+++`.
 fn parse_btrbk_snapshot_count(output: &str) -> usize {
     output
         .lines()
         .filter(|line| {
-            let lower = line.to_lowercase();
-            lower.contains("snapshot") && !lower.contains("error") && !lower.contains("warn")
+            let trimmed = line.trim_start();
+            trimmed.starts_with("+++")
         })
         .count()
 }
 
-/// Parse btrbk resume/run output and count lines that indicate a send operation.
+/// Count btrbk send lines.  btrbk marks sends with `>>>` (incremental) or
+/// `***` (non-incremental/full).
 fn parse_btrbk_send_count(output: &str) -> usize {
     output
         .lines()
         .filter(|line| {
-            let lower = line.to_lowercase();
-            lower.contains("send") && !lower.contains("error") && !lower.contains("warn")
+            let trimmed = line.trim_start();
+            trimmed.starts_with(">>>") || trimmed.starts_with("***")
         })
         .count()
 }
@@ -288,12 +289,13 @@ pub fn send_snapshots(
 
     let success = stream_command(&mut cmd, progress, |line| {
         stdout_lines.push(line.to_string());
-        let lower = line.to_lowercase();
-        if lower.contains("send") && !lower.contains("error") {
+        let trimmed = line.trim_start();
+        // btrbk marks sends with >>> (incremental) or *** (full)
+        if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
             snapshots_sent += 1;
         }
         // Parse throughput hints from btrbk progress lines.
-        // btrbk outputs lines like: "send   22.3 MiB/s"
+        let lower = line.to_lowercase();
         if lower.contains("mib/s") || lower.contains("kib/s") || lower.contains("gib/s") {
             let bytes_per_sec = parse_throughput_line(line);
             if bytes_per_sec > 0 {
@@ -831,17 +833,16 @@ mod tests {
 
     #[test]
     fn test_parse_btrbk_snapshot_count() {
+        // btrbk marks created snapshots with +++
         let output = "\
-Snapshot /.btrfs-nvme/.btrbk-snapshots/root.20260228T030012
-Snapshot /.btrfs-nvme/.btrbk-snapshots/home.20260228T030012
-Send-receive /mnt/backup/nvme/root.20260228T030012
-WARNING: something minor
-ERROR: something fatal
++++ /.btrfs-nvme/.btrbk-snapshots/root.20260228T030012
++++ /.btrfs-nvme/.btrbk-snapshots/home.20260228T030012
+>>> /mnt/backup/nvme/root.20260228T030012
+=== /.btrfs-nvme/.btrbk-snapshots/root.20260227T030012
+--- /.btrfs-nvme/.btrbk-snapshots/root.20260220T030012
 ";
-        // "snapshot" appears in lines 1 and 2; line 3 has "send", not "snapshot";
-        // lines 4-5 contain "warning"/"error" so they're filtered out.
         let count = parse_btrbk_snapshot_count(output);
-        assert_eq!(count, 2, "should count 2 snapshot lines, got {count}");
+        assert_eq!(count, 2, "should count 2 +++ lines, got {count}");
     }
 
     #[test]
@@ -851,8 +852,29 @@ ERROR: something fatal
 
     #[test]
     fn test_parse_btrbk_snapshot_count_no_snapshots() {
-        let output = "Starting btrbk\nDone.\n";
+        let output = "=== up-to-date\n--- deleted old\n";
         assert_eq!(parse_btrbk_snapshot_count(output), 0);
+    }
+
+    #[test]
+    fn test_parse_btrbk_send_count() {
+        // btrbk marks incremental sends with >>> and full sends with ***
+        let output = "\
++++ /.btrfs-nvme/.btrbk-snapshots/root.20260302T0835
+>>> /mnt/backup-22tb/nvme/root.20260302T0835
+>>> /mnt/backup-system/nvme/root.20260302T0835
+*** /mnt/backup-system-mirror/nvme/root.20260302T0835
+=== /.btrfs-nvme/.btrbk-snapshots/home.20260302T0828
+--- /mnt/backup-22tb/nvme/root.20260220T030012
+";
+        let count = parse_btrbk_send_count(output);
+        assert_eq!(count, 3, "should count 2 >>> + 1 ***, got {count}");
+    }
+
+    #[test]
+    fn test_parse_btrbk_send_count_none() {
+        let output = "+++ snapshot\n=== up-to-date\n--- deleted\n";
+        assert_eq!(parse_btrbk_send_count(output), 0);
     }
 
     // -----------------------------------------------------------------

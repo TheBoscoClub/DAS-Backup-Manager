@@ -28,6 +28,7 @@ use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
+use buttered_dasd::report;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
@@ -339,13 +340,32 @@ impl HelperInterface {
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let res = match backup::run_backup(&config, &options, &progress) {
-                    Ok(r) => Ok((
-                        r.success,
-                        format!(
-                            "Backup complete: {} snapshots created, {} sent",
-                            r.snapshots_created, r.snapshots_sent
-                        ),
-                    )),
+                    Ok(r) => {
+                        // Record the backup run in the database for history.
+                        match Database::open(&config.general.db_path) {
+                            Ok(db) => {
+                                if let Err(e) = report::record_backup_run(&db, &r) {
+                                    progress.on_log(
+                                        LogLevel::Warning,
+                                        &format!("Failed to record backup history: {e}"),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                progress.on_log(
+                                    LogLevel::Warning,
+                                    &format!("Failed to open DB for history: {e}"),
+                                );
+                            }
+                        }
+                        Ok((
+                            r.success,
+                            format!(
+                                "Backup complete: {} snapshots created, {} sent",
+                                r.snapshots_created, r.snapshots_sent
+                            ),
+                        ))
+                    }
                     Err(e) => Err(format!("Backup failed: {e}")),
                 };
 
