@@ -47,6 +47,12 @@ public:
     QString healthQuery(const QString &configPath);
     bool jobCancel(const QString &jobId);
 
+    // Async versions of slow methods (non-blocking, result via signal)
+    void healthQueryAsync(const QString &configPath);
+    void scheduleGetAsync(const QString &configPath);
+    void indexStatsAsync(const QString &dbPath);
+    void indexListSnapshotsAsync(const QString &dbPath);
+
     // Index read methods (read-only, no polkit auth for active sessions)
     QString indexStats(const QString &dbPath);
     QString indexListSnapshots(const QString &dbPath);
@@ -65,6 +71,12 @@ Q_SIGNALS:
     void jobFinished(const QString &jobId, bool success,
                      const QString &summary);
     void errorOccurred(const QString &operation, const QString &error);
+
+    // Async result signals
+    void healthQueryResult(const QString &json);
+    void scheduleGetResult(const QString &json);
+    void indexStatsResult(const QString &json);
+    void indexListSnapshotsResult(const QString &json);
 
 private Q_SLOTS:
     void onJobProgress(const QString &jobId, const QString &stage,

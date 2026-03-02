@@ -164,13 +164,27 @@ pub fn ensure_targets_mounted(
     for (i, target) in config.targets.iter().enumerate() {
         let mount_path = Path::new(&target.mount);
 
-        // Already mounted — nothing to do
+        // Already mounted at configured path — nothing to do
         if mount_path.exists() && health::is_mountpoint(mount_path) {
             any_available = true;
             progress.on_progress(
                 (i + 1) as u64,
                 total,
                 &format!("{} already mounted", target.label),
+            );
+            continue;
+        }
+
+        // Already mounted elsewhere (e.g. udisks2 at /run/media/) — use that
+        if let Some(actual) = health::find_mount_for_device(&target.serial, &target.role) {
+            any_available = true;
+            progress.on_progress(
+                (i + 1) as u64,
+                total,
+                &format!(
+                    "{} already mounted at {} (configured: {})",
+                    target.label, actual, target.mount
+                ),
             );
             continue;
         }

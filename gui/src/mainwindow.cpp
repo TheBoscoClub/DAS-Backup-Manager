@@ -70,6 +70,14 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
                 KMessageBox::error(this, i18n("%1: %2", operation, error));
             });
 
+    // Async status bar result handlers
+    connect(m_dbusClient, &DBusClient::indexStatsResult,
+            this, &MainWindow::onIndexStatsResult);
+    connect(m_dbusClient, &DBusClient::scheduleGetResult,
+            this, &MainWindow::onScheduleGetResult);
+    connect(m_dbusClient, &DBusClient::healthQueryResult,
+            this, &MainWindow::onHealthQueryResult);
+
     setupUi();
     setupActions();
     setupTrayIcon();
@@ -404,35 +412,65 @@ void MainWindow::showStats()
 
 void MainWindow::updateStatusBar()
 {
+    // Fire all 3 D-Bus queries asynchronously — results arrive via slots.
+    m_statusState = {};
+    m_statusState.pending = 3;
+    m_statusLabel->setText(i18n("Loading..."));
+
+    m_dbusClient->indexStatsAsync(m_dbPath);
+    m_dbusClient->scheduleGetAsync(QStringLiteral("/etc/das-backup/config.toml"));
+    m_dbusClient->healthQueryAsync(QStringLiteral("/etc/das-backup/config.toml"));
+}
+
+void MainWindow::onIndexStatsResult(const QString &json)
+{
+    m_statusState.statsJson = json;
+    if (m_statusState.pending > 0 && --m_statusState.pending == 0)
+        assembleStatusBar();
+}
+
+void MainWindow::onScheduleGetResult(const QString &json)
+{
+    m_statusState.scheduleJson = json;
+    if (m_statusState.pending > 0 && --m_statusState.pending == 0)
+        assembleStatusBar();
+}
+
+void MainWindow::onHealthQueryResult(const QString &json)
+{
+    m_statusState.healthJson = json;
+    if (m_statusState.pending > 0 && --m_statusState.pending == 0)
+        assembleStatusBar();
+}
+
+void MainWindow::assembleStatusBar()
+{
     QStringList parts;
 
-    // DB stats via D-Bus
-    const QString statsJson = m_dbusClient->indexStats(m_dbPath);
+    // DB stats
     qint64 dbSize = 0;
     qint64 snapshotCount = 0;
-    if (!statsJson.isEmpty()) {
-        const QJsonObject s = QJsonDocument::fromJson(statsJson.toUtf8()).object();
+    if (!m_statusState.statsJson.isEmpty()) {
+        const QJsonObject s = QJsonDocument::fromJson(
+            m_statusState.statsJson.toUtf8()).object();
         dbSize = s.value(QLatin1String("db_size_bytes")).toInteger();
         snapshotCount = s.value(QLatin1String("snapshots")).toInteger();
     }
 
-    // Next backup schedule (from D-Bus)
-    const QString scheduleJson = m_dbusClient->scheduleGet(
-        QStringLiteral("/etc/das-backup/config.toml"));
-    if (!scheduleJson.isEmpty()) {
-        const QJsonDocument doc = QJsonDocument::fromJson(scheduleJson.toUtf8());
-        const QJsonObject obj = doc.object();
+    // Next backup schedule
+    if (!m_statusState.scheduleJson.isEmpty()) {
+        const QJsonObject obj = QJsonDocument::fromJson(
+            m_statusState.scheduleJson.toUtf8()).object();
         const QString next = obj.value(QLatin1String("next_incremental")).toString();
         if (!next.isEmpty()) {
             parts.append(i18n("Next: %1", next));
         }
     }
 
-    // Targets online (from health)
-    const QString healthJson = m_dbusClient->healthQuery(
-        QStringLiteral("/etc/das-backup/config.toml"));
-    if (!healthJson.isEmpty()) {
-        const QJsonDocument doc = QJsonDocument::fromJson(healthJson.toUtf8());
+    // Targets online
+    if (!m_statusState.healthJson.isEmpty()) {
+        const QJsonDocument doc = QJsonDocument::fromJson(
+            m_statusState.healthJson.toUtf8());
         const QJsonArray targets = doc.object().value(QLatin1String("targets")).toArray();
         int mounted = 0;
         for (const QJsonValue &v : targets) {
@@ -513,8 +551,9 @@ void MainWindow::onBackupFinished(const QString &jobId, bool success, const QStr
             success ? i18n("Last backup: success") : i18n("Last backup: FAILED"));
     }
 
-    // Refresh status bar to pick up new schedule info
+    // Refresh status bar and snapshot list to pick up newly indexed snapshots
     updateStatusBar();
+    m_snapshotModel->reload();
 }
 
 void MainWindow::showSettings()

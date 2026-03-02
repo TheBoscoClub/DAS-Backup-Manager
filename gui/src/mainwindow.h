@@ -49,11 +49,17 @@ private Q_SLOTS:
     void showSettings();
     void onBackupFinished(const QString &jobId, bool success, const QString &summary);
 
+    // Async status bar result handlers
+    void onIndexStatsResult(const QString &json);
+    void onScheduleGetResult(const QString &json);
+    void onHealthQueryResult(const QString &json);
+
 private:
     void setupActions();
     void setupUi();
     void setupBrowsePage();
     void setupTrayIcon();
+    void assembleStatusBar();
 
     // Core services
     DBusClient *m_dbusClient = nullptr;
@@ -93,4 +99,12 @@ private:
 
     QString m_dbPath;
     qint64 m_currentSnapshotId = -1;
+
+    // Async status bar state (collected as D-Bus results arrive)
+    struct StatusBarState {
+        QString statsJson;
+        QString scheduleJson;
+        QString healthJson;
+        int pending = 0;
+    } m_statusState;
 };

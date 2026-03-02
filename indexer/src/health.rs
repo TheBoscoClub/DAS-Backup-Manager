@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, TargetRole};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -229,6 +229,48 @@ pub fn device_info_from_serial(serial: &str) -> Option<(String, bool)> {
     None
 }
 
+/// Find where a device partition is currently mounted, regardless of path.
+///
+/// Resolves the target's serial to a block device, determines its partition
+/// based on role, then scans `/proc/mounts` for that device.  Returns the
+/// actual mount path (which may be `/run/media/…` from udisks2, or the
+/// configured `/mnt/backup-…`, or wherever the kernel says it is).
+pub fn find_mount_for_device(serial: &str, role: &TargetRole) -> Option<String> {
+    let dev = device_from_serial(serial)?;
+    let part = crate::mount::partition_device(&dev, role);
+    // Canonicalize the partition device so we match /proc/mounts entries that
+    // use the real path (e.g. /dev/sdk1) rather than a symlink.
+    let canonical_part = std::fs::canonicalize(&part)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(part);
+
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    for line in mounts.lines() {
+        let mut cols = line.splitn(3, ' ');
+        if let (Some(device), Some(mountpoint)) = (cols.next(), cols.next())
+            && device == canonical_part
+        {
+            return Some(mountpoint.to_string());
+        }
+    }
+    None
+}
+
+/// Find the effective mount path for a target, checking both the configured
+/// path and any alternate mount (e.g. udisks2 at `/run/media/…`).
+///
+/// Returns `Some(path)` where the target is actually mounted, or `None`.
+pub fn find_any_mount(configured_path: &str, serial: &str, role: &TargetRole) -> Option<String> {
+    // 1. Prefer the configured path if it's an active mount point.
+    let cfg_path = Path::new(configured_path);
+    if cfg_path.exists() && is_mountpoint(cfg_path) {
+        return Some(configured_path.to_string());
+    }
+    // 2. Fall back to scanning /proc/mounts by device.
+    find_mount_for_device(serial, role)
+}
+
 /// Get disk space for `mount` using `statvfs(2)`.
 /// Returns `(total_bytes, used_bytes)` or `None` on error.
 fn disk_space_statvfs(mount: &str) -> Option<(u64, u64)> {
@@ -372,14 +414,14 @@ fn determine_status(targets: &[TargetHealth], warnings: &[String]) -> HealthStat
 pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::Error>> {
     let mut target_healths: Vec<TargetHealth> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    let mounts: Vec<String> = config.targets.iter().map(|t| t.mount.clone()).collect();
+    let mut effective_mounts: Vec<String> = Vec::new();
 
     for target in &config.targets {
-        let mount_path = Path::new(&target.mount);
-
-        // 1. Check mount status
-        let path_exists = mount_path.exists();
-        let mounted = path_exists && is_mountpoint(mount_path);
+        // 1. Check mount status — detect both configured path and udisks2 mounts
+        let actual_mount = find_any_mount(&target.mount, &target.serial, &target.role);
+        let mounted = actual_mount.is_some();
+        let effective_path = actual_mount.as_deref().unwrap_or(&target.mount).to_string();
+        effective_mounts.push(effective_path.clone());
 
         if !mounted {
             warnings.push(format!(
@@ -388,11 +430,10 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             ));
         }
 
-        // 2. Get disk space
+        // 2. Get disk space (using effective mount path)
         let (total_bytes, used_bytes) = if mounted {
-            // Prefer btrfs filesystem usage for accuracy; fall back to statvfs
             let btrfs_output = std::process::Command::new("btrfs")
-                .args(["filesystem", "usage", "--raw", &target.mount])
+                .args(["filesystem", "usage", "--raw", &effective_path])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -400,18 +441,18 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
 
             if let Some(output) = btrfs_output {
                 parse_btrfs_usage(&output)
-                    .or_else(|| disk_space_statvfs(&target.mount))
+                    .or_else(|| disk_space_statvfs(&effective_path))
                     .unwrap_or((0, 0))
             } else {
-                disk_space_statvfs(&target.mount).unwrap_or((0, 0))
+                disk_space_statvfs(&effective_path).unwrap_or((0, 0))
             }
         } else {
             (0, 0)
         };
 
-        // 3. Get snapshot count
+        // 3. Get snapshot count (using effective mount path)
         let snapshot_count = if mounted {
-            count_snapshots(&target.mount)
+            count_snapshots(&effective_path)
         } else {
             0
         };
@@ -486,17 +527,21 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
     }
 
     // 6. Parse growth log — map mount paths to target labels
-    let mount_to_label: std::collections::HashMap<&str, &str> = config
-        .targets
-        .iter()
-        .map(|t| (t.mount.as_str(), t.label.as_str()))
-        .collect();
+    //    Include both configured and effective mount paths for matching.
+    let mut mount_to_label: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (target, eff_mount) in config.targets.iter().zip(effective_mounts.iter()) {
+        mount_to_label.insert(target.mount.clone(), target.label.clone());
+        if eff_mount != &target.mount {
+            mount_to_label.insert(eff_mount.clone(), target.label.clone());
+        }
+    }
     let growth_points = fs::read_to_string(&config.general.growth_log)
         .map(|content| {
             let mut pts = parse_growth_log(&content);
             for pt in &mut pts {
-                if let Some(label) = mount_to_label.get(pt.target_label.as_str()) {
-                    pt.target_label = (*label).to_string();
+                if let Some(label) = mount_to_label.get(&pt.target_label) {
+                    pt.target_label = label.clone();
                 }
             }
             pts
@@ -506,8 +551,8 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
     // 7. Determine overall status
     let status = determine_status(&target_healths, &warnings);
 
-    // 8. Last backup time
-    let last_backup = latest_snapshot_time(&target_healths, &mounts);
+    // 8. Last backup time (use effective mount paths)
+    let last_backup = latest_snapshot_time(&target_healths, &effective_mounts);
 
     Ok(HealthReport {
         status,

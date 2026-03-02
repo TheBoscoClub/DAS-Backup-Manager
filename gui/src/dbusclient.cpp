@@ -223,6 +223,88 @@ bool DBusClient::jobCancel(const QString &jobId)
     return true;
 }
 
+// --- Async non-blocking methods ---
+
+void DBusClient::healthQueryAsync(const QString &configPath)
+{
+    QDBusPendingCall pending = m_interface->asyncCall(
+        QStringLiteral("HealthQuery"), configPath);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError()) {
+            Q_EMIT errorOccurred(QStringLiteral("HealthQuery"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+            Q_EMIT healthQueryResult({});
+        } else {
+            Q_EMIT healthQueryResult(reply.value());
+        }
+        w->deleteLater();
+    });
+}
+
+void DBusClient::scheduleGetAsync(const QString &configPath)
+{
+    QDBusPendingCall pending = m_interface->asyncCall(
+        QStringLiteral("ScheduleGet"), configPath);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError()) {
+            Q_EMIT errorOccurred(QStringLiteral("ScheduleGet"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+            Q_EMIT scheduleGetResult({});
+        } else {
+            Q_EMIT scheduleGetResult(reply.value());
+        }
+        w->deleteLater();
+    });
+}
+
+void DBusClient::indexStatsAsync(const QString &dbPath)
+{
+    QDBusPendingCall pending = m_interface->asyncCall(
+        QStringLiteral("IndexStats"), dbPath);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError()) {
+            Q_EMIT errorOccurred(QStringLiteral("IndexStats"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+            Q_EMIT indexStatsResult({});
+        } else {
+            Q_EMIT indexStatsResult(reply.value());
+        }
+        w->deleteLater();
+    });
+}
+
+void DBusClient::indexListSnapshotsAsync(const QString &dbPath)
+{
+    QDBusPendingCall pending = m_interface->asyncCall(
+        QStringLiteral("IndexListSnapshots"), dbPath);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError()) {
+            Q_EMIT errorOccurred(QStringLiteral("IndexListSnapshots"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+            Q_EMIT indexListSnapshotsResult({});
+        } else {
+            Q_EMIT indexListSnapshotsResult(reply.value());
+        }
+        w->deleteLater();
+    });
+}
+
 // --- Index read methods ---
 
 QString DBusClient::indexStats(const QString &dbPath)

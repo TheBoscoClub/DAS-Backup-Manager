@@ -77,6 +77,9 @@ HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
     setupGrowthTab();
     setupStatusTab();
 
+    connect(m_client, &DBusClient::healthQueryResult,
+            this, &HealthDashboard::onHealthResult);
+
     refresh();
 }
 
@@ -200,8 +203,11 @@ void HealthDashboard::setActiveTab(int index)
 
 void HealthDashboard::refresh()
 {
-    const QString json = m_client->healthQuery(m_configPath);
+    m_client->healthQueryAsync(m_configPath);
+}
 
+void HealthDashboard::onHealthResult(const QString &json)
+{
     if (json.isEmpty())
         return;
 

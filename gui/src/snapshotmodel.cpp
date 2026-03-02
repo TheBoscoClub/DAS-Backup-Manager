@@ -10,6 +10,8 @@ SnapshotModel::SnapshotModel(DBusClient *client, const QString &dbPath, QObject 
     , m_client(client)
     , m_dbPath(dbPath)
 {
+    connect(m_client, &DBusClient::indexListSnapshotsResult,
+            this, &SnapshotModel::onSnapshotsReceived);
 }
 
 QString SnapshotModel::tsToDate(const QString &ts)
@@ -21,11 +23,15 @@ QString SnapshotModel::tsToDate(const QString &ts)
 
 void SnapshotModel::reload()
 {
+    m_client->indexListSnapshotsAsync(m_dbPath);
+}
+
+void SnapshotModel::onSnapshotsReceived(const QString &json)
+{
     beginResetModel();
     m_snapshots.clear();
     m_groups.clear();
 
-    const QString json = m_client->indexListSnapshots(m_dbPath);
     if (!json.isEmpty()) {
         const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
         for (const QJsonValue &v : arr) {
