@@ -5,6 +5,7 @@ use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::health::HealthStatus;
 use buttered_dasd::indexer;
+use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::report;
 use buttered_dasd::{restore, schedule, subvol};
@@ -91,6 +92,9 @@ enum Commands {
         /// Path to SQLite database
         #[arg(long, default_value = DEFAULT_DB)]
         db: String,
+        /// Path to config.toml (for auto-mounting targets)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
     /// Full-text search across indexed files
     Search {
@@ -251,6 +255,9 @@ enum RestoreAction {
         /// File paths relative to snapshot root
         #[arg(required = true)]
         files: Vec<String>,
+        /// Path to config.toml (for auto-mounting targets)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
     /// Restore an entire snapshot (btrfs send/receive or recursive copy)
     Snapshot {
@@ -258,6 +265,9 @@ enum RestoreAction {
         snapshot: PathBuf,
         /// Destination directory
         dest: PathBuf,
+        /// Path to config.toml (for auto-mounting targets)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
     /// Browse files in a snapshot directory
     Browse {
@@ -266,6 +276,9 @@ enum RestoreAction {
         /// Optional subdirectory prefix to browse
         #[arg(long)]
         prefix: Option<String>,
+        /// Path to config.toml (for auto-mounting targets)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
 }
 
@@ -375,9 +388,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         // ----- Indexer commands (unchanged) -----
-        Commands::Walk { target, db } => {
+        Commands::Walk { target, db, config } => {
+            let cfg = Config::load(&config)?;
+            let progress = CliProgress;
+            let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
             let database = Database::open(&db)?;
-            let result = indexer::walk(&target, &database)?;
+            let result = indexer::walk(&target, &database);
+            guard.unmount(&progress);
+            let result = result?;
             if json {
                 println!(
                     "{{\"discovered\":{},\"indexed\":{},\"skipped\":{}}}",
@@ -525,7 +543,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 };
                 let progress = CliProgress;
-                let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress)?;
+                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
+                guard.unmount(&progress);
+                let result = result?;
                 if json {
                     println!(
                         "{{\"success\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{},\"duration_secs\":{}}}",
@@ -565,14 +586,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             BackupAction::Send { config, targets } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
-                let (sent, bytes) =
-                    buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, &progress)?;
+                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let result = buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, &progress);
+                guard.unmount(&progress);
+                let (sent, bytes) = result?;
                 println!("Sent {sent} snapshots ({})", report::format_bytes(bytes));
             }
             BackupAction::BootArchive { config } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
-                let archived = buttered_dasd::backup::archive_boot(&cfg, &progress)?;
+                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let result = buttered_dasd::backup::archive_boot(&cfg, &progress);
+                guard.unmount(&progress);
+                let archived = result?;
                 if archived {
                     println!("Boot subvolumes archived successfully");
                 } else {
@@ -632,10 +658,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 snapshot,
                 dest,
                 files,
+                config,
             } => {
+                let cfg = Config::load(&config)?;
                 let progress = CliProgress;
+                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-                let result = restore::restore_files(&snapshot, &file_refs, &dest, &progress)?;
+                let result = restore::restore_files(&snapshot, &file_refs, &dest, &progress);
+                guard.unmount(&progress);
+                let result = result?;
                 if json {
                     println!(
                         "{{\"files_restored\":{},\"bytes_restored\":{},\"errors\":{},\"duration_secs\":{}}}",
@@ -656,9 +687,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            RestoreAction::Snapshot { snapshot, dest } => {
+            RestoreAction::Snapshot {
+                snapshot,
+                dest,
+                config,
+            } => {
+                let cfg = Config::load(&config)?;
                 let progress = CliProgress;
-                let result = restore::restore_snapshot(&snapshot, &dest, &progress)?;
+                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let result = restore::restore_snapshot(&snapshot, &dest, &progress);
+                guard.unmount(&progress);
+                let result = result?;
                 if json {
                     println!(
                         "{{\"files_restored\":{},\"bytes_restored\":{},\"errors\":{},\"duration_secs\":{}}}",
@@ -679,8 +718,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            RestoreAction::Browse { snapshot, prefix } => {
-                let entries = restore::browse_snapshot(&snapshot, prefix.as_deref())?;
+            RestoreAction::Browse {
+                snapshot,
+                prefix,
+                config,
+            } => {
+                let cfg = Config::load(&config)?;
+                let progress = CliProgress;
+                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let entries = restore::browse_snapshot(&snapshot, prefix.as_deref());
+                guard.unmount(&progress);
+                let entries = entries?;
                 if json {
                     print!("[");
                     for (i, e) in entries.iter().enumerate() {
