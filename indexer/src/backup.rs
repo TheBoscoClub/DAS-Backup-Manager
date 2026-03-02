@@ -175,15 +175,32 @@ pub fn create_snapshots(
     let mut cmd = Command::new("btrbk");
     cmd.arg("-c").arg(&config.general.btrbk_conf);
 
-    // Add volume-path filter arguments for each requested source label.
+    // btrbk syntax: `btrbk -c <conf> snapshot [<volume-path>...]`
+    // The "snapshot" subcommand must appear exactly once, followed by volume
+    // paths as optional filter arguments.
+    cmd.arg("snapshot");
+
     if !sources.is_empty() {
+        // Collect unique volume paths — multiple sources can share a volume
+        // (e.g. hdd-projects and hdd-audiobooks both use /.btrfs-hdd).
+        let mut seen_volumes = std::collections::HashSet::new();
         for label in sources {
             if let Some(src) = config.sources.iter().find(|s| &s.label == label) {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("Snapshotting source '{}' at {}", label, src.volume),
-                );
-                cmd.arg("snapshot").arg(&src.volume);
+                if seen_volumes.insert(src.volume.clone()) {
+                    progress.on_log(
+                        LogLevel::Info,
+                        &format!("Snapshotting source '{}' at {}", label, src.volume),
+                    );
+                    cmd.arg(&src.volume);
+                } else {
+                    progress.on_log(
+                        LogLevel::Info,
+                        &format!(
+                            "Source '{}' shares volume {} (already included)",
+                            label, src.volume
+                        ),
+                    );
+                }
             } else {
                 progress.on_log(
                     LogLevel::Warning,
@@ -191,8 +208,6 @@ pub fn create_snapshots(
                 );
             }
         }
-    } else {
-        cmd.arg("snapshot");
     }
 
     let (stdout, success) = run_command(&mut cmd, progress)?;
@@ -230,10 +245,13 @@ pub fn send_snapshots(
     // Use `resume` to handle interrupted transfers gracefully.
     cmd.arg("resume");
 
-    // Add source volume path filters if requested.
+    // Add source volume path filters if requested (deduplicate shared volumes).
     if !sources.is_empty() {
+        let mut seen_volumes = std::collections::HashSet::new();
         for label in sources {
-            if let Some(src) = config.sources.iter().find(|s| &s.label == label) {
+            if let Some(src) = config.sources.iter().find(|s| &s.label == label)
+                && seen_volumes.insert(src.volume.clone())
+            {
                 cmd.arg(&src.volume);
             }
         }

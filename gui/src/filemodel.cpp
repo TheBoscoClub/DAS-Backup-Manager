@@ -17,10 +17,15 @@ void FileModel::loadSnapshot(qint64 snapshotId)
 {
     beginResetModel();
     m_files.clear();
+    m_currentSnapshotId = snapshotId;
+    m_totalFiles = 0;
 
-    const QString json = m_client->indexListFiles(m_dbPath, snapshotId);
+    const QString json = m_client->indexListFiles(m_dbPath, snapshotId, PageSize, 0);
     if (!json.isEmpty()) {
-        const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+        const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
+        m_totalFiles = root.value(QLatin1String("total")).toInteger();
+        const QJsonArray arr = root.value(QLatin1String("files")).toArray();
+        m_files.reserve(static_cast<int>(std::min(m_totalFiles, qint64(100000))));
         for (const QJsonValue &v : arr) {
             const QJsonObject obj = v.toObject();
             m_files.append({
@@ -36,10 +41,43 @@ void FileModel::loadSnapshot(qint64 snapshotId)
     endResetModel();
 }
 
+void FileModel::loadMore()
+{
+    if (!hasMore() || m_currentSnapshotId < 0)
+        return;
+
+    const qint64 currentOffset = m_files.size();
+    const QString json = m_client->indexListFiles(
+        m_dbPath, m_currentSnapshotId, PageSize, currentOffset);
+    if (json.isEmpty())
+        return;
+
+    const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
+    const QJsonArray arr = root.value(QLatin1String("files")).toArray();
+    if (arr.isEmpty())
+        return;
+
+    beginInsertRows({}, m_files.size(), m_files.size() + arr.size() - 1);
+    for (const QJsonValue &v : arr) {
+        const QJsonObject obj = v.toObject();
+        m_files.append({
+            .id = obj.value(QLatin1String("id")).toInteger(),
+            .path = obj.value(QLatin1String("path")).toString(),
+            .name = obj.value(QLatin1String("name")).toString(),
+            .size = obj.value(QLatin1String("size")).toInteger(),
+            .mtime = obj.value(QLatin1String("mtime")).toInteger(),
+            .type = obj.value(QLatin1String("type")).toInt(),
+        });
+    }
+    endInsertRows();
+}
+
 void FileModel::clear()
 {
     beginResetModel();
     m_files.clear();
+    m_currentSnapshotId = -1;
+    m_totalFiles = 0;
     endResetModel();
 }
 

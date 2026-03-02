@@ -154,32 +154,26 @@ void BackupPanel::loadConfig()
         return;
     }
 
-    // Parse TOML config to extract sources and targets.
+    // Parse TOML config to extract source labels and target labels.
     //
-    // Expected structure:
+    // The config uses inline arrays for subvolumes:
     //   [[source]]
     //   label = "nvme"
-    //   path = "/mnt/nvme"
-    //
-    //   [[source.subvolumes]]
-    //   name = "@home"
-    //   manual_only = false
+    //   volume = "/.btrfs-nvme"
+    //   subvolumes = ["@", "@home", "@root", "@log"]
     //
     //   [[target]]
     //   label = "primary-22tb"
-    //   mount = "/mnt/backup-hdd"
+    //   display_name = "22TB Exos (Bay 2)"
+    //
+    // The GUI shows source labels and target labels as checkboxes.
+    // The Rust backend resolves subvolumes from labels internally.
 
-    struct SourceEntry {
-        QString label;
-        bool manualOnly{false};
-    };
-
-    QList<SourceEntry> sources;
+    QStringList sources;
     QStringList targets;
 
-    enum class Section { None, Source, SourceSubvol, Target };
+    enum class Section { None, Source, Target };
     Section currentSection = Section::None;
-    QString currentSourceLabel;
 
     const QStringList lines = toml.split(QLatin1Char('\n'));
     for (const QString &rawLine : lines) {
@@ -188,24 +182,14 @@ void BackupPanel::loadConfig()
         // Detect section headers
         if (line == QLatin1String("[[source]]")) {
             currentSection = Section::Source;
-            currentSourceLabel.clear();
-            continue;
-        }
-        if (line == QLatin1String("[[source.subvolumes]]")) {
-            currentSection = Section::SourceSubvol;
             continue;
         }
         if (line == QLatin1String("[[target]]")) {
             currentSection = Section::Target;
             continue;
         }
-        // Any other [[...]] header resets context
-        if (line.startsWith(QLatin1String("[["))) {
-            currentSection = Section::None;
-            continue;
-        }
-        // Single [...] header also resets
-        if (line.startsWith(QLatin1Char('[')) && !line.startsWith(QLatin1String("[["))) {
+        // Any other section header resets context
+        if (line.startsWith(QLatin1Char('['))) {
             currentSection = Section::None;
             continue;
         }
@@ -222,34 +206,21 @@ void BackupPanel::loadConfig()
         const QString key = line.left(eqPos).trimmed();
         QString value = line.mid(eqPos + 1).trimmed();
         // Strip surrounding quotes
-        if (value.length() >= 2 && value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"'))) {
+        if (value.length() >= 2
+            && value.startsWith(QLatin1Char('"'))
+            && value.endsWith(QLatin1Char('"'))) {
             value = value.mid(1, value.length() - 2);
         }
 
         switch (currentSection) {
         case Section::Source:
             if (key == QLatin1String("label"))
-                currentSourceLabel = value;
+                sources.append(value);
             break;
-
-        case Section::SourceSubvol: {
-            if (key == QLatin1String("name")) {
-                const QString fullLabel = currentSourceLabel.isEmpty()
-                    ? value
-                    : currentSourceLabel + QLatin1Char('/') + value;
-                sources.append({fullLabel, false});
-            } else if (key == QLatin1String("manual_only")) {
-                if (!sources.isEmpty() && (value == QLatin1String("true")))
-                    sources.last().manualOnly = true;
-            }
-            break;
-        }
-
         case Section::Target:
             if (key == QLatin1String("label"))
                 targets.append(value);
             break;
-
         case Section::None:
             break;
         }
@@ -261,16 +232,10 @@ void BackupPanel::loadConfig()
         noSrc->setEnabled(false);
         srcLayout->addWidget(noSrc);
     } else {
-        for (const SourceEntry &entry : std::as_const(sources)) {
-            auto *cb = new QCheckBox(entry.label, m_sourcesGroup);
-            if (entry.manualOnly) {
-                cb->setChecked(false);
-                cb->setEnabled(false);
-                cb->setToolTip(i18n("Manual-only subvolume"));
-            } else {
-                cb->setChecked(true);
-                cb->setToolTip(i18n("Include this source in the backup"));
-            }
+        for (const QString &label : std::as_const(sources)) {
+            auto *cb = new QCheckBox(label, m_sourcesGroup);
+            cb->setChecked(true);
+            cb->setToolTip(i18n("Include this source in the backup"));
             srcLayout->addWidget(cb);
             m_sourceChecks.append(cb);
         }
@@ -282,8 +247,8 @@ void BackupPanel::loadConfig()
         noTgt->setEnabled(false);
         tgtLayout->addWidget(noTgt);
     } else {
-        for (const QString &path : std::as_const(targets)) {
-            auto *cb = new QCheckBox(path, m_targetsGroup);
+        for (const QString &label : std::as_const(targets)) {
+            auto *cb = new QCheckBox(label, m_targetsGroup);
             cb->setChecked(true);
             cb->setToolTip(i18n("Include this target in the backup"));
             tgtLayout->addWidget(cb);
