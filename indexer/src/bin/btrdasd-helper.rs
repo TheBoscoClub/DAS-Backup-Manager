@@ -28,8 +28,8 @@ use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
-use buttered_dasd::report;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
+use buttered_dasd::report;
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
 use buttered_dasd::subvol;
@@ -460,10 +460,11 @@ impl HelperInterface {
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
-                let res = match backup::send_snapshots(&config, &sources, &targets, &progress) {
-                    Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
-                    Err(e) => Err(format!("Send failed: {e}")),
-                };
+                let res =
+                    match backup::send_snapshots(&config, &sources, &targets, false, &progress) {
+                        Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
+                        Err(e) => Err(format!("Send failed: {e}")),
+                    };
 
                 guard.unmount(&progress);
                 res

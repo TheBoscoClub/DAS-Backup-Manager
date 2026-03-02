@@ -7,10 +7,26 @@ use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 /// Whether to run an incremental or full backup.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// **Incremental**: `btrbk snapshot` + `btrbk --preserve resume` — creates
+/// snapshots, sends deltas, but skips retention cleanup.  Fast daily use.
+///
+/// **Full**: `btrbk run` — creates snapshots, sends them, AND enforces
+/// retention policy (deletes old snapshots/backups outside retention windows).
+/// The complete backup lifecycle with housekeeping.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BackupMode {
     Incremental,
     Full,
+}
+
+impl std::fmt::Display for BackupMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackupMode::Incremental => write!(f, "incremental"),
+            BackupMode::Full => write!(f, "full"),
+        }
+    }
 }
 
 /// Options controlling what a backup run does.
@@ -40,8 +56,10 @@ pub struct BackupOptions {
 #[derive(Debug)]
 pub struct BackupResult {
     pub success: bool,
+    pub mode: BackupMode,
     pub snapshots_created: usize,
     pub snapshots_sent: usize,
+    pub snapshots_cleaned: usize,
     pub bytes_sent: u64,
     pub boot_archived: bool,
     pub indexed: bool,
@@ -231,16 +249,25 @@ pub fn create_snapshots(
 }
 
 /// Send snapshots to specified targets via btrbk.
+///
+/// When `preserve` is true, passes `--preserve` to btrbk so retention cleanup
+/// is skipped (incremental mode).  When false, btrbk enforces retention policy
+/// after sending (deletes old snapshots/backups outside the retention window).
+///
 /// Returns (snapshots_sent, bytes_sent).
 pub fn send_snapshots(
     config: &Config,
     sources: &[String],
     targets: &[String],
+    preserve: bool,
     progress: &dyn ProgressCallback,
 ) -> Result<(usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Sending snapshots", 1);
 
     let mut cmd = Command::new("btrbk");
+    if preserve {
+        cmd.arg("--preserve");
+    }
     cmd.arg("-c").arg(&config.general.btrbk_conf);
 
     // Use `resume` to handle interrupted transfers gracefully.
@@ -270,7 +297,10 @@ pub fn send_snapshots(
             if is_mounted(&tgt.mount) {
                 progress.on_log(
                     LogLevel::Info,
-                    &format!("Target '{}' at {} is mounted — will receive", label, tgt.mount),
+                    &format!(
+                        "Target '{}' at {} is mounted — will receive",
+                        label, tgt.mount
+                    ),
                 );
             } else {
                 progress.on_log(
@@ -321,6 +351,116 @@ pub fn send_snapshots(
 
     progress.on_log(LogLevel::Info, &format!("Snapshots sent: {snapshots_sent}"));
     Ok((snapshots_sent, bytes_sent))
+}
+
+/// Count lines matching btrbk's `---` (deleted) marker in output.
+fn parse_btrbk_clean_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("---"))
+        .count()
+}
+
+/// Run the full btrbk lifecycle: snapshot + send + retention cleanup.
+///
+/// Uses `btrbk run` which atomically handles all three steps.  This is the
+/// Full backup mode — equivalent to what the nightly bash script does.
+///
+/// Returns (snapshots_created, snapshots_sent, snapshots_cleaned, bytes_sent).
+pub fn run_full_pipeline(
+    config: &Config,
+    sources: &[String],
+    targets: &[String],
+    progress: &dyn ProgressCallback,
+) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
+    progress.on_stage("Full backup (snapshot + send + cleanup)", 1);
+
+    let mut cmd = Command::new("btrbk");
+    cmd.arg("-c").arg(&config.general.btrbk_conf);
+    cmd.arg("run");
+
+    // Add source volume path filters (deduplicate shared volumes).
+    if !sources.is_empty() {
+        let mut seen_volumes = std::collections::HashSet::new();
+        for label in sources {
+            if let Some(src) = config.sources.iter().find(|s| &s.label == label)
+                && seen_volumes.insert(src.volume.clone())
+            {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("Source '{}' at {}", label, src.volume),
+                );
+                cmd.arg(&src.volume);
+            }
+        }
+    }
+
+    // Log target mount status.
+    for label in targets {
+        if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
+            if is_mounted(&tgt.mount) {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "Target '{}' at {} is mounted — will receive",
+                        label, tgt.mount
+                    ),
+                );
+            } else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "Target '{}' at {} is not mounted — btrbk will skip",
+                        label, tgt.mount
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut snapshots_created: usize = 0;
+    let mut snapshots_sent: usize = 0;
+    let mut stdout_lines = Vec::new();
+
+    let success = stream_command(&mut cmd, progress, |line| {
+        stdout_lines.push(line.to_string());
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("+++") {
+            snapshots_created += 1;
+        } else if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
+            snapshots_sent += 1;
+        }
+        let lower = line.to_lowercase();
+        if lower.contains("mib/s") || lower.contains("kib/s") || lower.contains("gib/s") {
+            let bytes_per_sec = parse_throughput_line(line);
+            if bytes_per_sec > 0 {
+                progress.on_throughput(bytes_per_sec);
+            }
+        }
+    })?;
+
+    if !success {
+        progress.on_log(
+            LogLevel::Warning,
+            "btrbk run command exited with non-zero status",
+        );
+    }
+
+    // Re-count from accumulated output for accuracy.
+    let full_output = stdout_lines.join("\n");
+    snapshots_created = parse_btrbk_snapshot_count(&full_output);
+    snapshots_sent = parse_btrbk_send_count(&full_output);
+    let snapshots_cleaned = parse_btrbk_clean_count(&full_output);
+
+    progress.on_log(
+        LogLevel::Info,
+        &format!(
+            "Full backup: {} created, {} sent, {} cleaned up",
+            snapshots_created, snapshots_sent, snapshots_cleaned,
+        ),
+    );
+
+    Ok((snapshots_created, snapshots_sent, snapshots_cleaned, 0))
 }
 
 /// Parse a throughput value (e.g. "22.3 MiB/s") from a btrbk output line.
@@ -596,35 +736,42 @@ pub fn run_backup(
     };
     progress.on_stage("Backup", total_steps);
 
+    let mode = options.mode.unwrap_or(BackupMode::Incremental);
+
     // ---------- Dry-run path ----------
 
     if options.dry_run {
         progress.on_log(
             LogLevel::Info,
             &format!(
-                "DRY RUN: would create snapshots for {:?}",
+                "DRY RUN ({mode}): would create snapshots for {:?}",
                 effective_sources
             ),
         );
         progress.on_log(
             LogLevel::Info,
-            &format!("DRY RUN: would send to targets {:?}", effective_targets),
+            &format!(
+                "DRY RUN ({mode}): would send to targets {:?}",
+                effective_targets
+            ),
         );
         if options.boot_archive {
             progress.on_log(
                 LogLevel::Info,
                 &format!(
-                    "DRY RUN: would archive boot subvolumes: {:?}",
+                    "DRY RUN ({mode}): would archive boot subvolumes: {:?}",
                     config.boot.subvolumes
                 ),
             );
         }
 
-        let summary = "DRY RUN completed — no changes made".to_string();
+        let summary = format!("DRY RUN ({mode}) completed — no changes made");
         let result = BackupResult {
             success: true,
+            mode,
             snapshots_created: 0,
             snapshots_sent: 0,
+            snapshots_cleaned: 0,
             bytes_sent: 0,
             boot_archived: false,
             indexed: false,
@@ -637,35 +784,101 @@ pub fn run_backup(
     }
 
     // ---------- Live pipeline ----------
+    //
+    // Incremental: `btrbk snapshot` + `btrbk --preserve resume`
+    //   Creates snapshots and sends deltas.  --preserve skips retention
+    //   cleanup so old snapshots/backups are kept.  Fast daily use.
+    //
+    // Full: `btrbk run` (atomic snapshot + send + retention cleanup)
+    //   The complete backup lifecycle including housekeeping.  Deletes
+    //   snapshots and backups outside the configured retention windows.
 
-    // Step (a): Snapshots
-    if !options.send_only {
-        match create_snapshots(config, &effective_sources, progress) {
-            Ok(n) => snapshots_created = n,
-            Err(e) => {
-                let msg = format!("Snapshot step failed: {e}");
-                progress.on_log(LogLevel::Error, &msg);
-                errors.push(msg);
+    let mut snapshots_cleaned: usize = 0;
+
+    match mode {
+        BackupMode::Full => {
+            if options.snapshot_only {
+                // Full + snapshot-only: just create snapshots (same as incremental).
+                match create_snapshots(config, &effective_sources, progress) {
+                    Ok(n) => snapshots_created = n,
+                    Err(e) => {
+                        let msg = format!("Snapshot step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            } else if options.send_only {
+                // Full + send-only: send with retention cleanup (no --preserve).
+                match send_snapshots(
+                    config,
+                    &effective_sources,
+                    &effective_targets,
+                    false, // no preserve → btrbk enforces retention
+                    progress,
+                ) {
+                    Ok((sent, bytes)) => {
+                        snapshots_sent = sent;
+                        bytes_sent = bytes;
+                    }
+                    Err(e) => {
+                        let msg = format!("Send step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            } else {
+                // Full: btrbk run does snapshot + send + cleanup atomically.
+                match run_full_pipeline(config, &effective_sources, &effective_targets, progress) {
+                    Ok((snaps, sent, cleaned, bytes)) => {
+                        snapshots_created = snaps;
+                        snapshots_sent = sent;
+                        snapshots_cleaned = cleaned;
+                        bytes_sent = bytes;
+                    }
+                    Err(e) => {
+                        let msg = format!("Full backup pipeline failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+        }
+        BackupMode::Incremental => {
+            // Step (a): Snapshots
+            if !options.send_only {
+                match create_snapshots(config, &effective_sources, progress) {
+                    Ok(n) => snapshots_created = n,
+                    Err(e) => {
+                        let msg = format!("Snapshot step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+            // Step (b): Send with --preserve (skip retention cleanup)
+            if !options.snapshot_only {
+                match send_snapshots(
+                    config,
+                    &effective_sources,
+                    &effective_targets,
+                    true, // --preserve: skip retention cleanup
+                    progress,
+                ) {
+                    Ok((sent, bytes)) => {
+                        snapshots_sent = sent;
+                        bytes_sent = bytes;
+                    }
+                    Err(e) => {
+                        let msg = format!("Send step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
             }
         }
     }
 
-    // Step (b): Send
-    if !options.snapshot_only {
-        match send_snapshots(config, &effective_sources, &effective_targets, progress) {
-            Ok((sent, bytes)) => {
-                snapshots_sent = sent;
-                bytes_sent = bytes;
-            }
-            Err(e) => {
-                let msg = format!("Send step failed: {e}");
-                progress.on_log(LogLevel::Error, &msg);
-                errors.push(msg);
-            }
-        }
-    }
-
-    // Step (c): Boot archive
+    // Step (c): Boot archive (both modes)
     if options.boot_archive {
         match archive_boot(config, progress) {
             Ok(archived) => boot_archived = archived,
@@ -691,23 +904,30 @@ pub fn run_backup(
     }
 
     let success = errors.is_empty();
+    let cleaned_msg = if snapshots_cleaned > 0 {
+        format!(", {} cleaned up", snapshots_cleaned)
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "Backup {}: {} snapshots created, {} sent ({} bytes), boot archived: {}",
-        if success {
+        "Backup {status} ({mode}): {snaps} snapshots created, {sent} sent{cleaned}, boot archived: {boot}",
+        status = if success {
             "succeeded"
         } else {
             "completed with errors"
         },
-        snapshots_created,
-        snapshots_sent,
-        bytes_sent,
-        boot_archived,
+        snaps = snapshots_created,
+        sent = snapshots_sent,
+        cleaned = cleaned_msg,
+        boot = boot_archived,
     );
 
     let result = BackupResult {
         success,
+        mode,
         snapshots_created,
         snapshots_sent,
+        snapshots_cleaned,
         bytes_sent,
         boot_archived,
         indexed,
