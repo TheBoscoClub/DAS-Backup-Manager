@@ -64,7 +64,7 @@ void SnapshotWatcher::onDirectoryChanged(const QString &path)
 void SnapshotWatcher::triggerIndex()
 {
     if (m_runner && !m_runner->isRunning()) {
-        m_runner->run(m_watchPath, m_dbPath);
+        m_runner->run(QStringLiteral("/etc/das-backup/config.toml"), m_watchPath, m_dbPath);
         Q_EMIT indexingTriggered();
     }
 }

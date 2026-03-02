@@ -24,10 +24,12 @@ public:
     void backupSnapshot(const QString &configPath, const QStringList &sources);
     void backupSend(const QString &configPath, const QStringList &targets);
     void backupBootArchive(const QString &configPath);
-    void indexWalk(const QString &targetPath, const QString &dbPath);
-    void restoreFiles(const QString &snapshot, const QString &dest,
-                      const QStringList &files);
-    void restoreSnapshot(const QString &snapshot, const QString &dest);
+    void indexWalk(const QString &configPath, const QString &targetPath,
+                   const QString &dbPath);
+    void restoreFiles(const QString &configPath, const QString &snapshot,
+                      const QString &dest, const QStringList &files);
+    void restoreSnapshot(const QString &configPath, const QString &snapshot,
+                         const QString &dest);
 
     // Synchronous methods
     QString configGet(const QString &configPath);

@@ -77,25 +77,27 @@ void DBusClient::backupBootArchive(const QString &configPath)
               QStringLiteral("BackupBootArchive"));
 }
 
-void DBusClient::indexWalk(const QString &targetPath, const QString &dbPath)
+void DBusClient::indexWalk(const QString &configPath, const QString &targetPath,
+                           const QString &dbPath)
 {
     callAsync(QStringLiteral("IndexWalk"),
-              {targetPath, dbPath},
+              {configPath, targetPath, dbPath},
               QStringLiteral("IndexWalk"));
 }
 
-void DBusClient::restoreFiles(const QString &snapshot, const QString &dest,
-                              const QStringList &files)
+void DBusClient::restoreFiles(const QString &configPath, const QString &snapshot,
+                              const QString &dest, const QStringList &files)
 {
     callAsync(QStringLiteral("RestoreFiles"),
-              {snapshot, dest, QVariant::fromValue(files)},
+              {configPath, snapshot, dest, QVariant::fromValue(files)},
               QStringLiteral("RestoreFiles"));
 }
 
-void DBusClient::restoreSnapshot(const QString &snapshot, const QString &dest)
+void DBusClient::restoreSnapshot(const QString &configPath, const QString &snapshot,
+                                 const QString &dest)
 {
     callAsync(QStringLiteral("RestoreSnapshot"),
-              {snapshot, dest},
+              {configPath, snapshot, dest},
               QStringLiteral("RestoreSnapshot"));
 }
 

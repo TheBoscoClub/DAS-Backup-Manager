@@ -5,6 +5,7 @@ pub mod db;
 pub mod ffi;
 pub mod health;
 pub mod indexer;
+pub mod mount;
 pub mod progress;
 pub mod report;
 pub mod restore;
