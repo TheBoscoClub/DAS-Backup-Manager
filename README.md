@@ -28,9 +28,11 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
 - **Email Reports** — Automated backup status reports with throughput metrics and SMART status
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
-- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon for privilege-escalated operations (backup, restore, config, schedule, health)
+- **Auto-Mount/Unmount** — RAII `MountGuard` resolves target drive serials, auto-mounts BTRFS partitions before operations, and unmounts on completion (all D-Bus methods and CLI commands)
+- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 23 methods for backup, restore, config, schedule, health, and index read operations
 - **FFI Bridge** (`libbuttered_dasd_ffi.so`) — C-ABI shared library for GUI access to Rust library functions
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 full backup management application with sidebar navigation, Dolphin-style file browser, backup operations, health dashboard, config editor, first-run wizard, desktop notifications, and system tray
+- **USB SMART Passthrough** — Health queries use `-d sat` for USB-attached DAS drives to read SMART data through USB-SATA bridges
 - **Interactive Installer** (`btrdasd setup`) — 10-step wizard with 5 modes: install, modify, upgrade, uninstall, check
 - **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
@@ -46,10 +48,10 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.6.0) |
-| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components, 4 test suites) | Active (v0.6.0) |
-| `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.6.0) |
-| `polkit/` | Polkit policy for privilege escalation (backup, restore, config, health) | Active (v0.6.0) |
+| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.6.0+) |
+| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components, 4 test suites) | Active (v0.6.0+) |
+| `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.6.0+) |
+| `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.6.0+) |
 | `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
 
 ## Project Structure
@@ -59,7 +61,7 @@ DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf, email config template
 ├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper + FFI
-│   ├── src/           # Library modules (11): backup, config, db, health, indexer, progress, report, restore, scanner, schedule, subvol
+│   ├── src/           # Library modules (12): backup, config, db, health, indexer, mount, progress, report, restore, scanner, schedule, subvol
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 │   ├── src/bin/       # btrdasd-helper D-Bus daemon
 │   ├── src/ffi.rs     # C-ABI FFI bridge (extern "C" functions)

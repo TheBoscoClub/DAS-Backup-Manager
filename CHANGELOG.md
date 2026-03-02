@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Auto-mount/unmount** (`mount.rs`) — RAII `MountGuard` resolves target serials via `/dev/disk/by-id`, mounts BTRFS partitions before operations, unmounts on completion or panic; all D-Bus methods and CLI commands that access targets now auto-mount
+- **D-Bus index read methods** — `IndexStats`, `IndexListSnapshots`, `IndexListFiles` (paginated), `IndexSearch`, `IndexBackupHistory`, `IndexSnapshotPath` for read-only index access from the GUI
+- **Paginated `IndexListFiles`** — Accepts `limit`/`offset` parameters, returns JSON with `{files, total, limit, offset}` to handle snapshots with millions of files without D-Bus excess-data errors
+- **`org.dasbackup.config.read` polkit action** — `allow_active: yes` for read-only config/schedule queries, prevents synchronous D-Bus deadlock when GUI requests config without admin auth dialog
+- **`org.dasbackup.index.read` polkit action** — `allow_active: yes` for GUI read-only index access
+- **USB SMART passthrough** — Health queries use `-d sat` for USB-attached drives to read SMART data through USB-SATA bridges
+- **Growth log history in `HealthQuery`** — Parses `/var/lib/das-backup/growth.log` and includes growth history in health JSON response
+- **Service status in `HealthQuery`** — Checks systemd timer/service status and includes in health JSON
+- **`db::get_files_in_snapshot_paged()`** — Paginated file listing with `LIMIT`/`OFFSET` and `ORDER BY path`
+- **`db::count_files_in_snapshot()`** — Efficient file count using `COUNT(DISTINCT f.id)` for pagination total
+- **`FileModel::loadMore()`** — Incremental page loading in the GUI with `beginInsertRows`/`endInsertRows`
+
+### Changed
+- **Library modules** — 11 → 12 public modules (added `mount`)
+- **Polkit policy** — 5 → 7 actions (added `config.read`, `index.read`)
+- **D-Bus methods** — 17 → 23 (added 6 index read methods)
+- **`ConfigGet`/`ScheduleGet` polkit** — Changed from `org.dasbackup.config` (auth_admin_keep) to `org.dasbackup.config.read` (allow_active) to prevent Qt event-loop deadlock
+- **GUI architecture** — Removed direct `Database` class, rewired all models through `DBusClient`; `IndexRunner` converted from `QProcess` to D-Bus `IndexWalk`
+- **Rust test count** — 62 → 161 (133 lib + 19 setup + 9 integration)
+
+### Fixed
+- **btrbk command construction** — `create_snapshots()` placed "snapshot" subcommand inside the source loop, producing `btrbk snapshot vol1 snapshot vol2` instead of `btrbk snapshot vol1 vol2`; fixed by moving `cmd.arg("snapshot")` before the loop
+- **Volume deduplication** — Multiple sources sharing the same BTRFS volume (e.g., `hdd-projects` and `hdd-audiobooks` both on `/.btrfs-hdd`) caused duplicate btrbk arguments; fixed with `HashSet` deduplication in both `create_snapshots()` and `send_snapshots()`
+- **BackupPanel TOML parser** — Removed `SourceEntry`/`SourceSubvol` struct handling that didn't match actual `config.toml` format; simplified to extract source/target labels only
+- **Growth log ISO timestamp parser** — Fixed parsing of ISO 8601 timestamps in growth log
+- **Multi-target re-index** — Fixed index walk to handle multiple targets correctly
+- **JobProgress D-Bus signal** — Changed `percent` from `u8` to `i32` to match Qt D-Bus signal type
+- **HealthQuery JSON key** — Changed GUI JSON key from `drives` to `targets` to match helper response
+
 ## [0.6.0] - 2026-02-28
 
 ### Added
@@ -25,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **D-Bus methods** — BackupRun, BackupSnapshot, BackupSend, BackupBootArchive, IndexWalk, RestoreFiles, RestoreSnapshot, ConfigGet, ConfigSet, ScheduleGet, ScheduleSet, ScheduleEnable, SubvolAdd, SubvolRemove, SubvolSetManual, HealthQuery, JobCancel
 - **D-Bus signals** — JobProgress (stage/percent/message/throughput/ETA), JobLog (level/message), JobFinished (success/summary)
 - **Job management** — Tokio-based async job execution with cancellation tokens and job ID tracking
-- **Polkit policy** (`polkit/org.dasbackup.policy`) — 5 actions: backup, restore, config, index, health
+- **Polkit policy** (`polkit/org.dasbackup.policy`) — 5 actions: backup, restore, config, index, health (expanded to 7 in [Unreleased])
 - **D-Bus activation** (`dbus/org.dasbackup.Helper1.service`) — Automatic daemon startup on first method call
 - **Bus access rules** (`dbus/org.dasbackup.Helper1.conf`) — System bus ownership and method access control
 

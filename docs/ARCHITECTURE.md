@@ -33,6 +33,7 @@ Every architectural decision in this document — from the database schema to th
 │  │          libbuttered_dasd (Rust library)         │        │
 │  │  indexer │ config │ backup │ restore │ schedule   │        │
 │  │  search  │ health │ subvol │ progress│ reporting  │        │
+│  │  mount   │                                         │        │
 │  └──────────────────────┬───────────────────────────┘        │
 │                         │ D-Bus (org.dasbackup.Helper1)      │
 │  ┌──────────────────────┴────────────────────────┐           │
@@ -48,9 +49,9 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 |-----------|----------|--------|---------|
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 11 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 12 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
-| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon for privileged operations |
+| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions) |
 | FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 10-step setup wizard with template generation |
@@ -102,17 +103,22 @@ btrdasd walk /mnt/backup-target
 ### GUI Read Path
 
 ```
-btrdasd-gui --db /var/lib/das-backup/backup-index.db
+btrdasd-gui
          │
-         ├──▶ Database::open()            Read-only QSqlDatabase (WAL mode)
+         ├──▶ DBusClient (org.dasbackup.Helper1)
          │         │
-         │         ├──▶ listSnapshots()   → SnapshotModel (tree: date groups → snapshots)
-         │         ├──▶ filesInSnapshot() → FileModel (table: path, size, mtime, type)
-         │         └──▶ search()          → SearchModel (table: FTS5 results with span info)
+         │         ├──▶ IndexListSnapshots()  → SnapshotModel (tree: date groups → snapshots)
+         │         ├──▶ IndexListFiles()      → FileModel (paginated, 10k per page)
+         │         ├──▶ IndexSearch()          → SearchModel (FTS5 results with span info)
+         │         ├──▶ IndexStats()           → Stats display
+         │         ├──▶ IndexBackupHistory()   → BackupHistoryView
+         │         ├──▶ IndexSnapshotPath()    → Snapshot path resolution
+         │         ├──▶ HealthQuery()          → HealthDashboard (SMART, growth, services)
+         │         └──▶ ConfigGet()            → BackupPanel, ConfigDialog
          │
          ├──▶ SnapshotTimeline            Custom QPainter widget (visual timeline)
          ├──▶ SnapshotWatcher             QFileSystemWatcher → auto-detect new snapshots
-         ├──▶ IndexRunner                 QProcess wrapper → trigger btrdasd walk
+         ├──▶ IndexRunner                 D-Bus IndexWalk → trigger index walk
          └──▶ RestoreAction               KIO::copy file restore with destination chooser
 ```
 
@@ -170,9 +176,8 @@ Three triggers keep the FTS5 index consistent:
 
 - **WAL journal mode** enables simultaneous reads and writes
 - The indexer (`btrdasd walk`) holds a write connection
-- The GUI (`btrdasd-gui`) opens a **read-only** connection
-- Both can operate concurrently without locking conflicts
-- `PRAGMA optimize` runs on connection close (via Rust `Drop` / C++ destructor)
+- The GUI accesses the database through `btrdasd-helper` D-Bus methods (no direct database connection)
+- `PRAGMA optimize` runs on connection close (via Rust `Drop` impl)
 
 ## Installer Architecture
 
@@ -365,16 +370,25 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Module | File | Lines | Purpose |
 |--------|------|-------|---------|
-| `db` | `src/db.rs` | ~400 | Database connection, schema, CRUD, FTS5 search, stats |
-| `scanner` | `src/scanner.rs` | ~100 | walkdir-based filesystem traversal |
-| `indexer` | `src/indexer.rs` | ~250 | Snapshot discovery, span logic, walk orchestration |
-| `main` | `src/main.rs` | ~115 | CLI entry point with clap subcommands |
-| `setup/mod` | `src/setup/mod.rs` | ~65 | Setup subcommand routing and root check |
-| `setup/config` | `src/setup/config.rs` | ~250 | TOML config types with serde |
-| `setup/detect` | `src/setup/detect.rs` | ~500 | System detection (devices, init, packages) |
-| `setup/templates` | `src/setup/templates.rs` | ~400 | Render btrbk.conf, systemd, cron, scripts |
-| `setup/installer` | `src/setup/installer.rs` | ~270 | Install/uninstall/upgrade/check with manifest |
-| `setup/wizard` | `src/setup/wizard.rs` | ~985 | 10-step interactive dialoguer wizard |
+| `backup` | `src/backup.rs` | ~1020 | btrbk snapshot/send orchestration with volume deduplication |
+| `config` | `src/config.rs` | ~680 | TOML config types, DAS/source/target models |
+| `db` | `src/db.rs` | ~1060 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
+| `health` | `src/health.rs` | ~930 | Drive health (SMART), mountpoint checks, serial→device resolution |
+| `indexer` | `src/indexer.rs` | ~480 | Snapshot discovery, span logic, walk orchestration |
+| `mount` | `src/mount.rs` | ~350 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |
+| `progress` | `src/progress.rs` | ~115 | Progress reporting trait and D-Bus signal bridge |
+| `report` | `src/report.rs` | ~210 | Backup report formatting |
+| `restore` | `src/restore.rs` | ~640 | File and snapshot restore via btrfs send/receive |
+| `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
+| `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
+| `subvol` | `src/subvol.rs` | ~205 | Subvolume CRUD operations |
+| `main` | `src/main.rs` | — | CLI entry point with clap subcommands |
+| `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
+| `setup/config` | `src/setup/config.rs` | — | TOML config types with serde |
+| `setup/detect` | `src/setup/detect.rs` | — | System detection (devices, init, packages) |
+| `setup/templates` | `src/setup/templates.rs` | — | Render btrbk.conf, systemd, cron, scripts |
+| `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
+| `setup/wizard` | `src/setup/wizard.rs` | — | 10-step interactive dialoguer wizard |
 
 ### KDE Plasma GUI (`gui/src/`)
 
@@ -388,7 +402,7 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | ProgressPanel | `progresspanel.h/cpp` | Collapsible QDockWidget with progress bar, throughput, ETA, cancel, raw log |
 | Database | `database.h/cpp` | Read-only QSqlDatabase wrapper with UUID connections, backup history/usage queries |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
-| FileModel | `filemodel.h/cpp` | QAbstractTableModel for file listings |
+| FileModel | `filemodel.h/cpp` | QAbstractTableModel with paginated loading (10k per page via D-Bus) |
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |
 | SnapshotBrowser | `snapshotbrowser.h/cpp` | Dolphin-style file browser; breadcrumb nav, detail/icon views, context menu, filter bar |
 | BackupPanel | `backuppanel.h/cpp` | Mode selection, operation checkboxes, source/target selection, dry-run support |
@@ -397,7 +411,7 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
 | SetupWizard | `setupwizard.h/cpp` | QWizard first-run wizard: Welcome, Sources, Targets, Schedule, Summary |
 | SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
-| IndexRunner | `indexrunner.h/cpp` | QProcess wrapper for btrdasd walk |
+| IndexRunner | `indexrunner.h/cpp` | D-Bus IndexWalk trigger (was QProcess, now D-Bus) |
 | SnapshotWatcher | `snapshotwatcher.h/cpp` | QFileSystemWatcher with 30s debounce |
 | RestoreAction | `restoreaction.h/cpp` | KIO::copy with file dialog destination |
 | SettingsDialog | `settingsdialog.h/cpp` | KConfigDialog for paths and preferences |
@@ -406,8 +420,8 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Suite | Count | Framework |
 |-------|-------|-----------|
-| Rust unit tests | 37 | `#[cfg(test)]` modules in lib crate |
-| Rust setup tests | 16 | `#[cfg(test)]` modules in setup modules |
+| Rust unit tests | 133 | `#[cfg(test)]` modules in lib crate |
+| Rust setup tests | 19 | `#[cfg(test)]` modules in setup modules |
 | Rust integration tests | 9 | `indexer/tests/integration_test.rs` |
 | C++ GUI tests | 4 suites | QTest via ECMAddTests |
-| **Total** | **62 Rust + 4 Qt** | |
+| **Total** | **161 Rust + 4 Qt** | |
