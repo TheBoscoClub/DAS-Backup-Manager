@@ -64,6 +64,12 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
     connect(m_dbusClient, &DBusClient::jobFinished,
             this, &MainWindow::onBackupFinished);
 
+    // Show D-Bus errors to the user
+    connect(m_dbusClient, &DBusClient::errorOccurred,
+            this, [this](const QString &operation, const QString &error) {
+                KMessageBox::error(this, i18n("%1: %2", operation, error));
+            });
+
     setupUi();
     setupActions();
     setupTrayIcon();
