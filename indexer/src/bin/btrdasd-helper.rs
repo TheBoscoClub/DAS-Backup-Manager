@@ -575,13 +575,14 @@ impl HelperInterface {
 
                 let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
 
-                // Collect target paths to walk
+                // Collect target paths to walk (detect udisks2 mounts too)
                 let paths: Vec<String> = if target_path.is_empty() {
                     config
                         .targets
                         .iter()
-                        .filter(|t| health::is_mountpoint(Path::new(&t.mount)))
-                        .map(|t| t.mount.clone())
+                        .filter_map(|t| {
+                            health::find_any_mount(&t.mount, &t.serial, &t.role)
+                        })
                         .collect()
                 } else {
                     vec![target_path]

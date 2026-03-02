@@ -1,5 +1,6 @@
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
+use std::time::Duration;
 
 const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -127,6 +128,7 @@ pub struct Database {
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA_SQL)?;

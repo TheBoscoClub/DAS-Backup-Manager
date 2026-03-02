@@ -1,8 +1,9 @@
 use crate::config::Config;
+use crate::db::Database;
 use crate::health;
+use crate::indexer;
 use crate::progress::{LogLevel, ProgressCallback};
 use std::io::BufRead;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
@@ -71,11 +72,6 @@ pub struct BackupResult {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Check if a path is currently an active mount point.
-fn is_mounted(mount_path: &str) -> bool {
-    health::is_mountpoint(Path::new(mount_path))
-}
 
 /// Build a timestamp string in YYYYMMDDTHHMMSS format using SystemTime.
 /// Uses libc localtime_r to convert to local time without extra dependencies.
@@ -294,20 +290,17 @@ pub fn send_snapshots(
     // Log which targets are expected so the user knows the scope.
     for label in targets {
         if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
-            if is_mounted(&tgt.mount) {
+            if let Some(actual) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
                 progress.on_log(
                     LogLevel::Info,
-                    &format!(
-                        "Target '{}' at {} is mounted — will receive",
-                        label, tgt.mount
-                    ),
+                    &format!("Target '{label}' mounted at {actual} — will receive"),
                 );
             } else {
                 progress.on_log(
                     LogLevel::Warning,
                     &format!(
-                        "Target '{}' at {} is not mounted — btrbk will skip",
-                        label, tgt.mount
+                        "Target '{label}' at {} is not mounted — btrbk will skip",
+                        tgt.mount
                     ),
                 );
             }
@@ -315,6 +308,7 @@ pub fn send_snapshots(
     }
 
     let mut snapshots_sent: usize = 0;
+    let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
     let success = stream_command(&mut cmd, progress, |line| {
@@ -323,6 +317,7 @@ pub fn send_snapshots(
         // btrbk marks sends with >>> (incremental) or *** (full)
         if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
             snapshots_sent += 1;
+            bytes_sent += parse_btrbk_size_field(line);
         }
         // Parse throughput hints from btrbk progress lines.
         let lower = line.to_lowercase();
@@ -344,10 +339,6 @@ pub fn send_snapshots(
     // Re-count from accumulated output for accuracy.
     let full_output = stdout_lines.join("\n");
     snapshots_sent = parse_btrbk_send_count(&full_output);
-
-    // bytes_sent: btrbk doesn't give a clean total; we return 0 until we have
-    // a more reliable parsing strategy or wrap `btrfs send --dump`.
-    let bytes_sent: u64 = 0;
 
     progress.on_log(LogLevel::Info, &format!("Snapshots sent: {snapshots_sent}"));
     Ok((snapshots_sent, bytes_sent))
@@ -398,20 +389,17 @@ pub fn run_full_pipeline(
     // Log target mount status.
     for label in targets {
         if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
-            if is_mounted(&tgt.mount) {
+            if let Some(actual) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
                 progress.on_log(
                     LogLevel::Info,
-                    &format!(
-                        "Target '{}' at {} is mounted — will receive",
-                        label, tgt.mount
-                    ),
+                    &format!("Target '{label}' mounted at {actual} — will receive"),
                 );
             } else {
                 progress.on_log(
                     LogLevel::Warning,
                     &format!(
-                        "Target '{}' at {} is not mounted — btrbk will skip",
-                        label, tgt.mount
+                        "Target '{label}' at {} is not mounted — btrbk will skip",
+                        tgt.mount
                     ),
                 );
             }
@@ -420,6 +408,7 @@ pub fn run_full_pipeline(
 
     let mut snapshots_created: usize = 0;
     let mut snapshots_sent: usize = 0;
+    let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
     let success = stream_command(&mut cmd, progress, |line| {
@@ -429,6 +418,7 @@ pub fn run_full_pipeline(
             snapshots_created += 1;
         } else if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
             snapshots_sent += 1;
+            bytes_sent += parse_btrbk_size_field(line);
         }
         let lower = line.to_lowercase();
         if lower.contains("mib/s") || lower.contains("kib/s") || lower.contains("gib/s") {
@@ -460,7 +450,12 @@ pub fn run_full_pipeline(
         ),
     );
 
-    Ok((snapshots_created, snapshots_sent, snapshots_cleaned, 0))
+    Ok((
+        snapshots_created,
+        snapshots_sent,
+        snapshots_cleaned,
+        bytes_sent,
+    ))
 }
 
 /// Parse a throughput value (e.g. "22.3 MiB/s") from a btrbk output line.
@@ -517,6 +512,40 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
         .parse::<f64>()
         .ok()
         .map(|v| (v * mult as f64) as u64)
+}
+
+/// Best-effort parse of a size from a btrbk `>>>` or `***` output line.
+///
+/// btrbk may emit lines like:
+///   `>>> /path/to/snapshot (full send, 1.2 GiB)`
+///   `*** /path/to/snapshot (incremental, 45.3 MiB)`
+///
+/// Returns the size in bytes, or 0 if not parseable.
+fn parse_btrbk_size_field(line: &str) -> u64 {
+    // Look for a parenthetical at the end containing a size.
+    let paren_content = match (line.rfind('('), line.rfind(')')) {
+        (Some(open), Some(close)) if close > open => &line[open + 1..close],
+        _ => return 0,
+    };
+    // Split on comma — size is usually the last segment: "incremental, 45.3 MiB"
+    for segment in paren_content.rsplit(',') {
+        let seg = segment.trim();
+        let tokens: Vec<&str> = seg.split_whitespace().collect();
+        if tokens.len() == 2
+            && let Ok(val) = tokens[0].parse::<f64>()
+        {
+            let multiplier: u64 = match tokens[1].to_uppercase().as_str() {
+                "TIB" | "TB" => 1_099_511_627_776,
+                "GIB" | "GB" => 1_073_741_824,
+                "MIB" | "MB" => 1_048_576,
+                "KIB" | "KB" => 1_024,
+                "B" => 1,
+                _ => continue,
+            };
+            return (val * multiplier as f64) as u64;
+        }
+    }
+    0
 }
 
 /// Archive boot subvolumes as read-only snapshots on backup targets.
@@ -638,7 +667,7 @@ pub fn run_backup(
     let mut snapshots_sent: usize = 0;
     let mut bytes_sent: u64 = 0;
     let mut boot_archived = false;
-    let indexed = false; // indexing via D-Bus not yet integrated
+    let mut indexed = false;
     let report_sent = false; // email not yet integrated
 
     // ---------- Resolve effective sources ----------
@@ -668,7 +697,7 @@ pub fn run_backup(
         config
             .targets
             .iter()
-            .filter(|tgt| is_mounted(&tgt.mount))
+            .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
             .map(|tgt| tgt.label.clone())
             .collect()
     } else {
@@ -701,7 +730,7 @@ pub fn run_backup(
             config
                 .targets
                 .iter()
-                .filter(|tgt| is_mounted(&tgt.mount))
+                .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
                 .map(|tgt| tgt.label.clone())
                 .collect()
         } else {
@@ -890,9 +919,54 @@ pub fn run_backup(
         }
     }
 
-    // Step (d): Index
+    // Step (d): Index — walk each target's mount path to pick up new snapshots.
     if options.index_after {
-        progress.on_log(LogLevel::Info, "Indexing not yet integrated — skipping");
+        match Database::open(&config.general.db_path) {
+            Ok(db) => {
+                let mut targets_indexed = 0usize;
+                for target in &config.targets {
+                    let mount = health::find_any_mount(&target.mount, &target.serial, &target.role);
+                    if let Some(path) = mount {
+                        progress.on_log(
+                            LogLevel::Info,
+                            &format!("Indexing target '{}' at {path}", target.label),
+                        );
+                        match indexer::walk(std::path::Path::new(&path), &db) {
+                            Ok(result) => {
+                                progress.on_log(
+                                    LogLevel::Info,
+                                    &format!(
+                                        "Indexed '{}': {} new snapshots ({} files)",
+                                        target.label,
+                                        result.snapshots_indexed,
+                                        result.results.iter().map(|r| r.files_total).sum::<usize>(),
+                                    ),
+                                );
+                                targets_indexed += 1;
+                            }
+                            Err(e) => {
+                                progress.on_log(
+                                    LogLevel::Warning,
+                                    &format!(
+                                        "Indexing target '{}' failed (non-fatal): {e}",
+                                        target.label
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                if targets_indexed > 0 {
+                    indexed = true;
+                }
+            }
+            Err(e) => {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Cannot open index DB for post-backup indexing (non-fatal): {e}"),
+                );
+            }
+        }
     }
 
     // Step (e): Email report
@@ -904,23 +978,33 @@ pub fn run_backup(
     }
 
     let success = errors.is_empty();
-    let cleaned_msg = if snapshots_cleaned > 0 {
-        format!(", {} cleaned up", snapshots_cleaned)
+    let nothing_to_do = success
+        && snapshots_created == 0
+        && snapshots_sent == 0
+        && snapshots_cleaned == 0
+        && !options.dry_run;
+
+    let summary = if nothing_to_do {
+        format!("Backup ({mode}): nothing to do — all snapshots up to date")
     } else {
-        String::new()
-    };
-    let summary = format!(
-        "Backup {status} ({mode}): {snaps} snapshots created, {sent} sent{cleaned}, boot archived: {boot}",
-        status = if success {
-            "succeeded"
+        let cleaned_msg = if snapshots_cleaned > 0 {
+            format!(", {} cleaned up", snapshots_cleaned)
         } else {
-            "completed with errors"
-        },
-        snaps = snapshots_created,
-        sent = snapshots_sent,
-        cleaned = cleaned_msg,
-        boot = boot_archived,
-    );
+            String::new()
+        };
+        format!(
+            "Backup {status} ({mode}): {snaps} snapshots created, {sent} sent{cleaned}, boot archived: {boot}",
+            status = if success {
+                "succeeded"
+            } else {
+                "completed with errors"
+            },
+            snaps = snapshots_created,
+            sent = snapshots_sent,
+            cleaned = cleaned_msg,
+            boot = boot_archived,
+        )
+    };
 
     let result = BackupResult {
         success,
@@ -1030,24 +1114,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // is_mounted
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn test_is_mounted_proc_mounts() {
-        // "/" is always mounted on Linux.
-        assert!(is_mounted("/"), "root filesystem must be mounted");
-    }
-
-    #[test]
-    fn test_is_mounted_nonexistent_path() {
-        assert!(
-            !is_mounted("/definitely/not/a/mount/point/xyz123"),
-            "random path must not appear as mounted"
-        );
-    }
-
-    // -----------------------------------------------------------------
     // parse_btrbk_snapshot_count
     // -----------------------------------------------------------------
 
@@ -1095,6 +1161,41 @@ mod tests {
     fn test_parse_btrbk_send_count_none() {
         let output = "+++ snapshot\n=== up-to-date\n--- deleted\n";
         assert_eq!(parse_btrbk_send_count(output), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // parse_btrbk_size_field
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_size_field_incremental() {
+        let line = "*** /mnt/backup-22tb/nvme/root.20260302T0835 (incremental, 45.3 MiB)";
+        let bytes = parse_btrbk_size_field(line);
+        // 45.3 * 1_048_576 = 47_508_377
+        assert!(bytes > 47_000_000 && bytes < 48_000_000, "got {bytes}");
+    }
+
+    #[test]
+    fn test_parse_size_field_full_send() {
+        let line = ">>> /mnt/backup-22tb/nvme/root.20260302T0835 (full send, 1.2 GiB)";
+        let bytes = parse_btrbk_size_field(line);
+        // 1.2 * 1_073_741_824 = 1_288_490_188
+        assert!(
+            bytes > 1_200_000_000 && bytes < 1_400_000_000,
+            "got {bytes}"
+        );
+    }
+
+    #[test]
+    fn test_parse_size_field_no_parens() {
+        let line = ">>> /mnt/backup-22tb/nvme/root.20260302T0835";
+        assert_eq!(parse_btrbk_size_field(line), 0);
+    }
+
+    #[test]
+    fn test_parse_size_field_no_size_in_parens() {
+        let line = ">>> /mnt/backup-22tb/nvme/root.20260302T0835 (incremental)";
+        assert_eq!(parse_btrbk_size_field(line), 0);
     }
 
     // -----------------------------------------------------------------

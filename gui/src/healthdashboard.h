@@ -17,6 +17,9 @@ public:
 public Q_SLOTS:
     void refresh();
 
+private Q_SLOTS:
+    void onHealthResult(const QString &json);
+
 private:
     void setupDrivesTab();
     void setupGrowthTab();

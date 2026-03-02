@@ -210,22 +210,32 @@ pub fn walk(
     }
 
     // discovered is already sorted by (source, name, ts) from discover_snapshots
+    let mut index_errors = 0usize;
     for snap in &discovered {
         let key = (snap.source.clone(), snap.name.clone());
         let prev_id = latest_snap_id.get(&key).copied();
 
-        let result = index_snapshot(db, snap, prev_id)?;
-        latest_snap_id.insert(key, result.snapshot_id);
-        results.push(result);
+        match index_snapshot(db, snap, prev_id) {
+            Ok(result) => {
+                latest_snap_id.insert(key, result.snapshot_id);
+                results.push(result);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to index {}/{}.{}: {e}",
+                    snap.source, snap.name, snap.ts
+                );
+                index_errors += 1;
+            }
+        }
     }
 
-    let total_in_db = db.list_snapshots()?.len();
-    let skipped = total_in_db - discovered_count;
+    let indexed_count = results.len();
 
     Ok(WalkResult {
-        snapshots_discovered: total_in_db,
-        snapshots_indexed: discovered_count,
-        snapshots_skipped: skipped,
+        snapshots_discovered: discovered_count,
+        snapshots_indexed: indexed_count,
+        snapshots_skipped: discovered_count.saturating_sub(indexed_count + index_errors),
         results,
     })
 }

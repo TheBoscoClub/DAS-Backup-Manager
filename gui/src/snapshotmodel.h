@@ -37,6 +37,9 @@ public:
     [[nodiscard]] int columnCount(const QModelIndex &parent = {}) const override;
     [[nodiscard]] QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
 
+private Q_SLOTS:
+    void onSnapshotsReceived(const QString &json);
+
 private:
     struct DateGroup {
         QString date;
