@@ -323,5 +323,13 @@ void BackupPanel::runBackup(bool dryRun)
             },
             Qt::SingleShotConnection);
 
+    // Re-enable buttons if the D-Bus call itself fails (e.g. polkit denied)
+    connect(m_client, &DBusClient::errorOccurred, this,
+            [this](const QString & /*operation*/, const QString & /*error*/) {
+                m_dryRunButton->setEnabled(true);
+                m_runButton->setEnabled(true);
+            },
+            Qt::SingleShotConnection);
+
     m_client->backupRun(m_configPath, mode, sources, targets, dryRun);
 }

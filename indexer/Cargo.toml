@@ -36,7 +36,7 @@ dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 console = "0.15"
 libc = "0.2"
 serde_json = "1"
-zbus = { version = "5", optional = true }
+zbus = { version = "5", features = ["tokio"], optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal"], optional = true }
 
 [profile.release]
