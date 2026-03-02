@@ -186,6 +186,14 @@ pub fn parse_smartctl_details(json_str: &str) -> Option<SmartDetails> {
 /// serial string. Returns the first matching real device path (e.g.
 /// `/dev/sdb`), excluding partition entries (names that end in `-partN`).
 pub fn device_from_serial(serial: &str) -> Option<String> {
+    device_info_from_serial(serial).map(|(dev, _is_usb)| dev)
+}
+
+/// Resolve a `/dev/disk/by-id/` symlink for a drive identified by its
+/// serial string. Returns `(device_path, is_usb)` — `is_usb` is true when
+/// the by-id symlink name starts with `usb-`, indicating a USB-attached
+/// drive that needs `smartctl -d sat` for SMART access.
+pub fn device_info_from_serial(serial: &str) -> Option<(String, bool)> {
     if serial.is_empty() {
         return None;
     }
@@ -211,7 +219,8 @@ pub fn device_from_serial(serial: &str) -> Option<String> {
                     let dev_str = canonical.to_string_lossy().to_string();
                     // Skip partition devices (/dev/sdb1, /dev/nvme0n1p1, etc.)
                     if !dev_str.chars().last().is_some_and(|c| c.is_ascii_digit()) {
-                        return Some(dev_str);
+                        let is_usb = name.starts_with("usb-");
+                        return Some((dev_str, is_usb));
                     }
                 }
             }
@@ -407,14 +416,16 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             0
         };
 
-        // 4. Get SMART details
+        // 4. Get SMART details (use -d sat for USB-attached SATA drives)
         let smart_details = if !target.serial.is_empty() {
-            device_from_serial(&target.serial)
-                .and_then(|dev| {
-                    std::process::Command::new("smartctl")
-                        .args(["--json", "--all", &dev])
-                        .output()
-                        .ok()
+            device_info_from_serial(&target.serial)
+                .and_then(|(dev, is_usb)| {
+                    let mut cmd = std::process::Command::new("smartctl");
+                    cmd.args(["--json", "--all"]);
+                    if is_usb {
+                        cmd.arg("-d").arg("sat");
+                    }
+                    cmd.arg(&dev).output().ok()
                 })
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .and_then(|json| parse_smartctl_details(&json))
