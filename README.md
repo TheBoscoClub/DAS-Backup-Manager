@@ -50,7 +50,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.7.0+) |
-| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components, 4 test suites) | Active (v0.7.0+) |
+| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
 | `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
@@ -69,8 +69,7 @@ DAS-Backup-Manager/
 │   ├── include/       # C header (btrdasd_ffi.h)
 │   └── completions/   # Shell completion installation instructions
 ├── gui/               # Qt6/KDE Plasma GUI (19 C++ components)
-│   ├── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
-│   └── tests/         # QTest suites (database, snapshotmodel, filemodel, searchmodel)
+│   └── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
 ├── dbus/              # D-Bus bus config and service activation
 ├── polkit/            # Polkit privilege escalation policy
 ├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap)
