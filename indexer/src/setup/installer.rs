@@ -173,7 +173,16 @@ pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let config = Config::load(&config_path)?;
+    let mut config = Config::load(&config_path)?;
+    let old_version = config.general.version.clone();
+    config.general.version = env!("CARGO_PKG_VERSION").to_string();
+    if old_version != config.general.version {
+        println!(
+            "Updating config version: {} -> {}",
+            old_version, config.general.version
+        );
+        config.save(&config_path)?;
+    }
     println!("Regenerating files from {}...", config_path.display());
     install(&config)?;
     println!("Upgrade complete.");
