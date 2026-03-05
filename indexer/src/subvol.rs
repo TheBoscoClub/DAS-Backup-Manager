@@ -44,6 +44,7 @@ pub fn add_subvolume(
     src.subvolumes.push(SubvolConfig {
         name: name.to_string(),
         manual_only,
+        snapshot_name: None,
     });
     Ok(())
 }
@@ -101,15 +102,18 @@ mod tests {
                 SubvolConfig {
                     name: "@".into(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
                 SubvolConfig {
                     name: "@home".into(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
             ],
             device: "/dev/nvme0n1p2".into(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["nvme".into()],
+            target_labels: vec![],
         });
         cfg.sources.push(Source {
             label: "ssd".into(),
@@ -117,10 +121,12 @@ mod tests {
             subvolumes: vec![SubvolConfig {
                 name: "@opt".into(),
                 manual_only: false,
+                snapshot_name: None,
             }],
             device: "/dev/sdb".into(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["ssd".into()],
+            target_labels: vec![],
         });
         cfg
     }

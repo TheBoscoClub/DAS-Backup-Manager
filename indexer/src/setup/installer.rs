@@ -357,10 +357,12 @@ mod tests {
             subvolumes: vec![SubvolConfig {
                 name: "@".to_string(),
                 manual_only: false,
+                snapshot_name: None,
             }],
             device: "/dev/sda".to_string(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
+            target_labels: vec![],
         });
         config.targets.push(Target {
             label: "tgt".to_string(),

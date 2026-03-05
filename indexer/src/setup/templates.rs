@@ -22,8 +22,8 @@ const SCRIPT_BOOT_ARCHIVE_CLEANUP: &str = include_str!("../../../scripts/boot-ar
 // Render functions
 // ---------------------------------------------------------------------------
 
-/// Generate btrbk.conf with global settings, source retention, and per-source
-/// volume blocks with target retention and subvolumes.
+/// Generate btrbk.conf with global settings, per-source volume blocks (one block
+/// per source with all matching targets), and per-subvolume snapshot names.
 pub fn render_btrbk_conf(config: &Config) -> String {
     let mut out = String::from(GENERATED_HEADER);
     out.push('\n');
@@ -40,47 +40,150 @@ pub fn render_btrbk_conf(config: &Config) -> String {
     out.push_str("snapshot_preserve_min   latest\n");
     out.push_str("snapshot_preserve       2d\n\n");
 
-    // Per-source volume blocks
+    // Find the primary target to use as the global retention baseline
+    let primary = config
+        .targets
+        .iter()
+        .find(|t| t.role == TargetRole::Primary);
+    if let Some(p) = primary {
+        out.push_str(&format!(
+            "# Default target retention (from {})\n",
+            p.label
+        ));
+        out.push_str("target_preserve_min     latest\n");
+        out.push_str(&format!(
+            "target_preserve         {}\n\n",
+            format_retention(&p.retention)
+        ));
+    }
+
+    // One volume block per source, with all matching targets inline
     for source in &config.sources {
-        // Find targets that are primary or mirror (not esp-sync)
         let targets: Vec<&Target> = config
             .targets
             .iter()
             .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
+            .filter(|t| {
+                source.target_labels.is_empty()
+                    || source.target_labels.contains(&t.label)
+            })
             .collect();
 
-        for target in &targets {
-            out.push_str(&format!("# {} -> {}\n", source.label, target.label));
-            out.push_str(&format!(
-                "target_preserve_min     latest\n\
-                 target_preserve         {}w {}m\n\n",
-                target.retention.weekly, target.retention.monthly
-            ));
-            out.push_str(&format!("volume {}\n", source.volume));
-            out.push_str(&format!(
-                "  snapshot_dir          {}\n",
-                source.snapshot_dir
-            ));
-            out.push_str(&format!(
-                "  target                {}/{}\n\n",
-                target.mount, source.label
-            ));
+        if targets.is_empty() {
+            continue;
+        }
 
-            for subvol in &source.subvolumes {
-                out.push_str(&format!("  subvolume             {}\n", subvol.name));
-                // Generate a safe snapshot name from subvolume
-                let snap_name = subvol.name.replace('@', "").replace('/', "-");
-                let snap_name = if snap_name.is_empty() {
-                    "root"
-                } else {
-                    &snap_name
-                };
-                out.push_str(&format!("    snapshot_name       {snap_name}\n\n"));
+        // Determine the target subdir for this source
+        let subdir = source
+            .target_subdirs
+            .first()
+            .unwrap_or(&source.label);
+
+        out.push_str(&format!("# {}\n", source.label));
+        out.push_str(&format!("volume {}\n", source.volume));
+        out.push_str(&format!(
+            "  snapshot_dir          {}\n",
+            source.snapshot_dir
+        ));
+
+        // Emit target lines with per-target retention overrides
+        for target in &targets {
+            out.push_str(&format!("  target                {}/{}\n", target.mount, subdir));
+            // If this target's retention differs from primary, emit an override
+            if let Some(p) = primary {
+                if target.label != p.label && target.retention != p.retention {
+                    out.push_str(&format!(
+                        "    target_preserve     {}\n",
+                        format_retention(&target.retention)
+                    ));
+                }
             }
+        }
+        out.push('\n');
+
+        // Pre-compute snapshot names and detect collisions
+        let snap_names = resolve_snapshot_names(&source.subvolumes);
+
+        for (subvol, snap_name) in source.subvolumes.iter().zip(snap_names.iter()) {
+            out.push_str(&format!("  subvolume             {}\n", subvol.name));
+            out.push_str(&format!("    snapshot_name       {snap_name}\n\n"));
         }
     }
 
     out
+}
+
+/// Format a Retention struct into btrbk's preserve format (e.g., "4w 12m 4y").
+fn format_retention(r: &Retention) -> String {
+    let mut parts = Vec::new();
+    if r.daily > 0 {
+        parts.push(format!("{}d", r.daily));
+    }
+    if r.weekly > 0 {
+        parts.push(format!("{}w", r.weekly));
+    }
+    if r.monthly > 0 {
+        parts.push(format!("{}m", r.monthly));
+    }
+    if r.yearly > 0 {
+        parts.push(format!("{}y", r.yearly));
+    }
+    if parts.is_empty() {
+        "4w".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Resolve snapshot names for a list of subvolumes, using explicit overrides
+/// where present and generating safe algorithmic names otherwise.
+/// Detects collisions and appends suffixes to disambiguate.
+fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut names: Vec<String> = subvols
+        .iter()
+        .map(|sv| {
+            if let Some(ref name) = sv.snapshot_name {
+                return name.clone();
+            }
+            let stripped = sv.name.replace('@', "").replace('/', "-");
+            if stripped.is_empty() {
+                "root".to_string()
+            } else {
+                stripped
+            }
+        })
+        .collect();
+
+    // Detect and resolve collisions by appending the full subvol name
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in &names {
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+
+    for (i, name) in names.clone().iter().enumerate() {
+        if counts[name] > 1 && subvols[i].snapshot_name.is_none() {
+            // Disambiguate: use the full subvol name with @ → "" and special chars → "-"
+            let full = subvols[i]
+                .name
+                .replace('@', "")
+                .replace('/', "-");
+            let disambiguated = if full.is_empty() {
+                "root".to_string()
+            } else {
+                full
+            };
+            // If still the same, prepend "root-" for the bare @ case
+            if disambiguated == *name {
+                names[i] = format!("root-{}", subvols[i].name.replace('@', ""));
+            } else {
+                names[i] = disambiguated;
+            }
+        }
+    }
+
+    names
 }
 
 /// Generate a systemd .service unit file. When `full` is true, appends " --full"
@@ -420,15 +523,18 @@ mod tests {
                 SubvolConfig {
                     name: "@".to_string(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
                 SubvolConfig {
                     name: "@home".to_string(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
             ],
             device: "/dev/nvme0n1p2".to_string(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["nvme".into()],
+            target_labels: vec![],
         });
         config.targets.push(Target {
             label: "primary-22tb".to_string(),
@@ -492,10 +598,12 @@ mod tests {
             subvolumes: vec![SubvolConfig {
                 name: "ClaudeCodeProjects".to_string(),
                 manual_only: false,
+                snapshot_name: None,
             }],
             device: "/dev/sda".to_string(),
             snapshot_dir: "ClaudeCodeProjects/.btrbk-snapshots".into(),
             target_subdirs: vec![],
+            target_labels: vec![],
         });
         let result = render_btrbk_conf(&config);
         // The HDD source must use its custom snapshot_dir, not the default
