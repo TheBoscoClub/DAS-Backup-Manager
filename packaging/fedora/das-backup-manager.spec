@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.3
+Version:        0.7.4
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -64,5 +64,5 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
-* Thu Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.3-1
+* Thu Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.4-1
 - Initial RPM package for Fedora

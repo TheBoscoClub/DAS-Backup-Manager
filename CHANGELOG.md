@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.4] - 2026-03-05
+
+### Fixed
+- **btrbk.conf snapshot_dir hardcoded** — `render_btrbk_conf()` used hardcoded `.btrbk-snapshots` for all sources; HDD sources with custom `snapshot_dir` (e.g., `ClaudeCodeProjects/.btrbk-snapshots`) now generate correctly from per-source config
+- **Production btrbk_conf path** — Config `btrbk_conf` pointed to old hand-written `/etc/btrbk/btrbk.conf` instead of the generated `/etc/das-backup/btrbk.conf`; backup commands were reading the wrong config
+- **GUI table sorting missing** — SearchPanel, Health/Drives, and Health/Growth tables now have `QSortFilterProxyModel` with clickable column headers for sorting
+- **Snapshot timeline sort order** — Added ascending/descending date sort toggle button to the SnapshotTimeline panel
+
 ## [0.7.3] - 2026-03-05
 
 ### Added
@@ -262,7 +270,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.6.0...v0.7.0
