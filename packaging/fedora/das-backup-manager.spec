@@ -14,6 +14,7 @@ BuildRequires:  cmake(KF6ConfigWidgets) cmake(KF6IconThemes) cmake(KF6Crash) cma
 BuildRequires:  cmake(KF6Notifications) cmake(KF6StatusNotifierItem)
 BuildRequires:  cmake(Qt6Charts)
 Requires:       btrbk btrfs-progs smartmontools zsh util-linux
+Recommends:     s-nail rsync
 Requires:       qt6-qtbase qt6-qtcharts kf6-kcoreaddons kf6-ki18n kf6-kxmlgui
 Requires:       kf6-kconfigwidgets kf6-kiconthemes kf6-kcrash kf6-kio
 Requires:       kf6-knotifications kf6-kstatusnotifieritem
