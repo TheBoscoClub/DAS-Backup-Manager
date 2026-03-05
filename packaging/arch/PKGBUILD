@@ -6,12 +6,13 @@ pkgdesc='DAS backup manager with btrbk integration, SQLite FTS5 content indexing
 arch=('x86_64')
 url='https://github.com/TheBoscoClub/DAS-Backup-Manager'
 license=('MIT')
-depends=('btrbk' 'btrfs-progs' 'smartmontools' 'zsh' 'util-linux'
+depends=('btrbk' 'btrfs-progs' 'smartmontools' 'bash' 'util-linux'
          'qt6-base' 'qt6-charts' 'kcoreaddons' 'ki18n' 'kxmlgui'
          'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio'
          'knotifications' 'kstatusnotifieritem')
 optdepends=('s-nail: email backup reports (mailx)'
-            'rsync: ESP/boot partition mirroring')
+            'rsync: ESP/boot partition mirroring'
+            'mbuffer: buffered btrbk stream transfers')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')

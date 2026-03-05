@@ -13,8 +13,9 @@ Homepage: https://github.com/TheBoscoClub/DAS-Backup-Manager
 Package: das-backup-manager
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}, btrbk, btrfs-progs,
- smartmontools, zsh, util-linux
+ smartmontools, bash, util-linux
 Recommends: s-nail, rsync
+Suggests: mbuffer
 Description: DAS backup manager with btrbk, SQLite FTS5 indexing, KDE GUI
  ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)
  enclosures. Features config-driven backup orchestration via btrbk, full-text
