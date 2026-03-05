@@ -1188,18 +1188,30 @@ impl HelperInterface {
                 })
                 .collect();
 
+            // Build total_bytes lookup per target label
+            let target_totals: std::collections::HashMap<&str, u64> = report
+                .targets
+                .iter()
+                .map(|t| (t.label.as_str(), t.total_bytes))
+                .collect();
+
             // Build growth data grouped by target label
             let mut growth_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                 std::collections::BTreeMap::new();
             for gp in &report.growth_points {
                 let (y, m, d) = health::days_to_ymd(gp.timestamp / 86400);
                 let date_str = format!("{y:04}-{m:02}-{d:02}");
+                let total = target_totals
+                    .get(gp.target_label.as_str())
+                    .copied()
+                    .unwrap_or(0);
                 growth_map
                     .entry(gp.target_label.clone())
                     .or_default()
                     .push(serde_json::json!({
                         "date": date_str,
                         "used_bytes": gp.used_bytes,
+                        "total_bytes": total,
                     }));
             }
             let growth_json: Vec<serde_json::Value> = growth_map

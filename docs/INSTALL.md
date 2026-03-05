@@ -41,6 +41,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | Dependency | Version | Purpose |
 |-----------|---------|---------|
 | Qt6 | 6.6+ (tested 6.10.2) | UI framework |
+| Qt6 Charts | 6.6+ (tested 6.10.2) | Growth trendline chart (`qt6-charts` package) |
 | KDE Frameworks 6 | 6.0+ (tested 6.23.0) | KXmlGuiWindow, KIO, KAboutData |
 | CMake | 3.25+ (tested 4.2.3) | Build system for GUI component |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros |

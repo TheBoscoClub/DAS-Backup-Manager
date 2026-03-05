@@ -15,6 +15,7 @@ find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS
     Core
     Widgets
     DBus
+    Charts
 )
 
 find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS
@@ -62,6 +63,7 @@ target_link_libraries(btrdasd-gui PRIVATE
     Qt6::Core
     Qt6::Widgets
     Qt6::DBus
+    Qt6::Charts
     KF6::CoreAddons
     KF6::I18n
     KF6::XmlGui
