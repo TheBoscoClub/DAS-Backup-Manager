@@ -46,10 +46,7 @@ pub fn render_btrbk_conf(config: &Config) -> String {
         .iter()
         .find(|t| t.role == TargetRole::Primary);
     if let Some(p) = primary {
-        out.push_str(&format!(
-            "# Default target retention (from {})\n",
-            p.label
-        ));
+        out.push_str(&format!("# Default target retention (from {})\n", p.label));
         out.push_str("target_preserve_min     latest\n");
         out.push_str(&format!(
             "target_preserve         {}\n\n",
@@ -63,10 +60,7 @@ pub fn render_btrbk_conf(config: &Config) -> String {
             .targets
             .iter()
             .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
-            .filter(|t| {
-                source.target_labels.is_empty()
-                    || source.target_labels.contains(&t.label)
-            })
+            .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
             .collect();
 
         if targets.is_empty() {
@@ -74,10 +68,7 @@ pub fn render_btrbk_conf(config: &Config) -> String {
         }
 
         // Determine the target subdir for this source
-        let subdir = source
-            .target_subdirs
-            .first()
-            .unwrap_or(&source.label);
+        let subdir = source.target_subdirs.first().unwrap_or(&source.label);
 
         out.push_str(&format!("# {}\n", source.label));
         out.push_str(&format!("volume {}\n", source.volume));
@@ -88,15 +79,19 @@ pub fn render_btrbk_conf(config: &Config) -> String {
 
         // Emit target lines with per-target retention overrides
         for target in &targets {
-            out.push_str(&format!("  target                {}/{}\n", target.mount, subdir));
+            out.push_str(&format!(
+                "  target                {}/{}\n",
+                target.mount, subdir
+            ));
             // If this target's retention differs from primary, emit an override
-            if let Some(p) = primary {
-                if target.label != p.label && target.retention != p.retention {
-                    out.push_str(&format!(
-                        "    target_preserve     {}\n",
-                        format_retention(&target.retention)
-                    ));
-                }
+            if let Some(p) = primary
+                && target.label != p.label
+                && target.retention != p.retention
+            {
+                out.push_str(&format!(
+                    "    target_preserve     {}\n",
+                    format_retention(&target.retention)
+                ));
             }
         }
         out.push('\n');
@@ -165,10 +160,7 @@ fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
     for (i, name) in names.clone().iter().enumerate() {
         if counts[name] > 1 && subvols[i].snapshot_name.is_none() {
             // Disambiguate: use the full subvol name with @ → "" and special chars → "-"
-            let full = subvols[i]
-                .name
-                .replace('@', "")
-                .replace('/', "-");
+            let full = subvols[i].name.replace('@', "").replace('/', "-");
             let disambiguated = if full.is_empty() {
                 "root".to_string()
             } else {

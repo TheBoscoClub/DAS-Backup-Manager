@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.5] - 2026-03-05
+
+### Added
+- **`snapshot_name` config field** — Subvolumes can now specify an explicit `snapshot_name` to override the algorithmic default, preventing collisions (e.g., `@` and `@root` both resolving to `root`)
+- **`target_labels` config field** — Sources can now restrict which targets they back up to (e.g., HDD sources only to the 22TB primary, not the 2TB recovery drives)
+- **Source volume auto-mount in Rust backup path** — `ensure_sources_mounted()` mounts top-level BTRFS volumes (`subvolid=5`) before calling btrbk; the shell script did this but the Rust CLI/GUI code path didn't
+- **Optional dependencies in packaging** — `s-nail` (email reports) and `rsync` (ESP mirroring) declared as optional/recommended across all packaging formats (Arch, Debian, Fedora, Snap) and install guide
+
+### Fixed
+- **Backups producing "0 snapshots created, 0 sent"** — Three root causes fixed:
+  1. btrbk.conf generated separate volume blocks per source×target instead of one per source with multiple inline targets
+  2. Snapshot name collisions (`@` and `@root` both → `root`) caused btrbk errors
+  3. Source top-level volumes not mounted before btrbk calls in Rust code path
+- **btrbk.conf template rewrite** — `render_btrbk_conf()` now produces correct one-volume-block-per-source structure with inline targets, per-target retention overrides, and `resolve_snapshot_names()` collision detection
+- **2TB target retention** — 2TB targets now get `7d` emergency recovery retention instead of the full `4w 12m 4y` deep retention meant for the 22TB drive
+
 ## [0.7.4] - 2026-03-05
 
 ### Added

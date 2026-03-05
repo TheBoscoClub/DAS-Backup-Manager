@@ -511,4 +511,4 @@ btrdasd config show
 
 ---
 
-*Backup system version: 0.7.4*
+*Backup system version: 0.7.5*
