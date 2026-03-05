@@ -5,6 +5,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include <algorithm>
+
 SnapshotModel::SnapshotModel(DBusClient *client, const QString &dbPath, QObject *parent)
     : QAbstractItemModel(parent)
     , m_client(client)
@@ -47,6 +49,15 @@ void SnapshotModel::onSnapshotsReceived(const QString &json)
         }
     }
 
+    rebuildGroups();
+    endResetModel();
+}
+
+void SnapshotModel::rebuildGroups()
+{
+    m_groups.clear();
+
+    // Build groups from snapshot order (already sorted by ts from D-Bus)
     for (int i = 0; i < m_snapshots.size(); ++i) {
         QString date = tsToDate(m_snapshots[i].ts);
         if (m_groups.isEmpty() || m_groups.last().date != date) {
@@ -54,6 +65,20 @@ void SnapshotModel::onSnapshotsReceived(const QString &json)
         }
         m_groups.last().snapIndices.append(i);
     }
+
+    // Reverse group order for ascending (oldest-first)
+    if (m_sortOrder == Qt::AscendingOrder) {
+        std::reverse(m_groups.begin(), m_groups.end());
+    }
+}
+
+void SnapshotModel::setSortOrder(Qt::SortOrder order)
+{
+    if (m_sortOrder == order)
+        return;
+    m_sortOrder = order;
+    beginResetModel();
+    rebuildGroups();
     endResetModel();
 }
 

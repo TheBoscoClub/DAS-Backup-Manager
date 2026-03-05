@@ -14,6 +14,7 @@
 #include <QLabel>
 #include <QSplitter>
 #include <QStandardItem>
+#include <QSortFilterProxyModel>
 #include <QStandardItemModel>
 #include <QTabWidget>
 #include <QTableView>
@@ -115,7 +116,10 @@ void HealthDashboard::setupDrivesTab()
         i18n("Temp"),
         i18n("Power Hours"),
     });
-    m_drivesView->setModel(model);
+    auto *drivesProxy = new QSortFilterProxyModel(m_drivesView);
+    drivesProxy->setSourceModel(model);
+    m_drivesView->setModel(drivesProxy);
+    m_drivesView->setSortingEnabled(true);
 
     m_drivesView->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_drivesView->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -126,6 +130,8 @@ void HealthDashboard::setupDrivesTab()
 
     QHeaderView *hh = m_drivesView->horizontalHeader();
     hh->setStretchLastSection(true);
+    hh->setSectionsClickable(true);
+    hh->setSortIndicatorShown(true);
     hh->setSectionResizeMode(QHeaderView::ResizeToContents);
     hh->setSectionResizeMode(DrivesCol::Device, QHeaderView::Interactive);
     hh->setSectionResizeMode(DrivesCol::Label,  QHeaderView::Interactive);
@@ -170,7 +176,10 @@ void HealthDashboard::setupGrowthTab()
         i18n("Free"),
         i18n("ETA Full"),
     });
-    m_growthView->setModel(model);
+    auto *growthProxy = new QSortFilterProxyModel(m_growthView);
+    growthProxy->setSourceModel(model);
+    m_growthView->setModel(growthProxy);
+    m_growthView->setSortingEnabled(true);
 
     m_growthView->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_growthView->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -181,6 +190,8 @@ void HealthDashboard::setupGrowthTab()
 
     QHeaderView *hh = m_growthView->horizontalHeader();
     hh->setStretchLastSection(true);
+    hh->setSectionsClickable(true);
+    hh->setSortIndicatorShown(true);
     hh->setSectionResizeMode(QHeaderView::ResizeToContents);
     hh->setSectionResizeMode(GrowthCol::Date,  QHeaderView::Interactive);
     hh->setSectionResizeMode(GrowthCol::Label, QHeaderView::Interactive);
@@ -262,7 +273,10 @@ void HealthDashboard::updateDrives(const QString &json)
     const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
     const QJsonArray drives = doc.object().value(QLatin1String("targets")).toArray();
 
-    auto *model = qobject_cast<QStandardItemModel *>(m_drivesView->model());
+    auto *proxy = qobject_cast<QSortFilterProxyModel *>(m_drivesView->model());
+    auto *model = proxy
+        ? qobject_cast<QStandardItemModel *>(proxy->sourceModel())
+        : qobject_cast<QStandardItemModel *>(m_drivesView->model());
     if (!model)
         return;
 
@@ -345,7 +359,10 @@ void HealthDashboard::updateGrowth(const QString &json)
     const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
     const QJsonArray growthArr = doc.object().value(QLatin1String("growth")).toArray();
 
-    auto *model = qobject_cast<QStandardItemModel *>(m_growthView->model());
+    auto *growthProxyModel = qobject_cast<QSortFilterProxyModel *>(m_growthView->model());
+    auto *model = growthProxyModel
+        ? qobject_cast<QStandardItemModel *>(growthProxyModel->sourceModel())
+        : qobject_cast<QStandardItemModel *>(m_growthView->model());
     if (!model)
         return;
 
