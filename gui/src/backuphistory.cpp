@@ -48,7 +48,7 @@ public:
         Duration,
         Status,
         SnapshotsCreated,
-        BytesSent,
+        Sent,
         Errors,
         ColumnCount
     };
@@ -108,18 +108,26 @@ public:
 
         const BackupRunInfo &run = m_runs[index.row()];
 
-        if (role == Qt::DecorationRole && index.column() == Status) {
-            return run.success
-                ? QIcon::fromTheme(QStringLiteral("dialog-ok-apply"))
-                : QIcon::fromTheme(QStringLiteral("dialog-error"));
+        if (role == Qt::DecorationRole) {
+            if (index.column() == Status) {
+                return run.success
+                    ? QIcon::fromTheme(QStringLiteral("dialog-ok-apply"))
+                    : QIcon::fromTheme(QStringLiteral("dialog-error"));
+            }
+            if (index.column() == Sent) {
+                if (run.bytesSent > 0)
+                    return QIcon::fromTheme(QStringLiteral("dialog-ok-apply"));
+                if (!run.success)
+                    return QIcon::fromTheme(QStringLiteral("dialog-error"));
+            }
         }
 
         if (role == Qt::TextAlignmentRole) {
             switch (index.column()) {
             case SnapshotsCreated:
-            case BytesSent:
+            case Sent:
             case Errors:
-                return static_cast<int>(Qt::AlignRight | Qt::AlignVCenter);
+                return static_cast<int>(Qt::AlignCenter | Qt::AlignVCenter);
             default:
                 return static_cast<int>(Qt::AlignLeft | Qt::AlignVCenter);
             }
@@ -145,8 +153,12 @@ public:
         case SnapshotsCreated:
             return run.snapsCreated;
 
-        case BytesSent:
-            return FileModel::formatSize(run.bytesSent);
+        case Sent:
+            if (run.bytesSent > 0)
+                return i18n("Yes");
+            if (!run.success)
+                return i18n("No");
+            return QStringLiteral("—");
 
         case Errors:
             return run.errors.size();
@@ -168,7 +180,7 @@ public:
         case Duration:         return i18n("Duration");
         case Status:           return i18n("Status");
         case SnapshotsCreated: return i18n("Snapshots");
-        case BytesSent:        return i18n("Bytes Sent");
+        case Sent:             return i18n("Sent");
         case Errors:           return i18n("Errors");
         default:               return {};
         }
@@ -248,7 +260,7 @@ BackupHistoryView::BackupHistoryView(DBusClient *client, const QString &dbPath, 
     m_view->setColumnWidth(BackupHistoryModel::Duration,          80);
     m_view->setColumnWidth(BackupHistoryModel::Status,            80);
     m_view->setColumnWidth(BackupHistoryModel::SnapshotsCreated,  80);
-    m_view->setColumnWidth(BackupHistoryModel::BytesSent,         90);
+    m_view->setColumnWidth(BackupHistoryModel::Sent,               50);
     // Errors column stretches to fill remaining space
 
     // Sort by timestamp descending by default (most recent first)
