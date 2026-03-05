@@ -21,6 +21,10 @@ pub struct SetupArgs {
     #[arg(long)]
     pub uninstall: bool,
 
+    /// Remove ALL files: generated configs, binaries, D-Bus, polkit, icons, man page, completions
+    #[arg(long)]
+    pub uninstall_all: bool,
+
     /// Validate config + deps, report issues, change nothing
     #[arg(long)]
     pub check: bool,
@@ -41,6 +45,12 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             .default(false)
             .interact()?;
         installer::uninstall(remove_db)?;
+    } else if args.uninstall_all {
+        let remove_db = dialoguer::Confirm::new()
+            .with_prompt("Also remove the backup database?")
+            .default(false)
+            .interact()?;
+        installer::uninstall_all(remove_db)?;
     } else if args.upgrade {
         installer::upgrade()?;
     } else {
