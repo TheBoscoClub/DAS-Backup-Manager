@@ -1,5 +1,16 @@
 # Build Conventions
 
+## Single Canonical Source — No Duplication
+
+Every binary, library, config, version string, script, man page, and data file MUST have exactly ONE canonical location. All other references MUST be symlinks to that canonical path. Never copy binaries or version-bearing files to secondary locations.
+
+- **Binaries**: cmake installs to `/usr/bin/` and `/usr/libexec/`. If `/usr/local/bin/` needs them, use symlinks. Never `cp` or `cargo install` to a second path.
+- **Version strings**: ONE source of truth — `CMakeLists.txt` `project(VERSION ...)`. Rust gets it from `Cargo.toml`. GUI gets it via `target_compile_definitions(BTRDASD_VERSION="${CMAKE_PROJECT_VERSION}")`. Never hardcode version strings in source files.
+- **Build artifacts**: Always build via `cmake --build build` for installs (uses `build/cargo-target/`). Running bare `cargo build --release` builds to `indexer/target/release/` — a different directory. The cmake install copies from `build/cargo-target/` only.
+- **Shared libraries**: canonical at `/usr/lib/libbuttered_dasd_ffi.so`. Symlink if needed elsewhere.
+
+Violations of this rule cause version drift, stale binaries shadowing current ones via PATH priority, and wasted debugging time. If you find duplicate files, delete the copy and replace with a symlink.
+
 ## C++20 Standards
 - Use C++20 features: concepts, ranges, std::format, designated initializers
 - Compile with `-Wall -Wextra -Wpedantic -Werror`
