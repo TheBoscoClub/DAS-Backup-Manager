@@ -1,5 +1,5 @@
 name: das-backup-manager
-version: '0.6.0'
+version: '0.7.0'
 summary: DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 description: |
   ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)
