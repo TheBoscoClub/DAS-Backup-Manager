@@ -201,6 +201,7 @@ fn step_subvolumes(
                 .map(|name| SubvolConfig {
                     name,
                     manual_only: false,
+                    snapshot_name: None,
                 })
                 .collect();
 
@@ -215,6 +216,7 @@ fn step_subvolumes(
                 device,
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
+                target_labels: vec![],
             });
 
             let add_more = Confirm::new()
@@ -311,11 +313,13 @@ fn step_subvolumes(
                     .map(|name| SubvolConfig {
                         name,
                         manual_only: false,
+                        snapshot_name: None,
                     })
                     .collect(),
                 device,
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
+                target_labels: vec![],
             });
         }
 
@@ -339,6 +343,7 @@ fn step_subvolumes(
                 .map(|name| SubvolConfig {
                     name,
                     manual_only: false,
+                    snapshot_name: None,
                 })
                 .collect();
             let device: String = Input::new().with_prompt("Device path").interact_text()?;
@@ -350,6 +355,7 @@ fn step_subvolumes(
                 device,
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
+                target_labels: vec![],
             });
         }
     }

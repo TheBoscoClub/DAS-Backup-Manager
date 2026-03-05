@@ -1123,15 +1123,18 @@ mod tests {
                         SubvolConfig {
                             name: "@".into(),
                             manual_only: false,
+                            snapshot_name: None,
                         },
                         SubvolConfig {
                             name: "@home".into(),
                             manual_only: false,
+                            snapshot_name: None,
                         },
                     ],
                     device: "/dev/nvme0n1p2".into(),
                     snapshot_dir: ".btrbk-snapshots".into(),
                     target_subdirs: vec![],
+                    target_labels: vec![],
                 },
                 Source {
                     label: "manual-src".into(),
@@ -1139,10 +1142,12 @@ mod tests {
                     subvolumes: vec![SubvolConfig {
                         name: "@special".into(),
                         manual_only: true,
+                        snapshot_name: None,
                     }],
                     device: "/dev/sdb".into(),
                     snapshot_dir: ".btrbk-snapshots".into(),
                     target_subdirs: vec![],
+                    target_labels: vec![],
                 },
             ],
             targets: vec![Target {

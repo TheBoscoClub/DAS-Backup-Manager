@@ -173,15 +173,18 @@ mod tests {
                 SubvolConfig {
                     name: "@".to_string(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
                 SubvolConfig {
                     name: "@home".to_string(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
             ],
             device: "/dev/nvme0n1p2".to_string(),
             snapshot_dir: ".btrbk-snapshots".to_string(),
             target_subdirs: vec!["nvme".to_string()],
+            target_labels: vec![],
         });
         config.targets.push(Target {
             label: "primary-22tb".to_string(),

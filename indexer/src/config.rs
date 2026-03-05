@@ -136,14 +136,16 @@ impl Default for Boot {
     }
 }
 
-/// A subvolume within a source, with optional scheduling flags.
-/// Accepts both bare strings ("@") and full structs ({name = "@", manual_only = true})
-/// in TOML for backward compatibility.
+/// A subvolume within a source, with optional scheduling flags and snapshot name override.
+/// Accepts bare strings ("@"), structs with name+manual_only, or full structs with snapshot_name.
 #[derive(Debug, Clone, Serialize)]
 pub struct SubvolConfig {
     pub name: String,
     #[serde(default)]
     pub manual_only: bool,
+    /// Override the btrbk snapshot_name (default: algorithmic from subvol name).
+    #[serde(default)]
+    pub snapshot_name: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SubvolConfig {
@@ -159,6 +161,8 @@ impl<'de> Deserialize<'de> for SubvolConfig {
                 name: String,
                 #[serde(default)]
                 manual_only: bool,
+                #[serde(default)]
+                snapshot_name: Option<String>,
             },
         }
 
@@ -166,8 +170,17 @@ impl<'de> Deserialize<'de> for SubvolConfig {
             SubvolEntry::Simple(name) => Ok(SubvolConfig {
                 name,
                 manual_only: false,
+                snapshot_name: None,
             }),
-            SubvolEntry::Full { name, manual_only } => Ok(SubvolConfig { name, manual_only }),
+            SubvolEntry::Full {
+                name,
+                manual_only,
+                snapshot_name,
+            } => Ok(SubvolConfig {
+                name,
+                manual_only,
+                snapshot_name,
+            }),
         }
     }
 }
@@ -182,6 +195,9 @@ pub struct Source {
     pub snapshot_dir: String,
     #[serde(default)]
     pub target_subdirs: Vec<String>,
+    /// Which target labels this source sends to (empty = all non-EspSync targets).
+    #[serde(default)]
+    pub target_labels: Vec<String>,
 }
 
 fn default_snapshot_dir() -> String {
@@ -207,7 +223,7 @@ pub enum TargetRole {
     EspSync,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Retention {
     #[serde(default)]
     pub weekly: u32,
@@ -443,15 +459,18 @@ mod tests {
                 SubvolConfig {
                     name: "@".into(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
                 SubvolConfig {
                     name: "@home".into(),
                     manual_only: false,
+                    snapshot_name: None,
                 },
             ],
             device: "/dev/nvme0n1p2".into(),
             snapshot_dir: ".snapshots".into(),
             target_subdirs: vec!["nvme".into()],
+            target_labels: vec![],
         });
         cfg.targets.push(Target {
             label: "primary-22tb".into(),
@@ -586,10 +605,12 @@ enabled = false
             subvolumes: vec![SubvolConfig {
                 name: "@".into(),
                 manual_only: false,
+                snapshot_name: None,
             }],
             device: "/dev/sda".into(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
+            target_labels: vec![],
         });
         let errors = cfg.validate();
         assert!(
