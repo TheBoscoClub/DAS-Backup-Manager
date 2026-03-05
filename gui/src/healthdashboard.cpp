@@ -12,11 +12,20 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QSplitter>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QTabWidget>
 #include <QTableView>
 #include <QVBoxLayout>
+
+#include <QChart>
+#include <QChartView>
+#include <QDateTimeAxis>
+#include <QLineSeries>
+#include <QValueAxis>
+
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // Column indices for the drives table
@@ -46,6 +55,8 @@ namespace GrowthCol {
         Date = 0,
         Label,
         Used,
+        Free,
+        EtaFull,
         Count
     };
 }
@@ -130,17 +141,34 @@ void HealthDashboard::setupGrowthTab()
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(4);
 
-    auto *info = new QLabel(i18n("Growth data loaded from health query"), m_growthWidget);
+    auto *info = new QLabel(i18n("Storage usage over time — chart + table with ETA projection"),
+                            m_growthWidget);
     info->setToolTip(i18n("Storage usage over time for each backup target"));
     layout->addWidget(info);
 
-    m_growthView = new QTableView(m_growthWidget);
+    // Splitter: chart on top, table on bottom
+    m_growthSplitter = new QSplitter(Qt::Vertical, m_growthWidget);
+
+    // Chart view
+    auto *chart = new QChart();
+    chart->setTitle(i18n("Growth Trend"));
+    chart->setAnimationOptions(QChart::SeriesAnimations);
+    chart->legend()->setAlignment(Qt::AlignBottom);
+
+    m_chartView = new QChartView(chart, m_growthSplitter);
+    m_chartView->setRenderHint(QPainter::Antialiasing);
+    m_chartView->setMinimumHeight(200);
+
+    // Table view
+    m_growthView = new QTableView(m_growthSplitter);
 
     auto *model = new QStandardItemModel(0, GrowthCol::Count, m_growthView);
     model->setHorizontalHeaderLabels({
         i18n("Date"),
         i18n("Label"),
         i18n("Used"),
+        i18n("Free"),
+        i18n("ETA Full"),
     });
     m_growthView->setModel(model);
 
@@ -157,7 +185,12 @@ void HealthDashboard::setupGrowthTab()
     hh->setSectionResizeMode(GrowthCol::Date,  QHeaderView::Interactive);
     hh->setSectionResizeMode(GrowthCol::Label, QHeaderView::Interactive);
 
-    layout->addWidget(m_growthView, 1);
+    m_growthSplitter->addWidget(m_chartView);
+    m_growthSplitter->addWidget(m_growthView);
+    m_growthSplitter->setStretchFactor(0, 2);  // chart gets more space
+    m_growthSplitter->setStretchFactor(1, 1);
+
+    layout->addWidget(m_growthSplitter, 1);
 
     m_tabs->addTab(m_growthWidget, QIcon::fromTheme(QStringLiteral("office-chart-line")),
                    i18n("Growth"));
@@ -318,22 +351,166 @@ void HealthDashboard::updateGrowth(const QString &json)
 
     model->removeRows(0, model->rowCount());
 
+    // Chart: rebuild series
+    auto *chart = m_chartView->chart();
+    chart->removeAllSeries();
+
+    // Remove old axes
+    const auto oldAxes = chart->axes();
+    for (auto *axis : oldAxes)
+        chart->removeAxis(axis);
+
+    auto *axisX = new QDateTimeAxis();
+    axisX->setFormat(QStringLiteral("MM-dd"));
+    axisX->setTitleText(i18n("Date"));
+
+    auto *axisY = new QValueAxis();
+    axisY->setTitleText(i18n("Used (GiB)"));
+    axisY->setLabelFormat(QStringLiteral("%.0f"));
+
+    chart->addAxis(axisX, Qt::AlignBottom);
+    chart->addAxis(axisY, Qt::AlignLeft);
+
+    qreal yMax = 0;
+
+    // Color palette for target lines
+    const QColor colors[] = {
+        QColor(0x21, 0x96, 0xF3),  // blue
+        QColor(0x4C, 0xAF, 0x50),  // green
+        QColor(0xFF, 0x98, 0x00),  // amber
+        QColor(0xE9, 0x1E, 0x63),  // pink
+    };
+    int colorIdx = 0;
+
     for (const QJsonValue &gval : growthArr) {
         const QJsonObject gobj   = gval.toObject();
         const QString     glabel = gobj.value(QLatin1String("label")).toString();
         const QJsonArray  entries = gobj.value(QLatin1String("entries")).toArray();
 
+        if (entries.isEmpty())
+            continue;
+
+        auto *series = new QLineSeries();
+        series->setName(glabel);
+        series->setColor(colors[colorIdx % 4]);
+        ++colorIdx;
+
+        // Collect data for ETA calculation (linear regression on last 14 points)
+        struct GrowthEntry {
+            QDateTime date;
+            qint64 used;
+            qint64 total;
+        };
+        QVector<GrowthEntry> allEntries;
+
+        qint64 lastTotal = 0;
+
         for (const QJsonValue &eval : entries) {
             const QJsonObject entry = eval.toObject();
             const QString     date  = entry.value(QLatin1String("date")).toString();
             const qint64      used  = entry.value(QLatin1String("used_bytes")).toInteger();
+            const qint64      total = entry.value(QLatin1String("total_bytes")).toInteger();
+
+            const QDateTime dt = QDateTime::fromString(date, QStringLiteral("yyyy-MM-dd"));
+            if (!dt.isValid())
+                continue;
+
+            allEntries.append({dt, used, total});
+            if (total > 0)
+                lastTotal = total;
+
+            // Chart point
+            const qreal usedGiB = static_cast<qreal>(used) / (1024.0 * 1024.0 * 1024.0);
+            series->append(dt.toMSecsSinceEpoch(), usedGiB);
+
+            if (usedGiB > yMax)
+                yMax = usedGiB;
+        }
+
+        chart->addSeries(series);
+        series->attachAxis(axisX);
+        series->attachAxis(axisY);
+
+        // Capacity ceiling line for this target
+        if (lastTotal > 0) {
+            auto *capLine = new QLineSeries();
+            capLine->setName(glabel + i18n(" capacity"));
+            capLine->setColor(colors[(colorIdx - 1) % 4].lighter(150));
+
+            QPen dashPen(colors[(colorIdx - 1) % 4].lighter(150));
+            dashPen.setStyle(Qt::DashLine);
+            dashPen.setWidth(1);
+            capLine->setPen(dashPen);
+
+            const qreal capGiB = static_cast<qreal>(lastTotal) / (1024.0 * 1024.0 * 1024.0);
+            if (!allEntries.isEmpty()) {
+                capLine->append(allEntries.first().date.toMSecsSinceEpoch(), capGiB);
+                capLine->append(allEntries.last().date.toMSecsSinceEpoch(), capGiB);
+            }
+
+            chart->addSeries(capLine);
+            capLine->attachAxis(axisX);
+            capLine->attachAxis(axisY);
+
+            if (capGiB > yMax)
+                yMax = capGiB;
+        }
+
+        // Compute ETA using linear regression on last 14 entries
+        const int regressN = std::min(14, static_cast<int>(allEntries.size()));
+        double growthRatePerDay = 0.0;
+        bool hasEta = false;
+
+        if (regressN >= 2) {
+            const int startIdx = allEntries.size() - regressN;
+            double sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+            const qint64 epoch0 = allEntries[startIdx].date.toSecsSinceEpoch();
+
+            for (int i = startIdx; i < allEntries.size(); ++i) {
+                const double x = static_cast<double>(
+                    allEntries[i].date.toSecsSinceEpoch() - epoch0) / 86400.0;
+                const double y = static_cast<double>(allEntries[i].used);
+                sumX  += x;
+                sumY  += y;
+                sumXX += x * x;
+                sumXY += x * y;
+            }
+
+            const double denom = regressN * sumXX - sumX * sumX;
+            if (std::abs(denom) > 1e-9) {
+                growthRatePerDay = (regressN * sumXY - sumX * sumY) / denom;
+                hasEta = growthRatePerDay > 0 && lastTotal > 0;
+            }
+        }
+
+        // Populate table rows for this target
+        for (int i = 0; i < allEntries.size(); ++i) {
+            const auto &ge = allEntries[i];
+            const qint64 free = ge.total > 0 ? ge.total - ge.used : 0;
 
             QList<QStandardItem *> row;
             row.reserve(GrowthCol::Count);
 
-            row.append(new QStandardItem(date));
+            row.append(new QStandardItem(ge.date.toString(QStringLiteral("yyyy-MM-dd"))));
             row.append(new QStandardItem(glabel));
-            row.append(new QStandardItem(FileModel::formatSize(used)));
+            row.append(new QStandardItem(FileModel::formatSize(ge.used)));
+            row.append(new QStandardItem(
+                ge.total > 0 ? FileModel::formatSize(free < 0 ? 0 : free)
+                             : QStringLiteral("—")));
+
+            // ETA: only show on the last row per target
+            QString etaStr = QStringLiteral("—");
+            if (i == allEntries.size() - 1 && hasEta) {
+                const qint64 remaining = lastTotal - ge.used;
+                const double daysLeft = static_cast<double>(remaining) / growthRatePerDay;
+                if (daysLeft > 0 && daysLeft < 365 * 10) {
+                    const QDate etaDate = ge.date.date().addDays(static_cast<qint64>(daysLeft));
+                    etaStr = etaDate.toString(QStringLiteral("yyyy-MM-dd"));
+                } else if (daysLeft >= 365 * 10) {
+                    etaStr = i18n("> 10 years");
+                }
+            }
+            row.append(new QStandardItem(etaStr));
 
             for (QStandardItem *item : row)
                 item->setEditable(false);
@@ -341,6 +518,9 @@ void HealthDashboard::updateGrowth(const QString &json)
             model->appendRow(row);
         }
     }
+
+    // Finalize Y axis
+    axisY->setRange(0, yMax * 1.05);
 }
 
 void HealthDashboard::updateStatus(const QString &json)

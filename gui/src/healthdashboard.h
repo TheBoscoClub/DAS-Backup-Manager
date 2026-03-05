@@ -4,6 +4,8 @@
 class QTabWidget;
 class QTableView;
 class QLabel;
+class QSplitter;
+class QChartView;
 class DBusClient;
 
 class HealthDashboard : public QWidget
@@ -37,6 +39,8 @@ private:
 
     // Growth tab
     QWidget *m_growthWidget = nullptr;
+    QSplitter *m_growthSplitter = nullptr;
+    QChartView *m_chartView = nullptr;
     QTableView *m_growthView = nullptr;
 
     // Status tab
