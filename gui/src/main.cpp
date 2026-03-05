@@ -18,7 +18,7 @@ int main(int argc, char *argv[])
     KAboutData aboutData(
         u"btrdasd-gui"_s,
         i18n("ButteredDASD"),
-        u"0.6.0"_s,
+        QString::fromUtf8(BTRDASD_VERSION),
         i18n("Search, browse, and restore files from BTRFS backup snapshots"),
         KAboutLicense::MIT,
         i18n("(c) 2026 TheBoscoClub"),

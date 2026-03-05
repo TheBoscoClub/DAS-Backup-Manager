@@ -55,6 +55,8 @@ target_sources(btrdasd-gui PRIVATE
 
 target_compile_features(btrdasd-gui PRIVATE cxx_std_20)
 target_compile_options(btrdasd-gui PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_compile_definitions(btrdasd-gui PRIVATE
+    BTRDASD_VERSION="${CMAKE_PROJECT_VERSION}")
 
 target_link_libraries(btrdasd-gui PRIVATE
     Qt6::Core
