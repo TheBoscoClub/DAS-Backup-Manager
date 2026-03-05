@@ -1,3 +1,13 @@
+das-backup-manager (0.7.2-1) unstable; urgency=medium
+
+  * Add --uninstall-all to remove all installed files (cmake + installer)
+  * Enable btrdasd-helper.service on cmake install
+  * Fix indexer UNIQUE constraint and add bytes_sent measurement
+  * Resolve 7 interconnected GUI + backend bugs
+  * Add full backup mode with btrbk run and retention cleanup
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Wed, 05 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.1-1) unstable; urgency=medium
 
   * Full management GUI with D-Bus privilege escalation

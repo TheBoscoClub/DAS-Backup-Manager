@@ -330,10 +330,7 @@ pub fn ensure_targets_mounted(
 /// If the volume isn't already mounted, we mount it with `subvolid=5`.
 ///
 /// Returns a [`MountGuard`] that unmounts only newly-mounted volumes on drop.
-pub fn ensure_sources_mounted(
-    config: &Config,
-    progress: &dyn ProgressCallback,
-) -> MountGuard {
+pub fn ensure_sources_mounted(config: &Config, progress: &dyn ProgressCallback) -> MountGuard {
     let mut guard = MountGuard::new();
 
     // Deduplicate: multiple sources can share a volume (e.g. hdd-projects
@@ -407,10 +404,7 @@ pub fn ensure_sources_mounted(
             Err(e) => {
                 progress.on_log(
                     crate::progress::LogLevel::Warning,
-                    &format!(
-                        "Source '{}': failed to execute mount: {e}",
-                        source.label
-                    ),
+                    &format!("Source '{}': failed to execute mount: {e}", source.label),
                 );
             }
         }
