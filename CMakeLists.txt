@@ -147,6 +147,17 @@ if(BUILD_HELPER)
 
     install(FILES systemd/btrdasd-helper.service
         DESTINATION lib/systemd/system)
+
+    install(CODE "
+        execute_process(
+            COMMAND systemctl daemon-reload
+            ERROR_QUIET
+        )
+        execute_process(
+            COMMAND systemctl enable btrdasd-helper.service
+            ERROR_QUIET
+        )
+    ")
 endif()
 
 # =============================================================================
