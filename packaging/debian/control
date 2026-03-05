@@ -5,7 +5,8 @@ Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
 Build-Depends: debhelper-compat (= 13), cmake (>= 3.25), cargo, rustc,
  extra-cmake-modules, qt6-base-dev, libkf6coreaddons-dev, libkf6i18n-dev,
  libkf6xmlgui-dev, libkf6configwidgets-dev, libkf6iconthemes-dev,
- libkf6crash-dev, libkf6kio-dev
+ libkf6crash-dev, libkf6kio-dev, libkf6notifications-dev,
+ libkf6statusnotifieritem-dev, libqt6charts6-dev
 Standards-Version: 4.7.0
 Homepage: https://github.com/TheBoscoClub/DAS-Backup-Manager
 

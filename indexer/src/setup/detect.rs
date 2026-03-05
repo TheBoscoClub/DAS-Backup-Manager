@@ -291,7 +291,7 @@ pub struct DepStatus {
 /// Check whether required and optional dependencies are available.
 ///
 /// Always checks: btrbk, btrfs, smartctl, lsblk, mbuffer.
-/// Conditionally checks: msmtp (if email_enabled), rsync (if esp_mirror).
+/// Conditionally checks: mailx (if email_enabled), rsync (if esp_mirror).
 pub fn check_dependencies(email_enabled: bool, esp_mirror: bool) -> Vec<DepStatus> {
     let mut deps = vec![
         ("btrbk", true),
@@ -302,7 +302,7 @@ pub fn check_dependencies(email_enabled: bool, esp_mirror: bool) -> Vec<DepStatu
     ];
 
     if email_enabled {
-        deps.push(("msmtp", true));
+        deps.push(("mailx", true));
     }
     if esp_mirror {
         deps.push(("rsync", true));
