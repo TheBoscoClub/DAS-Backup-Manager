@@ -19,7 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--uninstall-all` mode** (`btrdasd setup --uninstall-all`) — Removes all installed files: generated configs (same as `--uninstall`), plus cmake-installed binaries, FFI library, D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon
 - **Auto-enable helper service** — `cmake --install` now runs `systemctl daemon-reload` and `systemctl enable btrdasd-helper.service` automatically
 
+### Changed
+- **GUI version from CMake** — `KAboutData` version in `gui/src/main.cpp` now uses `BTRDASD_VERSION` compile definition from `CMAKE_PROJECT_VERSION` instead of a hardcoded string; version stays in sync automatically across releases
+
 ### Fixed
+- **GUI About dialog showed v0.6.0** — `KAboutData` had a hardcoded `"0.6.0"` version string that was never updated; now derived from CMake project version
+- **Stale v0.6.0 binaries in `/usr/local/bin/`** — Manual install from earlier release left binaries in `/usr/local/bin/` that shadowed the cmake-installed `/usr/bin/` binaries due to PATH priority; removed and replaced with symlinks to canonical install locations
+- **CMake ExternalProject stale build cache** — `cmake --build` didn't always rebuild Rust binaries when only `cargo build --release` had been run (different `--target-dir`); `build/cargo-target/` vs `indexer/target/release/` divergence caused installed binary to lag behind
 - **Indexer UNIQUE constraint** — Resolved duplicate snapshot insertion errors during incremental indexing
 - **bytes_sent measurement** — Added `statvfs(2)` disk usage delta measurement for btrbk v0.32 (which doesn't report transfer sizes)
 - **7 interconnected GUI + backend bugs** — Resolved issues across D-Bus client, backup panel, health dashboard, and file browser
