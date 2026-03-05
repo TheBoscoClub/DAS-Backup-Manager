@@ -236,6 +236,96 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Remove a list of file paths, silently skipping any that don't exist.
+/// Returns the count of files successfully removed.
+fn remove_paths(paths: &[String]) -> usize {
+    let mut removed = 0;
+    for p in paths {
+        let path = Path::new(p);
+        if path.exists() && std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Return the list of all files installed by `cmake --install`.
+/// The `prefix` is the install prefix (e.g., `/usr` or `/usr/local`).
+fn cmake_installed_paths(prefix: &str) -> Vec<String> {
+    let p = |suffix: &str| format!("{prefix}/{suffix}");
+    vec![
+        // Binaries
+        p("bin/btrdasd"),
+        p("bin/btrdasd-gui"),
+        p("libexec/btrdasd-helper"),
+        // FFI
+        p("lib/libbuttered_dasd_ffi.so"),
+        p("include/btrdasd_ffi.h"),
+        // D-Bus
+        p("share/dbus-1/system.d/org.dasbackup.Helper1.conf"),
+        p("share/dbus-1/system-services/org.dasbackup.Helper1.service"),
+        // Polkit
+        p("share/polkit-1/actions/org.dasbackup.policy"),
+        // Man page
+        p("share/man/man1/btrdasd.1"),
+        // Shell completions
+        p("share/bash-completion/completions/btrdasd"),
+        p("share/zsh/site-functions/_btrdasd"),
+        p("share/fish/vendor_completions.d/btrdasd.fish"),
+        // Desktop entry and icon
+        p("share/applications/org.theboscoclub.btrdasd-gui.desktop"),
+        p("share/icons/hicolor/scalable/apps/btrdasd-gui.svg"),
+        // XML GUI
+        p("share/kxmlgui5/btrdasd-gui/btrdasd-gui.rc"),
+        // Backup scripts (cmake-installed, separate from setup-generated)
+        p("lib/das-backup/backup-run.sh"),
+        p("lib/das-backup/backup-verify.sh"),
+        p("lib/das-backup/boot-archive-cleanup.sh"),
+        p("lib/das-backup/das-partition-drives.sh"),
+        p("lib/das-backup/install-backup-timer.sh"),
+        p("lib/das-backup/config/btrbk.conf"),
+        p("lib/das-backup/config/das-backup-email.conf.example"),
+        // Systemd units (cmake-installed templates)
+        "/lib/systemd/system/das-backup.service".to_string(),
+        "/lib/systemd/system/das-backup-full.service".to_string(),
+        "/lib/systemd/system/das-backup.timer".to_string(),
+        "/lib/systemd/system/das-backup-full.timer".to_string(),
+        "/lib/systemd/system/btrdasd-helper.service".to_string(),
+    ]
+}
+
+/// Full uninstall: remove generated files (manifest), then cmake-installed files.
+pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Phase 1: run the standard uninstall (manifest files, timers, config dir)
+    uninstall(remove_db)?;
+
+    // Phase 2: stop the helper service
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "--now", "btrdasd-helper.service"])
+        .status();
+
+    // Phase 3: determine install prefix from config (default /usr)
+    let prefix = Config::load(&PathBuf::from(CONFIG_FILE))
+        .ok()
+        .map(|c| c.general.install_prefix.clone())
+        .unwrap_or_else(|| "/usr".to_string());
+
+    let paths = cmake_installed_paths(&prefix);
+    let removed = remove_paths(&paths);
+    println!("Removed {} cmake-installed files.", removed);
+
+    // Phase 4: clean up empty directories
+    let _ = std::fs::remove_dir_all(format!("{prefix}/lib/das-backup"));
+    let _ = std::fs::remove_dir("/var/lib/das-backup");
+
+    let _ = std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .status();
+
+    println!("Full uninstall complete.");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests (TDD — written first, implementation follows)
 // ---------------------------------------------------------------------------
@@ -288,6 +378,43 @@ mod tests {
         let manifest = std::fs::read_to_string(&manifest_path).unwrap();
         assert!(manifest.contains("btrbk.conf"));
         assert!(manifest.contains("backup-run.sh"));
+    }
+
+    #[test]
+    fn uninstall_all_removes_cmake_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Simulate cmake-installed files
+        let bin_dir = base.join("usr/bin");
+        let libexec_dir = base.join("usr/libexec");
+        let lib_dir = base.join("usr/lib");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&libexec_dir).unwrap();
+        std::fs::create_dir_all(&lib_dir).unwrap();
+
+        let btrdasd = bin_dir.join("btrdasd");
+        let gui = bin_dir.join("btrdasd-gui");
+        let helper = libexec_dir.join("btrdasd-helper");
+        let ffi = lib_dir.join("libbuttered_dasd_ffi.so");
+        std::fs::write(&btrdasd, "bin").unwrap();
+        std::fs::write(&gui, "bin").unwrap();
+        std::fs::write(&helper, "bin").unwrap();
+        std::fs::write(&ffi, "lib").unwrap();
+
+        let paths = vec![
+            btrdasd.to_string_lossy().to_string(),
+            gui.to_string_lossy().to_string(),
+            helper.to_string_lossy().to_string(),
+            ffi.to_string_lossy().to_string(),
+        ];
+
+        let removed = remove_paths(&paths);
+        assert_eq!(removed, 4);
+        assert!(!btrdasd.exists());
+        assert!(!gui.exists());
+        assert!(!helper.exists());
+        assert!(!ffi.exists());
     }
 
     #[test]
