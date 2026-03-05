@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.2] - 2026-03-05
+
+### Added
+- **`--uninstall-all` mode** (`btrdasd setup --uninstall-all`) — Removes all installed files: generated configs (same as `--uninstall`), plus cmake-installed binaries, FFI library, D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon
+- **Auto-enable helper service** — `cmake --install` now runs `systemctl daemon-reload` and `systemctl enable btrdasd-helper.service` automatically
+
+### Fixed
+- **Indexer UNIQUE constraint** — Resolved duplicate snapshot insertion errors during incremental indexing
+- **bytes_sent measurement** — Added `statvfs(2)` disk usage delta measurement for btrbk v0.32 (which doesn't report transfer sizes)
+- **7 interconnected GUI + backend bugs** — Resolved issues across D-Bus client, backup panel, health dashboard, and file browser
+- **btrbk output parsing** — Corrected parsing of btrbk stdout for backup history recording
+- **btrbk filter arguments** — Stopped passing target mount paths as btrbk filter arguments
+
 ## [0.7.1] - 2026-03-05
 
 ### Fixed
@@ -226,7 +239,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.1...v0.6.0
