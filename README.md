@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.2
+**Version**: 0.7.3
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -36,6 +36,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Interactive Installer** (`btrdasd setup`) — 10-step wizard with 5 modes: install, modify, upgrade, uninstall, check
 - **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
+- **Native Packaging** — Packaging recipes for Arch (PKGBUILD), Debian/Ubuntu (dpkg), Fedora (RPM), Flatpak, and Snap — all build-tested on their respective distributions before each release
 - **Docker Support** — Headless `btrdasd` CLI in a container
 
 ## Components
@@ -72,6 +73,7 @@ DAS-Backup-Manager/
 │   └── tests/         # QTest suites (database, snapshotmodel, filemodel, searchmodel)
 ├── dbus/              # D-Bus bus config and service activation
 ├── polkit/            # Polkit privilege escalation policy
+├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap)
 ├── docs/              # Architecture, installation, dependencies, recovery, man page
 ├── Dockerfile         # Headless CLI container
 └── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER, BUILD_FFI)
@@ -113,7 +115,7 @@ sudo cmake --install build
 sudo btrdasd setup
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including manual setup, Docker, and CMake build options.
+See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including native distro packages, manual setup, and CMake build options.
 
 ### Quick Docker
 

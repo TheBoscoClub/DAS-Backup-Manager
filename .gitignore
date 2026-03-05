@@ -233,3 +233,5 @@ sandbox-*/
 releases/*.tar.gz
 releases/*.tar.gz.sha256
 .staged-release
+Dockerfile
+.dockerignore

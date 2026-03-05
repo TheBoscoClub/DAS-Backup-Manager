@@ -3,9 +3,13 @@
 	dh $@
 
 override_dh_auto_configure:
-	cargo build --release --manifest-path indexer/Cargo.toml
-	dh_auto_configure -- -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_INDEXER=OFF
+	. $(HOME)/.cargo/env 2>/dev/null; cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
+
+override_dh_auto_build:
+	. $(HOME)/.cargo/env 2>/dev/null; cmake --build build
 
 override_dh_auto_install:
-	dh_auto_install
-	install -Dm755 indexer/target/release/btrdasd debian/das-backup-manager/usr/bin/btrdasd
+	DESTDIR=$(CURDIR)/debian/das-backup-manager cmake --install build
+
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info || true

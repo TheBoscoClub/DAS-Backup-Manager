@@ -1,3 +1,13 @@
+das-backup-manager (0.7.3-1) unstable; urgency=medium
+
+  * Replace "Bytes Sent" column with binary Yes/No indicator in backup history
+  * Fix config editor showing hardcoded 0.6.0 version; now auto-updates on upgrade
+  * Add Free space, ETA-until-full columns and Qt Charts trendline to Growth page
+  * Add Qt6 Charts dependency for growth trendline visualization
+  * Fix incremental indexing skipped-snapshot count
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Wed, 05 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.2-1) unstable; urgency=medium
 
   * Add --uninstall-all to remove all installed files (cmake + installer)

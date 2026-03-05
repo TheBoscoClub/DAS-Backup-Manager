@@ -1,14 +1,15 @@
 # Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
 pkgname=das-backup-manager
-pkgver=0.7.2
+pkgver=0.7.3
 pkgrel=1
 pkgdesc='DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI'
 arch=('x86_64')
 url='https://github.com/TheBoscoClub/DAS-Backup-Manager'
 license=('MIT')
 depends=('btrbk' 'btrfs-progs' 'smartmontools' 'zsh' 'util-linux'
-         'qt6-base' 'kcoreaddons' 'ki18n' 'kxmlgui'
-         'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio')
+         'qt6-base' 'qt6-charts' 'kcoreaddons' 'ki18n' 'kxmlgui'
+         'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio'
+         'knotifications' 'kstatusnotifieritem')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')

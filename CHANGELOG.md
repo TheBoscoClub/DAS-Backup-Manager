@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.3] - 2026-03-05
+
+### Added
+- **Growth trendline chart** — Health Dashboard growth tab now shows a Qt Charts line graph with per-target used-space trend and dashed capacity ceiling lines
+- **Free and ETA columns** — Growth table now includes Free (total - used) and ETA Full (14-point linear regression projection of when disk fills)
+- **Qt6 Charts dependency** — GUI now requires `qt6-charts` package for growth visualization
+- **Distro package testing** — All packaging recipes (Arch, Debian, Fedora, Flatpak, Snap) are now build-tested on their respective distributions before release
+- **KF6 Notifications and StatusNotifierItem** — Added missing KF6 dependencies to all packaging formats (required by GUI for desktop notifications and system tray)
+
+### Changed
+- **History "Sent" column** — Replaced wide "Bytes Sent" column (formatted byte sizes) with narrow binary "Sent" indicator: Yes (green icon) if data was sent, No (red icon) if backup failed, dash for dry-run/snapshot-only runs
+
+### Fixed
+- **Config version stuck at old value** — `setup --upgrade` now auto-updates the `version` field in `/etc/das-backup/config.toml` to match the installed binary version (was stuck at 0.6.0 through multiple releases)
+- **Incremental indexing `snapshots_skipped` always 0** — `discover_snapshots()` filtered out already-indexed snapshots before returning, making `walk()` unable to count skipped snapshots; added `DiscoveryResult` struct with both new snapshots and total-on-disk count
+- **Growth data missing total_bytes** — D-Bus helper growth JSON now includes `total_bytes` per entry (looked up from target health data) enabling Free/ETA calculations
+
 ## [0.7.2] - 2026-03-05
 
 ### Added

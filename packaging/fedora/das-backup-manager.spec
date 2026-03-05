@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.2
+Version:        0.7.3
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -11,9 +11,12 @@ BuildRequires:  rust cargo cmake >= 3.25 extra-cmake-modules gcc-c++
 BuildRequires:  cmake(Qt6Core) cmake(Qt6Widgets) cmake(Qt6Sql)
 BuildRequires:  cmake(KF6CoreAddons) cmake(KF6I18n) cmake(KF6XmlGui)
 BuildRequires:  cmake(KF6ConfigWidgets) cmake(KF6IconThemes) cmake(KF6Crash) cmake(KF6KIO)
+BuildRequires:  cmake(KF6Notifications) cmake(KF6StatusNotifierItem)
+BuildRequires:  cmake(Qt6Charts)
 Requires:       btrbk btrfs-progs smartmontools zsh util-linux
-Requires:       qt6-qtbase kf6-kcoreaddons kf6-ki18n kf6-kxmlgui
+Requires:       qt6-qtbase qt6-qtcharts kf6-kcoreaddons kf6-ki18n kf6-kxmlgui
 Requires:       kf6-kconfigwidgets kf6-kiconthemes kf6-kcrash kf6-kio
+Requires:       kf6-knotifications kf6-kstatusnotifieritem
 
 %description
 ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)
@@ -55,3 +58,10 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_datadir}/polkit-1/actions/org.dasbackup.policy
 %{_unitdir}/btrdasd-helper.service
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg
+%{_includedir}/btrdasd_ffi.h
+%{_prefix}/lib/libbuttered_dasd_ffi.so
+%{_mandir}/man1/btrdasd.1*
+
+%changelog
+* Thu Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.3-1
+- Initial RPM package for Fedora

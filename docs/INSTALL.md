@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.2
+**Version**: 0.7.3
 
 ## Before You Begin
 
@@ -42,7 +42,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 |-----------|---------|---------|
 | Qt6 | 6.6+ (tested 6.10.2) | UI framework |
 | Qt6 Charts | 6.6+ (tested 6.10.2) | Growth trendline chart (`qt6-charts` package) |
-| KDE Frameworks 6 | 6.0+ (tested 6.23.0) | KXmlGuiWindow, KIO, KAboutData |
+| KDE Frameworks 6 | 6.0+ (tested 6.23.0) | KXmlGuiWindow, KIO, KAboutData, Notifications, StatusNotifierItem |
 | CMake | 3.25+ (tested 4.2.3) | Build system for GUI component |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros |
 
@@ -204,6 +204,28 @@ cargo build --release
 # Binary at: indexer/target/release/btrdasd
 ```
 
+## Distribution Packages
+
+Native packaging recipes are included under `packaging/` and build-tested on their respective distributions before each release.
+
+| Distribution | Format | Directory | GUI Support |
+|---|---|---|---|
+| Arch Linux / CachyOS | PKGBUILD (`makepkg`) | `packaging/arch/` | Full |
+| Debian 13+ / Ubuntu 24.10+ | dpkg (`dpkg-buildpackage`) | `packaging/debian/` | Full (KF6 required) |
+| Fedora 43+ | RPM (`rpmbuild`) | `packaging/fedora/` | Full |
+| Flatpak | Flatpak manifest | `packaging/flatpak/` | Full |
+| Snap | snapcraft | `packaging/snap/` | Full |
+| Ubuntu 24.04 LTS | cmake (CLI-only) | — | No (KF6 unavailable) |
+
+**Arch Linux example:**
+
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+**Minimum Rust version**: 1.87+ (for Rust edition 2024 and `let_chains`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
+
 ## Docker
 
 Build and run `btrdasd` in a container (headless CLI only):
@@ -240,7 +262,7 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `version` | string | `"0.7.2"` | Config format version |
+| `version` | string | `"0.7.3"` | Config format version |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 
