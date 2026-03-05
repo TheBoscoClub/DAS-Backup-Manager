@@ -19,6 +19,12 @@ pub struct DiscoveredSnapshot {
 }
 
 #[derive(Debug)]
+pub struct DiscoveryResult {
+    pub new_snapshots: Vec<DiscoveredSnapshot>,
+    pub total_on_disk: usize,
+}
+
+#[derive(Debug)]
 pub struct WalkResult {
     pub snapshots_discovered: usize,
     pub snapshots_indexed: usize,
@@ -60,8 +66,9 @@ pub fn parse_snapshot_dirname(dirname: &str) -> Option<(String, String)> {
 pub fn discover_snapshots(
     target_root: &std::path::Path,
     db: &Database,
-) -> Result<Vec<DiscoveredSnapshot>, Box<dyn std::error::Error>> {
-    let mut discovered = Vec::new();
+) -> Result<DiscoveryResult, Box<dyn std::error::Error>> {
+    let mut new_snapshots = Vec::new();
+    let mut total_on_disk = 0usize;
 
     for source_entry in fs::read_dir(target_root)? {
         let source_entry = source_entry?;
@@ -77,11 +84,12 @@ pub fn discover_snapshots(
             }
             let dirname = snap_entry.file_name().to_string_lossy().to_string();
             if let Some((name, ts)) = parse_snapshot_dirname(&dirname) {
+                total_on_disk += 1;
                 let path = snap_entry.path();
                 // Use (source, name, ts) for dedup — the same snapshot may
                 // appear under different mount paths (bind mount vs udisks2).
                 if !db.snapshot_exists_by_key(&source, &name, &ts)? {
-                    discovered.push(DiscoveredSnapshot {
+                    new_snapshots.push(DiscoveredSnapshot {
                         name,
                         ts,
                         source: source.clone(),
@@ -92,8 +100,11 @@ pub fn discover_snapshots(
         }
     }
 
-    discovered.sort_by(|a, b| (&a.source, &a.name, &a.ts).cmp(&(&b.source, &b.name, &b.ts)));
-    Ok(discovered)
+    new_snapshots.sort_by(|a, b| (&a.source, &a.name, &a.ts).cmp(&(&b.source, &b.name, &b.ts)));
+    Ok(DiscoveryResult {
+        new_snapshots,
+        total_on_disk,
+    })
 }
 
 /// Index a single snapshot directory into the database.
@@ -186,8 +197,8 @@ pub fn walk(
     target_root: &std::path::Path,
     db: &Database,
 ) -> Result<WalkResult, Box<dyn std::error::Error>> {
-    let discovered = discover_snapshots(target_root, db)?;
-    let discovered_count = discovered.len();
+    let discovery = discover_snapshots(target_root, db)?;
+    let total_on_disk = discovery.total_on_disk;
 
     let mut results = Vec::new();
 
@@ -210,9 +221,9 @@ pub fn walk(
         }
     }
 
-    // discovered is already sorted by (source, name, ts) from discover_snapshots
+    // new_snapshots is already sorted by (source, name, ts) from discover_snapshots
     let mut index_errors = 0usize;
-    for snap in &discovered {
+    for snap in &discovery.new_snapshots {
         let key = (snap.source.clone(), snap.name.clone());
         let prev_id = latest_snap_id.get(&key).copied();
 
@@ -234,9 +245,9 @@ pub fn walk(
     let indexed_count = results.len();
 
     Ok(WalkResult {
-        snapshots_discovered: discovered_count,
+        snapshots_discovered: total_on_disk,
         snapshots_indexed: indexed_count,
-        snapshots_skipped: discovered_count.saturating_sub(indexed_count + index_errors),
+        snapshots_skipped: total_on_disk.saturating_sub(indexed_count + index_errors),
         results,
     })
 }
@@ -261,10 +272,11 @@ mod tests {
             &["nvme/root.20260220T0300", "nvme/root.20260221T0300"],
         );
         let db = Database::open(":memory:").unwrap();
-        let snaps = discover_snapshots(tmp.path(), &db).unwrap();
-        assert_eq!(snaps.len(), 2);
-        assert_eq!(snaps[0].name, "root");
-        assert_eq!(snaps[0].source, "nvme");
+        let result = discover_snapshots(tmp.path(), &db).unwrap();
+        assert_eq!(result.new_snapshots.len(), 2);
+        assert_eq!(result.total_on_disk, 2);
+        assert_eq!(result.new_snapshots[0].name, "root");
+        assert_eq!(result.new_snapshots[0].source, "nvme");
     }
 
     #[test]
@@ -292,9 +304,10 @@ mod tests {
         let path1 = tmp.path().join("nvme/root.20260220T0300");
         db.insert_snapshot("root", "20260220T0300", "nvme", &path1.to_string_lossy())
             .unwrap();
-        let snaps = discover_snapshots(tmp.path(), &db).unwrap();
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].ts, "20260221T0300");
+        let result = discover_snapshots(tmp.path(), &db).unwrap();
+        assert_eq!(result.new_snapshots.len(), 1);
+        assert_eq!(result.total_on_disk, 2);
+        assert_eq!(result.new_snapshots[0].ts, "20260221T0300");
     }
 
     fn write_file(path: &std::path::Path, content: &[u8]) {
@@ -431,8 +444,12 @@ mod tests {
             ],
         );
         let db = Database::open(":memory:").unwrap();
-        let snaps = discover_snapshots(tmp.path(), &db).unwrap();
-        let sources: Vec<&str> = snaps.iter().map(|s| s.source.as_str()).collect();
+        let result = discover_snapshots(tmp.path(), &db).unwrap();
+        let sources: Vec<&str> = result
+            .new_snapshots
+            .iter()
+            .map(|s| s.source.as_str())
+            .collect();
         assert!(sources.contains(&"nvme"));
         assert!(sources.contains(&"ssd"));
         assert!(sources.contains(&"projects"));
