@@ -29,6 +29,8 @@ public:
     explicit SnapshotModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
 
     void reload();
+    void setSortOrder(Qt::SortOrder order);
+    [[nodiscard]] Qt::SortOrder sortOrder() const { return m_sortOrder; }
 
     [[nodiscard]] QModelIndex index(int row, int column,
                                      const QModelIndex &parent = {}) const override;
@@ -51,5 +53,8 @@ private:
     QVector<SnapshotInfo> m_snapshots;
     QVector<DateGroup> m_groups;
 
+    Qt::SortOrder m_sortOrder = Qt::DescendingOrder;
+
+    void rebuildGroups();
     static QString tsToDate(const QString &ts);
 };

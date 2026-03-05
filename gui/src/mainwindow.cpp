@@ -38,6 +38,7 @@
 #include <QSortFilterProxyModel>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QToolButton>
 #include <QStatusBar>
 #include <QTableView>
 #include <QTimer>
@@ -200,14 +201,36 @@ void MainWindow::setupBrowsePage()
     connect(m_searchBar, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
     connect(m_searchTimer, &QTimer::timeout, this, &MainWindow::executeSearch);
 
-    // Timeline in scroll area
+    // Timeline in scroll area with sort toggle
     m_timeline = new SnapshotTimeline(m_snapshotModel, this);
     connect(m_timeline, &SnapshotTimeline::snapshotSelected, this, &MainWindow::onSnapshotSelected);
+
+    auto *sortBtn = new QToolButton(m_browsePage);
+    sortBtn->setIcon(QIcon::fromTheme(QStringLiteral("view-sort-descending")));
+    sortBtn->setToolTip(i18n("Toggle snapshot date sort order"));
+    sortBtn->setAutoRaise(true);
+    connect(sortBtn, &QToolButton::clicked, this, [this, sortBtn]() {
+        auto order = m_snapshotModel->sortOrder() == Qt::DescendingOrder
+                         ? Qt::AscendingOrder
+                         : Qt::DescendingOrder;
+        m_snapshotModel->setSortOrder(order);
+        sortBtn->setIcon(QIcon::fromTheme(
+            order == Qt::DescendingOrder
+                ? QStringLiteral("view-sort-descending")
+                : QStringLiteral("view-sort-ascending")));
+    });
 
     auto *scrollArea = new QScrollArea(m_browsePage);
     scrollArea->setWidget(m_timeline);
     scrollArea->setWidgetResizable(true);
     scrollArea->setMinimumWidth(200);
+
+    auto *timelinePanel = new QWidget(m_browsePage);
+    auto *timelineLayout = new QVBoxLayout(timelinePanel);
+    timelineLayout->setContentsMargins(0, 0, 0, 0);
+    timelineLayout->setSpacing(2);
+    timelineLayout->addWidget(sortBtn, 0, Qt::AlignRight);
+    timelineLayout->addWidget(scrollArea, 1);
 
     // File list
     m_fileProxy = new QSortFilterProxyModel(this);
@@ -220,11 +243,16 @@ void MainWindow::setupBrowsePage()
     m_fileView->horizontalHeader()->setStretchLastSection(true);
 
     // Search results
+    m_searchProxy = new QSortFilterProxyModel(this);
+    m_searchProxy->setSourceModel(m_searchModel);
     m_searchView = new QTableView(m_browsePage);
-    m_searchView->setModel(m_searchModel);
+    m_searchView->setModel(m_searchProxy);
+    m_searchView->setSortingEnabled(true);
     m_searchView->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_searchView->setAlternatingRowColors(true);
     m_searchView->horizontalHeader()->setStretchLastSection(true);
+    m_searchView->horizontalHeader()->setSectionsClickable(true);
+    m_searchView->horizontalHeader()->setSortIndicatorShown(true);
     m_searchView->setVisible(false);
 
     // Right splitter (files above, search below)
@@ -236,7 +264,7 @@ void MainWindow::setupBrowsePage()
 
     // Browse content splitter (timeline left, files right)
     auto *browseSplitter = new QSplitter(Qt::Horizontal, m_browsePage);
-    browseSplitter->addWidget(scrollArea);
+    browseSplitter->addWidget(timelinePanel);
     browseSplitter->addWidget(rightSplitter);
     browseSplitter->setStretchFactor(0, 1);
     browseSplitter->setStretchFactor(1, 3);

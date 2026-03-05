@@ -82,6 +82,7 @@ private:
     QLineEdit *m_searchBar = nullptr;
     QTimer *m_searchTimer = nullptr;
     QSortFilterProxyModel *m_fileProxy = nullptr;
+    QSortFilterProxyModel *m_searchProxy = nullptr;
 
     // Status bar
     QLabel *m_statusLabel = nullptr;
