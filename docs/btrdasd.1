@@ -96,6 +96,7 @@ Requires root privileges.
 .RB [ \-\-modify ]
 .RB [ \-\-upgrade ]
 .RB [ \-\-uninstall ]
+.RB [ \-\-uninstall\-all ]
 .RB [ \-\-check ]
 .TP
 .B \-\-modify
@@ -107,6 +108,12 @@ Regenerate all managed files from the existing configuration
 .TP
 .B \-\-uninstall
 Remove all generated files, disable timers, and optionally remove the database.
+.TP
+.B \-\-uninstall\-all
+Remove ALL installed files: generated configs (same as \-\-uninstall), plus
+cmake-installed binaries (btrdasd, btrdasd\-gui, btrdasd\-helper), FFI library,
+D\-Bus configs, polkit policy, systemd units, man page, shell completions,
+desktop entry, and icon. Prompts whether to remove the backup database.
 .TP
 .B \-\-check
 Validate the configuration and dependencies, report issues,

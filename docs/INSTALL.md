@@ -117,6 +117,14 @@ Removes all files listed in the install manifest (`/etc/das-backup/.manifest`):
 
 Prompts whether to also remove the backup database at `/var/lib/das-backup/backup-index.db`. The TOML config file is preserved for potential reinstallation.
 
+### Full Uninstall (everything)
+
+```bash
+sudo btrdasd setup --uninstall-all
+```
+
+Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), FFI library, D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon. Prompts whether to remove the backup database.
+
 ### Check Installation
 
 ```bash
