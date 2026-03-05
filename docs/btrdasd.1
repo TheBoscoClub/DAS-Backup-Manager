@@ -1,6 +1,6 @@
 .\" btrdasd(1) man page
 .\" Generated from clap CLI definitions in indexer/src/main.rs
-.TH BTRDASD 1 "2026-03-05" "0.7.2" "DAS Backup Manager"
+.TH BTRDASD 1 "2026-03-05" "0.7.4" "DAS Backup Manager"
 .SH NAME
 btrdasd \- DAS Backup Manager indexer and orchestrator
 .SH SYNOPSIS
@@ -98,6 +98,7 @@ Requires root privileges.
 .RB [ \-\-uninstall ]
 .RB [ \-\-uninstall\-all ]
 .RB [ \-\-check ]
+.RB [ \-\-force ]
 .TP
 .B \-\-modify
 Re-open the wizard with the current configuration pre-filled.
@@ -114,6 +115,13 @@ Remove ALL installed files: generated configs (same as \-\-uninstall), plus
 cmake-installed binaries (btrdasd, btrdasd\-gui, btrdasd\-helper), FFI library,
 D\-Bus configs, polkit policy, systemd units, man page, shell completions,
 desktop entry, and icon. Prompts whether to remove the backup database.
+.TP
+.B \-\-force
+Non-interactive mode: skip all prompts and never remove or overwrite the
+backup database. Enables unattended installs, upgrades, uninstalls, and
+full uninstalls. For install without an existing config, returns an error
+(use the interactive wizard first). Useful for scripted deployments and
+CI/CD pipelines.
 .TP
 .B \-\-check
 Validate the configuration and dependencies, report issues,
@@ -603,6 +611,22 @@ Run the interactive setup wizard:
 .RS
 .nf
 sudo btrdasd setup
+.fi
+.RE
+.PP
+Non-interactive full uninstall (preserves the backup database):
+.PP
+.RS
+.nf
+sudo btrdasd setup \-\-uninstall\-all \-\-force
+.fi
+.RE
+.PP
+Non-interactive reinstall from existing config:
+.PP
+.RS
+.nf
+sudo btrdasd setup \-\-force
 .fi
 .RE
 .SH FILES

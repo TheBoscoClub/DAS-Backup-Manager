@@ -28,6 +28,10 @@ pub struct SetupArgs {
     /// Validate config + deps, report issues, change nothing
     #[arg(long)]
     pub check: bool,
+
+    /// Non-interactive mode: skip all prompts, never remove/overwrite the backup database
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -40,19 +44,39 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.check {
         installer::check()?;
     } else if args.uninstall {
-        let remove_db = dialoguer::Confirm::new()
-            .with_prompt("Also remove the backup database?")
-            .default(false)
-            .interact()?;
+        let remove_db = if args.force {
+            false
+        } else {
+            dialoguer::Confirm::new()
+                .with_prompt("Also remove the backup database?")
+                .default(false)
+                .interact()?
+        };
         installer::uninstall(remove_db)?;
     } else if args.uninstall_all {
-        let remove_db = dialoguer::Confirm::new()
-            .with_prompt("Also remove the backup database?")
-            .default(false)
-            .interact()?;
+        let remove_db = if args.force {
+            false
+        } else {
+            dialoguer::Confirm::new()
+                .with_prompt("Also remove the backup database?")
+                .default(false)
+                .interact()?
+        };
         installer::uninstall_all(remove_db)?;
     } else if args.upgrade {
         installer::upgrade()?;
+    } else if args.force {
+        // Non-interactive install: requires existing config
+        let config_path = std::path::PathBuf::from("/etc/das-backup/config.toml");
+        if !config_path.exists() {
+            return Err(
+                "Cannot run non-interactive install: no existing config found. \
+                 Run the interactive wizard first, or use --upgrade to regenerate."
+                    .into(),
+            );
+        }
+        let config = config::Config::load(&config_path)?;
+        installer::install(&config)?;
     } else {
         // Fresh install or --modify
         let existing = if args.modify {
