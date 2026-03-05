@@ -45,21 +45,23 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | CMake | 3.25+ (tested 4.2.3) | Build system for GUI component |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros |
 
-## Quick Start with `btrdasd setup`
+## Quick Start — Full Build (CLI + GUI + Helper)
 
-The recommended installation method uses the interactive setup wizard:
+The recommended installation method builds all components and runs the setup wizard:
 
 ```bash
-# 1. Build the indexer
-cd indexer
-cargo build --release
+# 1. Build everything (CLI, D-Bus helper, FFI library, KDE GUI)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
-# 2. Install the binary
-sudo cp target/release/btrdasd /usr/local/bin/
+# 2. Install all components (binaries, scripts, systemd, D-Bus, polkit, man page, icons)
+sudo cmake --install build
 
 # 3. Run the interactive setup wizard
 sudo btrdasd setup
 ```
+
+This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon), `libbuttered_dasd_ffi.so` (FFI library), backup scripts, systemd units, D-Bus/polkit configs, shell completions, man page, and desktop entry.
 
 The wizard walks through 10 configuration steps:
 
@@ -129,22 +131,16 @@ Validates the current installation without changing anything:
 
 ## Manual Installation (without wizard)
 
-For users who prefer manual configuration:
+For users who prefer manual configuration without the setup wizard:
 
 ```bash
-# Build the Rust indexer
-cd indexer
-cargo build --release
-sudo cp target/release/btrdasd /usr/local/bin/
+# Build and install all components
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+sudo cmake --install build
 
 # Create database directory
 sudo mkdir -p /var/lib/das-backup
-
-# Install reference scripts via CMake
-cd ..
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
-cmake --build build
-sudo cmake --install build
 
 # Configure btrbk manually
 sudo cp config/btrbk.conf /etc/btrbk/btrbk.conf
@@ -155,23 +151,21 @@ sudo cp config/das-backup-email.conf.example /etc/das-backup-email.conf
 sudo chmod 600 /etc/das-backup-email.conf
 sudo vim /etc/das-backup-email.conf  # add SMTP credentials
 
-# Install and enable systemd timers
-sudo scripts/install-backup-timer.sh
-sudo systemctl start das-backup.timer
+# Enable systemd timers
+sudo systemctl enable --now das-backup.timer das-backup-full.timer
 ```
 
-## Building the GUI
+## CLI-Only Build (no GUI dependencies)
+
+If you don't have Qt6/KF6 installed or don't need the GUI:
 
 ```bash
-# Full build (indexer + GUI)
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF -DBUILD_FFI=OFF
 cmake --build build
-
-# Install
 sudo cmake --install build
 ```
 
-The GUI binary installs to `${CMAKE_INSTALL_PREFIX}/bin/btrdasd-gui` with a desktop entry for KDE application menus.
+This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit policy, and man page — everything except the GUI and FFI library.
 
 ## CMake Build Options
 
@@ -180,7 +174,7 @@ The GUI binary installs to `${CMAKE_INSTALL_PREFIX}/bin/btrdasd-gui` with a desk
 | `BUILD_GUI` | `ON` | Build the KDE Plasma GUI (requires Qt6/KF6) |
 | `BUILD_INDEXER` | `ON` | Build the `btrdasd` Rust binary via cargo |
 | `BUILD_HELPER` | `ON` | Build the `btrdasd-helper` D-Bus daemon and install polkit/D-Bus config |
-| `BUILD_FFI` | `OFF` | Build `libbuttered_dasd_ffi.so` C-ABI shared library (for GUI) |
+| `BUILD_FFI` | `ON` | Build `libbuttered_dasd_ffi.so` C-ABI shared library (for GUI) |
 | `CMAKE_INSTALL_PREFIX` | `/usr/local` | Installation prefix for binaries and scripts |
 | `CMAKE_BUILD_TYPE` | (unset) | `Release`, `RelWithDebInfo`, or `Debug` |
 

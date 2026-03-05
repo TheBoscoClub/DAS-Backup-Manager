@@ -61,7 +61,7 @@ DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf, email config template
 ├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper + FFI
-│   ├── src/           # Library modules (12): backup, config, db, health, indexer, mount, progress, report, restore, scanner, schedule, subvol
+│   ├── src/           # Library modules (13): backup, config, db, ffi, health, indexer, mount, progress, report, restore, scanner, schedule, subvol
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 │   ├── src/bin/       # btrdasd-helper D-Bus daemon
 │   ├── src/ffi.rs     # C-ABI FFI bridge (extern "C" functions)
@@ -88,18 +88,30 @@ DAS-Backup-Manager/
 
 ## Installation
 
-### Recommended: Interactive Setup
+### Recommended: Full Build (CLI + GUI + Helper)
 
 ```bash
-# Build and install the binary
-cd indexer && cargo build --release
-sudo cp target/release/btrdasd /usr/local/bin/
+# Build everything (Rust CLI, D-Bus helper, FFI library, KDE GUI)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
-# Run the interactive setup wizard
+# Install all components (binaries, scripts, systemd units, D-Bus, polkit, icons, man page)
+sudo cmake --install build
+
+# Run the interactive setup wizard to configure backups
 sudo btrdasd setup
 ```
 
 The wizard configures backup sources, targets, retention, scheduling, email, and ESP mirroring — then generates all configuration files and enables timers.
+
+### CLI-Only (no GUI dependencies)
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
+cmake --build build
+sudo cmake --install build
+sudo btrdasd setup
+```
 
 See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including manual setup, Docker, and CMake build options.
 

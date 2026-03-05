@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`FileModel::loadMore()`** — Incremental page loading in the GUI with `beginInsertRows`/`endInsertRows`
 
 ### Changed
-- **Library modules** — 11 → 12 public modules (added `mount`)
+- **Library modules** — 11 → 13 public modules (added `ffi`, `mount`)
 - **Polkit policy** — 5 → 7 actions (added `config.read`, `index.read`)
 - **D-Bus methods** — 17 → 23 (added 6 index read methods)
 - **`ConfigGet`/`ScheduleGet` polkit** — Changed from `org.dasbackup.config` (auth_admin_keep) to `org.dasbackup.config.read` (allow_active) to prevent Qt event-loop deadlock
