@@ -73,6 +73,54 @@ pub struct BackupResult {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Ensure source top-level volumes are mounted (subvolid=5).
+///
+/// btrbk needs the raw BTRFS volume mounted to see subvolumes.  The backup
+/// shell script (`backup-run.sh`) does this, but the Rust CLI/GUI code path
+/// calls btrbk directly.  This function mounts any unmounted source volumes.
+fn ensure_sources_mounted(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for src in &config.sources {
+        if !seen.insert((&src.volume, &src.device)) {
+            continue;
+        }
+        let mount_path = std::path::Path::new(&src.volume);
+        if !mount_path.exists() {
+            std::fs::create_dir_all(mount_path)?;
+        }
+        // Check if already mounted
+        let check = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&src.volume)
+            .status();
+        if check.map(|s| s.success()).unwrap_or(false) {
+            continue;
+        }
+        progress.on_log(
+            LogLevel::Info,
+            &format!("Mounting source volume {} from {}", src.volume, src.device),
+        );
+        let status = Command::new("mount")
+            .arg("-o")
+            .arg("subvolid=5")
+            .arg(&src.device)
+            .arg(&src.volume)
+            .status()?;
+        if !status.success() {
+            return Err(format!(
+                "Failed to mount source volume {} from {}",
+                src.volume, src.device
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Build a timestamp string in YYYYMMDDTHHMMSS format using SystemTime.
 /// Uses libc localtime_r to convert to local time without extra dependencies.
 fn format_timestamp() -> String {
@@ -847,6 +895,9 @@ pub fn run_backup(
     // Full: `btrbk run` (atomic snapshot + send + retention cleanup)
     //   The complete backup lifecycle including housekeeping.  Deletes
     //   snapshots and backups outside the configured retention windows.
+
+    // Mount source top-level volumes (subvolid=5) so btrbk can see subvolumes.
+    ensure_sources_mounted(config, progress)?;
 
     // Measure target disk usage before btrbk runs so we can calculate
     // bytes_sent as the delta (btrbk doesn't report transfer sizes).
