@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.0
+**Version**: 0.7.1
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -48,10 +48,10 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.7.0) |
-| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components, 4 test suites) | Active (v0.7.0) |
-| `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0) |
-| `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0) |
+| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.7.0+) |
+| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components, 4 test suites) | Active (v0.7.0+) |
+| `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
+| `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
 | `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
 
 ## Project Structure
