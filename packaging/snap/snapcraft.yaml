@@ -48,6 +48,8 @@ parts:
       - libqt6widgets6t64
       - libqt6sql6t64
       - libqt6charts6t64
+      - s-nail
+      - rsync
 
 apps:
   btrdasd:

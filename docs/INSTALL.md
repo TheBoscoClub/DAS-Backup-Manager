@@ -36,6 +36,13 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | smartmontools | system | Drive health and serial number detection |
 | bash | 4.0+ | Runtime shell for backup scripts |
 
+### Optional (for features)
+
+| Dependency | Version | Purpose |
+|-----------|---------|---------|
+| s-nail (mailx) | system | Email backup reports (when email reporting enabled) |
+| rsync | system | ESP/boot partition mirroring (when ESP sync enabled) |
+
 ### Optional (for GUI)
 
 | Dependency | Version | Purpose |

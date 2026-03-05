@@ -10,6 +10,8 @@ depends=('btrbk' 'btrfs-progs' 'smartmontools' 'zsh' 'util-linux'
          'qt6-base' 'qt6-charts' 'kcoreaddons' 'ki18n' 'kxmlgui'
          'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio'
          'knotifications' 'kstatusnotifieritem')
+optdepends=('s-nail: email backup reports (mailx)'
+            'rsync: ESP/boot partition mirroring')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
