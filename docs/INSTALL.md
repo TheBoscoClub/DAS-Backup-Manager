@@ -135,6 +135,23 @@ sudo btrdasd setup --uninstall-all
 
 Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), FFI library, D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon. Prompts whether to remove the backup database.
 
+### Non-Interactive Mode (`--force`)
+
+Add `--force` to any setup mode for unattended operation:
+
+```bash
+# Uninstall everything, keep database
+sudo btrdasd setup --uninstall-all --force
+
+# Reinstall from existing config
+sudo btrdasd setup --force
+
+# Upgrade without prompts
+sudo btrdasd setup --upgrade --force
+```
+
+The `--force` flag skips all interactive prompts and **never removes or overwrites the backup database**. Requires an existing config for install mode (use the interactive wizard for first-time setup).
+
 ### Check Installation
 
 ```bash
