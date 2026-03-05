@@ -1654,7 +1654,7 @@ git commit -m "feat(indexer): CLI with walk, search, list, info subcommands"
 
 Add a new function `run_indexer()` to backup-run.sh, called after `run_btrbk()` and `capture_usage "after"`:
 
-```zsh
+```bash
 run_indexer() {
     local indexer="/hddRaid1/ClaudeCodeProjects/DAS-Backup-Manager/indexer/target/release/das-index"
     local db="/var/lib/das-backup/backup-index.db"
@@ -1681,7 +1681,7 @@ Add `Indexer` line to the email report BACKUP OPERATIONS section.
 
 **Step 2: Test manually** (with DAS not mounted — verify skip message)
 
-Run: `sudo zsh scripts/backup-run.sh --dryrun 2>&1 | grep -i indexer`
+Run: `sudo bash scripts/backup-run.sh --dryrun 2>&1 | grep -i indexer`
 Expected: Shows "Content indexer not built -- skipping" or similar.
 
 **Step 3: Commit**

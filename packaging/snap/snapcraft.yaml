@@ -43,7 +43,7 @@ parts:
       - btrbk
       - btrfs-progs
       - smartmontools
-      - zsh
+      - bash
       - libqt6core6t64
       - libqt6widgets6t64
       - libqt6sql6t64

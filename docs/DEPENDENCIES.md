@@ -64,6 +64,7 @@ are automatically installed; they must be present before running the scripts.
 | `awk` | system (gawk) | All scripts | Parsing smartctl and df output |
 | `bash` | >= 4.0 | All scripts | Runtime shell; scripts use `#!/bin/bash` with `set -euo pipefail` |
 | `parted` / `mkfs.btrfs` / `mkfs.fat` | system | `das-partition-drives.sh` | Initial drive partitioning and formatting (one-time setup only) |
+| `mbuffer` | system (optional) | `btrbk` (via config) | Buffered stream transfers with progress; btrbk uses it if configured |
 | `lsblk` | system (util-linux) | `btrdasd setup` | Block device detection via JSON output |
 
 ### Init System Support
@@ -137,28 +138,3 @@ needed when building with `BUILD_GUI=ON` (the default).
 The GUI links against `Qt6::Sql` for database access and `Qt6::DBus` for communication with
 `btrdasd-helper`. The GUI opens the database read-only; all write operations go through D-Bus.
 
----
-
-## 5. Docker Dependencies
-
-The `Dockerfile` uses a multi-stage build with these base images:
-
-### Builder Stage
-
-| Image | Purpose |
-|-------|---------|
-| `rust:1.93-bookworm` | Debian Bookworm with Rust 1.93 toolchain |
-
-### Runtime Stage
-
-| Image | Purpose |
-|-------|---------|
-| `debian:bookworm-slim` | Minimal Debian runtime |
-
-| Package | Purpose |
-|---------|---------|
-| `btrfs-progs` | BTRFS operations in container |
-| `smartmontools` | Drive SMART data in container |
-| `bash` | Shell for script compatibility |
-
-The container runs the headless `btrdasd` CLI only (no GUI, no systemd).

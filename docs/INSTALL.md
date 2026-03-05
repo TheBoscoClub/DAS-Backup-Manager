@@ -34,6 +34,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | btrbk | 0.32+ | BTRFS snapshot creation and send/receive |
 | btrfs-progs | system | BTRFS subvolume operations |
 | smartmontools | system | Drive health and serial number detection |
+| util-linux | system | Block device detection (`lsblk`), mount/umount |
 | bash | 4.0+ | Runtime shell for backup scripts |
 
 ### Optional (for features)
@@ -42,6 +43,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 |-----------|---------|---------|
 | s-nail (mailx) | system | Email backup reports (when email reporting enabled) |
 | rsync | system | ESP/boot partition mirroring (when ESP sync enabled) |
+| mbuffer | system | Buffered btrbk stream transfers (improves throughput) |
 
 ### Optional (for GUI)
 
