@@ -336,6 +336,7 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
@@ -370,6 +371,7 @@ impl HelperInterface {
                 };
 
                 guard.unmount(&progress);
+                source_guard.unmount(&progress);
                 res
             })
             .await
@@ -411,10 +413,13 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                match backup::create_snapshots(&config, &sources, &progress) {
+                let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
+                let res = match backup::create_snapshots(&config, &sources, &progress) {
                     Ok(n) => Ok(format!("{n} snapshots created")),
                     Err(e) => Err(format!("Snapshot failed: {e}")),
-                }
+                };
+                source_guard.unmount(&progress);
+                res
             })
             .await
             .unwrap_or_else(|e| Err(format!("Snapshot task panicked: {e}")));
@@ -457,6 +462,7 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
@@ -467,6 +473,7 @@ impl HelperInterface {
                     };
 
                 guard.unmount(&progress);
+                source_guard.unmount(&progress);
                 res
             })
             .await

@@ -322,6 +322,127 @@ pub fn ensure_targets_mounted(
     Ok(guard)
 }
 
+/// Mount source top-level BTRFS volumes (`subvolid=5`) so btrbk can access
+/// subvolumes for snapshotting.
+///
+/// Each source in `config.sources` specifies a `volume` (mount point like
+/// `/.btrfs-nvme`) and a `device` (block device like `/dev/nvme1n1p2`).
+/// If the volume isn't already mounted, we mount it with `subvolid=5`.
+///
+/// Returns a [`MountGuard`] that unmounts only newly-mounted volumes on drop.
+pub fn ensure_sources_mounted(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+) -> MountGuard {
+    let mut guard = MountGuard::new();
+
+    // Deduplicate: multiple sources can share a volume (e.g. hdd-projects
+    // and hdd-audiobooks both use /.btrfs-hdd).
+    let mut seen_volumes = std::collections::HashSet::new();
+
+    for source in &config.sources {
+        if !seen_volumes.insert(source.volume.clone()) {
+            continue;
+        }
+
+        let mount_path = Path::new(&source.volume);
+
+        // Already mounted — nothing to do.
+        if mount_path.exists() && health::is_mountpoint(mount_path) {
+            progress.on_log(
+                crate::progress::LogLevel::Info,
+                &format!("Source volume {} already mounted", source.volume),
+            );
+            continue;
+        }
+
+        // Create mount point if needed.
+        if !mount_path.exists() {
+            let status = Command::new("mkdir").args(["-p", &source.volume]).status();
+            if status.is_err() || !status.unwrap().success() {
+                progress.on_log(
+                    crate::progress::LogLevel::Warning,
+                    &format!(
+                        "Source '{}': mkdir -p '{}' failed — skipping",
+                        source.label, source.volume
+                    ),
+                );
+                continue;
+            }
+        }
+
+        // Also create the snapshot directory inside the volume.
+        // btrbk requires it to exist before creating snapshots.
+        // We do this after mounting (below), but record it here for later.
+
+        // Mount with subvolid=5 to expose the top-level BTRFS tree.
+        let mount_result = Command::new("mount")
+            .args(["-o", "subvolid=5", &source.device, &source.volume])
+            .output();
+
+        match mount_result {
+            Ok(output) if output.status.success() => {
+                guard.newly_mounted.push(source.volume.clone());
+                progress.on_log(
+                    crate::progress::LogLevel::Info,
+                    &format!(
+                        "Source '{}': mounted {} at {} (subvolid=5)",
+                        source.label, source.device, source.volume
+                    ),
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                progress.on_log(
+                    crate::progress::LogLevel::Warning,
+                    &format!(
+                        "Source '{}': mount {} → {} failed: {}",
+                        source.label,
+                        source.device,
+                        source.volume,
+                        stderr.trim()
+                    ),
+                );
+            }
+            Err(e) => {
+                progress.on_log(
+                    crate::progress::LogLevel::Warning,
+                    &format!(
+                        "Source '{}': failed to execute mount: {e}",
+                        source.label
+                    ),
+                );
+            }
+        }
+    }
+
+    // Create snapshot directories inside now-mounted source volumes.
+    for source in &config.sources {
+        let snap_dir = Path::new(&source.volume).join(&source.snapshot_dir);
+        if !snap_dir.exists() {
+            let _ = Command::new("mkdir").args(["-p"]).arg(&snap_dir).status();
+        }
+    }
+
+    // Create target subdirectories on mounted targets (btrbk expects them).
+    for target in &config.targets {
+        let target_path = Path::new(&target.mount);
+        if !target_path.exists() || !health::is_mountpoint(target_path) {
+            continue;
+        }
+        for source in &config.sources {
+            for subdir in &source.target_subdirs {
+                let dir = target_path.join(subdir);
+                if !dir.exists() {
+                    let _ = Command::new("mkdir").args(["-p"]).arg(&dir).status();
+                }
+            }
+        }
+    }
+
+    guard
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

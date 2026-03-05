@@ -543,9 +543,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 };
                 let progress = CliProgress;
+                let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
                 guard.unmount(&progress);
+                source_guard.unmount(&progress);
                 let result = result?;
                 if json {
                     println!(
@@ -580,16 +582,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             BackupAction::Snapshot { config, sources } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
+                let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let count = buttered_dasd::backup::create_snapshots(&cfg, &sources, &progress)?;
+                source_guard.unmount(&progress);
                 println!("Created {count} snapshots");
             }
             BackupAction::Send { config, targets } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
+                let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result =
                     buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, false, &progress);
                 guard.unmount(&progress);
+                source_guard.unmount(&progress);
                 let (sent, bytes) = result?;
                 println!("Sent {sent} snapshots ({})", report::format_bytes(bytes));
             }
