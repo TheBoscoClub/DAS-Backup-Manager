@@ -1,6 +1,6 @@
 # ButteredDASD — Content Indexer for DAS Backup Snapshots
 
-**Binary**: `btrdasd` | **Version**: 0.6.0 | **Language**: Rust (edition 2024)
+**Binary**: `btrdasd` | **Version**: 0.7.0 | **Language**: Rust (edition 2024)
 
 ## Overview
 

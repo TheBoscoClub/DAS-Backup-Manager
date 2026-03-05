@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.7.0] - 2026-03-05
+
+### Added
+- **Source volume auto-mount** (`mount::ensure_sources_mounted`) — Mounts top-level BTRFS volumes (`subvolid=5`) before btrbk operations so snapshots can access `/@`, `/@opt`, `/@home` etc.; deduplicates shared volumes, creates snapshot dirs and target subdirs; returns `MountGuard` for RAII cleanup
 - **Auto-mount/unmount** (`mount.rs`) — RAII `MountGuard` resolves target serials via `/dev/disk/by-id`, mounts BTRFS partitions before operations, unmounts on completion or panic; all D-Bus methods and CLI commands that access targets now auto-mount
 - **D-Bus index read methods** — `IndexStats`, `IndexListSnapshots`, `IndexListFiles` (paginated), `IndexSearch`, `IndexBackupHistory`, `IndexSnapshotPath` for read-only index access from the GUI
 - **Paginated `IndexListFiles`** — Accepts `limit`/`offset` parameters, returns JSON with `{files, total, limit, offset}` to handle snapshots with millions of files without D-Bus excess-data errors
@@ -29,8 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rust test count** — 62 → 161 (133 lib + 19 setup + 9 integration)
 
 ### Fixed
+- **Source volumes not mounted for btrbk** — Full backup produced only 1 snapshot because `/.btrfs-nvme`, `/.btrfs-ssd`, `/.btrfs-hdd` were not mounted with `subvolid=5`; only `/dasRaid0` (pre-mounted) was accessible to btrbk
 - **btrbk command construction** — `create_snapshots()` placed "snapshot" subcommand inside the source loop, producing `btrbk snapshot vol1 snapshot vol2` instead of `btrbk snapshot vol1 vol2`; fixed by moving `cmd.arg("snapshot")` before the loop
 - **Volume deduplication** — Multiple sources sharing the same BTRFS volume (e.g., `hdd-projects` and `hdd-audiobooks` both on `/.btrfs-hdd`) caused duplicate btrbk arguments; fixed with `HashSet` deduplication in both `create_snapshots()` and `send_snapshots()`
+- **Indexer UNIQUE constraint** — `INSERT INTO snapshots` failed on re-index when snapshot already existed; fixed with `INSERT OR IGNORE`
+- **bytes_sent measurement** — Added `statvfs(2)` disk usage delta measurement since btrbk v0.32 doesn't report transfer sizes
 - **BackupPanel TOML parser** — Removed `SourceEntry`/`SourceSubvol` struct handling that didn't match actual `config.toml` format; simplified to extract source/target labels only
 - **Growth log ISO timestamp parser** — Fixed parsing of ISO 8601 timestamps in growth log
 - **Multi-target re-index** — Fixed index walk to handle multiple targets correctly
@@ -207,7 +219,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.4.0...v0.5.0
