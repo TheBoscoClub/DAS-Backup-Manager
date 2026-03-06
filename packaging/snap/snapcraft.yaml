@@ -1,5 +1,5 @@
 name: das-backup-manager
-version: '0.7.5'
+version: '0.7.6'
 summary: DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 description: |
   ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)
@@ -48,6 +48,16 @@ parts:
       - libqt6widgets6t64
       - libqt6sql6t64
       - libqt6charts6t64
+      - libkf6coreaddons6t64
+      - libkf6i18n6t64
+      - libkf6xmlgui6t64
+      - libkf6configwidgets6t64
+      - libkf6iconthemes6t64
+      - libkf6crash6t64
+      - libkf6kio6t64
+      - libkf6notifications6t64
+      - libkf6statusnotifieritem6t64
+      - util-linux
       - s-nail
       - rsync
 

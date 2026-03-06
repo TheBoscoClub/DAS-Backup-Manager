@@ -1,3 +1,12 @@
+das-backup-manager (0.7.6-1) unstable; urgency=medium
+
+  * Integrate email backup reports via s-nail/mailx
+  * Fix btrbk.conf canonical path to /etc/btrbk/btrbk.conf
+  * Skip recording dry-run backups in database history
+  * Add journald logging to D-Bus helper
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Wed, 05 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.3-1) unstable; urgency=medium
 
   * Replace "Bytes Sent" column with binary Yes/No indicator in backup history
