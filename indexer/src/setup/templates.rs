@@ -381,9 +381,9 @@ impl GeneratedFiles {
         let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
         let mut files = Vec::new();
 
-        // btrbk.conf
+        // btrbk.conf — canonical location is /etc/btrbk/btrbk.conf
         files.push((
-            "/etc/das-backup/btrbk.conf".to_string(),
+            "/etc/btrbk/btrbk.conf".to_string(),
             render_btrbk_conf(config),
         ));
 
@@ -664,7 +664,7 @@ mod tests {
         let config = test_config();
         let generated = GeneratedFiles::generate(&config);
         let manifest = generated.manifest_content();
-        assert!(manifest.contains("/etc/das-backup/btrbk.conf"));
+        assert!(manifest.contains("/etc/btrbk/btrbk.conf"));
         assert!(manifest.contains("backup-run.sh"));
         assert!(manifest.contains("das-backup.service"));
         assert!(manifest.contains("das-backup.timer"));

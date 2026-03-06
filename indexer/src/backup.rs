@@ -198,17 +198,30 @@ fn stream_command<F>(
 where
     F: FnMut(&str),
 {
+    // Log the command being executed for diagnostics.
+    progress.on_log(LogLevel::Info, &format!("stream_command: {:?}", cmd));
+
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
     // Read stdout line by line while the process runs.
     let stdout = child.stdout.take().expect("stdout must be piped");
     let reader = std::io::BufReader::new(stdout);
+    let mut line_count = 0usize;
     for line in reader.lines() {
         let line = line?;
+        line_count += 1;
         line_cb(&line);
     }
 
     let status = child.wait()?;
+    progress.on_log(
+        LogLevel::Info,
+        &format!(
+            "stream_command: exit={}, stdout_lines={}",
+            status.code().unwrap_or(-1),
+            line_count
+        ),
+    );
 
     // Collect stderr from the now-finished child.
     if let Some(stderr) = child.stderr.take() {
@@ -486,6 +499,15 @@ pub fn run_full_pipeline(
 
     // Re-count from accumulated output for accuracy.
     let full_output = stdout_lines.join("\n");
+
+    progress.on_log(
+        LogLevel::Debug,
+        &format!(
+            "run_full_pipeline: captured {} stdout lines",
+            stdout_lines.len()
+        ),
+    );
+
     snapshots_created = parse_btrbk_snapshot_count(&full_output);
     snapshots_sent = parse_btrbk_send_count(&full_output);
     let snapshots_cleaned = parse_btrbk_clean_count(&full_output);
@@ -562,6 +584,221 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
         .map(|v| (v * mult as f64) as u64)
 }
 
+/// Sync the ESP (EFI System Partition) from `/boot` to DAS mirror targets.
+///
+/// Discovers ESP partitions dynamically by looking for partition 1 on each
+/// mirror/system target's device (resolved from serial number).  This avoids
+/// hardcoded device paths that change between reboots.
+fn sync_esp(config: &Config, progress: &dyn ProgressCallback, errors: &mut Vec<String>) {
+    // Source is always the live ESP at /boot.
+    let source_mount = if !config.esp.mount_points.is_empty() {
+        &config.esp.mount_points[0]
+    } else {
+        "/boot"
+    };
+
+    // Ensure the source ESP is mounted.  CachyOS doesn't keep it
+    // persistently mounted, so automated backups may find /boot showing
+    // the root FS instead of the ESP.
+    let source_esp_mounted = Command::new("mountpoint")
+        .args(["-q", source_mount])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let did_mount_source = if !source_esp_mounted {
+        // Try mounting via fstab (which uses LABEL=EFI).
+        match Command::new("mount").arg(source_mount).output() {
+            Ok(output) if output.status.success() => {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("ESP sync: mounted source ESP at {source_mount}"),
+                );
+                true
+            }
+            _ => {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "ESP sync: source ESP not mounted at {source_mount} and mount failed — skipping"
+                    ),
+                );
+                return;
+            }
+        }
+    } else {
+        false
+    };
+
+    // Discover mirror targets that have ESP partitions.
+    let mirror_targets: Vec<_> = config
+        .targets
+        .iter()
+        .filter(|t| matches!(t.role, crate::config::TargetRole::Mirror))
+        .collect();
+
+    if mirror_targets.is_empty() {
+        progress.on_log(
+            LogLevel::Info,
+            "ESP sync: no mirror/system targets configured — skipping",
+        );
+        if did_mount_source {
+            let _ = Command::new("umount").arg(source_mount).status();
+        }
+        return;
+    }
+
+    progress.on_log(
+        LogLevel::Info,
+        &format!(
+            "ESP sync: updating kernel/initramfs on {} emergency target(s)",
+            mirror_targets.len()
+        ),
+    );
+
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+
+    for target in &mirror_targets {
+        // Resolve serial → block device.
+        let (device, _is_usb) = match health::device_info_from_serial(&target.serial) {
+            Some(info) => info,
+            None => {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "ESP sync: cannot find device for target '{}' (serial {})",
+                        target.label, target.serial
+                    ),
+                );
+                fail += 1;
+                continue;
+            }
+        };
+
+        // ESP is partition 1 of the device.
+        let esp_part = format!("{device}1");
+        if !std::path::Path::new(&esp_part).exists() {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "ESP sync: target '{}' device {device} has no partition 1 — skipping",
+                    target.label
+                ),
+            );
+            continue;
+        }
+
+        let mount_point = format!("/mnt/das-esp-{}", target.label);
+        let _ = Command::new("mkdir").args(["-p", &mount_point]).status();
+
+        // Mount if not already mounted.
+        let is_mounted = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&mount_point)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        let did_mount = if !is_mounted {
+            match Command::new("mount")
+                .arg(&esp_part)
+                .arg(&mount_point)
+                .output()
+            {
+                Ok(output) if output.status.success() => true,
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!(
+                            "ESP sync: mount {esp_part} → {mount_point} failed: {}",
+                            stderr.trim()
+                        ),
+                    );
+                    fail += 1;
+                    continue;
+                }
+                Err(e) => {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("ESP sync: failed to execute mount: {e}"),
+                    );
+                    fail += 1;
+                    continue;
+                }
+            }
+        } else {
+            false
+        };
+
+        // Sync ONLY kernel, initramfs, and microcode files.
+        //
+        // Emergency boot targets have their own independent CachyOS
+        // installation with their own loader/entries/ pointing to their
+        // own @rescue subvolume.  We must NEVER overwrite their boot
+        // entries or use --delete (which would remove their files).
+        //
+        // We only update the kernel + initramfs so they stay current
+        // with the main system's kernel updates.
+        let source_with_slash = format!("{source_mount}/");
+        let dest_with_slash = format!("{mount_point}/");
+        let rsync_result = Command::new("rsync")
+            .args([
+                "-aHAX",
+                "--include=vmlinuz-*",
+                "--include=initramfs-*",
+                "--include=amd-ucode.img",
+                "--include=intel-ucode.img",
+                "--exclude=*",
+                &source_with_slash,
+                &dest_with_slash,
+            ])
+            .output();
+
+        match rsync_result {
+            Ok(output) if output.status.success() => {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "ESP sync: updated kernel/initramfs on '{}' ({esp_part})",
+                        target.label
+                    ),
+                );
+                ok += 1;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let msg = format!("ESP sync: rsync to {mount_point} failed: {}", stderr.trim());
+                progress.on_log(LogLevel::Warning, &msg);
+                errors.push(msg);
+                fail += 1;
+            }
+            Err(e) => {
+                let msg = format!("ESP sync: failed to execute rsync: {e}");
+                progress.on_log(LogLevel::Warning, &msg);
+                errors.push(msg);
+                fail += 1;
+            }
+        }
+
+        // Unmount if we mounted it.
+        if did_mount {
+            let _ = Command::new("umount").arg(&mount_point).status();
+        }
+    }
+
+    progress.on_log(
+        LogLevel::Info,
+        &format!("ESP sync complete: {ok} synced, {fail} failed"),
+    );
+
+    // Unmount the source ESP if we mounted it.
+    if did_mount_source {
+        let _ = Command::new("umount").arg(source_mount).status();
+    }
+}
+
 /// Best-effort parse of a size from a btrbk `>>>` or `***` output line.
 ///
 /// btrbk v0.32 does NOT include size info in these lines (just paths).
@@ -597,29 +834,106 @@ fn parse_btrbk_size_field(line: &str) -> u64 {
     0
 }
 
+/// Force filesystem sync on all mounted backup targets so `statvfs` returns
+/// up-to-date space accounting. BTRFS defers transaction commits, so without
+/// an explicit sync after `btrfs receive`, the available-blocks counter can
+/// remain stale for several seconds.
+fn sync_targets(config: &Config) {
+    for tgt in &config.targets {
+        if let Some(path) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
+            // syncfs(2) syncs the filesystem containing the given fd.
+            if let Ok(file) = std::fs::File::open(&path) {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::syncfs(file.as_raw_fd());
+                }
+            }
+        }
+    }
+}
+
 /// Measure total used bytes across all mounted backup targets.
 ///
 /// Uses `statvfs(2)` to read filesystem usage directly (no child process).
 /// Returns the sum of used bytes across all target mount points. Used to
 /// calculate bytes_sent as the delta between before/after a backup, since
 /// btrbk doesn't report transfer sizes in its output.
-fn measure_target_usage(config: &Config) -> u64 {
+fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64 {
     config
         .targets
         .iter()
         .filter_map(|tgt| {
-            let path = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role)?;
-            let c_path = std::ffi::CString::new(path).ok()?;
+            let path = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role);
+            let path = match path {
+                Some(p) => p,
+                None => {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!(
+                            "measure_target_usage: target '{}' not mounted (configured: {})",
+                            tgt.label, tgt.mount
+                        ),
+                    );
+                    return None;
+                }
+            };
+            let c_path = std::ffi::CString::new(path.clone()).ok()?;
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
             if rc != 0 {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "measure_target_usage: statvfs failed for '{}' at {path}",
+                        tgt.label
+                    ),
+                );
                 return None;
             }
             let total = stat.f_blocks * stat.f_frsize;
             let avail = stat.f_bavail * stat.f_frsize;
-            Some(total.saturating_sub(avail))
+            let used = total.saturating_sub(avail);
+            progress.on_log(
+                LogLevel::Debug,
+                &format!(
+                    "measure_target_usage: '{}' at {path}: used={used}",
+                    tgt.label
+                ),
+            );
+            Some(used)
         })
         .sum()
+}
+
+/// Find the latest btrbk snapshot matching a given name on a target.
+///
+/// Looks for subvolumes in the `nvme/` subdirectory matching the pattern
+/// `nvme/{name}.YYYYMMDDTHHMM`.  Returns the most recent one (by
+/// lexicographic sort of the timestamp suffix).
+fn find_latest_btrbk_snapshot(target_mount: &str, snap_name: &str) -> Option<String> {
+    let output = Command::new("btrfs")
+        .args(["subvolume", "list", target_mount])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Pattern: "nvme/{snap_name}.YYYYMMDDTHHMM" in the path column (last field).
+    let prefix = format!("nvme/{snap_name}.");
+    let mut matches: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let path = line.split_whitespace().last()?;
+            if path.starts_with(&prefix) {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    matches.last().map(|s| s.to_string())
 }
 
 /// Archive boot subvolumes as read-only snapshots on backup targets.
@@ -659,62 +973,88 @@ pub fn archive_boot(
         // for "@home" -> "@home.archive.TIMESTAMP".
         let archive_name = format!("{subvol}.archive.{ts}");
 
+        // Map boot subvolume name to btrbk snapshot name.
+        let snap_name = match subvol.as_str() {
+            "@" => "root",
+            "@home" => "home",
+            other => other.trim_start_matches('@'),
+        };
+
         for target in &config.targets {
             let tgt_mount = &target.mount;
-
-            // Check if the boot subvolume exists on this target.
             let subvol_path = format!("{tgt_mount}/{subvol}");
-            if !std::path::Path::new(&subvol_path).exists() {
+
+            // Step 1-2: If the boot subvolume exists, archive it (read-only
+            // snapshot) then delete it.  If it doesn't exist, skip straight
+            // to the recreate step.
+            if std::path::Path::new(&subvol_path).exists() {
+                let archive_path = format!("{tgt_mount}/{archive_name}");
+
+                let snap_status = Command::new("btrfs")
+                    .args(["subvolume", "snapshot", "-r", &subvol_path, &archive_path])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status()?;
+
+                if !snap_status.success() {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("Failed to archive {subvol_path} -> {archive_path}"),
+                    );
+                    continue;
+                }
                 progress.on_log(
                     LogLevel::Info,
-                    &format!("Boot subvolume {subvol_path} does not exist on target — skipping"),
+                    &format!("Archived {subvol_path} -> {archive_path}"),
                 );
-                continue;
+
+                let del_status = Command::new("btrfs")
+                    .args(["subvolume", "delete", &subvol_path])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status()?;
+
+                if !del_status.success() {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("Failed to delete {subvol_path} after archiving"),
+                    );
+                    continue;
+                }
+                any_archived = true;
             }
 
-            let archive_path = format!("{tgt_mount}/{archive_name}");
-
-            // Step 1: Create read-only snapshot of the existing boot subvolume.
-            let snap_status = Command::new("btrfs")
-                .args(["subvolume", "snapshot", "-r", &subvol_path, &archive_path])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .status()?;
-
-            if !snap_status.success() {
+            // Step 3: Recreate the boot subvolume from the latest btrbk
+            // snapshot so the target always has a fresh, bootable @/@home.
+            if let Some(latest) = find_latest_btrbk_snapshot(tgt_mount, snap_name) {
+                let latest_path = format!("{tgt_mount}/{latest}");
+                let create = Command::new("btrfs")
+                    .args(["subvolume", "snapshot", &latest_path, &subvol_path])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status();
+                match create {
+                    Ok(s) if s.success() => {
+                        progress.on_log(
+                            LogLevel::Info,
+                            &format!("Created {subvol_path} from {latest}"),
+                        );
+                    }
+                    _ => {
+                        progress.on_log(
+                            LogLevel::Warning,
+                            &format!("Failed to create {subvol_path} from {latest}"),
+                        );
+                    }
+                }
+            } else {
                 progress.on_log(
                     LogLevel::Warning,
-                    &format!("Failed to snapshot {subvol_path} -> {archive_path}"),
+                    &format!(
+                        "No btrbk snapshot matching '{snap_name}' on {tgt_mount} — cannot create {subvol}"
+                    ),
                 );
-                continue;
             }
-            progress.on_log(
-                LogLevel::Info,
-                &format!("Archived {subvol_path} -> {archive_path}"),
-            );
-
-            // Step 2: Delete the existing boot subvolume.
-            let del_status = Command::new("btrfs")
-                .args(["subvolume", "delete", &subvol_path])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .status()?;
-
-            if !del_status.success() {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!("Failed to delete existing {subvol_path}"),
-                );
-                continue;
-            }
-
-            // Step 3: We intentionally do NOT recreate the subvolume here.
-            // The scripts recreate from the latest btrbk snapshot; that logic
-            // lives in backup-run.sh::update_boot_subvolumes and is driven
-            // by the shell script until the Rust orchestration is complete.
-            // This function only performs the archive (snapshot + delete) step.
-
-            any_archived = true;
         }
 
         progress.on_progress(
@@ -742,7 +1082,7 @@ pub fn run_backup(
     let mut bytes_sent: u64 = 0;
     let mut boot_archived = false;
     let mut indexed = false;
-    let report_sent = false; // email not yet integrated
+    let mut report_sent = false;
 
     // ---------- Resolve effective sources ----------
 
@@ -901,7 +1241,9 @@ pub fn run_backup(
 
     // Measure target disk usage before btrbk runs so we can calculate
     // bytes_sent as the delta (btrbk doesn't report transfer sizes).
-    let usage_before = measure_target_usage(config);
+    // Sync first so both before/after measurements use committed metadata.
+    sync_targets(config);
+    let usage_before = measure_target_usage(config, progress);
     progress.on_log(
         LogLevel::Info,
         &format!("Target usage before: {} bytes", usage_before),
@@ -969,13 +1311,15 @@ pub fn run_backup(
                     }
                 }
             }
-            // Step (b): Send with --preserve (skip retention cleanup)
+            // Step (b): Send with retention cleanup (same as full mode).
+            // Both incremental and full modes enforce retention policy to
+            // prevent targets from filling up.
             if !options.snapshot_only {
                 match send_snapshots(
                     config,
                     &effective_sources,
                     &effective_targets,
-                    true, // --preserve: skip retention cleanup
+                    false, // enforce retention cleanup on every backup
                     progress,
                 ) {
                     Ok((sent, bytes)) => {
@@ -998,7 +1342,11 @@ pub fn run_backup(
     // cleanup) it's the net change, which may underestimate if old data was
     // purged. Still better than reporting 0.
     if bytes_sent == 0 && (snapshots_sent > 0 || snapshots_created > 0) {
-        let usage_after = measure_target_usage(config);
+        // Force BTRFS to commit pending transactions so statvfs reflects the
+        // data that was just received. Without this, BTRFS defers metadata
+        // updates and statvfs returns stale values, making the delta zero.
+        sync_targets(config);
+        let usage_after = measure_target_usage(config, progress);
         progress.on_log(
             LogLevel::Info,
             &format!(
@@ -1020,6 +1368,11 @@ pub fn run_backup(
                 errors.push(msg);
             }
         }
+    }
+
+    // Step (c2): ESP sync — mirror /boot to DAS ESP partitions (both modes)
+    if config.esp.enabled && config.esp.mirror {
+        sync_esp(config, progress, &mut errors);
     }
 
     // Step (d): Index — walk each target's mount path to pick up new snapshots.
@@ -1073,11 +1426,46 @@ pub fn run_backup(
     }
 
     // Step (e): Email report
-    if options.send_report {
-        progress.on_log(
-            LogLevel::Info,
-            "Email reports not yet integrated — skipping",
+    if options.send_report && config.email.enabled {
+        let report_text = crate::report::format_report(
+            &BackupResult {
+                success: errors.is_empty(),
+                mode,
+                snapshots_created,
+                snapshots_sent,
+                snapshots_cleaned: 0,
+                bytes_sent,
+                boot_archived,
+                indexed,
+                report_sent: false,
+                errors: errors.clone(),
+                duration_secs: start.elapsed().as_secs(),
+            },
+            config,
         );
+
+        // Save report to last_report file for later viewing.
+        if let Err(e) = std::fs::write(&config.general.last_report, &report_text) {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Failed to save report to {}: {e}",
+                    config.general.last_report
+                ),
+            );
+        }
+
+        match crate::report::send_email_report(&report_text, config) {
+            Ok(()) => {
+                progress.on_log(LogLevel::Info, "Email report sent successfully");
+                report_sent = true;
+            }
+            Err(e) => {
+                let msg = format!("Failed to send email report: {e}");
+                progress.on_log(LogLevel::Warning, &msg);
+                errors.push(msg);
+            }
+        }
     }
 
     let success = errors.is_empty();

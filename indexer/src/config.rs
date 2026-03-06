@@ -56,7 +56,7 @@ fn default_last_report() -> String {
     "/var/lib/das-backup/last-report.txt".into()
 }
 fn default_btrbk_conf() -> String {
-    "/etc/das-backup/btrbk.conf".into()
+    "/etc/btrbk/btrbk.conf".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(parsed.schedule.randomized_delay_min, 30);
         // New fields have defaults
         assert_eq!(parsed.general.log_file, "/var/log/das-backup.log");
-        assert_eq!(parsed.general.btrbk_conf, "/etc/das-backup/btrbk.conf");
+        assert_eq!(parsed.general.btrbk_conf, "/etc/btrbk/btrbk.conf");
         assert_eq!(parsed.das.model_pattern, "TDAS");
         assert_eq!(parsed.das.io_scheduler, "mq-deadline");
         assert!(parsed.boot.enabled);
@@ -574,7 +574,7 @@ enabled = false
         let cfg = Config::from_toml(old_toml).expect("old config should parse with defaults");
         // New fields get sane defaults
         assert_eq!(cfg.general.log_file, "/var/log/das-backup.log");
-        assert_eq!(cfg.general.btrbk_conf, "/etc/das-backup/btrbk.conf");
+        assert_eq!(cfg.general.btrbk_conf, "/etc/btrbk/btrbk.conf");
         assert_eq!(cfg.das.model_pattern, "TDAS");
         assert_eq!(cfg.das.io_scheduler, "mq-deadline");
         assert!(cfg.boot.enabled);
