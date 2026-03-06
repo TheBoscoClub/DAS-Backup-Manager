@@ -19,7 +19,7 @@ set -euo pipefail
 # ============================================================================
 
 # Load configuration from config.toml via btrdasd
-BTRDASD_BIN="${BTRDASD_BIN:-/usr/local/bin/btrdasd}"
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
 DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
 if [[ -x "$BTRDASD_BIN" ]]; then
     eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"

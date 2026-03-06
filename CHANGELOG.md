@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.6] - 2026-03-05
+
+### Added
+- **Email backup reports** — `report.rs` rewritten with `send_email_report()` via s-nail/mailx and comprehensive `format_report()` matching the original shell script format (header, backup operations, throughput, disk capacity, SMART status, latest snapshots, errors, footer)
+- **Journald logging in D-Bus helper** — `btrdasd-helper` now logs all messages to stderr (journald) via `eprintln!` for post-mortem debugging
+
+### Fixed
+- **"Email reports not yet integrated — skipping"** — Email sending was stubbed out when orchestration moved from shell to Rust; now fully wired into the backup pipeline using Protonmail Bridge SMTP credentials from `/etc/das-backup-email.conf`
+- **btrbk.conf canonical path** — Default config path changed from `/etc/das-backup/btrbk.conf` to `/etc/btrbk/btrbk.conf` (the canonical location btrbk expects); setup template generation updated to match
+- **Dry-run backups polluting history** — Dry runs were recording zero-work entries in the `backup_runs` table; now guarded with `if !options.dry_run` in the D-Bus helper
+- **Packaging version sync** — All packaging formats (Arch PKGBUILD, Debian control, Fedora spec, Snap) synced to correct version with optional dependencies for s-nail and rsync
+- **Script BTRDASD_BIN defaults** — `das-partition-drives.sh` and `boot-archive-cleanup.sh` defaulted to `/usr/local/bin/btrdasd` instead of `/usr/bin/btrdasd` (the cmake install location); fixed both scripts
+- **Snap missing runtime dependencies** — Added KF6 runtime libraries (`libkf6*`) and `util-linux` to Snap `stage-packages` for GUI and `lsblk` support
+- **Docker missing btrbk and util-linux** — Dockerfile runtime stage lacked `btrbk` (required for backup operations) and `util-linux` (required for `lsblk`); added both and fixed binary install path from `/usr/local/bin` to `/usr/bin`
+
 ## [0.7.5] - 2026-03-05
 
 ### Added
@@ -289,7 +304,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.6...HEAD
+[0.7.6]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.1...v0.7.2
