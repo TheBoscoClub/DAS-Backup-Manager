@@ -154,6 +154,8 @@ impl ProgressCallback for DbusProgress {
             LogLevel::Warning => "warn",
             LogLevel::Error => "error",
         };
+        // Also log to stderr (journald) for post-mortem debugging.
+        eprintln!("[{level_str}] {message}");
         let conn = self.conn.clone();
         let job_id = self.job_id.clone();
         let lvl = level_str.to_owned();
@@ -342,21 +344,23 @@ impl HelperInterface {
 
                 let res = match backup::run_backup(&config, &options, &progress) {
                     Ok(r) => {
-                        // Record the backup run in the database for history.
-                        match Database::open(&config.general.db_path) {
-                            Ok(db) => {
-                                if let Err(e) = report::record_backup_run(&db, &r) {
+                        // Record the backup run in the database for history (skip dry runs).
+                        if !options.dry_run {
+                            match Database::open(&config.general.db_path) {
+                                Ok(db) => {
+                                    if let Err(e) = report::record_backup_run(&db, &r) {
+                                        progress.on_log(
+                                            LogLevel::Warning,
+                                            &format!("Failed to record backup history: {e}"),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     progress.on_log(
                                         LogLevel::Warning,
-                                        &format!("Failed to record backup history: {e}"),
+                                        &format!("Failed to open DB for history: {e}"),
                                     );
                                 }
-                            }
-                            Err(e) => {
-                                progress.on_log(
-                                    LogLevel::Warning,
-                                    &format!("Failed to open DB for history: {e}"),
-                                );
                             }
                         }
                         Ok((
