@@ -1,6 +1,6 @@
 # Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
 pkgname=das-backup-manager
-pkgver=0.7.6
+pkgver=0.7.7
 pkgrel=1
 pkgdesc='DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI'
 arch=('x86_64')

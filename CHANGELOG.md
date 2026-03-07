@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 ### Changed
+
+### Fixed
+
+## [0.7.7] - 2026-03-07
+
+### Changed
 - **Progress panel log view resizable** — Log area now uses a `QSplitter` between the status/progress controls and the log output; users can drag the handle to expand the log up to the full panel height
 - **Smart auto-scroll in log view** — New log entries only auto-scroll to bottom when the user is already at the bottom; scrolling up to inspect earlier entries no longer snaps back on each new line
 
@@ -309,7 +315,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.3...v0.7.4

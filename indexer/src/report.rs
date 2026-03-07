@@ -345,10 +345,7 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
     // Percent-encode '@' in username since it's part of a URL userinfo section.
     let encoded_user = smtp_user.replace('@', "%40");
     let encoded_pass = smtp_pass.replace('@', "%40").replace(':', "%3A");
-    let mta_url = format!(
-        "{smtp_url}",
-    )
-    .replacen("://", &format!("://{encoded_user}:{encoded_pass}@"), 1);
+    let mta_url = smtp_url.replacen("://", &format!("://{encoded_user}:{encoded_pass}@"), 1);
 
     // s-nail v14.9+ renamed ssl-verify → tls-verify.
     let tls_verify_key = "tls-verify";

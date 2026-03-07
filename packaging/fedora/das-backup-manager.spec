@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.6
+Version:        0.7.7
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -64,6 +64,9 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Sat Mar 07 2026 TheBoscoClub <gjbr@pm.me> - 0.7.7-1
+- Bump to 0.7.7: resizable log view, smart auto-scroll, non-fatal email errors, s-nail v15-compat
+
 * Wed Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.6-1
 - Bump to 0.7.6: email reports, btrbk.conf canonical path fix, dry-run DB fix
 
