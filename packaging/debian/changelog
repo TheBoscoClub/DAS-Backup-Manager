@@ -1,3 +1,13 @@
+das-backup-manager (0.7.7-1) unstable; urgency=medium
+
+  * Resizable progress panel log view via QSplitter
+  * Smart auto-scroll: only scroll when user is at bottom
+  * Keep log visible after backup completes for review
+  * Email failure no longer marks backup as Failed (non-fatal)
+  * Fix s-nail v14.9+ deprecated variable warnings (v15-compat)
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 07 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.6-1) unstable; urgency=medium
 
   * Integrate email backup reports via s-nail/mailx
