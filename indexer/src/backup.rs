@@ -1461,9 +1461,13 @@ pub fn run_backup(
                 report_sent = true;
             }
             Err(e) => {
-                let msg = format!("Failed to send email report: {e}");
-                progress.on_log(LogLevel::Warning, &msg);
-                errors.push(msg);
+                // Email failure is non-fatal — the backup data is safe.
+                // Log as warning but don't push to errors vec, which would
+                // mark the entire backup as "Failed" in the history.
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Failed to send email report (non-fatal): {e}"),
+                );
             }
         }
     }
