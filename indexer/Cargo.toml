@@ -31,7 +31,7 @@ clap_complete = "4"
 walkdir = "2.5"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.0"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.15"
 libc = "0.2"
