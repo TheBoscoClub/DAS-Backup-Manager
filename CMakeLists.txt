@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(DAS-Backup-Manager
-    VERSION 0.7.7
+    VERSION 0.7.8
     DESCRIPTION "DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI"
     LANGUAGES CXX
 )
