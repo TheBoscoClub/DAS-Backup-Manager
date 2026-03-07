@@ -134,3 +134,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including na
 ## License
 
 MIT — See [LICENSE](LICENSE) for details.
+
+---
+
+*(A note on versioning: Rust's `Cargo.toml` enforces strict 3-part semver — no `x.y.z.w` fourth segment allowed. This means non-functional changes like removing a dead Dockerfile or swapping an internal widget layout strategy each burn a full patch version. On 2026-03-07, this project went through v0.7.7, v0.7.8, AND v0.7.9 in a single evening — three patch releases that should have been one tweak bump from v0.7.7 to v0.7.7.3. >:| )*
