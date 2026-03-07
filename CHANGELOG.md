@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.7] - 2026-03-07
 
 ### Changed
-- **Progress panel log view resizable** — Log area now uses a `QSplitter` between the status/progress controls and the log output; users can drag the handle to expand the log up to the full panel height
+- **Progress panel log view resizable** — Central widget minimum height reduced to 50px so the bottom dock (progress panel) can expand to consume nearly the full window height via the native QMainWindow dock separator; drag the top edge of the panel to resize
 - **Smart auto-scroll in log view** — New log entries only auto-scroll to bottom when the user is already at the bottom; scrolling up to inspect earlier entries no longer snaps back on each new line
 
 ### Fixed

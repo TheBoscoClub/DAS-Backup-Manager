@@ -65,7 +65,7 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 
 %changelog
 * Sat Mar 07 2026 TheBoscoClub <gjbr@pm.me> - 0.7.7-1
-- Bump to 0.7.7: resizable log view, smart auto-scroll, non-fatal email errors, s-nail v15-compat
+- Bump to 0.7.7: resizable log view (native dock resize), smart auto-scroll, non-fatal email errors, s-nail v15-compat
 
 * Wed Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.6-1
 - Bump to 0.7.6: email reports, btrbk.conf canonical path fix, dry-run DB fix

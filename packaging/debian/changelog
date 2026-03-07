@@ -1,6 +1,6 @@
 das-backup-manager (0.7.7-1) unstable; urgency=medium
 
-  * Resizable progress panel log view via QSplitter
+  * Resizable progress panel log view via native dock resize
   * Smart auto-scroll: only scroll when user is at bottom
   * Keep log visible after backup completes for review
   * Email failure no longer marks backup as Failed (non-fatal)
