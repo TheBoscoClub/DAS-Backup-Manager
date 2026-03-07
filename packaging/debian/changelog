@@ -1,3 +1,10 @@
+das-backup-manager (0.7.8-1) unstable; urgency=medium
+
+  * Replace QSplitter with native dock resize for progress panel
+  * Central widget minimum height reduced to allow dock to consume nearly full window
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 07 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.7-1) unstable; urgency=medium
 
   * Resizable progress panel log view via native dock resize

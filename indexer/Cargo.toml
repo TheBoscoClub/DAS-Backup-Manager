@@ -1,6 +1,6 @@
 [package]
 name = "buttered-dasd"
-version = "0.7.7"
+version = "0.7.8"
 edition = "2024"
 description = "ButteredDASD — content indexer for DAS backup snapshots with SQLite FTS5 span-based storage"
 license = "MIT"

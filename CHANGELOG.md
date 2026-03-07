@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.8] - 2026-03-07
+
+### Fixed
+- **Progress panel dock resize** — Replaced internal `QSplitter` (which could only redistribute within the dock's fixed height) with native QMainWindow dock resizing; central widget minimum height set to 50px so the progress panel dock can expand to consume nearly the full window height by dragging the top edge
+
 ## [0.7.7] - 2026-03-07
 
 ### Changed
@@ -316,6 +321,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
 [Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.7...HEAD
+[0.7.8]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.4...v0.7.5
