@@ -6,7 +6,6 @@ class QProgressBar;
 class QPlainTextEdit;
 class QLabel;
 class QPushButton;
-class QSplitter;
 class QToolButton;
 class DBusClient;
 
@@ -45,5 +44,4 @@ private:
     QPushButton *m_cancelButton = nullptr;
     QToolButton *m_logToggle = nullptr;
     QPlainTextEdit *m_logView = nullptr;
-    QSplitter *m_splitter = nullptr;
 };

@@ -157,6 +157,9 @@ void MainWindow::setupUi()
     mainSplitter->setStretchFactor(1, 1); // stack: expands
     mainSplitter->setChildrenCollapsible(false);
 
+    // Allow the central widget to shrink very small so the bottom dock
+    // (progress panel) can expand to consume most of the window height.
+    mainSplitter->setMinimumHeight(50);
     setCentralWidget(mainSplitter);
 
     // --- Progress dock panel ---

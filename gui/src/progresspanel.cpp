@@ -9,7 +9,6 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollBar>
-#include <QSplitter>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -24,12 +23,6 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     auto *mainLayout = new QVBoxLayout(container);
     mainLayout->setContentsMargins(8, 6, 8, 6);
     mainLayout->setSpacing(4);
-
-    // --- Status area (compact, above the splitter) ---
-    auto *statusWidget = new QWidget(container);
-    auto *statusLayout = new QVBoxLayout(statusWidget);
-    statusLayout->setContentsMargins(0, 0, 0, 0);
-    statusLayout->setSpacing(4);
 
     // Row 1: operation label + stage label + cancel button
     auto *row1 = new QHBoxLayout();
@@ -51,14 +44,14 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     row1->addWidget(m_operationLabel);
     row1->addWidget(m_stageLabel, 1);
     row1->addWidget(m_cancelButton);
-    statusLayout->addLayout(row1);
+    mainLayout->addLayout(row1);
 
     // Row 2: progress bar
     m_progressBar = new QProgressBar(this);
     m_progressBar->setRange(0, 100);
     m_progressBar->setValue(0);
     m_progressBar->setTextVisible(true);
-    statusLayout->addWidget(m_progressBar);
+    mainLayout->addWidget(m_progressBar);
 
     // Row 3: throughput label + ETA label + log toggle
     auto *row3 = new QHBoxLayout();
@@ -70,7 +63,8 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     m_logToggle = new QToolButton(this);
     m_logToggle->setIcon(QIcon::fromTheme(QStringLiteral("arrow-up")));
     m_logToggle->setText(tr("Log"));
-    m_logToggle->setToolTip(tr("Toggle log output visibility"));
+    m_logToggle->setToolTip(tr("Toggle log output visibility — "
+                                "drag the top edge of this panel to resize"));
     m_logToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     m_logToggle->setCheckable(true);
     m_logToggle->setChecked(false);
@@ -79,32 +73,22 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     row3->addWidget(m_etaLabel);
     row3->addStretch(1);
     row3->addWidget(m_logToggle);
-    statusLayout->addLayout(row3);
+    mainLayout->addLayout(row3);
 
-    // --- Log view ---
+    // Row 4: log view (initially hidden, takes all remaining space)
     m_logView = new QPlainTextEdit(this);
     m_logView->setReadOnly(true);
     m_logView->setWordWrapMode(QTextOption::NoWrap);
     m_logView->setMaximumBlockCount(5000);
     m_logView->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     m_logView->setVisible(false);
+    mainLayout->addWidget(m_logView, 1);
 
     // Track user scroll position to avoid snapping back when they scroll up
     QScrollBar *vbar = m_logView->verticalScrollBar();
     connect(vbar, &QScrollBar::valueChanged, this, [this, vbar]() {
         m_userScrolledUp = vbar->value() < (vbar->maximum() - 4);
     });
-
-    // --- Splitter: status area on top, log on bottom (drag to resize) ---
-    m_splitter = new QSplitter(Qt::Vertical, container);
-    m_splitter->addWidget(statusWidget);
-    m_splitter->addWidget(m_logView);
-    m_splitter->setStretchFactor(0, 0);  // status area: compact
-    m_splitter->setStretchFactor(1, 1);  // log view: takes remaining space
-    m_splitter->setChildrenCollapsible(false);
-    m_splitter->setHandleWidth(5);
-
-    mainLayout->addWidget(m_splitter, 1);
 
     setWidget(container);
 
@@ -259,6 +243,15 @@ void ProgressPanel::toggleLog()
 {
     bool visible = m_logToggle->isChecked();
     m_logView->setVisible(visible);
+
+    // Request a taller dock when the log opens so there's room to read it.
+    // The user can then drag the dock's top edge to resize further.
+    if (visible) {
+        int desiredHeight = 350;
+        if (height() < desiredHeight) {
+            resize(width(), desiredHeight);
+        }
+    }
 
     m_logToggle->setIcon(QIcon::fromTheme(
         visible ? QStringLiteral("arrow-down") : QStringLiteral("arrow-up")));
