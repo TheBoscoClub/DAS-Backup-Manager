@@ -341,7 +341,19 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
     };
     let subject = format!("[DAS Backup] {hostname} — {status_word} — {now}");
 
-    // Send via mailx (s-nail), same flags as backup-run.sh.
+    // Build the mta URL with credentials embedded (s-nail v14.9+ / v15-compat).
+    // Percent-encode '@' in username since it's part of a URL userinfo section.
+    let encoded_user = smtp_user.replace('@', "%40");
+    let encoded_pass = smtp_pass.replace('@', "%40").replace(':', "%3A");
+    let mta_url = format!(
+        "{smtp_url}",
+    )
+    .replacen("://", &format!("://{encoded_user}:{encoded_pass}@"), 1);
+
+    // s-nail v14.9+ renamed ssl-verify → tls-verify.
+    let tls_verify_key = "tls-verify";
+
+    // Send via mailx (s-nail) using v15-compat mode for new-style URL credentials.
     let mut child = Command::new("mailx")
         .args([
             "-s",
@@ -349,15 +361,13 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
             "-r",
             &from,
             "-S",
-            &format!("smtp={smtp_url}"),
+            "v15-compat",
+            "-S",
+            &format!("mta={mta_url}"),
             "-S",
             "smtp-auth=login",
             "-S",
-            &format!("smtp-auth-user={smtp_user}"),
-            "-S",
-            &format!("smtp-auth-password={smtp_pass}"),
-            "-S",
-            &format!("ssl-verify={ssl_verify}"),
+            &format!("{tls_verify_key}={ssl_verify}"),
             &to,
         ])
         .stdin(Stdio::piped())
