@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Log disappears after backup completes** — The progress panel no longer auto-hides 5 seconds after job completion; the log stays visible (and auto-expands) so users can review the full output for errors and inconsistencies; the panel can be closed manually via the dock's X button
+- **Email failure marks entire backup as "Failed"** — Email report errors were pushed to the backup errors vec, causing successful backups (snapshots created, data sent, boot archived) to show as "Failed" in history; email failure is now a non-fatal warning matching the existing pattern for indexing failures
+- **s-nail v14.9+ deprecated variable warnings** — Switched from obsoleted `smtp`/`smtp-auth-user`/`smtp-auth-password`/`ssl-verify` variables to v15-compat mode with `mta=` URL (embedded credentials), `smtp-auth=login`, and `tls-verify` (renamed from `ssl-verify`)
 
 ## [0.7.6] - 2026-03-05
 
