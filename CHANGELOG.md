@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.9] - 2026-03-07
+
+### Removed
+- **Dockerfile and Docker references** — Docker containerization is incompatible with DAS backup operations (requires direct BTRFS subvolume access, physical drive access, btrfs send/receive); removed Dockerfile, .dockerignore, and all Docker documentation
+
 ## [0.7.8] - 2026-03-07
 
 ### Fixed
@@ -320,7 +325,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.7...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.9...HEAD
+[0.7.9]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.5...v0.7.6
