@@ -9,7 +9,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollBar>
-#include <QTimer>
+#include <QSplitter>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -24,6 +24,12 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     auto *mainLayout = new QVBoxLayout(container);
     mainLayout->setContentsMargins(8, 6, 8, 6);
     mainLayout->setSpacing(4);
+
+    // --- Status area (compact, above the splitter) ---
+    auto *statusWidget = new QWidget(container);
+    auto *statusLayout = new QVBoxLayout(statusWidget);
+    statusLayout->setContentsMargins(0, 0, 0, 0);
+    statusLayout->setSpacing(4);
 
     // Row 1: operation label + stage label + cancel button
     auto *row1 = new QHBoxLayout();
@@ -45,14 +51,14 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     row1->addWidget(m_operationLabel);
     row1->addWidget(m_stageLabel, 1);
     row1->addWidget(m_cancelButton);
-    mainLayout->addLayout(row1);
+    statusLayout->addLayout(row1);
 
     // Row 2: progress bar
     m_progressBar = new QProgressBar(this);
     m_progressBar->setRange(0, 100);
     m_progressBar->setValue(0);
     m_progressBar->setTextVisible(true);
-    mainLayout->addWidget(m_progressBar);
+    statusLayout->addWidget(m_progressBar);
 
     // Row 3: throughput label + ETA label + log toggle
     auto *row3 = new QHBoxLayout();
@@ -73,16 +79,32 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     row3->addWidget(m_etaLabel);
     row3->addStretch(1);
     row3->addWidget(m_logToggle);
-    mainLayout->addLayout(row3);
+    statusLayout->addLayout(row3);
 
-    // Row 4: log view (initially hidden)
+    // --- Log view ---
     m_logView = new QPlainTextEdit(this);
     m_logView->setReadOnly(true);
     m_logView->setWordWrapMode(QTextOption::NoWrap);
     m_logView->setMaximumBlockCount(5000);
     m_logView->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     m_logView->setVisible(false);
-    mainLayout->addWidget(m_logView, 1);
+
+    // Track user scroll position to avoid snapping back when they scroll up
+    QScrollBar *vbar = m_logView->verticalScrollBar();
+    connect(vbar, &QScrollBar::valueChanged, this, [this, vbar]() {
+        m_userScrolledUp = vbar->value() < (vbar->maximum() - 4);
+    });
+
+    // --- Splitter: status area on top, log on bottom (drag to resize) ---
+    m_splitter = new QSplitter(Qt::Vertical, container);
+    m_splitter->addWidget(statusWidget);
+    m_splitter->addWidget(m_logView);
+    m_splitter->setStretchFactor(0, 0);  // status area: compact
+    m_splitter->setStretchFactor(1, 1);  // log view: takes remaining space
+    m_splitter->setChildrenCollapsible(false);
+    m_splitter->setHandleWidth(5);
+
+    mainLayout->addWidget(m_splitter, 1);
 
     setWidget(container);
 
@@ -103,7 +125,7 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
             this, &ProgressPanel::toggleLog);
 
     // Start hidden
-    setIdle();
+    hide();
 }
 
 void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
@@ -114,8 +136,10 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
     m_throughputLabel->clear();
     m_etaLabel->clear();
     m_progressBar->setValue(0);
+    m_progressBar->setStyleSheet(QString());  // reset any error styling
     m_cancelButton->setEnabled(true);
     m_logView->clear();
+    m_userScrolledUp = false;
 
     show();
 }
@@ -186,9 +210,11 @@ void ProgressPanel::onJobLog(const QString &jobId, const QString &level,
         m_logView->appendHtml(html);
     }
 
-    // Auto-scroll to bottom
-    QScrollBar *vbar = m_logView->verticalScrollBar();
-    vbar->setValue(vbar->maximum());
+    // Only auto-scroll if the user hasn't scrolled up to inspect earlier entries
+    if (!m_userScrolledUp) {
+        QScrollBar *vbar = m_logView->verticalScrollBar();
+        vbar->setValue(vbar->maximum());
+    }
 }
 
 void ProgressPanel::onJobFinished(const QString &jobId, bool success,
@@ -212,13 +238,13 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
         m_stageLabel->setText(summary);
     }
 
-    // Auto-hide after 5 seconds unless a new job starts
-    QTimer::singleShot(5000, this, [this, jobId]() {
-        // Only hide if no new job has replaced this one
-        if (m_currentJobId == jobId) {
-            setIdle();
-        }
-    });
+    // Expand the log automatically so the user can review the results
+    if (!m_logToggle->isChecked()) {
+        m_logToggle->setChecked(true);
+    }
+
+    // Panel stays visible — user can close it manually via the dock's X button
+    // or it will be cleared when the next job starts.
 }
 
 void ProgressPanel::cancelJob()
@@ -238,7 +264,7 @@ void ProgressPanel::toggleLog()
         visible ? QStringLiteral("arrow-down") : QStringLiteral("arrow-up")));
 }
 
-void ProgressPanel::setIdle()
+void ProgressPanel::resetPanel()
 {
     m_currentJobId.clear();
     m_progressBar->setValue(0);
@@ -248,6 +274,7 @@ void ProgressPanel::setIdle()
     m_throughputLabel->clear();
     m_etaLabel->clear();
     m_cancelButton->setEnabled(false);
+    m_userScrolledUp = false;
 
     hide();
 }

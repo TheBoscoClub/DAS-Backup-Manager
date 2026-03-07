@@ -6,6 +6,7 @@ class QProgressBar;
 class QPlainTextEdit;
 class QLabel;
 class QPushButton;
+class QSplitter;
 class QToolButton;
 class DBusClient;
 
@@ -30,10 +31,11 @@ private Q_SLOTS:
     void toggleLog();
 
 private:
-    void setIdle();
+    void resetPanel();
 
     DBusClient *m_client;
     QString m_currentJobId;
+    bool m_userScrolledUp = false;
 
     QLabel *m_operationLabel = nullptr;
     QLabel *m_stageLabel = nullptr;
@@ -43,4 +45,5 @@ private:
     QPushButton *m_cancelButton = nullptr;
     QToolButton *m_logToggle = nullptr;
     QPlainTextEdit *m_logView = nullptr;
+    QSplitter *m_splitter = nullptr;
 };
