@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.2
 
       - name: Install build dependencies
         run: |
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.2
 
       - name: Install build dependencies
         run: |
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:43
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.2
 
       - name: Install build dependencies
         run: |
@@ -124,7 +124,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.2
 
       - name: Install build dependencies
         run: |
@@ -152,7 +152,7 @@ jobs:
   snap:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.2
 
       - name: Prepare snapcraft source
         run: |
@@ -177,7 +177,7 @@ jobs:
     container:
       image: bilelmoussaoui/flatpak-github-actions:kde-6.7
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6.0.2
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@fc80c13788c1ba0f45add99b19cf26b616ccab4f # v6.4
         with:
