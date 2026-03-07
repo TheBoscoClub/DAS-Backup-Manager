@@ -399,7 +399,7 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with sidebar + QStackedWidget, rich status bar, keyboard shortcuts |
 | Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health sections) |
 | DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
-| ProgressPanel | `progresspanel.h/cpp` | Collapsible QDockWidget with progress bar, throughput, ETA, cancel, raw log |
+| ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, resizable raw log (QSplitter), smart auto-scroll |
 | Database | `database.h/cpp` | Read-only QSqlDatabase wrapper with UUID connections, backup history/usage queries |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
 | FileModel | `filemodel.h/cpp` | QAbstractTableModel with paginated loading (10k per page via D-Bus) |

@@ -10,8 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 ### Changed
+- **Progress panel log view resizable** — Log area now uses a `QSplitter` between the status/progress controls and the log output; users can drag the handle to expand the log up to the full panel height
+- **Smart auto-scroll in log view** — New log entries only auto-scroll to bottom when the user is already at the bottom; scrolling up to inspect earlier entries no longer snaps back on each new line
 
 ### Fixed
+- **Log disappears after backup completes** — The progress panel no longer auto-hides 5 seconds after job completion; the log stays visible (and auto-expands) so users can review the full output for errors and inconsistencies; the panel can be closed manually via the dock's X button
 
 ## [0.7.6] - 2026-03-05
 
