@@ -252,33 +252,6 @@ makepkg -si
 
 **Minimum Rust version**: 1.87+ (for Rust edition 2024 and `let_chains`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
 
-## Docker
-
-Build and run `btrdasd` in a container (headless CLI only):
-
-```bash
-# Build the image
-docker build -t btrdasd .
-
-# Run commands
-docker run --rm btrdasd --version
-docker run --rm btrdasd --help
-
-# Index a mounted backup target
-docker run --rm \
-    -v /mnt/backup-hdd:/mnt/backup-hdd:ro \
-    -v /var/lib/das-backup:/var/lib/das-backup \
-    btrdasd walk /mnt/backup-hdd
-
-# Search
-docker run --rm \
-    -v /var/lib/das-backup:/var/lib/das-backup:ro \
-    btrdasd search "report.pdf"
-```
-
-The Dockerfile uses a multi-stage build:
-- **Builder**: `rust:1.93-bookworm` — compiles the release binary
-- **Runtime**: `debian:bookworm-slim` — minimal image with `btrfs-progs` and `smartmontools`
 
 ## Configuration Reference
 

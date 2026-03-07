@@ -37,8 +37,6 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
 - **Native Packaging** — Packaging recipes for Arch (PKGBUILD), Debian/Ubuntu (dpkg), Fedora (RPM), Flatpak, and Snap — all build-tested on their respective distributions before each release
-- **Docker Support** — Headless `btrdasd` CLI in a container
-
 ## Components
 
 | Component | Description | Status |
@@ -53,8 +51,6 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
-| `Dockerfile` | Multi-stage Docker build for headless btrdasd CLI | Active |
-
 ## Project Structure
 
 ```
@@ -74,7 +70,6 @@ DAS-Backup-Manager/
 ├── polkit/            # Polkit privilege escalation policy
 ├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap)
 ├── docs/              # Architecture, installation, dependencies, recovery, man page
-├── Dockerfile         # Headless CLI container
 └── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER, BUILD_FFI)
 ```
 
@@ -116,13 +111,6 @@ sudo btrdasd setup
 
 See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including native distro packages, manual setup, and CMake build options.
 
-### Quick Docker
-
-```bash
-docker build -t btrdasd .
-docker run --rm btrdasd --version
-```
-
 ## Design Philosophy
 
 - **Security-first**: Rust for the data pipeline (no buffer overflows, use-after-free, or data races). C++20 RAII with `-Werror` for the GUI. Exclusive prepared statements for all SQL.
@@ -134,7 +122,7 @@ docker run --rm btrdasd --version
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — System design, data flow, security decisions, encryption assessment
-- [Installation Guide](docs/INSTALL.md) — All installation methods, config reference, Docker
+- [Installation Guide](docs/INSTALL.md) — All installation methods, config reference
 - [ButteredDASD Indexer](docs/BUTTERED-DASD.md) — CLI usage, schema, span logic, development
 - [Dependencies](docs/DEPENDENCIES.md) — Rust crates, system deps, build deps, GUI deps
 - [Backup Planning](docs/OFFLINE-BACKUP-PLAN.md) — Capacity planning, drive selection, retention worksheet

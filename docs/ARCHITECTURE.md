@@ -260,13 +260,6 @@ option(BUILD_FFI     "Build libbuttered_dasd_ffi shared library" OFF)
 - `BUILD_GUI=ON`: Uses `add_subdirectory(gui)` with standard KDE/Qt6 CMake modules
 - `BUILD_GUI=OFF`: Skips Qt6/KF6 dependency entirely (headless CLI-only build)
 
-### Docker
-
-The `Dockerfile` provides a headless CLI build:
-- **Builder stage**: `rust:1.93-bookworm` — compiles `btrdasd` release binary
-- **Runtime stage**: `debian:bookworm-slim` — minimal with `btrfs-progs` and `smartmontools`
-- Entrypoint: `btrdasd` (all subcommands available)
-
 ## Security & Design Decisions
 
 ### Memory Safety

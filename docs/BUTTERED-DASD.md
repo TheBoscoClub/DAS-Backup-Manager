@@ -217,7 +217,6 @@ run_indexer() {
 See [INSTALL.md](INSTALL.md) for comprehensive installation instructions including:
 - Quick start with `btrdasd setup` wizard
 - Manual installation
-- Docker deployment
 - CMake build options
 
 ## Development
