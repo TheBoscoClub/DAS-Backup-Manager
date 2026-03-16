@@ -100,6 +100,13 @@ BTRBK_END_TIME=0
 # Operation status tracking (for email report)
 declare -A OP_STATUS=()
 
+# Track whether backup run has been recorded (prevents double-recording)
+BACKUP_RUN_RECORDED="false"
+# Track whether we're in a real (non-dryrun) backup
+BACKUP_MODE_REAL="false"
+# Track force_full for cleanup trap access
+BACKUP_FORCE_FULL="false"
+
 # Colors for interactive output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -934,6 +941,11 @@ send_report() {
 # ============================================================================
 
 record_backup_run_in_db() {
+    # Guard against double-recording (normal path + cleanup trap)
+    if [[ "$BACKUP_RUN_RECORDED" == "true" ]]; then
+        return 0
+    fi
+
     local overall_status="$1"
     local force_full="$2"
 
@@ -1002,6 +1014,7 @@ record_backup_run_in_db() {
     else
         log_warn "Failed to record backup run in database: $record_err (non-fatal)"
     fi
+    BACKUP_RUN_RECORDED="true"
 }
 
 # ============================================================================
@@ -1010,6 +1023,16 @@ record_backup_run_in_db() {
 
 cleanup() {
     log_warn "Cleaning up after error..."
+
+    # Record the failed backup run if we were in a real backup and haven't recorded yet
+    if [[ "$BACKUP_MODE_REAL" == "true" && "$BACKUP_RUN_RECORDED" == "false" ]]; then
+        # Ensure end time is set (may not be if failure was during btrbk)
+        if (( BTRBK_END_TIME == 0 )); then
+            BTRBK_END_TIME=$(date +%s)
+        fi
+        record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL"
+    fi
+
     unmount_all
 }
 
@@ -1063,6 +1086,8 @@ main() {
     create_target_dirs
 
     if [[ "$mode" != "dryrun" ]]; then
+        BACKUP_MODE_REAL="true"
+        BACKUP_FORCE_FULL="$force_full"
         capture_usage "before"
     fi
 

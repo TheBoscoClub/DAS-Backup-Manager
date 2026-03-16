@@ -666,7 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             print!(",");
                         }
                         print!(
-                            "{{\"id\":{},\"timestamp\":\"{}\",\"mode\":\"{}\",\"success\":{},\"duration_secs\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{}}}",
+                            "{{\"id\":{},\"timestamp\":\"{}\",\"mode\":\"{}\",\"success\":{},\"duration_secs\":{},\"snaps_created\":{},\"snaps_sent\":{},\"bytes_sent\":{}}}",
                             run.id,
                             run.timestamp,
                             run.mode,
