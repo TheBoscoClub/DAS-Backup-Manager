@@ -451,6 +451,15 @@ void MainWindow::updateStatusBar()
     m_dbusClient->indexStatsAsync(m_dbPath);
     m_dbusClient->scheduleGetAsync(QStringLiteral("/etc/das-backup/config.toml"));
     m_dbusClient->healthQueryAsync(QStringLiteral("/etc/das-backup/config.toml"));
+
+    // Safety timeout: if D-Bus results haven't all arrived within 10 seconds,
+    // assemble the status bar with whatever data we have so far.
+    QTimer::singleShot(10000, this, [this]() {
+        if (m_statusState.pending > 0) {
+            m_statusState.pending = 0;
+            assembleStatusBar();
+        }
+    });
 }
 
 void MainWindow::onIndexStatsResult(const QString &json)
