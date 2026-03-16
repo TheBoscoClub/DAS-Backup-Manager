@@ -8,10 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-
-### Changed
+- **`btrdasd backup record-run` subcommand** — Allows external scripts (backup-run.sh) to record backup runs in the database for GUI history display
 
 ### Fixed
+- **Backup history not recording from CLI or shell script** — Only GUI-initiated backups (via D-Bus helper) were recorded in `backup_runs` table; CLI `btrdasd backup run` and nightly `backup-run.sh` now both record runs
+- **Error messages with commas corrupted in record-run** — Changed from comma-delimited `--errors` to newline-separated string, matching database storage format
 
 ## [0.7.9] - 2026-03-07
 
