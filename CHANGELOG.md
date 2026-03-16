@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Backup history not recording from CLI or shell script** — Only GUI-initiated backups (via D-Bus helper) were recorded in `backup_runs` table; CLI `btrdasd backup run` and nightly `backup-run.sh` now both record runs
 - **Error messages with commas corrupted in record-run** — Changed from comma-delimited `--errors` to newline-separated string, matching database storage format
+- **JSON key naming inconsistency in `backup report --json`** — Changed `snapshots_created`/`snapshots_sent` to `snaps_created`/`snaps_sent` to match D-Bus, FFI, and GUI field naming
+- **Failed backups from shell script never recorded** — If `run_btrbk` or any post-backup operation failed, `set -e` + ERR trap would abort before reaching `record_backup_run_in_db`; now the cleanup trap records the failure, with double-recording guard
 
 ## [0.7.9] - 2026-03-07
 
