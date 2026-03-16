@@ -242,6 +242,33 @@ enum BackupAction {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Record a completed backup run in the database (for use by backup-run.sh)
+    RecordRun {
+        /// Path to SQLite database
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: String,
+        /// Whether the backup succeeded
+        #[arg(long)]
+        success: bool,
+        /// Backup mode (incremental or full)
+        #[arg(long, default_value = "incremental")]
+        mode: String,
+        /// Number of snapshots created
+        #[arg(long, default_value = "0")]
+        snaps_created: usize,
+        /// Number of snapshots sent to targets
+        #[arg(long, default_value = "0")]
+        snaps_sent: usize,
+        /// Bytes sent to targets
+        #[arg(long, default_value = "0")]
+        bytes_sent: u64,
+        /// Duration in seconds
+        #[arg(long, default_value = "0")]
+        duration_secs: u64,
+        /// Error messages (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        errors: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -549,6 +576,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 guard.unmount(&progress);
                 source_guard.unmount(&progress);
                 let result = result?;
+
+                // Record the backup run in the database (skip dry runs)
+                if !options.dry_run {
+                    match Database::open(&cfg.general.db_path) {
+                        Ok(db) => {
+                            if let Err(e) = report::record_backup_run(&db, &result) {
+                                eprintln!("  [WARN]  Failed to record backup history: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  [WARN]  Failed to open DB for history: {e}");
+                        }
+                    }
+                }
+
                 if json {
                     println!(
                         "{{\"success\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{},\"duration_secs\":{}}}",
@@ -655,6 +697,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             run.snaps_sent
                         );
                     }
+                }
+            }
+            BackupAction::RecordRun {
+                db,
+                success,
+                mode,
+                snaps_created,
+                snaps_sent,
+                bytes_sent,
+                duration_secs,
+                errors,
+            } => {
+                use buttered_dasd::db::NewBackupRun;
+                let database = Database::open(&db)?;
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64;
+                let id = database.insert_backup_run(&NewBackupRun {
+                    timestamp,
+                    success,
+                    mode: &mode,
+                    snaps_created,
+                    snaps_sent,
+                    bytes_sent,
+                    duration_secs,
+                    errors: &errors,
+                })?;
+                if json {
+                    println!("{{\"id\":{id},\"timestamp\":{timestamp}}}");
+                } else {
+                    println!("Recorded backup run (id={id})");
                 }
             }
         },
