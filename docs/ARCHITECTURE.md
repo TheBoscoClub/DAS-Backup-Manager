@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.10
+**Version**: 0.7.11
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -17,7 +17,7 @@ The following are permanently out of scope and will never be added:
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (v0.7.10)
+## Component Overview (v0.7.11)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -413,8 +413,8 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Suite | Count | Framework |
 |-------|-------|-----------|
-| Rust unit tests | 133 | `#[cfg(test)]` modules in lib crate |
-| Rust setup tests | 19 | `#[cfg(test)]` modules in setup modules |
+| Rust unit tests | 137 | `#[cfg(test)]` modules in lib crate |
+| Rust setup tests | 21 | `#[cfg(test)]` modules in setup modules |
 | Rust integration tests | 9 | `indexer/tests/integration_test.rs` |
 | C++ GUI tests | 4 suites | QTest via ECMAddTests |
-| **Total** | **161 Rust + 4 Qt** | |
+| **Total** | **167 Rust + 4 Qt** | |

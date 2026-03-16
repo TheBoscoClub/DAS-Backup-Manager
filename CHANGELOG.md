@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 ### Fixed
+
+## [0.7.11] - 2026-03-16
+
+### Fixed
 - **GUI: `&` accelerator markers corrupting source/target names sent to backend** — KDE's KAcceleratorManager auto-inserts `&` into checkbox text; `QCheckBox::text()` returned these markers (e.g., `"&primary-22tb"`) causing btrbk target mismatch warnings. Now stores original labels via `QWidget::setProperty()` and reads those back instead
 - **GUI: Backup Operations panel content invisible when progress dock expanded** — Mode, Operations, Sources, and Targets group boxes collapsed to title-only height because the progress dock consumed all vertical space. Wrapped panel content in `QScrollArea` so checkboxes remain accessible regardless of dock size
 - **GUI: Status bar stuck on "Loading..." indefinitely** — If any of the 3 async D-Bus status queries (IndexStats, ScheduleGet, HealthQuery) hung, the pending counter never reached zero. Added 10-second timeout fallback that assembles status bar with whatever data has arrived
