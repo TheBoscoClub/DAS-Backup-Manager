@@ -937,11 +937,6 @@ record_backup_run_in_db() {
     local overall_status="$1"
     local force_full="$2"
 
-    local success_flag="--success"
-    if [[ "$overall_status" != "SUCCESS" ]]; then
-        success_flag=""
-    fi
-
     local mode="incremental"
     if [[ "$force_full" == "true" ]]; then
         mode="full"
@@ -960,44 +955,52 @@ record_backup_run_in_db() {
         fi
     done
 
-    # Count snapshots from btrbk (created = up-to-date entries, sent = targets with data)
+    # Count snapshots from btrbk
     local snaps_created=0
     local snaps_sent=0
     if btrbk_latest=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | grep -v "^SOURCE_SUBVOLUME"); then
         snaps_created=$(echo "$btrbk_latest" | grep -c "up-to-date" || true)
-        snaps_sent=$snaps_created
+        # snaps_sent uses bytes written as a proxy: if data was transferred, snapshots were sent
+        if (( total_bytes > 0 )); then
+            snaps_sent=$snaps_created
+        fi
     fi
 
-    # Collect errors from failed operations
+    # Collect errors from failed operations (newline-separated for DB storage)
     local error_list=""
     for op in "${!OP_STATUS[@]}"; do
         if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
             local detail="${OP_STATUS[${op}_detail]:-}"
             if [[ -n "$detail" ]]; then
-                error_list="${error_list:+${error_list},}${op}: ${detail}"
+                error_list="${error_list:+${error_list}$'\n'}${op}: ${detail}"
             else
-                error_list="${error_list:+${error_list},}${op} failed"
+                error_list="${error_list:+${error_list}$'\n'}${op} failed"
             fi
         fi
     done
 
-    local error_args=()
+    # Build args array to avoid quoting issues with empty values
+    local args=(
+        backup record-run
+        --db "$DAS_DB_PATH"
+        --mode "$mode"
+        --snaps-created "$snaps_created"
+        --snaps-sent "$snaps_sent"
+        --bytes-sent "$total_bytes"
+        --duration-secs "$elapsed"
+    )
+    if [[ "$overall_status" == "SUCCESS" ]]; then
+        args+=(--success)
+    fi
     if [[ -n "$error_list" ]]; then
-        error_args=(--errors "$error_list")
+        args+=(--errors "$error_list")
     fi
 
-    if "$BTRDASD_BIN" backup record-run \
-        --db "$DAS_DB_PATH" \
-        $success_flag \
-        --mode "$mode" \
-        --snaps-created "$snaps_created" \
-        --snaps-sent "$snaps_sent" \
-        --bytes-sent "$total_bytes" \
-        --duration-secs "$elapsed" \
-        "${error_args[@]}" 2>/dev/null; then
+    local record_err
+    if record_err=$("$BTRDASD_BIN" "${args[@]}" 2>&1); then
         log_info "Backup run recorded in database"
     else
-        log_warn "Failed to record backup run in database (non-fatal)"
+        log_warn "Failed to record backup run in database: $record_err (non-fatal)"
     fi
 }
 
