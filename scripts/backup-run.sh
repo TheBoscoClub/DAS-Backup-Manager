@@ -226,7 +226,12 @@ mount_sources() {
         local mnt="${SOURCE_VOLUMES[$label]}"
         local dev="${SOURCE_DEVICES[$label]}"
         if ! mountpoint -q "$mnt"; then
-            mount -o subvolid=5 "$dev" "$mnt"
+            if [[ "$dev" == UUID=* ]]; then
+                # UUID-based mount (stable across device letter changes)
+                mount -t btrfs -o subvolid=5 "$dev" "$mnt"
+            else
+                mount -o subvolid=5 "$dev" "$mnt"
+            fi
             log_info "  Mounted $label at $mnt"
         fi
     done
@@ -925,6 +930,78 @@ send_report() {
 }
 
 # ============================================================================
+# RECORD BACKUP RUN IN DATABASE
+# ============================================================================
+
+record_backup_run_in_db() {
+    local overall_status="$1"
+    local force_full="$2"
+
+    local success_flag="--success"
+    if [[ "$overall_status" != "SUCCESS" ]]; then
+        success_flag=""
+    fi
+
+    local mode="incremental"
+    if [[ "$force_full" == "true" ]]; then
+        mode="full"
+    fi
+
+    local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
+
+    # Compute total bytes sent across all targets
+    local total_bytes=0
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        local before="${USAGE_BEFORE[$mnt]:-0}"
+        local after="${USAGE_AFTER[$mnt]:-0}"
+        local delta=$(( after - before ))
+        if (( delta > 0 )); then
+            total_bytes=$(( total_bytes + delta ))
+        fi
+    done
+
+    # Count snapshots from btrbk (created = up-to-date entries, sent = targets with data)
+    local snaps_created=0
+    local snaps_sent=0
+    if btrbk_latest=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | grep -v "^SOURCE_SUBVOLUME"); then
+        snaps_created=$(echo "$btrbk_latest" | grep -c "up-to-date" || true)
+        snaps_sent=$snaps_created
+    fi
+
+    # Collect errors from failed operations
+    local error_list=""
+    for op in "${!OP_STATUS[@]}"; do
+        if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
+            local detail="${OP_STATUS[${op}_detail]:-}"
+            if [[ -n "$detail" ]]; then
+                error_list="${error_list:+${error_list},}${op}: ${detail}"
+            else
+                error_list="${error_list:+${error_list},}${op} failed"
+            fi
+        fi
+    done
+
+    local error_args=()
+    if [[ -n "$error_list" ]]; then
+        error_args=(--errors "$error_list")
+    fi
+
+    if "$BTRDASD_BIN" backup record-run \
+        --db "$DAS_DB_PATH" \
+        $success_flag \
+        --mode "$mode" \
+        --snaps-created "$snaps_created" \
+        --snaps-sent "$snaps_sent" \
+        --bytes-sent "$total_bytes" \
+        --duration-secs "$elapsed" \
+        "${error_args[@]}" 2>/dev/null; then
+        log_info "Backup run recorded in database"
+    else
+        log_warn "Failed to record backup run in database (non-fatal)"
+    fi
+}
+
+# ============================================================================
 # CLEANUP
 # ============================================================================
 
@@ -1011,7 +1088,11 @@ main() {
         report=$(generate_report)
         echo ""
         echo "$report"
-        send_report "$report" "$overall_status"
+        send_report "$report" "$overall_status" || \
+            log_warn "Email delivery failed — backup itself completed successfully"
+
+        # Record backup run in the database for GUI history
+        record_backup_run_in_db "$overall_status" "$force_full"
     fi
 
     unmount_all
