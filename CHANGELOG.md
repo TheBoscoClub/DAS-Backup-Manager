@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.7.10] - 2026-03-16
+
+### Added
 - **`btrdasd backup record-run` subcommand** — Allows external scripts (backup-run.sh) to record backup runs in the database for GUI history display
 
 ### Fixed

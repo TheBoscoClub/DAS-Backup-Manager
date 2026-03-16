@@ -1,3 +1,11 @@
+das-backup-manager (0.7.10-1) unstable; urgency=medium
+
+  * Fix backup history recording from CLI and shell script
+  * Add btrdasd backup record-run subcommand for script integration
+  * Harden error handling and record failed backups in cleanup trap
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sun, 16 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.9-1) unstable; urgency=medium
 
   * Remove Dockerfile and Docker references (incompatible with DAS operations)

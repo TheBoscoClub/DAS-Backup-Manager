@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.9
+Version:        0.7.10
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -64,6 +64,9 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Sun Mar 16 2026 TheBoscoClub <gjbr@pm.me> - 0.7.10-1
+- Bump to 0.7.10: fix backup history recording from CLI and shell script
+
 * Sat Mar 07 2026 TheBoscoClub <gjbr@pm.me> - 0.7.9-1
 - Bump to 0.7.9: remove Dockerfile and Docker references (incompatible with DAS backup operations)
 
