@@ -14,12 +14,33 @@
 #include <QStringList>
 #include <QVBoxLayout>
 
+namespace {
+// Property key used to store the original (accelerator-free) label on each
+// dynamically created source/target checkbox.  KAcceleratorManager inserts
+// '&' characters into widget text for keyboard shortcuts; reading text()
+// back would pass those markers to the Rust backend as part of the label.
+const char OriginalLabelProp[] = "originalLabel";
+} // namespace
+
 BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     : QWidget(parent)
     , m_client(client)
     , m_configPath(QStringLiteral("/etc/das-backup/config.toml"))
 {
-    auto *outerLayout = new QVBoxLayout(this);
+    // Wrap the entire panel in a scroll area so that group-box content
+    // remains accessible when the progress dock squeezes the central widget.
+    auto *topLayout = new QVBoxLayout(this);
+    topLayout->setContentsMargins(0, 0, 0, 0);
+
+    auto *scrollArea = new QScrollArea(this);
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setFrameShape(QFrame::NoFrame);
+    topLayout->addWidget(scrollArea);
+
+    auto *innerWidget = new QWidget(scrollArea);
+    scrollArea->setWidget(innerWidget);
+
+    auto *outerLayout = new QVBoxLayout(innerWidget);
     outerLayout->setContentsMargins(12, 12, 12, 12);
     outerLayout->setSpacing(10);
 
@@ -234,6 +255,7 @@ void BackupPanel::loadConfig()
     } else {
         for (const QString &label : std::as_const(sources)) {
             auto *cb = new QCheckBox(label, m_sourcesGroup);
+            cb->setProperty(OriginalLabelProp, label);
             cb->setChecked(true);
             cb->setToolTip(i18n("Include this source in the backup"));
             srcLayout->addWidget(cb);
@@ -249,6 +271,7 @@ void BackupPanel::loadConfig()
     } else {
         for (const QString &label : std::as_const(targets)) {
             auto *cb = new QCheckBox(label, m_targetsGroup);
+            cb->setProperty(OriginalLabelProp, label);
             cb->setChecked(true);
             cb->setToolTip(i18n("Include this target in the backup"));
             tgtLayout->addWidget(cb);
@@ -266,14 +289,14 @@ void BackupPanel::runBackup(bool dryRun)
     QStringList sources;
     for (const QCheckBox *cb : std::as_const(m_sourceChecks)) {
         if (cb->isChecked()) {
-            sources.append(cb->text());
+            sources.append(cb->property(OriginalLabelProp).toString());
         }
     }
 
     QStringList targets;
     for (const QCheckBox *cb : std::as_const(m_targetChecks)) {
         if (cb->isChecked()) {
-            targets.append(cb->text());
+            targets.append(cb->property(OriginalLabelProp).toString());
         }
     }
 
