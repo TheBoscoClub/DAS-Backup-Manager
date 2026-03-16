@@ -250,8 +250,8 @@ enum BackupAction {
         /// Whether the backup succeeded
         #[arg(long)]
         success: bool,
-        /// Backup mode (incremental or full)
-        #[arg(long, default_value = "incremental")]
+        /// Backup mode
+        #[arg(long, default_value = "incremental", value_parser = ["incremental", "full"])]
         mode: String,
         /// Number of snapshots created
         #[arg(long, default_value = "0")]
@@ -265,9 +265,9 @@ enum BackupAction {
         /// Duration in seconds
         #[arg(long, default_value = "0")]
         duration_secs: u64,
-        /// Error messages (comma-separated)
-        #[arg(long, value_delimiter = ',')]
-        errors: Vec<String>,
+        /// Error messages (newline-separated string)
+        #[arg(long, default_value = "")]
+        errors: String,
     },
 }
 
@@ -714,6 +714,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_secs() as i64;
+                let error_list: Vec<String> = if errors.is_empty() {
+                    Vec::new()
+                } else {
+                    errors.split('\n').map(|s| s.to_string()).collect()
+                };
                 let id = database.insert_backup_run(&NewBackupRun {
                     timestamp,
                     success,
@@ -722,7 +727,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     snaps_sent,
                     bytes_sent,
                     duration_secs,
-                    errors: &errors,
+                    errors: &error_list,
                 })?;
                 if json {
                     println!("{{\"id\":{id},\"timestamp\":{timestamp}}}");
