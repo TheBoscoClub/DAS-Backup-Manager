@@ -26,7 +26,7 @@ ffi = []
 
 [dependencies]
 rusqlite = { version = "0.38", features = ["bundled"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4"
 walkdir = "2.5"
 regex = "1"
