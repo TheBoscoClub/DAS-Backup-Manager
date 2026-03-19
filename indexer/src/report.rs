@@ -231,6 +231,24 @@ pub fn record_backup_run(
     Ok(id)
 }
 
+/// Percent-encode a string for use in the userinfo section of a URL (RFC 3986).
+/// Only unreserved characters (A-Z, a-z, 0-9, `-`, `.`, `_`, `~`) pass through;
+/// everything else is encoded as %XX.
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 /// Parse a shell-style config file (KEY="VALUE" or KEY=VALUE, one per line).
 /// Skips comments (#) and blank lines.
 fn parse_shell_conf(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
@@ -241,8 +259,19 @@ fn parse_shell_conf(path: &str) -> Result<HashMap<String, String>, Box<dyn std::
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some((key, val)) = trimmed.split_once('=') {
-            let val = val.trim().trim_matches('"');
+        if let Some((key, raw_val)) = trimmed.split_once('=') {
+            let raw_val = raw_val.trim();
+            // Handle quoted values: extract content between quotes, ignoring
+            // any trailing inline comments (e.g., `"value"  # comment`).
+            let val = if let Some(after_quote) = raw_val.strip_prefix('"') {
+                // Find the closing quote after the opening one.
+                after_quote
+                    .find('"')
+                    .map_or_else(|| raw_val.trim_matches('"'), |end| &after_quote[..end])
+            } else {
+                // Unquoted: strip inline comments.
+                raw_val.split('#').next().unwrap_or("").trim()
+            };
             map.insert(key.trim().to_string(), val.to_string());
         }
     }
@@ -342,9 +371,9 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
     let subject = format!("[DAS Backup] {hostname} — {status_word} — {now}");
 
     // Build the mta URL with credentials embedded (s-nail v14.9+ / v15-compat).
-    // Percent-encode '@' in username since it's part of a URL userinfo section.
-    let encoded_user = smtp_user.replace('@', "%40");
-    let encoded_pass = smtp_pass.replace('@', "%40").replace(':', "%3A");
+    // Percent-encode all non-unreserved characters per RFC 3986 userinfo rules.
+    let encoded_user = percent_encode_userinfo(&smtp_user);
+    let encoded_pass = percent_encode_userinfo(&smtp_pass);
     let mta_url = smtp_url.replacen("://", &format!("://{encoded_user}:{encoded_pass}@"), 1);
 
     // s-nail v14.9+ renamed ssl-verify → tls-verify.
