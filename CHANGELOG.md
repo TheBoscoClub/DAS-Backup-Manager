@@ -343,7 +343,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.9...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...HEAD
+[0.7.11]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.10...v0.7.11
+[0.7.10]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.6...v0.7.7
