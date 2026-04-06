@@ -5,8 +5,8 @@
 > **System**: CachyOS (Arch-based) on ASUS ROG Crosshair VIII Dark Hero
 > **Boot**: systemd-boot (NOT GRUB)
 > **Filesystem**: BTRFS on all arrays, RAID-1 mirrors
-> **Last verified**: 2026-02-01
-> **HDD RAID-0->RAID-1 balance**: IN PROGRESS (see Section 7 WARNING)
+> **Last verified**: 2026-04-06
+> **HDD RAID-1 balance**: COMPLETE (all data RAID-1 as of 2026-04-06)
 
 ---
 
@@ -99,12 +99,12 @@
 +---------------------------------------------------------------------+
 
 +---------------------------------------------------------------------+
-|                     HDD RAID (BTRFS) -- 24TB x 2                    |
+|                     HDD RAID-1 (BTRFS) -- 24TB x 2                 |
 |                     sda + sdd (whole-disk)                          |
 |            UUID: 8b66e847-4273-4e2a-ad53-b312b3b3ee6d               |
 |                                                                     |
-|  WARNING: RAID-0->RAID-1 BALANCE IN PROGRESS (see Section 7)       |
-|  Data currently: RAID-0 (6.78 TiB) + RAID-1 (3.97 TiB)            |
+|  RAID-1 balance COMPLETE -- all data fully mirrored                 |
+|  Data: RAID-1 (8.77 TiB total, 8.71 TiB used)                     |
 |                                                                     |
 |  Top-level subvolumes:                                              |
 |  +- ClaudeCodeProjects -> /hddRaid1/ClaudeCodeProjects             |
@@ -232,18 +232,14 @@ initrd /initramfs-linux-cachyos.img
 | @hibp | ~/.local/share/hibp-checker | ssd,compress=zstd:1 | HIBP password data |
 | VirtualMachines | /hddRaid1/VirtualMachines | ssd,nodatacow,commit=30 | libvirt QCOW2 images |
 
-### 2c. HDD RAID -- Mass Storage
+### 2c. HDD RAID-1 -- Mass Storage
 
 **Devices**: sda (Exos X24, 21.83 TiB, devid 1) + sdd (Exos X24, 21.83 TiB, devid 2)
 **BTRFS UUID**: `8b66e847-4273-4e2a-ad53-b312b3b3ee6d`
-**Profile**: Mixed -- RAID-0 (legacy) + RAID-1 (new)
-**Current usage**: 9.03 TiB total used / ~15.3 TiB free
+**Profile**: Data RAID-1, Metadata RAID-1
+**Current usage**: 8.71 TiB used / ~13.1 TiB free
 
-> **CONVERSION HISTORY**: This array was originally RAID-0. A `btrfs balance` converting Data to RAID-1 was started. As of 2026-02-01, the balance is **still in progress**:
-> - Data,RAID0: 6.78 TiB (4.99 TiB used) -- **not yet converted**
-> - Data,RAID1: 3.97 TiB (3.96 TiB used) -- **already converted**
-> - Metadata,RAID1: fully converted
-> - System,RAID1: fully converted
+> **CONVERSION HISTORY**: This array was originally RAID-0. A `btrfs balance` converting Data to RAID-1 completed between 2026-02-01 and 2026-04-06. All data, metadata, and system profiles are now fully RAID-1.
 
 #### Top-Level Subvolumes (non-snapshot)
 
@@ -608,31 +604,7 @@ sudo btrfs scrub start -B /opt      # Full integrity check
 **Devices**: sda (Exos X24, devid 1) + sdd (Exos X24, devid 2)
 **Mount**: /hddRaid1 and all subvolumes
 
-> ### WARNING: RAID-0 DATA LOSS RISK
->
-> **As of 2026-02-01, the RAID-0 -> RAID-1 balance conversion is INCOMPLETE.**
->
-> ```
-> Data,RAID0: total=6.78TiB, used=4.99TiB   <- NOT YET MIRRORED
-> Data,RAID1: total=3.97TiB, used=3.96TiB   <- Already mirrored
-> ```
->
-> **If either HDD fails while RAID-0 chunks remain, ALL data in RAID-0 chunks is PERMANENTLY LOST.**
-> **There is NO recovery for RAID-0 data when one drive dies.**
->
-> #### Check current status:
-> ```bash
-> sudo btrfs filesystem df /hddRaid1
-> # If you see ANY line with "Data, RAID0" -- data loss risk exists
-> # Once ALL data shows "Data, RAID1" -- you are safe
->
-> # Check if balance is running:
-> sudo btrfs balance status /hddRaid1
-> ```
-
-### If Balance Is Complete (All RAID-1)
-
-Standard recovery -- same as SSD procedure but much slower:
+RAID-1 balance is **COMPLETE** as of 2026-04-06. All data is fully mirrored. Standard recovery applies:
 
 ```bash
 # 1. Identify failed drive
@@ -652,25 +624,6 @@ sudo btrfs replace start <devid> /dev/sdX /hddRaid1
 # Monitor: sudo btrfs replace status /hddRaid1
 
 # Expect 24-72 hours depending on data volume (~9 TiB to sync)
-```
-
-### If Balance Is Incomplete (Mixed RAID-0/RAID-1)
-
-If a drive fails while RAID-0 chunks exist:
-
-1. **RAID-1 chunks**: Recoverable from surviving drive
-2. **RAID-0 chunks**: **PERMANENTLY LOST** -- no recovery possible
-
-**Partial recovery attempt** (salvage RAID-1 data only):
-```bash
-# Mount degraded (may fail if critical metadata was on RAID-0 chunks)
-sudo mount -o degraded,ro UUID=8b66e847-4273-4e2a-ad53-b312b3b3ee6d /mnt/recovery
-
-# Copy what you can to another drive
-rsync -avP /mnt/recovery/ /path/to/backup/
-
-# If mount fails entirely, try btrfs-rescue:
-sudo btrfs rescue super-recover /dev/sda   # or sdd (surviving drive)
 ```
 
 **Replacement must be**: >= 21.83 TiB (24 TB class Seagate Exos or equivalent)
@@ -837,13 +790,15 @@ sudo snapper list-configs              # Verify snapper configs
 A comprehensive offline backup strategy is documented separately in [`OFFLINE-BACKUP-PLAN.md`](OFFLINE-BACKUP-PLAN.md).
 
 **Summary**:
-- **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) + 6x Seagate ST2000DM008 2TB
+- **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 3 of 6 bays occupied
+- **DAS Drives**: 1x 22TB Exos (primary backup), 2x 2TB Barracuda (independent emergency boot/recovery)
+- **Internal SATA**: dasRaid0 (4x 2TB Barracuda RAID0, general storage) — moved from DAS 2026-04-06
+- **Offline spares**: 1x 2TB Barracuda (ZFL416F6, cold spare for dasRaid0)
 - **Software**: btrbk 0.32.6 + mbuffer (installed)
 - **Irreplaceable data**: ~1 TiB (NVMe subvolumes, SSD /opt + /srv, ClaudeCodeProjects, audiobook sources)
-- **Strategy**: JBOD with mirrored drive pairs (Drives 1+3, 2+4) + 2 cold spares
 - **Not backed up**: VMs (recreatable), converted audiobooks (re-derivable), Steam/AI models/ISOs (re-downloadable), snapper snapshots (btrbk manages its own retention)
-- **Status**: Active -- DAS purchased and operational
+- **Status**: Active -- DAS operational with streamlined 3-drive layout
 
 ---
 
-*Document generated: 2026-02-01 from live system data. All UUIDs, serials, and partition layouts verified against running system.*
+*Document generated: 2026-02-01, updated 2026-04-06 from live system data. All UUIDs, serials, and partition layouts verified against running system.*
