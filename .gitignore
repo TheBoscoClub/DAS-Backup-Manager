@@ -109,10 +109,15 @@ INSTALL_NOTES.md
 .claude-checkpoint
 .claude-checkpoint.md
 .claude-recovery-plan.md
+.claude-session-context.md
+.claude-session-ring.jsonl
+.claude-task-state.md
 .session-count
 exit.*
 # CLAUDE.md — tracked in this repo (public project)
 .claude-md-history/
+.claude-session-active
+.claude-checkpoint-notes.md
 .claudeignore
 .snapshots/
 .test-vm-state
@@ -235,3 +240,7 @@ releases/*.tar.gz.sha256
 .staged-release
 Dockerfile
 .dockerignore
+
+# Claude Code workflow files
+.claude/hookify.*.local.md
+.btrbk-snapshots/
