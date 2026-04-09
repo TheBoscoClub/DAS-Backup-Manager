@@ -85,8 +85,11 @@ EMAIL_CONF="/etc/das-backup-email.conf"
 GROWTH_LOG="$DAS_GROWTH_LOG"
 LAST_REPORT="$DAS_LAST_REPORT"
 
-# ESP mount points from config
-IFS=' ' read -ra MOUNT_DAS_ESP <<< "$DAS_ESP_MOUNT_POINTS"
+# ESP mount points from config (may be empty if ESP is disabled)
+declare -a MOUNT_DAS_ESP=()
+if [[ -n "${DAS_ESP_MOUNT_POINTS:-}" ]]; then
+    IFS=' ' read -ra MOUNT_DAS_ESP <<< "$DAS_ESP_MOUNT_POINTS"
+fi
 
 # All target mount points (space-separated string from config -> array)
 IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
