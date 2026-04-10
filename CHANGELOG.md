@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.11.1] - 2026-04-10
+
+### Changed
+- **22TB primary retention** — Added 7-day daily retention and reduced yearly from 4 to 1 (`7d 4w 12m 1y`)
+- **DAS I/O tuning** — Comprehensive I/O scheduler, mount options, and BTRFS tuning for DAS backup drives via `das-tune-drives.sh`
+
+### Fixed
+- **2TB emergency recovery targets restored** — Re-added `system-2tb` and `system-mirror-2tb` as btrbk mirror targets with `7d` emergency retention; both had been removed in v0.7.11 due to stale device paths causing btrbk ABORT errors
+- **Source device paths use UUID** — SSD and HDD source devices changed from unstable `/dev/sdX` to `UUID=` notation, preventing wrong-filesystem mounts after dasRaid0 relocated to internal SATA
+- **Stale 2TB targets removed from btrbk config** — Config.toml target entries now match btrbk.conf generation; removed orphaned references that caused btrbk ABORT on every backup run
+- **DAS ESP mount guard** — `backup-run.sh` guards `DAS_ESP_MOUNT_POINTS` when ESP sync is disabled, preventing unbound variable errors
+
+### Security
+- **Dependabot dependency updates** — Bumped rusqlite 0.38→0.39, minor-and-patch group updates across 5 Cargo crates, flatpak/flatpak-github-actions 6.6→6.7
+- **Dependabot auto-merge workflow** — Added CI workflow for automated squash-merge of passing Dependabot PRs
+
 ## [0.7.11] - 2026-03-16
 
 ### Fixed
@@ -343,7 +359,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11.1...HEAD
+[0.7.11.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...v0.7.11.1
 [0.7.11]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.8...v0.7.9
