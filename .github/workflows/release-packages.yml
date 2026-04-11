@@ -38,11 +38,13 @@ jobs:
           VERSION_TAG: ${{ env.VERSION }}
         run: |
           VERSION_NUM="${VERSION_TAG#v}"
+          # Arch pkgver forbids hyphens — sanitize for test/RC versions
+          PKGVER_SAFE="${VERSION_NUM//-/_}"
           # makepkg refuses to run as root — create a build user
           useradd -m builder
           chown -R builder: .
           # Update PKGBUILD: pin pkgver to the release version, use local checkout
-          sed -i "s|^pkgver=.*|pkgver=${VERSION_NUM}|" packaging/arch/PKGBUILD
+          sed -i "s|^pkgver=.*|pkgver=${PKGVER_SAFE}|" packaging/arch/PKGBUILD
           sed -i "s|source=.*|source=()|" packaging/arch/PKGBUILD
           sed -i "s|sha256sums=.*|sha256sums=()|" packaging/arch/PKGBUILD
           sed -i "s|cd \"DAS-Backup-Manager-\$pkgver\"|cd \"\$GITHUB_WORKSPACE\"|g" packaging/arch/PKGBUILD
@@ -67,10 +69,16 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            cargo rustc cmake extra-cmake-modules debhelper \
+            curl build-essential cmake extra-cmake-modules debhelper \
             qt6-base-dev qt6-charts-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
             libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
             libkf6notifications-dev libkf6statusnotifieritem-dev
+
+      - name: Install rustup (trixie's rustc 1.85 is too old for let-chains and zbus 5.14)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build .deb
         run: |
@@ -106,11 +114,13 @@ jobs:
           VERSION_TAG: ${{ env.VERSION }}
         run: |
           VERSION_NUM="${VERSION_TAG#v}"
+          # RPM Version: tag forbids hyphens — sanitize for test/RC versions
+          RPMVER_SAFE="${VERSION_NUM//-/_}"
           mkdir -p ~/rpmbuild/{SOURCES,SPECS}
-          tar czf ~/rpmbuild/SOURCES/das-backup-manager-${VERSION_NUM}.tar.gz \
-            --transform "s,^\.,DAS-Backup-Manager-${VERSION_NUM}," .
+          tar czf ~/rpmbuild/SOURCES/das-backup-manager-${RPMVER_SAFE}.tar.gz \
+            --transform "s,^\.,DAS-Backup-Manager-${RPMVER_SAFE}," .
           cp packaging/fedora/das-backup-manager.spec ~/rpmbuild/SPECS/
-          sed -i "s/^Version:.*/Version:        ${VERSION_NUM}/" ~/rpmbuild/SPECS/das-backup-manager.spec
+          sed -i "s/^Version:.*/Version:        ${RPMVER_SAFE}/" ~/rpmbuild/SPECS/das-backup-manager.spec
           rpmbuild -ba ~/rpmbuild/SPECS/das-backup-manager.spec
 
       - name: Collect RPMs
@@ -137,11 +147,17 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            build-essential g++ cargo rustc \
+            build-essential g++ curl \
             cmake extra-cmake-modules fuse3 libfuse3-dev file wget desktop-file-utils \
             qt6-base-dev qt6-charts-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
             libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
             libkf6notifications-dev libkf6statusnotifieritem-dev
+
+      - name: Install rustup (trixie's rustc 1.85 is too old for let-chains and zbus 5.14)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build AppImage
         env:
@@ -167,6 +183,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: bilelmoussaoui/flatpak-github-actions:kde-6.7
+      options: --privileged
     steps:
       - uses: actions/checkout@v6.0.2
 
