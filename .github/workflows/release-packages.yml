@@ -3,12 +3,18 @@ name: Build Release Packages
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g. 0.7.12-test)'
+        required: true
+        default: '0.7.12-test'
 
 permissions:
   contents: write
 
 env:
-  VERSION: ${{ github.ref_name }}
+  VERSION: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
 
 jobs:
   # ===========================================================================
@@ -23,23 +29,24 @@ jobs:
       - name: Install build dependencies
         run: |
           pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
-            qt6-base qt6-charts kf6-kcoreaddons kf6-ki18n kf6-kxmlgui kf6-kconfigwidgets \
-            kf6-kiconthemes kf6-kcrash kf6-kio kf6-knotifications kf6-kstatusnotifieritem \
+            qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
+            kiconthemes kcrash kio knotifications kstatusnotifieritem \
             qt6-tools
 
       - name: Build package
+        env:
+          VERSION_TAG: ${{ env.VERSION }}
         run: |
+          VERSION_NUM="${VERSION_TAG#v}"
           # makepkg refuses to run as root — create a build user
           useradd -m builder
           chown -R builder: .
-          # Update PKGBUILD source to use local checkout
-          su builder -c '
-            cd packaging/arch
-            sed -i "s|source=.*|source=()|" PKGBUILD
-            sed -i "s|sha256sums=.*|sha256sums=()|" PKGBUILD
-            sed -i "s|cd \"DAS-Backup-Manager-\$pkgver\"|cd \"$GITHUB_WORKSPACE\"|g" PKGBUILD
-            makepkg -sf --noconfirm
-          '
+          # Update PKGBUILD: pin pkgver to the release version, use local checkout
+          sed -i "s|^pkgver=.*|pkgver=${VERSION_NUM}|" packaging/arch/PKGBUILD
+          sed -i "s|source=.*|source=()|" packaging/arch/PKGBUILD
+          sed -i "s|sha256sums=.*|sha256sums=()|" packaging/arch/PKGBUILD
+          sed -i "s|cd \"DAS-Backup-Manager-\$pkgver\"|cd \"\$GITHUB_WORKSPACE\"|g" packaging/arch/PKGBUILD
+          su builder -c 'cd packaging/arch && makepkg -sf --noconfirm'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.0
@@ -96,7 +103,7 @@ jobs:
 
       - name: Build RPM
         env:
-          VERSION_TAG: ${{ github.ref_name }}
+          VERSION_TAG: ${{ env.VERSION }}
         run: |
           VERSION_NUM="${VERSION_TAG#v}"
           mkdir -p ~/rpmbuild/{SOURCES,SPECS}
@@ -130,6 +137,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
+            build-essential g++ cargo rustc \
             cmake extra-cmake-modules fuse3 libfuse3-dev file wget desktop-file-utils \
             qt6-base-dev qt6-charts-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
             libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
@@ -137,7 +145,7 @@ jobs:
 
       - name: Build AppImage
         env:
-          VERSION_TAG: ${{ github.ref_name }}
+          VERSION_TAG: ${{ env.VERSION }}
         run: packaging/appimage/build-appimage.sh "${VERSION_TAG#v}"
 
       - name: Upload artifact
@@ -147,27 +155,10 @@ jobs:
           path: ButteredDASD-*.AppImage
 
   # ===========================================================================
-  # Snap (.snap, classic confinement)
+  # Snap — DISABLED until core26 (Ubuntu 26.04 LTS) becomes a snapcraft base.
+  # KF6 is not packaged in Ubuntu 24.04 noble (core24), so the GUI cannot be
+  # built on any currently-available snap base. Re-enable once core26 ships.
   # ===========================================================================
-  snap:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6.0.2
-
-      - name: Prepare snapcraft source
-        run: |
-          # snapcraft expects snap/snapcraft.yaml at project root
-          mkdir -p snap
-          cp packaging/snap/snapcraft.yaml snap/
-
-      - uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
-        id: snap-build
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
-        with:
-          name: snap-package
-          path: ${{ steps.snap-build.outputs.snap }}
 
   # ===========================================================================
   # Flatpak (GUI only)
@@ -194,7 +185,7 @@ jobs:
   # Collect all artifacts and attach to GitHub Release
   # ===========================================================================
   upload-release:
-    needs: [arch, debian, fedora, appimage, snap, flatpak]
+    needs: [arch, debian, fedora, appimage, flatpak]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8.0.1

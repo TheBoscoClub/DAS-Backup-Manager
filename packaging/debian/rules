@@ -3,10 +3,10 @@
 	dh $@
 
 override_dh_auto_configure:
-	. $(HOME)/.cargo/env 2>/dev/null; cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
+	cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
 
 override_dh_auto_build:
-	. $(HOME)/.cargo/env 2>/dev/null; cmake --build build
+	cmake --build build
 
 override_dh_auto_install:
 	DESTDIR=$(CURDIR)/debian/das-backup-manager cmake --install build

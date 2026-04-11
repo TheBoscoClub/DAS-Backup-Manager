@@ -8,6 +8,7 @@ URL:            https://github.com/TheBoscoClub/DAS-Backup-Manager
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  rust cargo cmake >= 3.25 extra-cmake-modules gcc-c++
+BuildRequires:  systemd-rpm-macros
 BuildRequires:  cmake(Qt6Core) cmake(Qt6Widgets) cmake(Qt6Sql)
 BuildRequires:  cmake(KF6CoreAddons) cmake(KF6I18n) cmake(KF6XmlGui)
 BuildRequires:  cmake(KF6ConfigWidgets) cmake(KF6IconThemes) cmake(KF6Crash) cmake(KF6KIO)
@@ -64,7 +65,7 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
-* Sun Mar 16 2026 TheBoscoClub <gjbr@pm.me> - 0.7.10-1
+* Mon Mar 16 2026 TheBoscoClub <gjbr@pm.me> - 0.7.10-1
 - Bump to 0.7.10: fix backup history recording from CLI and shell script
 
 * Sat Mar 07 2026 TheBoscoClub <gjbr@pm.me> - 0.7.9-1
@@ -76,10 +77,10 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 * Sat Mar 07 2026 TheBoscoClub <gjbr@pm.me> - 0.7.7-1
 - Bump to 0.7.7: resizable log view (native dock resize), smart auto-scroll, non-fatal email errors, s-nail v15-compat
 
-* Wed Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.6-1
+* Thu Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.6-1
 - Bump to 0.7.6: email reports, btrbk.conf canonical path fix, dry-run DB fix
 
-* Wed Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.5-1
+* Thu Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.5-1
 - Bump to 0.7.5: source volume auto-mount, snapshot_name/target_labels config
 
 * Thu Mar 05 2026 TheBoscoClub <gjbr@pm.me> - 0.7.4-1
