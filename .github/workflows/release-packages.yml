@@ -209,6 +209,7 @@ jobs:
   upload-release:
     needs: [arch, debian, fedora, appimage, flatpak]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v8.0.1
         with:

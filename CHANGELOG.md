@@ -11,7 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+### Fixed
+
+## [0.7.12] - 2026-04-11
+
+### Changed
+- **`release-packages.yml` workflow — all 6 packaging formats repaired end-to-end** — the workflow had been broken across 5 consecutive tagged releases, with every format failing for independent reasons (stale `kf6-` dependency prefixes in Arch, missing `systemd-rpm-macros` in Fedora, outdated rustc in the Debian and AppImage containers, a `FIXME` sha256 placeholder in the Flatpak manifest, and an unresolvable KF6 toolchain on the Snap `core24` base). The workflow now builds Arch, Debian, Fedora, AppImage, and Flatpak green from a single `workflow_dispatch` test run. See `### Removed` below for the Snap format disposition
+- **`release-packages.yml` now triggers on both `push: tags: ['v*']` and `workflow_dispatch`** — manual dispatch accepts a `version` input so the workflow can be iterated without cutting a real tag. `upload-release` is gated on `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')` so dispatch runs skip the GitHub Release upload step
+- **Debian and AppImage containers now install rustup inline** — Debian trixie ships `rustc 1.85.0`, but `zbus 5.14` and `zvariant 5.10` require `1.87` and the `buttered-dasd` lib crate uses `let`-chain expressions that require `1.88`. Both jobs now install the stable toolchain via `sh.rustup.rs` and prepend `~/.cargo/bin` to `$GITHUB_PATH` so the newer compiler shadows the apt-packaged one during the actual build
+- **Arch and Fedora jobs sanitize hyphens in version strings** — `pkgver` and RPM `Version:` both forbid `-`, so test/RC versions like `0.7.12-test` are rewritten to `0.7.12_test` before being sed'd into `PKGBUILD`/`.spec`
+- **Flatpak container now runs with `--privileged`** — `bwrap` inside the `bilelmoussaoui/flatpak-github-actions:kde-6.7` container cannot create user namespaces without elevated privileges on the GitHub runner, which blocked every previous Flatpak build at `module qtcharts: Child process exited with code 1`
+- **Flatpak manifest source type changed from `archive` to `dir`** — the old `archive` source pinned a release tarball with a `FIXME` sha256 placeholder, which meant every release manifest had to be hand-edited before it could build. The manifest now uses the local checkout (`type: dir, path: ../..`) so it builds from the tagged tree without round-tripping through GitHub's archive endpoint
+- **AppImage build sets `APPIMAGE_EXTRACT_AND_RUN=1`** — FUSE is unavailable inside the Debian trixie Docker container, so `linuxdeploy` and `appimagetool` now extract themselves instead of mounting via FUSE
+- **Fedora spec file gained `BuildRequires: systemd-rpm-macros`** — required so `%{_unitdir}` macro expands when the `%files` section is evaluated. The Fedora job's `dnf install` list now also pulls in the package
+- **Debian `debian/rules` simplified** — removed the `. $(HOME)/.cargo/env 2>/dev/null;` prelude from `override_dh_auto_configure` and `override_dh_auto_build`. Under `debhelper`'s `set -e` shell, sourcing a non-existent file aborted the build. The rustup PATH is now threaded through `$GITHUB_PATH` at the job level instead
+- **Arch `PKGBUILD` KF6 dependency names updated** — Arch renamed `kf6-kcoreaddons` etc. to the unprefixed `kcoreaddons` family some time ago; `makepkg -s` was failing to resolve the old names
+
 ### Removed
+- **Snap packaging temporarily disabled in `release-packages.yml`** — `snapcraft` has no snap `base` that provides a working KF6 toolchain. `core24` (Ubuntu 24.04 noble) does not package KF6, and there is no newer stable base available. The job is commented out with a note to re-enable once `core26` (Ubuntu 26.04 LTS) ships as a snap base. The `packaging/snap/snapcraft.yaml` manifest is retained unchanged so it is ready to re-enable
 - **`render_esp_hook()` template generator** — root cause of the 2026-03-05 DAS ESP wipe incident. The function in `indexer/src/setup/templates.rs` generated a pacman hook at `/etc/pacman.d/hooks/das-esp-sync.hook` that called `/usr/lib/das-backup/esp-sync.sh` (a script no longer present in the repo). The script discovered ESP partitions by label and mirrored the host ESP onto all of them — including `BACKUP-ESP` on the DAS 2TB emergency recovery drives, destroying their independent OS boot configurations. The function kept regenerating the orphan hook on every `btrdasd setup --upgrade` run, leaving a latent vector for the disaster to recur
 - **`EspHooks` struct and `HookType` enum** from `indexer/src/config.rs` — no remaining consumers after hook generator removal. Any `[esp.hooks]` block in an older `config.toml` is silently ignored via serde's default handling
 - **ESP hook auto-detect and prompt** from `indexer/src/setup/wizard.rs` — the interactive wizard no longer offers to install any package-manager ESP hook
@@ -351,7 +368,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12...HEAD
+[0.7.12]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...v0.7.12
 [0.7.11]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.8...v0.7.9

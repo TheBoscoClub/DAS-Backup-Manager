@@ -65,6 +65,12 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Sat Apr 11 2026 TheBoscoClub <gjbr@pm.me> - 0.7.12-1
+- Bump to 0.7.12: repair release-packages CI workflow end-to-end; permanent fix for 2026-03-05 DAS ESP wipe incident (render_esp_hook removed)
+
+* Mon Mar 16 2026 TheBoscoClub <gjbr@pm.me> - 0.7.11-1
+- Bump to 0.7.11: GUI accelerator/progress dock/status bar fixes
+
 * Mon Mar 16 2026 TheBoscoClub <gjbr@pm.me> - 0.7.10-1
 - Bump to 0.7.10: fix backup history recording from CLI and shell script
 
