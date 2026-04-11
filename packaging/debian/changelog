@@ -1,3 +1,26 @@
+das-backup-manager (0.7.12.1-1) unstable; urgency=medium
+
+  * Fix debian/changelog version lag (was shipping 0.7.10 debs for 0.7.12 tag)
+  * CI now sed-patches debian/changelog version at build time to match the release tag
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 11 Apr 2026 03:55:00 +0000
+
+das-backup-manager (0.7.12-1) unstable; urgency=medium
+
+  * Repair release-packages CI workflow end-to-end (all 5 formats now build green)
+  * Permanent fix for 2026-03-05 DAS ESP wipe incident (render_esp_hook removed)
+  * Snap packaging disabled until core26 (Ubuntu 26.04 LTS) ships as a snap base
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 11 Apr 2026 03:51:00 +0000
+
+das-backup-manager (0.7.11-1) unstable; urgency=medium
+
+  * GUI: strip KDE & accelerator markers from source/target names
+  * GUI: wrap Backup Operations panel in QScrollArea for collapsed dock
+  * GUI: add 10s status bar timeout fallback for hung D-Bus queries
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Mon, 16 Mar 2026 00:00:00 +0000
+
 das-backup-manager (0.7.10-1) unstable; urgency=medium
 
   * Fix backup history recording from CLI and shell script

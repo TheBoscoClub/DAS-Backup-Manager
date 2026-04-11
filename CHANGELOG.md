@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.12.1] - 2026-04-11
+
+### Fixed
+- **Debian `.deb` artifacts shipped with stale `0.7.10` version on the v0.7.12 release** — `packaging/debian/changelog` had not been bumped since 0.7.10, so `dpkg-buildpackage` stamped the artifacts with that version even though `CMakeLists.txt`, `Cargo.toml`, and the release tag all said 0.7.12. The `upload-release` step attached the mis-versioned debs to the v0.7.12 GitHub Release. Fix: inject a fresh top entry in `debian/changelog` at build time from `$VERSION_TAG` inside the debian job, so the artifacts always match the tag regardless of the committed changelog state
+
 ## [0.7.12] - 2026-04-11
 
 ### Changed
@@ -368,7 +373,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.1...HEAD
+[0.7.12.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12...v0.7.12.1
 [0.7.12]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...v0.7.12
 [0.7.11]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.9...v0.7.10
