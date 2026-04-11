@@ -37,6 +37,8 @@ modules:
       - -DBUILD_HELPER=OFF
       - -DBUILD_FFI=OFF
     sources:
-      - type: archive
-        url: https://github.com/TheBoscoClub/DAS-Backup-Manager/archive/refs/heads/main.tar.gz
-        sha256: FIXME
+      # Use the local checkout so releases build from the tagged tree without
+      # needing to round-trip through GitHub's archive endpoint (which would
+      # require pinning a sha256 per release). Path is relative to this manifest.
+      - type: dir
+        path: ../..
