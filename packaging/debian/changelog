@@ -1,3 +1,11 @@
+das-backup-manager (0.7.12.2-1) unstable; urgency=medium
+
+  * Fix debian Build .deb step shell: sh -e → bash ("Bad substitution" on ${var//-/\~})
+  * PKGBUILD: bump stale pkgver 0.7.10 → 0.7.12.2, add hicolor-icon-theme dep
+  * Verified clean local Arch build + install + binary launch
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 11 Apr 2026 05:00:00 +0000
+
 das-backup-manager (0.7.12.1-1) unstable; urgency=medium
 
   * Fix debian/changelog version lag (was shipping 0.7.10 debs for 0.7.12 tag)

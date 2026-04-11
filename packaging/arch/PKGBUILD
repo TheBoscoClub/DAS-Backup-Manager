@@ -1,6 +1,6 @@
 # Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
 pkgname=das-backup-manager
-pkgver=0.7.10
+pkgver=0.7.12.2
 pkgrel=1
 pkgdesc='DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI'
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('btrbk' 'btrfs-progs' 'smartmontools' 'bash' 'util-linux'
          'qt6-base' 'qt6-charts' 'kcoreaddons' 'ki18n' 'kxmlgui'
          'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio'
-         'knotifications' 'kstatusnotifieritem')
+         'knotifications' 'kstatusnotifieritem' 'hicolor-icon-theme')
 optdepends=('s-nail: email backup reports (mailx)'
             'rsync: ESP/boot partition mirroring'
             'mbuffer: buffered btrbk stream transfers')
