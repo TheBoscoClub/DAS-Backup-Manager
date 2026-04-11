@@ -82,6 +82,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build .deb
+        shell: bash
         env:
           VERSION_TAG: ${{ env.VERSION }}
         run: |
