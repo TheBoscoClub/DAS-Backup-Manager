@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.12.2] - 2026-04-11
+
+### Fixed
+- **Debian `Build .deb` step failed with `Bad substitution`** — the step ran under `sh -e` (the default GitHub Actions shell), and the bash-specific substitution `${VERSION_NUM//-/\~}` used to sanitize `-` → `~` in the injected debian/changelog version is not supported by dash (Debian trixie's `/bin/sh`). Arch and Fedora jobs happened to work because both containers ship bash as `/bin/sh`. Fix: explicit `shell: bash` on the Debian Build .deb step so the substitution runs under bash regardless of container default
+- **Arch `PKGBUILD` was missing `hicolor-icon-theme` dependency** — the package installs an icon under `/usr/share/icons/hicolor/scalable/apps/btrdasd-gui.svg` but did not declare the hicolor theme hierarchy as a dependency. namcap flagged this as an error during a local build audit. Fix: added `hicolor-icon-theme` to the `depends=` array
+- **Arch `PKGBUILD` stale `pkgver=0.7.10`** — the committed PKGBUILD had not been bumped since 0.7.10, seven releases ago. The release-packages CI workflow already sed-patches `pkgver` at build time from `$VERSION_TAG` so this was cosmetic only, but the file-level version is now in sync with the rest of the packaging manifests
+
 ## [0.7.12.1] - 2026-04-11
 
 ### Fixed
@@ -373,7 +380,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.2...HEAD
+[0.7.12.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.1...v0.7.12.2
 [0.7.12.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12...v0.7.12.1
 [0.7.12]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...v0.7.12
 [0.7.11]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.10...v0.7.11

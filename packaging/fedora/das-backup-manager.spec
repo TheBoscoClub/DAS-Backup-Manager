@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.10
+Version:        0.7.12.2
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -65,6 +65,9 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Sat Apr 11 2026 TheBoscoClub <gjbr@pm.me> - 0.7.12.2-1
+- Bump to 0.7.12.2: debian Build .deb step now uses shell:bash (fixes ${var//-/\~} "Bad substitution" on dash); PKGBUILD bumped from stale 0.7.10 and gained hicolor-icon-theme dep; verified clean local Arch build
+
 * Sat Apr 11 2026 TheBoscoClub <gjbr@pm.me> - 0.7.12.1-1
 - Bump to 0.7.12.1: fix debian/changelog version lag; CI now sed-patches debian changelog version at build time
 
