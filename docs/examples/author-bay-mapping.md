@@ -30,9 +30,9 @@
 
 | Bay | Serial | Model | Size | Partitions | Role | BTRFS Label |
 |-----|--------|-------|------|------------|------|-------------|
-| 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery only (independent OS) | das-backup-system-mirror |
+| 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system-mirror |
 | 2 | ZXA0LMAE | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup -- all btrbk targets | das-backup-22tb |
-| 3 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery only (independent OS) | das-backup-system |
+| 3 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system |
 | 4 | — | — | — | — | Empty | — |
 | 5 | — | — | — | — | Empty | — |
 | 6 | — | — | — | — | Empty | — |
@@ -50,8 +50,8 @@ Either drive can boot independently if the other fails. Sync between them is man
 
 ## Role Summary
 
-- **Primary Backup** (Bay 2): 22TB Exos -- all btrbk targets (NVMe, SSD, projects, audiobooks, das-storage), 4w/12m/4y retention
-- **Emergency Boot/Recovery** (Bays 1, 3): Independent 2TB drives with ESP + CachyOS -- standalone bootable systems only (removed as btrbk targets 2026-04-09)
+- **Primary Backup** (Bay 2): 22TB Exos -- all btrbk targets (NVMe, SSD, projects, audiobooks), deep retention
+- **Emergency Boot/Recovery** (Bays 1, 3): Independent 2TB drives with ESP + CachyOS -- also receive btrbk NVMe/SSD snapshots
 
 ## dasRaid0 — Relocated to Internal SATA (2026-04-06)
 
