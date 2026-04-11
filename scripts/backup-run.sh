@@ -202,39 +202,15 @@ check_das_connected() {
     fi
 }
 
-tune_das_io() {
-    log_info "Tuning I/O parameters for DAS drives..."
+set_io_scheduler() {
+    log_info "Setting I/O scheduler to $DAS_IO_SCHEDULER for DAS drives..."
 
     for label in "${!DISCOVERED_DEVICES[@]}"; do
         local drive="${DISCOVERED_DEVICES[$label]}"
         if [[ -n "$drive" && -b "$drive" ]]; then
             local dev="${drive#/dev/}"
-            local sysq="/sys/block/$dev/queue"
-
-            # I/O scheduler: mq-deadline for rotational drives behind USB
-            if [[ -f "$sysq/scheduler" ]]; then
-                echo "$DAS_IO_SCHEDULER" > "$sysq/scheduler" 2>/dev/null || true
-            fi
-
-            # Max request size: use the hardware maximum for large sequential I/O
-            if [[ -f "$sysq/max_hw_sectors_kb" && -f "$sysq/max_sectors_kb" ]]; then
-                local hw_max
-                hw_max=$(cat "$sysq/max_hw_sectors_kb" 2>/dev/null)
-                if [[ -n "$hw_max" && "$hw_max" -gt 0 ]]; then
-                    echo "$hw_max" > "$sysq/max_sectors_kb" 2>/dev/null || true
-                fi
-            fi
-
-            # nr_requests: BOT (usb-storage) processes one command at a time,
-            # so a deep queue just wastes memory. Keep it modest.
-            if [[ -f "$sysq/nr_requests" ]]; then
-                echo 32 > "$sysq/nr_requests" 2>/dev/null || true
-            fi
-
-            # Read-ahead: 4MB is ample for btrfs send/receive streams on HDD.
-            # 32MB (CachyOS default) overshoots for USB-attached rotational.
-            if [[ -f "$sysq/read_ahead_kb" ]]; then
-                echo 4096 > "$sysq/read_ahead_kb" 2>/dev/null || true
+            if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
+                echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
             fi
         fi
     done
@@ -1105,7 +1081,7 @@ main() {
 
     check_root
     check_das_connected
-    tune_das_io
+    set_io_scheduler
     create_mount_points
     mount_sources
     create_snapshot_dirs
