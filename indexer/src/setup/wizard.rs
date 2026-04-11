@@ -558,32 +558,9 @@ fn step_esp(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std::er
                 .interact()?;
         }
 
-        // Hooks — auto-detect type from package manager
-        let auto_hook_type = match &sys.package_manager {
-            PackageManager::Pacman => HookType::Pacman,
-            PackageManager::Apt => HookType::Apt,
-            PackageManager::Dnf => HookType::Dnf,
-            _ => HookType::None,
-        };
-
-        if auto_hook_type != HookType::None {
-            let hook_label = match auto_hook_type {
-                HookType::Pacman => "pacman",
-                HookType::Apt => "apt",
-                HookType::Dnf => "dnf",
-                HookType::None => "none",
-            };
-            let enable_hooks = Confirm::new()
-                .with_prompt(format!(
-                    "Install {hook_label} hook for automatic ESP sync after kernel updates?"
-                ))
-                .default(true)
-                .interact()?;
-            if enable_hooks {
-                config.esp.hooks.enabled = true;
-                config.esp.hooks.hook_type = auto_hook_type;
-            }
-        }
+        // ESP sync hook generation removed 2026-04-10 — see das-esp-safety.md.
+        // NVMe-pair ESP mirroring is handled by a separate mechanism outside
+        // this project; this wizard no longer offers to install any ESP hook.
     } else {
         config.esp.enabled = false;
     }
@@ -942,15 +919,6 @@ fn step_review(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.esp.enabled {
         println!("    partitions: {}", config.esp.partitions.join(", "));
         println!("    mirror: {}", config.esp.mirror);
-        if config.esp.hooks.enabled {
-            let hook_str = match config.esp.hooks.hook_type {
-                HookType::Pacman => "pacman",
-                HookType::Apt => "apt",
-                HookType::Dnf => "dnf",
-                HookType::None => "none",
-            };
-            println!("    hooks: {hook_str}");
-        }
     } else {
         println!("    disabled");
     }
