@@ -322,48 +322,11 @@ pub fn render_email_conf(config: &Config) -> String {
     )
 }
 
-/// Generate a package-manager-specific ESP sync hook. Returns (path, content)
-/// for pacman/apt/dnf, or None if hooks are disabled or type is None.
-pub fn render_esp_hook(config: &Config) -> Option<(String, String)> {
-    if !config.esp.hooks.enabled {
-        return None;
-    }
-
-    let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
-
-    match config.esp.hooks.hook_type {
-        HookType::Pacman => {
-            let content = format!(
-                "[Trigger]\n\
-                 Type = Path\n\
-                 Operation = Install\n\
-                 Operation = Upgrade\n\
-                 Target = usr/lib/modules/*/vmlinuz\n\
-                 Target = boot/*\n\
-                 \n\
-                 [Action]\n\
-                 Description = Syncing ESP mirrors after kernel update...\n\
-                 When = PostTransaction\n\
-                 Exec = {script_dir}/esp-sync.sh\n"
-            );
-            Some(("/etc/pacman.d/hooks/das-esp-sync.hook".to_string(), content))
-        }
-        HookType::Apt => {
-            let content = format!("DPkg::Post-Invoke {{\"{script_dir}/esp-sync.sh\";}};\n");
-            Some(("/etc/apt/apt.conf.d/99-das-esp-sync".to_string(), content))
-        }
-        HookType::Dnf => {
-            let content = format!(
-                "#!/usr/bin/env bash\n\
-                 {GENERATED_HEADER}\
-                 # DNF plugin hook — called after kernel/bootloader transactions\n\
-                 {script_dir}/esp-sync.sh\n"
-            );
-            Some(("/etc/dnf/plugins/das-esp-sync".to_string(), content))
-        }
-        HookType::None => None,
-    }
-}
+// ESP sync hook generation removed 2026-04-10 — root cause of the 2026-03-05
+// incident that wiped the DAS 2TB emergency recovery drives' independent OS
+// ESPs. NVMe-pair ESP mirroring is handled by a separate, unrelated mechanism
+// (/usr/local/bin/esp-sync.sh + /etc/pacman.d/hooks/esp-mirror.hook) outside
+// this project. See .claude/rules/das-esp-safety.md for the full postmortem.
 
 // ---------------------------------------------------------------------------
 // GeneratedFiles — aggregates all rendered files
@@ -442,11 +405,6 @@ impl GeneratedFiles {
                 "/etc/das-backup/email.conf".to_string(),
                 render_email_conf(config),
             ));
-        }
-
-        // ESP hook
-        if let Some((path, content)) = render_esp_hook(config) {
-            files.push((path, content));
         }
 
         Self { files }

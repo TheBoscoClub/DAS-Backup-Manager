@@ -245,27 +245,12 @@ pub struct Esp {
     pub partitions: Vec<String>,
     #[serde(default)]
     pub mount_points: Vec<String>,
-    #[serde(default)]
-    pub hooks: EspHooks,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EspHooks {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default, rename = "type")]
-    pub hook_type: HookType,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HookType {
-    Pacman,
-    Apt,
-    Dnf,
-    #[default]
-    None,
-}
+// EspHooks / HookType removed 2026-04-10 — the template-generated pacman hook
+// they drove was the root cause of the 2026-03-05 DAS ESP wipe incident.
+// See .claude/rules/das-esp-safety.md for the full postmortem. Any `[esp.hooks]`
+// block in an older config.toml is silently ignored via serde's default handling.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Email {
@@ -489,8 +474,6 @@ mod tests {
         cfg.esp.mirror = true;
         cfg.esp.partitions = vec!["/dev/nvme0n1p1".into()];
         cfg.esp.mount_points = vec!["/efi".into()];
-        cfg.esp.hooks.enabled = true;
-        cfg.esp.hooks.hook_type = HookType::Pacman;
         cfg.email.enabled = true;
         cfg.email.smtp_host = "127.0.0.1".into();
         cfg.email.smtp_port = 1025;
@@ -523,7 +506,6 @@ mod tests {
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home", "@log"]);
         assert!(parsed.esp.enabled);
         assert!(parsed.esp.mirror);
-        assert_eq!(parsed.esp.hooks.hook_type, HookType::Pacman);
         assert!(parsed.email.enabled);
         assert_eq!(parsed.email.smtp_port, 1025);
         assert_eq!(parsed.email.auth, AuthMethod::Plain);

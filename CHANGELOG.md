@@ -11,7 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+### Removed
+- **`render_esp_hook()` template generator** — root cause of the 2026-03-05 DAS ESP wipe incident. The function in `indexer/src/setup/templates.rs` generated a pacman hook at `/etc/pacman.d/hooks/das-esp-sync.hook` that called `/usr/lib/das-backup/esp-sync.sh` (a script no longer present in the repo). The script discovered ESP partitions by label and mirrored the host ESP onto all of them — including `BACKUP-ESP` on the DAS 2TB emergency recovery drives, destroying their independent OS boot configurations. The function kept regenerating the orphan hook on every `btrdasd setup --upgrade` run, leaving a latent vector for the disaster to recur
+- **`EspHooks` struct and `HookType` enum** from `indexer/src/config.rs` — no remaining consumers after hook generator removal. Any `[esp.hooks]` block in an older `config.toml` is silently ignored via serde's default handling
+- **ESP hook auto-detect and prompt** from `indexer/src/setup/wizard.rs` — the interactive wizard no longer offers to install any package-manager ESP hook
+- **`/etc/pacman.d/hooks/das-esp-sync.hook`** deleted from the live system
+- **`[esp.hooks]` block** removed from `/etc/das-backup/config.toml`
+
 ### Fixed
+- **2026-03-05 DAS ESP wipe incident — permanent fix** — DAS-Backup-Manager no longer contains any code path that can generate an ESP sync hook, pacman or otherwise. The independent NVMe-pair mirror sync (`/usr/local/bin/esp-sync.sh` via `esp-mirror.hook`) is a completely separate mechanism outside this project and continues to function normally. See `.claude/rules/das-esp-safety.md` for the full postmortem and the hard rule
 
 ## [0.7.11] - 2026-03-16
 
