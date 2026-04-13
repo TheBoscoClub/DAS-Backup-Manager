@@ -80,7 +80,6 @@ pub fn dump_env(config: &Config) -> String {
         let role_str = match tgt.role {
             TargetRole::Primary => "primary",
             TargetRole::Mirror => "mirror",
-            TargetRole::EspSync => "esp-sync",
         };
         out.push_str(&kv(&format!("{p}_ROLE"), role_str));
         if !tgt.display_name.is_empty() {
@@ -109,23 +108,6 @@ pub fn dump_env(config: &Config) -> String {
 
     let all_mounts: Vec<&str> = config.targets.iter().map(|t| t.mount.as_str()).collect();
     out.push_str(&kv("DAS_ALL_TARGET_MOUNTS", &all_mounts.join(" ")));
-
-    // ESP
-    out.push_str(&format!(
-        "DAS_ESP_ENABLED={}\n",
-        if config.esp.enabled { "true" } else { "false" }
-    ));
-    if config.esp.enabled {
-        out.push_str(&format!(
-            "DAS_ESP_MIRROR={}\n",
-            if config.esp.mirror { "true" } else { "false" }
-        ));
-        out.push_str(&kv("DAS_ESP_PARTITIONS", &config.esp.partitions.join(" ")));
-        out.push_str(&kv(
-            "DAS_ESP_MOUNT_POINTS",
-            &config.esp.mount_points.join(" "),
-        ));
-    }
 
     // Email
     out.push_str(&format!(
@@ -203,7 +185,7 @@ mod tests {
             label: "system-2tb".to_string(),
             serial: "ZFL41DNY".to_string(),
             mount: "/mnt/backup-system".to_string(),
-            role: TargetRole::EspSync,
+            role: TargetRole::Mirror,
             retention: Retention {
                 weekly: 4,
                 monthly: 2,
@@ -258,7 +240,7 @@ mod tests {
         assert!(output.contains("DAS_TARGET_0_RETENTION_DAILY=365"));
         assert!(output.contains("DAS_TARGET_0_RETENTION_YEARLY=4"));
         assert!(output.contains("DAS_TARGET_1_LABEL='system-2tb'"));
-        assert!(output.contains("DAS_TARGET_1_ROLE='esp-sync'"));
+        assert!(output.contains("DAS_TARGET_1_ROLE='mirror'"));
         // display_name empty → not emitted
         assert!(!output.contains("DAS_TARGET_1_DISPLAY_NAME"));
     }

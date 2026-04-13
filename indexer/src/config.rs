@@ -22,7 +22,6 @@ pub struct Config {
     pub sources: Vec<Source>,
     #[serde(default, rename = "target")]
     pub targets: Vec<Target>,
-    pub esp: Esp,
     pub email: Email,
     pub gui: Gui,
 }
@@ -195,7 +194,7 @@ pub struct Source {
     pub snapshot_dir: String,
     #[serde(default)]
     pub target_subdirs: Vec<String>,
-    /// Which target labels this source sends to (empty = all non-EspSync targets).
+    /// Which target labels this source sends to (empty = all targets).
     #[serde(default)]
     pub target_labels: Vec<String>,
 }
@@ -220,7 +219,6 @@ pub struct Target {
 pub enum TargetRole {
     Primary,
     Mirror,
-    EspSync,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -235,22 +233,14 @@ pub struct Retention {
     pub yearly: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Esp {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub mirror: bool,
-    #[serde(default)]
-    pub partitions: Vec<String>,
-    #[serde(default)]
-    pub mount_points: Vec<String>,
-}
-
-// EspHooks / HookType removed 2026-04-10 — the template-generated pacman hook
-// they drove was the root cause of the 2026-03-05 DAS ESP wipe incident.
-// See .claude/rules/das-esp-safety.md for the full postmortem. Any `[esp.hooks]`
-// block in an older config.toml is silently ignored via serde's default handling.
+// ESP struct, EspHooks, HookType, and sync_esp() all removed 2026-04-12.
+// The template-generated pacman hook was the root cause of the 2026-03-05
+// DAS ESP wipe incident; remaining ESP code (struct, sync function, wizard
+// step, env export, shell script references) was a latent risk vector and
+// caused the daily backup to stop running on 2026-04-09 when dump-env
+// stopped emitting DAS_ESP_MOUNT_POINTS.
+// See .claude/rules/das-esp-safety.md for the full postmortem.
+// Old config.toml files with [esp] sections are silently ignored by serde.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Email {
@@ -311,7 +301,6 @@ impl Default for Config {
             boot: Boot::default(),
             sources: Vec::new(),
             targets: Vec::new(),
-            esp: Esp::default(),
             email: Email::default(),
             gui: Gui::default(),
         }
@@ -393,10 +382,6 @@ impl Config {
             errors.push("Email is enabled but smtp_host is empty".into());
         }
 
-        if self.esp.mirror && self.esp.partitions.len() < 2 {
-            errors.push("ESP mirror is enabled but fewer than 2 partitions are configured".into());
-        }
-
         errors
     }
 }
@@ -470,10 +455,6 @@ mod tests {
             },
             display_name: "22TB Primary (Bay 2)".into(),
         });
-        cfg.esp.enabled = true;
-        cfg.esp.mirror = true;
-        cfg.esp.partitions = vec!["/dev/nvme0n1p1".into()];
-        cfg.esp.mount_points = vec!["/efi".into()];
         cfg.email.enabled = true;
         cfg.email.smtp_host = "127.0.0.1".into();
         cfg.email.smtp_port = 1025;
@@ -504,8 +485,6 @@ mod tests {
         assert_eq!(parsed.das.mount_opts, "noatime,compress=zstd");
         assert_eq!(parsed.boot.archive_retention_days, 180);
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home", "@log"]);
-        assert!(parsed.esp.enabled);
-        assert!(parsed.esp.mirror);
         assert!(parsed.email.enabled);
         assert_eq!(parsed.email.smtp_port, 1025);
         assert_eq!(parsed.email.auth, AuthMethod::Plain);
@@ -626,8 +605,6 @@ mount = "/mnt/t"
 role = "primary"
 [target.retention]
 weekly = 4
-[esp]
-enabled = false
 [email]
 enabled = false
 [gui]
@@ -669,8 +646,6 @@ mount = "/mnt/t"
 role = "primary"
 [target.retention]
 weekly = 4
-[esp]
-enabled = false
 [email]
 enabled = false
 [gui]

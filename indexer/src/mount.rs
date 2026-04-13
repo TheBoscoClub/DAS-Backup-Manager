@@ -61,12 +61,12 @@ impl std::error::Error for MountError {}
 ///
 /// - **Primary** targets use the first partition (`{dev}1`) — whole-disk BTRFS
 ///   with a single partition table entry.
-/// - **Mirror** and **EspSync** targets use the second partition (`{dev}2`) —
+/// - **Mirror** targets use the second partition (`{dev}2`) —
 ///   partition 1 is the ESP, partition 2 is the BTRFS data area.
 pub fn partition_device(dev: &str, role: &TargetRole) -> String {
     match role {
         TargetRole::Primary => format!("{dev}1"),
-        TargetRole::Mirror | TargetRole::EspSync => format!("{dev}2"),
+        TargetRole::Mirror => format!("{dev}2"),
     }
 }
 
@@ -458,14 +458,6 @@ mod tests {
         assert_eq!(
             partition_device("/dev/sdc", &TargetRole::Mirror),
             "/dev/sdc2"
-        );
-    }
-
-    #[test]
-    fn partition_device_esp_sync() {
-        assert_eq!(
-            partition_device("/dev/sdd", &TargetRole::EspSync),
-            "/dev/sdd2"
         );
     }
 

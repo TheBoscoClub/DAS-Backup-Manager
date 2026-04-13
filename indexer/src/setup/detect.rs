@@ -30,12 +30,6 @@ impl BlockDevice {
         self.tran.as_deref() == Some("usb")
     }
 
-    /// Returns true if this looks like an EFI System Partition candidate:
-    /// vfat filesystem and smaller than 2 GB.
-    pub fn is_esp_candidate(&self) -> bool {
-        self.fstype.as_deref() == Some("vfat") && self.size_bytes() < 2 * 1024 * 1024 * 1024
-    }
-
     /// Parse a human-readable size string like "512M", "22T", "2G" into bytes.
     fn size_bytes(&self) -> u64 {
         let s = self.size.trim();
@@ -291,8 +285,8 @@ pub struct DepStatus {
 /// Check whether required and optional dependencies are available.
 ///
 /// Always checks: btrbk, btrfs, smartctl, lsblk, mbuffer.
-/// Conditionally checks: mailx (if email_enabled), rsync (if esp_mirror).
-pub fn check_dependencies(email_enabled: bool, esp_mirror: bool) -> Vec<DepStatus> {
+/// Conditionally checks: mailx (if email_enabled).
+pub fn check_dependencies(email_enabled: bool) -> Vec<DepStatus> {
     let mut deps = vec![
         ("btrbk", true),
         ("btrfs", true),
@@ -303,9 +297,6 @@ pub fn check_dependencies(email_enabled: bool, esp_mirror: bool) -> Vec<DepStatu
 
     if email_enabled {
         deps.push(("mailx", true));
-    }
-    if esp_mirror {
-        deps.push(("rsync", true));
     }
 
     deps.into_iter()
@@ -339,7 +330,7 @@ impl SystemInfo {
             subvolumes: detect_subvolumes(),
             init_system: detect_init_system(),
             package_manager: detect_package_manager(),
-            deps: check_dependencies(false, false),
+            deps: check_dependencies(false),
         }
     }
 }
@@ -387,22 +378,19 @@ mod tests {
         let devices = parse_lsblk_output(json).expect("parse lsblk JSON");
         assert_eq!(devices.len(), 3);
 
-        // First device: sata, not usb, not esp
+        // First device: sata, not usb
         assert_eq!(devices[0].name, "sda");
         assert_eq!(devices[0].serial.as_deref(), Some("ZXA0LMAE"));
         assert_eq!(devices[0].tran.as_deref(), Some("sata"));
         assert!(!devices[0].is_usb());
-        assert!(!devices[0].is_esp_candidate());
 
-        // Second device: usb, vfat, 512M < 2GB so esp candidate
+        // Second device: usb
         assert_eq!(devices[1].name, "sdb");
         assert!(devices[1].is_usb());
-        assert!(devices[1].is_esp_candidate());
 
-        // Third device: no tran, btrfs, 2T > 2GB so not esp candidate
+        // Third device: no tran
         assert_eq!(devices[2].name, "nvme0n1");
         assert!(!devices[2].is_usb());
-        assert!(!devices[2].is_esp_candidate());
     }
 
     #[test]

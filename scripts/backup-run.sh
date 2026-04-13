@@ -6,7 +6,6 @@
 # Features:
 #   - Incremental BTRFS backups via btrbk to configured targets
 #   - Maintains stable boot subvolumes (@ and @home) for disaster recovery
-#   - Syncs ESP to bootable recovery drives (serial-based discovery)
 #   - Detects DAS drives by serial number (stable across reboots)
 #   - Logs per-target throughput (data written + MB/s rate)
 #   - Designed for unattended nightly execution
@@ -43,6 +42,7 @@ declare -A DAS_SERIALS=()
 declare -A TARGET_MOUNTS=()
 declare -A TARGET_NAMES=()
 declare -A TARGET_ROLES=()
+declare -A MOUNT_ROLES=()
 for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     label_var="DAS_TARGET_${i}_LABEL"
     serial_var="DAS_TARGET_${i}_SERIAL"
@@ -52,6 +52,7 @@ for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     DAS_SERIALS[${!label_var}]="${!serial_var}"
     TARGET_MOUNTS[${!label_var}]="${!mount_var}"
     TARGET_ROLES[${!label_var}]="${!role_var}"
+    MOUNT_ROLES[${!mount_var}]="${!role_var}"
     name_val="${!name_var}"
     if [[ -n "${name_val:-}" ]]; then
         TARGET_NAMES[${!mount_var}]="$name_val"
@@ -84,9 +85,6 @@ LOG_FILE="$DAS_LOG_FILE"
 EMAIL_CONF="/etc/das-backup-email.conf"
 GROWTH_LOG="$DAS_GROWTH_LOG"
 LAST_REPORT="$DAS_LAST_REPORT"
-
-# ESP mount points from config
-IFS=' ' read -ra MOUNT_DAS_ESP <<< "$DAS_ESP_MOUNT_POINTS"
 
 # All target mount points (space-separated string from config -> array)
 IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
@@ -221,9 +219,6 @@ create_mount_points() {
     for label in "${!TARGET_MOUNTS[@]}"; do
         mkdir -p "${TARGET_MOUNTS[$label]}"
     done
-    for esp in "${MOUNT_DAS_ESP[@]}"; do
-        mkdir -p "$esp"
-    done
 }
 
 mount_sources() {
@@ -344,9 +339,18 @@ update_boot_subvolumes() {
 
     log_info "Updating stable boot subvolumes..."
 
-    # Update boot subvolumes on each mounted backup target that has NVMe snapshots
+    # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
+    # bootable systems and must never have their @ replaced with host snapshots.
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+
+        # Skip mirror targets — they have their own OS installations
+        local mount_role="${MOUNT_ROLES[$mnt]:-}"
+        if [[ "$mount_role" == "mirror" ]]; then
+            log_info "  [$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")] Skipping mirror target (independent OS)"
+            (( skipped += 1 ))
             continue
         fi
 
@@ -425,73 +429,9 @@ update_boot_subvolumes() {
     fi
 }
 
-sync_das_esp() {
-    if [[ "$DAS_ESP_ENABLED" != "true" ]]; then
-        log_info "ESP sync disabled in config — skipping"
-        record_op "esp_sync" "SKIP" "disabled"
-        return
-    fi
-
-    log_info "Syncing ESP to DAS backup drives..."
-
-    local esp_source="/boot"
-    local esp_ok=0 esp_fail=0 esp_total=0
-
-    # Discover ESP partitions from mirror targets (partition 1 of each discovered device)
-    for label in "${!TARGET_ROLES[@]}"; do
-        [[ "${TARGET_ROLES[$label]}" == "mirror" ]] || continue
-        local dev="${DISCOVERED_DEVICES[$label]:-}"
-        [[ -n "$dev" ]] || continue
-
-        local esp_part="${dev}1"
-        (( esp_total += 1 ))
-
-        if [[ ! -b "$esp_part" ]]; then
-            log_warn "ESP partition $esp_part not found for $label — skipping"
-            (( esp_fail += 1 ))
-            continue
-        fi
-
-        local mount_point="/mnt/das-esp-${label}"
-        mkdir -p "$mount_point"
-
-        if ! mountpoint -q "$mount_point"; then
-            mount "$esp_part" "$mount_point" 2>/dev/null || {
-                log_warn "Could not mount ESP $esp_part at $mount_point"
-                (( esp_fail += 1 ))
-                continue
-            }
-        fi
-
-        if rsync -aHAX --delete \
-            --exclude='loader/random-seed' \
-            "$esp_source/" "$mount_point/" 2>/dev/null; then
-            log_info "  Synced ESP to $esp_part ($label)"
-            (( esp_ok += 1 ))
-        else
-            log_warn "  ESP sync to $esp_part failed"
-            (( esp_fail += 1 ))
-        fi
-
-        umount "$mount_point" 2>/dev/null || true
-    done
-
-    if (( esp_total == 0 )); then
-        log_info "  No mirror targets discovered — no ESP sync needed"
-        record_op "esp_sync" "SKIP" "no mirror targets"
-    elif (( esp_fail > 0 )); then
-        record_op "esp_sync" "FAIL" "$esp_ok of $esp_total synced, $esp_fail failed"
-    else
-        record_op "esp_sync" "OK" "$esp_ok of $esp_total ESPs synced"
-    fi
-}
-
 unmount_all() {
     log_info "Unmounting volumes..."
 
-    for esp in "${MOUNT_DAS_ESP[@]}"; do
-        umount "$esp" 2>/dev/null || true
-    done
     # Unmount targets in reverse order (0-based indexing)
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
         umount "${ALL_TARGET_MOUNTS[$i]}" 2>/dev/null || true
@@ -752,7 +692,6 @@ BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
-  ESP mirror            ${OP_STATUS[esp_sync]:-N/A}  (${OP_STATUS[esp_sync_detail]:-n/a})
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
 
 THROUGHPUT
@@ -1097,7 +1036,6 @@ main() {
         capture_usage "after"
         log_throughput
         update_boot_subvolumes "$force_full"
-        sync_das_esp
         show_stats
         run_indexer
 

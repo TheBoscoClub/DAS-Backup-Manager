@@ -584,220 +584,7 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
         .map(|v| (v * mult as f64) as u64)
 }
 
-/// Sync the ESP (EFI System Partition) from `/boot` to DAS mirror targets.
-///
-/// Discovers ESP partitions dynamically by looking for partition 1 on each
-/// mirror/system target's device (resolved from serial number).  This avoids
-/// hardcoded device paths that change between reboots.
-fn sync_esp(config: &Config, progress: &dyn ProgressCallback, errors: &mut Vec<String>) {
-    // Source is always the live ESP at /boot.
-    let source_mount = if !config.esp.mount_points.is_empty() {
-        &config.esp.mount_points[0]
-    } else {
-        "/boot"
-    };
-
-    // Ensure the source ESP is mounted.  CachyOS doesn't keep it
-    // persistently mounted, so automated backups may find /boot showing
-    // the root FS instead of the ESP.
-    let source_esp_mounted = Command::new("mountpoint")
-        .args(["-q", source_mount])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    let did_mount_source = if !source_esp_mounted {
-        // Try mounting via fstab (which uses LABEL=EFI).
-        match Command::new("mount").arg(source_mount).output() {
-            Ok(output) if output.status.success() => {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("ESP sync: mounted source ESP at {source_mount}"),
-                );
-                true
-            }
-            _ => {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "ESP sync: source ESP not mounted at {source_mount} and mount failed — skipping"
-                    ),
-                );
-                return;
-            }
-        }
-    } else {
-        false
-    };
-
-    // Discover mirror targets that have ESP partitions.
-    let mirror_targets: Vec<_> = config
-        .targets
-        .iter()
-        .filter(|t| matches!(t.role, crate::config::TargetRole::Mirror))
-        .collect();
-
-    if mirror_targets.is_empty() {
-        progress.on_log(
-            LogLevel::Info,
-            "ESP sync: no mirror/system targets configured — skipping",
-        );
-        if did_mount_source {
-            let _ = Command::new("umount").arg(source_mount).status();
-        }
-        return;
-    }
-
-    progress.on_log(
-        LogLevel::Info,
-        &format!(
-            "ESP sync: updating kernel/initramfs on {} emergency target(s)",
-            mirror_targets.len()
-        ),
-    );
-
-    let mut ok = 0usize;
-    let mut fail = 0usize;
-
-    for target in &mirror_targets {
-        // Resolve serial → block device.
-        let (device, _is_usb) = match health::device_info_from_serial(&target.serial) {
-            Some(info) => info,
-            None => {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "ESP sync: cannot find device for target '{}' (serial {})",
-                        target.label, target.serial
-                    ),
-                );
-                fail += 1;
-                continue;
-            }
-        };
-
-        // ESP is partition 1 of the device.
-        let esp_part = format!("{device}1");
-        if !std::path::Path::new(&esp_part).exists() {
-            progress.on_log(
-                LogLevel::Info,
-                &format!(
-                    "ESP sync: target '{}' device {device} has no partition 1 — skipping",
-                    target.label
-                ),
-            );
-            continue;
-        }
-
-        let mount_point = format!("/mnt/das-esp-{}", target.label);
-        let _ = Command::new("mkdir").args(["-p", &mount_point]).status();
-
-        // Mount if not already mounted.
-        let is_mounted = Command::new("mountpoint")
-            .arg("-q")
-            .arg(&mount_point)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        let did_mount = if !is_mounted {
-            match Command::new("mount")
-                .arg(&esp_part)
-                .arg(&mount_point)
-                .output()
-            {
-                Ok(output) if output.status.success() => true,
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    progress.on_log(
-                        LogLevel::Warning,
-                        &format!(
-                            "ESP sync: mount {esp_part} → {mount_point} failed: {}",
-                            stderr.trim()
-                        ),
-                    );
-                    fail += 1;
-                    continue;
-                }
-                Err(e) => {
-                    progress.on_log(
-                        LogLevel::Warning,
-                        &format!("ESP sync: failed to execute mount: {e}"),
-                    );
-                    fail += 1;
-                    continue;
-                }
-            }
-        } else {
-            false
-        };
-
-        // Sync ONLY kernel, initramfs, and microcode files.
-        //
-        // Emergency boot targets have their own independent CachyOS
-        // installation with their own loader/entries/ pointing to their
-        // own @rescue subvolume.  We must NEVER overwrite their boot
-        // entries or use --delete (which would remove their files).
-        //
-        // We only update the kernel + initramfs so they stay current
-        // with the main system's kernel updates.
-        let source_with_slash = format!("{source_mount}/");
-        let dest_with_slash = format!("{mount_point}/");
-        let rsync_result = Command::new("rsync")
-            .args([
-                "-aHAX",
-                "--include=vmlinuz-*",
-                "--include=initramfs-*",
-                "--include=amd-ucode.img",
-                "--include=intel-ucode.img",
-                "--exclude=*",
-                &source_with_slash,
-                &dest_with_slash,
-            ])
-            .output();
-
-        match rsync_result {
-            Ok(output) if output.status.success() => {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!(
-                        "ESP sync: updated kernel/initramfs on '{}' ({esp_part})",
-                        target.label
-                    ),
-                );
-                ok += 1;
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let msg = format!("ESP sync: rsync to {mount_point} failed: {}", stderr.trim());
-                progress.on_log(LogLevel::Warning, &msg);
-                errors.push(msg);
-                fail += 1;
-            }
-            Err(e) => {
-                let msg = format!("ESP sync: failed to execute rsync: {e}");
-                progress.on_log(LogLevel::Warning, &msg);
-                errors.push(msg);
-                fail += 1;
-            }
-        }
-
-        // Unmount if we mounted it.
-        if did_mount {
-            let _ = Command::new("umount").arg(&mount_point).status();
-        }
-    }
-
-    progress.on_log(
-        LogLevel::Info,
-        &format!("ESP sync complete: {ok} synced, {fail} failed"),
-    );
-
-    // Unmount the source ESP if we mounted it.
-    if did_mount_source {
-        let _ = Command::new("umount").arg(source_mount).status();
-    }
-}
+// sync_esp() removed 2026-04-12 — see .claude/rules/das-esp-safety.md.
 
 /// Best-effort parse of a size from a btrbk `>>>` or `***` output line.
 ///
@@ -1370,11 +1157,6 @@ pub fn run_backup(
         }
     }
 
-    // Step (c2): ESP sync — mirror /boot to DAS ESP partitions (both modes)
-    if config.esp.enabled && config.esp.mirror {
-        sync_esp(config, progress, &mut errors);
-    }
-
     // Step (d): Index — walk each target's mount path to pick up new snapshots.
     if options.index_after {
         match Database::open(&config.general.db_path) {
@@ -1527,7 +1309,7 @@ pub fn run_backup(
 mod tests {
     use super::*;
     use crate::config::{
-        Boot, Config, Das, Email, Esp, General, Gui, Init, InitSystem, Retention, Schedule, Source,
+        Boot, Config, Das, Email, General, Gui, Init, InitSystem, Retention, Schedule, Source,
         SubvolConfig, Target, TargetRole,
     };
     use crate::progress::TestProgress;
@@ -1607,7 +1389,6 @@ mod tests {
                 },
                 display_name: "Test 22TB".into(),
             }],
-            esp: Esp::default(),
             email: Email::default(),
             gui: Gui::default(),
         }

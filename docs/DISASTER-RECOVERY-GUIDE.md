@@ -18,8 +18,18 @@ This guide is written for users with minimal technical experience. Follow each s
    - [Scenario B: Both NVMe Drives Failed](#scenario-b-both-nvme-drives-failed)
    - [Scenario C: Complete System Replacement](#scenario-c-complete-system-replacement)
 5. [Step-by-Step Recovery Procedures](#step-by-step-recovery-procedures)
-6. [Troubleshooting](#troubleshooting)
-7. [Reference Information](#reference-information)
+6. [Common Boot Repairs](#common-boot-repairs)
+   - [Reset a Forgotten Root Password](#reset-a-forgotten-root-password)
+   - [Fix a Broken /etc/fstab](#fix-a-broken-etcfstab)
+   - [Fix a Broken Bootloader or Missing Kernel](#fix-a-broken-bootloader-or-missing-kernel)
+   - [Fix a Systemd Service That Hangs Boot](#fix-a-systemd-service-that-hangs-boot)
+   - [Fix a Read-Only Root Filesystem](#fix-a-read-only-root-filesystem)
+7. [Restoring Individual Files and Subvolumes](#restoring-individual-files-and-subvolumes)
+   - [Browse Backup Snapshots](#browse-backup-snapshots)
+   - [Restore a Single File](#restore-a-single-file)
+   - [Restore an Entire Subvolume](#restore-an-entire-subvolume)
+8. [Troubleshooting](#troubleshooting)
+9. [Reference Information](#reference-information)
 
 ---
 
@@ -378,6 +388,452 @@ Follow the [Full System Restoration](#full-system-restoration) procedure, then:
 
 ---
 
+## Common Boot Repairs
+
+These procedures fix the most common reasons a Linux system won't boot. In every case, you boot from this recovery drive first, then fix the broken system from the outside.
+
+### Preparation: Mount the Broken System
+
+Before any repair below, you need to mount the broken system's root filesystem. These steps are the same for all repairs:
+
+```bash
+# 1. Find the broken system's drive
+lsblk -f
+# Look for the BTRFS partition with your system's UUID or label
+
+# 2. Mount it
+sudo mkdir -p /mnt/broken
+sudo mount -o subvol=@ /dev/<broken-system-partition> /mnt/broken
+
+# 3. If you also need to fix boot files, mount the ESP
+sudo mount /dev/<broken-system-esp> /mnt/broken/boot
+
+# 4. For operations that need a running system (mkinitcpio, passwd, systemctl),
+#    set up a chroot:
+sudo mount --bind /dev  /mnt/broken/dev
+sudo mount --bind /proc /mnt/broken/proc
+sudo mount --bind /sys  /mnt/broken/sys
+sudo mount --bind /run  /mnt/broken/run
+sudo chroot /mnt/broken
+```
+
+When you are done with any repair, exit the chroot and unmount:
+```bash
+exit                          # leave chroot
+sudo umount -R /mnt/broken    # unmount everything
+sudo reboot
+```
+
+---
+
+### Reset a Forgotten Root Password
+
+**Symptoms**: You cannot log in as root or use `sudo`. No system damage -- you just need the password reset.
+
+**When booted from this recovery drive:**
+
+1. Mount the broken system and enter chroot (see [Preparation](#preparation-mount-the-broken-system) above)
+
+2. **Reset the root password**:
+   ```bash
+   passwd root
+   ```
+   Type the new password twice when prompted. There is no output while typing -- this is normal.
+
+3. **If you also need to reset a user password**:
+   ```bash
+   passwd <username>
+   ```
+
+4. **If sudo is broken** (user removed from wheel group, sudoers corrupted):
+   ```bash
+   # Add user back to wheel group
+   usermod -aG wheel <username>
+
+   # Or fix sudoers (this opens a safe editor that checks syntax)
+   visudo
+   # Make sure this line exists and is NOT commented out:
+   #   %wheel ALL=(ALL:ALL) ALL
+   ```
+
+5. Exit chroot, unmount, reboot.
+
+---
+
+### Fix a Broken /etc/fstab
+
+**Symptoms**: System starts booting but hangs or drops to an emergency shell with messages like:
+- "A dependency job for local-fs.target failed"
+- "You are in emergency mode"
+- "Failed to mount /home" or any other mount point
+- "Timed out waiting for device"
+
+**When booted from this recovery drive:**
+
+1. Mount the broken system (see [Preparation](#preparation-mount-the-broken-system) above). You do NOT need a full chroot for this repair -- just mount the root filesystem.
+
+2. **Look at the current fstab**:
+   ```bash
+   cat /mnt/broken/etc/fstab
+   ```
+
+3. **Identify the problem**. Common issues:
+   - **Wrong UUID**: A drive was replaced and the UUID changed
+   - **Missing drive**: An entry references a drive that no longer exists
+   - **Typo in mount options**: A misspelled option prevents mounting
+   - **Wrong subvolume name**: BTRFS subvolume was renamed or deleted
+
+4. **Get the correct UUIDs**:
+   ```bash
+   # Show all detected filesystems with UUIDs
+   blkid
+
+   # Show block devices with filesystem info
+   lsblk -f
+   ```
+
+5. **Edit the fstab**:
+   ```bash
+   sudo nano /mnt/broken/etc/fstab
+   ```
+
+   **Key rules**:
+   - Every `UUID=` must match an actual device from `blkid` output
+   - If a drive is gone and you don't have a replacement, **comment out the line** by putting `#` at the start
+   - The root (`/`) entry MUST be correct or the system will not boot at all
+   - Check that `subvol=` names match actual BTRFS subvolumes:
+     ```bash
+     sudo btrfs subvolume list /mnt/broken
+     ```
+
+6. **Save the file** (in nano: Ctrl+O, Enter, Ctrl+X) and unmount:
+   ```bash
+   sudo umount /mnt/broken
+   sudo reboot
+   ```
+
+**Tip**: If you are unsure what the fstab should look like, you can generate a fresh one:
+```bash
+genfstab -U /mnt/broken
+```
+This prints what fstab SHOULD contain based on currently mounted filesystems. Compare it to the existing file and fix discrepancies.
+
+---
+
+### Fix a Broken Bootloader or Missing Kernel
+
+**Symptoms**:
+- "No bootable device found"
+- Bootloader menu appears but selecting an entry fails
+- "vmlinuz not found" or "initramfs not found"
+- Boot drops to a `systemd-boot` error or GRUB rescue shell
+
+**When booted from this recovery drive:**
+
+1. Mount the broken system AND its ESP, then enter chroot (see [Preparation](#preparation-mount-the-broken-system) above)
+
+2. **Check what's on the ESP**:
+   ```bash
+   ls /boot/
+   # You should see: vmlinuz-linux-*, initramfs-linux-*, amd-ucode.img or intel-ucode.img, EFI/, loader/
+   ```
+
+3. **If kernel files are missing**, reinstall the kernel:
+   ```bash
+   # CachyOS/Arch:
+   pacman -S linux-cachyos    # or whichever kernel package you use
+   # This reinstalls the kernel AND regenerates initramfs
+
+   # Debian/Ubuntu:
+   apt install --reinstall linux-image-$(uname -r)
+   update-initramfs -u
+   ```
+
+4. **If boot entries are missing or wrong** (systemd-boot):
+   ```bash
+   # List current entries
+   ls /boot/loader/entries/
+
+   # If empty or corrupt, reinstall systemd-boot
+   bootctl install
+
+   # Then create a boot entry (CachyOS example):
+   cat > /boot/loader/entries/linux-cachyos.conf << 'ENTRY'
+   title   CachyOS
+   linux   /vmlinuz-linux-cachyos
+   initrd  /amd-ucode.img
+   initrd  /initramfs-linux-cachyos.img
+   options root=UUID=<your-root-uuid> rw rootflags=subvol=/@
+   ENTRY
+   ```
+   Replace `<your-root-uuid>` with your actual root partition UUID from `blkid`.
+
+5. **If initramfs is corrupt or missing**, regenerate it:
+   ```bash
+   # CachyOS/Arch:
+   mkinitcpio -P     # regenerates ALL initramfs images
+
+   # Debian/Ubuntu:
+   update-initramfs -u -k all
+   ```
+
+6. **Register the UEFI boot entry** (if BIOS doesn't see the drive):
+   ```bash
+   efibootmgr --create --disk /dev/<drive> --part <esp-number> \
+     --loader '\EFI\systemd\systemd-bootx64.efi' \
+     --label "CachyOS" --unicode
+   ```
+
+7. Exit chroot, unmount, reboot.
+
+---
+
+### Fix a Systemd Service That Hangs Boot
+
+**Symptoms**:
+- Boot freezes at "A start job is running for ..." and never finishes
+- Boot hangs for 90+ seconds, then drops to a degraded shell
+- System boots but critical services (networking, display manager) are broken
+
+**When booted from this recovery drive:**
+
+1. Mount the broken system and enter chroot (see [Preparation](#preparation-mount-the-broken-system) above)
+
+2. **Find the failing service**. If you saw the service name on screen during the hang, use that. Otherwise:
+   ```bash
+   # List services that failed on last boot
+   systemctl --root=/mnt/broken list-units --state=failed
+
+   # Or from inside chroot:
+   journalctl -b -1 -p err    # errors from last boot
+   ```
+
+3. **Disable the problem service** so the system can boot:
+   ```bash
+   # From inside chroot:
+   systemctl disable <service-name>
+
+   # Or without chroot, by removing the symlink directly:
+   rm /mnt/broken/etc/systemd/system/multi-user.target.wants/<service-name>.service
+   ```
+
+4. **Common problem services and fixes**:
+
+   | Service | Common Cause | Fix |
+   |---------|-------------|-----|
+   | `NetworkManager-wait-online` | Waiting for a network that doesn't exist | `systemctl disable NetworkManager-wait-online` |
+   | Any `.mount` unit | Corresponds to an fstab entry | Fix fstab (see [above](#fix-a-broken-etcfstab)) |
+   | `lvm2-*` or `mdadm*` | RAID/LVM array missing a device | Comment out the array in `/etc/mdadm.conf` or `/etc/lvm/lvm.conf` |
+   | Display manager (sddm, gdm) | GPU driver issue | `systemctl disable sddm` then boot to TTY and fix drivers |
+
+5. **If you need to edit a service file**:
+   ```bash
+   nano /mnt/broken/etc/systemd/system/<service-name>.service
+   # Or find the upstream file:
+   nano /mnt/broken/usr/lib/systemd/system/<service-name>.service
+   ```
+   To override without editing the original, create a drop-in:
+   ```bash
+   mkdir -p /mnt/broken/etc/systemd/system/<service-name>.service.d/
+   cat > /mnt/broken/etc/systemd/system/<service-name>.service.d/override.conf << 'EOF'
+   [Service]
+   TimeoutStartSec=10
+   EOF
+   ```
+
+6. Exit chroot, unmount, reboot. Once the system is up, investigate and fix the root cause, then re-enable the service.
+
+---
+
+### Fix a Read-Only Root Filesystem
+
+**Symptoms**:
+- "Read-only file system" errors when trying to save files or install packages
+- System boots but nothing can be written to disk
+- BTRFS errors in `dmesg` output
+
+**When booted from this recovery drive:**
+
+1. **First, check if the filesystem has errors**:
+   ```bash
+   # Find the broken system's BTRFS partition
+   lsblk -f
+
+   # Run a read-only check (safe, does not modify anything)
+   sudo btrfs check --readonly /dev/<partition>
+   ```
+
+2. **If no errors found**, the filesystem may have been mounted read-only by the kernel due to a minor issue. Try:
+   ```bash
+   sudo mount -o remount,rw /dev/<partition> /mnt/broken
+   ```
+   If this works, the issue was transient. Reboot the system and see if it persists.
+
+3. **If errors are found**, you have two options:
+
+   **Option A — Restore from backup** (recommended, safest):
+   - Follow [Restore an Entire Subvolume](#restore-an-entire-subvolume) to replace the corrupted subvolume with a known-good backup snapshot.
+
+   **Option B — Attempt repair** (risky, last resort):
+   ```bash
+   # WARNING: --repair can make things worse. Only use if you have no backup
+   # or the backup is also corrupted.
+   sudo btrfs check --repair /dev/<partition>
+   ```
+
+4. **If the drive has SMART errors**, it may be physically failing:
+   ```bash
+   sudo smartctl -a /dev/<drive>
+   # Look for "Reallocated_Sector_Ct" or "Current_Pending_Sector" > 0
+   ```
+   If the drive is failing, replace it immediately. See [Scenario A](#scenario-a-single-nvme-drive-failure) or [Scenario B](#scenario-b-both-nvme-drives-failed).
+
+---
+
+## Restoring Individual Files and Subvolumes
+
+You don't always need a full system restore. Often you just need one file you accidentally deleted, or you need to roll back a subvolume to an earlier state.
+
+### Browse Backup Snapshots
+
+Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot is a frozen copy of a subvolume at a specific point in time.
+
+1. **Mount the backup drive** (if not already mounted):
+   ```bash
+   sudo mkdir -p /mnt/backup
+   sudo mount /dev/<backup-partition> /mnt/backup
+   ```
+
+2. **List available snapshots**:
+   ```bash
+   # Show all subvolumes (snapshots are subvolumes)
+   sudo btrfs subvolume list /mnt/backup | sort -k9
+
+   # Example output:
+   # ID 419 gen 763 top level 5 path nvme/root.20260228T0300
+   # ID 420 gen 766 top level 5 path nvme/root.20260302T0828
+   # ID 485 gen 1038 top level 5 path nvme/root.20260305T0809
+   # ...
+   ```
+   The date is in the name: `root.20260302T0828` = root snapshot from March 2, 2026, 8:28 AM.
+
+3. **Browse a specific snapshot**:
+   ```bash
+   # Mount a snapshot read-only
+   sudo mkdir -p /mnt/snapshot
+   sudo mount -o subvol=nvme/root.20260302T0828,ro /dev/<backup-partition> /mnt/snapshot
+
+   # Now browse it like a normal filesystem
+   ls /mnt/snapshot/etc/
+   ls /mnt/snapshot/home/
+   cat /mnt/snapshot/etc/fstab
+   ```
+
+4. **Use the GUI file manager** (if in graphical mode):
+   - Open Dolphin
+   - Navigate to `/mnt/snapshot`
+   - Browse, search, and preview files normally
+
+5. **When done, unmount**:
+   ```bash
+   sudo umount /mnt/snapshot
+   ```
+
+### Restore a Single File
+
+1. Mount the backup snapshot that contains the file version you want (see above).
+
+2. **Copy the file to the live system**:
+   ```bash
+   # Example: restore a deleted config file
+   sudo cp /mnt/snapshot/etc/important.conf /mnt/broken/etc/important.conf
+
+   # Example: restore a file from home directory
+   sudo cp /mnt/snapshot/home/bosco/Documents/thesis.odt /mnt/broken/home/bosco/Documents/
+
+   # Preserve permissions and ownership
+   sudo cp -a /mnt/snapshot/path/to/file /mnt/broken/path/to/file
+   ```
+
+3. **To find which snapshot contains a specific file** (if you don't know the date):
+   ```bash
+   # Search across multiple snapshots
+   for snap in /mnt/backup/nvme/root.*/; do
+     if [ -f "${snap}path/to/file" ]; then
+       echo "Found in: $snap"
+       ls -la "${snap}path/to/file"
+     fi
+   done
+   ```
+
+4. **To search by filename** (if you don't remember the exact path):
+   ```bash
+   # Search inside a single snapshot
+   find /mnt/snapshot -name "thesis*" 2>/dev/null
+
+   # Or use the btrdasd search tool (if installed)
+   btrdasd search "thesis"
+   ```
+
+### Restore an Entire Subvolume
+
+Use this when you want to roll back an entire subvolume (root, home, etc.) to a previous state.
+
+**Method 1: BTRFS send/receive (fast, preserves BTRFS metadata)**
+
+```bash
+# 1. Mount backup drive
+sudo mount /dev/<backup-partition> /mnt/backup
+
+# 2. Mount the target where you want to restore
+sudo mount /dev/<target-partition> /mnt/target
+
+# 3. Rename the current (broken) subvolume
+sudo mv /mnt/target/@ /mnt/target/@.broken
+
+# 4. Send the backup snapshot to the target
+#    (This is a fast BTRFS-native operation, not a file copy)
+sudo btrfs send /mnt/backup/nvme/root.20260302T0828 | sudo btrfs receive /mnt/target/
+
+# 5. Rename the received snapshot to @
+sudo mv /mnt/target/root.20260302T0828 /mnt/target/@
+
+# 6. Make it writable (snapshots are read-only by default)
+sudo btrfs property set /mnt/target/@ ro false
+
+# 7. IMPORTANT: Update /etc/fstab in the restored subvolume
+#    The backup snapshot's fstab has the UUIDs from when it was taken.
+#    If you're restoring to different drives, update the UUIDs.
+sudo nano /mnt/target/@/etc/fstab
+
+# 8. Clean up: delete the broken subvolume (when you're sure the restore works)
+sudo btrfs subvolume delete /mnt/target/@.broken
+
+# 9. Unmount
+sudo umount /mnt/target /mnt/backup
+```
+
+**Method 2: rsync (slower but works across filesystem types)**
+
+```bash
+# Mount source snapshot and target
+sudo mount -o subvol=nvme/root.20260302T0828,ro /dev/<backup-partition> /mnt/snapshot
+sudo mount -o subvol=@ /dev/<target-partition> /mnt/target
+
+# Sync (--delete removes files that don't exist in the snapshot)
+sudo rsync -aAXHv --delete --info=progress2 /mnt/snapshot/ /mnt/target/
+
+# Unmount
+sudo umount /mnt/snapshot /mnt/target
+```
+
+**Important**: After restoring a root subvolume, always check and update:
+- `/etc/fstab` — UUIDs may not match current drives
+- Boot entries in `/boot/loader/entries/` — root UUID must be correct
+- Regenerate initramfs: `arch-chroot /mnt/target && mkinitcpio -P`
+
+---
+
 ## Troubleshooting
 
 ### "No bootable device" after selecting DAS
@@ -511,4 +967,4 @@ btrdasd config show
 
 ---
 
-*Backup system version: 0.7.11*
+*Backup system version: 0.7.12*

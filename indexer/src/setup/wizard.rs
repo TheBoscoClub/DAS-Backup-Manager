@@ -23,7 +23,6 @@ pub fn run_wizard(
     step_dependencies(sys)?;
     step_subvolumes(sys, &mut config)?;
     step_targets(sys, &mut config)?;
-    step_esp(sys, &mut config)?;
     step_retention(&mut config)?;
     step_scheduling(sys, &mut config)?;
     step_email(&mut config)?;
@@ -423,7 +422,7 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
             .with_prompt("Mount point (e.g. /mnt/backup-22tb)")
             .interact_text()?;
 
-        let role_choices = vec!["primary", "mirror", "esp-sync"];
+        let role_choices = vec!["primary", "mirror"];
         let role_idx = Select::new()
             .with_prompt("Target role")
             .items(&role_choices)
@@ -431,8 +430,7 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
             .interact()?;
         let role = match role_idx {
             0 => TargetRole::Primary,
-            1 => TargetRole::Mirror,
-            _ => TargetRole::EspSync,
+            _ => TargetRole::Mirror,
         };
 
         let weekly: u32 = Input::new()
@@ -468,122 +466,10 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Step 4: ESP (EFI System Partition)
-// ---------------------------------------------------------------------------
-
-fn step_esp(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "\n{} {}",
-        style("[4/10]").bold().cyan(),
-        style("EFI System Partition (ESP) Backup").bold()
-    );
-
-    // Show ESP candidates
-    let esp_candidates: Vec<&BlockDevice> = sys
-        .devices
-        .iter()
-        .filter(|d| d.is_esp_candidate())
-        .collect();
-
-    if !esp_candidates.is_empty() {
-        println!("\n  Detected ESP candidates:");
-        for dev in &esp_candidates {
-            println!(
-                "    {} /dev/{} ({} vfat)",
-                style("•").dim(),
-                dev.name,
-                dev.size,
-            );
-        }
-    }
-
-    let enable_esp = Confirm::new()
-        .with_prompt("Back up ESP?")
-        .default(!esp_candidates.is_empty())
-        .interact()?;
-
-    if enable_esp {
-        config.esp.enabled = true;
-
-        // Auto-populate from detected candidates
-        if !esp_candidates.is_empty() {
-            config.esp.partitions = esp_candidates
-                .iter()
-                .map(|d| format!("/dev/{}", d.name))
-                .collect();
-            // Provide default mount points
-            config.esp.mount_points = if esp_candidates.len() == 1 {
-                vec!["/efi".to_string()]
-            } else {
-                esp_candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| {
-                        if i == 0 {
-                            "/efi".to_string()
-                        } else {
-                            format!("/efi{}", i + 1)
-                        }
-                    })
-                    .collect()
-            };
-
-            println!("  Auto-detected: {}", config.esp.partitions.join(", "));
-        } else {
-            let parts_str: String = Input::new()
-                .with_prompt("ESP partitions (comma-separated, e.g. /dev/nvme0n1p1)")
-                .interact_text()?;
-            config.esp.partitions = parts_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mounts_str: String = Input::new()
-                .with_prompt("ESP mount points (comma-separated, e.g. /efi)")
-                .default("/efi".to_string())
-                .interact_text()?;
-            config.esp.mount_points = mounts_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-
-        // Mirror if >1 partition
-        if config.esp.partitions.len() > 1 {
-            config.esp.mirror = Confirm::new()
-                .with_prompt("Enable ESP mirroring between partitions?")
-                .default(true)
-                .interact()?;
-        }
-
-        // ESP sync hook generation removed 2026-04-10 — see das-esp-safety.md.
-        // NVMe-pair ESP mirroring is handled by a separate mechanism outside
-        // this project; this wizard no longer offers to install any ESP hook.
-    } else {
-        config.esp.enabled = false;
-    }
-
-    println!(
-        "\n  {} ESP: {}",
-        style("✓").green().bold(),
-        if config.esp.enabled {
-            let parts = config.esp.partitions.join(", ");
-            format!(
-                "enabled ({}{})",
-                parts,
-                if config.esp.mirror { " + mirror" } else { "" }
-            )
-        } else {
-            "disabled".to_string()
-        }
-    );
-    Ok(())
-}
+// step_esp() removed 2026-04-12 — see .claude/rules/das-esp-safety.md.
 
 // ---------------------------------------------------------------------------
-// Step 5: Retention
+// Step 4: Retention
 // ---------------------------------------------------------------------------
 
 fn step_retention(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -899,7 +785,6 @@ fn step_review(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         let role_str = match tgt.role {
             TargetRole::Primary => "primary",
             TargetRole::Mirror => "mirror",
-            TargetRole::EspSync => "esp-sync",
         };
         println!(
             "    {} {} [{}] role={}",
@@ -912,15 +797,6 @@ fn step_review(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             "      mount: {}, retention: {}w {}m",
             tgt.mount, tgt.retention.weekly, tgt.retention.monthly
         );
-    }
-
-    // ESP
-    println!("\n  {}:", style("ESP").bold());
-    if config.esp.enabled {
-        println!("    partitions: {}", config.esp.partitions.join(", "));
-        println!("    mirror: {}", config.esp.mirror);
-    } else {
-        println!("    disabled");
     }
 
     // Schedule
