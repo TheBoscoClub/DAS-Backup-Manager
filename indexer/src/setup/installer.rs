@@ -231,7 +231,7 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
         println!("No manifest found. Files may be from a manual install.");
     }
 
-    let deps = crate::setup::detect::check_dependencies(config.email.enabled, config.esp.mirror);
+    let deps = crate::setup::detect::check_dependencies(config.email.enabled);
     for dep in &deps {
         if let Some(path) = &dep.path {
             println!("{} ({})", dep.name, path);

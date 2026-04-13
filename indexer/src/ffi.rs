@@ -503,8 +503,6 @@ mount = "/mnt/t"
 role = "primary"
 [target.retention]
 weekly = 4
-[esp]
-enabled = false
 [email]
 enabled = false
 [gui]
