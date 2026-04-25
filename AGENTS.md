@@ -1,39 +1,40 @@
-# DAS-Backup-Manager
+# Agent Instructions
 
-DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasma GUI.
+This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
-## Project Rules
-
-- **PUBLIC REPO** — TheBoscoClub/DAS-Backup-Manager on GitHub. Push allowed.
-- **Rust** — Library (`buttered_dasd`) + CLI (`btrdasd`): Rust 2024 edition, rusqlite 0.38 (bundled FTS5), clap 4.5, walkdir 2.5
-- **C++20** — GUI (`btrdasd-gui`): Qt6 6.10.2, KF6 6.23.0, CMake 4.2.3
-- **BTRFS RAID-1** — Backup targets on HDD RAID-1 and DAS enclosure
-
-## Key Paths
-
-- **Backup DB**: `/var/lib/das-backup/backup-index.db`
-- **btrbk config**: `/etc/btrbk/btrbk.conf`
-- **Email config**: `/etc/das-backup-email.conf`
-- **Growth log**: `/var/lib/das-backup/growth.log`
-
-## Build
+## Quick Reference
 
 ```bash
-# Indexer (Rust)
-cd indexer && cargo build --release && cargo test
-
-# Scripts/systemd (CMake)
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work atomically
+bd close <id>         # Complete work
+bd dolt push          # Push beads data to remote
 ```
 
-## Detailed Rules
+## Non-Interactive Shell Commands
 
-See `.claude/rules/` for project-specific rules:
-- `esp-safety.md` — **CRITICAL** — DAS ESP partition safety (never sync host ESP onto DAS drives)
-- `build.md` — CMake, Qt6/KF6, C++20 build conventions
-- `backup.md` — btrbk, DAS, retention, boot archival
+**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
 
+Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+
+**Use these forms instead:**
+```bash
+# Force overwrite without prompting
+cp -f source dest           # NOT: cp source dest
+mv -f source dest           # NOT: mv source dest
+rm -f file                  # NOT: rm file
+
+# For recursive operations
+rm -rf directory            # NOT: rm -r directory
+cp -rf source dest          # NOT: cp -r source dest
+```
+
+**Other commands that may prompt:**
+- `scp` - use `-o BatchMode=yes` for non-interactive
+- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
+- `apt-get` - use `-y` flag
+- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker

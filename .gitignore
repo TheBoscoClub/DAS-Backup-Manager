@@ -212,6 +212,7 @@ junit*.xml
 # TEMPORARY & CACHE
 *.tmp
 *.temp
+*.lock
 .cache/
 .temp/
 tmp/
@@ -244,3 +245,7 @@ Dockerfile
 # Claude Code workflow files
 .claude/hookify.*.local.md
 .btrbk-snapshots/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
