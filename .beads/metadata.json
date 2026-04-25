@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "DAS_Backup_Manager",
+  "project_id": "19a88916-2236-4ef5-8a31-f3c755eb2734"
+}
