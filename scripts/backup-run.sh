@@ -356,10 +356,12 @@ update_boot_subvolumes() {
 
         local label
         label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
+        # `|| true` guards against `set -o pipefail` + `set -e` killing the run when
+        # grep finds zero matches — the empty-string check below is the intended path.
         local latest_root
-        latest_root=$(btrfs subvolume list "$mnt" | grep "nvme/root\." | awk '{print $NF}' | sort | tail -1)
+        latest_root=$(btrfs subvolume list "$mnt" 2>/dev/null | grep "nvme/root\." | awk '{print $NF}' | sort | tail -1) || true
         local latest_home
-        latest_home=$(btrfs subvolume list "$mnt" | grep "nvme/home\." | awk '{print $NF}' | sort | tail -1)
+        latest_home=$(btrfs subvolume list "$mnt" 2>/dev/null | grep "nvme/home\." | awk '{print $NF}' | sort | tail -1) || true
 
         if [[ -z "$latest_root" || -z "$latest_home" ]]; then
             log_warn "  [$label] No btrbk snapshots found, skipping"

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 ### Fixed
+- **`das-backup.service` exited 1 after every successful btrbk replication** — `update_boot_subvolumes()` in `scripts/backup-run.sh` ran two pipeline assignments per target (`latest_root=$(btrfs subvolume list "$mnt" | grep "nvme/root\." | awk … | sort | tail -1)` and the matching `latest_home`). On mirror targets the host only replicates `nvme/home.*`, never `nvme/root.*`, so `grep` returned 1, `set -o pipefail` propagated it, and `set -e` killed the script before the empty-string check on the next line could run. The failure happened silently on iter 2 of the loop, which is why the last log line was always iter 1's `@home exists, skipping` — making the symptom look like the skip itself was fatal. Fix: append `|| true` to both pipeline assignments so the empty-result branch (`[[ -z "$latest_root" || -z "$latest_home" ]]`) is reachable as originally intended. The mirror-skip guard added in `7f334a7` already covers this on a second axis once the rebuilt `btrdasd` binary is deployed (the script is embedded into the binary via `include_str!` at compile time, so a source-only update without rebuild has no effect)
 
 ## [0.7.12.2] - 2026-04-11
 
