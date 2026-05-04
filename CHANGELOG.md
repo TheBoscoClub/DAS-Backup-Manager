@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 ### Fixed
+
+## [0.7.12.3] - 2026-05-04
+
+### Changed
+- **Cargo dependency bumps via Dependabot** — `clap` 4.6.0→4.6.1, `clap_complete` 4.6.0→4.6.3, `libc` 0.2.184→0.2.186, `zbus` 5.14.0→5.15.0, `tokio` 1.51.0→1.52.1. All patch/minor; no behavioral changes; 136 tests pass on the new lockfile (PR #22)
+- **GitHub Actions runner bumps via Dependabot** — `softprops/action-gh-release` 2.6.1→3.0.0 and `actions/upload-artifact` 7.0.0→7.0.1, both moving to Node 24. Action interfaces unchanged (PRs #18, #19)
+- **`dependabot-auto-merge.yml` workflow repaired** — the workflow had pinned a non-existent SHA for `dependabot/fetch-metadata` (the comment said `v2.4.0` but the SHA below was a copy-paste mistake), causing every Dependabot PR's auto-merge job to fail since the pin landed. Bumped to `v3.1.0` with verified SHA so future Dependabot PRs auto-merge cleanly
+
+### Fixed
 - **`das-backup.service` exited 1 after every successful btrbk replication** — `update_boot_subvolumes()` in `scripts/backup-run.sh` ran two pipeline assignments per target (`latest_root=$(btrfs subvolume list "$mnt" | grep "nvme/root\." | awk … | sort | tail -1)` and the matching `latest_home`). On mirror targets the host only replicates `nvme/home.*`, never `nvme/root.*`, so `grep` returned 1, `set -o pipefail` propagated it, and `set -e` killed the script before the empty-string check on the next line could run. The failure happened silently on iter 2 of the loop, which is why the last log line was always iter 1's `@home exists, skipping` — making the symptom look like the skip itself was fatal. Fix: append `|| true` to both pipeline assignments so the empty-result branch (`[[ -z "$latest_root" || -z "$latest_home" ]]`) is reachable as originally intended. The mirror-skip guard added in `7f334a7` already covers this on a second axis once the rebuilt `btrdasd` binary is deployed (the script is embedded into the binary via `include_str!` at compile time, so a source-only update without rebuild has no effect)
 
 ## [0.7.12.2] - 2026-04-11
@@ -381,7 +390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.2...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.3...HEAD
+[0.7.12.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.2...v0.7.12.3
 [0.7.12.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.1...v0.7.12.2
 [0.7.12.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12...v0.7.12.1
 [0.7.12]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.11...v0.7.12

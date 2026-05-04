@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.12.2
+Version:        0.7.12.3
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 

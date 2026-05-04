@@ -1,3 +1,13 @@
+das-backup-manager (0.7.12.3-1) unstable; urgency=medium
+
+  * Fix das-backup.service exit-1 after successful btrbk replication
+    (set -o pipefail trap on grep no-match in update_boot_subvolumes)
+  * Bump cargo deps: clap, clap_complete, libc, zbus, tokio (PR #22)
+  * Bump GHA: softprops/action-gh-release v3, actions/upload-artifact v7.0.1
+  * Repair dependabot-auto-merge.yml workflow (stale fetch-metadata SHA)
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Mon, 04 May 2026 15:30:00 +0000
+
 das-backup-manager (0.7.12.2-1) unstable; urgency=medium
 
   * Fix debian Build .deb step shell: sh -e → bash ("Bad substitution" on ${var//-/\~})
