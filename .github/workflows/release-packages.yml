@@ -52,7 +52,7 @@ jobs:
           su builder -c 'cd packaging/arch && makepkg -sf --noconfirm'
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: arch-package
           path: packaging/arch/*.pkg.tar.zst
@@ -107,7 +107,7 @@ jobs:
           cp ../*.deb dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: debian-package
           path: dist/*.deb
@@ -149,7 +149,7 @@ jobs:
           find ~/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fedora-package
           path: dist/*.rpm
@@ -188,7 +188,7 @@ jobs:
         run: packaging/appimage/build-appimage.sh "${VERSION_TAG#v}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: appimage
           path: ButteredDASD-*.AppImage
@@ -216,7 +216,7 @@ jobs:
           bundle: ButteredDASD-GUI.flatpak
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: flatpak-bundle
           path: ButteredDASD-GUI.flatpak
