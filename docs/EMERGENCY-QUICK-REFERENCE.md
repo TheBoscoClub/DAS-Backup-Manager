@@ -92,6 +92,79 @@ sudo cp /mnt/snapshot/path/to/file /where/you/want/it
 sudo umount /mnt/snapshot /mnt/backup
 ```
 
+### One of the two 22TB backup drives failed (RAID-1 degraded)
+
+The two 22TB drives in bays 2 and 5 are a BTRFS RAID-1 pair. If one fails, your data is safe on the surviving drive — but you need to mount it specially and replace the failed drive.
+
+**1. Confirm the failure**
+```bash
+sudo btrfs filesystem show /mnt/backup-22tb
+# A line saying "*** Some devices missing" means one leg failed
+sudo btrfs device stats /mnt/backup-22tb
+# Look for a device with non-zero error counters
+```
+
+**2. Mount the surviving leg (degraded)**
+
+If `/mnt/backup-22tb` is not currently mounted (or won't mount normally):
+```bash
+sudo mkdir -p /mnt/backup-22tb
+sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+```
+
+The system's automatic backups already use `degraded` in their mount options, so the next nightly backup should run even with one drive missing. Email reports will warn loudly about the degraded state.
+
+**3. Replace the failed drive**
+
+Power down the DAS, swap in a new 22TB drive of equal or larger capacity (Seagate ST22000NM000C-3WC103 recommended for matching speed), power up.
+
+**4. Find the new drive's letter**
+```bash
+lsblk -o NAME,SIZE,SERIAL,TRAN
+# The new drive will have NO partitions and a different serial than ZXA0LMAE / ZXA1NYGZ
+```
+
+**5. Partition the new drive identically to the surviving one**
+```bash
+# Replace /dev/sdNEW with the new drive's letter
+sudo sgdisk --zap-all /dev/sdNEW
+sudo sgdisk --new=1:2048:42970644446 --typecode=1:8300 \
+    --change-name=1:das-backup-22tb /dev/sdNEW
+sudo partprobe /dev/sdNEW
+```
+
+**6. Replace the failed device in the BTRFS array**
+```bash
+# Get the missing devid from `btrfs filesystem show`
+sudo btrfs filesystem show /mnt/backup-22tb
+# Look for "devid X size Y path /dev/sd?1 MISSING" — note X
+
+# Start the replace (this can take 24-48 hours for 5+ TiB of data over USB)
+sudo btrfs replace start <missing-devid> /dev/sdNEW1 /mnt/backup-22tb
+
+# Watch progress
+sudo btrfs replace status /mnt/backup-22tb
+```
+
+**7. After replace completes — restore RAID-1 chunks that were written `single` while degraded**
+```bash
+# This balance moves any single-profile chunks back to RAID-1
+sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /mnt/backup-22tb
+
+# Then verify integrity
+sudo btrfs scrub start -B /mnt/backup-22tb
+sudo btrfs device stats /mnt/backup-22tb   # All counters should be 0
+```
+
+**8. Reset error counters and remount normally**
+```bash
+sudo btrfs device stats --reset /mnt/backup-22tb
+sudo umount /mnt/backup-22tb
+sudo mount UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+```
+
+For more detail, see `DISASTER-RECOVERY-GUIDE.md` section "Recovery: 22TB RAID-1 Backup Array Single-Leg Failure".
+
 ### Restore my entire system from backup
 
 See the full guide: `DISASTER-RECOVERY-GUIDE.md` section "Full System Restoration".
@@ -125,9 +198,17 @@ sudo btrfs filesystem show
 |------|-------|--------|------|
 | NVMe 1 (boot) | | | |
 | NVMe 2 (mirror) | | | |
-| DAS Bay 1 (2TB mirror) | das-backup-system-mirror | ZK208Q77 | |
-| DAS Bay 2 (22TB primary) | das-backup-22tb | ZXA0LMAE | |
-| DAS Bay 3 (2TB system) | das-backup-system | ZFL41DNY | |
+| DAS Bay 1 (2TB mirror, recovery) | das-backup-system-mirror | ZK208Q77 | 60b05268-7f8f-47b5-a38a-752576a1172a |
+| DAS Bay 2 (22TB primary, RAID-1 leg 1) | das-backup-22tb | ZXA0LMAE | 46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 |
+| DAS Bay 3 | (empty) | — | — |
+| DAS Bay 4 (2TB system, recovery) | das-backup-system | ZFL41DNY | 7c7ae72d-09d6-4086-b249-1ac60f21b73b |
+| DAS Bay 5 (22TB primary, RAID-1 leg 2) | das-backup-22tb | ZXA1NYGZ | 46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 |
+| DAS Bay 6 | (empty) | — | — |
+
+> **22TB primary is BTRFS RAID-1**: bays 2 + 5 share one filesystem (UUID `46ffbd7c-…`). If one drive fails, mount with `-o degraded`:
+> ```bash
+> sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup
+> ```
 
 ---
 

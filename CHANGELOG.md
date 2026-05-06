@@ -8,8 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Second 22TB CMR drive in DAS bay 5; `das-backup-22tb` converted from single-device to BTRFS RAID-1** — Seagate Exos `ST22000NM000C-3WC103` serial `ZXA1NYGZ` (~38h SMART extended self-test passed prior to commit). Partitioned identically to existing leg (`d3ac162f-…`): GPT type `8300`, sectors 2048–42970644446, partition name `das-backup-22tb`, PARTUUID `b24e0ea8-fd90-4a36-8c76-26587a29755b`. Added to filesystem UUID `46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1` as devid 2; `btrfs balance start -dconvert=raid1 -mconvert=raid1 -sconvert=raid1` rewrote all data, metadata, and system chunks across both legs. Sourced from a different manufacturing batch than `ZXA0LMAE` to mitigate correlated-failure risk.
+- **DISASTER-RECOVERY-GUIDE.md Scenario D — 22TB RAID-1 Backup Array Single-Leg Failure** — step-by-step procedure for confirming the failure, mounting the surviving leg degraded, sourcing/SMART-checking a replacement, partitioning to match, `btrfs replace`-ing the failed devid, restoring RAID-1 across single-profile chunks written while degraded, and verifying integrity. Also added the layman walkthrough to `EMERGENCY-QUICK-REFERENCE.md` so the printable cheat sheet covers it.
 
 ### Changed
+- **`[das].mount_opts` in `/etc/das-backup/config.toml` now includes `degraded`** — so a single-leg failure of the new 22TB RAID-1 array does not block backups, restores, or recovery. Trade-off: any chunks written while degraded are allocated as `single` profile until a post-replacement balance restores RAID-1 (documented in the new Scenario D)
+- **DAS bay map (2026-05-06 reshuffle)** — bay 3 emptied, `ZFL41DNY` (das-backup-system, 1.8 TB SMR) moved from bay 3 → bay 4 to free bay 5 for the new 22TB drive. Updated `display_name` fields in `config.toml` to reflect the new bay numbers and the RAID-1 pairing: `primary-22tb` is now `"22TB Exos RAID-1 (Bays 2+5)"`, `system-2tb` is `"2TB System (Bay 4)"`. Re-ran `btrdasd setup --upgrade` so derived files (`/etc/btrbk/btrbk.conf`, generated scripts, systemd units) pick up the new env exports
+- **`docs/examples/author-bay-mapping.md`, `docs/examples/author-storage-reference.md`, `docs/OFFLINE-BACKUP-PLAN.md`** — refreshed bay grid, drive details, role summary, and the "Why RAID-1 on the Primary Backup" rationale block. Now includes PARTUUID + UUID_SUB per leg so a failed-leg recovery can match identifiers exactly
+- **`.claude/rules/backup.md`** — replaced stale entries (wrong DAS model, wrong device letters, wrong retention numbers, RAID-0 reference for the 22TB target) with the current state from `config.toml` and the new RAID-1 layout
+- **`.claude/rules/esp-safety.md`** — `ZFL41DNY` now annotated as bay 4 (was bay 3 prior to 2026-05-06); `ZXA1NYGZ` added to the recognized-drive list as the new RAID-1 partner
 
 ### Fixed
 

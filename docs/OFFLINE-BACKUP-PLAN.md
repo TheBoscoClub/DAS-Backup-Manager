@@ -232,27 +232,45 @@ Shingled Magnetic Recording (SMR) drives have poor random write performance once
 ### Hardware
 
 - **Enclosure**: TerraMaster D6-320, 6-bay USB 3.2 Gen2 JBOD, ~$300
-- **Primary backup**: 1x Seagate Exos X22 22TB (ST22000NM000C), CMR, factory recertified ~$250
-- **Recovery + storage**: 5x Seagate Barracuda 2TB (ST2000DM008), SMR, same batch March 2021
-- **Total raw capacity**: ~32 TB (22TB + 5x 2TB)
-- **Total cost**: ~$550
+- **Primary backup**: 2x Seagate Exos 22TB (ST22000NM000C-3WC103), CMR, factory recertified ~$250 each — added second drive 2026-05-06 to form a BTRFS RAID-1 mirror
+- **Recovery drives**: 2x Seagate Barracuda 2TB (ST2000DM008), SMR, same batch March 2021 (the previous 5x 2TB pool was consolidated when dasRaid0 moved to internal SATA in 2026-04-06)
+- **Total raw capacity**: ~48 TB (2x 22TB + 2x 2TB)
+- **Total cost**: ~$800 (~$550 prior to second 22TB)
 
-### Drive Allocation
+### Drive Allocation (2026-05-06)
 
 ```
-Bay 2 -- 22TB Exos: PRIMARY BACKUP
-  All btrbk targets (NVMe, SSD, HDD projects, audiobooks, DAS storage)
-  Retention: 4 weekly + 12 monthly + 4 yearly
+Bay 1 -- 2TB Barracuda: BOOTABLE RECOVERY #1
+  Independent ESP + bootable OS + btrbk NVMe/SSD snapshots
+  Label: das-backup-system-mirror (serial ZK208Q77)
 
-Bay 6 -- 2TB Barracuda: BOOTABLE RECOVERY #1
-  ESP + bootable OS + btrbk NVMe/SSD snapshots
+Bay 2 -- 22TB Exos: PRIMARY BACKUP — RAID-1 leg 1 (serial ZXA0LMAE)
+  Pairs with bay 5 in a single BTRFS RAID-1 filesystem
+  Receives all btrbk targets (NVMe, SSD, HDD projects, audiobooks, DAS storage)
+  Retention: 7 daily + 4 weekly + 12 monthly + 1 yearly
 
-Bay 1 -- 2TB Barracuda: BOOTABLE RECOVERY #2
-  ESP + bootable OS + btrbk NVMe/SSD snapshots (mirror of #1)
+Bay 3 -- empty
 
-Bays 3,4,5 -- 3x 2TB Barracuda: BTRFS RAID0 GENERAL STORAGE
-  ~5.5 TiB striped array for expendable data, backed up to 22TB nightly
+Bay 4 -- 2TB Barracuda: BOOTABLE RECOVERY #2 (moved from bay 3 on 2026-05-06)
+  Independent ESP + bootable OS + btrbk NVMe/SSD snapshots
+  Label: das-backup-system (serial ZFL41DNY)
+
+Bay 5 -- 22TB Exos: PRIMARY BACKUP — RAID-1 leg 2 (serial ZXA1NYGZ)
+  Pairs with bay 2 in a single BTRFS RAID-1 filesystem
+  Mounted with `degraded` so single-leg failure does not block backups/recovery
+
+Bay 6 -- empty
 ```
+
+### Why RAID-1 on the Primary Backup (Author's Choice)
+
+The "Why Not BTRFS RAID on Backup Drives?" section above argues that backup drives should remain JBOD to preserve the offline/rotation model. The author chose live RAID-1 for the primary backup target instead, accepting these trade-offs:
+
+- **Both drives must be online** during nightly backup runs (no air-gap rotation between them)
+- **Replacement window**: a 22TB drive replace takes 24-48 hours over USB; during that window the backup target has no redundancy. RAID-1 narrows this to "during replacement only" instead of "until next manual rotation"
+- **Mount option**: `degraded` is in `[das].mount_opts` so backups continue if one leg fails. Data written while degraded is `single` profile until a balance restores RAID-1 (see `DISASTER-RECOVERY-GUIDE.md` Scenario D)
+
+For users who prefer the rotation-and-air-gap model, two-drive JBOD with manual rotation is still the right choice. RAID-1 is the trade-off you make when you want resilience against silent corruption and against single-drive failure during the multi-day replacement window for high-capacity drives.
 
 ### Capacity Budget
 

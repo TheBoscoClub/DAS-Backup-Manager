@@ -3,7 +3,7 @@
 # TerraMaster D6-320 Bay Mapping
 
 **Date mapped**: 2026-02-04
-**Updated**: 2026-04-06 (dasRaid0 moved to internal SATA; bays 4-6 cleared)
+**Updated**: 2026-05-06 (added second 22TB CMR drive in bay 5; das-backup-22tb converted from single to BTRFS RAID-1)
 **Method**: I/O activity LED identification + serial number verification
 
 ## Physical Bay Layout
@@ -13,16 +13,18 @@
 | TerraMaster D6-320 (front view)                 |
 +--------------+--------------+-------------------+
 |    Bay 1     |    Bay 2     |    Bay 3          |
-|   ZK208Q77   |   ZXA0LMAE   |   ZFL41DNY        |
-|   2TB SMR    | * 22TB CMR   |   2TB SMR          |
-|  Emergency   |  PRIMARY     |  Emergency        |
-|  Boot/Recov  |  BACKUP      |  Boot/Recov       |
+|   ZK208Q77   |   ZXA0LMAE   |   (empty)         |
+|   2TB SMR    | * 22TB CMR   |                   |
+|  Emergency   |  PRIMARY     |                   |
+|  Boot/Recov  |  BACKUP      |                   |
+|              |  RAID-1 leg 1|                   |
 +--------------+--------------+-------------------+
 |    Bay 4     |    Bay 5     |    Bay 6          |
-|   (empty)    |   (empty)    |   (empty)         |
-|              |              |                    |
-|              |              |                    |
-|              |              |                    |
+|   ZFL41DNY   |   ZXA1NYGZ   |   (empty)         |
+|   2TB SMR    | * 22TB CMR   |                   |
+|  Emergency   |  PRIMARY     |                   |
+|  Boot/Recov  |  BACKUP      |                   |
+|              |  RAID-1 leg 2|                   |
 +--------------+--------------+-------------------+
 ```
 
@@ -31,17 +33,53 @@
 | Bay | Serial | Model | Size | Partitions | Role | BTRFS Label |
 |-----|--------|-------|------|------------|------|-------------|
 | 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system-mirror |
-| 2 | ZXA0LMAE | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup -- all btrbk targets | das-backup-22tb |
-| 3 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system |
-| 4 | — | — | — | — | Empty | — |
-| 5 | — | — | — | — | Empty | — |
+| 2 | ZXA0LMAE | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 1 — all btrbk targets | das-backup-22tb |
+| 3 | — | — | — | — | Empty | — |
+| 4 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system |
+| 5 | ZXA1NYGZ | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 2 — all btrbk targets | das-backup-22tb |
 | 6 | — | — | — | — | Empty | — |
+
+## Primary Backup — BTRFS RAID-1 Across Bays 2 & 5 (added 2026-05-06)
+
+The two 22TB CMR drives in bays 2 and 5 form a single BTRFS RAID-1 filesystem. Both drives must be online for the backup target to mount; this trades the offline/air-gap model for live redundancy against single-drive failure during the multi-day recovery window of a 22TB drive replacement.
+
+| | Bay 2 (ZXA0LMAE) | Bay 5 (ZXA1NYGZ) |
+|---|---|---|
+| **Partition** | `p1` — whole disk (sectors 2048–42970644446), GPT type 8300, name `das-backup-22tb` | `p1` — identical layout |
+| **PARTUUID** | `d3ac162f-9bf4-4fd8-87c0-a104200bcd01` | `b24e0ea8-fd90-4a36-8c76-26587a29755b` |
+| **BTRFS devid** | 1 | 2 |
+| **BTRFS UUID_SUB** | `abbb98a9-9e5d-48a5-aba1-a99281eea79d` | `69ac05e0-f2c5-4a4e-845a-8149c6fb4b14` |
+
+**Filesystem-level identifiers** (shared across both devices):
+- BTRFS UUID: `46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1`
+- Label: `das-backup-22tb`
+- Profiles: Data RAID-1, Metadata RAID-1, System RAID-1
+- Mount: `/mnt/backup-22tb` (production) / `/run/media/bosco/das-backup-22tb` (auto-mounted)
+
+**Adding a second leg** (the 2026-05-06 conversion, for reference):
+```bash
+# Match partition geometry exactly to existing leg
+sudo sgdisk --new=1:2048:42970644446 --typecode=1:8300 \
+    --change-name=1:das-backup-22tb /dev/<new-leg>
+sudo partprobe /dev/<new-leg>
+
+# Add device to filesystem
+sudo btrfs device add /dev/<new-leg>1 /mnt/backup-22tb
+
+# Convert all profiles to RAID-1 (data, metadata, system)
+sudo btrfs balance start -dconvert=raid1 -mconvert=raid1 -sconvert=raid1 \
+    --force /mnt/backup-22tb
+
+# Verify after balance completes (no mixed profiles)
+sudo btrfs filesystem df /mnt/backup-22tb
+sudo btrfs scrub start -B /mnt/backup-22tb  # Verifies both copies
+```
 
 ## Emergency Boot/Recovery Drives
 
-The two 2TB drives in bays 1 and 3 are **independent standalone bootable systems** — NOT a BTRFS RAID1 pair. Each has its own ESP and its own BTRFS root filesystem with a separate UUID:
+The two 2TB drives in bays 1 and 4 are **independent standalone bootable systems** — NOT a BTRFS RAID-1 pair. Each has its own ESP and its own BTRFS root filesystem with a separate UUID:
 
-| | Bay 1 (ZK208Q77) | Bay 3 (ZFL41DNY) |
+| | Bay 1 (ZK208Q77) | Bay 4 (ZFL41DNY) |
 |---|---|---|
 | **ESP** | `p1` — 1.5G FAT32, label `BACKUP-ESP`, UUID `6D15-0632` | `p1` — 1.5G FAT32, label `BACKUP-ESP`, UUID `6CAB-B04D` |
 | **BTRFS** | `p2` — label `das-backup-system-mirror`, UUID `60b05268-7f8f-47b5-a38a-752576a1172a` | `p2` — label `das-backup-system`, UUID `7c7ae72d-09d6-4086-b249-1ac60f21b73b` |
@@ -50,8 +88,8 @@ Either drive can boot independently if the other fails. Sync between them is man
 
 ## Role Summary
 
-- **Primary Backup** (Bay 2): 22TB Exos -- all btrbk targets (NVMe, SSD, projects, audiobooks), deep retention
-- **Emergency Boot/Recovery** (Bays 1, 3): Independent 2TB drives with ESP + CachyOS -- also receive btrbk NVMe/SSD snapshots
+- **Primary Backup** (Bays 2 + 5): 2x 22TB Exos in BTRFS RAID-1 — all btrbk targets (NVMe, SSD, projects, audiobooks, das-storage), deep retention. Single-drive failure does not lose data; replacement happens online via `btrfs replace`.
+- **Emergency Boot/Recovery** (Bays 1, 4): Independent 2TB drives with ESP + CachyOS — also receive btrbk NVMe/SSD snapshots. No mutual redundancy.
 
 ## dasRaid0 — Relocated to Internal SATA (2026-04-06)
 
@@ -77,8 +115,10 @@ The BTRFS RAID0 general storage array was moved from DAS bays 3/4/5 to internal 
 
 ## Notes
 
-- **Device letters change on every reboot/reconnect** -- always identify by serial number
+- **Device letters change on every reboot/reconnect** — always identify by serial number
 - LED identification: `sudo dd if=/dev/sdX of=/dev/null bs=1M count=2000 status=progress`
-- 22TB Exos is CMR (conventional magnetic recording) -- no SMR write penalties
+- 22TB Exos drives are CMR (conventional magnetic recording) — no SMR write penalties
 - 2TB drives: all ST2000DM008 (SMR), same batch March 2021, ~13,000 hours each
+- 22TB drives: ST22000NM000C, sourced ZXA0LMAE 2026-02 + ZXA1NYGZ 2026-05 (different batches, mitigates correlated-failure risk for the RAID-1 pair)
 - USB topology: each bay gets an independent USB sub-device via the enclosure's bridge chip (4-1.3.x)
+- 2026-05-06 bay reshuffle: ZFL41DNY moved from bay 3 → bay 4 to make room for the new 22TB CMR drive in bay 5

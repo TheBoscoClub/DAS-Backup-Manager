@@ -17,6 +17,7 @@ This guide is written for users with minimal technical experience. Follow each s
    - [Scenario A: Single NVMe Drive Failure](#scenario-a-single-nvme-drive-failure)
    - [Scenario B: Both NVMe Drives Failed](#scenario-b-both-nvme-drives-failed)
    - [Scenario C: Complete System Replacement](#scenario-c-complete-system-replacement)
+   - [Scenario D: 22TB RAID-1 Backup Array Single-Leg Failure](#scenario-d-22tb-raid-1-backup-array-single-leg-failure)
 5. [Step-by-Step Recovery Procedures](#step-by-step-recovery-procedures)
 6. [Common Boot Repairs](#common-boot-repairs)
    - [Reset a Forgotten Root Password](#reset-a-forgotten-root-password)
@@ -168,6 +169,157 @@ See [Full System Restoration](#full-system-restoration) for detailed steps.
 5. Update hardware-specific drivers if needed
 
 See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
+
+---
+
+### Scenario D: 22TB RAID-1 Backup Array Single-Leg Failure
+
+**Applies if** your primary backup is a BTRFS RAID-1 across two large drives (in this setup: 22TB Exos drives in DAS bays 2 and 5, sharing BTRFS UUID `46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1`).
+
+**Symptoms**:
+- Email backup report warns that the array is degraded or that one leg has SMART errors
+- `sudo btrfs filesystem show /mnt/backup-22tb` says `*** Some devices missing`
+- `sudo btrfs device stats /mnt/backup-22tb` shows non-zero error counters on one leg
+
+**Why this is a separate scenario**: This array is not in `/etc/fstab` and has nothing to do with system boot. The system continues booting and running normally on its NVMe RAID-1. What needs recovery is the *backup target itself* — so that incremental backups, restores, and disaster-recovery procedures keep working during the days it takes to replace a 22TB drive.
+
+#### Why backups still work in degraded mode
+
+`/etc/das-backup/config.toml` sets `[das].mount_opts` to include `degraded`. The `backup-run.sh` script mounts the target with these options, so a missing leg does not abort the nightly backup. The downside: **any data written while degraded is allocated as `single` profile** (not redundant). After the failed leg is replaced, a balance restores RAID-1 across all chunks. Until then, only one copy of recent data exists.
+
+#### Step 1: Confirm which leg failed
+
+```bash
+sudo btrfs filesystem show /mnt/backup-22tb
+# Output looks like:
+#   Label: 'das-backup-22tb' uuid: 46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1
+#       Total devices 2 FS bytes used X.XTiB
+#       devid    1 size 20.01TiB used Y path /dev/sdk1
+#       devid    2 size 0 used 0 path MISSING
+# (the "MISSING" line — note that devid number)
+
+sudo btrfs device stats /mnt/backup-22tb
+# Look for non-zero counters: write_io_errs, read_io_errs, corruption_errs
+```
+
+Cross-reference the device serial against your bay map (`docs/examples/author-bay-mapping.md`):
+- `ZXA0LMAE` (bay 2, devid 1)
+- `ZXA1NYGZ` (bay 5, devid 2)
+
+#### Step 2: Mount the array degraded if it failed to mount
+
+The `backup-run.sh` script always uses degraded mount options, so scheduled backups continue. For interactive use:
+
+```bash
+# If /mnt/backup-22tb is not currently mounted
+sudo mkdir -p /mnt/backup-22tb
+sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+
+# Or, if udisks2 auto-mounted at /run/media/bosco/das-backup-22tb but failed
+# because of degraded state, force the explicit mount:
+sudo umount /run/media/bosco/das-backup-22tb 2>/dev/null
+sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+```
+
+#### Step 3: Verify SMART on the surviving leg
+
+Before relying on the surviving drive for days while the replacement is sourced and rebuilt:
+
+```bash
+sudo smartctl -a -d sat /dev/<surviving-leg>     # Quick attribute view
+sudo smartctl -t short -d sat /dev/<surviving-leg>  # 2-min sanity test
+# Optional: full extended test (~38h, runs in firmware, no host I/O hit)
+sudo smartctl -t long -d sat /dev/<surviving-leg>
+```
+
+If the surviving drive shows reallocated sectors or pending sectors, copy the most critical recent snapshots elsewhere immediately — running degraded on a marginal drive is a one-failure-from-data-loss situation.
+
+#### Step 4: Source a replacement drive
+
+- **Required**: equal or larger capacity (≥ 20.01 TiB usable).
+- **Recommended**: same model (Seagate ST22000NM000C-3WC103) for matching speed and behavior. Different model is acceptable.
+- **Risk hedge**: prefer a drive from a different manufacturing batch than the surviving leg to avoid correlated failure.
+
+When the new drive arrives, run a full SMART extended test (~38 hours) before committing data:
+
+```bash
+sudo smartctl -i -d sat /dev/<new-drive>           # Confirm capacity matches
+sudo smartctl -t short -d sat /dev/<new-drive>     # 2-min DOA check
+sudo smartctl -t long  -d sat /dev/<new-drive>     # 38h extended test
+# Wait for completion, then:
+sudo smartctl -l selftest -d sat /dev/<new-drive>
+# All tests should show "Completed without error"
+```
+
+You can begin Step 5 in parallel with the long test — the test runs in the drive's firmware in offline mode and yields to host I/O.
+
+#### Step 5: Power off DAS, swap drive in, power up
+
+Use your bay map to identify the failed drive's bay before pulling. The DAS does not require host shutdown — only DAS power-cycling.
+
+#### Step 6: Partition the new drive identically
+
+The replacement must have a GPT partition that exactly matches the surviving leg's geometry. Replace `/dev/sdNEW` with the new drive's device letter (find via `lsblk -o NAME,SIZE,SERIAL,TRAN`):
+
+```bash
+sudo sgdisk --zap-all /dev/sdNEW
+sudo sgdisk --new=1:2048:42970644446 --typecode=1:8300 \
+    --change-name=1:das-backup-22tb /dev/sdNEW
+sudo partprobe /dev/sdNEW
+```
+
+Verify with `sudo sgdisk --print /dev/sdNEW` — the partition should be sectors 2048–42970644446, 20.0 TiB, type 8300, name `das-backup-22tb`.
+
+#### Step 7: Replace the failed device in the array
+
+```bash
+# Get the missing devid from `btrfs filesystem show` (Step 1)
+MISSING_DEVID=<number from "MISSING" line>
+
+# Start the replace — runs in background by default
+sudo btrfs replace start "$MISSING_DEVID" /dev/sdNEW1 /mnt/backup-22tb
+
+# Monitor (recover takes ~24-48 hours for ~5 TiB over USB)
+watch -n 60 sudo btrfs replace status /mnt/backup-22tb
+```
+
+`btrfs replace` reads from the surviving leg, writes to the new device, and updates the superblock. It is online — backups can continue running concurrently (slower).
+
+#### Step 8: Restore RAID-1 across single-profile chunks
+
+Any data that was written while the array was degraded is in `single` profile chunks. Convert them back to RAID-1:
+
+```bash
+# `soft` filter only touches chunks that aren't already RAID-1
+sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft \
+    /mnt/backup-22tb
+
+# Watch progress
+sudo btrfs balance status /mnt/backup-22tb
+```
+
+#### Step 9: Verify integrity and reset counters
+
+```bash
+# Full read of every block on both legs, repairs any checksum mismatches
+sudo btrfs scrub start -B /mnt/backup-22tb
+sudo btrfs scrub status /mnt/backup-22tb
+# "Error summary: no errors found" is what you want
+
+# Confirm all error counters are zero
+sudo btrfs device stats /mnt/backup-22tb
+
+# Reset stats to baseline now that the array is healthy
+sudo btrfs device stats --reset /mnt/backup-22tb
+
+# Confirm RAID-1 across the board
+sudo btrfs filesystem df /mnt/backup-22tb
+# Expect: Data, RAID1 / Metadata, RAID1 / System, RAID1 (no `single` lines)
+```
+
+#### Step 10: Update bay map and CHANGELOG
+
+Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (from `sudo blkid /dev/sdNEW1`). Update CHANGELOG.md to record the replacement date and the failure cause.
 
 ---
 

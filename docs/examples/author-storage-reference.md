@@ -790,15 +790,16 @@ sudo snapper list-configs              # Verify snapper configs
 A comprehensive offline backup strategy is documented separately in [`OFFLINE-BACKUP-PLAN.md`](OFFLINE-BACKUP-PLAN.md).
 
 **Summary**:
-- **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 3 of 6 bays occupied
-- **DAS Drives**: 1x 22TB Exos (primary backup), 2x 2TB Barracuda (independent emergency boot/recovery)
+- **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 4 of 6 bays occupied (bays 3 and 6 empty)
+- **Primary Backup (BTRFS RAID-1)**: 2x 22TB Exos (ST22000NM000C-3WC103) in bays 2 (`ZXA0LMAE`) and 5 (`ZXA1NYGZ`), single BTRFS filesystem `das-backup-22tb` UUID `46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1`. Mounted with `degraded` so single-leg failure does not interrupt backups, restores, or recovery.
+- **Recovery Drives**: 2x 2TB Barracuda (independent, NOT a RAID pair) in bays 1 (`ZK208Q77`, `das-backup-system-mirror`) and 4 (`ZFL41DNY`, `das-backup-system`) — each can boot the system standalone via its own ESP
 - **Internal SATA**: dasRaid0 (4x 2TB Barracuda RAID0, general storage) — moved from DAS 2026-04-06
 - **Offline spares**: 1x 2TB Barracuda (ZFL416F6, cold spare for dasRaid0)
 - **Software**: btrbk 0.32.6 + mbuffer (installed)
 - **Irreplaceable data**: ~1 TiB (NVMe subvolumes, SSD /opt + /srv, ClaudeCodeProjects, audiobook sources)
 - **Not backed up**: VMs (recreatable), converted audiobooks (re-derivable), Steam/AI models/ISOs (re-downloadable), snapper snapshots (btrbk manages its own retention)
-- **Status**: Active -- DAS operational with streamlined 3-drive layout
+- **Status**: Active — primary backup runs with live RAID-1 redundancy (added 2026-05-06)
 
 ---
 
-*Document generated: 2026-02-01, updated 2026-04-06 from live system data. All UUIDs, serials, and partition layouts verified against running system.*
+*Document generated: 2026-02-01, updated 2026-05-06 (added second 22TB CMR drive in bay 5, das-backup-22tb converted to BTRFS RAID-1). All UUIDs, serials, and partition layouts verified against running system.*
