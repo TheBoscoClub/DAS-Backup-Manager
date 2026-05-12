@@ -2,10 +2,12 @@
 
 #include <QDBusConnection>
 #include <QDBusInterface>
+#include <QDBusMessage>
 #include <QDBusPendingCall>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusReply>
+#include <QTimer>
 
 namespace {
 const auto ServiceName = QStringLiteral("org.dasbackup.Helper1");
@@ -19,9 +21,38 @@ DBusClient::DBusClient(QObject *parent)
           ServiceName, ObjectPath, InterfaceName,
           QDBusConnection::systemBus(), this))
 {
-    m_available = m_interface->isValid();
+    // QDBusInterface::isValid() only verifies the proxy object was constructed
+    // — it does NOT verify the remote service can be activated. To know whether
+    // org.dasbackup.Helper1 is actually reachable, we have to round-trip a real
+    // method call. Use Peer.Ping (a standard no-op on every D-Bus object) which
+    // triggers normal activation and returns quickly when the helper is healthy.
+    //
+    // Doing this ONCE here lets every other call site assume m_available is the
+    // truth. Without it, each of the GUI's startup views (status bar, snapshot
+    // list, backup history, health, config) discovers the activation failure
+    // independently and fires its own modal dialog — see bd DAS-Backup-Manager-mw0
+    // for the cascade we are eliminating.
+    QDBusMessage ping = QDBusMessage::createMethodCall(
+        ServiceName, ObjectPath,
+        QStringLiteral("org.freedesktop.DBus.Peer"),
+        QStringLiteral("Ping"));
+    QDBusMessage reply = QDBusConnection::systemBus().call(ping);
+    m_available = (reply.type() != QDBusMessage::ErrorMessage);
 
-    // Connect D-Bus signals to local slots
+    if (!m_available) {
+        m_unavailableReason = mapDBusError(reply.errorName(), reply.errorMessage());
+        // Defer signal emission until after the event loop starts so consumers
+        // that connect after DBusClient construction (e.g. MainWindow's slot
+        // for helperUnavailable) can still receive it.
+        QTimer::singleShot(0, this, [this] {
+            Q_EMIT helperUnavailable(m_unavailableReason);
+        });
+        return;
+    }
+
+    // Connect D-Bus signals to local slots — only if the helper actually
+    // exists; binding signals on an unreachable service is pointless and
+    // causes spurious noise in journals on some D-Bus implementations.
     auto bus = QDBusConnection::systemBus();
 
     bus.connect(ServiceName, ObjectPath, InterfaceName,
@@ -42,6 +73,11 @@ DBusClient::~DBusClient() = default;
 bool DBusClient::isAvailable() const
 {
     return m_available;
+}
+
+QString DBusClient::unavailableReason() const
+{
+    return m_unavailableReason;
 }
 
 // --- Async job-returning methods ---
@@ -105,6 +141,7 @@ void DBusClient::restoreSnapshot(const QString &configPath, const QString &snaps
 
 QString DBusClient::configGet(const QString &configPath)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(QStringLiteral("ConfigGet"), configPath);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ConfigGet"),
@@ -116,6 +153,7 @@ QString DBusClient::configGet(const QString &configPath)
 
 bool DBusClient::configSet(const QString &configPath, const QString &tomlContent)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("ConfigSet"),
                                                configPath, tomlContent);
     if (!reply.isValid()) {
@@ -128,6 +166,7 @@ bool DBusClient::configSet(const QString &configPath, const QString &tomlContent
 
 QString DBusClient::scheduleGet(const QString &configPath)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(QStringLiteral("ScheduleGet"), configPath);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ScheduleGet"),
@@ -140,6 +179,7 @@ QString DBusClient::scheduleGet(const QString &configPath)
 bool DBusClient::scheduleSet(const QString &configPath, const QString &incremental,
                              const QString &full, quint32 delay)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("ScheduleSet"),
                                                configPath, incremental, full, delay);
     if (!reply.isValid()) {
@@ -152,6 +192,7 @@ bool DBusClient::scheduleSet(const QString &configPath, const QString &increment
 
 bool DBusClient::scheduleEnable(const QString &configPath, bool enabled)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("ScheduleEnable"),
                                                configPath, enabled);
     if (!reply.isValid()) {
@@ -165,6 +206,7 @@ bool DBusClient::scheduleEnable(const QString &configPath, bool enabled)
 bool DBusClient::subvolAdd(const QString &configPath, const QString &source,
                            const QString &name)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolAdd"),
                                                configPath, source, name);
     if (!reply.isValid()) {
@@ -178,6 +220,7 @@ bool DBusClient::subvolAdd(const QString &configPath, const QString &source,
 bool DBusClient::subvolRemove(const QString &configPath, const QString &source,
                               const QString &name)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolRemove"),
                                                configPath, source, name);
     if (!reply.isValid()) {
@@ -191,6 +234,7 @@ bool DBusClient::subvolRemove(const QString &configPath, const QString &source,
 bool DBusClient::subvolSetManual(const QString &configPath, const QString &source,
                                  const QString &name, bool manual)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolSetManual"),
                                                configPath, source, name, manual);
     if (!reply.isValid()) {
@@ -203,6 +247,7 @@ bool DBusClient::subvolSetManual(const QString &configPath, const QString &sourc
 
 QString DBusClient::healthQuery(const QString &configPath)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(QStringLiteral("HealthQuery"), configPath);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("HealthQuery"),
@@ -214,6 +259,7 @@ QString DBusClient::healthQuery(const QString &configPath)
 
 bool DBusClient::jobCancel(const QString &jobId)
 {
+    if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("JobCancel"), jobId);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("JobCancel"),
@@ -227,6 +273,10 @@ bool DBusClient::jobCancel(const QString &jobId)
 
 void DBusClient::healthQueryAsync(const QString &configPath)
 {
+    if (!m_available) {
+        Q_EMIT healthQueryResult({});
+        return;
+    }
     QDBusPendingCall pending = m_interface->asyncCall(
         QStringLiteral("HealthQuery"), configPath);
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
@@ -247,6 +297,10 @@ void DBusClient::healthQueryAsync(const QString &configPath)
 
 void DBusClient::scheduleGetAsync(const QString &configPath)
 {
+    if (!m_available) {
+        Q_EMIT scheduleGetResult({});
+        return;
+    }
     QDBusPendingCall pending = m_interface->asyncCall(
         QStringLiteral("ScheduleGet"), configPath);
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
@@ -267,6 +321,10 @@ void DBusClient::scheduleGetAsync(const QString &configPath)
 
 void DBusClient::indexStatsAsync(const QString &dbPath)
 {
+    if (!m_available) {
+        Q_EMIT indexStatsResult({});
+        return;
+    }
     QDBusPendingCall pending = m_interface->asyncCall(
         QStringLiteral("IndexStats"), dbPath);
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
@@ -287,6 +345,10 @@ void DBusClient::indexStatsAsync(const QString &dbPath)
 
 void DBusClient::indexListSnapshotsAsync(const QString &dbPath)
 {
+    if (!m_available) {
+        Q_EMIT indexListSnapshotsResult({});
+        return;
+    }
     QDBusPendingCall pending = m_interface->asyncCall(
         QStringLiteral("IndexListSnapshots"), dbPath);
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
@@ -309,6 +371,7 @@ void DBusClient::indexListSnapshotsAsync(const QString &dbPath)
 
 QString DBusClient::indexStats(const QString &dbPath)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(QStringLiteral("IndexStats"), dbPath);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("IndexStats"),
@@ -320,6 +383,7 @@ QString DBusClient::indexStats(const QString &dbPath)
 
 QString DBusClient::indexListSnapshots(const QString &dbPath)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(
         QStringLiteral("IndexListSnapshots"), dbPath);
     if (!reply.isValid()) {
@@ -333,6 +397,7 @@ QString DBusClient::indexListSnapshots(const QString &dbPath)
 QString DBusClient::indexListFiles(const QString &dbPath, qint64 snapshotId,
                                    qint64 limit, qint64 offset)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(
         QStringLiteral("IndexListFiles"), dbPath, snapshotId, limit, offset);
     if (!reply.isValid()) {
@@ -345,6 +410,7 @@ QString DBusClient::indexListFiles(const QString &dbPath, qint64 snapshotId,
 
 QString DBusClient::indexSearch(const QString &dbPath, const QString &query, qint64 limit)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(
         QStringLiteral("IndexSearch"), dbPath, query, limit);
     if (!reply.isValid()) {
@@ -357,6 +423,7 @@ QString DBusClient::indexSearch(const QString &dbPath, const QString &query, qin
 
 QString DBusClient::indexBackupHistory(const QString &dbPath, qint64 limit)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(
         QStringLiteral("IndexBackupHistory"), dbPath, limit);
     if (!reply.isValid()) {
@@ -369,6 +436,7 @@ QString DBusClient::indexBackupHistory(const QString &dbPath, qint64 limit)
 
 QString DBusClient::indexSnapshotPath(const QString &dbPath, qint64 snapshotId)
 {
+    if (!m_available) return {};
     QDBusReply<QString> reply = m_interface->call(
         QStringLiteral("IndexSnapshotPath"), dbPath, snapshotId);
     if (!reply.isValid()) {
@@ -404,6 +472,11 @@ void DBusClient::onJobFinished(const QString &jobId, bool success,
 void DBusClient::callAsync(const QString &method, const QList<QVariant> &args,
                            const QString &operation)
 {
+    // When the helper isn't reachable we silently no-op every job-starting
+    // call. The single helperUnavailable signal emitted from the constructor
+    // is the user's one notification; per-action errorOccurred firings here
+    // would just rebuild the cascade we're trying to eliminate.
+    if (!m_available) return;
     QDBusPendingCall pending = m_interface->asyncCallWithArgumentList(method, args);
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
 

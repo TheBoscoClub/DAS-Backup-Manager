@@ -19,6 +19,52 @@ option(BUILD_HELPER "Build btrdasd-helper D-Bus daemon (requires zbus)" ON)
 option(BUILD_FFI "Build libbuttered_dasd_ffi.so shared library for GUI" ON)
 
 # =============================================================================
+# Defense-in-depth: refuse to install zero-byte Rust binaries
+# =============================================================================
+#
+# Three real incidents (May 2026) had cmake --install copy 0-byte stubs over
+# valid binaries in /usr, producing services that failed at runtime with exec
+# status 203/EXEC (no ELF magic, no shebang). The root cause is that cargo
+# can leave an empty file at the output path when a build is interrupted, and
+# install(PROGRAMS) faithfully copies whatever's there.
+#
+# This helper emits an install(CODE) block that aborts the install if the
+# given artifact is missing or zero bytes — catching the bug at install time,
+# before /usr is corrupted. See bd issues DAS-Backup-Manager-29j (root cause
+# investigation) and DAS-Backup-Manager-9rx (this defense).
+#
+function(das_require_nonzero_artifact PATH DESCRIPTION)
+    install(CODE "
+        set(_p \"${PATH}\")
+        if(NOT EXISTS \"\${_p}\")
+            message(FATAL_ERROR
+                \"\\n\\n=== INSTALL ABORTED ===\\n\"
+                \"Pre-install check failed: ${DESCRIPTION} is missing.\\n\"
+                \"  Expected at: \${_p}\\n\\n\"
+                \"This usually means 'cmake --install build' was run before \"
+                \"'cmake --build build' — ExternalProject_Add artifacts are \"
+                \"produced at build time, not configure time.\\n\\n\"
+                \"Recovery: run 'cmake --build build' first.\")
+        endif()
+        file(SIZE \"\${_p}\" _sz)
+        if(_sz EQUAL 0)
+            message(FATAL_ERROR
+                \"\\n\\n=== INSTALL ABORTED ===\\n\"
+                \"Pre-install check failed: ${DESCRIPTION} is zero bytes.\\n\"
+                \"  Path: \${_p}\\n\\n\"
+                \"This is the failure class tracked by bd DAS-Backup-Manager-29j: \"
+                \"cargo can leave an empty stub at the output path when a previous \"
+                \"build was interrupted. install(PROGRAMS) would faithfully copy \"
+                \"that stub to /usr, producing a binary that fails at runtime with \"
+                \"exec status 203/EXEC (Exec format error — no ELF magic, no shebang).\\n\\n\"
+                \"Recovery: run 'cmake --build build' to rebuild ${DESCRIPTION}, \"
+                \"verify the output binary is non-zero, then re-run install.\")
+        endif()
+        message(STATUS \"Install check OK: ${DESCRIPTION} (\${_sz} bytes)\")
+    ")
+endfunction()
+
+# =============================================================================
 # Rust indexer (btrdasd binary)
 # =============================================================================
 
@@ -37,6 +83,8 @@ if(BUILD_INDEXER)
         BUILD_ALWAYS TRUE
     )
 
+    das_require_nonzero_artifact("${CARGO_TARGET_DIR}/release/btrdasd"
+                                  "btrdasd CLI binary")
     install(PROGRAMS "${CARGO_TARGET_DIR}/release/btrdasd"
         DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
 endif()
@@ -61,6 +109,8 @@ if(BUILD_HELPER)
         BUILD_ALWAYS TRUE
     )
 
+    das_require_nonzero_artifact("${CARGO_TARGET_DIR}/release/btrdasd-helper"
+                                  "btrdasd-helper D-Bus daemon")
     install(PROGRAMS "${CARGO_TARGET_DIR}/release/btrdasd-helper"
         DESTINATION "${CMAKE_INSTALL_PREFIX}/libexec")
 endif()
@@ -85,6 +135,8 @@ if(BUILD_FFI)
         BUILD_ALWAYS TRUE
     )
 
+    das_require_nonzero_artifact("${CARGO_TARGET_DIR}/release/libbuttered_dasd.so"
+                                  "libbuttered_dasd FFI library")
     install(FILES "${CARGO_TARGET_DIR}/release/libbuttered_dasd.so"
         DESTINATION "${CMAKE_INSTALL_PREFIX}/lib"
         RENAME "libbuttered_dasd_ffi.so")
