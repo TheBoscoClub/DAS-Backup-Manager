@@ -204,14 +204,88 @@ fn default_snapshot_dir() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "TargetRaw")]
 pub struct Target {
     pub label: String,
+    // Legacy single-anchor serial. Populated from `serials[0]` so existing
+    // call sites (health/SMART/GUI/mount) keep working unchanged. Skipped on
+    // serialization — `serials` is the canonical written form.
+    #[serde(skip_serializing)]
     pub serial: String,
+    // Expected RAID-1 member serials. Length 1 = single-drive target,
+    // length 2 = RAID-1 pair. Operator advisory only: backup-run.sh warns
+    // when a serial is absent but does NOT abort, because a degraded BTRFS
+    // RAID-1 array remains mountable from any present leg.
+    #[serde(default)]
+    pub serials: Vec<String>,
+    // BTRFS filesystem UUID for mount-by-UUID. When set, backup-run.sh mounts
+    // via `UUID=<mount_uuid>` instead of resolving a device from `serials`.
+    // BTRFS auto-discovers remaining members from any present leg's
+    // superblock, making backups tolerant of single-member loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_uuid: Option<String>,
     pub mount: String,
     pub role: TargetRole,
     pub retention: Retention,
     #[serde(default)]
     pub display_name: String,
+}
+
+impl Target {
+    /// Effective list of expected serials, falling back to the legacy
+    /// `serial` field when `serials` is empty (in-code construction sites
+    /// not yet migrated to the new field).
+    pub fn effective_serials(&self) -> Vec<String> {
+        if !self.serials.is_empty() {
+            self.serials.clone()
+        } else if !self.serial.is_empty() {
+            vec![self.serial.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+// TOML deserialization shim. Accepts both legacy `serial = "X"` and new
+// `serials = ["X", "Y"]` forms; normalizes both into the canonical Target.
+#[derive(Debug, Deserialize)]
+struct TargetRaw {
+    label: String,
+    #[serde(default)]
+    serial: Option<String>,
+    #[serde(default)]
+    serials: Option<Vec<String>>,
+    #[serde(default)]
+    mount_uuid: Option<String>,
+    mount: String,
+    role: TargetRole,
+    retention: Retention,
+    #[serde(default)]
+    display_name: String,
+}
+
+impl From<TargetRaw> for Target {
+    fn from(raw: TargetRaw) -> Self {
+        // Prefer new-form `serials`; fall back to legacy `serial`.
+        let serials = match (raw.serials, raw.serial.as_ref()) {
+            (Some(list), _) if !list.is_empty() => list,
+            (_, Some(s)) if !s.is_empty() => vec![s.clone()],
+            (Some(list), _) => list,
+            (None, None) => Vec::new(),
+            (None, Some(_)) => Vec::new(),
+        };
+        let serial = serials.first().cloned().unwrap_or_default();
+        Target {
+            label: raw.label,
+            serial,
+            serials,
+            mount_uuid: raw.mount_uuid,
+            mount: raw.mount,
+            role: raw.role,
+            retention: raw.retention,
+            display_name: raw.display_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -370,9 +444,13 @@ impl Config {
         }
 
         for (i, tgt) in self.targets.iter().enumerate() {
-            if tgt.serial.is_empty() {
+            // A target needs at least one way to find its filesystem:
+            // legacy `serial`, new `serials`, or `mount_uuid`. UUID-only is
+            // valid and preferred for RAID-1 because the FS is mountable
+            // from any present member.
+            if tgt.serial.is_empty() && tgt.serials.is_empty() && tgt.mount_uuid.is_none() {
                 errors.push(format!(
-                    "Target '{}' (index {i}) has an empty serial number",
+                    "Target '{}' (index {i}) needs at least one of: `serial`, `serials`, or `mount_uuid`",
                     tgt.label
                 ));
             }
@@ -445,6 +523,8 @@ mod tests {
         cfg.targets.push(Target {
             label: "primary-22tb".into(),
             serial: "ZXA0LMAE".into(),
+            serials: vec!["ZXA0LMAE".into()],
+            mount_uuid: None,
             mount: "/mnt/backup-22tb".into(),
             role: TargetRole::Primary,
             retention: Retention {
@@ -545,6 +625,184 @@ enabled = false
         assert_eq!(cfg.targets[0].retention.daily, 0);
         assert_eq!(cfg.targets[0].retention.yearly, 0);
         assert!(cfg.targets[0].display_name.is_empty());
+    }
+
+    #[test]
+    fn target_parses_legacy_single_serial() {
+        let toml = r#"
+label = "primary"
+serial = "ZXA0LMAE"
+mount = "/mnt/backup"
+role = "primary"
+[retention]
+daily = 7
+"#;
+        let t: Target = toml::from_str(toml).expect("legacy form should parse");
+        assert_eq!(t.serial, "ZXA0LMAE");
+        assert_eq!(t.serials, vec!["ZXA0LMAE"]);
+        assert!(t.mount_uuid.is_none());
+        assert_eq!(t.effective_serials(), vec!["ZXA0LMAE"]);
+    }
+
+    #[test]
+    fn target_parses_new_serials_list() {
+        let toml = r#"
+label = "primary"
+serials = ["ZXA0LMAE", "ZXA1NYGZ"]
+mount_uuid = "46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1"
+mount = "/mnt/backup"
+role = "primary"
+[retention]
+daily = 7
+"#;
+        let t: Target = toml::from_str(toml).expect("new form should parse");
+        assert_eq!(t.serials, vec!["ZXA0LMAE", "ZXA1NYGZ"]);
+        // legacy `serial` is auto-populated from serials[0] for back-compat
+        assert_eq!(t.serial, "ZXA0LMAE");
+        assert_eq!(
+            t.mount_uuid.as_deref(),
+            Some("46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1")
+        );
+    }
+
+    #[test]
+    fn target_parses_uuid_only() {
+        // Valid: UUID-only target with no serial — degraded RAID-1 with both
+        // legs unidentified by serial but the FS is mountable.
+        let toml = r#"
+label = "primary"
+mount_uuid = "46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1"
+mount = "/mnt/backup"
+role = "primary"
+[retention]
+daily = 7
+"#;
+        let t: Target = toml::from_str(toml).expect("uuid-only form should parse");
+        assert!(t.serial.is_empty());
+        assert!(t.serials.is_empty());
+        assert_eq!(
+            t.mount_uuid.as_deref(),
+            Some("46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1")
+        );
+    }
+
+    #[test]
+    fn target_parses_mixed_prefers_serials() {
+        // Both forms present → `serials` wins, `serial` is ignored.
+        let toml = r#"
+label = "primary"
+serial = "OLDSERIAL"
+serials = ["NEW1", "NEW2"]
+mount = "/mnt/backup"
+role = "primary"
+[retention]
+daily = 7
+"#;
+        let t: Target = toml::from_str(toml).expect("mixed form should parse");
+        assert_eq!(t.serials, vec!["NEW1", "NEW2"]);
+        assert_eq!(t.serial, "NEW1");
+    }
+
+    #[test]
+    fn target_round_trips_new_form_only() {
+        // After serialize → deserialize, the legacy `serial` field is dropped
+        // from output and re-derived from `serials[0]`.
+        let original = Target {
+            label: "primary-22tb".into(),
+            serial: "ZXA1NYGZ".into(),
+            serials: vec!["ZXA1NYGZ".into(), "NEWLEG".into()],
+            mount_uuid: Some("46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1".into()),
+            mount: "/mnt/backup-22tb".into(),
+            role: TargetRole::Primary,
+            retention: Retention {
+                weekly: 4,
+                monthly: 12,
+                daily: 7,
+                yearly: 1,
+            },
+            display_name: "22TB RAID-1 Primary".into(),
+        };
+        let s = toml::to_string(&original).expect("serialize");
+        // Legacy `serial = ` line MUST NOT appear in canonical output
+        assert!(!s.contains("\nserial = "), "found legacy serial in: {s}");
+        assert!(s.contains("serials = "));
+        assert!(s.contains("mount_uuid = "));
+        let parsed: Target = toml::from_str(&s).expect("round-trip parse");
+        assert_eq!(parsed.serials, original.serials);
+        assert_eq!(parsed.mount_uuid, original.mount_uuid);
+        assert_eq!(parsed.serial, "ZXA1NYGZ"); // re-derived from serials[0]
+    }
+
+    #[test]
+    fn target_validate_uuid_only_passes() {
+        let mut cfg = Config::default();
+        // Make a config that's otherwise valid except the target uses UUID-only.
+        cfg.sources.push(Source {
+            label: "src".into(),
+            volume: "/mnt/src".into(),
+            subvolumes: vec![SubvolConfig {
+                name: "@".into(),
+                manual_only: false,
+                snapshot_name: None,
+            }],
+            device: "/dev/nvme0n1p2".into(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![],
+            target_labels: vec![],
+        });
+        // Replace the default target with a UUID-only one.
+        cfg.targets.clear();
+        cfg.targets.push(Target {
+            label: "primary".into(),
+            serial: String::new(),
+            serials: Vec::new(),
+            mount_uuid: Some("46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1".into()),
+            mount: "/mnt/backup".into(),
+            role: TargetRole::Primary,
+            retention: Retention::default(),
+            display_name: String::new(),
+        });
+        let errors = cfg.validate();
+        assert!(
+            !errors.iter().any(|e| e.contains("primary")),
+            "UUID-only target should validate, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn target_validate_no_anchor_fails() {
+        let mut cfg = Config::default();
+        cfg.sources.push(Source {
+            label: "src".into(),
+            volume: "/mnt/src".into(),
+            subvolumes: vec![SubvolConfig {
+                name: "@".into(),
+                manual_only: false,
+                snapshot_name: None,
+            }],
+            device: "/dev/nvme0n1p2".into(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![],
+            target_labels: vec![],
+        });
+        cfg.targets.clear();
+        cfg.targets.push(Target {
+            label: "naked".into(),
+            serial: String::new(),
+            serials: Vec::new(),
+            mount_uuid: None,
+            mount: "/mnt/backup".into(),
+            role: TargetRole::Primary,
+            retention: Retention::default(),
+            display_name: String::new(),
+        });
+        let errors = cfg.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("naked") && (e.contains("serial") || e.contains("mount_uuid"))),
+            "no-anchor target should fail validation, got: {errors:?}"
+        );
     }
 
     #[test]

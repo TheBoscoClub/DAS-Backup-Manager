@@ -74,8 +74,22 @@ pub fn dump_env(config: &Config) -> String {
     out.push_str(&format!("DAS_TARGET_COUNT={}\n", config.targets.len()));
     for (i, tgt) in config.targets.iter().enumerate() {
         let p = format!("DAS_TARGET_{i}");
+        let effective = tgt.effective_serials();
+        let primary_serial = effective.first().cloned().unwrap_or_default();
         out.push_str(&kv(&format!("{p}_LABEL"), &tgt.label));
-        out.push_str(&kv(&format!("{p}_SERIAL"), &tgt.serial));
+        // Legacy single-serial — read by health/SMART code paths and existing
+        // shell scripts that have not yet migrated to the SERIALS list form.
+        out.push_str(&kv(&format!("{p}_SERIAL"), &primary_serial));
+        // Full list of expected RAID-1 member serials (space-separated).
+        // backup-run.sh uses this to issue per-serial-absence warnings without
+        // aborting — a missing serial is degraded, not failed.
+        out.push_str(&kv(&format!("{p}_SERIALS"), &effective.join(" ")));
+        // BTRFS filesystem UUID for mount-by-UUID. Empty when unset; backup-run.sh
+        // falls back to device-by-serial when empty.
+        out.push_str(&kv(
+            &format!("{p}_MOUNT_UUID"),
+            tgt.mount_uuid.as_deref().unwrap_or(""),
+        ));
         out.push_str(&kv(&format!("{p}_MOUNT"), &tgt.mount));
         let role_str = match tgt.role {
             TargetRole::Primary => "primary",
@@ -98,11 +112,17 @@ pub fn dump_env(config: &Config) -> String {
         }
     }
 
-    // Convenience: serial map and all target mounts
+    // Convenience: serial map and all target mounts.
+    // Map preserves legacy single-serial form (anchor:label) for compatibility;
+    // multi-leg targets contribute one entry per expected serial.
     let serial_map: Vec<String> = config
         .targets
         .iter()
-        .map(|t| format!("{}:{}", t.serial, t.label))
+        .flat_map(|t| {
+            t.effective_serials()
+                .into_iter()
+                .map(move |s| format!("{}:{}", s, t.label))
+        })
         .collect();
     out.push_str(&kv("DAS_SERIAL_MAP", &serial_map.join(" ")));
 
@@ -171,6 +191,8 @@ mod tests {
         config.targets.push(Target {
             label: "primary-22tb".to_string(),
             serial: "ZXA0LMAE".to_string(),
+            serials: vec!["ZXA0LMAE".to_string(), "ZXA1NYGZ".to_string()],
+            mount_uuid: Some("46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1".to_string()),
             mount: "/mnt/backup-22tb".to_string(),
             role: TargetRole::Primary,
             retention: Retention {
@@ -184,6 +206,8 @@ mod tests {
         config.targets.push(Target {
             label: "system-2tb".to_string(),
             serial: "ZFL41DNY".to_string(),
+            serials: vec!["ZFL41DNY".to_string()],
+            mount_uuid: None,
             mount: "/mnt/backup-system".to_string(),
             role: TargetRole::Mirror,
             retention: Retention {
@@ -234,12 +258,17 @@ mod tests {
         assert!(output.contains("DAS_TARGET_COUNT=2"));
         assert!(output.contains("DAS_TARGET_0_LABEL='primary-22tb'"));
         assert!(output.contains("DAS_TARGET_0_SERIAL='ZXA0LMAE'"));
+        assert!(output.contains("DAS_TARGET_0_SERIALS='ZXA0LMAE ZXA1NYGZ'"));
+        assert!(output.contains("DAS_TARGET_0_MOUNT_UUID='46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1'"));
         assert!(output.contains("DAS_TARGET_0_MOUNT='/mnt/backup-22tb'"));
         assert!(output.contains("DAS_TARGET_0_ROLE='primary'"));
         assert!(output.contains("DAS_TARGET_0_DISPLAY_NAME='22TB Primary (Bay 2)'"));
         assert!(output.contains("DAS_TARGET_0_RETENTION_DAILY=365"));
         assert!(output.contains("DAS_TARGET_0_RETENTION_YEARLY=4"));
         assert!(output.contains("DAS_TARGET_1_LABEL='system-2tb'"));
+        assert!(output.contains("DAS_TARGET_1_SERIALS='ZFL41DNY'"));
+        // mount_uuid not set on the 2tb mirror — emits empty string
+        assert!(output.contains("DAS_TARGET_1_MOUNT_UUID=''"));
         assert!(output.contains("DAS_TARGET_1_ROLE='mirror'"));
         // display_name empty → not emitted
         assert!(!output.contains("DAS_TARGET_1_DISPLAY_NAME"));
@@ -250,7 +279,10 @@ mod tests {
         let config = test_config();
         let output = dump_env(&config);
 
-        assert!(output.contains("DAS_SERIAL_MAP='ZXA0LMAE:primary-22tb ZFL41DNY:system-2tb'"));
+        // Multi-leg targets contribute one entry per expected serial.
+        assert!(output.contains(
+            "DAS_SERIAL_MAP='ZXA0LMAE:primary-22tb ZXA1NYGZ:primary-22tb ZFL41DNY:system-2tb'"
+        ));
         assert!(output.contains("DAS_ALL_TARGET_MOUNTS='/mnt/backup-22tb /mnt/backup-system'"));
     }
 

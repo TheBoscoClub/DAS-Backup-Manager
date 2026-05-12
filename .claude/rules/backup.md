@@ -38,3 +38,9 @@
 - FTS5 for full-text filename/path search
 - Incremental indexing: only walk new snapshots
 - Soft-fail: indexing errors don't abort the backup
+
+## Sentinel Interaction — `cachyos-sentinel` Auto-Restarts Failed Services
+- `sentinel-core` (project at `/hddRaid1/ClaudeCodeProjects/cachyos-sentinel/`) monitors all systemd services and auto-remediates ones it sees in `failed` state by re-issuing `systemctl start`. **This includes `das-backup.service`** — confirmed 2026-05-11 by journal evidence (`sentinel-core` WARN log immediately followed by `systemd Starting DAS Backup` within the same second of a manual kill).
+- **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00; the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
+- **For intentional manual stops** of an in-progress backup (e.g. wrong targeting, debugging) — `systemctl stop das-backup.service` alone is insufficient: Sentinel will restart it within seconds. The correct sequence for a manual stop is `systemctl stop das-backup.service && systemctl mask das-backup.service`. Mask makes Sentinel's start attempt fail at the systemd layer (`unit is masked`), and Sentinel will log the failure rather than thrash on it. Unmask + re-enable timer to resume normal operation.
+- **If Sentinel's retries become unwanted** (e.g. persistent hardware fault causing thrashing), add an exclusion in Sentinel's runtime config at `/etc/sentinel/` — service-monitoring exclusion list. The das-backup unit files themselves are clean (no `Restart=`, no `OnFailure=`, no `OnUnitInactiveSec=`); Sentinel is the layer above.

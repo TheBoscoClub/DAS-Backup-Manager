@@ -445,7 +445,9 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
 
         config.targets.push(Target {
             label,
+            serials: vec![serial.clone()],
             serial,
+            mount_uuid: None,
             mount,
             role,
             retention: Retention {

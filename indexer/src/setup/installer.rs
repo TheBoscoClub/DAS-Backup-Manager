@@ -367,6 +367,8 @@ mod tests {
         config.targets.push(Target {
             label: "tgt".to_string(),
             serial: "ABC123".to_string(),
+            serials: vec!["ABC123".to_string()],
+            mount_uuid: None,
             mount: "/mnt/tgt".to_string(),
             role: TargetRole::Primary,
             retention: Retention {

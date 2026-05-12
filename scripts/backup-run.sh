@@ -1,15 +1,22 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.1.0
-# Date: 2026-02-28
+# Version: 4.2.1
+# Date: 2026-05-11
 #
 # Features:
 #   - Incremental BTRFS backups via btrbk to configured targets
 #   - Maintains stable boot subvolumes (@ and @home) for disaster recovery
 #   - Detects DAS drives by serial number (stable across reboots)
+#   - RAID-1 multi-serial + mount-by-UUID: surviving-leg backups continue when
+#     a single RAID-1 partner is missing (degraded mount), no manual config
+#     edit required. See DAS-Backup-Manager-2qe.
 #   - Logs per-target throughput (data written + MB/s rate)
 #   - Designed for unattended nightly execution
 #   - All configuration loaded from config.toml via btrdasd
+#   - Single-instance guard via flock on /run/das-backup.lock — second
+#     invocation exits 0 immediately if another is running. Protects against
+#     timer fires during long runs, Sentinel auto-restart races, and direct
+#     manual invocations.
 #
 # Prerequisites:
 #   - DAS connected and powered on
@@ -22,6 +29,22 @@
 #   sudo ./backup-run.sh --full       # Force full backup (recreate boot subvols)
 
 set -euo pipefail
+
+# ============================================================================
+# SINGLE-INSTANCE GUARD
+# ============================================================================
+# Refuse to run a second backup if another das-backup invocation is already in
+# progress. /run is tmpfs (auto-cleared at boot) so the lockfile can't go stale
+# across reboots. Exit 0 (not failure) when locked so that cachyos-sentinel
+# does not interpret a skipped concurrent fire as a unit failure needing retry.
+LOCKFILE="/run/das-backup.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "[INFO] Another das-backup run holds $LOCKFILE — skipping this invocation" >&2
+    exit 0
+fi
+# FD 9 stays open for the rest of the script; lock auto-releases when the
+# process exits (FD 9 closes), no explicit unlock needed.
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
@@ -38,7 +61,9 @@ else
 fi
 
 # Build associative arrays from config
-declare -A DAS_SERIALS=()
+declare -A DAS_SERIALS=()           # legacy: anchor serial per label
+declare -A DAS_SERIALS_LIST=()      # space-separated list of all expected serials
+declare -A TARGET_MOUNT_UUIDS=()    # BTRFS FS UUID for mount-by-UUID, "" if unset
 declare -A TARGET_MOUNTS=()
 declare -A TARGET_NAMES=()
 declare -A TARGET_ROLES=()
@@ -46,18 +71,24 @@ declare -A MOUNT_ROLES=()
 for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
     label_var="DAS_TARGET_${i}_LABEL"
     serial_var="DAS_TARGET_${i}_SERIAL"
+    serials_var="DAS_TARGET_${i}_SERIALS"
+    uuid_var="DAS_TARGET_${i}_MOUNT_UUID"
     mount_var="DAS_TARGET_${i}_MOUNT"
     name_var="DAS_TARGET_${i}_DISPLAY_NAME"
     role_var="DAS_TARGET_${i}_ROLE"
-    DAS_SERIALS[${!label_var}]="${!serial_var}"
-    TARGET_MOUNTS[${!label_var}]="${!mount_var}"
-    TARGET_ROLES[${!label_var}]="${!role_var}"
+    label="${!label_var}"
+    DAS_SERIALS[$label]="${!serial_var}"
+    # SERIALS list (new env var) — fall back to legacy single SERIAL when not emitted
+    DAS_SERIALS_LIST[$label]="${!serials_var:-${!serial_var}}"
+    TARGET_MOUNT_UUIDS[$label]="${!uuid_var:-}"
+    TARGET_MOUNTS[$label]="${!mount_var}"
+    TARGET_ROLES[$label]="${!role_var}"
     MOUNT_ROLES[${!mount_var}]="${!role_var}"
     name_val="${!name_var}"
     if [[ -n "${name_val:-}" ]]; then
         TARGET_NAMES[${!mount_var}]="$name_val"
     else
-        TARGET_NAMES[${!mount_var}]="${!label_var}"
+        TARGET_NAMES[${!mount_var}]="$label"
     fi
 done
 
@@ -168,31 +199,96 @@ find_device_by_serial() {
 check_das_connected() {
     log_info "Detecting DAS drives by serial number..."
 
-    # Detect all target drives by serial, storing discovered device paths
+    # Each target may have one or more expected serials (RAID-1 → 2). For each
+    # target we record the *first* device found in DISCOVERED_DEVICES (used by
+    # legacy code paths) and the *availability* in TARGET_AVAILABLE.
+    #
+    # A target is AVAILABLE when:
+    #   - mount_uuid is set, AND any expected serial is present OR the FS UUID
+    #     itself is discoverable on the system (BTRFS multi-device superblock
+    #     can satisfy this from the surviving leg alone)
+    #   - or, mount_uuid is unset (legacy targets) AND at least one expected
+    #     serial is present
+    #
+    # An UNAVAILABLE primary target aborts the run; an unavailable mirror is
+    # skipped with a warning. RAID-1 partial-membership is degraded, not an
+    # outage — we proceed with a warning.
     declare -gA DISCOVERED_DEVICES=()
-    local required_found=true
+    declare -gA TARGET_AVAILABLE=()
+    local any_primary_available="false"
+    local any_primary_configured="false"
 
     for label in "${!DAS_SERIALS[@]}"; do
-        local serial="${DAS_SERIALS[$label]}"
+        local serials_list="${DAS_SERIALS_LIST[$label]}"
+        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
         local role="${TARGET_ROLES[$label]}"
-        local dev
-        dev=$(find_device_by_serial "$serial") || dev=""
+        if [[ "$role" == "primary" ]]; then
+            any_primary_configured="true"
+        fi
 
-        if [[ -n "$dev" ]]; then
-            DISCOVERED_DEVICES[$label]="$dev"
-            log_info "  $label: $dev ($serial) — $role"
+        local first_dev=""
+        local -a found_devs=()
+        local -a missing_serials=()
+        local -a found_serials=()
+        local serial
+        for serial in $serials_list; do
+            local dev
+            dev=$(find_device_by_serial "$serial") || dev=""
+            if [[ -n "$dev" ]]; then
+                found_devs+=("$dev")
+                found_serials+=("$serial")
+                if [[ -z "$first_dev" ]]; then
+                    first_dev="$dev"
+                fi
+            else
+                missing_serials+=("$serial")
+            fi
+        done
+
+        local available="false"
+        # Path 1: mount_uuid known → BTRFS can satisfy from any one leg
+        if [[ -n "$uuid" ]]; then
+            if (( ${#found_devs[@]} > 0 )); then
+                available="true"
+            elif blkid -U "$uuid" >/dev/null 2>&1; then
+                # FS UUID resolves on this host even without a configured serial
+                # match (e.g. a replacement drive with a yet-unknown serial).
+                available="true"
+                first_dev="$(blkid -U "$uuid" 2>/dev/null | sed 's/[0-9]*$//')"
+            fi
+        else
+            # Path 2: legacy device-by-serial only
+            if (( ${#found_devs[@]} > 0 )); then
+                available="true"
+            fi
+        fi
+
+        TARGET_AVAILABLE[$label]="$available"
+        if [[ "$available" == "true" ]]; then
+            DISCOVERED_DEVICES[$label]="$first_dev"
+            if (( ${#missing_serials[@]} > 0 )); then
+                log_warn "  $label: present=[${found_serials[*]}] missing=[${missing_serials[*]}] — RAID-1 degraded, proceeding"
+            else
+                log_info "  $label: $first_dev (${found_serials[*]:-<uuid-only>}) — $role"
+            fi
+            if [[ "$role" == "primary" ]]; then
+                any_primary_available="true"
+            fi
         else
             if [[ "$role" == "primary" ]]; then
-                log_error "Primary backup drive ($label, $serial) not found"
-                log_error "Is the DAS connected and powered on?"
-                required_found=false
+                log_error "  $label ($role): no expected drives present and no mountable UUID"
+                log_error "    expected serials: ${serials_list:-<none>}"
+                log_error "    mount UUID:       ${uuid:-<unset>}"
             else
-                log_warn "  $label ($serial) not found — will skip"
+                log_warn "  $label ($role): no expected drives present — will skip"
             fi
         fi
     done
 
-    if [[ "$required_found" == "false" ]]; then
+    # Only abort when at least one primary was configured AND none are reachable.
+    if [[ "$any_primary_configured" == "true" && "$any_primary_available" != "true" ]]; then
+        log_error "No primary backup target is available — aborting"
+        log_error "Is the DAS connected and powered on?"
         exit 1
     fi
 }
@@ -244,33 +340,54 @@ mount_targets() {
 
     for label in "${!TARGET_MOUNTS[@]}"; do
         local mnt="${TARGET_MOUNTS[$label]}"
-        local dev="${DISCOVERED_DEVICES[$label]:-}"
+        local available="${TARGET_AVAILABLE[$label]:-false}"
+        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
+        local role="${TARGET_ROLES[$label]}"
 
-        if [[ -z "$dev" ]]; then
+        if [[ "$available" != "true" ]]; then
             continue
         fi
 
-        local role="${TARGET_ROLES[$label]}"
+        if mountpoint -q "$mnt"; then
+            continue
+        fi
 
-        if ! mountpoint -q "$mnt"; then
-            # Determine the right partition suffix based on role
-            local part_dev
-            if [[ "$role" == "primary" ]]; then
-                part_dev="${dev}1"  # Single partition, whole-disk BTRFS
-            else
-                part_dev="${dev}2"  # Partition 2 for bootable drives (partition 1 = ESP)
-            fi
-
-            if [[ ! -b "$part_dev" ]]; then
-                log_warn "Partition $part_dev not found — skipping $label"
+        # Prefer mount-by-UUID when configured. BTRFS auto-discovers all
+        # present members from any single one's superblock, so a degraded
+        # RAID-1 (one leg missing) still mounts cleanly. The DAS_MOUNT_OPTS
+        # config value is expected to include `degraded` for RAID-1 targets.
+        if [[ -n "$uuid" ]]; then
+            if mount -t btrfs -o "$DAS_MOUNT_OPTS" "UUID=$uuid" "$mnt"; then
+                log_info "  Mounted $label at $mnt (UUID=$uuid)"
                 continue
-            fi
-
-            if mount -o "$DAS_MOUNT_OPTS" "$part_dev" "$mnt"; then
-                log_info "  Mounted $label at $mnt"
             else
-                log_warn "  Could not mount $label at $mnt — btrbk will skip it"
+                log_warn "  UUID=$uuid mount failed for $label — falling back to device-based mount"
             fi
+        fi
+
+        # Legacy device-by-serial path (used when mount_uuid is unset)
+        local dev="${DISCOVERED_DEVICES[$label]:-}"
+        if [[ -z "$dev" ]]; then
+            log_warn "  No discovered device for $label and no UUID configured — skipping"
+            continue
+        fi
+
+        local part_dev
+        if [[ "$role" == "primary" ]]; then
+            part_dev="${dev}1"  # Single partition, whole-disk BTRFS
+        else
+            part_dev="${dev}2"  # Partition 2 for bootable drives (partition 1 = ESP)
+        fi
+
+        if [[ ! -b "$part_dev" ]]; then
+            log_warn "  Partition $part_dev not found — skipping $label"
+            continue
+        fi
+
+        if mount -o "$DAS_MOUNT_OPTS" "$part_dev" "$mnt"; then
+            log_info "  Mounted $label at $mnt ($part_dev)"
+        else
+            log_warn "  Could not mount $label at $mnt — btrbk will skip it"
         fi
     done
 }
@@ -860,7 +977,7 @@ send_report() {
 
     # Send via s-nail (mailx) with Proton Bridge SMTP
     # stderr suppressed to hide s-nail v14 deprecation warnings
-    echo "$report" | mailx \
+    if echo "$report" | mailx \
         -s "$subject" \
         -r "${REPORT_FROM:-das-backup@$(hostname)}" \
         -S "smtp=${SMTP_URL}" \
@@ -868,13 +985,13 @@ send_report() {
         -S "smtp-auth-user=${SMTP_AUTH_USER}" \
         -S "smtp-auth-password=${SMTP_AUTH_PASS}" \
         -S "ssl-verify=${SMTP_SSL_VERIFY:-strict}" \
-        "$REPORT_TO" 2>/dev/null && {
+        "$REPORT_TO" 2>/dev/null; then
         log_info "Report emailed to $REPORT_TO"
         return 0
-    } || {
+    else
         log_warn "Failed to email report to $REPORT_TO — saved to $LAST_REPORT"
         return 1
-    }
+    fi
 }
 
 # ============================================================================

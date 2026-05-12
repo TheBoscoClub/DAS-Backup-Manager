@@ -1378,6 +1378,8 @@ mod tests {
             targets: vec![Target {
                 label: "primary-22tb".into(),
                 serial: "TESTSERIAL".into(),
+                serials: vec!["TESTSERIAL".into()],
+                mount_uuid: None,
                 // Use a path that's definitely mounted in any Linux test environment.
                 mount: "/proc".into(),
                 role: TargetRole::Primary,
