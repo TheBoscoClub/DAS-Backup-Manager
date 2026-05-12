@@ -16,6 +16,7 @@ public:
     ~DBusClient() override;
 
     [[nodiscard]] bool isAvailable() const;
+    [[nodiscard]] QString unavailableReason() const;
 
     // Async job-returning methods (return job_id via signal)
     void backupRun(const QString &configPath, const QString &mode,
@@ -72,6 +73,12 @@ Q_SIGNALS:
                      const QString &summary);
     void errorOccurred(const QString &operation, const QString &error);
 
+    // Fired once, deferred to the next event-loop iteration, if the helper
+    // could not be activated at startup. Collapses what would otherwise be
+    // one errorOccurred per view's first call (a six-dialog cascade) into a
+    // single notification. See bd issue DAS-Backup-Manager-mw0.
+    void helperUnavailable(const QString &reason);
+
     // Async result signals
     void healthQueryResult(const QString &json);
     void scheduleGetResult(const QString &json);
@@ -94,4 +101,5 @@ private:
 
     QDBusInterface *m_interface = nullptr;
     bool m_available = false;
+    QString m_unavailableReason;
 };

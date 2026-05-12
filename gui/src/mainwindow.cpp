@@ -71,6 +71,29 @@ MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
                 KMessageBox::error(this, i18n("%1: %2", operation, error));
             });
 
+    // One-shot notification when the helper service is unreachable at startup.
+    // Replaces the six-dialog cascade (one per view's first D-Bus call) the GUI
+    // used to produce when btrdasd-helper failed to activate. The DBusClient
+    // ctor probes Peer.Ping synchronously; if that fails, every subsequent
+    // method on the client returns silently, and this single dialog explains
+    // why the views are empty. See bd issue DAS-Backup-Manager-mw0.
+    connect(m_dbusClient, &DBusClient::helperUnavailable,
+            this, [this](const QString &reason) {
+                KMessageBox::error(this,
+                    xi18nc("@info",
+                        "<para>The DAS Backup helper service "
+                        "(<icode>btrdasd-helper</icode>) could not be "
+                        "activated on the system D-Bus.</para>"
+                        "<para>Details: %1</para>"
+                        "<para>The window will open, but data views will "
+                        "stay empty until the helper is restored. To "
+                        "diagnose, check:</para>"
+                        "<para><icode>systemctl status btrdasd-helper.service</icode><nl/>"
+                        "<icode>journalctl -u btrdasd-helper.service -n 30</icode></para>",
+                        reason),
+                    i18nc("@title:window", "Helper Service Unavailable"));
+            });
+
     // Async status bar result handlers
     connect(m_dbusClient, &DBusClient::indexStatsResult,
             this, &MainWindow::onIndexStatsResult);
