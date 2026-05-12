@@ -489,6 +489,8 @@ mod tests {
         config.targets.push(Target {
             label: "primary-22tb".to_string(),
             serial: "SERIAL08".to_string(),
+            serials: vec!["SERIAL08".to_string()],
+            mount_uuid: None,
             mount: "/mnt/backup-22tb".to_string(),
             role: TargetRole::Primary,
             retention: Retention {
