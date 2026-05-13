@@ -44,3 +44,24 @@
 - **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00; the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
 - **For intentional manual stops** of an in-progress backup (e.g. wrong targeting, debugging) — `systemctl stop das-backup.service` alone is insufficient: Sentinel will restart it within seconds. The correct sequence for a manual stop is `systemctl stop das-backup.service && systemctl mask das-backup.service`. Mask makes Sentinel's start attempt fail at the systemd layer (`unit is masked`), and Sentinel will log the failure rather than thrash on it. Unmask + re-enable timer to resume normal operation.
 - **If Sentinel's retries become unwanted** (e.g. persistent hardware fault causing thrashing), add an exclusion in Sentinel's runtime config at `/etc/sentinel/` — service-monitoring exclusion list. The das-backup unit files themselves are clean (no `Restart=`, no `OnFailure=`, no `OnUnitInactiveSec=`); Sentinel is the layer above.
+
+## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
+
+**`backup-run.sh` MUST NEVER invoke `btrbk` against a target path that is not a real mountpoint backed by the expected DAS filesystem.** Writing to a bare mountpoint directory falls through to the underlying filesystem (typically the NVMe root `/`), filling it. This caused a real incident in May 2026 (`bd DAS-Backup-Manager-9on`) when the original 22TB drive was removed and a backup ran before the replacement was in place.
+
+Two layers of defense, both implemented in `scripts/backup-run.sh` v4.2.2+:
+
+1. **`create_mount_points`** (mountpoint hygiene) — only creates `$mnt` directories for targets where `TARGET_AVAILABLE[label]="true"`. For unavailable targets, if a pre-existing bare directory at `$mnt` is found:
+   - **empty**: `rmdir`'d silently so `btrbk` cannot write to it later
+   - **non-empty**: ABORT with a fatal error pointing to bd `9on` — this is evidence a prior backup leaked to the bare dir and needs manual cleanup before re-running
+2. **`verify_targets_before_btrbk`** (post-mount assertion) — runs after `mount_targets` and before `run_btrbk`. For each configured target:
+   - If `available=true`: must be a real mountpoint via `mountpoint -q`, AND the mounted filesystem's UUID (preferred, via `findmnt -o UUID`) or device serial (fallback, via `smartctl -i`) must match the value expected in `config.toml`
+   - If `available=false`: `$mnt` must NOT exist on disk
+   - Any violation aborts the run with a clear error listing each affected target
+
+Both layers run unconditionally — `--dryrun` includes them. The verify function records `OP_STATUS[verify_targets]` so failures appear in the email report.
+
+**Cross-references:**
+- `bd DAS-Backup-Manager-9on` — failure-mode writeup and incident notes
+- `scripts/backup-run.sh` `verify_targets_before_btrbk()` and the `create_mount_points` rmdir/abort branches
+- Tools required: `mountpoint`, `findmnt`, `smartctl` (all already used elsewhere in the script)

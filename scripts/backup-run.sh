@@ -1,7 +1,7 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.2.1
-# Date: 2026-05-11
+# Version: 4.2.2
+# Date: 2026-05-12
 #
 # Features:
 #   - Incremental BTRFS backups via btrbk to configured targets
@@ -10,6 +10,13 @@
 #   - RAID-1 multi-serial + mount-by-UUID: surviving-leg backups continue when
 #     a single RAID-1 partner is missing (degraded mount), no manual config
 #     edit required. See DAS-Backup-Manager-2qe.
+#   - Bare-mountpoint guard (v4.2.2): refuses to invoke btrbk unless every
+#     configured target either (a) is a real mountpoint backed by the
+#     expected UUID/serial, or (b) does not exist on disk at all. Unmounted
+#     bare directories at $mnt are auto-removed (when empty) so btrbk
+#     cannot silently write to / instead of the DAS. Prevents recurrence of
+#     the May 2026 incident where a removed 22TB drive let btrbk fill the
+#     root filesystem.
 #   - Logs per-target throughput (data written + MB/s rate)
 #   - Designed for unattended nightly execution
 #   - All configuration loaded from config.toml via btrdasd
@@ -312,8 +319,52 @@ create_mount_points() {
     for label in "${!SOURCE_VOLUMES[@]}"; do
         mkdir -p "${SOURCE_VOLUMES[$label]}"
     done
+
+    # Only create mountpoint dirs for targets we actually plan to mount.
+    # Bare directories at $mnt are a foot-gun: btrbk's config references
+    # them, and if the underlying DAS filesystem isn't mounted there at
+    # backup time, btrbk will silently write to the bare directory on /
+    # (the NVMe root), filling the root filesystem. This happened in May
+    # 2026 when the original 22TB drive was removed and a backup ran
+    # before the replacement was in place — see bd DAS-Backup-Manager-9on.
+    #
+    # For UNAVAILABLE targets, proactively rmdir any pre-existing empty
+    # mountpoint dir so btrbk's path is non-existent at write time
+    # (btrbk fails fast and safely). If the dir is non-empty, that's
+    # evidence a prior write hit the bare dir — refuse to proceed.
     for label in "${!TARGET_MOUNTS[@]}"; do
-        mkdir -p "${TARGET_MOUNTS[$label]}"
+        local mnt="${TARGET_MOUNTS[$label]}"
+        local available="${TARGET_AVAILABLE[$label]:-false}"
+        if [[ "$available" == "true" ]]; then
+            mkdir -p "$mnt"
+            continue
+        fi
+
+        if [[ ! -e "$mnt" ]]; then
+            continue   # already non-existent — safe, nothing to do
+        fi
+
+        # Already mounted from a prior run? Try to unmount cleanly first.
+        # (Should not happen given mount_targets symmetry, but be defensive.)
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            log_warn "  $label is unavailable but $mnt is currently mounted — attempting umount"
+            if ! umount "$mnt" 2>/dev/null; then
+                log_error "  $label: refusing to proceed — $mnt is mounted but target is marked unavailable"
+                exit 1
+            fi
+        fi
+
+        # Now $mnt should be a bare directory. Remove it if empty.
+        if rmdir "$mnt" 2>/dev/null; then
+            log_info "  Removed pre-existing bare mountpoint $mnt (target unavailable)"
+        else
+            log_error "  ABORTING: target $label is unavailable but $mnt is non-empty."
+            log_error "  This is the failure pattern that filled / in May 2026: a prior backup"
+            log_error "  wrote data to a bare directory because the DAS target wasn't mounted."
+            log_error "  Inspect $mnt manually, move/delete its contents (likely on /), and re-run."
+            log_error "  See bd DAS-Backup-Manager-9on."
+            exit 1
+        fi
     done
 }
 
@@ -429,6 +480,109 @@ create_target_dirs() {
             mkdir -p "$mnt/$subdir"
         done
     done
+}
+
+# Verify EVERY configured target is in one of two safe states before invoking
+# btrbk:
+#   1. Real mountpoint backed by the expected filesystem (UUID match preferred,
+#      device-serial match as fallback). btrbk will write to the DAS as
+#      intended.
+#   2. Non-existent on disk (no directory at $mnt). btrbk will fail safely
+#      with a missing-path error for that target rather than writing to /.
+#
+# Anything else — a bare directory at $mnt, or a mountpoint backed by an
+# UNEXPECTED filesystem (wrong UUID, wrong serial, root filesystem
+# shadowing the path) — is the May 2026 foot-gun and we ABORT.
+#
+# This is the last gate before btrbk gets to make irreversible decisions.
+# Tracks bd DAS-Backup-Manager-9on.
+verify_targets_before_btrbk() {
+    log_info "Verifying every backup target is backed by an expected DAS device..."
+
+    local violations=()
+
+    for label in "${!TARGET_MOUNTS[@]}"; do
+        local mnt="${TARGET_MOUNTS[$label]}"
+        local available="${TARGET_AVAILABLE[$label]:-false}"
+        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
+        local serials_list="${DAS_SERIALS_LIST[$label]}"
+        local role="${TARGET_ROLES[$label]}"
+
+        # State A: target intentionally not active this run (no DAS drive
+        # present, mirror role). Confirmed-safe ONLY if $mnt does not exist;
+        # otherwise btrbk could still write to a bare dir.
+        if [[ "$available" != "true" ]]; then
+            if [[ -e "$mnt" ]]; then
+                violations+=("$label: marked unavailable but $mnt still exists (would let btrbk write to bare dir on /)")
+            fi
+            continue
+        fi
+
+        # State B: target should be active — MUST be a real mountpoint.
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            violations+=("$label ($role): expected mounted but $mnt is NOT a mountpoint (mount failed silently in mount_targets)")
+            continue
+        fi
+
+        # State B verification: the mounted filesystem must be the one we
+        # expected, not some other filesystem (or worse, the root FS shadowing
+        # an unmounted path). Prefer UUID match (works for BTRFS RAID-1 even
+        # under degraded mount), fall back to disk serial.
+        if [[ -n "$uuid" ]]; then
+            local fs_uuid
+            fs_uuid=$(findmnt -n -o UUID --target "$mnt" 2>/dev/null || true)
+            if [[ "$fs_uuid" != "$uuid" ]]; then
+                violations+=("$label: $mnt has fs UUID '${fs_uuid:-<none>}', expected '$uuid' — different filesystem mounted here")
+                continue
+            fi
+            log_info "  $label: OK ($mnt → UUID=$fs_uuid)"
+            continue
+        fi
+
+        # Legacy device-by-serial verification (used when mount_uuid is unset)
+        local mount_src
+        mount_src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null || true)
+        if [[ -z "$mount_src" ]]; then
+            violations+=("$label: $mnt is a mountpoint but findmnt could not resolve its source device")
+            continue
+        fi
+        local mount_dev="${mount_src%%[0-9]*}"   # /dev/sde1 → /dev/sde
+        local got_serial
+        got_serial=$(smartctl -i "$mount_dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
+        local serial_match="false"
+        local expected
+        for expected in $serials_list; do
+            if [[ "$got_serial" == "$expected" ]]; then
+                serial_match="true"
+                break
+            fi
+        done
+        if [[ "$serial_match" != "true" ]]; then
+            violations+=("$label: $mnt mounted from $mount_src (serial='${got_serial:-?}'), expected one of: $serials_list")
+            continue
+        fi
+        log_info "  $label: OK ($mnt → $mount_src, serial=$got_serial)"
+    done
+
+    if (( ${#violations[@]} > 0 )); then
+        log_error "============================================================"
+        log_error "ABORTING — refusing to invoke btrbk. Target verification failed:"
+        log_error ""
+        local v
+        for v in "${violations[@]}"; do
+            log_error "  - $v"
+        done
+        log_error ""
+        log_error "Continuing would let btrbk write to a bare directory on the root"
+        log_error "filesystem, filling /. This is the May 2026 incident pattern."
+        log_error "See bd DAS-Backup-Manager-9on for the full failure-mode writeup."
+        log_error "============================================================"
+        record_op "verify_targets" "FAIL" "${#violations[@]} violation(s)"
+        exit 1
+    fi
+
+    log_info "All backup targets verified — safe to invoke btrbk."
+    record_op "verify_targets" "OK"
 }
 
 run_btrbk() {
@@ -1142,6 +1296,7 @@ main() {
     create_snapshot_dirs
     mount_targets
     create_target_dirs
+    verify_targets_before_btrbk
 
     if [[ "$mode" != "dryrun" ]]; then
         BACKUP_MODE_REAL="true"
