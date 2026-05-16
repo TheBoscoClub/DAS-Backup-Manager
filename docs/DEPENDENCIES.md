@@ -79,9 +79,12 @@ The installer supports three init systems. Only one is required:
 
 ### SMTP Configuration
 
-`backup-run.sh` reads `/etc/das-backup-email.conf` (mode 600) for SMTP
-credentials. The mailer is `s-nail` (mailx). Proton Bridge is the configured
-SMTP relay; `msmtp` may substitute if preferred.
+`backup-run.sh` (`parse_pbridge_smtp`) and the Rust reporter
+(`indexer/src/report.rs::parse_pbridge_smtp_block`) both read SMTP credentials
+directly from `~/.config/pbridge.conf` (mode 600) — the single canonical
+source for Protonmail Bridge credentials per `~/.claude/rules/infrastructure.md`.
+The mailer is `s-nail` (mailx). Bridge listens on `127.0.0.1:1025` with
+STARTTLS and a self-signed cert (`ssl-verify=ignore`).
 
 ---
 

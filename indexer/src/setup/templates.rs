@@ -290,37 +290,12 @@ pub fn render_backup_run(config: &Config) -> String {
     )
 }
 
-/// Generate SMTP email configuration file. Returns empty string if email is disabled.
-pub fn render_email_conf(config: &Config) -> String {
-    if !config.email.enabled {
-        return String::new();
-    }
-
-    let auth = match config.email.auth {
-        AuthMethod::Plain | AuthMethod::Starttls => "on",
-        AuthMethod::None => "off",
-    };
-    let tls = match config.email.auth {
-        AuthMethod::Starttls => "on",
-        _ => "off",
-    };
-
-    format!(
-        "{GENERATED_HEADER}\
-         SMTP_HOST=\"{}\"\n\
-         SMTP_PORT=\"{}\"\n\
-         EMAIL_FROM=\"{}\"\n\
-         EMAIL_TO=\"{}\"\n\
-         SMTP_AUTH=\"{}\"\n\
-         SMTP_TLS=\"{}\"\n",
-        config.email.smtp_host,
-        config.email.smtp_port,
-        config.email.from,
-        config.email.to,
-        auth,
-        tls
-    )
-}
+// Email config file generation removed 2026-05-16 — Protonmail Bridge SMTP
+// credentials are sourced directly from `~/.config/pbridge.conf` (the single
+// canonical source per `~/.claude/rules/infrastructure.md`). Both the bash
+// orchestrator (`scripts/backup-run.sh::parse_pbridge_smtp`) and the Rust
+// reporter (`indexer/src/report.rs::send_email_report`) read pbridge.conf
+// directly — no project-local email config file is generated or installed.
 
 // ESP sync hook generation removed 2026-04-10 — root cause of the 2026-03-05
 // incident that wiped the DAS 2TB emergency recovery drives' independent OS
@@ -399,13 +374,9 @@ impl GeneratedFiles {
             }
         }
 
-        // Email config
-        if config.email.enabled {
-            files.push((
-                "/etc/das-backup/email.conf".to_string(),
-                render_email_conf(config),
-            ));
-        }
+        // Email credentials are sourced directly from `~/.config/pbridge.conf`
+        // — no project-local email config file is generated. See
+        // `~/.claude/rules/infrastructure.md` (Protonmail Bridge section).
 
         Self { files }
     }

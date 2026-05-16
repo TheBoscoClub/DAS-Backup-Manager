@@ -181,10 +181,9 @@ sudo mkdir -p /var/lib/das-backup
 sudo cp config/btrbk.conf /etc/btrbk/btrbk.conf
 sudo vim /etc/btrbk/btrbk.conf  # edit for your drives
 
-# Set up email config
-sudo cp config/das-backup-email.conf.example /etc/das-backup-email.conf
-sudo chmod 600 /etc/das-backup-email.conf
-sudo vim /etc/das-backup-email.conf  # add SMTP credentials
+# Email credentials are read directly from ~/.config/pbridge.conf — no
+# project-local email config file is required. See the Protonmail Bridge
+# section of ~/.claude/rules/infrastructure.md.
 
 # Enable systemd timers
 sudo systemctl enable --now das-backup.timer das-backup-full.timer
@@ -340,7 +339,7 @@ The installer creates the following files (tracked in `/etc/das-backup/.manifest
 | `/etc/systemd/system/das-backup-full.service` | Full backup service (systemd) |
 | `/etc/systemd/system/das-backup-full.timer` | Full backup timer (systemd) |
 | `/usr/local/lib/das-backup/backup-run-generated.sh` | Generated backup script |
-| `/etc/das-backup-email.conf` | SMTP credentials (mode 0600) |
+| `~/.config/pbridge.conf` | SMTP credentials (Protonmail Bridge — single canonical source, mode 0600) |
 | `/usr/share/libalpm/hooks/das-backup-esp.hook` | Pacman ESP hook (if enabled) |
 
 For sysvinit/OpenRC systems, cron entries replace systemd units.

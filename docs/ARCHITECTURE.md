@@ -219,8 +219,10 @@ Templates are rendered programmatically (no external template files):
 | `render_systemd_timer()` | `.timer` unit | OnCalendar with RandomizedDelaySec |
 | `render_cron_entry()` | cron lines | For sysvinit/OpenRC systems |
 | `render_backup_run()` | `backup-run-generated.sh` | Script with DAS serials, mount vars |
-| `render_email_conf()` | `das-backup-email.conf` | SMTP configuration |
-| `render_esp_hook()` | pacman/apt/dnf hook | Package manager hook for ESP sync |
+
+SMTP credentials are sourced directly from `~/.config/pbridge.conf` — no
+project-local email config file is generated. ESP sync hook generation was
+removed 2026-04-10 (see `.claude/rules/esp-safety.md`).
 
 ### System Detection
 
@@ -297,8 +299,8 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 
 | File | Mode | Owner | Reason |
 |------|------|-------|--------|
-| `/etc/das-backup-email.conf` | `0o600` | root | Contains SMTP credentials |
-| `/etc/das-backup/config.toml` | `0o644` | root | No secrets (email config separate) |
+| `~/.config/pbridge.conf` | `0o600` | user | Protonmail Bridge credentials (single canonical source) |
+| `/etc/das-backup/config.toml` | `0o644` | root | No secrets (Bridge credentials live in `~/.config/pbridge.conf`) |
 | Generated scripts | `0o755` | root | Executable by system |
 | `/var/lib/das-backup/backup-index.db` | `0o644` | root | Readable by GUI, writable by indexer |
 
@@ -332,7 +334,7 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 ### Privacy
 
 - **Metadata only**: The database stores file paths, names, sizes, and timestamps — never file contents. No user data is read or stored beyond filesystem metadata.
-- **Email config isolation**: SMTP credentials are in a separate file (`/etc/das-backup-email.conf`, mode 0600), not in the main TOML config.
+- **Email credential isolation**: SMTP credentials live in `~/.config/pbridge.conf` (mode 0600 — the single canonical source per `~/.claude/rules/infrastructure.md`), not in the project's TOML config. Both consumers — `scripts/backup-run.sh::parse_pbridge_smtp` and `indexer/src/report.rs::parse_pbridge_smtp_block` — read this file directly.
 - **No telemetry**: No network connections, analytics, or usage tracking of any kind.
 
 ### Database Encryption Assessment

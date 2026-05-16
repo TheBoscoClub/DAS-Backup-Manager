@@ -13,7 +13,7 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 
 - **Backup DB**: `/var/lib/das-backup/backup-index.db`
 - **btrbk config**: `/etc/btrbk/btrbk.conf`
-- **Email config**: `/etc/das-backup-email.conf`
+- **Email credentials**: `~/.config/pbridge.conf` (single canonical Bridge credential source — see `~/.claude/rules/infrastructure.md`)
 - **Growth log**: `/var/lib/das-backup/growth.log`
 
 ## Build

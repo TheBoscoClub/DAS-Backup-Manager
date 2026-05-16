@@ -56,7 +56,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 ```
 DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
-├── config/            # btrbk.conf, email config template
+├── config/            # btrbk.conf reference template
 ├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper + FFI
 │   ├── src/           # Library modules (13): backup, config, db, ffi, health, indexer, mount, progress, report, restore, scanner, schedule, subvol
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)

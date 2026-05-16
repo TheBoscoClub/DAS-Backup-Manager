@@ -28,9 +28,11 @@
 - Cleanup runs after backup, prunes archives older than 365 days
 
 ## Email Reports
-- SMTP config at `/etc/das-backup/email.conf` (mode 600)
-- Reports include: btrbk status, throughput, archive/cleanup counts, indexing status, SMART summary, growth trend
-- Sent via Protonmail Bridge SMTP at `127.0.0.1:1025` STARTTLS
+- **SMTP credentials**: sourced at runtime from `~/.config/pbridge.conf` (the single canonical Bridge credential source per `~/.claude/rules/infrastructure.md`). Both consumers — `scripts/backup-run.sh` `parse_pbridge_smtp()` and `indexer/src/report.rs` `parse_pbridge_smtp_block()` — read this file directly. No project-local email config file is generated, installed, or read; legacy `/etc/das-backup-email.conf` and `/etc/das-backup/email.conf` were retired 2026-05-16
+- **Recipient/sender**: default to the Bridge account holder (the `Username:` field of the SMTP block in `pbridge.conf`). Override via `DAS_REPORT_TO` / `DAS_REPORT_FROM` env vars only if a separate notification address is required
+- **TLS**: `ssl-verify=ignore` because Bridge listens with a self-signed cert on the loopback interface
+- **Reports include**: btrbk status, throughput, archive/cleanup counts, indexing status, SMART summary, growth trend
+- **Transport**: Protonmail Bridge SMTP at `127.0.0.1:1025` STARTTLS
 
 ## Content Indexer
 - Database at `/var/lib/das-backup/backup-index.db`

@@ -120,7 +120,10 @@ done
 LOG_FILE="$DAS_LOG_FILE"
 
 # Email and growth tracking (now from config)
-EMAIL_CONF="/etc/das-backup-email.conf"
+# Bridge credentials live in ~/.config/pbridge.conf — the single canonical source for
+# Protonmail Bridge SMTP credentials across all projects. See ~/.claude/rules/infrastructure.md.
+# Path is hardcoded because backup-run.sh runs as root via systemd (no $HOME).
+PBRIDGE_CONF="${PBRIDGE_CONF:-/home/bosco/.config/pbridge.conf}"
 GROWTH_LOG="$DAS_GROWTH_LOG"
 LAST_REPORT="$DAS_LAST_REPORT"
 
@@ -1096,6 +1099,44 @@ generate_smart_section() {
     done
 }
 
+# Parse Bridge SMTP credentials from ~/.config/pbridge.conf (the single canonical
+# source for Protonmail Bridge credentials per ~/.claude/rules/infrastructure.md).
+# Sets globals: PB_SMTP_HOST, PB_SMTP_PORT, PB_SMTP_USER, PB_SMTP_PASS.
+# Returns 0 on success, 1 if config missing or credentials incomplete.
+parse_pbridge_smtp() {
+    if [[ ! -f "$PBRIDGE_CONF" ]]; then
+        log_warn "Bridge config $PBRIDGE_CONF not found — report saved but not emailed"
+        log_warn "pbridge.conf is the single canonical Bridge credential source — see ~/.claude/rules/infrastructure.md"
+        return 1
+    fi
+
+    # The token in this file is sensitive — warn loudly if perms aren't 0600
+    local perms
+    perms=$(stat -c '%a' "$PBRIDGE_CONF" 2>/dev/null || echo "???")
+    if [[ "$perms" != "600" ]]; then
+        log_warn "Bridge config $PBRIDGE_CONF has permissions $perms — should be 600 (contains auth token)"
+    fi
+
+    PB_SMTP_HOST=""; PB_SMTP_PORT=""; PB_SMTP_USER=""; PB_SMTP_PASS=""
+    local in_smtp_block=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^SMTP: ]]; then in_smtp_block=1; continue; fi
+        if [[ "$line" =~ ^IMAP: ]]; then in_smtp_block=0; continue; fi
+        if [[ "$line" =~ ^[A-Za-z][A-Za-z0-9]*:$ ]]; then in_smtp_block=0; continue; fi
+        [[ $in_smtp_block -eq 0 ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*Hostname:[[:space:]]*(.+)$ ]]; then PB_SMTP_HOST="${BASH_REMATCH[1]}"; fi
+        if [[ "$line" =~ ^[[:space:]]*Port:[[:space:]]*(.+)$ ]]; then PB_SMTP_PORT="${BASH_REMATCH[1]}"; fi
+        if [[ "$line" =~ ^[[:space:]]*Username:[[:space:]]*(.+)$ ]]; then PB_SMTP_USER="${BASH_REMATCH[1]}"; fi
+        if [[ "$line" =~ ^[[:space:]]*Password:[[:space:]]*(.+)$ ]]; then PB_SMTP_PASS="${BASH_REMATCH[1]}"; fi
+    done < "$PBRIDGE_CONF"
+
+    if [[ -z "$PB_SMTP_USER" || -z "$PB_SMTP_PASS" ]]; then
+        log_warn "Bridge SMTP credentials missing in $PBRIDGE_CONF — report saved but not emailed"
+        return 1
+    fi
+    return 0
+}
+
 send_report() {
     local report="$1"
     local overall_status="$2"
@@ -1105,25 +1146,19 @@ send_report() {
     echo "$report" > "$LAST_REPORT"
     log_info "Report saved to $LAST_REPORT"
 
-    # Load email config
-    if [[ ! -f "$EMAIL_CONF" ]]; then
-        log_warn "Email config $EMAIL_CONF not found — report saved but not emailed"
+    # Source Bridge SMTP credentials from pbridge.conf (single canonical source)
+    if ! parse_pbridge_smtp; then
         return 1
     fi
 
-    # shellcheck source=/dev/null
-    source "$EMAIL_CONF"
-
-    if [[ -z "${REPORT_TO:-}" ]]; then
-        log_warn "REPORT_TO not set in $EMAIL_CONF — report saved but not emailed"
-        return 1
-    fi
-
-    if [[ -z "${SMTP_AUTH_PASS:-}" ]]; then
-        log_warn "SMTP_AUTH_PASS not set in $EMAIL_CONF — report saved but not emailed"
-        log_warn "Get the Bridge password from: Proton Bridge GUI → Account → IMAP/SMTP → Password"
-        return 1
-    fi
+    local smtp_url="smtp://${PB_SMTP_HOST}:${PB_SMTP_PORT}"
+    # Recipient defaults to the Bridge account holder (single-user setup).
+    # Sender uses the Bridge account address (Bridge enforces SMTP MAIL FROM to match
+    # the authenticated user) but renders a friendly display name "DAS Backup (<host>)"
+    # so the email stands out in the inbox From column instead of looking like
+    # gjbr@pm.me sending mail to itself. Override either via DAS_REPORT_TO/FROM.
+    local report_to="${DAS_REPORT_TO:-$PB_SMTP_USER}"
+    local report_from="${DAS_REPORT_FROM:-DAS Backup ($(hostname -s)) <$PB_SMTP_USER>}"
 
     # Build subject line
     local subject
@@ -1131,19 +1166,20 @@ send_report() {
 
     # Send via s-nail (mailx) with Proton Bridge SMTP
     # stderr suppressed to hide s-nail v14 deprecation warnings
+    # ssl-verify=ignore because Bridge uses a self-signed cert on the loopback listener
     if echo "$report" | mailx \
         -s "$subject" \
-        -r "${REPORT_FROM:-das-backup@$(hostname)}" \
-        -S "smtp=${SMTP_URL}" \
+        -r "$report_from" \
+        -S "smtp=${smtp_url}" \
         -S "smtp-auth=login" \
-        -S "smtp-auth-user=${SMTP_AUTH_USER}" \
-        -S "smtp-auth-password=${SMTP_AUTH_PASS}" \
-        -S "ssl-verify=${SMTP_SSL_VERIFY:-strict}" \
-        "$REPORT_TO" 2>/dev/null; then
-        log_info "Report emailed to $REPORT_TO"
+        -S "smtp-auth-user=${PB_SMTP_USER}" \
+        -S "smtp-auth-password=${PB_SMTP_PASS}" \
+        -S "ssl-verify=ignore" \
+        "$report_to" 2>/dev/null; then
+        log_info "Report emailed to $report_to"
         return 0
     else
-        log_warn "Failed to email report to $REPORT_TO — saved to $LAST_REPORT"
+        log_warn "Failed to email report to $report_to — saved to $LAST_REPORT"
         return 1
     fi
 }
