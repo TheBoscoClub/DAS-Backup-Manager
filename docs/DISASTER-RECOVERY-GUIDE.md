@@ -174,7 +174,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 
 ### Scenario D: 22TB RAID-1 Backup Array Single-Leg Failure
 
-**Applies if** your primary backup is a BTRFS RAID-1 across two large drives (in this setup: 22TB Exos drives in DAS bays 2 and 5, sharing BTRFS UUID `46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1`).
+**Applies if** your primary backup is a BTRFS RAID-1 across two large drives (in this setup: 22TB Exos drives in DAS bays 2 and 5, sharing BTRFS UUID `b2dbe07d-40b9-422e-8ccf-ef4931c40457`).
 
 **Symptoms**:
 - Email backup report warns that the array is degraded or that one leg has SMART errors
@@ -192,7 +192,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 ```bash
 sudo btrfs filesystem show /mnt/backup-22tb
 # Output looks like:
-#   Label: 'das-backup-22tb' uuid: 46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1
+#   Label: 'das-backup-22tb' uuid: b2dbe07d-40b9-422e-8ccf-ef4931c40457
 #       Total devices 2 FS bytes used X.XTiB
 #       devid    1 size 20.01TiB used Y path /dev/sdk1
 #       devid    2 size 0 used 0 path MISSING
@@ -203,8 +203,8 @@ sudo btrfs device stats /mnt/backup-22tb
 ```
 
 Cross-reference the device serial against your bay map (`docs/examples/author-bay-mapping.md`):
-- `ZXA0LMAE` (bay 2, devid 1)
-- `ZXA1NYGZ` (bay 5, devid 2)
+- `ZXA1R71M` (bay 2, devid 2) — RMA replacement for failed `ZXA0LMAE` since 2026-05-15. Note: devid numbering was reversed by the 2026-05-07 `mkfs.btrfs` rebuild — the surviving leg became devid 1.
+- `ZXA1NYGZ` (bay 5, devid 1) — was devid 2 prior to 2026-05-07
 
 #### Step 2: Mount the array degraded if it failed to mount
 
@@ -213,12 +213,12 @@ The `backup-run.sh` script always uses degraded mount options, so scheduled back
 ```bash
 # If /mnt/backup-22tb is not currently mounted
 sudo mkdir -p /mnt/backup-22tb
-sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 
 # Or, if udisks2 auto-mounted at /run/media/bosco/das-backup-22tb but failed
 # because of degraded state, force the explicit mount:
 sudo umount /run/media/bosco/das-backup-22tb 2>/dev/null
-sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 ```
 
 #### Step 3: Verify SMART on the surviving leg

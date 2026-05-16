@@ -12,7 +12,7 @@
 - Drives are BTRFS-formatted; the 22TB primary backup target is BTRFS RAID-1 across two drives (since 2026-05-06), the 2TB recovery drives are independent single-device filesystems
 
 ## Targets and Retention (per `/etc/das-backup/config.toml`)
-- **`primary-22tb`** — 22TB Exos RAID-1 across bays 2 (`ZXA0LMAE`) + 5 (`ZXA1NYGZ`), label `das-backup-22tb`, mount `/mnt/backup-22tb`. Retention: `daily=7, weekly=4, monthly=12, yearly=1`. Receives all source streams (NVMe, SSD, hdd-projects, hdd-audiobooks, das-storage).
+- **`primary-22tb`** — 22TB Exos RAID-1 across bays 2 (`ZXA1R71M`, RMA replacement installed 2026-05-15) + 5 (`ZXA1NYGZ`), label `das-backup-22tb`, uuid `b2dbe07d-40b9-422e-8ccf-ef4931c40457`, mount `/mnt/backup-22tb`. Retention: `daily=7, weekly=4, monthly=12, yearly=1`. Receives all source streams (NVMe, SSD, hdd-projects, hdd-audiobooks, das-storage). The original bay-2 drive (`ZXA0LMAE`) failed and was RMA'd; the 2026-05-07 post-RMA rebuild used `mkfs.btrfs` single by mistake and was restored to RAID-1 on 2026-05-15/16 via `btrfs device add` + `balance -dconvert=raid1 -mconvert=raid1 -sconvert=raid1` (see bd `DAS-Backup-Manager-453`).
 - **`system-2tb`** — 2TB SMR bay 4 (`ZFL41DNY`), label `das-backup-system`, mount `/mnt/backup-system`. Retention: `daily=7`. Mirror role.
 - **`system-mirror-2tb`** — 2TB SMR bay 1 (`ZK208Q77`), label `das-backup-system-mirror`, mount `/mnt/backup-system-mirror`. Retention: `daily=7`. Mirror role.
 - Boot archives: 1 year retention, pruned by `boot-archive-cleanup.sh`

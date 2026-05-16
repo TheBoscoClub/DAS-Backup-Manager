@@ -33,7 +33,7 @@ The emergency response disabled `[esp] enabled = false` in `config.toml` but lef
 
 DAS backup drives are identifiable by:
 - Labels: `BACKUP-ESP`, `das-backup-system`, `das-backup-system-mirror`, `das-backup-22tb`
-- Serials: `ZK208Q77` (bay 1), `ZXA0LMAE` (bay 2), `ZFL41DNY` (bay 4), `ZXA1NYGZ` (bay 5, RAID-1 partner of ZXA0LMAE — added 2026-05-06)
+- Serials: `ZK208Q77` (bay 1), `ZXA1R71M` (bay 2, RMA replacement for failed `ZXA0LMAE` — installed 2026-05-15), `ZFL41DNY` (bay 4, was bay 3 prior to 2026-05-06), `ZXA1NYGZ` (bay 5, RAID-1 partner of `ZXA1R71M` in the 22TB array; added 2026-05-06 originally as partner of `ZXA0LMAE`)
 - Device paths: vary on reconnect (USB-attached TerraMaster D6-320 enclosure)
 - Mount points: `/mnt/backup-22tb`, `/run/media/bosco/das-*`
 

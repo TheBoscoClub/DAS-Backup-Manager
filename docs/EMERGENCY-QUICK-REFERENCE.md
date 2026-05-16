@@ -109,7 +109,7 @@ sudo btrfs device stats /mnt/backup-22tb
 If `/mnt/backup-22tb` is not currently mounted (or won't mount normally):
 ```bash
 sudo mkdir -p /mnt/backup-22tb
-sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 ```
 
 The system's automatic backups already use `degraded` in their mount options, so the next nightly backup should run even with one drive missing. Email reports will warn loudly about the degraded state.
@@ -121,7 +121,7 @@ Power down the DAS, swap in a new 22TB drive of equal or larger capacity (Seagat
 **4. Find the new drive's letter**
 ```bash
 lsblk -o NAME,SIZE,SERIAL,TRAN
-# The new drive will have NO partitions and a different serial than ZXA0LMAE / ZXA1NYGZ
+# The new drive will have NO partitions and a different serial than ZXA1R71M / ZXA1NYGZ
 ```
 
 **5. Partition the new drive identically to the surviving one**
@@ -160,7 +160,7 @@ sudo btrfs device stats /mnt/backup-22tb   # All counters should be 0
 ```bash
 sudo btrfs device stats --reset /mnt/backup-22tb
 sudo umount /mnt/backup-22tb
-sudo mount UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup-22tb
+sudo mount UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 ```
 
 For more detail, see `DISASTER-RECOVERY-GUIDE.md` section "Recovery: 22TB RAID-1 Backup Array Single-Leg Failure".
@@ -199,15 +199,15 @@ sudo btrfs filesystem show
 | NVMe 1 (boot) | | | |
 | NVMe 2 (mirror) | | | |
 | DAS Bay 1 (2TB mirror, recovery) | das-backup-system-mirror | ZK208Q77 | 60b05268-7f8f-47b5-a38a-752576a1172a |
-| DAS Bay 2 (22TB primary, RAID-1 leg 1) | das-backup-22tb | ZXA0LMAE | 46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 |
+| DAS Bay 2 (22TB primary, RAID-1 leg 1) | das-backup-22tb | ZXA1R71M | b2dbe07d-40b9-422e-8ccf-ef4931c40457 |
 | DAS Bay 3 | (empty) | — | — |
 | DAS Bay 4 (2TB system, recovery) | das-backup-system | ZFL41DNY | 7c7ae72d-09d6-4086-b249-1ac60f21b73b |
-| DAS Bay 5 (22TB primary, RAID-1 leg 2) | das-backup-22tb | ZXA1NYGZ | 46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 |
+| DAS Bay 5 (22TB primary, RAID-1 leg 2) | das-backup-22tb | ZXA1NYGZ | b2dbe07d-40b9-422e-8ccf-ef4931c40457 |
 | DAS Bay 6 | (empty) | — | — |
 
-> **22TB primary is BTRFS RAID-1**: bays 2 + 5 share one filesystem (UUID `46ffbd7c-…`). If one drive fails, mount with `-o degraded`:
+> **22TB primary is BTRFS RAID-1**: bays 2 + 5 share one filesystem (UUID `b2dbe07d-…`). If one drive fails, mount with `-o degraded`:
 > ```bash
-> sudo mount -o degraded UUID=46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1 /mnt/backup
+> sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup
 > ```
 
 ---

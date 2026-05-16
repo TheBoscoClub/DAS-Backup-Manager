@@ -13,7 +13,7 @@
 | TerraMaster D6-320 (front view)                 |
 +--------------+--------------+-------------------+
 |    Bay 1     |    Bay 2     |    Bay 3          |
-|   ZK208Q77   |   ZXA0LMAE   |   (empty)         |
+|   ZK208Q77   |   ZXA1R71M   |   (empty)         |
 |   2TB SMR    | * 22TB CMR   |                   |
 |  Emergency   |  PRIMARY     |                   |
 |  Boot/Recov  |  BACKUP      |                   |
@@ -33,25 +33,25 @@
 | Bay | Serial | Model | Size | Partitions | Role | BTRFS Label |
 |-----|--------|-------|------|------------|------|-------------|
 | 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system-mirror |
-| 2 | ZXA0LMAE | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 1 — all btrbk targets | das-backup-22tb |
+| 2 | ZXA1R71M | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 1 — all btrbk targets (RMA replacement for `ZXA0LMAE` since 2026-05-15) | das-backup-22tb |
 | 3 | — | — | — | — | Empty | — |
 | 4 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system |
 | 5 | ZXA1NYGZ | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 2 — all btrbk targets | das-backup-22tb |
 | 6 | — | — | — | — | Empty | — |
 
-## Primary Backup — BTRFS RAID-1 Across Bays 2 & 5 (added 2026-05-06)
+## Primary Backup — BTRFS RAID-1 Across Bays 2 & 5 (originally added 2026-05-06; restored 2026-05-16 after RMA replacement of failed `ZXA0LMAE`)
 
 The two 22TB CMR drives in bays 2 and 5 form a single BTRFS RAID-1 filesystem. Both drives must be online for the backup target to mount; this trades the offline/air-gap model for live redundancy against single-drive failure during the multi-day recovery window of a 22TB drive replacement.
 
-| | Bay 2 (ZXA0LMAE) | Bay 5 (ZXA1NYGZ) |
+| | Bay 2 (ZXA1R71M) | Bay 5 (ZXA1NYGZ) |
 |---|---|---|
 | **Partition** | `p1` — whole disk (sectors 2048–42970644446), GPT type 8300, name `das-backup-22tb` | `p1` — identical layout |
-| **PARTUUID** | `d3ac162f-9bf4-4fd8-87c0-a104200bcd01` | `b24e0ea8-fd90-4a36-8c76-26587a29755b` |
-| **BTRFS devid** | 1 | 2 |
-| **BTRFS UUID_SUB** | `abbb98a9-9e5d-48a5-aba1-a99281eea79d` | `69ac05e0-f2c5-4a4e-845a-8149c6fb4b14` |
+| **PARTUUID** | `099edf5b-e35e-4c0c-86fa-0837a6ebbd73` | `b24e0ea8-fd90-4a36-8c76-26587a29755b` |
+| **BTRFS devid** | 2 | 1 |
+| **BTRFS UUID_SUB** | `68a45e02-54dc-4d76-a626-6ebe9a084879` | `b72e7628-c9e3-4b04-87dd-55e253ecaec3` |
 
 **Filesystem-level identifiers** (shared across both devices):
-- BTRFS UUID: `46ffbd7c-dfd9-4ba5-82ae-0afffde99bb1`
+- BTRFS UUID: `b2dbe07d-40b9-422e-8ccf-ef4931c40457`
 - Label: `das-backup-22tb`
 - Profiles: Data RAID-1, Metadata RAID-1, System RAID-1
 - Mount: `/mnt/backup-22tb` (production) / `/run/media/bosco/das-backup-22tb` (auto-mounted)
@@ -119,6 +119,6 @@ The BTRFS RAID0 general storage array was moved from DAS bays 3/4/5 to internal 
 - LED identification: `sudo dd if=/dev/sdX of=/dev/null bs=1M count=2000 status=progress`
 - 22TB Exos drives are CMR (conventional magnetic recording) — no SMR write penalties
 - 2TB drives: all ST2000DM008 (SMR), same batch March 2021, ~13,000 hours each
-- 22TB drives: ST22000NM000C, sourced ZXA0LMAE 2026-02 + ZXA1NYGZ 2026-05 (different batches, mitigates correlated-failure risk for the RAID-1 pair)
+- 22TB drives: ST22000NM000C — original `ZXA0LMAE` sourced 2026-02 (failed, RMA'd) + `ZXA1NYGZ` sourced 2026-05 + `ZXA1R71M` arrived 2026-05-15 as RMA replacement for `ZXA0LMAE` (factory recertified 2025-08-05, ~45h burn-in). Current RAID-1 pair is `ZXA1NYGZ` + `ZXA1R71M`, sourced from different production batches to mitigate correlated-failure risk
 - USB topology: each bay gets an independent USB sub-device via the enclosure's bridge chip (4-1.3.x)
 - 2026-05-06 bay reshuffle: ZFL41DNY moved from bay 3 → bay 4 to make room for the new 22TB CMR drive in bay 5
