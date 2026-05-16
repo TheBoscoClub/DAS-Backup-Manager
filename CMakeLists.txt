@@ -162,7 +162,6 @@ install(PROGRAMS
 
 install(FILES
     config/btrbk.conf
-    config/das-backup-email.conf.example
     DESTINATION "${DAS_SCRIPT_DIR}/config"
 )
 

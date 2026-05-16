@@ -70,13 +70,6 @@ pub fn install_to_prefix(
             std::fs::set_permissions(&full_path, perms)?;
         }
 
-        // Email config gets restricted permissions
-        if full_path.to_string_lossy().contains("email.conf") {
-            let mut perms = std::fs::metadata(&full_path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&full_path, perms)?;
-        }
-
         manifest_entries.push(full_path.to_string_lossy().to_string());
     }
 
@@ -293,7 +286,6 @@ fn cmake_installed_paths(prefix: &str) -> Vec<String> {
         p("lib/das-backup/das-partition-drives.sh"),
         p("lib/das-backup/install-backup-timer.sh"),
         p("lib/das-backup/config/btrbk.conf"),
-        p("lib/das-backup/config/das-backup-email.conf.example"),
         // Systemd units (cmake-installed templates)
         "/lib/systemd/system/das-backup.service".to_string(),
         "/lib/systemd/system/das-backup-full.service".to_string(),
