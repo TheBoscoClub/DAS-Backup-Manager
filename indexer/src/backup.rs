@@ -1431,8 +1431,8 @@ mod tests {
         let output = "\
 +++ /.btrfs-nvme/.btrbk-snapshots/root.20260302T0835
 >>> /mnt/backup-22tb/nvme/root.20260302T0835
->>> /mnt/backup-system/nvme/root.20260302T0835
-*** /mnt/backup-system-mirror/nvme/root.20260302T0835
+>>> /mnt/backup-system-recovery-B/nvme/root.20260302T0835
+*** /mnt/backup-system-recovery-A/nvme/root.20260302T0835
 === /.btrfs-nvme/.btrbk-snapshots/home.20260302T0828
 --- /mnt/backup-22tb/nvme/root.20260220T030012
 ";

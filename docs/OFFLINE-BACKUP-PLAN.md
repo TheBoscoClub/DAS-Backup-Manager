@@ -242,7 +242,7 @@ Shingled Magnetic Recording (SMR) drives have poor random write performance once
 ```
 Bay 1 -- 2TB Barracuda: BOOTABLE RECOVERY #1
   Independent ESP + bootable OS + btrbk NVMe/SSD snapshots
-  Label: das-backup-system-mirror (serial ZK208Q77)
+  Label: das-backup-system-recovery-A (serial ZK208Q77)
 
 Bay 2 -- 22TB Exos: PRIMARY BACKUP — RAID-1 leg 1 (serial ZXA1R71M, RMA replacement for failed ZXA0LMAE since 2026-05-15)
   Pairs with bay 5 in a single BTRFS RAID-1 filesystem
@@ -253,7 +253,7 @@ Bay 3 -- empty
 
 Bay 4 -- 2TB Barracuda: BOOTABLE RECOVERY #2 (moved from bay 3 on 2026-05-06)
   Independent ESP + bootable OS + btrbk NVMe/SSD snapshots
-  Label: das-backup-system (serial ZFL41DNY)
+  Label: das-backup-system-recovery-B (serial ZFL41DNY)
 
 Bay 5 -- 22TB Exos: PRIMARY BACKUP — RAID-1 leg 2 (serial ZXA1NYGZ)
   Pairs with bay 2 in a single BTRFS RAID-1 filesystem

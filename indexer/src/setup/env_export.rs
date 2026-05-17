@@ -204,11 +204,11 @@ mod tests {
             display_name: "22TB Primary (Bay 2)".to_string(),
         });
         config.targets.push(Target {
-            label: "system-2tb".to_string(),
+            label: "system-recovery-B-2tb".to_string(),
             serial: "ZFL41DNY".to_string(),
             serials: vec!["ZFL41DNY".to_string()],
             mount_uuid: None,
-            mount: "/mnt/backup-system".to_string(),
+            mount: "/mnt/backup-system-recovery-B".to_string(),
             role: TargetRole::Mirror,
             retention: Retention {
                 weekly: 4,
@@ -265,9 +265,9 @@ mod tests {
         assert!(output.contains("DAS_TARGET_0_DISPLAY_NAME='22TB Primary (Bay 2)'"));
         assert!(output.contains("DAS_TARGET_0_RETENTION_DAILY=365"));
         assert!(output.contains("DAS_TARGET_0_RETENTION_YEARLY=4"));
-        assert!(output.contains("DAS_TARGET_1_LABEL='system-2tb'"));
+        assert!(output.contains("DAS_TARGET_1_LABEL='system-recovery-B-2tb'"));
         assert!(output.contains("DAS_TARGET_1_SERIALS='ZFL41DNY'"));
-        // mount_uuid not set on the 2tb mirror — emits empty string
+        // mount_uuid not set on the 2tb recovery copy — emits empty string
         assert!(output.contains("DAS_TARGET_1_MOUNT_UUID=''"));
         assert!(output.contains("DAS_TARGET_1_ROLE='mirror'"));
         // display_name empty → not emitted
@@ -281,9 +281,11 @@ mod tests {
 
         // Multi-leg targets contribute one entry per expected serial.
         assert!(output.contains(
-            "DAS_SERIAL_MAP='ZXA0LMAE:primary-22tb ZXA1NYGZ:primary-22tb ZFL41DNY:system-2tb'"
+            "DAS_SERIAL_MAP='ZXA0LMAE:primary-22tb ZXA1NYGZ:primary-22tb ZFL41DNY:system-recovery-B-2tb'"
         ));
-        assert!(output.contains("DAS_ALL_TARGET_MOUNTS='/mnt/backup-22tb /mnt/backup-system'"));
+        assert!(output.contains(
+            "DAS_ALL_TARGET_MOUNTS='/mnt/backup-22tb /mnt/backup-system-recovery-B'"
+        ));
     }
 
     #[test]

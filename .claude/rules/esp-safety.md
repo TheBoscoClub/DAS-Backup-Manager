@@ -4,8 +4,8 @@
 
 The DAS Backup Manager project manages two 2 TB drives in a TerraMaster D6-320 enclosure (bays 1 and 3) that contain **fully independent operating system installations** with their own ESP partitions. Device letters vary on each reconnect — identify by serial or label:
 
-- Serial ZK208Q77 (bay 1): p1 (1.5G, vfat, LABEL=BACKUP-ESP) + p2 (das-backup-system-mirror)
-- Serial ZFL41DNY (bay 4, was bay 3 prior to 2026-05-06): p1 (1.5G, vfat, LABEL=BACKUP-ESP) + p2 (das-backup-system)
+- Serial ZK208Q77 (bay 1): p1 (1.5G, vfat, LABEL=BACKUP-ESP) + p2 (das-backup-system-recovery-A; was `das-backup-system-mirror` prior to the 2026-05-17 rename)
+- Serial ZFL41DNY (bay 4, was bay 3 prior to 2026-05-06): p1 (1.5G, vfat, LABEL=BACKUP-ESP) + p2 (das-backup-system-recovery-B; was `das-backup-system` prior to the 2026-05-17 rename)
 
 ### HARD RULES — No Exceptions
 
@@ -32,7 +32,7 @@ The emergency response disabled `[esp] enabled = false` in `config.toml` but lef
 ### Identification
 
 DAS backup drives are identifiable by:
-- Labels: `BACKUP-ESP`, `das-backup-system`, `das-backup-system-mirror`, `das-backup-22tb`
+- Labels: `BACKUP-ESP` (ESP partitions on both 2TB drives), `das-backup-system-recovery-A`, `das-backup-system-recovery-B`, `das-backup-22tb`
 - Serials: `ZK208Q77` (bay 1), `ZXA1R71M` (bay 2, RMA replacement for failed `ZXA0LMAE` — installed 2026-05-15), `ZFL41DNY` (bay 4, was bay 3 prior to 2026-05-06), `ZXA1NYGZ` (bay 5, RAID-1 partner of `ZXA1R71M` in the 22TB array; added 2026-05-06 originally as partner of `ZXA0LMAE`)
 - Device paths: vary on reconnect (USB-attached TerraMaster D6-320 enclosure)
 - Mount points: `/mnt/backup-22tb`, `/run/media/bosco/das-*`

@@ -1041,16 +1041,24 @@ mod tests {
             150,
         )
         .unwrap();
-        db.insert_target_usage(now, "system-2tb", 2_000_000_000_000, 500_000_000_000, 7)
-            .unwrap();
+        db.insert_target_usage(
+            now,
+            "system-recovery-B-2tb",
+            2_000_000_000_000,
+            500_000_000_000,
+            7,
+        )
+        .unwrap();
 
         let primary = db.get_target_usage_history("primary-22tb", 30).unwrap();
         assert_eq!(primary.len(), 1);
         assert_eq!(primary[0].target_label, "primary-22tb");
 
-        let system = db.get_target_usage_history("system-2tb", 30).unwrap();
+        let system = db
+            .get_target_usage_history("system-recovery-B-2tb", 30)
+            .unwrap();
         assert_eq!(system.len(), 1);
-        assert_eq!(system[0].target_label, "system-2tb");
+        assert_eq!(system[0].target_label, "system-recovery-B-2tb");
     }
 
     #[test]

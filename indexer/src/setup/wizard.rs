@@ -465,6 +465,35 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
         style("✓").green().bold(),
         config.targets.len()
     );
+
+    // Policy: audiobook source content must NEVER land on the 2TB recovery drives.
+    // The recovery drives are bootable standalone systems with limited capacity;
+    // ~509 GiB of audiobook source files would overflow them and defeat the recovery role.
+    // Restrict any source whose label contains "audiobook" (case-insensitive) to the
+    // primary target(s) only. Skips sources whose target_labels are already non-empty
+    // (the user has made an explicit choice).
+    let primary_labels: Vec<String> = config
+        .targets
+        .iter()
+        .filter(|t| t.role == TargetRole::Primary)
+        .map(|t| t.label.clone())
+        .collect();
+    if !primary_labels.is_empty() {
+        for source in config.sources.iter_mut() {
+            if source.target_labels.is_empty()
+                && source.label.to_lowercase().contains("audiobook")
+            {
+                source.target_labels = primary_labels.clone();
+                println!(
+                    "  {} Source '{}' restricted to primary target(s) only: {}",
+                    style("→").dim(),
+                    source.label,
+                    primary_labels.join(", ")
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

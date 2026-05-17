@@ -432,8 +432,8 @@ When user selects "Run Now" from navigation:
 │                                                              │
 │  Sources:                        Targets:                    │
 │    ☑ nvme (@, @home, @root, @log)  ☑ primary-22tb (Bay 2)  │
-│    ☑ ssd (@opt, @srv)              ☑ system-2tb (Bay 6)    │
-│    ☑ hdd-projects (ClaudeCode...)   ☑ system-mirror (Bay 1) │
+│    ☑ ssd (@opt, @srv)              ☑ system-recovery-B-2tb (Bay 4) │
+│    ☑ hdd-projects (ClaudeCode...)   ☑ system-recovery-A-2tb (Bay 1) │
 │    ☑ hdd-audiobooks (Audiobooks)                             │
 │    ☑ das-storage (@data)                                     │
 │                                                              │

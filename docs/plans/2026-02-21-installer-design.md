@@ -160,9 +160,9 @@ weekly = 4
 monthly = 2
 
 [[target]]
-label = "system-2tb"
+label = "system-recovery-B-2tb"
 serial = "ZFL41DNY"
-mount = "/mnt/backup-system"
+mount = "/mnt/backup-system-recovery-B"
 role = "esp-sync"
 
 [esp]

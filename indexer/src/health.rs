@@ -693,25 +693,25 @@ mod tests {
     fn parse_growth_log_entries() {
         let log = "1709000000 primary-22tb 5368709120\n\
                     1709086400 primary-22tb 5905580032\n\
-                    1709000000 system-2tb 1073741824\n";
+                    1709000000 system-recovery-B-2tb 1073741824\n";
         let points = parse_growth_log(log);
         assert_eq!(points.len(), 3);
         assert_eq!(points[0].timestamp, 1709000000);
         assert_eq!(points[0].target_label, "primary-22tb");
         assert_eq!(points[0].used_bytes, 5368709120);
-        assert_eq!(points[2].target_label, "system-2tb");
+        assert_eq!(points[2].target_label, "system-recovery-B-2tb");
     }
 
     #[test]
     fn parse_growth_log_iso_timestamps() {
         let log = "2026-02-20T07:39:42 /mnt/backup-22tb 1861347422208\n\
-                   2026-02-20T07:39:42 /mnt/backup-system 871137460224\n";
+                   2026-02-20T07:39:42 /mnt/backup-system-recovery-B 871137460224\n";
         let points = parse_growth_log(log);
         assert_eq!(points.len(), 2);
         assert!(points[0].timestamp > 1_700_000_000);
         assert_eq!(points[0].target_label, "/mnt/backup-22tb");
         assert_eq!(points[0].used_bytes, 1861347422208);
-        assert_eq!(points[1].target_label, "/mnt/backup-system");
+        assert_eq!(points[1].target_label, "/mnt/backup-system-recovery-B");
     }
 
     #[test]

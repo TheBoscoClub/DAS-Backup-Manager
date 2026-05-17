@@ -792,7 +792,7 @@ A comprehensive offline backup strategy is documented separately in [`OFFLINE-BA
 **Summary**:
 - **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 4 of 6 bays occupied (bays 3 and 6 empty)
 - **Primary Backup (BTRFS RAID-1)**: 2x 22TB Exos (ST22000NM000C-3WC103) in bays 2 (`ZXA1R71M`, RMA replacement for failed `ZXA0LMAE` since 2026-05-15) and 5 (`ZXA1NYGZ`), single BTRFS filesystem `das-backup-22tb` UUID `b2dbe07d-40b9-422e-8ccf-ef4931c40457`. Mounted with `degraded` so single-leg failure does not interrupt backups, restores, or recovery.
-- **Recovery Drives**: 2x 2TB Barracuda (independent, NOT a RAID pair) in bays 1 (`ZK208Q77`, `das-backup-system-mirror`) and 4 (`ZFL41DNY`, `das-backup-system`) — each can boot the system standalone via its own ESP
+- **Recovery Drives**: 2x 2TB Barracuda (independent, NOT a RAID pair) in bays 1 (`ZK208Q77`, `das-backup-system-recovery-A`) and 4 (`ZFL41DNY`, `das-backup-system-recovery-B`) — each can boot the system standalone via its own ESP
 - **Internal SATA**: dasRaid0 (4x 2TB Barracuda RAID0, general storage) — moved from DAS 2026-04-06
 - **Offline spares**: 1x 2TB Barracuda (ZFL416F6, cold spare for dasRaid0)
 - **Software**: btrbk 0.32.6 + mbuffer (installed)

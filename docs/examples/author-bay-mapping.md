@@ -32,10 +32,10 @@
 
 | Bay | Serial | Model | Size | Partitions | Role | BTRFS Label |
 |-----|--------|-------|------|------------|------|-------------|
-| 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system-mirror |
+| 1 | ZK208Q77 | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target (independent recovery copy A) | das-backup-system-recovery-A |
 | 2 | ZXA1R71M | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 1 — all btrbk targets (RMA replacement for `ZXA0LMAE` since 2026-05-15) | das-backup-22tb |
 | 3 | — | — | — | — | Empty | — |
-| 4 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target | das-backup-system |
+| 4 | ZFL41DNY | ST2000DM008 | 1.8T | p1 (ESP) + p2 (BTRFS) | Emergency Boot/Recovery + btrbk NVMe/SSD target (independent recovery copy B) | das-backup-system-recovery-B |
 | 5 | ZXA1NYGZ | ST22000NM000C (Exos) | 20T | p1 (BTRFS, whole disk) | Primary Backup — RAID-1 leg 2 — all btrbk targets | das-backup-22tb |
 | 6 | — | — | — | — | Empty | — |
 
@@ -82,7 +82,7 @@ The two 2TB drives in bays 1 and 4 are **independent standalone bootable systems
 | | Bay 1 (ZK208Q77) | Bay 4 (ZFL41DNY) |
 |---|---|---|
 | **ESP** | `p1` — 1.5G FAT32, label `BACKUP-ESP`, UUID `6D15-0632` | `p1` — 1.5G FAT32, label `BACKUP-ESP`, UUID `6CAB-B04D` |
-| **BTRFS** | `p2` — label `das-backup-system-mirror`, UUID `60b05268-7f8f-47b5-a38a-752576a1172a` | `p2` — label `das-backup-system`, UUID `7c7ae72d-09d6-4086-b249-1ac60f21b73b` |
+| **BTRFS** | `p2` — label `das-backup-system-recovery-A`, UUID `60b05268-7f8f-47b5-a38a-752576a1172a` | `p2` — label `das-backup-system-recovery-B`, UUID `7c7ae72d-09d6-4086-b249-1ac60f21b73b` |
 
 Either drive can boot independently if the other fails. Sync between them is manual (btrbk send/receive or similar), not automatic.
 
