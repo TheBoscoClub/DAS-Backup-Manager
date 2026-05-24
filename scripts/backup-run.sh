@@ -1,7 +1,7 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.2.2
-# Date: 2026-05-12
+# Version: 4.2.3
+# Date: 2026-05-23
 #
 # Features:
 #   - Incremental BTRFS backups via btrbk to configured targets
@@ -17,6 +17,14 @@
 #     cannot silently write to / instead of the DAS. Prevents recurrence of
 #     the May 2026 incident where a removed 22TB drive let btrbk fill the
 #     root filesystem.
+#   - Snapshot_dir absolute-path resolution (v4.2.3): create_snapshot_dirs
+#     now composes ${SOURCE_VOLUMES[label]}/${SOURCE_SNAPSHOT_DIRS[label]}
+#     before mkdir, so newly-added sources whose snapshot_dir is relative
+#     (the common case in config.toml) land on the source's volume rather
+#     than systemd's cwd (/). Fixes the silent-skip pattern where btrbk
+#     would emit "Failed to fetch subvolume detail for snapshot_dir" for
+#     7 consecutive nightly runs after the 2026-05-17 commit added the
+#     hdd-media and hdd-system sources. Tracks DAS-Backup-Manager-0p2.
 #   - Logs per-target throughput (data written + MB/s rate)
 #   - Designed for unattended nightly execution
 #   - All configuration loaded from config.toml via btrdasd
@@ -447,12 +455,35 @@ mount_targets() {
 }
 
 create_snapshot_dirs() {
+    # Each [[source]] in config.toml declares snapshot_dir relative to its
+    # volume root. Resolve to an absolute path before mkdir so the directory
+    # lands inside the source's volume rather than the script's cwd
+    # (systemd-started services run with cwd=/, where mkdir would silently
+    # create the dir on the root filesystem — see DAS-Backup-Manager-0p2).
     log_info "Creating btrbk snapshot directories..."
     for label in "${!SOURCE_SNAPSHOT_DIRS[@]}"; do
         local snap_dir="${SOURCE_SNAPSHOT_DIRS[$label]}"
-        if [[ -n "$snap_dir" ]]; then
-            mkdir -p "$snap_dir"
+        if [[ -z "$snap_dir" ]]; then
+            continue
         fi
+
+        local abs_dir
+        if [[ "$snap_dir" = /* ]]; then
+            abs_dir="$snap_dir"
+        else
+            local volume="${SOURCE_VOLUMES[$label]:-}"
+            if [[ -z "$volume" ]]; then
+                log_warn "  $label: no source volume known, cannot resolve snapshot_dir '$snap_dir' — skipping"
+                continue
+            fi
+            abs_dir="${volume%/}/$snap_dir"
+        fi
+
+        if ! mkdir -p "$abs_dir" 2>/dev/null; then
+            log_warn "  $label: failed to create snapshot_dir $abs_dir (mkdir error)"
+            continue
+        fi
+        log_info "  $label: $abs_dir"
     done
 }
 
@@ -991,7 +1022,7 @@ LATEST SNAPSHOTS
 $(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
 
 ===============================================================
-  backup-run.sh v4.1.0
+  backup-run.sh v4.2.3
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
