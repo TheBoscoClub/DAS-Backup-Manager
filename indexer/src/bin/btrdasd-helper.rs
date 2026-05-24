@@ -62,12 +62,20 @@ impl CancelFlag {
 
 type JobMap = Arc<Mutex<HashMap<String, (JoinHandle<()>, CancelFlag)>>>;
 
-/// Cache of IndexStats JSON keyed by DB path, invalidated when the DB file's
-/// mtime changes.  Cold COUNT(*) on a 13.7M-row files table + 68M-row spans
-/// table is ~30-60s on HDD, which trips the GUI's 25s D-Bus call timeout.
-/// Once the indexer has computed the counts they don't change until the next
-/// indexer run, which bumps the DB mtime — so keying by mtime gives us a
-/// "compute once per indexer run" policy with no manual invalidation.
+/// Cache of IndexStats JSON keyed by DB path.  Cold COUNT(*) on a 13.7M-row
+/// files table + 68M-row spans table is ~30-60s on HDD, which trips the
+/// GUI's 25s D-Bus call timeout.  Stats only change when the indexer bumps
+/// the DB mtime.
+///
+/// Strategy is **stale-while-revalidate**: index_stats always returns the
+/// cached value if anything is cached, even if mtime no longer matches.  A
+/// mtime mismatch triggers a background refresh that updates the cache for
+/// the next call.  This way the GUI never blocks on a cold COUNT — at worst
+/// it sees stats one indexer run out of date for a few seconds.
+///
+/// `in_flight` deduplicates concurrent background refreshes so we don't
+/// run multiple expensive computes against the same DB path.
+///
 /// See DAS-Backup-Manager-aem.
 #[derive(Clone)]
 struct StatsCacheEntry {
@@ -76,6 +84,7 @@ struct StatsCacheEntry {
     json: String,
 }
 type StatsCache = Arc<Mutex<HashMap<String, StatsCacheEntry>>>;
+type StatsRefreshSet = Arc<Mutex<std::collections::HashSet<String>>>;
 
 /// Generate a unique job ID.
 fn new_job_id() -> String {
@@ -282,6 +291,7 @@ struct HelperInterface {
     jobs: JobMap,
     conn: Connection,
     stats_cache: StatsCache,
+    stats_refresh_in_flight: StatsRefreshSet,
 }
 
 #[interface(name = "org.dasbackup.Helper1")]
@@ -676,12 +686,17 @@ impl HelperInterface {
 
     /// Return JSON stats: {snapshots, files, spans, db_size_bytes}.
     ///
-    /// Wrapped in spawn_blocking AND backed by an in-helper cache keyed by
-    /// the DB file's mtime + size — cold COUNT(*) on a 13.7M-row files
-    /// table plus a 68M-row spans table is tens of seconds on HDD, which
-    /// trips the GUI's 25 s D-Bus call timeout.  Stats only change when
-    /// the indexer writes (which bumps mtime), so the cache key naturally
-    /// invalidates itself.  See DAS-Backup-Manager-aem.
+    /// **Stale-while-revalidate**: returns the cached value immediately if
+    /// anything is cached for this DB path, even when the DB file's mtime
+    /// has changed since the cache was populated.  A mtime mismatch fires
+    /// a background refresh that updates the cache for the next call.
+    /// This keeps the GUI's Health Dashboard responsive after a backup
+    /// run (which bumps DB mtime via the indexer), at the cost of one
+    /// indexer-run's worth of staleness for a few seconds.
+    ///
+    /// Concurrent refreshes are deduplicated by stats_refresh_in_flight.
+    ///
+    /// See DAS-Backup-Manager-aem.
     async fn index_stats(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -690,39 +705,74 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
         let db_path = db_path.to_owned();
-        let cache = self.stats_cache.clone();
 
-        // Fast path: read mtime + size in spawn_blocking (cheap stat call),
-        // hit cache if (mtime, size) match.
-        let cache_check = cache.clone();
-        let db_path_check = db_path.clone();
-        let cached = tokio::task::spawn_blocking(move || -> Option<String> {
-            let meta = std::fs::metadata(&db_path_check).ok()?;
-            let mtime_nanos = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_nanos() as i128;
-            let size = meta.len();
-            // Synchronous lock acquire is fine: this Mutex is std::sync, held
-            // only for a HashMap lookup. Switched to std::sync below.
-            let guard = cache_check.blocking_lock();
-            let entry = guard.get(&db_path_check)?;
-            if entry.db_mtime_nanos == mtime_nanos && entry.db_size_bytes == size {
-                Some(entry.json.clone())
-            } else {
-                None
-            }
+        // Read the file's current mtime/size cheaply on a blocking thread.
+        let probe_path = db_path.clone();
+        let (current_mtime, current_size) = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&probe_path)
+                .ok()
+                .map(|m| {
+                    let mtime_nanos = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as i128)
+                        .unwrap_or(0);
+                    (mtime_nanos, m.len())
+                })
+                .unwrap_or((0, 0))
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("Stats cache check failed: {e}")))?;
-        if let Some(json) = cached {
-            return Ok(json);
+        .map_err(|e| fdo::Error::Failed(format!("Stat probe failed: {e}")))?;
+
+        // Examine the cache.  Three branches:
+        //   1. Cache hit, mtime/size match    -> return cached, no refresh.
+        //   2. Cache hit, mtime/size differ   -> return STALE cached + fire
+        //                                        background refresh.
+        //   3. Cache miss                     -> slow path (compute now).
+        let cached_entry = self.stats_cache.lock().await.get(&db_path).cloned();
+        if let Some(entry) = cached_entry {
+            if entry.db_mtime_nanos != current_mtime || entry.db_size_bytes != current_size {
+                // Stale — schedule background refresh.
+                self.spawn_stats_refresh(db_path.clone());
+            }
+            return Ok(entry.json);
         }
 
-        // Slow path: actually run the COUNTs.
+        // Cache miss: run the slow compute synchronously this one time so
+        // the caller gets a real answer.  Subsequent callers will hit the
+        // cache.  If another caller is already computing for this path,
+        // wait briefly and return their result.
+        let cache = self.stats_cache.clone();
+        let in_flight = self.stats_refresh_in_flight.clone();
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            // Mark in-flight; on Drop the guard auto-removes.
+            struct InFlightGuard {
+                set: StatsRefreshSet,
+                key: String,
+            }
+            impl Drop for InFlightGuard {
+                fn drop(&mut self) {
+                    self.set.blocking_lock().remove(&self.key);
+                }
+            }
+            let already = !in_flight.blocking_lock().insert(db_path.clone());
+            let _guard = InFlightGuard {
+                set: in_flight.clone(),
+                key: db_path.clone(),
+            };
+            if already {
+                // Another task is computing.  Spin briefly waiting for
+                // them to populate the cache, then return.  Bounded to
+                // 20 s so we never exceed the GUI's 25 s deadline.
+                for _ in 0..400 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if let Some(entry) = cache.blocking_lock().get(&db_path).cloned() {
+                        return Ok(entry.json);
+                    }
+                }
+            }
+
             let db = Database::open(&db_path)
                 .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
             let stats = db
@@ -744,7 +794,6 @@ impl HelperInterface {
                 "db_size_bytes": db_size_bytes,
             })
             .to_string();
-            // Populate cache (blocking_lock — cheap HashMap insert).
             cache.blocking_lock().insert(
                 db_path.clone(),
                 StatsCacheEntry {
@@ -1423,6 +1472,60 @@ impl HelperInterface {
     }
 }
 
+impl HelperInterface {
+    /// Spawn a background task that recomputes IndexStats for `db_path`
+    /// and writes the fresh entry into the cache.  Deduplicated by the
+    /// stats_refresh_in_flight set so concurrent refresh requests for the
+    /// same path collapse to a single compute.  Called from index_stats
+    /// on the stale-while-revalidate path; never blocks the caller.
+    fn spawn_stats_refresh(&self, db_path: String) {
+        let cache = self.stats_cache.clone();
+        let in_flight = self.stats_refresh_in_flight.clone();
+        tokio::spawn(async move {
+            // Claim the in-flight slot.  If another task already holds it,
+            // we drop out — they'll populate the cache for us.
+            {
+                let mut guard = in_flight.lock().await;
+                if !guard.insert(db_path.clone()) {
+                    return;
+                }
+            }
+            let cache_inner = cache.clone();
+            let path_inner = db_path.clone();
+            let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let db = Database::open(&path_inner).map_err(|e| format!("open: {e}"))?;
+                let stats = db.get_stats().map_err(|e| format!("stats: {e}"))?;
+                let meta = std::fs::metadata(&path_inner).map_err(|e| format!("stat: {e}"))?;
+                let db_size_bytes = meta.len();
+                let mtime_nanos = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i128)
+                    .unwrap_or(0);
+                let json = serde_json::json!({
+                    "snapshots": stats.snapshot_count,
+                    "files": stats.file_count,
+                    "spans": stats.span_count,
+                    "db_size_bytes": db_size_bytes,
+                })
+                .to_string();
+                cache_inner.blocking_lock().insert(
+                    path_inner.clone(),
+                    StatsCacheEntry {
+                        db_mtime_nanos: mtime_nanos,
+                        db_size_bytes,
+                        json,
+                    },
+                );
+                Ok(())
+            })
+            .await;
+            in_flight.lock().await.remove(&db_path);
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -1465,6 +1568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jobs: jobs.clone(),
         conn: conn.clone(),
         stats_cache: Arc::new(Mutex::new(HashMap::new())),
+        stats_refresh_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
 
     conn.object_server()
