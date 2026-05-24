@@ -131,6 +131,14 @@ impl Database {
         conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Reduce cold-cache latency on multi-GB indices: mmap a generous
+        // 4 GiB window so SQLite reads via the kernel page cache (shared
+        // with the next opener) and bump the per-connection page cache
+        // to 256 MiB so b-tree walks don't thrash on small queries.
+        // negative cache_size = KiB, so -262144 = 256 MiB.
+        // See DAS-Backup-Manager-aem.
+        conn.pragma_update(None, "mmap_size", 4_294_967_296i64)?;
+        conn.pragma_update(None, "cache_size", -262_144i64)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Database { conn })
     }
