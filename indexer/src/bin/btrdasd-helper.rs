@@ -62,6 +62,21 @@ impl CancelFlag {
 
 type JobMap = Arc<Mutex<HashMap<String, (JoinHandle<()>, CancelFlag)>>>;
 
+/// Cache of IndexStats JSON keyed by DB path, invalidated when the DB file's
+/// mtime changes.  Cold COUNT(*) on a 13.7M-row files table + 68M-row spans
+/// table is ~30-60s on HDD, which trips the GUI's 25s D-Bus call timeout.
+/// Once the indexer has computed the counts they don't change until the next
+/// indexer run, which bumps the DB mtime — so keying by mtime gives us a
+/// "compute once per indexer run" policy with no manual invalidation.
+/// See DAS-Backup-Manager-aem.
+#[derive(Clone)]
+struct StatsCacheEntry {
+    db_mtime_nanos: i128,
+    db_size_bytes: u64,
+    json: String,
+}
+type StatsCache = Arc<Mutex<HashMap<String, StatsCacheEntry>>>;
+
 /// Generate a unique job ID.
 fn new_job_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -266,6 +281,7 @@ fn save_config(config: &Config, path: &str) -> Result<(), fdo::Error> {
 struct HelperInterface {
     jobs: JobMap,
     conn: Connection,
+    stats_cache: StatsCache,
 }
 
 #[interface(name = "org.dasbackup.Helper1")]
@@ -659,6 +675,13 @@ impl HelperInterface {
     // ---- Index read methods (synchronous, polkit: org.dasbackup.index.read) ----
 
     /// Return JSON stats: {snapshots, files, spans, db_size_bytes}.
+    ///
+    /// Wrapped in spawn_blocking AND backed by an in-helper cache keyed by
+    /// the DB file's mtime + size — cold COUNT(*) on a 13.7M-row files
+    /// table plus a 68M-row spans table is tens of seconds on HDD, which
+    /// trips the GUI's 25 s D-Bus call timeout.  Stats only change when
+    /// the indexer writes (which bumps mtime), so the cache key naturally
+    /// invalidates itself.  See DAS-Backup-Manager-aem.
     async fn index_stats(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -666,20 +689,74 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
+        let db_path = db_path.to_owned();
+        let cache = self.stats_cache.clone();
 
-        let db = Database::open(db_path)
-            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
-        let stats = db
-            .get_stats()
-            .map_err(|e| fdo::Error::Failed(format!("Stats query failed: {e}")))?;
-        let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-        let json = serde_json::json!({
-            "snapshots": stats.snapshot_count,
-            "files": stats.file_count,
-            "spans": stats.span_count,
-            "db_size_bytes": db_size_bytes,
-        });
-        Ok(json.to_string())
+        // Fast path: read mtime + size in spawn_blocking (cheap stat call),
+        // hit cache if (mtime, size) match.
+        let cache_check = cache.clone();
+        let db_path_check = db_path.clone();
+        let cached = tokio::task::spawn_blocking(move || -> Option<String> {
+            let meta = std::fs::metadata(&db_path_check).ok()?;
+            let mtime_nanos = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos() as i128;
+            let size = meta.len();
+            // Synchronous lock acquire is fine: this Mutex is std::sync, held
+            // only for a HashMap lookup. Switched to std::sync below.
+            let guard = cache_check.blocking_lock();
+            let entry = guard.get(&db_path_check)?;
+            if entry.db_mtime_nanos == mtime_nanos && entry.db_size_bytes == size {
+                Some(entry.json.clone())
+            } else {
+                None
+            }
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Stats cache check failed: {e}")))?;
+        if let Some(json) = cached {
+            return Ok(json);
+        }
+
+        // Slow path: actually run the COUNTs.
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let db = Database::open(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            let stats = db
+                .get_stats()
+                .map_err(|e| fdo::Error::Failed(format!("Stats query failed: {e}")))?;
+            let meta = std::fs::metadata(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB stat failed: {e}")))?;
+            let db_size_bytes = meta.len();
+            let mtime_nanos = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0);
+            let json = serde_json::json!({
+                "snapshots": stats.snapshot_count,
+                "files": stats.file_count,
+                "spans": stats.span_count,
+                "db_size_bytes": db_size_bytes,
+            })
+            .to_string();
+            // Populate cache (blocking_lock — cheap HashMap insert).
+            cache.blocking_lock().insert(
+                db_path.clone(),
+                StatsCacheEntry {
+                    db_mtime_nanos: mtime_nanos,
+                    db_size_bytes,
+                    json: json.clone(),
+                },
+            );
+            Ok(json)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Stats task join failed: {e}")))?
     }
 
     /// Return JSON array of all snapshots.
@@ -690,26 +767,30 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-
-        let db = Database::open(db_path)
-            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
-        let snapshots = db
-            .list_snapshots()
-            .map_err(|e| fdo::Error::Failed(format!("List snapshots failed: {e}")))?;
-        let arr: Vec<serde_json::Value> = snapshots
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "name": s.name,
-                    "ts": s.ts,
-                    "source": s.source,
-                    "path": s.path,
-                    "indexed_at": s.indexed_at,
+        let db_path = db_path.to_owned();
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let db = Database::open(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            let snapshots = db
+                .list_snapshots()
+                .map_err(|e| fdo::Error::Failed(format!("List snapshots failed: {e}")))?;
+            let arr: Vec<serde_json::Value> = snapshots
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "name": s.name,
+                        "ts": s.ts,
+                        "source": s.source,
+                        "path": s.path,
+                        "indexed_at": s.indexed_at,
+                    })
                 })
-            })
-            .collect();
-        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+                .collect();
+            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("List snapshots task join failed: {e}")))?
     }
 
     /// Return paginated JSON of files in a given snapshot.
@@ -726,42 +807,46 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
+        let db_path = db_path.to_owned();
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let db = Database::open(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
 
-        let db = Database::open(db_path)
-            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            let total = db
+                .count_files_in_snapshot(snapshot_id)
+                .map_err(|e| fdo::Error::Failed(format!("Count files failed: {e}")))?;
 
-        let total = db
-            .count_files_in_snapshot(snapshot_id)
-            .map_err(|e| fdo::Error::Failed(format!("Count files failed: {e}")))?;
+            // Default to 10000 if limit is 0 or negative (prevents giant responses)
+            let effective_limit = if limit <= 0 { 10_000 } else { limit };
 
-        // Default to 10000 if limit is 0 or negative (prevents giant responses)
-        let effective_limit = if limit <= 0 { 10_000 } else { limit };
-
-        let files = db
-            .get_files_in_snapshot_paged(snapshot_id, effective_limit, offset)
-            .map_err(|e| fdo::Error::Failed(format!("List files failed: {e}")))?;
-        let arr: Vec<serde_json::Value> = files
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "id": f.id,
-                    "path": f.path,
-                    "name": f.name,
-                    "size": f.size,
-                    "mtime": f.mtime,
-                    "type": f.file_type,
+            let files = db
+                .get_files_in_snapshot_paged(snapshot_id, effective_limit, offset)
+                .map_err(|e| fdo::Error::Failed(format!("List files failed: {e}")))?;
+            let arr: Vec<serde_json::Value> = files
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "id": f.id,
+                        "path": f.path,
+                        "name": f.name,
+                        "size": f.size,
+                        "mtime": f.mtime,
+                        "type": f.file_type,
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let result = serde_json::json!({
-            "files": arr,
-            "total": total,
-            "limit": effective_limit,
-            "offset": offset,
-        });
-        Ok(serde_json::to_string(&result)
-            .unwrap_or_else(|_| r#"{"files":[],"total":0,"limit":0,"offset":0}"#.to_string()))
+            let result = serde_json::json!({
+                "files": arr,
+                "total": total,
+                "limit": effective_limit,
+                "offset": offset,
+            });
+            Ok(serde_json::to_string(&result)
+                .unwrap_or_else(|_| r#"{"files":[],"total":0,"limit":0,"offset":0}"#.to_string()))
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("List files task join failed: {e}")))?
     }
 
     /// FTS5 search returning JSON array of matches.
@@ -774,26 +859,31 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-
-        let db = Database::open(db_path)
-            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
-        let results = db
-            .search(query, limit)
-            .map_err(|e| fdo::Error::Failed(format!("Search failed: {e}")))?;
-        let arr: Vec<serde_json::Value> = results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "path": r.path,
-                    "name": r.name,
-                    "size": r.size,
-                    "mtime": r.mtime,
-                    "first_snap": r.first_snap,
-                    "last_snap": r.last_snap,
+        let db_path = db_path.to_owned();
+        let query = query.to_owned();
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let db = Database::open(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            let results = db
+                .search(&query, limit)
+                .map_err(|e| fdo::Error::Failed(format!("Search failed: {e}")))?;
+            let arr: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "path": r.path,
+                        "name": r.name,
+                        "size": r.size,
+                        "mtime": r.mtime,
+                        "first_snap": r.first_snap,
+                        "last_snap": r.last_snap,
+                    })
                 })
-            })
-            .collect();
-        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+                .collect();
+            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Search task join failed: {e}")))?
     }
 
     /// Return JSON array of recent backup history.
@@ -805,29 +895,33 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-
-        let db = Database::open(db_path)
-            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
-        let runs = db
-            .get_backup_history(limit as usize)
-            .map_err(|e| fdo::Error::Failed(format!("History query failed: {e}")))?;
-        let arr: Vec<serde_json::Value> = runs
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.id,
-                    "timestamp": r.timestamp,
-                    "mode": r.mode,
-                    "success": r.success,
-                    "duration_secs": r.duration_secs,
-                    "snaps_created": r.snaps_created,
-                    "snaps_sent": r.snaps_sent,
-                    "bytes_sent": r.bytes_sent,
-                    "errors": &r.errors,
+        let db_path = db_path.to_owned();
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let db = Database::open(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            let runs = db
+                .get_backup_history(limit as usize)
+                .map_err(|e| fdo::Error::Failed(format!("History query failed: {e}")))?;
+            let arr: Vec<serde_json::Value> = runs
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "timestamp": r.timestamp,
+                        "mode": r.mode,
+                        "success": r.success,
+                        "duration_secs": r.duration_secs,
+                        "snaps_created": r.snaps_created,
+                        "snaps_sent": r.snaps_sent,
+                        "bytes_sent": r.bytes_sent,
+                        "errors": &r.errors,
+                    })
                 })
-            })
-            .collect();
-        Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+                .collect();
+            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("History task join failed: {e}")))?
     }
 
     /// Return the filesystem path for a snapshot by ID.
@@ -839,14 +933,18 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-
-        let db = Database::open(db_path)
-            .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
-        let path = db
-            .snapshot_path_by_id(snapshot_id)
-            .map_err(|e| fdo::Error::Failed(format!("Path query failed: {e}")))?
-            .ok_or_else(|| fdo::Error::Failed(format!("No snapshot with id {snapshot_id}")))?;
-        Ok(path)
+        let db_path = db_path.to_owned();
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let db = Database::open(&db_path)
+                .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            let path = db
+                .snapshot_path_by_id(snapshot_id)
+                .map_err(|e| fdo::Error::Failed(format!("Path query failed: {e}")))?
+                .ok_or_else(|| fdo::Error::Failed(format!("No snapshot with id {snapshot_id}")))?;
+            Ok(path)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Snapshot path task join failed: {e}")))?
     }
 
     /// Restore specific files from a snapshot.
@@ -1366,6 +1464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iface = HelperInterface {
         jobs: jobs.clone(),
         conn: conn.clone(),
+        stats_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     conn.object_server()
@@ -1373,6 +1472,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     eprintln!("btrdasd-helper: listening on system bus as org.dasbackup.Helper1");
+
+    // Pre-warm the IndexStats cache at startup so the first GUI Health
+    // Dashboard click hits a populated cache instead of waiting 30-60 s for
+    // a cold COUNT(*) on a multi-GB index — that wait trips the GUI's 25 s
+    // D-Bus call timeout on cold systems.  See DAS-Backup-Manager-aem.
+    {
+        let conn_for_warm = conn.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                let path = "/var/lib/das-backup/backup-index.db";
+                if !Path::new(path).exists() {
+                    return Err(format!("DB not present at {path}"));
+                }
+                let db = Database::open(path).map_err(|e| format!("open: {e}"))?;
+                let stats = db.get_stats().map_err(|e| format!("stats: {e}"))?;
+                let meta = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
+                let db_size_bytes = meta.len();
+                let mtime_nanos = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i128)
+                    .unwrap_or(0);
+                let json = serde_json::json!({
+                    "snapshots": stats.snapshot_count,
+                    "files": stats.file_count,
+                    "spans": stats.span_count,
+                    "db_size_bytes": db_size_bytes,
+                })
+                .to_string();
+
+                // Reach into the registered interface to populate its cache.
+                // We block on a runtime handle since we're on a blocking thread.
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    if let Ok(iface_ref) = conn_for_warm
+                        .object_server()
+                        .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+                        .await
+                    {
+                        let cache = iface_ref.get().await.stats_cache.clone();
+                        cache.lock().await.insert(
+                            path.to_string(),
+                            StatsCacheEntry {
+                                db_mtime_nanos: mtime_nanos,
+                                db_size_bytes,
+                                json: json.clone(),
+                            },
+                        );
+                    }
+                });
+                Ok(json)
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => eprintln!("btrdasd-helper: pre-warmed IndexStats cache"),
+                Ok(Err(e)) => eprintln!("btrdasd-helper: pre-warm skipped ({e})"),
+                Err(e) => eprintln!("btrdasd-helper: pre-warm task panicked ({e})"),
+            }
+        });
+    }
 
     // Wait for SIGTERM or SIGINT for graceful shutdown.
     let mut sigterm = signal(SignalKind::terminate())?;
