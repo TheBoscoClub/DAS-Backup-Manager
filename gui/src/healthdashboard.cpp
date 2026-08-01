@@ -43,6 +43,8 @@ namespace DrivesCol {
         Smart,
         Temp,
         PowerHours,
+        ScrubStatus,
+        ScrubAge,
         Count
     };
 }
@@ -115,6 +117,8 @@ void HealthDashboard::setupDrivesTab()
         i18n("SMART"),
         i18n("Temp"),
         i18n("Power Hours"),
+        i18n("Scrub"),
+        i18n("Scrub Age"),
     });
     auto *drivesProxy = new QSortFilterProxyModel(m_drivesView);
     drivesProxy->setSourceModel(model);
@@ -296,6 +300,10 @@ void HealthDashboard::updateDrives(const QString &json)
         const int     pwrHours = drv.value(QLatin1String("power_on_hours")).toInt();
         const int     errors   = drv.value(QLatin1String("errors")).toInt();
 
+        const QJsonObject scrub       = drv.value(QLatin1String("scrub")).toObject();
+        const QString     scrubStatus = scrub.value(QLatin1String("status")).toString();
+        const QJsonValue  scrubAgeVal = scrub.value(QLatin1String("age_days"));
+
         QList<QStandardItem *> row;
         row.reserve(DrivesCol::Count);
 
@@ -346,6 +354,41 @@ void HealthDashboard::updateDrives(const QString &json)
             ? QStringLiteral("%1 h").arg(pwrHours)
             : QStringLiteral("—");
         row.append(new QStandardItem(pwrStr));
+
+        // Scrub status — mirrors the SMART column's color convention:
+        // green for OK, red for anything the operator needs to act on,
+        // default color for states that are informational, not alarming
+        // (not-applicable, or the target simply predates the scrub feature).
+        auto *scrubStatusItem = new QStandardItem();
+        if (scrubStatus == QLatin1String("ok")) {
+            scrubStatusItem->setText(i18n("OK"));
+            scrubStatusItem->setForeground(QColor(0x22, 0x8B, 0x22));  // forest green
+        } else if (scrubStatus == QLatin1String("warn")) {
+            scrubStatusItem->setText(i18n("WARN"));
+            scrubStatusItem->setForeground(QColor(0xCC, 0x88, 0x00));  // amber
+        } else if (scrubStatus == QLatin1String("fail")) {
+            scrubStatusItem->setText(i18n("FAIL"));
+            scrubStatusItem->setForeground(QColor(0xCC, 0x00, 0x00));  // red
+        } else if (scrubStatus == QLatin1String("never_scrubbed")) {
+            scrubStatusItem->setText(i18n("Never scrubbed"));
+            scrubStatusItem->setForeground(QColor(0xCC, 0x88, 0x00));  // amber
+        } else if (scrubStatus == QLatin1String("unresolved")) {
+            scrubStatusItem->setText(i18n("Unresolved"));
+        } else {
+            // "not_applicable" (scrub disabled, or this target isn't a
+            // configured scrub target) — nothing to flag.
+            scrubStatusItem->setText(QStringLiteral("—"));
+        }
+        scrubStatusItem->setToolTip(
+            i18n("BTRFS scrub health from the scrub engine's persisted state "
+                 "(see btrdasd scrub status for raw per-device history)"));
+        row.append(scrubStatusItem);
+
+        // Scrub age
+        const QString scrubAgeStr = scrubAgeVal.isDouble()
+            ? i18n("%1 d", static_cast<int>(scrubAgeVal.toDouble()))
+            : QStringLiteral("—");
+        row.append(new QStandardItem(scrubAgeStr));
 
         for (QStandardItem *item : row)
             item->setEditable(false);
