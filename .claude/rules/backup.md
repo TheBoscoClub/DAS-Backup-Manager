@@ -74,3 +74,16 @@ Both layers run unconditionally — `--dryrun` includes them. The verify functio
 - `bd DAS-Backup-Manager-9on` — failure-mode writeup and incident notes
 - `scripts/backup-run.sh` `verify_targets_before_btrbk()` and the `create_mount_points` rmdir/abort branches
 - Tools required: `mountpoint`, `findmnt`, `smartctl` (all already used elsewhere in the script)
+
+## Maintenance Interlock — backup vs. scrub mutual exclusion
+
+Backups (`scripts/backup-run.sh`) and the scheduled BTRFS scrub engine (`indexer/src/scrub.rs`) both mount and unmount the same DAS filesystems, so they must never run concurrently. Two-lock design, identical on both sides, acquired in the same order (singleton → maintenance) so the pair is deadlock-free by construction:
+
+1. **Singleton lock** — non-blocking, prevents two instances of the *same* kind of job. Backup: `flock -n` fd 9 on `/run/das-backup.lock` (held ⇒ skip, exit 0). Scrub: `flock -n` on `/run/das-scrub.lock` (held ⇒ skip, no state written).
+2. **Maintenance lock** — `/run/das-maintenance.lock`, path shared verbatim between both sides. Blocking on both sides: whichever job arrives second **waits**, it is never skipped or canceled. Held for the entire operation, including that job's own mounts/unmounts, then released — reverse of acquisition order (maintenance before singleton).
+
+Backup side: `acquire_maintenance_lock()` in `backup-run.sh` (v4.3.0+), called from `main()` right after the singleton lock succeeds and before any mount work (`create_mount_points` is the first mounter). A short non-blocking probe runs first; if still held, logs `"DAS maintenance lock held (scrub in progress?) — waiting..."`, blocks, then logs the total wait duration and records `OP_STATUS["lock_wait"]="OK"` with the duration — surfaced as a "Maintenance lock" row in the email report. Scrub side: `scrub::acquire_locks()` / `ScrubLocks` (`indexer/src/scrub.rs`), same lock path constant `MAINTENANCE_LOCK_PATH`, same announce-then-block pattern (plus a 15-minute re-announce loop the bash side does not replicate — a single wait-start + acquired-with-duration pair was judged sufficient there).
+
+This design replaced an earlier proposal (a pre-unmount scrub cancel/wait guard) that was abandoned before implementation: with a genuine mutual-hold lock, backup and scrub can never overlap in the first place, so there is nothing to cancel.
+
+`/run` is tmpfs, so neither lock can go stale across a reboot. Tracks `bd DAS-Backup-Manager-b6f` (backup side) and the scrub engine's own two-lock design (`bd DAS-Backup-Manager-212`).

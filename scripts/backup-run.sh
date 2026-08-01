@@ -1,9 +1,40 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.2.4
+# Version: 4.3.0
 # Date: 2026-08-01
 #
 # Features:
+#   - Maintenance interlock + honest unmount reporting (v4.3.0):
+#     * Backup side of the mutual-hold interlock shared with the scrub engine
+#       (indexer/src/scrub.rs): after the existing fd-9 singleton lock on
+#       /run/das-backup.lock succeeds, acquire_maintenance_lock() takes a
+#       BLOCKING flock on /run/das-maintenance.lock (fd 8) before any mount
+#       work, held to process exit. A backup whose scheduled time lands
+#       mid-scrub defers and starts the moment the scrub releases the lock —
+#       never skipped, never canceled. A non-trivial wait logs a visible
+#       "waiting" line and a "lock_wait" OP_STATUS entry with the wait
+#       duration. Lock path and singleton->maintenance acquisition order
+#       match scrub.rs exactly (deadlock-free by construction — release order
+#       is the reverse of acquisition on both sides). Tracks
+#       DAS-Backup-Manager-b6f.
+#     * unmount_all() no longer discards DAS target umount failures via
+#       `|| true`. Every configured target mountpoint (ALL_TARGET_MOUNTS) is
+#       attempted (a stuck unmount no longer masks the rest); a path that
+#       isn't currently mounted is skipped via `mountpoint -q` rather than
+#       counted as a failure. Failures are collected and reported via
+#       record_op "unmount" FAIL, and the final "DAS can be safely
+#       disconnected" message is now conditional on every target having
+#       actually unmounted — previously it printed unconditionally even when
+#       a target was still mounted. Source volumes remain a best-effort,
+#       untracked unmount (`|| true`, unchanged) since they are host
+#       filesystems outside the physical DAS enclosure and some (das-storage
+#       on /dasRaid0) can legitimately stay busy indefinitely (running VMs).
+#       Tracks DAS-Backup-Manager-b6f.
+#     * run_btrbk()'s dryrun branch is now guarded the same way the real-run
+#       branch always was — a `btrbk dryrun` failure records
+#       record_op "btrbk" FAIL and lets the script continue (soft-fail)
+#       instead of aborting under set -euo pipefail with no report entry.
+#       Tracks DAS-Backup-Manager-vuw.
 #   - Boot archive-then-recreate + pruner wiring (v4.2.4): update_boot_subvolumes()
 #     now archives the outgoing @/@home as a read-only snapshot
 #     (@.archive.<TS> / @home.archive.<TS>, TS=YYYYMMDDTHHMMSS) BEFORE the
@@ -70,6 +101,13 @@ if ! flock -n 9; then
 fi
 # FD 9 stays open for the rest of the script; lock auto-releases when the
 # process exits (FD 9 closes), no explicit unlock needed.
+
+# Path of the blocking maintenance lock shared with the scrub engine
+# (indexer/src/scrub.rs MAINTENANCE_LOCK_PATH). MUST match exactly — this is
+# the backup side of the mutual-hold interlock. Acquired on fd 8 by
+# acquire_maintenance_lock() (defined below, called early in main(), after
+# this singleton but before any mount work).
+MAINTENANCE_LOCKFILE="/run/das-maintenance.lock"
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
@@ -208,6 +246,48 @@ check_root() {
         log_error "This script must be run as root"
         exit 1
     fi
+}
+
+# Acquire the blocking maintenance lock — the backup side of the mutual-hold
+# interlock shared with the scrub engine (indexer/src/scrub.rs). Must be
+# called AFTER the fd-9 singleton lock succeeds and BEFORE any mount work,
+# held open (fd 8) to process exit — same "open once, let process exit
+# release it" lifetime as the singleton lock above.
+#
+# A short non-blocking probe runs first so ordinary sub-second contention
+# stays quiet. If the lock is still held, a visible line is logged and the
+# call falls through to a genuinely blocking flock. This is a deferral,
+# never a cancellation: a backup whose scheduled time lands mid-scrub waits
+# and starts the moment the scrub releases the lock. The wait duration is
+# logged and recorded via record_op so a non-trivial wait is visible in the
+# journal (and, for a same-run report, the email). Mirrors scrub.rs's
+# acquire_blocking() announce-then-block pattern (5s announce threshold);
+# the 15-minute re-announce loop it also has is not reproduced here for
+# simplicity — a single "waiting" line plus the acquired-with-duration line
+# meets the brief's documented "at least" bar and keeps this function free
+# of background-job cleanup edge cases.
+acquire_maintenance_lock() {
+    exec 8>"$MAINTENANCE_LOCKFILE"
+    if flock -n 8; then
+        return
+    fi
+
+    # Mirrors scrub.rs's LOCK_WAIT_ANNOUNCE_SECS=5s probe before announcing.
+    sleep 5
+    if flock -n 8; then
+        return
+    fi
+
+    log_info "DAS maintenance lock held (scrub in progress?) — waiting..."
+    local wait_start
+    wait_start=$(date +%s)
+
+    flock 8
+
+    local wait_secs
+    wait_secs=$(( $(date +%s) - wait_start ))
+    log_info "DAS maintenance lock acquired after waiting ${wait_secs}s"
+    record_op "lock_wait" "OK" "waited ${wait_secs}s for $MAINTENANCE_LOCKFILE"
 }
 
 # Find device by serial number
@@ -637,8 +717,19 @@ run_btrbk() {
     log_info "Running btrbk ($mode)..."
 
     if [[ "$mode" == "dryrun" ]]; then
-        btrbk -c "$DAS_BTRBK_CONF" dryrun
-        record_op "btrbk" "OK" "dryrun"
+        # Guarded the same way the real-run branch below always was: under
+        # set -euo pipefail an unguarded `btrbk dryrun` failure aborted the
+        # whole script with no record_op entry at all (bd DAS-Backup-Manager-vuw
+        # — a stale source entry in config.toml made this a real, reproducible
+        # failure until the config was fixed). Soft-fail instead, matching
+        # every other btrbk-adjacent operation in this script.
+        if btrbk -c "$DAS_BTRBK_CONF" dryrun; then
+            record_op "btrbk" "OK" "dryrun"
+            log_info "btrbk dryrun completed"
+        else
+            record_op "btrbk" "FAIL" "dryrun exit code $?"
+            log_error "btrbk dryrun failed"
+        fi
     else
         if btrbk -c "$DAS_BTRBK_CONF" run; then
             record_op "btrbk" "OK"
@@ -799,16 +890,48 @@ run_archive_cleanup() {
 unmount_all() {
     log_info "Unmounting volumes..."
 
-    # Unmount targets in reverse order (0-based indexing)
+    local -a failed_mounts=()
+
+    # Unmount DAS backup targets in reverse order (0-based indexing). Every
+    # configured mountpoint is attempted regardless of an earlier failure (a
+    # stuck unmount must not mask the rest). A path that mountpoint(1) does
+    # not consider mounted is skipped, not counted as a failure — the same
+    # filesystem may legitimately be mounted elsewhere too (e.g. udisks under
+    # /run/media), only this script's own mountpoints matter here. These
+    # target mountpoints are the only thing that gates the "safe to
+    # disconnect" claim below — they are the physical DAS enclosure.
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
-        umount "${ALL_TARGET_MOUNTS[$i]}" 2>/dev/null || true
+        local mnt="${ALL_TARGET_MOUNTS[$i]}"
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+        if ! umount "$mnt" 2>/dev/null; then
+            log_error "  Failed to unmount $mnt"
+            failed_mounts+=("$mnt")
+        fi
     done
-    # Unmount sources
+
+    # Unmount sources — best-effort only, deliberately NOT tracked as a
+    # failure. Sources are host filesystems (NVMe/SSD/HDD/das-storage), not
+    # part of the removable DAS enclosure, so a stuck source unmount has no
+    # bearing on whether the DAS is safe to disconnect. Some sources are
+    # host-managed mounts this script did not create and can legitimately
+    # stay busy for reasons unrelated to backup — das-storage on /dasRaid0
+    # is a real example: it hosts running libvirt VMs and can never unmount
+    # while any are up, which would otherwise fire a FAIL on every single
+    # nightly run.
     for label in "${!SOURCE_VOLUMES[@]}"; do
         umount "${SOURCE_VOLUMES[$label]}" 2>/dev/null || true
     done
 
-    log_info "All volumes unmounted"
+    if (( ${#failed_mounts[@]} > 0 )); then
+        local detail="${failed_mounts[*]}"
+        record_op "unmount" "FAIL" "$detail"
+        log_error "Unmount FAILED for: $detail"
+    else
+        record_op "unmount" "OK"
+        log_info "All volumes unmounted"
+    fi
 }
 
 show_stats() {
@@ -1058,6 +1181,7 @@ generate_report() {
 
 BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
+  Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
   Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
@@ -1084,7 +1208,7 @@ LATEST SNAPSHOTS
 $(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
 
 ===============================================================
-  backup-run.sh v4.2.4
+  backup-run.sh v4.3.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -1418,6 +1542,11 @@ main() {
     trap cleanup ERR
 
     check_root
+    # Backup side of the mutual-hold interlock with the scrub engine — must
+    # run before any mount work (create_mount_points is the first mounter
+    # below). Blocks (deferral, never cancellation) if a scrub currently
+    # holds /run/das-maintenance.lock.
+    acquire_maintenance_lock
     check_das_connected
     set_io_scheduler
     create_mount_points
@@ -1479,7 +1608,11 @@ main() {
 
     log_info "=== DAS Backup Completed ==="
     echo ""
-    log_info "Backup complete. DAS can be safely disconnected."
+    if [[ "${OP_STATUS[unmount]:-OK}" == "FAIL" ]]; then
+        log_warn "Backup complete, but NOT all volumes unmounted cleanly — DAS is NOT safe to disconnect (still mounted: ${OP_STATUS[unmount_detail]:-unknown})."
+    else
+        log_info "Backup complete. DAS can be safely disconnected."
+    fi
 }
 
 main "$@"
