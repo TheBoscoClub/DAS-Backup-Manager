@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.11
+**Version**: 0.7.12.3
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -94,6 +94,28 @@ backup is enforced by the engine's own blocking maintenance lock — identical t
 only whether `das-scrub.timer` is enabled by `btrdasd setup`; the engine still honors a manual
 run regardless (warn-only). See `.claude/rules/backup.md` and `docs/SCRUB-SCHEDULING-PROPOSAL.md`
 for the full design rationale.
+
+**Operational note — a caught-up boot scrub can legitimately delay a backup by hours.**
+`das-scrub.timer` sets `Persistent=true`, so a monthly fire missed while the host was off (or the
+DAS enclosure was disconnected) runs as soon as the timer unit is next active, not just at the next
+`OnCalendar=` match. Combined with the service's unbounded `TimeoutStartSec`, a catch-up scrub that
+starts shortly before `das-backup.timer` fires can still be mid-pass (a 22 TB RAID-1 pass measured
+~8h53m in production) when the backup would normally start. The blocking maintenance lock makes the
+backup wait rather than collide with the scrub — `backup-run.sh` defers, it does not fail — so the
+visible symptom is a backup that starts hours late with `journalctl` "waiting on maintenance lock"
+lines in between, not a missed or broken backup. This is the designed trade-off (deferral over data
+races), not a bug; see the "Locking" section of the `scrub` module doc comment
+(`indexer/src/scrub.rs`) for the lock-acquisition order.
+
+**Health integration** (`indexer/src/health.rs`, bd `DAS-Backup-Manager-5kb`): `TargetHealth::scrub`
+reports per-filesystem age (days since the last `finished`, zero-error scrub), WARN/FAIL against
+`[scrub].warn_age_days` / `fail_age_days`, and an immediate FAIL for any aborted/canceled/errored
+latest attempt or nonzero error counter — regardless of how recent or clean an earlier success was.
+It reads **only** `scrub-state.json` (mode `0644`), never the raw per-device
+`/var/lib/btrfs/scrub.status.<fsuuid>` record (mode `0600`, root-only, and the exact record type
+that made an aborted `system-recovery-A` scrub look healthy for 64 days). This keeps `btrdasd health`
+(any user) and the GUI's `HealthQuery()` (root, via `btrdasd-helper`) in agreement — see the
+`ScrubHealth` doc comment in `health.rs` for the full rationale.
 
 ### Indexing Pipeline
 

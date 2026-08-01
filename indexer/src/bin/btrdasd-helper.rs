@@ -143,11 +143,10 @@ impl ProgressCallback for DbusProgress {
         if self.cancel.is_cancelled() {
             return;
         }
-        let percent = if total > 0 {
-            ((current * 100) / total).min(100) as i32
-        } else {
-            0i32
-        };
+        let percent = (current * 100)
+            .checked_div(total)
+            .map(|p| p.min(100) as i32)
+            .unwrap_or(0);
         let conn = self.conn.clone();
         let job_id = self.job_id.clone();
         let msg = message.to_owned();
@@ -1323,6 +1322,14 @@ impl HelperInterface {
                 .targets
                 .iter()
                 .map(|t| {
+                    let scrub_status_str = match t.scrub.status {
+                        health::ScrubHealthStatus::NotApplicable => "not_applicable",
+                        health::ScrubHealthStatus::NeverScrubbed => "never_scrubbed",
+                        health::ScrubHealthStatus::Unresolved => "unresolved",
+                        health::ScrubHealthStatus::Ok => "ok",
+                        health::ScrubHealthStatus::Warn => "warn",
+                        health::ScrubHealthStatus::Fail => "fail",
+                    };
                     serde_json::json!({
                         "label": t.label,
                         "serial": t.serial,
@@ -1335,6 +1342,14 @@ impl HelperInterface {
                         "temperature_c": t.temperature_c,
                         "power_on_hours": t.power_on_hours,
                         "errors": t.errors,
+                        "scrub": {
+                            "status": scrub_status_str,
+                            "age_days": t.scrub.age_days,
+                            "last_outcome": t.scrub.last_outcome,
+                            "last_ok": t.scrub.last_ok,
+                            "error_total": t.scrub.error_total,
+                            "last_success_epoch": t.scrub.last_success_epoch,
+                        },
                     })
                 })
                 .collect();
@@ -1434,6 +1449,11 @@ impl HelperInterface {
                 "last_backup": report.last_backup,
                 "warnings": report.warnings,
                 "growth": growth_json,
+                "scrub_thresholds": {
+                    "enabled": config.scrub.enabled,
+                    "warn_age_days": config.scrub.warn_age_days,
+                    "fail_age_days": config.scrub.fail_age_days,
+                },
                 "services": {
                     "btrbk_available": btrbk_available,
                     "timer_enabled": timer_enabled,

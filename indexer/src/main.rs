@@ -3,7 +3,7 @@ mod setup;
 use buttered_dasd::backup::{BackupMode, BackupOptions};
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
-use buttered_dasd::health::HealthStatus;
+use buttered_dasd::health::{self, HealthStatus};
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
@@ -1401,8 +1401,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if i > 0 {
                         print!(",");
                     }
+                    let scrub_status = match t.scrub.status {
+                        health::ScrubHealthStatus::NotApplicable => "not_applicable",
+                        health::ScrubHealthStatus::NeverScrubbed => "never_scrubbed",
+                        health::ScrubHealthStatus::Unresolved => "unresolved",
+                        health::ScrubHealthStatus::Ok => "ok",
+                        health::ScrubHealthStatus::Warn => "warn",
+                        health::ScrubHealthStatus::Fail => "fail",
+                    };
                     print!(
-                        "{{\"label\":\"{}\",\"serial\":\"{}\",\"mounted\":{},\"total_bytes\":{},\"used_bytes\":{},\"snapshot_count\":{},\"smart_status\":{}}}",
+                        "{{\"label\":\"{}\",\"serial\":\"{}\",\"mounted\":{},\"total_bytes\":{},\"used_bytes\":{},\"snapshot_count\":{},\"smart_status\":{},\"scrub\":{{\"status\":\"{}\",\"age_days\":{},\"last_outcome\":{},\"error_total\":{}}}}}",
                         t.label,
                         t.serial,
                         t.mounted,
@@ -1411,7 +1419,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         t.snapshot_count,
                         t.smart_status
                             .as_ref()
-                            .map_or("null".to_string(), |s| format!("\"{s}\""))
+                            .map_or("null".to_string(), |s| format!("\"{s}\"")),
+                        scrub_status,
+                        t.scrub
+                            .age_days
+                            .map_or("null".to_string(), |a| a.to_string()),
+                        t.scrub
+                            .last_outcome
+                            .as_ref()
+                            .map_or("null".to_string(), |o| format!("\"{o}\"")),
+                        t.scrub
+                            .error_total
+                            .map_or("null".to_string(), |e| e.to_string()),
                     );
                 }
                 print!("],\"warnings\":[");
@@ -1435,26 +1454,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!();
                 println!(
-                    "{:<16} {:<12} {:>10} {:>10} {:>6} {:<10}",
-                    "Target", "Serial", "Used", "Total", "Use%", "SMART"
+                    "{:<16} {:<12} {:>10} {:>10} {:>6} {:<10} {:<15} {:>5}",
+                    "Target", "Serial", "Used", "Total", "Use%", "SMART", "Scrub", "Age"
                 );
-                println!("{}", "-".repeat(70));
+                println!("{}", "-".repeat(90));
                 for t in &report.targets {
+                    let scrub_word = match t.scrub.status {
+                        health::ScrubHealthStatus::NotApplicable => "-",
+                        health::ScrubHealthStatus::NeverScrubbed => "NEVER SCRUBBED",
+                        health::ScrubHealthStatus::Unresolved => "UNRESOLVED",
+                        health::ScrubHealthStatus::Ok => "OK",
+                        health::ScrubHealthStatus::Warn => "WARN",
+                        health::ScrubHealthStatus::Fail => "FAIL",
+                    };
+                    let scrub_age = t
+                        .scrub
+                        .age_days
+                        .map(|a| format!("{a}d"))
+                        .unwrap_or_else(|| "-".to_string());
                     if !t.mounted {
                         println!(
-                            "{:<16} {:<12} {:>10} {:>10} {:>6} {:<10}",
-                            t.label, t.serial, "-", "-", "-", "not mounted"
+                            "{:<16} {:<12} {:>10} {:>10} {:>6} {:<10} {:<15} {:>5}",
+                            t.label, t.serial, "-", "-", "-", "not mounted", scrub_word, scrub_age
                         );
                         continue;
                     }
                     println!(
-                        "{:<16} {:<12} {:>10} {:>10} {:>5.1}% {:<10}",
+                        "{:<16} {:<12} {:>10} {:>10} {:>5.1}% {:<10} {:<15} {:>5}",
                         t.label,
                         t.serial,
                         buttered_dasd::report::format_bytes(t.used_bytes),
                         buttered_dasd::report::format_bytes(t.total_bytes),
                         t.usage_percent(),
-                        t.smart_status.as_deref().unwrap_or("N/A")
+                        t.smart_status.as_deref().unwrap_or("N/A"),
+                        scrub_word,
+                        scrub_age
                     );
                 }
                 if !report.warnings.is_empty() {

@@ -1,4 +1,5 @@
-use crate::config::{Config, TargetRole};
+use crate::config::{Config, Target, TargetRole};
+use crate::scrub;
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -30,6 +31,218 @@ pub struct TargetHealth {
     pub temperature_c: Option<i32>,
     pub power_on_hours: Option<u64>,
     pub errors: Option<u64>,
+    pub scrub: ScrubHealth,
+}
+
+// ---------------------------------------------------------------------------
+// Scrub health (bd DAS-Backup-Manager-5kb)
+// ---------------------------------------------------------------------------
+
+/// Overall scrub-health bucket for one DAS filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubHealthStatus {
+    /// Not a configured `[scrub].targets` entry, or `[scrub].enabled = false`.
+    NotApplicable,
+    /// The engine's state file has no entry for this filesystem's UUID —
+    /// scrub is enabled for this target but has never completed a pass.
+    NeverScrubbed,
+    /// The filesystem UUID could not be resolved (drive missing, config gap).
+    Unresolved,
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// Scrub health of one DAS filesystem, derived from the scrub engine's
+/// persisted state (`/var/lib/das-backup/scrub-state.json`) and the
+/// `[scrub]` config thresholds (`warn_age_days` / `fail_age_days`).
+///
+/// **Deliberately sourced only from the engine's own state file — never
+/// from the raw per-device `/var/lib/btrfs/scrub.status.<fsuuid>` record.**
+/// Two reasons, both load-bearing:
+///
+/// 1. The state file (mode `0644`) is the contract the `scrub` module docs
+///    name for this integration ("written... so health checks and the GUI
+///    can read it without any DAS filesystem mounted"). The raw record
+///    (mode `0600`, root-only) is reserved for `btrdasd scrub status`'s
+///    manual/diagnostic display, which already implements that fallback —
+///    see `build_scrub_target_view` in `main.rs`.
+/// 2. Automated Healthy/Warning/Critical determination must never trust an
+///    ad hoc, out-of-band scrub record blindly. That is exactly the bug
+///    this feature exists to fix: `system-recovery-A`'s aborted scrub
+///    looked healthy for 64 days because a raw record was read at face
+///    value. Only records the engine itself produced — with its
+///    aborted/error cross-checks already applied via
+///    [`crate::scrub::ScrubFsResult::ok`] — feed the automated rollup.
+///
+/// A consequence, verified live 2026-08-01: on a host where the scrub
+/// engine has not yet completed a single pass (`scrub-state.json` does not
+/// exist), every configured scrub target reports [`ScrubHealthStatus::NeverScrubbed`]
+/// here — even for a filesystem that has a genuine, root-only, *finished*
+/// raw btrfs record from an earlier manual `btrfs scrub start` run. That is
+/// correct: the engine has no tracked history for it yet, and "never
+/// scrubbed" is the honest answer for the source of truth this struct
+/// reports. `btrdasd scrub status` (root) remains available to show the
+/// raw-record history for manual triage.
+///
+/// This also keeps the CLI (`btrdasd health`, any user) and the GUI (via
+/// the root `btrdasd-helper` D-Bus daemon) in agreement regardless of which
+/// one runs privileged — there is no root-vs-unprivileged divergence to
+/// reconcile here, unlike SMART data.
+#[derive(Debug, Clone)]
+pub struct ScrubHealth {
+    pub status: ScrubHealthStatus,
+    pub fsuuid: Option<String>,
+    /// Epoch of the last scrub that finished clean (zero errors). Carried
+    /// forward across a later failed attempt by the engine itself — never
+    /// reset by an aborted/errored record.
+    pub last_success_epoch: Option<i64>,
+    pub age_days: Option<i64>,
+    /// `finished`, `canceled`, `aborted`, or `error` — the *latest* attempt's
+    /// outcome, which may be worse than `last_success_epoch` suggests.
+    pub last_outcome: Option<String>,
+    /// Whether the latest attempt passed (`false` = immediate fail).
+    pub last_ok: Option<bool>,
+    pub error_total: Option<u64>,
+    pub resolve_error: Option<String>,
+}
+
+impl ScrubHealth {
+    pub fn not_applicable() -> Self {
+        Self {
+            status: ScrubHealthStatus::NotApplicable,
+            fsuuid: None,
+            last_success_epoch: None,
+            age_days: None,
+            last_outcome: None,
+            last_ok: None,
+            error_total: None,
+            resolve_error: None,
+        }
+    }
+
+    pub fn never_scrubbed() -> Self {
+        Self {
+            status: ScrubHealthStatus::NeverScrubbed,
+            ..Self::not_applicable()
+        }
+    }
+
+    pub fn unresolved(err: String) -> Self {
+        Self {
+            status: ScrubHealthStatus::Unresolved,
+            resolve_error: Some(err),
+            ..Self::not_applicable()
+        }
+    }
+}
+
+/// Days elapsed from `then_epoch` to `now_epoch`, floored, clamped at 0 so a
+/// slightly-in-the-future record (clock skew) never reads as a negative age.
+fn age_days_between(now_epoch: i64, then_epoch: i64) -> i64 {
+    (now_epoch - then_epoch).max(0) / 86_400
+}
+
+/// Derive scrub health for one filesystem from its engine state entry (or
+/// the absence of one). Pure function — `now_epoch` and the thresholds are
+/// parameters (not read internally) so fixture tests can pin "now" and walk
+/// the warn/fail day boundaries exactly.
+///
+/// Threshold semantics (per the `[scrub]` config doc comments): WARN when
+/// age of the last successful scrub is *strictly greater than*
+/// `warn_age_days`; FAIL when *strictly greater than* `fail_age_days`. So
+/// `age == warn_age_days` is still OK, and `age == fail_age_days` is still
+/// only WARN.
+pub fn scrub_health_for(
+    fs: Option<&scrub::FsState>,
+    now_epoch: i64,
+    warn_age_days: u32,
+    fail_age_days: u32,
+) -> ScrubHealth {
+    let Some(fs) = fs else {
+        return ScrubHealth::never_scrubbed();
+    };
+    let attempt = &fs.last_attempt;
+
+    if !attempt.ok {
+        // Immediate fail: the latest attempt is aborted/canceled/errored, or
+        // carries nonzero error counters (`ok` already folds both cases —
+        // see `ScrubFsResult::ok`). This applies regardless of how recent or
+        // how clean `last_success_epoch` is: a good scrub from weeks ago
+        // must never mask a bad one today. `last_success_epoch` is still
+        // reported below (carried forward by the engine, never reset by
+        // this failed attempt) so callers can show "last known good" even
+        // while flagging FAIL.
+        return ScrubHealth {
+            status: ScrubHealthStatus::Fail,
+            fsuuid: None,
+            last_success_epoch: fs.last_success_epoch,
+            age_days: fs
+                .last_success_epoch
+                .map(|t| age_days_between(now_epoch, t)),
+            last_outcome: Some(attempt.outcome.clone()),
+            last_ok: Some(false),
+            error_total: Some(attempt.error_total),
+            resolve_error: None,
+        };
+    }
+
+    // Latest attempt passed clean. Age off `last_success_epoch` — set by the
+    // engine whenever `ok`, and the field the config thresholds are
+    // documented against — never off `attempt.finished_epoch` directly.
+    let Some(success_epoch) = fs.last_success_epoch else {
+        // Defensive: `ok == true` should always carry a `last_success_epoch`
+        // (the engine sets both together in `merge_pass_into_state`), but a
+        // health check must never trust that invariant blindly — fall back
+        // to "never scrubbed" rather than reporting a clean pass with no age.
+        return ScrubHealth::never_scrubbed();
+    };
+    let age = age_days_between(now_epoch, success_epoch);
+    let status = if age > i64::from(fail_age_days) {
+        ScrubHealthStatus::Fail
+    } else if age > i64::from(warn_age_days) {
+        ScrubHealthStatus::Warn
+    } else {
+        ScrubHealthStatus::Ok
+    };
+    ScrubHealth {
+        status,
+        fsuuid: None,
+        last_success_epoch: Some(success_epoch),
+        age_days: Some(age),
+        last_outcome: Some(attempt.outcome.clone()),
+        last_ok: Some(true),
+        error_total: Some(attempt.error_total),
+        resolve_error: None,
+    }
+}
+
+/// Compute a target's scrub health, folding in config applicability
+/// (`[scrub].enabled`, whether this target's label is in `[scrub].targets`)
+/// and UUID resolution ahead of [`scrub_health_for`].
+fn target_scrub_health(
+    config: &Config,
+    target: &Target,
+    state: Option<&scrub::ScrubState>,
+    now_epoch: i64,
+) -> ScrubHealth {
+    if !config.scrub.enabled || !config.scrub.targets.iter().any(|l| l == &target.label) {
+        return ScrubHealth::not_applicable();
+    }
+    match scrub::resolve_target_fsuuid(config, &target.label) {
+        Ok(fsuuid) => {
+            let fs = state.and_then(|s| s.filesystems.get(&fsuuid));
+            let mut health = scrub_health_for(
+                fs,
+                now_epoch,
+                config.scrub.warn_age_days,
+                config.scrub.fail_age_days,
+            );
+            health.fsuuid = Some(fsuuid);
+            health
+        }
+        Err(e) => ScrubHealth::unresolved(e),
+    }
 }
 
 impl TargetHealth {
@@ -386,8 +599,10 @@ pub fn days_to_ymd(z: i64) -> (i32, u32, u32) {
 /// records and an accompanying list of warning messages.
 ///
 /// Rules:
-/// - Critical: any target with SMART "FAILED" or usage > 95 %
-/// - Warning: any target with usage > 85 %, SMART unavailable, or unmounted
+/// - Critical: any target with SMART "FAILED", usage > 95 %, or scrub FAIL
+///   (aborted/errored latest attempt, or age past `fail_age_days`)
+/// - Warning: any target with usage > 85 %, SMART unavailable, unmounted,
+///   or scrub WARN/never-scrubbed/unresolved
 /// - Healthy: everything else
 fn determine_status(targets: &[TargetHealth], warnings: &[String]) -> HealthStatus {
     for t in targets {
@@ -395,6 +610,9 @@ fn determine_status(targets: &[TargetHealth], warnings: &[String]) -> HealthStat
             return HealthStatus::Critical;
         }
         if t.total_bytes > 0 && t.usage_percent() > 95.0 {
+            return HealthStatus::Critical;
+        }
+        if t.scrub.status == ScrubHealthStatus::Fail {
             return HealthStatus::Critical;
         }
     }
@@ -415,6 +633,28 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
     let mut target_healths: Vec<TargetHealth> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut effective_mounts: Vec<String> = Vec::new();
+
+    // Load the scrub engine's persisted state once, up front, for all
+    // targets — see `ScrubHealth` doc comment for why this (and only this)
+    // is the source for scrub health. A missing file is normal (no pass has
+    // run yet) and yields the default empty state, not an error; only a
+    // present-but-unreadable/corrupt file produces a warning here, and only
+    // once for the whole report rather than once per target.
+    let scrub_state = if config.scrub.enabled {
+        match scrub::load_state() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warnings.push(format!("Scrub state unreadable: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     for target in &config.targets {
         // 1. Check mount status — detect both configured path and udisks2 mounts
@@ -512,6 +752,44 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             }
         }
 
+        // 5b. Scrub health — independent of mount state, since the engine's
+        // state file (unlike disk usage / SMART) is readable whether or not
+        // the DAS filesystem is currently mounted.
+        let scrub_health = target_scrub_health(config, target, scrub_state.as_ref(), now_epoch);
+        match scrub_health.status {
+            ScrubHealthStatus::NeverScrubbed => warnings.push(format!(
+                "Target '{}': never scrubbed — no successful scrub recorded yet",
+                target.label
+            )),
+            ScrubHealthStatus::Warn => warnings.push(format!(
+                "Target '{}': last successful scrub is {} day(s) old (warn threshold {}d)",
+                target.label,
+                scrub_health.age_days.unwrap_or(0),
+                config.scrub.warn_age_days
+            )),
+            ScrubHealthStatus::Fail => warnings.push(format!(
+                "Target '{}': scrub FAILED — last attempt outcome '{}'{}",
+                target.label,
+                scrub_health.last_outcome.as_deref().unwrap_or("unknown"),
+                match scrub_health.age_days {
+                    Some(age) => format!(
+                        ", last known-good scrub {age} day(s) old (fail threshold {}d)",
+                        config.scrub.fail_age_days
+                    ),
+                    None => " (never a successful scrub)".to_string(),
+                }
+            )),
+            ScrubHealthStatus::Unresolved => warnings.push(format!(
+                "Target '{}': cannot resolve filesystem UUID for scrub health: {}",
+                target.label,
+                scrub_health
+                    .resolve_error
+                    .as_deref()
+                    .unwrap_or("unknown error")
+            )),
+            ScrubHealthStatus::Ok | ScrubHealthStatus::NotApplicable => {}
+        }
+
         target_healths.push(TargetHealth {
             label: target.label.clone(),
             serial: target.serial.clone(),
@@ -523,6 +801,7 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             temperature_c,
             power_on_hours,
             errors,
+            scrub: scrub_health,
         });
     }
 
@@ -642,6 +921,7 @@ mod tests {
             temperature_c: Some(32),
             power_on_hours: Some(12345),
             errors: None,
+            scrub: ScrubHealth::not_applicable(),
         };
         let pct = th.usage_percent();
         assert!((pct - 25.0).abs() < 0.01);
@@ -660,6 +940,7 @@ mod tests {
             temperature_c: None,
             power_on_hours: None,
             errors: None,
+            scrub: ScrubHealth::not_applicable(),
         };
         assert_eq!(th.usage_percent(), 0.0);
     }
@@ -843,6 +1124,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 temperature_c: None,
                 power_on_hours: None,
                 errors: None,
+                scrub: ScrubHealth::not_applicable(),
             },
             TargetHealth {
                 label: "t2".into(),
@@ -855,6 +1137,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 temperature_c: None,
                 power_on_hours: None,
                 errors: None,
+                scrub: ScrubHealth::not_applicable(),
             },
         ];
         let warnings: Vec<String> = vec![];
@@ -874,6 +1157,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             temperature_c: None,
             power_on_hours: None,
             errors: None,
+            scrub: ScrubHealth::not_applicable(),
         }];
         let warnings = vec!["Target 't1' is nearly full: 90.0% used".to_string()];
         assert_eq!(determine_status(&targets, &warnings), HealthStatus::Warning);
@@ -892,6 +1176,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             temperature_c: None,
             power_on_hours: None,
             errors: None,
+            scrub: ScrubHealth::not_applicable(),
         }];
         let warnings = vec!["Target 't1': SMART status FAILED".to_string()];
         assert_eq!(
@@ -913,6 +1198,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             temperature_c: None,
             power_on_hours: None,
             errors: None,
+            scrub: ScrubHealth::not_applicable(),
         }];
         let warnings = vec!["Target 't1' is critically full: 97.0% used".to_string()];
         assert_eq!(
@@ -970,5 +1256,297 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
     fn test_parse_smartctl_details_invalid() {
         assert!(parse_smartctl_details("not json").is_none());
         assert!(parse_smartctl_details("{}").is_none());
+    }
+
+    // --- scrub health (bd DAS-Backup-Manager-5kb) ---
+
+    const NOW: i64 = 1_800_000_000; // fixed "now" so age-day tests are exact
+
+    /// Build a clean, `finished`, zero-error `FsState` whose last success was
+    /// `age_days` ago (relative to [`NOW`]).
+    fn fs_state_clean(age_days: i64) -> scrub::FsState {
+        let success_epoch = NOW - age_days * 86_400;
+        scrub::FsState {
+            target_label: "t1".into(),
+            mountpoint: "/mnt/t1".into(),
+            last_success_epoch: Some(success_epoch),
+            last_attempt: scrub::AttemptState {
+                outcome: "finished".into(),
+                ok: true,
+                started_epoch: success_epoch - 6000,
+                finished_epoch: success_epoch,
+                duration_secs: 6000,
+                bytes_scrubbed: 1_000_000_000,
+                error_total: 0,
+                counters: scrub::ScrubCounters::default(),
+                messages: Vec::new(),
+            },
+        }
+    }
+
+    /// Build an `FsState` whose *latest* attempt is bad (`ok: false`), with
+    /// an optional carried-forward `last_success_epoch` from an earlier
+    /// clean pass (`prior_success_age_days` ago), mirroring what
+    /// `merge_pass_into_state` produces for a failed pass following a good
+    /// one.
+    fn fs_state_bad_latest(
+        outcome: &str,
+        error_total: u64,
+        prior_success_age_days: Option<i64>,
+    ) -> scrub::FsState {
+        let latest_epoch = NOW - 86_400; // latest (bad) attempt: yesterday
+        scrub::FsState {
+            target_label: "t1".into(),
+            mountpoint: "/mnt/t1".into(),
+            last_success_epoch: prior_success_age_days.map(|d| NOW - d * 86_400),
+            last_attempt: scrub::AttemptState {
+                outcome: outcome.into(),
+                ok: false,
+                started_epoch: latest_epoch - 3000,
+                finished_epoch: latest_epoch,
+                duration_secs: 3000,
+                bytes_scrubbed: 500_000_000,
+                error_total,
+                counters: scrub::ScrubCounters::default(),
+                messages: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn scrub_health_never_scrubbed_when_no_state_entry() {
+        let h = scrub_health_for(None, NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::NeverScrubbed);
+        assert_eq!(h.age_days, None);
+        assert_eq!(h.last_success_epoch, None);
+    }
+
+    #[test]
+    fn scrub_health_warn_age_boundary_44_still_ok() {
+        let fs = fs_state_clean(44);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Ok);
+        assert_eq!(h.age_days, Some(44));
+    }
+
+    #[test]
+    fn scrub_health_warn_age_boundary_45_still_ok() {
+        // Requirement text: "WARN when age ... > warn_age_days" — age equal
+        // to the threshold is not yet a warning.
+        let fs = fs_state_clean(45);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Ok);
+        assert_eq!(h.age_days, Some(45));
+    }
+
+    #[test]
+    fn scrub_health_warn_age_boundary_46_crosses_to_warn() {
+        let fs = fs_state_clean(46);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Warn);
+        assert_eq!(h.age_days, Some(46));
+    }
+
+    #[test]
+    fn scrub_health_fail_age_boundary_74_still_warn() {
+        let fs = fs_state_clean(74);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Warn);
+        assert_eq!(h.age_days, Some(74));
+    }
+
+    #[test]
+    fn scrub_health_fail_age_boundary_75_still_warn() {
+        let fs = fs_state_clean(75);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Warn);
+        assert_eq!(h.age_days, Some(75));
+    }
+
+    #[test]
+    fn scrub_health_fail_age_boundary_76_crosses_to_fail() {
+        let fs = fs_state_clean(76);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Fail);
+        assert_eq!(h.age_days, Some(76));
+    }
+
+    #[test]
+    fn scrub_health_aborted_is_immediate_fail_regardless_of_age() {
+        // Motivating case: recovery-A sat 64 days with an aborted super=3
+        // scrub that looked fine. Even a *recent* aborted attempt (well
+        // inside the warn window) must fail immediately.
+        let fs = fs_state_bad_latest("aborted", 0, Some(5));
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Fail);
+        assert_eq!(h.last_outcome.as_deref(), Some("aborted"));
+        assert_eq!(h.last_ok, Some(false));
+    }
+
+    #[test]
+    fn scrub_health_nonzero_errors_is_immediate_fail_regardless_of_age() {
+        // A "finished" outcome with nonzero error counters is still an
+        // immediate fail — outcome alone is not sufficient, per the
+        // requirement ("Any nonzero error counter ... = IMMEDIATE FAIL").
+        let fs = fs_state_bad_latest("finished", 3, Some(2));
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Fail);
+        assert_eq!(h.error_total, Some(3));
+    }
+
+    #[test]
+    fn scrub_health_aborted_does_not_reset_age() {
+        // A finished record 10 days old, followed by an aborted attempt
+        // yesterday: the reported age must still reflect the *finished*
+        // record (10 days), never reset to the aborted attempt's date —
+        // this is `last_success_epoch`'s carried-forward contract.
+        let fs = fs_state_bad_latest("aborted", 0, Some(10));
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Fail);
+        assert_eq!(h.age_days, Some(10));
+        assert_eq!(h.last_success_epoch, Some(NOW - 10 * 86_400));
+    }
+
+    #[test]
+    fn scrub_health_bad_latest_with_no_prior_success_reports_no_age() {
+        let fs = fs_state_bad_latest("error", 0, None);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Fail);
+        assert_eq!(h.age_days, None);
+        assert_eq!(h.last_success_epoch, None);
+    }
+
+    #[test]
+    fn scrub_health_ok_clean_records_last_ok_true() {
+        let fs = fs_state_clean(1);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.last_ok, Some(true));
+        assert_eq!(h.last_outcome.as_deref(), Some("finished"));
+        assert_eq!(h.error_total, Some(0));
+    }
+
+    #[test]
+    fn scrub_health_not_applicable_constructor() {
+        let h = ScrubHealth::not_applicable();
+        assert_eq!(h.status, ScrubHealthStatus::NotApplicable);
+        assert_eq!(h.fsuuid, None);
+    }
+
+    #[test]
+    fn scrub_health_unresolved_constructor_carries_error() {
+        let h = ScrubHealth::unresolved("no serial".to_string());
+        assert_eq!(h.status, ScrubHealthStatus::Unresolved);
+        assert_eq!(h.resolve_error.as_deref(), Some("no serial"));
+    }
+
+    fn base_target_health(scrub: ScrubHealth) -> TargetHealth {
+        TargetHealth {
+            label: "t1".into(),
+            serial: "S1".into(),
+            mounted: true,
+            total_bytes: 1_000_000_000,
+            used_bytes: 100_000_000, // 10% — fine on its own
+            snapshot_count: 10,
+            smart_status: Some("PASSED".into()),
+            temperature_c: None,
+            power_on_hours: None,
+            errors: None,
+            scrub,
+        }
+    }
+
+    #[test]
+    fn determine_status_scrub_fail_is_critical() {
+        let fs = fs_state_clean(76);
+        let scrub = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(scrub.status, ScrubHealthStatus::Fail);
+        let targets = vec![base_target_health(scrub)];
+        let warnings = vec!["Target 't1': scrub FAILED".to_string()];
+        assert_eq!(
+            determine_status(&targets, &warnings),
+            HealthStatus::Critical
+        );
+    }
+
+    #[test]
+    fn determine_status_scrub_warn_is_warning_not_critical() {
+        let fs = fs_state_clean(46);
+        let scrub = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(scrub.status, ScrubHealthStatus::Warn);
+        let targets = vec![base_target_health(scrub)];
+        let warnings = vec!["Target 't1': last successful scrub is 46 day(s) old".to_string()];
+        assert_eq!(determine_status(&targets, &warnings), HealthStatus::Warning);
+    }
+
+    #[test]
+    fn determine_status_scrub_not_applicable_stays_healthy() {
+        let targets = vec![base_target_health(ScrubHealth::not_applicable())];
+        let warnings: Vec<String> = vec![];
+        assert_eq!(determine_status(&targets, &warnings), HealthStatus::Healthy);
+    }
+
+    /// Minimal target with an explicit `mount_uuid`, mirroring the
+    /// `test_target` helper in `main.rs`'s scrub CLI tests — `resolve_target_fsuuid`
+    /// prefers `mount_uuid` and never has to touch a real device for it.
+    fn scrub_test_target(label: &str, mount_uuid: &str) -> Target {
+        Target {
+            label: label.to_string(),
+            serial: String::new(),
+            serials: Vec::new(),
+            mount_uuid: Some(mount_uuid.to_string()),
+            mount: format!("/mnt/{label}"),
+            role: crate::config::TargetRole::Primary,
+            retention: crate::config::Retention::default(),
+            display_name: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn target_scrub_health_not_applicable_when_scrub_disabled() {
+        let mut config = Config::default();
+        config.scrub.enabled = false;
+        let target = scrub_test_target("primary-22tb", "11111111-1111-1111-1111-111111111111");
+        let h = target_scrub_health(&config, &target, None, NOW);
+        assert_eq!(h.status, ScrubHealthStatus::NotApplicable);
+    }
+
+    #[test]
+    fn target_scrub_health_not_applicable_when_label_not_a_scrub_target() {
+        let mut config = Config::default();
+        config.scrub.enabled = true;
+        config.scrub.targets = vec!["primary-22tb".into()];
+        let target = scrub_test_target("some-other-target", "11111111-1111-1111-1111-111111111111");
+        let h = target_scrub_health(&config, &target, None, NOW);
+        assert_eq!(h.status, ScrubHealthStatus::NotApplicable);
+    }
+
+    #[test]
+    fn target_scrub_health_never_scrubbed_when_state_empty() {
+        let mut config = Config::default();
+        config.scrub.enabled = true;
+        config.scrub.targets = vec!["primary-22tb".into()];
+        let target = scrub_test_target("primary-22tb", "11111111-1111-1111-1111-111111111111");
+        config.targets = vec![target.clone()];
+        let state = scrub::ScrubState::default();
+        let h = target_scrub_health(&config, &target, Some(&state), NOW);
+        assert_eq!(h.status, ScrubHealthStatus::NeverScrubbed);
+    }
+
+    #[test]
+    fn target_scrub_health_ok_when_state_has_recent_clean_entry() {
+        let mut config = Config::default();
+        config.scrub.enabled = true;
+        config.scrub.targets = vec!["primary-22tb".into()];
+        config.scrub.warn_age_days = 45;
+        config.scrub.fail_age_days = 75;
+        let fsuuid = "11111111-1111-1111-1111-111111111111".to_string();
+        let target = scrub_test_target("primary-22tb", &fsuuid);
+        config.targets = vec![target.clone()];
+        let mut state = scrub::ScrubState::default();
+        state.filesystems.insert(fsuuid.clone(), fs_state_clean(5));
+        let h = target_scrub_health(&config, &target, Some(&state), NOW);
+        assert_eq!(h.status, ScrubHealthStatus::Ok);
+        assert_eq!(h.fsuuid.as_deref(), Some(fsuuid.as_str()));
+        assert_eq!(h.age_days, Some(5));
     }
 }

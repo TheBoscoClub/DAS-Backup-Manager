@@ -1,6 +1,9 @@
 # Scheduled Scrub Integration — Analysis & Proposal
 
-**Status**: proposal awaiting discussion — **this is the next thing to work on in this project**
+**Status**: **IMPLEMENTED** (Option B) — bd tasks `ikn`, `212`, `0kn`, `atq`, `5kb`, `b6f`, landed
+2026-08-01. This document is kept as the historical design record; it is no longer the source of
+truth for current behavior. See `ARCHITECTURE.md`'s "Scrub Pipeline" section for how the shipped
+system actually works (engine, state file, health integration, systemd units).
 **Written**: 2026-07-27
 **Origin**: investigated from the `CachyOS-Kernel` project while setting up host-wide scrub timers.
 That project deliberately stopped at the DAS boundary — the non-DAS filesystems now have scrub
