@@ -318,7 +318,7 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
     // With nothing running, the engine must decide to force.
     rig.with_temporary_mount(|mnt| {
         assert_eq!(
-            live_scrub_state(mnt.to_str().unwrap()),
+            live_scrub_state(mnt.to_str().unwrap(), &rig.uuid),
             LiveScrubState::NotRunning,
             "no scrub should be running on the idle rig"
         );
@@ -389,7 +389,7 @@ fn live_scrub_is_never_force_restarted() {
     // Wait for the kernel to report it, so the assertion is not racing.
     let mut state = LiveScrubState::Unknown;
     for _ in 0..40 {
-        state = live_scrub_state(&mnt);
+        state = live_scrub_state(&mnt, &rig.uuid);
         if state == LiveScrubState::Running {
             break;
         }
