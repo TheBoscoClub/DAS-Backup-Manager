@@ -1,9 +1,19 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.2.3
-# Date: 2026-05-23
+# Version: 4.2.4
+# Date: 2026-08-01
 #
 # Features:
+#   - Boot archive-then-recreate + pruner wiring (v4.2.4): update_boot_subvolumes()
+#     now archives the outgoing @/@home as a read-only snapshot
+#     (@.archive.<TS> / @home.archive.<TS>, TS=YYYYMMDDTHHMMSS) BEFORE the
+#     create-then-swap replacement on --full runs, matching indexer/src/backup.rs
+#     archive_boot() semantics exactly. If the archive snapshot fails, the
+#     recreation is skipped for that subvolume so the only copy is never
+#     destroyed. boot-archive-cleanup.sh (previously installed but never
+#     invoked) is now run at the end of every backup, daily and full alike,
+#     while targets are still mounted, and reports through
+#     record_op "archive_cleanup". Tracks DAS-Backup-Manager-64h, -1j7.
 #   - Incremental BTRFS backups via btrbk to configured targets
 #   - Maintains stable boot subvolumes (@ and @home) for disaster recovery
 #   - Detects DAS drives by serial number (stable across reboots)
@@ -68,6 +78,8 @@ fi
 # Load configuration from config.toml via btrdasd
 BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
 DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+# Boot archive pruner — sibling script, same install directory as this one.
+BOOT_ARCHIVE_CLEANUP_BIN="${BOOT_ARCHIVE_CLEANUP_BIN:-/usr/lib/das-backup/boot-archive-cleanup.sh}"
 if [[ -x "$BTRDASD_BIN" ]]; then
     eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
 else
@@ -641,6 +653,11 @@ run_btrbk() {
 update_boot_subvolumes() {
     local force="${1:-false}"
     local updated=0 skipped=0 failed=0
+    # One timestamp per run (not per subvolume/target) — matches the Rust
+    # archive_boot() format exactly so boot-archive-cleanup.sh's
+    # parse_archive_timestamp() can parse either origin's archives.
+    local ts
+    ts=$(date +%Y%m%dT%H%M%S)
 
     log_info "Updating stable boot subvolumes..."
 
@@ -677,16 +694,23 @@ update_boot_subvolumes() {
         log_info "  [$label] Latest root: $latest_root"
         log_info "  [$label] Latest home: $latest_home"
 
-        # Update @ subvolume (create-then-swap to avoid power-loss window)
+        # Update @ subvolume (archive-then-swap: archive the outgoing @ as a
+        # read-only snapshot BEFORE the create-then-swap replacement, so the
+        # only copy of the outgoing subvolume is never destroyed. If the
+        # archive snapshot fails, skip the recreation entirely for this
+        # subvolume — never delete @ without a preserved archive.)
         if btrfs subvolume show "$mnt/@" &>/dev/null; then
             if [[ "$force" == "true" ]]; then
-                if btrfs subvolume snapshot "$mnt/$latest_root" "$mnt/@.new" && \
-                   btrfs subvolume delete "$mnt/@" && \
-                   mv "$mnt/@.new" "$mnt/@"; then
-                    log_info "  [$label] Recreated @ from $latest_root"
+                if ! btrfs subvolume snapshot -r "$mnt/@" "$mnt/@.archive.$ts"; then
+                    log_error "  [$label] Failed to archive @ -> @.archive.$ts — skipping recreation (old @ preserved)"
+                    (( failed += 1 ))
+                elif btrfs subvolume snapshot "$mnt/$latest_root" "$mnt/@.new" && \
+                     btrfs subvolume delete "$mnt/@" && \
+                     mv "$mnt/@.new" "$mnt/@"; then
+                    log_info "  [$label] Recreated @ from $latest_root (archived old @ -> @.archive.$ts)"
                     (( updated += 1 ))
                 else
-                    log_error "  [$label] Failed to recreate @"
+                    log_error "  [$label] Failed to recreate @ (archive @.archive.$ts was created)"
                     (( failed += 1 ))
                 fi
             else
@@ -703,20 +727,25 @@ update_boot_subvolumes() {
             fi
         fi
 
-        # Update @home subvolume (create-then-swap to avoid power-loss window)
+        # Update @home subvolume (archive-then-swap — see @ handling above for
+        # the archive-before-delete rationale).
         if btrfs subvolume show "$mnt/@home" &>/dev/null; then
             if [[ "$force" == "true" ]]; then
-                if btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home.new" && \
-                   btrfs subvolume delete "$mnt/@home" && \
-                   mv "$mnt/@home.new" "$mnt/@home"; then
-                    log_info "  [$label] Recreated @home from $latest_home"
+                if ! btrfs subvolume snapshot -r "$mnt/@home" "$mnt/@home.archive.$ts"; then
+                    log_error "  [$label] Failed to archive @home -> @home.archive.$ts — skipping recreation (old @home preserved)"
+                    (( failed += 1 ))
+                elif btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home.new" && \
+                     btrfs subvolume delete "$mnt/@home" && \
+                     mv "$mnt/@home.new" "$mnt/@home"; then
+                    log_info "  [$label] Recreated @home from $latest_home (archived old @home -> @home.archive.$ts)"
                     (( updated += 1 ))
                 else
-                    log_error "  [$label] Failed to recreate @home"
+                    log_error "  [$label] Failed to recreate @home (archive @home.archive.$ts was created)"
                     (( failed += 1 ))
                 fi
             else
                 log_info "  [$label] @home exists, skipping (use --full to recreate)"
+                (( skipped += 1 ))
             fi
         else
             if btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home"; then
@@ -733,6 +762,37 @@ update_boot_subvolumes() {
         record_op "boot_subvols" "FAIL" "$updated updated, $failed failed"
     else
         record_op "boot_subvols" "OK" "$updated updated, $skipped skipped"
+    fi
+}
+
+# Prune expired boot-subvolume archives (@.archive.<TS> / @home.archive.<TS>)
+# created by update_boot_subvolumes(). Must run while targets are still
+# mounted — boot-archive-cleanup.sh silently skips any target mount point
+# that isn't currently mounted. Soft-fail: a pruner failure is recorded for
+# the email report but never aborts the backup, matching run_indexer().
+run_archive_cleanup() {
+    local mode="$1"
+    local args=()
+
+    if [[ "$mode" == "dryrun" ]]; then
+        args+=(--dryrun)
+    fi
+
+    if [[ ! -x "$BOOT_ARCHIVE_CLEANUP_BIN" ]]; then
+        log_warn "Boot archive cleanup script not found at $BOOT_ARCHIVE_CLEANUP_BIN — skipping"
+        record_op "archive_cleanup" "FAIL" "script not found at $BOOT_ARCHIVE_CLEANUP_BIN"
+        return
+    fi
+
+    log_info "Running boot archive cleanup..."
+    local cleanup_output
+    if cleanup_output=$("$BOOT_ARCHIVE_CLEANUP_BIN" "${args[@]}" 2>&1); then
+        record_op "archive_cleanup" "OK" "$(echo "$cleanup_output" | tail -1)"
+        log_info "Boot archive cleanup completed"
+    else
+        local exit_code=$?
+        log_warn "Boot archive cleanup failed (non-fatal): $cleanup_output"
+        record_op "archive_cleanup" "FAIL" "exit code $exit_code"
     fi
 }
 
@@ -959,8 +1019,9 @@ run_indexer() {
         record_op "indexer" "OK"
         log_info "  $indexer_output"
     else
+        local exit_code=$?
         log_warn "Content indexer failed (non-fatal)"
-        record_op "indexer" "FAIL" "exit code $?"
+        record_op "indexer" "FAIL" "exit code $exit_code"
     fi
 }
 
@@ -999,6 +1060,7 @@ BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
+  Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
 
 THROUGHPUT
@@ -1022,7 +1084,7 @@ LATEST SNAPSHOTS
 $(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
 
 ===============================================================
-  backup-run.sh v4.2.3
+  backup-run.sh v4.2.4
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -1383,6 +1445,11 @@ main() {
         # Record growth data and generate email report
         record_growth
 
+        # Prune expired boot archives (daily and full runs alike) while
+        # targets are still mounted, before the report is built so pruner
+        # failures are visible in overall_status and the email report.
+        run_archive_cleanup "$mode"
+
         local overall_status="SUCCESS"
         for op in "${!OP_STATUS[@]}"; do
             if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
@@ -1400,6 +1467,12 @@ main() {
 
         # Record backup run in the database for GUI history
         record_backup_run_in_db "$overall_status" "$force_full"
+    else
+        # Dryrun mode never mutates boot subvolumes or sends an email report,
+        # but the pruner still needs a preview pass (its own --dryrun) while
+        # targets are mounted — boot-archive-cleanup.sh silently skips any
+        # target that isn't currently mounted.
+        run_archive_cleanup "$mode"
     fi
 
     unmount_all

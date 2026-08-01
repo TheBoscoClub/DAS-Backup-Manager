@@ -122,7 +122,7 @@ fn default_boot_subvolumes() -> Vec<String> {
     vec!["@".into(), "@home".into()]
 }
 fn default_archive_retention_days() -> u32 {
-    365
+    60
 }
 
 impl Default for Boot {
@@ -130,7 +130,7 @@ impl Default for Boot {
         Self {
             enabled: true,
             subvolumes: default_boot_subvolumes(),
-            archive_retention_days: 365,
+            archive_retention_days: 60,
         }
     }
 }
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(parsed.das.io_scheduler, "mq-deadline");
         assert!(parsed.boot.enabled);
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home"]);
-        assert_eq!(parsed.boot.archive_retention_days, 365);
+        assert_eq!(parsed.boot.archive_retention_days, 60);
     }
 
     #[test]
@@ -619,7 +619,7 @@ enabled = false
         assert_eq!(cfg.das.model_pattern, "TDAS");
         assert_eq!(cfg.das.io_scheduler, "mq-deadline");
         assert!(cfg.boot.enabled);
-        assert_eq!(cfg.boot.archive_retention_days, 365);
+        assert_eq!(cfg.boot.archive_retention_days, 60);
         assert_eq!(cfg.sources[0].snapshot_dir, ".btrbk-snapshots");
         assert!(cfg.sources[0].target_subdirs.is_empty());
         assert_eq!(cfg.targets[0].retention.daily, 0);

@@ -573,10 +573,9 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
         (s, 1_024u64)
     } else if let Some(s) = upper.strip_suffix("KB/S") {
         (s, 1_000u64)
-    } else if let Some(s) = upper.strip_suffix("B/S") {
-        (s, 1u64)
     } else {
-        return None;
+        let s = upper.strip_suffix("B/S")?;
+        (s, 1u64)
     };
     val_str
         .parse::<f64>()
