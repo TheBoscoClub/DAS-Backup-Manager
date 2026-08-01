@@ -73,6 +73,28 @@ The system has six major components:
          └──▶ mailx              → sends email report
 ```
 
+### Scrub Pipeline
+
+```
+1. systemd timer fires (das-scrub.timer, monthly OnCalendar from [scrub].on_calendar)
+         │
+         ▼
+2. btrdasd scrub run (indexer/src/scrub.rs)
+         │
+         ├──▶ /run/das-scrub.lock         non-blocking singleton — a second pass skips, never queues
+         ├──▶ /run/das-maintenance.lock   blocking, shared with backup-run.sh — deferral, not cancellation
+         ├──▶ mount + btrfs scrub start   sequential, per configured [scrub].targets
+         └──▶ /var/lib/das-backup/scrub-state.json   consumed by health checks
+```
+
+`das-scrub.service` is deliberately dumb (`Type=oneshot`, unbounded `TimeoutStartSec=infinity`,
+no `Conflicts=`, no `ExecStopPost` cancel, no `RuntimeMaxSec=`). All ordering against a running
+backup is enforced by the engine's own blocking maintenance lock — identical to a manual
+`btrdasd scrub run` invocation, so there is no unit-layer special case. `[scrub].enabled` gates
+only whether `das-scrub.timer` is enabled by `btrdasd setup`; the engine still honors a manual
+run regardless (warn-only). See `.claude/rules/backup.md` and `docs/SCRUB-SCHEDULING-PROPOSAL.md`
+for the full design rationale.
+
 ### Indexing Pipeline
 
 ```

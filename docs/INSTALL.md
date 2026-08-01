@@ -326,6 +326,16 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Install GUI desktop entry |
 
+### `[scrub]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable `das-scrub.timer` (the scrub engine itself always allows manual `btrdasd scrub run`, warning-only when disabled) |
+| `on_calendar` | string | `"*-*-01 05:30:00"` | systemd `OnCalendar=` expression consumed verbatim by `das-scrub.timer` (monthly, 05:30) |
+| `targets` | string[] | `["primary-22tb", "system-recovery-A-2tb", "system-recovery-B-2tb"]` | `[[target]].label` values scrubbed sequentially in list order |
+| `warn_age_days` | u32 | `45` | Days since a target's last successful scrub before health checks warn |
+| `fail_age_days` | u32 | `75` | Days since a target's last successful scrub before health checks fail |
+
 ## Generated Files
 
 The installer creates the following files (tracked in `/etc/das-backup/.manifest`):
@@ -338,6 +348,8 @@ The installer creates the following files (tracked in `/etc/das-backup/.manifest
 | `/etc/systemd/system/das-backup.timer` | Incremental backup timer (systemd) |
 | `/etc/systemd/system/das-backup-full.service` | Full backup service (systemd) |
 | `/etc/systemd/system/das-backup-full.timer` | Full backup timer (systemd) |
+| `/etc/systemd/system/das-scrub.service` | Scheduled BTRFS scrub service (systemd) — runs `btrdasd scrub run` |
+| `/etc/systemd/system/das-scrub.timer` | Scheduled BTRFS scrub timer (systemd) — `OnCalendar` from `[scrub].on_calendar`, enabled only when `[scrub].enabled = true` |
 | `/usr/local/lib/das-backup/backup-run-generated.sh` | Generated backup script |
 | `~/.config/pbridge.conf` | SMTP credentials (Protonmail Bridge — single canonical source, mode 0600) |
 | `/usr/share/libalpm/hooks/das-backup-esp.hook` | Pacman ESP hook (if enabled) |
