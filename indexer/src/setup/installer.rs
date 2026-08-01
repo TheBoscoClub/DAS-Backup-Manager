@@ -31,6 +31,26 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::process::Command::new("systemctl")
             .args(["enable", "--now", "das-backup-full.timer"])
             .status();
+
+        // das-scrub.service/.timer are always generated and installed (see
+        // GeneratedFiles::generate), but the timer is only *enabled* when
+        // `[scrub].enabled = true`. The scrub engine itself ignores
+        // `enabled` for manual `btrdasd scrub run` invocations (warn only)
+        // — the timer is the sole enforcement point for the schedule
+        // (bd DAS-Backup-Manager-atq). Explicitly disable on the false path
+        // too (not just "skip enabling") so a later `enabled = true -> false`
+        // edit followed by `setup --upgrade` actually turns the timer off —
+        // `enable --now`/`disable --now` are both idempotent no-ops if the
+        // unit is already in the target state.
+        if config.scrub.enabled {
+            let _ = std::process::Command::new("systemctl")
+                .args(["enable", "--now", "das-scrub.timer"])
+                .status();
+        } else {
+            let _ = std::process::Command::new("systemctl")
+                .args(["disable", "--now", "das-scrub.timer"])
+                .status();
+        }
     }
 
     Ok(())
@@ -114,6 +134,9 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         .status();
     let _ = std::process::Command::new("systemctl")
         .args(["disable", "--now", "das-backup-full.timer"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "--now", "das-scrub.timer"])
         .status();
 
     let removed = uninstall_from_manifest(&manifest_path);

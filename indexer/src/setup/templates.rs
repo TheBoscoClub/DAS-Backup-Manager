@@ -180,6 +180,14 @@ fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
 
 /// Generate a systemd .service unit file. When `full` is true, appends " --full"
 /// to the ExecStart line.
+///
+/// `TimeoutStartSec=infinity` (not a fixed bound): `backup-run.sh` takes the
+/// blocking `/run/das-maintenance.lock` shared with the scrub engine
+/// (`indexer/src/scrub.rs`, bd DAS-Backup-Manager-212/atq), so a backup that
+/// starts while a scrub pass is running legitimately waits — potentially for
+/// hours — before it can proceed. A finite `TimeoutStartSec` would SIGKILL the
+/// backup mid-wait. The maintenance lock is the correctness mechanism against
+/// overlap, not a timeout (user decision 2026-07-27, bd DAS-Backup-Manager-b6f).
 pub fn render_systemd_service(config: &Config, full: bool) -> String {
     let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
     let desc = if full {
@@ -202,7 +210,7 @@ pub fn render_systemd_service(config: &Config, full: bool) -> String {
          StandardError=journal\n\
          Nice=19\n\
          IOSchedulingClass=idle\n\
-         TimeoutStartSec=21600\n\
+         TimeoutStartSec=infinity\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -248,6 +256,64 @@ pub fn render_systemd_timer(config: &Config, full: bool) -> String {
          [Timer]\n\
          OnCalendar={on_calendar}\n\
          RandomizedDelaySec={delay_secs}\n\
+         Persistent=true\n\
+         WakeSystem=false\n\
+         \n\
+         [Install]\n\
+         WantedBy=timers.target\n"
+    )
+}
+
+/// Generate the das-scrub.service unit file. Deliberately dumb by design
+/// (user decision 2026-07-27, bd DAS-Backup-Manager-atq): NO `Conflicts=`
+/// (which would stop the other unit — cancellation was explicitly scrapped
+/// in favor of deferral), NO `ExecStopPost` cancel, NO `RuntimeMaxSec=`. The
+/// scrub engine (`indexer/src/scrub.rs`) itself defers to a running backup
+/// via the blocking `/run/das-maintenance.lock` shared with
+/// `backup-run.sh`, so a unit-layer mechanism would not cover manual
+/// `btrdasd scrub run` invocations anyway. `TimeoutStartSec=infinity`
+/// because the pass (and any lock wait ahead of it) is unbounded — a real
+/// monthly pass across the DAS filesystems runs many hours.
+pub fn render_systemd_scrub_service(config: &Config) -> String {
+    let prefix = &config.general.install_prefix;
+
+    format!(
+        "{GENERATED_HEADER}\n\
+         [Unit]\n\
+         Description=DAS Backup - Scheduled BTRFS scrub of backup targets\n\
+         After=local-fs.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={prefix}/bin/btrdasd scrub run\n\
+         StandardOutput=journal\n\
+         StandardError=journal\n\
+         Nice=19\n\
+         IOSchedulingClass=idle\n\
+         TimeoutStartSec=infinity\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+/// Generate the das-scrub.timer unit file. `OnCalendar` is consumed verbatim
+/// from `config.scrub.on_calendar` (default `*-*-01 05:30:00`, monthly) — see
+/// the doc comment on `Scrub::on_calendar` in `indexer/src/config.rs`. NO
+/// `RandomizedDelaySec`: the fixed time clears the daily-backup worst case
+/// (~04:15) and the Sunday-full worst case (~04:55) with margin, and the
+/// maintenance lock — not timing — is the safety net against overlap (user
+/// decision 2026-07-27).
+pub fn render_systemd_scrub_timer(config: &Config) -> String {
+    let on_calendar = &config.scrub.on_calendar;
+
+    format!(
+        "{GENERATED_HEADER}\n\
+         [Unit]\n\
+         Description=DAS Backup - Monthly BTRFS scrub timer\n\
+         \n\
+         [Timer]\n\
+         OnCalendar={on_calendar}\n\
          Persistent=true\n\
          WakeSystem=false\n\
          \n\
@@ -364,6 +430,20 @@ impl GeneratedFiles {
                 files.push((
                     "/etc/systemd/system/das-backup-full.timer".to_string(),
                     render_systemd_timer(config, true),
+                ));
+
+                // Scrub unit + timer always installed; whether the timer is
+                // *enabled* is gated on `config.scrub.enabled` in
+                // `installer::install()` (the engine ignores `enabled` for
+                // manual `btrdasd scrub run` and only warns — the timer is
+                // the sole enforcement point, bd DAS-Backup-Manager-atq).
+                files.push((
+                    "/etc/systemd/system/das-scrub.service".to_string(),
+                    render_systemd_scrub_service(config),
+                ));
+                files.push((
+                    "/etc/systemd/system/das-scrub.timer".to_string(),
+                    render_systemd_scrub_timer(config),
                 ));
             }
             InitSystem::Sysvinit | InitSystem::Openrc => {
@@ -546,11 +626,59 @@ mod tests {
     }
 
     #[test]
+    fn render_systemd_service_timeout_is_unbounded_test() {
+        // bd DAS-Backup-Manager-b6f: a backup can defer for hours behind a
+        // running scrub pass via the shared maintenance lock, so the unit
+        // must never be killed by a finite TimeoutStartSec.
+        let config = test_config();
+        let incremental = render_systemd_service(&config, false);
+        let full = render_systemd_service(&config, true);
+        assert!(incremental.contains("TimeoutStartSec=infinity"));
+        assert!(full.contains("TimeoutStartSec=infinity"));
+        assert!(!incremental.contains("TimeoutStartSec=21600"));
+        assert!(!full.contains("TimeoutStartSec=21600"));
+    }
+
+    #[test]
     fn render_systemd_timer_test() {
         let config = test_config();
         let result = render_systemd_timer(&config, false);
         assert!(result.contains("OnCalendar=*-*-* 03:00:00"));
         assert!(result.contains("RandomizedDelaySec=1800"));
+    }
+
+    #[test]
+    fn render_systemd_scrub_service_test() {
+        let config = test_config();
+        let result = render_systemd_scrub_service(&config);
+        assert!(result.contains("Type=oneshot"));
+        assert!(result.contains("ExecStart=/usr/local/bin/btrdasd scrub run"));
+        assert!(result.contains("TimeoutStartSec=infinity"));
+        assert!(result.contains("# Generated by btrdasd setup"));
+        // Explicitly scrapped by user decision 2026-07-27 — deferral via the
+        // maintenance lock replaces unit-layer cancellation.
+        assert!(!result.contains("Conflicts="));
+        assert!(!result.contains("RuntimeMaxSec="));
+        assert!(!result.contains("ExecStopPost"));
+    }
+
+    #[test]
+    fn render_systemd_scrub_timer_test() {
+        let config = test_config();
+        let result = render_systemd_scrub_timer(&config);
+        assert!(result.contains("OnCalendar=*-*-01 05:30:00"));
+        assert!(result.contains("Persistent=true"));
+        // Fixed 05:30 clears the daily/full worst cases with margin; the
+        // maintenance lock is the safety net, not randomized timing.
+        assert!(!result.contains("RandomizedDelaySec"));
+    }
+
+    #[test]
+    fn render_systemd_scrub_timer_uses_configured_calendar_test() {
+        let mut config = test_config();
+        config.scrub.on_calendar = "*-*-15 02:00:00".to_string();
+        let result = render_systemd_scrub_timer(&config);
+        assert!(result.contains("OnCalendar=*-*-15 02:00:00"));
     }
 
     #[test]
@@ -599,5 +727,7 @@ mod tests {
         assert!(manifest.contains("backup-run.sh"));
         assert!(manifest.contains("das-backup.service"));
         assert!(manifest.contains("das-backup.timer"));
+        assert!(manifest.contains("das-scrub.service"));
+        assert!(manifest.contains("das-scrub.timer"));
     }
 }
