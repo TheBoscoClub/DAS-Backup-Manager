@@ -41,7 +41,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 | Component | Description | Status |
 |-----------|-------------|--------|
-| `scripts/backup-run.sh` | btrbk backup orchestrator with email reporting | Active (v4.2.4) |
+| `scripts/backup-run.sh` | btrbk backup orchestrator with email reporting | Active (v4.3.0) |
 | `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active (v2.0.0) |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run) | Active (v2.0.1) |
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
