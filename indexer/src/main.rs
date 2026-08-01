@@ -8,7 +8,7 @@ use buttered_dasd::indexer;
 use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::report;
-use buttered_dasd::{restore, schedule, subvol};
+use buttered_dasd::{restore, schedule, scrub, subvol};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use std::path::PathBuf;
@@ -70,6 +70,7 @@ impl ProgressCallback for CliProgress {
         btrdasd backup run --dry-run    Preview without making changes\n  \
         btrdasd restore browse /mnt/backup/root.20260228T030000\n  \
         btrdasd health                  Show drive health and backup status\n  \
+        btrdasd scrub status            Show last scrub result per DAS filesystem\n  \
         btrdasd schedule show           Show backup schedule and next run times\n  \
         btrdasd search 'report*'        FTS5 search across all indexed files\n  \
         btrdasd subvol list             List all configured subvolumes"
@@ -153,6 +154,11 @@ enum Commands {
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+    },
+    /// Scheduled BTRFS scrub of the DAS backup filesystems
+    Scrub {
+        #[command(subcommand)]
+        action: ScrubAction,
     },
     /// Generate shell completions
     Completions {
@@ -403,6 +409,354 @@ enum SubvolAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ScrubAction {
+    /// Run a full scrub pass now — locks, mount, `btrfs scrub`, unmount,
+    /// report — the same path the scheduled systemd timer uses.
+    ///
+    /// This runs even when [scrub].enabled = false in config.toml: that flag
+    /// only gates whether the *scheduled* timer fires, never a direct
+    /// invocation of this command — a manual run is exactly the intended use
+    /// of a temporarily-disabled schedule (testing, or scrubbing on demand).
+    /// A warning is printed when this happens so it is never silent.
+    Run {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Show the last scrub result for every configured scrub target
+    ///
+    /// Resolved by filesystem UUID, never by mount path, so this works while
+    /// the DAS filesystems are unmounted. Reads the engine's persisted state
+    /// (/var/lib/das-backup/scrub-state.json) when available, falling back to
+    /// the raw btrfs record (/var/lib/btrfs/scrub.status.<fsuuid>) for a
+    /// filesystem that has scrub history predating this CLI. A target with
+    /// neither source is reported as "never scrubbed", not an error.
+    Status {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Cancel the filesystem currently being scrubbed
+    ///
+    /// Manual operator action only — the scrub interlock never cancels a
+    /// pass automatically. Finds the actively-scrubbing filesystem via the
+    /// engine's lock and live kernel state, then issues
+    /// `btrfs scrub cancel` against it. A no-op (clean exit) when no scrub
+    /// is running.
+    Cancel {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Scrub CLI helpers
+// ---------------------------------------------------------------------------
+
+/// Combined view of one configured scrub target, as shown by
+/// `btrdasd scrub status`.
+///
+/// Two sources are consulted, in order: the engine's own
+/// `scrub-state.json` (richer — carries `last_success_epoch` and engine-level
+/// errors), falling back to the raw `/var/lib/btrfs/scrub.status.<fsuuid>`
+/// record for a filesystem whose scrub history predates this CLI or the
+/// state file. Everything is resolved by filesystem UUID, never by mount
+/// path — see the `scrub` module docs for why that matters.
+struct ScrubTargetView {
+    label: String,
+    fsuuid: Option<String>,
+    resolve_error: Option<String>,
+    /// "state", "btrfs", "never", "unresolved", or "error".
+    source: &'static str,
+    outcome: Option<String>,
+    ok: Option<bool>,
+    last_success_epoch: Option<i64>,
+    finished_epoch: Option<i64>,
+    duration_secs: Option<u64>,
+    bytes_scrubbed: Option<u64>,
+    counters_summary: Option<String>,
+    /// Extra error detail for the "error" source (a read failure that is
+    /// neither "state entry present" nor "no record at all").
+    detail: Option<String>,
+}
+
+impl ScrubTargetView {
+    fn new(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            fsuuid: None,
+            resolve_error: None,
+            source: "unresolved",
+            outcome: None,
+            ok: None,
+            last_success_epoch: None,
+            finished_epoch: None,
+            duration_secs: None,
+            bytes_scrubbed: None,
+            counters_summary: None,
+            detail: None,
+        }
+    }
+
+    fn status_word(&self) -> &'static str {
+        match self.source {
+            "unresolved" => "UNRESOLVED",
+            "never" => "NEVER SCRUBBED",
+            "error" => "ERROR",
+            _ => match (self.ok, self.outcome.as_deref()) {
+                (Some(true), _) => "OK",
+                (Some(false), Some("aborted")) => "ABORTED",
+                (Some(false), Some("canceled")) => "CANCELED",
+                (Some(false), Some("finished")) => "ERRORS",
+                _ => "FAILED",
+            },
+        }
+    }
+
+    fn age_days(&self, now_epoch: i64) -> Option<i64> {
+        self.last_success_epoch
+            .map(|t| (now_epoch - t).max(0) / 86_400)
+    }
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Build one target's status view. `state` is the already-loaded engine
+/// state (or `None` if it could not be loaded at all — a warning about that
+/// is the caller's job, once, not per-target).
+fn build_scrub_target_view(
+    config: &Config,
+    label: &str,
+    state: Option<&scrub::ScrubState>,
+) -> ScrubTargetView {
+    let mut view = ScrubTargetView::new(label);
+
+    let fsuuid = match scrub::resolve_target_fsuuid(config, label) {
+        Ok(u) => u,
+        Err(e) => {
+            view.resolve_error = Some(e);
+            return view;
+        }
+    };
+    view.fsuuid = Some(fsuuid.clone());
+
+    if let Some(fs) = state.and_then(|s| s.filesystems.get(&fsuuid)) {
+        view.source = "state";
+        view.outcome = Some(fs.last_attempt.outcome.clone());
+        view.ok = Some(fs.last_attempt.ok);
+        view.last_success_epoch = fs.last_success_epoch;
+        view.finished_epoch = Some(fs.last_attempt.finished_epoch);
+        view.duration_secs = Some(fs.last_attempt.duration_secs);
+        view.bytes_scrubbed = Some(fs.last_attempt.bytes_scrubbed);
+        view.counters_summary = Some(fs.last_attempt.counters.summary());
+        return view;
+    }
+
+    // No entry in the engine's state (it may not exist at all yet) — fall
+    // back to the raw btrfs record, which can hold real history from before
+    // this CLI existed.
+    match scrub::read_scrub_status(&fsuuid) {
+        Ok(record) => {
+            view.source = "btrfs";
+            view.outcome = Some(record.outcome().as_str().to_string());
+            view.ok = Some(record.is_clean());
+            view.finished_epoch = Some(record.finished_epoch());
+            if record.is_clean() {
+                view.last_success_epoch = Some(record.finished_epoch());
+            }
+            view.duration_secs = Some(record.duration_secs());
+            view.bytes_scrubbed = Some(record.bytes_scrubbed());
+            view.counters_summary = Some(record.counters().summary());
+        }
+        Err(scrub::ScrubError::StatusMissing { .. }) => {
+            view.source = "never";
+        }
+        Err(e) => {
+            view.source = "error";
+            view.detail = Some(e.to_string());
+        }
+    }
+    view
+}
+
+/// Build the status view for every configured scrub target, in config order.
+/// Returns a warning string when the engine state file exists but could not
+/// be parsed — the per-target views still get built from the btrfs fallback.
+fn gather_scrub_status(config: &Config) -> (Vec<ScrubTargetView>, Option<String>) {
+    let (state, warning) = match scrub::load_state() {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(format!("could not read scrub state: {e}"))),
+    };
+    let views = config
+        .scrub
+        .targets
+        .iter()
+        .map(|label| build_scrub_target_view(config, label, state.as_ref()))
+        .collect();
+    (views, warning)
+}
+
+/// Format a duration in seconds as `HHhMMm` (mirrors `scrub::format_duration`,
+/// which is private to that module).
+fn format_duration_secs(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m {}s", secs % 60)
+    }
+}
+
+/// Render `btrdasd scrub status` as a human-readable table.
+fn format_scrub_status(views: &[ScrubTargetView], config: &Config) -> String {
+    let now = now_epoch_secs();
+    let thin = "-".repeat(70);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<24} {:<15} {:>6} {:>12} {:>10}\n",
+        "Target", "Status", "Age", "Bytes", "Duration"
+    ));
+    out.push_str(&format!("{thin}\n"));
+    for v in views {
+        let age = v
+            .age_days(now)
+            .map(|d| format!("{d}d"))
+            .unwrap_or_else(|| "-".to_string());
+        let bytes = v
+            .bytes_scrubbed
+            .map(buttered_dasd::report::format_bytes)
+            .unwrap_or_else(|| "-".to_string());
+        let duration = v
+            .duration_secs
+            .map(format_duration_secs)
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "{:<24} {:<15} {:>6} {:>12} {:>10}\n",
+            v.label,
+            v.status_word(),
+            age,
+            bytes,
+            duration
+        ));
+        let detail = v
+            .resolve_error
+            .as_deref()
+            .or(v.detail.as_deref())
+            .unwrap_or("");
+        out.push_str(&format!(
+            "    uuid={} source={} outcome={} errors={}{}\n",
+            v.fsuuid.as_deref().unwrap_or("<unresolved>"),
+            v.source,
+            v.outcome.as_deref().unwrap_or("<none>"),
+            v.counters_summary.as_deref().unwrap_or("-"),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({detail})")
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "\nwarn_age_days={} fail_age_days={} (age is measured against last_success_epoch)\n",
+        config.scrub.warn_age_days, config.scrub.fail_age_days
+    ));
+    out
+}
+
+/// Render one target's status view as a single JSON object.
+fn scrub_target_json(v: &ScrubTargetView) -> String {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "{{\"label\":\"{}\",\"fsuuid\":{},\"source\":\"{}\",\"status\":\"{}\",\"outcome\":{},\"ok\":{},\"last_success_epoch\":{},\"finished_epoch\":{},\"duration_secs\":{},\"bytes_scrubbed\":{},\"resolve_error\":{}}}",
+        esc(&v.label),
+        v.fsuuid
+            .as_deref()
+            .map_or("null".to_string(), |u| format!("\"{}\"", esc(u))),
+        v.source,
+        v.status_word(),
+        v.outcome
+            .as_deref()
+            .map_or("null".to_string(), |o| format!("\"{}\"", esc(o))),
+        v.ok.map_or("null".to_string(), |b| b.to_string()),
+        v.last_success_epoch
+            .map_or("null".to_string(), |e| e.to_string()),
+        v.finished_epoch
+            .map_or("null".to_string(), |e| e.to_string()),
+        v.duration_secs
+            .map_or("null".to_string(), |d| d.to_string()),
+        v.bytes_scrubbed
+            .map_or("null".to_string(), |b| b.to_string()),
+        v.resolve_error
+            .as_deref()
+            .map_or("null".to_string(), |e| format!("\"{}\"", esc(e))),
+    )
+}
+
+/// Find and cancel the filesystem currently being scrubbed, if any.
+///
+/// Manual operator action only — never invoked automatically. The scrub
+/// lock (`/run/das-scrub.lock`) tells us *whether* a pass is running but not
+/// *which* filesystem; once contention on that lock confirms a pass is live,
+/// each configured target's mount point is probed with
+/// `scrub::live_scrub_state`. That call is safe against an unmounted path
+/// here for the same reason the engine's own doc comment gives: only a
+/// filesystem the engine itself mounted for scrubbing can ever report
+/// `Running`, so an idle/unmounted target simply resolves to `Unknown` or
+/// `NotRunning` and is skipped.
+fn cancel_running_scrub(config: &Config) -> Result<String, String> {
+    match scrub::FileLock::try_acquire(scrub::SCRUB_LOCK_PATH) {
+        Ok(Some(_lock)) => {
+            // Acquired and immediately dropped at end of scope — proof that
+            // nothing was scrubbing, not a lock we intend to hold.
+            return Ok("No scrub pass is currently running — nothing to cancel.".to_string());
+        }
+        Ok(None) => {} // held elsewhere: a pass IS running
+        Err(e) => return Err(format!("could not check scrub lock: {e}")),
+    }
+
+    for label in &config.scrub.targets {
+        let Ok(fsuuid) = scrub::resolve_target_fsuuid(config, label) else {
+            continue;
+        };
+        let Some(target) = config.targets.iter().find(|t| t.label == *label) else {
+            continue;
+        };
+        if scrub::live_scrub_state(&target.mount) == scrub::LiveScrubState::Running {
+            let out = std::process::Command::new("btrfs")
+                .args(["scrub", "cancel", &target.mount])
+                .output()
+                .map_err(|e| format!("cannot execute 'btrfs scrub cancel': {e}"))?;
+            return if out.status.success() {
+                Ok(format!(
+                    "Canceled scrub of '{label}' (uuid={fsuuid}) at {}",
+                    target.mount
+                ))
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(format!(
+                    "btrfs scrub cancel {} failed: {stderr}",
+                    target.mount
+                ))
+            };
+        }
+    }
+
+    Ok(
+        "A scrub pass is running (lock held) but no configured target's mount currently \
+        shows an active scrub — it may be between filesystems (mounting/unmounting); \
+        try again in a few seconds."
+            .to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,6 +1450,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // ----- Scrub commands -----
+        Commands::Scrub { action } => match action {
+            ScrubAction::Run { config } => {
+                let cfg = Config::load(&config)?;
+                if !cfg.scrub.enabled {
+                    eprintln!(
+                        "NOTE: [scrub].enabled = false in {} — proceeding anyway. \
+                         'btrdasd scrub run' is a manual/forced invocation; the enabled \
+                         flag only gates the scheduled systemd timer, never a direct run.",
+                        config.display()
+                    );
+                }
+                let progress = CliProgress;
+                let pass = scrub::run_scrub_pass(&cfg, &progress)?;
+                let status_word = match pass.status {
+                    scrub::PassStatus::Completed => "completed",
+                    scrub::PassStatus::Skipped => "skipped",
+                };
+                if json {
+                    println!(
+                        "{{\"status\":\"{}\",\"success\":{},\"targets_attempted\":{},\"targets_failed\":{}}}",
+                        status_word,
+                        pass.success(),
+                        pass.results.len(),
+                        pass.failed_count(),
+                    );
+                } else {
+                    println!(
+                        "Scrub pass {status_word}: {} of {} filesystems clean",
+                        pass.results.len() - pass.failed_count(),
+                        pass.results.len()
+                    );
+                }
+                if !pass.success() {
+                    std::process::exit(1);
+                }
+            }
+            ScrubAction::Status { config } => {
+                let cfg = Config::load(&config)?;
+                let (views, warning) = gather_scrub_status(&cfg);
+                if let Some(w) = &warning {
+                    eprintln!("  [WARN]  {w}");
+                }
+                if json {
+                    print!("[");
+                    for (i, v) in views.iter().enumerate() {
+                        if i > 0 {
+                            print!(",");
+                        }
+                        print!("{}", scrub_target_json(v));
+                    }
+                    println!("]");
+                } else {
+                    print!("{}", format_scrub_status(&views, &cfg));
+                }
+            }
+            ScrubAction::Cancel { config } => {
+                let cfg = Config::load(&config)?;
+                match cancel_running_scrub(&cfg) {
+                    Ok(msg) => {
+                        if json {
+                            println!("{{\"message\":\"{}\"}}", msg.replace('"', "\\\""));
+                        } else {
+                            println!("{msg}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
         // ----- Completions command -----
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1104,4 +1532,252 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buttered_dasd::config::{Retention, Target, TargetRole};
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-wide env vars
+    /// (`DAS_SCRUB_STATE` / `DAS_BTRFS_STATUS_DIR`) — `cargo test` runs test
+    /// functions in parallel by default within one binary.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Standard clap sanity check: catches conflicting arg definitions,
+    /// missing help text, and other structural mistakes in the `Cli` tree
+    /// (including the new `Scrub`/`ScrubAction` variants) without needing to
+    /// actually invoke the binary.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn scrub_subcommands_parse() {
+        let run = Cli::try_parse_from(["btrdasd", "scrub", "run"]).unwrap();
+        assert!(matches!(
+            run.command,
+            Commands::Scrub {
+                action: ScrubAction::Run { .. }
+            }
+        ));
+
+        let status = Cli::try_parse_from(["btrdasd", "scrub", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Scrub {
+                action: ScrubAction::Status { .. }
+            }
+        ));
+
+        let cancel = Cli::try_parse_from(["btrdasd", "scrub", "cancel"]).unwrap();
+        assert!(matches!(
+            cancel.command,
+            Commands::Scrub {
+                action: ScrubAction::Cancel { .. }
+            }
+        ));
+
+        // A bare "scrub" with no action must fail, not silently no-op.
+        assert!(Cli::try_parse_from(["btrdasd", "scrub"]).is_err());
+    }
+
+    fn set_env(key: &str, value: &std::path::Path) {
+        // SAFETY: callers hold `ENV_LOCK` for the duration of the mutation
+        // and any code that reads the var, so no other thread observes a
+        // torn value.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn clear_env(key: &str) {
+        // SAFETY: see `set_env`.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    fn test_target(label: &str, mount_uuid: &str, mount: &str) -> Target {
+        Target {
+            label: label.to_string(),
+            serial: String::new(),
+            serials: Vec::new(),
+            mount_uuid: Some(mount_uuid.to_string()),
+            mount: mount.to_string(),
+            role: TargetRole::Primary,
+            retention: Retention::default(),
+            display_name: label.to_string(),
+        }
+    }
+
+    fn test_config(labels_and_uuids: &[(&str, &str)]) -> Config {
+        let mut config = Config::default();
+        config.scrub.targets = labels_and_uuids
+            .iter()
+            .map(|(l, _)| l.to_string())
+            .collect();
+        config.targets = labels_and_uuids
+            .iter()
+            .map(|(label, uuid)| test_target(label, uuid, &format!("/mnt/{label}")))
+            .collect();
+        config
+    }
+
+    /// A target with no scrub-state entry and no btrfs record at all must
+    /// report "never scrubbed" — not an error, not a crash. This is the
+    /// exact shape `system-recovery-B-2tb` was in before its first scrub
+    /// (bd DAS-Backup-Manager-0kn acceptance criterion).
+    #[test]
+    fn never_scrubbed_target_is_graceful() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("btrdasd-scrub-test-never-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state_path = tmp.join("scrub-state.json");
+        let btrfs_dir = tmp.join("btrfs-status");
+        std::fs::create_dir_all(&btrfs_dir).unwrap();
+
+        set_env("DAS_SCRUB_STATE", &state_path);
+        set_env("DAS_BTRFS_STATUS_DIR", &btrfs_dir);
+
+        let config = test_config(&[("never-target", "11111111-1111-1111-1111-111111111111")]);
+        let (views, warning) = gather_scrub_status(&config);
+
+        clear_env("DAS_SCRUB_STATE");
+        clear_env("DAS_BTRFS_STATUS_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(warning.is_none(), "a missing state file is not an error");
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(v.source, "never");
+        assert_eq!(v.status_word(), "NEVER SCRUBBED");
+        assert_eq!(
+            v.fsuuid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert!(v.last_success_epoch.is_none());
+        assert!(v.bytes_scrubbed.is_none());
+
+        // Must also render and JSON-encode without panicking.
+        let table = format_scrub_status(&views, &config);
+        assert!(table.contains("NEVER SCRUBBED"));
+        let json = scrub_target_json(v);
+        assert!(json.contains("\"status\":\"NEVER SCRUBBED\""));
+        assert!(json.contains("\"last_success_epoch\":null"));
+    }
+
+    /// A target with a raw btrfs record but no entry in the engine's own
+    /// state file (the real shape of all three DAS filesystems today — see
+    /// bd DAS-Backup-Manager-0kn) must be reported from that record, not
+    /// treated as "never scrubbed".
+    #[test]
+    fn btrfs_record_fallback_when_state_has_no_entry() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "btrdasd-scrub-test-fallback-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state_path = tmp.join("scrub-state.json");
+        let btrfs_dir = tmp.join("btrfs-status");
+        std::fs::create_dir_all(&btrfs_dir).unwrap();
+
+        let fsuuid = "22222222-2222-2222-2222-222222222222";
+        let record = format!(
+            "scrub status:1\n{fsuuid}:1|data_extents_scrubbed:10|tree_extents_scrubbed:1|\
+data_bytes_scrubbed:1048576|tree_bytes_scrubbed:4096|read_errors:0|csum_errors:0|\
+verify_errors:0|no_csum:0|csum_discards:0|super_errors:0|malloc_errors:0|\
+uncorrectable_errors:0|corrected_errors:0|last_physical:1048576|t_start:1785000000|\
+t_resumed:0|duration:120|canceled:0|finished:1\n"
+        );
+        std::fs::write(btrfs_dir.join(format!("scrub.status.{fsuuid}")), record).unwrap();
+
+        set_env("DAS_SCRUB_STATE", &state_path);
+        set_env("DAS_BTRFS_STATUS_DIR", &btrfs_dir);
+
+        let config = test_config(&[("fallback-target", fsuuid)]);
+        let (views, warning) = gather_scrub_status(&config);
+
+        clear_env("DAS_SCRUB_STATE");
+        clear_env("DAS_BTRFS_STATUS_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(warning.is_none());
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(v.source, "btrfs");
+        assert_eq!(v.status_word(), "OK");
+        assert_eq!(v.outcome.as_deref(), Some("finished"));
+        assert_eq!(v.ok, Some(true));
+        assert_eq!(v.last_success_epoch, Some(1785000000 + 120));
+        assert_eq!(v.bytes_scrubbed, Some(1048576 + 4096));
+    }
+
+    /// An unresolvable target (no matching `[[target]]`, no serial, no
+    /// `mount_uuid`) must surface a clear resolve error, never panic.
+    #[test]
+    fn unresolvable_target_reports_error_not_panic() {
+        let mut config = Config::default();
+        config.scrub.targets = vec!["ghost-target".to_string()];
+        // Deliberately no matching [[target]] entry.
+        config.targets = Vec::new();
+
+        let (views, _warning) = gather_scrub_status(&config);
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(v.source, "unresolved");
+        assert_eq!(v.status_word(), "UNRESOLVED");
+        assert!(v.resolve_error.is_some());
+        assert!(v.fsuuid.is_none());
+
+        let table = format_scrub_status(&views, &config);
+        assert!(table.contains("UNRESOLVED"));
+        let json = scrub_target_json(v);
+        assert!(json.contains("\"fsuuid\":null"));
+    }
+
+    /// `cancel_running_scrub` probes the real, host-wide
+    /// `/run/das-scrub.lock` (it is not overridable — the engine's own
+    /// tests take the same real path, single-threaded, for the same
+    /// reason: cancel semantics must exercise the actual production lock).
+    /// This test therefore cannot assume a particular host state — it may
+    /// run unprivileged (EACCES opening the lock), as root with no DAS
+    /// scrub running (the ordinary "nothing to cancel" case), or, in
+    /// principle, while a real scrub happens to be in progress. What it
+    /// asserts is only that every one of those paths returns cleanly
+    /// (no panic) with a non-empty, recognizable message — never silence,
+    /// never a crash.
+    #[test]
+    fn cancel_running_scrub_never_panics() {
+        let config = test_config(&[]);
+        match cancel_running_scrub(&config) {
+            Ok(msg) => assert!(
+                msg.contains("nothing to cancel")
+                    || msg.contains("No scrub pass")
+                    || msg.contains("lock held"),
+                "unexpected message: {msg}"
+            ),
+            Err(e) => {
+                // Only acceptable failure is a permissions error opening the
+                // real /run/das-scrub.lock path when not running as root.
+                assert!(
+                    e.contains("scrub must run as root")
+                        || e.contains("could not check scrub lock"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn format_duration_secs_formats_hours_and_minutes() {
+        assert_eq!(format_duration_secs(59), "0m 59s");
+        assert_eq!(format_duration_secs(60), "1m 0s");
+        assert_eq!(format_duration_secs(3661), "1h 1m");
+        assert_eq!(format_duration_secs(6274), "1h 44m");
+    }
 }
