@@ -153,9 +153,12 @@ pub struct Scrub {
     /// substitute it directly — see bd DAS-Backup-Manager-ikn.
     #[serde(default = "default_scrub_on_calendar")]
     pub on_calendar: String,
-    /// Target labels (matching `[[target]].label` in this same config),
-    /// scrubbed sequentially in list order. UUIDs are resolved from the
-    /// existing `[[target]]` blocks at use time — never duplicated here.
+    /// Config target labels, scrubbed sequentially in list order. Entries
+    /// MUST match `[[target]].label` values elsewhere in this same config
+    /// (e.g. `primary-22tb`, not the underlying BTRFS filesystem label
+    /// `das-backup-22tb`) — UUIDs are resolved from the existing
+    /// `[[target]]` blocks at use time by joining on this field, never
+    /// duplicated here.
     #[serde(default = "default_scrub_targets")]
     pub targets: Vec<String>,
     /// Days since the last completed scrub of a target before health
@@ -172,10 +175,12 @@ fn default_scrub_on_calendar() -> String {
     "*-*-01 05:30:00".into()
 }
 fn default_scrub_targets() -> Vec<String> {
+    // Config target labels (`[[target]].label`), not BTRFS filesystem
+    // labels — see the doc comment on `Scrub::targets`.
     vec![
-        "das-backup-22tb".into(),
-        "das-backup-system-recovery-A".into(),
-        "das-backup-system-recovery-B".into(),
+        "primary-22tb".into(),
+        "system-recovery-A-2tb".into(),
+        "system-recovery-B-2tb".into(),
     ]
 }
 fn default_scrub_warn_age_days() -> u32 {
@@ -558,9 +563,9 @@ mod tests {
         assert_eq!(
             parsed.scrub.targets,
             vec![
-                "das-backup-22tb",
-                "das-backup-system-recovery-A",
-                "das-backup-system-recovery-B",
+                "primary-22tb",
+                "system-recovery-A-2tb",
+                "system-recovery-B-2tb",
             ]
         );
         assert_eq!(parsed.scrub.warn_age_days, 45);
@@ -575,9 +580,9 @@ mod tests {
         assert_eq!(
             scrub.targets,
             vec![
-                "das-backup-22tb",
-                "das-backup-system-recovery-A",
-                "das-backup-system-recovery-B",
+                "primary-22tb",
+                "system-recovery-A-2tb",
+                "system-recovery-B-2tb",
             ]
         );
         assert_eq!(scrub.warn_age_days, 45);
@@ -743,9 +748,9 @@ enabled = false
         assert_eq!(
             cfg.scrub.targets,
             vec![
-                "das-backup-22tb",
-                "das-backup-system-recovery-A",
-                "das-backup-system-recovery-B",
+                "primary-22tb",
+                "system-recovery-A-2tb",
+                "system-recovery-B-2tb",
             ]
         );
         assert_eq!(cfg.scrub.warn_age_days, 45);

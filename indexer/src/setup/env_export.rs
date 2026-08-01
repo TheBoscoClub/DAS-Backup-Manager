@@ -257,7 +257,7 @@ mod tests {
         assert!(output.contains("DAS_SCRUB_ENABLED=true"));
         assert!(output.contains("DAS_SCRUB_ON_CALENDAR='*-*-01 05:30:00'"));
         assert!(output.contains(
-            "DAS_SCRUB_TARGETS='das-backup-22tb das-backup-system-recovery-A das-backup-system-recovery-B'"
+            "DAS_SCRUB_TARGETS='primary-22tb system-recovery-A-2tb system-recovery-B-2tb'"
         ));
         assert!(output.contains("DAS_SCRUB_WARN_AGE_DAYS=45"));
         assert!(output.contains("DAS_SCRUB_FAIL_AGE_DAYS=75"));
