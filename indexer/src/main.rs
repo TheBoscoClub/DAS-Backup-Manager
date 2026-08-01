@@ -702,17 +702,45 @@ fn scrub_target_json(v: &ScrubTargetView) -> String {
     )
 }
 
+/// Find the configured scrub target whose mount is verified — by filesystem
+/// UUID, not just by path — as currently undergoing a live scrub, if any.
+///
+/// Pure (no locks, no side effects): deliberately separated from
+/// `cancel_running_scrub` so the skip-not-cancel behavior for an
+/// idle/mismatched target can be unit tested without needing to hold the
+/// real, host-wide `/run/das-scrub.lock`.
+///
+/// Each candidate is checked with `scrub::live_scrub_state(mount, fsuuid)`,
+/// which verifies via `findmnt` that the mount point is actually backed by
+/// that exact filesystem UUID before it will ever report `Running` — an
+/// idle/unmounted target's configured mount point is an ordinary directory
+/// that falls through to whatever filesystem its parent belongs to, so
+/// without that verification this could observe an unrelated live scrub
+/// (e.g. a scheduled `btrfs-scrub@` unit on the host root) and mistake it
+/// for the DAS target (`bd DAS-Backup-Manager-0kn` review, 2026-08-01). An
+/// unverified target simply resolves to `Unknown` and is skipped.
+fn find_actively_scrubbing_target(config: &Config) -> Option<(String, String, String)> {
+    for label in &config.scrub.targets {
+        let Ok(fsuuid) = scrub::resolve_target_fsuuid(config, label) else {
+            continue;
+        };
+        let Some(target) = config.targets.iter().find(|t| t.label == *label) else {
+            continue;
+        };
+        if scrub::live_scrub_state(&target.mount, &fsuuid) == scrub::LiveScrubState::Running {
+            return Some((label.clone(), fsuuid, target.mount.clone()));
+        }
+    }
+    None
+}
+
 /// Find and cancel the filesystem currently being scrubbed, if any.
 ///
 /// Manual operator action only — never invoked automatically. The scrub
 /// lock (`/run/das-scrub.lock`) tells us *whether* a pass is running but not
-/// *which* filesystem; once contention on that lock confirms a pass is live,
-/// each configured target's mount point is probed with
-/// `scrub::live_scrub_state`. That call is safe against an unmounted path
-/// here for the same reason the engine's own doc comment gives: only a
-/// filesystem the engine itself mounted for scrubbing can ever report
-/// `Running`, so an idle/unmounted target simply resolves to `Unknown` or
-/// `NotRunning` and is skipped.
+/// *which* filesystem; once contention on that lock confirms a pass is
+/// live, `find_actively_scrubbing_target` locates it (UUID-verified, never
+/// by path alone — see its doc comment).
 fn cancel_running_scrub(config: &Config) -> Result<String, String> {
     match scrub::FileLock::try_acquire(scrub::SCRUB_LOCK_PATH) {
         Ok(Some(_lock)) => {
@@ -724,39 +752,28 @@ fn cancel_running_scrub(config: &Config) -> Result<String, String> {
         Err(e) => return Err(format!("could not check scrub lock: {e}")),
     }
 
-    for label in &config.scrub.targets {
-        let Ok(fsuuid) = scrub::resolve_target_fsuuid(config, label) else {
-            continue;
-        };
-        let Some(target) = config.targets.iter().find(|t| t.label == *label) else {
-            continue;
-        };
-        if scrub::live_scrub_state(&target.mount) == scrub::LiveScrubState::Running {
+    match find_actively_scrubbing_target(config) {
+        Some((label, fsuuid, mount)) => {
             let out = std::process::Command::new("btrfs")
-                .args(["scrub", "cancel", &target.mount])
+                .args(["scrub", "cancel", &mount])
                 .output()
                 .map_err(|e| format!("cannot execute 'btrfs scrub cancel': {e}"))?;
-            return if out.status.success() {
+            if out.status.success() {
                 Ok(format!(
-                    "Canceled scrub of '{label}' (uuid={fsuuid}) at {}",
-                    target.mount
+                    "Canceled scrub of '{label}' (uuid={fsuuid}) at {mount}"
                 ))
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                Err(format!(
-                    "btrfs scrub cancel {} failed: {stderr}",
-                    target.mount
-                ))
-            };
+                Err(format!("btrfs scrub cancel {mount} failed: {stderr}"))
+            }
         }
+        None => Ok(
+            "A scrub pass is running (lock held) but no configured target's mount currently \
+             shows an active scrub — it may be between filesystems (mounting/unmounting); \
+             try again in a few seconds."
+                .to_string(),
+        ),
     }
-
-    Ok(
-        "A scrub pass is running (lock held) but no configured target's mount currently \
-        shows an active scrub — it may be between filesystems (mounting/unmounting); \
-        try again in a few seconds."
-            .to_string(),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,6 +1755,43 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert!(table.contains("UNRESOLVED"));
         let json = scrub_target_json(v);
         assert!(json.contains("\"fsuuid\":null"));
+    }
+
+    /// The critical negative-path proof (`bd DAS-Backup-Manager-0kn`
+    /// review, 2026-08-01): idle DAS targets — the real, everyday state
+    /// between backups — have configured mount points that are bare,
+    /// unmounted directories. `find_actively_scrubbing_target` must never
+    /// mistake that for "this filesystem is scrubbing", no matter what is
+    /// actually mounted underneath that bare path. `test_target()` sets
+    /// `mount = "/mnt/<label>"`, which does not exist as a mountpoint on a
+    /// dev box — exactly the idle-target shape.
+    #[test]
+    fn find_actively_scrubbing_target_skips_unmounted_targets() {
+        let config = test_config(&[
+            ("bogus-a", "11111111-1111-1111-1111-111111111111"),
+            ("bogus-b", "22222222-2222-2222-2222-222222222222"),
+        ]);
+        assert!(
+            find_actively_scrubbing_target(&config).is_none(),
+            "an unmounted target's bare directory must never read as an active scrub"
+        );
+    }
+
+    /// The sharper half of the same proof: point a target's mount at a
+    /// path that IS a real, live mountpoint ("/") but tag it with a UUID
+    /// that can never match. This is exactly the exploit the reviewer
+    /// demonstrated — a bare DAS mount point falling through to a live
+    /// filesystem that happens to be mid-scrub for unrelated reasons (a
+    /// scheduled `btrfs-scrub@` unit) must still be skipped, proving the
+    /// guard is genuinely UUID-driven and not merely "path doesn't exist".
+    #[test]
+    fn find_actively_scrubbing_target_skips_real_mount_with_mismatched_uuid() {
+        let mut config = test_config(&[("root-mismatch", "00000000-0000-0000-0000-000000000000")]);
+        config.targets[0].mount = "/".to_string();
+        assert!(
+            find_actively_scrubbing_target(&config).is_none(),
+            "a real mount backed by the WRONG filesystem must never be trusted"
+        );
     }
 
     /// `cancel_running_scrub` probes the real, host-wide

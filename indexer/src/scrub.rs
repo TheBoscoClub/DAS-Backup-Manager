@@ -1273,15 +1273,34 @@ pub enum LiveScrubState {
 
 /// Ask `btrfs scrub status` whether a scrub is live on this filesystem.
 ///
-/// This is the one place a mount *path* is used for a scrub query, and it is
-/// safe here specifically because the caller has already asserted, via
-/// `findmnt -o UUID`, that the expected filesystem is mounted at this path,
-/// and holds both DAS locks. The dangerous case the module exists to prevent —
-/// querying an *unmounted* path and silently getting the backing filesystem's
-/// answer — cannot occur on this call path. Result interpretation is kernel
+/// This is the one place a mount *path* is used for a scrub query, so the
+/// `expected_fsuuid` parameter is not optional decoration — it is what makes
+/// the call safe. `btrfs scrub status <path>` on a path that is *not*
+/// currently a mountpoint for that exact filesystem silently answers for
+/// whatever backing filesystem the path happens to resolve through instead
+/// (an idle/unmounted DAS target's configured mountpoint is a perfectly
+/// ordinary directory that falls through to its parent filesystem — see the
+/// 2026-08-01 `bd DAS-Backup-Manager-0kn` review: a caller that skipped this
+/// verification could observe an unrelated system `btrfs-scrub@` pass
+/// running on the backing filesystem and mistake it for *this* filesystem's
+/// scrub). This is exactly the same hazard class `parse_scrub_status`'s UUID
+/// check guards against for the persisted record — the fix here is the same
+/// shape: verify by UUID, via `findmnt`, before trusting anything read
+/// through a path.
+///
+/// Returns [`LiveScrubState::Unknown`] whenever `mount_point` is not
+/// currently backed by `expected_fsuuid` (including "nothing is mounted
+/// there at all") — every caller in this codebase already treats `Unknown`
+/// exactly like `NotRunning` for any action gated on `Running`, so an
+/// unverified mount safely resolves to "do nothing", never to a false
+/// positive. When the verification passes, result interpretation is kernel
 /// truth: `Status: running` is only printed while a scrub is actually in
 /// progress (verified empirically, 2026-08-01 loopback rig).
-pub fn live_scrub_state(mount_point: &str) -> LiveScrubState {
+pub fn live_scrub_state(mount_point: &str, expected_fsuuid: &str) -> LiveScrubState {
+    match mounted_fs_uuid(mount_point) {
+        Some(found) if found.eq_ignore_ascii_case(expected_fsuuid) => {}
+        _ => return LiveScrubState::Unknown,
+    }
     let Ok(out) = Command::new("btrfs")
         .args(["scrub", "status", mount_point])
         .output()
@@ -1348,7 +1367,7 @@ pub fn decide_scrub_start_mode(fsuuid: &str, mount_point: &str) -> ScrubStartMod
     if prior.outcome() != ScrubOutcome::Aborted {
         return ScrubStartMode::Normal;
     }
-    match live_scrub_state(mount_point) {
+    match live_scrub_state(mount_point, fsuuid) {
         LiveScrubState::NotRunning => ScrubStartMode::Forced {
             reason: format!(
                 "previous scrub of {fsuuid} left an aborted record \
@@ -2309,6 +2328,40 @@ Error summary:    no errors found\n";
 \tno stats available\n\
 Total to scrub:   401.28MiB\n";
         assert_eq!(parse_scrub_status_output(no_stats), LiveScrubState::Unknown);
+    }
+
+    /// `live_scrub_state` must never trust a path that is not verifiably
+    /// backed by the expected filesystem — the exact hazard the
+    /// 2026-08-01 `bd DAS-Backup-Manager-0kn` review caught: an unmounted
+    /// (or wrongly-mounted) DAS target's configured mount point is an
+    /// ordinary directory that resolves through to whatever filesystem is
+    /// actually there, and a caller that skipped UUID verification could
+    /// mistake an unrelated live scrub for this filesystem's own.
+    #[test]
+    fn live_scrub_state_is_unknown_without_verified_mount() {
+        // A path that does not exist at all can never verify.
+        assert_eq!(
+            live_scrub_state(
+                "/nonexistent/das-scrub-uuid-check",
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            LiveScrubState::Unknown,
+            "a nonexistent path must never be trusted"
+        );
+
+        // "/" is always a real, live mountpoint — findmnt will happily
+        // report ITS uuid. The point of this assertion is that a REAL,
+        // VERIFIABLE mount at the path is still `Unknown` when the caller's
+        // expected UUID does not match what is actually mounted there: this
+        // is precisely the scenario a `cancel` command must get right,
+        // since a bare DAS target directory falling through to root (or any
+        // other live filesystem) must never be read as "this DAS
+        // filesystem's scrub".
+        assert_eq!(
+            live_scrub_state("/", "00000000-0000-0000-0000-000000000000"),
+            LiveScrubState::Unknown,
+            "a real mount with the WRONG uuid must never be trusted"
+        );
     }
 
     // --- UUID resolution from config -------------------------------------
