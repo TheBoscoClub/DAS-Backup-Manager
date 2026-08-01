@@ -13,10 +13,13 @@
 #       mid-scrub defers and starts the moment the scrub releases the lock —
 #       never skipped, never canceled. A non-trivial wait logs a visible
 #       "waiting" line and a "lock_wait" OP_STATUS entry with the wait
-#       duration. Lock path and singleton->maintenance acquisition order
-#       match scrub.rs exactly (deadlock-free by construction — release order
-#       is the reverse of acquisition on both sides). Tracks
-#       DAS-Backup-Manager-b6f.
+#       duration. Lock path and singleton->maintenance ACQUISITION order
+#       match scrub.rs exactly, which is what makes the pair deadlock-free
+#       by construction — release order does not need to match (this side
+#       just holds both fds open to process exit; the scrub engine's
+#       ScrubLocks additionally releases maintenance before singleton via
+#       Rust field-drop order, but that symmetry isn't required here).
+#       Tracks DAS-Backup-Manager-b6f.
 #     * unmount_all() no longer discards DAS target umount failures via
 #       `|| true`. Every configured target mountpoint (ALL_TARGET_MOUNTS) is
 #       attempted (a stuck unmount no longer masks the rest); a path that
@@ -26,9 +29,11 @@
 #       disconnected" message is now conditional on every target having
 #       actually unmounted — previously it printed unconditionally even when
 #       a target was still mounted. Source volumes remain a best-effort,
-#       untracked unmount (`|| true`, unchanged) since they are host
-#       filesystems outside the physical DAS enclosure and some (das-storage
-#       on /dasRaid0) can legitimately stay busy indefinitely (running VMs).
+#       untracked unmount since they are host filesystems outside the
+#       physical DAS enclosure and some (das-storage on /dasRaid0) can
+#       legitimately stay busy indefinitely (running VMs) — a source unmount
+#       failure now logs a visible log_warn (previously fully silent via
+#       `|| true`) but still never touches record_op or the disconnect gate.
 #       Tracks DAS-Backup-Manager-b6f.
 #     * run_btrbk()'s dryrun branch is now guarded the same way the real-run
 #       branch always was — a `btrbk dryrun` failure records
@@ -911,17 +916,25 @@ unmount_all() {
         fi
     done
 
-    # Unmount sources — best-effort only, deliberately NOT tracked as a
-    # failure. Sources are host filesystems (NVMe/SSD/HDD/das-storage), not
-    # part of the removable DAS enclosure, so a stuck source unmount has no
-    # bearing on whether the DAS is safe to disconnect. Some sources are
-    # host-managed mounts this script did not create and can legitimately
-    # stay busy for reasons unrelated to backup — das-storage on /dasRaid0
-    # is a real example: it hosts running libvirt VMs and can never unmount
-    # while any are up, which would otherwise fire a FAIL on every single
-    # nightly run.
+    # Unmount sources — best-effort only, deliberately NOT tracked via
+    # record_op and NOT part of the disconnect gate above. Sources are host
+    # filesystems (NVMe/SSD/HDD/das-storage), not part of the removable DAS
+    # enclosure, so a stuck source unmount has no bearing on whether the DAS
+    # is safe to disconnect. Some sources are host-managed mounts this
+    # script did not create and can legitimately stay busy for reasons
+    # unrelated to backup — das-storage on /dasRaid0 is a real example: it
+    # hosts running libvirt VMs and can never unmount while any are up,
+    # which would otherwise fire a FAIL on every single nightly run. Still
+    # logged (not silently swallowed) so a genuinely stuck source is visible
+    # in the journal rather than invisible.
     for label in "${!SOURCE_VOLUMES[@]}"; do
-        umount "${SOURCE_VOLUMES[$label]}" 2>/dev/null || true
+        local src_mnt="${SOURCE_VOLUMES[$label]}"
+        if ! mountpoint -q "$src_mnt" 2>/dev/null; then
+            continue
+        fi
+        if ! umount "$src_mnt" 2>/dev/null; then
+            log_warn "  Could not unmount source $label ($src_mnt) — untracked, not a DAS disconnect concern"
+        fi
     done
 
     if (( ${#failed_mounts[@]} > 0 )); then
