@@ -1,12 +1,15 @@
 #!/bin/bash
 # boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
-# Version: 2.0.0
-# Date: 2026-02-21
+# Version: 2.0.1
+# Date: 2026-08-01
 #
-# When backup-run.sh --full recreates @ and @home, it snapshots the old ones
-# as @.archive.YYYYMMDDTHHMMSS before deletion. This script prunes archives
-# older than the retention period (from config.toml, default: 365 days).
-# All configuration loaded from config.toml via btrdasd.
+# When backup-run.sh --full (or the Rust btrdasd manual path) recreates @ and
+# @home, it snapshots the old ones as @.archive.YYYYMMDDTHHMMSS before
+# deletion. This script prunes archives older than the retention period (from
+# config.toml, default: 60 days). All configuration loaded from config.toml
+# via btrdasd. As of v4.2.4, backup-run.sh invokes this script automatically
+# at the end of every run (daily and full) while targets are still mounted —
+# it was previously installed but never called by anything (DAS-Backup-Manager-64h).
 #
 # Usage:
 #   sudo ./boot-archive-cleanup.sh              # Prune archives past retention

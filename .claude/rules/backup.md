@@ -15,7 +15,7 @@
 - **`primary-22tb`** — 22TB Exos RAID-1 across bays 2 (`ZXA1R71M`, RMA replacement installed 2026-05-15) + 5 (`ZXA1NYGZ`), label `das-backup-22tb`, uuid `b2dbe07d-40b9-422e-8ccf-ef4931c40457`, mount `/mnt/backup-22tb`. Retention: `daily=7, weekly=4, monthly=12, yearly=1`. Receives all source streams (NVMe, SSD, hdd-projects, hdd-audiobooks, das-storage). The original bay-2 drive (`ZXA0LMAE`) failed and was RMA'd; the 2026-05-07 post-RMA rebuild used `mkfs.btrfs` single by mistake and was restored to RAID-1 on 2026-05-15/16 via `btrfs device add` + `balance -dconvert=raid1 -mconvert=raid1 -sconvert=raid1` (see bd `DAS-Backup-Manager-453`).
 - **`system-recovery-A-2tb`** — 2TB SMR bay 1 (`ZK208Q77`), label `das-backup-system-recovery-A`, mount `/mnt/backup-system-recovery-A`. Retention: `daily=7`. Independent recovery copy (not a RAID mirror) — each 2TB drive has its own BTRFS filesystem, UUID, and ESP, and can boot CachyOS standalone.
 - **`system-recovery-B-2tb`** — 2TB SMR bay 4 (`ZFL41DNY`), label `das-backup-system-recovery-B`, mount `/mnt/backup-system-recovery-B`. Retention: `daily=7`. Independent recovery copy (peer of `system-recovery-A-2tb`, not a RAID mirror).
-- Boot archives: 1 year retention, pruned by `boot-archive-cleanup.sh`
+- Boot archives: 60 day retention (was 1 year prior to 2026-08-01), pruned by `boot-archive-cleanup.sh`, which runs automatically at the end of every backup (daily and full) while targets are still mounted — added 2026-08-01; previously the script was installed but nothing invoked it, so retention was unenforced (bd `DAS-Backup-Manager-64h`)
 
 ## Mount Options for the RAID-1 Primary Target
 - `DAS_MOUNT_OPTS` (set from `[das].mount_opts` in config.toml) includes `degraded` so a single-leg failure of the 22TB RAID-1 array does not block backups, restores, or recovery
@@ -23,9 +23,16 @@
 - The das-backup-22tb filesystem is NOT in `/etc/fstab` — boot is unaffected by either-leg failure regardless
 
 ## Boot Subvolume Archival
-- Behavior: snapshot live `@`/`@home` to `@.archive.YYYYMMDDTHHMMSS`, then delete+recreate the live boot subvolumes from the latest btrbk snapshot
+- Behavior: snapshot live `@`/`@home` read-only to `@.archive.YYYYMMDDTHHMMSS` / `@home.archive.YYYYMMDDTHHMMSS`, THEN delete+recreate the live boot subvolumes from the latest btrbk snapshot. If the archive snapshot fails, the recreation is skipped for that subvolume — the only copy of the outgoing `@`/`@home` is never destroyed.
+- **Both code paths implement this identically** as of 2026-08-01: the bash scheduled path (`scripts/backup-run.sh` `update_boot_subvolumes()`, `--full` runs only) and the Rust manual path (`indexer/src/backup.rs` `archive_boot()`, used by manual `btrdasd` runs) both archive-then-recreate. Prior to 2026-08-01, `backup-run.sh` recreated `@`/`@home` with no archive step at all — the Rust path's archive-then-recreate semantics are authoritative and the bash path was brought in line with them (user decision 2026-08-01).
 - Archives are read-only snapshots on the backup target
-- Cleanup runs after backup, prunes archives older than 365 days
+- The pruner (`boot-archive-cleanup.sh`) runs at the end of every backup, daily and full alike, while targets are still mounted — see the retention line above. It only ever deletes `@.archive.*` / `@home.archive.*` snapshots past retention; it never touches the live `@`/`@home` or btrbk-managed snapshots.
+
+### Delete vs mutate — send/receive chain safety
+- Deleting a *target* snapshot is harmless while at least one common pair survives (source snapshot UUID == target Received UUID) — that is what `target_preserve` does daily; only clearing one side entirely forces a full re-send.
+- **NEVER clear `ro` on a received subvolume** — it permanently destroys the Received UUID (only `btrfs receive` can set it) and leaves a subvolume that looks like a valid replica while its content may drift.
+- Mutating an already-sent LOCAL parent silently desynchronizes source and target, because `btrfs send -p` diffs against the local parent and never re-emits what the target is missing — nothing reports it.
+- In-place purging of a file is safe ONLY for snapshots that are neither send sources nor received (e.g. snapper's).
 
 ## Email Reports
 - **SMTP credentials**: sourced at runtime from `~/.config/pbridge.conf` (the single canonical Bridge credential source per `~/.claude/rules/infrastructure.md`). Both consumers — `scripts/backup-run.sh` `parse_pbridge_smtp()` and `indexer/src/report.rs` `parse_pbridge_smtp_block()` — read this file directly. No project-local email config file is generated, installed, or read; legacy `/etc/das-backup-email.conf` and `/etc/das-backup/email.conf` were retired 2026-05-16
