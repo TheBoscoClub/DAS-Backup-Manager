@@ -11,4 +11,5 @@ pub mod report;
 pub mod restore;
 pub mod scanner;
 pub mod schedule;
+pub mod scrub;
 pub mod subvol;
