@@ -310,9 +310,10 @@ mod tests {
         assert!(output.contains(
             "DAS_SERIAL_MAP='SERIAL08:primary-22tb SERIAL11:primary-22tb SERIAL02:system-recovery-B-2tb'"
         ));
-        assert!(output.contains(
-            "DAS_ALL_TARGET_MOUNTS='/mnt/backup-22tb /mnt/backup-system-recovery-B'"
-        ));
+        assert!(
+            output
+                .contains("DAS_ALL_TARGET_MOUNTS='/mnt/backup-22tb /mnt/backup-system-recovery-B'")
+        );
     }
 
     #[test]

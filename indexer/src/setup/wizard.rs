@@ -480,8 +480,7 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
         .collect();
     if !primary_labels.is_empty() {
         for source in config.sources.iter_mut() {
-            if source.target_labels.is_empty()
-                && source.label.to_lowercase().contains("audiobook")
+            if source.target_labels.is_empty() && source.label.to_lowercase().contains("audiobook")
             {
                 source.target_labels = primary_labels.clone();
                 println!(
