@@ -270,11 +270,8 @@ struct PbridgeSmtp {
 /// indented `Key: Value` lines (Hostname, Port, Username, Password, Security).
 /// This parser tracks the current block by line prefix: a line starting with
 /// `SMTP:` enters the block; any other top-level `<Word>:` line exits it.
-fn parse_pbridge_smtp_block(
-    path: &str,
-) -> Result<PbridgeSmtp, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {path}: {e}"))?;
+fn parse_pbridge_smtp_block(path: &str) -> Result<PbridgeSmtp, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
 
     let mut host = String::new();
     let mut port = String::new();
@@ -340,17 +337,32 @@ fn parse_pbridge_smtp_block(
 
 /// Send a backup report via email using s-nail (mailx).
 ///
+/// Thin wrapper over [`send_email_report_with_kind`] with the `Backup` subject kind.
+pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    send_email_report_with_kind(report, config, "Backup")
+}
+
+/// Send a report via email using s-nail (mailx).
+///
 /// Reads SMTP credentials from `~/.config/pbridge.conf` (the single canonical
 /// source for Protonmail Bridge credentials). The recipient and sender default
 /// to the Bridge account holder (the `Username` field); override via
 /// `DAS_REPORT_TO` / `DAS_REPORT_FROM` env vars if a different address is needed.
-pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `kind` names the report in the subject line (`[DAS <kind>] …`) so backup and
+/// scrub reports are distinguishable in the inbox; the status word is derived
+/// from the body containing `FAILURE`.
+pub fn send_email_report_with_kind(
+    report: &str,
+    config: &Config,
+    kind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !config.email.enabled {
         return Err("Email is not enabled in config".into());
     }
 
-    let pbridge_conf = std::env::var("PBRIDGE_CONF")
-        .unwrap_or_else(|_| PBRIDGE_CONF_DEFAULT.to_string());
+    let pbridge_conf =
+        std::env::var("PBRIDGE_CONF").unwrap_or_else(|_| PBRIDGE_CONF_DEFAULT.to_string());
 
     // Warn (do not fatal) if the credentials file is world/group-readable. The
     // bash side issues the same warning — pbridge.conf contains a Bridge auth
@@ -389,12 +401,13 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
     // email is visually distinct from ordinary self-to-self mail in the inbox.
     // Override either via DAS_REPORT_TO/FROM env vars.
     let to = std::env::var("DAS_REPORT_TO").unwrap_or_else(|_| smtp.username.clone());
-    let from = std::env::var("DAS_REPORT_FROM").unwrap_or_else(|_| {
-        format!("DAS Backup ({short_hostname}) <{}>", smtp.username)
-    });
+    let from = std::env::var("DAS_REPORT_FROM")
+        .unwrap_or_else(|_| format!("DAS {kind} ({short_hostname}) <{}>", smtp.username));
 
     if to.is_empty() {
-        return Err("No email recipient configured (DAS_REPORT_TO or pbridge.conf Username)".into());
+        return Err(
+            "No email recipient configured (DAS_REPORT_TO or pbridge.conf Username)".into(),
+        );
     }
 
     let smtp_url = format!("smtp://{}:{}", smtp.host, smtp.port);
@@ -423,7 +436,7 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
             tm.tm_min
         )
     };
-    let subject = format!("[DAS Backup] {hostname} — {status_word} — {now}");
+    let subject = format!("[DAS {kind}] {hostname} — {status_word} — {now}");
 
     // Build the mta URL with credentials embedded (s-nail v14.9+ / v15-compat).
     // Percent-encode all non-unreserved characters per RFC 3986 userinfo rules.
