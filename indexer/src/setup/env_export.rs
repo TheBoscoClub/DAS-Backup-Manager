@@ -52,6 +52,26 @@ pub fn dump_env(config: &Config) -> String {
         config.boot.archive_retention_days
     ));
 
+    // Scrub
+    out.push_str(&format!(
+        "DAS_SCRUB_ENABLED={}\n",
+        if config.scrub.enabled {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    out.push_str(&kv("DAS_SCRUB_ON_CALENDAR", &config.scrub.on_calendar));
+    out.push_str(&kv("DAS_SCRUB_TARGETS", &config.scrub.targets.join(" ")));
+    out.push_str(&format!(
+        "DAS_SCRUB_WARN_AGE_DAYS={}\n",
+        config.scrub.warn_age_days
+    ));
+    out.push_str(&format!(
+        "DAS_SCRUB_FAIL_AGE_DAYS={}\n",
+        config.scrub.fail_age_days
+    ));
+
     // Sources (indexed)
     out.push_str(&format!("DAS_SOURCE_COUNT={}\n", config.sources.len()));
     for (i, src) in config.sources.iter().enumerate() {
@@ -234,6 +254,13 @@ mod tests {
         assert!(output.contains("DAS_IO_SCHEDULER='mq-deadline'"));
         assert!(output.contains("DAS_BOOT_ENABLED=true"));
         assert!(output.contains("DAS_BOOT_ARCHIVE_RETENTION_DAYS=365"));
+        assert!(output.contains("DAS_SCRUB_ENABLED=true"));
+        assert!(output.contains("DAS_SCRUB_ON_CALENDAR='*-*-01 05:30:00'"));
+        assert!(output.contains(
+            "DAS_SCRUB_TARGETS='das-backup-22tb das-backup-system-recovery-A das-backup-system-recovery-B'"
+        ));
+        assert!(output.contains("DAS_SCRUB_WARN_AGE_DAYS=45"));
+        assert!(output.contains("DAS_SCRUB_FAIL_AGE_DAYS=75"));
     }
 
     #[test]

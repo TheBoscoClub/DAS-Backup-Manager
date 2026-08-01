@@ -18,6 +18,8 @@ pub struct Config {
     pub das: Das,
     #[serde(default)]
     pub boot: Boot,
+    #[serde(default)]
+    pub scrub: Scrub,
     #[serde(default, rename = "source")]
     pub sources: Vec<Source>,
     #[serde(default, rename = "target")]
@@ -131,6 +133,66 @@ impl Default for Boot {
             enabled: true,
             subvolumes: default_boot_subvolumes(),
             archive_retention_days: 60,
+        }
+    }
+}
+
+/// Scheduled BTRFS scrub of the DAS backup filesystems. Consumed by the
+/// scrub engine (bd DAS-Backup-Manager-212), the systemd timer template
+/// (bd DAS-Backup-Manager-atq), and the health checks (bd DAS-Backup-Manager-5kb).
+/// Design decisions (2026-07-27, user-confirmed): unbounded monthly pass,
+/// sequential, per-filesystem — three scrubs cover the four DAS drives
+/// because the 22tb target is a single RAID-1 filesystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scrub {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// systemd `OnCalendar=` expression consumed verbatim by the timer
+    /// template. Kept as a plain string (rather than structured
+    /// day/hour/minute fields) because the timer template only needs to
+    /// substitute it directly — see bd DAS-Backup-Manager-ikn.
+    #[serde(default = "default_scrub_on_calendar")]
+    pub on_calendar: String,
+    /// Target labels (matching `[[target]].label` in this same config),
+    /// scrubbed sequentially in list order. UUIDs are resolved from the
+    /// existing `[[target]]` blocks at use time — never duplicated here.
+    #[serde(default = "default_scrub_targets")]
+    pub targets: Vec<String>,
+    /// Days since the last completed scrub of a target before health
+    /// checks report a warning.
+    #[serde(default = "default_scrub_warn_age_days")]
+    pub warn_age_days: u32,
+    /// Days since the last completed scrub of a target before health
+    /// checks report a failure.
+    #[serde(default = "default_scrub_fail_age_days")]
+    pub fail_age_days: u32,
+}
+
+fn default_scrub_on_calendar() -> String {
+    "*-*-01 05:30:00".into()
+}
+fn default_scrub_targets() -> Vec<String> {
+    vec![
+        "das-backup-22tb".into(),
+        "das-backup-system-recovery-A".into(),
+        "das-backup-system-recovery-B".into(),
+    ]
+}
+fn default_scrub_warn_age_days() -> u32 {
+    45
+}
+fn default_scrub_fail_age_days() -> u32 {
+    75
+}
+
+impl Default for Scrub {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_calendar: default_scrub_on_calendar(),
+            targets: default_scrub_targets(),
+            warn_age_days: default_scrub_warn_age_days(),
+            fail_age_days: default_scrub_fail_age_days(),
         }
     }
 }
@@ -373,6 +435,7 @@ impl Default for Config {
             },
             das: Das::default(),
             boot: Boot::default(),
+            scrub: Scrub::default(),
             sources: Vec::new(),
             targets: Vec::new(),
             email: Email::default(),
@@ -490,6 +553,55 @@ mod tests {
         assert!(parsed.boot.enabled);
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home"]);
         assert_eq!(parsed.boot.archive_retention_days, 60);
+        assert!(parsed.scrub.enabled);
+        assert_eq!(parsed.scrub.on_calendar, "*-*-01 05:30:00");
+        assert_eq!(
+            parsed.scrub.targets,
+            vec![
+                "das-backup-22tb",
+                "das-backup-system-recovery-A",
+                "das-backup-system-recovery-B",
+            ]
+        );
+        assert_eq!(parsed.scrub.warn_age_days, 45);
+        assert_eq!(parsed.scrub.fail_age_days, 75);
+    }
+
+    #[test]
+    fn scrub_defaults() {
+        let scrub = Scrub::default();
+        assert!(scrub.enabled);
+        assert_eq!(scrub.on_calendar, "*-*-01 05:30:00");
+        assert_eq!(
+            scrub.targets,
+            vec![
+                "das-backup-22tb",
+                "das-backup-system-recovery-A",
+                "das-backup-system-recovery-B",
+            ]
+        );
+        assert_eq!(scrub.warn_age_days, 45);
+        assert_eq!(scrub.fail_age_days, 75);
+    }
+
+    #[test]
+    fn scrub_round_trip_custom_values() {
+        let mut cfg = Config::default();
+        cfg.scrub.enabled = false;
+        cfg.scrub.on_calendar = "*-*-15 02:00:00".into();
+        cfg.scrub.targets = vec!["custom-target".into()];
+        cfg.scrub.warn_age_days = 30;
+        cfg.scrub.fail_age_days = 60;
+
+        let toml_str = cfg.to_toml().expect("serialize config with custom scrub");
+        assert!(toml_str.contains("[scrub]"));
+        let parsed = Config::from_toml(&toml_str).expect("deserialize config with custom scrub");
+
+        assert!(!parsed.scrub.enabled);
+        assert_eq!(parsed.scrub.on_calendar, "*-*-15 02:00:00");
+        assert_eq!(parsed.scrub.targets, vec!["custom-target"]);
+        assert_eq!(parsed.scrub.warn_age_days, 30);
+        assert_eq!(parsed.scrub.fail_age_days, 60);
     }
 
     #[test]
@@ -625,6 +737,19 @@ enabled = false
         assert_eq!(cfg.targets[0].retention.daily, 0);
         assert_eq!(cfg.targets[0].retention.yearly, 0);
         assert!(cfg.targets[0].display_name.is_empty());
+        // [scrub] absent entirely from this old config — must parse to defaults
+        assert!(cfg.scrub.enabled);
+        assert_eq!(cfg.scrub.on_calendar, "*-*-01 05:30:00");
+        assert_eq!(
+            cfg.scrub.targets,
+            vec![
+                "das-backup-22tb",
+                "das-backup-system-recovery-A",
+                "das-backup-system-recovery-B",
+            ]
+        );
+        assert_eq!(cfg.scrub.warn_age_days, 45);
+        assert_eq!(cfg.scrub.fail_age_days, 75);
     }
 
     #[test]
