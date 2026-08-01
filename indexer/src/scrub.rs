@@ -28,8 +28,56 @@
 //!    `findmnt -o UUID` before a scrub is started against it.
 //!
 //! A third guard falls out of the same incident: after the scrub, the record's
-//! `t_start` must be at or after this pass's start time. A stale record left by
-//! an earlier scrub is reported as a failure rather than mistaken for a result.
+//! last start-or-resume time must be at or after this filesystem's scrub start.
+//! A stale record left by an earlier scrub is reported as a failure rather than
+//! mistaken for a result.
+//!
+//! # Vocabulary warning: `aborted` here vs. in `btrfs scrub status`
+//!
+//! The CLI's `Status:` line and this module's [`ScrubOutcome`] do **not** use
+//! the same words for the same states (verified on btrfs-progs v7.1):
+//!
+//! | record flags | `btrfs scrub status` prints | [`ScrubOutcome`] |
+//! |---|---|---|
+//! | `finished:1 canceled:0` | `finished` | `Finished` |
+//! | `canceled:1` | `aborted` | `Canceled` |
+//! | `finished:0 canceled:0`, nothing running | `interrupted` | `Aborted` |
+//! | `finished:0 canceled:0`, scrub live | `running` | `Aborted` |
+//!
+//! This module keys on the raw flags, never on the rendered word, because the
+//! rendering has changed across btrfs-progs versions. Both non-`Finished`
+//! states are failures, so behavior is unaffected — but do not expect the
+//! module's word and the CLI's word to match when comparing by eye.
+//!
+//! # Clearing a stale aborted record (`-f`)
+//!
+//! `btrfs-progs` can read a saved record whose device row is neither
+//! `finished` nor `canceled` as evidence of a live scrub, and refuse to start
+//! ("useful when scrub status file is damaged and reports a running scrub
+//! although it is not", `man btrfs-scrub` on `-f`). Left unhandled, one
+//! aborted pass could wedge that filesystem's scrubs indefinitely.
+//! [`decide_scrub_start_mode`] adds `-f` **only** when the prior record is
+//! `Aborted` *and* the kernel confirms nothing is running — never
+//! unconditionally, because these locks cannot stop an operator from starting
+//! a scrub by hand and force-restarting theirs would discard hours of work.
+//!
+//! # Operational notes
+//!
+//! * **Unmount failure does not cascade.** An unmount that fails (after one
+//!   retry) fails that filesystem and is reported, but the pass continues to
+//!   the next target and the locks are still released at the end. The
+//!   consequence of a target left mounted is caught downstream:
+//!   `backup-run.sh`'s `verify_targets_before_btrbk` checks the mounted
+//!   filesystem's UUID against the config, so a stray mount is surfaced by the
+//!   next backup rather than silently used.
+//! * **Double mounts alongside udisks are expected and tolerated.** The 22 TB
+//!   array is often also mounted at `/run/media/bosco/…` by the file manager —
+//!   that is what triggers `btrfs-scrub-resume-das-22tb.service` and is
+//!   deliberately not cleaned up. BTRFS permits the same filesystem at several
+//!   mount points; a scrub is per-filesystem, not per-mount, so it makes no
+//!   difference to this engine. If the configured mountpoint already holds the
+//!   *expected* UUID the engine reuses it and does **not** unmount it on the
+//!   way out (it only unmounts what it mounted).
 //!
 //! # On-disk status record format
 //!
@@ -159,6 +207,9 @@ const SCRUB_PROGRESS_LOG_SECS: u64 = 60;
 /// before the record is treated as stale (clock granularity, btrfs recording
 /// the start a moment before the child is observed to have launched).
 const RECORD_FRESHNESS_SLACK_SECS: i64 = 120;
+/// How often to repeat the maintenance-lock wait notice, so a pass blocked
+/// behind a long backup does not look hung.
+const LOCK_WAIT_REANNOUNCE_SECS: u64 = 900;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -174,15 +225,13 @@ pub enum ScrubError {
     Lock { path: String, detail: String },
     /// The state file could not be read or written.
     State { path: String, detail: String },
-    /// The state file held unparseable JSON and was moved aside to
-    /// `<path>.corrupt`. Distinct from [`ScrubError::State`] because there is
-    /// nothing left to lose: a fresh state may safely be written over it,
-    /// whereas an unreadable-but-intact file must never be overwritten.
-    StateCorrupt {
-        path: String,
-        moved_to: String,
-        detail: String,
-    },
+    /// The state file holds unparseable JSON. Distinct from
+    /// [`ScrubError::State`] because the two demand opposite handling: a
+    /// corrupt file may be quarantined and replaced, whereas an
+    /// unreadable-but-intact file must never be overwritten. Reporting it does
+    /// **not** modify anything — quarantine is [`quarantine_state_file`]'s job,
+    /// so that reading state stays a pure, unprivileged-safe operation.
+    StateCorrupt { path: String, detail: String },
     /// The status record file is missing.
     StatusMissing { path: String },
     /// The status record file could not be read.
@@ -206,14 +255,9 @@ impl fmt::Display for ScrubError {
             Self::NoTargets => write!(f, "No scrub targets configured ([scrub].targets is empty)"),
             Self::Lock { path, detail } => write!(f, "Lock '{path}': {detail}"),
             Self::State { path, detail } => write!(f, "Scrub state '{path}': {detail}"),
-            Self::StateCorrupt {
-                path,
-                moved_to,
-                detail,
-            } => write!(
-                f,
-                "Scrub state '{path}' is unparseable ({detail}) — moved aside to '{moved_to}'"
-            ),
+            Self::StateCorrupt { path, detail } => {
+                write!(f, "Scrub state '{path}' is unparseable: {detail}")
+            }
             Self::StatusMissing { path } => {
                 write!(f, "No scrub status record at '{path}'")
             }
@@ -367,6 +411,10 @@ pub struct ScrubDeviceStatus {
     pub tree_bytes_scrubbed: u64,
     /// Unix epoch when this device's scrub started (0 if the field is absent).
     pub t_start: i64,
+    /// Unix epoch when an interrupted scrub was resumed, 0 if never resumed.
+    /// Freshness is judged against `max(t_start, t_resumed)` — a resumed scrub
+    /// legitimately keeps its original `t_start`.
+    pub t_resumed: i64,
     pub duration_secs: u64,
     pub canceled: bool,
     pub finished: bool,
@@ -440,6 +488,17 @@ impl ScrubStatusRecord {
             .map(|d| d.t_start)
             .filter(|t| *t > 0)
             .min()
+            .unwrap_or(0)
+    }
+
+    /// Latest moment any device began or resumed scrubbing — the anchor for
+    /// the freshness check. A resumed scrub keeps its original `t_start`, so
+    /// judging freshness on `t_start` alone would wrongly call it stale.
+    pub fn last_activity_start(&self) -> i64 {
+        self.devices
+            .iter()
+            .map(|d| d.t_start.max(d.t_resumed))
+            .max()
             .unwrap_or(0)
     }
 
@@ -520,6 +579,7 @@ pub fn parse_scrub_status(
             data_bytes_scrubbed: 0,
             tree_bytes_scrubbed: 0,
             t_start: 0,
+            t_resumed: 0,
             duration_secs: 0,
             canceled: false,
             finished: false,
@@ -547,6 +607,7 @@ pub fn parse_scrub_status(
                 "data_bytes_scrubbed" => dev.data_bytes_scrubbed = num.unwrap_or(0),
                 "tree_bytes_scrubbed" => dev.tree_bytes_scrubbed = num.unwrap_or(0),
                 "t_start" => dev.t_start = value.parse::<i64>().unwrap_or(0),
+                "t_resumed" => dev.t_resumed = value.parse::<i64>().unwrap_or(0),
                 "duration" => dev.duration_secs = num.unwrap_or(0),
                 "canceled" => dev.canceled = num.unwrap_or(0) != 0,
                 "finished" => dev.finished = num.unwrap_or(0) != 0,
@@ -631,9 +692,28 @@ impl FileLock {
             .truncate(false)
             .mode(0o644)
             .open(path)
-            .map_err(|e| ScrubError::Lock {
-                path: path.display().to_string(),
-                detail: format!("cannot open lock file: {e}"),
+            .map_err(|e| {
+                // `/run` is root-owned, so a permission error here almost
+                // always means the caller simply is not root. Say that,
+                // instead of surfacing a bare EACCES.
+                let denied = matches!(
+                    e.raw_os_error(),
+                    Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
+                );
+                // SAFETY: geteuid() is always safe.
+                let unprivileged = unsafe { libc::geteuid() } != 0;
+                let detail = if denied && unprivileged {
+                    format!(
+                        "cannot open lock file ({e}) — scrub must run as root \
+                         (try: sudo btrdasd scrub run)"
+                    )
+                } else {
+                    format!("cannot open lock file: {e}")
+                };
+                ScrubError::Lock {
+                    path: path.display().to_string(),
+                    detail,
+                }
             })
     }
 
@@ -700,9 +780,32 @@ impl FileLock {
         progress.on_log(LogLevel::Info, waiting_message);
 
         // A blocking LOCK_EX only returns once held (or on a real error);
-        // EINTR is retried inside `flock`.
+        // EINTR is retried inside `flock`. A scoped companion thread repeats
+        // the notice so a pass parked behind a multi-hour backup is visibly
+        // waiting rather than apparently hung.
         let file = Self::open(path)?;
-        Self::flock(&file, path, libc::LOCK_EX)?;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut waited = LOCK_WAIT_ANNOUNCE_SECS;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    waited += 1;
+                    if waited.is_multiple_of(LOCK_WAIT_REANNOUNCE_SECS)
+                        && !done.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        progress.on_log(
+                            LogLevel::Info,
+                            &format!("{waiting_message} — still waiting after {}m", waited / 60),
+                        );
+                    }
+                }
+            });
+            let result = Self::flock(&file, path, libc::LOCK_EX);
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
+        });
+        outcome?;
         Ok(FileLock {
             path: path.to_path_buf(),
             file,
@@ -844,13 +947,14 @@ pub fn state_path() -> PathBuf {
 
 /// Load the state file. A missing file yields the default (empty) state.
 ///
-/// Unparseable JSON is moved aside to `<path>.corrupt` and reported as
-/// [`ScrubError::StateCorrupt`], so one bad write cannot wedge every future
-/// pass while the evidence is still kept. Every other failure (EIO, EACCES, a
-/// file that is intact but momentarily unreadable) is reported as
-/// [`ScrubError::State`] and leaves the file untouched — callers must not
-/// overwrite it, or a readable-later file's `last_success_epoch` history would
-/// be silently destroyed.
+/// **Pure**: this never writes, renames, or deletes anything, so the
+/// unprivileged readers (health checks, the GUI) can call it freely and get an
+/// error that means exactly one thing. Unparseable JSON is reported as
+/// [`ScrubError::StateCorrupt`]; every other failure (EIO, EACCES, a file that
+/// is intact but momentarily unreadable) is [`ScrubError::State`] and the file
+/// must not be overwritten — doing so would destroy the `last_success_epoch`
+/// history silently. Quarantine is the writer's job:
+/// [`quarantine_state_file`].
 pub fn load_state_from(path: &Path) -> Result<ScrubState, ScrubError> {
     if !path.exists() {
         return Ok(ScrubState::default());
@@ -859,23 +963,30 @@ pub fn load_state_from(path: &Path) -> Result<ScrubState, ScrubError> {
         path: path.display().to_string(),
         detail: e.to_string(),
     })?;
-    match serde_json::from_str::<ScrubState>(&content) {
-        Ok(state) => Ok(state),
-        Err(e) => {
-            let corrupt = path.with_extension("corrupt");
-            if let Err(rename_err) = fs::rename(path, &corrupt) {
-                return Err(ScrubError::State {
-                    path: path.display().to_string(),
-                    detail: format!("unparseable ({e}) and could not be moved aside: {rename_err}"),
-                });
-            }
-            Err(ScrubError::StateCorrupt {
-                path: path.display().to_string(),
-                moved_to: corrupt.display().to_string(),
-                detail: e.to_string(),
-            })
-        }
-    }
+    serde_json::from_str::<ScrubState>(&content).map_err(|e| ScrubError::StateCorrupt {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })
+}
+
+/// Move an unparseable state file aside to `<path>.corrupt`, preserving the
+/// evidence while freeing the canonical path for a fresh write.
+///
+/// Root-only in practice (the state file lives under `/var/lib/das-backup`).
+/// Callers must have established that the file is corrupt — never call this
+/// for a file that merely could not be read.
+pub fn quarantine_state_file(path: &Path) -> Result<PathBuf, ScrubError> {
+    // Append rather than `with_extension`, so `scrub-state.json` becomes
+    // `scrub-state.json.corrupt` and cannot collide with the live file's stem.
+    let corrupt = PathBuf::from(format!("{}.corrupt", path.display()));
+    fs::rename(path, &corrupt).map_err(|e| ScrubError::State {
+        path: path.display().to_string(),
+        detail: format!(
+            "cannot quarantine corrupt state file to {}: {e}",
+            corrupt.display()
+        ),
+    })?;
+    Ok(corrupt)
 }
 
 /// Load the state file from the configured location.
@@ -909,6 +1020,14 @@ pub fn save_state_to(state: &ScrubState, path: &Path) -> Result<(), ScrubError> 
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))
         .map_err(|e| err(format!("cannot chmod temp file: {e}")))?;
     fs::rename(&tmp, path).map_err(|e| err(format!("cannot rename temp file: {e}")))?;
+    // fsync the directory so the rename itself survives a crash — without it
+    // the file contents are durable but the name may not be, and health checks
+    // would read a state file that no longer exists.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -1139,6 +1258,109 @@ fn blkid_uuid(device: &str) -> Option<String> {
     if uuid.is_empty() { None } else { Some(uuid) }
 }
 
+/// Whether a scrub is running *right now* on a mounted filesystem, as the
+/// kernel sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveScrubState {
+    /// The kernel reports an in-progress scrub.
+    Running,
+    /// The kernel reports no scrub in progress.
+    NotRunning,
+    /// Could not be determined — treated as "assume something is running", so
+    /// the engine never forces on a guess.
+    Unknown,
+}
+
+/// Ask `btrfs scrub status` whether a scrub is live on this filesystem.
+///
+/// This is the one place a mount *path* is used for a scrub query, and it is
+/// safe here specifically because the caller has already asserted, via
+/// `findmnt -o UUID`, that the expected filesystem is mounted at this path,
+/// and holds both DAS locks. The dangerous case the module exists to prevent —
+/// querying an *unmounted* path and silently getting the backing filesystem's
+/// answer — cannot occur on this call path. Result interpretation is kernel
+/// truth: `Status: running` is only printed while a scrub is actually in
+/// progress (verified empirically, 2026-08-01 loopback rig).
+pub fn live_scrub_state(mount_point: &str) -> LiveScrubState {
+    let Ok(out) = Command::new("btrfs")
+        .args(["scrub", "status", mount_point])
+        .output()
+    else {
+        return LiveScrubState::Unknown;
+    };
+    if !out.status.success() {
+        return LiveScrubState::Unknown;
+    }
+    parse_scrub_status_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Extract the liveness verdict from `btrfs scrub status` output.
+///
+/// btrfs-progs v7.1 prints exactly one `Status:` line per filesystem:
+/// `running`, `finished`, `aborted` (a cancelled scrub), or `interrupted` (the
+/// aborted-record shape). Output with no `Status:` line at all — which happens
+/// when a just-started scrub has no stats yet — is [`LiveScrubState::Unknown`],
+/// never "not running", because that case *is* a live scrub.
+pub fn parse_scrub_status_output(stdout: &str) -> LiveScrubState {
+    for line in stdout.lines() {
+        if let Some(value) = line.trim().strip_prefix("Status:") {
+            return match value.trim() {
+                "running" => LiveScrubState::Running,
+                "" => LiveScrubState::Unknown,
+                _ => LiveScrubState::NotRunning,
+            };
+        }
+    }
+    LiveScrubState::Unknown
+}
+
+/// Whether the next `btrfs scrub start` needs `-f`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrubStartMode {
+    /// Plain `btrfs scrub start -B`.
+    Normal,
+    /// `btrfs scrub start -B -f`, because a previous pass left an aborted
+    /// record behind and nothing is running now.
+    Forced { reason: String },
+}
+
+/// Decide whether this filesystem's scrub must be forced.
+///
+/// `btrfs-progs` decides "a scrub is already running" partly from the saved
+/// status record: a device row that is neither `finished` nor `canceled` can
+/// read as a live scrub even when nothing is running, and the documented
+/// remedy is `-f` ("useful when scrub status file is damaged and reports a
+/// running scrub although it is not", `man btrfs-scrub`). Left unhandled, an
+/// aborted pass can wedge every later scrub of that filesystem until a human
+/// intervenes.
+///
+/// `-f` is emphatically **not** unconditional: the locks in this module do not
+/// protect against an operator running `btrfs scrub start` by hand, and
+/// force-restarting somebody else's scrub would throw away hours of work. It is
+/// used only when the prior record is [`ScrubOutcome::Aborted`] **and** the
+/// kernel confirms nothing is running. Anything unknown falls back to a plain
+/// start, which fails loudly rather than stomping.
+pub fn decide_scrub_start_mode(fsuuid: &str, mount_point: &str) -> ScrubStartMode {
+    let Ok(prior) = read_scrub_status(fsuuid) else {
+        // No prior record at all — nothing to clear.
+        return ScrubStartMode::Normal;
+    };
+    if prior.outcome() != ScrubOutcome::Aborted {
+        return ScrubStartMode::Normal;
+    }
+    match live_scrub_state(mount_point) {
+        LiveScrubState::NotRunning => ScrubStartMode::Forced {
+            reason: format!(
+                "previous scrub of {fsuuid} left an aborted record \
+                 (canceled:0 finished:0) and the kernel reports no scrub running — \
+                 forcing a fresh scrub so the stale record cannot block it"
+            ),
+        },
+        LiveScrubState::Running => ScrubStartMode::Normal,
+        LiveScrubState::Unknown => ScrubStartMode::Normal,
+    }
+}
+
 /// Filesystem UUID currently mounted at `mount_point`, via `findmnt`.
 ///
 /// Returns `None` when nothing is mounted there. Used only to *verify* an
@@ -1190,6 +1412,9 @@ pub fn run_scrub_pass(
             LogLevel::Info,
             &format!("Another scrub holds {SCRUB_LOCK_PATH} — skipping this invocation"),
         );
+        // Close the progress lifecycle on this path too, so a caller driving a
+        // UI or a log does not see a stage opened and never completed.
+        progress.on_complete(true, "Skipped — another scrub pass is already running");
         return Ok(ScrubPass {
             status: PassStatus::Skipped,
             started_epoch,
@@ -1242,7 +1467,7 @@ pub fn run_scrub_pass(
 
     // Persist before emailing: the state file is what health checks read, and
     // it must survive an email failure.
-    match persist_pass(&pass) {
+    match persist_pass(&pass, progress) {
         Ok(path) => progress.on_log(
             LogLevel::Info,
             &format!("Scrub state written to {}", path.display()),
@@ -1277,16 +1502,27 @@ pub fn run_scrub_pass(
 
 /// Merge a pass into the persisted state and write it back.
 ///
-/// A corrupt state file must not cost us this pass's result — it has already
-/// been moved aside, so a fresh state is written over it. Any *other* read
-/// failure aborts the write: the existing file may be intact and holds the
-/// `last_success_epoch` history that health checks age against, and
-/// overwriting it from a blank state would erase that silently.
-fn persist_pass(pass: &ScrubPass) -> Result<PathBuf, ScrubError> {
+/// A corrupt state file must not cost us this pass's result: it is quarantined
+/// here (the writer's job, not the reader's — see [`load_state_from`]) and a
+/// fresh state is written in its place. Any *other* read failure aborts the
+/// write: the existing file may be intact and holds the `last_success_epoch`
+/// history that health checks age against, and overwriting it from a blank
+/// state would erase that silently.
+fn persist_pass(pass: &ScrubPass, progress: &dyn ProgressCallback) -> Result<PathBuf, ScrubError> {
     let path = state_path();
     let mut state = match load_state_from(&path) {
         Ok(state) => state,
-        Err(ScrubError::StateCorrupt { .. }) => ScrubState::default(),
+        Err(ScrubError::StateCorrupt { detail, .. }) => {
+            let moved = quarantine_state_file(&path)?;
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Scrub state file was unparseable ({detail}) — quarantined to {} and rebuilt",
+                    moved.display()
+                ),
+            );
+            ScrubState::default()
+        }
         Err(e) => return Err(e),
     };
     merge_pass_into_state(&mut state, pass);
@@ -1366,18 +1602,20 @@ fn scrub_one_target(
             // anchor is *this filesystem's* start, not the pass's: a pass runs
             // for many hours, so anchoring on the pass would accept a record
             // written half a day before this target was even touched.
-            let t_start = record.t_start();
-            if t_start == 0 {
+            let activity = record.last_activity_start();
+            if activity == 0 {
                 result.errors.push(format!(
                     "scrub status record for {fsuuid} has no start timestamp — cannot confirm it \
                      belongs to this run"
                 ));
-            } else if t_start < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
+            } else if activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
                 result.errors.push(format!(
-                    "scrub status record for {fsuuid} is stale (t_start {t_start} predates this \
-                     filesystem's scrub start {scrub_started}) — no result was written for this run"
+                    "scrub status record for {fsuuid} is stale (last start/resume {activity} \
+                     predates this filesystem's scrub start {scrub_started}) — no result was \
+                     written for this run"
                 ));
             } else {
+                let t_start = record.t_start();
                 result.outcome = Some(record.outcome());
                 result.counters = record.counters();
                 result.bytes_scrubbed = record.bytes_scrubbed();
@@ -1444,10 +1682,23 @@ fn ensure_mounted(
         };
     }
 
-    if !path.exists() {
+    // Track whether the directory is ours, so a failed mount can take it back
+    // out again. A bare directory left at a configured target path is how
+    // btrbk once wrote a backup onto the root filesystem (bd
+    // DAS-Backup-Manager-9on) — the engine must not manufacture one.
+    let created_dir = !path.exists();
+    if created_dir {
         fs::create_dir_all(path)
             .map_err(|e| format!("cannot create mount point {mount_point}: {e}"))?;
     }
+    let cleanup_dir = |progress: &dyn ProgressCallback| {
+        if created_dir && fs::remove_dir(path).is_ok() {
+            progress.on_log(
+                LogLevel::Info,
+                &format!("Removed mount point {mount_point} created for this pass"),
+            );
+        }
+    };
 
     let mut cmd = Command::new("mount");
     cmd.args(["-t", "btrfs"]);
@@ -1456,13 +1707,18 @@ fn ensure_mounted(
     }
     cmd.arg(format!("UUID={fsuuid}")).arg(mount_point);
 
-    let out = cmd
-        .output()
-        .map_err(|e| format!("cannot execute mount for UUID={fsuuid}: {e}"))?;
+    let out = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup_dir(progress);
+            return Err(format!("cannot execute mount for UUID={fsuuid}: {e}"));
+        }
+    };
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        cleanup_dir(progress);
         return Err(format!(
-            "mount UUID={fsuuid} → {mount_point} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "mount UUID={fsuuid} → {mount_point} failed: {stderr}"
         ));
     }
 
@@ -1478,6 +1734,7 @@ fn ensure_mounted(
         }
         other => {
             let _ = Command::new("umount").arg(mount_point).status();
+            cleanup_dir(progress);
             Err(format!(
                 "post-mount verification failed for {mount_point}: expected UUID '{fsuuid}', \
                  found '{}' — unmounted again",
@@ -1523,8 +1780,23 @@ fn run_btrfs_scrub(
     fsuuid: &str,
     progress: &dyn ProgressCallback,
 ) -> Result<(), String> {
+    // Clear a stale aborted record out of the way if — and only if — nothing
+    // is running. See `decide_scrub_start_mode`.
+    let mut args = vec!["scrub", "start", "-B"];
+    match decide_scrub_start_mode(fsuuid, mount_point) {
+        ScrubStartMode::Forced { reason } => {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("Using 'btrfs scrub start -B -f': {reason}"),
+            );
+            args.push("-f");
+        }
+        ScrubStartMode::Normal => {}
+    }
+    args.push(mount_point);
+
     let mut child = Command::new("btrfs")
-        .args(["scrub", "start", "-B", mount_point])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1925,6 +2197,120 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
         assert_eq!(rec.t_start(), 100);
     }
 
+    // --- resumed scrubs / freshness anchor --------------------------------
+
+    #[test]
+    fn freshness_anchor_uses_the_later_of_start_and_resume() {
+        // A resumed scrub keeps its original t_start; anchoring on t_start
+        // alone would call a fresh resume "stale".
+        let content = REAL_FINISHED.replace("t_resumed:0", "t_resumed:1785200000");
+        let rec = parse_scrub_status(&content, "60b05268-7f8f-47b5-a38a-752576a1172a").unwrap();
+        assert_eq!(rec.t_start(), 1785182081);
+        assert_eq!(rec.devices[0].t_resumed, 1785200000);
+        assert_eq!(rec.last_activity_start(), 1785200000);
+    }
+
+    #[test]
+    fn freshness_anchor_falls_back_to_t_start_when_never_resumed() {
+        let rec =
+            parse_scrub_status(REAL_FINISHED, "60b05268-7f8f-47b5-a38a-752576a1172a").unwrap();
+        assert_eq!(rec.last_activity_start(), rec.t_start());
+    }
+
+    // --- forced-start decision (C1) ---------------------------------------
+
+    #[test]
+    fn no_prior_record_starts_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        temp_env("DAS_BTRFS_STATUS_DIR", dir.path().to_str().unwrap(), || {
+            // Mount point is never consulted when there is no record to clear.
+            assert_eq!(
+                decide_scrub_start_mode("00000000-0000-0000-0000-000000000000", "/nonexistent"),
+                ScrubStartMode::Normal
+            );
+        });
+    }
+
+    #[test]
+    fn finished_prior_record_starts_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "60b05268-7f8f-47b5-a38a-752576a1172a";
+        fs::write(
+            dir.path().join(format!("scrub.status.{uuid}")),
+            REAL_FINISHED,
+        )
+        .unwrap();
+        temp_env("DAS_BTRFS_STATUS_DIR", dir.path().to_str().unwrap(), || {
+            assert_eq!(
+                decide_scrub_start_mode(uuid, "/nonexistent"),
+                ScrubStartMode::Normal
+            );
+        });
+    }
+
+    /// An unusable mount path yields `Unknown` liveness, which must never
+    /// force — the engine only forces on positive evidence that nothing runs.
+    #[test]
+    fn aborted_prior_record_does_not_force_when_liveness_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "60b05268-7f8f-47b5-a38a-752576a1172a";
+        fs::write(
+            dir.path().join(format!("scrub.status.{uuid}")),
+            REAL_ABORTED_SUPER,
+        )
+        .unwrap();
+        temp_env("DAS_BTRFS_STATUS_DIR", dir.path().to_str().unwrap(), || {
+            // `/nonexistent` is not a btrfs mount, so `btrfs scrub status`
+            // errors → Unknown → never force on a guess.
+            assert_eq!(
+                decide_scrub_start_mode(uuid, "/nonexistent"),
+                ScrubStartMode::Normal,
+                "must not force when liveness cannot be determined"
+            );
+        });
+    }
+
+    /// Verbatim `btrfs scrub status` output captured from the v7.1 loopback
+    /// rig on 2026-08-01, one sample per state the engine must distinguish.
+    #[test]
+    fn live_scrub_state_parses_real_status_output() {
+        let running = "UUID:             a5db734a-d7b4-4c5b-8ff6-13bc83b5f07d\n\
+Scrub started:    Sat Aug  1 15:44:08 2026\n\
+Status:           running\n\
+Duration:         0:00:03\n\
+Bytes scrubbed:   257.12MiB  (64.08%)\n";
+        assert_eq!(parse_scrub_status_output(running), LiveScrubState::Running);
+
+        let finished = "UUID:             a5db734a-d7b4-4c5b-8ff6-13bc83b5f07d\n\
+Status:           finished\n\
+Error summary:    no errors found\n";
+        assert_eq!(
+            parse_scrub_status_output(finished),
+            LiveScrubState::NotRunning
+        );
+
+        // What v7.1 prints for a cancelled scrub (canceled:1) …
+        let cancelled = "Status:           aborted\n";
+        assert_eq!(
+            parse_scrub_status_output(cancelled),
+            LiveScrubState::NotRunning
+        );
+        // … and for the aborted-record shape (canceled:0 finished:0).
+        let interrupted = "Status:           interrupted\n";
+        assert_eq!(
+            parse_scrub_status_output(interrupted),
+            LiveScrubState::NotRunning
+        );
+
+        // A scrub that just started has no stats yet and prints no Status line
+        // — that must read as Unknown, never as NotRunning, or the engine
+        // could force-restart a live scrub.
+        let no_stats = "UUID:             a5db734a-d7b4-4c5b-8ff6-13bc83b5f07d\n\
+\tno stats available\n\
+Total to scrub:   401.28MiB\n";
+        assert_eq!(parse_scrub_status_output(no_stats), LiveScrubState::Unknown);
+    }
+
     // --- UUID resolution from config -------------------------------------
 
     /// A config carrying one target, since `Config::default()` has none.
@@ -2151,8 +2537,16 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
         fs::write(&path, "{ this is not json").unwrap();
         let err = load_state_from(&path).unwrap_err();
         assert!(matches!(err, ScrubError::StateCorrupt { .. }));
+        // Loading is pure: the corrupt file is still exactly where it was, so
+        // an unprivileged health check cannot mutate the writer's state.
+        assert!(path.exists(), "load_state_from must not move the file");
+        assert!(!dir.path().join("scrub-state.json.corrupt").exists());
+
+        // Quarantine is a separate, explicit, writer-side call.
+        let moved = quarantine_state_file(&path).unwrap();
+        assert_eq!(moved, dir.path().join("scrub-state.json.corrupt"));
         assert!(!path.exists());
-        assert!(dir.path().join("scrub-state.corrupt").exists());
+        assert!(moved.exists());
     }
 
     /// A corrupt file is already moved aside, so this pass's result is still
@@ -2165,12 +2559,12 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
         let pass = pass_with(vec![fs_result("primary-22tb", "uuid-a", true, 1_000_400)]);
 
         temp_env("DAS_SCRUB_STATE", path.to_str().unwrap(), || {
-            persist_pass(&pass).expect("corrupt state must not block persistence");
+            persist_pass(&pass, &NullProgress).expect("corrupt state must not block persistence");
         });
 
         let loaded = load_state_from(&path).unwrap();
         assert!(loaded.filesystems.contains_key("uuid-a"));
-        assert!(dir.path().join("scrub-state.corrupt").exists());
+        assert!(dir.path().join("scrub-state.json.corrupt").exists());
     }
 
     /// An intact-but-unreadable state file must never be overwritten from a
@@ -2197,7 +2591,7 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
 
         let pass = pass_with(vec![fs_result("recovery-a", "uuid-b", false, 2_000_400)]);
         let err = temp_env("DAS_SCRUB_STATE", path.to_str().unwrap(), || {
-            persist_pass(&pass).expect_err("unreadable state must abort the write")
+            persist_pass(&pass, &NullProgress).expect_err("unreadable state must abort the write")
         });
         assert!(matches!(err, ScrubError::State { .. }));
 
