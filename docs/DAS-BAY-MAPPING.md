@@ -97,14 +97,22 @@ Each `[[target]]` entry in `/etc/das-backup/config.toml` identifies a drive by s
 ```toml
 [[target]]
 label = "primary-backup"
-serial = "<your-drive-serial>"
+serials = ["<your-drive-serial>"]
 mount = "/mnt/backup-primary"
 role = "primary"
 
 [target.retention]
+daily = 7
 weekly = 4
 monthly = 12
+yearly = 0
 ```
+
+`serials` takes an array — a single-drive target lists one serial, a BTRFS RAID-1 target
+lists both member serials (operator advisory only: a missing member logs a warning but
+does not abort, since a degraded RAID-1 array still mounts from any present leg). For a
+multi-device target you can also set `mount_uuid` to mount by the filesystem's BTRFS UUID
+directly instead of resolving a device from `serials`.
 
 The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
 

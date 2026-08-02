@@ -17,7 +17,7 @@ The following are permanently out of scope and will never be added:
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (v0.7.11)
+## Component Overview (v0.7.12.3)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -32,8 +32,8 @@ Every architectural decision in this document — from the database schema to th
 │  ┌────┴─────────────────────┴──────────────────────┐        │
 │  │          libbuttered_dasd (Rust library)         │        │
 │  │  indexer │ config │ backup │ restore │ schedule   │        │
-│  │  search  │ health │ subvol │ progress│ reporting  │        │
-│  │  mount   │                                         │        │
+│  │  db      │ health │ subvol │ progress│ report     │        │
+│  │  mount   │ doctor │ scrub  │ ffi     │ scanner    │        │
 │  └──────────────────────┬───────────────────────────┘        │
 │                         │ D-Bus (org.dasbackup.Helper1)      │
 │  ┌──────────────────────┴────────────────────────┐           │
@@ -49,7 +49,7 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 |-----------|----------|--------|---------|
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 13 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 15 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions) |
 | FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |
@@ -66,12 +66,16 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
-         ├──▶ btrbk run          → creates BTRFS snapshots on backup targets
-         ├──▶ btrbk run (full)   → weekly full backup with send/receive
-         ├──▶ rsync              → ESP synchronization to recovery drives
-         ├──▶ btrdasd walk       → indexes new snapshots into SQLite
-         └──▶ mailx              → sends email report
+         ├──▶ btrbk run                    → creates BTRFS snapshots on backup targets
+         ├──▶ btrbk run (full)             → weekly full backup with send/receive
+         ├──▶ update_boot_subvolumes()     → archives + recreates @/@home boot subvolumes (--full runs)
+         ├──▶ btrdasd walk                 → indexes new snapshots into SQLite
+         ├──▶ boot-archive-cleanup.sh      → prunes expired @.archive.*/@home.archive.* snapshots
+         └──▶ mailx                        → sends email report (Proton Bridge SMTP)
 ```
+
+ESP synchronization to recovery drives was removed 2026-04-10 after the ESP-overwrite
+incident — see `.claude/rules/esp-safety.md`. `backup-run.sh` has no ESP/rsync step.
 
 ### Scrub Pipeline
 
@@ -246,11 +250,18 @@ wizard → Config struct → config.toml (save)
 | `general` | version, install_prefix, db_path | Global settings |
 | `init` | system (systemd/sysvinit/openrc) | Init system selection |
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
+| `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
+| `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
+| `doctor` | exclude[] | Subvolume drift detector exclusions (`btrdasd doctor --check-drift`) |
 | `source[]` | label, subvolume, mount_point, subvolumes[] | BTRFS sources |
 | `target[]` | label, device, mount_point, role, retention | Backup targets |
-| `esp` | enabled, source_path, method, packages[] | ESP/boot mirroring |
 | `email` | enabled, smtp_host, smtp_port, from, to, tls | Email reports |
 | `gui` | install (bool) | GUI installation toggle |
+
+**Removed section**: `[esp]` (enabled, source_path, method, packages[]) — ESP/boot mirroring
+was removed from the codebase in two steps: the orphan hook generator on 2026-04-10, then the
+remaining `Esp` struct and `sync_esp()` on 2026-04-12 (see `.claude/rules/esp-safety.md`). Old
+`config.toml` files with a leftover `[esp]` section are silently ignored by serde on load.
 
 ### Template Engine
 
@@ -409,19 +420,22 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Module | File | Lines | Purpose |
 |--------|------|-------|---------|
-| `backup` | `src/backup.rs` | ~1020 | btrbk snapshot/send orchestration with volume deduplication |
-| `config` | `src/config.rs` | ~680 | TOML config types, DAS/source/target models |
-| `db` | `src/db.rs` | ~1060 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
-| `health` | `src/health.rs` | ~930 | Drive health (SMART), mountpoint checks, serial→device resolution |
-| `indexer` | `src/indexer.rs` | ~480 | Snapshot discovery, span logic, walk orchestration |
-| `mount` | `src/mount.rs` | ~350 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |
+| `backup` | `src/backup.rs` | ~1750 | btrbk snapshot/send orchestration with volume deduplication |
+| `config` | `src/config.rs` | ~1080 | TOML config types, DAS/source/target models |
+| `db` | `src/db.rs` | ~1090 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
+| `doctor` | `src/doctor.rs` | ~1120 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
+| `ffi` | `src/ffi.rs` | ~670 | C-ABI FFI bridge (extern "C" functions for the GUI's `libbuttered_dasd_ffi.so`) |
+| `health` | `src/health.rs` | ~1550 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
+| `indexer` | `src/indexer.rs` | ~510 | Snapshot discovery, span logic, walk orchestration |
+| `mount` | `src/mount.rs` | ~510 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |
 | `progress` | `src/progress.rs` | ~115 | Progress reporting trait and D-Bus signal bridge |
-| `report` | `src/report.rs` | ~210 | Backup report formatting |
+| `report` | `src/report.rs` | ~610 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~640 | File and snapshot restore via btrfs send/receive |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
-| `subvol` | `src/subvol.rs` | ~205 | Subvolume CRUD operations |
-| `main` | `src/main.rs` | — | CLI entry point with clap subcommands |
+| `scrub` | `src/scrub.rs` | ~2850 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
+| `subvol` | `src/subvol.rs` | ~210 | Subvolume CRUD operations |
+| `main` | `src/main.rs` | ~2340 | CLI entry point with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
 | `setup/config` | `src/setup/config.rs` | — | TOML config types with serde |
 | `setup/detect` | `src/setup/detect.rs` | — | System detection (devices, init, packages) |
@@ -431,7 +445,9 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 ### KDE Plasma GUI (`gui/src/`)
 
-19 C++ components implementing full backup management:
+18 C++ components implementing full backup management (the previous read-only `Database`
+QSqlDatabase wrapper was removed when the GUI's models were rewired to go through
+`DBusClient`/`btrdasd-helper` exclusively — see `dbusclient.h/cpp` below):
 
 | Component | Files | Purpose |
 |-----------|-------|---------|
@@ -439,13 +455,12 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health sections) |
 | DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
 | ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, resizable raw log (native dock resize), smart auto-scroll |
-| Database | `database.h/cpp` | Read-only QSqlDatabase wrapper with UUID connections, backup history/usage queries |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
 | FileModel | `filemodel.h/cpp` | QAbstractTableModel with paginated loading (10k per page via D-Bus) |
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |
 | SnapshotBrowser | `snapshotbrowser.h/cpp` | Dolphin-style file browser; breadcrumb nav, detail/icon views, context menu, filter bar |
 | BackupPanel | `backuppanel.h/cpp` | Mode selection, operation checkboxes, source/target selection, dry-run support |
-| BackupHistoryView | `backuphistoryview.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
+| BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
 | SetupWizard | `setupwizard.h/cpp` | QWizard first-run wizard: Welcome, Sources, Targets, Schedule, Summary |
@@ -459,8 +474,10 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Suite | Count | Framework |
 |-------|-------|-----------|
-| Rust unit tests | 137 | `#[cfg(test)]` modules in lib crate |
-| Rust setup tests | 21 | `#[cfg(test)]` modules in setup modules |
+| Rust unit tests | 267 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 15 `pub mod`s) |
+| Rust CLI tests | 21 | `#[cfg(test)]` module in `main.rs` (`btrdasd` binary, not part of the lib crate) |
+| Rust setup tests | 26 | `#[cfg(test)]` modules in `setup/` (binary-only, declared from `main.rs`) |
 | Rust integration tests | 9 | `indexer/tests/integration_test.rs` |
-| C++ GUI tests | 4 suites | QTest via ECMAddTests |
-| **Total** | **167 Rust + 4 Qt** | |
+| Rust loopback tests (manual, root-gated) | 2 | `indexer/tests/scrub_loopback.rs` — `#[ignore]`d; real loop-device BTRFS + `btrfs scrub`, not run by plain `cargo test` |
+| C++ GUI tests | 0 | None currently — the 4 QTest suites (`gui/tests/*.cpp`) were removed 2026-03-01 as orphaned references to a deleted `database.h`; `Qt6::Test` is still linked by `gui/CMakeLists.txt` but nothing uses it |
+| **Total** | **323 Rust (325 incl. manual) + 0 Qt** | |

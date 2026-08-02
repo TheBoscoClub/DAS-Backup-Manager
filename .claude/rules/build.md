@@ -30,7 +30,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 
 ## Rust (buttered_dasd library + btrdasd CLI)
 - Rust 2024 edition, `cargo clippy` and `cargo fmt` before committing
-- Library crate `buttered_dasd` exports 13 public modules; `setup/` is binary-only
+- Library crate `buttered_dasd` exports 15 public modules (`backup`, `config`, `db`, `doctor`, `ffi`, `health`, `indexer`, `mount`, `progress`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only
 - Use `LazyLock<Regex>` for compile-once regex patterns (not per-call `Regex::new()`)
 - Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - All database access through `db::Database` with prepared statements

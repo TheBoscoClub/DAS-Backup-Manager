@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.7.11
+**Version**: 0.7.12.3
 
 ## 1. Rust Crate Dependencies
 
@@ -11,37 +11,37 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 
 | Crate | Version (locked) | Purpose | License |
 |-------|-----------------|---------|---------|
-| `rusqlite` | 0.38.0 | SQLite bindings with FTS5 support; uses `bundled` feature to compile SQLite from source | MIT |
-| `clap` | 4.5.60 | Command-line argument parsing with derive macros (`derive` feature) | MIT / Apache-2.0 |
+| `rusqlite` | 0.40.1 | SQLite bindings with FTS5 support; uses `bundled` feature to compile SQLite from source | MIT |
+| `clap` | 4.6.4 | Command-line argument parsing with derive macros (`derive` feature) | MIT / Apache-2.0 |
 | `walkdir` | 2.5.0 | Recursive directory traversal for snapshot indexing | Unlicense / MIT |
-| `regex` | 1.12.3 | Pattern matching for snapshot path filtering | MIT / Apache-2.0 |
-| `serde` | 1.0.228 | Serialization/deserialization framework with `derive` feature for TOML config | MIT / Apache-2.0 |
-| `toml` | 0.8.23 | TOML parser and serializer for installer configuration | MIT / Apache-2.0 |
-| `dialoguer` | 0.11.0 | Interactive terminal prompts with `fuzzy-select` feature for setup wizard | MIT |
-| `console` | 0.15.11 | Terminal styling and interaction (used by dialoguer) | MIT |
-| `libc` | 0.2.182 | Low-level C bindings for `geteuid()` root detection in setup module | MIT / Apache-2.0 |
-| `serde_json` | 1.0.149 | JSON parsing for `lsblk --json` output in system detection and FFI interchange | MIT / Apache-2.0 |
-| `clap_complete` | 4.5.x | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
-| `tokio` | 1.x | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation | MIT |
-| `zbus` | 5.x | D-Bus implementation for `btrdasd-helper` system bus daemon | MIT |
+| `regex` | 1.13.1 | Pattern matching for snapshot path filtering | MIT / Apache-2.0 |
+| `serde` | 1.0.229 | Serialization/deserialization framework with `derive` feature for TOML config | MIT / Apache-2.0 |
+| `toml` | 1.1.3 | TOML parser and serializer for installer configuration | MIT / Apache-2.0 |
+| `dialoguer` | 0.12.0 | Interactive terminal prompts with `fuzzy-select` feature for setup wizard | MIT |
+| `console` | 0.16.4 | Terminal styling and interaction (used by dialoguer) | MIT |
+| `libc` | 0.2.189 | Low-level C bindings for `geteuid()` root detection in setup module | MIT / Apache-2.0 |
+| `serde_json` | 1.0.151 | JSON parsing for `lsblk --json` output in system detection and FFI interchange | MIT / Apache-2.0 |
+| `clap_complete` | 4.6.8 | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
+| `tokio` | 1.53.1 | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation | MIT |
+| `zbus` | 5.18.0 | D-Bus implementation for `btrdasd-helper` system bus daemon | MIT |
 
 ### Dev Dependencies (test only)
 
 | Crate | Version (locked) | Purpose | License |
 |-------|-----------------|---------|---------|
-| `tempfile` | 3.25.0 | Creates temporary files and directories for integration tests | MIT / Apache-2.0 |
-| `filetime` | 0.2.27 | Sets file modification timestamps in tests to simulate incremental indexing | MIT / Apache-2.0 |
+| `tempfile` | 3.27.0 | Creates temporary files and directories for integration tests | MIT / Apache-2.0 |
+| `filetime` | 0.2.29 | Sets file modification timestamps in tests to simulate incremental indexing | MIT / Apache-2.0 |
 
 ### Notable Transitive Dependencies
 
 | Crate | Version | Role |
 |-------|---------|------|
-| `libsqlite3-sys` | 0.36.0 | Low-level SQLite FFI; compiles bundled SQLite via the `cc` crate |
-| `clap_derive` | 4.5.55 | Proc-macro backend for clap derive API |
-| `regex-automata` | 0.4.14 | DFA/NFA engine underlying the `regex` crate |
+| `libsqlite3-sys` | 0.38.1 | Low-level SQLite FFI; compiles bundled SQLite via the `cc` crate |
+| `clap_derive` | 4.6.4 | Proc-macro backend for clap derive API |
+| `regex-automata` | 0.4.16 | DFA/NFA engine underlying the `regex` crate |
 | `aho-corasick` | 1.1.4 | Multi-pattern string search used by `regex` |
-| `toml_edit` | 0.22.x | TOML document model underlying the `toml` crate |
-| `serde_derive` | 1.0.x | Proc-macro for `#[derive(Serialize, Deserialize)]` |
+| `toml_edit` | 0.23.10 | TOML document model underlying the `toml` crate |
+| `serde_derive` | 1.0.229 | Proc-macro for `#[derive(Serialize, Deserialize)]` |
 
 ---
 
@@ -53,9 +53,9 @@ are automatically installed; they must be present before running the scripts.
 | Tool | Version / Source | Used By | Purpose |
 |------|-----------------|---------|---------|
 | `btrbk` | >= 0.32 (AUR/pacman) | `backup-run.sh`, `backup-verify.sh` | BTRFS snapshot creation and send/receive to DAS targets |
-| `btrfs-progs` | system (`btrfs` CLI) | `backup-run.sh`, `backup-verify.sh`, `btrdasd setup` | BTRFS subvolume operations: list, snapshot, delete, usage, label |
-| `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh` | Drive serial number detection, SMART health, temperature, power-on hours |
-| `rsync` | system | `backup-run.sh` | ESP synchronization from `/boot` to DAS bootable recovery drives |
+| `btrfs-progs` | system (`btrfs` CLI) | `backup-run.sh`, `backup-verify.sh`, `btrdasd setup`, `btrdasd scrub`, `btrdasd doctor` | BTRFS subvolume operations, `btrfs scrub start`/`status`, subvolume listing for drift detection |
+| `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh`, `btrdasd health` | Drive serial number detection, SMART health, temperature, power-on hours |
+| `rsync` | system | Manual disaster-recovery restores only (see `docs/DISASTER-RECOVERY-GUIDE.md`) | Not used by any automated script — ESP synchronization was removed 2026-04-10/12 (`.claude/rules/esp-safety.md`) |
 | `s-nail` (mailx) | system | `backup-run.sh` | Sends email backup reports via SMTP (Proton Bridge); invoked as `mailx` |
 | `msmtp` | system (optional) | `backup-run.sh` | Alternative SMTP transport; `s-nail` is the primary sender |
 | `mount` / `umount` | system (util-linux) | `backup-run.sh`, `backup-verify.sh` | Mounts BTRFS source volumes and DAS targets before backup |
@@ -119,7 +119,7 @@ needed when building with `BUILD_GUI=ON` (the default).
 
 | Dependency | Version Target | Purpose | License |
 |-----------|---------------|---------|---------|
-| Qt6 | 6.6+ (tested 6.10.2) | UI framework: widgets, signals/slots, model/view, SQL | LGPL-3.0 |
+| Qt6 | 6.6+ (tested 6.10.2) | UI framework: Core, Widgets, DBus, Charts (growth trendline) | LGPL-3.0 |
 | KDE Frameworks 6 (KF6) | 6.0+ (tested 6.23.0) | KXmlGuiWindow, KAboutData, KIO for restore operations, KDE HIG compliance | LGPL-2.1 / LGPL-3.0 |
 | CMake | >= 3.25 (tested 4.2.3) | Build system for the Qt/KF6 C++20 GUI component | BSD-3-Clause |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros and platform integration | BSD-2-Clause |
@@ -138,6 +138,10 @@ needed when building with `BUILD_GUI=ON` (the default).
 | Notifications | KNotification for backup complete/fail desktop notifications |
 | StatusNotifierItem | KStatusNotifierItem for system tray integration |
 
-The GUI links against `Qt6::Sql` for database access and `Qt6::DBus` for communication with
-`btrdasd-helper`. The GUI opens the database read-only; all write operations go through D-Bus.
+The GUI links against `Qt6::DBus` for all communication with `btrdasd-helper` — every read
+and write goes through D-Bus. There is no `Qt6::Sql` dependency and no direct database
+connection: the previous read-only `QSqlDatabase` wrapper (`database.h/cpp`) was removed
+when the GUI's models were rewired onto `DBusClient` exclusively. `Qt6::Test` is still
+found under `BUILD_TESTING` for `ECMAddTests`, but no test target currently uses it (see
+the Tests section of `docs/ARCHITECTURE.md`).
 

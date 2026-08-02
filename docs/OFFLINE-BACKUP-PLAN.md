@@ -46,7 +46,11 @@ You can designate one or more DAS drives as bootable recovery systems:
 - To recover: plug in DAS, select it from UEFI boot menu, boot into a working system
 - From the recovery OS, repair or reinstall to production drives
 
-**ESP mirroring**: If you have multiple bootable recovery drives, `btrdasd setup` can configure package manager hooks to automatically sync the ESP across all of them whenever the kernel or bootloader updates.
+**ESP mirroring**: `btrdasd setup` does **not** provide this — ESP/boot partition mirroring
+and its package-manager hook generator were removed from the codebase on 2026-04-10/12
+after an ESP-overwrite incident (see `.claude/rules/esp-safety.md`). If you want multiple
+bootable recovery drives to stay in sync, that is a manual or host-level concern entirely
+outside this project's scope, independent of any `[[target]]` role here.
 
 ### Tiered Backup Architecture
 
@@ -173,18 +177,24 @@ The `das-backup.timer` systemd unit (or cron job on sysvinit/OpenRC) runs nightl
 3. Records pre-backup disk usage for throughput measurement
 4. Runs `btrbk run` -- creates snapshots and sends incremental deltas to all targets
 5. Records post-backup usage, logs per-target throughput
-6. Updates stable boot subvolumes on bootable recovery drives (if configured)
-7. Syncs ESP to bootable drives (if configured)
+6. Archives and recreates boot subvolumes on non-mirror targets (`--full` runs only; skips `role=mirror` targets)
+7. Prunes expired boot subvolume archives past `[boot].archive_retention_days`
 8. Records growth data point for trend analysis
 9. Generates and emails a backup report (if configured)
 10. Unmounts all volumes and cleans up
 
+There is no ESP sync step — ESP/boot partition mirroring was removed from the codebase
+2026-04-10/12 (see `.claude/rules/esp-safety.md`).
+
 ### Manual Backup
 
+`backup-run.sh` is not on `$PATH` — it is installed flat at `${prefix}/lib/das-backup/`
+(`/usr/lib/das-backup/backup-run.sh` on this host's default `install_prefix = /usr`):
+
 ```bash
-sudo backup-run.sh                # incremental
-sudo backup-run.sh --dryrun       # preview
-sudo backup-run.sh --full         # force full send
+sudo /usr/lib/das-backup/backup-run.sh                # incremental
+sudo /usr/lib/das-backup/backup-run.sh --dryrun       # preview
+sudo /usr/lib/das-backup/backup-run.sh --full         # force full send
 ```
 
 ### Recommended Schedule
@@ -198,7 +208,7 @@ sudo backup-run.sh --full         # force full send
 
 After each backup, the report includes:
 
-- **Backup Operations** -- btrbk success/fail + duration, boot subvolume update status, ESP sync status
+- **Backup Operations** -- btrbk success/fail + duration, boot subvolume archive/cleanup status, unmount status
 - **Throughput** -- per-target data written and transfer rate
 - **Disk Capacity** -- used/available/percentage for all backup targets
 - **Growth Analysis** -- daily growth, 7-day average, 30-day average, capacity runway projection

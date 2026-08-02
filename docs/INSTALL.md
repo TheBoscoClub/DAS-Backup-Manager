@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.11
+**Version**: 0.7.12.3
 
 ## Before You Begin
 
@@ -42,7 +42,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | Dependency | Version | Purpose |
 |-----------|---------|---------|
 | s-nail (mailx) | system | Email backup reports (when email reporting enabled) |
-| rsync | system | ESP/boot partition mirroring (when ESP sync enabled) |
+| rsync | system | Manual disaster-recovery restores (see [Disaster Recovery Guide](DISASTER-RECOVERY-GUIDE.md)) — not used by any automated backup path |
 | mbuffer | system | Buffered btrbk stream transfers (improves throughput) |
 
 ### Optional (for GUI)
@@ -73,18 +73,22 @@ sudo btrdasd setup
 
 This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon), `libbuttered_dasd_ffi.so` (FFI library), backup scripts, systemd units, D-Bus/polkit configs, shell completions, man page, and desktop entry.
 
-The wizard walks through 10 configuration steps:
+The wizard auto-detects the init system, package manager, and installed dependencies
+before it starts, then walks through the following on-screen steps (numbered `[1/10]`
+through `[10/10]` — step 4 was the ESP-mirroring step, removed 2026-04-12 along with all
+ESP sync code; the wizard's step counter still skips straight from `[3/10]` to `[5/10]`):
 
-1. **Init system detection** — systemd, sysvinit, or OpenRC
-2. **Package manager detection** — pacman, apt, dnf, zypper
-3. **Dependency check** — verifies btrbk, btrfs, smartctl, etc.
-4. **Source selection** — choose BTRFS subvolumes to back up
-5. **Target selection** — choose backup destination drives
-6. **Retention policy** — weekly and monthly snapshot counts per target
-7. **Schedule** — incremental and full backup times
-8. **ESP mirroring** — optional boot partition synchronization
-9. **Email reports** — optional SMTP configuration
-10. **Review and install** — shows generated config, writes files
+1. **Checking Dependencies** `[1/10]` — verifies btrbk, btrfs, smartctl, etc. against the
+   auto-detected system info
+2. **Backup Sources (BTRFS Subvolumes)** `[2/10]` — choose BTRFS subvolumes to back up
+3. **Backup Targets** `[3/10]` — choose backup destination drives
+4. **Retention Policy** `[5/10]` — weekly and monthly snapshot counts per target
+5. **Backup Schedule** `[6/10]` — incremental and full backup times
+6. **Email Notifications** `[7/10]` — optional SMTP configuration (reads
+   `~/.config/pbridge.conf`)
+7. **Install Location** `[8/10]` — binary/script install prefix
+8. **KDE Plasma GUI** `[9/10]` — GUI desktop entry install toggle
+9. **Review Configuration** `[10/10]` — shows generated config, writes files
 
 ## Installer Modes
 
@@ -120,10 +124,11 @@ sudo btrdasd setup --uninstall
 
 Removes all files listed in the install manifest (`/etc/das-backup/.manifest`):
 - Generated btrbk.conf
-- systemd/cron units
+- systemd/cron units (backup, scrub, doctor)
 - Generated backup scripts
-- Email configuration
-- ESP hooks
+
+`~/.config/pbridge.conf` is never touched — it is a user-curated credential file the
+installer only reads from, never generates or removes.
 
 Prompts whether to also remove the backup database at `/var/lib/das-backup/backup-index.db`. The TOML config file is preserved for potential reinstallation.
 
@@ -260,9 +265,13 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `version` | string | `"0.7.11"` | Config format version |
+| `version` | string | `"0.7.12"` | Config format version (tracks `CARGO_PKG_VERSION`, the 3-part semver) |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
+| `log_file` | string | `"/var/log/das-backup.log"` | Backup log path |
+| `growth_log` | string | `"/var/lib/das-backup/growth.log"` | Capacity growth trend log path |
+| `last_report` | string | `"/var/lib/das-backup/last-report.txt"` | Most recent email report body, cached for the GUI |
+| `btrbk_conf` | string | `"/etc/btrbk/btrbk.conf"` | btrbk config path |
 
 ### `[init]`
 
@@ -294,20 +303,29 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 | `label` | string | Human-readable name (e.g., `"primary-22tb"`) |
 | `serial` | string | Drive serial for identification |
 | `mount` | string | Mount point (e.g., `"/mnt/backup-22tb"`) |
-| `role` | enum | `"primary"`, `"mirror"`, or `"esp-sync"` |
+| `role` | enum | `"primary"` or `"mirror"` |
 | `retention.weekly` | u32 | Number of weekly snapshots to retain |
 | `retention.monthly` | u32 | Number of monthly snapshots to retain |
 
-### `[esp]`
+### `[boot]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable ESP/boot partition mirroring |
-| `mirror` | bool | `false` | Mirror ESP across multiple partitions |
-| `partitions` | string[] | `[]` | ESP partition device paths |
-| `mount_points` | string[] | `[]` | ESP mount points |
-| `hooks.enabled` | bool | `false` | Generate package manager hooks |
-| `hooks.type` | enum | `"none"` | `"pacman"`, `"apt"`, `"dnf"`, or `"none"` |
+| `enabled` | bool | `true` | Enable boot subvolume archival (archive-then-recreate on `--full` runs) |
+| `subvolumes` | string[] | `["@", "@home"]` | Subvolumes archived and recreated |
+| `archive_retention_days` | u32 | `60` | Days to retain `@.archive.*`/`@home.archive.*` snapshots before `boot-archive-cleanup.sh` prunes them |
+
+### `[doctor]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `exclude` | string[] | `[]` | Extra glob patterns excluded from `btrdasd doctor --check-drift` reporting, on top of the built-in exclusions |
+
+**Removed section**: `[esp]` (enabled, mirror, partitions, mount_points, hooks.enabled,
+hooks.type) — ESP/boot partition mirroring was removed from the codebase on 2026-04-10
+(orphan pacman hook generator) and 2026-04-12 (remaining `Esp` struct and `sync_esp()`);
+see `.claude/rules/esp-safety.md`. Old `config.toml` files with a leftover `[esp]` section
+are silently ignored by serde on load.
 
 ### `[email]`
 
@@ -344,15 +362,23 @@ The installer creates the following files (tracked in `/etc/das-backup/.manifest
 |------|---------|
 | `/etc/das-backup/config.toml` | Master configuration |
 | `/etc/btrbk/btrbk.conf` | btrbk snapshot configuration |
+| `${prefix}/lib/das-backup/backup-run.sh` | Real production backup orchestrator script, installed flat (same layout `cmake --install` uses — no `scripts/` subdirectory, no wrapper) |
+| `${prefix}/lib/das-backup/backup-verify.sh` | Real production drive-verification script, installed flat |
+| `${prefix}/lib/das-backup/boot-archive-cleanup.sh` | Real production archive-pruner script, installed flat |
 | `/etc/systemd/system/das-backup.service` | Incremental backup service (systemd) |
 | `/etc/systemd/system/das-backup.timer` | Incremental backup timer (systemd) |
 | `/etc/systemd/system/das-backup-full.service` | Full backup service (systemd) |
 | `/etc/systemd/system/das-backup-full.timer` | Full backup timer (systemd) |
 | `/etc/systemd/system/das-scrub.service` | Scheduled BTRFS scrub service (systemd) — runs `btrdasd scrub run` |
 | `/etc/systemd/system/das-scrub.timer` | Scheduled BTRFS scrub timer (systemd) — `OnCalendar` from `[scrub].on_calendar`, enabled only when `[scrub].enabled = true` |
-| `/usr/local/lib/das-backup/backup-run-generated.sh` | Generated backup script |
-| `~/.config/pbridge.conf` | SMTP credentials (Protonmail Bridge — single canonical source, mode 0600) |
-| `/usr/share/libalpm/hooks/das-backup-esp.hook` | Pacman ESP hook (if enabled) |
+| `/etc/systemd/system/das-backup-doctor.service` | Subvolume drift detector service (systemd) — runs `btrdasd doctor --check-drift --email` |
+| `/etc/systemd/system/das-backup-doctor.timer` | Subvolume drift detector timer (systemd) — fixed `Sun 02:00`, always enabled |
+
+`${prefix}` is `[general].install_prefix` (default `/usr/local`, `/usr` on the live system
+here). SMTP credentials are **not** a generated file — `~/.config/pbridge.conf` is a
+user-curated file the installer reads from but never writes (see the Protonmail Bridge
+section of `~/.claude/rules/infrastructure.md`). ESP pacman hook generation was removed
+2026-04-10; no ESP hook file is ever generated.
 
 For sysvinit/OpenRC systems, cron entries replace systemd units.
 

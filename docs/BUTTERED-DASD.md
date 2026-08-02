@@ -1,6 +1,6 @@
 # ButteredDASD — Content Indexer for DAS Backup Snapshots
 
-**Binary**: `btrdasd` | **Version**: 0.7.11 | **Language**: Rust (edition 2024)
+**Binary**: `btrdasd` | **Version**: 0.7.12.3 | **Language**: Rust (edition 2024)
 
 ## Overview
 
@@ -223,7 +223,7 @@ See [INSTALL.md](INSTALL.md) for comprehensive installation instructions includi
 
 ```bash
 cd indexer
-cargo test              # 62 tests (37 unit + 16 setup + 9 integration)
+cargo test              # 323 tests (267 lib unit + 21 CLI + 26 setup + 9 integration)
 cargo clippy            # Lint check
 cargo fmt --check       # Format check
 cargo audit             # Security audit
