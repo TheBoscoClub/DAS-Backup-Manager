@@ -1,9 +1,28 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.3.1
-# Date: 2026-08-01
+# Version: 4.4.0
+# Date: 2026-08-02
 #
 # Features:
+#   - Report generated after unmount, from cached mount-time data (v4.4.0):
+#     previously generate_report() ran BEFORE unmount_all(), so an unmount
+#     failure was visible only in the console/journal — never in the same
+#     run's email, and never reflected in the DB-recorded overall_status.
+#     New capture_report_data() snapshots df -h / df --output=avail capacity
+#     figures and `btrbk list latest` per target while targets are still
+#     mounted, into CAPACITY_USED/CAPACITY_AVAIL/CAPACITY_PCT/AVAIL_BYTES,
+#     an ordered REPORT_TARGETS array, and BTRBK_LATEST. generate_
+#     capacity_section()/generate_growth_section() now iterate
+#     REPORT_TARGETS and read only these caches — no live mountpoint/df
+#     calls — so report output is byte-identical to the pre-unmount case.
+#     main()'s real-backup path is reordered to run_archive_cleanup ->
+#     capture_report_data -> unmount_all -> overall_status -> generate_
+#     report -> send_report -> record_backup_run_in_db, and BACKUP
+#     OPERATIONS gained a dedicated "Unmount targets" row fed by
+#     OP_STATUS[unmount]/[unmount_detail]. overall_status now includes
+#     unmount failures — intentional: the email subject and DB row now
+#     correctly flip to FAILURE when the DAS didn't unmount cleanly. Tracks
+#     bd DAS-Backup-Manager-ecg.
 #   - Boot subvolume snapshot finder pattern fix (v4.3.1): update_boot_subvolumes()'s
 #     latest_root/latest_home finders were matching zero snapshots on every
 #     run, on every target, silently. btrbk.conf's nvme volume sets
@@ -225,6 +244,20 @@ BTRBK_END_TIME=0
 
 # Operation status tracking (for email report)
 declare -A OP_STATUS=()
+
+# Report-time cache — populated by capture_report_data() while targets are
+# still mounted, BEFORE unmount_all() runs in main(). generate_capacity_
+# section()/generate_growth_section() and the LATEST SNAPSHOTS line in
+# generate_report() read ONLY these cached values (never a live mountpoint/
+# df/btrbk call), so the report can be built after unmount without losing
+# data and an unmount failure still lands in the same run's email. Tracks
+# bd DAS-Backup-Manager-ecg.
+declare -A CAPACITY_USED=()
+declare -A CAPACITY_AVAIL=()
+declare -A CAPACITY_PCT=()
+declare -A AVAIL_BYTES=()
+REPORT_TARGETS=()
+BTRBK_LATEST=""
 
 # Track whether backup run has been recorded (prevents double-recording)
 BACKUP_RUN_RECORDED="false"
@@ -1050,6 +1083,56 @@ capture_usage() {
     fi
 }
 
+# Cache all report data that requires a live mount or a live btrbk call,
+# while targets are still mounted. MUST run before unmount_all() in main()'s
+# real-backup path. generate_capacity_section(), generate_growth_section(),
+# and the LATEST SNAPSHOTS line in generate_report() read only the globals
+# populated here (REPORT_TARGETS, CAPACITY_*, AVAIL_BYTES, BTRBK_LATEST) —
+# no mountpoint/df/btrbk calls after this point. Tracks bd DAS-Backup-Manager-ecg.
+capture_report_data() {
+    REPORT_TARGETS=()
+
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+        REPORT_TARGETS+=("$mnt")
+
+        # `|| true` on both df calls: same set -euo pipefail hazard as
+        # BTRBK_LATEST below, but worse here — capture_report_data() runs as
+        # a bare statement in main() (not inside an if/&&/||), and this
+        # script has no `set -o errtrace`, so a killed df here would NOT
+        # even trigger the ERR trap/cleanup() — unmount_all() would simply
+        # never run, leaving the DAS mounted with no email and no DB row.
+        # A guarded df failure instead leaves df_line/the avail read empty;
+        # the target stays in REPORT_TARGETS (mountpoint -q already
+        # confirmed it's genuinely mounted) and renders as "?"/0 downstream
+        # via the existing ${CAPACITY_*[$mnt]:-?} / ${AVAIL_BYTES[$mnt]:-0}
+        # defaults in generate_capacity_section()/generate_growth_section()
+        # — chosen over silently dropping the target so a genuine target
+        # with a flaky df call still shows up in the report instead of
+        # vanishing from it. Tracks bd DAS-Backup-Manager-ecg.
+        local df_line
+        df_line=$(df -h "$mnt" 2>/dev/null | tail -1) || true
+        CAPACITY_USED[$mnt]=$(echo "$df_line" | awk '{print $3}')
+        CAPACITY_AVAIL[$mnt]=$(echo "$df_line" | awk '{print $4}')
+        CAPACITY_PCT[$mnt]=$(echo "$df_line" | awk '{print $5}')
+
+        AVAIL_BYTES[$mnt]=$(df --output=avail -B1 "$mnt" 2>/dev/null | tail -1 | tr -d ' ') || true
+    done
+
+    # `|| true` is required, not decorative: under set -euo pipefail, a bare
+    # `VAR=$(cmd1 | cmd2)` assignment fails the whole script the instant
+    # `btrbk list latest` returns nonzero (config error, transient lock,
+    # etc.) — the exact class of footgun run_btrbk()'s dryrun branch was
+    # fixed for in v4.3.0 (bd DAS-Backup-Manager-vuw). Falling back to an
+    # empty BTRBK_LATEST is safe: generate_report()'s
+    # ${BTRBK_LATEST:-  (none yet)} already handles empty. Caught live by
+    # the bd DAS-Backup-Manager-ecg verification harness, which reproduced
+    # exactly this abort against a deliberately-broken btrbk config.
+    BTRBK_LATEST=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}') || true
+}
+
 # Log throughput report for all targets
 log_throughput() {
     local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
@@ -1247,6 +1330,7 @@ BACKUP OPERATIONS
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
   Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
+  Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
 
 THROUGHPUT
@@ -1267,10 +1351,10 @@ $(generate_smart_section)
 
 LATEST SNAPSHOTS
 ───────────────────────────────────────────────────────────────
-$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
+${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.3.1
+  backup-run.sh v4.4.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -1310,22 +1394,20 @@ generate_throughput_section() {
 generate_capacity_section() {
     printf "  %-24s %-10s %-10s %s\n" "Target" "Used" "Avail" "Use%"
 
-    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        if ! mountpoint -q "$mnt" 2>/dev/null; then continue; fi
+    # Reads ONLY the cache populated by capture_report_data() while targets
+    # were still mounted — no live mountpoint/df calls here. See
+    # capture_report_data() for why: this runs after unmount_all() in
+    # main()'s real-backup path. Tracks bd DAS-Backup-Manager-ecg.
+    for mnt in "${REPORT_TARGETS[@]}"; do
         local name="${TARGET_NAMES[$mnt]:-$mnt}"
-        local df_line
-        df_line=$(df -h "$mnt" 2>/dev/null | tail -1)
-        local used avail pct
-        used=$(echo "$df_line" | awk '{print $3}')
-        avail=$(echo "$df_line" | awk '{print $4}')
-        pct=$(echo "$df_line" | awk '{print $5}')
-        printf "  %-24s %-10s %-10s %s\n" "$name" "$used" "$avail" "$pct"
+        printf "  %-24s %-10s %-10s %s\n" "$name" "${CAPACITY_USED[$mnt]:-?}" "${CAPACITY_AVAIL[$mnt]:-?}" "${CAPACITY_PCT[$mnt]:-?}"
     done
 }
 
 generate_growth_section() {
-    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        if ! mountpoint -q "$mnt" 2>/dev/null; then continue; fi
+    # Reads ONLY the cache populated by capture_report_data() — see
+    # generate_capacity_section() above. Tracks bd DAS-Backup-Manager-ecg.
+    for mnt in "${REPORT_TARGETS[@]}"; do
         local name="${TARGET_NAMES[$mnt]:-$mnt}"
         local current="${USAGE_AFTER[$mnt]:-0}"
         local today_delta=$(( ${USAGE_AFTER[$mnt]:-0} - ${USAGE_BEFORE[$mnt]:-0} ))
@@ -1344,9 +1426,8 @@ generate_growth_section() {
             printf "    30-day avg:         %s/day\n" "$(format_bytes "$avg_30d")"
         fi
 
-        # Capacity runway projection
-        local avail_bytes
-        avail_bytes=$(df --output=avail -B1 "$mnt" 2>/dev/null | tail -1 | tr -d ' ')
+        # Capacity runway projection (cached avail bytes, captured while mounted)
+        local avail_bytes="${AVAIL_BYTES[$mnt]:-0}"
         local growth_rate=$avg_30d
         if (( growth_rate <= 0 )); then growth_rate=$avg_7d; fi
         if (( growth_rate <= 0 && today_delta > 0 )); then growth_rate=$today_delta; fi
@@ -1494,11 +1575,25 @@ record_backup_run_in_db() {
         fi
     done
 
-    # Count snapshots from btrbk
+    # Count snapshots — read from the cached BTRBK_LATEST populated by
+    # capture_report_data() while targets were still mounted. This function
+    # now runs AFTER unmount_all() in main()'s real-backup path, and a live
+    # `btrbk list latest` call here would see every target's STATUS column
+    # as `-` post-unmount, silently recording snaps-created=0/snaps-sent=0
+    # into the DB the GUI reads on every real run (bd DAS-Backup-Manager-ecg
+    # review finding, reproduced live). BTRBK_LATEST already has its header
+    # line stripped and each data line prefixed with two spaces (built via
+    # `awk 'NR>1{printf "  %s\n", $0}'` in capture_report_data()) — leading
+    # whitespace does not affect `grep -c`'s substring match, so counting
+    # semantics are unchanged from the original raw-output version (whose
+    # `grep -v "^SOURCE_SUBVOLUME"` also only ever stripped the header
+    # line). An empty BTRBK_LATEST (capture failed, or genuinely nothing to
+    # report) leaves both counts at 0, matching the original's behavior when
+    # the live btrbk call failed or produced no non-header output.
     local snaps_created=0
     local snaps_sent=0
-    if btrbk_latest=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | grep -v "^SOURCE_SUBVOLUME"); then
-        snaps_created=$(echo "$btrbk_latest" | grep -c "up-to-date" || true)
+    if [[ -n "$BTRBK_LATEST" ]]; then
+        snaps_created=$(echo "$BTRBK_LATEST" | grep -c "up-to-date" || true)
         # snaps_sent uses bytes written as a proxy: if data was transferred, snapshots were sent
         if (( total_bytes > 0 )); then
             snaps_sent=$snaps_created
@@ -1633,13 +1728,25 @@ main() {
         show_stats
         run_indexer
 
-        # Record growth data and generate email report
+        # Record growth data — must still run before unmount (writes to
+        # GROWTH_LOG using live per-target usage figures).
         record_growth
 
         # Prune expired boot archives (daily and full runs alike) while
         # targets are still mounted, before the report is built so pruner
         # failures are visible in overall_status and the email report.
         run_archive_cleanup "$mode"
+
+        # Cache capacity/growth/btrbk-latest report data while targets are
+        # still mounted, THEN unmount, THEN build the report. This ordering
+        # (vs. the previous report-before-unmount sequence) is what lets an
+        # unmount failure appear in the SAME run's email and DB row instead
+        # of only the post-unmount console/journal message below. See
+        # capture_report_data() and generate_capacity_section()/
+        # generate_growth_section() for the cache the report now reads from.
+        # Tracks bd DAS-Backup-Manager-ecg.
+        capture_report_data
+        unmount_all
 
         local overall_status="SUCCESS"
         for op in "${!OP_STATUS[@]}"; do
@@ -1664,9 +1771,8 @@ main() {
         # targets are mounted — boot-archive-cleanup.sh silently skips any
         # target that isn't currently mounted.
         run_archive_cleanup "$mode"
+        unmount_all
     fi
-
-    unmount_all
 
     log_info "=== DAS Backup Completed ==="
     echo ""
