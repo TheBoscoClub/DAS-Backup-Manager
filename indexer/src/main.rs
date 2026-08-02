@@ -2071,9 +2071,9 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         // What the pre-fix bug would have left behind: a non-zero
         // started_epoch despite the child process never launching.
         spawn_failed.started_epoch = 1_700_000_100;
-        spawn_failed.errors.push(
-            "cannot start btrfs scrub on /mnt/a: No such file or directory".to_string(),
-        );
+        spawn_failed
+            .errors
+            .push("cannot start btrfs scrub on /mnt/a: No such file or directory".to_string());
         let pass = fake_pass(scrub::PassStatus::Completed, vec![spawn_failed]);
         assert_eq!(
             exit_code_for_pass(&pass),
