@@ -1,9 +1,33 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.3.0
+# Version: 4.3.1
 # Date: 2026-08-01
 #
 # Features:
+#   - Boot subvolume snapshot finder pattern fix (v4.3.1): update_boot_subvolumes()'s
+#     latest_root/latest_home finders were matching zero snapshots on every
+#     run, on every target, silently. btrbk.conf's nvme volume sets
+#     snapshot_name "root-" for @ (and "home" for @home), so on-disk
+#     snapshot names are "root-.<TS>" / "home.<TS>" — the finder's old
+#     `nvme/root\.` pattern (root immediately followed by a dot) has NEVER
+#     matched "root-.<TS>" (an extra "-" sits between "root" and the dot).
+#     Pre-existing since the snapshot_name scheme was introduced, predates
+#     this file's v4.x history entirely — found 2026-08-01 during the real
+#     das-backup-full.service proof run, whose journal showed
+#     "[das-backup-22tb] No btrbk snapshots found, skipping" even though
+#     btrbk had just created fresh snapshots that same run. Combined with
+#     the correct role=mirror skip on the two recovery targets, this made
+#     the scheduled full-backup boot-subvolume-refresh path a complete
+#     no-op on every target, every time it ran on a schedule — only manual
+#     Rust-path runs (indexer/src/backup.rs) ever actually updated @/@home.
+#     Fixed by anchoring both patterns to the real snapshot name (including
+#     the "-" for root) and the real timestamp shape (btrbk's default
+#     `timestamp_format long` is YYYYMMDD<T>HHMM — 4-digit HHMM, NOT
+#     HHMMSS — with an optional "_N" collision suffix), verified live
+#     against the mounted 22TB target's actual subvolume list. Tracks
+#     DAS-Backup-Manager-ycr; bd DAS-Backup-Manager-01u (the config-vs-script
+#     drift detector) is the systemic guard against this class of bug for a
+#     future rename.
 #   - Maintenance interlock + honest unmount reporting (v4.3.0):
 #     * Backup side of the mutual-hold interlock shared with the scrub engine
 #       (indexer/src/scrub.rs): after the existing fd-9 singleton lock on
@@ -776,10 +800,35 @@ update_boot_subvolumes() {
         label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
         # `|| true` guards against `set -o pipefail` + `set -e` killing the run when
         # grep finds zero matches — the empty-string check below is the intended path.
+        #
+        # Snapshot names come straight from /etc/btrbk/btrbk.conf's per-subvolume
+        # `snapshot_name` (nvme volume: @ -> "root-", @home -> "home"), so the
+        # on-disk names are "root-.<TS>" and "home.<TS>" -- NOT "root.<TS>". A
+        # bare `nvme/root\.` pattern (root immediately followed by a dot) has
+        # NEVER matched "root-.<TS>" (bd DAS-Backup-Manager-ycr, pre-existing at
+        # e363919, predates this file's v4.x history) -- it silently found zero
+        # snapshots on every run, so this whole function no-op'd on every target
+        # whose @ subvolume already existed, with no error, just a
+        # "No btrbk snapshots found, skipping" warning that looked like a benign
+        # first-run condition instead of a permanent pattern bug. Both patterns
+        # are anchored to a full `-<TS>`/`.<TS>` timestamp suffix so a rename in
+        # btrbk.conf breaks this loudly (empty match -> the skip warning below)
+        # rather than silently matching an unrelated subvolume (e.g.
+        # "root-root.<TS>", a different snapshot_name entirely, which the old
+        # unanchored pattern happened not to match only by the accident of "root"
+        # not being immediately followed by "."). bd DAS-Backup-Manager-01u (the
+        # config-vs-script drift detector) is the systemic guard against this
+        # class of bug recurring for a *different* rename in the future.
+        #
+        # Timestamp suffix is btrbk's default `timestamp_format long`
+        # (btrbk.conf(5)): YYYYMMDD<T>hhmm, i.e. 8 digits + T + 4 digits
+        # (HHMM, no seconds) — verified live against real snapshot names
+        # below, NOT hhmmss/6 digits. An optional "_N" collision suffix is
+        # appended by btrbk if two snapshots land on the exact same minute.
         local latest_root
-        latest_root=$(btrfs subvolume list "$mnt" 2>/dev/null | grep "nvme/root\." | awk '{print $NF}' | sort | tail -1) || true
+        latest_root=$(btrfs subvolume list "$mnt" 2>/dev/null | grep -E 'nvme/root-\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
         local latest_home
-        latest_home=$(btrfs subvolume list "$mnt" 2>/dev/null | grep "nvme/home\." | awk '{print $NF}' | sort | tail -1) || true
+        latest_home=$(btrfs subvolume list "$mnt" 2>/dev/null | grep -E 'nvme/home\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
 
         if [[ -z "$latest_root" || -z "$latest_home" ]]; then
             log_warn "  [$label] No btrbk snapshots found, skipping"
@@ -1221,7 +1270,7 @@ LATEST SNAPSHOTS
 $(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}' || echo "  (none yet)")
 
 ===============================================================
-  backup-run.sh v4.3.0
+  backup-run.sh v4.3.1
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
