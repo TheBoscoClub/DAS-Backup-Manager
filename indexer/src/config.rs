@@ -174,7 +174,15 @@ pub struct Scrub {
 }
 
 fn default_scrub_on_calendar() -> String {
-    "*-*-01 05:30:00".into()
+    // 03:05 on the 1st — five minutes AFTER the 03:00 daily backup fires, so
+    // the backup already holds /run/das-maintenance.lock and the scrub
+    // engine's blocking acquire makes the scrub start the moment the backup
+    // finishes ("scrub follows the backup", user decision 2026-08-02). The
+    // same blocking flock also guarantees the inverse on overrun: a scrub
+    // still running when the NEXT day's 03:00 backup fires HOLDS that backup
+    // (deferral, never a skip) and releases it the moment the scrub
+    // completes.
+    "*-*-01 03:05:00".into()
 }
 fn default_scrub_targets() -> Vec<String> {
     // Config target labels (`[[target]].label`), not BTRFS filesystem
@@ -577,7 +585,7 @@ mod tests {
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home"]);
         assert_eq!(parsed.boot.archive_retention_days, 60);
         assert!(parsed.scrub.enabled);
-        assert_eq!(parsed.scrub.on_calendar, "*-*-01 05:30:00");
+        assert_eq!(parsed.scrub.on_calendar, "*-*-01 03:05:00");
         assert_eq!(
             parsed.scrub.targets,
             vec![
@@ -609,7 +617,7 @@ mod tests {
     fn scrub_defaults() {
         let scrub = Scrub::default();
         assert!(scrub.enabled);
-        assert_eq!(scrub.on_calendar, "*-*-01 05:30:00");
+        assert_eq!(scrub.on_calendar, "*-*-01 03:05:00");
         assert_eq!(
             scrub.targets,
             vec![
@@ -777,7 +785,7 @@ enabled = false
         assert!(cfg.targets[0].display_name.is_empty());
         // [scrub] absent entirely from this old config — must parse to defaults
         assert!(cfg.scrub.enabled);
-        assert_eq!(cfg.scrub.on_calendar, "*-*-01 05:30:00");
+        assert_eq!(cfg.scrub.on_calendar, "*-*-01 03:05:00");
         assert_eq!(
             cfg.scrub.targets,
             vec![
