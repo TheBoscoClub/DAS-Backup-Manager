@@ -1,7 +1,7 @@
 #!/bin/bash
 # boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
-# Version: 2.0.1
-# Date: 2026-08-01
+# Version: 2.1.0
+# Date: 2026-08-02
 #
 # When backup-run.sh --full (or the Rust btrdasd manual path) recreates @ and
 # @home, it snapshots the old ones as @.archive.YYYYMMDDTHHMMSS before
@@ -10,6 +10,15 @@
 # via btrdasd. As of v4.2.4, backup-run.sh invokes this script automatically
 # at the end of every run (daily and full) while targets are still mounted —
 # it was previously installed but never called by anything (DAS-Backup-Manager-64h).
+#
+# v2.1.0: role=mirror targets (e.g. the recovery-A/B 2TB drives, which carry a
+# genuinely independent OS install in their own @/@home) are skipped entirely.
+# On a mirror, a @.archive.* snapshot may be the LAST surviving copy of that
+# independent install if the Rust archive_boot() path ever clobbered live @
+# before it learned to skip mirrors (bd DAS-Backup-Manager-am1) — pruning it
+# after 60 days would make that loss unrecoverable. Mirror-role skip logic and
+# wording mirror update_boot_subvolumes() further down in the sibling
+# backup-run.sh, both driven by the same `btrdasd config dump-env` ROLE field.
 #
 # Usage:
 #   sudo ./boot-archive-cleanup.sh              # Prune archives past retention
@@ -35,6 +44,16 @@ RETENTION_DAYS="$DAS_BOOT_ARCHIVE_RETENTION_DAYS"
 DRYRUN=false
 # All target mount points from config
 IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
+
+# Mount -> role map, built the same way backup-run.sh builds MOUNT_ROLES —
+# reused here so the pruner and the archiver agree on which targets are
+# mirrors without a second source of truth (bd DAS-Backup-Manager-am1).
+declare -A MOUNT_ROLES=()
+for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+    mount_var="DAS_TARGET_${i}_MOUNT"
+    role_var="DAS_TARGET_${i}_ROLE"
+    MOUNT_ROLES[${!mount_var}]="${!role_var}"
+done
 
 # Colors
 RED='\033[0;31m'
@@ -81,6 +100,17 @@ cleanup_target() {
 
     local label
     label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
+
+    # Never prune archives on mirror targets — their @.archive.* snapshots may
+    # be the only surviving copy of that target's independent OS install.
+    # Same skip condition and wording as update_boot_subvolumes() in
+    # backup-run.sh (bd DAS-Backup-Manager-am1).
+    local mount_role="${MOUNT_ROLES[$mnt]:-}"
+    if [[ "$mount_role" == "mirror" ]]; then
+        log_info "  [$label] Skipping mirror target (independent OS)"
+        return
+    fi
+
     log_info "Scanning [$label] for boot archives..."
 
     local cutoff_epoch=$(( $(date '+%s') - (RETENTION_DAYS * 86400) ))
