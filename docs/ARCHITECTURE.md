@@ -14,6 +14,14 @@ The following are permanently out of scope and will never be added:
 - **SAN** (Storage Area Network)
 - **Cloud storage** (S3, Azure Blob, GCS, Backblaze, etc.)
 - **Any filesystem other than BTRFS** (ext4, XFS, ZFS, NTFS, etc.)
+- **Maintenance of non-backup (host-native) filesystems** — scrubbing, balancing, or
+  otherwise servicing the host's own NVMe/SATA filesystems belongs to system-scope
+  tooling (`btrfs-scrub@` timers), never to this project
+
+The boundary is exclusive in both directions (user decision 2026-08-02): this project is
+the **only** thing that scrubs the backup-media filesystems — their scrub must be tied to
+the backup lifecycle (mounts, maintenance lock), which no calendar-driven system timer can
+do — and this project never touches filesystems that aren't backup media.
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 

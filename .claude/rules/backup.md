@@ -51,6 +51,21 @@
 - Incremental indexing: only walk new snapshots
 - Soft-fail: indexing errors don't abort the backup
 
+## Scrub Ownership Boundary — exclusive in both directions (user decision 2026-08-02)
+- **This project is the ONLY thing that scrubs backup-media filesystems** (the three
+  `[scrub].targets` DAS filesystems). Their scrub must be tied to the backup lifecycle —
+  the engine mounts them itself and serializes behind backups via the maintenance lock —
+  which no calendar-driven `btrfs-scrub@` system timer can do. Never add system-scope
+  scrub timers for DAS backup media from this or any other project (mirrors the same rule
+  in `~/.claude/rules/infrastructure.md`).
+- **This project never scrubs (or otherwise services) non-backup filesystems.** Host-native
+  NVMe/SATA scrubs belong to the system-scope `btrfs-scrub@` timers and may run in
+  parallel with each other and with this engine; the DAS targets are scrubbed sequentially
+  in `[scrub].targets` order (shared USB path).
+- Schedule (since 2026-08-02): `[scrub].on_calendar = *-*-01 03:05:00` — deliberately trails
+  the 03:00 backup so the blocking maintenance flock starts the scrub the moment the backup
+  finishes; an overrunning scrub HOLDS the next backup until done (defer, never skip).
+
 ## Sentinel Interaction — `cachyos-sentinel` Auto-Restarts Failed Services
 - `sentinel-core` (project at `/hddRaid1/ClaudeCodeProjects/cachyos-sentinel/`) monitors all systemd services and auto-remediates ones it sees in `failed` state by re-issuing `systemctl start`. **This includes `das-backup.service`** — confirmed 2026-05-11 by journal evidence (`sentinel-core` WARN log immediately followed by `systemd Starting DAS Backup` within the same second of a manual kill).
 - **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00; the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
