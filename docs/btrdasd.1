@@ -12,8 +12,8 @@ btrdasd \- DAS Backup Manager indexer and orchestrator
 .B btrdasd
 (ButteredDASD) manages BTRFS backups to Direct-Attached Storage (DAS).
 It provides btrbk orchestration, content indexing with FTS5 full-text search,
-health monitoring, schedule management, scheduled BTRFS scrub, and backup
-history tracking.
+health monitoring, schedule management, scheduled BTRFS scrub, subvolume
+drift detection, and backup history tracking.
 .PP
 Progress messages are printed to stderr so that stdout remains
 machine-parseable.
@@ -586,6 +586,95 @@ against it. A no-op (clean exit, no error) when no scrub is running.
 Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
+.SS doctor
+Subvolume drift detector \(em find source subvolumes that exist on disk but
+aren't backed up, and configured subvolumes that no longer exist on disk.
+.PP
+For each configured
+.I [[source]]
+volume (deduplicated \(em multiple sources commonly share one physical
+volume), mounts it if needed, runs
+.BR "btrfs subvolume list" ,
+and compares the result against every
+.I [[source]].subvolume
+name configured for that volume. Built-in exclusions (never configurable)
+skip anything under a
+.I .snapshots/
+or
+.I .btrbk-snapshots/
+directory at any depth, and the
+.B @tmp
+/
+.B @var\-tmp
+ephemeral subvolumes. An optional
+.I [doctor].exclude
+list of shell-style glob patterns
+.RI ( * / ? )
+in config.toml adds further exclusions on top.
+.PP
+Missing subvolumes (on disk, not in config) are split into
+.B "likely irreplaceable"
+(add to config) and
+.B "probably rebuildable"
+(cache/build/package-manager-state names \(em review before adding), and a
+ready-to-paste
+.I [[source.subvolumes]]
+snippet is printed for the irreplaceable set. When multiple sources share a
+volume, every source label sharing it is listed rather than guessing which
+one a new subvolume belongs under \(em only a human knows whether a new
+top-level directory is a new project, new media, or something else. Stale
+config entries (configured, no longer on disk) are reported separately.
+.PP
+.B Locking:
+non-blocking only \(em a drift check that finds either its own singleton lock
+.RI ( /run/das\-doctor.lock )
+or the shared maintenance lock
+.RI ( /run/das\-maintenance.lock ,
+held by a running backup or scrub) already taken defers immediately rather
+than waiting, since a fast read-mostly scan has nothing urgent enough to
+delay a real backup or scrub for.
+.PP
+.B Exit code:
+.B 0
+means no drift was found, or the check deferred because a lock was held
+(never treated as a failure).
+.B 1
+means the run was
+.I not clean
+\(em drift was found (missing or stale subvolumes),
+.B OR
+at least one configured volume failed to mount or list while others were
+checked successfully (that volume's subvolumes went unchecked, itself a
+finding this exit code surfaces rather than silently ignores). Unlike
+.B "btrdasd scrub run" ,
+this genuinely surfaces through the exit code, because a drift check has no
+Sentinel multi-hour-retry hazard to protect against.
+.B 2
+means the check could not run at all: a config load failure, a lock I/O
+error, or every configured source volume failed to mount or list (nothing
+was ever examined).
+.PP
+.B btrdasd doctor
+.RB [ \-\-check\-drift ]
+.RB [ \-\-email ]
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.B \-\-check\-drift
+Run the subvolume drift check. Currently the only check this command
+performs \(em the flag exists so future checks can be selected individually
+without a breaking CLI change. Omitting it still runs the drift check today.
+.TP
+.B \-\-email
+Email a report via the configured SMTP settings, but only when drift or an
+error was found \(em a clean run stays silent even with this flag, so the
+weekly timer doesn't send an all-clear every Sunday.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
 .SH OPTIONS
 .TP
 .B \-\-json
@@ -690,6 +779,14 @@ Cancel a scrub currently in progress:
 .RS
 .nf
 sudo btrdasd scrub cancel
+.fi
+.RE
+.PP
+Check for subvolume drift (source vs config) and email a report if found:
+.PP
+.RS
+.nf
+sudo btrdasd doctor \-\-check\-drift \-\-email
 .fi
 .RE
 .PP

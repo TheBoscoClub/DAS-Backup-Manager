@@ -51,6 +51,22 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 .args(["disable", "--now", "das-scrub.timer"])
                 .status();
         }
+
+        // das-backup-doctor.timer is always generated and always enabled —
+        // unlike das-scrub, there is no `[doctor].enabled` config toggle
+        // (bd DAS-Backup-Manager-01u). Rationale: the drift check is a fast,
+        // read-mostly scan (mount + `btrfs subvolume list` + compare), not a
+        // resource-intensive operation like a multi-hour scrub pass, so there
+        // is no meaningful cost an operator would want to opt out of — and a
+        // drift detector that's off by default defeats its own purpose (the
+        // whole feature exists because the 2026-05-17 audit found ~30
+        // subvolumes silently unbacked-up for months; an opt-in check would
+        // have caught none of them any sooner than a human remembering to
+        // look). If a future need for disabling it emerges, add
+        // `[doctor].enabled` and gate this the same way scrub is gated above.
+        let _ = std::process::Command::new("systemctl")
+            .args(["enable", "--now", "das-backup-doctor.timer"])
+            .status();
     }
 
     Ok(())
@@ -137,6 +153,9 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         .status();
     let _ = std::process::Command::new("systemctl")
         .args(["disable", "--now", "das-scrub.timer"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "--now", "das-backup-doctor.timer"])
         .status();
 
     let removed = uninstall_from_manifest(&manifest_path);

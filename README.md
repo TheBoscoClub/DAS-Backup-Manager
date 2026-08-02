@@ -26,6 +26,8 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure
 - **Multi-Target Architecture** — Configurable primary, mirror, and ESP-sync roles across any number of DAS drives
 - **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
+- **Scheduled BTRFS Scrub** (`btrdasd scrub`) — Monthly integrity scrub of all DAS backup filesystems, with health-check integration and email reports
+- **Subvolume Drift Detector** (`btrdasd doctor --check-drift`) — Weekly check comparing every source filesystem's actual subvolumes against config.toml, catching silent backup gaps (missing) and stale entries (removed), with a ready-to-paste config diff and email alerts
 - **Email Reports** — Automated backup status reports with throughput metrics and SMART status
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
 - **Auto-Mount/Unmount** — RAII `MountGuard` resolves target drive serials, auto-mounts BTRFS partitions before operations, and unmounts on completion (all D-Bus methods and CLI commands)
@@ -58,7 +60,7 @@ DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf reference template
 ├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper + FFI
-│   ├── src/           # Library modules (13): backup, config, db, ffi, health, indexer, mount, progress, report, restore, scanner, schedule, subvol
+│   ├── src/           # Library modules (15): backup, config, db, doctor, ffi, health, indexer, mount, progress, report, restore, scanner, schedule, scrub, subvol
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 │   ├── src/bin/       # btrdasd-helper D-Bus daemon
 │   ├── src/ffi.rs     # C-ABI FFI bridge (extern "C" functions)
