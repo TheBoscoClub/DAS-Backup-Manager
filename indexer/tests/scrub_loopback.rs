@@ -424,3 +424,20 @@ fn live_scrub_is_never_force_restarted() {
     must("btrfs", &["scrub", "cancel", &mnt]);
     println!("== live-scrub protection verified ==");
 }
+
+// A live loopback test reproducing a genuine `Command::spawn()` failure for
+// `btrfs scrub start` (the `bd DAS-Backup-Manager-18p` review scenario) was
+// attempted here and removed: shadowing "btrfs" earlier in `PATH` with a
+// non-executable stub, a directory, or a script with a broken `#!`
+// interpreter all failed to force a spawn error — verified empirically
+// (`std::process::Command`'s PATH search, like glibc's `execvp`, silently
+// continues past `EACCES`/bad-interpreter entries to the next `PATH`
+// component and finds the real `/usr/bin/btrfs` regardless). Reliably
+// forcing this at the OS level would require either touching the real
+// system `btrfs` binary (unsafe on a host with other live scrubs and
+// mounted filesystems) or breaking `PATH` so thoroughly that `mount`/
+// `findmnt`/`umount` fail too, which changes the scenario to "the mount
+// step failed", not "resolution and mounting succeeded but only the scrub
+// spawn failed". `exit_code_for_pass_spawn_failure_on_all_targets_is_nonzero`
+// in `indexer/src/main.rs` is the unit-test proof instead, per the
+// reviewer's own explicit fallback for exactly this case.
