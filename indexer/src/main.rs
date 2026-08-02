@@ -809,19 +809,32 @@ fn cancel_running_scrub(config: &Config) -> Result<String, String> {
 ///
 /// - A [`PassStatus::Skipped`] pass (another scrub already running) is
 ///   always 0 — nothing went wrong, there was simply nothing to do here.
-/// - Otherwise: 0 if at least one target's `started_epoch` is nonzero —
-///   `scrub_one_target` only sets it once `resolve_target_fsuuid` and
-///   `ensure_mounted` have both succeeded and a real `btrfs scrub start`
-///   was issued, so this is exactly "resolution + mount succeeded and
-///   scrubbing was attempted" for that filesystem, regardless of what
-///   happened afterward.
-/// - Otherwise (every target failed before any scrub was attempted — e.g.
-///   all targets unresolvable or unmountable): nonzero. This is the one
-///   judgment call the brief left explicit: a pass where *some* targets
-///   scrubbed and *some* could not be mounted is still 0 (scrubbing did
-///   occur, and the email/`scrub status` output already surfaces the
-///   skips) — only *zero* targets ever reaching a scrub attempt counts as
-///   "could not run".
+/// - Otherwise: 0 if at least one target's `scrub_launched` is `true` —
+///   [`scrub::ScrubFsResult::scrub_launched`] is set only once
+///   `resolve_target_fsuuid` and `ensure_mounted` have both succeeded *and*
+///   the `btrfs scrub start` child process is confirmed to have launched
+///   (`Command::spawn()` returned `Ok`), so this is exactly "a real scrub
+///   attempt happened" for that filesystem, regardless of what happened
+///   afterward (error counters, aborted, unmount failure post-scrub, or
+///   even the scrub process itself later exiting nonzero). Deliberately
+///   **not** keyed on `started_epoch != 0`: that field used to be stamped
+///   before `spawn()` was even attempted, which meant a spawn failure
+///   (binary missing, broken `PATH`) on every target still left every
+///   `started_epoch` non-zero and made a fast, systemic setup failure
+///   masquerade as "the pass ran" — exactly the inverse of the bug this
+///   function exists to prevent (`bd DAS-Backup-Manager-18p` review,
+///   2026-08-02). `scrub_launched` is set in the same branch as
+///   `started_epoch` now, so the two are always consistent, but this
+///   function keys on the explicit flag rather than relying on that
+///   consistency.
+/// - Otherwise (every target failed before any scrub was ever launched —
+///   e.g. all targets unresolvable/unmountable, or the `btrfs` binary
+///   itself could not be spawned for any of them): nonzero. This is the
+///   one judgment call the brief left explicit: a pass where *some*
+///   targets scrubbed and *some* could not be mounted is still 0
+///   (scrubbing did occur, and the email/`scrub status` output already
+///   surfaces the skips) — only *zero* targets ever reaching a launched
+///   scrub counts as "could not run".
 ///
 /// Setup-stage failures before a [`ScrubPass`] value even exists — config
 /// load errors, lock-file IO errors, `ScrubError::NoTargets` — never reach
@@ -833,8 +846,8 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
     if pass.status == scrub::PassStatus::Skipped {
         return 0;
     }
-    let any_scrub_attempted = pass.results.iter().any(|r| r.started_epoch != 0);
-    if any_scrub_attempted { 0 } else { 1 }
+    let any_scrub_launched = pass.results.iter().any(|r| r.scrub_launched);
+    if any_scrub_launched { 0 } else { 1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1955,7 +1968,11 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     // propagated a nonzero exit through the same path) — see this task's
     // report file for the transcript.
 
-    fn fake_result(started_epoch: i64) -> scrub::ScrubFsResult {
+    /// `scrub_launched` mirrors the real engine invariant: it is only ever
+    /// `true` once `Command::spawn()` for `btrfs scrub start` has been
+    /// confirmed to succeed, and `started_epoch` is stamped in the same
+    /// branch — see `scrub::ScrubFsResult::scrub_launched`.
+    fn fake_result(scrub_launched: bool) -> scrub::ScrubFsResult {
         scrub::ScrubFsResult {
             target_label: "t".to_string(),
             fsuuid: "11111111-1111-1111-1111-111111111111".to_string(),
@@ -1963,11 +1980,12 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             outcome: None,
             counters: scrub::ScrubCounters::default(),
             bytes_scrubbed: 0,
-            started_epoch,
+            started_epoch: if scrub_launched { 1_700_000_100 } else { 0 },
             finished_epoch: 0,
             duration_secs: 0,
             errors: Vec::new(),
             mounted_by_engine: false,
+            scrub_launched,
         }
     }
 
@@ -1986,7 +2004,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
 
     #[test]
     fn exit_code_for_pass_all_clean_is_zero() {
-        let mut result = fake_result(1_700_000_100);
+        let mut result = fake_result(true);
         result.outcome = Some(scrub::ScrubOutcome::Finished);
         let pass = fake_pass(scrub::PassStatus::Completed, vec![result]);
         assert_eq!(exit_code_for_pass(&pass), 0);
@@ -1998,7 +2016,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         // (nonzero error counters). The whole point of bd 18p: this must
         // NOT fail the process exit code, or Sentinel would retry-loop a
         // multi-hour pass on hardware that is genuinely failing.
-        let mut result = fake_result(1_700_000_100);
+        let mut result = fake_result(true);
         result.outcome = Some(scrub::ScrubOutcome::Finished);
         result.counters.csum_errors = 3;
         result.errors.push("errors found: csum=3".to_string());
@@ -2012,9 +2030,9 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
 
     #[test]
     fn exit_code_for_pass_aborted_mid_pass_is_zero() {
-        // A scrub that started (started_epoch set) but died mid-run
+        // A scrub that launched (scrub_launched set) but died mid-run
         // (Aborted) still counts as "ran" for exit-code purposes.
-        let mut result = fake_result(1_700_000_100);
+        let mut result = fake_result(true);
         result.outcome = Some(scrub::ScrubOutcome::Aborted);
         result
             .errors
@@ -2026,17 +2044,43 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     #[test]
     fn exit_code_for_pass_nothing_resolvable_is_nonzero() {
         // Every target failed before any scrub was ever attempted --
-        // started_epoch stays 0 because resolve_target_fsuuid/ensure_mounted
-        // never succeeded for anything. This is the one case that must be
-        // treated as "could not run".
-        let mut a = fake_result(0);
+        // scrub_launched stays false because resolve_target_fsuuid/
+        // ensure_mounted never succeeded for anything. This is the one case
+        // that must be treated as "could not run".
+        let mut a = fake_result(false);
         a.errors
             .push("no [[target]] with label 'a' in config".to_string());
-        let mut b = fake_result(0);
+        let mut b = fake_result(false);
         b.errors
             .push("cannot mount /mnt/b: exit status 32".to_string());
         let pass = fake_pass(scrub::PassStatus::Completed, vec![a, b]);
         assert_eq!(exit_code_for_pass(&pass), 1);
+    }
+
+    /// The exact regression this task's review caught: `Command::spawn()`
+    /// for `btrfs scrub start` failing on every target (binary missing,
+    /// broken `PATH`, exec format error) is a fast, systemic setup failure —
+    /// no scrub was ever issued anywhere. Constructed the way the OLD buggy
+    /// code would have produced it (`started_epoch` stamped as if a scrub
+    /// began, because that used to happen *before* `spawn()` was even
+    /// attempted) to prove `exit_code_for_pass` now ignores `started_epoch`
+    /// entirely and keys only on `scrub_launched`.
+    #[test]
+    fn exit_code_for_pass_spawn_failure_on_all_targets_is_nonzero() {
+        let mut spawn_failed = fake_result(false);
+        // What the pre-fix bug would have left behind: a non-zero
+        // started_epoch despite the child process never launching.
+        spawn_failed.started_epoch = 1_700_000_100;
+        spawn_failed.errors.push(
+            "cannot start btrfs scrub on /mnt/a: No such file or directory".to_string(),
+        );
+        let pass = fake_pass(scrub::PassStatus::Completed, vec![spawn_failed]);
+        assert_eq!(
+            exit_code_for_pass(&pass),
+            1,
+            "a spawn failure on every target must exit nonzero even if started_epoch is \
+             (wrongly) non-zero — scrub_launched is the authoritative signal"
+        );
     }
 
     #[test]
@@ -2045,11 +2089,11 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         // some could not be mounted. Recommendation taken: still 0, since
         // scrubbing genuinely occurred and the skips are surfaced via email
         // / `scrub status` rather than the exit code.
-        let mut unresolved = fake_result(0);
+        let mut unresolved = fake_result(false);
         unresolved
             .errors
             .push("no [[target]] with label 'a' in config".to_string());
-        let mut scrubbed = fake_result(1_700_000_100);
+        let mut scrubbed = fake_result(true);
         scrubbed.outcome = Some(scrub::ScrubOutcome::Finished);
         let pass = fake_pass(scrub::PassStatus::Completed, vec![unresolved, scrubbed]);
         assert_eq!(exit_code_for_pass(&pass), 0);

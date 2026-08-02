@@ -1126,6 +1126,22 @@ pub struct ScrubFsResult {
     pub errors: Vec<String>,
     /// Whether this engine mounted the filesystem (and therefore unmounted it).
     pub mounted_by_engine: bool,
+    /// Whether a real `btrfs scrub start` child process was confirmed to
+    /// launch for this filesystem — `true` only once `Command::spawn()` has
+    /// actually succeeded, never set pre-emptively.
+    ///
+    /// This is the authoritative "was a scrub genuinely attempted" signal
+    /// consumed by the CLI's `exit_code_for_pass` (`bd
+    /// DAS-Backup-Manager-18p`): if `spawn()` fails for every configured
+    /// target (binary missing, broken `PATH`, exec format error — a fast,
+    /// systemic setup failure), no scrub was ever issued anywhere, and that
+    /// must be distinguishable from "the pass ran but found damage" so
+    /// Sentinel's fast-retry path still engages for it. `started_epoch` is
+    /// deliberately *not* used for this purpose: it used to be stamped
+    /// before the spawn was attempted, which meant a spawn failure still
+    /// left it non-zero and masqueraded as "ran". This field is set exactly
+    /// once, in lockstep with the first moment `started_epoch` is stamped.
+    pub scrub_launched: bool,
 }
 
 impl ScrubFsResult {
@@ -1142,6 +1158,7 @@ impl ScrubFsResult {
             duration_secs: 0,
             errors: Vec::new(),
             mounted_by_engine: false,
+            scrub_launched: false,
         }
     }
 
@@ -1620,10 +1637,24 @@ fn scrub_one_target(
     }
 
     // --- scrub ------------------------------------------------------------
+    // `scrub_started` anchors the freshness check below regardless of
+    // outcome, but `result.started_epoch`/`result.scrub_launched` are
+    // deliberately only stamped once `run_btrfs_scrub` confirms the child
+    // process actually launched — see the doc comment on
+    // `ScrubFsResult::scrub_launched` for why a pre-emptive stamp here was a
+    // bug (`bd DAS-Backup-Manager-18p` review).
     let scrub_started = now_epoch();
-    result.started_epoch = scrub_started;
-    if let Err(e) = run_btrfs_scrub(&mount_point, &fsuuid, progress) {
-        result.errors.push(e);
+    match run_btrfs_scrub(&mount_point, &fsuuid, progress) {
+        ScrubRunOutcome::SpawnFailed(e) => {
+            result.errors.push(e);
+        }
+        ScrubRunOutcome::Launched(outcome) => {
+            result.started_epoch = scrub_started;
+            result.scrub_launched = true;
+            if let Err(e) = outcome {
+                result.errors.push(e);
+            }
+        }
     }
 
     // --- status by UUID (never by path) -----------------------------------
@@ -1801,6 +1832,29 @@ fn unmount(mount_point: &str, progress: &dyn ProgressCallback) -> Result<(), Str
     unreachable!("loop returns on both attempts")
 }
 
+/// Outcome of attempting to run `btrfs scrub start` against one filesystem.
+///
+/// The distinction that matters is whether the child process ever launched
+/// at all. `Command::spawn()` failing (binary missing, broken `PATH`, exec
+/// format error) means **no scrub was ever issued** — a fast, systemic setup
+/// failure, indistinguishable in kind from a config load error. Everything
+/// that can go wrong *after* a successful spawn (nonzero exit, a failed
+/// `wait()`) means a real scrub attempt genuinely happened, even though it
+/// didn't succeed. Conflating the two was the exact bug flagged in the `bd
+/// DAS-Backup-Manager-18p` review: stamping `started_epoch` before spawn was
+/// attempted meant a spawn failure on every target still looked like "the
+/// pass ran" to `exit_code_for_pass`, losing the fast-retry signal Sentinel
+/// needs for a genuine can't-even-start failure.
+#[derive(Debug)]
+enum ScrubRunOutcome {
+    /// The child process never launched. No scrub was issued.
+    SpawnFailed(String),
+    /// The child process launched — a real `btrfs scrub start` ran — with
+    /// `Ok(())` if it exited zero, `Err` describing what went wrong
+    /// otherwise (nonzero exit, or the wait itself failing).
+    Launched(Result<(), String>),
+}
+
 /// Run `btrfs scrub start -B` in the foreground, logging progress read from the
 /// UUID-keyed status record while it runs.
 ///
@@ -1811,7 +1865,7 @@ fn run_btrfs_scrub(
     mount_point: &str,
     fsuuid: &str,
     progress: &dyn ProgressCallback,
-) -> Result<(), String> {
+) -> ScrubRunOutcome {
     // Clear a stale aborted record out of the way if — and only if — nothing
     // is running. See `decide_scrub_start_mode`.
     let mut args = vec!["scrub", "start", "-B"];
@@ -1827,12 +1881,21 @@ fn run_btrfs_scrub(
     }
     args.push(mount_point);
 
-    let mut child = Command::new("btrfs")
+    let mut child = match Command::new("btrfs")
         .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot start btrfs scrub on {mount_point}: {e}"))?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return ScrubRunOutcome::SpawnFailed(format!(
+                "cannot start btrfs scrub on {mount_point}: {e}"
+            ));
+        }
+    };
+    // From here on the child genuinely launched — every path below is
+    // `ScrubRunOutcome::Launched`, whatever its inner `Result`.
 
     // Drain stderr on a dedicated thread. The poll loop below cannot read the
     // pipe itself, and a child blocked writing into a full pipe would never
@@ -1858,7 +1921,9 @@ fn run_btrfs_scrub(
                 // shared USB bus while the next target scrubs.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("waiting for btrfs scrub failed: {e}"));
+                return ScrubRunOutcome::Launched(Err(format!(
+                    "waiting for btrfs scrub failed: {e}"
+                )));
             }
         }
         std::thread::sleep(SCRUB_POLL_INTERVAL);
@@ -1882,7 +1947,7 @@ fn run_btrfs_scrub(
         .map(|h| h.join().unwrap_or_default())
         .unwrap_or_default();
 
-    if status.success() {
+    ScrubRunOutcome::Launched(if status.success() {
         Ok(())
     } else {
         Err(format!(
@@ -1894,7 +1959,7 @@ fn run_btrfs_scrub(
                 format!(": {}", stderr.trim())
             }
         ))
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
