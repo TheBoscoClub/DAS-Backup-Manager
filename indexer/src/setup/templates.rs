@@ -333,6 +333,86 @@ pub fn render_systemd_scrub_timer(config: &Config) -> String {
     )
 }
 
+/// Generate the das-backup-doctor.service unit file. `Type=oneshot`, no
+/// `Restart=` (Sentinel — `cachyos-sentinel` — handles retries for a unit
+/// that lands in `failed` state; the unit itself stays as clean as
+/// `das-backup.service`/`das-scrub.service`, per the project's established
+/// convention of leaving retry policy entirely to Sentinel rather than
+/// duplicating it in the unit).
+///
+/// `ExecStart` is preceded by a comment documenting the exit-code split (bd
+/// DAS-Backup-Manager-01u, mirroring das-scrub.service's precedent for bd
+/// DAS-Backup-Manager-18p): unlike scrub, a drift check genuinely wants exit
+/// 1 to mean "drift found" — it is a fast, read-mostly scan with no
+/// multi-hour-retry hazard, so there is no reason to hide findings from the
+/// exit code the way scrub does.
+///
+/// `TimeoutStartSec=600` (not `infinity` like das-backup/das-scrub): those
+/// units use a *blocking* maintenance-lock acquisition that can legitimately
+/// wait hours behind a real backup or scrub pass, so a finite timeout would
+/// `SIGKILL` them mid-wait. `btrdasd doctor` deliberately acquires both its
+/// locks non-blocking (`doctor::try_acquire_locks`) and defers immediately
+/// (exit 0) rather than queuing — so it never has a legitimate reason to run
+/// long, and a bound here is a real safety net against a hung `btrfs`
+/// subprocess rather than fighting the unit's own design.
+pub fn render_systemd_doctor_service(config: &Config) -> String {
+    let prefix = &config.general.install_prefix;
+
+    format!(
+        "{GENERATED_HEADER}\n\
+         [Unit]\n\
+         Description=DAS Backup - Weekly subvolume drift check\n\
+         After=local-fs.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         # Exit semantics (bd DAS-Backup-Manager-01u): 0 = no drift found, or\n\
+         # deferred because a backup/scrub/another doctor run holds a lock (never\n\
+         # a failure). 1 = the run was not clean — drift found (missing or stale\n\
+         # subvolumes), OR at least one configured volume failed to mount/list\n\
+         # while others were checked successfully (that volume's subvolumes went\n\
+         # unchecked, which is itself a finding this exit code surfaces). Unlike\n\
+         # das-scrub.service's exit code, this one is meant to surface findings,\n\
+         # because a drift check is a fast read-mostly scan with no multi-hour-\n\
+         # retry hazard to protect against. 2 = could not run at all — every\n\
+         # configured source volume failed to mount or list, so nothing was ever\n\
+         # examined (config load failure and lock I/O errors also land here, via\n\
+         # the CLI's own error path rather than this exit-code mapping).\n\
+         ExecStart={prefix}/bin/btrdasd doctor --check-drift --email\n\
+         StandardOutput=journal\n\
+         StandardError=journal\n\
+         Nice=19\n\
+         IOSchedulingClass=idle\n\
+         TimeoutStartSec=600\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+/// Generate the das-backup-doctor.timer unit file. Fixed `Sun 02:00` — before
+/// the Sunday full backup (04:00) and monthly scrub (05:30 on the 1st), so a
+/// drift finding is visible ahead of that week's backup window rather than
+/// discovered after the fact. No `RandomizedDelaySec` — like das-scrub.timer,
+/// the fixed time is deliberate and the maintenance lock (which this check
+/// acquires non-blocking and defers on, never queuing) is the safety net
+/// against overlap, not timing.
+pub fn render_systemd_doctor_timer(_config: &Config) -> String {
+    format!(
+        "{GENERATED_HEADER}\n\
+         [Unit]\n\
+         Description=DAS Backup - Weekly subvolume drift check timer\n\
+         \n\
+         [Timer]\n\
+         OnCalendar=Sun *-*-* 02:00:00\n\
+         Persistent=true\n\
+         WakeSystem=false\n\
+         \n\
+         [Install]\n\
+         WantedBy=timers.target\n"
+    )
+}
+
 /// Generate cron entries for incremental (daily) and full (weekly) backups.
 pub fn render_cron_entry(config: &Config) -> String {
     let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
@@ -438,6 +518,20 @@ impl GeneratedFiles {
                 files.push((
                     "/etc/systemd/system/das-scrub.timer".to_string(),
                     render_systemd_scrub_timer(config),
+                ));
+
+                // Doctor unit + timer always installed and always enabled —
+                // unlike scrub, there is no config toggle for the drift check
+                // (it has no meaningful "disabled" state to gate on: it is a
+                // read-mostly scan, not a write operation with resource cost
+                // worth opting out of). See `installer::install()`.
+                files.push((
+                    "/etc/systemd/system/das-backup-doctor.service".to_string(),
+                    render_systemd_doctor_service(config),
+                ));
+                files.push((
+                    "/etc/systemd/system/das-backup-doctor.timer".to_string(),
+                    render_systemd_doctor_timer(config),
                 ));
             }
             InitSystem::Sysvinit | InitSystem::Openrc => {
@@ -682,6 +776,35 @@ mod tests {
     }
 
     #[test]
+    fn render_systemd_doctor_service_test() {
+        let config = test_config();
+        let result = render_systemd_doctor_service(&config);
+        assert!(result.contains("Type=oneshot"));
+        assert!(result.contains("ExecStart=/usr/local/bin/btrdasd doctor --check-drift --email"));
+        assert!(result.contains("# Generated by btrdasd setup"));
+        // bd DAS-Backup-Manager-01u: the unit documents its own exit-code
+        // split, mirroring das-scrub.service's precedent.
+        assert!(result.contains("# Exit semantics"));
+        assert!(result.contains("bd DAS-Backup-Manager-01u"));
+        // Deliberately finite (unlike das-backup/das-scrub's infinity) — the
+        // doctor's own lock acquisition is non-blocking, so it never has a
+        // legitimate reason to run long.
+        assert!(result.contains("TimeoutStartSec=600"));
+        assert!(!result.contains("TimeoutStartSec=infinity"));
+    }
+
+    #[test]
+    fn render_systemd_doctor_timer_test() {
+        let config = test_config();
+        let result = render_systemd_doctor_timer(&config);
+        assert!(result.contains("OnCalendar=Sun *-*-* 02:00:00"));
+        assert!(result.contains("Persistent=true"));
+        // Fixed Sunday 02:00, ahead of the Sunday full backup (04:00) and
+        // monthly scrub (05:30 on the 1st) — no RandomizedDelaySec.
+        assert!(!result.contains("RandomizedDelaySec"));
+    }
+
+    #[test]
     fn render_cron_entry_test() {
         let config = test_config();
         let result = render_cron_entry(&config);
@@ -723,5 +846,7 @@ mod tests {
         assert!(manifest.contains("das-backup.timer"));
         assert!(manifest.contains("das-scrub.service"));
         assert!(manifest.contains("das-scrub.timer"));
+        assert!(manifest.contains("das-backup-doctor.service"));
+        assert!(manifest.contains("das-backup-doctor.timer"));
     }
 }

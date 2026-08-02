@@ -8,7 +8,7 @@ use buttered_dasd::indexer;
 use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::report;
-use buttered_dasd::{restore, schedule, scrub, subvol};
+use buttered_dasd::{doctor, restore, schedule, scrub, subvol};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use std::path::PathBuf;
@@ -71,6 +71,7 @@ impl ProgressCallback for CliProgress {
         btrdasd restore browse /mnt/backup/root.20260228T030000\n  \
         btrdasd health                  Show drive health and backup status\n  \
         btrdasd scrub status            Show last scrub result per DAS filesystem\n  \
+        btrdasd doctor --check-drift    Find unbacked-up subvolumes (source vs config drift)\n  \
         btrdasd schedule show           Show backup schedule and next run times\n  \
         btrdasd search 'report*'        FTS5 search across all indexed files\n  \
         btrdasd subvol list             List all configured subvolumes"
@@ -159,6 +160,36 @@ enum Commands {
     Scrub {
         #[command(subcommand)]
         action: ScrubAction,
+    },
+    /// Subvolume drift detector — find source subvolumes that exist on disk
+    /// but aren't backed up (or config entries for subvolumes that no longer
+    /// exist)
+    ///
+    /// EXIT CODE: 0 means no drift found, or the check deferred because the
+    /// singleton/maintenance lock was held (a backup or scrub is in
+    /// progress, or another doctor run is already checking — never treated
+    /// as a failure). 1 means the run was not clean: drift was found
+    /// (missing or stale subvolumes), OR at least one configured volume
+    /// failed to mount/list while others were checked successfully. 2
+    /// means the check could not run at all: config load failure, lock I/O
+    /// error, or every configured volume failed to mount or list (nothing
+    /// was ever examined).
+    Doctor {
+        /// Run the subvolume drift check. Currently the only check this
+        /// command performs — the flag exists so future checks can be
+        /// selected individually without a breaking CLI change. Omitting it
+        /// still runs the drift check today.
+        #[arg(long)]
+        check_drift: bool,
+        /// Email a report via the configured SMTP settings, but only when
+        /// drift or an error was found — a clean run stays silent even with
+        /// this flag, so the weekly timer doesn't spam an all-clear every
+        /// Sunday.
+        #[arg(long)]
+        email: bool,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
     /// Generate shell completions
     Completions {
@@ -848,6 +879,50 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
     }
     let any_scrub_launched = pass.results.iter().any(|r| r.scrub_launched);
     if any_scrub_launched { 0 } else { 1 }
+}
+
+/// Map a `btrdasd doctor --check-drift` outcome to its process exit code
+/// (bd DAS-Backup-Manager-01u). Unlike `exit_code_for_pass`, this command
+/// genuinely distinguishes three outcomes rather than collapsing "ran but
+/// found problems" into 0: a drift check has no Sentinel-retry-loop hazard
+/// (it is a fast, read-mostly scan, not a multi-hour operation), so there is
+/// no reason to hide "drift was found" from the exit code the way scrub hides
+/// "damage was found" — quite the opposite, exit 1 is the whole point of the
+/// weekly timer.
+///
+/// - `Deferred` (either lock held) is always 0 — nothing went wrong, the
+///   check simply yielded to a real backup/scrub or another doctor run.
+/// - `Ran` with zero volumes examined is 2 — "could not run" (every
+///   configured volume failed to mount or list).
+/// - `Ran` with at least one volume examined: 1 if
+///   [`doctor::DriftReport::not_clean`] is true (drift found, OR at least one
+///   — but not all — configured volumes failed to mount/list), else 0.
+///
+/// This reads `not_clean()` rather than `has_drift()` directly so this
+/// function, `doctor::format_report`, and the `--email` trigger below all
+/// agree on what "not clean" means. An earlier version of this function
+/// checked only `has_drift()`: a run where 1 of 4 volumes failed to mount
+/// while the other 3 were clean had `volumes_checked > 0` (so "ran") and
+/// `has_drift() == false` (no missing/stale subvolumes among the volumes
+/// that *were* examined) — exit 0, while the printed report said `DRIFT
+/// DETECTED — FAILURE` and the `--email` guard sent a failure email for the
+/// same run. That is the same masquerading-exit-code class already fixed
+/// once in this file for scrub (`exit_code_for_pass`, bd
+/// DAS-Backup-Manager-18p) — silence about the reviewer catching it here
+/// would have been how it survived.
+pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
+    match outcome {
+        doctor::DoctorOutcome::Deferred { .. } => 0,
+        doctor::DoctorOutcome::Ran(report) => {
+            if !report.ran() {
+                2
+            } else if report.not_clean() {
+                1
+            } else {
+                0
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,6 +1736,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
 
+        // ----- Doctor command -----
+        Commands::Doctor {
+            check_drift: _,
+            email,
+            config,
+        } => {
+            let cfg = match Config::load(&config) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: could not load config {}: {e}", config.display());
+                    std::process::exit(2);
+                }
+            };
+            let progress = CliProgress;
+            let outcome = match doctor::run_drift_check(&cfg, &progress) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    if email {
+                        let failure_text = format!(
+                            "═══════════════════════════════════════════════════════════\n  \
+                             DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n\
+                             ═══════════════════════════════════════════════════════════\n\n\
+                             The drift check could not run: {e}\n"
+                        );
+                        match report::send_email_report_with_kind(&failure_text, &cfg, "Doctor") {
+                            Ok(()) => eprintln!("Doctor failure report emailed"),
+                            Err(mail_err) => {
+                                eprintln!("Could not send doctor failure report email: {mail_err}")
+                            }
+                        }
+                    }
+                    std::process::exit(2);
+                }
+            };
+
+            let exit_code = exit_code_for_doctor(&outcome);
+
+            match &outcome {
+                doctor::DoctorOutcome::Deferred { reason } => {
+                    if json {
+                        println!(
+                            "{{\"status\":\"deferred\",\"reason\":\"{}\"}}",
+                            reason.replace('"', "\\\"")
+                        );
+                    } else {
+                        println!("{reason}");
+                    }
+                }
+                doctor::DoctorOutcome::Ran(dr) => {
+                    if json {
+                        println!(
+                            "{{\"status\":\"ran\",\"volumes_checked\":{},\"volumes_failed\":{},\"missing\":{},\"stale\":{}}}",
+                            dr.volumes_checked,
+                            dr.volumes_failed.len(),
+                            dr.missing.len(),
+                            dr.stale.len(),
+                        );
+                    } else {
+                        print!("{}", doctor::format_report(dr));
+                    }
+
+                    if email && (!dr.ran() || dr.not_clean()) {
+                        let email_text = doctor::format_report(dr);
+                        match report::send_email_report_with_kind(&email_text, &cfg, "Doctor") {
+                            Ok(()) => eprintln!("Doctor report emailed"),
+                            Err(e) => {
+                                eprintln!("Could not send doctor report email: {e}")
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::process::exit(exit_code);
+        }
+
         // ----- Completions command -----
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -2103,5 +2255,81 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     fn exit_code_for_pass_singleton_skip_is_zero() {
         let pass = fake_pass(scrub::PassStatus::Skipped, Vec::new());
         assert_eq!(exit_code_for_pass(&pass), 0);
+    }
+
+    // -- exit_code_for_doctor (bd DAS-Backup-Manager-01u) --------------------
+    //
+    // Mirrors the exit_code_for_pass suite above. The `partial_volume_failure`
+    // case is the exact regression the reviewer caught: with only `has_drift()`
+    // consulted, 1-of-4 volumes failing while the rest are clean produced exit
+    // 0 alongside a `DRIFT DETECTED — FAILURE` report and a failure email.
+
+    #[test]
+    fn exit_code_for_doctor_clean_is_zero() {
+        let report = doctor::DriftReport {
+            volumes_checked: 4,
+            ..Default::default()
+        };
+        let outcome = doctor::DoctorOutcome::Ran(report);
+        assert_eq!(exit_code_for_doctor(&outcome), 0);
+    }
+
+    #[test]
+    fn exit_code_for_doctor_drift_is_one() {
+        let mut report = doctor::DriftReport {
+            volumes_checked: 4,
+            ..Default::default()
+        };
+        report.missing.push(doctor::MissingSubvolume {
+            volume: "/.btrfs-hdd".into(),
+            source_labels: vec!["hdd-projects".into()],
+            name: "ClaudeCodeProjects/new-project".into(),
+            category: doctor::DriftCategory::Irreplaceable,
+        });
+        let outcome = doctor::DoctorOutcome::Ran(report);
+        assert_eq!(exit_code_for_doctor(&outcome), 1);
+    }
+
+    #[test]
+    fn exit_code_for_doctor_partial_volume_failure_is_one() {
+        // 3 of 4 volumes examined cleanly (no missing/stale among them), 1
+        // failed to mount/list. `ran()` is true (volumes_checked > 0) and
+        // `has_drift()` is false, but this must still exit 1 — a volume that
+        // went unchecked is exactly the kind of gap this tool exists to
+        // surface, and the report/email already call it a failure.
+        let report = doctor::DriftReport {
+            volumes_checked: 3,
+            volumes_failed: vec![("/.btrfs-ssd".into(), "not mounted".into())],
+            ..Default::default()
+        };
+        assert!(report.ran());
+        assert!(!report.has_drift());
+        assert!(report.not_clean());
+        let outcome = doctor::DoctorOutcome::Ran(report);
+        assert_eq!(exit_code_for_doctor(&outcome), 1);
+    }
+
+    #[test]
+    fn exit_code_for_doctor_total_failure_is_two() {
+        // Every configured volume failed — nothing was ever examined.
+        let report = doctor::DriftReport {
+            volumes_checked: 0,
+            volumes_failed: vec![
+                ("/.btrfs-hdd".into(), "not mounted".into()),
+                ("/.btrfs-nvme".into(), "mount failed".into()),
+            ],
+            ..Default::default()
+        };
+        assert!(!report.ran());
+        let outcome = doctor::DoctorOutcome::Ran(report);
+        assert_eq!(exit_code_for_doctor(&outcome), 2);
+    }
+
+    #[test]
+    fn exit_code_for_doctor_deferred_is_zero() {
+        let outcome = doctor::DoctorOutcome::Deferred {
+            reason: "maintenance lock held".into(),
+        };
+        assert_eq!(exit_code_for_doctor(&outcome), 0);
     }
 }

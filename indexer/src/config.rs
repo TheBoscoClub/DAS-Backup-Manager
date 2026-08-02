@@ -20,6 +20,8 @@ pub struct Config {
     pub boot: Boot,
     #[serde(default)]
     pub scrub: Scrub,
+    #[serde(default)]
+    pub doctor: Doctor,
     #[serde(default, rename = "source")]
     pub sources: Vec<Source>,
     #[serde(default, rename = "target")]
@@ -200,6 +202,21 @@ impl Default for Scrub {
             fail_age_days: default_scrub_fail_age_days(),
         }
     }
+}
+
+/// Subvolume drift detector (`btrdasd doctor --check-drift`, bd DAS-Backup-Manager-01u).
+/// Entirely optional — an absent `[doctor]` section (every config predating this
+/// feature) parses to an empty exclude list via `#[serde(default)]`, identical in
+/// effect to an explicit `exclude = []`. The built-in exclusions (`.snapshots/`,
+/// `.btrbk-snapshots/`, `@tmp`, `@var-tmp`) are never configurable — this list only
+/// adds patterns on top of them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Doctor {
+    /// Additional glob patterns (`*`/`?` wildcards, matched case-sensitively
+    /// against the full on-disk subvolume path) excluded from drift reporting,
+    /// on top of the built-in exclusions. See `doctor::glob_match`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// A subvolume within a source, with optional scheduling flags and snapshot name override.
@@ -441,6 +458,7 @@ impl Default for Config {
             das: Das::default(),
             boot: Boot::default(),
             scrub: Scrub::default(),
+            doctor: Doctor::default(),
             sources: Vec::new(),
             targets: Vec::new(),
             email: Email::default(),
@@ -570,6 +588,21 @@ mod tests {
         );
         assert_eq!(parsed.scrub.warn_age_days, 45);
         assert_eq!(parsed.scrub.fail_age_days, 75);
+        // [doctor] is optional — default config has no exclude patterns
+        assert!(parsed.doctor.exclude.is_empty());
+    }
+
+    #[test]
+    fn doctor_round_trip_custom_exclude() {
+        let mut cfg = Config::default();
+        cfg.doctor.exclude = vec!["*.cache".into(), "Downloads/*".into()];
+        let toml_str = cfg
+            .to_toml()
+            .expect("serialize config with custom doctor exclude");
+        assert!(toml_str.contains("[doctor]"));
+        let parsed =
+            Config::from_toml(&toml_str).expect("deserialize config with custom doctor exclude");
+        assert_eq!(parsed.doctor.exclude, vec!["*.cache", "Downloads/*"]);
     }
 
     #[test]
@@ -755,6 +788,8 @@ enabled = false
         );
         assert_eq!(cfg.scrub.warn_age_days, 45);
         assert_eq!(cfg.scrub.fail_age_days, 75);
+        // [doctor] absent entirely from this old config — must parse to defaults
+        assert!(cfg.doctor.exclude.is_empty());
     }
 
     #[test]

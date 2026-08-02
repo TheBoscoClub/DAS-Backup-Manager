@@ -1323,8 +1323,8 @@ pub fn run_backup(
 mod tests {
     use super::*;
     use crate::config::{
-        Boot, Config, Das, Email, General, Gui, Init, InitSystem, Retention, Schedule, Scrub,
-        Source, SubvolConfig, Target, TargetRole,
+        Boot, Config, Das, Doctor, Email, General, Gui, Init, InitSystem, Retention, Schedule,
+        Scrub, Source, SubvolConfig, Target, TargetRole,
     };
     use crate::progress::TestProgress;
 
@@ -1355,6 +1355,7 @@ mod tests {
                 archive_retention_days: 365,
             },
             scrub: Scrub::default(),
+            doctor: Doctor::default(),
             sources: vec![
                 Source {
                     label: "nvme-root".into(),
