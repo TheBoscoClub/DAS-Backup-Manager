@@ -255,7 +255,7 @@ mod tests {
         assert!(output.contains("DAS_BOOT_ENABLED=true"));
         assert!(output.contains("DAS_BOOT_ARCHIVE_RETENTION_DAYS=365"));
         assert!(output.contains("DAS_SCRUB_ENABLED=true"));
-        assert!(output.contains("DAS_SCRUB_ON_CALENDAR='*-*-01 05:30:00'"));
+        assert!(output.contains("DAS_SCRUB_ON_CALENDAR='*-*-01 03:05:00'"));
         assert!(output.contains(
             "DAS_SCRUB_TARGETS='primary-22tb system-recovery-A-2tb system-recovery-B-2tb'"
         ));

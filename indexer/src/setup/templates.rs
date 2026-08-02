@@ -309,12 +309,19 @@ pub fn render_systemd_scrub_service(config: &Config) -> String {
 }
 
 /// Generate the das-scrub.timer unit file. `OnCalendar` is consumed verbatim
-/// from `config.scrub.on_calendar` (default `*-*-01 05:30:00`, monthly) — see
-/// the doc comment on `Scrub::on_calendar` in `indexer/src/config.rs`. NO
-/// `RandomizedDelaySec`: the fixed time clears the daily-backup worst case
-/// (~04:15) and the Sunday-full worst case (~04:55) with margin, and the
-/// maintenance lock — not timing — is the safety net against overlap (user
-/// decision 2026-07-27).
+/// from `config.scrub.on_calendar` (default `*-*-01 03:05:00`, monthly) — see
+/// the doc comment on `default_scrub_on_calendar()` in `indexer/src/config.rs`.
+/// The 03:05 default is deliberately five minutes AFTER the 03:00 daily backup
+/// fires: the backup already holds /run/das-maintenance.lock, so the scrub
+/// engine's blocking acquire starts the scrub the moment the backup finishes
+/// — "scrub follows the backup on the 1st" (user decision 2026-08-02,
+/// superseding the fixed-05:30 gap design of 2026-07-27). The same blocking
+/// flock covers overrun in the other direction: a scrub still running when
+/// the next day's 03:00 backup fires HOLDS that backup until the scrub
+/// completes — deferral, never a skip. When the 1st is a Sunday, the 04:00
+/// full backup likewise defers behind the running scrub. NO
+/// `RandomizedDelaySec`: the maintenance lock — not timing — is the
+/// serialization mechanism.
 pub fn render_systemd_scrub_timer(config: &Config) -> String {
     let on_calendar = &config.scrub.on_calendar;
 
@@ -391,7 +398,7 @@ pub fn render_systemd_doctor_service(config: &Config) -> String {
 }
 
 /// Generate the das-backup-doctor.timer unit file. Fixed `Sun 02:00` — before
-/// the Sunday full backup (04:00) and monthly scrub (05:30 on the 1st), so a
+/// the Sunday full backup (04:00) and monthly scrub (03:05 on the 1st), so a
 /// drift finding is visible ahead of that week's backup window rather than
 /// discovered after the fact. No `RandomizedDelaySec` — like das-scrub.timer,
 /// the fixed time is deliberate and the maintenance lock (which this check
@@ -760,10 +767,11 @@ mod tests {
     fn render_systemd_scrub_timer_test() {
         let config = test_config();
         let result = render_systemd_scrub_timer(&config);
-        assert!(result.contains("OnCalendar=*-*-01 05:30:00"));
+        assert!(result.contains("OnCalendar=*-*-01 03:05:00"));
         assert!(result.contains("Persistent=true"));
-        // Fixed 05:30 clears the daily/full worst cases with margin; the
-        // maintenance lock is the safety net, not randomized timing.
+        // 03:05 deliberately trails the 03:00 backup so the maintenance lock
+        // serializes scrub-after-backup; the lock, not randomized timing, is
+        // the mechanism.
         assert!(!result.contains("RandomizedDelaySec"));
     }
 

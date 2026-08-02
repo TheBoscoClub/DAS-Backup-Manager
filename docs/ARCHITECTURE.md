@@ -94,7 +94,15 @@ incident — see `.claude/rules/esp-safety.md`. `backup-run.sh` has no ESP/rsync
 `das-scrub.service` is deliberately dumb (`Type=oneshot`, unbounded `TimeoutStartSec=infinity`,
 no `Conflicts=`, no `ExecStopPost` cancel, no `RuntimeMaxSec=`). All ordering against a running
 backup is enforced by the engine's own blocking maintenance lock — identical to a manual
-`btrdasd scrub run` invocation, so there is no unit-layer special case. `[scrub].enabled` gates
+`btrdasd scrub run` invocation, so there is no unit-layer special case. The timer default
+(`*-*-01 03:05:00`, since 2026-08-02) deliberately fires five minutes after the 03:00 daily
+backup on the 1st: the backup already holds the maintenance lock, so the scrub blocks and then
+starts the moment the backup finishes — and if a long scrub is still running when the *next*
+day's 03:00 backup fires, the same lock holds that backup until the scrub completes (deferral,
+never a skipped backup). The three DAS filesystems are scrubbed **sequentially** in
+`[scrub].targets` list order because they share one USB path; the host's native NVMe/SATA
+filesystems are scrubbed by the system-scope `btrfs-scrub@` timers outside this project and may
+run in parallel with each other and with this engine. `[scrub].enabled` gates
 only whether `das-scrub.timer` is enabled by `btrdasd setup`; the engine still honors a manual
 run regardless (warn-only). See `.claude/rules/backup.md` and `docs/SCRUB-SCHEDULING-PROPOSAL.md`
 for the full design rationale.

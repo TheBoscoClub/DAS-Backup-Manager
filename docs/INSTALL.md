@@ -349,7 +349,7 @@ are silently ignored by serde on load.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable `das-scrub.timer` (the scrub engine itself always allows manual `btrdasd scrub run`, warning-only when disabled) |
-| `on_calendar` | string | `"*-*-01 05:30:00"` | systemd `OnCalendar=` expression consumed verbatim by `das-scrub.timer` (monthly, 05:30) |
+| `on_calendar` | string | `"*-*-01 03:05:00"` | systemd `OnCalendar=` expression consumed verbatim by `das-scrub.timer` (monthly, 03:05 on the 1st — deliberately trails the 03:00 backup so the maintenance lock starts the scrub immediately after it finishes) |
 | `targets` | string[] | `["primary-22tb", "system-recovery-A-2tb", "system-recovery-B-2tb"]` | `[[target]].label` values scrubbed sequentially in list order |
 | `warn_age_days` | u32 | `45` | Days since a target's last successful scrub before health checks warn |
 | `fail_age_days` | u32 | `75` | Days since a target's last successful scrub before health checks fail |
