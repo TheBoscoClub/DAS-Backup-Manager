@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.11
+**Version**: 0.7.12.3
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -24,7 +24,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 ## Features
 
 - **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure
-- **Multi-Target Architecture** — Configurable primary, mirror, and ESP-sync roles across any number of DAS drives
+- **Multi-Target Architecture** — Configurable primary and mirror roles across any number of DAS drives
 - **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
 - **Scheduled BTRFS Scrub** (`btrdasd scrub`) — Monthly integrity scrub of all DAS backup filesystems, with health-check integration and email reports
 - **Subvolume Drift Detector** (`btrdasd doctor --check-drift`) — Weekly check comparing every source filesystem's actual subvolumes against config.toml, catching silent backup gaps (missing) and stale entries (removed), with a ready-to-paste config diff and email alerts
@@ -44,13 +44,13 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | Component | Description | Status |
 |-----------|-------------|--------|
 | `scripts/backup-run.sh` | btrbk backup orchestrator with email reporting | Active (v4.4.1) |
-| `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active (v2.0.0) |
+| `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active (v3.0.0) |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active (v2.1.0) |
-| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v1.0.0) |
+| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v2.0.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.7.0+) |
-| `gui/` | Qt6/KDE Plasma full backup management GUI (19 C++ components) | Active (v0.7.0+) |
+| `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
 ## Project Structure
@@ -66,7 +66,7 @@ DAS-Backup-Manager/
 │   ├── src/ffi.rs     # C-ABI FFI bridge (extern "C" functions)
 │   ├── include/       # C header (btrdasd_ffi.h)
 │   └── completions/   # Shell completion installation instructions
-├── gui/               # Qt6/KDE Plasma GUI (19 C++ components)
+├── gui/               # Qt6/KDE Plasma GUI (18 C++ components)
 │   └── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
 ├── dbus/              # D-Bus bus config and service activation
 ├── polkit/            # Polkit privilege escalation policy
@@ -100,7 +100,7 @@ sudo cmake --install build
 sudo btrdasd setup
 ```
 
-The wizard configures backup sources, targets, retention, scheduling, email, and ESP mirroring — then generates all configuration files and enables timers.
+The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files and enables timers.
 
 ### CLI-Only (no GUI dependencies)
 
