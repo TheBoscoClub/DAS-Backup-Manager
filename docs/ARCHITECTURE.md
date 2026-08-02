@@ -262,7 +262,7 @@ Templates are rendered programmatically (no external template files):
 | `render_systemd_service()` | `.service` unit | ExecStart with full flag support |
 | `render_systemd_timer()` | `.timer` unit | OnCalendar with RandomizedDelaySec |
 | `render_cron_entry()` | cron lines | For sysvinit/OpenRC systems |
-| `render_backup_run()` | `backup-run-generated.sh` | Script with DAS serials, mount vars |
+| embedded scripts (`include_str!`) | `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh` | Real production scripts installed flat at `${prefix}/lib/das-backup/` (same layout as cmake's install) |
 
 SMTP credentials are sourced directly from `~/.config/pbridge.conf` — no
 project-local email config file is generated. ESP sync hook generation was
