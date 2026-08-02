@@ -518,6 +518,26 @@ timer fires, never a direct invocation of this command. A manual run is
 exactly the intended use of a temporarily-disabled schedule, and a
 warning is printed to make that explicit rather than silent.
 .PP
+.B Exit code:
+0 means the pass
+.I ran
+(scrubbing was attempted on at least one target), regardless of what it
+found \(em per-FS errors, aborted scrubs, and unmount problems are
+reported via the FAILURE email and
+.B "btrdasd health"
+Critical escalation, never via this exit code. Nonzero means the pass
+could
+.I not
+run at all: a config load failure, a lock-file I/O error, or every
+target failing before any scrub was attempted. This split (bd
+.B DAS\-Backup\-Manager\-18p )
+exists so a Sentinel-monitored systemd unit never retry-loops a real
+multi-hour scrub over failing hardware just because it found damage
+\(em only a genuine can't-even-start failure, which fails in seconds,
+trips the unit into
+.B failed
+state.
+.PP
 .B btrdasd scrub run
 .RB [ \-\-config
 .IR PATH ]

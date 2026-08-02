@@ -421,6 +421,18 @@ enum ScrubAction {
     /// invocation of this command — a manual run is exactly the intended use
     /// of a temporarily-disabled schedule (testing, or scrubbing on demand).
     /// A warning is printed when this happens so it is never silent.
+    ///
+    /// EXIT CODE: 0 means the pass RAN (scrubbing was attempted on at least
+    /// one target), regardless of what it found — per-FS errors, aborted
+    /// scrubs, and unmount problems are reported via the FAILURE email and
+    /// `btrdasd health` Critical escalation, never via this exit code.
+    /// Nonzero means the pass could NOT run at all (config load failure,
+    /// lock IO error, or every target unresolvable/unmountable before any
+    /// scrub was attempted). This split exists so a Sentinel-monitored
+    /// systemd unit never retry-loops a real multi-hour scrub over and over
+    /// on failing hardware just because it found damage (bd
+    /// DAS-Backup-Manager-18p) — only genuine can't-even-start failures,
+    /// which fail in seconds, trip the unit into `failed` state.
     Run {
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -774,6 +786,55 @@ fn cancel_running_scrub(config: &Config) -> Result<String, String> {
                 .to_string(),
         ),
     }
+}
+
+/// Map a completed (or skipped) scrub pass to `btrdasd scrub run`'s process
+/// exit code (`bd DAS-Backup-Manager-18p`).
+///
+/// This is a CLI-only concern, deliberately kept separate from
+/// `ScrubPass::success()` — the engine's own "did everything pass cleanly"
+/// bit, unchanged, and still what the FAILURE email and `btrdasd health`
+/// Critical escalation key on. The split exists because Sentinel
+/// (`cachyos-sentinel`) auto-restarts any systemd unit it observes in
+/// `failed` state, and its restart-rate limiter (3 restarts / 600 s) never
+/// engages for scrub failures spaced 14–18 h apart (one monthly pass) — so
+/// if this exit code mirrored `ScrubPass::success()`, a pass that ran to
+/// completion but found real damage on failing hardware would retry-loop
+/// the entire multi-hour pass forever. Exit 0 therefore means only "the
+/// pass ran" — per-FS outcomes (error counters, aborted scrubs, unmount
+/// failures after scrubbing) are irrelevant to this decision and are
+/// reported through the email/health channels instead. Exit nonzero means
+/// "the pass could not even start" — that fails in seconds, exactly where
+/// Sentinel's limiter genuinely brakes a real crash loop.
+///
+/// - A [`PassStatus::Skipped`] pass (another scrub already running) is
+///   always 0 — nothing went wrong, there was simply nothing to do here.
+/// - Otherwise: 0 if at least one target's `started_epoch` is nonzero —
+///   `scrub_one_target` only sets it once `resolve_target_fsuuid` and
+///   `ensure_mounted` have both succeeded and a real `btrfs scrub start`
+///   was issued, so this is exactly "resolution + mount succeeded and
+///   scrubbing was attempted" for that filesystem, regardless of what
+///   happened afterward.
+/// - Otherwise (every target failed before any scrub was attempted — e.g.
+///   all targets unresolvable or unmountable): nonzero. This is the one
+///   judgment call the brief left explicit: a pass where *some* targets
+///   scrubbed and *some* could not be mounted is still 0 (scrubbing did
+///   occur, and the email/`scrub status` output already surfaces the
+///   skips) — only *zero* targets ever reaching a scrub attempt counts as
+///   "could not run".
+///
+/// Setup-stage failures before a [`ScrubPass`] value even exists — config
+/// load errors, lock-file IO errors, `ScrubError::NoTargets` — never reach
+/// this function at all; they already propagate as `Err` through
+/// `scrub::run_scrub_pass`'s `?` in the caller and exit nonzero via Rust's
+/// default `main()` error handling, which is exactly the desired "could not
+/// run" outcome for that class of failure too.
+pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
+    if pass.status == scrub::PassStatus::Skipped {
+        return 0;
+    }
+    let any_scrub_attempted = pass.results.iter().any(|r| r.started_epoch != 0);
+    if any_scrub_attempted { 0 } else { 1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,6 +1576,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let progress = CliProgress;
                 let pass = scrub::run_scrub_pass(&cfg, &progress)?;
+                let exit_code = exit_code_for_pass(&pass);
                 let status_word = match pass.status {
                     scrub::PassStatus::Completed => "completed",
                     scrub::PassStatus::Skipped => "skipped",
@@ -1533,10 +1595,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pass.results.len() - pass.failed_count(),
                         pass.results.len()
                     );
+                    if !pass.success() && exit_code == 0 {
+                        // The pass ran (exit 0) despite failures — make sure a
+                        // console reader isn't misled by the exit code alone.
+                        // When exit_code is nonzero instead (nothing was ever
+                        // resolvable), the exit code itself already signals
+                        // the problem, so this note would be redundant there.
+                        println!(
+                            "NOTE: failures were detected in the pass above (per-FS errors, \
+                             aborted scrubs, or unmount problems) — this is reported via the \
+                             FAILURE email and health Critical escalation, not via this \
+                             command's exit code. See 'btrdasd scrub status' or 'btrdasd health'."
+                        );
+                    }
                 }
-                if !pass.success() {
-                    std::process::exit(1);
-                }
+                std::process::exit(exit_code);
             }
             ScrubAction::Status { config } => {
                 let cfg = Config::load(&config)?;
@@ -1867,5 +1940,124 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert_eq!(format_duration_secs(60), "1m 0s");
         assert_eq!(format_duration_secs(3661), "1h 1m");
         assert_eq!(format_duration_secs(6274), "1h 44m");
+    }
+
+    // --- exit_code_for_pass (bd DAS-Backup-Manager-18p) --------------------
+    //
+    // "Setup failure -> nonzero" (config load errors, lock IO errors,
+    // ScrubError::NoTargets) is deliberately NOT tested here: those never
+    // produce a `ScrubPass` value at all, so `exit_code_for_pass` is never
+    // called for them — they already exit nonzero via `?` propagation out
+    // of `scrub::run_scrub_pass` in `main()`. This was exercised live
+    // during the original `scrub run` wiring verification (a config with
+    // `[scrub].targets = []` correctly produced `Error: NoTargets` and
+    // process exit 1, and a disabled/unresolvable-target config correctly
+    // propagated a nonzero exit through the same path) — see this task's
+    // report file for the transcript.
+
+    fn fake_result(started_epoch: i64) -> scrub::ScrubFsResult {
+        scrub::ScrubFsResult {
+            target_label: "t".to_string(),
+            fsuuid: "11111111-1111-1111-1111-111111111111".to_string(),
+            mountpoint: "/mnt/t".to_string(),
+            outcome: None,
+            counters: scrub::ScrubCounters::default(),
+            bytes_scrubbed: 0,
+            started_epoch,
+            finished_epoch: 0,
+            duration_secs: 0,
+            errors: Vec::new(),
+            mounted_by_engine: false,
+        }
+    }
+
+    fn fake_pass(
+        status: scrub::PassStatus,
+        results: Vec<scrub::ScrubFsResult>,
+    ) -> scrub::ScrubPass {
+        scrub::ScrubPass {
+            status,
+            started_epoch: 1_700_000_000,
+            finished_epoch: 1_700_003_600,
+            results,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exit_code_for_pass_all_clean_is_zero() {
+        let mut result = fake_result(1_700_000_100);
+        result.outcome = Some(scrub::ScrubOutcome::Finished);
+        let pass = fake_pass(scrub::PassStatus::Completed, vec![result]);
+        assert_eq!(exit_code_for_pass(&pass), 0);
+    }
+
+    #[test]
+    fn exit_code_for_pass_ran_with_errors_is_zero() {
+        // Scrubbing was attempted and completed, but found real damage
+        // (nonzero error counters). The whole point of bd 18p: this must
+        // NOT fail the process exit code, or Sentinel would retry-loop a
+        // multi-hour pass on hardware that is genuinely failing.
+        let mut result = fake_result(1_700_000_100);
+        result.outcome = Some(scrub::ScrubOutcome::Finished);
+        result.counters.csum_errors = 3;
+        result.errors.push("errors found: csum=3".to_string());
+        let pass = fake_pass(scrub::PassStatus::Completed, vec![result]);
+        assert_eq!(
+            exit_code_for_pass(&pass),
+            0,
+            "per-FS damage must not fail the process exit code"
+        );
+    }
+
+    #[test]
+    fn exit_code_for_pass_aborted_mid_pass_is_zero() {
+        // A scrub that started (started_epoch set) but died mid-run
+        // (Aborted) still counts as "ran" for exit-code purposes.
+        let mut result = fake_result(1_700_000_100);
+        result.outcome = Some(scrub::ScrubOutcome::Aborted);
+        result
+            .errors
+            .push("scrub aborted (did not complete)".to_string());
+        let pass = fake_pass(scrub::PassStatus::Completed, vec![result]);
+        assert_eq!(exit_code_for_pass(&pass), 0);
+    }
+
+    #[test]
+    fn exit_code_for_pass_nothing_resolvable_is_nonzero() {
+        // Every target failed before any scrub was ever attempted --
+        // started_epoch stays 0 because resolve_target_fsuuid/ensure_mounted
+        // never succeeded for anything. This is the one case that must be
+        // treated as "could not run".
+        let mut a = fake_result(0);
+        a.errors
+            .push("no [[target]] with label 'a' in config".to_string());
+        let mut b = fake_result(0);
+        b.errors
+            .push("cannot mount /mnt/b: exit status 32".to_string());
+        let pass = fake_pass(scrub::PassStatus::Completed, vec![a, b]);
+        assert_eq!(exit_code_for_pass(&pass), 1);
+    }
+
+    #[test]
+    fn exit_code_for_pass_partially_resolvable_is_zero() {
+        // The explicit judgment call from the brief: some targets scrubbed,
+        // some could not be mounted. Recommendation taken: still 0, since
+        // scrubbing genuinely occurred and the skips are surfaced via email
+        // / `scrub status` rather than the exit code.
+        let mut unresolved = fake_result(0);
+        unresolved
+            .errors
+            .push("no [[target]] with label 'a' in config".to_string());
+        let mut scrubbed = fake_result(1_700_000_100);
+        scrubbed.outcome = Some(scrub::ScrubOutcome::Finished);
+        let pass = fake_pass(scrub::PassStatus::Completed, vec![unresolved, scrubbed]);
+        assert_eq!(exit_code_for_pass(&pass), 0);
+    }
+
+    #[test]
+    fn exit_code_for_pass_singleton_skip_is_zero() {
+        let pass = fake_pass(scrub::PassStatus::Skipped, Vec::new());
+        assert_eq!(exit_code_for_pass(&pass), 0);
     }
 }

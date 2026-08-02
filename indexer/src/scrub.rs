@@ -1416,6 +1416,19 @@ fn now_epoch() -> i64 {
 ///
 /// Returns `Ok` with [`PassStatus::Skipped`] when another scrub already holds
 /// the singleton lock; that is a success, not a failure, and writes no state.
+///
+/// [`ScrubPass::success()`] is the library's own "did everything pass
+/// cleanly" bit — the source of truth for the FAILURE email and
+/// `btrdasd health` Critical escalation, and it is **not** the same
+/// question as "should the calling process exit nonzero". The CLI
+/// (`indexer/src/main.rs`, `exit_code_for_pass`) deliberately maps a pass
+/// that ran but found errors to exit code 0: `btrdasd scrub run` runs under
+/// a Sentinel-monitored systemd unit whose restart-rate limiter cannot
+/// brake failures spaced a month apart, so treating "ran with damage found"
+/// the same as "could not run at all" would retry-loop a real multi-hour
+/// scrub over failing hardware indefinitely (`bd DAS-Backup-Manager-18p`).
+/// This function's return value stays truthful either way — only the CLI's
+/// interpretation of it for the process exit code is split.
 pub fn run_scrub_pass(
     config: &Config,
     progress: &dyn ProgressCallback,
