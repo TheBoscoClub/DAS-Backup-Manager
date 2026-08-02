@@ -1,9 +1,60 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.4.0
+# Version: 4.4.1
 # Date: 2026-08-02
 #
 # Features:
+#   - cleanup() guaranteed on every abort path (v4.4.1): 'trap cleanup ERR'
+#     (installed inside main(), no 'set -E'/errtrace) only ever fired for a
+#     failing command directly in main()'s own body — never for a set -e
+#     abort or explicit `exit 1` inside a called function (create_mount_points,
+#     verify_targets_before_btrbk, mount_targets, run_btrbk, check_root, ...).
+#     Reproduced empirically on bash 5.3.15: `false`, `exit 1`, and
+#     `x=$(false)` inside a helper function all killed the script with zero
+#     cleanup() output — no unmount_all, no FAILURE DB row, DAS left mounted,
+#     the run invisible to the GUI history. Replaced with a top-level
+#     `trap cleanup EXIT`, which bash runs on every termination path
+#     (normal completion, `exit N` at any call depth, a set -e abort at any
+#     call depth). New SCRIPT_COMPLETED flag, set as the last statement of
+#     main(), makes cleanup() a true no-op on the clean-completion path
+#     (unmount_all/record_backup_run_in_db already ran in main()'s own
+#     body in that case) while still running the abort-recovery body for
+#     every earlier exit. `trap 'exit 130' INT`/`trap 'exit 143' TERM` route
+#     signal deaths (e.g. `systemctl stop das-backup` mid-run sending TERM)
+#     through the same EXIT trap instead of bash's default "die without
+#     running EXIT traps" behavior for unhandled fatal signals — explicit
+#     128+signum codes, not a bare `trap 'exit' ...`, which was proven in
+#     the harness to reuse a stale pre-signal $? (often 0) and mask a
+#     mid-run TERM abort as a false success. cleanup() now captures
+#     `$?` as its first statement and finishes with `exit "$rc"` so the
+#     original exit code — 0 for a clean run, nonzero for an abort — is
+#     never clobbered by cleanup's own command exit statuses (unmount_all's
+#     internal calls are already `if`-guarded/non-propagating; the
+#     record_backup_run_in_db and unmount_all calls in cleanup() are also
+#     `|| true`-guarded so a failure inside the abort-recovery body itself
+#     cannot skip the trailing `exit "$rc"`).
+#     CLEANUP_ARMED gate (same v4.4.1 change, added after review): the
+#     EXIT trap above is installed, and ALL_TARGET_MOUNTS is populated,
+#     entirely at top level — both well before main() is ever entered.
+#     Review confirmed a literal "singleton-skip" collision (a second
+#     backup-run.sh instance's flock-held skip triggering cleanup) does
+#     NOT reproduce, because that skip's `exit 0` (top-level, before the
+#     singleton-lock section) happens before the trap is even installed —
+#     proven empirically by running a real flock-held second instance and
+#     observing no cleanup() output. But a DIFFERENT, real exposure was
+#     found: main()'s own argument-parsing usage error (`exit 1` for an
+#     unrecognized flag) or a check_root() failure aborts AFTER the trap
+#     is active but BEFORE this process holds /run/das-maintenance.lock —
+#     at that point unmount_all() would run over ALL_TARGET_MOUNTS with no
+#     exclusivity guarantee against indexer/src/scrub.rs, which mounts the
+#     SAME /mnt/backup-* paths under that identical lock and states the
+#     invariant this closes: "a backup can never unmount a filesystem out
+#     from under a running scrub". New CLEANUP_ARMED flag, set "true" in
+#     main() immediately after acquire_maintenance_lock() returns (the
+#     earliest point this process actually owns the shared mountpoints);
+#     cleanup()'s recovery body now requires
+#     `CLEANUP_ARMED == "true" && SCRIPT_COMPLETED != "true"`, silently
+#     preserving the original exit code otherwise. Tracks bd DAS-Backup-Manager-oeo.
 #   - Report generated after unmount, from cached mount-time data (v4.4.0):
 #     previously generate_report() ran BEFORE unmount_all(), so an unmount
 #     failure was visible only in the console/journal — never in the same
@@ -265,6 +316,27 @@ BACKUP_RUN_RECORDED="false"
 BACKUP_MODE_REAL="false"
 # Track force_full for cleanup trap access
 BACKUP_FORCE_FULL="false"
+# Set as the LAST statement of main() on the clean-completion path (both
+# real-run and dryrun). While "false", the EXIT trap (cleanup()) treats
+# termination as an abort and runs its full recovery body; once "true",
+# cleanup() no-ops immediately (unmount_all/record_backup_run_in_db already
+# ran in main()'s own body for a clean run). bd DAS-Backup-Manager-oeo.
+SCRIPT_COMPLETED="false"
+# Set inside main() the moment this process actually OWNS the shared DAS
+# mountpoints — immediately after acquire_maintenance_lock() returns (see
+# the arming site in main() for the exact line and full rationale). Until
+# then, cleanup() must NOT run its recovery body even though the EXIT trap
+# is already installed and ALL_TARGET_MOUNTS is already populated (both
+# happen well before main() is entered): indexer/src/scrub.rs mounts the
+# SAME /mnt/backup-* paths under the protection of that same maintenance
+# lock, and states its own invariant explicitly — "a backup can never
+# unmount a filesystem out from under a running scrub". An abort inside
+# main() BEFORE the maintenance lock is held (a `--typo` usage error,
+# check_root() failing) would otherwise call unmount_all() over those same
+# paths with no exclusivity guarantee against a live scrub pass holding one
+# of them. CLEANUP_ARMED is what keeps that invariant true on backup's
+# abort paths, not just its happy path. bd DAS-Backup-Manager-oeo.
+CLEANUP_ARMED="false"
 
 # Colors for interactive output
 RED='\033[0;31m'
@@ -1354,7 +1426,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.4.0
+  backup-run.sh v4.4.1
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -1644,19 +1716,95 @@ record_backup_run_in_db() {
 # ============================================================================
 
 cleanup() {
-    log_warn "Cleaning up after error..."
+    # First statement, unconditionally: capture the exit status that
+    # triggered this EXIT trap invocation BEFORE any other command in this
+    # function can overwrite $?. This is the status cleanup() must preserve
+    # on exit — 0 for a normal fall-through completion of the script, or the
+    # nonzero status from whatever `exit N` / set -e abort fired the trap.
+    local rc=$?
 
-    # Record the failed backup run if we were in a real backup and haven't recorded yet
+    # Two independent reasons the recovery body below must NOT run — both
+    # exit silently (no log line), explicit `exit "$rc"` (not fallthrough)
+    # so this no-op path can never alter the process's final status:
+    #   1. SCRIPT_COMPLETED == "true": main() already ran unmount_all()/
+    #      record_backup_run_in_db() itself and reached its own last
+    #      statement — this is the ordinary clean-completion path.
+    #   2. CLEANUP_ARMED != "true": this process has not yet reached the
+    #      point where it actually owns the shared DAS mountpoints (see
+    #      CLEANUP_ARMED's definition in the globals block and its arming
+    #      site in main(), right after acquire_maintenance_lock()). The
+    #      EXIT trap is installed, and ALL_TARGET_MOUNTS is already
+    #      populated, well before main() is even entered — so WITHOUT this
+    #      gate, an abort as early as main()'s own argument-parsing usage
+    #      error (`exit 1` for an unrecognized flag) or a check_root()
+    #      failure would call unmount_all() over ALL_TARGET_MOUNTS before
+    #      this process holds /run/das-maintenance.lock. Those same
+    #      /mnt/backup-* paths are mounted by indexer/src/scrub.rs under
+    #      that identical lock's protection — scrub.rs's own doc comment
+    #      states the invariant this gate exists to preserve: "a backup can
+    #      never unmount a filesystem out from under a running scrub". A
+    #      preserves-the-exit-code silent exit here (0 for e.g. an orderly
+    #      early return, nonzero for a usage error) is correct in both
+    #      cases — neither is "abnormal termination of a run in progress"
+    #      from this process's own perspective. bd DAS-Backup-Manager-oeo.
+    if [[ "$SCRIPT_COMPLETED" == "true" || "$CLEANUP_ARMED" != "true" ]]; then
+        exit "$rc"
+    fi
+
+    log_warn "Cleaning up after abnormal termination (exit code $rc)..."
+
+    # Record the failed backup run if we were in a real backup and haven't
+    # recorded yet. `|| true`: a failure inside record_backup_run_in_db must
+    # not itself abort cleanup() under set -e and skip unmount_all/exit "$rc"
+    # below — record_backup_run_in_db already soft-fails internally (its
+    # BTRDASD_BIN call is guarded by an `if`), this guard is defense in depth
+    # for cleanup() specifically, since cleanup() runs as an EXIT trap where
+    # there is no outer handler left to catch a set -e abort.
     if [[ "$BACKUP_MODE_REAL" == "true" && "$BACKUP_RUN_RECORDED" == "false" ]]; then
         # Ensure end time is set (may not be if failure was during btrbk)
         if (( BTRBK_END_TIME == 0 )); then
             BTRBK_END_TIME=$(date +%s)
         fi
-        record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL"
+        record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL" || true
     fi
 
-    unmount_all
+    # `|| true`: same defense-in-depth rationale as above — unmount_all
+    # already handles its own per-mount failures internally, but a failure
+    # here must never prevent the trailing `exit "$rc"` from running.
+    unmount_all || true
+
+    # Explicit exit, not fallthrough: preserves the original abort status
+    # ($rc) as the process's final exit code rather than letting it become
+    # whatever unmount_all's last internal command happened to return.
+    exit "$rc"
 }
+
+# Installed at top level (not inside main()) so it is active before main()
+# is even called — covering argument-parsing aborts (main()'s `exit 1` on an
+# unrecognized flag) in addition to every abort at any call depth once
+# main() is running. Placed here, after cleanup()'s definition and after the
+# BACKUP_MODE_REAL/BACKUP_RUN_RECORDED/BTRBK_END_TIME/SCRIPT_COMPLETED
+# globals above are already initialized, so cleanup() can never observe an
+# unset variable if something aborts before main() starts. Replaces the old
+# `trap cleanup ERR` (installed inside main(), and only ever effective for a
+# failing command directly in main()'s own body — see the v4.4.1 header
+# note). `trap 'exit 130' INT`/`trap 'exit 143' TERM` convert SIGINT/SIGTERM
+# into an `exit` builtin call with the conventional 128+signum code, so they
+# route through this same EXIT trap instead of bash's default "kill without
+# running EXIT traps" behavior for unhandled fatal signals. A bare
+# `trap 'exit' INT TERM` was tried first and rejected: `exit` with no
+# argument reuses whatever $? happened to be from the last command that ran
+# BEFORE the signal arrived (often 0, e.g. right after a successful
+# mountpoint/df call mid-run) — proven empirically in the harness (kill
+# -TERM mid-run right after a `true`) to yield exit code 0, which would
+# silently satisfy point 5's Sentinel nonzero-exit requirement as a false
+# "success" for an operator-initiated `systemctl stop das-backup` abort. The
+# explicit-code form was proven in the same harness to yield 143 for TERM /
+# 130 for INT regardless of the preceding command's status. See bd
+# DAS-Backup-Manager-oeo.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ============================================================================
 # MAIN
@@ -1696,14 +1844,26 @@ main() {
 
     log_info "=== DAS Backup Started ==="
 
-    trap cleanup ERR
-
     check_root
     # Backup side of the mutual-hold interlock with the scrub engine — must
     # run before any mount work (create_mount_points is the first mounter
     # below). Blocks (deferral, never cancellation) if a scrub currently
     # holds /run/das-maintenance.lock.
     acquire_maintenance_lock
+
+    # Arm cleanup()'s recovery body: acquire_maintenance_lock() just
+    # returned, which means this process now holds /run/das-maintenance.lock
+    # and is the exclusive owner of the shared DAS mountpoints (the same
+    # ones indexer/src/scrub.rs mounts under that lock's protection). Only
+    # from this point on is it safe for an abort's cleanup() to call
+    # unmount_all() over ALL_TARGET_MOUNTS — see CLEANUP_ARMED's definition
+    # in the globals block for the full disaster scenario this closes.
+    # Deliberately placed AFTER acquire_maintenance_lock, not after the
+    # earlier check_root — check_root() itself can still abort with the
+    # recovery body correctly skipped (CLEANUP_ARMED is still "false" then).
+    # bd DAS-Backup-Manager-oeo.
+    CLEANUP_ARMED="true"
+
     check_das_connected
     set_io_scheduler
     create_mount_points
@@ -1781,6 +1941,12 @@ main() {
     else
         log_info "Backup complete. DAS can be safely disconnected."
     fi
+
+    # Last statement of main(): marks the clean-completion path so the EXIT
+    # trap (cleanup()) no-ops instead of re-running unmount_all/record_
+    # backup_run_in_db, which main() has already run itself by this point on
+    # every reachable path (real-run and dryrun alike). bd DAS-Backup-Manager-oeo.
+    SCRIPT_COMPLETED="true"
 }
 
 main "$@"
