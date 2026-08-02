@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, TargetRole};
 use crate::db::Database;
 use crate::health;
 use crate::indexer;
@@ -767,6 +767,21 @@ pub fn archive_boot(
         };
 
         for target in &config.targets {
+            // Mirror targets carry a genuinely independent OS install in their
+            // own @/@home (e.g. das-recovery-bay1) — never archive-then-replace
+            // it with a host snapshot. Mirrors still receive ordinary btrbk
+            // send/receive via run_backup(); only this boot-subvol step skips
+            // them. Wording matches update_boot_subvolumes() in
+            // scripts/backup-run.sh so both origins log identically
+            // (bd DAS-Backup-Manager-am1).
+            if target.role == TargetRole::Mirror {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("[{}] Skipping mirror target (independent OS)", target.mount),
+                );
+                continue;
+            }
+
             let tgt_mount = &target.mount;
             let subvol_path = format!("{tgt_mount}/{subvol}");
 
@@ -1669,5 +1684,67 @@ mod tests {
     #[test]
     fn test_parse_throughput_line_no_throughput() {
         assert_eq!(parse_throughput_line("Snapshot /.btrfs/root.20260228"), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // archive_boot: mirror-role targets must never be archived/replaced
+    // (bd DAS-Backup-Manager-am1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_archive_boot_skips_mirror_targets() {
+        // Two targets: a primary (fair game for archive/replace) and a mirror
+        // (independent OS — must be skipped entirely by archive_boot). Both
+        // mount paths are real tempdirs so `Path::exists()` checks behave
+        // like a real (if empty) target; neither has an "@"/"@home" subvolume
+        // on disk, so no actual btrfs mutation is attempted against either —
+        // this test only asserts *target selection*, not btrfs plumbing.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+
+        let mut config = make_test_config();
+        config.targets[0].mount = primary_dir.path().to_string_lossy().to_string();
+        config.targets[0].label = "primary-22tb".into();
+        config.targets.push(Target {
+            label: "system-recovery-A-2tb".into(),
+            serial: "MIRRORSERIAL".into(),
+            serials: vec!["MIRRORSERIAL".into()],
+            mount_uuid: None,
+            mount: mirror_dir.path().to_string_lossy().to_string(),
+            role: TargetRole::Mirror,
+            retention: Retention {
+                weekly: 4,
+                monthly: 2,
+                daily: 7,
+                yearly: 0,
+            },
+            display_name: "Recovery A (independent OS)".into(),
+        });
+
+        let progress = TestProgress::new();
+        let result = archive_boot(&config, &progress);
+        assert!(result.is_ok(), "archive_boot must not error: {result:?}");
+
+        let logs = progress.logs.lock().unwrap();
+
+        // The mirror target must be explicitly skipped, with wording mirroring
+        // scripts/backup-run.sh's update_boot_subvolumes().
+        let mirror_mount = mirror_dir.path().to_string_lossy().to_string();
+        assert!(
+            logs.iter().any(|(_, msg)| msg.contains(&mirror_mount)
+                && msg.contains("Skipping mirror target (independent OS)")),
+            "expected a 'Skipping mirror target (independent OS)' log mentioning {mirror_mount}, got: {logs:?}"
+        );
+
+        // No archive/create/delete/snapshot log line may ever reference the
+        // mirror's mount path — the skip must happen before any btrfs
+        // subvolume operation is attempted against it.
+        assert!(
+            !logs.iter().any(|(_, msg)| {
+                (msg.contains("Archived") || msg.contains("Created") || msg.contains("delete"))
+                    && msg.contains(&mirror_mount)
+            }),
+            "no archive/create/delete operation may reference the mirror mount, got: {logs:?}"
+        );
     }
 }
