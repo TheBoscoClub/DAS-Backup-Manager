@@ -3,8 +3,10 @@
 
 #![allow(dead_code)]
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::setup::config::Config;
 use crate::setup::templates::GeneratedFiles;
@@ -197,7 +199,53 @@ pub fn uninstall_from_manifest(manifest_path: &Path) -> usize {
     removed
 }
 
-/// Upgrade: reload existing config and regenerate all files.
+/// Can we open a TCP connection to the configured mail relay?
+///
+/// Used only to warn during `--upgrade`/`--check`. A connect is the whole test:
+/// it proves something is listening, which is the failure this catches (relay
+/// not installed, not running, or a config pointing at the wrong port). It
+/// deliberately does not speak SMTP — a real send is the only proof of
+/// deliverability, and that belongs to a backup run, not the installer.
+fn relay_reachable(config: &Config) -> bool {
+    let addr = format!("{}:{}", config.email.smtp_host, config.email.smtp_port);
+    let Ok(mut addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(2)).is_ok())
+}
+
+/// Rewrite settings that a new binary would otherwise misread from an
+/// old-but-valid `config.toml`.
+///
+/// The live config is preserved across upgrades, so a compiled default change
+/// alone never reaches an existing host — it only affects fresh installs. Any
+/// setting whose *meaning* changes between releases has to be migrated here or
+/// the upgraded host silently keeps the old behaviour.
+///
+/// Returns the human-readable list of changes applied (empty when nothing
+/// needed changing). Idempotent: running it twice changes nothing the second
+/// time, which is what makes it safe on every `--upgrade`.
+fn migrate_config(config: &mut Config) -> Vec<String> {
+    let mut changes = Vec::new();
+
+    // 2026-08-06 — Protonmail Bridge to local mail relay.
+    //
+    // Port 1025 is Bridge's loopback submission port. A host still carrying it
+    // would have the new, credential-free sender talking to Bridge, which
+    // demands authentication — so every report would fail rather than fail
+    // over. Only the exact Bridge port is rewritten: an operator who has
+    // deliberately set some other port keeps it.
+    if config.email.smtp_port == 1025 {
+        config.email.smtp_port = 25;
+        changes.push(
+            "[email] smtp_port 1025 -> 25 (Protonmail Bridge -> local mail relay)".to_string(),
+        );
+    }
+
+    changes
+}
+
+/// Upgrade: reload existing config, apply migrations, and regenerate all files.
 pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = PathBuf::from(CONFIG_FILE);
     if !config_path.exists() {
@@ -211,12 +259,32 @@ pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::load(&config_path)?;
     let old_version = config.general.version.clone();
     config.general.version = env!("CARGO_PKG_VERSION").to_string();
-    if old_version != config.general.version {
-        println!(
-            "Updating config version: {} -> {}",
-            old_version, config.general.version
-        );
+
+    let migrations = migrate_config(&mut config);
+    for change in &migrations {
+        println!("Migrating config: {change}");
+    }
+
+    if old_version != config.general.version || !migrations.is_empty() {
+        if old_version != config.general.version {
+            println!(
+                "Updating config version: {} -> {}",
+                old_version, config.general.version
+            );
+        }
         config.save(&config_path)?;
+    }
+
+    // The relay is a hard dependency of email reporting now. Warn rather than
+    // fail: a backup whose report cannot be sent is still a completed backup,
+    // and the report is always written to disk regardless.
+    if config.email.enabled && !relay_reachable(&config) {
+        println!(
+            "Warning: email is enabled but nothing is listening on {}:{}",
+            config.email.smtp_host, config.email.smtp_port
+        );
+        println!("  Reports will be saved to disk but not delivered.");
+        println!("  Check the local mail relay: systemctl status postfix");
     }
     println!("Regenerating files from {}...", config_path.display());
     install(&config)?;
@@ -242,6 +310,23 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for err in &errors {
             println!("Config error: {}", err);
+        }
+    }
+
+    // A config that still names the Bridge port is valid but undeliverable —
+    // report it here rather than letting the next backup discover it.
+    if config.email.enabled {
+        let relay = format!("{}:{}", config.email.smtp_host, config.email.smtp_port);
+        if relay_reachable(&config) {
+            println!("Mail relay reachable at {relay}");
+        } else {
+            println!("Mail relay UNREACHABLE at {relay}");
+            if config.email.smtp_port == 1025 {
+                println!("  Port 1025 is Protonmail Bridge, which this version no longer uses.");
+                println!("  Fix with: sudo btrdasd setup --upgrade");
+            } else {
+                println!("  Reports will be saved to disk but not delivered.");
+            }
         }
     }
 
@@ -377,6 +462,123 @@ pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> 
 mod tests {
     use super::*;
     use crate::setup::config::*;
+
+    #[test]
+    fn migrate_rewrites_bridge_port_to_relay_port() {
+        let mut config = Config::default();
+        config.email.enabled = true;
+        config.email.smtp_port = 1025;
+
+        let changes = migrate_config(&mut config);
+
+        assert_eq!(config.email.smtp_port, 25);
+        assert_eq!(changes.len(), 1, "one migration should have been reported");
+        assert!(changes[0].contains("1025 -> 25"), "got: {}", changes[0]);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let mut config = Config::default();
+        config.email.enabled = true;
+        config.email.smtp_port = 1025;
+
+        migrate_config(&mut config);
+        // Second pass must be a no-op — `--upgrade` runs on every install.
+        let changes = migrate_config(&mut config);
+
+        assert_eq!(config.email.smtp_port, 25);
+        assert!(changes.is_empty(), "second pass reported: {changes:?}");
+    }
+
+    #[test]
+    fn migrate_preserves_a_deliberate_non_bridge_port() {
+        // Only the exact Bridge port is rewritten. An operator running their
+        // relay on a non-default port keeps it.
+        let mut config = Config::default();
+        config.email.enabled = true;
+        config.email.smtp_port = 2525;
+
+        let changes = migrate_config(&mut config);
+
+        assert_eq!(config.email.smtp_port, 2525);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn email_defaults_target_the_local_relay() {
+        // A fresh install must not inherit the Bridge port from anywhere.
+        let config = Config::default();
+        assert_eq!(config.email.smtp_host, "127.0.0.1");
+        assert_eq!(config.email.smtp_port, 25);
+    }
+
+    /// Serialize a valid config, then edit its `[email]` table textually to
+    /// reproduce an on-disk file from before this release. Building the fixture
+    /// from `Config::default()` rather than hand-writing one keeps it valid as
+    /// unrelated sections gain required fields.
+    fn config_toml_with_email_table(body: &str) -> String {
+        let toml = Config::default()
+            .to_toml()
+            .expect("serialize default config");
+        let start = toml.find("[email]").expect("default config has [email]");
+        // The [email] table runs to the next table header or end of file.
+        let rest = &toml[start + "[email]".len()..];
+        let end = rest
+            .find("\n[")
+            .map(|i| start + "[email]".len() + i + 1)
+            .unwrap_or(toml.len());
+        format!("{}[email]\n{}\n{}", &toml[..start], body, &toml[end..])
+    }
+
+    #[test]
+    fn bridge_era_config_without_new_keys_parses_to_relay_defaults() {
+        // A config.toml predating the [email] keys must not deserialize to
+        // port 0 / empty host — serde defaults carry it onto the relay.
+        let toml = config_toml_with_email_table("enabled = true");
+
+        let config = Config::from_toml(&toml).expect("parse config with a minimal [email] table");
+
+        assert_eq!(config.email.smtp_host, "127.0.0.1");
+        assert_eq!(config.email.smtp_port, 25);
+        assert_eq!(config.email.from, "backup@localhost");
+        assert_eq!(config.email.to, "root@localhost");
+        // Scoped to email: the fixture has no sources/targets, so the config as
+        // a whole is legitimately invalid for unrelated reasons.
+        let email_errors: Vec<_> = config
+            .validate()
+            .into_iter()
+            .filter(|e| e.contains("smtp") || e.contains("Email"))
+            .collect();
+        assert!(
+            email_errors.is_empty(),
+            "email defaults must satisfy validation: {email_errors:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_era_auth_key_is_ignored_not_fatal() {
+        // The live config carries `auth = "starttls"`. The field is gone; serde
+        // must skip it rather than fail the whole load and take backups down.
+        let toml = config_toml_with_email_table(
+            r#"enabled = true
+smtp_host = "127.0.0.1"
+smtp_port = 1025
+from = "someone@example.com"
+to = "someone@example.com"
+auth = "starttls""#,
+        );
+
+        let mut config =
+            Config::from_toml(&toml).expect("an unknown [email] key must not fail the load");
+
+        assert_eq!(config.email.smtp_port, 1025, "fixture should start on 1025");
+        migrate_config(&mut config);
+        assert_eq!(config.email.smtp_port, 25);
+        // The dropped key must not survive a save/load round trip either.
+        let round_tripped = Config::from_toml(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(round_tripped.email.smtp_port, 25);
+        assert!(!config.to_toml().unwrap().contains("auth ="));
+    }
 
     #[test]
     fn install_creates_files_and_manifest() {

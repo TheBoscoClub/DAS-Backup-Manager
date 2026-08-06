@@ -408,29 +408,70 @@ pub struct Retention {
 // See .claude/rules/das-esp-safety.md for the full postmortem.
 // Old config.toml files with [esp] sections are silently ignored by serde.
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Report email settings.
+///
+/// Submission is **unauthenticated plaintext to a local mail relay** — the
+/// relay (Postfix null-client on `127.0.0.1:25`) holds the upstream credential
+/// and authenticates to the provider by envelope sender. Nothing in this
+/// project reads, stores, or transmits a mail credential; see
+/// `.claude/rules/backup.md` §Email Reports.
+///
+/// Every field here is read at send time by [`crate::report`] and exported to
+/// the shell orchestrator by `setup::env_export` as `DAS_EMAIL_*`. Prior to
+/// 2026-08-06 these keys were parsed and then ignored — both senders read
+/// Protonmail Bridge's own credentials file instead — so a host could
+/// set `smtp_host` to anything with no effect whatsoever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Email {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
+    /// Relay host. Loopback in every sane configuration — mail leaves the host
+    /// over the relay's authenticated, certificate-verified uplink, not this hop.
+    #[serde(default = "default_smtp_host")]
     pub smtp_host: String,
-    #[serde(default)]
+    /// Relay port. 25 is the local submission port of the null-client relay,
+    /// NOT outbound port 25 (which is blocked at this host's uplink anyway).
+    #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
-    #[serde(default)]
+    /// Envelope sender AND `From:` address. The relay selects the upstream API
+    /// key by this value, so it must be an address the relay has a key for;
+    /// anything unknown is rewritten by the relay's canonical-sender fallback
+    /// and delivered under a different identity.
+    #[serde(default = "default_email_from")]
     pub from: String,
-    #[serde(default)]
+    #[serde(default = "default_email_to")]
     pub to: String,
-    #[serde(default)]
-    pub auth: AuthMethod,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMethod {
-    Plain,
-    Starttls,
-    #[default]
-    None,
+fn default_smtp_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// Local relay submission port. Deliberately not 1025 (Protonmail Bridge) or
+/// 587 (direct provider submission) — both imply a credential this project no
+/// longer holds.
+fn default_smtp_port() -> u16 {
+    25
+}
+
+fn default_email_from() -> String {
+    "backup@localhost".to_string()
+}
+
+fn default_email_to() -> String {
+    "root@localhost".to_string()
+}
+
+impl Default for Email {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: default_smtp_host(),
+            smtp_port: default_smtp_port(),
+            from: default_email_from(),
+            to: default_email_to(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -550,8 +591,23 @@ impl Config {
             }
         }
 
-        if self.email.enabled && self.email.smtp_host.is_empty() {
-            errors.push("Email is enabled but smtp_host is empty".into());
+        if self.email.enabled {
+            // These are read at send time now (they were inert before 2026-08-06),
+            // so an empty value is a real misconfiguration rather than a cosmetic
+            // one. An empty recipient in particular produces a mailx invocation
+            // with no destination, which fails at submission rather than silently.
+            if self.email.smtp_host.is_empty() {
+                errors.push("Email is enabled but smtp_host is empty".into());
+            }
+            if self.email.smtp_port == 0 {
+                errors.push("Email is enabled but smtp_port is 0".into());
+            }
+            if self.email.from.is_empty() {
+                errors.push("Email is enabled but from is empty".into());
+            }
+            if self.email.to.is_empty() {
+                errors.push("Email is enabled but to is empty".into());
+            }
         }
 
         errors
@@ -695,10 +751,9 @@ mod tests {
         });
         cfg.email.enabled = true;
         cfg.email.smtp_host = "127.0.0.1".into();
-        cfg.email.smtp_port = 1025;
+        cfg.email.smtp_port = 25;
         cfg.email.from = "backup@example.com".into();
         cfg.email.to = "user@example.com".into();
-        cfg.email.auth = AuthMethod::Plain;
 
         let toml_str = cfg.to_toml().expect("serialize full config");
         let parsed = Config::from_toml(&toml_str).expect("deserialize full config");
@@ -724,8 +779,9 @@ mod tests {
         assert_eq!(parsed.boot.archive_retention_days, 180);
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home", "@log"]);
         assert!(parsed.email.enabled);
-        assert_eq!(parsed.email.smtp_port, 1025);
-        assert_eq!(parsed.email.auth, AuthMethod::Plain);
+        assert_eq!(parsed.email.smtp_port, 25);
+        assert_eq!(parsed.email.from, "backup@example.com");
+        assert_eq!(parsed.email.to, "user@example.com");
     }
 
     #[test]
