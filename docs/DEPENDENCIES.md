@@ -56,8 +56,8 @@ are automatically installed; they must be present before running the scripts.
 | `btrfs-progs` | system (`btrfs` CLI) | `backup-run.sh`, `backup-verify.sh`, `btrdasd setup`, `btrdasd scrub`, `btrdasd doctor` | BTRFS subvolume operations, `btrfs scrub start`/`status`, subvolume listing for drift detection |
 | `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh`, `btrdasd health` | Drive serial number detection, SMART health, temperature, power-on hours |
 | `rsync` | system | Manual disaster-recovery restores only (see `docs/DISASTER-RECOVERY-GUIDE.md`) | Not used by any automated script — ESP synchronization was removed 2026-04-10/12 (`.claude/rules/esp-safety.md`) |
-| `s-nail` (mailx) | system | `backup-run.sh` | Sends email backup reports via SMTP (Proton Bridge); invoked as `mailx` |
-| `msmtp` | system (optional) | `backup-run.sh` | Alternative SMTP transport; `s-nail` is the primary sender |
+| `s-nail` (mailx) | system | `backup-run.sh`, `indexer/src/report.rs` | Submits email backup reports to the local mail relay; invoked as `mailx` |
+| a local mail relay | system (optional) | `backup-run.sh`, `indexer/src/report.rs` | Anything accepting SMTP on `[email].smtp_host:smtp_port` — a Postfix null-client smarthost here. Required only when `[email].enabled = true`; without it reports are written to disk and the send is logged as failed |
 | `mount` / `umount` | system (util-linux) | `backup-run.sh`, `backup-verify.sh` | Mounts BTRFS source volumes and DAS targets before backup |
 | `df` | system (coreutils) | `backup-run.sh` | Disk space reporting and throughput calculation |
 | `date` | system (coreutils) | All scripts | Timestamp generation and ISO 8601 epoch arithmetic |
@@ -79,12 +79,22 @@ The installer supports three init systems. Only one is required:
 
 ### SMTP Configuration
 
-`backup-run.sh` (`parse_pbridge_smtp`) and the Rust reporter
-(`indexer/src/report.rs::parse_pbridge_smtp_block`) both read SMTP credentials
-directly from `~/.config/pbridge.conf` (mode 600) — the single canonical
-source for Protonmail Bridge credentials per `~/.claude/rules/infrastructure.md`.
-The mailer is `s-nail` (mailx). Bridge listens on `127.0.0.1:1025` with
-STARTTLS and a self-signed cert (`ssl-verify=ignore`).
+`backup-run.sh` (`send_report`) and the Rust reporter
+(`indexer/src/report.rs::send_email_report_with_kind`) both submit through
+`s-nail` (mailx) to the relay named by `[email].smtp_host`/`smtp_port` in
+`/etc/das-backup/config.toml` — `127.0.0.1:25` by default.
+
+**This project holds no mail credential.** Submission is unauthenticated
+plaintext over loopback; the relay authenticates to the upstream provider
+itself, selecting a key by envelope sender (`[email].from`), and owns the
+certificate-verified TLS leg. `-S smtp-auth=none` is required on every mailx
+invocation: s-nail otherwise demands a password for any `smtp://` mta and
+exits 4.
+
+Migrated from Protonmail Bridge (`127.0.0.1:1025`, STARTTLS, self-signed cert,
+`ssl-verify=ignore`) on 2026-08-06 — Bridge's vault decrypts through the
+desktop keyring, so it is dead after an unattended reboot and every report was
+silently lost until someone logged in.
 
 ---
 

@@ -637,26 +637,35 @@ fn step_email(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
     if enable {
         config.email.enabled = true;
 
+        println!(
+            "  Reports are submitted unauthenticated to a local mail relay,\n  \
+             which holds the upstream credential. btrdasd never stores one."
+        );
+
         config.email.smtp_host = Input::new()
-            .with_prompt("SMTP host")
+            .with_prompt("Relay host")
             .default(if config.email.smtp_host.is_empty() {
-                "localhost".to_string()
+                "127.0.0.1".to_string()
             } else {
                 config.email.smtp_host.clone()
             })
             .interact_text()?;
 
         config.email.smtp_port = Input::new()
-            .with_prompt("SMTP port")
+            .with_prompt("Relay port")
             .default(if config.email.smtp_port == 0 {
-                587_u16
+                25_u16
             } else {
                 config.email.smtp_port
             })
             .interact_text()?;
 
+        // The relay routes by envelope sender: this address selects which
+        // upstream credential the relay authenticates with. It must be an
+        // address the relay is configured for, or the relay's canonical-sender
+        // fallback rewrites it and reports arrive under another identity.
         config.email.from = Input::new()
-            .with_prompt("From address")
+            .with_prompt("From address (selects the relay's upstream credential)")
             .default(if config.email.from.is_empty() {
                 "backup@localhost".to_string()
             } else {
@@ -672,23 +681,6 @@ fn step_email(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
                 config.email.to.clone()
             })
             .interact_text()?;
-
-        let auth_choices = vec!["none", "plain", "starttls"];
-        let auth_default = match config.email.auth {
-            AuthMethod::None => 0,
-            AuthMethod::Plain => 1,
-            AuthMethod::Starttls => 2,
-        };
-        let auth_idx = Select::new()
-            .with_prompt("Authentication method")
-            .items(&auth_choices)
-            .default(auth_default)
-            .interact()?;
-        config.email.auth = match auth_idx {
-            1 => AuthMethod::Plain,
-            2 => AuthMethod::Starttls,
-            _ => AuthMethod::None,
-        };
     } else {
         config.email.enabled = false;
     }

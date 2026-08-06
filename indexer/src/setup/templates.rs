@@ -442,12 +442,14 @@ pub fn render_cron_entry(config: &Config) -> String {
     )
 }
 
-// Email config file generation removed 2026-05-16 — Protonmail Bridge SMTP
-// credentials are sourced directly from `~/.config/pbridge.conf` (the single
-// canonical source per `~/.claude/rules/infrastructure.md`). Both the bash
-// orchestrator (`scripts/backup-run.sh::parse_pbridge_smtp`) and the Rust
-// reporter (`indexer/src/report.rs::send_email_report`) read pbridge.conf
-// directly — no project-local email config file is generated or installed.
+// Email config file generation removed 2026-05-16, and there is nothing to
+// bring back: since the 2026-08-06 relay migration this project holds no mail
+// credential at all. Reports are submitted unauthenticated to the local relay
+// at `[email].smtp_host:smtp_port`, which authenticates upstream by envelope
+// sender using a key readable only by root. Both senders
+// (`scripts/backup-run.sh::send_report` and
+// `indexer/src/report.rs::send_email_report`) take their coordinates from
+// `[email]` in config.toml — no project-local email config file exists.
 
 // ESP sync hook generation removed 2026-04-10 — root cause of the 2026-03-05
 // incident that wiped the DAS 2TB emergency recovery drives' independent OS
@@ -549,9 +551,9 @@ impl GeneratedFiles {
             }
         }
 
-        // Email credentials are sourced directly from `~/.config/pbridge.conf`
-        // — no project-local email config file is generated. See
-        // `~/.claude/rules/infrastructure.md` (Protonmail Bridge section).
+        // No email config file is generated: this project stores no mail
+        // credential. See the note above `render_cron_entry`'s neighbours and
+        // `.claude/rules/backup.md` §Email Reports.
 
         Self { files }
     }

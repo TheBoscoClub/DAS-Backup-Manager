@@ -277,10 +277,10 @@ done
 LOG_FILE="$DAS_LOG_FILE"
 
 # Email and growth tracking (now from config)
-# Bridge credentials live in ~/.config/pbridge.conf — the single canonical source for
-# Protonmail Bridge SMTP credentials across all projects. See ~/.claude/rules/infrastructure.md.
-# Path is hardcoded because backup-run.sh runs as root via systemd (no $HOME).
-PBRIDGE_CONF="${PBRIDGE_CONF:-/home/bosco/.config/pbridge.conf}"
+# Reports are submitted unauthenticated to the local mail relay named by
+# DAS_EMAIL_SMTP_HOST/PORT (exported by `btrdasd config dump-env`). This script
+# holds no mail credential — the relay authenticates upstream by envelope sender
+# using a key readable only by root. See .claude/rules/backup.md §Email Reports.
 GROWTH_LOG="$DAS_GROWTH_LOG"
 LAST_REPORT="$DAS_LAST_REPORT"
 
@@ -1531,87 +1531,76 @@ generate_smart_section() {
     done
 }
 
-# Parse Bridge SMTP credentials from ~/.config/pbridge.conf (the single canonical
-# source for Protonmail Bridge credentials per ~/.claude/rules/infrastructure.md).
-# Sets globals: PB_SMTP_HOST, PB_SMTP_PORT, PB_SMTP_USER, PB_SMTP_PASS.
-# Returns 0 on success, 1 if config missing or credentials incomplete.
-parse_pbridge_smtp() {
-    if [[ ! -f "$PBRIDGE_CONF" ]]; then
-        log_warn "Bridge config $PBRIDGE_CONF not found — report saved but not emailed"
-        log_warn "pbridge.conf is the single canonical Bridge credential source — see ~/.claude/rules/infrastructure.md"
-        return 1
-    fi
-
-    # The token in this file is sensitive — warn loudly if perms aren't 0600
-    local perms
-    perms=$(stat -c '%a' "$PBRIDGE_CONF" 2>/dev/null || echo "???")
-    if [[ "$perms" != "600" ]]; then
-        log_warn "Bridge config $PBRIDGE_CONF has permissions $perms — should be 600 (contains auth token)"
-    fi
-
-    PB_SMTP_HOST=""; PB_SMTP_PORT=""; PB_SMTP_USER=""; PB_SMTP_PASS=""
-    local in_smtp_block=0
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^SMTP: ]]; then in_smtp_block=1; continue; fi
-        if [[ "$line" =~ ^IMAP: ]]; then in_smtp_block=0; continue; fi
-        if [[ "$line" =~ ^[A-Za-z][A-Za-z0-9]*:$ ]]; then in_smtp_block=0; continue; fi
-        [[ $in_smtp_block -eq 0 ]] && continue
-        if [[ "$line" =~ ^[[:space:]]*Hostname:[[:space:]]*(.+)$ ]]; then PB_SMTP_HOST="${BASH_REMATCH[1]}"; fi
-        if [[ "$line" =~ ^[[:space:]]*Port:[[:space:]]*(.+)$ ]]; then PB_SMTP_PORT="${BASH_REMATCH[1]}"; fi
-        if [[ "$line" =~ ^[[:space:]]*Username:[[:space:]]*(.+)$ ]]; then PB_SMTP_USER="${BASH_REMATCH[1]}"; fi
-        if [[ "$line" =~ ^[[:space:]]*Password:[[:space:]]*(.+)$ ]]; then PB_SMTP_PASS="${BASH_REMATCH[1]}"; fi
-    done < "$PBRIDGE_CONF"
-
-    if [[ -z "$PB_SMTP_USER" || -z "$PB_SMTP_PASS" ]]; then
-        log_warn "Bridge SMTP credentials missing in $PBRIDGE_CONF — report saved but not emailed"
-        return 1
-    fi
-    return 0
-}
-
 send_report() {
     local report="$1"
     local overall_status="$2"
 
-    # Always save to file for reference
+    # Always save to file for reference. This happens BEFORE any send attempt so
+    # the report survives a relay outage — a failed send loses nothing.
     mkdir -p "$(dirname "$LAST_REPORT")"
     echo "$report" > "$LAST_REPORT"
     log_info "Report saved to $LAST_REPORT"
 
-    # Source Bridge SMTP credentials from pbridge.conf (single canonical source)
-    if ! parse_pbridge_smtp; then
+    if [[ "${DAS_EMAIL_ENABLED:-false}" != "true" ]]; then
+        log_info "Email reporting disabled in config — report saved only"
+        return 0
+    fi
+
+    # Relay coordinates come from config via `btrdasd config dump-env`. Before
+    # 2026-08-06 these exports existed and nothing read them; the script parsed
+    # Protonmail Bridge credentials instead, so editing [email] in config.toml
+    # had no effect on where mail went.
+    local smtp_url="smtp://${DAS_EMAIL_SMTP_HOST}:${DAS_EMAIL_SMTP_PORT}"
+    local report_to="${DAS_REPORT_TO:-$DAS_EMAIL_TO}"
+    local report_from_addr="${DAS_REPORT_FROM:-$DAS_EMAIL_FROM}"
+
+    if [[ -z "$report_to" || -z "$report_from_addr" ]]; then
+        log_warn "Email enabled but from/to unset in config — report saved but not emailed"
         return 1
     fi
 
-    local smtp_url="smtp://${PB_SMTP_HOST}:${PB_SMTP_PORT}"
-    # Recipient defaults to the Bridge account holder (single-user setup).
-    # Sender uses the Bridge account address (Bridge enforces SMTP MAIL FROM to match
-    # the authenticated user) but renders a friendly display name "DAS Backup (<host>)"
-    # so the email stands out in the inbox From column instead of looking like
-    # gjbr@pm.me sending mail to itself. Override either via DAS_REPORT_TO/FROM.
-    local report_to="${DAS_REPORT_TO:-$PB_SMTP_USER}"
-    local report_from="${DAS_REPORT_FROM:-DAS Backup ($(hostname -s)) <$PB_SMTP_USER>}"
+    # A bare address gets the standard display name so reports stand out in the
+    # inbox From column; an override that already has one is used verbatim.
+    # s-nail extracts the bracketed address for the SMTP envelope, and the
+    # envelope sender is what the relay keys its upstream credential on.
+    local report_from="$report_from_addr"
+    if [[ "$report_from_addr" != *"<"* ]]; then
+        report_from="DAS Backup ($(hostname -s)) <${report_from_addr}>"
+    fi
 
-    # Build subject line
     local subject
     subject="[DAS Backup] $(hostname) — $overall_status — $(date '+%Y-%m-%d %H:%M')"
 
-    # Send via s-nail (mailx) with Proton Bridge SMTP
-    # stderr suppressed to hide s-nail v14 deprecation warnings
-    # ssl-verify=ignore because Bridge uses a self-signed cert on the loopback listener
-    if echo "$report" | mailx \
+    # Submit to the local relay: no credentials, no TLS on this hop. The relay
+    # owns the authenticated, certificate-verified leg to the provider.
+    #   smtp-auth=none  — REQUIRED. s-nail defaults to demanding a password for
+    #                     any smtp:// mta and aborts with exit 4 without this.
+    #   nosave          — a failed send otherwise drops the body in
+    #                     /root/dead.letter, which nothing ever reads or prunes.
+    #                     The report is already in $LAST_REPORT.
+    #
+    # stderr is captured rather than discarded: a successful send emits nothing
+    # on stderr (measured), so anything here is the real reason for a failure.
+    # The previous `2>/dev/null` claimed to hide s-nail deprecation warnings
+    # that do not exist, and cost every failure its diagnosis.
+    local mail_err rc
+    mail_err=$(echo "$report" | mailx \
         -s "$subject" \
         -r "$report_from" \
-        -S "smtp=${smtp_url}" \
-        -S "smtp-auth=login" \
-        -S "smtp-auth-user=${PB_SMTP_USER}" \
-        -S "smtp-auth-password=${PB_SMTP_PASS}" \
-        -S "ssl-verify=ignore" \
-        "$report_to" 2>/dev/null; then
-        log_info "Report emailed to $report_to"
+        -S v15-compat \
+        -S "mta=${smtp_url}" \
+        -S "smtp-auth=none" \
+        -S nosave \
+        "$report_to" 2>&1 >/dev/null)
+    rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        log_info "Report emailed to $report_to via $smtp_url"
+        [[ -n "$mail_err" ]] && log_warn "mailx wrote to stderr despite success: $mail_err"
         return 0
     else
-        log_warn "Failed to email report to $report_to — saved to $LAST_REPORT"
+        log_warn "Failed to email report to $report_to via $smtp_url (mailx exit $rc) — saved to $LAST_REPORT"
+        [[ -n "$mail_err" ]] && log_warn "mailx: $mail_err"
         return 1
     fi
 }

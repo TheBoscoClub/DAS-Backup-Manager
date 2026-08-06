@@ -84,8 +84,8 @@ ESP sync code; the wizard's step counter still skips straight from `[3/10]` to `
 3. **Backup Targets** `[3/10]` — choose backup destination drives
 4. **Retention Policy** `[5/10]` — weekly and monthly snapshot counts per target
 5. **Backup Schedule** `[6/10]` — incremental and full backup times
-6. **Email Notifications** `[7/10]` — optional SMTP configuration (reads
-   `~/.config/pbridge.conf`)
+6. **Email Notifications** `[7/10]` — optional; relay host/port and the
+   from/to addresses (no credentials are requested or stored)
 7. **Install Location** `[8/10]` — binary/script install prefix
 8. **KDE Plasma GUI** `[9/10]` — GUI desktop entry install toggle
 9. **Review Configuration** `[10/10]` — shows generated config, writes files
@@ -127,8 +127,8 @@ Removes all files listed in the install manifest (`/etc/das-backup/.manifest`):
 - systemd/cron units (backup, scrub, doctor)
 - Generated backup scripts
 
-`~/.config/pbridge.conf` is never touched — it is a user-curated credential file the
-installer only reads from, never generates or removes.
+No credential file is touched, because none exists: mail submission is
+unauthenticated and the relay's upstream key is the relay's own business.
 
 Prompts whether to also remove the backup database at `/var/lib/das-backup/backup-index.db`. The TOML config file is preserved for potential reinstallation.
 
@@ -186,9 +186,9 @@ sudo mkdir -p /var/lib/das-backup
 sudo cp config/btrbk.conf /etc/btrbk/btrbk.conf
 sudo vim /etc/btrbk/btrbk.conf  # edit for your drives
 
-# Email credentials are read directly from ~/.config/pbridge.conf — no
-# project-local email config file is required. See the Protonmail Bridge
-# section of ~/.claude/rules/infrastructure.md.
+# Email needs no credentials — reports are submitted unauthenticated to a
+# local mail relay ([email].smtp_host/smtp_port, default 127.0.0.1:25).
+# Verify one is listening:  ss -ltn | grep ':25 '
 
 # Enable systemd timers
 sudo systemctl enable --now das-backup.timer das-backup-full.timer
@@ -332,11 +332,26 @@ are silently ignored by serde on load.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable email backup reports |
-| `smtp_host` | string | `""` | SMTP server hostname |
-| `smtp_port` | u16 | `0` | SMTP server port |
-| `from` | string | `""` | Sender email address |
-| `to` | string | `""` | Recipient email address |
-| `auth` | enum | `"none"` | `"plain"`, `"starttls"`, or `"none"` |
+| `smtp_host` | string | `"127.0.0.1"` | Local mail relay host |
+| `smtp_port` | u16 | `25` | Local mail relay port |
+| `from` | string | `"backup@localhost"` | Sender address — **also the SMTP envelope sender**, which is how a sender-dependent relay picks its upstream credential |
+| `to` | string | `"root@localhost"` | Recipient address |
+
+Submission is **unauthenticated plaintext** — btrdasd stores no mail credential
+and never asks for one. Point `smtp_host`/`smtp_port` at a local relay (Postfix,
+msmtp, or any SMTP listener) and let it own authentication, TLS, and retries.
+`DAS_REPORT_FROM` / `DAS_REPORT_TO` override `from`/`to` at run time for testing.
+
+Two behaviour changes landed with the 2026-08-06 relay migration:
+
+- **These keys are now read.** Before, both senders parsed Protonmail Bridge
+  credentials and ignored `[email]` entirely, so editing this table changed
+  nothing. `enabled = false` was likewise ignored by the shell path.
+- **`auth` was removed.** Unauthenticated submission has no auth method to
+  choose. An `auth = …` line in an existing config is ignored, not an error.
+  `btrdasd setup --upgrade` rewrites the Bridge port `1025` to `25`; any other
+  port is left alone, and `btrdasd setup --check` reports whether the relay is
+  actually listening.
 
 ### `[gui]`
 
@@ -375,10 +390,9 @@ The installer creates the following files (tracked in `/etc/das-backup/.manifest
 | `/etc/systemd/system/das-backup-doctor.timer` | Subvolume drift detector timer (systemd) — fixed `Sun 02:00`, always enabled |
 
 `${prefix}` is `[general].install_prefix` (default `/usr/local`, `/usr` on the live system
-here). SMTP credentials are **not** a generated file — `~/.config/pbridge.conf` is a
-user-curated file the installer reads from but never writes (see the Protonmail Bridge
-section of `~/.claude/rules/infrastructure.md`). ESP pacman hook generation was removed
-2026-04-10; no ESP hook file is ever generated.
+here). There is no generated credential file and no credential of any kind —
+mail submission is unauthenticated to a local relay. ESP pacman hook generation
+was removed 2026-04-10; no ESP hook file is ever generated.
 
 For sysvinit/OpenRC systems, cron entries replace systemd units.
 

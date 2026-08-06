@@ -2,13 +2,7 @@ use crate::backup::BackupResult;
 use crate::config::Config;
 use crate::db::{Database, NewBackupRun};
 
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-
-/// Canonical Protonmail Bridge credentials file. Root services hardcode the
-/// user's home path because Bridge is a per-user concept and root has no $HOME
-/// of its own. Override via the `PBRIDGE_CONF` env var for testing.
-const PBRIDGE_CONF_DEFAULT: &str = "/home/bosco/.config/pbridge.conf";
 
 /// A historical backup run record (stored in DB).
 #[derive(Debug, Clone)]
@@ -236,105 +230,6 @@ pub fn record_backup_run(
     Ok(id)
 }
 
-/// Percent-encode a string for use in the userinfo section of a URL (RFC 3986).
-/// Only unreserved characters (A-Z, a-z, 0-9, `-`, `.`, `_`, `~`) pass through;
-/// everything else is encoded as %XX.
-fn percent_encode_userinfo(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push_str(&format!("%{b:02X}"));
-            }
-        }
-    }
-    out
-}
-
-/// SMTP credentials parsed from the `SMTP:` block of `~/.config/pbridge.conf`.
-#[derive(Debug, Clone)]
-struct PbridgeSmtp {
-    host: String,
-    port: String,
-    username: String,
-    password: String,
-}
-
-/// Parse the `SMTP:` block of `~/.config/pbridge.conf` (the single canonical
-/// source for Protonmail Bridge credentials per `~/.claude/rules/infrastructure.md`).
-///
-/// The file consists of top-level `IMAP:` and `SMTP:` blocks, each followed by
-/// indented `Key: Value` lines (Hostname, Port, Username, Password, Security).
-/// This parser tracks the current block by line prefix: a line starting with
-/// `SMTP:` enters the block; any other top-level `<Word>:` line exits it.
-fn parse_pbridge_smtp_block(path: &str) -> Result<PbridgeSmtp, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-
-    let mut host = String::new();
-    let mut port = String::new();
-    let mut username = String::new();
-    let mut password = String::new();
-    let mut in_smtp_block = false;
-
-    for raw in content.lines() {
-        // Detect block transitions on top-level (unindented) `<Word>:` lines.
-        if !raw.starts_with(|c: char| c.is_whitespace()) {
-            let trimmed = raw.trim_end();
-            if trimmed == "SMTP:" {
-                in_smtp_block = true;
-                continue;
-            }
-            // Any other unindented "Word:" line exits the SMTP block.
-            if trimmed.ends_with(':')
-                && trimmed[..trimmed.len() - 1]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric())
-            {
-                in_smtp_block = false;
-                continue;
-            }
-        }
-        if !in_smtp_block {
-            continue;
-        }
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((key, val)) = trimmed.split_once(':') {
-            let key = key.trim();
-            let val = val.trim();
-            if val.is_empty() {
-                continue;
-            }
-            match key {
-                "Hostname" => host = val.to_string(),
-                "Port" => port = val.to_string(),
-                "Username" => username = val.to_string(),
-                "Password" => password = val.to_string(),
-                _ => {}
-            }
-        }
-    }
-
-    if host.is_empty() || port.is_empty() || username.is_empty() || password.is_empty() {
-        return Err(format!(
-            "incomplete SMTP credentials in {path} (need Hostname, Port, Username, Password)"
-        )
-        .into());
-    }
-
-    Ok(PbridgeSmtp {
-        host,
-        port,
-        username,
-        password,
-    })
-}
-
 /// Send a backup report via email using s-nail (mailx).
 ///
 /// Thin wrapper over [`send_email_report_with_kind`] with the `Backup` subject kind.
@@ -344,10 +239,16 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
 
 /// Send a report via email using s-nail (mailx).
 ///
-/// Reads SMTP credentials from `~/.config/pbridge.conf` (the single canonical
-/// source for Protonmail Bridge credentials). The recipient and sender default
-/// to the Bridge account holder (the `Username` field); override via
-/// `DAS_REPORT_TO` / `DAS_REPORT_FROM` env vars if a different address is needed.
+/// Submits **unauthenticated plaintext** to the local mail relay named by
+/// `[email].smtp_host`/`smtp_port` (`127.0.0.1:25`). This process holds no mail
+/// credential of any kind: the relay authenticates upstream on its own, keyed by
+/// the envelope sender, using a key readable only by root under `/etc`. Before
+/// 2026-08-06 this function parsed Protonmail Bridge's credentials file and
+/// passed the password to a child process — visible in `/proc/<pid>/cmdline` to
+/// any local process for the duration of the send.
+///
+/// Sender and recipient come from `[email].from`/`to`; `DAS_REPORT_FROM` /
+/// `DAS_REPORT_TO` override them for testing without editing the live config.
 ///
 /// `kind` names the report in the subject line (`[DAS <kind>] …`) so backup and
 /// scrub reports are distinguishable in the inbox; the status word is derived
@@ -360,24 +261,6 @@ pub fn send_email_report_with_kind(
     if !config.email.enabled {
         return Err("Email is not enabled in config".into());
     }
-
-    let pbridge_conf =
-        std::env::var("PBRIDGE_CONF").unwrap_or_else(|_| PBRIDGE_CONF_DEFAULT.to_string());
-
-    // Warn (do not fatal) if the credentials file is world/group-readable. The
-    // bash side issues the same warning — pbridge.conf contains a Bridge auth
-    // token and should be 0600.
-    if let Ok(meta) = std::fs::metadata(&pbridge_conf) {
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            eprintln!(
-                "warning: {pbridge_conf} has permissions {mode:o} — should be 600 \
-                 (contains Bridge auth token)"
-            );
-        }
-    }
-
-    let smtp = parse_pbridge_smtp_block(&pbridge_conf)?;
 
     // Hostname is needed both for the subject line and the From display name —
     // compute it once up front. libc::gethostname returns whatever the kernel has
@@ -395,27 +278,33 @@ pub fn send_email_report_with_kind(
     };
     let short_hostname = hostname.split('.').next().unwrap_or(&hostname).to_string();
 
-    // Recipient defaults to the Bridge account holder. Sender uses the Bridge
-    // account address (Bridge enforces SMTP MAIL FROM to match the authenticated
-    // user) but renders a friendly display name "DAS Backup (<host>)" so the
-    // email is visually distinct from ordinary self-to-self mail in the inbox.
-    // Override either via DAS_REPORT_TO/FROM env vars.
-    let to = std::env::var("DAS_REPORT_TO").unwrap_or_else(|_| smtp.username.clone());
-    let from = std::env::var("DAS_REPORT_FROM")
-        .unwrap_or_else(|_| format!("DAS {kind} ({short_hostname}) <{}>", smtp.username));
+    // Sender and recipient come from config; env vars override for testing.
+    // The configured `from` is wrapped in a display name "DAS <kind> (<host>)"
+    // so reports stand out in the inbox From column — s-nail extracts the
+    // bracketed address for the SMTP envelope, which is what the relay keys its
+    // upstream credential lookup on.
+    let to = std::env::var("DAS_REPORT_TO").unwrap_or_else(|_| config.email.to.clone());
+    let from_addr = std::env::var("DAS_REPORT_FROM").unwrap_or_else(|_| config.email.from.clone());
 
     if to.is_empty() {
-        return Err(
-            "No email recipient configured (DAS_REPORT_TO or pbridge.conf Username)".into(),
-        );
+        return Err("No email recipient configured ([email].to or DAS_REPORT_TO)".into());
+    }
+    if from_addr.is_empty() {
+        return Err("No email sender configured ([email].from or DAS_REPORT_FROM)".into());
     }
 
-    let smtp_url = format!("smtp://{}:{}", smtp.host, smtp.port);
-    let smtp_user = smtp.username.clone();
-    let smtp_pass = smtp.password.clone();
-    // Bridge listens on loopback with a self-signed certificate — mirror the
-    // bash side's `ssl-verify=ignore` rather than failing the cert check.
-    let ssl_verify = "ignore";
+    // A DAS_REPORT_FROM that already carries its own display name is used
+    // verbatim; a bare address gets the standard one.
+    let from = if from_addr.contains('<') {
+        from_addr
+    } else {
+        format!("DAS {kind} ({short_hostname}) <{from_addr}>")
+    };
+
+    let smtp_url = format!(
+        "smtp://{}:{}",
+        config.email.smtp_host, config.email.smtp_port
+    );
     let status_word = if report.contains("FAILURE") {
         "FAILURE"
     } else {
@@ -438,16 +327,16 @@ pub fn send_email_report_with_kind(
     };
     let subject = format!("[DAS {kind}] {hostname} — {status_word} — {now}");
 
-    // Build the mta URL with credentials embedded (s-nail v14.9+ / v15-compat).
-    // Percent-encode all non-unreserved characters per RFC 3986 userinfo rules.
-    let encoded_user = percent_encode_userinfo(&smtp_user);
-    let encoded_pass = percent_encode_userinfo(&smtp_pass);
-    let mta_url = smtp_url.replacen("://", &format!("://{encoded_user}:{encoded_pass}@"), 1);
-
-    // s-nail v14.9+ renamed ssl-verify → tls-verify.
-    let tls_verify_key = "tls-verify";
-
-    // Send via mailx (s-nail) using v15-compat mode for new-style URL credentials.
+    // Submit to the relay. No credential and no TLS setting: the hop is
+    // loopback-only plaintext and the relay owns the authenticated,
+    // certificate-verified leg to the provider. `v15-compat` stays because it
+    // is what makes s-nail honour the `mta=` URL form.
+    //
+    // `smtp-auth=none` is NOT optional and NOT symmetry with the shell path:
+    // s-nail demands a password for any `smtp://` mta and aborts with
+    // "A password is necessary for smtp authentication" (exit 4) without it.
+    // `nosave` stops a failed send from dropping the body into /root/dead.letter,
+    // which nothing reads or prunes — the caller has the report either way.
     let mut child = Command::new("mailx")
         .args([
             "-s",
@@ -457,11 +346,11 @@ pub fn send_email_report_with_kind(
             "-S",
             "v15-compat",
             "-S",
-            &format!("mta={mta_url}"),
+            &format!("mta={smtp_url}"),
             "-S",
-            "smtp-auth=login",
+            "smtp-auth=none",
             "-S",
-            &format!("{tls_verify_key}={ssl_verify}"),
+            "nosave",
             &to,
         ])
         .stdin(Stdio::piped())

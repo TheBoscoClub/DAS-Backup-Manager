@@ -79,7 +79,7 @@ The system has six major components:
          ├──▶ update_boot_subvolumes()     → archives + recreates @/@home boot subvolumes (--full runs)
          ├──▶ btrdasd walk                 → indexes new snapshots into SQLite
          ├──▶ boot-archive-cleanup.sh      → prunes expired @.archive.*/@home.archive.* snapshots
-         └──▶ mailx                        → sends email report (Proton Bridge SMTP)
+         └──▶ mailx                        → sends email report (local relay, 127.0.0.1:25)
 ```
 
 ESP synchronization to recovery drives was removed 2026-04-10 after the ESP-overwrite
@@ -291,9 +291,10 @@ Templates are rendered programmatically (no external template files):
 | `render_cron_entry()` | cron lines | For sysvinit/OpenRC systems |
 | embedded scripts (`include_str!`) | `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh` | Real production scripts installed flat at `${prefix}/lib/das-backup/` (same layout as cmake's install) |
 
-SMTP credentials are sourced directly from `~/.config/pbridge.conf` — no
-project-local email config file is generated. ESP sync hook generation was
-removed 2026-04-10 (see `.claude/rules/esp-safety.md`).
+No email config file is generated because this project stores no mail
+credential: reports are submitted unauthenticated to the local relay named by
+`[email].smtp_host`/`smtp_port`. ESP sync hook generation was removed
+2026-04-10 (see `.claude/rules/esp-safety.md`).
 
 ### System Detection
 
@@ -370,8 +371,7 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 
 | File | Mode | Owner | Reason |
 |------|------|-------|--------|
-| `~/.config/pbridge.conf` | `0o600` | user | Protonmail Bridge credentials (single canonical source) |
-| `/etc/das-backup/config.toml` | `0o644` | root | No secrets (Bridge credentials live in `~/.config/pbridge.conf`) |
+| `/etc/das-backup/config.toml` | `0o644` | root | No secrets — mail submission is unauthenticated; the relay's upstream key lives in `/etc/postfix/sasl_passwd` (root-only) |
 | Generated scripts | `0o755` | root | Executable by system |
 | `/var/lib/das-backup/backup-index.db` | `0o644` | root | Readable by GUI, writable by indexer |
 
@@ -405,8 +405,8 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 ### Privacy
 
 - **Metadata only**: The database stores file paths, names, sizes, and timestamps — never file contents. No user data is read or stored beyond filesystem metadata.
-- **Email credential isolation**: SMTP credentials live in `~/.config/pbridge.conf` (mode 0600 — the single canonical source per `~/.claude/rules/infrastructure.md`), not in the project's TOML config. Both consumers — `scripts/backup-run.sh::parse_pbridge_smtp` and `indexer/src/report.rs::parse_pbridge_smtp_block` — read this file directly.
-- **No telemetry**: No network connections, analytics, or usage tracking of any kind.
+- **No email credential at all** (since 2026-08-06): reports are submitted unauthenticated over loopback to a local mail relay, which holds the upstream key under `/etc` and authenticates by envelope sender. Neither sender reads, stores, or transmits a password. This also closed a real exposure — both paths previously placed the SMTP password on a child process's command line, readable in `/proc/<pid>/cmdline` by any local process for the duration of the send.
+- **No telemetry**: No analytics or usage tracking of any kind. The only outbound network activity is the backup report, and only as far as `127.0.0.1:25`; forwarding it off-host is the relay's job, and its provider sees report contents (drive serials, capacities, SMART status, snapshot paths).
 
 ### Database Encryption Assessment
 

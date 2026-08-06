@@ -167,8 +167,9 @@
 //! # Test-only environment overrides
 //!
 //! `DAS_BTRFS_STATUS_DIR` and `DAS_SCRUB_STATE` relocate the btrfs status
-//! directory and the state file, mirroring the `PBRIDGE_CONF` override in
-//! [`crate::report`]. Production leaves both unset.
+//! directory and the state file, mirroring the `DAS_REPORT_TO` /
+//! `DAS_REPORT_FROM` overrides in [`crate::report`]. Production leaves all of
+//! them unset.
 
 use std::collections::BTreeMap;
 use std::fmt;
