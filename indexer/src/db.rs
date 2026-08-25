@@ -509,6 +509,35 @@ impl Database {
             }
         }
 
+        // (0) Refuse to prune an index that already violates its own foreign keys.
+        //
+        // `PRAGMA foreign_keys` is ON (see `Database::open`), so re-inserting a
+        // repaired span re-validates it: a row whose `last_snap` was ALREADY
+        // dangling is tolerated as legacy data but REJECTED on rewrite, aborting
+        // the pass with SQLITE_CONSTRAINT_FOREIGNKEY after minutes of work.
+        // Observed live 2026-08-24 against an index carrying 14,984,318 such rows
+        // (`bd DAS-Backup-Manager-opd`).
+        //
+        // The check is deliberately scoped to the spans this pass would actually
+        // rewrite rather than the whole table, so a healthy index pays a bounded
+        // cost instead of a full 85M-row `PRAGMA foreign_key_check`.
+        let dangling: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM spans s
+             WHERE s.first_snap IN (SELECT id FROM doomed_snaps)
+               AND NOT EXISTS (SELECT 1 FROM snapshots n WHERE n.id = s.last_snap)",
+            [],
+            |r| r.get(0),
+        )?;
+        if dangling > 0 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some(format!(
+                    "index has {dangling} span(s) referencing snapshots that do not exist; \
+                     refusing to prune (see bd DAS-Backup-Manager-opd — rebuild the index)"
+                )),
+            ));
+        }
+
         // (A) Spans with no surviving snapshot in their series/range at all.
         let spans_removed = tx.execute(
             "DELETE FROM spans
@@ -1132,6 +1161,43 @@ mod tests {
             .collect();
         assert_eq!(rows, vec![(a3, a4)]);
         assert_eq!(db.get_files_in_snapshot(a4).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_refuses_when_a_span_references_a_missing_snapshot() {
+        // bd DAS-Backup-Manager-opd: the production index carries ~15M spans whose
+        // endpoints name snapshots that no longer exist. Rewriting such a span
+        // re-validates its FKs and aborts the pass minutes in. Fail fast instead,
+        // with a diagnosis rather than a raw SqliteFailure.
+        let (db, ids) = one_series(3);
+        let (a1, a2, a3) = (ids[0], ids[1], ids[2]);
+        let f = db.upsert_file("x.txt", "x.txt", 1, 0, 0).unwrap();
+        db.insert_span(f, a1, a3).unwrap();
+
+        // Manufacture the corruption the way it exists in production: a snapshot
+        // row gone while spans still reference it. Requires bypassing the FK
+        // enforcement that would otherwise prevent creating this state.
+        db.conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.conn
+            .execute("DELETE FROM snapshots WHERE id = ?1", [a3])
+            .unwrap();
+        db.conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let err = db.prune_snapshots(&[a1]).expect_err("must refuse to prune");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("do not exist") && msg.contains("opd"),
+            "error should diagnose the cause and name the tracking issue, got: {msg}"
+        );
+
+        // And it must refuse WITHOUT having changed anything.
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM spans", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(db.get_snapshot_by_id(a2).is_ok());
     }
 
     #[test]

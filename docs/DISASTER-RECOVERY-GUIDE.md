@@ -1119,4 +1119,4 @@ btrdasd config show
 
 ---
 
-*Backup system version: 0.7.13.2*
+*Backup system version: 0.7.13.3*

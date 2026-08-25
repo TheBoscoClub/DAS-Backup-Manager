@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.13.3] - 2026-08-25
+
+### Fixed
+- **`prune_snapshots()` now refuses an index that already violates its own foreign keys, instead of aborting minutes in** (`bd DAS-Backup-Manager-opd`): `Database::open` sets `PRAGMA foreign_keys = ON`, so re-inserting a repaired span re-validates it — a span whose `last_snap` was *already* dangling is tolerated as legacy data but rejected on rewrite. Against the production index (14,984,318 such rows) `btrdasd reconcile` ground for ~10 minutes and aborted with `SQLITE_CONSTRAINT_FOREIGNKEY`, rolling back cleanly but achieving nothing — and would have repeated that on every `btrdasd walk`, i.e. every nightly backup
+  - The pass now returns a diagnosed error naming the cause and the tracking issue. The check is scoped to the spans the pass would actually rewrite, not the whole table, so a healthy index pays a bounded cost rather than a full 85M-row `PRAGMA foreign_key_check`
+
 ## [0.7.13.2] - 2026-08-24
 
 ### Fixed
@@ -528,7 +534,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.2...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.3...HEAD
+[0.7.13.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.2...v0.7.13.3
 [0.7.13.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.1...v0.7.13.2
 [0.7.13.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.0...v0.7.13.1
 [0.7.13.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.3...v0.7.13.0
