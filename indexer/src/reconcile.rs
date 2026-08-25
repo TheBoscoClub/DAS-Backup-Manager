@@ -108,11 +108,15 @@ pub struct PruneStats {
 pub struct ReconcilePlan {
     /// Snapshot ids confirmed absent from a mounted target.
     pub doomed: Vec<i64>,
-    /// Snapshots left alone because their root was not a verified mountpoint,
-    /// or was not a recognised target root at all. The two are deliberately not
-    /// distinguished: both mean "we cannot tell whether this path is really gone",
-    /// and both must therefore be skipped.
+    /// Under a CONFIGURED target root that is not mounted right now. Transient:
+    /// the next pass with that target mounted will resolve it.
     pub skipped_unmounted: usize,
+    /// Under no configured target root at all — typically a mount path retired by
+    /// a rename. Permanently unreachable: the root will never be mounted again, so
+    /// no reconcile can ever confirm these paths are gone, and they would otherwise
+    /// be counted as "unmounted" forever and mask the transient number
+    /// (bd DAS-Backup-Manager-wl8). Clearing them needs `btrdasd reindex --rebuild`.
+    pub skipped_unknown_root: usize,
     /// Snapshots whose path was confirmed present.
     pub confirmed_present: usize,
 }
@@ -148,6 +152,7 @@ pub fn root_for<'a>(path: &str, roots: &'a [String]) -> Option<&'a str> {
 pub fn plan_reconcile<E>(
     snapshots: &[Snapshot],
     mounted_roots: &[String],
+    configured_roots: &[String],
     exists: E,
 ) -> ReconcilePlan
 where
@@ -157,13 +162,14 @@ where
 
     for snap in snapshots {
         match root_for(&snap.path, mounted_roots) {
-            None => {
-                // Either the target is unmounted right now, or this path predates
-                // the current target set. Both are "we cannot tell" — never prune.
-                plan.skipped_unmounted += 1;
-            }
             Some(_) if exists(&snap.path) => plan.confirmed_present += 1,
             Some(_) => plan.doomed.push(snap.id),
+            // Not under a mounted root, so we cannot tell whether it is really
+            // gone — never prune. But WHY we cannot tell matters: a configured
+            // root that happens to be unmounted resolves itself next pass, while
+            // a root no longer in the config never will.
+            None if root_for(&snap.path, configured_roots).is_some() => plan.skipped_unmounted += 1,
+            None => plan.skipped_unknown_root += 1,
         }
     }
 
@@ -231,9 +237,13 @@ mod tests {
             snap(1, "/mnt/backup-22tb/projects/a.20260824"),
             snap(2, "/mnt/backup-22tb/projects/b.20260824"),
         ];
-        let plan = plan_reconcile(&snaps, &[], |_| false);
+        // Both paths are under a CONFIGURED root that simply is not mounted, so
+        // they count as transient-unmounted rather than permanently unreachable.
+        let roots_cfg = vec!["/mnt/backup-22tb".to_string()];
+        let plan = plan_reconcile(&snaps, &[], &roots_cfg, |_| false);
         assert!(plan.doomed.is_empty());
         assert_eq!(plan.skipped_unmounted, 2);
+        assert_eq!(plan.skipped_unknown_root, 0);
     }
 
     #[test]
@@ -243,7 +253,7 @@ mod tests {
             snap(2, "/mnt/backup-22tb/projects/here.20260824"),
         ];
         let roots = vec!["/mnt/backup-22tb".to_string()];
-        let plan = plan_reconcile(&snaps, &roots, |p| p.ends_with("here.20260824"));
+        let plan = plan_reconcile(&snaps, &roots, &roots, |p| p.ends_with("here.20260824"));
         assert_eq!(plan.doomed, vec![1]);
         assert_eq!(plan.confirmed_present, 1);
         assert_eq!(plan.skipped_unmounted, 0);
@@ -257,15 +267,44 @@ mod tests {
             snap(1, "/mnt/backup-22tb/projects/gone.20260824"),
             snap(2, "/mnt/backup-system-recovery-A/projects/gone.20260824"),
         ];
-        let roots = vec!["/mnt/backup-22tb".to_string()];
-        let plan = plan_reconcile(&snaps, &roots, |_| false);
+        // Both targets are configured; only one is mounted. The unmounted one is
+        // transient, NOT a retired root.
+        let mounted = vec!["/mnt/backup-22tb".to_string()];
+        let configured = vec![
+            "/mnt/backup-22tb".to_string(),
+            "/mnt/backup-system-recovery-A".to_string(),
+        ];
+        let plan = plan_reconcile(&snaps, &mounted, &configured, |_| false);
         assert_eq!(plan.doomed, vec![1]);
         assert_eq!(plan.skipped_unmounted, 1);
+        assert_eq!(plan.skipped_unknown_root, 0);
+    }
+
+    #[test]
+    fn a_retired_mount_root_is_counted_separately_from_a_merely_unmounted_one() {
+        // bd DAS-Backup-Manager-wl8: rows under a root retired by a rename can
+        // never be confirmed gone, because that root will never be mounted again.
+        // Folding them into "unmounted" left a count that never reached zero and
+        // so stopped being a signal.
+        let snaps = vec![
+            snap(1, "/mnt/backup-22tb/projects/a.20260824"), // configured, not mounted
+            snap(2, "/mnt/backup-system-mirror/projects/b.20260824"), // retired root
+            snap(3, "/mnt/backup-system/nvme/c.20260824"),   // retired root
+        ];
+        let configured = vec!["/mnt/backup-22tb".to_string()];
+        let plan = plan_reconcile(&snaps, &[], &configured, |_| false);
+
+        assert!(
+            plan.doomed.is_empty(),
+            "nothing may be pruned with no mounted root"
+        );
+        assert_eq!(plan.skipped_unmounted, 1);
+        assert_eq!(plan.skipped_unknown_root, 2);
     }
 
     #[test]
     fn empty_plan_reports_itself_empty() {
-        let plan = plan_reconcile(&[], &[], |_| true);
+        let plan = plan_reconcile(&[], &[], &[], |_| true);
         assert!(plan.is_empty());
     }
 
@@ -275,7 +314,7 @@ mod tests {
         // constant `true` and every prune would silently become a no-op.
         let snaps = vec![snap(1, "/mnt/backup-22tb/projects/gone.20260824")];
         let roots = vec!["/mnt/backup-22tb".to_string()];
-        let plan = plan_reconcile(&snaps, &roots, |_| false);
+        let plan = plan_reconcile(&snaps, &roots, &roots, |_| false);
         assert!(!plan.is_empty());
     }
 

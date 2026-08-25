@@ -200,7 +200,7 @@ fn run_reconcile(
     let roots: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
     let mounted = reconcile::verified_mounted_roots(&roots);
     let snapshots = database.list_snapshots()?;
-    let plan = reconcile::plan_reconcile(&snapshots, &mounted, reconcile::path_exists);
+    let plan = reconcile::plan_reconcile(&snapshots, &mounted, &roots, reconcile::path_exists);
     if dry_run || plan.is_empty() {
         return Ok(reconcile::PruneStats::default());
     }
@@ -1291,7 +1291,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mounted = reconcile::verified_mounted_roots(&roots);
             let snapshots = database.list_snapshots();
             let outcome = snapshots.map(|snaps| {
-                let plan = reconcile::plan_reconcile(&snaps, &mounted, reconcile::path_exists);
+                let plan =
+                    reconcile::plan_reconcile(&snaps, &mounted, &roots, reconcile::path_exists);
                 let stats = if dry_run || plan.is_empty() {
                     Ok(reconcile::PruneStats::default())
                 } else {
@@ -1306,12 +1307,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if json {
                 println!(
-                    "{{\"dry_run\":{},\"mounted_roots\":{},\"doomed\":{},\"present\":{},\"skipped_unmounted\":{},\"snapshots_removed\":{},\"spans_repaired\":{},\"spans_removed\":{},\"files_removed\":{}}}",
+                    "{{\"dry_run\":{},\"mounted_roots\":{},\"doomed\":{},\"present\":{},\"skipped_unmounted\":{},\"skipped_unknown_root\":{},\"snapshots_removed\":{},\"spans_repaired\":{},\"spans_removed\":{},\"files_removed\":{}}}",
                     dry_run,
                     mounted.len(),
                     plan.doomed.len(),
                     plan.confirmed_present,
                     plan.skipped_unmounted,
+                    plan.skipped_unknown_root,
                     stats.snapshots_removed,
                     stats.spans_repaired,
                     stats.spans_removed,
@@ -1321,6 +1323,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Mounted target roots: {}", mounted.len());
                 println!("Confirmed present:    {}", plan.confirmed_present);
                 println!("Skipped (unmounted):  {}", plan.skipped_unmounted);
+                if plan.skipped_unknown_root > 0 {
+                    println!(
+                        "Skipped (retired root): {} — under a mount path no longer in \
+                         config; unreachable by any reconcile, clear with \
+                         `btrdasd reindex --rebuild`",
+                        plan.skipped_unknown_root
+                    );
+                }
                 println!("Stale (absent):       {}", plan.doomed.len());
                 if dry_run {
                     println!("\nDry run — nothing was changed.");
