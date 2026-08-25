@@ -82,9 +82,47 @@ install(FILES icons/btrdasd-gui.svg DESTINATION ${KDE_INSTALL_ICONDIR}/hicolor/s
 
 feature_summary(WHAT ALL INCLUDE_QUIET_PACKAGES FATAL_ON_MISSING_REQUIRED_PACKAGES)
 
-# Tests — direct-DB tests removed; database logic is tested in Rust indexer.
-# TODO: Add D-Bus-based model tests with mock JSON data.
+# Tests — headless smoke suite (bd DAS-Backup-Manager-a59).
+#
+# Deliberately smoke, not interaction: the GUI is a thin D-Bus view over
+# btrdasd, whose logic the Rust suite covers, and the click-simulation suite
+# deleted in March 2026 was brittle. This covers the part with no Rust
+# equivalent — pure formatting the user reads, D-Bus error mapping, and that
+# every panel constructs when the helper is unavailable.
+#
+# Runs under the offscreen QPA platform, so it needs neither a display nor a
+# session bus and is safe in CI.
 if(BUILD_TESTING)
     find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS Test)
     include(ECMAddTests)
+
+    add_executable(gui-smoketest
+        tests/smoketest.cpp
+        src/dbusclient.cpp
+        src/filemodel.cpp
+        src/healthdashboard.cpp
+        src/backuphistory.cpp
+        src/progresspanel.cpp
+        src/indexrunner.cpp
+    )
+    target_link_libraries(gui-smoketest PRIVATE
+        Qt6::Test
+        Qt6::Widgets
+        Qt6::DBus
+        Qt6::Charts
+        KF6::CoreAddons
+        KF6::I18n
+        KF6::XmlGui
+        KF6::ConfigWidgets
+        KF6::IconThemes
+        KF6::Crash
+        KF6::KIOCore
+        KF6::KIOWidgets
+        KF6::Notifications
+        KF6::StatusNotifierItem
+    )
+    add_test(NAME gui-smoketest COMMAND gui-smoketest)
+    set_tests_properties(gui-smoketest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
 endif()

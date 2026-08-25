@@ -67,12 +67,20 @@ jobs:
             qt6-tools
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 
       # Always via cmake — a bare `cargo build` writes to a different target dir
       # and the install step then picks up a stale binary.
       - name: Build
         run: cmake --build build
+
+      # Offscreen QPA so the GUI smoke suite needs no display or session bus.
+      # --output-on-failure, because a bare pass/fail count is not a diagnosis.
+      - name: ctest (GUI smoke suite)
+        working-directory: build
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --output-on-failure
 
   shell:
     name: Shell — shellcheck

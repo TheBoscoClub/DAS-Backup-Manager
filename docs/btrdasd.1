@@ -1,6 +1,6 @@
 .\" btrdasd(1) man page
 .\" Generated from clap CLI definitions in indexer/src/main.rs
-.TH BTRDASD 1 "2026-08-24" "0.7.15.0" "DAS Backup Manager"
+.TH BTRDASD 1 "2026-08-24" "0.7.16.0" "DAS Backup Manager"
 .SH NAME
 btrdasd \- DAS Backup Manager indexer and orchestrator
 .SH SYNOPSIS
@@ -152,6 +152,70 @@ snapshots not already present.
 .TP
 .B \-\-rebuild
 Discard the index and rebuild it. Takes hours on a large target set.
+.\"
+.SS forget
+Delete obsolete snapshots whose series name matches a pattern.
+.PP
+For snapshots stranded by a subvolume rename: the old
+.I snapshot_name
+matches no retention rule, so btrbk never prunes them \(em
+.B btrbk clean
+handles incomplete and garbled snapshots only, and
+.B btrbk prune
+matches configured names \(em and they accumulate indefinitely.
+.PP
+.B Refuses outright
+if the pattern also matches a series btrbk is still backing up. The live series
+are read from
+.IR /etc/btrbk/btrbk.conf ,
+the file btrbk itself uses, rather than re-derived from
+.IR config.toml ,
+so the guard cannot disagree with reality. Without that file the command exits
+rather than proceeding unguarded.
+.PP
+.B btrdasd forget
+.I PATTERN
+.RB [ \-\-dry\-run ]
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-btrbk\-conf
+.IR PATH ]
+.TP
+.B \-\-dry\-run
+Print the plan without deleting anything.
+.\"
+.SS purge
+Delete every snapshot containing files matching a path pattern.
+.PP
+.B A file cannot be removed from inside a backup.
+Target snapshots are received read-only subvolumes; deleting a file requires
+clearing
+.IR ro ,
+which permanently destroys the Received UUID that only
+.B btrfs receive
+can set, leaving a subvolume that looks like a valid replica while its content
+may drift. Whole-snapshot deletion is therefore the only sound granularity, and
+purge deletes whole snapshots \(em losing those restore points, and forcing a
+full re-send of the affected series on the next backup.
+.PP
+Unlike
+.BR forget ,
+purge deliberately has no live-series guard: removing a leaked credential means
+removing it from the series still being backed up, which is the case it exists
+for.
+.PP
+.B btrdasd purge
+.I PATH_PATTERN
+.RB [ \-\-dry\-run ]
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.B \-\-dry\-run
+Print the plan without deleting anything.
 .\"
 .SS setup
 Interactive setup wizard \(em configure backup sources, targets, and scheduling.

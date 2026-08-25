@@ -93,11 +93,16 @@ private Q_SLOTS:
     void onJobFinished(const QString &jobId, bool success,
                        const QString &summary);
 
+public:
+    // Public because it is a pure mapping from a D-Bus error onto the text the
+    // user actually sees when the helper is unavailable, and that text is worth
+    // pinning in a test (bd DAS-Backup-Manager-a59). No state is exposed.
+    [[nodiscard]] static QString mapDBusError(const QString &errorName,
+                                              const QString &errorMessage);
+
 private:
     void callAsync(const QString &method, const QList<QVariant> &args,
                    const QString &operation);
-    [[nodiscard]] static QString mapDBusError(const QString &errorName,
-                                              const QString &errorMessage);
 
     QDBusInterface *m_interface = nullptr;
     bool m_available = false;
