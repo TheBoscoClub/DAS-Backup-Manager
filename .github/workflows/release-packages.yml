@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -119,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:43
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -161,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -208,7 +208,7 @@ jobs:
       image: bilelmoussaoui/flatpak-github-actions:kde-6.7
       options: --privileged
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6.7
         with:
