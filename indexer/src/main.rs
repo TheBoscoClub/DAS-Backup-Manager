@@ -297,6 +297,12 @@ enum Commands {
         /// Report what would be removed without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Drop all index rows recorded under a mount path that is no longer a
+        /// configured target — e.g. one retired by a rename. Such rows can never
+        /// be reconciled, because that root will never be mounted again
+        /// (bd DAS-Backup-Manager-wl8). Refuses a root that IS configured.
+        #[arg(long, value_name = "PATH")]
+        forget_root: Option<String>,
         /// First delete spans whose endpoints name snapshots that do not exist.
         /// Required on an index carrying such rows, because foreign keys are
         /// enforced and they cannot be rewritten (bd DAS-Backup-Manager-opd).
@@ -1272,6 +1278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             dry_run,
             repair,
+            forget_root,
         } => {
             let cfg = Config::load(&config)?;
 
@@ -1292,6 +1299,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
             let database = Database::open(&db)?;
+
+            if let Some(root) = &forget_root {
+                let configured: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
+                if configured
+                    .iter()
+                    .any(|c| c.trim_end_matches('/') == root.trim_end_matches('/'))
+                {
+                    eprintln!(
+                        "refusing: {root} IS a configured target — reconcile handles it \
+                         normally, and dropping its rows would discard a live index"
+                    );
+                    return Ok(());
+                }
+                let ids = database.snapshots_under_root(root)?;
+                if ids.is_empty() {
+                    println!("No index rows under {root}.");
+                } else if dry_run {
+                    println!("Would drop {} index rows under {root}.", ids.len());
+                } else {
+                    let stats = database.prune_snapshots(&ids)?;
+                    println!(
+                        "Retired {root}: dropped {} snapshots, {} spans, {} files",
+                        stats.snapshots_removed, stats.spans_removed, stats.files_removed
+                    );
+                }
+            }
 
             if repair {
                 if dry_run {
