@@ -562,6 +562,29 @@ impl Database {
         Ok(())
     }
 
+    /// Snapshot ids containing any file whose path matches `path_glob`.
+    ///
+    /// This is the scoping query for `btrdasd purge` (`bd DAS-Backup-Manager-rt6`):
+    /// "which snapshots contain this file". It is series-scoped for the same
+    /// reason `get_files_in_snapshot` is — matching a span by raw id range alone
+    /// spans unrelated subvolumes (`bd DAS-Backup-Manager-5uq`), and a purge
+    /// wired to that would delete the WRONG snapshots, which is data loss rather
+    /// than a wrong answer on screen.
+    pub fn snapshots_containing(&self, path_glob: &str) -> SqlResult<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT sn.id
+             FROM files f
+             JOIN spans sp        ON sp.file_id = f.id
+             JOIN snapshots ser   ON ser.id = sp.first_snap
+             JOIN snapshots sn    ON sn.name = ser.name AND sn.source = ser.source
+                                 AND sn.id >= sp.first_snap AND sn.id <= sp.last_snap
+             WHERE f.path GLOB ?1
+             ORDER BY sn.id",
+        )?;
+        let rows = stmt.query_map([path_glob], |row| row.get(0))?;
+        rows.collect()
+    }
+
     // -----------------------------------------------------------------
     // Reconciliation (bd DAS-Backup-Manager-cu8)
     // -----------------------------------------------------------------
@@ -1262,6 +1285,30 @@ mod tests {
         // is the property that makes the key safe without escaping.
         assert!(!"projA".contains(SERIES_SEP));
         assert!(!"projects".contains(SERIES_SEP));
+    }
+
+    #[test]
+    fn snapshots_containing_finds_only_the_series_that_holds_the_file() {
+        // The purge scoping query. A file in one series must not drag snapshots
+        // of another into the plan — that would delete the wrong backups.
+        let (db, a1, b1, a2, b2) = interleaved_fixture();
+        let secret = db
+            .upsert_file(SERIES_A, "config/secret.env", "secret.env", 1, 0, 0)
+            .unwrap();
+        db.insert_span(secret, a1, a2).unwrap();
+        let other = db
+            .upsert_file(SERIES_B, "Library/book.opus", "book.opus", 1, 0, 0)
+            .unwrap();
+        db.insert_span(other, b1, b2).unwrap();
+
+        let hits = db.snapshots_containing("*secret.env").unwrap();
+        assert_eq!(hits, vec![a1, a2], "must return only series A's snapshots");
+
+        assert!(
+            db.snapshots_containing("*nothing-like-this*")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ButteredDASD — Content Indexer for DAS Backup Snapshots
 
-**Binary**: `btrdasd` | **Version**: 0.7.15.0 | **Language**: Rust (edition 2024)
+**Binary**: `btrdasd` | **Version**: 0.7.16.0 | **Language**: Rust (edition 2024)
 
 ## Overview
 
@@ -48,6 +48,7 @@ backup-run.sh                   btrdasd CLI
 | `scanner` | `src/scanner.rs` | Filesystem traversal with walkdir |
 | `indexer` | `src/indexer.rs` | Snapshot discovery, span logic, walk orchestration |
 | `reconcile` | `src/reconcile.rs` | Prune index rows for snapshots gone from disk; mountpoint-gated |
+| `forget` | `src/forget.rs` | Snapshot selection + deletion for `forget`/`purge`; live-series guard |
 | `main` | `src/main.rs` | CLI with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | Setup subcommand routing and root check |
 | `setup/config` | `src/setup/config.rs` | TOML config types with serde serialization |

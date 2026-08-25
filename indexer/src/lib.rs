@@ -4,6 +4,7 @@ pub mod db;
 pub mod doctor;
 #[cfg(feature = "ffi")]
 pub mod ffi;
+pub mod forget;
 pub mod health;
 pub mod indexer;
 pub mod mount;

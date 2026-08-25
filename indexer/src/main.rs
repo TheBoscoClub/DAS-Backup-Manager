@@ -3,6 +3,7 @@ mod setup;
 use buttered_dasd::backup::{self, BackupLockAttempt, BackupMode, BackupOptions};
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
+use buttered_dasd::forget;
 use buttered_dasd::health::{self, HealthStatus};
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
@@ -12,7 +13,7 @@ use buttered_dasd::report;
 use buttered_dasd::{doctor, restore, schedule, scrub, subvol};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_DB: &str = "/var/lib/das-backup/backup-index.db";
 const DEFAULT_CONFIG: &str = "/etc/das-backup/config.toml";
@@ -91,6 +92,103 @@ struct Cli {
 /// Callers MUST invoke this while the targets are mounted — `plan_reconcile`
 /// refuses to prune anything under a root that is not a verified mountpoint, so
 /// calling it with everything unmounted is safe but useless (bd DAS-Backup-Manager-cu8).
+/// Shared driver for `forget` and `purge`: mount, plan, report, delete, prune.
+///
+/// Both commands differ only in how they select snapshots, so selection is the
+/// closure and everything dangerous — the interlock, the dry-run gate, deleting
+/// via `btrfs subvolume delete`, and pruning the index afterwards — is written
+/// once.
+fn run_deletion<F>(
+    db: &str,
+    config: &Path,
+    json: bool,
+    dry_run: bool,
+    verb: &str,
+    select: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(&[buttered_dasd::db::Snapshot]) -> Result<forget::ForgetPlan, forget::ForgetRefusal>,
+{
+    let cfg = Config::load(config)?;
+
+    // Deleting subvolumes on the targets is maintenance: same interlock.
+    let _locks = match reconcile::try_acquire_locks()? {
+        reconcile::LockAttempt::Acquired(locks) => locks,
+        reconcile::LockAttempt::Deferred(why) => {
+            println!("Deferred — {why}");
+            return Ok(());
+        }
+    };
+
+    let progress = CliProgress;
+    let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+    let database = Database::open(db)?;
+
+    let outcome =
+        (|| -> Result<(forget::ForgetPlan, usize, Vec<String>), Box<dyn std::error::Error>> {
+            let snapshots = database.list_snapshots()?;
+            let plan = match select(&snapshots) {
+                Ok(p) => p,
+                Err(forget::ForgetRefusal::LiveSeries(name)) => {
+                    return Err(format!(
+                        "refusing: the pattern also matches '{name}', a series btrbk is \
+                     still backing up — narrow the pattern"
+                    )
+                    .into());
+                }
+                Err(forget::ForgetRefusal::NoMatch) => return Err("nothing matched".into()),
+            };
+            if dry_run {
+                return Ok((plan, 0, Vec::new()));
+            }
+            let mut deleted = 0usize;
+            let mut failures = Vec::new();
+            for c in &plan.candidates {
+                match forget::delete_subvolume(&c.path) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => failures.push(format!("{}: {e}", c.path.display())),
+                }
+            }
+            // Prune the index for what actually went, so search stops serving it.
+            let gone: Vec<i64> = plan.candidates.iter().map(|c| c.id).collect();
+            if deleted > 0 {
+                database.prune_snapshots(&gone)?;
+            }
+            Ok((plan, deleted, failures))
+        })();
+
+    guard.unmount(&progress);
+    let (plan, deleted, failures) = outcome?;
+
+    if json {
+        println!(
+            "{{\"verb\":\"{verb}\",\"dry_run\":{dry_run},\"matched\":{},\"series\":{},\"deleted\":{},\"failed\":{}}}",
+            plan.candidates.len(),
+            plan.series.len(),
+            deleted,
+            failures.len()
+        );
+    } else {
+        println!(
+            "Matched {} snapshots across {} series:",
+            plan.candidates.len(),
+            plan.series.len()
+        );
+        for s in &plan.series {
+            println!("  {s}");
+        }
+        if dry_run {
+            println!("\nDry run — nothing was deleted.");
+        } else {
+            println!("\nDeleted {deleted} snapshots; index rows pruned.");
+            for f in &failures {
+                eprintln!("  FAILED {f}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Per-target reindex outcome: label, snapshots indexed, snapshots on disk.
 type ReindexOutcome = Vec<(String, usize, usize)>;
 
@@ -146,6 +244,33 @@ enum Commands {
         /// Path to SQLite database
         #[arg(long, default_value = DEFAULT_DB)]
         db: String,
+    },
+    /// Delete obsolete snapshots whose series name matches a pattern
+    Forget {
+        /// Glob over the snapshot SERIES name, e.g. 'Projects-old-name'
+        pattern: String,
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: String,
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// btrbk config, read to learn which series are still live
+        #[arg(long, default_value = "/etc/btrbk/btrbk.conf")]
+        btrbk_conf: PathBuf,
+        /// Show the plan without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete every snapshot containing files matching a path pattern
+    Purge {
+        /// Glob over the file path WITHIN a snapshot, e.g. '*id_rsa'
+        path: String,
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: String,
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Show the plan without deleting anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Re-index every mounted backup target; --rebuild discards the index first
     Reindex {
@@ -1027,6 +1152,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+        }
+        Commands::Forget {
+            pattern,
+            db,
+            config,
+            btrbk_conf,
+            dry_run,
+        } => {
+            let live = forget::live_snapshot_names(&btrbk_conf).unwrap_or_else(|e| {
+                eprintln!("Warning: could not read {}: {e}", btrbk_conf.display());
+                eprintln!(
+                    "Refusing to continue — without the live series list the \
+                           guard against deleting an active chain cannot run."
+                );
+                std::process::exit(2);
+            });
+            run_deletion(&db, &config, json, dry_run, "forget", |snaps| {
+                forget::plan_forget(snaps, &pattern, &live)
+            })?;
+        }
+        Commands::Purge {
+            path,
+            db,
+            config,
+            dry_run,
+        } => {
+            let database = Database::open(&db)?;
+            let ids = database.snapshots_containing(&path)?;
+            drop(database);
+            println!(
+                "Matched {} snapshot(s) containing files like '{path}'.",
+                ids.len()
+            );
+            println!(
+                "NOTE: whole snapshots are deleted — a file cannot be removed from \
+                 inside one. Affected series re-send in full on the next backup."
+            );
+            run_deletion(&db, &config, json, dry_run, "purge", |snaps| {
+                forget::plan_purge(snaps, &ids)
+            })?;
         }
         Commands::Reindex {
             db,

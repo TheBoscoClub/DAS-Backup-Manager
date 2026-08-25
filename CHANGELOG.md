@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.16.0] - 2026-08-25
+
+### Added
+- **`btrdasd forget <pattern>`** (`bd DAS-Backup-Manager-u8n`): deletes obsolete snapshots whose series name matches a glob. Snapshots stranded by a subvolume rename carry an old `snapshot_name` that matches no retention rule, so btrbk never prunes them — `btrbk clean` handles incomplete/garbled only and `btrbk prune` matches configured names — and they accumulate indefinitely
+  - **Refuses outright when the pattern also matches a live series.** The live names are read from `/etc/btrbk/btrbk.conf`, the file btrbk itself consumes, rather than re-derived from `config.toml`, so the guard cannot disagree with reality the way a second implementation of the naming rules could. If that file cannot be read the command exits rather than proceeding unguarded
+- **`btrdasd purge <path-pattern>`** (`bd DAS-Backup-Manager-rt6`): deletes every snapshot containing files matching a path glob, for a credential or PII that reached a backup
+  - **Whole-snapshot granularity is the only sound option, not a limitation of the implementation.** Target snapshots are received read-only subvolumes; removing a file requires clearing `ro`, which permanently destroys the Received UUID only `btrfs receive` can set, leaving something that looks like a valid replica while its content may drift. The command says so up front, along with the restore points lost and the full re-send that follows
+  - Deliberately has **no** live-series guard, unlike `forget`: purging a leaked secret means removing it from the series still being backed up, which is the case it exists for
+  - Scoping uses a new `Database::snapshots_containing()`, series-scoped for the same reason the read path is — matching spans by raw id range spans unrelated subvolumes (`5uq`), and a purge wired to that would delete the *wrong* snapshots, which is data loss rather than a wrong answer on screen
+  - Both commands share one driver: the maintenance interlock, the dry-run gate, `btrfs subvolume delete` (never `rm -rf`, never a `ro` flip) and index pruning are written once, so only snapshot *selection* differs
+- **Headless GUI smoke suite** (`bd DAS-Backup-Manager-a59`): `gui/CMakeLists.txt` found `Qt6::Test` and included `ECMAddTests`, then registered no tests — a dependency implying coverage that did not exist. New `gui/tests/smoketest.cpp` covers size formatting at every unit boundary, D-Bus error mapping onto the text users actually read, and that every panel constructs when the helper is unavailable — the ordinary state on a machine without `btrdasd-helper`, and the one where a missing null-check surfaces as a crash on launch. Runs under `QT_QPA_PLATFORM=offscreen`, needs no display or session bus, and is wired into CI via `ctest`. Deliberately smoke rather than interaction: the click-simulation suite deleted in March 2026 was brittle, and the logic beneath the GUI is covered by the Rust suite
+
 ## [0.7.15.0] - 2026-08-25
 
 ### Added
@@ -572,7 +584,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.15.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.16.0...HEAD
+[0.7.16.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.15.0...v0.7.16.0
 [0.7.15.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.1...v0.7.15.0
 [0.7.14.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.0...v0.7.14.1
 [0.7.14.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.3...v0.7.14.0
