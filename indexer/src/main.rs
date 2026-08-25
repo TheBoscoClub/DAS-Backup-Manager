@@ -190,7 +190,7 @@ where
 }
 
 /// Per-target reindex outcome: label, snapshots indexed, snapshots on disk.
-type ReindexOutcome = Vec<(String, usize, usize)>;
+type ReindexOutcome = Vec<(String, usize, usize, usize)>;
 
 fn run_reconcile(
     database: &Database,
@@ -1243,6 +1243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         target.label.clone(),
                         r.snapshots_indexed,
                         r.snapshots_discovered,
+                        r.presence_recorded,
                     ));
                 }
                 Ok(per_target)
@@ -1251,12 +1252,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             guard.unmount(&progress);
             let per_target = outcome?;
 
-            let total: usize = per_target.iter().map(|(_, i, _)| i).sum();
+            let total: usize = per_target.iter().map(|(_, i, _, _)| i).sum();
             if json {
                 let parts: Vec<String> = per_target
                     .iter()
-                    .map(|(l, i, d)| {
-                        format!("{{\"target\":\"{l}\",\"indexed\":{i},\"discovered\":{d}}}")
+                    .map(|(l, i, d, p)| {
+                        format!(
+                            "{{\"target\":\"{l}\",\"indexed\":{i},\"discovered\":{d},\"copies_recorded\":{p}}}"
+                        )
                     })
                     .collect();
                 println!(
@@ -1267,8 +1270,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 println!();
-                for (label, indexed, discovered) in &per_target {
-                    println!("  {label}: {indexed} indexed of {discovered} on disk");
+                for (label, indexed, discovered, present) in &per_target {
+                    // "0 indexed of 237" alone reads as a failure. It is not: the
+                    // same logical snapshot is indexed once, under whichever
+                    // target is walked first, and its presence here is recorded
+                    // rather than ignored (bd DAS-Backup-Manager-gt0).
+                    if *indexed == 0 && *present > 0 {
+                        println!(
+                            "  {label}: {present} copies recorded of {discovered} on disk \
+                             (already indexed from another target)"
+                        );
+                    } else {
+                        println!(
+                            "  {label}: {indexed} indexed of {discovered} on disk, \
+                             {present} copies recorded"
+                        );
+                    }
                 }
                 println!("Total newly indexed: {total}");
             }

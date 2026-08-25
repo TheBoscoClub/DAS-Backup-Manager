@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.19.0] - 2026-08-25
+
+### Added
+- **The index now records WHICH targets hold each snapshot — schema v3** (`bd DAS-Backup-Manager-gt0`): `discover_snapshots` dedups on `(source, name, ts)`, so a snapshot replicated to all three targets is one logical snapshot and is indexed once, always under whichever target is walked first — the primary. The index therefore could not say a copy existed anywhere else, and in the disaster the recovery drives exist for (primary array unavailable) `search` could name the snapshot holding a file while only ever pointing at an unreachable path
+  - New `snapshot_targets(snapshot_id, target_root, path)` with `ON DELETE CASCADE`, so presence rows can never outlive their snapshot and reintroduce the stale-row problem `cu8` was about — asserted by a test
+  - `walk` records presence for both newly-indexed snapshots and copies already indexed from another target. The files of an existing copy are deliberately NOT re-read; it is the same logical snapshot
+  - Presence is **not derivable** and had to be recorded: the recovery targets keep `daily=7` only against the primary's daily/weekly/monthly/yearly, so they hold a subset — measured 2026-08-25 at 295 snapshot directories against 730
+
+### Changed
+- **The reindex summary no longer prints a bare `0 indexed of 237 on disk`** for the recovery targets, which read as a failure and was in fact correct behaviour. It now reports `N copies recorded of M on disk (already indexed from another target)`, and `--json` gains `copies_recorded` per target
+
 ## [0.7.18.0] - 2026-08-25
 
 ### Fixed
@@ -603,7 +614,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.18.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.0...HEAD
+[0.7.19.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.18.0...v0.7.19.0
 [0.7.18.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.17.0...v0.7.18.0
 [0.7.17.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.16.0...v0.7.17.0
 [0.7.16.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.15.0...v0.7.16.0

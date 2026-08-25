@@ -1,6 +1,6 @@
 # ButteredDASD — Content Indexer for DAS Backup Snapshots
 
-**Binary**: `btrdasd` | **Version**: 0.7.18.0 | **Language**: Rust (edition 2024)
+**Binary**: `btrdasd` | **Version**: 0.7.19.0 | **Language**: Rust (edition 2024)
 
 ## Overview
 
@@ -114,6 +114,7 @@ This approach dramatically reduces database size — a file unchanged across 100
 | `idx_spans_file_id` | file_id | Fast lookup of spans for a file |
 | `idx_files_name` | name | Direct file name lookups |
 | `idx_files_series_path` | series, path (UNIQUE) | File dedup, scoped per subvolume series |
+| `idx_snapshot_targets_snap` | snapshot_id | Which targets hold a given snapshot |
 | `idx_spans_last` | last_snap | Span extension queries |
 
 ## CLI Usage
