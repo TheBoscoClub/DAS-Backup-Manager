@@ -91,6 +91,16 @@ backup-run.sh                   btrdasd CLI
 | first_snap | INTEGER FK | First snapshot containing this file version |
 | last_snap | INTEGER FK | Last snapshot containing this file version |
 
+**snapshot_targets** — One row per (snapshot, target) pair: which backup targets physically hold a copy of a snapshot. Added in schema v3 (v0.7.19.0). A snapshot replicated to all three targets is still ONE logical snapshot indexed once, so without this table the index could name the snapshot holding a file but only ever point at the primary's path — useless in the disaster the recovery drives exist for. Presence is not derivable: the recovery targets keep `daily=7` against the primary's daily/weekly/monthly/yearly, so they hold a strict subset.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| snapshot_id | INTEGER FK | References snapshots(id) `ON DELETE CASCADE` — presence rows can never outlive their snapshot |
+| target_root | TEXT | Mount root of the target holding this copy (e.g. `/mnt/backup-22tb`) |
+| path | TEXT | Full path to the copy on that target |
+
+Primary key is `(snapshot_id, target_root)`.
+
 **files_fts** — FTS5 virtual table synced from `files` via triggers. Enables full-text search on file names and paths.
 
 ### Span Logic
@@ -195,6 +205,27 @@ sudo btrdasd setup --check          # Validate config and dependencies
 ```
 
 See [INSTALL.md](INSTALL.md) for full installer documentation.
+
+### Reconcile the index against disk
+
+```bash
+sudo btrdasd reconcile --dry-run     # Report what would be removed, change nothing
+sudo btrdasd reconcile               # Prune index rows for snapshots gone from disk
+sudo btrdasd reconcile --repair      # First delete spans whose endpoints name missing
+                                     # snapshots — REQUIRED on an index carrying such
+                                     # rows, since foreign keys are enforced and they
+                                     # cannot be rewritten
+sudo btrdasd reconcile --forget-root /mnt/old-target
+                                     # Drop all rows recorded under a mount path that is
+                                     # no longer a configured target (e.g. retired by a
+                                     # rename). Such rows can never be reconciled, because
+                                     # that root will never be mounted again. Refuses a
+                                     # root that IS still configured
+```
+
+Reconcile is **mountpoint-gated**: it will not prune rows for a target that is not currently
+mounted, because an unmounted target is indistinguishable from an empty one and pruning on
+that basis would discard a valid index.
 
 ### Default database path
 

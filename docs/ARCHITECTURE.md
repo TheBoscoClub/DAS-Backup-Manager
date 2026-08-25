@@ -190,12 +190,14 @@ btrdasd-gui
 
 ### Schema
 
-The SQLite database at `/var/lib/das-backup/backup-index.db` uses three core tables plus an FTS5 virtual table:
+The SQLite database at `/var/lib/das-backup/backup-index.db` uses four core tables plus an FTS5 virtual table:
 
 ```sql
 snapshots (id PK, name, ts, source, path UNIQUE, indexed_at)
 files     (id PK, path, name, size, mtime, type)
 spans     (file_id FK, first_snap FK, last_snap FK, PK(file_id, first_snap))
+snapshot_targets (snapshot_id FK ON DELETE CASCADE, target_root, path,
+                  PK(snapshot_id, target_root))   -- schema v3, which targets hold a snapshot
 files_fts (FTS5 virtual: name, path — synced via triggers)
 ```
 
