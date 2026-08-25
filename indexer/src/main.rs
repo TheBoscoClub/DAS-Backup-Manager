@@ -297,6 +297,11 @@ enum Commands {
         /// Report what would be removed without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// First delete spans whose endpoints name snapshots that do not exist.
+        /// Required on an index carrying such rows, because foreign keys are
+        /// enforced and they cannot be rewritten (bd DAS-Backup-Manager-opd).
+        #[arg(long)]
+        repair: bool,
     },
     /// Interactive setup wizard — configure backup sources, targets, and scheduling
     Setup(setup::SetupArgs),
@@ -1266,6 +1271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             db,
             config,
             dry_run,
+            repair,
         } => {
             let cfg = Config::load(&config)?;
 
@@ -1286,6 +1292,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
             let database = Database::open(&db)?;
+
+            if repair {
+                if dry_run {
+                    println!("(--repair has no effect with --dry-run)");
+                } else {
+                    match database.delete_dangling_spans() {
+                        Ok((spans, files)) => println!(
+                            "Repaired: removed {spans} dangling spans, {files} orphaned files"
+                        ),
+                        Err(e) => eprintln!("Repair failed: {e}"),
+                    }
+                }
+            }
 
             let roots: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
             let mounted = reconcile::verified_mounted_roots(&roots);
