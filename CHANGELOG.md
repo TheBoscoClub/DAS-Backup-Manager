@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.18.0] - 2026-08-25
+
+### Fixed
+- **Indexing no longer degrades quadratically as the index grows** (`bd DAS-Backup-Manager-3sa`): `index_snapshot` pre-fetches the previous snapshot's entire file set on every snapshot it walks, and did so through `get_files_in_snapshot`, which drives off `idx_spans_last (last_snap >= ?)`. The scanned fraction of `spans` grows with the id space — tolerable when a handful of snapshots are indexed per night, but a rebuild walking hundreds back-to-back collapsed to **670 files/min by 4.3M rows**, roughly 13 days extrapolated across the full index
+  - New `get_files_in_series_snapshot()` takes the series the caller already knows, letting SQLite narrow on `idx_files_series_path` first and then check each candidate's spans by primary key. `EXPLAIN QUERY PLAN` confirms the change: `SEARCH s USING INDEX idx_spans_last (last_snap>?)` becomes `SEARCH f USING COVERING INDEX idx_files_series_path (series=?)`, so cost tracks the size of one series instead of the whole table
+  - Only possible because of the `lc9` schema change — `files` did not carry a series before 0.7.14.0
+  - The read path keeps `get_files_in_snapshot`'s span-derived scoping, which works on mixed data; the fast path requires `files.series` and correctly returns nothing for rows migrated from v1, which re-indexes them under their real series. Both behaviours are pinned by tests, including one asserting the two paths agree on v2 data so a rebuild cannot silently produce a different index than an incremental walk
+
 ## [0.7.17.0] - 2026-08-25
 
 ### Added
@@ -595,7 +603,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.17.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.18.0...HEAD
+[0.7.18.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.17.0...v0.7.18.0
 [0.7.17.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.16.0...v0.7.17.0
 [0.7.16.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.15.0...v0.7.16.0
 [0.7.15.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.1...v0.7.15.0

@@ -600,6 +600,54 @@ impl Database {
         Ok((spans, files))
     }
 
+    /// Files present in `snap_id`, for a caller that already knows the series.
+    ///
+    /// # Why this exists alongside `get_files_in_snapshot`
+    ///
+    /// The indexer pre-fetches the previous snapshot's entire file set on every
+    /// snapshot it walks. Doing that through `get_files_in_snapshot` drives off
+    /// `idx_spans_last (last_snap >= ?)`, whose scanned fraction grows with the id
+    /// space — fine when a handful of snapshots are indexed per night, quadratic
+    /// when a rebuild walks hundreds back to back. Measured at 670 files/min by
+    /// 4.3M rows (`bd DAS-Backup-Manager-3sa`).
+    ///
+    /// Passing the series lets SQLite narrow on `idx_files_series_path` FIRST and
+    /// then check each candidate's spans by primary key, so the cost tracks the
+    /// size of the one series rather than the whole table.
+    ///
+    /// Requires `files.series` to be populated, which is true for anything this
+    /// binary indexed and for every row after a rebuild, but NOT for rows migrated
+    /// from schema v1 (they carry `''`, since the series of an already-collapsed
+    /// row cannot be recovered). On such rows this correctly returns nothing and
+    /// the file is re-indexed under its real series — which is the migration, not
+    /// a bug. The read path deliberately still uses `get_files_in_snapshot`, whose
+    /// span-derived scoping works on mixed data.
+    pub fn get_files_in_series_snapshot(
+        &self,
+        series: &str,
+        snap_id: i64,
+    ) -> SqlResult<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.path, f.name, f.size, f.mtime, f.type
+             FROM files f
+             WHERE f.series = ?1
+               AND EXISTS (SELECT 1 FROM spans s
+                           WHERE s.file_id = f.id
+                             AND s.first_snap <= ?2 AND s.last_snap >= ?2)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![series, snap_id], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                size: row.get(3)?,
+                mtime: row.get(4)?,
+                file_type: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Snapshot ids recorded under `root`, for retiring a mount path that is no
     /// longer configured.
     pub fn snapshots_under_root(&self, root: &str) -> SqlResult<Vec<i64>> {
@@ -1448,6 +1496,59 @@ mod tests {
             db.snapshots_under_root("/mnt/backup-22tb/").unwrap(),
             vec![live]
         );
+    }
+
+    #[test]
+    fn series_scoped_fetch_matches_the_span_scoped_one_on_v2_data() {
+        // The fast path used by the indexer must agree with the read path on data
+        // that carries a real series — otherwise a rebuild would silently produce
+        // a different index than an incremental walk.
+        let (db, a1, b1, a2, _b2) = interleaved_fixture();
+        let proj = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
+        db.insert_span(proj, a1, a2).unwrap();
+        let abook = db
+            .upsert_file(SERIES_B, "Library/book.opus", "book.opus", 20, 0, 0)
+            .unwrap();
+        db.insert_span(abook, b1, b1).unwrap();
+
+        for (series, id) in [(SERIES_A, a1), (SERIES_A, a2), (SERIES_B, b1)] {
+            let fast: Vec<String> = db
+                .get_files_in_series_snapshot(series, id)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            let slow: Vec<String> = db
+                .get_files_in_snapshot(id)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            assert_eq!(fast, slow, "series={series} snap={id}");
+        }
+    }
+
+    #[test]
+    fn series_scoped_fetch_returns_nothing_for_unmigrated_rows() {
+        // Rows migrated from v1 carry series='' and cannot be matched by series.
+        // Returning nothing is correct — the file is re-indexed under its real
+        // series — and this pins that behaviour so it is a decision, not a
+        // surprise.
+        let (db, a1, _b1, a2, _b2) = interleaved_fixture();
+        let legacy = db
+            .upsert_file("", "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
+        db.insert_span(legacy, a1, a2).unwrap();
+
+        assert!(
+            db.get_files_in_series_snapshot(SERIES_A, a1)
+                .unwrap()
+                .is_empty()
+        );
+        // The read path still finds it, which is why it keeps span-derived scoping.
+        assert_eq!(db.get_files_in_snapshot(a1).unwrap().len(), 1);
     }
 
     #[test]
