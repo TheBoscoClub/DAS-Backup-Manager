@@ -1,6 +1,6 @@
 # ButteredDASD — Content Indexer for DAS Backup Snapshots
 
-**Binary**: `btrdasd` | **Version**: 0.7.14.1 | **Language**: Rust (edition 2024)
+**Binary**: `btrdasd` | **Version**: 0.7.15.0 | **Language**: Rust (edition 2024)
 
 ## Overview
 
@@ -54,7 +54,7 @@ backup-run.sh                   btrdasd CLI
 | `setup/detect` | `src/setup/detect.rs` | System detection (devices, subvols, init, packages) |
 | `setup/templates` | `src/setup/templates.rs` | Template engine for btrbk.conf, systemd, cron, scripts |
 | `setup/installer` | `src/setup/installer.rs` | Install/uninstall/upgrade/check with manifest tracking |
-| `setup/wizard` | `src/setup/wizard.rs` | 10-step interactive dialoguer wizard |
+| `setup/wizard` | `src/setup/wizard.rs` | 9-step interactive dialoguer wizard |
 
 ## Database Schema
 

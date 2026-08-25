@@ -84,9 +84,28 @@ pub fn install_to_prefix(
     // Save config
     config.save(config_path)?;
 
+    // What the PREVIOUS install put on disk. Needed to spot files that have
+    // dropped out of the generated set (bd DAS-Backup-Manager-e23).
+    let previous: Vec<String> = std::fs::read_to_string(manifest_path)
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // mtime of the running binary, for the staleness check below.
+    let exe_mtime = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+
     // Generate all files
     let generated = GeneratedFiles::generate(config);
     let mut manifest_entries = vec![config_path.to_string_lossy().to_string()];
+    let mut skipped_newer: Vec<String> = Vec::new();
 
     for (rel_path, content) in &generated.files {
         let full_path = if rel_path.starts_with('/') {
@@ -97,6 +116,32 @@ pub fn install_to_prefix(
 
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+
+        // Never overwrite an on-disk file that is NEWER than the binary carrying
+        // the embedded copy (bd DAS-Backup-Manager-2lj). Scripts are compiled in
+        // via include_str!, so a btrdasd built before a script edit holds a stale
+        // copy; `setup --upgrade` would then silently downgrade the file that
+        // `cmake --install` had just refreshed. Skipping is safe in the normal
+        // direction too: after a rebuild the binary is newer than the file, so a
+        // genuine upgrade still writes.
+        let is_stale_overwrite = match (exe_mtime, std::fs::metadata(&full_path)) {
+            (Some(exe), Ok(meta)) => meta
+                .modified()
+                .ok()
+                .filter(|disk| *disk > exe)
+                .map(|_| {
+                    std::fs::read(&full_path)
+                        .map(|d| d != content.as_bytes())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if is_stale_overwrite {
+            skipped_newer.push(full_path.to_string_lossy().to_string());
+            manifest_entries.push(full_path.to_string_lossy().to_string());
+            continue;
         }
 
         std::fs::write(&full_path, content)?;
@@ -120,6 +165,35 @@ pub fn install_to_prefix(
     // Create DB directory
     if let Some(parent) = Path::new(&config.general.db_path).parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Files the previous install owned that this one no longer generates. Left
+    // behind they look installed and supported while nothing maintains them.
+    let mut pruned = Vec::new();
+    for stale in &previous {
+        if manifest_entries.iter().any(|e| e == stale) {
+            continue;
+        }
+        let path = Path::new(stale);
+        // Only ever remove something the manifest says WE installed, and never
+        // the config itself.
+        if path == config_path || !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => pruned.push(stale.clone()),
+            Err(e) => eprintln!("Warning: could not remove stale file {stale}: {e}"),
+        }
+    }
+
+    for path in &skipped_newer {
+        println!(
+            "Kept existing {path} — it is newer than this btrdasd binary, whose \
+             embedded copy would be a downgrade (rebuild and re-run to update it)"
+        );
+    }
+    for path in &pruned {
+        println!("Removed stale file no longer generated: {path}");
     }
 
     println!("Installation complete.");
@@ -462,6 +536,119 @@ pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> 
 mod tests {
     use super::*;
     use crate::setup::config::*;
+
+    /// Install into a throwaway prefix and hand back the paths used.
+    fn install_into(dir: &Path) -> (PathBuf, PathBuf) {
+        let config_path = dir.join("etc/das-backup/config.toml");
+        let manifest_path = dir.join("etc/das-backup/.manifest");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let config = Config::default();
+        install_to_prefix(&config, dir, &config_path, &manifest_path).unwrap();
+        (config_path, manifest_path)
+    }
+
+    #[test]
+    fn upgrade_prunes_files_that_left_the_generated_set() {
+        // bd DAS-Backup-Manager-e23: the manifest was overwritten without diffing,
+        // so a file that dropped out of the generated set stayed on disk looking
+        // installed and supported while nothing maintained it.
+        let dir = tempfile::tempdir().unwrap();
+        let (_config_path, manifest_path) = install_into(dir.path());
+
+        // Simulate a previous install that owned an extra file.
+        let orphan = dir
+            .path()
+            .join("usr/lib/das-backup/dropped-by-a-later-release.sh");
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, "#!/bin/bash\n").unwrap();
+        let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        manifest.push('\n');
+        manifest.push_str(&orphan.to_string_lossy());
+        std::fs::write(&manifest_path, manifest).unwrap();
+        assert!(orphan.exists());
+
+        // Re-install: the orphan is no longer generated, so it must go.
+        install_into(dir.path());
+
+        assert!(!orphan.exists(), "stale file was left on disk");
+        let final_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(!final_manifest.contains("dropped-by-a-later-release"));
+    }
+
+    #[test]
+    fn upgrade_never_prunes_the_config_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, _manifest) = install_into(dir.path());
+        install_into(dir.path());
+        assert!(config_path.exists(), "config must survive a re-install");
+    }
+
+    #[test]
+    fn upgrade_keeps_a_script_newer_than_the_binary() {
+        // bd DAS-Backup-Manager-2lj: scripts are embedded with include_str!, so a
+        // btrdasd built BEFORE a script edit carries a stale copy. Re-running
+        // `setup --upgrade` would silently overwrite the file cmake had just
+        // refreshed. A file newer than the running binary must be left alone.
+        let dir = tempfile::tempdir().unwrap();
+        let (_c, _m) = install_into(dir.path());
+
+        // Pick any installed .sh and make it look hand-updated after the build.
+        let script = walk_installed_scripts(dir.path())
+            .into_iter()
+            .next()
+            .expect("install should have produced at least one script");
+        let sentinel = b"#!/bin/bash\n# edited after the binary was built\n";
+        std::fs::write(&script, sentinel).unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        filetime::set_file_mtime(&script, filetime::FileTime::from_system_time(future)).unwrap();
+
+        install_into(dir.path());
+
+        assert_eq!(
+            std::fs::read(&script).unwrap(),
+            sentinel,
+            "a script newer than the binary must not be overwritten by the embedded copy"
+        );
+    }
+
+    #[test]
+    fn upgrade_does_overwrite_a_script_older_than_the_binary() {
+        // The complement: without this, "keep newer" could be implemented as
+        // "never write", and upgrades would silently stop working.
+        let dir = tempfile::tempdir().unwrap();
+        install_into(dir.path());
+        let script = walk_installed_scripts(dir.path())
+            .into_iter()
+            .next()
+            .expect("install should have produced at least one script");
+        std::fs::write(&script, b"stale contents\n").unwrap();
+        let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        filetime::set_file_mtime(&script, filetime::FileTime::from_system_time(past)).unwrap();
+
+        install_into(dir.path());
+
+        assert_ne!(
+            std::fs::read(&script).unwrap(),
+            b"stale contents\n".to_vec(),
+            "an older script must still be refreshed"
+        );
+    }
+
+    fn walk_installed_scripts(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file()
+                && entry.path().extension().and_then(|e| e.to_str()) == Some("sh")
+            {
+                out.push(entry.path().to_path_buf());
+            }
+        }
+        out.sort();
+        out
+    }
 
     #[test]
     fn migrate_rewrites_bridge_port_to_relay_port() {

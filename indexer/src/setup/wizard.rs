@@ -1,4 +1,9 @@
-// Interactive 10-step setup wizard using dialoguer prompts and console styling.
+// Interactive setup wizard using dialoguer prompts and console styling.
+//
+// The step count lives in `TOTAL_STEPS` rather than being written into each
+// banner: the numbering had drifted to "[3/10]" followed by "[5/10]" across nine
+// actual steps, so the wizard skipped a number and overstated its own length
+// (bd DAS-Backup-Manager-kvg).
 // Binary-only module (main.rs scope). No unit tests — testing via `btrdasd setup` on VM.
 // Functions are consumed by the run() orchestrator in Task 6.
 #![allow(dead_code)]
@@ -11,6 +16,12 @@ use crate::setup::detect::*;
 
 /// Run the interactive setup wizard. Takes detected system info and an optional
 /// existing config (for --modify mode). Returns a completed, validated Config.
+/// Number of interactive steps the wizard walks through.
+///
+/// Single source for every banner's denominator, so adding or removing a step
+/// cannot leave the printed count stale.
+const TOTAL_STEPS: usize = 9;
+
 pub fn run_wizard(
     sys: &SystemInfo,
     existing: Option<Config>,
@@ -40,7 +51,7 @@ pub fn run_wizard(
 fn step_dependencies(sys: &SystemInfo) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[1/10]").bold().cyan(),
+        style(format!("[1/{TOTAL_STEPS}]")).bold().cyan(),
         style("Checking Dependencies").bold()
     );
     println!();
@@ -171,7 +182,7 @@ fn step_subvolumes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[2/10]").bold().cyan(),
+        style(format!("[2/{TOTAL_STEPS}]")).bold().cyan(),
         style("Backup Sources (BTRFS Subvolumes)").bold()
     );
 
@@ -374,7 +385,7 @@ fn step_subvolumes(
 fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[3/10]").bold().cyan(),
+        style(format!("[3/{TOTAL_STEPS}]")).bold().cyan(),
         style("Backup Targets").bold()
     );
 
@@ -505,7 +516,7 @@ fn step_targets(sys: &SystemInfo, config: &mut Config) -> Result<(), Box<dyn std
 fn step_retention(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[5/10]").bold().cyan(),
+        style(format!("[4/{TOTAL_STEPS}]")).bold().cyan(),
         style("Retention Policy").bold()
     );
 
@@ -561,7 +572,7 @@ fn step_scheduling(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[6/10]").bold().cyan(),
+        style(format!("[5/{TOTAL_STEPS}]")).bold().cyan(),
         style("Backup Schedule").bold()
     );
 
@@ -625,7 +636,7 @@ fn step_scheduling(
 fn step_email(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[7/10]").bold().cyan(),
+        style(format!("[6/{TOTAL_STEPS}]")).bold().cyan(),
         style("Email Notifications").bold()
     );
 
@@ -704,7 +715,7 @@ fn step_email(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
 fn step_install_location(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[8/10]").bold().cyan(),
+        style(format!("[7/{TOTAL_STEPS}]")).bold().cyan(),
         style("Install Location").bold()
     );
 
@@ -745,7 +756,7 @@ fn step_install_location(config: &mut Config) -> Result<(), Box<dyn std::error::
 fn step_gui(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[9/10]").bold().cyan(),
+        style(format!("[8/{TOTAL_STEPS}]")).bold().cyan(),
         style("KDE Plasma GUI").bold()
     );
 
@@ -773,7 +784,7 @@ fn step_gui(config: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
 fn step_review(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n{} {}",
-        style("[10/10]").bold().cyan(),
+        style(format!("[9/{TOTAL_STEPS}]")).bold().cyan(),
         style("Review Configuration").bold()
     );
     println!("\n{}", style("═".repeat(50)).dim());

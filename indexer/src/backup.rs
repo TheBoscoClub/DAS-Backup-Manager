@@ -3,9 +3,84 @@ use crate::db::Database;
 use crate::health;
 use crate::indexer;
 use crate::progress::{LogLevel, ProgressCallback};
+use crate::scrub;
 use std::io::BufRead;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
+
+// ---------------------------------------------------------------------------
+// Maintenance interlock for manual backups (bd DAS-Backup-Manager-pe6)
+// ---------------------------------------------------------------------------
+
+/// Singleton lock shared with the scheduled path.
+///
+/// Deliberately the SAME file `scripts/backup-run.sh` takes, so a manual
+/// `btrdasd backup` and the 03:00 timer contend with each other rather than
+/// running two backups over one set of targets.
+pub const BACKUP_LOCK_PATH: &str = "/run/das-backup.lock";
+
+/// Both locks a manual backup holds, released on drop.
+pub struct BackupLocks {
+    _maintenance: scrub::FileLock,
+    _singleton: scrub::FileLock,
+}
+
+/// Outcome of trying to take the manual-backup locks.
+pub enum BackupLockAttempt {
+    Acquired(Box<BackupLocks>),
+    /// Another backup already holds the singleton — decline rather than queue.
+    AlreadyRunning,
+}
+
+/// Take the manual-backup locks, mirroring `backup-run.sh` exactly.
+///
+/// The manual `btrdasd backup` subcommands mounted and unmounted the DAS
+/// filesystems with no lock at all, outside the mutual-exclusion scheme that
+/// `backup-run.sh`, the scrub engine and `doctor` all participate in. The
+/// concrete hazard: `doctor` mounts a source, a concurrent manual backup finds it
+/// already mounted and uses it unregistered, then `doctor` finishes first and
+/// unmounts it mid-use.
+///
+/// The two halves behave differently, matching the scheduled path rather than
+/// inventing a third convention:
+///
+/// * **singleton, non-blocking** — a second backup is redundant, not merely
+///   late, so it declines instead of queueing (`flock -n` in the bash path).
+/// * **maintenance, blocking** — a scrub is a peer operation, so the backup
+///   waits for it. Defer, never skip.
+///
+/// Acquisition order is singleton then maintenance, the same order used
+/// everywhere else; that shared order is what keeps the set deadlock-free.
+pub fn acquire_manual_locks_at(
+    singleton_path: &Path,
+    maintenance_path: &Path,
+    progress: &dyn ProgressCallback,
+) -> Result<BackupLockAttempt, scrub::ScrubError> {
+    let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
+        return Ok(BackupLockAttempt::AlreadyRunning);
+    };
+    let maintenance = scrub::FileLock::acquire_blocking(
+        maintenance_path,
+        progress,
+        "DAS maintenance lock held (scrub in progress?) — waiting...",
+    )?;
+    Ok(BackupLockAttempt::Acquired(Box::new(BackupLocks {
+        _maintenance: maintenance,
+        _singleton: singleton,
+    })))
+}
+
+/// Take the manual-backup locks at their production paths.
+pub fn acquire_manual_locks(
+    progress: &dyn ProgressCallback,
+) -> Result<BackupLockAttempt, scrub::ScrubError> {
+    acquire_manual_locks_at(
+        Path::new(BACKUP_LOCK_PATH),
+        Path::new(scrub::MAINTENANCE_LOCK_PATH),
+        progress,
+    )
+}
 
 /// Whether to run an incremental or full backup.
 ///
@@ -1322,6 +1397,41 @@ pub fn run_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- manual-backup interlock (bd DAS-Backup-Manager-pe6) ----------------
+
+    #[test]
+    fn manual_backup_declines_when_another_backup_holds_the_singleton() {
+        // A second backup is redundant, not merely late, so it declines rather
+        // than queueing — matching `flock -n` in backup-run.sh.
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("backup.lock");
+        let maintenance = dir.path().join("maintenance.lock");
+        let held = scrub::FileLock::try_acquire(&singleton).unwrap();
+        assert!(held.is_some(), "fixture must hold the singleton");
+
+        let progress = crate::progress::NullProgress;
+        match acquire_manual_locks_at(&singleton, &maintenance, &progress).unwrap() {
+            BackupLockAttempt::AlreadyRunning => {}
+            BackupLockAttempt::Acquired(_) => panic!("two backups acquired at once"),
+        }
+    }
+
+    #[test]
+    fn manual_backup_acquires_when_nothing_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = crate::progress::NullProgress;
+        match acquire_manual_locks_at(
+            &dir.path().join("backup.lock"),
+            &dir.path().join("maintenance.lock"),
+            &progress,
+        )
+        .unwrap()
+        {
+            BackupLockAttempt::Acquired(_) => {}
+            BackupLockAttempt::AlreadyRunning => panic!("declined with nothing held"),
+        }
+    }
     use crate::config::{
         Boot, Config, Das, Doctor, Email, General, Gui, Init, InitSystem, Retention, Schedule,
         Scrub, Source, SubvolConfig, Target, TargetRole,

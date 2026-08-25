@@ -59,7 +59,6 @@ parts:
       - libkf6statusnotifieritem6t64
       - util-linux
       - s-nail
-      - rsync
 
 apps:
   btrdasd:

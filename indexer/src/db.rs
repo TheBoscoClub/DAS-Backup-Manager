@@ -1196,6 +1196,75 @@ mod tests {
     }
 
     #[test]
+    fn cache_size_is_configured_in_kibibytes_not_pages() {
+        // The SIGN of cache_size selects the unit: negative is KiB, positive is
+        // PAGES. Losing the minus turns a 256 MiB cache into 262144 pages (~1 GiB
+        // at 4K) with no error anywhere (bd DAS-Backup-Manager-bxl).
+        let db = Database::open(":memory:").unwrap();
+        let cache: i64 = db
+            .conn
+            .pragma_query_value(None, "cache_size", |r| r.get(0))
+            .unwrap();
+        assert!(
+            cache < 0,
+            "cache_size must stay negative (KiB); got {cache}, which SQLite reads as pages"
+        );
+        assert_eq!(cache, -262_144);
+    }
+
+    #[test]
+    fn usage_history_window_excludes_older_records() {
+        // Guards the cutoff arithmetic (now - days*86400). Any other operator
+        // moves the boundary and silently returns the wrong window.
+        let db = Database::open(":memory:").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let day = 86_400;
+
+        db.insert_target_usage(now - 2 * day, "t", 100, 50, 1)
+            .unwrap();
+        db.insert_target_usage(now - 12 * 3600, "t", 100, 60, 2)
+            .unwrap();
+
+        // A 1-day window sees only the 12-hour-old row.
+        let recent = db.get_target_usage_history("t", 1).unwrap();
+        assert_eq!(
+            recent.len(),
+            1,
+            "1-day window must exclude the 2-day-old row"
+        );
+
+        // A 7-day window sees both.
+        assert_eq!(db.get_target_usage_history("t", 7).unwrap().len(), 2);
+
+        // Another label is not included.
+        assert!(db.get_target_usage_history("other", 7).unwrap().is_empty());
+    }
+
+    #[test]
+    fn series_key_joins_name_and_source_unambiguously() {
+        // The key must actually contain both halves and the US separator: a
+        // constant or empty return would silently merge every subvolume back
+        // into one bucket, undoing lc9 with no test noticing.
+        let k = series_key("projA", "projects");
+        assert_eq!(k, format!("projA{SERIES_SEP}projects"));
+        assert!(k.starts_with("projA"));
+        assert!(k.ends_with("projects"));
+
+        // Distinct inputs must not collide — including the case a printable
+        // separator would break, where one name ends with the other's prefix.
+        assert_ne!(series_key("a", "bc"), series_key("ab", "c"));
+        assert_ne!(series_key("x", "y"), series_key("y", "x"));
+
+        // The separator cannot occur in a subvolume name or source label, which
+        // is the property that makes the key safe without escaping.
+        assert!(!"projA".contains(SERIES_SEP));
+        assert!(!"projects".contains(SERIES_SEP));
+    }
+
+    #[test]
     fn schema_version_is_stamped() {
         let db = Database::open(":memory:").unwrap();
         let v: i64 = db

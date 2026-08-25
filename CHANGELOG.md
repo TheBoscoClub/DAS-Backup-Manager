@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.15.0] - 2026-08-25
+
+### Added
+- **CI workflow that actually builds and tests** (`bd DAS-Backup-Manager-b14`): the repo had only `dependabot-auto-merge.yml` and the tags-only `release-packages.yml`, so nothing built or tested on push or pull request. CodeQL's default setup goes green while neither building nor testing, meaning all-green checks could sit over a broken build. New `.github/workflows/ci.yml` runs `cargo fmt`/`clippy -D warnings`/`test`, a full cmake build including the Qt6 GUI, and `shellcheck` over `scripts/` — all in `archlinux:latest`, the same base image as the Arch release job, so CI and the shipped package share one toolchain. It publishes nothing, so the tags-only rule for release workflows is untouched
+
+### Changed
+- **Manual `btrdasd backup` subcommands now join the maintenance interlock** (`bd DAS-Backup-Manager-pe6`): `Run`, `Snapshot`, `Send` and `BootArchive` mounted and unmounted the DAS filesystems with no lock at all, outside the scheme `backup-run.sh`, the scrub engine and `doctor` all participate in — so `doctor` could mount a source, a concurrent manual backup use it unregistered, and `doctor` then unmount it mid-use. They now take `/run/das-backup.lock` (the same singleton the scheduled path uses, so the two contend rather than running two backups over one target set) and then `/run/das-maintenance.lock`. Singleton is **non-blocking** — a second backup is redundant, not late, so it declines — while maintenance is **blocking**: a scrub is a peer operation, so the backup waits. Defer, never skip
+- **`setup --upgrade` prunes files that left the generated set** (`bd DAS-Backup-Manager-e23`): the manifest was overwritten without diffing the previous one, so a file dropped from a later release stayed on disk looking installed and supported while nothing maintained it. `install_to_prefix()` now reads the prior manifest, removes paths absent from the new set, and logs each one. The config file is never pruned
+
+### Fixed
+- **`setup --upgrade` could silently downgrade a script newer than the binary** (`bd DAS-Backup-Manager-2lj`): scripts are compiled in via `include_str!`, so a `btrdasd` built *before* a script edit carries a stale copy and re-running upgrade overwrote the file `cmake --install` had just refreshed — no warning, no diff. An on-disk file newer than the running binary is now kept, with a line saying so. The normal direction still works: after a rebuild the binary is newer, so a genuine upgrade writes
+- **`snaps_created`/`snaps_sent` recorded 0 on every run since 2026-06-26** (`bd DAS-Backup-Manager-oi0`): the counters grepped `btrbk list latest` for the string `up-to-date`. btrbk 0.32.7 renders STATUS as `-` for every row and that string no longer appears anywhere — verified live, `grep -c` returns 0 — so the GUI's backup history showed 0 snapshots created and sent for five weeks while `bytes_sent` stayed correct. Counts now come from `btrbk --format=raw list latest`, whose named `key='value'` fields are an interface rather than a table layout. `snaps_sent` is also no longer a proxy for `snaps_created`: one source subvolume yields one snapshot replicated to N targets, so on this host the same run is **48 created / 123 sent**, two genuinely different numbers
+- **Setup wizard skipped a step number and overstated its length** (`bd DAS-Backup-Manager-kvg`): banners ran `[1/10]`, `[2/10]`, `[3/10]`, then `[5/10]` — no step 4 — across nine actual steps. Renumbered 1–9, with the denominator now read from a single `TOTAL_STEPS` constant so it cannot drift again
+- **Packaging still declared `rsync` as an ESP-mirroring dependency** (`bd DAS-Backup-Manager-vgn`): removed from the Arch, Debian, Fedora and Snap manifests. ESP mirroring is not a feature of this project — see `.claude/rules/esp-safety.md`
+- **`report.rs` claimed a report format parity it never had** (`bd DAS-Backup-Manager-39w`): the doc comment said the Rust path's report matched `backup-run.sh`'s. Adding the missing rows would have been worse than the drift — the shell path's "Archive cleanup" row reports `boot-archive-cleanup.sh`, which the Rust path does not run, and its "Unmount targets" row reports the script's own `unmount_all`, where the Rust path delegates to `MountGuard`. The comment now documents the divergence instead of denying it. Confirmed by grep that nothing parses either report's text
+- **Two untested `db.rs` behaviours where the mutation survived** (`bd DAS-Backup-Manager-bxl`): `cache_size` is set to `-262144`, where the **sign** selects the unit — losing it turns a 256 MiB cache into 262144 pages with no error — and `get_target_usage_history`'s `now - days*86400` cutoff silently returned the wrong window under any other operator. Both now covered. `cargo-mutants` over `db.rs` and `reconcile.rs` reports **0 missed, 52 caught**; the one genuinely untestable mutant (`Drop::drop`, which issues `PRAGMA optimize` and exposes no observable result) is excluded in a new `indexer/.cargo/mutants.toml` with its reason recorded
+
 ## [0.7.14.1] - 2026-08-25
 
 ### Fixed
@@ -555,7 +572,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.15.0...HEAD
+[0.7.15.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.1...v0.7.15.0
 [0.7.14.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.0...v0.7.14.1
 [0.7.14.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.3...v0.7.14.0
 [0.7.13.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.2...v0.7.13.3
