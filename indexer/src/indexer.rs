@@ -134,11 +134,13 @@ pub fn index_snapshot(
 
     // Every file indexed from this snapshot belongs to this subvolume series;
     // `path` alone is not unique across subvolumes (bd DAS-Backup-Manager-lc9).
+    // The series also scopes the prev-fetch below, which is what keeps a rebuild
+    // from degrading quadratically (bd DAS-Backup-Manager-3sa).
     let series = crate::db::series_key(&snap.name, &snap.source);
 
     // Pre-fetch previous snapshot's files for O(1) comparison
     let prev_files: HashMap<String, crate::db::FileRecord> = if let Some(prev_id) = prev_snap_id {
-        db.get_files_in_snapshot(prev_id)?
+        db.get_files_in_series_snapshot(&series, prev_id)?
             .into_iter()
             .map(|f| (f.path.clone(), f))
             .collect()
