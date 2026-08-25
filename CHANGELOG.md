@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.14.1] - 2026-08-25
+
+### Fixed
+- **Opening a pre-v2 database failed with `no such column: series`**: `SCHEMA_SQL` created `idx_files_series_path` on `files(series, path)`, but on an existing database `CREATE TABLE IF NOT EXISTS files` is a no-op, so the column did not exist yet and the whole batch failed *before* `Database::migrate()` could add it. Every command was therefore broken against a real v1 index — including `btrdasd reindex --rebuild`, the tool meant to repair it
+  - Index creation moved out of `SCHEMA_SQL` into `migrate()`, which now ensures the column and the index in that order and is idempotent for both a fresh database and a migrated one. `rebuild_content_tables()` resets `user_version` and re-runs the migration so it recreates the indexes it owns
+  - **Root cause of the miss: every existing test used `:memory:`**, where `CREATE TABLE` builds `files` with `series` and the ordering bug cannot occur. A regression test now constructs a genuine v1-shaped database on disk, opens it, and asserts the column is added, `idx_files_path` is replaced by `idx_files_series_path`, legacy rows survive with an empty series, and a second open is a no-op. Confirmed to fail with the original error against the previous ordering
+
 ## [0.7.14.0] - 2026-08-25
 
 ### Added
@@ -548,7 +555,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.1...HEAD
+[0.7.14.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.0...v0.7.14.1
 [0.7.14.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.3...v0.7.14.0
 [0.7.13.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.2...v0.7.13.3
 [0.7.13.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.1...v0.7.13.2

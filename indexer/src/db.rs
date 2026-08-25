@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS files (
     type   INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_files_series_path ON files(series, path);
+-- NOTE: idx_files_series_path is created by `Database::migrate`, NOT here.
+-- On a pre-v2 database `CREATE TABLE IF NOT EXISTS files` is a no-op, so the
+-- `series` column does not exist yet and indexing it here fails the whole batch
+-- before the migration can add it.
 
 CREATE TABLE IF NOT EXISTS spans (
     file_id    INTEGER NOT NULL REFERENCES files(id),
@@ -190,13 +193,14 @@ impl Database {
             .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'series'")?
             .exists([])?;
         if !has_series {
-            conn.execute_batch(
-                "ALTER TABLE files ADD COLUMN series TEXT NOT NULL DEFAULT '';
-                 DROP INDEX IF EXISTS idx_files_path;
-                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_series_path
-                     ON files(series, path);",
-            )?;
+            conn.execute_batch("ALTER TABLE files ADD COLUMN series TEXT NOT NULL DEFAULT '';")?;
         }
+        // Idempotent, and correct for both paths: a fresh database created by
+        // SCHEMA_SQL already has the column but not yet the index.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_files_path;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_files_series_path ON files(series, path);",
+        )?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -552,8 +556,9 @@ impl Database {
              PRAGMA foreign_keys = ON;",
         )?;
         self.conn.execute_batch(SCHEMA_SQL)?;
-        self.conn
-            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        // Reset the stamp so migrate() re-creates the indexes it owns.
+        self.conn.pragma_update(None, "user_version", 0i64)?;
+        Self::migrate(&self.conn)?;
         Ok(())
     }
 
@@ -1108,6 +1113,86 @@ mod tests {
         let f2 = db.upsert_file(SERIES_A, "y.txt", "y.txt", 2, 0, 0).unwrap();
         db.insert_span(f2, sid2, sid2).unwrap();
         assert_eq!(db.get_files_in_snapshot(sid2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn opens_and_migrates_a_v1_database() {
+        // REGRESSION: every other test uses :memory:, where CREATE TABLE builds
+        // `files` WITH `series`. Only a pre-existing v1 database exercises the
+        // migration — and the first attempt failed there with "no such column:
+        // series" because SCHEMA_SQL indexed a column migrate() had not added yet.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+
+        // Build a v1-shaped database: files keyed on path alone, no series.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snapshots (
+                     id INTEGER PRIMARY KEY, name TEXT NOT NULL, ts TEXT NOT NULL,
+                     source TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                     indexed_at INTEGER NOT NULL);
+                 CREATE TABLE files (
+                     id INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL,
+                     size INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL DEFAULT 0,
+                     type INTEGER NOT NULL DEFAULT 0);
+                 CREATE UNIQUE INDEX idx_files_path ON files(path);
+                 INSERT INTO files(path, name, size) VALUES ('a.txt', 'a.txt', 7);",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).expect("must migrate a v1 database, not fail");
+
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Column added, old unique index replaced by the series-scoped one.
+        assert!(
+            db.conn
+                .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name='series'")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        let idx: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='files'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(idx.contains(&"idx_files_series_path".to_string()));
+        assert!(!idx.contains(&"idx_files_path".to_string()));
+
+        // Legacy rows survive with an empty series, and are still reachable.
+        assert_eq!(db.get_file("", "a.txt").unwrap().unwrap().size, 7);
+
+        // Re-opening an already-migrated database is a no-op, not an error.
+        drop(db);
+        Database::open(&path).expect("second open must succeed");
+    }
+
+    #[test]
+    fn rebuild_recreates_the_series_index() {
+        let db = Database::open(":memory:").unwrap();
+        db.rebuild_content_tables().unwrap();
+        let idx: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='files'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            idx.contains(&"idx_files_series_path".to_string()),
+            "rebuild must recreate the unique index, got {idx:?}"
+        );
     }
 
     #[test]
