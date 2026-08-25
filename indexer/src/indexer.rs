@@ -132,6 +132,10 @@ pub fn index_snapshot(
         &snap.path.to_string_lossy(),
     )?;
 
+    // Every file indexed from this snapshot belongs to this subvolume series;
+    // `path` alone is not unique across subvolumes (bd DAS-Backup-Manager-lc9).
+    let series = crate::db::series_key(&snap.name, &snap.source);
+
     // Pre-fetch previous snapshot's files for O(1) comparison
     let prev_files: HashMap<String, crate::db::FileRecord> = if let Some(prev_id) = prev_snap_id {
         db.get_files_in_snapshot(prev_id)?
@@ -148,6 +152,7 @@ pub fn index_snapshot(
 
     for entry in &scan.entries {
         let file_id = db.upsert_file(
+            &series,
             &entry.path,
             &entry.name,
             entry.size,

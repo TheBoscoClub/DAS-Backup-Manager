@@ -91,6 +91,9 @@ struct Cli {
 /// Callers MUST invoke this while the targets are mounted — `plan_reconcile`
 /// refuses to prune anything under a root that is not a verified mountpoint, so
 /// calling it with everything unmounted is safe but useless (bd DAS-Backup-Manager-cu8).
+/// Per-target reindex outcome: label, snapshots indexed, snapshots on disk.
+type ReindexOutcome = Vec<(String, usize, usize)>;
+
 fn run_reconcile(
     database: &Database,
     cfg: &Config,
@@ -143,6 +146,20 @@ enum Commands {
         /// Path to SQLite database
         #[arg(long, default_value = DEFAULT_DB)]
         db: String,
+    },
+    /// Re-index every mounted backup target; --rebuild discards the index first
+    Reindex {
+        /// Path to SQLite database
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: String,
+        /// Path to config.toml (for target mount points)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Discard the existing index and rebuild it from scratch. Required to
+        /// clear spans referencing missing snapshots and to populate file series
+        /// (bd DAS-Backup-Manager-opd, -lc9). Backup history is preserved.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Remove index rows for snapshots that no longer exist on disk
     Reconcile {
@@ -1009,6 +1026,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         r.scan_errors
                     );
                 }
+            }
+        }
+        Commands::Reindex {
+            db,
+            config,
+            rebuild,
+        } => {
+            let cfg = Config::load(&config)?;
+
+            // Mounts the DAS targets for the duration, so it takes the same
+            // non-blocking interlock as reconcile.
+            let _locks = match reconcile::try_acquire_locks()? {
+                reconcile::LockAttempt::Acquired(locks) => locks,
+                reconcile::LockAttempt::Deferred(why) => {
+                    println!("Deferred — {why}");
+                    return Ok(());
+                }
+            };
+
+            let progress = CliProgress;
+            let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+            let database = Database::open(&db)?;
+
+            let outcome = (|| -> Result<ReindexOutcome, Box<dyn std::error::Error>> {
+                if rebuild {
+                    println!("Discarding existing index (backup history preserved)...");
+                    database.rebuild_content_tables()?;
+                }
+                let mut per_target = Vec::new();
+                for target in &cfg.targets {
+                    let root = std::path::Path::new(&target.mount);
+                    if !buttered_dasd::health::is_mountpoint(root) {
+                        println!("  {} — not mounted, skipping", target.label);
+                        continue;
+                    }
+                    println!("  {} — indexing {}", target.label, target.mount);
+                    let r = buttered_dasd::indexer::walk(root, &database)?;
+                    per_target.push((
+                        target.label.clone(),
+                        r.snapshots_indexed,
+                        r.snapshots_discovered,
+                    ));
+                }
+                Ok(per_target)
+            })();
+
+            guard.unmount(&progress);
+            let per_target = outcome?;
+
+            let total: usize = per_target.iter().map(|(_, i, _)| i).sum();
+            if json {
+                let parts: Vec<String> = per_target
+                    .iter()
+                    .map(|(l, i, d)| {
+                        format!("{{\"target\":\"{l}\",\"indexed\":{i},\"discovered\":{d}}}")
+                    })
+                    .collect();
+                println!(
+                    "{{\"rebuild\":{},\"indexed\":{},\"targets\":[{}]}}",
+                    rebuild,
+                    total,
+                    parts.join(",")
+                );
+            } else {
+                println!();
+                for (label, indexed, discovered) in &per_target {
+                    println!("  {label}: {indexed} indexed of {discovered} on disk");
+                }
+                println!("Total newly indexed: {total}");
             }
         }
         Commands::Reconcile {
