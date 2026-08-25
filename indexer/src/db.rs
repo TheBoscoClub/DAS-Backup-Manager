@@ -562,6 +562,44 @@ impl Database {
         Ok(())
     }
 
+    /// Delete spans whose endpoints name snapshots that do not exist, and any
+    /// files left with no spans.
+    ///
+    /// # Why these rows are safe to delete
+    ///
+    /// A span referencing a missing snapshot is unreachable, not merely untidy:
+    /// since `bd DAS-Backup-Manager-5uq` the read path joins `snapshots` on
+    /// `first_snap`, so a dangling start matches nothing and the row can never
+    /// appear in a listing. It is also a live FOREIGN KEY violation — with
+    /// `foreign_keys=ON` such a row cannot be rewritten at all, which is what
+    /// aborted `reconcile` minutes into a pass (`bd DAS-Backup-Manager-opd`).
+    ///
+    /// The production index holds ~15M of them, from an event that predates any
+    /// of this work (identical counts in a backup taken before the first change).
+    /// A full re-index would also clear them but is impractical at this scale:
+    /// `get_files_in_snapshot` drives off `idx_spans_last (last_snap >= ?)`, whose
+    /// scanned fraction grows with the id space, so rebuilding 1300 snapshots
+    /// back-to-back degrades quadratically — measured at ~670 files/min against
+    /// 16.8M rows.
+    ///
+    /// One transaction, so a partial repair cannot leave a half-consistent index.
+    pub fn delete_dangling_spans(&self) -> SqlResult<(usize, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let spans = tx.execute(
+            "DELETE FROM spans
+             WHERE NOT EXISTS (SELECT 1 FROM snapshots n WHERE n.id = spans.first_snap)
+                OR NOT EXISTS (SELECT 1 FROM snapshots n WHERE n.id = spans.last_snap)",
+            [],
+        )?;
+        let files = tx.execute(
+            "DELETE FROM files
+             WHERE NOT EXISTS (SELECT 1 FROM spans WHERE spans.file_id = files.id)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok((spans, files))
+    }
+
     /// Snapshot ids containing any file whose path matches `path_glob`.
     ///
     /// This is the scoping query for `btrdasd purge` (`bd DAS-Backup-Manager-rt6`):
@@ -1309,6 +1347,60 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn deletes_dangling_spans_and_their_orphan_files() {
+        // bd DAS-Backup-Manager-opd. Build the production shape: a span whose
+        // last_snap names a snapshot that no longer exists.
+        let (db, ids) = one_series(3);
+        let (a1, a2, a3) = (ids[0], ids[1], ids[2]);
+        let doomed = db
+            .upsert_file(SERIES_A, "gone.txt", "gone.txt", 1, 0, 0)
+            .unwrap();
+        db.insert_span(doomed, a1, a3).unwrap();
+        let kept = db
+            .upsert_file(SERIES_A, "kept.txt", "kept.txt", 1, 0, 0)
+            .unwrap();
+        db.insert_span(kept, a1, a2).unwrap();
+
+        // Only a non-enforcing connection could have created this state, which is
+        // exactly how production acquired it.
+        db.conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.conn
+            .execute("DELETE FROM snapshots WHERE id = ?1", [a3])
+            .unwrap();
+        db.conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        assert!(
+            db.prune_snapshots(&[a1]).is_err(),
+            "guard should still refuse"
+        );
+
+        let (spans, files) = db.delete_dangling_spans().unwrap();
+        assert_eq!(spans, 1);
+        assert_eq!(files, 1, "the file left with no spans goes too");
+
+        // The healthy span and its file are untouched...
+        assert!(db.get_file(SERIES_A, "kept.txt").unwrap().is_some());
+        assert_eq!(db.get_files_in_snapshot(a2).unwrap().len(), 1);
+        assert!(db.get_file(SERIES_A, "gone.txt").unwrap().is_none());
+        // ...and search stops serving the removed one.
+        assert!(db.search("gone.txt", 10).unwrap().is_empty());
+
+        // ...and the prune that was blocked now runs.
+        assert!(
+            db.prune_snapshots(&[a1]).is_ok(),
+            "repair must unblock the prune"
+        );
+    }
+
+    #[test]
+    fn repairing_a_clean_index_changes_nothing() {
+        let (db, ids) = one_series(2);
+        let f = db.upsert_file(SERIES_A, "x.txt", "x.txt", 1, 0, 0).unwrap();
+        db.insert_span(f, ids[0], ids[1]).unwrap();
+        assert_eq!(db.delete_dangling_spans().unwrap(), (0, 0));
+        assert_eq!(db.get_files_in_snapshot(ids[1]).unwrap().len(), 1);
     }
 
     #[test]
