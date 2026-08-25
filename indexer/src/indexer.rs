@@ -21,6 +21,11 @@ pub struct DiscoveredSnapshot {
 #[derive(Debug)]
 pub struct DiscoveryResult {
     pub new_snapshots: Vec<DiscoveredSnapshot>,
+    /// Snapshots already indexed (from another target) but present here too, as
+    /// `(snapshot_id, path_on_this_target)`. Their files are not re-read — it is
+    /// the same logical snapshot — but their presence on THIS target is worth
+    /// recording (bd DAS-Backup-Manager-gt0).
+    pub existing_here: Vec<(i64, std::path::PathBuf)>,
     pub total_on_disk: usize,
 }
 
@@ -29,6 +34,9 @@ pub struct WalkResult {
     pub snapshots_discovered: usize,
     pub snapshots_indexed: usize,
     pub snapshots_skipped: usize,
+    /// Copies whose presence on this target was recorded — the snapshots counted
+    /// by `snapshots_skipped`, which are skipped for INDEXING but not ignored.
+    pub presence_recorded: usize,
     pub results: Vec<IndexResult>,
 }
 
@@ -68,6 +76,7 @@ pub fn discover_snapshots(
     db: &Database,
 ) -> Result<DiscoveryResult, Box<dyn std::error::Error>> {
     let mut new_snapshots = Vec::new();
+    let mut existing_here: Vec<(i64, std::path::PathBuf)> = Vec::new();
     let mut total_on_disk = 0usize;
 
     for source_entry in fs::read_dir(target_root)? {
@@ -88,13 +97,17 @@ pub fn discover_snapshots(
                 let path = snap_entry.path();
                 // Use (source, name, ts) for dedup — the same snapshot may
                 // appear under different mount paths (bind mount vs udisks2).
-                if !db.snapshot_exists_by_key(&source, &name, &ts)? {
-                    new_snapshots.push(DiscoveredSnapshot {
+                match db.snapshot_id_by_key(&source, &name, &ts)? {
+                    // Already indexed from another target: same logical snapshot,
+                    // so do not re-read its files — but do record that a copy
+                    // lives here (bd DAS-Backup-Manager-gt0).
+                    Some(id) => existing_here.push((id, path)),
+                    None => new_snapshots.push(DiscoveredSnapshot {
                         name,
                         ts,
                         source: source.clone(),
                         path,
-                    });
+                    }),
                 }
             }
         }
@@ -103,6 +116,7 @@ pub fn discover_snapshots(
     new_snapshots.sort_by(|a, b| (&a.source, &a.name, &a.ts).cmp(&(&b.source, &b.name, &b.ts)));
     Ok(DiscoveryResult {
         new_snapshots,
+        existing_here,
         total_on_disk,
     })
 }
@@ -206,6 +220,18 @@ pub fn walk(
 ) -> Result<WalkResult, Box<dyn std::error::Error>> {
     let discovery = discover_snapshots(target_root, db)?;
     let total_on_disk = discovery.total_on_disk;
+    let root_str = target_root.to_string_lossy().to_string();
+
+    // Copies of snapshots already indexed from another target. Recording where
+    // they live is what lets a restore name a REACHABLE path when the primary is
+    // gone — the disaster the recovery drives exist for (bd DAS-Backup-Manager-gt0).
+    let mut presence_recorded = 0usize;
+    for (snap_id, path) in &discovery.existing_here {
+        match db.record_snapshot_target(*snap_id, &root_str, &path.to_string_lossy()) {
+            Ok(()) => presence_recorded += 1,
+            Err(e) => eprintln!("Warning: could not record copy at {}: {e}", path.display()),
+        }
+    }
 
     let mut results = Vec::new();
 
@@ -236,6 +262,20 @@ pub fn walk(
 
         match index_snapshot(db, snap, prev_id) {
             Ok(result) => {
+                // Counted alongside the already-indexed copies, so
+                // `presence_recorded` means "copies of any snapshot now known to
+                // live on this target", not only the skipped ones.
+                match db.record_snapshot_target(
+                    result.snapshot_id,
+                    &root_str,
+                    &snap.path.to_string_lossy(),
+                ) {
+                    Ok(()) => presence_recorded += 1,
+                    Err(e) => eprintln!(
+                        "Warning: could not record copy at {}: {e}",
+                        snap.path.display()
+                    ),
+                }
                 latest_snap_id.insert(key, result.snapshot_id);
                 results.push(result);
             }
@@ -255,6 +295,7 @@ pub fn walk(
         snapshots_discovered: total_on_disk,
         snapshots_indexed: indexed_count,
         snapshots_skipped: total_on_disk.saturating_sub(indexed_count + index_errors),
+        presence_recorded,
         results,
     })
 }
@@ -473,6 +514,60 @@ mod tests {
         let result = walk(tmp.path(), &db).unwrap();
         assert_eq!(result.snapshots_indexed, 2);
         assert_eq!(result.snapshots_skipped, 0);
+    }
+
+    #[test]
+    fn walk_records_a_copy_found_on_a_second_target() {
+        // bd DAS-Backup-Manager-gt0. The same logical snapshot replicated to two
+        // targets is indexed ONCE, but both copies must be recorded — otherwise
+        // the index can never name a reachable path when the first target is gone.
+        let primary = TempDir::new().unwrap();
+        let recovery = TempDir::new().unwrap();
+        for root in [&primary, &recovery] {
+            make_snap_dirs(root, &["nvme/root.20260220T0300"]);
+            write_file(&root.path().join("nvme/root.20260220T0300/a.txt"), b"a");
+        }
+
+        let db = Database::open(":memory:").unwrap();
+
+        let first = walk(primary.path(), &db).unwrap();
+        assert_eq!(first.snapshots_indexed, 1);
+        assert_eq!(first.presence_recorded, 1, "its own copy is recorded too");
+
+        let second = walk(recovery.path(), &db).unwrap();
+        assert_eq!(second.snapshots_indexed, 0, "same snapshot, not re-indexed");
+        assert_eq!(
+            second.presence_recorded, 1,
+            "but the copy on the second target IS recorded"
+        );
+
+        // One snapshot row, two known locations.
+        let snaps = db.list_snapshots().unwrap();
+        assert_eq!(snaps.len(), 1);
+        let targets = db.targets_for_snapshot(snaps[0].id).unwrap();
+        assert_eq!(targets.len(), 2);
+        let roots: Vec<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
+        assert!(roots.contains(&primary.path().to_string_lossy().as_ref()));
+        assert!(roots.contains(&recovery.path().to_string_lossy().as_ref()));
+
+        // Each recorded path actually points into its own target.
+        for (root, path) in &targets {
+            assert!(path.starts_with(root), "{path} should be under {root}");
+        }
+    }
+
+    #[test]
+    fn re_walking_a_target_does_not_duplicate_presence() {
+        let primary = TempDir::new().unwrap();
+        make_snap_dirs(&primary, &["nvme/root.20260220T0300"]);
+        write_file(&primary.path().join("nvme/root.20260220T0300/a.txt"), b"a");
+
+        let db = Database::open(":memory:").unwrap();
+        walk(primary.path(), &db).unwrap();
+        walk(primary.path(), &db).unwrap();
+
+        let snaps = db.list_snapshots().unwrap();
+        assert_eq!(db.targets_for_snapshot(snaps[0].id).unwrap().len(), 1);
     }
 
     #[test]

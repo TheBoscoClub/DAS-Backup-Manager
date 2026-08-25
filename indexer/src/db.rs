@@ -5,7 +5,9 @@ use std::time::Duration;
 /// Schema version stored in `PRAGMA user_version`.
 ///
 /// 2 — `files` re-keyed on `(series, path)` (bd DAS-Backup-Manager-lc9).
-pub const SCHEMA_VERSION: i64 = 2;
+/// 3 — `snapshot_targets` records which targets hold each snapshot
+///     (bd DAS-Backup-Manager-gt0).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
 ///
@@ -63,6 +65,29 @@ CREATE TABLE IF NOT EXISTS spans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_last ON spans(last_snap);
+
+-- Which backup targets hold a copy of each snapshot.
+--
+-- A snapshot replicated to several targets is ONE logical snapshot, and
+-- `discover_snapshots` dedups on (source, name, ts) so it is indexed once —
+-- always under whichever target is walked first, i.e. the primary. Without this
+-- table the index cannot say a copy exists anywhere else, so in the disaster the
+-- recovery drives exist for (primary array gone) search could name the snapshot
+-- holding a file but only ever point at an unreachable path
+-- (bd DAS-Backup-Manager-gt0).
+--
+-- Presence is NOT derivable: the recovery targets keep daily=7 only, against the
+-- primary's daily/weekly/monthly/yearly, so they hold a subset — 295 snapshot
+-- directories against 730 as measured 2026-08-25.
+CREATE TABLE IF NOT EXISTS snapshot_targets (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    target_root TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, target_root)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_targets_snap
+    ON snapshot_targets(snapshot_id);
 
 -- Performance indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_snapshots_source_name ON snapshots(source, name);
@@ -201,6 +226,9 @@ impl Database {
             "DROP INDEX IF EXISTS idx_files_path;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_files_series_path ON files(series, path);",
         )?;
+        // v2 -> v3: snapshot_targets. CREATE TABLE IF NOT EXISTS in SCHEMA_SQL
+        // already made it, so nothing to add here — but the stamp must advance,
+        // and existing rows carry no presence until the next walk records it.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -646,6 +674,56 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    /// Record that `target_root` holds a copy of `snapshot_id` at `path`.
+    ///
+    /// Idempotent — re-walking a target refreshes the path rather than failing.
+    pub fn record_snapshot_target(
+        &self,
+        snapshot_id: i64,
+        target_root: &str,
+        path: &str,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO snapshot_targets(snapshot_id, target_root, path)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(snapshot_id, target_root) DO UPDATE SET path = excluded.path",
+            rusqlite::params![snapshot_id, target_root, path],
+        )?;
+        Ok(())
+    }
+
+    /// Every target holding a copy of `snapshot_id`, as `(target_root, path)`.
+    pub fn targets_for_snapshot(&self, snapshot_id: i64) -> SqlResult<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_root, path FROM snapshot_targets
+             WHERE snapshot_id = ?1 ORDER BY target_root",
+        )?;
+        let rows = stmt.query_map([snapshot_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Resolve a snapshot id from its identity, for recording a copy found on
+    /// another target.
+    pub fn snapshot_id_by_key(&self, source: &str, name: &str, ts: &str) -> SqlResult<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM snapshots WHERE source = ?1 AND name = ?2 AND ts = ?3")?;
+        let mut rows = stmt.query_map(rusqlite::params![source, name, ts], |r| r.get(0))?;
+        match rows.next() {
+            Some(id) => Ok(Some(id?)),
+            None => Ok(None),
+        }
+    }
+
+    /// How many snapshots have a recorded copy on `target_root`.
+    pub fn count_snapshots_on_target(&self, target_root: &str) -> SqlResult<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM snapshot_targets WHERE target_root = ?1",
+            [target_root],
+            |r| r.get(0),
+        )
     }
 
     /// Snapshot ids recorded under `root`, for retiring a mount path that is no
@@ -1549,6 +1627,107 @@ mod tests {
         );
         // The read path still finds it, which is why it keeps span-derived scoping.
         assert_eq!(db.get_files_in_snapshot(a1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn records_and_reads_back_per_target_presence() {
+        // bd DAS-Backup-Manager-gt0. One logical snapshot, copies on two targets.
+        let db = Database::open(":memory:").unwrap();
+        let id = db
+            .insert_snapshot(
+                "proj",
+                "T1",
+                "projects",
+                "/mnt/backup-22tb/projects/proj.T1",
+            )
+            .unwrap();
+        db.record_snapshot_target(id, "/mnt/backup-22tb", "/mnt/backup-22tb/projects/proj.T1")
+            .unwrap();
+        db.record_snapshot_target(
+            id,
+            "/mnt/backup-system-recovery-A",
+            "/mnt/backup-system-recovery-A/projects/proj.T1",
+        )
+        .unwrap();
+
+        let targets = db.targets_for_snapshot(id).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].0, "/mnt/backup-22tb");
+        assert_eq!(targets[1].0, "/mnt/backup-system-recovery-A");
+        assert_eq!(db.count_snapshots_on_target("/mnt/backup-22tb").unwrap(), 1);
+        assert_eq!(
+            db.count_snapshots_on_target("/mnt/backup-system-recovery-A")
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.count_snapshots_on_target("/mnt/nowhere").unwrap(), 0);
+    }
+
+    #[test]
+    fn recording_the_same_target_twice_updates_rather_than_fails() {
+        // Re-walking a target must be idempotent, not an error.
+        let db = Database::open(":memory:").unwrap();
+        let id = db
+            .insert_snapshot(
+                "proj",
+                "T1",
+                "projects",
+                "/mnt/backup-22tb/projects/proj.T1",
+            )
+            .unwrap();
+        db.record_snapshot_target(id, "/mnt/backup-22tb", "/old/path")
+            .unwrap();
+        db.record_snapshot_target(id, "/mnt/backup-22tb", "/new/path")
+            .unwrap();
+        let targets = db.targets_for_snapshot(id).unwrap();
+        assert_eq!(
+            targets,
+            vec![("/mnt/backup-22tb".into(), "/new/path".into())]
+        );
+    }
+
+    #[test]
+    fn snapshot_id_resolves_by_identity_not_path() {
+        // The same snapshot under a different mount path must resolve to the same
+        // row — that identity is exactly why it is indexed once.
+        let db = Database::open(":memory:").unwrap();
+        let id = db
+            .insert_snapshot(
+                "proj",
+                "T1",
+                "projects",
+                "/mnt/backup-22tb/projects/proj.T1",
+            )
+            .unwrap();
+        assert_eq!(
+            db.snapshot_id_by_key("projects", "proj", "T1").unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            db.snapshot_id_by_key("projects", "proj", "T2").unwrap(),
+            None
+        );
+        assert_eq!(db.snapshot_id_by_key("nvme", "proj", "T1").unwrap(), None);
+    }
+
+    #[test]
+    fn pruning_a_snapshot_drops_its_target_rows() {
+        // Otherwise presence rows outlive the snapshot and reintroduce exactly the
+        // stale-row problem cu8 was about.
+        let (db, ids) = one_series(2);
+        let f = db.upsert_file(SERIES_A, "x.txt", "x.txt", 1, 0, 0).unwrap();
+        db.insert_span(f, ids[0], ids[1]).unwrap();
+        db.record_snapshot_target(ids[0], "/mnt/backup-22tb", "/mnt/backup-22tb/p/a.T0")
+            .unwrap();
+        assert_eq!(db.count_snapshots_on_target("/mnt/backup-22tb").unwrap(), 1);
+
+        db.prune_snapshots(&[ids[0]]).unwrap();
+
+        assert_eq!(
+            db.count_snapshots_on_target("/mnt/backup-22tb").unwrap(),
+            0,
+            "presence rows must not outlive their snapshot"
+        );
     }
 
     #[test]
