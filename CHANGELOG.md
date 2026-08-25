@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.13.2] - 2026-08-24
+
+### Fixed
+- **`prune_snapshots()` aborted on overlapping spans — reconcile could not complete against a real index** (`bd DAS-Backup-Manager-cu8` follow-up): repairing a doomed `first_snap` was a plain `UPDATE`, but `spans` is keyed `(file_id, first_snap)` and moving a start forward can land it on a start another span of the same file already occupies. The production index holds **7,402,503 overlapping span pairs** — `.Trash-0`, for instance, carries both `(219,221)` and `(220,220)` within one series, so pruning 219 moves the first span's start onto 220
+  - Symptom: `btrdasd reconcile` against the live 85,038,167-span index ran for three minutes and aborted with `SQLITE_CONSTRAINT_PRIMARYKEY (1555) UNIQUE constraint failed: spans.file_id, spans.first_snap`. The pass is a single transaction, so it rolled back with the index byte-identical — no data was lost, but the reconcile could never succeed
+  - Repairs are now materialized into a temp table, detached, and re-inserted `GROUP BY file_id, new_first` with `ON CONFLICT(file_id, first_snap) DO UPDATE SET last_snap = MAX(last_snap, excluded.last_snap)`. Overlapping spans are redundant by construction — `(219,221)` already covers `(220,220)` — so merging to the union is the correct resolution; the `GROUP BY` handles repaired-onto-repaired and the upsert handles repaired-onto-existing
+  - `PruneStats` counts are **derived** rather than read from the upsert's rows-affected, which reports one change whether it inserted a fresh span or absorbed an existing one and so cannot distinguish "endpoint moved" from "two spans became one". `spans_repaired` is now the count of distinct repair destinations and `spans_removed` adds collapsed-into-each-other plus collided-with-existing
+  - Two regression tests reproduce the production shape directly (nested spans in one series, and two repairs resolving to the same start); both were confirmed to fail with `SQLITE 1555` against the previous implementation
+
 ## [0.7.13.1] - 2026-08-24
 
 ### Fixed
@@ -519,7 +528,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.2...HEAD
+[0.7.13.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.1...v0.7.13.2
 [0.7.13.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.0...v0.7.13.1
 [0.7.13.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.3...v0.7.13.0
 [0.7.12.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.2...v0.7.12.3
