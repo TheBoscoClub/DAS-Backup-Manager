@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.13.0
+**Version**: 0.7.13.1
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -25,7 +25,7 @@ do — and this project never touches filesystems that aren't backup media.
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (v0.7.13.0)
+## Component Overview (v0.7.13.1)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

@@ -1017,6 +1017,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
         } => {
             let cfg = Config::load(&config)?;
+
+            // A standalone pass mounts the DAS targets, so it must respect the
+            // maintenance interlock. Non-blocking: defer rather than delay a backup.
+            let _locks = match reconcile::try_acquire_locks()? {
+                reconcile::LockAttempt::Acquired(locks) => locks,
+                reconcile::LockAttempt::Deferred(why) => {
+                    if json {
+                        println!("{{\"deferred\":true,\"reason\":\"{why}\"}}");
+                    } else {
+                        println!("Deferred — {why}");
+                    }
+                    return Ok(());
+                }
+            };
+
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
             let database = Database::open(&db)?;

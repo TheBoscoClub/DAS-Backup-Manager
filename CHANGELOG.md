@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.13.1] - 2026-08-24
+
+### Fixed
+- **Standalone `btrdasd reconcile` ignored the maintenance interlock**: the command mounts and unmounts the DAS targets, so it falls under the same mutual exclusion as backups and the scrub engine (`.claude/rules/backup.md`), but shipped in 0.7.13.0 taking no lock at all — a manual reconcile during the 03:00 backup window could have mounted and unmounted targets underneath a running backup
+  - Now takes `/run/das-reconcile.lock` (new singleton) and then the shared `/run/das-maintenance.lock`, in that order — matching `backup-run.sh`, the scrub engine and `doctor.rs`, which is what keeps the set deadlock-free. Both are **non-blocking**, following `doctor.rs` rather than the scrub engine: an index tidy-up has nothing urgent enough to delay a real backup, so a held lock defers the pass (exit 0) instead of queuing behind it
+  - The reconcile performed inside `btrdasd walk` deliberately takes **no** lock — `backup-run.sh` invokes `walk` while already holding the maintenance lock, so a non-blocking attempt there would fail every time and the in-backup reconcile would silently never run. `try_acquire_locks_at()` is split out from `try_acquire_locks()` so the acquisition order and both defer paths are unit-tested against temp paths, with no root and no writes to `/run`
+
 ## [0.7.13.0] - 2026-08-24
 
 ### Added
@@ -512,7 +519,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.1...HEAD
+[0.7.13.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.0...v0.7.13.1
 [0.7.13.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.3...v0.7.13.0
 [0.7.12.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.2...v0.7.12.3
 [0.7.12.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.1...v0.7.12.2
