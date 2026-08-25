@@ -309,6 +309,7 @@ declare -A CAPACITY_PCT=()
 declare -A AVAIL_BYTES=()
 REPORT_TARGETS=()
 BTRBK_LATEST=""
+BTRBK_LATEST_RAW=""
 
 # Track whether backup run has been recorded (prevents double-recording)
 BACKUP_RUN_RECORDED="false"
@@ -1203,6 +1204,15 @@ capture_report_data() {
     # the bd DAS-Backup-Manager-ecg verification harness, which reproduced
     # exactly this abort against a deliberately-broken btrbk config.
     BTRBK_LATEST=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}') || true
+
+    # Machine-readable copy for the DB counters. The human table's STATUS column
+    # is presentation, not API: btrbk 0.32.7 renders it as "-" for every row and
+    # the "up-to-date" string the counters grepped for no longer appears at all,
+    # which silently zeroed snaps_created/snaps_sent on every run from
+    # 2026-06-26 onward (bd DAS-Backup-Manager-oi0). `--format=raw` emits named
+    # key='value' fields instead, so the counters no longer depend on how btrbk
+    # chooses to lay out a table.
+    BTRBK_LATEST_RAW=$(btrbk -c "$DAS_BTRBK_CONF" --format=raw list latest 2>/dev/null) || true
 }
 
 # Log throughput report for all targets
@@ -1653,12 +1663,15 @@ record_backup_run_in_db() {
     # the live btrbk call failed or produced no non-header output.
     local snaps_created=0
     local snaps_sent=0
-    if [[ -n "$BTRBK_LATEST" ]]; then
-        snaps_created=$(echo "$BTRBK_LATEST" | grep -c "up-to-date" || true)
-        # snaps_sent uses bytes written as a proxy: if data was transferred, snapshots were sent
-        if (( total_bytes > 0 )); then
-            snaps_sent=$snaps_created
-        fi
+    if [[ -n "$BTRBK_LATEST_RAW" ]]; then
+        # One source subvolume yields one snapshot, replicated to N targets, so
+        # the two counts are genuinely different numbers — the old code set
+        # snaps_sent = snaps_created as a proxy, which was never right even while
+        # the grep still matched.
+        snaps_created=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
+            | grep -o "snapshot_subvolume='[^']*'" | sort -u | grep -c . || true)
+        snaps_sent=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
+            | grep -c "target_subvolume='[^']" || true)
     fi
 
     # Collect errors from failed operations (newline-separated for DB storage)

@@ -18,7 +18,7 @@ Depends: ${shlibs:Depends}, ${misc:Depends}, btrbk, btrfs-progs,
  libkf6coreaddons6, libkf6i18n6, libkf6xmlgui6,
  libkf6configwidgets6, libkf6iconthemes6, libkf6crash6, libkf6kio6,
  libkf6notifications6, libkf6statusnotifieritem6
-Recommends: s-nail, rsync
+Recommends: s-nail
 Suggests: mbuffer
 Description: DAS backup manager with btrbk, SQLite FTS5 indexing, KDE GUI
  ButteredDASD manages BTRFS-based backups to DAS (Direct Attached Storage)

@@ -1,6 +1,6 @@
 mod setup;
 
-use buttered_dasd::backup::{BackupMode, BackupOptions};
+use buttered_dasd::backup::{self, BackupLockAttempt, BackupMode, BackupOptions};
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::health::{self, HealthStatus};
@@ -1298,6 +1298,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 };
                 let progress = CliProgress;
+                // Manual backups mount and unmount the DAS filesystems, so they
+                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
+                let _locks = match backup::acquire_manual_locks(&progress)? {
+                    BackupLockAttempt::Acquired(locks) => locks,
+                    BackupLockAttempt::AlreadyRunning => {
+                        println!("A backup is already running — declining.");
+                        return Ok(());
+                    }
+                };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
@@ -1352,6 +1361,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             BackupAction::Snapshot { config, sources } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
+                // Manual backups mount and unmount the DAS filesystems, so they
+                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
+                let _locks = match backup::acquire_manual_locks(&progress)? {
+                    BackupLockAttempt::Acquired(locks) => locks,
+                    BackupLockAttempt::AlreadyRunning => {
+                        println!("A backup is already running — declining.");
+                        return Ok(());
+                    }
+                };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let count = buttered_dasd::backup::create_snapshots(&cfg, &sources, &progress)?;
                 source_guard.unmount(&progress);
@@ -1360,6 +1378,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             BackupAction::Send { config, targets } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
+                // Manual backups mount and unmount the DAS filesystems, so they
+                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
+                let _locks = match backup::acquire_manual_locks(&progress)? {
+                    BackupLockAttempt::Acquired(locks) => locks,
+                    BackupLockAttempt::AlreadyRunning => {
+                        println!("A backup is already running — declining.");
+                        return Ok(());
+                    }
+                };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result =
@@ -1372,6 +1399,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             BackupAction::BootArchive { config } => {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
+                // Manual backups mount and unmount the DAS filesystems, so they
+                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
+                let _locks = match backup::acquire_manual_locks(&progress)? {
+                    BackupLockAttempt::Acquired(locks) => locks,
+                    BackupLockAttempt::AlreadyRunning => {
+                        println!("A backup is already running — declining.");
+                        return Ok(());
+                    }
+                };
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 guard.unmount(&progress);

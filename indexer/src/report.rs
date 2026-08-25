@@ -18,11 +18,29 @@ pub struct BackupRun {
     pub errors: Vec<String>,
 }
 
-/// Generate a comprehensive backup report matching the original shell script format.
+/// Generate a backup report for the Rust (manual `btrdasd backup run`) path.
 ///
 /// Sections: Header, Backup Operations, Throughput, Disk Capacity, SMART Status,
-/// Latest Snapshots, Footer.  The Growth Analysis section requires historical data
+/// Latest Snapshots, Footer. The Growth Analysis section requires historical data
 /// from the growth log — if available, it is included.
+///
+/// # This deliberately does NOT match `scripts/backup-run.sh` row-for-row
+///
+/// The comment here used to claim parity with the shell script's format
+/// (`bd DAS-Backup-Manager-39w`). It never had it, and chasing it would be worse
+/// than the drift: the shell path's "Archive cleanup" row reports
+/// `boot-archive-cleanup.sh`, which this path does not run at all — it calls
+/// `backup::archive_boot` and nothing prunes afterward — and its "Unmount
+/// targets" row reports the script's own `unmount_all`, whereas here unmounting
+/// is `MountGuard`'s business and its failures surface through the guard.
+///
+/// Emitting those rows here would report on work that did not happen. The two
+/// reports describe two different pipelines and are allowed to differ; what is
+/// not allowed is a comment claiming otherwise.
+///
+/// Nothing parses either report's text — verified by grep across the tree: no
+/// consumer reads `LAST_REPORT` or matches these section strings — so the
+/// divergence is a documentation question, not a compatibility one.
 pub fn format_report(result: &BackupResult, config: &Config) -> String {
     let sep = "═".repeat(63);
     let thin = "─".repeat(63);

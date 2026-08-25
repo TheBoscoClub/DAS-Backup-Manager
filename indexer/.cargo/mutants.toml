@@ -1,0 +1,20 @@
+# cargo-mutants configuration.
+#
+# Run with:  cargo mutants --in-place --file src/db.rs --file src/reconcile.rs -- --lib
+#
+# --in-place is REQUIRED in this crate. Without it cargo-mutants copies only the
+# crate directory, `setup/templates.rs`'s include_str!("../../../scripts/*.sh")
+# cannot resolve, and the run exits 0 having tested NOTHING — reporting success
+# for zero work done.
+
+# Mutants deliberately not tested, each with a reason. This list is not a place
+# to park inconvenient failures: everything here must be untestable in principle,
+# not merely awkward.
+exclude_re = [
+    # `Drop for Database` issues `PRAGMA optimize` on close. SQLite exposes no
+    # observable result from it — no return value, no state change a query can
+    # see — so there is no assertion that distinguishes the real impl from an
+    # empty one. Deleting the body would be a real (if minor) regression, which
+    # is why it stays; it simply cannot be covered by a test.
+    "<impl Drop for Database>::drop",
+]
