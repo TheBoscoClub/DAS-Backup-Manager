@@ -249,3 +249,7 @@ Dockerfile
 # Beads / Dolt files (added by bd init)
 .dolt/
 .beads-credential-key
+
+# cargo-mutants working output (see bd DAS-Backup-Manager-bxl)
+mutants.out/
+mutants.out.old/

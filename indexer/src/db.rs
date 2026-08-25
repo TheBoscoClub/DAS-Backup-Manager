@@ -312,12 +312,31 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Files present in `snap_id`, resolved from the span index.
+    ///
+    /// # Why the `snapshots` self-join is load-bearing
+    ///
+    /// A span is `(file_id, first_snap, last_snap)` — an *id range*. Snapshot ids
+    /// are allocated globally in indexing order, so every source's snapshots are
+    /// interleaved in id space. Matching on the range alone therefore claims a file
+    /// is present in every snapshot whose id falls in the window, **across unrelated
+    /// subvolumes**: before `bd DAS-Backup-Manager-5uq` this reported a
+    /// `cloudflare-manager` project snapshot as containing Stephen King audiobooks,
+    /// with a file count of 3,637,016 for a project of a few hundred files.
+    ///
+    /// Constraining `(name, source)` of the span's `first_snap` to equal the target
+    /// snapshot's restores correctness. Deriving the series from `first_snap` is
+    /// sound because spans are series-coherent by construction — verified against
+    /// the production index, 0 of 85,038,167 spans had endpoints in different series.
     pub fn get_files_in_snapshot(&self, snap_id: i64) -> SqlResult<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.id, f.path, f.name, f.size, f.mtime, f.type
              FROM files f
              JOIN spans s ON s.file_id = f.id
-             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1",
+             JOIN snapshots fs ON fs.id = s.first_snap
+             JOIN snapshots tgt ON tgt.id = ?1
+             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1
+               AND fs.name = tgt.name AND fs.source = tgt.source",
         )?;
         let rows = stmt.query_map([snap_id], |row| {
             Ok(FileRecord {
@@ -343,7 +362,10 @@ impl Database {
             "SELECT f.id, f.path, f.name, f.size, f.mtime, f.type
              FROM files f
              JOIN spans s ON s.file_id = f.id
+             JOIN snapshots fs ON fs.id = s.first_snap
+             JOIN snapshots tgt ON tgt.id = ?1
              WHERE s.first_snap <= ?1 AND s.last_snap >= ?1
+               AND fs.name = tgt.name AND fs.source = tgt.source
              ORDER BY f.path
              LIMIT ?2 OFFSET ?3",
         )?;
@@ -366,7 +388,10 @@ impl Database {
             "SELECT COUNT(DISTINCT f.id)
              FROM files f
              JOIN spans s ON s.file_id = f.id
-             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1",
+             JOIN snapshots fs ON fs.id = s.first_snap
+             JOIN snapshots tgt ON tgt.id = ?1
+             WHERE s.first_snap <= ?1 AND s.last_snap >= ?1
+               AND fs.name = tgt.name AND fs.source = tgt.source",
             [snap_id],
             |row| row.get(0),
         )
@@ -432,6 +457,118 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Reconciliation (bd DAS-Backup-Manager-cu8)
+    // -----------------------------------------------------------------
+
+    /// Remove index rows for `doomed` snapshot ids, repairing spans that merely
+    /// *touch* them rather than discarding presence information for snapshots
+    /// that survive.
+    ///
+    /// # Span repair, and why whole-span deletion would be wrong
+    ///
+    /// A span is `(file_id, first_snap, last_snap)` — an id range covering every
+    /// snapshot of one series in which the file was present. Retention deletes the
+    /// OLDEST snapshots, which are overwhelmingly the `first_snap` end. Dropping any
+    /// span that references a doomed id would therefore delete the file's presence
+    /// across the whole surviving range too: prune one 2026-08-02 snapshot and the
+    /// file silently disappears from every snapshot up to today.
+    ///
+    /// So endpoints are moved inward to the nearest surviving snapshot of the same
+    /// series, and only spans with no surviving snapshot at all are deleted. Spans
+    /// whose doomed ids fall strictly *between* the endpoints need no change — the
+    /// id simply ceases to exist and can never be matched again.
+    ///
+    /// Ordering is load-bearing: survivor-less spans are deleted first (an `UPDATE`
+    /// to a `NULL` endpoint would violate `NOT NULL`), endpoints are repaired while
+    /// the doomed `snapshots` rows still exist to resolve each span's series, and
+    /// only then are the snapshot rows themselves removed. Files left with no spans
+    /// are deleted last; the existing `files_ad` trigger keeps `files_fts` in step.
+    ///
+    /// The whole pass is one transaction — a partial prune would leave spans
+    /// pointing at snapshot ids that no longer resolve, which reads as an empty
+    /// snapshot rather than an error.
+    pub fn prune_snapshots(&self, doomed: &[i64]) -> SqlResult<crate::reconcile::PruneStats> {
+        use crate::reconcile::PruneStats;
+
+        if doomed.is_empty() {
+            return Ok(PruneStats::default());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS doomed_snaps(id INTEGER PRIMARY KEY);
+             DELETE FROM doomed_snaps;",
+        )?;
+        {
+            let mut ins = tx.prepare("INSERT OR IGNORE INTO doomed_snaps(id) VALUES (?1)")?;
+            for id in doomed {
+                ins.execute([id])?;
+            }
+        }
+
+        // (A) Spans with no surviving snapshot in their series/range at all.
+        let spans_removed = tx.execute(
+            "DELETE FROM spans
+             WHERE (first_snap IN (SELECT id FROM doomed_snaps)
+                 OR last_snap  IN (SELECT id FROM doomed_snaps))
+               AND NOT EXISTS (
+                   SELECT 1 FROM snapshots s2, snapshots ser
+                   WHERE ser.id = spans.first_snap
+                     AND s2.name = ser.name AND s2.source = ser.source
+                     AND s2.id >= spans.first_snap AND s2.id <= spans.last_snap
+                     AND s2.id NOT IN (SELECT id FROM doomed_snaps))",
+            [],
+        )?;
+
+        // (B) Pull a doomed first_snap forward to the earliest survivor.
+        let repaired_first = tx.execute(
+            "UPDATE spans SET first_snap = (
+                 SELECT MIN(s2.id) FROM snapshots s2, snapshots ser
+                 WHERE ser.id = spans.first_snap
+                   AND s2.name = ser.name AND s2.source = ser.source
+                   AND s2.id >= spans.first_snap AND s2.id <= spans.last_snap
+                   AND s2.id NOT IN (SELECT id FROM doomed_snaps))
+             WHERE first_snap IN (SELECT id FROM doomed_snaps)",
+            [],
+        )?;
+
+        // (C) Pull a doomed last_snap back to the latest survivor.
+        let repaired_last = tx.execute(
+            "UPDATE spans SET last_snap = (
+                 SELECT MAX(s2.id) FROM snapshots s2, snapshots ser
+                 WHERE ser.id = spans.last_snap
+                   AND s2.name = ser.name AND s2.source = ser.source
+                   AND s2.id >= spans.first_snap AND s2.id <= spans.last_snap
+                   AND s2.id NOT IN (SELECT id FROM doomed_snaps))
+             WHERE last_snap IN (SELECT id FROM doomed_snaps)",
+            [],
+        )?;
+
+        // (D) The snapshot rows themselves.
+        let snapshots_removed = tx.execute(
+            "DELETE FROM snapshots WHERE id IN (SELECT id FROM doomed_snaps)",
+            [],
+        )?;
+
+        // (E) Files that no span references any more. files_ad maintains files_fts.
+        let files_removed = tx.execute(
+            "DELETE FROM files
+             WHERE NOT EXISTS (SELECT 1 FROM spans WHERE spans.file_id = files.id)",
+            [],
+        )?;
+
+        tx.execute_batch("DROP TABLE IF EXISTS doomed_snaps;")?;
+        tx.commit()?;
+
+        Ok(PruneStats {
+            snapshots_removed,
+            spans_removed,
+            spans_repaired: repaired_first + repaired_last,
+            files_removed,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -590,6 +727,294 @@ impl Drop for Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // bd DAS-Backup-Manager-5uq — span reads must be scoped to one series
+    // -----------------------------------------------------------------
+
+    /// Two series whose snapshot ids interleave, exactly as production allocates
+    /// them: every source is snapshotted in the same run, so ids alternate.
+    fn interleaved_fixture() -> (Database, i64, i64, i64, i64) {
+        let db = Database::open(":memory:").unwrap();
+        let a1 = db
+            .insert_snapshot(
+                "projA",
+                "20260101T0300",
+                "projects",
+                "/mnt/t/projects/projA.20260101T0300",
+            )
+            .unwrap();
+        let b1 = db
+            .insert_snapshot(
+                "abooks",
+                "20260101T0300",
+                "audiobooks",
+                "/mnt/t/audiobooks/abooks.20260101T0300",
+            )
+            .unwrap();
+        let a2 = db
+            .insert_snapshot(
+                "projA",
+                "20260102T0300",
+                "projects",
+                "/mnt/t/projects/projA.20260102T0300",
+            )
+            .unwrap();
+        let b2 = db
+            .insert_snapshot(
+                "abooks",
+                "20260102T0300",
+                "audiobooks",
+                "/mnt/t/audiobooks/abooks.20260102T0300",
+            )
+            .unwrap();
+        assert!(a1 < b1 && b1 < a2 && a2 < b2, "fixture must interleave ids");
+        (db, a1, b1, a2, b2)
+    }
+
+    #[test]
+    fn files_in_snapshot_are_scoped_to_their_series() {
+        // REGRESSION (5uq): before the fix this returned the projects file too,
+        // because span (a1..a2) brackets b1 in raw id space. Live symptom was a
+        // cloudflare-manager snapshot listing Stephen King audiobooks.
+        let (db, a1, b1, a2, _b2) = interleaved_fixture();
+
+        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        db.insert_span(proj, a1, a2).unwrap();
+
+        let abook = db
+            .upsert_file("Library/book.opus", "book.opus", 20, 0, 0)
+            .unwrap();
+        db.insert_span(abook, b1, b1).unwrap();
+
+        let listed = db.get_files_in_snapshot(b1).unwrap();
+        let paths: Vec<&str> = listed.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["Library/book.opus"]);
+        assert!(
+            !paths.contains(&"src/main.rs"),
+            "a projects-series span must never appear in an audiobooks snapshot"
+        );
+    }
+
+    #[test]
+    fn count_in_snapshot_is_scoped_to_its_series() {
+        let (db, a1, b1, a2, _b2) = interleaved_fixture();
+        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        db.insert_span(proj, a1, a2).unwrap();
+        // Pre-fix this counted 1 (the foreign projects file); correct answer is 0.
+        assert_eq!(db.count_files_in_snapshot(b1).unwrap(), 0);
+        assert_eq!(db.count_files_in_snapshot(a1).unwrap(), 1);
+    }
+
+    #[test]
+    fn paged_listing_is_scoped_to_its_series() {
+        let (db, a1, b1, a2, _b2) = interleaved_fixture();
+        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        db.insert_span(proj, a1, a2).unwrap();
+        assert!(
+            db.get_files_in_snapshot_paged(b1, 100, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.get_files_in_snapshot_paged(a1, 100, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn same_relative_path_in_two_series_stays_separated() {
+        // files.path is UNIQUE and relative-within-snapshot, so both series share
+        // ONE files row. Scoping must still keep their spans apart.
+        let (db, a1, b1, a2, b2) = interleaved_fixture();
+        let shared = db
+            .upsert_file("packaging/PKGBUILD", "PKGBUILD", 1, 0, 0)
+            .unwrap();
+        db.insert_span(shared, a1, a2).unwrap();
+        db.insert_span(shared, b1, b2).unwrap();
+        assert_eq!(db.get_files_in_snapshot(a1).unwrap().len(), 1);
+        assert_eq!(db.get_files_in_snapshot(b1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_snapshot_id_lists_nothing() {
+        let (db, a1, _b1, a2, _b2) = interleaved_fixture();
+        let f = db.upsert_file("x", "x", 1, 0, 0).unwrap();
+        db.insert_span(f, a1, a2).unwrap();
+        assert!(db.get_files_in_snapshot(9999).unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // bd DAS-Backup-Manager-cu8 — pruning deleted snapshots
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn prune_repairs_a_span_whose_first_snap_is_deleted() {
+        // The retention-shaped case: the OLDEST snapshot goes. Deleting the whole
+        // span would erase the file from every surviving snapshot too.
+        let (db, a1, _b1, a2, _b2) = interleaved_fixture();
+        let f = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        db.insert_span(f, a1, a2).unwrap();
+
+        let stats = db.prune_snapshots(&[a1]).unwrap();
+        assert_eq!(stats.snapshots_removed, 1);
+        assert_eq!(stats.spans_repaired, 1);
+        assert_eq!(stats.spans_removed, 0);
+        assert_eq!(stats.files_removed, 0);
+
+        // The file must still be listed in the snapshot that survived.
+        let listed = db.get_files_in_snapshot(a2).unwrap();
+        assert_eq!(listed.len(), 1, "surviving snapshot lost its file");
+        let (first, last): (i64, i64) = db
+            .conn
+            .query_row("SELECT first_snap, last_snap FROM spans", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((first, last), (a2, a2));
+    }
+
+    #[test]
+    fn prune_removes_a_span_with_no_survivors_and_its_orphan_file() {
+        let (db, a1, _b1, a2, _b2) = interleaved_fixture();
+        let f = db.upsert_file("gone.txt", "gone.txt", 1, 0, 0).unwrap();
+        db.insert_span(f, a1, a2).unwrap();
+
+        let stats = db.prune_snapshots(&[a1, a2]).unwrap();
+        assert_eq!(stats.snapshots_removed, 2);
+        assert_eq!(stats.spans_removed, 1);
+        assert_eq!(stats.files_removed, 1);
+        assert!(db.get_file("gone.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_leaves_other_series_untouched() {
+        let (db, a1, b1, a2, b2) = interleaved_fixture();
+        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        db.insert_span(proj, a1, a2).unwrap();
+        let abook = db
+            .upsert_file("Library/book.opus", "book.opus", 20, 0, 0)
+            .unwrap();
+        db.insert_span(abook, b1, b2).unwrap();
+
+        db.prune_snapshots(&[a1, a2]).unwrap();
+
+        assert_eq!(db.get_files_in_snapshot(b1).unwrap().len(), 1);
+        assert!(db.get_file("Library/book.opus").unwrap().is_some());
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn prune_repairs_both_ends_of_a_span() {
+        // Both endpoints doomed with a survivor between them. Distinguishes
+        // `repaired_first + repaired_last` from any other combination of the two —
+        // every earlier prune test moves only one end, so `+` vs `-` was invisible.
+        let db = Database::open(":memory:").unwrap();
+        let a1 = db
+            .insert_snapshot("projA", "T1", "projects", "/mnt/t/projects/projA.T1")
+            .unwrap();
+        let a2 = db
+            .insert_snapshot("projA", "T2", "projects", "/mnt/t/projects/projA.T2")
+            .unwrap();
+        let a3 = db
+            .insert_snapshot("projA", "T3", "projects", "/mnt/t/projects/projA.T3")
+            .unwrap();
+        let f = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        db.insert_span(f, a1, a3).unwrap();
+
+        let stats = db.prune_snapshots(&[a1, a3]).unwrap();
+        assert_eq!(stats.spans_repaired, 2, "both endpoints should count");
+        assert_eq!(stats.spans_removed, 0);
+        assert_eq!(stats.snapshots_removed, 2);
+
+        let (first, last): (i64, i64) = db
+            .conn
+            .query_row("SELECT first_snap, last_snap FROM spans", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((first, last), (a2, a2));
+        assert_eq!(db.get_files_in_snapshot(a2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_file_updates_when_only_the_size_changed() {
+        // Guards the `||` in upsert_file's change detection: with `&&`, or with
+        // either comparison inverted, a size-only change is silently dropped and
+        // the index keeps reporting the old size forever.
+        let db = Database::open(":memory:").unwrap();
+        let id = db.upsert_file("a.txt", "a.txt", 10, 100, 0).unwrap();
+        let again = db.upsert_file("a.txt", "a.txt", 999, 100, 0).unwrap();
+        assert_eq!(id, again, "same path must reuse the row");
+        assert_eq!(db.get_file("a.txt").unwrap().unwrap().size, 999);
+    }
+
+    #[test]
+    fn upsert_file_updates_when_only_the_mtime_changed() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_file("a.txt", "a.txt", 10, 100, 0).unwrap();
+        db.upsert_file("a.txt", "a.txt", 10, 555, 0).unwrap();
+        assert_eq!(db.get_file("a.txt").unwrap().unwrap().mtime, 555);
+    }
+
+    #[test]
+    fn search_passes_prefix_wildcards_through_to_fts() {
+        // `repo*` must reach FTS5 unquoted. If the passthrough condition is
+        // inverted the term is quoted, `*` becomes a literal, and prefix search
+        // silently returns nothing.
+        let db = Database::open(":memory:").unwrap();
+        let sid = db
+            .insert_snapshot("s", "T1", "src", "/mnt/t/src/s.T1")
+            .unwrap();
+        let f = db
+            .upsert_file("report2026.txt", "report2026.txt", 1, 0, 0)
+            .unwrap();
+        db.insert_span(f, sid, sid).unwrap();
+        assert_eq!(db.search("repo*", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_passes_column_filters_through_to_fts() {
+        // Exercises the SECOND `||` in the passthrough condition, which the `*`
+        // test short-circuits past. `path:deep` is an FTS5 column filter; quoting
+        // it would make it a literal phrase and match nothing.
+        let db = Database::open(":memory:").unwrap();
+        let sid = db
+            .insert_snapshot("s", "T1", "src", "/mnt/t/src/s.T1")
+            .unwrap();
+        let f = db
+            .upsert_file("deep/dir/alpha.txt", "alpha.txt", 1, 0, 0)
+            .unwrap();
+        db.insert_span(f, sid, sid).unwrap();
+        assert_eq!(db.search("path:deep", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_of_nothing_changes_nothing() {
+        let (db, a1, _b1, a2, _b2) = interleaved_fixture();
+        let f = db.upsert_file("x", "x", 1, 0, 0).unwrap();
+        db.insert_span(f, a1, a2).unwrap();
+        let stats = db.prune_snapshots(&[]).unwrap();
+        assert_eq!(stats, crate::reconcile::PruneStats::default());
+        assert_eq!(db.get_files_in_snapshot(a1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_drops_fts_entries_with_the_file() {
+        // files_ad trigger keeps files_fts in step — proves search stops serving
+        // a purged path, which is cu8's whole point.
+        let (db, a1, _b1, a2, _b2) = interleaved_fixture();
+        let f = db.upsert_file("secret.env", "secret.env", 1, 0, 0).unwrap();
+        db.insert_span(f, a1, a2).unwrap();
+        assert_eq!(db.search("secret.env", 10).unwrap().len(), 1);
+
+        db.prune_snapshots(&[a1, a2]).unwrap();
+        assert!(
+            db.search("secret.env", 10).unwrap().is_empty(),
+            "search still returns a file whose snapshots were pruned"
+        );
+    }
 
     #[test]
     fn opens_in_memory() {
