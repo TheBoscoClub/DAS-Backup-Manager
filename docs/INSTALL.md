@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.19.0
+**Version**: 0.7.19.1
 
 ## Before You Begin
 

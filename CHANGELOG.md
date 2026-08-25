@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.19.1] - 2026-08-25
+
+Documentation-only release — no code changes. The diff against `0.7.19.0` is docs and
+project rules; binaries are functionally identical.
+
+### Added
+- **`snapshot_targets` is now documented** in both `docs/ARCHITECTURE.md` and `docs/BUTTERED-DASD.md`. Both files listed `idx_snapshot_targets_snap` in their index tables while never documenting the table that index is on — the schema v3 addition shipped in `0.7.19.0`. `ARCHITECTURE.md` also still described the schema as "three core tables". The new reference records why presence is stored rather than derived: the recovery targets keep `daily=7` against the primary's `daily`/`weekly`/`monthly`/`yearly`, so they hold a strict subset and no rule can compute which target holds what
+- **`reconcile` now has a CLI Usage section** in `docs/BUTTERED-DASD.md`, covering `--dry-run`, `--repair`, and `--forget-root` — the last shipped in `744799a` and was documented nowhere. Also states the mountpoint gate explicitly: reconcile will not prune rows for an unmounted target, because an unmounted target is indistinguishable from an empty one
+- **Unattended email delivery is recorded as proven** in `.claude/rules/backup.md`, with the journal evidence that closed `bd DAS-Backup-Manager-hvf` — two boots that emailed the backup report hours before that boot's first graphical login, with Protonmail Bridge unable to start and no `:1025` listener present. Includes the two traps that make the journal easy to misread: logind *quotes* the session id (so a `New session [0-9]+` pattern silently matches nothing and reports "no login" for every boot), and `graphical-session.target` is reached spuriously via the `foot-server.socket` ordering cycle, so it is not evidence of a login — `class 'user'` is
+
 ## [0.7.19.0] - 2026-08-25
 
 ### Added
@@ -614,7 +624,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.1...HEAD
+[0.7.19.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.0...v0.7.19.1
 [0.7.19.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.18.0...v0.7.19.0
 [0.7.18.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.17.0...v0.7.18.0
 [0.7.17.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.16.0...v0.7.17.0
