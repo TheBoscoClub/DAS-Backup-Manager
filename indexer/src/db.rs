@@ -524,16 +524,81 @@ impl Database {
         )?;
 
         // (B) Pull a doomed first_snap forward to the earliest survivor.
-        let repaired_first = tx.execute(
-            "UPDATE spans SET first_snap = (
-                 SELECT MIN(s2.id) FROM snapshots s2, snapshots ser
-                 WHERE ser.id = spans.first_snap
-                   AND s2.name = ser.name AND s2.source = ser.source
-                   AND s2.id >= spans.first_snap AND s2.id <= spans.last_snap
-                   AND s2.id NOT IN (SELECT id FROM doomed_snaps))
-             WHERE first_snap IN (SELECT id FROM doomed_snaps)",
+        //
+        // This CANNOT be a plain UPDATE. spans is keyed (file_id, first_snap),
+        // and moving a start forward can land it on a start another span of the
+        // same file already occupies — 7,402,503 overlapping span pairs exist in
+        // the production index, e.g. `.Trash-0` holding both (219,221) and
+        // (220,220) in one series, where pruning 219 moves the first onto 220.
+        // A direct UPDATE aborts the whole pass with SQLITE_CONSTRAINT_PRIMARYKEY
+        // (1555); an earlier build did exactly that three minutes into a live run.
+        //
+        // So repairs are materialized first, then re-inserted grouped by their
+        // destination key with ON CONFLICT DO UPDATE. Overlapping spans are
+        // redundant by definition — (219,221) already covers (220,220) — so the
+        // correct resolution is a merge to the union, which the GROUP BY handles
+        // for repaired-vs-repaired and the upsert handles for repaired-vs-existing.
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS span_repair(
+                 rid INTEGER PRIMARY KEY, file_id INTEGER, last_snap INTEGER, new_first INTEGER);
+             DELETE FROM span_repair;",
+        )?;
+        tx.execute(
+            "INSERT INTO span_repair(rid, file_id, last_snap, new_first)
+             SELECT s.rowid, s.file_id, s.last_snap,
+                    (SELECT MIN(s2.id) FROM snapshots s2, snapshots ser
+                     WHERE ser.id = s.first_snap
+                       AND s2.name = ser.name AND s2.source = ser.source
+                       AND s2.id >= s.first_snap AND s2.id <= s.last_snap
+                       AND s2.id NOT IN (SELECT id FROM doomed_snaps))
+             FROM spans s
+             WHERE s.first_snap IN (SELECT id FROM doomed_snaps)",
             [],
         )?;
+        // Detach EVERY candidate, including any with no survivor. Step (A) should
+        // already have removed those — a span with no survivor necessarily has a
+        // doomed `last_snap`, which (A) matches — but detaching unconditionally
+        // means a hypothetical NULL is simply dropped rather than left behind
+        // pointing at a snapshot row that is about to disappear.
+        let detached = tx.execute(
+            "DELETE FROM spans WHERE rowid IN (SELECT rid FROM span_repair)",
+            [],
+        )?;
+        // Accounting has to be derived, not read off the upsert: `INSERT ... ON
+        // CONFLICT DO UPDATE` reports ONE change whether it inserted a fresh span
+        // or absorbed an existing one, so it cannot distinguish "endpoint moved"
+        // from "two spans became one".
+        //
+        //   groups   — distinct destinations, i.e. spans that survive the repair
+        //   collapsed— candidates that merged into each other  (detached - groups)
+        //   collided — destinations already occupied by a span that stays put
+        let groups: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT file_id, new_first
+                                   FROM span_repair WHERE new_first IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        let collided: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT file_id, new_first
+                                   FROM span_repair WHERE new_first IS NOT NULL) r
+             WHERE EXISTS (SELECT 1 FROM spans s
+                           WHERE s.file_id = r.file_id AND s.first_snap = r.new_first)",
+            [],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO spans(file_id, first_snap, last_snap)
+             SELECT file_id, new_first, MAX(last_snap)
+             FROM span_repair WHERE new_first IS NOT NULL
+             GROUP BY file_id, new_first
+             ON CONFLICT(file_id, first_snap)
+               DO UPDATE SET last_snap = MAX(last_snap, excluded.last_snap)",
+            [],
+        )?;
+        let groups = groups as usize;
+        let collided = collided as usize;
+        let repaired_first = groups;
+        let merged_away = detached.saturating_sub(groups) + collided;
 
         // (C) Pull a doomed last_snap back to the latest survivor.
         let repaired_last = tx.execute(
@@ -560,12 +625,12 @@ impl Database {
             [],
         )?;
 
-        tx.execute_batch("DROP TABLE IF EXISTS doomed_snaps;")?;
+        tx.execute_batch("DROP TABLE IF EXISTS doomed_snaps; DROP TABLE IF EXISTS span_repair;")?;
         tx.commit()?;
 
         Ok(PruneStats {
             snapshots_removed,
-            spans_removed,
+            spans_removed: spans_removed + merged_away,
             spans_repaired: repaired_first + repaired_last,
             files_removed,
         })
@@ -988,6 +1053,85 @@ mod tests {
             .unwrap();
         db.insert_span(f, sid, sid).unwrap();
         assert_eq!(db.search("path:deep", 10).unwrap().len(), 1);
+    }
+
+    /// N snapshots in ONE series, so span endpoints can be moved onto each other.
+    fn one_series(n: usize) -> (Database, Vec<i64>) {
+        let db = Database::open(":memory:").unwrap();
+        let ids = (0..n)
+            .map(|i| {
+                db.insert_snapshot(
+                    "projA",
+                    &format!("T{i}"),
+                    "projects",
+                    &format!("/mnt/t/projects/projA.T{i}"),
+                )
+                .unwrap()
+            })
+            .collect();
+        (db, ids)
+    }
+
+    #[test]
+    fn prune_merges_a_repaired_span_onto_an_overlapping_one() {
+        // The production shape that broke a live run: `.Trash-0` held spans
+        // (219,221) AND (220,220) in one series, so pruning 219 moved the first
+        // span's start onto 220 and hit UNIQUE(file_id, first_snap) = SQLITE 1555.
+        // 7,402,503 such overlapping pairs exist in the production index.
+        let (db, ids) = one_series(3);
+        let (a1, a2, a3) = (ids[0], ids[1], ids[2]);
+        let f = db
+            .upsert_file("\u{2e}Trash-0", "\u{2e}Trash-0", 1, 0, 0)
+            .unwrap();
+        db.insert_span(f, a1, a3).unwrap();
+        db.insert_span(f, a2, a2).unwrap();
+
+        let stats = db
+            .prune_snapshots(&[a1])
+            .expect("overlapping spans must merge, not violate the primary key");
+        assert_eq!(stats.snapshots_removed, 1);
+        // Two spans in, one out: the merged-away row counts as a removal.
+        assert_eq!(stats.spans_removed, 1);
+        assert_eq!(stats.spans_repaired, 1);
+
+        // One merged span covering the union, and the file still resolves in both
+        // surviving snapshots.
+        let rows: Vec<(i64, i64)> = db
+            .conn
+            .prepare("SELECT first_snap, last_snap FROM spans ORDER BY first_snap")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![(a2, a3)], "spans should merge to their union");
+        assert_eq!(db.get_files_in_snapshot(a2).unwrap().len(), 1);
+        assert_eq!(db.get_files_in_snapshot(a3).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_merges_two_repaired_spans_landing_on_the_same_start() {
+        // Repaired-vs-repaired: both spans lose their start and both resolve to
+        // the same survivor. Handled by the GROUP BY rather than the upsert.
+        let (db, ids) = one_series(4);
+        let (a1, a2, a3, a4) = (ids[0], ids[1], ids[2], ids[3]);
+        let f = db.upsert_file("x.txt", "x.txt", 1, 0, 0).unwrap();
+        db.insert_span(f, a1, a4).unwrap();
+        db.insert_span(f, a2, a3).unwrap();
+
+        db.prune_snapshots(&[a1, a2])
+            .expect("two repairs onto one start must merge");
+
+        let rows: Vec<(i64, i64)> = db
+            .conn
+            .prepare("SELECT first_snap, last_snap FROM spans ORDER BY first_snap")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![(a3, a4)]);
+        assert_eq!(db.get_files_in_snapshot(a4).unwrap().len(), 1);
     }
 
     #[test]
