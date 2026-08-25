@@ -7,6 +7,7 @@ use buttered_dasd::health::{self, HealthStatus};
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
+use buttered_dasd::reconcile;
 use buttered_dasd::report;
 use buttered_dasd::{doctor, restore, schedule, scrub, subvol};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -85,6 +86,26 @@ struct Cli {
     json: bool,
 }
 
+/// Prune index rows for snapshots that have disappeared from mounted targets.
+///
+/// Callers MUST invoke this while the targets are mounted — `plan_reconcile`
+/// refuses to prune anything under a root that is not a verified mountpoint, so
+/// calling it with everything unmounted is safe but useless (bd DAS-Backup-Manager-cu8).
+fn run_reconcile(
+    database: &Database,
+    cfg: &Config,
+    dry_run: bool,
+) -> rusqlite::Result<reconcile::PruneStats> {
+    let roots: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
+    let mounted = reconcile::verified_mounted_roots(&roots);
+    let snapshots = database.list_snapshots()?;
+    let plan = reconcile::plan_reconcile(&snapshots, &mounted, reconcile::path_exists);
+    if dry_run || plan.is_empty() {
+        return Ok(reconcile::PruneStats::default());
+    }
+    database.prune_snapshots(&plan.doomed)
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Index all new snapshots on a backup target
@@ -122,6 +143,18 @@ enum Commands {
         /// Path to SQLite database
         #[arg(long, default_value = DEFAULT_DB)]
         db: String,
+    },
+    /// Remove index rows for snapshots that no longer exist on disk
+    Reconcile {
+        /// Path to SQLite database
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: String,
+        /// Path to config.toml (for target mount points)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Report what would be removed without changing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Interactive setup wizard — configure backup sources, targets, and scheduling
     Setup(setup::SetupArgs),
@@ -941,6 +974,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
             let database = Database::open(&db)?;
             let result = indexer::walk(&target, &database);
+            // Reconcile while the targets are still mounted — the prune is only
+            // ever safe under a verified mountpoint (bd DAS-Backup-Manager-cu8).
+            let reconciled = run_reconcile(&database, &cfg, false);
             guard.unmount(&progress);
             let result = result?;
             if json {
@@ -952,6 +988,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Discovered: {} snapshots", result.snapshots_discovered);
                 println!("Indexed:    {} new", result.snapshots_indexed);
                 println!("Skipped:    {} already indexed", result.snapshots_skipped);
+                match &reconciled {
+                    Ok(stats) if stats.snapshots_removed > 0 => println!(
+                        "Reconciled: {} stale snapshots pruned ({} spans repaired, {} removed, {} files dropped)",
+                        stats.snapshots_removed,
+                        stats.spans_repaired,
+                        stats.spans_removed,
+                        stats.files_removed
+                    ),
+                    Ok(_) => println!("Reconciled: index already consistent"),
+                    Err(e) => eprintln!("Warning: reconcile failed: {e}"),
+                }
                 for r in &result.results {
                     println!(
                         "  {} files ({} new, {} extended, {} changed, {} errors)",
@@ -960,6 +1007,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         r.files_extended,
                         r.files_changed,
                         r.scan_errors
+                    );
+                }
+            }
+        }
+        Commands::Reconcile {
+            db,
+            config,
+            dry_run,
+        } => {
+            let cfg = Config::load(&config)?;
+            let progress = CliProgress;
+            let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+            let database = Database::open(&db)?;
+
+            let roots: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
+            let mounted = reconcile::verified_mounted_roots(&roots);
+            let snapshots = database.list_snapshots();
+            let outcome = snapshots.map(|snaps| {
+                let plan = reconcile::plan_reconcile(&snaps, &mounted, reconcile::path_exists);
+                let stats = if dry_run || plan.is_empty() {
+                    Ok(reconcile::PruneStats::default())
+                } else {
+                    database.prune_snapshots(&plan.doomed)
+                };
+                (plan, stats)
+            });
+            guard.unmount(&progress);
+
+            let (plan, stats) = outcome?;
+            let stats = stats?;
+
+            if json {
+                println!(
+                    "{{\"dry_run\":{},\"mounted_roots\":{},\"doomed\":{},\"present\":{},\"skipped_unmounted\":{},\"snapshots_removed\":{},\"spans_repaired\":{},\"spans_removed\":{},\"files_removed\":{}}}",
+                    dry_run,
+                    mounted.len(),
+                    plan.doomed.len(),
+                    plan.confirmed_present,
+                    plan.skipped_unmounted,
+                    stats.snapshots_removed,
+                    stats.spans_repaired,
+                    stats.spans_removed,
+                    stats.files_removed
+                );
+            } else {
+                println!("Mounted target roots: {}", mounted.len());
+                println!("Confirmed present:    {}", plan.confirmed_present);
+                println!("Skipped (unmounted):  {}", plan.skipped_unmounted);
+                println!("Stale (absent):       {}", plan.doomed.len());
+                if dry_run {
+                    println!("\nDry run — nothing was changed.");
+                } else if plan.is_empty() {
+                    println!("\nIndex already consistent.");
+                } else {
+                    println!(
+                        "\nPruned {} snapshots, repaired {} spans, removed {} spans, dropped {} files.",
+                        stats.snapshots_removed,
+                        stats.spans_repaired,
+                        stats.spans_removed,
+                        stats.files_removed
                     );
                 }
             }
