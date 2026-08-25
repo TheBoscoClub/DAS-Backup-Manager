@@ -600,6 +600,17 @@ impl Database {
         Ok((spans, files))
     }
 
+    /// Snapshot ids recorded under `root`, for retiring a mount path that is no
+    /// longer configured.
+    pub fn snapshots_under_root(&self, root: &str) -> SqlResult<Vec<i64>> {
+        let prefix = format!("{}/%", root.trim_end_matches('/'));
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM snapshots WHERE path LIKE ?1 ORDER BY id")?;
+        let rows = stmt.query_map([prefix], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// Snapshot ids containing any file whose path matches `path_glob`.
     ///
     /// This is the scoping query for `btrdasd purge` (`bd DAS-Backup-Manager-rt6`):
@@ -1401,6 +1412,42 @@ mod tests {
         db.insert_span(f, ids[0], ids[1]).unwrap();
         assert_eq!(db.delete_dangling_spans().unwrap(), (0, 0));
         assert_eq!(db.get_files_in_snapshot(ids[1]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snapshots_under_root_matches_on_a_path_boundary() {
+        // bd DAS-Backup-Manager-wl8. The prefix must not let `/mnt/backup-22`
+        // capture rows under `/mnt/backup-22tb` — retiring a root by a sloppy
+        // prefix would delete a live target's index rows.
+        let db = Database::open(":memory:").unwrap();
+        let retired = db
+            .insert_snapshot("s", "T1", "nvme", "/mnt/backup-system-mirror/nvme/s.T1")
+            .unwrap();
+        let live = db
+            .insert_snapshot("s", "T2", "nvme", "/mnt/backup-22tb/nvme/s.T2")
+            .unwrap();
+        let near_miss = db
+            .insert_snapshot("s", "T3", "nvme", "/mnt/backup-22/nvme/s.T3")
+            .unwrap();
+
+        assert_eq!(
+            db.snapshots_under_root("/mnt/backup-system-mirror")
+                .unwrap(),
+            vec![retired]
+        );
+        assert_eq!(
+            db.snapshots_under_root("/mnt/backup-22").unwrap(),
+            vec![near_miss]
+        );
+        assert_eq!(
+            db.snapshots_under_root("/mnt/backup-22tb").unwrap(),
+            vec![live]
+        );
+        // A trailing slash must behave identically.
+        assert_eq!(
+            db.snapshots_under_root("/mnt/backup-22tb/").unwrap(),
+            vec![live]
+        );
     }
 
     #[test]

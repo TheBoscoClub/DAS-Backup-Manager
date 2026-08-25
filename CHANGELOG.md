@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.17.0] - 2026-08-25
+
+### Added
+- **`btrdasd reconcile --repair`**: deletes spans whose endpoints name snapshots that do not exist, plus any file left with no spans, in one transaction (`bd DAS-Backup-Manager-opd`). Such rows are unreachable — since `5uq` the read path joins `snapshots` on `first_snap`, so a dangling start matches nothing — and they are live FK violations that cannot be rewritten at all, which aborted every prune minutes in. **Verified live: 15,085,764 spans and 271 orphaned files removed; `PRAGMA foreign_key_check` now returns zero rows**
+- **`btrdasd reconcile --forget-root <path>`**: drops index rows recorded under a mount path that is no longer a configured target (`bd DAS-Backup-Manager-wl8`). Ordinary reconcile can never clear these — that root will never be mounted again, so their absence can never be confirmed — and they would otherwise mask the transient unmounted count forever. Refuses a root that IS configured, since dropping a live target's rows would discard a working index
+- **`reconcile` now reports retired roots separately from merely unmounted ones**: `plan_reconcile` takes the configured-root list alongside the mounted subset. An unmounted target resolves itself next pass; a retired root never will, and conflating them left a count that never reached zero
+
+### Fixed
+- **Verified live on the production index**: after `--repair`, the auto-reconcile inside `btrdasd walk` completed the remediation during the 2026-08-25 scheduled backup — **5861 stale snapshots pruned, 22,713,781 spans repaired, 23,158,421 removed, 5,919,536 files dropped**. `btrdasd search` now returns **zero** hits for the `claude-cowork-linux` snapshots deleted on 2026-08-24, and a follow-up `reconcile --dry-run` reports **Stale (absent): 0** — the index is consistent with disk (`bd DAS-Backup-Manager-cu8`)
+- **`snaps_created`/`snaps_sent` confirmed working**: the same run recorded **48 created / 126 sent** — nonzero and genuinely distinct — against `0|0` on every run since 2026-06-26 (`bd DAS-Backup-Manager-oi0`)
+
 ## [0.7.16.0] - 2026-08-25
 
 ### Added
@@ -584,7 +595,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.16.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.17.0...HEAD
+[0.7.17.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.16.0...v0.7.17.0
 [0.7.16.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.15.0...v0.7.16.0
 [0.7.15.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.1...v0.7.15.0
 [0.7.14.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.0...v0.7.14.1
