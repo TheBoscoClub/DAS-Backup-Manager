@@ -1,0 +1,96 @@
+# Continuous integration — builds and tests, publishes nothing.
+#
+# Deliberately separate from release-packages.yml, which triggers ONLY on version
+# tags because it publishes artifacts. A workflow that publishes must never run on
+# push-to-main; a workflow that gates correctness must.
+#
+# This exists because CodeQL's default setup neither builds nor tests, so the repo
+# could show all-green checks over a broken build (bd DAS-Backup-Manager-b14).
+#
+# Actions are referenced by the same tags used in release-packages.yml so the two
+# stay in step and Dependabot's github_actions ecosystem updates both together.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the in-flight run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, test
+    runs-on: ubuntu-latest
+    # Same base image as the Arch release job, so CI and the shipped package are
+    # built by the same toolchain rather than two that drift independently.
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install toolchain
+        run: pacman -Syu --noconfirm base-devel rust
+
+      - name: cargo fmt --check
+        working-directory: indexer
+        run: cargo fmt --check
+
+      - name: cargo clippy -D warnings
+        working-directory: indexer
+        run: cargo clippy --all-targets -- -D warnings
+
+      # No --lib, no filtering: an integration binary's failure has been missed
+      # before by a command that only printed the first result line.
+      - name: cargo test
+        working-directory: indexer
+        run: cargo test
+
+  build:
+    name: Build — Rust library, CLI, and Qt6 GUI
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
+            qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
+            kiconthemes kcrash kio knotifications kstatusnotifieritem \
+            qt6-tools
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      # Always via cmake — a bare `cargo build` writes to a different target dir
+      # and the install step then picks up a stale binary.
+      - name: Build
+        run: cmake --build build
+
+  shell:
+    name: Shell — shellcheck
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install shellcheck
+        run: pacman -Syu --noconfirm shellcheck
+
+      - name: shellcheck
+        run: |
+          shopt -s nullglob
+          files=(scripts/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no shell scripts found — failing rather than silently passing"
+            exit 1
+          fi
+          printf 'checking %s\n' "${files[@]}"
+          shellcheck "${files[@]}"
