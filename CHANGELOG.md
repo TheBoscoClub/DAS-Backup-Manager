@@ -13,6 +13,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.14.0] - 2026-08-25
+
+### Added
+- **`btrdasd reindex [--rebuild]`**: re-indexes every mounted backup target. `--rebuild` discards the index first and rebuilds it from scratch — the only repair for two defects that cannot be fixed in place, because both are properties of rows already written. Backup run history and target usage history are preserved; they are operational records, not derived content. Takes the same non-blocking maintenance interlock as `reconcile`
+- **Schema version tracking** via `PRAGMA user_version`, with `Database::migrate()` applied on open. `CREATE TABLE IF NOT EXISTS` silently does nothing on an existing table, so a change to an established column set has to be applied explicitly or it never lands
+
+### Changed
+- **`files` is now keyed on `(series, path)` instead of `path` alone — schema v2** (`bd DAS-Backup-Manager-lc9`): `path` is relative to the snapshot root, so the same string occurs in many subvolumes. Keyed on `path` alone, `packaging/PKGBUILD` from every project collapsed into ONE row whose `size`/`mtime` were overwritten by whichever subvolume was indexed last — 1,261,207 files in the production index had spans originating in more than one series. `files` gains a `series` column (snapshot `name` + `source`, joined by US `0x1f`, which cannot occur in either so needs no escaping), and `idx_files_path` is replaced by `idx_files_series_path`
+  - `upsert_file()` and `get_file()` take the series, so writing the same path under a different series now INSERTs rather than UPDATEs
+  - The v1 → v2 migration adds the column and re-keys the index, but **does not repair data** — existing rows get `series = ''`, reproducing the old behaviour exactly, because the series of an already-collapsed row cannot be recovered. Only `btrdasd reindex --rebuild` populates real values
+
+### Fixed
+- **Integration fixture used two different snapshot names as a consecutive pair**: `test_index_snapshot_directly` built `snap_a.<ts>` and `snap_b.<ts>` and expected spans to extend between them. Real btrbk snapshots of one subvolume share a `snapshot_name` and differ only by timestamp — two different names are two different subvolumes, which since v2 correctly do not share file rows. Confirmed against production: **0 of 85,038,167** spans have endpoints in different series
+
 ## [0.7.13.3] - 2026-08-25
 
 ### Fixed
@@ -534,7 +548,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.3...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.14.0...HEAD
+[0.7.14.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.3...v0.7.14.0
 [0.7.13.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.2...v0.7.13.3
 [0.7.13.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.1...v0.7.13.2
 [0.7.13.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.0...v0.7.13.1

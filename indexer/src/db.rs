@@ -2,6 +2,27 @@ use rusqlite::{Connection, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 use std::time::Duration;
 
+/// Schema version stored in `PRAGMA user_version`.
+///
+/// 2 — `files` re-keyed on `(series, path)` (bd DAS-Backup-Manager-lc9).
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
+///
+/// US is used rather than a printable separator because it cannot occur in a
+/// subvolume name or a source label, so the key is unambiguous without escaping.
+pub fn series_key(name: &str, source: &str) -> String {
+    let mut key = String::with_capacity(name.len() + source.len() + 1);
+    key.push_str(name);
+    key.push(SERIES_SEP);
+    key.push_str(source);
+    key
+}
+
+/// Separator between a series' name and source. US (0x1f) cannot occur in a
+/// subvolume name or source label, so the key needs no escaping.
+pub const SERIES_SEP: char = '\u{1f}';
+
 const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -15,15 +36,21 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 
 CREATE TABLE IF NOT EXISTS files (
-    id    INTEGER PRIMARY KEY,
-    path  TEXT NOT NULL,
-    name  TEXT NOT NULL,
-    size  INTEGER NOT NULL DEFAULT 0,
-    mtime INTEGER NOT NULL DEFAULT 0,
-    type  INTEGER NOT NULL DEFAULT 0
+    id     INTEGER PRIMARY KEY,
+    -- Subvolume series this file belongs to: snapshot name + source, joined by
+    -- US (0x1f). `path` is relative to the snapshot root, so it is NOT unique on
+    -- its own — the same relative path occurs in many subvolumes and keying on
+    -- it alone collapsed them into one row whose size/mtime were overwritten by
+    -- whichever series was indexed last (bd DAS-Backup-Manager-lc9).
+    series TEXT NOT NULL DEFAULT '',
+    path   TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    size   INTEGER NOT NULL DEFAULT 0,
+    mtime  INTEGER NOT NULL DEFAULT 0,
+    type   INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path ON files(path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_series_path ON files(series, path);
 
 CREATE TABLE IF NOT EXISTS spans (
     file_id    INTEGER NOT NULL REFERENCES files(id),
@@ -140,7 +167,38 @@ impl Database {
         conn.pragma_update(None, "mmap_size", 4_294_967_296i64)?;
         conn.pragma_update(None, "cache_size", -262_144i64)?;
         conn.execute_batch(SCHEMA_SQL)?;
+        Self::migrate(&conn)?;
         Ok(Database { conn })
+    }
+
+    /// Bring a pre-existing database up to `SCHEMA_VERSION`.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` silently does nothing on a database that
+    /// already has the table, so a schema change to an existing column set has to
+    /// be applied explicitly here or it never lands.
+    ///
+    /// v0/v1 -> v2 adds `files.series` and re-keys the unique index. Existing rows
+    /// get `series = ''`, which reproduces the old `UNIQUE(path)` behaviour exactly
+    /// — the migration makes the schema correct, it does not repair the data. Only
+    /// re-indexing populates real series values (`btrdasd reindex --rebuild`).
+    fn migrate(conn: &Connection) -> SqlResult<()> {
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let has_series: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'series'")?
+            .exists([])?;
+        if !has_series {
+            conn.execute_batch(
+                "ALTER TABLE files ADD COLUMN series TEXT NOT NULL DEFAULT '';
+                 DROP INDEX IF EXISTS idx_files_path;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_series_path
+                     ON files(series, path);",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
     }
 
     pub fn insert_snapshot(
@@ -249,13 +307,14 @@ impl Database {
 
     pub fn upsert_file(
         &self,
+        series: &str,
         path: &str,
         name: &str,
         size: i64,
         mtime: i64,
         file_type: i32,
     ) -> SqlResult<i64> {
-        if let Some(existing) = self.get_file(path)? {
+        if let Some(existing) = self.get_file(series, path)? {
             if existing.size != size || existing.mtime != mtime {
                 self.conn.execute(
                     "UPDATE files SET size = ?1, mtime = ?2 WHERE id = ?3",
@@ -265,17 +324,19 @@ impl Database {
             return Ok(existing.id);
         }
         self.conn.execute(
-            "INSERT INTO files (path, name, size, mtime, type) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![path, name, size, mtime, file_type],
+            "INSERT INTO files (series, path, name, size, mtime, type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![series, path, name, size, mtime, file_type],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn get_file(&self, path: &str) -> SqlResult<Option<FileRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, name, size, mtime, type FROM files WHERE path = ?1")?;
-        let mut rows = stmt.query_map([path], |row| {
+    pub fn get_file(&self, series: &str, path: &str) -> SqlResult<Option<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, name, size, mtime, type FROM files
+             WHERE series = ?1 AND path = ?2",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![series, path], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
                 path: row.get(1)?,
@@ -457,6 +518,43 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    /// Drop and recreate the content tables, leaving history intact.
+    ///
+    /// Removes `snapshots`, `files`, `spans` and the `files_fts` index, then
+    /// recreates them at the current `SCHEMA_VERSION`. `backup_runs` and
+    /// `target_usage` are deliberately preserved — they are operational history,
+    /// not derived content, and cannot be reconstructed by re-walking.
+    ///
+    /// This is the only repair for two defects that a migration cannot fix in
+    /// place, because both are properties of rows already written:
+    ///
+    /// * `bd DAS-Backup-Manager-opd` — spans whose endpoints name snapshots that
+    ///   no longer exist. `PRAGMA foreign_keys` is ON, so these cannot be rewritten
+    ///   at all; only discarding and re-deriving them clears the violation.
+    /// * `bd DAS-Backup-Manager-lc9` — `files.series` is empty on every row
+    ///   migrated from v1, since the series of an already-collapsed row cannot be
+    ///   recovered. Only re-indexing populates it.
+    ///
+    /// The caller is responsible for re-walking the targets afterwards; on its own
+    /// this leaves an empty index.
+    pub fn rebuild_content_tables(&self) -> SqlResult<()> {
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER IF EXISTS files_ai;
+             DROP TRIGGER IF EXISTS files_ad;
+             DROP TRIGGER IF EXISTS files_au;
+             DROP TABLE IF EXISTS files_fts;
+             DROP TABLE IF EXISTS spans;
+             DROP TABLE IF EXISTS files;
+             DROP TABLE IF EXISTS snapshots;
+             PRAGMA foreign_keys = ON;",
+        )?;
+        self.conn.execute_batch(SCHEMA_SQL)?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -822,6 +920,10 @@ impl Drop for Database {
 mod tests {
     use super::*;
 
+    /// The two series produced by `interleaved_fixture`.
+    const SERIES_A: &str = "projA\u{1f}projects";
+    const SERIES_B: &str = "abooks\u{1f}audiobooks";
+
     // -----------------------------------------------------------------
     // bd DAS-Backup-Manager-5uq — span reads must be scoped to one series
     // -----------------------------------------------------------------
@@ -873,11 +975,13 @@ mod tests {
         // cloudflare-manager snapshot listing Stephen King audiobooks.
         let (db, a1, b1, a2, _b2) = interleaved_fixture();
 
-        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        let proj = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
         db.insert_span(proj, a1, a2).unwrap();
 
         let abook = db
-            .upsert_file("Library/book.opus", "book.opus", 20, 0, 0)
+            .upsert_file(SERIES_B, "Library/book.opus", "book.opus", 20, 0, 0)
             .unwrap();
         db.insert_span(abook, b1, b1).unwrap();
 
@@ -893,7 +997,9 @@ mod tests {
     #[test]
     fn count_in_snapshot_is_scoped_to_its_series() {
         let (db, a1, b1, a2, _b2) = interleaved_fixture();
-        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        let proj = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
         db.insert_span(proj, a1, a2).unwrap();
         // Pre-fix this counted 1 (the foreign projects file); correct answer is 0.
         assert_eq!(db.count_files_in_snapshot(b1).unwrap(), 0);
@@ -903,7 +1009,9 @@ mod tests {
     #[test]
     fn paged_listing_is_scoped_to_its_series() {
         let (db, a1, b1, a2, _b2) = interleaved_fixture();
-        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        let proj = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
         db.insert_span(proj, a1, a2).unwrap();
         assert!(
             db.get_files_in_snapshot_paged(b1, 100, 0)
@@ -914,23 +1022,108 @@ mod tests {
     }
 
     #[test]
-    fn same_relative_path_in_two_series_stays_separated() {
-        // files.path is UNIQUE and relative-within-snapshot, so both series share
-        // ONE files row. Scoping must still keep their spans apart.
+    fn same_relative_path_in_two_series_gets_its_own_row() {
+        // bd DAS-Backup-Manager-lc9: `path` is relative to the snapshot root, so
+        // the same string occurs in many subvolumes. Keyed on `path` alone these
+        // collapsed into ONE row and clobbered each other's size/mtime. Keyed on
+        // (series, path) each series keeps its own metadata.
         let (db, a1, b1, a2, b2) = interleaved_fixture();
-        let shared = db
-            .upsert_file("packaging/PKGBUILD", "PKGBUILD", 1, 0, 0)
+        let proj = db
+            .upsert_file(SERIES_A, "packaging/PKGBUILD", "PKGBUILD", 111, 1, 0)
             .unwrap();
-        db.insert_span(shared, a1, a2).unwrap();
-        db.insert_span(shared, b1, b2).unwrap();
+        let abook = db
+            .upsert_file(SERIES_B, "packaging/PKGBUILD", "PKGBUILD", 222, 2, 0)
+            .unwrap();
+        assert_ne!(proj, abook, "same path in two series must not share a row");
+
+        db.insert_span(proj, a1, a2).unwrap();
+        db.insert_span(abook, b1, b2).unwrap();
+
+        // Each series reports its OWN size, not whichever was written last.
+        let pa = db
+            .get_file(SERIES_A, "packaging/PKGBUILD")
+            .unwrap()
+            .unwrap();
+        let pb = db
+            .get_file(SERIES_B, "packaging/PKGBUILD")
+            .unwrap()
+            .unwrap();
+        assert_eq!((pa.size, pb.size), (111, 222));
         assert_eq!(db.get_files_in_snapshot(a1).unwrap().len(), 1);
         assert_eq!(db.get_files_in_snapshot(b1).unwrap().len(), 1);
     }
 
     #[test]
+    fn upsert_is_scoped_to_its_series() {
+        // Writing the same path under a different series must INSERT, not UPDATE.
+        let db = Database::open(":memory:").unwrap();
+        let a = db
+            .upsert_file(SERIES_A, "x.txt", "x.txt", 10, 0, 0)
+            .unwrap();
+        let b = db
+            .upsert_file(SERIES_B, "x.txt", "x.txt", 20, 0, 0)
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(db.get_file(SERIES_A, "x.txt").unwrap().unwrap().size, 10);
+        assert_eq!(db.get_file(SERIES_B, "x.txt").unwrap().unwrap().size, 20);
+    }
+
+    #[test]
+    fn rebuild_clears_content_but_keeps_history() {
+        let db = Database::open(":memory:").unwrap();
+        let sid = db
+            .insert_snapshot("s", "T1", "src", "/mnt/t/src/s.T1")
+            .unwrap();
+        let f = db.upsert_file(SERIES_A, "x.txt", "x.txt", 1, 0, 0).unwrap();
+        db.insert_span(f, sid, sid).unwrap();
+        db.insert_backup_run(&NewBackupRun {
+            timestamp: 1,
+            success: true,
+            mode: "incremental",
+            snaps_created: 1,
+            snaps_sent: 1,
+            bytes_sent: 1,
+            duration_secs: 1,
+            errors: &[],
+        })
+        .unwrap();
+
+        db.rebuild_content_tables().unwrap();
+
+        // Content gone...
+        assert_eq!(db.list_snapshots().unwrap().len(), 0);
+        assert!(db.get_file(SERIES_A, "x.txt").unwrap().is_none());
+        assert!(db.search("x.txt", 10).unwrap().is_empty());
+        let spans: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM spans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(spans, 0);
+
+        // ...history kept, and the schema is usable again.
+        assert_eq!(db.get_backup_history(10).unwrap().len(), 1);
+        let sid2 = db
+            .insert_snapshot("s", "T2", "src", "/mnt/t/src/s.T2")
+            .unwrap();
+        let f2 = db.upsert_file(SERIES_A, "y.txt", "y.txt", 2, 0, 0).unwrap();
+        db.insert_span(f2, sid2, sid2).unwrap();
+        assert_eq!(db.get_files_in_snapshot(sid2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_version_is_stamped() {
+        let db = Database::open(":memory:").unwrap();
+        let v: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn unknown_snapshot_id_lists_nothing() {
         let (db, a1, _b1, a2, _b2) = interleaved_fixture();
-        let f = db.upsert_file("x", "x", 1, 0, 0).unwrap();
+        let f = db.upsert_file(SERIES_A, "x", "x", 1, 0, 0).unwrap();
         db.insert_span(f, a1, a2).unwrap();
         assert!(db.get_files_in_snapshot(9999).unwrap().is_empty());
     }
@@ -944,7 +1137,9 @@ mod tests {
         // The retention-shaped case: the OLDEST snapshot goes. Deleting the whole
         // span would erase the file from every surviving snapshot too.
         let (db, a1, _b1, a2, _b2) = interleaved_fixture();
-        let f = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        let f = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
         db.insert_span(f, a1, a2).unwrap();
 
         let stats = db.prune_snapshots(&[a1]).unwrap();
@@ -968,30 +1163,38 @@ mod tests {
     #[test]
     fn prune_removes_a_span_with_no_survivors_and_its_orphan_file() {
         let (db, a1, _b1, a2, _b2) = interleaved_fixture();
-        let f = db.upsert_file("gone.txt", "gone.txt", 1, 0, 0).unwrap();
+        let f = db
+            .upsert_file(SERIES_A, "gone.txt", "gone.txt", 1, 0, 0)
+            .unwrap();
         db.insert_span(f, a1, a2).unwrap();
 
         let stats = db.prune_snapshots(&[a1, a2]).unwrap();
         assert_eq!(stats.snapshots_removed, 2);
         assert_eq!(stats.spans_removed, 1);
         assert_eq!(stats.files_removed, 1);
-        assert!(db.get_file("gone.txt").unwrap().is_none());
+        assert!(db.get_file(SERIES_A, "gone.txt").unwrap().is_none());
     }
 
     #[test]
     fn prune_leaves_other_series_untouched() {
         let (db, a1, b1, a2, b2) = interleaved_fixture();
-        let proj = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        let proj = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
         db.insert_span(proj, a1, a2).unwrap();
         let abook = db
-            .upsert_file("Library/book.opus", "book.opus", 20, 0, 0)
+            .upsert_file(SERIES_B, "Library/book.opus", "book.opus", 20, 0, 0)
             .unwrap();
         db.insert_span(abook, b1, b2).unwrap();
 
         db.prune_snapshots(&[a1, a2]).unwrap();
 
         assert_eq!(db.get_files_in_snapshot(b1).unwrap().len(), 1);
-        assert!(db.get_file("Library/book.opus").unwrap().is_some());
+        assert!(
+            db.get_file(SERIES_B, "Library/book.opus")
+                .unwrap()
+                .is_some()
+        );
         let remaining: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
@@ -1014,7 +1217,9 @@ mod tests {
         let a3 = db
             .insert_snapshot("projA", "T3", "projects", "/mnt/t/projects/projA.T3")
             .unwrap();
-        let f = db.upsert_file("src/main.rs", "main.rs", 10, 0, 0).unwrap();
+        let f = db
+            .upsert_file(SERIES_A, "src/main.rs", "main.rs", 10, 0, 0)
+            .unwrap();
         db.insert_span(f, a1, a3).unwrap();
 
         let stats = db.prune_snapshots(&[a1, a3]).unwrap();
@@ -1038,18 +1243,24 @@ mod tests {
         // either comparison inverted, a size-only change is silently dropped and
         // the index keeps reporting the old size forever.
         let db = Database::open(":memory:").unwrap();
-        let id = db.upsert_file("a.txt", "a.txt", 10, 100, 0).unwrap();
-        let again = db.upsert_file("a.txt", "a.txt", 999, 100, 0).unwrap();
+        let id = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 10, 100, 0)
+            .unwrap();
+        let again = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 999, 100, 0)
+            .unwrap();
         assert_eq!(id, again, "same path must reuse the row");
-        assert_eq!(db.get_file("a.txt").unwrap().unwrap().size, 999);
+        assert_eq!(db.get_file(SERIES_A, "a.txt").unwrap().unwrap().size, 999);
     }
 
     #[test]
     fn upsert_file_updates_when_only_the_mtime_changed() {
         let db = Database::open(":memory:").unwrap();
-        db.upsert_file("a.txt", "a.txt", 10, 100, 0).unwrap();
-        db.upsert_file("a.txt", "a.txt", 10, 555, 0).unwrap();
-        assert_eq!(db.get_file("a.txt").unwrap().unwrap().mtime, 555);
+        db.upsert_file(SERIES_A, "a.txt", "a.txt", 10, 100, 0)
+            .unwrap();
+        db.upsert_file(SERIES_A, "a.txt", "a.txt", 10, 555, 0)
+            .unwrap();
+        assert_eq!(db.get_file(SERIES_A, "a.txt").unwrap().unwrap().mtime, 555);
     }
 
     #[test]
@@ -1062,7 +1273,7 @@ mod tests {
             .insert_snapshot("s", "T1", "src", "/mnt/t/src/s.T1")
             .unwrap();
         let f = db
-            .upsert_file("report2026.txt", "report2026.txt", 1, 0, 0)
+            .upsert_file(SERIES_A, "report2026.txt", "report2026.txt", 1, 0, 0)
             .unwrap();
         db.insert_span(f, sid, sid).unwrap();
         assert_eq!(db.search("repo*", 10).unwrap().len(), 1);
@@ -1078,7 +1289,7 @@ mod tests {
             .insert_snapshot("s", "T1", "src", "/mnt/t/src/s.T1")
             .unwrap();
         let f = db
-            .upsert_file("deep/dir/alpha.txt", "alpha.txt", 1, 0, 0)
+            .upsert_file(SERIES_A, "deep/dir/alpha.txt", "alpha.txt", 1, 0, 0)
             .unwrap();
         db.insert_span(f, sid, sid).unwrap();
         assert_eq!(db.search("path:deep", 10).unwrap().len(), 1);
@@ -1110,7 +1321,7 @@ mod tests {
         let (db, ids) = one_series(3);
         let (a1, a2, a3) = (ids[0], ids[1], ids[2]);
         let f = db
-            .upsert_file("\u{2e}Trash-0", "\u{2e}Trash-0", 1, 0, 0)
+            .upsert_file(SERIES_A, "\u{2e}Trash-0", "\u{2e}Trash-0", 1, 0, 0)
             .unwrap();
         db.insert_span(f, a1, a3).unwrap();
         db.insert_span(f, a2, a2).unwrap();
@@ -1144,7 +1355,7 @@ mod tests {
         // the same survivor. Handled by the GROUP BY rather than the upsert.
         let (db, ids) = one_series(4);
         let (a1, a2, a3, a4) = (ids[0], ids[1], ids[2], ids[3]);
-        let f = db.upsert_file("x.txt", "x.txt", 1, 0, 0).unwrap();
+        let f = db.upsert_file(SERIES_A, "x.txt", "x.txt", 1, 0, 0).unwrap();
         db.insert_span(f, a1, a4).unwrap();
         db.insert_span(f, a2, a3).unwrap();
 
@@ -1171,7 +1382,7 @@ mod tests {
         // with a diagnosis rather than a raw SqliteFailure.
         let (db, ids) = one_series(3);
         let (a1, a2, a3) = (ids[0], ids[1], ids[2]);
-        let f = db.upsert_file("x.txt", "x.txt", 1, 0, 0).unwrap();
+        let f = db.upsert_file(SERIES_A, "x.txt", "x.txt", 1, 0, 0).unwrap();
         db.insert_span(f, a1, a3).unwrap();
 
         // Manufacture the corruption the way it exists in production: a snapshot
@@ -1203,7 +1414,7 @@ mod tests {
     #[test]
     fn prune_of_nothing_changes_nothing() {
         let (db, a1, _b1, a2, _b2) = interleaved_fixture();
-        let f = db.upsert_file("x", "x", 1, 0, 0).unwrap();
+        let f = db.upsert_file(SERIES_A, "x", "x", 1, 0, 0).unwrap();
         db.insert_span(f, a1, a2).unwrap();
         let stats = db.prune_snapshots(&[]).unwrap();
         assert_eq!(stats, crate::reconcile::PruneStats::default());
@@ -1215,7 +1426,9 @@ mod tests {
         // files_ad trigger keeps files_fts in step — proves search stops serving
         // a purged path, which is cu8's whole point.
         let (db, a1, _b1, a2, _b2) = interleaved_fixture();
-        let f = db.upsert_file("secret.env", "secret.env", 1, 0, 0).unwrap();
+        let f = db
+            .upsert_file(SERIES_A, "secret.env", "secret.env", 1, 0, 0)
+            .unwrap();
         db.insert_span(f, a1, a2).unwrap();
         assert_eq!(db.search("secret.env", 10).unwrap().len(), 1);
 
@@ -1355,7 +1568,7 @@ mod tests {
     fn upsert_file_new() {
         let db = Database::open(":memory:").unwrap();
         let id = db
-            .upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0)
+            .upsert_file(SERIES_A, "home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0)
             .unwrap();
         assert!(id > 0);
     }
@@ -1363,9 +1576,9 @@ mod tests {
     #[test]
     fn get_file_by_path() {
         let db = Database::open(":memory:").unwrap();
-        db.upsert_file("home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0)
+        db.upsert_file(SERIES_A, "home/bosco/.zshrc", ".zshrc", 1024, 1708500000, 0)
             .unwrap();
-        let f = db.get_file("home/bosco/.zshrc").unwrap().unwrap();
+        let f = db.get_file(SERIES_A, "home/bosco/.zshrc").unwrap().unwrap();
         assert_eq!(f.name, ".zshrc");
         assert_eq!(f.size, 1024);
     }
@@ -1373,18 +1586,26 @@ mod tests {
     #[test]
     fn upsert_file_unchanged() {
         let db = Database::open(":memory:").unwrap();
-        let id1 = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
-        let id2 = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        let id1 = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 100, 1000, 0)
+            .unwrap();
+        let id2 = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 100, 1000, 0)
+            .unwrap();
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn upsert_file_changed() {
         let db = Database::open(":memory:").unwrap();
-        let id1 = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
-        let id2 = db.upsert_file("a.txt", "a.txt", 200, 2000, 0).unwrap();
+        let id1 = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 100, 1000, 0)
+            .unwrap();
+        let id2 = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 200, 2000, 0)
+            .unwrap();
         assert_eq!(id1, id2);
-        let f = db.get_file("a.txt").unwrap().unwrap();
+        let f = db.get_file(SERIES_A, "a.txt").unwrap().unwrap();
         assert_eq!(f.size, 200);
         assert_eq!(f.mtime, 2000);
     }
@@ -1395,7 +1616,9 @@ mod tests {
         let snap_id = db
             .insert_snapshot("root", "20260221T0304", "nvme", "/snap1")
             .unwrap();
-        let file_id = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        let file_id = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 100, 1000, 0)
+            .unwrap();
         db.insert_span(file_id, snap_id, snap_id).unwrap();
         let count: i64 = db
             .conn
@@ -1417,7 +1640,9 @@ mod tests {
         let s2 = db
             .insert_snapshot("root", "20260221T0300", "nvme", "/snap2")
             .unwrap();
-        let fid = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        let fid = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 100, 1000, 0)
+            .unwrap();
         db.insert_span(fid, s1, s1).unwrap();
         let extended = db.extend_span(fid, s1, s2).unwrap();
         assert!(extended);
@@ -1441,7 +1666,9 @@ mod tests {
         let s3 = db
             .insert_snapshot("root", "20260222T0300", "nvme", "/snap3")
             .unwrap();
-        let fid = db.upsert_file("a.txt", "a.txt", 100, 1000, 0).unwrap();
+        let fid = db
+            .upsert_file(SERIES_A, "a.txt", "a.txt", 100, 1000, 0)
+            .unwrap();
         db.insert_span(fid, s1, s1).unwrap();
         let extended = db.extend_span(fid, s3, s3).unwrap();
         assert!(!extended);
@@ -1453,13 +1680,14 @@ mod tests {
             .insert_snapshot("root", "20260220T0300", "nvme", "/snap1")
             .unwrap();
         let f1 = db
-            .upsert_file("docs/report.pdf", "report.pdf", 1000, 100, 0)
+            .upsert_file(SERIES_A, "docs/report.pdf", "report.pdf", 1000, 100, 0)
             .unwrap();
         let f2 = db
-            .upsert_file("photos/photo.jpg", "photo.jpg", 2000, 200, 0)
+            .upsert_file(SERIES_A, "photos/photo.jpg", "photo.jpg", 2000, 200, 0)
             .unwrap();
         let f3 = db
             .upsert_file(
+                SERIES_A,
                 "docs/annual-report.docx",
                 "annual-report.docx",
                 3000,

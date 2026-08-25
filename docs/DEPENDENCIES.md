@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.7.13.3
+**Version**: 0.7.14.0
 
 ## 1. Rust Crate Dependencies
 

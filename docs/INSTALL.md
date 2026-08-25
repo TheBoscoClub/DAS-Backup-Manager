@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.13.3
+**Version**: 0.7.14.0
 
 ## Before You Begin
 
@@ -265,7 +265,7 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `version` | string | `"0.7.13"` | Config format version (tracks `CARGO_PKG_VERSION`, the 3-part semver) |
+| `version` | string | `"0.7.14"` | Config format version (tracks `CARGO_PKG_VERSION`, the 3-part semver) |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 | `log_file` | string | `"/var/log/das-backup.log"` | Backup log path |

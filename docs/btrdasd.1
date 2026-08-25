@@ -1,6 +1,6 @@
 .\" btrdasd(1) man page
 .\" Generated from clap CLI definitions in indexer/src/main.rs
-.TH BTRDASD 1 "2026-08-24" "0.7.13.3" "DAS Backup Manager"
+.TH BTRDASD 1 "2026-08-24" "0.7.14.0" "DAS Backup Manager"
 .SH NAME
 btrdasd \- DAS Backup Manager indexer and orchestrator
 .SH SYNOPSIS
@@ -124,6 +124,34 @@ Default:
 .TP
 .B \-\-dry\-run
 Report what would be removed without changing anything.
+.\"
+.SS reindex
+Re-index every mounted backup target.
+.PP
+With
+.B \-\-rebuild
+the existing index is discarded first and rebuilt from scratch. This is the only
+repair for two defects that cannot be fixed in place, because both are properties
+of rows already written: spans whose endpoints name snapshots that no longer
+exist (foreign keys are enforced, so such rows cannot be rewritten at all), and
+file rows migrated from schema v1, whose subvolume series cannot be recovered
+after the fact. Backup run history and target usage history are preserved \(em
+they are operational records, not derived content.
+.PP
+Without
+.B \-\-rebuild
+this is an incremental top-up across every mounted target, indexing only
+snapshots not already present.
+.PP
+.B btrdasd reindex
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-rebuild ]
+.TP
+.B \-\-rebuild
+Discard the index and rebuild it. Takes hours on a large target set.
 .\"
 .SS setup
 Interactive setup wizard \(em configure backup sources, targets, and scheduling.

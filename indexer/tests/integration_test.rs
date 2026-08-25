@@ -582,8 +582,12 @@ fn test_index_snapshot_directly() {
     let root = tmp.path();
 
     // Build two snapshot dirs manually
-    let snap_a_path = root.join("nvme/snap_a.20260220T0300");
-    let snap_b_path = root.join("nvme/snap_b.20260221T0300");
+    // One subvolume, two consecutive snapshots — btrbk names these with a shared
+    // snapshot_name and a differing timestamp. Using two DIFFERENT names would
+    // make them two distinct subvolume series, which since schema v2 correctly
+    // do not share file rows (bd DAS-Backup-Manager-lc9).
+    let snap_a_path = root.join("nvme/snap.20260220T0300");
+    let snap_b_path = root.join("nvme/snap.20260221T0300");
 
     write_file(&snap_a_path.join("readme.txt"), b"version 1");
     write_file(&snap_a_path.join("data.bin"), b"\x00\x01\x02\x03");
@@ -598,7 +602,7 @@ fn test_index_snapshot_directly() {
     let db = Database::open(":memory:").unwrap();
 
     let ds_a = DiscoveredSnapshot {
-        name: "snap_a".into(),
+        name: "snap".into(),
         ts: "20260220T0300".into(),
         source: "nvme".into(),
         path: snap_a_path,
@@ -613,7 +617,7 @@ fn test_index_snapshot_directly() {
     assert_eq!(ra.files_changed, 0);
 
     let ds_b = DiscoveredSnapshot {
-        name: "snap_b".into(),
+        name: "snap".into(),
         ts: "20260221T0300".into(),
         source: "nvme".into(),
         path: snap_b_path,
