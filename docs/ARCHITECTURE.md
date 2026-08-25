@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.12.3
+**Version**: 0.7.13.0
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -25,7 +25,7 @@ do — and this project never touches filesystems that aren't backup media.
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (v0.7.12.3)
+## Component Overview (v0.7.13.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -57,7 +57,7 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 |-----------|----------|--------|---------|
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 15 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 16 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions) |
 | FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |

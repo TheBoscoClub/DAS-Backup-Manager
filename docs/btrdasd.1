@@ -1,6 +1,6 @@
 .\" btrdasd(1) man page
 .\" Generated from clap CLI definitions in indexer/src/main.rs
-.TH BTRDASD 1 "2026-08-02" "0.7.12.3" "DAS Backup Manager"
+.TH BTRDASD 1 "2026-08-24" "0.7.13.0" "DAS Backup Manager"
 .SH NAME
 btrdasd \- DAS Backup Manager indexer and orchestrator
 .SH SYNOPSIS
@@ -88,6 +88,42 @@ Show database statistics (snapshot count, file count, span count, database size)
 Path to SQLite database.
 Default:
 .IR /var/lib/das\-backup/backup\-index.db .
+.\"
+.SS reconcile
+Remove index rows for snapshots that no longer exist on disk.
+.PP
+Backup targets are unmounted between runs, so an absent path is normally no
+evidence at all that a snapshot is gone. A snapshot is therefore only ever a
+prune candidate when its target root is a
+.B verified mountpoint;
+anything under an unmounted or unrecognised root is skipped and counted, never
+pruned. Spans that merely touch a pruned snapshot have their endpoints moved
+inward to the nearest surviving snapshot of the same series rather than being
+deleted, so a file is never dropped from snapshots that still exist.
+.PP
+Targets are mounted for the duration of the pass and unmounted afterward.
+.B btrdasd walk
+runs the same pass automatically while targets are still mounted.
+.PP
+.B btrdasd reconcile
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-dry\-run ]
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used for target mount points.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-dry\-run
+Report what would be removed without changing anything.
 .\"
 .SS setup
 Interactive setup wizard \(em configure backup sources, targets, and scheduling.

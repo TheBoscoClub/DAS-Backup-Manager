@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.7.13.0] - 2026-08-24
+
+### Added
 - **Subvolume drift detector — `btrdasd doctor --check-drift`** (`bd DAS-Backup-Manager-01u`): a new top-level `btrdasd doctor` command that catches the exact failure mode found in the 2026-05-17 audit — ~30 subvolumes (all of `ClaudeCodeProjects/*`, audiobook app state, `@docker`, `@hibp`, Steam libraries, ISOs) silently never backed up for months because daily backups of the *configured* subvolumes kept succeeding and masked the gap
   - **New `indexer/src/doctor.rs` module**, exported from `lib.rs` alongside `health`/`scrub`. For each configured `[[source]]` volume (deduplicated — multiple sources commonly share one physical volume, e.g. all four `/.btrfs-hdd` sources), mounts it via the existing `mount::ensure_sources_mounted`/`MountGuard`, runs `btrfs subvolume list`, and compares the result against the union of every `[[source]].subvolume` name configured for that volume — missing (on disk, not configured) and stale (configured, not on disk) both reported. Missing subvolumes are categorized `likely irreplaceable` vs. `probably rebuildable` (case-insensitive substring match against a fixed pattern list — cache/tmp/steam/docker/build/target/node_modules/.cargo/iso), with a ready-to-paste `[[source.subvolumes]]` config.toml snippet printed for the irreplaceable set. Every comparison, exclusion, and categorization decision is a pure function over `Vec<String>`/structs (`compute_missing`, `compute_stale`, `categorize`, `glob_match`, `parse_subvolume_list_output`, `group_sources_by_volume`) — fixture-tested with no root privileges and no real btrfs filesystem (37 new unit tests)
   - **Built-in exclusions** (never configurable, applied to the missing side only): anything under a `.snapshots/` or `.btrbk-snapshots/` directory at any depth (nested too, e.g. `Audiobooks/.btrbk-snapshots/...`), and the `@tmp`/`@var-tmp` ephemeral subvolumes exactly. **New optional `[doctor]` config section** (`indexer/src/config.rs`) adds `exclude` (`Vec<String>` of shell-style glob patterns, `*`/`?`, hand-rolled matcher rather than a new crate dependency) on top of the built-ins. `#[serde(default)]` throughout — an existing config.toml with no `[doctor]` section parses to an empty exclude list, proven both by a fixture test and live against the production config (`sudo btrdasd setup --upgrade` round-tripped the config from lacking `[doctor]` to an explicit `[doctor]\nexclude = []` with no manual edits)
@@ -504,7 +512,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.3...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.13.0...HEAD
+[0.7.13.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.3...v0.7.13.0
 [0.7.12.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.2...v0.7.12.3
 [0.7.12.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12.1...v0.7.12.2
 [0.7.12.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.12...v0.7.12.1
