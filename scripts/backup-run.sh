@@ -1,0 +1,1954 @@
+#!/bin/bash
+# backup-run.sh - Run btrbk backup to DAS drives (config-driven)
+# Version: 4.4.1
+# Date: 2026-08-02
+#
+# Features:
+#   - cleanup() guaranteed on every abort path (v4.4.1): 'trap cleanup ERR'
+#     (installed inside main(), no 'set -E'/errtrace) only ever fired for a
+#     failing command directly in main()'s own body — never for a set -e
+#     abort or explicit `exit 1` inside a called function (create_mount_points,
+#     verify_targets_before_btrbk, mount_targets, run_btrbk, check_root, ...).
+#     Reproduced empirically on bash 5.3.15: `false`, `exit 1`, and
+#     `x=$(false)` inside a helper function all killed the script with zero
+#     cleanup() output — no unmount_all, no FAILURE DB row, DAS left mounted,
+#     the run invisible to the GUI history. Replaced with a top-level
+#     `trap cleanup EXIT`, which bash runs on every termination path
+#     (normal completion, `exit N` at any call depth, a set -e abort at any
+#     call depth). New SCRIPT_COMPLETED flag, set as the last statement of
+#     main(), makes cleanup() a true no-op on the clean-completion path
+#     (unmount_all/record_backup_run_in_db already ran in main()'s own
+#     body in that case) while still running the abort-recovery body for
+#     every earlier exit. `trap 'exit 130' INT`/`trap 'exit 143' TERM` route
+#     signal deaths (e.g. `systemctl stop das-backup` mid-run sending TERM)
+#     through the same EXIT trap instead of bash's default "die without
+#     running EXIT traps" behavior for unhandled fatal signals — explicit
+#     128+signum codes, not a bare `trap 'exit' ...`, which was proven in
+#     the harness to reuse a stale pre-signal $? (often 0) and mask a
+#     mid-run TERM abort as a false success. cleanup() now captures
+#     `$?` as its first statement and finishes with `exit "$rc"` so the
+#     original exit code — 0 for a clean run, nonzero for an abort — is
+#     never clobbered by cleanup's own command exit statuses (unmount_all's
+#     internal calls are already `if`-guarded/non-propagating; the
+#     record_backup_run_in_db and unmount_all calls in cleanup() are also
+#     `|| true`-guarded so a failure inside the abort-recovery body itself
+#     cannot skip the trailing `exit "$rc"`).
+#     CLEANUP_ARMED gate (same v4.4.1 change, added after review): the
+#     EXIT trap above is installed, and ALL_TARGET_MOUNTS is populated,
+#     entirely at top level — both well before main() is ever entered.
+#     Review confirmed a literal "singleton-skip" collision (a second
+#     backup-run.sh instance's flock-held skip triggering cleanup) does
+#     NOT reproduce, because that skip's `exit 0` (top-level, before the
+#     singleton-lock section) happens before the trap is even installed —
+#     proven empirically by running a real flock-held second instance and
+#     observing no cleanup() output. But a DIFFERENT, real exposure was
+#     found: main()'s own argument-parsing usage error (`exit 1` for an
+#     unrecognized flag) or a check_root() failure aborts AFTER the trap
+#     is active but BEFORE this process holds /run/das-maintenance.lock —
+#     at that point unmount_all() would run over ALL_TARGET_MOUNTS with no
+#     exclusivity guarantee against indexer/src/scrub.rs, which mounts the
+#     SAME /mnt/backup-* paths under that identical lock and states the
+#     invariant this closes: "a backup can never unmount a filesystem out
+#     from under a running scrub". New CLEANUP_ARMED flag, set "true" in
+#     main() immediately after acquire_maintenance_lock() returns (the
+#     earliest point this process actually owns the shared mountpoints);
+#     cleanup()'s recovery body now requires
+#     `CLEANUP_ARMED == "true" && SCRIPT_COMPLETED != "true"`, silently
+#     preserving the original exit code otherwise. Tracks bd DAS-Backup-Manager-oeo.
+#   - Report generated after unmount, from cached mount-time data (v4.4.0):
+#     previously generate_report() ran BEFORE unmount_all(), so an unmount
+#     failure was visible only in the console/journal — never in the same
+#     run's email, and never reflected in the DB-recorded overall_status.
+#     New capture_report_data() snapshots df -h / df --output=avail capacity
+#     figures and `btrbk list latest` per target while targets are still
+#     mounted, into CAPACITY_USED/CAPACITY_AVAIL/CAPACITY_PCT/AVAIL_BYTES,
+#     an ordered REPORT_TARGETS array, and BTRBK_LATEST. generate_
+#     capacity_section()/generate_growth_section() now iterate
+#     REPORT_TARGETS and read only these caches — no live mountpoint/df
+#     calls — so report output is byte-identical to the pre-unmount case.
+#     main()'s real-backup path is reordered to run_archive_cleanup ->
+#     capture_report_data -> unmount_all -> overall_status -> generate_
+#     report -> send_report -> record_backup_run_in_db, and BACKUP
+#     OPERATIONS gained a dedicated "Unmount targets" row fed by
+#     OP_STATUS[unmount]/[unmount_detail]. overall_status now includes
+#     unmount failures — intentional: the email subject and DB row now
+#     correctly flip to FAILURE when the DAS didn't unmount cleanly. Tracks
+#     bd DAS-Backup-Manager-ecg.
+#   - Boot subvolume snapshot finder pattern fix (v4.3.1): update_boot_subvolumes()'s
+#     latest_root/latest_home finders were matching zero snapshots on every
+#     run, on every target, silently. btrbk.conf's nvme volume sets
+#     snapshot_name "root-" for @ (and "home" for @home), so on-disk
+#     snapshot names are "root-.<TS>" / "home.<TS>" — the finder's old
+#     `nvme/root\.` pattern (root immediately followed by a dot) has NEVER
+#     matched "root-.<TS>" (an extra "-" sits between "root" and the dot).
+#     Pre-existing since the snapshot_name scheme was introduced, predates
+#     this file's v4.x history entirely — found 2026-08-01 during the real
+#     das-backup-full.service proof run, whose journal showed
+#     "[das-backup-22tb] No btrbk snapshots found, skipping" even though
+#     btrbk had just created fresh snapshots that same run. Combined with
+#     the correct role=mirror skip on the two recovery targets, this made
+#     the scheduled full-backup boot-subvolume-refresh path a complete
+#     no-op on every target, every time it ran on a schedule — only manual
+#     Rust-path runs (indexer/src/backup.rs) ever actually updated @/@home.
+#     Fixed by anchoring both patterns to the real snapshot name (including
+#     the "-" for root) and the real timestamp shape (btrbk's default
+#     `timestamp_format long` is YYYYMMDD<T>HHMM — 4-digit HHMM, NOT
+#     HHMMSS — with an optional "_N" collision suffix), verified live
+#     against the mounted 22TB target's actual subvolume list. Tracks
+#     DAS-Backup-Manager-ycr; bd DAS-Backup-Manager-01u (the config-vs-script
+#     drift detector) is the systemic guard against this class of bug for a
+#     future rename.
+#   - Maintenance interlock + honest unmount reporting (v4.3.0):
+#     * Backup side of the mutual-hold interlock shared with the scrub engine
+#       (indexer/src/scrub.rs): after the existing fd-9 singleton lock on
+#       /run/das-backup.lock succeeds, acquire_maintenance_lock() takes a
+#       BLOCKING flock on /run/das-maintenance.lock (fd 8) before any mount
+#       work, held to process exit. A backup whose scheduled time lands
+#       mid-scrub defers and starts the moment the scrub releases the lock —
+#       never skipped, never canceled. A non-trivial wait logs a visible
+#       "waiting" line and a "lock_wait" OP_STATUS entry with the wait
+#       duration. Lock path and singleton->maintenance ACQUISITION order
+#       match scrub.rs exactly, which is what makes the pair deadlock-free
+#       by construction — release order does not need to match (this side
+#       just holds both fds open to process exit; the scrub engine's
+#       ScrubLocks additionally releases maintenance before singleton via
+#       Rust field-drop order, but that symmetry isn't required here).
+#       Tracks DAS-Backup-Manager-b6f.
+#     * unmount_all() no longer discards DAS target umount failures via
+#       `|| true`. Every configured target mountpoint (ALL_TARGET_MOUNTS) is
+#       attempted (a stuck unmount no longer masks the rest); a path that
+#       isn't currently mounted is skipped via `mountpoint -q` rather than
+#       counted as a failure. Failures are collected and reported via
+#       record_op "unmount" FAIL, and the final "DAS can be safely
+#       disconnected" message is now conditional on every target having
+#       actually unmounted — previously it printed unconditionally even when
+#       a target was still mounted. Source volumes remain a best-effort,
+#       untracked unmount since they are host filesystems outside the
+#       physical DAS enclosure and some (das-storage on /dasRaid0) can
+#       legitimately stay busy indefinitely (running VMs) — a source unmount
+#       failure now logs a visible log_warn (previously fully silent via
+#       `|| true`) but still never touches record_op or the disconnect gate.
+#       Tracks DAS-Backup-Manager-b6f.
+#     * run_btrbk()'s dryrun branch is now guarded the same way the real-run
+#       branch always was — a `btrbk dryrun` failure records
+#       record_op "btrbk" FAIL and lets the script continue (soft-fail)
+#       instead of aborting under set -euo pipefail with no report entry.
+#       Tracks DAS-Backup-Manager-vuw.
+#   - Boot archive-then-recreate + pruner wiring (v4.2.4): update_boot_subvolumes()
+#     now archives the outgoing @/@home as a read-only snapshot
+#     (@.archive.<TS> / @home.archive.<TS>, TS=YYYYMMDDTHHMMSS) BEFORE the
+#     create-then-swap replacement on --full runs, matching indexer/src/backup.rs
+#     archive_boot() semantics exactly. If the archive snapshot fails, the
+#     recreation is skipped for that subvolume so the only copy is never
+#     destroyed. boot-archive-cleanup.sh (previously installed but never
+#     invoked) is now run at the end of every backup, daily and full alike,
+#     while targets are still mounted, and reports through
+#     record_op "archive_cleanup". Tracks DAS-Backup-Manager-64h, -1j7.
+#   - Incremental BTRFS backups via btrbk to configured targets
+#   - Maintains stable boot subvolumes (@ and @home) for disaster recovery
+#   - Detects DAS drives by serial number (stable across reboots)
+#   - RAID-1 multi-serial + mount-by-UUID: surviving-leg backups continue when
+#     a single RAID-1 partner is missing (degraded mount), no manual config
+#     edit required. See DAS-Backup-Manager-2qe.
+#   - Bare-mountpoint guard (v4.2.2): refuses to invoke btrbk unless every
+#     configured target either (a) is a real mountpoint backed by the
+#     expected UUID/serial, or (b) does not exist on disk at all. Unmounted
+#     bare directories at $mnt are auto-removed (when empty) so btrbk
+#     cannot silently write to / instead of the DAS. Prevents recurrence of
+#     the May 2026 incident where a removed 22TB drive let btrbk fill the
+#     root filesystem.
+#   - Snapshot_dir absolute-path resolution (v4.2.3): create_snapshot_dirs
+#     now composes ${SOURCE_VOLUMES[label]}/${SOURCE_SNAPSHOT_DIRS[label]}
+#     before mkdir, so newly-added sources whose snapshot_dir is relative
+#     (the common case in config.toml) land on the source's volume rather
+#     than systemd's cwd (/). Fixes the silent-skip pattern where btrbk
+#     would emit "Failed to fetch subvolume detail for snapshot_dir" for
+#     7 consecutive nightly runs after the 2026-05-17 commit added the
+#     hdd-media and hdd-system sources. Tracks DAS-Backup-Manager-0p2.
+#   - Logs per-target throughput (data written + MB/s rate)
+#   - Designed for unattended nightly execution
+#   - All configuration loaded from config.toml via btrdasd
+#   - Single-instance guard via flock on /run/das-backup.lock — second
+#     invocation exits 0 immediately if another is running. Protects against
+#     timer fires during long runs, Sentinel auto-restart races, and direct
+#     manual invocations.
+#
+# Prerequisites:
+#   - DAS connected and powered on
+#   - btrdasd built and installed
+#   - config.toml installed at /etc/das-backup/config.toml
+#
+# Usage:
+#   sudo ./backup-run.sh              # Incremental backup
+#   sudo ./backup-run.sh --dryrun     # Preview only
+#   sudo ./backup-run.sh --full       # Force full backup (recreate boot subvols)
+
+set -euo pipefail
+
+# ============================================================================
+# SINGLE-INSTANCE GUARD
+# ============================================================================
+# Refuse to run a second backup if another das-backup invocation is already in
+# progress. /run is tmpfs (auto-cleared at boot) so the lockfile can't go stale
+# across reboots. Exit 0 (not failure) when locked so that cachyos-sentinel
+# does not interpret a skipped concurrent fire as a unit failure needing retry.
+LOCKFILE="/run/das-backup.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "[INFO] Another das-backup run holds $LOCKFILE — skipping this invocation" >&2
+    exit 0
+fi
+# FD 9 stays open for the rest of the script; lock auto-releases when the
+# process exits (FD 9 closes), no explicit unlock needed.
+
+# Path of the blocking maintenance lock shared with the scrub engine
+# (indexer/src/scrub.rs MAINTENANCE_LOCK_PATH). MUST match exactly — this is
+# the backup side of the mutual-hold interlock. Acquired on fd 8 by
+# acquire_maintenance_lock() (defined below, called early in main(), after
+# this singleton but before any mount work).
+MAINTENANCE_LOCKFILE="/run/das-maintenance.lock"
+
+# ============================================================================
+# CONFIGURATION (loaded from config.toml via btrdasd)
+# ============================================================================
+
+# Load configuration from config.toml via btrdasd
+BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
+DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+# Boot archive pruner — sibling script, same install directory as this one.
+BOOT_ARCHIVE_CLEANUP_BIN="${BOOT_ARCHIVE_CLEANUP_BIN:-/usr/lib/das-backup/boot-archive-cleanup.sh}"
+if [[ -x "$BTRDASD_BIN" ]]; then
+    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
+else
+    echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
+    exit 1
+fi
+
+# Build associative arrays from config
+declare -A DAS_SERIALS=()           # legacy: anchor serial per label
+declare -A DAS_SERIALS_LIST=()      # space-separated list of all expected serials
+declare -A TARGET_MOUNT_UUIDS=()    # BTRFS FS UUID for mount-by-UUID, "" if unset
+declare -A TARGET_MOUNTS=()
+declare -A TARGET_NAMES=()
+declare -A TARGET_ROLES=()
+declare -A MOUNT_ROLES=()
+for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+    label_var="DAS_TARGET_${i}_LABEL"
+    serial_var="DAS_TARGET_${i}_SERIAL"
+    serials_var="DAS_TARGET_${i}_SERIALS"
+    uuid_var="DAS_TARGET_${i}_MOUNT_UUID"
+    mount_var="DAS_TARGET_${i}_MOUNT"
+    name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+    role_var="DAS_TARGET_${i}_ROLE"
+    label="${!label_var}"
+    DAS_SERIALS[$label]="${!serial_var}"
+    # SERIALS list (new env var) — fall back to legacy single SERIAL when not emitted
+    DAS_SERIALS_LIST[$label]="${!serials_var:-${!serial_var}}"
+    TARGET_MOUNT_UUIDS[$label]="${!uuid_var:-}"
+    TARGET_MOUNTS[$label]="${!mount_var}"
+    TARGET_ROLES[$label]="${!role_var}"
+    MOUNT_ROLES[${!mount_var}]="${!role_var}"
+    name_val="${!name_var}"
+    if [[ -n "${name_val:-}" ]]; then
+        TARGET_NAMES[${!mount_var}]="$name_val"
+    else
+        TARGET_NAMES[${!mount_var}]="$label"
+    fi
+done
+
+# Source volumes and devices from config
+declare -A SOURCE_VOLUMES=()
+declare -A SOURCE_DEVICES=()
+declare -A SOURCE_SNAPSHOT_DIRS=()
+for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
+    label_var="DAS_SOURCE_${i}_LABEL"
+    vol_var="DAS_SOURCE_${i}_VOLUME"
+    dev_var="DAS_SOURCE_${i}_DEVICE"
+    snap_var="DAS_SOURCE_${i}_SNAPSHOT_DIR"
+    SOURCE_VOLUMES[${!label_var}]="${!vol_var}"
+    SOURCE_DEVICES[${!label_var}]="${!dev_var}"
+    snap_val="${!snap_var}"
+    if [[ -n "${snap_val:-}" ]]; then
+        SOURCE_SNAPSHOT_DIRS[${!label_var}]="$snap_val"
+    fi
+done
+
+# Logging (now from config)
+LOG_FILE="$DAS_LOG_FILE"
+
+# Email and growth tracking (now from config)
+# Reports are submitted unauthenticated to the local mail relay named by
+# DAS_EMAIL_SMTP_HOST/PORT (exported by `btrdasd config dump-env`). This script
+# holds no mail credential — the relay authenticates upstream by envelope sender
+# using a key readable only by root. See .claude/rules/backup.md §Email Reports.
+GROWTH_LOG="$DAS_GROWTH_LOG"
+LAST_REPORT="$DAS_LAST_REPORT"
+
+# All target mount points (space-separated string from config -> array)
+IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
+
+# Throughput tracking (populated at runtime)
+declare -A USAGE_BEFORE=()
+declare -A USAGE_AFTER=()
+BTRBK_START_TIME=0
+BTRBK_END_TIME=0
+
+# Operation status tracking (for email report)
+declare -A OP_STATUS=()
+
+# Report-time cache — populated by capture_report_data() while targets are
+# still mounted, BEFORE unmount_all() runs in main(). generate_capacity_
+# section()/generate_growth_section() and the LATEST SNAPSHOTS line in
+# generate_report() read ONLY these cached values (never a live mountpoint/
+# df/btrbk call), so the report can be built after unmount without losing
+# data and an unmount failure still lands in the same run's email. Tracks
+# bd DAS-Backup-Manager-ecg.
+declare -A CAPACITY_USED=()
+declare -A CAPACITY_AVAIL=()
+declare -A CAPACITY_PCT=()
+declare -A AVAIL_BYTES=()
+REPORT_TARGETS=()
+BTRBK_LATEST=""
+BTRBK_LATEST_RAW=""
+
+# Track whether backup run has been recorded (prevents double-recording)
+BACKUP_RUN_RECORDED="false"
+# Track whether we're in a real (non-dryrun) backup
+BACKUP_MODE_REAL="false"
+# Track force_full for cleanup trap access
+BACKUP_FORCE_FULL="false"
+# Set as the LAST statement of main() on the clean-completion path (both
+# real-run and dryrun). While "false", the EXIT trap (cleanup()) treats
+# termination as an abort and runs its full recovery body; once "true",
+# cleanup() no-ops immediately (unmount_all/record_backup_run_in_db already
+# ran in main()'s own body for a clean run). bd DAS-Backup-Manager-oeo.
+SCRIPT_COMPLETED="false"
+# Set inside main() the moment this process actually OWNS the shared DAS
+# mountpoints — immediately after acquire_maintenance_lock() returns (see
+# the arming site in main() for the exact line and full rationale). Until
+# then, cleanup() must NOT run its recovery body even though the EXIT trap
+# is already installed and ALL_TARGET_MOUNTS is already populated (both
+# happen well before main() is entered): indexer/src/scrub.rs mounts the
+# SAME /mnt/backup-* paths under the protection of that same maintenance
+# lock, and states its own invariant explicitly — "a backup can never
+# unmount a filesystem out from under a running scrub". An abort inside
+# main() BEFORE the maintenance lock is held (a `--typo` usage error,
+# check_root() failing) would otherwise call unmount_all() over those same
+# paths with no exclusivity guarantee against a live scrub pass holding one
+# of them. CLEANUP_ARMED is what keeps that invariant true on backup's
+# abort paths, not just its happy path. bd DAS-Backup-Manager-oeo.
+CLEANUP_ARMED="false"
+
+# Colors for interactive output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+log() {
+    local level="$1"
+    local msg="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
+
+    case "$level" in
+        INFO)  echo -e "${GREEN}[INFO]${NC} $msg" ;;
+        WARN)  echo -e "${YELLOW}[WARN]${NC} $msg" ;;
+        ERROR) echo -e "${RED}[ERROR]${NC} $msg" ;;
+    esac
+}
+
+log_info()  { log "INFO" "$1"; }
+log_warn()  { log "WARN" "$1"; }
+log_error() { log "ERROR" "$1"; }
+
+# Track operation status for the email report
+record_op() {
+    local op="$1" result="$2" detail="${3:-}"
+    OP_STATUS[$op]="$result"
+    if [[ -n "$detail" ]]; then
+        OP_STATUS["${op}_detail"]="$detail"
+    fi
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+# Acquire the blocking maintenance lock — the backup side of the mutual-hold
+# interlock shared with the scrub engine (indexer/src/scrub.rs). Must be
+# called AFTER the fd-9 singleton lock succeeds and BEFORE any mount work,
+# held open (fd 8) to process exit — same "open once, let process exit
+# release it" lifetime as the singleton lock above.
+#
+# A short non-blocking probe runs first so ordinary sub-second contention
+# stays quiet. If the lock is still held, a visible line is logged and the
+# call falls through to a genuinely blocking flock. This is a deferral,
+# never a cancellation: a backup whose scheduled time lands mid-scrub waits
+# and starts the moment the scrub releases the lock. The wait duration is
+# logged and recorded via record_op so a non-trivial wait is visible in the
+# journal (and, for a same-run report, the email). Mirrors scrub.rs's
+# acquire_blocking() announce-then-block pattern (5s announce threshold);
+# the 15-minute re-announce loop it also has is not reproduced here for
+# simplicity — a single "waiting" line plus the acquired-with-duration line
+# meets the brief's documented "at least" bar and keeps this function free
+# of background-job cleanup edge cases.
+acquire_maintenance_lock() {
+    exec 8>"$MAINTENANCE_LOCKFILE"
+    if flock -n 8; then
+        return
+    fi
+
+    # Mirrors scrub.rs's LOCK_WAIT_ANNOUNCE_SECS=5s probe before announcing.
+    sleep 5
+    if flock -n 8; then
+        return
+    fi
+
+    log_info "DAS maintenance lock held (scrub in progress?) — waiting..."
+    local wait_start
+    wait_start=$(date +%s)
+
+    flock 8
+
+    local wait_secs
+    wait_secs=$(( $(date +%s) - wait_start ))
+    log_info "DAS maintenance lock acquired after waiting ${wait_secs}s"
+    record_op "lock_wait" "OK" "waited ${wait_secs}s for $MAINTENANCE_LOCKFILE"
+}
+
+# Find device by serial number
+find_device_by_serial() {
+    local serial="$1"
+    local dev dev_serial
+    for dev in /dev/sd[a-z] /dev/sd[a-z][a-z]; do
+        if [[ -b "$dev" ]]; then
+            dev_serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}')
+            if [[ "$dev_serial" == "$serial" ]]; then
+                echo "$dev"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+check_das_connected() {
+    log_info "Detecting DAS drives by serial number..."
+
+    # Each target may have one or more expected serials (RAID-1 → 2). For each
+    # target we record the *first* device found in DISCOVERED_DEVICES (used by
+    # legacy code paths) and the *availability* in TARGET_AVAILABLE.
+    #
+    # A target is AVAILABLE when:
+    #   - mount_uuid is set, AND any expected serial is present OR the FS UUID
+    #     itself is discoverable on the system (BTRFS multi-device superblock
+    #     can satisfy this from the surviving leg alone)
+    #   - or, mount_uuid is unset (legacy targets) AND at least one expected
+    #     serial is present
+    #
+    # An UNAVAILABLE primary target aborts the run; an unavailable mirror is
+    # skipped with a warning. RAID-1 partial-membership is degraded, not an
+    # outage — we proceed with a warning.
+    declare -gA DISCOVERED_DEVICES=()
+    declare -gA TARGET_AVAILABLE=()
+    local any_primary_available="false"
+    local any_primary_configured="false"
+
+    for label in "${!DAS_SERIALS[@]}"; do
+        local serials_list="${DAS_SERIALS_LIST[$label]}"
+        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
+        local role="${TARGET_ROLES[$label]}"
+        if [[ "$role" == "primary" ]]; then
+            any_primary_configured="true"
+        fi
+
+        local first_dev=""
+        local -a found_devs=()
+        local -a missing_serials=()
+        local -a found_serials=()
+        local serial
+        for serial in $serials_list; do
+            local dev
+            dev=$(find_device_by_serial "$serial") || dev=""
+            if [[ -n "$dev" ]]; then
+                found_devs+=("$dev")
+                found_serials+=("$serial")
+                if [[ -z "$first_dev" ]]; then
+                    first_dev="$dev"
+                fi
+            else
+                missing_serials+=("$serial")
+            fi
+        done
+
+        local available="false"
+        # Path 1: mount_uuid known → BTRFS can satisfy from any one leg
+        if [[ -n "$uuid" ]]; then
+            if (( ${#found_devs[@]} > 0 )); then
+                available="true"
+            elif blkid -U "$uuid" >/dev/null 2>&1; then
+                # FS UUID resolves on this host even without a configured serial
+                # match (e.g. a replacement drive with a yet-unknown serial).
+                available="true"
+                first_dev="$(blkid -U "$uuid" 2>/dev/null | sed 's/[0-9]*$//')"
+            fi
+        else
+            # Path 2: legacy device-by-serial only
+            if (( ${#found_devs[@]} > 0 )); then
+                available="true"
+            fi
+        fi
+
+        TARGET_AVAILABLE[$label]="$available"
+        if [[ "$available" == "true" ]]; then
+            DISCOVERED_DEVICES[$label]="$first_dev"
+            if (( ${#missing_serials[@]} > 0 )); then
+                log_warn "  $label: present=[${found_serials[*]}] missing=[${missing_serials[*]}] — RAID-1 degraded, proceeding"
+            else
+                log_info "  $label: $first_dev (${found_serials[*]:-<uuid-only>}) — $role"
+            fi
+            if [[ "$role" == "primary" ]]; then
+                any_primary_available="true"
+            fi
+        else
+            if [[ "$role" == "primary" ]]; then
+                log_error "  $label ($role): no expected drives present and no mountable UUID"
+                log_error "    expected serials: ${serials_list:-<none>}"
+                log_error "    mount UUID:       ${uuid:-<unset>}"
+            else
+                log_warn "  $label ($role): no expected drives present — will skip"
+            fi
+        fi
+    done
+
+    # Only abort when at least one primary was configured AND none are reachable.
+    if [[ "$any_primary_configured" == "true" && "$any_primary_available" != "true" ]]; then
+        log_error "No primary backup target is available — aborting"
+        log_error "Is the DAS connected and powered on?"
+        exit 1
+    fi
+}
+
+set_io_scheduler() {
+    log_info "Setting I/O scheduler to $DAS_IO_SCHEDULER for DAS drives..."
+
+    for label in "${!DISCOVERED_DEVICES[@]}"; do
+        local drive="${DISCOVERED_DEVICES[$label]}"
+        if [[ -n "$drive" && -b "$drive" ]]; then
+            local dev="${drive#/dev/}"
+            if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
+                echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+create_mount_points() {
+    log_info "Creating mount points..."
+    for label in "${!SOURCE_VOLUMES[@]}"; do
+        mkdir -p "${SOURCE_VOLUMES[$label]}"
+    done
+
+    # Only create mountpoint dirs for targets we actually plan to mount.
+    # Bare directories at $mnt are a foot-gun: btrbk's config references
+    # them, and if the underlying DAS filesystem isn't mounted there at
+    # backup time, btrbk will silently write to the bare directory on /
+    # (the NVMe root), filling the root filesystem. This happened in May
+    # 2026 when the original 22TB drive was removed and a backup ran
+    # before the replacement was in place — see bd DAS-Backup-Manager-9on.
+    #
+    # For UNAVAILABLE targets, proactively rmdir any pre-existing empty
+    # mountpoint dir so btrbk's path is non-existent at write time
+    # (btrbk fails fast and safely). If the dir is non-empty, that's
+    # evidence a prior write hit the bare dir — refuse to proceed.
+    for label in "${!TARGET_MOUNTS[@]}"; do
+        local mnt="${TARGET_MOUNTS[$label]}"
+        local available="${TARGET_AVAILABLE[$label]:-false}"
+        if [[ "$available" == "true" ]]; then
+            mkdir -p "$mnt"
+            continue
+        fi
+
+        if [[ ! -e "$mnt" ]]; then
+            continue   # already non-existent — safe, nothing to do
+        fi
+
+        # Already mounted from a prior run? Try to unmount cleanly first.
+        # (Should not happen given mount_targets symmetry, but be defensive.)
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            log_warn "  $label is unavailable but $mnt is currently mounted — attempting umount"
+            if ! umount "$mnt" 2>/dev/null; then
+                log_error "  $label: refusing to proceed — $mnt is mounted but target is marked unavailable"
+                exit 1
+            fi
+        fi
+
+        # Now $mnt should be a bare directory. Remove it if empty.
+        if rmdir "$mnt" 2>/dev/null; then
+            log_info "  Removed pre-existing bare mountpoint $mnt (target unavailable)"
+        else
+            log_error "  ABORTING: target $label is unavailable but $mnt is non-empty."
+            log_error "  This is the failure pattern that filled / in May 2026: a prior backup"
+            log_error "  wrote data to a bare directory because the DAS target wasn't mounted."
+            log_error "  Inspect $mnt manually, move/delete its contents (likely on /), and re-run."
+            log_error "  See bd DAS-Backup-Manager-9on."
+            exit 1
+        fi
+    done
+}
+
+mount_sources() {
+    log_info "Mounting source top-level volumes..."
+
+    for label in "${!SOURCE_VOLUMES[@]}"; do
+        local mnt="${SOURCE_VOLUMES[$label]}"
+        local dev="${SOURCE_DEVICES[$label]}"
+        if ! mountpoint -q "$mnt"; then
+            if [[ "$dev" == UUID=* ]]; then
+                # UUID-based mount (stable across device letter changes)
+                mount -t btrfs -o subvolid=5 "$dev" "$mnt"
+            else
+                mount -o subvolid=5 "$dev" "$mnt"
+            fi
+            log_info "  Mounted $label at $mnt"
+        fi
+    done
+}
+
+mount_targets() {
+    log_info "Mounting backup targets..."
+
+    for label in "${!TARGET_MOUNTS[@]}"; do
+        local mnt="${TARGET_MOUNTS[$label]}"
+        local available="${TARGET_AVAILABLE[$label]:-false}"
+        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
+        local role="${TARGET_ROLES[$label]}"
+
+        if [[ "$available" != "true" ]]; then
+            continue
+        fi
+
+        if mountpoint -q "$mnt"; then
+            continue
+        fi
+
+        # Prefer mount-by-UUID when configured. BTRFS auto-discovers all
+        # present members from any single one's superblock, so a degraded
+        # RAID-1 (one leg missing) still mounts cleanly. The DAS_MOUNT_OPTS
+        # config value is expected to include `degraded` for RAID-1 targets.
+        if [[ -n "$uuid" ]]; then
+            if mount -t btrfs -o "$DAS_MOUNT_OPTS" "UUID=$uuid" "$mnt"; then
+                log_info "  Mounted $label at $mnt (UUID=$uuid)"
+                continue
+            else
+                log_warn "  UUID=$uuid mount failed for $label — falling back to device-based mount"
+            fi
+        fi
+
+        # Legacy device-by-serial path (used when mount_uuid is unset)
+        local dev="${DISCOVERED_DEVICES[$label]:-}"
+        if [[ -z "$dev" ]]; then
+            log_warn "  No discovered device for $label and no UUID configured — skipping"
+            continue
+        fi
+
+        local part_dev
+        if [[ "$role" == "primary" ]]; then
+            part_dev="${dev}1"  # Single partition, whole-disk BTRFS
+        else
+            part_dev="${dev}2"  # Partition 2 for bootable drives (partition 1 = ESP)
+        fi
+
+        if [[ ! -b "$part_dev" ]]; then
+            log_warn "  Partition $part_dev not found — skipping $label"
+            continue
+        fi
+
+        if mount -o "$DAS_MOUNT_OPTS" "$part_dev" "$mnt"; then
+            log_info "  Mounted $label at $mnt ($part_dev)"
+        else
+            log_warn "  Could not mount $label at $mnt — btrbk will skip it"
+        fi
+    done
+}
+
+create_snapshot_dirs() {
+    # Each [[source]] in config.toml declares snapshot_dir relative to its
+    # volume root. Resolve to an absolute path before mkdir so the directory
+    # lands inside the source's volume rather than the script's cwd
+    # (systemd-started services run with cwd=/, where mkdir would silently
+    # create the dir on the root filesystem — see DAS-Backup-Manager-0p2).
+    log_info "Creating btrbk snapshot directories..."
+    for label in "${!SOURCE_SNAPSHOT_DIRS[@]}"; do
+        local snap_dir="${SOURCE_SNAPSHOT_DIRS[$label]}"
+        if [[ -z "$snap_dir" ]]; then
+            continue
+        fi
+
+        local abs_dir
+        if [[ "$snap_dir" = /* ]]; then
+            abs_dir="$snap_dir"
+        else
+            local volume="${SOURCE_VOLUMES[$label]:-}"
+            if [[ -z "$volume" ]]; then
+                log_warn "  $label: no source volume known, cannot resolve snapshot_dir '$snap_dir' — skipping"
+                continue
+            fi
+            abs_dir="${volume%/}/$snap_dir"
+        fi
+
+        if ! mkdir -p "$abs_dir" 2>/dev/null; then
+            log_warn "  $label: failed to create snapshot_dir $abs_dir (mkdir error)"
+            continue
+        fi
+        log_info "  $label: $abs_dir"
+    done
+}
+
+create_target_dirs() {
+    log_info "Creating target directory structure..."
+
+    # Collect all target subdirs from sources
+    local -a all_subdirs=()
+    for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
+        local subdirs_var="DAS_SOURCE_${i}_TARGET_SUBDIRS"
+        local subdirs="${!subdirs_var:-}"
+        if [[ -n "$subdirs" ]]; then
+            IFS=' ' read -ra parts <<< "$subdirs"
+            all_subdirs+=("${parts[@]}")
+        fi
+    done
+
+    # Create subdirs on every mounted target
+    for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+        local mount_var="DAS_TARGET_${i}_MOUNT"
+        local mnt="${!mount_var}"
+
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+
+        for subdir in "${all_subdirs[@]}"; do
+            mkdir -p "$mnt/$subdir"
+        done
+    done
+}
+
+# Verify EVERY configured target is in one of two safe states before invoking
+# btrbk:
+#   1. Real mountpoint backed by the expected filesystem (UUID match preferred,
+#      device-serial match as fallback). btrbk will write to the DAS as
+#      intended.
+#   2. Non-existent on disk (no directory at $mnt). btrbk will fail safely
+#      with a missing-path error for that target rather than writing to /.
+#
+# Anything else — a bare directory at $mnt, or a mountpoint backed by an
+# UNEXPECTED filesystem (wrong UUID, wrong serial, root filesystem
+# shadowing the path) — is the May 2026 foot-gun and we ABORT.
+#
+# This is the last gate before btrbk gets to make irreversible decisions.
+# Tracks bd DAS-Backup-Manager-9on.
+verify_targets_before_btrbk() {
+    log_info "Verifying every backup target is backed by an expected DAS device..."
+
+    local violations=()
+
+    for label in "${!TARGET_MOUNTS[@]}"; do
+        local mnt="${TARGET_MOUNTS[$label]}"
+        local available="${TARGET_AVAILABLE[$label]:-false}"
+        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
+        local serials_list="${DAS_SERIALS_LIST[$label]}"
+        local role="${TARGET_ROLES[$label]}"
+
+        # State A: target intentionally not active this run (no DAS drive
+        # present, mirror role). Confirmed-safe ONLY if $mnt does not exist;
+        # otherwise btrbk could still write to a bare dir.
+        if [[ "$available" != "true" ]]; then
+            if [[ -e "$mnt" ]]; then
+                violations+=("$label: marked unavailable but $mnt still exists (would let btrbk write to bare dir on /)")
+            fi
+            continue
+        fi
+
+        # State B: target should be active — MUST be a real mountpoint.
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            violations+=("$label ($role): expected mounted but $mnt is NOT a mountpoint (mount failed silently in mount_targets)")
+            continue
+        fi
+
+        # State B verification: the mounted filesystem must be the one we
+        # expected, not some other filesystem (or worse, the root FS shadowing
+        # an unmounted path). Prefer UUID match (works for BTRFS RAID-1 even
+        # under degraded mount), fall back to disk serial.
+        if [[ -n "$uuid" ]]; then
+            local fs_uuid
+            fs_uuid=$(findmnt -n -o UUID --target "$mnt" 2>/dev/null || true)
+            if [[ "$fs_uuid" != "$uuid" ]]; then
+                violations+=("$label: $mnt has fs UUID '${fs_uuid:-<none>}', expected '$uuid' — different filesystem mounted here")
+                continue
+            fi
+            log_info "  $label: OK ($mnt → UUID=$fs_uuid)"
+            continue
+        fi
+
+        # Legacy device-by-serial verification (used when mount_uuid is unset)
+        local mount_src
+        mount_src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null || true)
+        if [[ -z "$mount_src" ]]; then
+            violations+=("$label: $mnt is a mountpoint but findmnt could not resolve its source device")
+            continue
+        fi
+        local mount_dev="${mount_src%%[0-9]*}"   # /dev/sde1 → /dev/sde
+        local got_serial
+        got_serial=$(smartctl -i "$mount_dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
+        local serial_match="false"
+        local expected
+        for expected in $serials_list; do
+            if [[ "$got_serial" == "$expected" ]]; then
+                serial_match="true"
+                break
+            fi
+        done
+        if [[ "$serial_match" != "true" ]]; then
+            violations+=("$label: $mnt mounted from $mount_src (serial='${got_serial:-?}'), expected one of: $serials_list")
+            continue
+        fi
+        log_info "  $label: OK ($mnt → $mount_src, serial=$got_serial)"
+    done
+
+    if (( ${#violations[@]} > 0 )); then
+        log_error "============================================================"
+        log_error "ABORTING — refusing to invoke btrbk. Target verification failed:"
+        log_error ""
+        local v
+        for v in "${violations[@]}"; do
+            log_error "  - $v"
+        done
+        log_error ""
+        log_error "Continuing would let btrbk write to a bare directory on the root"
+        log_error "filesystem, filling /. This is the May 2026 incident pattern."
+        log_error "See bd DAS-Backup-Manager-9on for the full failure-mode writeup."
+        log_error "============================================================"
+        record_op "verify_targets" "FAIL" "${#violations[@]} violation(s)"
+        exit 1
+    fi
+
+    log_info "All backup targets verified — safe to invoke btrbk."
+    record_op "verify_targets" "OK"
+}
+
+run_btrbk() {
+    local mode="${1:-run}"
+
+    log_info "Running btrbk ($mode)..."
+
+    if [[ "$mode" == "dryrun" ]]; then
+        # Guarded the same way the real-run branch below always was: under
+        # set -euo pipefail an unguarded `btrbk dryrun` failure aborted the
+        # whole script with no record_op entry at all (bd DAS-Backup-Manager-vuw
+        # — a stale source entry in config.toml made this a real, reproducible
+        # failure until the config was fixed). Soft-fail instead, matching
+        # every other btrbk-adjacent operation in this script.
+        if btrbk -c "$DAS_BTRBK_CONF" dryrun; then
+            record_op "btrbk" "OK" "dryrun"
+            log_info "btrbk dryrun completed"
+        else
+            record_op "btrbk" "FAIL" "dryrun exit code $?"
+            log_error "btrbk dryrun failed"
+        fi
+    else
+        if btrbk -c "$DAS_BTRBK_CONF" run; then
+            record_op "btrbk" "OK"
+            log_info "btrbk completed"
+        else
+            record_op "btrbk" "FAIL" "exit code $?"
+            log_error "btrbk failed"
+        fi
+    fi
+}
+
+update_boot_subvolumes() {
+    local force="${1:-false}"
+    local updated=0 skipped=0 failed=0
+    # One timestamp per run (not per subvolume/target) — matches the Rust
+    # archive_boot() format exactly so boot-archive-cleanup.sh's
+    # parse_archive_timestamp() can parse either origin's archives.
+    local ts
+    ts=$(date +%Y%m%dT%H%M%S)
+
+    log_info "Updating stable boot subvolumes..."
+
+    # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
+    # bootable systems and must never have their @ replaced with host snapshots.
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+
+        # Skip mirror targets — they have their own OS installations
+        local mount_role="${MOUNT_ROLES[$mnt]:-}"
+        if [[ "$mount_role" == "mirror" ]]; then
+            log_info "  [$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")] Skipping mirror target (independent OS)"
+            (( skipped += 1 ))
+            continue
+        fi
+
+        local label
+        label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
+        # `|| true` guards against `set -o pipefail` + `set -e` killing the run when
+        # grep finds zero matches — the empty-string check below is the intended path.
+        #
+        # Snapshot names come straight from /etc/btrbk/btrbk.conf's per-subvolume
+        # `snapshot_name` (nvme volume: @ -> "root-", @home -> "home"), so the
+        # on-disk names are "root-.<TS>" and "home.<TS>" -- NOT "root.<TS>". A
+        # bare `nvme/root\.` pattern (root immediately followed by a dot) has
+        # NEVER matched "root-.<TS>" (bd DAS-Backup-Manager-ycr, pre-existing at
+        # e363919, predates this file's v4.x history) -- it silently found zero
+        # snapshots on every run, so this whole function no-op'd on every target
+        # whose @ subvolume already existed, with no error, just a
+        # "No btrbk snapshots found, skipping" warning that looked like a benign
+        # first-run condition instead of a permanent pattern bug. Both patterns
+        # are anchored to a full `-<TS>`/`.<TS>` timestamp suffix so a rename in
+        # btrbk.conf breaks this loudly (empty match -> the skip warning below)
+        # rather than silently matching an unrelated subvolume (e.g.
+        # "root-root.<TS>", a different snapshot_name entirely, which the old
+        # unanchored pattern happened not to match only by the accident of "root"
+        # not being immediately followed by "."). bd DAS-Backup-Manager-01u (the
+        # config-vs-script drift detector) is the systemic guard against this
+        # class of bug recurring for a *different* rename in the future.
+        #
+        # Timestamp suffix is btrbk's default `timestamp_format long`
+        # (btrbk.conf(5)): YYYYMMDD<T>hhmm, i.e. 8 digits + T + 4 digits
+        # (HHMM, no seconds) — verified live against real snapshot names
+        # below, NOT hhmmss/6 digits. An optional "_N" collision suffix is
+        # appended by btrbk if two snapshots land on the exact same minute.
+        local latest_root
+        latest_root=$(btrfs subvolume list "$mnt" 2>/dev/null | grep -E 'nvme/root-\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
+        local latest_home
+        latest_home=$(btrfs subvolume list "$mnt" 2>/dev/null | grep -E 'nvme/home\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
+
+        if [[ -z "$latest_root" || -z "$latest_home" ]]; then
+            log_warn "  [$label] No btrbk snapshots found, skipping"
+            (( skipped += 1 ))
+            continue
+        fi
+
+        log_info "  [$label] Latest root: $latest_root"
+        log_info "  [$label] Latest home: $latest_home"
+
+        # Update @ subvolume (archive-then-swap: archive the outgoing @ as a
+        # read-only snapshot BEFORE the create-then-swap replacement, so the
+        # only copy of the outgoing subvolume is never destroyed. If the
+        # archive snapshot fails, skip the recreation entirely for this
+        # subvolume — never delete @ without a preserved archive.)
+        if btrfs subvolume show "$mnt/@" &>/dev/null; then
+            if [[ "$force" == "true" ]]; then
+                if ! btrfs subvolume snapshot -r "$mnt/@" "$mnt/@.archive.$ts"; then
+                    log_error "  [$label] Failed to archive @ -> @.archive.$ts — skipping recreation (old @ preserved)"
+                    (( failed += 1 ))
+                elif btrfs subvolume snapshot "$mnt/$latest_root" "$mnt/@.new" && \
+                     btrfs subvolume delete "$mnt/@" && \
+                     mv "$mnt/@.new" "$mnt/@"; then
+                    log_info "  [$label] Recreated @ from $latest_root (archived old @ -> @.archive.$ts)"
+                    (( updated += 1 ))
+                else
+                    log_error "  [$label] Failed to recreate @ (archive @.archive.$ts was created)"
+                    (( failed += 1 ))
+                fi
+            else
+                log_info "  [$label] @ exists, skipping (use --full to recreate)"
+                (( skipped += 1 ))
+            fi
+        else
+            if btrfs subvolume snapshot "$mnt/$latest_root" "$mnt/@"; then
+                log_info "  [$label] Created @ from $latest_root"
+                (( updated += 1 ))
+            else
+                log_error "  [$label] Failed to create @"
+                (( failed += 1 ))
+            fi
+        fi
+
+        # Update @home subvolume (archive-then-swap — see @ handling above for
+        # the archive-before-delete rationale).
+        if btrfs subvolume show "$mnt/@home" &>/dev/null; then
+            if [[ "$force" == "true" ]]; then
+                if ! btrfs subvolume snapshot -r "$mnt/@home" "$mnt/@home.archive.$ts"; then
+                    log_error "  [$label] Failed to archive @home -> @home.archive.$ts — skipping recreation (old @home preserved)"
+                    (( failed += 1 ))
+                elif btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home.new" && \
+                     btrfs subvolume delete "$mnt/@home" && \
+                     mv "$mnt/@home.new" "$mnt/@home"; then
+                    log_info "  [$label] Recreated @home from $latest_home (archived old @home -> @home.archive.$ts)"
+                    (( updated += 1 ))
+                else
+                    log_error "  [$label] Failed to recreate @home (archive @home.archive.$ts was created)"
+                    (( failed += 1 ))
+                fi
+            else
+                log_info "  [$label] @home exists, skipping (use --full to recreate)"
+                (( skipped += 1 ))
+            fi
+        else
+            if btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home"; then
+                log_info "  [$label] Created @home from $latest_home"
+                (( updated += 1 ))
+            else
+                log_error "  [$label] Failed to create @home"
+                (( failed += 1 ))
+            fi
+        fi
+    done
+
+    if (( failed > 0 )); then
+        record_op "boot_subvols" "FAIL" "$updated updated, $failed failed"
+    else
+        record_op "boot_subvols" "OK" "$updated updated, $skipped skipped"
+    fi
+}
+
+# Prune expired boot-subvolume archives (@.archive.<TS> / @home.archive.<TS>)
+# created by update_boot_subvolumes(). Must run while targets are still
+# mounted — boot-archive-cleanup.sh silently skips any target mount point
+# that isn't currently mounted. Soft-fail: a pruner failure is recorded for
+# the email report but never aborts the backup, matching run_indexer().
+run_archive_cleanup() {
+    local mode="$1"
+    local args=()
+
+    if [[ "$mode" == "dryrun" ]]; then
+        args+=(--dryrun)
+    fi
+
+    if [[ ! -x "$BOOT_ARCHIVE_CLEANUP_BIN" ]]; then
+        log_warn "Boot archive cleanup script not found at $BOOT_ARCHIVE_CLEANUP_BIN — skipping"
+        record_op "archive_cleanup" "FAIL" "script not found at $BOOT_ARCHIVE_CLEANUP_BIN"
+        return
+    fi
+
+    log_info "Running boot archive cleanup..."
+    local cleanup_output
+    if cleanup_output=$("$BOOT_ARCHIVE_CLEANUP_BIN" "${args[@]}" 2>&1); then
+        record_op "archive_cleanup" "OK" "$(echo "$cleanup_output" | tail -1)"
+        log_info "Boot archive cleanup completed"
+    else
+        local exit_code=$?
+        log_warn "Boot archive cleanup failed (non-fatal): $cleanup_output"
+        record_op "archive_cleanup" "FAIL" "exit code $exit_code"
+    fi
+}
+
+unmount_all() {
+    log_info "Unmounting volumes..."
+
+    local -a failed_mounts=()
+
+    # Unmount DAS backup targets in reverse order (0-based indexing). Every
+    # configured mountpoint is attempted regardless of an earlier failure (a
+    # stuck unmount must not mask the rest). A path that mountpoint(1) does
+    # not consider mounted is skipped, not counted as a failure — the same
+    # filesystem may legitimately be mounted elsewhere too (e.g. udisks under
+    # /run/media), only this script's own mountpoints matter here. These
+    # target mountpoints are the only thing that gates the "safe to
+    # disconnect" claim below — they are the physical DAS enclosure.
+    for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
+        local mnt="${ALL_TARGET_MOUNTS[$i]}"
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+        if ! umount "$mnt" 2>/dev/null; then
+            log_error "  Failed to unmount $mnt"
+            failed_mounts+=("$mnt")
+        fi
+    done
+
+    # Unmount sources — best-effort only, deliberately NOT tracked via
+    # record_op and NOT part of the disconnect gate above. Sources are host
+    # filesystems (NVMe/SSD/HDD/das-storage), not part of the removable DAS
+    # enclosure, so a stuck source unmount has no bearing on whether the DAS
+    # is safe to disconnect. Some sources are host-managed mounts this
+    # script did not create and can legitimately stay busy for reasons
+    # unrelated to backup — das-storage on /dasRaid0 is a real example: it
+    # hosts running libvirt VMs and can never unmount while any are up,
+    # which would otherwise fire a FAIL on every single nightly run. Still
+    # logged (not silently swallowed) so a genuinely stuck source is visible
+    # in the journal rather than invisible.
+    for label in "${!SOURCE_VOLUMES[@]}"; do
+        local src_mnt="${SOURCE_VOLUMES[$label]}"
+        if ! mountpoint -q "$src_mnt" 2>/dev/null; then
+            continue
+        fi
+        if ! umount "$src_mnt" 2>/dev/null; then
+            log_warn "  Could not unmount source $label ($src_mnt) — untracked, not a DAS disconnect concern"
+        fi
+    done
+
+    if (( ${#failed_mounts[@]} > 0 )); then
+        local detail="${failed_mounts[*]}"
+        record_op "unmount" "FAIL" "$detail"
+        log_error "Unmount FAILED for: $detail"
+    else
+        record_op "unmount" "OK"
+        log_info "All volumes unmounted"
+    fi
+}
+
+show_stats() {
+    log_info "Backup statistics:"
+    btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null || true
+
+    log_info "Target disk usage:"
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            df -h "$mnt" 2>/dev/null || true
+        fi
+    done
+}
+
+# Get used bytes on a mounted filesystem
+get_used_bytes() {
+    df --output=used -B1 "$1" 2>/dev/null | tail -1 | tr -d ' '
+}
+
+# Format byte count to human-readable string
+format_bytes() {
+    local bytes=$1
+    if (( bytes >= 1073741824 )); then
+        awk "BEGIN {printf \"%.2f GiB\", $bytes / 1073741824}"
+    elif (( bytes >= 1048576 )); then
+        awk "BEGIN {printf \"%.2f MiB\", $bytes / 1048576}"
+    elif (( bytes >= 1024 )); then
+        awk "BEGIN {printf \"%.2f KiB\", $bytes / 1024}"
+    else
+        printf "%d B" "$bytes"
+    fi
+}
+
+# Capture disk usage on all mounted backup targets
+capture_usage() {
+    local phase="$1"  # "before" or "after"
+
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            local used
+            used=$(get_used_bytes "$mnt")
+            if [[ "$phase" == "before" ]]; then
+                USAGE_BEFORE[$mnt]=$used
+            else
+                USAGE_AFTER[$mnt]=$used
+            fi
+        fi
+    done
+
+    if [[ "$phase" == "before" ]]; then
+        BTRBK_START_TIME=$(date +%s)
+    else
+        BTRBK_END_TIME=$(date +%s)
+    fi
+}
+
+# Cache all report data that requires a live mount or a live btrbk call,
+# while targets are still mounted. MUST run before unmount_all() in main()'s
+# real-backup path. generate_capacity_section(), generate_growth_section(),
+# and the LATEST SNAPSHOTS line in generate_report() read only the globals
+# populated here (REPORT_TARGETS, CAPACITY_*, AVAIL_BYTES, BTRBK_LATEST) —
+# no mountpoint/df/btrbk calls after this point. Tracks bd DAS-Backup-Manager-ecg.
+capture_report_data() {
+    REPORT_TARGETS=()
+
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            continue
+        fi
+        REPORT_TARGETS+=("$mnt")
+
+        # `|| true` on both df calls: same set -euo pipefail hazard as
+        # BTRBK_LATEST below, but worse here — capture_report_data() runs as
+        # a bare statement in main() (not inside an if/&&/||), and this
+        # script has no `set -o errtrace`, so a killed df here would NOT
+        # even trigger the ERR trap/cleanup() — unmount_all() would simply
+        # never run, leaving the DAS mounted with no email and no DB row.
+        # A guarded df failure instead leaves df_line/the avail read empty;
+        # the target stays in REPORT_TARGETS (mountpoint -q already
+        # confirmed it's genuinely mounted) and renders as "?"/0 downstream
+        # via the existing ${CAPACITY_*[$mnt]:-?} / ${AVAIL_BYTES[$mnt]:-0}
+        # defaults in generate_capacity_section()/generate_growth_section()
+        # — chosen over silently dropping the target so a genuine target
+        # with a flaky df call still shows up in the report instead of
+        # vanishing from it. Tracks bd DAS-Backup-Manager-ecg.
+        local df_line
+        df_line=$(df -h "$mnt" 2>/dev/null | tail -1) || true
+        CAPACITY_USED[$mnt]=$(echo "$df_line" | awk '{print $3}')
+        CAPACITY_AVAIL[$mnt]=$(echo "$df_line" | awk '{print $4}')
+        CAPACITY_PCT[$mnt]=$(echo "$df_line" | awk '{print $5}')
+
+        AVAIL_BYTES[$mnt]=$(df --output=avail -B1 "$mnt" 2>/dev/null | tail -1 | tr -d ' ') || true
+    done
+
+    # `|| true` is required, not decorative: under set -euo pipefail, a bare
+    # `VAR=$(cmd1 | cmd2)` assignment fails the whole script the instant
+    # `btrbk list latest` returns nonzero (config error, transient lock,
+    # etc.) — the exact class of footgun run_btrbk()'s dryrun branch was
+    # fixed for in v4.3.0 (bd DAS-Backup-Manager-vuw). Falling back to an
+    # empty BTRBK_LATEST is safe: generate_report()'s
+    # ${BTRBK_LATEST:-  (none yet)} already handles empty. Caught live by
+    # the bd DAS-Backup-Manager-ecg verification harness, which reproduced
+    # exactly this abort against a deliberately-broken btrbk config.
+    BTRBK_LATEST=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}') || true
+
+    # Machine-readable copy for the DB counters. The human table's STATUS column
+    # is presentation, not API: btrbk 0.32.7 renders it as "-" for every row and
+    # the "up-to-date" string the counters grepped for no longer appears at all,
+    # which silently zeroed snaps_created/snaps_sent on every run from
+    # 2026-06-26 onward (bd DAS-Backup-Manager-oi0). `--format=raw` emits named
+    # key='value' fields instead, so the counters no longer depend on how btrbk
+    # chooses to lay out a table.
+    BTRBK_LATEST_RAW=$(btrbk -c "$DAS_BTRBK_CONF" --format=raw list latest 2>/dev/null) || true
+}
+
+# Log throughput report for all targets
+log_throughput() {
+    local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
+    local elapsed_min=$(( elapsed / 60 ))
+    local elapsed_sec=$(( elapsed % 60 ))
+
+    log_info "=== Throughput Report ==="
+    log_info "  Elapsed: ${elapsed_min}m ${elapsed_sec}s"
+
+    local total_written=0
+
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
+        local before="${USAGE_BEFORE[$mnt]:-}"
+        local after="${USAGE_AFTER[$mnt]:-}"
+
+        if [[ -z "$before" || -z "$after" ]]; then
+            continue
+        fi
+
+        local delta=$(( after - before ))
+        total_written=$(( total_written + delta ))
+
+        if (( delta <= 0 )); then
+            log_info "  $name: no new data written"
+        elif (( elapsed > 0 )); then
+            local rate_bytes=$(( delta / elapsed ))
+            log_info "  $name: $(format_bytes $delta) @ $(format_bytes $rate_bytes)/s"
+        else
+            log_info "  $name: $(format_bytes $delta)"
+        fi
+    done
+
+    if (( total_written > 0 && elapsed > 0 )); then
+        local total_rate=$(( total_written / elapsed ))
+        log_info "  ─────────────────────────────────────"
+        log_info "  Total: $(format_bytes $total_written) @ $(format_bytes $total_rate)/s"
+    fi
+}
+
+# ============================================================================
+# GROWTH TRACKING
+# ============================================================================
+
+# Append current usage to the growth log for trend analysis
+record_growth() {
+    mkdir -p "$(dirname "$GROWTH_LOG")"
+    local ts
+    ts=$(date '+%Y-%m-%dT%H:%M:%S')
+
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        if mountpoint -q "$mnt" 2>/dev/null; then
+            local used
+            used=$(get_used_bytes "$mnt")
+            echo "$ts $mnt $used" >> "$GROWTH_LOG"
+        fi
+    done
+}
+
+# Compute average daily growth over a lookback period (returns bytes/day)
+compute_growth_stats() {
+    local mnt="$1"
+    local current_used="$2"
+    local lookback_days="$3"
+
+    if [[ ! -f "$GROWTH_LOG" ]]; then
+        echo "0"
+        return
+    fi
+
+    local now
+    now=$(date +%s)
+    local cutoff=$(( now - (lookback_days * 86400) ))
+
+    # Find the oldest entry for this mount within the lookback window
+    local oldest_epoch=0 oldest_used=0
+    local ts entry_mnt entry_used entry_epoch
+    while IFS=' ' read -r ts entry_mnt entry_used; do
+        [[ "$entry_mnt" != "$mnt" ]] && continue
+        # Parse ISO timestamp to epoch
+        entry_epoch=$(date -d "$ts" '+%s' 2>/dev/null || echo 0)
+        if (( entry_epoch >= cutoff && oldest_epoch == 0 )); then
+            oldest_epoch=$entry_epoch
+            oldest_used=$entry_used
+            break
+        fi
+    done < "$GROWTH_LOG"
+
+    if (( oldest_epoch == 0 )); then
+        echo "0"
+        return
+    fi
+
+    local actual_days=$(( (now - oldest_epoch) / 86400 ))
+    if (( actual_days <= 0 )); then
+        echo "0"
+        return
+    fi
+
+    local delta=$(( current_used - oldest_used ))
+    if (( delta < 0 )); then delta=0; fi
+
+    echo $(( delta / actual_days ))
+}
+
+# ============================================================================
+# SMART SUMMARY
+# ============================================================================
+
+# Get quick SMART data for a drive (returns "health|temp|hours|serial")
+get_smart_summary() {
+    local dev="$1"
+    local health temp hours serial
+
+    health=$(smartctl -H "$dev" 2>/dev/null | grep -o "PASSED\|FAILED" || echo "UNKNOWN")
+    temp=$(smartctl -A "$dev" 2>/dev/null | awk '/Temperature_Celsius/{print $10}' || echo "?")
+    hours=$(smartctl -A "$dev" 2>/dev/null | awk '/Power_On_Hours/{print $10}' || echo "?")
+    serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || echo "?")
+
+    echo "${health}|${temp}|${hours}|${serial}"
+}
+
+# ============================================================================
+# CONTENT INDEXER
+# ============================================================================
+
+run_indexer() {
+    if [[ ! -x "$BTRDASD_BIN" ]]; then
+        log_warn "Content indexer not built -- skipping (build with: cargo build --release --manifest-path indexer/Cargo.toml)"
+        record_op "indexer" "SKIP" "binary not found"
+        return
+    fi
+
+    # Find the primary target mount for indexing
+    local primary_mount=""
+    for label in "${!TARGET_ROLES[@]}"; do
+        if [[ "${TARGET_ROLES[$label]}" == "primary" ]]; then
+            primary_mount="${TARGET_MOUNTS[$label]}"
+            break
+        fi
+    done
+
+    if [[ -z "$primary_mount" ]] || ! mountpoint -q "$primary_mount" 2>/dev/null; then
+        log_warn "Primary target not mounted — skipping indexer"
+        record_op "indexer" "SKIP" "primary target not mounted"
+        return
+    fi
+
+    log_info "Running content indexer..."
+    local indexer_output
+    if indexer_output=$("$BTRDASD_BIN" walk "$primary_mount" --db "$DAS_DB_PATH" 2>&1); then
+        record_op "indexer" "OK"
+        log_info "  $indexer_output"
+    else
+        local exit_code=$?
+        log_warn "Content indexer failed (non-fatal)"
+        record_op "indexer" "FAIL" "exit code $exit_code"
+    fi
+}
+
+# ============================================================================
+# EMAIL REPORT
+# ============================================================================
+
+generate_report() {
+    local hostname
+    hostname=$(hostname)
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M')
+    local overall_status="ALL OPERATIONS SUCCESSFUL"
+
+    # Check for any failures
+    for op in "${!OP_STATUS[@]}"; do
+        if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
+            overall_status="FAILURES DETECTED"
+            break
+        fi
+    done
+
+    local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
+    local elapsed_min=$(( elapsed / 60 ))
+    local elapsed_sec=$(( elapsed % 60 ))
+
+    # Build the report
+    cat <<-REPORT
+===============================================================
+  DAS Backup Report — $timestamp
+  Host: $hostname
+  Status: $overall_status
+===============================================================
+
+BACKUP OPERATIONS
+───────────────────────────────────────────────────────────────
+  Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
+  btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
+  Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
+  Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
+  Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
+  Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
+
+THROUGHPUT
+───────────────────────────────────────────────────────────────
+$(generate_throughput_section)
+
+DISK CAPACITY
+───────────────────────────────────────────────────────────────
+$(generate_capacity_section)
+
+GROWTH ANALYSIS
+───────────────────────────────────────────────────────────────
+$(generate_growth_section)
+
+SMART STATUS
+───────────────────────────────────────────────────────────────
+$(generate_smart_section)
+
+LATEST SNAPSHOTS
+───────────────────────────────────────────────────────────────
+${BTRBK_LATEST:-  (none yet)}
+
+===============================================================
+  backup-run.sh v4.4.1
+  Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
+===============================================================
+REPORT
+}
+
+generate_throughput_section() {
+    local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
+    local total_written=0
+
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
+        local before="${USAGE_BEFORE[$mnt]:-}"
+        local after="${USAGE_AFTER[$mnt]:-}"
+
+        if [[ -z "$before" || -z "$after" ]]; then continue; fi
+
+        local delta=$(( after - before ))
+        total_written=$(( total_written + delta ))
+
+        if (( delta <= 0 )); then
+            printf "  %-24s no new data\n" "$name"
+        elif (( elapsed > 0 )); then
+            local rate=$(( delta / elapsed ))
+            printf "  %-24s %s @ %s/s\n" "$name" "$(format_bytes $delta)" "$(format_bytes $rate)"
+        else
+            printf "  %-24s %s\n" "$name" "$(format_bytes $delta)"
+        fi
+    done
+
+    if (( total_written > 0 && elapsed > 0 )); then
+        local total_rate=$(( total_written / elapsed ))
+        printf "  ─────────────────────────────────────\n"
+        printf "  %-24s %s @ %s/s\n" "Total" "$(format_bytes $total_written)" "$(format_bytes $total_rate)"
+    fi
+}
+
+generate_capacity_section() {
+    printf "  %-24s %-10s %-10s %s\n" "Target" "Used" "Avail" "Use%"
+
+    # Reads ONLY the cache populated by capture_report_data() while targets
+    # were still mounted — no live mountpoint/df calls here. See
+    # capture_report_data() for why: this runs after unmount_all() in
+    # main()'s real-backup path. Tracks bd DAS-Backup-Manager-ecg.
+    for mnt in "${REPORT_TARGETS[@]}"; do
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
+        printf "  %-24s %-10s %-10s %s\n" "$name" "${CAPACITY_USED[$mnt]:-?}" "${CAPACITY_AVAIL[$mnt]:-?}" "${CAPACITY_PCT[$mnt]:-?}"
+    done
+}
+
+generate_growth_section() {
+    # Reads ONLY the cache populated by capture_report_data() — see
+    # generate_capacity_section() above. Tracks bd DAS-Backup-Manager-ecg.
+    for mnt in "${REPORT_TARGETS[@]}"; do
+        local name="${TARGET_NAMES[$mnt]:-$mnt}"
+        local current="${USAGE_AFTER[$mnt]:-0}"
+        local today_delta=$(( ${USAGE_AFTER[$mnt]:-0} - ${USAGE_BEFORE[$mnt]:-0} ))
+
+        printf "  %s:\n" "$name"
+        printf "    Today:              +%s\n" "$(format_bytes $today_delta)"
+
+        local avg_7d avg_30d
+        avg_7d=$(compute_growth_stats "$mnt" "$current" 7)
+        avg_30d=$(compute_growth_stats "$mnt" "$current" 30)
+
+        if (( avg_7d > 0 )); then
+            printf "    7-day avg:          %s/day\n" "$(format_bytes "$avg_7d")"
+        fi
+        if (( avg_30d > 0 )); then
+            printf "    30-day avg:         %s/day\n" "$(format_bytes "$avg_30d")"
+        fi
+
+        # Capacity runway projection (cached avail bytes, captured while mounted)
+        local avail_bytes="${AVAIL_BYTES[$mnt]:-0}"
+        local growth_rate=$avg_30d
+        if (( growth_rate <= 0 )); then growth_rate=$avg_7d; fi
+        if (( growth_rate <= 0 && today_delta > 0 )); then growth_rate=$today_delta; fi
+
+        if (( growth_rate > 0 && avail_bytes > 0 )); then
+            local days_left=$(( avail_bytes / growth_rate ))
+            local years_left
+            years_left=$(awk "BEGIN {printf \"%.1f\", $days_left / 365}")
+            printf "    Capacity runway:    ~%s days (~%s years)\n" "$days_left" "$years_left"
+        else
+            printf "    Capacity runway:    no growth trend yet\n"
+        fi
+        echo ""
+    done
+}
+
+generate_smart_section() {
+    for label in "${!DISCOVERED_DEVICES[@]}"; do
+        local drive="${DISCOVERED_DEVICES[$label]}"
+        if [[ -z "$drive" || ! -b "$drive" ]]; then continue; fi
+        local name="${TARGET_NAMES[${TARGET_MOUNTS[$label]}]:-$label}"
+        local smart_data
+        smart_data=$(get_smart_summary "$drive")
+        local health=${smart_data%%|*}; smart_data=${smart_data#*|}
+        local temp=${smart_data%%|*}; smart_data=${smart_data#*|}
+        local hours=${smart_data%%|*}; smart_data=${smart_data#*|}
+        local serial=$smart_data
+        printf "  %-24s %-10s %-8s %s°C  %s hours\n" "$name" "$serial" "$health" "$temp" "$hours"
+    done
+}
+
+send_report() {
+    local report="$1"
+    local overall_status="$2"
+
+    # Always save to file for reference. This happens BEFORE any send attempt so
+    # the report survives a relay outage — a failed send loses nothing.
+    mkdir -p "$(dirname "$LAST_REPORT")"
+    echo "$report" > "$LAST_REPORT"
+    log_info "Report saved to $LAST_REPORT"
+
+    if [[ "${DAS_EMAIL_ENABLED:-false}" != "true" ]]; then
+        log_info "Email reporting disabled in config — report saved only"
+        return 0
+    fi
+
+    # Relay coordinates come from config via `btrdasd config dump-env`. Before
+    # 2026-08-06 these exports existed and nothing read them; the script parsed
+    # Protonmail Bridge credentials instead, so editing [email] in config.toml
+    # had no effect on where mail went.
+    local smtp_url="smtp://${DAS_EMAIL_SMTP_HOST}:${DAS_EMAIL_SMTP_PORT}"
+    local report_to="${DAS_REPORT_TO:-$DAS_EMAIL_TO}"
+    local report_from_addr="${DAS_REPORT_FROM:-$DAS_EMAIL_FROM}"
+
+    if [[ -z "$report_to" || -z "$report_from_addr" ]]; then
+        log_warn "Email enabled but from/to unset in config — report saved but not emailed"
+        return 1
+    fi
+
+    # A bare address gets the standard display name so reports stand out in the
+    # inbox From column; an override that already has one is used verbatim.
+    # s-nail extracts the bracketed address for the SMTP envelope, and the
+    # envelope sender is what the relay keys its upstream credential on.
+    local report_from="$report_from_addr"
+    if [[ "$report_from_addr" != *"<"* ]]; then
+        report_from="DAS Backup ($(hostname -s)) <${report_from_addr}>"
+    fi
+
+    local subject
+    subject="[DAS Backup] $(hostname) — $overall_status — $(date '+%Y-%m-%d %H:%M')"
+
+    # Submit to the local relay: no credentials, no TLS on this hop. The relay
+    # owns the authenticated, certificate-verified leg to the provider.
+    #   smtp-auth=none  — REQUIRED. s-nail defaults to demanding a password for
+    #                     any smtp:// mta and aborts with exit 4 without this.
+    #   nosave          — a failed send otherwise drops the body in
+    #                     /root/dead.letter, which nothing ever reads or prunes.
+    #                     The report is already in $LAST_REPORT.
+    #
+    # stderr is captured rather than discarded: a successful send emits nothing
+    # on stderr (measured), so anything here is the real reason for a failure.
+    # The previous `2>/dev/null` claimed to hide s-nail deprecation warnings
+    # that do not exist, and cost every failure its diagnosis.
+    local mail_err rc
+    mail_err=$(echo "$report" | mailx \
+        -s "$subject" \
+        -r "$report_from" \
+        -S v15-compat \
+        -S "mta=${smtp_url}" \
+        -S "smtp-auth=none" \
+        -S nosave \
+        "$report_to" 2>&1 >/dev/null)
+    rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        log_info "Report emailed to $report_to via $smtp_url"
+        [[ -n "$mail_err" ]] && log_warn "mailx wrote to stderr despite success: $mail_err"
+        return 0
+    else
+        log_warn "Failed to email report to $report_to via $smtp_url (mailx exit $rc) — saved to $LAST_REPORT"
+        [[ -n "$mail_err" ]] && log_warn "mailx: $mail_err"
+        return 1
+    fi
+}
+
+# ============================================================================
+# RECORD BACKUP RUN IN DATABASE
+# ============================================================================
+
+record_backup_run_in_db() {
+    # Guard against double-recording (normal path + cleanup trap)
+    if [[ "$BACKUP_RUN_RECORDED" == "true" ]]; then
+        return 0
+    fi
+
+    local overall_status="$1"
+    local force_full="$2"
+
+    local mode="incremental"
+    if [[ "$force_full" == "true" ]]; then
+        mode="full"
+    fi
+
+    local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
+
+    # Compute total bytes sent across all targets
+    local total_bytes=0
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        local before="${USAGE_BEFORE[$mnt]:-0}"
+        local after="${USAGE_AFTER[$mnt]:-0}"
+        local delta=$(( after - before ))
+        if (( delta > 0 )); then
+            total_bytes=$(( total_bytes + delta ))
+        fi
+    done
+
+    # Count snapshots — read from the cached BTRBK_LATEST populated by
+    # capture_report_data() while targets were still mounted. This function
+    # now runs AFTER unmount_all() in main()'s real-backup path, and a live
+    # `btrbk list latest` call here would see every target's STATUS column
+    # as `-` post-unmount, silently recording snaps-created=0/snaps-sent=0
+    # into the DB the GUI reads on every real run (bd DAS-Backup-Manager-ecg
+    # review finding, reproduced live). BTRBK_LATEST already has its header
+    # line stripped and each data line prefixed with two spaces (built via
+    # `awk 'NR>1{printf "  %s\n", $0}'` in capture_report_data()) — leading
+    # whitespace does not affect `grep -c`'s substring match, so counting
+    # semantics are unchanged from the original raw-output version (whose
+    # `grep -v "^SOURCE_SUBVOLUME"` also only ever stripped the header
+    # line). An empty BTRBK_LATEST (capture failed, or genuinely nothing to
+    # report) leaves both counts at 0, matching the original's behavior when
+    # the live btrbk call failed or produced no non-header output.
+    local snaps_created=0
+    local snaps_sent=0
+    if [[ -n "$BTRBK_LATEST_RAW" ]]; then
+        # One source subvolume yields one snapshot, replicated to N targets, so
+        # the two counts are genuinely different numbers — the old code set
+        # snaps_sent = snaps_created as a proxy, which was never right even while
+        # the grep still matched.
+        snaps_created=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
+            | grep -o "snapshot_subvolume='[^']*'" | sort -u | grep -c . || true)
+        snaps_sent=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
+            | grep -c "target_subvolume='[^']" || true)
+    fi
+
+    # Collect errors from failed operations (newline-separated for DB storage)
+    local error_list=""
+    for op in "${!OP_STATUS[@]}"; do
+        if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
+            local detail="${OP_STATUS[${op}_detail]:-}"
+            if [[ -n "$detail" ]]; then
+                error_list="${error_list:+${error_list}$'\n'}${op}: ${detail}"
+            else
+                error_list="${error_list:+${error_list}$'\n'}${op} failed"
+            fi
+        fi
+    done
+
+    # Build args array to avoid quoting issues with empty values
+    local args=(
+        backup record-run
+        --db "$DAS_DB_PATH"
+        --mode "$mode"
+        --snaps-created "$snaps_created"
+        --snaps-sent "$snaps_sent"
+        --bytes-sent "$total_bytes"
+        --duration-secs "$elapsed"
+    )
+    if [[ "$overall_status" == "SUCCESS" ]]; then
+        args+=(--success)
+    fi
+    if [[ -n "$error_list" ]]; then
+        args+=(--errors "$error_list")
+    fi
+
+    local record_err
+    if record_err=$("$BTRDASD_BIN" "${args[@]}" 2>&1); then
+        log_info "Backup run recorded in database"
+    else
+        log_warn "Failed to record backup run in database: $record_err (non-fatal)"
+    fi
+    BACKUP_RUN_RECORDED="true"
+}
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+
+cleanup() {
+    # First statement, unconditionally: capture the exit status that
+    # triggered this EXIT trap invocation BEFORE any other command in this
+    # function can overwrite $?. This is the status cleanup() must preserve
+    # on exit — 0 for a normal fall-through completion of the script, or the
+    # nonzero status from whatever `exit N` / set -e abort fired the trap.
+    local rc=$?
+
+    # Two independent reasons the recovery body below must NOT run — both
+    # exit silently (no log line), explicit `exit "$rc"` (not fallthrough)
+    # so this no-op path can never alter the process's final status:
+    #   1. SCRIPT_COMPLETED == "true": main() already ran unmount_all()/
+    #      record_backup_run_in_db() itself and reached its own last
+    #      statement — this is the ordinary clean-completion path.
+    #   2. CLEANUP_ARMED != "true": this process has not yet reached the
+    #      point where it actually owns the shared DAS mountpoints (see
+    #      CLEANUP_ARMED's definition in the globals block and its arming
+    #      site in main(), right after acquire_maintenance_lock()). The
+    #      EXIT trap is installed, and ALL_TARGET_MOUNTS is already
+    #      populated, well before main() is even entered — so WITHOUT this
+    #      gate, an abort as early as main()'s own argument-parsing usage
+    #      error (`exit 1` for an unrecognized flag) or a check_root()
+    #      failure would call unmount_all() over ALL_TARGET_MOUNTS before
+    #      this process holds /run/das-maintenance.lock. Those same
+    #      /mnt/backup-* paths are mounted by indexer/src/scrub.rs under
+    #      that identical lock's protection — scrub.rs's own doc comment
+    #      states the invariant this gate exists to preserve: "a backup can
+    #      never unmount a filesystem out from under a running scrub". A
+    #      preserves-the-exit-code silent exit here (0 for e.g. an orderly
+    #      early return, nonzero for a usage error) is correct in both
+    #      cases — neither is "abnormal termination of a run in progress"
+    #      from this process's own perspective. bd DAS-Backup-Manager-oeo.
+    if [[ "$SCRIPT_COMPLETED" == "true" || "$CLEANUP_ARMED" != "true" ]]; then
+        exit "$rc"
+    fi
+
+    log_warn "Cleaning up after abnormal termination (exit code $rc)..."
+
+    # Record the failed backup run if we were in a real backup and haven't
+    # recorded yet. `|| true`: a failure inside record_backup_run_in_db must
+    # not itself abort cleanup() under set -e and skip unmount_all/exit "$rc"
+    # below — record_backup_run_in_db already soft-fails internally (its
+    # BTRDASD_BIN call is guarded by an `if`), this guard is defense in depth
+    # for cleanup() specifically, since cleanup() runs as an EXIT trap where
+    # there is no outer handler left to catch a set -e abort.
+    if [[ "$BACKUP_MODE_REAL" == "true" && "$BACKUP_RUN_RECORDED" == "false" ]]; then
+        # Ensure end time is set (may not be if failure was during btrbk)
+        if (( BTRBK_END_TIME == 0 )); then
+            BTRBK_END_TIME=$(date +%s)
+        fi
+        record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL" || true
+    fi
+
+    # `|| true`: same defense-in-depth rationale as above — unmount_all
+    # already handles its own per-mount failures internally, but a failure
+    # here must never prevent the trailing `exit "$rc"` from running.
+    unmount_all || true
+
+    # Explicit exit, not fallthrough: preserves the original abort status
+    # ($rc) as the process's final exit code rather than letting it become
+    # whatever unmount_all's last internal command happened to return.
+    exit "$rc"
+}
+
+# Installed at top level (not inside main()) so it is active before main()
+# is even called — covering argument-parsing aborts (main()'s `exit 1` on an
+# unrecognized flag) in addition to every abort at any call depth once
+# main() is running. Placed here, after cleanup()'s definition and after the
+# BACKUP_MODE_REAL/BACKUP_RUN_RECORDED/BTRBK_END_TIME/SCRIPT_COMPLETED
+# globals above are already initialized, so cleanup() can never observe an
+# unset variable if something aborts before main() starts. Replaces the old
+# `trap cleanup ERR` (installed inside main(), and only ever effective for a
+# failing command directly in main()'s own body — see the v4.4.1 header
+# note). `trap 'exit 130' INT`/`trap 'exit 143' TERM` convert SIGINT/SIGTERM
+# into an `exit` builtin call with the conventional 128+signum code, so they
+# route through this same EXIT trap instead of bash's default "kill without
+# running EXIT traps" behavior for unhandled fatal signals. A bare
+# `trap 'exit' INT TERM` was tried first and rejected: `exit` with no
+# argument reuses whatever $? happened to be from the last command that ran
+# BEFORE the signal arrived (often 0, e.g. right after a successful
+# mountpoint/df call mid-run) — proven empirically in the harness (kill
+# -TERM mid-run right after a `true`) to yield exit code 0, which would
+# silently satisfy point 5's Sentinel nonzero-exit requirement as a false
+# "success" for an operator-initiated `systemctl stop das-backup` abort. The
+# explicit-code form was proven in the same harness to yield 143 for TERM /
+# 130 for INT regardless of the preceding command's status. See bd
+# DAS-Backup-Manager-oeo.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    local mode="run"
+    local force_full="false"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dryrun|-n)
+                mode="dryrun"
+                ;;
+            --full|-f)
+                force_full="true"
+                ;;
+            *)
+                echo "Usage: $0 [--dryrun|-n] [--full|-f]"
+                echo "  --dryrun  Preview backup without making changes"
+                echo "  --full    Force recreation of boot subvolumes"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$LOG_FILE")"
+
+    echo "========================================"
+    echo "  DAS Backup (config-driven)"
+    echo "  Mode: $mode"
+    echo "  Date: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "========================================"
+    echo ""
+
+    log_info "=== DAS Backup Started ==="
+
+    check_root
+    # Backup side of the mutual-hold interlock with the scrub engine — must
+    # run before any mount work (create_mount_points is the first mounter
+    # below). Blocks (deferral, never cancellation) if a scrub currently
+    # holds /run/das-maintenance.lock.
+    acquire_maintenance_lock
+
+    # Arm cleanup()'s recovery body: acquire_maintenance_lock() just
+    # returned, which means this process now holds /run/das-maintenance.lock
+    # and is the exclusive owner of the shared DAS mountpoints (the same
+    # ones indexer/src/scrub.rs mounts under that lock's protection). Only
+    # from this point on is it safe for an abort's cleanup() to call
+    # unmount_all() over ALL_TARGET_MOUNTS — see CLEANUP_ARMED's definition
+    # in the globals block for the full disaster scenario this closes.
+    # Deliberately placed AFTER acquire_maintenance_lock, not after the
+    # earlier check_root — check_root() itself can still abort with the
+    # recovery body correctly skipped (CLEANUP_ARMED is still "false" then).
+    # bd DAS-Backup-Manager-oeo.
+    CLEANUP_ARMED="true"
+
+    check_das_connected
+    set_io_scheduler
+    create_mount_points
+    mount_sources
+    create_snapshot_dirs
+    mount_targets
+    create_target_dirs
+    verify_targets_before_btrbk
+
+    if [[ "$mode" != "dryrun" ]]; then
+        BACKUP_MODE_REAL="true"
+        BACKUP_FORCE_FULL="$force_full"
+        capture_usage "before"
+    fi
+
+    run_btrbk "$mode"
+
+    if [[ "$mode" != "dryrun" ]]; then
+        capture_usage "after"
+        log_throughput
+        update_boot_subvolumes "$force_full"
+        show_stats
+        run_indexer
+
+        # Record growth data — must still run before unmount (writes to
+        # GROWTH_LOG using live per-target usage figures).
+        record_growth
+
+        # Prune expired boot archives (daily and full runs alike) while
+        # targets are still mounted, before the report is built so pruner
+        # failures are visible in overall_status and the email report.
+        run_archive_cleanup "$mode"
+
+        # Cache capacity/growth/btrbk-latest report data while targets are
+        # still mounted, THEN unmount, THEN build the report. This ordering
+        # (vs. the previous report-before-unmount sequence) is what lets an
+        # unmount failure appear in the SAME run's email and DB row instead
+        # of only the post-unmount console/journal message below. See
+        # capture_report_data() and generate_capacity_section()/
+        # generate_growth_section() for the cache the report now reads from.
+        # Tracks bd DAS-Backup-Manager-ecg.
+        capture_report_data
+        unmount_all
+
+        local overall_status="SUCCESS"
+        for op in "${!OP_STATUS[@]}"; do
+            if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
+                overall_status="FAILURE"
+                break
+            fi
+        done
+
+        local report
+        report=$(generate_report)
+        echo ""
+        echo "$report"
+        send_report "$report" "$overall_status" || \
+            log_warn "Email delivery failed — backup itself completed successfully"
+
+        # Record backup run in the database for GUI history
+        record_backup_run_in_db "$overall_status" "$force_full"
+    else
+        # Dryrun mode never mutates boot subvolumes or sends an email report,
+        # but the pruner still needs a preview pass (its own --dryrun) while
+        # targets are mounted — boot-archive-cleanup.sh silently skips any
+        # target that isn't currently mounted.
+        run_archive_cleanup "$mode"
+        unmount_all
+    fi
+
+    log_info "=== DAS Backup Completed ==="
+    echo ""
+    if [[ "${OP_STATUS[unmount]:-OK}" == "FAIL" ]]; then
+        log_warn "Backup complete, but NOT all volumes unmounted cleanly — DAS is NOT safe to disconnect (still mounted: ${OP_STATUS[unmount_detail]:-unknown})."
+    else
+        log_info "Backup complete. DAS can be safely disconnected."
+    fi
+
+    # Last statement of main(): marks the clean-completion path so the EXIT
+    # trap (cleanup()) no-ops instead of re-running unmount_all/record_
+    # backup_run_in_db, which main() has already run itself by this point on
+    # every reachable path (real-run and dryrun alike). bd DAS-Backup-Manager-oeo.
+    SCRIPT_COMPLETED="true"
+}
+
+main "$@"

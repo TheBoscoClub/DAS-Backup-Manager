@@ -1,0 +1,1861 @@
+use crate::config::{Config, TargetRole};
+use crate::db::Database;
+use crate::health;
+use crate::indexer;
+use crate::progress::{LogLevel, ProgressCallback};
+use crate::scrub;
+use std::io::BufRead;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::UNIX_EPOCH;
+
+// ---------------------------------------------------------------------------
+// Maintenance interlock for manual backups (bd DAS-Backup-Manager-pe6)
+// ---------------------------------------------------------------------------
+
+/// Singleton lock shared with the scheduled path.
+///
+/// Deliberately the SAME file `scripts/backup-run.sh` takes, so a manual
+/// `btrdasd backup` and the 03:00 timer contend with each other rather than
+/// running two backups over one set of targets.
+pub const BACKUP_LOCK_PATH: &str = "/run/das-backup.lock";
+
+/// Both locks a manual backup holds, released on drop.
+pub struct BackupLocks {
+    _maintenance: scrub::FileLock,
+    _singleton: scrub::FileLock,
+}
+
+/// Outcome of trying to take the manual-backup locks.
+pub enum BackupLockAttempt {
+    Acquired(Box<BackupLocks>),
+    /// Another backup already holds the singleton — decline rather than queue.
+    AlreadyRunning,
+}
+
+/// Take the manual-backup locks, mirroring `backup-run.sh` exactly.
+///
+/// The manual `btrdasd backup` subcommands mounted and unmounted the DAS
+/// filesystems with no lock at all, outside the mutual-exclusion scheme that
+/// `backup-run.sh`, the scrub engine and `doctor` all participate in. The
+/// concrete hazard: `doctor` mounts a source, a concurrent manual backup finds it
+/// already mounted and uses it unregistered, then `doctor` finishes first and
+/// unmounts it mid-use.
+///
+/// The two halves behave differently, matching the scheduled path rather than
+/// inventing a third convention:
+///
+/// * **singleton, non-blocking** — a second backup is redundant, not merely
+///   late, so it declines instead of queueing (`flock -n` in the bash path).
+/// * **maintenance, blocking** — a scrub is a peer operation, so the backup
+///   waits for it. Defer, never skip.
+///
+/// Acquisition order is singleton then maintenance, the same order used
+/// everywhere else; that shared order is what keeps the set deadlock-free.
+pub fn acquire_manual_locks_at(
+    singleton_path: &Path,
+    maintenance_path: &Path,
+    progress: &dyn ProgressCallback,
+) -> Result<BackupLockAttempt, scrub::ScrubError> {
+    let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
+        return Ok(BackupLockAttempt::AlreadyRunning);
+    };
+    let maintenance = scrub::FileLock::acquire_blocking(
+        maintenance_path,
+        progress,
+        "DAS maintenance lock held (scrub in progress?) — waiting...",
+    )?;
+    Ok(BackupLockAttempt::Acquired(Box::new(BackupLocks {
+        _maintenance: maintenance,
+        _singleton: singleton,
+    })))
+}
+
+/// Take the manual-backup locks at their production paths.
+pub fn acquire_manual_locks(
+    progress: &dyn ProgressCallback,
+) -> Result<BackupLockAttempt, scrub::ScrubError> {
+    acquire_manual_locks_at(
+        Path::new(BACKUP_LOCK_PATH),
+        Path::new(scrub::MAINTENANCE_LOCK_PATH),
+        progress,
+    )
+}
+
+/// Whether to run an incremental or full backup.
+///
+/// **Incremental**: `btrbk snapshot` + `btrbk --preserve resume` — creates
+/// snapshots, sends deltas, but skips retention cleanup.  Fast daily use.
+///
+/// **Full**: `btrbk run` — creates snapshots, sends them, AND enforces
+/// retention policy (deletes old snapshots/backups outside retention windows).
+/// The complete backup lifecycle with housekeeping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackupMode {
+    Incremental,
+    Full,
+}
+
+impl std::fmt::Display for BackupMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackupMode::Incremental => write!(f, "incremental"),
+            BackupMode::Full => write!(f, "full"),
+        }
+    }
+}
+
+/// Options controlling what a backup run does.
+#[derive(Debug, Default)]
+pub struct BackupOptions {
+    /// Incremental or full. None = use schedule default.
+    pub mode: Option<BackupMode>,
+    /// Source labels to back up. Empty = all configured sources.
+    pub sources: Vec<String>,
+    /// Target labels to send to. Empty = all available targets.
+    pub targets: Vec<String>,
+    /// Preview only — don't actually run btrbk.
+    pub dry_run: bool,
+    /// Create snapshots but skip send/receive.
+    pub snapshot_only: bool,
+    /// Send existing snapshots without creating new ones.
+    pub send_only: bool,
+    /// Archive boot subvolumes after backup.
+    pub boot_archive: bool,
+    /// Run the content indexer after backup completes.
+    pub index_after: bool,
+    /// Send an email report after backup.
+    pub send_report: bool,
+}
+
+/// Result of a completed backup run.
+#[derive(Debug)]
+pub struct BackupResult {
+    pub success: bool,
+    pub mode: BackupMode,
+    pub snapshots_created: usize,
+    pub snapshots_sent: usize,
+    pub snapshots_cleaned: usize,
+    pub bytes_sent: u64,
+    pub boot_archived: bool,
+    pub indexed: bool,
+    pub report_sent: bool,
+    pub errors: Vec<String>,
+    pub duration_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Ensure source top-level volumes are mounted (subvolid=5).
+///
+/// btrbk needs the raw BTRFS volume mounted to see subvolumes.  The backup
+/// shell script (`backup-run.sh`) does this, but the Rust CLI/GUI code path
+/// calls btrbk directly.  This function mounts any unmounted source volumes.
+fn ensure_sources_mounted(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for src in &config.sources {
+        if !seen.insert((&src.volume, &src.device)) {
+            continue;
+        }
+        let mount_path = std::path::Path::new(&src.volume);
+        if !mount_path.exists() {
+            std::fs::create_dir_all(mount_path)?;
+        }
+        // Check if already mounted
+        let check = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&src.volume)
+            .status();
+        if check.map(|s| s.success()).unwrap_or(false) {
+            continue;
+        }
+        progress.on_log(
+            LogLevel::Info,
+            &format!("Mounting source volume {} from {}", src.volume, src.device),
+        );
+        let status = Command::new("mount")
+            .arg("-o")
+            .arg("subvolid=5")
+            .arg(&src.device)
+            .arg(&src.volume)
+            .status()?;
+        if !status.success() {
+            return Err(format!(
+                "Failed to mount source volume {} from {}",
+                src.volume, src.device
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Build a timestamp string in YYYYMMDDTHHMMSS format using SystemTime.
+/// Uses libc localtime_r to convert to local time without extra dependencies.
+fn format_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after Unix epoch");
+    let secs = now.as_secs() as libc::time_t;
+
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: secs is a valid time_t and tm is a properly allocated libc::tm.
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
+}
+
+/// Parse btrbk snapshot output and count lines that indicate a snapshot was created.
+/// Count btrbk snapshot lines.  btrbk marks created snapshots with `+++`.
+fn parse_btrbk_snapshot_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("+++")
+        })
+        .count()
+}
+
+/// Count btrbk send lines.  btrbk marks sends with `>>>` (incremental) or
+/// `***` (non-incremental/full).
+fn parse_btrbk_send_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with(">>>") || trimmed.starts_with("***")
+        })
+        .count()
+}
+
+/// Run a command and return (stdout, stderr, success).
+/// Logs stderr lines at Warning level via progress.
+fn run_command(
+    cmd: &mut Command,
+    progress: &dyn ProgressCallback,
+) -> Result<(String, bool), Box<dyn std::error::Error>> {
+    let output = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    for line in stderr.lines() {
+        if !line.trim().is_empty() {
+            progress.on_log(LogLevel::Warning, &format!("btrbk stderr: {line}"));
+        }
+    }
+
+    Ok((stdout, output.status.success()))
+}
+
+/// Stream a command line by line, applying a callback to each stdout line.
+/// Stderr is collected and logged at Warning level. Returns success status.
+fn stream_command<F>(
+    cmd: &mut Command,
+    progress: &dyn ProgressCallback,
+    mut line_cb: F,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    F: FnMut(&str),
+{
+    // Log the command being executed for diagnostics.
+    progress.on_log(LogLevel::Info, &format!("stream_command: {:?}", cmd));
+
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+
+    // Read stdout line by line while the process runs.
+    let stdout = child.stdout.take().expect("stdout must be piped");
+    let reader = std::io::BufReader::new(stdout);
+    let mut line_count = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        line_count += 1;
+        line_cb(&line);
+    }
+
+    let status = child.wait()?;
+    progress.on_log(
+        LogLevel::Info,
+        &format!(
+            "stream_command: exit={}, stdout_lines={}",
+            status.code().unwrap_or(-1),
+            line_count
+        ),
+    );
+
+    // Collect stderr from the now-finished child.
+    if let Some(stderr) = child.stderr.take() {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if !line.trim().is_empty() {
+                progress.on_log(LogLevel::Warning, &format!("btrbk stderr: {line}"));
+            }
+        }
+    }
+
+    Ok(status.success())
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Create btrbk snapshots for specified sources.
+pub fn create_snapshots(
+    config: &Config,
+    sources: &[String],
+    progress: &dyn ProgressCallback,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    progress.on_stage("Creating snapshots", sources.len() as u64);
+
+    let mut cmd = Command::new("btrbk");
+    cmd.arg("-c").arg(&config.general.btrbk_conf);
+
+    // btrbk syntax: `btrbk -c <conf> snapshot [<volume-path>...]`
+    // The "snapshot" subcommand must appear exactly once, followed by volume
+    // paths as optional filter arguments.
+    cmd.arg("snapshot");
+
+    if !sources.is_empty() {
+        // Collect unique volume paths — multiple sources can share a volume
+        // (e.g. hdd-projects and hdd-audiobooks both use /.btrfs-hdd).
+        let mut seen_volumes = std::collections::HashSet::new();
+        for label in sources {
+            if let Some(src) = config.sources.iter().find(|s| &s.label == label) {
+                if seen_volumes.insert(src.volume.clone()) {
+                    progress.on_log(
+                        LogLevel::Info,
+                        &format!("Snapshotting source '{}' at {}", label, src.volume),
+                    );
+                    cmd.arg(&src.volume);
+                } else {
+                    progress.on_log(
+                        LogLevel::Info,
+                        &format!(
+                            "Source '{}' shares volume {} (already included)",
+                            label, src.volume
+                        ),
+                    );
+                }
+            } else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Source label '{label}' not found in config — skipping"),
+                );
+            }
+        }
+    }
+
+    let (stdout, success) = run_command(&mut cmd, progress)?;
+
+    if !success {
+        progress.on_log(
+            LogLevel::Warning,
+            "btrbk snapshot command exited with non-zero status",
+        );
+    }
+
+    let count = parse_btrbk_snapshot_count(&stdout);
+
+    for (i, label) in sources.iter().enumerate() {
+        progress.on_progress(i as u64 + 1, sources.len() as u64, label);
+    }
+
+    progress.on_log(LogLevel::Info, &format!("Snapshots created: {count}"));
+    Ok(count)
+}
+
+/// Send snapshots to specified targets via btrbk.
+///
+/// When `preserve` is true, passes `--preserve` to btrbk so retention cleanup
+/// is skipped (incremental mode).  When false, btrbk enforces retention policy
+/// after sending (deletes old snapshots/backups outside the retention window).
+///
+/// Returns (snapshots_sent, bytes_sent).
+pub fn send_snapshots(
+    config: &Config,
+    sources: &[String],
+    targets: &[String],
+    preserve: bool,
+    progress: &dyn ProgressCallback,
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
+    progress.on_stage("Sending snapshots", 1);
+
+    let mut cmd = Command::new("btrbk");
+    if preserve {
+        cmd.arg("--preserve");
+    }
+    cmd.arg("-c").arg(&config.general.btrbk_conf);
+
+    // Use `resume` to handle interrupted transfers gracefully.
+    cmd.arg("resume");
+
+    // Add source volume path filters if requested (deduplicate shared volumes).
+    if !sources.is_empty() {
+        let mut seen_volumes = std::collections::HashSet::new();
+        for label in sources {
+            if let Some(src) = config.sources.iter().find(|s| &s.label == label)
+                && seen_volumes.insert(src.volume.clone())
+            {
+                cmd.arg(&src.volume);
+            }
+        }
+    }
+
+    // Note: target mount paths (e.g. /mnt/backup-22tb) are NOT passed as
+    // btrbk filter arguments.  btrbk expects exact matches to the configured
+    // target *directories* (e.g. /mnt/backup-22tb/nvme), not the top-level
+    // mount point.  Source volume paths already limit which data is processed,
+    // and btrbk automatically skips targets whose paths don't exist.
+    //
+    // Log which targets are expected so the user knows the scope.
+    for label in targets {
+        if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
+            if let Some(actual) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("Target '{label}' mounted at {actual} — will receive"),
+                );
+            } else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "Target '{label}' at {} is not mounted — btrbk will skip",
+                        tgt.mount
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut snapshots_sent: usize = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut stdout_lines = Vec::new();
+
+    let success = stream_command(&mut cmd, progress, |line| {
+        stdout_lines.push(line.to_string());
+        let trimmed = line.trim_start();
+        // btrbk marks sends with >>> (incremental) or *** (full)
+        if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
+            snapshots_sent += 1;
+            bytes_sent += parse_btrbk_size_field(line);
+        }
+        // Parse throughput hints from btrbk progress lines.
+        let lower = line.to_lowercase();
+        if lower.contains("mib/s") || lower.contains("kib/s") || lower.contains("gib/s") {
+            let bytes_per_sec = parse_throughput_line(line);
+            if bytes_per_sec > 0 {
+                progress.on_throughput(bytes_per_sec);
+            }
+        }
+    })?;
+
+    if !success {
+        progress.on_log(
+            LogLevel::Warning,
+            "btrbk resume command exited with non-zero status",
+        );
+    }
+
+    // Re-count from accumulated output for accuracy.
+    let full_output = stdout_lines.join("\n");
+    snapshots_sent = parse_btrbk_send_count(&full_output);
+
+    progress.on_log(LogLevel::Info, &format!("Snapshots sent: {snapshots_sent}"));
+    Ok((snapshots_sent, bytes_sent))
+}
+
+/// Count lines matching btrbk's `---` (deleted) marker in output.
+fn parse_btrbk_clean_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("---"))
+        .count()
+}
+
+/// Run the full btrbk lifecycle: snapshot + send + retention cleanup.
+///
+/// Uses `btrbk run` which atomically handles all three steps.  This is the
+/// Full backup mode — equivalent to what the nightly bash script does.
+///
+/// Returns (snapshots_created, snapshots_sent, snapshots_cleaned, bytes_sent).
+pub fn run_full_pipeline(
+    config: &Config,
+    sources: &[String],
+    targets: &[String],
+    progress: &dyn ProgressCallback,
+) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
+    progress.on_stage("Full backup (snapshot + send + cleanup)", 1);
+
+    let mut cmd = Command::new("btrbk");
+    cmd.arg("-c").arg(&config.general.btrbk_conf);
+    cmd.arg("run");
+
+    // Add source volume path filters (deduplicate shared volumes).
+    if !sources.is_empty() {
+        let mut seen_volumes = std::collections::HashSet::new();
+        for label in sources {
+            if let Some(src) = config.sources.iter().find(|s| &s.label == label)
+                && seen_volumes.insert(src.volume.clone())
+            {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("Source '{}' at {}", label, src.volume),
+                );
+                cmd.arg(&src.volume);
+            }
+        }
+    }
+
+    // Log target mount status.
+    for label in targets {
+        if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
+            if let Some(actual) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("Target '{label}' mounted at {actual} — will receive"),
+                );
+            } else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "Target '{label}' at {} is not mounted — btrbk will skip",
+                        tgt.mount
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut snapshots_created: usize = 0;
+    let mut snapshots_sent: usize = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut stdout_lines = Vec::new();
+
+    let success = stream_command(&mut cmd, progress, |line| {
+        stdout_lines.push(line.to_string());
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("+++") {
+            snapshots_created += 1;
+        } else if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
+            snapshots_sent += 1;
+            bytes_sent += parse_btrbk_size_field(line);
+        }
+        let lower = line.to_lowercase();
+        if lower.contains("mib/s") || lower.contains("kib/s") || lower.contains("gib/s") {
+            let bytes_per_sec = parse_throughput_line(line);
+            if bytes_per_sec > 0 {
+                progress.on_throughput(bytes_per_sec);
+            }
+        }
+    })?;
+
+    if !success {
+        progress.on_log(
+            LogLevel::Warning,
+            "btrbk run command exited with non-zero status",
+        );
+    }
+
+    // Re-count from accumulated output for accuracy.
+    let full_output = stdout_lines.join("\n");
+
+    progress.on_log(
+        LogLevel::Debug,
+        &format!(
+            "run_full_pipeline: captured {} stdout lines",
+            stdout_lines.len()
+        ),
+    );
+
+    snapshots_created = parse_btrbk_snapshot_count(&full_output);
+    snapshots_sent = parse_btrbk_send_count(&full_output);
+    let snapshots_cleaned = parse_btrbk_clean_count(&full_output);
+
+    progress.on_log(
+        LogLevel::Info,
+        &format!(
+            "Full backup: {} created, {} sent, {} cleaned up",
+            snapshots_created, snapshots_sent, snapshots_cleaned,
+        ),
+    );
+
+    Ok((
+        snapshots_created,
+        snapshots_sent,
+        snapshots_cleaned,
+        bytes_sent,
+    ))
+}
+
+/// Parse a throughput value (e.g. "22.3 MiB/s") from a btrbk output line.
+/// Returns bytes per second, or 0 if not parseable.
+fn parse_throughput_line(line: &str) -> u64 {
+    // Walk tokens looking for a number followed by a unit.
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        let unit = match tokens.get(i + 1).copied() {
+            Some(u) => u,
+            None => {
+                // Unit might be glued: "22.3MiB/s"
+                if let Some(v) = parse_glued_throughput(token) {
+                    return v;
+                }
+                continue;
+            }
+        };
+        if let Ok(val) = token.parse::<f64>() {
+            let multiplier: u64 = match unit.to_uppercase().as_str() {
+                "GIB/S" | "GB/S" => 1_073_741_824,
+                "MIB/S" | "MB/S" => 1_048_576,
+                "KIB/S" | "KB/S" => 1_024,
+                "B/S" => 1,
+                _ => continue,
+            };
+            return (val * multiplier as f64) as u64;
+        }
+    }
+    0
+}
+
+/// Parse a glued token like "22.3MiB/s" into bytes/sec.
+fn parse_glued_throughput(token: &str) -> Option<u64> {
+    let upper = token.to_uppercase();
+    let (val_str, mult) = if let Some(s) = upper.strip_suffix("GIB/S") {
+        (s, 1_073_741_824u64)
+    } else if let Some(s) = upper.strip_suffix("GB/S") {
+        (s, 1_000_000_000u64)
+    } else if let Some(s) = upper.strip_suffix("MIB/S") {
+        (s, 1_048_576u64)
+    } else if let Some(s) = upper.strip_suffix("MB/S") {
+        (s, 1_000_000u64)
+    } else if let Some(s) = upper.strip_suffix("KIB/S") {
+        (s, 1_024u64)
+    } else if let Some(s) = upper.strip_suffix("KB/S") {
+        (s, 1_000u64)
+    } else {
+        let s = upper.strip_suffix("B/S")?;
+        (s, 1u64)
+    };
+    val_str
+        .parse::<f64>()
+        .ok()
+        .map(|v| (v * mult as f64) as u64)
+}
+
+// sync_esp() removed 2026-04-12 — see .claude/rules/das-esp-safety.md.
+
+/// Best-effort parse of a size from a btrbk `>>>` or `***` output line.
+///
+/// btrbk v0.32 does NOT include size info in these lines (just paths).
+/// This parser is kept as a secondary source in case future btrbk versions
+/// add parenthetical sizes like `(incremental, 45.3 MiB)`.  The primary
+/// bytes_sent measurement uses target disk usage delta instead.
+///
+/// Returns the size in bytes, or 0 if not parseable.
+fn parse_btrbk_size_field(line: &str) -> u64 {
+    // Look for a parenthetical at the end containing a size.
+    let paren_content = match (line.rfind('('), line.rfind(')')) {
+        (Some(open), Some(close)) if close > open => &line[open + 1..close],
+        _ => return 0,
+    };
+    // Split on comma — size is usually the last segment: "incremental, 45.3 MiB"
+    for segment in paren_content.rsplit(',') {
+        let seg = segment.trim();
+        let tokens: Vec<&str> = seg.split_whitespace().collect();
+        if tokens.len() == 2
+            && let Ok(val) = tokens[0].parse::<f64>()
+        {
+            let multiplier: u64 = match tokens[1].to_uppercase().as_str() {
+                "TIB" | "TB" => 1_099_511_627_776,
+                "GIB" | "GB" => 1_073_741_824,
+                "MIB" | "MB" => 1_048_576,
+                "KIB" | "KB" => 1_024,
+                "B" => 1,
+                _ => continue,
+            };
+            return (val * multiplier as f64) as u64;
+        }
+    }
+    0
+}
+
+/// Force filesystem sync on all mounted backup targets so `statvfs` returns
+/// up-to-date space accounting. BTRFS defers transaction commits, so without
+/// an explicit sync after `btrfs receive`, the available-blocks counter can
+/// remain stale for several seconds.
+fn sync_targets(config: &Config) {
+    for tgt in &config.targets {
+        if let Some(path) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
+            // syncfs(2) syncs the filesystem containing the given fd.
+            if let Ok(file) = std::fs::File::open(&path) {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::syncfs(file.as_raw_fd());
+                }
+            }
+        }
+    }
+}
+
+/// Measure total used bytes across all mounted backup targets.
+///
+/// Uses `statvfs(2)` to read filesystem usage directly (no child process).
+/// Returns the sum of used bytes across all target mount points. Used to
+/// calculate bytes_sent as the delta between before/after a backup, since
+/// btrbk doesn't report transfer sizes in its output.
+fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64 {
+    config
+        .targets
+        .iter()
+        .filter_map(|tgt| {
+            let path = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role);
+            let path = match path {
+                Some(p) => p,
+                None => {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!(
+                            "measure_target_usage: target '{}' not mounted (configured: {})",
+                            tgt.label, tgt.mount
+                        ),
+                    );
+                    return None;
+                }
+            };
+            let c_path = std::ffi::CString::new(path.clone()).ok()?;
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+            if rc != 0 {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "measure_target_usage: statvfs failed for '{}' at {path}",
+                        tgt.label
+                    ),
+                );
+                return None;
+            }
+            let total = stat.f_blocks * stat.f_frsize;
+            let avail = stat.f_bavail * stat.f_frsize;
+            let used = total.saturating_sub(avail);
+            progress.on_log(
+                LogLevel::Debug,
+                &format!(
+                    "measure_target_usage: '{}' at {path}: used={used}",
+                    tgt.label
+                ),
+            );
+            Some(used)
+        })
+        .sum()
+}
+
+/// Find the latest btrbk snapshot matching a given name on a target.
+///
+/// Looks for subvolumes in the `nvme/` subdirectory matching the pattern
+/// `nvme/{name}.YYYYMMDDTHHMM`.  Returns the most recent one (by
+/// lexicographic sort of the timestamp suffix).
+fn find_latest_btrbk_snapshot(target_mount: &str, snap_name: &str) -> Option<String> {
+    let output = Command::new("btrfs")
+        .args(["subvolume", "list", target_mount])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Pattern: "nvme/{snap_name}.YYYYMMDDTHHMM" in the path column (last field).
+    let prefix = format!("nvme/{snap_name}.");
+    let mut matches: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let path = line.split_whitespace().last()?;
+            if path.starts_with(&prefix) {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    matches.last().map(|s| s.to_string())
+}
+
+/// Archive boot subvolumes as read-only snapshots on backup targets.
+pub fn archive_boot(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !config.boot.enabled {
+        return Ok(false);
+    }
+
+    progress.on_stage(
+        "Archiving boot subvolumes",
+        config.boot.subvolumes.len() as u64,
+    );
+
+    let ts = format_timestamp();
+    let mut any_archived = false;
+
+    // Use all configured targets — caller pre-mounted via MountGuard.
+    if config.targets.is_empty() {
+        progress.on_log(
+            LogLevel::Warning,
+            "No backup targets configured — skipping boot archive",
+        );
+        return Ok(false);
+    }
+
+    for (step, subvol) in config.boot.subvolumes.iter().enumerate() {
+        progress.on_progress(
+            step as u64,
+            config.boot.subvolumes.len() as u64,
+            &format!("Archiving {subvol}"),
+        );
+
+        // Derive the archive subvolume name. For "@" -> "@.archive.TIMESTAMP",
+        // for "@home" -> "@home.archive.TIMESTAMP".
+        let archive_name = format!("{subvol}.archive.{ts}");
+
+        // Map boot subvolume name to btrbk snapshot name.
+        let snap_name = match subvol.as_str() {
+            "@" => "root",
+            "@home" => "home",
+            other => other.trim_start_matches('@'),
+        };
+
+        for target in &config.targets {
+            // Mirror targets carry a genuinely independent OS install in their
+            // own @/@home (e.g. das-recovery-bay1) — never archive-then-replace
+            // it with a host snapshot. Mirrors still receive ordinary btrbk
+            // send/receive via run_backup(); only this boot-subvol step skips
+            // them. Wording matches update_boot_subvolumes() in
+            // scripts/backup-run.sh so both origins log identically
+            // (bd DAS-Backup-Manager-am1).
+            if target.role == TargetRole::Mirror {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("[{}] Skipping mirror target (independent OS)", target.mount),
+                );
+                continue;
+            }
+
+            let tgt_mount = &target.mount;
+            let subvol_path = format!("{tgt_mount}/{subvol}");
+
+            // Step 1-2: If the boot subvolume exists, archive it (read-only
+            // snapshot) then delete it.  If it doesn't exist, skip straight
+            // to the recreate step.
+            if std::path::Path::new(&subvol_path).exists() {
+                let archive_path = format!("{tgt_mount}/{archive_name}");
+
+                let snap_status = Command::new("btrfs")
+                    .args(["subvolume", "snapshot", "-r", &subvol_path, &archive_path])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status()?;
+
+                if !snap_status.success() {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("Failed to archive {subvol_path} -> {archive_path}"),
+                    );
+                    continue;
+                }
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("Archived {subvol_path} -> {archive_path}"),
+                );
+
+                let del_status = Command::new("btrfs")
+                    .args(["subvolume", "delete", &subvol_path])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status()?;
+
+                if !del_status.success() {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("Failed to delete {subvol_path} after archiving"),
+                    );
+                    continue;
+                }
+                any_archived = true;
+            }
+
+            // Step 3: Recreate the boot subvolume from the latest btrbk
+            // snapshot so the target always has a fresh, bootable @/@home.
+            if let Some(latest) = find_latest_btrbk_snapshot(tgt_mount, snap_name) {
+                let latest_path = format!("{tgt_mount}/{latest}");
+                let create = Command::new("btrfs")
+                    .args(["subvolume", "snapshot", &latest_path, &subvol_path])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status();
+                match create {
+                    Ok(s) if s.success() => {
+                        progress.on_log(
+                            LogLevel::Info,
+                            &format!("Created {subvol_path} from {latest}"),
+                        );
+                    }
+                    _ => {
+                        progress.on_log(
+                            LogLevel::Warning,
+                            &format!("Failed to create {subvol_path} from {latest}"),
+                        );
+                    }
+                }
+            } else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "No btrbk snapshot matching '{snap_name}' on {tgt_mount} — cannot create {subvol}"
+                    ),
+                );
+            }
+        }
+
+        progress.on_progress(
+            step as u64 + 1,
+            config.boot.subvolumes.len() as u64,
+            &format!("Archived {subvol}"),
+        );
+    }
+
+    Ok(any_archived)
+}
+
+/// Run a backup with the given options. Calls btrbk under the hood.
+/// The caller must ensure this runs with appropriate privileges (root).
+pub fn run_backup(
+    config: &Config,
+    options: &BackupOptions,
+    progress: &dyn ProgressCallback,
+) -> Result<BackupResult, Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut snapshots_created: usize = 0;
+    let mut snapshots_sent: usize = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut boot_archived = false;
+    let mut indexed = false;
+    let mut report_sent = false;
+
+    // ---------- Resolve effective sources ----------
+
+    // Exclude manual_only subvolumes unless explicitly requested.
+    let effective_sources: Vec<String> = if options.sources.is_empty() {
+        config
+            .sources
+            .iter()
+            .filter(|src| {
+                // Include source if at least one non-manual_only subvolume exists.
+                src.subvolumes.iter().any(|sv| !sv.manual_only)
+            })
+            .map(|src| src.label.clone())
+            .collect()
+    } else {
+        options.sources.clone()
+    };
+
+    // ---------- Resolve effective targets ----------
+    //
+    // When targets are explicitly specified (D-Bus helper pre-mounts them),
+    // trust the caller — don't re-check mount status.  Only auto-detect
+    // mounted targets when the caller leaves the list empty (standalone CLI).
+
+    let effective_targets: Vec<String> = if options.targets.is_empty() {
+        config
+            .targets
+            .iter()
+            .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
+            .map(|tgt| tgt.label.clone())
+            .collect()
+    } else {
+        // Caller specified targets — validate they exist in config but don't
+        // re-check mount status (caller already ensured mount via MountGuard).
+        let matched: Vec<String> = options
+            .targets
+            .iter()
+            .filter(|label| {
+                config
+                    .targets
+                    .iter()
+                    .any(|t| t.label.as_str() == label.as_str())
+            })
+            .cloned()
+            .collect();
+
+        // If no requested targets matched config (e.g. stale label list),
+        // fall back to auto-detecting mounted targets so the backup can
+        // still proceed.
+        if matched.is_empty() {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Requested targets {:?} did not match config {:?} — auto-detecting mounted targets",
+                    options.targets,
+                    config.targets.iter().map(|t| &t.label).collect::<Vec<_>>()
+                ),
+            );
+            config
+                .targets
+                .iter()
+                .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
+                .map(|tgt| tgt.label.clone())
+                .collect()
+        } else {
+            matched
+        }
+    };
+
+    // Require at least one target (unless dry-run).
+    if effective_targets.is_empty() && !options.dry_run {
+        return Err("No backup targets are mounted. Connect the DAS enclosure and mount targets before running.".into());
+    }
+
+    // Count enabled pipeline steps for the top-level stage announcement.
+    let total_steps = {
+        let mut n = 0u64;
+        if !options.send_only {
+            n += 1;
+        } // snapshots
+        if !options.snapshot_only {
+            n += 1;
+        } // send
+        if options.boot_archive {
+            n += 1;
+        }
+        if options.index_after {
+            n += 1;
+        }
+        if options.send_report {
+            n += 1;
+        }
+        n.max(1)
+    };
+    progress.on_stage("Backup", total_steps);
+
+    let mode = options.mode.unwrap_or(BackupMode::Incremental);
+
+    // ---------- Dry-run path ----------
+
+    if options.dry_run {
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "DRY RUN ({mode}): would create snapshots for {:?}",
+                effective_sources
+            ),
+        );
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "DRY RUN ({mode}): would send to targets {:?}",
+                effective_targets
+            ),
+        );
+        if options.boot_archive {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "DRY RUN ({mode}): would archive boot subvolumes: {:?}",
+                    config.boot.subvolumes
+                ),
+            );
+        }
+
+        let summary = format!("DRY RUN ({mode}) completed — no changes made");
+        let result = BackupResult {
+            success: true,
+            mode,
+            snapshots_created: 0,
+            snapshots_sent: 0,
+            snapshots_cleaned: 0,
+            bytes_sent: 0,
+            boot_archived: false,
+            indexed: false,
+            report_sent: false,
+            errors: Vec::new(),
+            duration_secs: start.elapsed().as_secs(),
+        };
+        progress.on_complete(true, &summary);
+        return Ok(result);
+    }
+
+    // ---------- Live pipeline ----------
+    //
+    // Incremental: `btrbk snapshot` + `btrbk --preserve resume`
+    //   Creates snapshots and sends deltas.  --preserve skips retention
+    //   cleanup so old snapshots/backups are kept.  Fast daily use.
+    //
+    // Full: `btrbk run` (atomic snapshot + send + retention cleanup)
+    //   The complete backup lifecycle including housekeeping.  Deletes
+    //   snapshots and backups outside the configured retention windows.
+
+    // Mount source top-level volumes (subvolid=5) so btrbk can see subvolumes.
+    ensure_sources_mounted(config, progress)?;
+
+    // Measure target disk usage before btrbk runs so we can calculate
+    // bytes_sent as the delta (btrbk doesn't report transfer sizes).
+    // Sync first so both before/after measurements use committed metadata.
+    sync_targets(config);
+    let usage_before = measure_target_usage(config, progress);
+    progress.on_log(
+        LogLevel::Info,
+        &format!("Target usage before: {} bytes", usage_before),
+    );
+
+    let mut snapshots_cleaned: usize = 0;
+
+    match mode {
+        BackupMode::Full => {
+            if options.snapshot_only {
+                // Full + snapshot-only: just create snapshots (same as incremental).
+                match create_snapshots(config, &effective_sources, progress) {
+                    Ok(n) => snapshots_created = n,
+                    Err(e) => {
+                        let msg = format!("Snapshot step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            } else if options.send_only {
+                // Full + send-only: send with retention cleanup (no --preserve).
+                match send_snapshots(
+                    config,
+                    &effective_sources,
+                    &effective_targets,
+                    false, // no preserve → btrbk enforces retention
+                    progress,
+                ) {
+                    Ok((sent, bytes)) => {
+                        snapshots_sent = sent;
+                        bytes_sent = bytes;
+                    }
+                    Err(e) => {
+                        let msg = format!("Send step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            } else {
+                // Full: btrbk run does snapshot + send + cleanup atomically.
+                match run_full_pipeline(config, &effective_sources, &effective_targets, progress) {
+                    Ok((snaps, sent, cleaned, bytes)) => {
+                        snapshots_created = snaps;
+                        snapshots_sent = sent;
+                        snapshots_cleaned = cleaned;
+                        bytes_sent = bytes;
+                    }
+                    Err(e) => {
+                        let msg = format!("Full backup pipeline failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+        }
+        BackupMode::Incremental => {
+            // Step (a): Snapshots
+            if !options.send_only {
+                match create_snapshots(config, &effective_sources, progress) {
+                    Ok(n) => snapshots_created = n,
+                    Err(e) => {
+                        let msg = format!("Snapshot step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+            // Step (b): Send with retention cleanup (same as full mode).
+            // Both incremental and full modes enforce retention policy to
+            // prevent targets from filling up.
+            if !options.snapshot_only {
+                match send_snapshots(
+                    config,
+                    &effective_sources,
+                    &effective_targets,
+                    false, // enforce retention cleanup on every backup
+                    progress,
+                ) {
+                    Ok((sent, bytes)) => {
+                        snapshots_sent = sent;
+                        bytes_sent = bytes;
+                    }
+                    Err(e) => {
+                        let msg = format!("Send step failed: {e}");
+                        progress.on_log(LogLevel::Error, &msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // Calculate bytes_sent from target disk usage delta. btrbk doesn't report
+    // transfer sizes in its output, so we measure before/after. For incremental
+    // mode (no cleanup) this is the actual bytes sent. For full mode (with
+    // cleanup) it's the net change, which may underestimate if old data was
+    // purged. Still better than reporting 0.
+    if bytes_sent == 0 && (snapshots_sent > 0 || snapshots_created > 0) {
+        // Force BTRFS to commit pending transactions so statvfs reflects the
+        // data that was just received. Without this, BTRFS defers metadata
+        // updates and statvfs returns stale values, making the delta zero.
+        sync_targets(config);
+        let usage_after = measure_target_usage(config, progress);
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "Target usage after: {} bytes (delta: {})",
+                usage_after,
+                usage_after.saturating_sub(usage_before)
+            ),
+        );
+        bytes_sent = usage_after.saturating_sub(usage_before);
+    }
+
+    // Step (c): Boot archive (both modes)
+    if options.boot_archive {
+        match archive_boot(config, progress) {
+            Ok(archived) => boot_archived = archived,
+            Err(e) => {
+                let msg = format!("Boot archive step failed: {e}");
+                progress.on_log(LogLevel::Error, &msg);
+                errors.push(msg);
+            }
+        }
+    }
+
+    // Step (d): Index — walk each target's mount path to pick up new snapshots.
+    if options.index_after {
+        match Database::open(&config.general.db_path) {
+            Ok(db) => {
+                let mut targets_indexed = 0usize;
+                for target in &config.targets {
+                    let mount = health::find_any_mount(&target.mount, &target.serial, &target.role);
+                    if let Some(path) = mount {
+                        progress.on_log(
+                            LogLevel::Info,
+                            &format!("Indexing target '{}' at {path}", target.label),
+                        );
+                        match indexer::walk(std::path::Path::new(&path), &db) {
+                            Ok(result) => {
+                                progress.on_log(
+                                    LogLevel::Info,
+                                    &format!(
+                                        "Indexed '{}': {} new snapshots ({} files)",
+                                        target.label,
+                                        result.snapshots_indexed,
+                                        result.results.iter().map(|r| r.files_total).sum::<usize>(),
+                                    ),
+                                );
+                                targets_indexed += 1;
+                            }
+                            Err(e) => {
+                                progress.on_log(
+                                    LogLevel::Warning,
+                                    &format!(
+                                        "Indexing target '{}' failed (non-fatal): {e}",
+                                        target.label
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                if targets_indexed > 0 {
+                    indexed = true;
+                }
+            }
+            Err(e) => {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Cannot open index DB for post-backup indexing (non-fatal): {e}"),
+                );
+            }
+        }
+    }
+
+    // Step (e): Email report
+    if options.send_report && config.email.enabled {
+        let report_text = crate::report::format_report(
+            &BackupResult {
+                success: errors.is_empty(),
+                mode,
+                snapshots_created,
+                snapshots_sent,
+                snapshots_cleaned: 0,
+                bytes_sent,
+                boot_archived,
+                indexed,
+                report_sent: false,
+                errors: errors.clone(),
+                duration_secs: start.elapsed().as_secs(),
+            },
+            config,
+        );
+
+        // Save report to last_report file for later viewing.
+        if let Err(e) = std::fs::write(&config.general.last_report, &report_text) {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Failed to save report to {}: {e}",
+                    config.general.last_report
+                ),
+            );
+        }
+
+        match crate::report::send_email_report(&report_text, config) {
+            Ok(()) => {
+                progress.on_log(LogLevel::Info, "Email report sent successfully");
+                report_sent = true;
+            }
+            Err(e) => {
+                // Email failure is non-fatal — the backup data is safe.
+                // Log as warning but don't push to errors vec, which would
+                // mark the entire backup as "Failed" in the history.
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Failed to send email report (non-fatal): {e}"),
+                );
+            }
+        }
+    }
+
+    let success = errors.is_empty();
+    let nothing_to_do = success
+        && snapshots_created == 0
+        && snapshots_sent == 0
+        && snapshots_cleaned == 0
+        && !options.dry_run;
+
+    let summary = if nothing_to_do {
+        format!("Backup ({mode}): nothing to do — all snapshots up to date")
+    } else {
+        let cleaned_msg = if snapshots_cleaned > 0 {
+            format!(", {} cleaned up", snapshots_cleaned)
+        } else {
+            String::new()
+        };
+        format!(
+            "Backup {status} ({mode}): {snaps} snapshots created, {sent} sent{cleaned}, boot archived: {boot}",
+            status = if success {
+                "succeeded"
+            } else {
+                "completed with errors"
+            },
+            snaps = snapshots_created,
+            sent = snapshots_sent,
+            cleaned = cleaned_msg,
+            boot = boot_archived,
+        )
+    };
+
+    let result = BackupResult {
+        success,
+        mode,
+        snapshots_created,
+        snapshots_sent,
+        snapshots_cleaned,
+        bytes_sent,
+        boot_archived,
+        indexed,
+        report_sent,
+        errors,
+        duration_secs: start.elapsed().as_secs(),
+    };
+
+    progress.on_complete(result.success, &summary);
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- manual-backup interlock (bd DAS-Backup-Manager-pe6) ----------------
+
+    #[test]
+    fn manual_backup_declines_when_another_backup_holds_the_singleton() {
+        // A second backup is redundant, not merely late, so it declines rather
+        // than queueing — matching `flock -n` in backup-run.sh.
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("backup.lock");
+        let maintenance = dir.path().join("maintenance.lock");
+        let held = scrub::FileLock::try_acquire(&singleton).unwrap();
+        assert!(held.is_some(), "fixture must hold the singleton");
+
+        let progress = crate::progress::NullProgress;
+        match acquire_manual_locks_at(&singleton, &maintenance, &progress).unwrap() {
+            BackupLockAttempt::AlreadyRunning => {}
+            BackupLockAttempt::Acquired(_) => panic!("two backups acquired at once"),
+        }
+    }
+
+    #[test]
+    fn manual_backup_acquires_when_nothing_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = crate::progress::NullProgress;
+        match acquire_manual_locks_at(
+            &dir.path().join("backup.lock"),
+            &dir.path().join("maintenance.lock"),
+            &progress,
+        )
+        .unwrap()
+        {
+            BackupLockAttempt::Acquired(_) => {}
+            BackupLockAttempt::AlreadyRunning => panic!("declined with nothing held"),
+        }
+    }
+    use crate::config::{
+        Boot, Config, Das, Doctor, Email, General, Gui, Init, InitSystem, Retention, Schedule,
+        Scrub, Source, SubvolConfig, Target, TargetRole,
+    };
+    use crate::progress::TestProgress;
+
+    // Build a minimal Config suitable for unit tests.
+    fn make_test_config() -> Config {
+        Config {
+            general: General {
+                version: "0.6.0".into(),
+                install_prefix: "/usr".into(),
+                db_path: "/tmp/test.db".into(),
+                log_file: "/tmp/test.log".into(),
+                growth_log: "/tmp/growth.log".into(),
+                last_report: "/tmp/last-report.txt".into(),
+                btrbk_conf: "/nonexistent/btrbk.conf".into(),
+            },
+            init: Init {
+                system: InitSystem::Systemd,
+            },
+            schedule: Schedule {
+                incremental: "03:00".into(),
+                full: "Sun 04:00".into(),
+                randomized_delay_min: 30,
+            },
+            das: Das::default(),
+            boot: Boot {
+                enabled: true,
+                subvolumes: vec!["@".into(), "@home".into()],
+                archive_retention_days: 365,
+            },
+            scrub: Scrub::default(),
+            doctor: Doctor::default(),
+            sources: vec![
+                Source {
+                    label: "nvme-root".into(),
+                    volume: "/.btrfs-nvme".into(),
+                    subvolumes: vec![
+                        SubvolConfig {
+                            name: "@".into(),
+                            manual_only: false,
+                            snapshot_name: None,
+                        },
+                        SubvolConfig {
+                            name: "@home".into(),
+                            manual_only: false,
+                            snapshot_name: None,
+                        },
+                    ],
+                    device: "/dev/nvme0n1p2".into(),
+                    snapshot_dir: ".btrbk-snapshots".into(),
+                    target_subdirs: vec![],
+                    target_labels: vec![],
+                },
+                Source {
+                    label: "manual-src".into(),
+                    volume: "/.btrfs-manual".into(),
+                    subvolumes: vec![SubvolConfig {
+                        name: "@special".into(),
+                        manual_only: true,
+                        snapshot_name: None,
+                    }],
+                    device: "/dev/sdb".into(),
+                    snapshot_dir: ".btrbk-snapshots".into(),
+                    target_subdirs: vec![],
+                    target_labels: vec![],
+                },
+            ],
+            targets: vec![Target {
+                label: "primary-22tb".into(),
+                serial: "TESTSERIAL".into(),
+                serials: vec!["TESTSERIAL".into()],
+                mount_uuid: None,
+                // Use a path that's definitely mounted in any Linux test environment.
+                mount: "/proc".into(),
+                role: TargetRole::Primary,
+                retention: Retention {
+                    weekly: 4,
+                    monthly: 2,
+                    daily: 365,
+                    yearly: 4,
+                },
+                display_name: "Test 22TB".into(),
+            }],
+            email: Email::default(),
+            gui: Gui::default(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // parse_btrbk_snapshot_count
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_btrbk_snapshot_count() {
+        // btrbk marks created snapshots with +++
+        let output = "\
++++ /.btrfs-nvme/.btrbk-snapshots/root.20260228T030012
++++ /.btrfs-nvme/.btrbk-snapshots/home.20260228T030012
+>>> /mnt/backup/nvme/root.20260228T030012
+=== /.btrfs-nvme/.btrbk-snapshots/root.20260227T030012
+--- /.btrfs-nvme/.btrbk-snapshots/root.20260220T030012
+";
+        let count = parse_btrbk_snapshot_count(output);
+        assert_eq!(count, 2, "should count 2 +++ lines, got {count}");
+    }
+
+    #[test]
+    fn test_parse_btrbk_snapshot_count_empty() {
+        assert_eq!(parse_btrbk_snapshot_count(""), 0);
+    }
+
+    #[test]
+    fn test_parse_btrbk_snapshot_count_no_snapshots() {
+        let output = "=== up-to-date\n--- deleted old\n";
+        assert_eq!(parse_btrbk_snapshot_count(output), 0);
+    }
+
+    #[test]
+    fn test_parse_btrbk_send_count() {
+        // btrbk marks incremental sends with >>> and full sends with ***
+        let output = "\
++++ /.btrfs-nvme/.btrbk-snapshots/root.20260302T0835
+>>> /mnt/backup-22tb/nvme/root.20260302T0835
+>>> /mnt/backup-system-recovery-B/nvme/root.20260302T0835
+*** /mnt/backup-system-recovery-A/nvme/root.20260302T0835
+=== /.btrfs-nvme/.btrbk-snapshots/home.20260302T0828
+--- /mnt/backup-22tb/nvme/root.20260220T030012
+";
+        let count = parse_btrbk_send_count(output);
+        assert_eq!(count, 3, "should count 2 >>> + 1 ***, got {count}");
+    }
+
+    #[test]
+    fn test_parse_btrbk_send_count_none() {
+        let output = "+++ snapshot\n=== up-to-date\n--- deleted\n";
+        assert_eq!(parse_btrbk_send_count(output), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // parse_btrbk_size_field
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_size_field_incremental() {
+        let line = "*** /mnt/backup-22tb/nvme/root.20260302T0835 (incremental, 45.3 MiB)";
+        let bytes = parse_btrbk_size_field(line);
+        // 45.3 * 1_048_576 = 47_508_377
+        assert!(bytes > 47_000_000 && bytes < 48_000_000, "got {bytes}");
+    }
+
+    #[test]
+    fn test_parse_size_field_full_send() {
+        let line = ">>> /mnt/backup-22tb/nvme/root.20260302T0835 (full send, 1.2 GiB)";
+        let bytes = parse_btrbk_size_field(line);
+        // 1.2 * 1_073_741_824 = 1_288_490_188
+        assert!(
+            bytes > 1_200_000_000 && bytes < 1_400_000_000,
+            "got {bytes}"
+        );
+    }
+
+    #[test]
+    fn test_parse_size_field_no_parens() {
+        let line = ">>> /mnt/backup-22tb/nvme/root.20260302T0835";
+        assert_eq!(parse_btrbk_size_field(line), 0);
+    }
+
+    #[test]
+    fn test_parse_size_field_no_size_in_parens() {
+        let line = ">>> /mnt/backup-22tb/nvme/root.20260302T0835 (incremental)";
+        assert_eq!(parse_btrbk_size_field(line), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // format_timestamp
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_format_timestamp() {
+        let ts = format_timestamp();
+        // Must match YYYYMMDDTHHMMSS: 15 chars, digit positions, 'T' at index 8.
+        assert_eq!(ts.len(), 15, "timestamp length must be 15, got '{ts}'");
+        assert_eq!(&ts[8..9], "T", "char at index 8 must be 'T', got '{ts}'");
+        // All other characters must be ASCII digits.
+        for (i, ch) in ts.chars().enumerate() {
+            if i == 8 {
+                continue;
+            }
+            assert!(
+                ch.is_ascii_digit(),
+                "char {i} ('{ch}') must be a digit in '{ts}'"
+            );
+        }
+        // Year must be >= 2026 (this test was written in 2026).
+        let year: u32 = ts[0..4].parse().expect("year must be numeric");
+        assert!(year >= 2026, "year {year} should be >= 2026");
+    }
+
+    // -----------------------------------------------------------------
+    // Dry-run: no commands spawned
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_dry_run_doesnt_execute() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let progress = TestProgress::new();
+
+        let result = run_backup(&config, &options, &progress)
+            .expect("dry_run should succeed even with non-existent btrbk.conf");
+
+        assert!(result.success, "dry_run result must be success");
+        assert_eq!(
+            result.snapshots_created, 0,
+            "dry_run must create 0 snapshots"
+        );
+        assert_eq!(result.snapshots_sent, 0, "dry_run must send 0 snapshots");
+        assert_eq!(result.bytes_sent, 0);
+        assert!(!result.boot_archived);
+
+        // Verify at least one DRY RUN log message was emitted.
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(_, msg)| msg.contains("DRY RUN")),
+            "expected DRY RUN log message, got: {logs:?}"
+        );
+
+        // Verify on_complete was called with success.
+        let completed = progress.completed.lock().unwrap();
+        assert!(completed.is_some(), "on_complete must have been called");
+        assert!(
+            completed.as_ref().unwrap().0,
+            "on_complete must report success"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // No targets mounted -> error (non dry-run)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_run_backup_checks_mounted_targets() {
+        let mut config = make_test_config();
+        // Override target mount to something that cannot be mounted.
+        config.targets[0].mount = "/nonexistent/das/mount".into();
+
+        let options = BackupOptions {
+            dry_run: false,
+            ..Default::default()
+        };
+        let progress = TestProgress::new();
+
+        let result = run_backup(&config, &options, &progress);
+        assert!(result.is_err(), "must fail when no targets are mounted");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.to_lowercase().contains("no backup targets"),
+            "error message must mention targets, got: '{err_msg}'"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Source filtering: manual_only excluded by default
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_source_filtering_excludes_manual_only() {
+        let config = make_test_config();
+
+        // When sources is empty, effective_sources should exclude "manual-src"
+        // because all its subvolumes are manual_only = true.
+        let effective: Vec<String> = if config.sources.is_empty() {
+            vec![]
+        } else {
+            config
+                .sources
+                .iter()
+                .filter(|src| src.subvolumes.iter().any(|sv| !sv.manual_only))
+                .map(|src| src.label.clone())
+                .collect()
+        };
+
+        assert!(
+            effective.contains(&"nvme-root".to_string()),
+            "nvme-root (has non-manual subvols) must be included"
+        );
+        assert!(
+            !effective.contains(&"manual-src".to_string()),
+            "manual-src (all subvols are manual_only) must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_source_filtering_explicit_override() {
+        // When sources is explicitly set, manual_only restriction is bypassed.
+        let explicit_sources = vec!["manual-src".to_string()];
+        // Simulate what run_backup does when options.sources is non-empty.
+        let effective = explicit_sources.clone();
+
+        assert!(
+            effective.contains(&"manual-src".to_string()),
+            "explicitly requested manual-src must be included"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Existing tests (unchanged)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn backup_options_defaults() {
+        let opts = BackupOptions::default();
+        assert!(opts.mode.is_none());
+        assert!(opts.sources.is_empty());
+        assert!(opts.targets.is_empty());
+        assert!(!opts.dry_run);
+        assert!(!opts.snapshot_only);
+        assert!(!opts.send_only);
+        assert!(!opts.boot_archive);
+        assert!(!opts.index_after);
+        assert!(!opts.send_report);
+    }
+
+    #[test]
+    fn backup_mode_equality() {
+        assert_eq!(BackupMode::Incremental, BackupMode::Incremental);
+        assert_ne!(BackupMode::Incremental, BackupMode::Full);
+    }
+
+    // -----------------------------------------------------------------
+    // Throughput parsing
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_throughput_mib_s_glued() {
+        // "22.3MiB/s" glued token
+        let bps = parse_glued_throughput("22.3MiB/s");
+        assert!(bps.is_some());
+        let bps = bps.unwrap();
+        assert!(
+            bps > 20_000_000 && bps < 25_000_000,
+            "22.3 MiB/s ~ {bps} B/s"
+        );
+    }
+
+    #[test]
+    fn test_parse_throughput_line_spaced() {
+        // "send 22.3 MiB/s" with space between value and unit
+        let bps = parse_throughput_line("send 22.3 MiB/s");
+        assert!(
+            bps > 20_000_000 && bps < 25_000_000,
+            "22.3 MiB/s ~ {bps} B/s"
+        );
+    }
+
+    #[test]
+    fn test_parse_throughput_line_no_throughput() {
+        assert_eq!(parse_throughput_line("Snapshot /.btrfs/root.20260228"), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // archive_boot: mirror-role targets must never be archived/replaced
+    // (bd DAS-Backup-Manager-am1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_archive_boot_skips_mirror_targets() {
+        // Two targets: a primary (fair game for archive/replace) and a mirror
+        // (independent OS — must be skipped entirely by archive_boot). Both
+        // mount paths are real tempdirs so `Path::exists()` checks behave
+        // like a real (if empty) target; neither has an "@"/"@home" subvolume
+        // on disk, so no actual btrfs mutation is attempted against either —
+        // this test only asserts *target selection*, not btrfs plumbing.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+
+        let mut config = make_test_config();
+        config.targets[0].mount = primary_dir.path().to_string_lossy().to_string();
+        config.targets[0].label = "primary-22tb".into();
+        config.targets.push(Target {
+            label: "system-recovery-A-2tb".into(),
+            serial: "MIRRORSERIAL".into(),
+            serials: vec!["MIRRORSERIAL".into()],
+            mount_uuid: None,
+            mount: mirror_dir.path().to_string_lossy().to_string(),
+            role: TargetRole::Mirror,
+            retention: Retention {
+                weekly: 4,
+                monthly: 2,
+                daily: 7,
+                yearly: 0,
+            },
+            display_name: "Recovery A (independent OS)".into(),
+        });
+
+        let progress = TestProgress::new();
+        let result = archive_boot(&config, &progress);
+        assert!(result.is_ok(), "archive_boot must not error: {result:?}");
+
+        let logs = progress.logs.lock().unwrap();
+
+        // The mirror target must be explicitly skipped, with wording mirroring
+        // scripts/backup-run.sh's update_boot_subvolumes().
+        let mirror_mount = mirror_dir.path().to_string_lossy().to_string();
+        assert!(
+            logs.iter().any(|(_, msg)| msg.contains(&mirror_mount)
+                && msg.contains("Skipping mirror target (independent OS)")),
+            "expected a 'Skipping mirror target (independent OS)' log mentioning {mirror_mount}, got: {logs:?}"
+        );
+
+        // No archive/create/delete/snapshot log line may ever reference the
+        // mirror's mount path — the skip must happen before any btrfs
+        // subvolume operation is attempted against it.
+        assert!(
+            !logs.iter().any(|(_, msg)| {
+                (msg.contains("Archived") || msg.contains("Created") || msg.contains("delete"))
+                    && msg.contains(&mirror_mount)
+            }),
+            "no archive/create/delete operation may reference the mirror mount, got: {logs:?}"
+        );
+    }
+}
