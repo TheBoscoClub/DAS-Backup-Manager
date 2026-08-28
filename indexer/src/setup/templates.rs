@@ -421,16 +421,16 @@ pub fn render_systemd_doctor_timer(_config: &Config) -> String {
 }
 
 /// Generate cron entries for incremental (daily) and full (weekly) backups.
-pub fn render_cron_entry(config: &Config) -> String {
+pub fn render_cron_entry(config: &Config) -> Result<String, String> {
     let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
 
     // Parse "03:00" -> hour=3, minute=0
-    let (inc_hour, inc_min) = parse_time(&config.schedule.incremental);
+    let (inc_hour, inc_min) = parse_time(&config.schedule.incremental)?;
 
     // Parse "Sun 04:00" -> dow=0, hour=4, minute=0
-    let (full_dow, full_hour, full_min) = parse_schedule_with_day(&config.schedule.full);
+    let (full_dow, full_hour, full_min) = parse_schedule_with_day(&config.schedule.full)?;
 
-    format!(
+    Ok(format!(
         "{GENERATED_HEADER}\
          # Incremental backup (daily)\n\
          {inc_min} {inc_hour} * * * root {script_dir}/backup-run.sh \
@@ -439,7 +439,7 @@ pub fn render_cron_entry(config: &Config) -> String {
          # Full backup (weekly)\n\
          {full_min} {full_hour} * * {full_dow} root {script_dir}/backup-run.sh --full \
          >> /var/log/das-backup.log 2>&1\n"
-    )
+    ))
 }
 
 // Email config file generation removed 2026-05-16, and there is nothing to
@@ -544,10 +544,18 @@ impl GeneratedFiles {
                 ));
             }
             InitSystem::Sysvinit | InitSystem::Openrc => {
-                files.push((
-                    "/etc/cron.d/das-backup".to_string(),
-                    render_cron_entry(config),
-                ));
+                // Fail closed: an unparseable schedule yields NO cron file
+                // rather than one silently pinned to 03:00 Sunday. Unreachable
+                // via the normal flow — `Config::validate()` rejects a bad
+                // schedule before setup ever generates anything
+                // (bd DAS-Backup-Manager-06p).
+                match render_cron_entry(config) {
+                    Ok(entry) => files.push(("/etc/cron.d/das-backup".to_string(), entry)),
+                    Err(e) => eprintln!(
+                        "Refusing to generate /etc/cron.d/das-backup — {e}. \
+                         Fix [schedule] in config.toml and re-run setup."
+                    ),
+                }
             }
         }
 
@@ -571,37 +579,6 @@ impl GeneratedFiles {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Parse a time string like "03:00" into (hour, minute).
-fn parse_time(time_str: &str) -> (u32, u32) {
-    let parts: Vec<&str> = time_str.split(':').collect();
-    let hour = parts.first().and_then(|s| s.parse().ok()).unwrap_or(3);
-    let min = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (hour, min)
-}
-
-/// Parse a schedule string like "Sun 04:00" into (day_of_week, hour, minute).
-/// Day of week: Sun=0, Mon=1, ..., Sat=6.
-fn parse_schedule_with_day(schedule: &str) -> (u32, u32, u32) {
-    let parts: Vec<&str> = schedule.split_whitespace().collect();
-    if parts.len() == 2 {
-        let dow = match parts[0].to_lowercase().as_str() {
-            "sun" => 0,
-            "mon" => 1,
-            "tue" => 2,
-            "wed" => 3,
-            "thu" => 4,
-            "fri" => 5,
-            "sat" => 6,
-            _ => 0,
-        };
-        let (hour, min) = parse_time(parts[1]);
-        (dow, hour, min)
-    } else {
-        let (hour, min) = parse_time(parts[0]);
-        (0, hour, min) // Default to Sunday
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests (TDD — written first, implementation follows)
@@ -817,9 +794,44 @@ mod tests {
     #[test]
     fn render_cron_entry_test() {
         let config = test_config();
-        let result = render_cron_entry(&config);
+        let result = render_cron_entry(&config).expect("valid schedule renders");
         assert!(result.contains("0 3 * * *"));
         assert!(result.contains("/usr/local/lib/das-backup/backup-run.sh"));
+    }
+
+    // Counter-tests for bd DAS-Backup-Manager-06p. Each of these produced a
+    // silently-defaulted cron entry before the parsers returned Result:
+    // "3 AM" became 03:00, and "Friday 04:00" became SUNDAY 04:00.
+    #[test]
+    fn render_cron_entry_refuses_an_unparseable_time() {
+        let mut config = test_config();
+        config.schedule.incremental = "3 AM".into();
+        let err = render_cron_entry(&config).expect_err("must not silently default to 03:00");
+        assert!(err.contains("3 AM"), "{err}");
+    }
+
+    #[test]
+    fn render_cron_entry_refuses_a_full_weekday_name() {
+        let mut config = test_config();
+        config.schedule.full = "Friday 04:00".into();
+        let err = render_cron_entry(&config).expect_err("must not silently default to Sunday");
+        assert!(err.contains("friday"), "{err}");
+    }
+
+    #[test]
+    fn schedule_errors_are_surfaced_by_config_validate() {
+        let mut config = test_config();
+        config.schedule.incremental = "0300".into();
+        config.schedule.full = "Funday 04:00".into();
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("schedule.incremental")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("schedule.full")),
+            "{errors:?}"
+        );
     }
 
     #[test]

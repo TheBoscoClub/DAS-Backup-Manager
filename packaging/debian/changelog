@@ -1,3 +1,17 @@
+das-backup-manager (0.7.20.0-1) unstable; urgency=medium
+
+  * Security and correctness release from an independent privilege-boundary review
+  * archive_boot: locate the replacement and build it alongside the live subvolume
+    before deleting; names now read from btrbk.conf (bd DAS-Backup-Manager-5ig)
+  * D-Bus helper takes the singleton and maintenance locks (bd DAS-Backup-Manager-dca)
+  * config_path dropped from 17 D-Bus methods (bd DAS-Backup-Manager-wd7)
+  * restore: [restore] allowed_roots, fail-closed guard, O_NOFOLLOW (bd DAS-Backup-Manager-s05)
+  * stream_command drains stderr on its own thread (bd DAS-Backup-Manager-az3)
+  * job_cancel enforces ownership (bd DAS-Backup-Manager-h2s)
+  * Fail-silent cluster fixed (bd DAS-Backup-Manager-06p)
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Fri, 28 Aug 2026 07:45:00 -0500
+
 das-backup-manager (0.7.12.3-1) unstable; urgency=medium
 
   * Fix das-backup.service exit-1 after successful btrbk replication

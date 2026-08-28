@@ -444,7 +444,7 @@ void MainWindow::triggerReindex()
 
     // Empty target path → D-Bus helper walks ALL mounted config targets
     statusBar()->showMessage(i18n("Re-indexing all targets..."));
-    m_indexRunner->run(QStringLiteral("/etc/das-backup/config.toml"), QString(), m_dbPath);
+    m_indexRunner->run(QString(), m_dbPath);
 }
 
 void MainWindow::showStats()
@@ -472,8 +472,8 @@ void MainWindow::updateStatusBar()
     m_statusLabel->setText(i18n("Loading..."));
 
     m_dbusClient->indexStatsAsync(m_dbPath);
-    m_dbusClient->scheduleGetAsync(QStringLiteral("/etc/das-backup/config.toml"));
-    m_dbusClient->healthQueryAsync(QStringLiteral("/etc/das-backup/config.toml"));
+    m_dbusClient->scheduleGetAsync();
+    m_dbusClient->healthQueryAsync();
 
     // Safety timeout: if D-Bus results haven't all arrived within 10 seconds,
     // assemble the status bar with whatever data we have so far.

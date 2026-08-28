@@ -82,67 +82,67 @@ QString DBusClient::unavailableReason() const
 
 // --- Async job-returning methods ---
 
-void DBusClient::backupRun(const QString &configPath, const QString &mode,
+void DBusClient::backupRun(const QString &mode,
                            const QStringList &sources, const QStringList &targets,
                            bool dryRun)
 {
     callAsync(QStringLiteral("BackupRun"),
-              {configPath, mode, QVariant::fromValue(sources),
+              {mode, QVariant::fromValue(sources),
                QVariant::fromValue(targets), dryRun},
               QStringLiteral("BackupRun"));
 }
 
-void DBusClient::backupSnapshot(const QString &configPath, const QStringList &sources)
+void DBusClient::backupSnapshot(const QStringList &sources)
 {
     callAsync(QStringLiteral("BackupSnapshot"),
-              {configPath, QVariant::fromValue(sources)},
+              {QVariant::fromValue(sources)},
               QStringLiteral("BackupSnapshot"));
 }
 
-void DBusClient::backupSend(const QString &configPath, const QStringList &targets)
+void DBusClient::backupSend(const QStringList &targets)
 {
     callAsync(QStringLiteral("BackupSend"),
-              {configPath, QVariant::fromValue(targets)},
+              {QVariant::fromValue(targets)},
               QStringLiteral("BackupSend"));
 }
 
-void DBusClient::backupBootArchive(const QString &configPath)
+void DBusClient::backupBootArchive()
 {
     callAsync(QStringLiteral("BackupBootArchive"),
-              {configPath},
+              {},
               QStringLiteral("BackupBootArchive"));
 }
 
-void DBusClient::indexWalk(const QString &configPath, const QString &targetPath,
+void DBusClient::indexWalk(const QString &targetPath,
                            const QString &dbPath)
 {
     callAsync(QStringLiteral("IndexWalk"),
-              {configPath, targetPath, dbPath},
+              {targetPath, dbPath},
               QStringLiteral("IndexWalk"));
 }
 
-void DBusClient::restoreFiles(const QString &configPath, const QString &snapshot,
+void DBusClient::restoreFiles(const QString &snapshot,
                               const QString &dest, const QStringList &files)
 {
     callAsync(QStringLiteral("RestoreFiles"),
-              {configPath, snapshot, dest, QVariant::fromValue(files)},
+              {snapshot, dest, QVariant::fromValue(files)},
               QStringLiteral("RestoreFiles"));
 }
 
-void DBusClient::restoreSnapshot(const QString &configPath, const QString &snapshot,
+void DBusClient::restoreSnapshot(const QString &snapshot,
                                  const QString &dest)
 {
     callAsync(QStringLiteral("RestoreSnapshot"),
-              {configPath, snapshot, dest},
+              {snapshot, dest},
               QStringLiteral("RestoreSnapshot"));
 }
 
 // --- Synchronous methods ---
 
-QString DBusClient::configGet(const QString &configPath)
+QString DBusClient::configGet()
 {
     if (!m_available) return {};
-    QDBusReply<QString> reply = m_interface->call(QStringLiteral("ConfigGet"), configPath);
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("ConfigGet"));
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ConfigGet"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -151,11 +151,11 @@ QString DBusClient::configGet(const QString &configPath)
     return reply.value();
 }
 
-bool DBusClient::configSet(const QString &configPath, const QString &tomlContent)
+bool DBusClient::configSet(const QString &tomlContent)
 {
     if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("ConfigSet"),
-                                               configPath, tomlContent);
+                                               tomlContent);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ConfigSet"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -164,10 +164,10 @@ bool DBusClient::configSet(const QString &configPath, const QString &tomlContent
     return true;
 }
 
-QString DBusClient::scheduleGet(const QString &configPath)
+QString DBusClient::scheduleGet()
 {
     if (!m_available) return {};
-    QDBusReply<QString> reply = m_interface->call(QStringLiteral("ScheduleGet"), configPath);
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("ScheduleGet"));
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ScheduleGet"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -176,12 +176,12 @@ QString DBusClient::scheduleGet(const QString &configPath)
     return reply.value();
 }
 
-bool DBusClient::scheduleSet(const QString &configPath, const QString &incremental,
+bool DBusClient::scheduleSet(const QString &incremental,
                              const QString &full, quint32 delay)
 {
     if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("ScheduleSet"),
-                                               configPath, incremental, full, delay);
+                                               incremental, full, delay);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ScheduleSet"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -190,11 +190,11 @@ bool DBusClient::scheduleSet(const QString &configPath, const QString &increment
     return true;
 }
 
-bool DBusClient::scheduleEnable(const QString &configPath, bool enabled)
+bool DBusClient::scheduleEnable(bool enabled)
 {
     if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("ScheduleEnable"),
-                                               configPath, enabled);
+                                               enabled);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("ScheduleEnable"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -203,12 +203,12 @@ bool DBusClient::scheduleEnable(const QString &configPath, bool enabled)
     return true;
 }
 
-bool DBusClient::subvolAdd(const QString &configPath, const QString &source,
+bool DBusClient::subvolAdd(const QString &source,
                            const QString &name)
 {
     if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolAdd"),
-                                               configPath, source, name);
+                                               source, name);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("SubvolAdd"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -217,12 +217,12 @@ bool DBusClient::subvolAdd(const QString &configPath, const QString &source,
     return true;
 }
 
-bool DBusClient::subvolRemove(const QString &configPath, const QString &source,
+bool DBusClient::subvolRemove(const QString &source,
                               const QString &name)
 {
     if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolRemove"),
-                                               configPath, source, name);
+                                               source, name);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("SubvolRemove"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -231,12 +231,12 @@ bool DBusClient::subvolRemove(const QString &configPath, const QString &source,
     return true;
 }
 
-bool DBusClient::subvolSetManual(const QString &configPath, const QString &source,
+bool DBusClient::subvolSetManual(const QString &source,
                                  const QString &name, bool manual)
 {
     if (!m_available) return false;
     QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolSetManual"),
-                                               configPath, source, name, manual);
+                                               source, name, manual);
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("SubvolSetManual"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -245,10 +245,10 @@ bool DBusClient::subvolSetManual(const QString &configPath, const QString &sourc
     return true;
 }
 
-QString DBusClient::healthQuery(const QString &configPath)
+QString DBusClient::healthQuery()
 {
     if (!m_available) return {};
-    QDBusReply<QString> reply = m_interface->call(QStringLiteral("HealthQuery"), configPath);
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("HealthQuery"));
     if (!reply.isValid()) {
         Q_EMIT errorOccurred(QStringLiteral("HealthQuery"),
                              mapDBusError(reply.error().name(), reply.error().message()));
@@ -271,14 +271,14 @@ bool DBusClient::jobCancel(const QString &jobId)
 
 // --- Async non-blocking methods ---
 
-void DBusClient::healthQueryAsync(const QString &configPath)
+void DBusClient::healthQueryAsync()
 {
     if (!m_available) {
         Q_EMIT healthQueryResult({});
         return;
     }
     QDBusPendingCall pending = m_interface->asyncCall(
-        QStringLiteral("HealthQuery"), configPath);
+        QStringLiteral("HealthQuery"));
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
     connect(watcher, &QDBusPendingCallWatcher::finished,
             this, [this](QDBusPendingCallWatcher *w) {
@@ -295,14 +295,14 @@ void DBusClient::healthQueryAsync(const QString &configPath)
     });
 }
 
-void DBusClient::scheduleGetAsync(const QString &configPath)
+void DBusClient::scheduleGetAsync()
 {
     if (!m_available) {
         Q_EMIT scheduleGetResult({});
         return;
     }
     QDBusPendingCall pending = m_interface->asyncCall(
-        QStringLiteral("ScheduleGet"), configPath);
+        QStringLiteral("ScheduleGet"));
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
     connect(watcher, &QDBusPendingCallWatcher::finished,
             this, [this](QDBusPendingCallWatcher *w) {

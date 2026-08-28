@@ -86,14 +86,140 @@ pub fn browse_snapshot(
 }
 
 /// Restore specific files from a snapshot to a destination.
+/// Resolve `path` as far as it exists on disk, then re-attach the part that
+/// does not exist yet.
+///
+/// A restore destination is routinely a directory that has not been created,
+/// so plain `canonicalize()` would fail on exactly the input we most need to
+/// judge. Resolving the existing prefix is what makes a symlinked ancestor
+/// impossible to hide behind.
+fn resolve_for_policy(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut existing = path;
+    let mut trailing = Vec::new();
+    loop {
+        if existing.exists() {
+            let mut out = existing.canonicalize()?;
+            for part in trailing.iter().rev() {
+                out.push(part);
+            }
+            return Ok(out);
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                trailing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no existing ancestor of {}", path.display()),
+                ));
+            }
+        }
+    }
+}
+
+/// Refuse a restore destination that policy does not permit.
+///
+/// Two checks, denylist first: [`RESTORE_DENIED_ROOTS`] can never be written to
+/// even if someone lists one in `allowed_roots`, and the destination must then
+/// fall under one of the configured roots. Both are applied to the RESOLVED
+/// path, so a symlinked ancestor cannot smuggle a write past them.
+///
+/// Before 0.7.20.0 there was no check at all: `restore_files` runs as root under
+/// the D-Bus helper and would happily write into a systemd unit directory or a
+/// package-manager hook directory (bd DAS-Backup-Manager-s05).
+pub fn check_dest_allowed(
+    dest: &Path,
+    allowed_roots: &[String],
+) -> Result<std::path::PathBuf, String> {
+    let resolved = resolve_for_policy(dest)
+        .map_err(|e| format!("Cannot resolve destination '{}': {e}", dest.display()))?;
+
+    for denied in crate::config::RESTORE_DENIED_ROOTS {
+        if resolved.starts_with(denied) {
+            return Err(format!(
+                "Refusing to restore into '{}': '{denied}' is never a permitted destination",
+                resolved.display()
+            ));
+        }
+    }
+
+    if allowed_roots
+        .iter()
+        .any(|root| resolved.starts_with(Path::new(root)))
+    {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "Refusing to restore into '{}': not under any [restore] allowed_roots ({})",
+            resolved.display(),
+            allowed_roots.join(", ")
+        ))
+    }
+}
+
+/// Reject a member path that could escape the snapshot or the destination.
+///
+/// One check covers both directions, because the same string is joined onto
+/// each: a `..` component in `file_path` would otherwise let `src` climb out of
+/// the snapshot AND let `dest_file` climb out of the validated destination.
+fn safe_member(file_path: &str) -> Result<&Path, String> {
+    use std::path::Component;
+    let p = Path::new(file_path);
+    if p.is_absolute() {
+        return Err(format!("'{file_path}' is absolute"));
+    }
+    for component in p.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(format!(
+                "'{file_path}' contains a non-literal path component"
+            ));
+        }
+    }
+    Ok(p)
+}
+
+/// Copy `src` over `dest` without following a symlink at `dest`.
+///
+/// `std::fs::copy` opens the destination write-truncate, which FOLLOWS a
+/// symlink sitting at that path — so a pre-planted link at the destination
+/// turned a restore into an overwrite of whatever it pointed at. `O_NOFOLLOW`
+/// applies to the final component, which is precisely that case.
+fn copy_no_follow(src: &Path, dest: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut reader = std::fs::File::open(src)?;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dest)?;
+    std::io::copy(&mut reader, &mut writer)
+}
+
 pub fn restore_files(
     snapshot_path: &Path,
     file_paths: &[&str],
     dest: &Path,
+    allowed_roots: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<RestoreResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let total = file_paths.len() as u64;
+
+    // Destination policy is checked BEFORE anything is created — including the
+    // destination directory itself, which `create_dir_all` below would
+    // otherwise materialise inside a forbidden root.
+    let dest = &check_dest_allowed(dest, allowed_roots)?;
+
+    // Resolve the snapshot root once. The old code compared a canonicalized
+    // `src` against a RAW `snapshot_path`, so on a udisks2 mount
+    // (/run/media/... vs /mnt/...) the two never shared a prefix and every
+    // legitimate restore was refused as traversal.
+    let snapshot_root = snapshot_path
+        .canonicalize()
+        .unwrap_or_else(|_| snapshot_path.to_path_buf());
 
     progress.on_stage("Restoring files", total);
     progress.on_log(
@@ -108,12 +234,25 @@ pub fn restore_files(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, file_path) in file_paths.iter().enumerate() {
-        let src = snapshot_path.join(file_path);
-        let dest_file = dest.join(file_path);
+        // Reject the member path itself. This is the check that actually stops
+        // traversal, and unlike the old guard it CANNOT fail open: it inspects
+        // the requested string, not whatever the filesystem happens to resolve.
+        let member = match safe_member(file_path) {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(format!("Path traversal blocked: {e}"));
+                continue;
+            }
+        };
+        let src = snapshot_path.join(member);
+        let dest_file = dest.join(member);
 
-        // Path traversal guard: ensure resolved paths stay within boundaries
+        // Belt and braces: if `src` resolves at all, it must land inside the
+        // snapshot. A resolve FAILURE is no longer silently tolerated for
+        // regular files — only a symlink may legitimately fail to resolve, and
+        // that case is handled explicitly below.
         if let Ok(canonical_src) = src.canonicalize()
-            && !canonical_src.starts_with(snapshot_path)
+            && !canonical_src.starts_with(&snapshot_root)
         {
             errors.push(format!("Path traversal blocked: '{}'", file_path));
             continue;
@@ -151,7 +290,7 @@ pub fn restore_files(
                     }
                 }
             }
-            Ok(_) => match std::fs::copy(&src, &dest_file) {
+            Ok(_) => match copy_no_follow(&src, &dest_file) {
                 Ok(bytes) => {
                     bytes_restored += bytes;
                     files_restored += 1;
@@ -191,9 +330,12 @@ pub fn restore_files(
 pub fn restore_snapshot(
     snapshot_path: &Path,
     dest: &Path,
+    allowed_roots: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<RestoreResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
+
+    let dest = &check_dest_allowed(dest, allowed_roots)?;
 
     progress.on_stage("Restoring snapshot", 1);
     progress.on_log(
@@ -438,6 +580,108 @@ mod tests {
     use tempfile::TempDir;
 
     /// Helper: write a file with given content inside a base dir.
+    // --- bd DAS-Backup-Manager-s05 --------------------------------------
+    #[test]
+    fn dest_policy_refuses_denied_roots_even_if_allowed() {
+        // The denylist wins over configuration: listing a system root in
+        // allowed_roots must NOT enable it.
+        for denied in crate::config::RESTORE_DENIED_ROOTS {
+            let err =
+                check_dest_allowed(Path::new(denied), &[denied.to_string(), "/tmp".to_string()])
+                    .expect_err("{denied} must never be a permitted destination");
+            assert!(err.contains("never a permitted destination"), "{err}");
+        }
+    }
+
+    #[test]
+    fn dest_policy_refuses_paths_outside_allowed_roots() {
+        let outside = std::env::temp_dir().join("das-restore-outside-test");
+        let err = check_dest_allowed(&outside, &["/home".to_string()])
+            .expect_err("a temp path is not under /home");
+        assert!(err.contains("allowed_roots"), "{err}");
+    }
+
+    #[test]
+    fn dest_policy_admits_a_path_under_an_allowed_root() {
+        let dir = TempDir::new().unwrap();
+        // Positive control: without this, the two refusals above would pass
+        // even if the function refused everything unconditionally.
+        check_dest_allowed(dir.path(), &test_roots()).expect("temp dir must be allowed");
+    }
+
+    #[test]
+    fn member_paths_may_not_escape() {
+        for bad in ["../etc/passwd", "a/../../b", "/absolute/path", ".."] {
+            assert!(safe_member(bad).is_err(), "{bad} must be rejected");
+        }
+        // Positive control.
+        assert!(safe_member("dir/file.txt").is_ok());
+    }
+
+    #[test]
+    fn restore_refuses_a_traversing_member_without_writing() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "ok.txt", "fine");
+        let dest = TempDir::new().unwrap();
+        let progress = TestProgress::new();
+
+        let result = restore_files(
+            snap.path(),
+            &["../escape.txt", "ok.txt"],
+            dest.path(),
+            &test_roots(),
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(result.files_restored, 1, "only the safe member restores");
+        assert!(
+            result.errors.iter().any(|e| e.contains("traversal")),
+            "{:?}",
+            result.errors
+        );
+        assert!(!dest.path().parent().unwrap().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn copy_does_not_follow_a_symlink_planted_at_the_destination() {
+        // The concrete attack: a pre-planted link at dest_file turned a restore
+        // into an overwrite of whatever it pointed at. `std::fs::copy` follows
+        // it; `copy_no_follow` must not.
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "payload.txt", "attacker content");
+        let dest = TempDir::new().unwrap();
+
+        let victim = dest.path().join("victim.txt");
+        std::fs::write(&victim, "original").unwrap();
+        std::os::unix::fs::symlink(&victim, dest.path().join("payload.txt")).unwrap();
+
+        let err = copy_no_follow(
+            &snap.path().join("payload.txt"),
+            &dest.path().join("payload.txt"),
+        )
+        .expect_err("must refuse to write through a symlink");
+        // ELOOP on stable Rust: ErrorKind::FilesystemLoop is still unstable, so
+        // assert the raw errno rather than a nightly-only variant.
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "the symlink target must be untouched"
+        );
+    }
+
+    /// Allow the platform temp root, wherever TMPDIR points.
+    fn test_roots() -> Vec<String> {
+        vec![
+            std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::temp_dir())
+                .to_string_lossy()
+                .into_owned(),
+        ]
+    }
+
     fn write_file(base: &Path, rel: &str, content: &str) {
         let path = base.join(rel);
         if let Some(parent) = path.parent() {
@@ -550,6 +794,7 @@ mod tests {
             snap.path(),
             &["hello.txt", "data.bin"],
             dest.path(),
+            &test_roots(),
             &progress,
         )
         .unwrap();
@@ -578,6 +823,7 @@ mod tests {
             snap.path(),
             &["docs/guide.txt", "docs/nested/deep.txt", "root.txt"],
             dest.path(),
+            &test_roots(),
             &progress,
         )
         .unwrap();
@@ -611,6 +857,7 @@ mod tests {
             snap.path(),
             &["a.txt", "b.txt", "c.txt"],
             dest.path(),
+            &test_roots(),
             &progress,
         )
         .unwrap();

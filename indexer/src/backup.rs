@@ -221,6 +221,63 @@ fn format_timestamp() -> String {
 
 /// Parse btrbk snapshot output and count lines that indicate a snapshot was created.
 /// Count btrbk snapshot lines.  btrbk marks created snapshots with `+++`.
+/// Snapshot/send counts taken from `btrbk --format=raw list latest`.
+///
+/// The marker parsers below read btrbk's HUMAN output, which is presentation
+/// rather than interface. btrbk 0.32.7 stopped emitting the `up-to-date` string
+/// the bash counters grepped for and silently zeroed `snaps_created`/`snaps_sent`
+/// on every run for five weeks (bd DAS-Backup-Manager-oi0). `scripts/backup-run.sh`
+/// was migrated to `--format=raw` named fields then; the Rust path was not, and
+/// carried the identical defect until 0.7.20.0 (bd DAS-Backup-Manager-06p).
+///
+/// Deliberately a SEPARATE query rather than a flag on the run itself: the run's
+/// stdout is consumed line-by-line for progress reporting, and switching that
+/// stream to raw would break the progress callback. This mirrors what
+/// `backup-run.sh` does, so the two implementations agree by construction.
+fn btrbk_raw_listing(config: &Config) -> Option<String> {
+    let output = Command::new("btrbk")
+        .args([
+            "-c",
+            &config.general.btrbk_conf,
+            "--format=raw",
+            "list",
+            "latest",
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Distinct `snapshot_subvolume='…'` values in a raw listing.
+///
+/// One source subvolume yields one snapshot replicated to N targets, so this is
+/// genuinely a different number from [`parse_raw_send_count`] — the pre-`oi0`
+/// code used one as a proxy for the other, which was never right.
+fn parse_raw_snapshot_count(raw: &str) -> usize {
+    raw_field_values(raw, "snapshot_subvolume")
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Rows carrying a non-empty `target_subvolume='…'` in a raw listing.
+fn parse_raw_send_count(raw: &str) -> usize {
+    raw_field_values(raw, "target_subvolume").count()
+}
+
+/// Non-empty values of a named `key='value'` field across a raw listing.
+fn raw_field_values<'a>(raw: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    let needle = format!("{key}='");
+    raw.lines().filter_map(move |line| {
+        let start = line.find(&needle)? + needle.len();
+        let rest = &line[start..];
+        let end = rest.find('\'')?;
+        (end > 0).then(|| &rest[..end])
+    })
+}
+
 fn parse_btrbk_snapshot_count(output: &str) -> usize {
     output
         .lines()
@@ -278,6 +335,22 @@ where
 
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
+    // stderr MUST be drained concurrently with stdout, not after the child
+    // exits. A pipe buffer is ~64 KiB on Linux; once it fills, the child blocks
+    // in write(2), therefore stops producing stdout, therefore the stdout loop
+    // below blocks forever on a line that never comes and `wait()` is never
+    // reached. `run_command` avoids this by using `Command::output()`, which
+    // drains both streams on separate threads internally; this is the same
+    // thing, done by hand because we stream stdout line by line
+    // (bd DAS-Backup-Manager-az3).
+    let stderr = child.stderr.take().expect("stderr must be piped");
+    let stderr_thread = std::thread::spawn(move || {
+        std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+            .collect::<Vec<String>>()
+    });
+
     // Read stdout line by line while the process runs.
     let stdout = child.stdout.take().expect("stdout must be piped");
     let reader = std::io::BufReader::new(stdout);
@@ -298,13 +371,10 @@ where
         ),
     );
 
-    // Collect stderr from the now-finished child.
-    if let Some(stderr) = child.stderr.take() {
-        let reader = std::io::BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            if !line.trim().is_empty() {
-                progress.on_log(LogLevel::Warning, &format!("btrbk stderr: {line}"));
-            }
+    // The reader thread ends at stderr EOF, which the exit above guarantees.
+    for line in stderr_thread.join().unwrap_or_default() {
+        if !line.trim().is_empty() {
+            progress.on_log(LogLevel::Warning, &format!("btrbk stderr: {line}"));
         }
     }
 
@@ -370,7 +440,18 @@ pub fn create_snapshots(
         );
     }
 
-    let count = parse_btrbk_snapshot_count(&stdout);
+    // Prefer the machine-readable listing; fall back to the marker parse only
+    // if btrbk cannot be queried (bd DAS-Backup-Manager-06p).
+    let count = match btrbk_raw_listing(config) {
+        Some(raw) => parse_raw_snapshot_count(&raw),
+        None => {
+            progress.on_log(
+                LogLevel::Warning,
+                "btrbk --format=raw list latest failed — counts fall back to output markers",
+            );
+            parse_btrbk_snapshot_count(&stdout)
+        }
+    };
 
     for (i, label) in sources.iter().enumerate() {
         progress.on_progress(i as u64 + 1, sources.len() as u64, label);
@@ -472,9 +553,18 @@ pub fn send_snapshots(
         );
     }
 
-    // Re-count from accumulated output for accuracy.
+    // Count from the machine-readable listing, not the human output.
     let full_output = stdout_lines.join("\n");
-    snapshots_sent = parse_btrbk_send_count(&full_output);
+    snapshots_sent = match btrbk_raw_listing(config) {
+        Some(raw) => parse_raw_send_count(&raw),
+        None => {
+            progress.on_log(
+                LogLevel::Warning,
+                "btrbk --format=raw list latest failed — counts fall back to output markers",
+            );
+            parse_btrbk_send_count(&full_output)
+        }
+    };
 
     progress.on_log(LogLevel::Info, &format!("Snapshots sent: {snapshots_sent}"));
     Ok((snapshots_sent, bytes_sent))
@@ -583,8 +673,23 @@ pub fn run_full_pipeline(
         ),
     );
 
-    snapshots_created = parse_btrbk_snapshot_count(&full_output);
-    snapshots_sent = parse_btrbk_send_count(&full_output);
+    match btrbk_raw_listing(config) {
+        Some(raw) => {
+            snapshots_created = parse_raw_snapshot_count(&raw);
+            snapshots_sent = parse_raw_send_count(&raw);
+        }
+        None => {
+            progress.on_log(
+                LogLevel::Warning,
+                "btrbk --format=raw list latest failed — counts fall back to output markers",
+            );
+            snapshots_created = parse_btrbk_snapshot_count(&full_output);
+            snapshots_sent = parse_btrbk_send_count(&full_output);
+        }
+    }
+    // No raw equivalent exists for deletions, so this one still reads markers.
+    // Same caveat as above: if btrbk restyles its `---` lines this silently
+    // returns 0. Tracked with the rest of 06p.
     let snapshots_cleaned = parse_btrbk_clean_count(&full_output);
 
     progress.on_log(
@@ -771,7 +876,19 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
 /// Looks for subvolumes in the `nvme/` subdirectory matching the pattern
 /// `nvme/{name}.YYYYMMDDTHHMM`.  Returns the most recent one (by
 /// lexicographic sort of the timestamp suffix).
-fn find_latest_btrbk_snapshot(target_mount: &str, snap_name: &str) -> Option<String> {
+/// Latest btrbk snapshot named `snap_name` under any of `subdirs` on `target_mount`.
+///
+/// Both inputs are supplied by the caller from a source of truth: `snap_name`
+/// from the live `btrbk.conf`, `subdirs` from the owning [`Source`]. Neither is
+/// derived here. The previous version hardcoded `nvme/` and an algorithmic
+/// name, and the pair silently stopped matching the moment
+/// `resolve_snapshot_names` disambiguated a bare `@` to `root-`
+/// (bd DAS-Backup-Manager-5ig).
+fn find_latest_btrbk_snapshot(
+    target_mount: &str,
+    subdirs: &[String],
+    snap_name: &str,
+) -> Option<String> {
     let output = Command::new("btrfs")
         .args(["subvolume", "list", target_mount])
         .output()
@@ -780,24 +897,65 @@ fn find_latest_btrbk_snapshot(target_mount: &str, snap_name: &str) -> Option<Str
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Pattern: "nvme/{snap_name}.YYYYMMDDTHHMM" in the path column (last field).
-    let prefix = format!("nvme/{snap_name}.");
-    let mut matches: Vec<&str> = stdout
+    Some(latest_matching_snapshot(&stdout, subdirs, snap_name)?.to_string())
+}
+
+/// Pure half of [`find_latest_btrbk_snapshot`], so the matching rule is testable
+/// without a btrfs filesystem.
+fn latest_matching_snapshot<'a>(
+    listing: &'a str,
+    subdirs: &[String],
+    snap_name: &str,
+) -> Option<&'a str> {
+    let prefixes: Vec<String> = subdirs
+        .iter()
+        .map(|d| format!("{}/{snap_name}.", d.trim_matches('/')))
+        .collect();
+    let mut matches: Vec<&str> = listing
         .lines()
         .filter_map(|line| {
             let path = line.split_whitespace().last()?;
-            if path.starts_with(&prefix) {
-                Some(path)
-            } else {
-                None
-            }
+            prefixes.iter().any(|p| path.starts_with(p)).then_some(path)
         })
         .collect();
     matches.sort();
-    matches.last().map(|s| s.to_string())
+    matches.last().copied()
 }
 
-/// Archive boot subvolumes as read-only snapshots on backup targets.
+/// Which `target_subdirs` a given boot subvolume's snapshots live under.
+fn subdirs_for_subvol(config: &Config, subvol: &str) -> Vec<String> {
+    let mut dirs: Vec<String> = config
+        .sources
+        .iter()
+        .filter(|s| s.subvolumes.iter().any(|sv| sv.name == subvol))
+        .flat_map(|s| s.target_subdirs.iter().cloned())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Run a `btrfs` subcommand, returning whether it succeeded.
+fn btrfs_ok(args: &[&str]) -> std::io::Result<bool> {
+    Ok(Command::new("btrfs")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .status()?
+        .success())
+}
+
+/// Archive boot subvolumes as read-only snapshots on backup targets, then
+/// refresh the live subvolume from the newest received snapshot.
+///
+/// **The ordering is the safety property**, and it mirrors
+/// `update_boot_subvolumes()` in `scripts/backup-run.sh`: locate the
+/// replacement and build it alongside the live subvolume BEFORE removing the
+/// live one, so no failure path can leave `@` absent. Until 0.7.20.0 the order
+/// was archive -> delete -> look up -> recreate, which destroyed the live
+/// subvolume whenever the lookup failed — and for `@` the lookup could never
+/// succeed, so every Rust-path run on a primary target left the mount without a
+/// bootable `@` (bd DAS-Backup-Manager-5ig).
 pub fn archive_boot(
     config: &Config,
     progress: &dyn ProgressCallback,
@@ -811,10 +969,6 @@ pub fn archive_boot(
         config.boot.subvolumes.len() as u64,
     );
 
-    let ts = format_timestamp();
-    let mut any_archived = false;
-
-    // Use all configured targets — caller pre-mounted via MountGuard.
     if config.targets.is_empty() {
         progress.on_log(
             LogLevel::Warning,
@@ -823,6 +977,27 @@ pub fn archive_boot(
         return Ok(false);
     }
 
+    // Snapshot names come from the file btrbk itself reads. If it cannot be
+    // read we do nothing at all rather than fall back to a guess: a wrong name
+    // here is what used to cost the live subvolume.
+    let btrbk_conf = std::path::Path::new(&config.general.btrbk_conf);
+    let snap_names = match crate::forget::live_subvol_snapshot_names(btrbk_conf) {
+        Ok(map) => map,
+        Err(e) => {
+            progress.on_log(
+                LogLevel::Error,
+                &format!(
+                    "Cannot read {} ({e}) — skipping boot archive rather than guessing snapshot names",
+                    btrbk_conf.display()
+                ),
+            );
+            return Ok(false);
+        }
+    };
+
+    let ts = format_timestamp();
+    let mut any_archived = false;
+
     for (step, subvol) in config.boot.subvolumes.iter().enumerate() {
         progress.on_progress(
             step as u64,
@@ -830,16 +1005,27 @@ pub fn archive_boot(
             &format!("Archiving {subvol}"),
         );
 
-        // Derive the archive subvolume name. For "@" -> "@.archive.TIMESTAMP",
-        // for "@home" -> "@home.archive.TIMESTAMP".
         let archive_name = format!("{subvol}.archive.{ts}");
 
-        // Map boot subvolume name to btrbk snapshot name.
-        let snap_name = match subvol.as_str() {
-            "@" => "root",
-            "@home" => "home",
-            other => other.trim_start_matches('@'),
+        let Some(snap_name) = snap_names.get(subvol.as_str()) else {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "{subvol} has no snapshot_name in {} — leaving it untouched",
+                    btrbk_conf.display()
+                ),
+            );
+            continue;
         };
+
+        let subdirs = subdirs_for_subvol(config, subvol);
+        if subdirs.is_empty() {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("No source declares target_subdirs for {subvol} — leaving it untouched"),
+            );
+            continue;
+        }
 
         for target in &config.targets {
             // Mirror targets carry a genuinely independent OS install in their
@@ -859,20 +1045,25 @@ pub fn archive_boot(
 
             let tgt_mount = &target.mount;
             let subvol_path = format!("{tgt_mount}/{subvol}");
+            let staging = format!("{subvol_path}.new");
 
-            // Step 1-2: If the boot subvolume exists, archive it (read-only
-            // snapshot) then delete it.  If it doesn't exist, skip straight
-            // to the recreate step.
+            // Step 1: locate the replacement FIRST. Nothing is destroyed if
+            // this fails.
+            let Some(latest) = find_latest_btrbk_snapshot(tgt_mount, &subdirs, snap_name) else {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "[{tgt_mount}] No btrbk snapshot named '{snap_name}' — leaving {subvol} untouched"
+                    ),
+                );
+                continue;
+            };
+            let latest_path = format!("{tgt_mount}/{latest}");
+
+            // Step 2: archive the outgoing subvolume read-only, if there is one.
             if std::path::Path::new(&subvol_path).exists() {
                 let archive_path = format!("{tgt_mount}/{archive_name}");
-
-                let snap_status = Command::new("btrfs")
-                    .args(["subvolume", "snapshot", "-r", &subvol_path, &archive_path])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .status()?;
-
-                if !snap_status.success() {
+                if !btrfs_ok(&["subvolume", "snapshot", "-r", &subvol_path, &archive_path])? {
                     progress.on_log(
                         LogLevel::Warning,
                         &format!("Failed to archive {subvol_path} -> {archive_path}"),
@@ -883,54 +1074,58 @@ pub fn archive_boot(
                     LogLevel::Info,
                     &format!("Archived {subvol_path} -> {archive_path}"),
                 );
-
-                let del_status = Command::new("btrfs")
-                    .args(["subvolume", "delete", &subvol_path])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .status()?;
-
-                if !del_status.success() {
-                    progress.on_log(
-                        LogLevel::Warning,
-                        &format!("Failed to delete {subvol_path} after archiving"),
-                    );
-                    continue;
-                }
                 any_archived = true;
             }
 
-            // Step 3: Recreate the boot subvolume from the latest btrbk
-            // snapshot so the target always has a fresh, bootable @/@home.
-            if let Some(latest) = find_latest_btrbk_snapshot(tgt_mount, snap_name) {
-                let latest_path = format!("{tgt_mount}/{latest}");
-                let create = Command::new("btrfs")
-                    .args(["subvolume", "snapshot", &latest_path, &subvol_path])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .status();
-                match create {
-                    Ok(s) if s.success() => {
-                        progress.on_log(
-                            LogLevel::Info,
-                            &format!("Created {subvol_path} from {latest}"),
-                        );
-                    }
-                    _ => {
-                        progress.on_log(
-                            LogLevel::Warning,
-                            &format!("Failed to create {subvol_path} from {latest}"),
-                        );
-                    }
-                }
-            } else {
+            // Step 3: clear any staging subvolume left by an interrupted run.
+            if std::path::Path::new(&staging).exists()
+                && !btrfs_ok(&["subvolume", "delete", &staging])?
+            {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Stale {staging} could not be removed — leaving {subvol} untouched"),
+                );
+                continue;
+            }
+
+            // Step 4: build the replacement ALONGSIDE the live subvolume.
+            if !btrfs_ok(&["subvolume", "snapshot", &latest_path, &staging])? {
                 progress.on_log(
                     LogLevel::Warning,
                     &format!(
-                        "No btrbk snapshot matching '{snap_name}' on {tgt_mount} — cannot create {subvol}"
+                        "Failed to create {staging} from {latest} — leaving {subvol} untouched"
                     ),
                 );
+                continue;
             }
+
+            // Step 5: only now remove the live subvolume.
+            if std::path::Path::new(&subvol_path).exists()
+                && !btrfs_ok(&["subvolume", "delete", &subvol_path])?
+            {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Failed to delete {subvol_path} — discarding {staging}"),
+                );
+                let _ = btrfs_ok(&["subvolume", "delete", &staging]);
+                continue;
+            }
+
+            // Step 6: swap the replacement into place.
+            if let Err(e) = std::fs::rename(&staging, &subvol_path) {
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!(
+                        "Renamed nothing: {staging} -> {subvol_path} failed ({e}). \
+                         The archive {archive_name} on {tgt_mount} holds the previous contents."
+                    ),
+                );
+                continue;
+            }
+            progress.on_log(
+                LogLevel::Info,
+                &format!("Created {subvol_path} from {latest}"),
+            );
         }
 
         progress.on_progress(
@@ -1441,6 +1636,7 @@ mod tests {
     // Build a minimal Config suitable for unit tests.
     fn make_test_config() -> Config {
         Config {
+            restore: crate::config::Restore::default(),
             general: General {
                 version: "0.6.0".into(),
                 install_prefix: "/usr".into(),
@@ -1802,6 +1998,130 @@ mod tests {
     // (bd DAS-Backup-Manager-am1)
     // -----------------------------------------------------------------
 
+    // --- bd DAS-Backup-Manager-az3 --------------------------------------
+    // A child that writes more than one pipe buffer (~64 KiB) of stderr used to
+    // deadlock stream_command: it blocked in write(2), stopped producing
+    // stdout, and the stdout loop waited forever for a line that never came.
+    // Run it on a worker thread with a wall-clock bound so a regression FAILS
+    // instead of hanging the whole suite.
+    #[test]
+    fn stream_command_survives_more_stderr_than_a_pipe_buffer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progress = TestProgress::new();
+            let mut cmd = Command::new("sh");
+            // 200 KiB of stderr, comfortably past the 64 KiB default, plus a
+            // little stdout so the reader has something to consume first.
+            cmd.arg("-c")
+                .arg("echo start; head -c 204800 /dev/zero | tr '\\0' 'x' >&2; echo done");
+            let _ = tx.send(stream_command(&mut cmd, &progress, |_| {}).is_ok());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(ok) => assert!(ok, "stream_command reported failure"),
+            Err(_) => panic!("stream_command deadlocked on a large stderr write"),
+        }
+    }
+
+    /// A minimal btrbk.conf declaring one subvolume and its snapshot_name.
+    fn write_btrbk_conf(subvol: &str, snapshot_name: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "volume /.btrfs-nvme\n  subvolume  {subvol}\n    snapshot_name  {snapshot_name}\n"
+        )
+        .unwrap();
+        f
+    }
+
+    // --- bd DAS-Backup-Manager-5ig ---------------------------------------
+    // The finder must resolve the name btrbk ACTUALLY writes. Production
+    // btrbk.conf carries `snapshot_name root-` for a bare `@` (disambiguated
+    // against `root-root`), so on-disk paths are `nvme/root-.<TS>`. The old
+    // hardcoded prefix was `nvme/root.`, which never matched, and the caller
+    // deleted the live subvolume before discovering that.
+    #[test]
+    fn finder_matches_the_real_disambiguated_snapshot_name() {
+        let listing = "ID 256 gen 1 top level 5 path nvme/root-.20260827T2015\n\
+                       ID 257 gen 1 top level 5 path nvme/home.20260827T2015\n";
+        let subdirs = vec!["nvme".to_string()];
+        assert_eq!(
+            latest_matching_snapshot(listing, &subdirs, "root-"),
+            Some("nvme/root-.20260827T2015"),
+            "must find the hyphenated series btrbk really writes"
+        );
+        // Counter-test: the name the old code derived algorithmically finds
+        // nothing at all against the same listing.
+        assert_eq!(
+            latest_matching_snapshot(listing, &subdirs, "root"),
+            None,
+            "the pre-5ig hardcoded name must be shown NOT to match"
+        );
+    }
+
+    #[test]
+    fn finder_picks_the_newest_of_several() {
+        let listing = "path nvme/root-.20260101T0100\npath nvme/root-.20260827T2015\n\
+                       path nvme/root-.20260501T0300\n";
+        assert_eq!(
+            latest_matching_snapshot(listing, &["nvme".to_string()], "root-"),
+            Some("nvme/root-.20260827T2015")
+        );
+    }
+
+    #[test]
+    fn finder_is_scoped_to_the_declared_subdir() {
+        let listing = "path ssd/root-.20260827T2015\n";
+        assert_eq!(
+            latest_matching_snapshot(listing, &["nvme".to_string()], "root-"),
+            None,
+            "a snapshot under another source's subdir must not be adopted"
+        );
+    }
+
+    #[test]
+    fn archive_boot_refuses_to_act_without_a_readable_btrbk_conf() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut config = make_test_config();
+        config.general.btrbk_conf = "/nonexistent/btrbk.conf".into();
+        config.targets[0].mount = target_dir.path().to_string_lossy().to_string();
+
+        let progress = TestProgress::new();
+        let result = archive_boot(&config, &progress).expect("must not error");
+        assert!(
+            !result,
+            "nothing may be archived when names cannot be resolved"
+        );
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(_, m)| m.contains("skipping boot archive rather than guessing")),
+            "must say why it declined, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn archive_boot_leaves_the_subvolume_alone_when_no_snapshot_exists() {
+        // The regression that motivated 5ig: with no matching snapshot on the
+        // target, the OLD code had already deleted the live subvolume by the
+        // time it found out. Nothing may be deleted now.
+        let target_dir = tempfile::tempdir().unwrap();
+        let live = target_dir.path().join("@");
+        std::fs::create_dir(&live).unwrap();
+
+        let conf = write_btrbk_conf("@", "root-");
+        let mut config = make_test_config();
+        config.general.btrbk_conf = conf.path().to_string_lossy().to_string();
+        config.targets[0].mount = target_dir.path().to_string_lossy().to_string();
+
+        let progress = TestProgress::new();
+        archive_boot(&config, &progress).expect("must not error");
+        assert!(
+            live.exists(),
+            "live subvolume must survive a failed snapshot lookup"
+        );
+    }
+
     #[test]
     fn test_archive_boot_skips_mirror_targets() {
         // Two targets: a primary (fair game for archive/replace) and a mirror
@@ -1814,6 +2134,19 @@ mod tests {
         let mirror_dir = tempfile::tempdir().unwrap();
 
         let mut config = make_test_config();
+        // archive_boot resolves snapshot names from the live btrbk.conf and
+        // refuses to act at all if it cannot read it, so the fixture needs one.
+        let conf = write_btrbk_conf("@", "root-");
+        config.general.btrbk_conf = conf.path().to_string_lossy().to_string();
+        // The source must declare @ and a target subdir, or archive_boot
+        // correctly declines before it ever reaches the target loop.
+        config.boot.subvolumes = vec!["@".to_string()];
+        config.sources[0].subvolumes = vec![SubvolConfig {
+            name: "@".into(),
+            manual_only: false,
+            snapshot_name: None,
+        }];
+        config.sources[0].target_subdirs = vec!["nvme".into()];
         config.targets[0].mount = primary_dir.path().to_string_lossy().to_string();
         config.targets[0].label = "primary-22tb".into();
         config.targets.push(Target {

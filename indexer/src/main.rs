@@ -1757,7 +1757,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let progress = CliProgress;
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-                let result = restore::restore_files(&snapshot, &file_refs, &dest, &progress);
+                let result = restore::restore_files(
+                    &snapshot,
+                    &file_refs,
+                    &dest,
+                    &cfg.restore.allowed_roots,
+                    &progress,
+                );
                 guard.unmount(&progress);
                 let result = result?;
                 if json {
@@ -1788,7 +1794,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cfg = Config::load(&config)?;
                 let progress = CliProgress;
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-                let result = restore::restore_snapshot(&snapshot, &dest, &progress);
+                let result = restore::restore_snapshot(
+                    &snapshot,
+                    &dest,
+                    &cfg.restore.allowed_roots,
+                    &progress,
+                );
                 guard.unmount(&progress);
                 let result = result?;
                 if json {

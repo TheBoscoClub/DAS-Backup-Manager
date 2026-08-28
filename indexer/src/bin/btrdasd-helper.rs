@@ -22,7 +22,7 @@ use zbus::fdo;
 use zbus::object_server::SignalEmitter;
 use zbus::{Connection, interface};
 
-use buttered_dasd::backup::{self, BackupMode, BackupOptions};
+use buttered_dasd::backup::{self, BackupLockAttempt, BackupMode, BackupOptions};
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::health;
@@ -60,7 +60,15 @@ impl CancelFlag {
 // Job tracking
 // ---------------------------------------------------------------------------
 
-type JobMap = Arc<Mutex<HashMap<String, (JoinHandle<()>, CancelFlag)>>>;
+/// Live jobs, keyed by id: `(task handle, cancel flag, owning D-Bus sender)`.
+///
+/// The sender is what makes `job_cancel` authorizable. Without it the map held
+/// no notion of ownership at all, so a polkit check for
+/// `org.dasbackup.backup` — a question about the CALLER, not about the JOB —
+/// was the only gate, and any authorized caller could abort anyone's in-flight
+/// backup or restore (bd DAS-Backup-Manager-h2s).
+type JobEntry = (JoinHandle<()>, CancelFlag, String);
+type JobMap = Arc<Mutex<HashMap<String, JobEntry>>>;
 
 /// Cache of IndexStats JSON keyed by DB path.  Cold COUNT(*) on a 13.7M-row
 /// files table + 68M-row spans table is ~30-60s on HDD, which trips the
@@ -271,15 +279,30 @@ async fn check_polkit(conn: &Connection, sender: &str, action_id: &str) -> Resul
 // Helper: load/save config with error mapping
 // ---------------------------------------------------------------------------
 
-fn load_config(config_path: &str) -> Result<Config, fdo::Error> {
-    Config::load(Path::new(config_path))
-        .map_err(|e| fdo::Error::Failed(format!("Failed to load config '{config_path}': {e}")))
+/// The one configuration file this daemon will read or write.
+///
+/// Every `#[interface]` method used to take a `config_path: &str` from the
+/// caller and pass it straight to `Config::load`/`save` as root. Polkit
+/// authorizes the ACTION (`org.dasbackup.config`), never the PATH, so
+/// `org.dasbackup.config.read` — which the installed policy grants to any
+/// active session with no prompt, so the GUI can list sources on startup —
+/// doubled as a root-privileged read of any TOML-parseable file on the system,
+/// and the mutating actions doubled as a root-privileged overwrite
+/// (bd DAS-Backup-Manager-wd7).
+///
+/// The parameter was never load-bearing: the only client, the Plasma GUI,
+/// hardcoded this exact string at both of its call sites.
+const CANONICAL_CONFIG: &str = "/etc/das-backup/config.toml";
+
+fn load_config() -> Result<Config, fdo::Error> {
+    Config::load(Path::new(CANONICAL_CONFIG))
+        .map_err(|e| fdo::Error::Failed(format!("Failed to load config '{CANONICAL_CONFIG}': {e}")))
 }
 
-fn save_config(config: &Config, path: &str) -> Result<(), fdo::Error> {
+fn save_config(config: &Config) -> Result<(), fdo::Error> {
     config
-        .save(Path::new(path))
-        .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{path}': {e}")))
+        .save(Path::new(CANONICAL_CONFIG))
+        .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +351,6 @@ impl HelperInterface {
     async fn backup_run(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         mode: &str,
         sources: Vec<String>,
         targets: Vec<String>,
@@ -337,7 +359,7 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let backup_mode = match mode.to_lowercase().as_str() {
             "full" => Some(BackupMode::Full),
             "incremental" => Some(BackupMode::Incremental),
@@ -363,6 +385,22 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                // Join the same two-lock interlock as the scheduled path and the
+                // CLI: singleton (non-blocking — a second backup is redundant,
+                // not late) then the shared maintenance lock (blocking — a scrub
+                // is a peer operation and this should wait for it). Without it
+                // a GUI backup could run concurrently with the 03:00 timer or a
+                // live scrub, and MountGuard::Drop could unmount a target out
+                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
+                // fixed this for main.rs in 0.7.15.0 and never reached the
+                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
+                let _locks = match backup::acquire_manual_locks(&progress) {
+                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
+                    Ok(BackupLockAttempt::AlreadyRunning) => {
+                        return Err("A backup is already running — declined".to_string());
+                    }
+                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
+                };
                 let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
@@ -418,7 +456,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -426,13 +464,12 @@ impl HelperInterface {
     async fn backup_snapshot(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         sources: Vec<String>,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -442,6 +479,22 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                // Join the same two-lock interlock as the scheduled path and the
+                // CLI: singleton (non-blocking — a second backup is redundant,
+                // not late) then the shared maintenance lock (blocking — a scrub
+                // is a peer operation and this should wait for it). Without it
+                // a GUI backup could run concurrently with the 03:00 timer or a
+                // live scrub, and MountGuard::Drop could unmount a target out
+                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
+                // fixed this for main.rs in 0.7.15.0 and never reached the
+                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
+                let _locks = match backup::acquire_manual_locks(&progress) {
+                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
+                    Ok(BackupLockAttempt::AlreadyRunning) => {
+                        return Err("A backup is already running — declined".to_string());
+                    }
+                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
+                };
                 let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
                 let res = match backup::create_snapshots(&config, &sources, &progress) {
                     Ok(n) => Ok(format!("{n} snapshots created")),
@@ -465,7 +518,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -473,13 +526,12 @@ impl HelperInterface {
     async fn backup_send(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         targets: Vec<String>,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -491,6 +543,22 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                // Join the same two-lock interlock as the scheduled path and the
+                // CLI: singleton (non-blocking — a second backup is redundant,
+                // not late) then the shared maintenance lock (blocking — a scrub
+                // is a peer operation and this should wait for it). Without it
+                // a GUI backup could run concurrently with the 03:00 timer or a
+                // live scrub, and MountGuard::Drop could unmount a target out
+                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
+                // fixed this for main.rs in 0.7.15.0 and never reached the
+                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
+                let _locks = match backup::acquire_manual_locks(&progress) {
+                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
+                    Ok(BackupLockAttempt::AlreadyRunning) => {
+                        return Err("A backup is already running — declined".to_string());
+                    }
+                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
+                };
                 let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
@@ -520,7 +588,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -528,12 +596,11 @@ impl HelperInterface {
     async fn backup_boot_archive(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -543,6 +610,22 @@ impl HelperInterface {
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                // Join the same two-lock interlock as the scheduled path and the
+                // CLI: singleton (non-blocking — a second backup is redundant,
+                // not late) then the shared maintenance lock (blocking — a scrub
+                // is a peer operation and this should wait for it). Without it
+                // a GUI backup could run concurrently with the 03:00 timer or a
+                // live scrub, and MountGuard::Drop could unmount a target out
+                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
+                // fixed this for main.rs in 0.7.15.0 and never reached the
+                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
+                let _locks = match backup::acquire_manual_locks(&progress) {
+                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
+                    Ok(BackupLockAttempt::AlreadyRunning) => {
+                        return Err("A backup is already running — declined".to_string());
+                    }
+                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
+                };
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
@@ -576,7 +659,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -587,14 +670,13 @@ impl HelperInterface {
     async fn index_walk(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         target_path: &str,
         db_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -677,7 +759,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -999,7 +1081,6 @@ impl HelperInterface {
     async fn restore_files(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         snapshot: &str,
         dest: &str,
         files: Vec<String>,
@@ -1007,7 +1088,7 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -1027,6 +1108,7 @@ impl HelperInterface {
                     Path::new(&snapshot),
                     &file_refs,
                     Path::new(&dest),
+                    &config.restore.allowed_roots,
                     &progress,
                 ) {
                     Ok(r) => Ok((
@@ -1059,7 +1141,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -1067,14 +1149,13 @@ impl HelperInterface {
     async fn restore_snapshot(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         snapshot: &str,
         dest: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
         let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
@@ -1092,6 +1173,7 @@ impl HelperInterface {
                 let res = match restore::restore_snapshot(
                     Path::new(&snapshot),
                     Path::new(&dest),
+                    &config.restore.allowed_roots,
                     &progress,
                 ) {
                     Ok(r) => Ok((
@@ -1124,7 +1206,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel));
+            .insert(job_id.clone(), (handle, cancel, sender.clone()));
         Ok(job_id)
     }
 
@@ -1136,12 +1218,11 @@ impl HelperInterface {
     async fn config_get(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         config
             .to_toml()
             .map_err(|e| fdo::Error::Failed(format!("Failed to serialize config: {e}")))
@@ -1151,7 +1232,6 @@ impl HelperInterface {
     async fn config_set(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         toml_content: &str,
     ) -> fdo::Result<()> {
         let sender = sender_from_header(&header)?;
@@ -1168,7 +1248,7 @@ impl HelperInterface {
             )));
         }
 
-        save_config(&config, config_path)
+        save_config(&config)
     }
 
     /// Get the current backup schedule as JSON.
@@ -1176,12 +1256,11 @@ impl HelperInterface {
     async fn schedule_get(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         let info = schedule::get_schedule(&config)
             .map_err(|e| fdo::Error::Failed(format!("Failed to get schedule: {e}")))?;
 
@@ -1202,7 +1281,6 @@ impl HelperInterface {
     async fn schedule_set(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         incremental: &str,
         full: &str,
         delay: u32,
@@ -1210,7 +1288,7 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config(config_path)?;
+        let mut config = load_config()?;
 
         let inc = if incremental.is_empty() {
             None
@@ -1223,20 +1301,19 @@ impl HelperInterface {
         schedule::set_schedule(&mut config, inc, f, d)
             .map_err(|e| fdo::Error::Failed(format!("Failed to set schedule: {e}")))?;
 
-        save_config(&config, config_path)
+        save_config(&config)
     }
 
     /// Enable or disable scheduled backups.
     async fn schedule_enable(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         enabled: bool,
     ) -> fdo::Result<()> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
         schedule::set_enabled(&config, enabled)
             .map_err(|e| fdo::Error::Failed(format!("Failed to set schedule enabled: {e}")))
     }
@@ -1245,39 +1322,36 @@ impl HelperInterface {
     async fn subvol_add(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         source: &str,
         name: &str,
     ) -> fdo::Result<()> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config(config_path)?;
+        let mut config = load_config()?;
         subvol::add_subvolume(&mut config, source, name, false).map_err(fdo::Error::Failed)?;
-        save_config(&config, config_path)
+        save_config(&config)
     }
 
     /// Remove a subvolume from a source.
     async fn subvol_remove(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         source: &str,
         name: &str,
     ) -> fdo::Result<()> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config(config_path)?;
+        let mut config = load_config()?;
         subvol::remove_subvolume(&mut config, source, name).map_err(fdo::Error::Failed)?;
-        save_config(&config, config_path)
+        save_config(&config)
     }
 
     /// Set the manual_only flag on a subvolume.
     async fn subvol_set_manual(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
         source: &str,
         name: &str,
         manual: bool,
@@ -1285,9 +1359,9 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config(config_path)?;
+        let mut config = load_config()?;
         subvol::set_manual(&mut config, source, name, manual).map_err(fdo::Error::Failed)?;
-        save_config(&config, config_path)
+        save_config(&config)
     }
 
     /// Query system health and return a JSON report.
@@ -1297,12 +1371,11 @@ impl HelperInterface {
     async fn health_query(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        config_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
 
-        let config = load_config(config_path)?;
+        let config = load_config()?;
 
         // Run the entire health query (blocking I/O: smartctl, btrfs, mount)
         // inside spawn_blocking.  Do NOT auto-mount — the health report should
@@ -1482,12 +1555,19 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
         let mut jobs = self.jobs.lock().await;
-        if let Some((handle, cancel)) = jobs.remove(job_id) {
-            cancel.cancel();
-            handle.abort();
-            Ok(true)
-        } else {
-            Ok(false)
+        // Ownership is a property of the JOB, and polkit only answered a
+        // question about the caller. Check both.
+        match jobs.get(job_id) {
+            None => Ok(false),
+            Some((_, _, owner)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
+                "Job '{job_id}' belongs to another client"
+            ))),
+            Some(_) => {
+                let (handle, cancel, _) = jobs.remove(job_id).expect("checked present above");
+                cancel.cancel();
+                handle.abort();
+                Ok(true)
+            }
         }
     }
 }
@@ -1674,8 +1754,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cancel all running jobs.
     {
         let mut active_jobs = jobs.lock().await;
-        let entries: Vec<(String, (JoinHandle<()>, CancelFlag))> = active_jobs.drain().collect();
-        for (id, (handle, cancel)) in entries {
+        let entries: Vec<(String, JobEntry)> = active_jobs.drain().collect();
+        for (id, (handle, cancel, _owner)) in entries {
             eprintln!("btrdasd-helper: cancelling job {id}");
             cancel.cancel();
             handle.abort();
