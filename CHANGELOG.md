@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-## [0.7.20.0] - 2026-08-27
+## [0.7.20.0] - 2026-08-28
 
 Security and correctness release from an independent multi-agent review of the privilege
 boundary — the D-Bus helper, the backup and restore engines, mount lifecycle, subvolume
