@@ -19,38 +19,38 @@ public:
     [[nodiscard]] QString unavailableReason() const;
 
     // Async job-returning methods (return job_id via signal)
-    void backupRun(const QString &configPath, const QString &mode,
+    void backupRun(const QString &mode,
                    const QStringList &sources, const QStringList &targets,
                    bool dryRun);
-    void backupSnapshot(const QString &configPath, const QStringList &sources);
-    void backupSend(const QString &configPath, const QStringList &targets);
-    void backupBootArchive(const QString &configPath);
-    void indexWalk(const QString &configPath, const QString &targetPath,
+    void backupSnapshot(const QStringList &sources);
+    void backupSend(const QStringList &targets);
+    void backupBootArchive();
+    void indexWalk(const QString &targetPath,
                    const QString &dbPath);
-    void restoreFiles(const QString &configPath, const QString &snapshot,
+    void restoreFiles(const QString &snapshot,
                       const QString &dest, const QStringList &files);
-    void restoreSnapshot(const QString &configPath, const QString &snapshot,
+    void restoreSnapshot(const QString &snapshot,
                          const QString &dest);
 
     // Synchronous methods
-    QString configGet(const QString &configPath);
-    bool configSet(const QString &configPath, const QString &tomlContent);
-    QString scheduleGet(const QString &configPath);
-    bool scheduleSet(const QString &configPath, const QString &incremental,
+    QString configGet();
+    bool configSet(const QString &tomlContent);
+    QString scheduleGet();
+    bool scheduleSet(const QString &incremental,
                      const QString &full, quint32 delay);
-    bool scheduleEnable(const QString &configPath, bool enabled);
-    bool subvolAdd(const QString &configPath, const QString &source,
+    bool scheduleEnable(bool enabled);
+    bool subvolAdd(const QString &source,
                    const QString &name);
-    bool subvolRemove(const QString &configPath, const QString &source,
+    bool subvolRemove(const QString &source,
                       const QString &name);
-    bool subvolSetManual(const QString &configPath, const QString &source,
+    bool subvolSetManual(const QString &source,
                          const QString &name, bool manual);
-    QString healthQuery(const QString &configPath);
+    QString healthQuery();
     bool jobCancel(const QString &jobId);
 
     // Async versions of slow methods (non-blocking, result via signal)
-    void healthQueryAsync(const QString &configPath);
-    void scheduleGetAsync(const QString &configPath);
+    void healthQueryAsync();
+    void scheduleGetAsync();
     void indexStatsAsync(const QString &dbPath);
     void indexListSnapshotsAsync(const QString &dbPath);
 

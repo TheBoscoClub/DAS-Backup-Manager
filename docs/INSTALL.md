@@ -315,6 +315,21 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 | `subvolumes` | string[] | `["@", "@home"]` | Subvolumes archived and recreated |
 | `archive_retention_days` | u32 | `60` | Days to retain `@.archive.*`/`@home.archive.*` snapshots before `boot-archive-cleanup.sh` prunes them |
 
+Snapshot names are read from `/etc/btrbk/btrbk.conf`, not derived from this section — if that file cannot be read, the boot-archive step declines rather than guessing. The replacement snapshot is located and built alongside the live subvolume **before** the live one is removed, so no failure path can leave `@` absent (`bd DAS-Backup-Manager-5ig`).
+
+### `[restore]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allowed_roots` | string[] | `["/home", "/tmp"]` | Roots a restore may write beneath. A destination must resolve to a path under one of these |
+
+Restores run as root under `btrdasd-helper`, so the destination is policy rather than a free parameter. Two rules apply on top of `allowed_roots`, and neither is configurable:
+
+- **A built-in denylist always wins.** `/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/root`, `/var/lib`, `/var/spool`, `/dev`, `/proc` and `/sys` are refused even if you list one in `allowed_roots` — the denylist is checked first. These are the paths where a restored file becomes executable code or changes system identity.
+- **Writes use `O_NOFOLLOW`**, so a symlink pre-planted at the destination fails the open rather than being followed.
+
+Both roots are compared after the path is resolved, so a symlinked ancestor cannot get around them. To restore somewhere else — an external drive, a staging area under `/mnt` — add that root here rather than working around the check.
+
 ### `[doctor]`
 
 | Field | Type | Default | Description |

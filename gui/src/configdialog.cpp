@@ -109,7 +109,7 @@ void ConfigDialog::loadConfig()
 {
     m_statusLabel->clear();
 
-    const QString content = m_client->configGet(m_configPath);
+    const QString content = m_client->configGet();
 
     if (content.isEmpty()) {
         const QString placeholder = QStringLiteral(
@@ -245,7 +245,7 @@ void ConfigDialog::saveConfig()
         return;
     }
 
-    const bool ok = m_client->configSet(m_configPath, currentContent);
+    const bool ok = m_client->configSet(currentContent);
     if (ok) {
         m_originalContent = currentContent;
         m_statusLabel->setText(i18n("Configuration saved successfully."));

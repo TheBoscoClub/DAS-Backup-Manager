@@ -162,7 +162,7 @@ void BackupPanel::loadConfig()
     }
     m_targetChecks.clear();
 
-    const QString toml = m_client->configGet(m_configPath);
+    const QString toml = m_client->configGet();
 
     if (toml.isEmpty()) {
         auto *errLabel = new QLabel(i18n("Could not load configuration"), m_sourcesGroup);
@@ -319,5 +319,5 @@ void BackupPanel::runBackup(bool dryRun)
             },
             Qt::SingleShotConnection);
 
-    m_client->backupRun(m_configPath, mode, sources, targets, dryRun);
+    m_client->backupRun(mode, sources, targets, dryRun);
 }

@@ -128,9 +128,22 @@ impl MountGuard {
 
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        // Safety net: unmount anything not yet explicitly unmounted.
+        // Safety net: unmount anything not yet explicitly unmounted. This is the
+        // SOLE cleanup path when a job panics or is aborted mid-flight, so a
+        // swallowed failure here leaves a target mounted and invisible — and the
+        // next run's mountpoint reasoning is then wrong. Drop cannot return a
+        // Result and has no ProgressCallback, so the failure goes to stderr,
+        // which journald captures for the helper daemon
+        // (bd DAS-Backup-Manager-06p).
         for mount_point in self.newly_mounted.drain(..).rev() {
-            let _ = Command::new("umount").arg(&mount_point).status();
+            match Command::new("umount").arg(&mount_point).status() {
+                Ok(s) if s.success() => {}
+                Ok(s) => eprintln!(
+                    "MountGuard::drop: umount {mount_point} exited {} — target left mounted",
+                    s.code().unwrap_or(-1)
+                ),
+                Err(e) => eprintln!("MountGuard::drop: umount {mount_point} failed to run: {e}"),
+            }
         }
     }
 }
@@ -179,19 +192,18 @@ pub fn ensure_targets_mounted(
         // at the configured path so btrbk can find the target where it expects it.
         if let Some(actual) = health::find_mount_for_device(&target.serial, &target.role) {
             // Create configured mount point directory if needed
-            if !mount_path.exists() {
-                let status = Command::new("mkdir").arg("-p").arg(&target.mount).status();
-                if status.is_err() || !status.unwrap().success() {
-                    progress.on_log(
-                        crate::progress::LogLevel::Warning,
-                        &format!(
-                            "Failed to create mount point {} for bind mount",
-                            target.mount
-                        ),
-                    );
-                    any_available = true;
-                    continue;
-                }
+            if !mount_path.exists()
+                && let Err(e) = std::fs::create_dir_all(&target.mount)
+            {
+                progress.on_log(
+                    crate::progress::LogLevel::Warning,
+                    &format!(
+                        "Failed to create mount point {} for bind mount: {e}",
+                        target.mount
+                    ),
+                );
+                any_available = true;
+                continue;
             }
             let status = Command::new("mount")
                 .arg("--bind")
@@ -254,21 +266,17 @@ pub fn ensure_targets_mounted(
         }
 
         // Ensure mount point directory exists
-        if !mount_path.exists() {
-            let mkdir = Command::new("mkdir").args(["-p", &target.mount]).status();
-            match mkdir {
-                Ok(s) if s.success() => {}
-                _ => {
-                    progress.on_log(
-                        crate::progress::LogLevel::Warning,
-                        &format!(
-                            "Target '{}': mkdir -p '{}' failed — skipping",
-                            target.label, target.mount
-                        ),
-                    );
-                    continue;
-                }
-            }
+        if !mount_path.exists()
+            && let Err(e) = std::fs::create_dir_all(&target.mount)
+        {
+            progress.on_log(
+                crate::progress::LogLevel::Warning,
+                &format!(
+                    "Target '{}': could not create '{}' ({e}) — skipping",
+                    target.label, target.mount
+                ),
+            );
+            continue;
         }
 
         // Build mount command
@@ -354,18 +362,17 @@ pub fn ensure_sources_mounted(config: &Config, progress: &dyn ProgressCallback) 
         }
 
         // Create mount point if needed.
-        if !mount_path.exists() {
-            let status = Command::new("mkdir").args(["-p", &source.volume]).status();
-            if status.is_err() || !status.unwrap().success() {
-                progress.on_log(
-                    crate::progress::LogLevel::Warning,
-                    &format!(
-                        "Source '{}': mkdir -p '{}' failed — skipping",
-                        source.label, source.volume
-                    ),
-                );
-                continue;
-            }
+        if !mount_path.exists()
+            && let Err(e) = std::fs::create_dir_all(&source.volume)
+        {
+            progress.on_log(
+                crate::progress::LogLevel::Warning,
+                &format!(
+                    "Source '{}': could not create '{}' ({e}) — skipping",
+                    source.label, source.volume
+                ),
+            );
+            continue;
         }
 
         // Also create the snapshot directory inside the volume.
@@ -413,8 +420,16 @@ pub fn ensure_sources_mounted(config: &Config, progress: &dyn ProgressCallback) 
     // Create snapshot directories inside now-mounted source volumes.
     for source in &config.sources {
         let snap_dir = Path::new(&source.volume).join(&source.snapshot_dir);
-        if !snap_dir.exists() {
-            let _ = Command::new("mkdir").args(["-p"]).arg(&snap_dir).status();
+        if !snap_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&snap_dir)
+        {
+            // Previously `let _ = Command::new("mkdir")…` — a read-only or full
+            // filesystem produced no signal at all, and btrbk failed later with
+            // a generic "directory not found" (bd DAS-Backup-Manager-06p).
+            progress.on_log(
+                crate::progress::LogLevel::Warning,
+                &format!("Could not create snapshot dir {}: {e}", snap_dir.display()),
+            );
         }
     }
 
@@ -427,8 +442,13 @@ pub fn ensure_sources_mounted(config: &Config, progress: &dyn ProgressCallback) 
         for source in &config.sources {
             for subdir in &source.target_subdirs {
                 let dir = target_path.join(subdir);
-                if !dir.exists() {
-                    let _ = Command::new("mkdir").args(["-p"]).arg(&dir).status();
+                if !dir.exists()
+                    && let Err(e) = std::fs::create_dir_all(&dir)
+                {
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!("Could not create target subdir {}: {e}", dir.display()),
+                    );
                 }
             }
         }

@@ -345,7 +345,7 @@ void SetupWizard::applyConfiguration()
     }
 
     const QString configPath = QStringLiteral("/etc/btrbk/btrbk.conf");
-    const bool ok = m_client->configSet(configPath, config);
+    const bool ok = m_client->configSet(config);
 
     if (ok) {
         Q_EMIT setupComplete();

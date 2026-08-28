@@ -82,6 +82,56 @@ pub fn parse_live_snapshot_names(conf: &str) -> Vec<String> {
         .collect()
 }
 
+/// Map each `subvolume` declared in `btrbk.conf` to the `snapshot_name` btrbk
+/// will actually write for it.
+///
+/// Same rationale as [`live_snapshot_names`], and the same source of truth: the
+/// generated file btrbk itself consumes. Re-deriving the mapping from
+/// `config.toml` would reintroduce the second-implementation drift that
+/// `DAS-Backup-Manager-5ig` was — `resolve_snapshot_names` disambiguates a bare
+/// `@` to `root-` when another subvolume also resolves to `root`, and nothing
+/// outside that function can predict when that happens.
+pub fn live_subvol_snapshot_names(
+    btrbk_conf: &Path,
+) -> std::io::Result<std::collections::HashMap<String, String>> {
+    let text = std::fs::read_to_string(btrbk_conf)?;
+    Ok(parse_subvol_snapshot_names(&text))
+}
+
+/// Pure half of [`live_subvol_snapshot_names`].
+///
+/// btrbk.conf nests `snapshot_name` under the `subvolume` it belongs to:
+///
+/// ```text
+/// subvolume             @
+///   snapshot_name       root-
+/// ```
+///
+/// A `subvolume` with no `snapshot_name` of its own is absent from the map
+/// rather than guessed at — callers must treat "not present" as "do not act",
+/// never as "use a default".
+pub fn parse_subvol_snapshot_names(conf: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut current: Option<String> = None;
+    for line in conf.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("subvolume") {
+            let name = rest.trim();
+            current = (!name.is_empty()).then(|| name.to_string());
+        } else if let Some(rest) = line.strip_prefix("snapshot_name") {
+            let value = rest.trim();
+            if let Some(subvol) = current.as_ref()
+                && !value.is_empty()
+            {
+                map.insert(subvol.clone(), value.to_string());
+            }
+        } else if line.starts_with("volume ") {
+            // A new volume block ends the previous subvolume's scope.
+            current = None;
+        }
+    }
+    map
+}
+
 /// Select snapshots whose SERIES NAME matches `pattern`.
 ///
 /// Refuses outright if the pattern also matches a series btrbk still writes —

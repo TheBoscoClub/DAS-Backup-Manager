@@ -59,7 +59,7 @@ The system has six major components:
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
 | Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 17 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
-| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions) |
+| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). Since 0.7.20.0 no method accepts a config path from the caller — the daemon reads `CANONICAL_CONFIG` only |
 | FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 10-step setup wizard with template generation |
@@ -317,6 +317,17 @@ Every install writes `/etc/das-backup/.manifest` — a plain-text list of genera
 - `--upgrade`: Regenerate the same files from updated config
 - `--check`: Verify all manifest files exist and match
 
+
+## Privilege Boundary
+
+`btrdasd-helper` is a root daemon on the system bus, reachable by unprivileged local clients. Polkit answers *may this caller perform this action* — it says nothing about *which object*. Three rules follow, all introduced in 0.7.20.0 after an independent review found each one violated:
+
+1. **No path arrives from the caller.** The daemon reads and writes exactly one configuration file, `CANONICAL_CONFIG`. Seventeen methods previously took a `config_path` and passed it to `Config::load`/`save` as root, so `ConfigGet` — whose action `org.dasbackup.config.read` the installed policy grants to any active session with **no prompt**, so the GUI can list sources at startup — doubled as an unauthenticated root-privileged read of any TOML-parseable file (`bd DAS-Backup-Manager-wd7`).
+2. **A destination is policy, not a parameter.** Restore paths are checked against `[restore] allowed_roots` and an unoverridable denylist before anything is created, and writes use `O_NOFOLLOW` (`bd DAS-Backup-Manager-s05`).
+3. **Authorization of an action is not authorization over an object.** `JobCancel` checks polkit *and* that the caller owns the job; job ids are broadcast on every progress signal, so the action check alone let any authorized client abort anyone's work (`bd DAS-Backup-Manager-h2s`).
+
+The daemon also participates in the same singleton + maintenance lock interlock as `backup-run.sh` and the scrub engine. It did not until 0.7.20.0: `bd DAS-Backup-Manager-pe6` fixed the CLI in 0.7.15.0 and never reached the daemon the GUI actually calls (`bd DAS-Backup-Manager-dca`).
+
 ## Build System
 
 ### CMake + ExternalProject
@@ -448,7 +459,7 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | `mount` | `src/mount.rs` | ~510 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |
 | `progress` | `src/progress.rs` | ~115 | Progress reporting trait and D-Bus signal bridge |
 | `report` | `src/report.rs` | ~610 | Backup report formatting |
-| `restore` | `src/restore.rs` | ~640 | File and snapshot restore via btrfs send/receive |
+| `restore` | `src/restore.rs` | ~760 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
 | `scrub` | `src/scrub.rs` | ~2850 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |

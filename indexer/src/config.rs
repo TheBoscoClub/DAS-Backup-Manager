@@ -22,6 +22,8 @@ pub struct Config {
     pub scrub: Scrub,
     #[serde(default)]
     pub doctor: Doctor,
+    #[serde(default)]
+    pub restore: Restore,
     #[serde(default, rename = "source")]
     pub sources: Vec<Source>,
     #[serde(default, rename = "target")]
@@ -33,6 +35,55 @@ pub struct Config {
 // ---------------------------------------------------------------------------
 // Section structs
 // ---------------------------------------------------------------------------
+
+/// Where a restore is permitted to write.
+///
+/// `restore_files`/`restore_snapshot` run as root under the D-Bus helper and
+/// used to accept ANY destination, so a caller could land a file in
+/// `/etc/systemd/system` or `/etc/pacman.d/hooks` — the same class of write that
+/// caused the 2026-03-05 ESP wipe (`.claude/rules/esp-safety.md`). Destinations
+/// are now checked against this allowlist, and against a built-in denylist that
+/// no configuration can override (bd DAS-Backup-Manager-s05).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Restore {
+    /// Roots a restore may write beneath. A destination must canonicalize to a
+    /// path under one of these.
+    #[serde(default = "default_restore_roots")]
+    pub allowed_roots: Vec<String>,
+}
+
+fn default_restore_roots() -> Vec<String> {
+    vec!["/home".into(), "/tmp".into()]
+}
+
+impl Default for Restore {
+    fn default() -> Self {
+        Self {
+            allowed_roots: default_restore_roots(),
+        }
+    }
+}
+
+/// Roots a restore may NEVER write beneath, regardless of `allowed_roots`.
+///
+/// Listing one of these in `allowed_roots` does not enable it — the denylist is
+/// checked first and wins. These are the paths where a restored file becomes
+/// executable code or changes system identity.
+pub const RESTORE_DENIED_ROOTS: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/root",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/var/lib",
+    "/var/spool",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct General {
@@ -499,6 +550,7 @@ impl Default for Config {
             init: Init {
                 system: InitSystem::Systemd,
             },
+            restore: Restore::default(),
             schedule: Schedule {
                 incremental: "03:00".into(),
                 full: "Sun 04:00".into(),
@@ -554,6 +606,15 @@ impl Config {
     /// An empty vec means the config is valid.
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
+
+        // A malformed schedule used to be absorbed by silent defaults in the
+        // cron generator (03:00, Sunday). Rejecting it here means `setup` and
+        // the D-Bus `config_set` both refuse it, on every init system
+        // (bd DAS-Backup-Manager-06p).
+        errors.extend(schedule_errors(
+            &self.schedule.incremental,
+            &self.schedule.full,
+        ));
 
         if self.sources.is_empty() {
             errors.push("No backup sources defined — add at least one [[source]]".into());
@@ -612,6 +673,93 @@ impl Config {
 
         errors
     }
+}
+
+// ---------------------------------------------------------------------------
+// Schedule parsing (moved here from setup/templates.rs — `setup` is
+// binary-only, and `Config` owns these fields, so validation must live with
+// the type rather than with one of its consumers).
+// ---------------------------------------------------------------------------
+
+/// Parse `"HH:MM"`.
+///
+/// Returns `Err` rather than defaulting. The previous version fell back to
+/// `(3, 0)` on any parse failure, so `"3 AM"`, `"03:15am"` and `"0300"` all
+/// silently produced an 03:00 cron entry with no warning at generation time, no
+/// warning at cron-load time, and nothing in the journal — discoverable only by
+/// noticing backups at the wrong hour (bd DAS-Backup-Manager-06p).
+pub fn parse_time(time_str: &str) -> Result<(u32, u32), String> {
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!("expected HH:MM, got '{time_str}'"));
+    }
+    let hour: u32 = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| format!("hour is not a number in '{time_str}'"))?;
+    let min: u32 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| format!("minute is not a number in '{time_str}'"))?;
+    if hour > 23 {
+        return Err(format!("hour {hour} out of range in '{time_str}'"));
+    }
+    if min > 59 {
+        return Err(format!("minute {min} out of range in '{time_str}'"));
+    }
+    Ok((hour, min))
+}
+
+/// Parse a schedule string like "Sun 04:00" into (day_of_week, hour, minute).
+/// Day of week: Sun=0, Mon=1, ..., Sat=6.
+pub fn parse_schedule_with_day(schedule: &str) -> Result<(u32, u32, u32), String> {
+    let parts: Vec<&str> = schedule.split_whitespace().collect();
+    match parts.len() {
+        2 => {
+            // An unrecognised token used to fall through to `_ => 0`, so
+            // "Friday 04:00" (full name instead of "Fri") silently scheduled
+            // SUNDAY backups. Locale day names collapsed the same way.
+            let dow = match parts[0].to_lowercase().as_str() {
+                "sun" => 0,
+                "mon" => 1,
+                "tue" => 2,
+                "wed" => 3,
+                "thu" => 4,
+                "fri" => 5,
+                "sat" => 6,
+                other => {
+                    return Err(format!(
+                        "unrecognised weekday '{other}' in '{schedule}' \
+                         (expected one of sun mon tue wed thu fri sat)"
+                    ));
+                }
+            };
+            let (hour, min) = parse_time(parts[1])?;
+            Ok((dow, hour, min))
+        }
+        1 => {
+            let (hour, min) = parse_time(parts[0])?;
+            Ok((0, hour, min)) // bare time means Sunday
+        }
+        n => Err(format!(
+            "expected \"HH:MM\" or \"Day HH:MM\", got {n} fields in '{schedule}'"
+        )),
+    }
+}
+
+/// Reasons `schedule.incremental` / `schedule.full` cannot be turned into a
+/// schedule. Consumed by [`Config::validate`] so a malformed
+/// value is refused at config load on EVERY init system — not just where a cron
+/// entry happens to be generated.
+pub fn schedule_errors(incremental: &str, full: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(e) = parse_time(incremental) {
+        errors.push(format!("schedule.incremental: {e}"));
+    }
+    if let Err(e) = parse_schedule_with_day(full) {
+        errors.push(format!("schedule.full: {e}"));
+    }
+    errors
 }
 
 // ---------------------------------------------------------------------------

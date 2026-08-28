@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.12.3
+Version:        0.7.20.0
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -65,6 +65,16 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Fri Aug 28 2026 TheBoscoClub <gjbr@pm.me> - 0.7.20.0-1
+- Security and correctness release from an independent review of the privilege boundary
+- archive_boot no longer deletes the live @ before locating its replacement (bd 5ig)
+- D-Bus helper joins the backup/scrub maintenance interlock (bd dca)
+- config_path removed from 17 D-Bus methods; daemon uses the canonical path only (bd wd7)
+- restore gains [restore] allowed_roots, a fail-closed traversal guard, and O_NOFOLLOW writes (bd s05)
+- stream_command drains stderr concurrently; no longer deadlocks past a pipe buffer (bd az3)
+- job_cancel enforces job ownership (bd h2s)
+- Fail-silent cluster: btrbk counters, MountGuard::Drop, mkdir shell-outs, schedule parsers (bd 06p)
+
 * Sat Apr 11 2026 TheBoscoClub <gjbr@pm.me> - 0.7.12.2-1
 - Bump to 0.7.12.2: debian Build .deb step now uses shell:bash (fixes ${var//-/\~} "Bad substitution" on dash); PKGBUILD bumped from stale 0.7.10 and gained hicolor-icon-theme dep; verified clean local Arch build
 

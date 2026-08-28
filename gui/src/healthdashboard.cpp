@@ -251,7 +251,7 @@ void HealthDashboard::setActiveTab(int index)
 
 void HealthDashboard::refresh()
 {
-    m_client->healthQueryAsync(m_configPath);
+    m_client->healthQueryAsync();
 }
 
 void HealthDashboard::onHealthResult(const QString &json)

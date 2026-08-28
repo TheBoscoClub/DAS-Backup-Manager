@@ -13,6 +13,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.20.0] - 2026-08-27
+
+Security and correctness release from an independent multi-agent review of the privilege
+boundary — the D-Bus helper, the backup and restore engines, mount lifecycle, subvolume
+operations, and the system-config generator, read in full. All ten findings were
+independently re-derived from source before any code changed; five of them carried
+inaccurate supporting facts, recorded in `bd DAS-Backup-Manager-dyq`.
+
+### Added
+- **`[restore] allowed_roots` in `config.toml`** — the roots a restore may write beneath,
+  defaulting to `/home` and `/tmp`. Paired with `RESTORE_DENIED_ROOTS`, a built-in denylist
+  (`/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/root`, `/var/lib`, and peers) that
+  **no configuration can override** — listing one in `allowed_roots` does not enable it,
+  because the denylist is checked first
+- **`forget::live_subvol_snapshot_names()`** maps each `subvolume` in `btrbk.conf` to the
+  `snapshot_name` btrbk will actually write for it, extending the same read-the-file-btrbk-reads
+  precedent `btrdasd forget` set in `0.7.16.0`
+- **`indexer/tests/boot_archive_loopback.rs`** — `archive_boot` exercised against a real
+  BTRFS filesystem on a loop device. The unit tests could not prove the property that
+  mattered: `btrfs subvolume delete` fails on a plain directory, so a tempdir-based test
+  passes against the broken code
+
+### Changed
+- **The D-Bus interface no longer takes a `config_path` from callers.** Seventeen methods
+  dropped the parameter; the daemon uses `CANONICAL_CONFIG` (`/etc/das-backup/config.toml`)
+  and nothing else. The GUI's `DBusClient` and its seven call sites were updated in lockstep.
+  This is a wire-format change — a helper and GUI from different releases will not interoperate
+- **`Config::validate()` now rejects a malformed `[schedule]`**, so `setup` and the D-Bus
+  `config_set` both refuse one, on every init system rather than only where a cron entry is
+  generated
+
+### Fixed
+- **`archive_boot` deleted the live `@` and could not recreate it** (`bd DAS-Backup-Manager-5ig`):
+  two defects that only bite together. The order was archive → **delete live `@`** → look up a
+  replacement → recreate, so a failed lookup left the subvolume deleted behind a single warning.
+  And the lookup could never succeed for `@`: `find_latest_btrbk_snapshot` built the prefix
+  `nvme/{snap_name}.` from a hardcoded `"@" => "root"` map, while the live `btrbk.conf` carries
+  `snapshot_name root-` (disambiguated by `resolve_snapshot_names` against `root-root`), so
+  on-disk `nvme/root-.<TS>` never matched `nvme/root.`
+  - **Asymmetric, which the review did not note**: `@home` maps to `home`, `btrbk.conf` carries
+    a plain `home`, and it was recreated correctly throughout. Only `@` was destroyed
+  - Ordering now mirrors `update_boot_subvolumes()` in `scripts/backup-run.sh`: locate the
+    replacement, archive, build `@.new` **alongside** the live subvolume, delete, then rename.
+    No failure path can leave `@` absent
+  - Names come from `btrbk.conf` and subdirs from `Source.target_subdirs`; neither is derived
+    locally. An unreadable `btrbk.conf` declines the whole step rather than guessing
+  - Scheduled 03:00 backups were never affected — they run `backup-run.sh`, which was correct
+- **The D-Bus helper took no maintenance or singleton lock** (`bd DAS-Backup-Manager-dca`):
+  `backup_run`, `backup_snapshot`, `backup_send` and `backup_boot_archive` went straight from
+  `check_polkit` to mounting, so a GUI backup could run concurrently with the 03:00 timer or a
+  live scrub, and `MountGuard::Drop` could unmount a target out from under a running
+  `btrfs receive`. This is `bd DAS-Backup-Manager-pe6` left half-done — that fix landed in
+  `0.7.15.0` and covered `main.rs` only, never reaching the daemon the GUI actually calls
+- **`config_path` was caller-supplied on 17 D-Bus methods** (`bd DAS-Backup-Manager-wd7`):
+  passed straight to `Config::load`/`save` as root with no allowlist or canonicalization.
+  Polkit authorizes the *action*, never the *path*, and the installed policy grants
+  `org.dasbackup.config.read` to any active session with no prompt so the GUI can list sources
+  on startup — so `config_get` doubled as an **unauthenticated root-privileged read of any
+  TOML-parseable file**. The mutating half additionally required admin auth, which is why the
+  read is the serious one
+- **The restore path was a root-privileged arbitrary-write primitive** (`bd DAS-Backup-Manager-s05`):
+  - The traversal guard sat behind `if let Ok(canonical_src) = src.canonicalize()` and **no-opped
+    whenever canonicalize failed** — a broken symlink, `EACCES` on any component, a missing
+    intermediate. It is replaced by `safe_member`, which inspects the requested string and so
+    cannot fail open, and covers both directions at once because the same string is joined onto
+    `src` and `dest_file`
+  - `dest` was unvalidated; it is now checked against `[restore] allowed_roots` **before** any
+    directory is created
+  - Writes use `O_NOFOLLOW`, so a symlink pre-planted at the destination fails the open instead
+    of being followed
+  - `snapshot_path` was compared un-canonicalized against a canonicalized `src`, so on a udisks2
+    mount (`/run/media/…` vs `/mnt/…`) every legitimate restore was refused as traversal
+- **`stream_command` deadlocked on more than a pipe buffer of `btrbk` stderr**
+  (`bd DAS-Backup-Manager-az3`): stdout was read to EOF before stderr was drained, so past
+  ~64 KiB the child blocked in `write(2)`, stopped producing stdout, and the parent waited
+  forever — holding the maintenance lock and leaving targets mounted, so every later backup and
+  scrub blocked until the daemon was killed. stderr is now drained on its own thread, which is
+  what `Command::output()` does internally and why `run_command` was never affected
+- **`job_cancel` let any authorized caller cancel any job** (`bd DAS-Backup-Manager-h2s`):
+  `JobMap` stored only `(JoinHandle, CancelFlag)`, so ownership could not be enforced at all,
+  while job ids are broadcast on every `JobProgress`/`JobLog`/`JobFinished` signal. The map now
+  records the owning sender and a mismatch returns `AccessDenied`
+- **Backup counters read btrbk's human output** (`bd DAS-Backup-Manager-06p`): `snapshots_created`
+  and `snapshots_sent` were derived by grepping for `+++`/`>>>`/`***` markers — the same defect as
+  `bd DAS-Backup-Manager-oi0`, which zeroed the bash counters for five weeks, surviving untouched
+  in the Rust twin because that fix was applied only to `backup-run.sh`. Counts now come from
+  `btrbk --format=raw list latest` and its named `key='value'` fields. Deletions still read
+  markers — no raw equivalent exists — and say so
+- **`MountGuard::Drop` swallowed `umount` failures** (`bd DAS-Backup-Manager-06p`): `let _ = …status()`
+  with no log, on the *only* cleanup path that runs when a job panics or is aborted. A target left
+  mounted is invisible, and the next run's mountpoint reasoning is then wrong. Failures now go to
+  stderr, which journald captures for the daemon
+- **Five `mkdir -p` subprocesses in `mount.rs`**, two discarding their exit status entirely, replaced
+  by `std::fs::create_dir_all` with the `io::Result` logged (`bd DAS-Backup-Manager-06p`)
+- **The schedule parsers silently defaulted** (`bd DAS-Backup-Manager-06p`): `parse_time` fell back to
+  `(3, 0)` and `parse_schedule_with_day` mapped any unrecognised weekday to Sunday, so
+  `schedule.full = "Friday 04:00"` silently produced Sunday backups. Both return `Result`, and both
+  moved to `config.rs` so `Config::validate()` can reject a bad schedule at load
+
+### Security
+- The restore allowlist, the removal of caller-supplied `config_path`, and the `job_cancel`
+  ownership check together close every path by which a polkit-authorized local caller could
+  direct this daemon's root privileges at a file of their choosing
+
 ## [0.7.19.1] - 2026-08-25
 
 Documentation-only release — no code changes. The diff against `0.7.19.0` is docs and
@@ -624,7 +728,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.20.0...HEAD
+[0.7.20.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.1...v0.7.20.0
 [0.7.19.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.0...v0.7.19.1
 [0.7.19.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.18.0...v0.7.19.0
 [0.7.18.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.17.0...v0.7.18.0

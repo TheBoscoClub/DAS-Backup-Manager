@@ -30,13 +30,13 @@ IndexRunner::IndexRunner(DBusClient *client, QObject *parent)
     });
 }
 
-void IndexRunner::run(const QString &configPath, const QString &targetPath,
+void IndexRunner::run(const QString &targetPath,
                       const QString &dbPath)
 {
     if (m_running)
         return;
 
-    m_client->indexWalk(configPath, targetPath, dbPath);
+    m_client->indexWalk(targetPath, dbPath);
 }
 
 void IndexRunner::abort()
