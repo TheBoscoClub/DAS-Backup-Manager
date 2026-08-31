@@ -1,5 +1,24 @@
 # ButteredDASD Installer (`btrdasd setup`) Implementation Plan
 
+> ## ⛔ WITHDRAWN SECTION — ESP sync is FORBIDDEN in this project
+>
+> This document predates the **2026-03-05 incident**, in which a generated
+> ESP-sync hook discovered ESP partitions by label/filesystem and mirrored the
+> host ESP onto every one it found, **destroying both DAS emergency recovery
+> ESPs and their independent OS boot configurations**.
+>
+> Every ESP-related element below — the `esp-sync` target role, the
+> `esp-sync-hook.tmpl` template, the `das-esp-sync.hook` / `99-das-esp-sync` /
+> `dnf` hook recipes, and `rsync` as an ESP-mirroring dependency — was
+> **deleted from the codebase on 2026-04-10/12 and MUST NOT be reimplemented**,
+> in any language, under any name. See `.claude/rules/esp-safety.md` and the
+> global `~/.claude/rules/esp-ownership.md`.
+>
+> The rest of this plan (config externalization, target discovery by serial,
+> scheduling, email) shipped and remains accurate. Only the ESP parts are void.
+
+---
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add a `btrdasd setup` subcommand that interactively configures the backup system, generating all config files and scripts from a single TOML source of truth.
@@ -1385,6 +1404,7 @@ pub fn render_esp_hook(config: &Config) -> Option<(String, String)> {
                  Description = Syncing ESP mirrors after kernel update...\n\
                  When = PostTransaction\n\
                  Exec = {script_dir}/esp-sync.sh\n"
+// ^^^ DELETED 2026-04-10 — this recipe is the 2026-03-05 vector. Do not implement.
             );
             Some(("/etc/pacman.d/hooks/das-esp-sync.hook".to_string(), content))
         }

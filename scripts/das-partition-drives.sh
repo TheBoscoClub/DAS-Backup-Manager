@@ -1,6 +1,6 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.0.0
+# Version: 2.1.0
 # Date: 2026-02-21
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
@@ -174,8 +174,14 @@ show_plan() {
         echo "$name ($dev, serial: $serial):"
         if [[ "$role" == "primary" ]]; then
             echo "  Whole disk BTRFS (single partition) - label: ${BTRFS_LABEL_PREFIX}-${label}"
-        elif [[ "$role" == *"esp"* || "$role" == *"boot"* || "$role" == *"system"* || "$role" == *"mirror"* ]]; then
-            echo "  Partition 1: 1.5G ESP (FAT32) - EFI System Partition"
+        elif is_bootable_role "$role"; then
+            # Show the ESP label the run would actually write. It is unique per
+            # drive and is what identifies this recovery system afterwards, so
+            # it belongs in the preview rather than being a surprise at format
+            # time.
+            local esp_label
+            esp_label="$(derive_esp_label "$serial")" || exit 1
+            echo "  Partition 1: 1.5G ESP (FAT32) - EFI System Partition, label: $esp_label"
             echo "  Partition 2: remainder BTRFS - label: ${BTRFS_LABEL_PREFIX}-${label}"
         else
             echo "  Whole disk BTRFS - label: ${BTRFS_LABEL_PREFIX}-${label}"
@@ -205,9 +211,81 @@ confirm_destruction() {
     fi
 }
 
+# -- ESP label derivation (must be UNIQUE per drive) ------------------
+# Each bootable recovery drive carries its own independent OS, so its ESP
+# must be addressable on its own. A single shared label makes
+# `blkid -t LABEL=<x> -o device` return BOTH partitions, and every consumer
+# of that lookup then has to guess which one it meant. The live drives use
+# the bay-numbered convention RECOV-ESP-<bay>; this reproduces it.
+#
+# FAT32 volume labels are capped at 11 bytes, so "RECOV-ESP-<bay>" only fits
+# a single-digit bay. Both the length and the uniqueness are checked, and
+# both fail closed -- a wrong label here is written to a recovery drive.
+ESP_LABEL_PREFIX="RECOV-ESP"
+FAT_LABEL_MAX=11
+
+# Single definition of "this target gets an ESP" -- used by both the
+# uniqueness pre-check and the partitioning loop, so they cannot disagree.
+is_bootable_role() {
+    local role="$1"
+    [[ "$role" == *"esp"* || "$role" == *"boot"* || "$role" == *"system"* || "$role" == *"mirror"* ]]
+}
+
+derive_esp_label() {
+    local serial="$1"
+    local display="${TARGET_NAMES[$serial]:-}"
+    local bay=""
+
+    # Bay number lives in the target's display_name, e.g.
+    #   "2TB Recovery A (Bay 1, ZK208Q77)"
+    if [[ "$display" =~ [Bb]ay[[:space:]]+([0-9]+) ]]; then
+        bay="${BASH_REMATCH[1]}"
+    fi
+
+    if [[ -z "$bay" ]]; then
+        # stderr, not stdout: this function's stdout IS the label.
+        # return, not exit: every caller reaches this through $( ), where an
+        # exit would kill only the subshell and hand back an empty label.
+        log_error "Cannot derive ESP label for serial $serial: no bay number in display_name ('$display')." >&2
+        log_error "Add a display_name containing 'Bay <N>' for this target in config.toml." >&2
+        return 1
+    fi
+
+    local esp_label="${ESP_LABEL_PREFIX}-${bay}"
+    if (( ${#esp_label} > FAT_LABEL_MAX )); then
+        log_error "Derived ESP label '$esp_label' is ${#esp_label} chars; FAT32 allows $FAT_LABEL_MAX." >&2
+        return 1
+    fi
+
+    printf '%s' "$esp_label"
+}
+
+# Refuse to touch anything if two bootable targets would collide on one ESP
+# label. Checked BEFORE the first destructive step, never per-drive mid-run.
+verify_esp_labels_unique() {
+    local -A seen=()
+    local serial role esp_label
+    for serial in "${!DISCOVERED_DEVICES[@]}"; do
+        role="${TARGET_ROLES[$serial]}"
+        is_bootable_role "$role" || continue
+        esp_label="$(derive_esp_label "$serial")" || exit 1
+        [[ -n "$esp_label" ]] || {
+            log_error "Empty ESP label derived for serial $serial — refusing to continue."
+            exit 1
+        }
+        if [[ -n "${seen[$esp_label]:-}" ]]; then
+            log_error "ESP label collision: '$esp_label' derived for BOTH serial ${seen[$esp_label]} and serial $serial."
+            log_error "Each bootable drive needs a distinct bay number in its display_name."
+            exit 1
+        fi
+        seen[$esp_label]="$serial"
+    done
+}
+
 partition_bootable_drive() {
     local dev="$1"
     local label="$2"
+    local esp_label="$3"
 
     log_info "Partitioning $dev (bootable)..."
 
@@ -225,8 +303,8 @@ partition_bootable_drive() {
     sleep 2
 
     # Format ESP
-    log_info "  Formatting ${dev}1 as FAT32 (ESP)..."
-    mkfs.fat -F32 -n "BACKUP-ESP" "${dev}1"
+    log_info "  Formatting ${dev}1 as FAT32 (ESP, label=$esp_label)..."
+    mkfs.fat -F32 -n "$esp_label" "${dev}1"
 
     # Format BTRFS partition
     log_info "  Formatting ${dev}2 as BTRFS..."
@@ -262,6 +340,8 @@ partition_data_drive() {
 run_partitioning() {
     log_header "Executing Partitioning"
 
+    verify_esp_labels_unique
+
     for serial in "${!DISCOVERED_DEVICES[@]}"; do
         local dev="${DISCOVERED_DEVICES[$serial]}"
         local label="${TARGET_LABELS[$serial]}"
@@ -269,8 +349,14 @@ run_partitioning() {
 
         if [[ "$role" == "primary" ]]; then
             partition_data_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
-        elif [[ "$role" == *"esp"* || "$role" == *"boot"* || "$role" == *"system"* || "$role" == *"mirror"* ]]; then
-            partition_bootable_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
+        elif is_bootable_role "$role"; then
+            local esp_label
+            esp_label="$(derive_esp_label "$serial")" || exit 1
+            [[ -n "$esp_label" ]] || {
+                log_error "Empty ESP label derived for serial $serial — refusing to format."
+                exit 1
+            }
+            partition_bootable_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}" "$esp_label"
         else
             partition_data_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
         fi
@@ -300,6 +386,12 @@ main() {
     check_root
     discover_devices
     verify_serials
+
+    # Run the ESP-label pre-flight in EVERY mode, --check included, so a
+    # misconfigured display_name surfaces in the preview rather than at the
+    # moment drives are being formatted. run_partitioning calls it again as a
+    # last line of defence for any future caller that bypasses main.
+    verify_esp_labels_unique
 
     case "$mode" in
         --check|-c)

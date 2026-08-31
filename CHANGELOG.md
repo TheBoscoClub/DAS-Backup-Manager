@@ -8,10 +8,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`tests/test_esp_label_derivation.sh`** — falsification suite for the new ESP-label logic in
+  `scripts/das-partition-drives.sh`. Ten cases covering both directions: three that the derivation
+  produces exactly the labels present on the live drives today, five that each guard actually
+  refuses (no bay in `display_name`, empty `display_name`, missing target, a two-digit bay
+  exceeding the FAT32 11-byte cap, and two targets colliding on one label), and two controls
+  proving the guards stay silent on valid input. Failure cases assert on the specific guard's
+  message, not merely on a nonzero exit — an earlier draft of the harness "passed" four cases on
+  `command not found` and then on `unbound variable`, neither of which touched the code under test
 
 ### Changed
+- **ESP and boot documentation now identifies entries by PARTUUID, never by firmware entry number**:
+  the motherboard was replaced on 2026-08-31 (ASUS ROG Crosshair VIII **Dark Hero** → **Hero**,
+  BIOS 5601), and an NVRAM wipe renumbered every UEFI entry. `docs/examples/author-storage-reference.md`
+  had documented failover as `Boot0006 -> Boot0000`, and described named `Linux Boot Manager` entries
+  that no longer exist — the new firmware auto-created four generic `UEFI OS` entries pointing at
+  `\EFI\BOOT\BOOTX64.EFI`. Entry numbers are re-issued on any NVRAM reset, which is precisely when
+  a recovery procedure gets read, so the boot-entry table is now keyed on PARTUUID and LABEL with a
+  command to re-derive the current numbering
+- **`.claude/rules/esp-safety.md` documents why `esp-sync.sh` structurally cannot reach the DAS ESPs**:
+  it enumerates nothing (source and destination are the hardcoded `/boot` and `/mnt/esp-backup`, with
+  no discovery loop — the key difference from the deleted 2026-03-05 code), cross-checks label against
+  mount, and **hard-blocks any resolved device not matching `/dev/nvme*`**. The device-class guard is
+  the load-bearing one: a label can be renamed with `fatlabel`, a bus class cannot
+- **Corrected the long-standing claim that the ESP mirror is an `rsync -aHAXS --delete`**: it is a
+  per-file `md5sum` comparison with `cp -a` of only what differs, skipping `loader/random-seed`,
+  `loader/.#bootctl*` and `test-sync-trigger` via `is_unique_file()`. The implementation was
+  materially safer than four separate documents described
+- **SMART and device examples now use `/dev/disk/by-id/` paths instead of `/dev/sdX` letters** in
+  `docs/examples/author-storage-reference.md` — the letters drifted with the board swap (`ZXA0MHSK`
+  was `/dev/sda` in April and is `/dev/sdh` now) and drift again on every USB re-enumeration
 
 ### Fixed
+- **`scripts/das-partition-drives.sh` gave every bootable recovery drive the same ESP label** (v2.1.0):
+  `mkfs.fat -F32 -n "BACKUP-ESP"` was hardcoded, so re-partitioning both 2 TB recovery drives produced
+  two partitions sharing one label and `blkid -t LABEL=BACKUP-ESP -o device` returning both — every
+  consumer of that lookup then had to guess which independent recovery system it meant. The label is
+  now derived per drive as `RECOV-ESP-<bay>` from the target's `display_name`, matching the live
+  drives. Three fail-closed guards run **before** the first destructive step: `derive_esp_label()`
+  refuses a target with no parseable bay number, refuses a label exceeding the FAT32 11-byte cap, and
+  `verify_esp_labels_unique()` aborts the whole run if two bootable targets would collide. The
+  `is_bootable_role()` predicate is now defined once and shared by the pre-check, `show_plan`, and the
+  partitioning loop, so the three cannot disagree about which drives get an ESP. The pre-flight runs in
+  **every** mode including `--check`, so a misconfigured `display_name` surfaces in the preview rather
+  than at format time, and `show_plan` now prints the ESP label each drive would receive
+- **`derive_esp_label` refusals could not escape their own subshell**: the function signalled failure
+  with `exit 1`, but every caller reaches it through command substitution, where `exit` terminates only
+  the subshell — so an underivable target left `verify_esp_labels_unique` returning 0 and handed an
+  **empty string** to the formatting step. It now `return`s a status both callers check, writes
+  diagnostics to `stderr` (its `stdout` is the label), and both call sites additionally reject an empty
+  result. Caught by reading the diff rather than by the first version of the suite, which had only ever
+  called the function directly; `tests/test_esp_label_derivation.sh` now exercises the substitution path
+  in both directions and was observed RED against the pre-fix code
+- **Documented DAS recovery ESP labels were stale in six places**: both partitions were relabelled in
+  place from `BACKUP-ESP` to `RECOV-ESP-1` (bay 1, `ZK208Q77`) and `RECOV-ESP-4` (bay 4, `ZFL41DNY`),
+  but `.claude/rules/esp-safety.md`, `docs/examples/author-bay-mapping.md`, and the global
+  `~/.claude/rules/esp-ownership.md` all still named the old label. The vfat UUIDs (`6D15-0632`,
+  `6CAB-B04D`) are unchanged, which is what proves a relabel rather than a reformat. **A safety rule
+  keyed to a label that exists on no partition cannot fire** — "never write to `BACKUP-ESP`" matched
+  nothing, and to a label-based lookup that is indistinguishable from "no DAS ESPs present". Nothing
+  failed open in practice only because `esp-sync.sh` never matched on that label in the first place
+- **Removed `/boot/test-sync-trigger`**, a 0-byte artifact left from testing the sync mechanism on
+  2026-01-31. It is named in `esp-sync.sh`'s `is_unique_file()` so it was never mirrored; deleting it
+  leaves `loader/random-seed` — per-ESP entropy, deliberately never copied — as the only difference
+  between the primary and mirror ESPs
 
 ## [0.7.20.0] - 2026-08-28
 

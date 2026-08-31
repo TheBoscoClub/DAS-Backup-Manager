@@ -3,6 +3,25 @@
 **Date:** 2026-02-21
 **Status:** Approved
 
+> ## ⛔ WITHDRAWN SECTION — ESP sync is FORBIDDEN in this project
+>
+> This document predates the **2026-03-05 incident**, in which a generated
+> ESP-sync hook discovered ESP partitions by label/filesystem and mirrored the
+> host ESP onto every one it found, **destroying both DAS emergency recovery
+> ESPs and their independent OS boot configurations**.
+>
+> Every ESP-related element below — the `esp-sync` target role, the
+> `esp-sync-hook.tmpl` template, the `das-esp-sync.hook` / `99-das-esp-sync` /
+> `dnf` hook recipes, and `rsync` as an ESP-mirroring dependency — was
+> **deleted from the codebase on 2026-04-10/12 and MUST NOT be reimplemented**,
+> in any language, under any name. See `.claude/rules/esp-safety.md` and the
+> global `~/.claude/rules/esp-ownership.md`.
+>
+> The rest of this plan (config externalization, target discovery by serial,
+> scheduling, email) shipped and remains accurate. Only the ESP parts are void.
+
+---
+
 ## Goal
 
 A distro-agnostic, desktop-agnostic installer/setup tool that replaces all hardcoded paths, serials, and mount points with an externalized TOML config. Supports interactive subvolume/ESP selection, backup target configuration, optional email reports, optional GUI, install/upgrade/uninstall/modify modes, and scheduling configuration.

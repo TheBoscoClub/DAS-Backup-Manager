@@ -2,11 +2,23 @@
 
 # Storage Architecture & Emergency Recovery Guide
 
-> **System**: CachyOS (Arch-based) on ASUS ROG Crosshair VIII Dark Hero
+> **System**: CachyOS (Arch-based) on ASUS ROG Crosshair VIII **Hero**, BIOS 5601 (2026-08-18)
 > **Boot**: systemd-boot (NOT GRUB)
 > **Filesystem**: BTRFS on all arrays, RAID-1 mirrors
-> **Last verified**: 2026-04-06
+> **Last verified**: 2026-08-31 (boot/ESP facts re-verified after the board swap)
 > **HDD RAID-1 balance**: COMPLETE (all data RAID-1 as of 2026-04-06)
+>
+> **Board swap, 2026-08-31**: the motherboard was replaced (Crosshair VIII **Dark
+> Hero** → Crosshair VIII **Hero**). A board swap wipes UEFI NVRAM, so **every
+> boot-entry number in this document changed**, and the named `Linux Boot Manager`
+> entries this file used to describe no longer exist — the new firmware
+> auto-created four generic `UEFI OS` entries instead. Device letters for the
+> USB-attached DAS drives were also re-enumerated.
+>
+> **Boot entries are therefore documented by PARTUUID and LABEL below, not by
+> entry number.** Entry numbers are firmware-assigned and are re-issued on any
+> NVRAM reset; a recovery procedure that quotes one is wrong the moment the
+> NVRAM is cleared — which is exactly when the procedure gets used.
 
 ---
 
@@ -72,14 +84,15 @@
 |  UUID: 129B-4CA4               UUID: 7DE5-027D                     |
 |  Mount: /boot (primary)        Mount: /mnt/esp-backup              |
 |                                                                     |
-|  UEFI Boot0006 <- nvme0n1p3   UEFI Boot0000 <- nvme1n1p3          |
-|  (BootCurrent)                 (automatic fallback)                 |
+|  PARTUUID ca1c0553-...        PARTUUID cc7834c1-...                |
+|  (BootCurrent)                 (fallback -- boot it by PARTUUID,   |
+|                                 never by a remembered entry no.)   |
 |                                                                     |
 |  /boot/loader/entries:         Synced via /usr/local/bin/esp-sync  |
 |   +- linux-cachyos.conf       Triggered by pacman hook:            |
 |   +- linux-cachyos-fallback   /etc/pacman.d/hooks/esp-mirror.hook  |
-|   +- linux-cachyos-safe                                             |
-|   +- linux-cachyos-cli        rsync --delete /boot/ /mnt/esp-backup|
+|   +- linux-cachyos-safe       per-file md5 compare + cp -a,        |
+|   +- linux-cachyos-cli        NVMe-only, fail-closed (NOT rsync)   |
 +---------------------------------------------------------------------+
 
 +---------------------------------------------------------------------+
@@ -165,24 +178,76 @@ p2          11534336       926G    0FC63DAF (Linux FS)     BTRFS RAID-1 root
 | p2 (BTRFS)| `ADFDF354-30D4-47F8-A98C-C0BB689E0EF8` | `37E61C6B-9448-46E9-917D-77D73DA28A4B` |
 | p3 (ESP)  | `CA1C0553-72EB-4117-BAC4-981927B721A6` | `CC7834C1-A4C8-4090-B396-2EAB7E9CF463` |
 
-#### UEFI Boot Entries
+#### UEFI Boot Entries — identify by PARTUUID, never by entry number
 
-| Entry | Name | Target Drive | GPT PARTUUID | EFI Path |
-|-------|------|-------------|-------------|----------|
-| Boot0006 | Linux Boot Manager | nvme0n1p3 | `CA1C0553-...` | `\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI` |
-| Boot0000 | Linux Boot Manager (NVMe1) | nvme1n1p3 | `CC7834C1-...` | `\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI` |
-| Boot0007 | UEFI OS | nvme0n1p3 | `CA1C0553-...` | `\EFI\BOOT\BOOTX64.EFI` |
+All four disk entries are **firmware auto-created generics**, every one of them
+named `UEFI OS` and pointing at the removable-media fallback path
+`\EFI\BOOT\BOOTX64.EFI`. The PARTUUID is the only field that distinguishes
+them, and the only field that survives an NVRAM reset.
 
-**Boot order**: `0006,0000,0007,0001,0002,0003`
-**Current boot**: Boot0006 (nvme0n1p3)
+| GPT PARTUUID | Partition | LABEL | Role | EFI Path |
+|--------------|-----------|-------|------|----------|
+| `ca1c0553-72eb-4117-bac4-981927b721a6` | nvme0n1p3 | `EFI` | Primary ESP, mounted `/boot` | `\EFI\BOOT\BOOTX64.EFI` |
+| `cc7834c1-a4c8-4090-b396-2eab7e9cf463` | nvme1n1p3 | `EFI-BACKUP` | Mirror ESP, mounted `/mnt/esp-backup` | `\EFI\BOOT\BOOTX64.EFI` |
+| `fe640619-2c7b-457a-be77-61bc9aff4875` | 2TB bay 1, serial `ZK208Q77` | `RECOV-ESP-1` | **Independent recovery OS** | `\EFI\BOOT\BOOTX64.EFI` |
+| `ef19ce6e-de5e-4623-bed0-8717749916b8` | 2TB bay 4, serial `ZFL41DNY` | `RECOV-ESP-4` | **Independent recovery OS** | `\EFI\BOOT\BOOTX64.EFI` |
+
+**Never delete the last three entries.** The mirror entry is the failover if
+`nvme0n1` dies; the two `RECOV-ESP-*` entries are how the standalone recovery
+systems are booted. They look like firmware clutter and are not.
+
+Resolve the current numbering — do this rather than trusting any number written
+down here or anywhere else:
+
+```bash
+sudo efibootmgr -v
+for u in ca1c0553-72eb-4117-bac4-981927b721a6 cc7834c1-a4c8-4090-b396-2eab7e9cf463 \
+         fe640619-2c7b-457a-be77-61bc9aff4875 ef19ce6e-de5e-4623-bed0-8717749916b8; do
+  printf '%s -> ' "$u"; blkid -t PARTUUID="$u" -o device
+done
+```
+
+**Numbering as observed on 2026-08-31** (informational only — re-derive it with
+the command above): `Boot0001` primary, `Boot0002` mirror, `Boot0003` bay 1
+recovery, `Boot0004` bay 4 recovery; BootOrder `0001,0002,0003,0004,0005,0006,0007`;
+BootCurrent `0001`.
+
+**Known gap**: there is currently no *named* NVRAM entry for the primary ESP —
+boot selection falls to firmware enumeration order, and two of the candidates
+are USB-attached recovery disks. Creating a `Linux Boot Manager` entry resolved
+by partition GUID (`bootctl install` on `/boot`) would pin this. That is a
+bootloader change on the primary ESP and belongs to the CachyOS-Kernel project,
+not to DAS-Backup-Manager — see `.claude/rules/esp-safety.md` for the boundary.
 
 #### ESP Sync Chain
 
 1. Pacman installs/upgrades kernel, initramfs, or bootloader
 2. Pacman hook `/etc/pacman.d/hooks/esp-mirror.hook` fires (PostTransaction)
 3. Calls `/usr/local/bin/esp-sync.sh`
-4. `rsync -aHAXS --delete /boot/ /mnt/esp-backup/`
-5. Both ESPs are now identical
+4. The script walks `/boot` file-by-file, compares `md5sum` against the mirror,
+   and `cp -a`s only what differs; it then removes files present on the mirror
+   but absent from `/boot`. **It is not rsync** — earlier revisions of this
+   document said `rsync -aHAXS --delete`, which understated the safety.
+5. Both ESPs are now identical apart from `loader/random-seed`, which is
+   per-ESP entropy and is deliberately never copied
+
+**Three fail-closed guards run before a single byte is written** (`validate_device()`):
+
+| Guard | Effect |
+|-------|--------|
+| Label ↔ mount cross-check | The device mounted at the path must be the same device `LABEL=EFI` / `LABEL=EFI-BACKUP` resolves to, else `REFUSING to sync` |
+| **NVMe-only device class** | Any resolved device not matching `/dev/nvme*` aborts — this is what makes the USB-attached DAS ESPs structurally unreachable, regardless of what they are labelled |
+| vfat + read-write check | Refuses if the mount is not a real read-write vfat ESP |
+
+The device-class guard is the load-bearing one. Labels can be renamed by anyone
+with `fatlabel`; a bus class cannot be renamed into existence. Note this matters
+in practice: the DAS recovery ESPs were relabelled from `BACKUP-ESP` to
+`RECOV-ESP-1` / `RECOV-ESP-4` at some point without any doc being updated, and
+the sync mechanism was unaffected precisely because it never depended on their
+label.
+
+`loader/random-seed`, `loader/.#bootctl*` and `test-sync-trigger` are listed in
+the script's `is_unique_file()` and are never synced in either direction.
 
 #### Boot Entries (systemd-boot)
 
@@ -274,12 +339,20 @@ sudo smartctl -a /dev/nvme0n1    # Primary NVMe
 sudo smartctl -a /dev/nvme1n1    # Secondary NVMe
 ```
 
-Check SATA drives:
+Check SATA drives. **Address them by `by-id` path, not by letter** — the
+letters below drifted when the board was swapped (`ZXA0MHSK` was `/dev/sda`
+in April and is `/dev/sdh` today), and they drift again on any USB
+re-enumeration:
 ```bash
-sudo smartctl -a /dev/sdb    # Samsung 860 PRO
-sudo smartctl -a /dev/sdc    # Samsung 850 EVO
-sudo smartctl -a /dev/sda    # Seagate Exos X24 (sn: ZXA0MHSK)
-sudo smartctl -a /dev/sdd    # Seagate Exos X24 (sn: ZXA0V0EY)
+sudo smartctl -a /dev/disk/by-id/ata-Samsung_SSD_860_PRO_1TB_*      # 860 PRO
+sudo smartctl -a /dev/disk/by-id/ata-Samsung_SSD_850_EVO_mSATA_1TB_*  # 850 EVO
+sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0MHSK   # Exos X24
+sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0V0EY   # Exos X24
+
+# To see the current letter-to-serial mapping at any moment:
+for d in /dev/sd?; do
+  printf '%-9s ' "$d"; sudo smartctl -i "$d" | awk '/Serial Number:/{print $3}'
+done
 ```
 
 **Key SMART attributes to watch**:
@@ -387,13 +460,20 @@ When you suspect a drive failure:
 ### 5a. nvme0n1 Fails (Primary Boot Drive)
 
 **Impact**: System loses primary ESP (/boot) and one leg of root RAID-1.
-**Auto-recovery**: UEFI falls through Boot0006 -> Boot0000 (nvme1n1p3), which has identical ESP contents.
+**Auto-recovery**: UEFI falls through to the mirror ESP on `nvme1n1p3`
+(PARTUUID `cc7834c1-a4c8-4090-b396-2eab7e9cf463`, `LABEL=EFI-BACKUP`), which
+holds identical ESP contents.
 
 #### Step 1: Boot from backup NVMe
 
-The UEFI boot order already includes Boot0000 pointing to nvme1n1p3. If BIOS doesn't auto-fallback:
+The boot order already includes an entry for `nvme1n1p3`. If the firmware does
+not auto-fall-through:
 1. Enter BIOS (DEL at POST)
-2. Select "Linux Boot Manager (NVMe1)" manually
+2. Pick the entry for the **second NVMe**. Every disk entry is named `UEFI OS`,
+   so the name cannot tell them apart — match on the partition, and if the menu
+   is ambiguous, physically remove the failed `nvme0n1` so only one candidate
+   remains. Do **not** pick either 2TB USB recovery disk here; those boot a
+   different OS entirely.
 3. At systemd-boot menu, select **"CachyOS (Safe Mode)"** which has `rootflags=subvol=/@,degraded`
 
 If Safe Mode entry is missing, press `e` on any entry and append to the options line:
@@ -477,10 +557,13 @@ sudo efibootmgr --create --disk /dev/nvme0n1 --part 3 \
   --loader '\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI' \
   --label "Linux Boot Manager" --unicode
 
-# Set boot order (new entry first, then nvme1n1 as fallback)
-# Check efibootmgr output for the new entry number, then:
-sudo efibootmgr -o XXXX,0000,0007,0001,0002,0003
-# Replace XXXX with the new entry number
+# Set boot order. Do NOT copy a boot order from this document -- read the
+# CURRENT entries and build the order from what is actually there:
+sudo efibootmgr -v          # note the new entry's number, and the others
+sudo efibootmgr -o <new>,<mirror>,<rest...>
+
+# Whatever you do, keep the mirror ESP entry and BOTH RECOV-ESP-* entries in
+# the order. They are the failover and the two recovery systems.
 ```
 
 #### Step 10: Update fstab
@@ -536,11 +619,13 @@ diff <(sudo ls -laR /boot/) <(sudo ls -laR /mnt/esp-backup/)
    NEW_UUID=$(blkid -s UUID -o value /dev/nvme1n1p3)
    # Update: UUID=<NEW_UUID>  /mnt/esp-backup  vfat  defaults,umask=0077,nofail  0 2
    ```
-10. Re-register UEFI Boot0000 fallback entry:
+10. Re-register the mirror-ESP fallback entry (its number will be whatever
+    the firmware assigns; do not expect a particular one):
     ```bash
     sudo efibootmgr --create --disk /dev/nvme1n1 --part 3 \
       --loader '\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI' \
       --label "Linux Boot Manager (NVMe1)" --unicode
+    sudo efibootmgr -v    # confirm it exists and note its PARTUUID
     ```
 
 ---
@@ -713,8 +798,10 @@ efibootmgr                   # Boot order correct
 | Purpose | UUID | Device(s) |
 |---------|------|-----------|
 | NVMe BTRFS | `20b5fa7e-d8c0-4035-ae45-f80263073a96` | nvme0n1p2, nvme1n1p2 |
-| SSD BTRFS | `2638d087-0be1-436e-bfe4-8d6551ec02be` | sdb, sdc |
-| HDD BTRFS | `8b66e847-4273-4e2a-ad53-b312b3b3ee6d` | sda, sdd |
+| SSD BTRFS | `2638d087-0be1-436e-bfe4-8d6551ec02be` | 860 PRO + 850 EVO mSATA (letters drift) |
+| HDD BTRFS | `8b66e847-4273-4e2a-ad53-b312b3b3ee6d` | Exos X24 `ZXA0V0EY` + `ZXA0MHSK` (letters drift) |
+| ESP recovery bay 1 | `6D15-0632` | 2TB `ZK208Q77`, `LABEL=RECOV-ESP-1` |
+| ESP recovery bay 4 | `6CAB-B04D` | 2TB `ZFL41DNY`, `LABEL=RECOV-ESP-4` |
 | ESP primary | `129B-4CA4` | nvme0n1p3 |
 | ESP backup | `7DE5-027D` | nvme1n1p3 |
 | Swap 0 | `ddba4cee-f2b9-4820-96bf-46ac82c6e779` | nvme0n1p1 |
@@ -741,7 +828,7 @@ sudo btrfs device stats /opt           # SSD errors
 sudo btrfs device stats /hddRaid1     # HDD errors
 sudo btrfs filesystem show             # All arrays, device status
 sudo smartctl -a /dev/nvme0n1          # NVMe SMART
-sudo smartctl -a /dev/sda              # HDD SMART
+sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0V0EY  # HDD SMART (by-id, not sdX)
 
 # --- DEGRADED OPERATIONS ---
 sudo btrfs filesystem show             # Find "missing" device

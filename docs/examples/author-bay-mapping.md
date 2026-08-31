@@ -81,10 +81,19 @@ The two 2TB drives in bays 1 and 4 are **independent standalone bootable systems
 
 | | Bay 1 (ZK208Q77) | Bay 4 (ZFL41DNY) |
 |---|---|---|
-| **ESP** | `p1` — 1.5G FAT32, label `BACKUP-ESP`, UUID `6D15-0632` | `p1` — 1.5G FAT32, label `BACKUP-ESP`, UUID `6CAB-B04D` |
+| **ESP** | `p1` — 1.5G FAT32, label `RECOV-ESP-1`, UUID `6D15-0632` | `p1` — 1.5G FAT32, label `RECOV-ESP-4`, UUID `6CAB-B04D` |
 | **BTRFS** | `p2` — label `das-backup-system-recovery-A`, UUID `60b05268-7f8f-47b5-a38a-752576a1172a` | `p2` — label `das-backup-system-recovery-B`, UUID `7c7ae72d-09d6-4086-b249-1ac60f21b73b` |
 
 Either drive can boot independently if the other fails. Sync between them is manual (btrbk send/receive or similar), not automatic.
+
+> **ESP label history**: both ESPs were originally labelled `BACKUP-ESP` and were
+> relabelled in place to the bay-numbered `RECOV-ESP-<bay>` form. The vfat UUIDs
+> above are unchanged, which is how the relabel is distinguishable from a
+> reformat — the filesystems are the originals. The bay-numbered form is the
+> correct one to keep: a single shared label made
+> `blkid -t LABEL=BACKUP-ESP -o device` return *both* partitions, so any lookup
+> had to guess which recovery system it meant. `scripts/das-partition-drives.sh`
+> derives this label per drive and refuses to run if two targets would collide.
 
 ## Role Summary
 
