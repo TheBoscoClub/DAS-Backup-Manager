@@ -18,6 +18,34 @@ const SCRIPT_BACKUP_RUN: &str = include_str!("../../../scripts/backup-run.sh");
 const SCRIPT_BACKUP_VERIFY: &str = include_str!("../../../scripts/backup-verify.sh");
 const SCRIPT_BOOT_ARCHIVE_CLEANUP: &str = include_str!("../../../scripts/boot-archive-cleanup.sh");
 
+/// Basenames of the files above — the only generated files whose content is
+/// fixed at build time rather than derived from `Config`.
+///
+/// This distinction is what the installer's staleness guard
+/// (bd `DAS-Backup-Manager-2lj`) actually rests on. A binary built before a
+/// script edit carries a stale `include_str!` copy, so refusing to overwrite an
+/// on-disk script newer than the binary is correct. Every OTHER generated file —
+/// `btrbk.conf`, every systemd unit, the cron entry — is rendered from the
+/// user's `config.toml` by `render_*`, so its content depends on the config and
+/// never on the binary's vintage. Guarding those by binary mtime made config
+/// edits inert: a successful upgrade stamps them with `now`, which outlives the
+/// binary, so the next upgrade refused to rewrite them
+/// (bd `DAS-Backup-Manager-bwt`).
+const EMBEDDED_SCRIPTS: [&str; 3] = [
+    "backup-run.sh",
+    "backup-verify.sh",
+    "boot-archive-cleanup.sh",
+];
+
+/// True when `path` names one of the [`EMBEDDED_SCRIPTS`], i.e. a file whose
+/// content came from `include_str!` and may legitimately be older in the binary
+/// than on disk. Matches on the final path component so it holds regardless of
+/// the configured `install_prefix`.
+pub fn is_embedded_script(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    EMBEDDED_SCRIPTS.contains(&base)
+}
+
 // ---------------------------------------------------------------------------
 // Render functions
 // ---------------------------------------------------------------------------

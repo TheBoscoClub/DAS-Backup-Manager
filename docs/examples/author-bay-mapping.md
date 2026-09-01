@@ -97,7 +97,7 @@ Either drive can boot independently if the other fails. Sync between them is man
 
 ## Role Summary
 
-- **Primary Backup** (Bays 2 + 5): 2x 22TB Exos in BTRFS RAID-1 — all btrbk targets (NVMe, SSD, projects, audiobooks, das-storage), deep retention. Single-drive failure does not lose data; replacement happens online via `btrfs replace`.
+- **Primary Backup** (Bays 2 + 5): 2x 22TB Exos in BTRFS RAID-1 — all btrbk targets (NVMe, SSD, ssd-steam, ssd-vm, projects, media, system, audiobooks, das-storage), deep retention. Single-drive failure does not lose data; replacement happens online via `btrfs replace`.
 - **Emergency Boot/Recovery** (Bays 1, 4): Independent 2TB drives with ESP + CachyOS — also receive btrbk NVMe/SSD snapshots. No mutual redundancy.
 
 ## dasRaid0 — Relocated to Internal SATA (2026-04-06)

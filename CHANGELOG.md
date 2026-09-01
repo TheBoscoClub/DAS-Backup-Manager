@@ -8,10 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Backup coverage for `/srv/VirtualMachines`** — new `ssd-vm` source in `config.toml` carrying
+  the nested subvolume `@srv/VirtualMachines` (34 GiB, holds `win11pro.qcow2`), scoped to
+  `target_labels = ["primary-22tb"]` so a growing VM image never lands on the two 2 TB recovery
+  drives. It was created 2026-08-31 20:14 nested inside `@srv`, and `btrfs send` does not descend
+  into nested subvolumes — the daily `srv.<TS>` stream carried an empty directory at that path
+  while every signal reported success (bd `DAS-Backup-Manager-tku`)
+- **`ClaudeCodeProjects/powershell-scripts`** added to the `hdd-projects` source — a subvolume
+  created 2026-08-11 that had never been declared, so it went three weeks unbacked-up for the same
+  nesting reason (bd `DAS-Backup-Manager-rjc`)
+- **Nested-subvolume rule in `.claude/rules/backup.md`** — the send-does-not-descend property, a
+  reproducible proof, the per-filesystem command that finds coverage gaps, the deliberate
+  omissions (`@tmp`, `@var-tmp`, `@cache`, `coredumps`, `.snapshots/`) so a future audit is a diff
+  rather than a re-derivation, and the target-scoping convention for bulk data
+- **`upgrade_rewrites_a_config_derived_file_newer_than_the_binary`** in `setup/installer.rs` —
+  falsification for the guard scoping below; observed RED with the fix reverted
 
-### Changed
+### Removed
+- **`ClaudeCodeProjects/Asus-DarkHero`** from the `hdd-projects` source — the subvolume was deleted
+  after the `20260831T1359` run, and btrbk had been printing `WARNING: Skipping subvolume …
+  Failed to fetch subvolume detail` while continuing with `rc=0`. Its three existing target
+  snapshots (`20260828`, `20260829`, `20260831`) remain on the 22 TB array and are now unmanaged —
+  btrbk prunes only what is configured, so they persist rather than aging out
+  (bd `DAS-Backup-Manager-zm6`)
 
 ### Fixed
+- **`setup --upgrade` silently declined to regenerate `btrbk.conf`, making every config edit
+  inert**: the `2lj` staleness guard skipped any generated file whose mtime exceeded the `btrdasd`
+  binary's. That reasoning holds only for the three `include_str!` scripts, whose content is fixed
+  at build time; `btrbk.conf` and every systemd unit are rendered from `config.toml` by
+  `render_*`, so the binary's vintage says nothing about whether they are current. Because a
+  successful upgrade stamps them with `now`, the guard then refused every subsequent rewrite — and
+  refused precisely when a real config change was waiting — while still printing
+  `Upgrade complete`. The guard is now scoped by `templates::is_embedded_script()` to the three
+  embedded scripts, and the original `2lj` protection is unchanged
+  (bd `DAS-Backup-Manager-bwt`)
 
 ## [0.7.21.0] - 2026-08-31
 
