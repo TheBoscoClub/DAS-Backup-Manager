@@ -351,15 +351,19 @@ enum Commands {
     /// but aren't backed up (or config entries for subvolumes that no longer
     /// exist)
     ///
-    /// EXIT CODE: 0 means no drift found, or the check deferred because the
-    /// singleton/maintenance lock was held (a backup or scrub is in
-    /// progress, or another doctor run is already checking — never treated
-    /// as a failure). 1 means the run was not clean: drift was found
-    /// (missing or stale subvolumes), OR at least one configured volume
-    /// failed to mount/list while others were checked successfully. 2
-    /// means the check could not run at all: config load failure, lock I/O
-    /// error, or every configured volume failed to mount or list (nothing
-    /// was ever examined).
+    /// EXIT CODE: 0 means the check ran and found nothing, or it deferred
+    /// because the singleton/maintenance lock was held (a backup or scrub is
+    /// in progress, or another doctor run is already checking — never
+    /// treated as a failure). 1 means DRIFT WAS FOUND: missing or stale
+    /// subvolumes. This is a finding, not a malfunction — the check did its
+    /// job — so das-backup-doctor.service carries SuccessExitStatus=1 and
+    /// systemd does not mark the unit failed for it. 3 means at least one
+    /// configured volume failed to mount/list while others were checked
+    /// successfully: those subvolumes went unexamined, which is an
+    /// operational fault rather than a finding, so the unit DOES fail on it
+    /// (and it outranks 1 when both occur). 2 means the check could not run
+    /// at all: config load failure, lock I/O error, or every configured
+    /// volume failed to mount or list (nothing was ever examined).
     Doctor {
         /// Run the subvolume drift check. Currently the only check this
         /// command performs — the flag exists so future checks can be
@@ -1068,41 +1072,56 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
 }
 
 /// Map a `btrdasd doctor --check-drift` outcome to its process exit code
-/// (bd DAS-Backup-Manager-01u). Unlike `exit_code_for_pass`, this command
-/// genuinely distinguishes three outcomes rather than collapsing "ran but
-/// found problems" into 0: a drift check has no Sentinel-retry-loop hazard
-/// (it is a fast, read-mostly scan, not a multi-hour operation), so there is
-/// no reason to hide "drift was found" from the exit code the way scrub hides
-/// "damage was found" — quite the opposite, exit 1 is the whole point of the
-/// weekly timer.
+/// (bd DAS-Backup-Manager-01u, refined by `DAS-Backup-Manager-f6p`). Unlike
+/// `exit_code_for_pass`, this command deliberately does NOT collapse "ran but
+/// found problems" into 0: a drift check is a fast read-mostly scan with no
+/// Sentinel-retry-loop hazard, so exit 1 on drift is useful to scripts and CI
+/// and is, as `01u` put it, the whole point of the weekly timer.
+///
+/// What `01u` did not weigh is that systemd cannot tell a *finding* from a
+/// *malfunction*: any nonzero exit put `das-backup-doctor.service` into
+/// `failed`, cachyos-sentinel then restarted it and notified `"backup service
+/// das-backup-doctor.service last run failed: Result=exit-code"`. The operator
+/// was told the checker broke at the exact moment it worked and had something
+/// to say, and that alert competed with the drift email carrying the real
+/// signal. Measured 2026-08-31: 13:47:34 run → drift found → emailed → exit 1
+/// → sentinel restart at 13:47:57 → identical failure → notification 13:48:08.
+///
+/// The CLI contract is therefore kept and the two meanings that shared exit 1
+/// are split, so the unit can succeed on the benign one and fail on the other:
 ///
 /// - `Deferred` (either lock held) is always 0 — nothing went wrong, the
 ///   check simply yielded to a real backup/scrub or another doctor run.
 /// - `Ran` with zero volumes examined is 2 — "could not run" (every
 ///   configured volume failed to mount or list).
-/// - `Ran` with at least one volume examined: 1 if
-///   [`doctor::DriftReport::not_clean`] is true (drift found, OR at least one
-///   — but not all — configured volumes failed to mount/list), else 0.
+/// - `Ran` with at least one volume that failed to mount/list is **3** — those
+///   subvolumes went unexamined. That is an operational fault, not a finding,
+///   so the generated unit lets it fail. It outranks drift when both occur:
+///   an incomplete check cannot assert that its drift list is complete.
+/// - `Ran` cleanly with drift is **1** — a successful check with a result.
+///   `render_systemd_doctor_service` pairs this with `SuccessExitStatus=1`.
+/// - Otherwise 0.
 ///
-/// This reads `not_clean()` rather than `has_drift()` directly so this
-/// function, `doctor::format_report`, and the `--email` trigger below all
-/// agree on what "not clean" means. An earlier version of this function
-/// checked only `has_drift()`: a run where 1 of 4 volumes failed to mount
-/// while the other 3 were clean had `volumes_checked > 0` (so "ran") and
-/// `has_drift() == false` (no missing/stale subvolumes among the volumes
-/// that *were* examined) — exit 0, while the printed report said `DRIFT
-/// DETECTED — FAILURE` and the `--email` guard sent a failure email for the
-/// same run. That is the same masquerading-exit-code class already fixed
-/// once in this file for scrub (`exit_code_for_pass`, bd
-/// DAS-Backup-Manager-18p) — silence about the reviewer catching it here
-/// would have been how it survived.
+/// `not_clean()` remains the source of truth for `doctor::format_report` and
+/// the `--email` trigger, exactly as `ScrubPass::success()` stayed the source
+/// of truth for the scrub FAILURE email while `exit_code_for_pass` narrowed
+/// (bd DAS-Backup-Manager-18p). What travels by email is unchanged; only how
+/// systemd reads the process is.
+///
+/// An earlier version checked only `has_drift()`: a run where 1 of 4 volumes
+/// failed to mount while the other 3 were clean had `volumes_checked > 0` (so
+/// "ran") and `has_drift() == false` — exit 0, while the printed report said
+/// `DRIFT DETECTED — FAILURE` and `--email` sent a failure email for the same
+/// run. The split below keeps that case nonzero; it moves it from 1 to 3.
 pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
     match outcome {
         doctor::DoctorOutcome::Deferred { .. } => 0,
         doctor::DoctorOutcome::Ran(report) => {
             if !report.ran() {
                 2
-            } else if report.not_clean() {
+            } else if !report.volumes_failed.is_empty() {
+                3
+            } else if report.has_drift() {
                 1
             } else {
                 0
@@ -2792,12 +2811,17 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     }
 
     #[test]
-    fn exit_code_for_doctor_partial_volume_failure_is_one() {
+    fn exit_code_for_doctor_partial_volume_failure_is_three() {
         // 3 of 4 volumes examined cleanly (no missing/stale among them), 1
         // failed to mount/list. `ran()` is true (volumes_checked > 0) and
-        // `has_drift()` is false, but this must still exit 1 — a volume that
-        // went unchecked is exactly the kind of gap this tool exists to
+        // `has_drift()` is false, but this must still be NONZERO — a volume
+        // that went unchecked is exactly the kind of gap this tool exists to
         // surface, and the report/email already call it a failure.
+        //
+        // It is 3 rather than 1 (bd DAS-Backup-Manager-f6p) so the generated
+        // unit can carry `SuccessExitStatus=1` for the drift case without also
+        // swallowing this one. Drift is a finding; an unexamined volume is an
+        // operational fault, and only the latter should fail the unit.
         let report = doctor::DriftReport {
             volumes_checked: 3,
             volumes_failed: vec![("/.btrfs-ssd".into(), "not mounted".into())],
@@ -2807,7 +2831,49 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert!(!report.has_drift());
         assert!(report.not_clean());
         let outcome = doctor::DoctorOutcome::Ran(report);
-        assert_eq!(exit_code_for_doctor(&outcome), 1);
+        assert_eq!(exit_code_for_doctor(&outcome), 3);
+    }
+
+    #[test]
+    fn exit_code_for_doctor_volume_failure_outranks_drift() {
+        // Both at once. The fault wins: a check that could not examine every
+        // volume cannot assert that the drift list it produced is complete, so
+        // reporting only "drift found" would overstate what the run knows.
+        let mut report = doctor::DriftReport {
+            volumes_checked: 3,
+            volumes_failed: vec![("/.btrfs-ssd".into(), "not mounted".into())],
+            ..Default::default()
+        };
+        report.missing.push(doctor::MissingSubvolume {
+            volume: "/.btrfs-hdd".into(),
+            source_labels: vec!["hdd-projects".into()],
+            name: "ClaudeCodeProjects/powershell-scripts".into(),
+            category: doctor::DriftCategory::Irreplaceable,
+        });
+        assert!(report.has_drift());
+        let outcome = doctor::DoctorOutcome::Ran(report);
+        assert_eq!(
+            exit_code_for_doctor(&outcome),
+            3,
+            "an incomplete check must not report as a mere finding"
+        );
+    }
+
+    #[test]
+    fn doctor_unit_does_not_fail_systemd_on_a_drift_finding() {
+        // The other half of the f6p fix, and the half that actually silences
+        // sentinel's "last run failed" notification. Without this line systemd
+        // marks the unit failed for exit 1, which is a finding, not a fault.
+        let config = Config::default();
+        let unit = setup::templates::render_systemd_doctor_service(&config);
+        // Match the DIRECTIVE, not the string: the explanatory comment in this
+        // unit also contains the words "SuccessExitStatus=1", so a bare
+        // `contains()` passes on the documentation even when the directive is
+        // gone — caught by sabotaging the template and watching this stay green.
+        assert!(
+            unit.lines().any(|l| l.trim() == "SuccessExitStatus=1"),
+            "doctor unit must not treat exit 1 (drift found) as a unit failure:\n{unit}"
+        );
     }
 
     #[test]

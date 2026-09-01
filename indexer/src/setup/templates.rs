@@ -401,18 +401,29 @@ pub fn render_systemd_doctor_service(config: &Config) -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         # Exit semantics (bd DAS-Backup-Manager-01u): 0 = no drift found, or\n\
-         # deferred because a backup/scrub/another doctor run holds a lock (never\n\
-         # a failure). 1 = the run was not clean — drift found (missing or stale\n\
-         # subvolumes), OR at least one configured volume failed to mount/list\n\
-         # while others were checked successfully (that volume's subvolumes went\n\
-         # unchecked, which is itself a finding this exit code surfaces). Unlike\n\
-         # das-scrub.service's exit code, this one is meant to surface findings,\n\
-         # because a drift check is a fast read-mostly scan with no multi-hour-\n\
-         # retry hazard to protect against. 2 = could not run at all — every\n\
-         # configured source volume failed to mount or list, so nothing was ever\n\
-         # examined (config load failure and lock I/O errors also land here, via\n\
-         # the CLI's own error path rather than this exit-code mapping).\n\
+         # Exit semantics (bd DAS-Backup-Manager-01u, refined by -f6p):\n\
+         #   0 = ran clean, or deferred because a backup/scrub/another doctor run\n\
+         #       holds a lock (never a failure).\n\
+         #   1 = DRIFT FOUND — missing or stale subvolumes. A successful check\n\
+         #       WITH A RESULT, not a malfunction, which is why SuccessExitStatus\n\
+         #       below tells systemd not to fail the unit for it. The finding\n\
+         #       travels by email (--email) and by the journal report.\n\
+         #   3 = at least one configured volume failed to mount/list while others\n\
+         #       were checked — those subvolumes went unexamined. An operational\n\
+         #       fault, so the unit DOES fail. Outranks 1 when both occur: an\n\
+         #       incomplete check cannot claim its drift list is complete.\n\
+         #   2 = could not run at all — every configured source volume failed to\n\
+         #       mount or list, so nothing was ever examined (config load failure\n\
+         #       and lock I/O errors also land here, via the CLI's own error path\n\
+         #       rather than this exit-code mapping).\n\
+         #\n\
+         # Without SuccessExitStatus=1 systemd cannot tell a finding from a\n\
+         # malfunction: it marked this unit `failed` on drift, cachyos-sentinel\n\
+         # then restarted it and notified 'backup service das-backup-doctor\n\
+         # .service last run failed', so the operator was told the checker broke\n\
+         # at the moment it worked — an alert that contradicted the drift email\n\
+         # carrying the real signal (observed 2026-08-31 13:47).\n\
+         SuccessExitStatus=1\n\
          ExecStart={prefix}/bin/btrdasd doctor --check-drift --email\n\
          StandardOutput=journal\n\
          StandardError=journal\n\

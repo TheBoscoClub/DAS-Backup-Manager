@@ -673,6 +673,32 @@ mod tests {
     }
 
     #[test]
+    fn dest_policy_admits_a_srv_subdir_while_still_refusing_the_srv_doc_roots() {
+        // bd DAS-Backup-Manager-tku. Backing up /srv/VirtualMachines is useless
+        // if it cannot be restored, so it is granted in allowed_roots — but as a
+        // SUBDIRECTORY of /srv, never /srv itself, because /srv/http and
+        // /srv/ftp are served to the network.
+        check_dest_allowed(
+            Path::new("/srv/VirtualMachines"),
+            &["/srv/VirtualMachines".to_string()],
+        )
+        .expect("the granted VM subdirectory must be a permitted destination");
+
+        // And the denylist holds even against the widest plausible mistake —
+        // someone granting the whole of /srv later.
+        for served in ["/srv/http", "/srv/ftp"] {
+            let err = check_dest_allowed(Path::new(served), &["/srv".to_string()])
+                .expect_err("a served document root must never be a destination");
+            assert!(err.contains("never a permitted destination"), "{err}");
+        }
+
+        // Component-wise, not string-prefix: a sibling that merely starts with
+        // the same characters must not be caught by the denylist.
+        check_dest_allowed(Path::new("/srv/http-archive"), &["/srv".to_string()])
+            .expect("/srv/http-archive is not /srv/http");
+    }
+
+    #[test]
     fn dest_policy_refuses_paths_outside_allowed_roots() {
         let outside = std::env::temp_dir().join("das-restore-outside-test");
         let err = check_dest_allowed(&outside, &["/home".to_string()])
