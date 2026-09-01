@@ -570,7 +570,11 @@ fn cmake_installed_paths(prefix: &str) -> Vec<String> {
         p("bin/btrdasd"),
         p("bin/btrdasd-gui"),
         p("libexec/btrdasd-helper"),
-        // FFI
+        // LEGACY FFI artifacts. The C-ABI library was removed in 0.7.22.2
+        // (bd DAS-Backup-Manager-5xo) and is no longer built or installed, but
+        // hosts installed at 0.7.22.1 or earlier still carry these two files.
+        // They stay on the uninstall list so a full uninstall cleans them up;
+        // remove these entries only once no supported host can still have them.
         p("lib/libbuttered_dasd_ffi.so"),
         p("include/btrdasd_ffi.h"),
         // D-Bus

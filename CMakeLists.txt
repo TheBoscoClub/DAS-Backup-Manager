@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(DAS-Backup-Manager
-    VERSION 0.7.22.1
+    VERSION 0.7.22.2
     DESCRIPTION "DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI"
     LANGUAGES CXX
 )
@@ -16,7 +16,6 @@ include(CTest)
 option(BUILD_GUI "Build KDE Plasma GUI (requires Qt6/KF6)" ON)
 option(BUILD_INDEXER "Build btrdasd Rust binary via cargo" ON)
 option(BUILD_HELPER "Build btrdasd-helper D-Bus daemon (requires zbus)" ON)
-option(BUILD_FFI "Build libbuttered_dasd_ffi.so shared library for GUI" ON)
 
 # =============================================================================
 # Defense-in-depth: refuse to install zero-byte Rust binaries
@@ -115,35 +114,6 @@ if(BUILD_HELPER)
         DESTINATION "${CMAKE_INSTALL_PREFIX}/libexec")
 endif()
 
-# =============================================================================
-# FFI shared library (libbuttered_dasd_ffi.so)
-# =============================================================================
-
-if(BUILD_FFI)
-    include(ExternalProject)
-
-    set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target")
-
-    ExternalProject_Add(buttered_dasd_ffi
-        SOURCE_DIR "${CMAKE_SOURCE_DIR}/indexer"
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND cargo build --release --features ffi
-            --manifest-path "${CMAKE_SOURCE_DIR}/indexer/Cargo.toml"
-            --target-dir "${CARGO_TARGET_DIR}"
-        INSTALL_COMMAND ""
-        BUILD_IN_SOURCE FALSE
-        BUILD_ALWAYS TRUE
-    )
-
-    das_require_nonzero_artifact("${CARGO_TARGET_DIR}/release/libbuttered_dasd.so"
-                                  "libbuttered_dasd FFI library")
-    install(FILES "${CARGO_TARGET_DIR}/release/libbuttered_dasd.so"
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/lib"
-        RENAME "libbuttered_dasd_ffi.so")
-
-    install(FILES "${CMAKE_SOURCE_DIR}/indexer/include/btrdasd_ffi.h"
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/include")
-endif()
 
 # =============================================================================
 # Install targets for reference scripts and config
