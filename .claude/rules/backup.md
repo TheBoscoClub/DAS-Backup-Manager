@@ -79,9 +79,25 @@ its parent for the same reason described above).
 `WARNING: Skipping subvolume … Failed to fetch subvolume detail` and **exit 10**.
 Measured 2026-09-01 against an isolated config whose only defect was a missing
 subvolume: `btrbk dryrun` → 10, `btrbk list snapshots` → 10. `run_btrbk()` turns
-that into `record_op btrbk FAIL`, so **the emailed report says the backup FAILED**
-even though every other subvolume was backed up correctly. The run itself still
-exits 0 per the `18p` split, so systemd stays green and sentinel does not thrash.
+that into `record_op btrbk FAIL`, so **the report's `Status:` becomes `FAILURES
+DETECTED` and `backup_runs.success` is written 0**, even though every other
+subvolume was backed up correctly. The run itself still exits 0 per the `18p`
+split, so systemd stays green and sentinel does not thrash.
+
+**Measured both shapes, because the first measurement did not settle it.** A
+config whose *only* subvolume is missing exits 10 — but so does one with a
+present subvolume alongside a missing one, which is the shape a real config has.
+So the failure does not require the config to be entirely broken; one dead entry
+among thirty is enough.
+
+**It nevertheless never fired here, and the distinction is worth keeping.** The
+`Asus-DarkHero` subvolume was deleted after the 2026-08-31 14:26 run and its
+config entry was removed before the next run began, so no backup ever executed in
+that state — every row in `backup_runs` is `SUCCESS`. An earlier write-up of this
+section said the reports "had been" saying FAILED. They had not. The mechanism is
+real and the correction is real; what was wrong was the tense. **Verify that a
+mechanism actually fired before describing it in the past tense** — `backup_runs`
+answers that in one query and the emailed report does not.
 
 An earlier draft of this section said btrbk continues with `rc=0` and that "no exit
 code carries" — that is wrong in the dangerous direction, because it reads as

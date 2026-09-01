@@ -44,11 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ClaudeCodeProjects/Asus-DarkHero`** from the `hdd-projects` source — the subvolume was deleted
   after the `20260831T1359` run, and btrbk had been printing `WARNING: Skipping subvolume …
   Failed to fetch subvolume detail` and **exiting 10** — which `run_btrbk()` records as
-  `record_op btrbk FAIL`, so every emailed report said the backup FAILED while every other
-  subvolume was in fact backed up correctly (the run itself still exits 0 per the `18p` split, so
-  systemd stayed green). Its three existing target
-  snapshots (`20260828`, `20260829`, `20260831`) remain on the 22 TB array and are now unmanaged —
-  btrbk prunes only what is configured, so they persist rather than aging out
+  `record_op btrbk FAIL`, setting the report's `Status:` to `FAILURES DETECTED` and
+  `backup_runs.success = 0`, while every other subvolume was in fact backed up correctly (the run
+  itself still exits 0 per the `18p` split, so systemd stays green). **No run ever executed in
+  that state**: the subvolume was deleted after the 2026-08-31 14:26 run and the config entry was
+  removed before the next one, so this is the failure that was avoided, not one that occurred —
+  confirmed against `backup_runs`, where every recorded run is `SUCCESS`. Its fourteen existing
+  target
+  snapshots (`20260517` … `20260831`, 14 MB total, each still a `readonly` replica with its
+  Received UUID intact) remain on the 22 TB array and are now unmanaged — btrbk prunes only what is
+  configured, so they persist rather than aging out
   (bd `DAS-Backup-Manager-zm6`)
 
 ### Fixed
