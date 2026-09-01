@@ -1,11 +1,11 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.7.22.1
+**Version**: 0.7.22.2
 
 ## 1. Rust Crate Dependencies
 
 These are the direct dependencies declared in `indexer/Cargo.toml` for the
-`buttered_dasd` library, `btrdasd` CLI, `btrdasd-helper` daemon, and `libbuttered_dasd_ffi` shared library.
+`buttered_dasd` library, `btrdasd` CLI, and the `btrdasd-helper` D-Bus daemon.
 
 ### Runtime Dependencies
 

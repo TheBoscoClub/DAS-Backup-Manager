@@ -60,8 +60,6 @@ install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-he
 %{_datadir}/polkit-1/actions/org.dasbackup.policy
 %{_unitdir}/btrdasd-helper.service
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg
-%{_includedir}/btrdasd_ffi.h
-%{_prefix}/lib/libbuttered_dasd_ffi.so
 %{_mandir}/man1/btrdasd.1*
 
 %changelog

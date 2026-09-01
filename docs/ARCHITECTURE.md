@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.22.1
+**Version**: 0.7.22.2
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -44,7 +44,7 @@ at that path. `ClaudeCodeProjects/powershell-scripts` had been in the same state
 for three weeks. See `.claude/rules/backup.md` for the reproduction and the
 per-filesystem command that finds coverage gaps.
 
-## Component Overview (v0.7.22.1)
+## Component Overview (v0.7.22.2)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -54,13 +54,12 @@ per-filesystem command that finds coverage gaps.
 │  │  (CLI)   │    │  File Browser │ Config │ Monitor      │   │
 │  └────┬─────┘    └──────────┬───────────────────────────┘   │
 │       │    ┌────────────────┴──────────────┐                │
-│       │    │  libbuttered_dasd_ffi (C ABI) │                │
 │       │    └────────────────┬──────────────┘                │
 │  ┌────┴─────────────────────┴──────────────────────┐        │
 │  │          libbuttered_dasd (Rust library)         │        │
 │  │  indexer │ config │ backup │ restore │ schedule   │        │
 │  │  db      │ health │ subvol │ progress│ report     │        │
-│  │  mount   │ doctor │ scrub  │ ffi     │ scanner    │        │
+│  │  mount   │ doctor │ scrub  │ scanner │ restore    │        │
 │  └──────────────────────┬───────────────────────────┘        │
 │                         │ D-Bus (org.dasbackup.Helper1)      │
 │  ┌──────────────────────┴────────────────────────┐           │
@@ -79,7 +78,6 @@ The system has six major components:
 | Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 17 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
-| FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 10-step setup wizard with template generation |
 
@@ -392,12 +390,10 @@ The root `CMakeLists.txt` orchestrates both C++ and Rust builds:
 option(BUILD_GUI     "Build KDE Plasma GUI (requires Qt6/KF6)" ON)
 option(BUILD_INDEXER "Build btrdasd Rust binary via cargo"      ON)
 option(BUILD_HELPER  "Build btrdasd-helper D-Bus daemon"        ON)
-option(BUILD_FFI     "Build libbuttered_dasd_ffi shared library" OFF)
 ```
 
 - `BUILD_INDEXER=ON`: Uses `ExternalProject_Add` to invoke `cargo build --release` for all Rust targets
 - `BUILD_HELPER=ON`: Builds `btrdasd-helper` D-Bus daemon and installs polkit/D-Bus configuration
-- `BUILD_FFI=ON`: Builds `libbuttered_dasd_ffi.so` C-ABI shared library (used by GUI)
 - `BUILD_GUI=ON`: Uses `add_subdirectory(gui)` with standard KDE/Qt6 CMake modules
 - `BUILD_GUI=OFF`: Skips Qt6/KF6 dependency entirely (headless CLI-only build)
 
@@ -509,7 +505,6 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | `config` | `src/config.rs` | ~1080 | TOML config types, DAS/source/target models |
 | `db` | `src/db.rs` | ~1090 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
 | `doctor` | `src/doctor.rs` | ~1120 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
-| `ffi` | `src/ffi.rs` | ~670 | C-ABI FFI bridge (extern "C" functions for the GUI's `libbuttered_dasd_ffi.so`) |
 | `health` | `src/health.rs` | ~1550 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
 | `indexer` | `src/indexer.rs` | ~510 | Snapshot discovery, span logic, walk orchestration |
 | `mount` | `src/mount.rs` | ~510 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |

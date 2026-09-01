@@ -7,7 +7,6 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 - **Version source of truth**: `CMakeLists.txt` `project(VERSION ...)`. Rust gets it from `Cargo.toml`. GUI gets it via `target_compile_definitions(BTRDASD_VERSION="${CMAKE_PROJECT_VERSION}")`.
 - **btrbk config**: `/etc/btrbk/btrbk.conf` (canonical). `/etc/das-backup/btrbk.conf` is a symlink. `/usr/lib/das-backup/config/btrbk.conf` is a reference template only.
 - **Binaries**: cmake installs to `/usr/bin/` and `/usr/libexec/`. Symlinks only if other paths need them.
-- **Shared library**: canonical at `/usr/lib/libbuttered_dasd_ffi.so`.
 - **Build artifacts**: Always build via `cmake --build build` (uses `build/cargo-target/`). Never bare `cargo build`.
 
 ## C++20 Standards
@@ -30,7 +29,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 
 ## Rust (buttered_dasd library + btrdasd CLI)
 - Rust 2024 edition, `cargo clippy` and `cargo fmt` before committing
-- Library crate `buttered_dasd` exports 15 public modules (`backup`, `config`, `db`, `doctor`, `ffi`, `health`, `indexer`, `mount`, `progress`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only
+- Library crate `buttered_dasd` exports 16 public modules (`backup`, `config`, `db`, `doctor`, `forget`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line — it said 15 and listed `ffi` while omitting `forget` and `reconcile`, so it was wrong in both directions at once
 - Use `LazyLock<Regex>` for compile-once regex patterns (not per-call `Regex::new()`)
 - Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - All database access through `db::Database` with prepared statements

@@ -13,6 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.7.22.2] - 2026-09-01
+
+### Removed
+- **`libbuttered_dasd_ffi.so` and `btrdasd_ffi.h` — the entire C-ABI surface** (bd
+  `DAS-Backup-Manager-5xo`). Twelve `extern "C"` entry points were built, size-asserted, installed to
+  `/usr/lib` and `/usr/include`, and listed in the Fedora RPM `%files` — and **nothing has ever
+  called them**. `git log -S'btrdasd_ffi' -- gui/` returns no commits: the GUI never linked it. The
+  2026-02-24 design plan intended the GUI to consume it, that integration was never built, and
+  `btrdasd-helper`'s D-Bus API covers the same ground (`config_get`/`config_set`, `subvol_*`,
+  `health_query`, `index_backup_history`, `index_stats`) behind polkit authorisation, which a
+  C ABI loaded in-process would bypass. Removed: `indexer/src/ffi.rs`, `indexer/include/btrdasd_ffi.h`,
+  the `ffi` Cargo feature, the `BUILD_FFI` CMake option and its `ExternalProject`/install rules, both
+  RPM `%files` lines, and the stale "canonical shared library" claim in the build rules.
+
+  **This is a public ABI removal.** Nothing in this repo or on this host consumes it, but anything
+  external that linked it would break. It remains in git history at `v0.7.22.1` if ever wanted.
+
+  The two paths stay on the `--uninstall-all` list, deliberately and with a comment: hosts installed
+  at 0.7.22.1 or earlier still carry those files, and a full uninstall should still clean them up.
+
 ## [0.7.22.1] - 2026-09-01
 
 ### Added
@@ -1004,7 +1024,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.2...HEAD
+[0.7.22.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.1...v0.7.22.2
 [0.7.22.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.0...v0.7.22.1
 [0.7.22.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.21.0...v0.7.22.0
 [0.7.21.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.20.0...v0.7.21.0
