@@ -46,6 +46,10 @@ done
 # Expected DAS drives (detected by USB transport)
 DAS_DEVICES=()
 
+# Set by check_smart_health when any drive fails or cannot be read. main()
+# exits nonzero on it so this script can be used as a gate.
+SMART_FAILED=false
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -81,6 +85,84 @@ check_root() {
         log_error "This script must be run as root"
         exit 1
     fi
+}
+
+# Read one SMART attribute's raw value (field 10 of the attribute table row).
+#
+# Prints exactly one of:
+#   <value>          the raw value as smartctl reported it
+#   NOT_PRESENT      smartctl produced a table, but not this attribute
+#   SMARTCTL_FAILED  smartctl produced nothing usable for this device
+#
+# It must NEVER substitute a zero. `... | grep ATTR | awk '{print $10}' ||
+# echo "0"` fabricated a clean sector count whenever the attribute was absent
+# or smartctl failed, and that zero was then printed in green — a manufactured
+# clean bill of health from the check that decides whether a drive is dying.
+smart_attr_raw() {
+    local dev="$1" attr="$2"
+    local out=""
+
+    # smartctl exits nonzero for real read failures AND for benign health-flag
+    # bits, so the presence of output is what distinguishes them.
+    out=$(smartctl -A "$dev" 2>/dev/null) || true
+
+    if [[ -z "$out" ]]; then
+        echo "SMARTCTL_FAILED"
+        return 0
+    fi
+
+    # Herestring, not a pipe: awk's early `exit` closes its input, and under
+    # `set -o pipefail` a SIGPIPE'd producer would fail the whole assignment.
+    local value
+    value=$(awk -v a="$attr" '$2 ~ a { print $10; exit }' <<< "$out")
+
+    if [[ -z "$value" ]]; then
+        echo "NOT_PRESENT"
+        return 0
+    fi
+
+    echo "$value"
+}
+
+# Print a sector-count attribute. Returns nonzero when the value could not be
+# established, so only a real number is ever reported as healthy.
+report_sector_attr() {
+    local label="$1" value="$2"
+
+    case "$value" in
+        SMARTCTL_FAILED)
+            echo -e "  $label: ${RED}UNKNOWN (smartctl could not read this device)${NC}"
+            return 1
+            ;;
+        NOT_PRESENT)
+            echo -e "  $label: ${RED}UNKNOWN (attribute not reported by this device)${NC}"
+            return 1
+            ;;
+        0)
+            echo -e "  $label: ${GREEN}0${NC}"
+            return 0
+            ;;
+        *)
+            if [[ "$value" =~ ^[0-9]+$ ]]; then
+                echo -e "  $label: ${YELLOW}$value${NC}"
+                return 0
+            fi
+            echo -e "  $label: ${RED}UNKNOWN (unparseable value: $value)${NC}"
+            return 1
+            ;;
+    esac
+}
+
+# Render an informational attribute without ever printing an empty field
+# (the old awk-miss path produced lines like "Temperature: °C").
+format_attr() {
+    local value="$1" suffix="${2:-}"
+
+    case "$value" in
+        SMARTCTL_FAILED) echo "unavailable (smartctl could not read this device)" ;;
+        NOT_PRESENT)     echo "unavailable (not reported by this device)" ;;
+        *)               echo "${value}${suffix}" ;;
+    esac
 }
 
 detect_das_drives() {
@@ -120,10 +202,35 @@ detect_das_drives() {
     echo "Found ${#DAS_DEVICES[@]} DAS drive(s):"
     for dev in "${DAS_DEVICES[@]}"; do
         local serial
-        serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3; exit}' || echo "unknown")
+        serial=$(read_drive_serial "$dev")
         local role="${DRIVE_MAP[$serial]:-Unknown}"
         echo "  $dev → Serial: $serial → $role"
     done
+}
+
+# Read one drive's serial, or the empty string.
+#
+# The previous shape was:
+#   serial=$(smartctl -i "$dev" 2>/dev/null | awk '.../{print $3; exit}' || echo "unknown")
+#
+# `awk ... exit` closes the pipe, smartctl dies of SIGPIPE (141), and under this
+# script's `set -o pipefail` that fails the whole pipeline -- so `|| echo
+# "unknown"` fired and APPENDED a second line AFTER awk had already printed the
+# real serial. Measured on this host: serial=[ZFL41DNY\nunknown].
+#
+# Two live consequences, both of which had been true for the entire life of the
+# script: every drive rendered as "Unknown" instead of its configured display
+# name, and in check_btrbk_status the `[[ "$serial" == "$primary_serial" ]]`
+# comparison could never match -- so `primary_dev` was always empty and the
+# whole btrbk/disk-usage section silently took its "primary not found" branch
+# and had NEVER executed. bd DAS-Backup-Manager-nsp.
+#
+# Capture first, filter second: nothing can SIGPIPE a producer that has already
+# finished, so the pipeline status means what it appears to mean.
+read_drive_serial() {
+    local dev="$1" info
+    info=$(smartctl -i "$dev" 2>/dev/null) || true
+    printf '%s' "$(awk '/Serial Number:/{print $3; exit}' <<<"$info")"
 }
 
 check_smart_health() {
@@ -133,7 +240,7 @@ check_smart_health() {
 
     for dev in "${DAS_DEVICES[@]}"; do
         local serial
-        serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3; exit}' || echo "unknown")
+        serial=$(read_drive_serial "$dev")
         local role="${DRIVE_MAP[$serial]:-Unknown}"
 
         echo ""
@@ -150,41 +257,38 @@ check_smart_health() {
             all_passed=false
         fi
 
-        # Check for pending/reallocated sectors
+        # Check for pending/reallocated sectors. "attribute missing" and
+        # "smartctl failed" are distinct states from a real zero and must never
+        # be collapsed into one.
         local reallocated pending
-        reallocated=$(smartctl -A "$dev" 2>/dev/null | grep "Reallocated_Sector" | awk '{print $10}' || echo "0")
-        pending=$(smartctl -A "$dev" 2>/dev/null | grep "Current_Pending_Sector" | awk '{print $10}' || echo "0")
+        reallocated=$(smart_attr_raw "$dev" "Reallocated_Sector")
+        pending=$(smart_attr_raw "$dev" "Current_Pending_Sector")
 
-        if [[ "$reallocated" != "0" ]]; then
-            echo -e "  Reallocated Sectors: ${YELLOW}$reallocated${NC}"
-        else
-            echo -e "  Reallocated Sectors: ${GREEN}0${NC}"
-        fi
-
-        if [[ "$pending" != "0" ]]; then
-            echo -e "  Pending Sectors: ${YELLOW}$pending${NC}"
-        else
-            echo -e "  Pending Sectors: ${GREEN}0${NC}"
-        fi
+        report_sector_attr "Reallocated Sectors" "$reallocated" || all_passed=false
+        report_sector_attr "Pending Sectors" "$pending" || all_passed=false
 
         # Check power-on hours and temperature
         local hours temp
-        hours=$(smartctl -A "$dev" 2>/dev/null | grep "Power_On_Hours" | awk '{print $10}' || echo "unknown")
-        temp=$(smartctl -A "$dev" 2>/dev/null | grep "Temperature_Celsius" | awk '{print $10}' || echo "unknown")
+        hours=$(smart_attr_raw "$dev" "Power_On_Hours")
+        temp=$(smart_attr_raw "$dev" "Temperature_Celsius")
 
-        echo "  Power-On Hours: $hours"
-        echo "  Temperature: ${temp}°C"
+        echo "  Power-On Hours: $(format_attr "$hours")"
+        echo "  Temperature: $(format_attr "$temp" "°C")"
 
-        # Check for running/completed self-tests
-        local test_status
-        test_status=$(smartctl -l selftest "$dev" 2>/dev/null | grep -E "# 1" | head -1 || echo "No tests")
-        echo "  Last Test: $test_status"
+        # Check for running/completed self-tests. The log is captured whole
+        # first: piping smartctl straight into `head -1` closed the pipe while
+        # smartctl was still writing, killing it mid-read.
+        local selftest_log test_status
+        selftest_log=$(smartctl -l selftest "$dev" 2>/dev/null) || true
+        test_status=$(printf '%s\n' "$selftest_log" | grep -E "^# *1[[:space:]]" | head -1 || true)
+        echo "  Last Test: ${test_status:-unavailable (no self-test log entry)}"
     done
 
     echo ""
     if $all_passed; then
         log_info "All drives passed SMART health check"
     else
+        SMART_FAILED=true
         log_warn "One or more drives have SMART issues - investigate!"
     fi
 }
@@ -214,26 +318,68 @@ check_btrbk_status() {
     local primary_dev=""
     for dev in "${DAS_DEVICES[@]}"; do
         local serial
-        serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3; exit}' || echo "unknown")
-        if [[ "$serial" == "$primary_serial" ]]; then
+        serial=$(read_drive_serial "$dev")
+        if [[ -n "$serial" && "$serial" == "$primary_serial" ]]; then
             primary_dev="${dev}1"  # Single partition, whole-disk BTRFS
         fi
     done
 
-    # Check if primary backup drive is mountable
+    # Check if primary backup drive is mountable. The mount error is captured:
+    # discarding it made every failure - busy, wrong filesystem, or a RAID-1 leg
+    # missing and needing 'degraded' - read as "not found or not formatted".
     local mounted=false
+    local mount_err=""
 
-    if [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
+    # This branch was unreachable until the serial fix above, so it is
+    # effectively new code and must obey the rules the rest of the project
+    # already follows.
+    #
+    # (a) MAINTENANCE INTERLOCK. Backups and the scrub engine both mount and
+    #     unmount these same filesystems and serialise behind
+    #     /run/das-maintenance.lock. This script took no lock at all, so
+    #     mounting here could collide with a running backup. Non-blocking on
+    #     purpose: backup-verify is an interactive diagnostic, and waiting up
+    #     to an hour behind a backup is not what an operator asked for --
+    #     skipping with a clear reason is.
+    # (b) `degraded`. The 22 TB primary is BTRFS RAID-1; per
+    #     .claude/rules/backup.md its mount options carry `degraded` so a
+    #     single-leg failure does not block inspection. A verify tool that
+    #     cannot look at a degraded array is useless exactly when it matters.
+    local maint_lock="/run/das-maintenance.lock"
+    if [[ -n "$primary_dev" && -b "$primary_dev" ]] && ! exec 8>"$maint_lock"; then
+        log_warn "Cannot open $maint_lock — skipping btrbk/usage inspection"
+    elif [[ -n "$primary_dev" && -b "$primary_dev" ]] && ! flock -n 8; then
+        log_warn "DAS maintenance lock held (backup or scrub running) — skipping btrbk/usage inspection"
+        log_warn "  Re-run when the backup finishes; this section mounts the array read-only."
+    elif [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
         mkdir -p "$primary_mount"
-        if mount -o ro,nossd,noatime "$primary_dev" "$primary_mount" 2>/dev/null; then
+        local mount_stderr
+        mount_stderr=$(mktemp)
+        if mount -o ro,nossd,noatime,degraded "$primary_dev" "$primary_mount" 2>"$mount_stderr"; then
             mounted=true
+        else
+            mount_err=$(tr '\n' ' ' < "$mount_stderr")
         fi
+        rm -f "$mount_stderr"
     fi
 
     if $mounted; then
         echo ""
         echo "Latest snapshots:"
-        btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null || echo "  (no snapshots yet)"
+        # "btrbk failed" and "btrbk ran and found nothing" are different facts;
+        # `|| echo "(no snapshots yet)"` reported the first as the second.
+        local btrbk_out btrbk_stderr
+        btrbk_stderr=$(mktemp)
+        if btrbk_out=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>"$btrbk_stderr"); then
+            if [[ -n "$btrbk_out" ]]; then
+                printf '%s\n' "$btrbk_out"
+            else
+                echo "  (no snapshots yet)"
+            fi
+        else
+            log_error "  btrbk list failed - snapshot status UNKNOWN: $(tr '\n' ' ' < "$btrbk_stderr")"
+        fi
+        rm -f "$btrbk_stderr"
 
         echo ""
         echo "Disk usage:"
@@ -245,8 +391,12 @@ check_btrbk_status() {
 
         # Cleanup
         umount "$primary_mount" 2>/dev/null || log_warn "Failed to unmount $primary_mount"
+    elif [[ -z "$primary_dev" ]]; then
+        log_warn "Primary backup drive (serial ${primary_serial:-unset}) not among the detected DAS devices"
+    elif [[ ! -b "$primary_dev" ]]; then
+        log_warn "Primary backup partition $primary_dev is not a block device"
     else
-        log_warn "Primary backup drive not found or not formatted"
+        log_error "Failed to mount $primary_dev at $primary_mount: ${mount_err:-(no error output)}"
     fi
 }
 
@@ -286,6 +436,17 @@ main() {
     fi
 
     show_summary
+
+    # Exit status must reflect the SMART result. Ending on show_summary made the
+    # script exit 0 even with a failing drive, so no caller or timer could gate
+    # on it.
+    if $SMART_FAILED; then
+        echo ""
+        log_error "Verification FAILED: SMART health could not be confirmed on one or more drives"
+        return 1
+    fi
+
+    return 0
 }
 
 main "$@"

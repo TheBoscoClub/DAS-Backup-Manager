@@ -877,7 +877,7 @@ sudo snapper list-configs              # Verify snapper configs
 A comprehensive offline backup strategy is documented separately in [`OFFLINE-BACKUP-PLAN.md`](OFFLINE-BACKUP-PLAN.md).
 
 **Summary**:
-- **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 4 of 6 bays occupied (bays 3 and 6 empty)
+- **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 4 of 6 bays occupied (bays 3 and 6 empty). *Gen2 is the rating, not a promise*: the tree ran at **480 Mbit/s** for nine days in August 2026 with no symptom other than slower backups. Verify with `cat /sys/bus/usb/devices/*/speed`, expect **10000** (Mbit/s)
 - **Primary Backup (BTRFS RAID-1)**: 2x 22TB Exos (ST22000NM000C-3WC103) in bays 2 (`ZXA1R71M`, RMA replacement for failed `ZXA0LMAE` since 2026-05-15) and 5 (`ZXA1NYGZ`), single BTRFS filesystem `das-backup-22tb` UUID `b2dbe07d-40b9-422e-8ccf-ef4931c40457`. Mounted with `degraded` so single-leg failure does not interrupt backups, restores, or recovery.
 - **Recovery Drives**: 2x 2TB Barracuda (independent, NOT a RAID pair) in bays 1 (`ZK208Q77`, `das-backup-system-recovery-A`) and 4 (`ZFL41DNY`, `das-backup-system-recovery-B`) — each can boot the system standalone via its own ESP
 - **Internal SATA**: dasRaid0 (4x 2TB Barracuda RAID0, general storage) — moved from DAS 2026-04-06

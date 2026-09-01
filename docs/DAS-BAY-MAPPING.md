@@ -116,6 +116,50 @@ directly instead of resolving a device from `serials`.
 
 The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
 
+
+## Re-cabling and moving the enclosure — POWER IT DOWN FIRST
+
+**Always power the enclosure off before moving, reseating, or re-routing its USB
+cable.** Pulling the cable on a live enclosure is not a hot-unplug the filesystem
+can absorb.
+
+```bash
+# 1. Stop and mask the backup unit so nothing (and no watchdog) restarts it mid-move.
+sudo systemctl stop das-backup.service
+sudo systemctl mask das-backup.service      # cachyos-sentinel WILL restart it otherwise
+
+# 2. Unmount everything the enclosure backs, including any udisks mounts a file
+#    manager opened. Confirm NOTHING is left mounted before touching the cable.
+sudo umount /mnt/backup-22tb /mnt/backup-system-recovery-A /mnt/backup-system-recovery-B 2>/dev/null
+mount | grep -E 'backup-22tb|backup-system-recovery|/run/media/bosco/das-' || echo "clear"
+
+# 3. Power the enclosure OFF at its own switch. Then move the cable.
+
+# 4. Power on, wait for enumeration, then re-register multi-device filesystems.
+sudo btrfs device scan
+
+# 5. Confirm the link came back at full rate BEFORE relying on it.
+for d in /sys/bus/usb/devices/*/; do
+  [ -f "$d/speed" ] && [ -f "$d/product" ] || continue
+  printf '%-28s %s Mbit/s\n' "$(cat "$d/product")" "$(cat "$d/speed")"
+done | sort -u        # enclosure should read 10000
+
+# 6. Unmask and resume.
+sudo systemctl unmask das-backup.service
+```
+
+**What happens if you skip this.** On 2026-08-28 15:03 the cable was pulled while
+udisks held all three backup filesystems mounted. Every one took a BTRFS emergency
+shutdown, and the kernel kept stale device registrations that then *rejected the
+returning disks* — `duplicate device ... scanned by (udev-worker)` — leaving the
+array unmountable until the registrations were cleared with `btrfs device scan`.
+No data was lost, but the array was offline until someone diagnosed it.
+
+**Step 1 is not optional.** `cachyos-sentinel` auto-restarts any unit it observes
+in `failed` state, so a plain `systemctl stop` is undone within seconds. Masking
+makes the restart fail at the systemd layer instead. See
+`.claude/rules/backup.md` § Sentinel Interaction.
+
 ## Maintenance
 
 - **Update your mapping** whenever you add, remove, or rearrange drives

@@ -1,4 +1,9 @@
 #!/bin/bash
+# shellcheck disable=SC2016,SC1090,SC2034
+# SC2016: fixtures are single-quoted ON PURPOSE — they are eval'd inside the
+#   test subshell, so expanding them here would defeat the whole harness.
+# SC1090: $LIB is a generated extract; its path is dynamic by design.
+# SC2034: the TARGET_* arrays are consumed by the extracted functions.
 # Falsification harness for derive_esp_label / verify_esp_labels_unique.
 #
 # Extracts the real functions from das-partition-drives.sh (the logic is NOT
@@ -19,7 +24,8 @@ trap 'rm -f "$LIB"' EXIT
 sed -n '/^ESP_LABEL_PREFIX=/,/^partition_bootable_drive() {/p' "$SRC" | sed '$d' > "$LIB"
 sed -n '/^log_error()/p;/^RED=/p;/^GREEN=/p;/^YELLOW=/p;/^BLUE=/p;/^NC=/p' "$SRC" >> "$LIB"
 
-for fn in is_bootable_role derive_esp_label verify_esp_labels_unique log_error; do
+for fn in is_bootable_role derive_esp_label verify_esp_labels_unique log_error \
+           btrfs_partition_for_role resolve_fs_label read_fs_label; do
     grep -q "^$fn()" "$LIB" || { echo "HARNESS BROKEN: $fn not extracted"; exit 2; }
 done
 grep -q '^RED=' "$LIB" || { echo "HARNESS BROKEN: colour vars not extracted"; exit 2; }
@@ -31,9 +37,7 @@ bad() { echo "  FAIL: $1"; fail=$((fail+1)); }
 # accept <desc> <fixture> <exact-expected-stdout>
 accept() {
     local desc="$1" fixture="$2" want="$3" out rc
-    # shellcheck disable=SC1090  # $LIB is a generated extract, path is dynamic by design
     out=$( source "$LIB"
-           # shellcheck disable=SC2034  # consumed by the extracted functions via eval
            declare -A TARGET_NAMES=() TARGET_ROLES=() DISCOVERED_DEVICES=()
            eval "$fixture" ) ; rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -51,9 +55,7 @@ refuse() {
     # 2>&1 is required: derive_esp_label writes its diagnostics to stderr on
     # purpose, because its stdout is the label it returns. A refusal has to be
     # asserted wherever the code actually sends it.
-    # shellcheck disable=SC1090  # $LIB is a generated extract, path is dynamic by design
     out=$( source "$LIB"
-           # shellcheck disable=SC2034  # consumed by the extracted functions via eval
            declare -A TARGET_NAMES=() TARGET_ROLES=() DISCOVERED_DEVICES=()
            eval "$fixture" 2>&1 ) ; rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -110,6 +112,51 @@ refuse "underivable target never yields an empty label to its caller" \
      [[ -z "$lbl" ]] && { echo "EMPTY-LABEL-LEAKED"; exit 9; }
      echo "SURVIVED-THE-GUARD"' \
     "no bay number in display_name"
+
+echo "== BTRFS LABEL ROUND-TRIP (bd 5j7): the live label must win =="
+# blkid is stubbed so the partition it is asked about is observable. The bug
+# being guarded against is a re-partition silently RENAMING a filesystem.
+accept "existing label on a data target is preserved verbatim" \
+    'blkid() { echo "das-backup-22tb"; }
+     resolve_fs_label /dev/sdl primary "das-backup-primary-22tb"' \
+    "preserved|das-backup-22tb"
+accept "existing label on a bootable target is preserved verbatim" \
+    'blkid() { echo "das-backup-system-recovery-A"; }
+     resolve_fs_label /dev/sdj mirror "das-backup-system-recovery-A-2tb"' \
+    "preserved|das-backup-system-recovery-A"
+accept "blank drive falls back to the derived name, flagged as new" \
+    'blkid() { return 2; }
+     resolve_fs_label /dev/sdz primary "das-backup-fresh"' \
+    "new|das-backup-fresh"
+accept "data role reads partition 1" \
+    'blkid() { echo "PART:${!#}"; }
+     resolve_fs_label /dev/sdl primary fb' \
+    "preserved|PART:/dev/sdl1"
+accept "bootable role reads partition 2" \
+    'blkid() { echo "PART:${!#}"; }
+     resolve_fs_label /dev/sdj mirror fb' \
+    "preserved|PART:/dev/sdj2"
+
+refuse "blank drive with no fallback is refused, not silently unlabelled" \
+    'blkid() { return 2; }
+     resolve_fs_label /dev/sdz primary ""' \
+    "no fallback supplied"
+refuse "read_fs_label propagates that refusal through the substitution" \
+    'blkid() { return 2; }
+     read_fs_label /dev/sdz primary "" || exit 1
+     echo "SURVIVED-THE-GUARD"' \
+    "no fallback supplied"
+
+echo "== STRUCTURAL: every read_fs_label call site must check the status =="
+# read_fs_label returns rather than exits, by design -- so an unchecked call
+# site would silently proceed with a stale/empty FS_LABEL. Assert on the
+# source, because no fixture can catch a call site nobody wrote a test for.
+bad_sites=$(grep -n 'read_fs_label ' "$SRC" | grep -v '^\s*#' | grep -v '||' || true)
+if [[ -n "$bad_sites" ]]; then
+    bad "read_fs_label call site does not check its status: $bad_sites"
+else
+    ok "all read_fs_label call sites check their status"
+fi
 
 echo "== CONTROL: the guards must NOT fire on valid input =="
 accept "two bootable targets, distinct bays" \

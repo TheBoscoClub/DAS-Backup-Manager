@@ -6,7 +6,13 @@
 - Never modify btrbk internals — use its CLI and config
 
 ## DAS Enclosure (Author's Setup)
-- TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD)
+- TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — **Gen2 is the rating; always check the
+  negotiated rate.** `cat /sys/bus/usb/devices/*/speed` should read `10000` (Mbit/s) for the
+  enclosure. It read `480` for nine days (2026-08-19 → 2026-08-28) and nothing detected it:
+  backups completed, reported success, and were merely slower. **Throughput does NOT detect
+  this** — measured aggregate was 9.17 MiB/s degraded vs 10.97 MiB/s on the first restored
+  run, which is inside normal run-to-run variation. Only the link speed distinguishes them
+  (bd `DAS-Backup-Manager-6lr`)
 - Bay map: see `docs/examples/author-bay-mapping.md`. Generic guide: `docs/DAS-BAY-MAPPING.md`
 - DAS must be powered on; targets are mounted by `backup-run.sh` (not auto-mounted via fstab)
 - Drives are BTRFS-formatted; the 22TB primary backup target is BTRFS RAID-1 across two drives (since 2026-05-06), the 2TB recovery drives are independent single-device filesystems

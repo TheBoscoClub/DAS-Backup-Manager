@@ -1,4 +1,8 @@
 #!/bin/bash
+# shellcheck disable=SC2034,SC2329
+# SC2034: the associative arrays are read by the function extracted from
+#   backup-run.sh at runtime, so the use site is invisible to shellcheck.
+# SC2329: the log_* stubs are called by that same extracted code.
 # tests/test_create_snapshot_dirs.sh
 #
 # Regression test for DAS-Backup-Manager-0p2.
@@ -21,6 +25,9 @@
 # function (a) lands every dir under its volume, (b) creates nothing under /.
 
 set -euo pipefail
+
+# The associative arrays below are consumed by the function extracted from
+# backup-run.sh at runtime, so shellcheck cannot see the use site.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/backup-run.sh"

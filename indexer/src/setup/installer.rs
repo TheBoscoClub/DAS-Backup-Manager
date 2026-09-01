@@ -16,6 +16,28 @@ const CONFIG_FILE: &str = "/etc/das-backup/config.toml";
 const MANIFEST_FILE: &str = "/etc/das-backup/.manifest";
 
 /// Install using system defaults (/etc, /).
+/// Run one `systemctl` verb, returning a description of the failure instead of
+/// discarding it.
+///
+/// Every call site used to be `let _ = Command::new("systemctl")...status()`,
+/// so `install()` returned `Ok(())` whether or not a single timer had been
+/// enabled. Installing the schedule is the entire purpose of the command: a
+/// masked unit, a malformed generated unit, or systemctl being unavailable
+/// produced a clean "install complete" and **no scheduled backup, no scheduled
+/// scrub, and no drift check ever running**, with nothing to surface it until
+/// someone noticed the absence of the 03:00 report.
+/// bd DAS-Backup-Manager-nsp (finding #5).
+fn run_systemctl(args: &[&str]) -> Result<(), String> {
+    match std::process::Command::new("systemctl").args(args).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("systemctl {} exited with {}", args.join(" "), st)),
+        Err(e) => Err(format!(
+            "systemctl {} could not be run: {e}",
+            args.join(" ")
+        )),
+    }
+}
+
 pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = PathBuf::from(CONFIG_FILE);
     let manifest_path = PathBuf::from(MANIFEST_FILE);
@@ -24,15 +46,18 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Enable systemd timers (only in real installs, not in install_to_prefix tests)
     if config.init.system == crate::setup::config::InitSystem::Systemd {
-        let _ = std::process::Command::new("systemctl")
-            .args(["daemon-reload"])
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args(["enable", "--now", "das-backup.timer"])
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args(["enable", "--now", "das-backup-full.timer"])
-            .status();
+        // Collected rather than discarded — see run_systemctl. A schedule that
+        // was not installed must not be reported as an install that succeeded.
+        let mut unit_errors: Vec<String> = Vec::new();
+        if let Err(e) = run_systemctl(&["daemon-reload"]) {
+            unit_errors.push(e);
+        }
+        if let Err(e) = run_systemctl(&["enable", "--now", "das-backup.timer"]) {
+            unit_errors.push(e);
+        }
+        if let Err(e) = run_systemctl(&["enable", "--now", "das-backup-full.timer"]) {
+            unit_errors.push(e);
+        }
 
         // das-scrub.service/.timer are always generated and installed (see
         // GeneratedFiles::generate), but the timer is only *enabled* when
@@ -45,13 +70,13 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         // `enable --now`/`disable --now` are both idempotent no-ops if the
         // unit is already in the target state.
         if config.scrub.enabled {
-            let _ = std::process::Command::new("systemctl")
-                .args(["enable", "--now", "das-scrub.timer"])
-                .status();
+            if let Err(e) = run_systemctl(&["enable", "--now", "das-scrub.timer"]) {
+                unit_errors.push(e);
+            }
         } else {
-            let _ = std::process::Command::new("systemctl")
-                .args(["disable", "--now", "das-scrub.timer"])
-                .status();
+            if let Err(e) = run_systemctl(&["disable", "--now", "das-scrub.timer"]) {
+                unit_errors.push(e);
+            }
         }
 
         // das-backup-doctor.timer is always generated and always enabled —
@@ -66,9 +91,25 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         // have caught none of them any sooner than a human remembering to
         // look). If a future need for disabling it emerges, add
         // `[doctor].enabled` and gate this the same way scrub is gated above.
-        let _ = std::process::Command::new("systemctl")
-            .args(["enable", "--now", "das-backup-doctor.timer"])
-            .status();
+        if let Err(e) = run_systemctl(&["enable", "--now", "das-backup-doctor.timer"]) {
+            unit_errors.push(e);
+        }
+
+        // A schedule that was not installed is not an install that succeeded.
+        // This is the entire point of finding #5: the command's purpose is to
+        // put the timers in place, so failing to do so must not be reported as
+        // success. Listed individually because "one timer failed" and "systemd
+        // is unreachable" need different operator responses.
+        if !unit_errors.is_empty() {
+            for e in &unit_errors {
+                eprintln!("ERROR: {e}");
+            }
+            return Err(format!(
+                "{} systemd unit operation(s) failed — the backup schedule is NOT fully installed",
+                unit_errors.len()
+            )
+            .into());
+        }
     }
 
     Ok(())
@@ -221,18 +262,10 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|c| c.general.db_path);
 
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "--now", "das-backup.timer"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "--now", "das-backup-full.timer"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "--now", "das-scrub.timer"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "--now", "das-backup-doctor.timer"])
-        .status();
+    let _ = run_systemctl(&["disable", "--now", "das-backup.timer"]);
+    let _ = run_systemctl(&["disable", "--now", "das-backup-full.timer"]);
+    let _ = run_systemctl(&["disable", "--now", "das-scrub.timer"]);
+    let _ = run_systemctl(&["disable", "--now", "das-backup-doctor.timer"]);
 
     let removed = uninstall_from_manifest(&manifest_path);
     println!("Removed {} files.", removed);
@@ -248,9 +281,7 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("Removed database: {}", db);
     }
 
-    let _ = std::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .status();
+    let _ = run_systemctl(&["daemon-reload"]);
 
     println!("Uninstall complete.");
     Ok(())
@@ -502,9 +533,7 @@ pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> 
     uninstall(remove_db)?;
 
     // Phase 2: stop the helper service
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "--now", "btrdasd-helper.service"])
-        .status();
+    let _ = run_systemctl(&["disable", "--now", "btrdasd-helper.service"]);
 
     // Phase 3: determine install prefix from config (default /usr)
     let prefix = Config::load(&PathBuf::from(CONFIG_FILE))
@@ -520,9 +549,7 @@ pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> 
     let _ = std::fs::remove_dir_all(format!("{prefix}/lib/das-backup"));
     let _ = std::fs::remove_dir("/var/lib/das-backup");
 
-    let _ = std::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .status();
+    let _ = run_systemctl(&["daemon-reload"]);
 
     println!("Full uninstall complete.");
     Ok(())

@@ -1,6 +1,6 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.1.0
+# Version: 2.2.0
 # Date: 2026-02-21
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
@@ -171,9 +171,14 @@ show_plan() {
         local role="${TARGET_ROLES[$serial]}"
         local name="${TARGET_NAMES[$serial]}"
 
+        local FS_LABEL FS_LABEL_ORIGIN
+        read_fs_label "$dev" "$role" "${BTRFS_LABEL_PREFIX}-${label}" || exit 1
+        local origin_note="(preserved from disk)"
+        [[ "$FS_LABEL_ORIGIN" == "new" ]] && origin_note="(NEW — no existing filesystem found)"
+
         echo "$name ($dev, serial: $serial):"
         if [[ "$role" == "primary" ]]; then
-            echo "  Whole disk BTRFS (single partition) - label: ${BTRFS_LABEL_PREFIX}-${label}"
+            echo "  Whole disk BTRFS (single partition) - label: ${FS_LABEL} ${origin_note}"
         elif is_bootable_role "$role"; then
             # Show the ESP label the run would actually write. It is unique per
             # drive and is what identifies this recovery system afterwards, so
@@ -182,9 +187,9 @@ show_plan() {
             local esp_label
             esp_label="$(derive_esp_label "$serial")" || exit 1
             echo "  Partition 1: 1.5G ESP (FAT32) - EFI System Partition, label: $esp_label"
-            echo "  Partition 2: remainder BTRFS - label: ${BTRFS_LABEL_PREFIX}-${label}"
+            echo "  Partition 2: remainder BTRFS - label: ${FS_LABEL} ${origin_note}"
         else
-            echo "  Whole disk BTRFS - label: ${BTRFS_LABEL_PREFIX}-${label}"
+            echo "  Whole disk BTRFS - label: ${FS_LABEL} ${origin_note}"
         fi
         echo ""
     done
@@ -282,6 +287,66 @@ verify_esp_labels_unique() {
     done
 }
 
+# -- BTRFS filesystem label resolution (must ROUND-TRIP) --------------
+# The BTRFS label is the filesystem's identity for everything downstream.
+# Building it as "das-backup-" + the config TARGET ID does not reproduce
+# what is deployed -- it never matched any drive:
+#
+#     config target id        would derive                    on disk
+#     primary-22tb            das-backup-primary-22tb         das-backup-22tb
+#     system-recovery-A-2tb   das-backup-system-recovery-A-2tb  das-backup-system-recovery-A
+#     system-recovery-B-2tb   das-backup-system-recovery-B-2tb  das-backup-system-recovery-B
+#
+# so re-partitioning any target silently RENAMED its filesystem (bd 5j7).
+#
+# Re-partitioning destroys the data but must reproduce the same IDENTITY,
+# or config.toml, btrbk.conf and every operator lookup stop resolving. So
+# the live label wins when there is one; the derived name is a fallback
+# for a genuinely blank drive only.
+#
+# Deliberately NOT symmetric with the ESP label above, and the asymmetry is
+# the point: the deployed BTRFS labels are known-good and worth preserving,
+# whereas the deployed ESP labels were historically a single shared
+# "BACKUP-ESP" across both recovery drives -- a value we specifically do
+# not want to perpetuate. Preserve a good identity; derive a corrected one.
+btrfs_partition_for_role() {
+    local role="$1"
+    if is_bootable_role "$role"; then echo 2; else echo 1; fi
+}
+
+# Prints "<origin>|<label>" so the caller learns both facts through the
+# command substitution. A global would not survive the subshell.
+resolve_fs_label() {
+    local dev="$1" role="$2" fallback="$3"
+    local part existing
+    part="$(btrfs_partition_for_role "$role")"
+    existing="$(blkid -s LABEL -o value "${dev}${part}" 2>/dev/null || true)"
+
+    if [[ -n "$existing" ]]; then
+        printf 'preserved|%s' "$existing"
+        return 0
+    fi
+    if [[ -z "$fallback" ]]; then
+        log_error "No existing BTRFS label on ${dev}${part} and no fallback supplied." >&2
+        return 1
+    fi
+    printf 'new|%s' "$fallback"
+}
+
+# Split what resolve_fs_label returns, failing closed on either half.
+# Callers use this rather than repeating the parsing three times.
+read_fs_label() {   # sets FS_LABEL and FS_LABEL_ORIGIN in the CALLER's scope
+    local dev="$1" role="$2" fallback="$3" r
+    r="$(resolve_fs_label "$dev" "$role" "$fallback")" || return 1
+    FS_LABEL_ORIGIN="${r%%|*}"
+    FS_LABEL="${r#*|}"
+    [[ -n "$FS_LABEL" && "$FS_LABEL_ORIGIN" != "$r" ]] || {
+        log_error "Malformed label resolution for $dev: '$r'"
+        return 1
+    }
+    return 0
+}
+
 partition_bootable_drive() {
     local dev="$1"
     local label="$2"
@@ -347,8 +412,12 @@ run_partitioning() {
         local label="${TARGET_LABELS[$serial]}"
         local role="${TARGET_ROLES[$serial]}"
 
+        local FS_LABEL FS_LABEL_ORIGIN
+        read_fs_label "$dev" "$role" "${BTRFS_LABEL_PREFIX}-${label}" || exit 1
+        log_info "  BTRFS label: $FS_LABEL ($FS_LABEL_ORIGIN)"
+
         if [[ "$role" == "primary" ]]; then
-            partition_data_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
+            partition_data_drive "$dev" "$FS_LABEL"
         elif is_bootable_role "$role"; then
             local esp_label
             esp_label="$(derive_esp_label "$serial")" || exit 1
@@ -356,9 +425,9 @@ run_partitioning() {
                 log_error "Empty ESP label derived for serial $serial — refusing to format."
                 exit 1
             }
-            partition_bootable_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}" "$esp_label"
+            partition_bootable_drive "$dev" "$FS_LABEL" "$esp_label"
         else
-            partition_data_drive "$dev" "${BTRFS_LABEL_PREFIX}-${label}"
+            partition_data_drive "$dev" "$FS_LABEL"
         fi
     done
 

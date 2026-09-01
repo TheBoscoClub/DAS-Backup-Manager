@@ -434,10 +434,16 @@ pub fn create_snapshots(
     let (stdout, success) = run_command(&mut cmd, progress)?;
 
     if !success {
-        progress.on_log(
-            LogLevel::Warning,
-            "btrbk snapshot command exited with non-zero status",
-        );
+        // Must be an Err, not a Warning. Every caller turns Err into an entry
+        // in `errors`, and run_backup derives `success = errors.is_empty()`,
+        // so a Warning here left the run reporting SUCCESS to the CLI exit
+        // code, the GUI JobFinished flag, the DB history row and the email
+        // subject alike. bd DAS-Backup-Manager-nsp (finding #1/#2) — the same
+        // shape as bd oi0, where the outcome was decided by whether anything
+        // pushed an error and nothing ever did.
+        let msg = "btrbk snapshot command exited with non-zero status. No snapshots can be assumed created.";
+        progress.on_log(LogLevel::Error, msg);
+        return Err(msg.into());
     }
 
     // Prefer the machine-readable listing; fall back to the marker parse only
@@ -547,10 +553,16 @@ pub fn send_snapshots(
     })?;
 
     if !success {
-        progress.on_log(
-            LogLevel::Warning,
-            "btrbk resume command exited with non-zero status",
-        );
+        // Must be an Err, not a Warning. Every caller turns Err into an entry
+        // in `errors`, and run_backup derives `success = errors.is_empty()`,
+        // so a Warning here left the run reporting SUCCESS to the CLI exit
+        // code, the GUI JobFinished flag, the DB history row and the email
+        // subject alike. bd DAS-Backup-Manager-nsp (finding #1/#2) — the same
+        // shape as bd oi0, where the outcome was decided by whether anything
+        // pushed an error and nothing ever did.
+        let msg = "btrbk resume command exited with non-zero status. The send may be incomplete.";
+        progress.on_log(LogLevel::Error, msg);
+        return Err(msg.into());
     }
 
     // Count from the machine-readable listing, not the human output.
@@ -656,10 +668,16 @@ pub fn run_full_pipeline(
     })?;
 
     if !success {
-        progress.on_log(
-            LogLevel::Warning,
-            "btrbk run command exited with non-zero status",
-        );
+        // Must be an Err, not a Warning. Every caller turns Err into an entry
+        // in `errors`, and run_backup derives `success = errors.is_empty()`,
+        // so a Warning here left the run reporting SUCCESS to the CLI exit
+        // code, the GUI JobFinished flag, the DB history row and the email
+        // subject alike. bd DAS-Backup-Manager-nsp (finding #1/#2) — the same
+        // shape as bd oi0, where the outcome was decided by whether anything
+        // pushed an error and nothing ever did.
+        let msg = "btrbk run command exited with non-zero status. The backup may be incomplete.";
+        progress.on_log(LogLevel::Error, msg);
+        return Err(msg.into());
     }
 
     // Re-count from accumulated output for accuracy.

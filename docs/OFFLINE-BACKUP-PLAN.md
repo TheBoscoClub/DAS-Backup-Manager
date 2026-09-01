@@ -241,11 +241,31 @@ Shingled Magnetic Recording (SMR) drives have poor random write performance once
 
 ### Hardware
 
-- **Enclosure**: TerraMaster D6-320, 6-bay USB 3.2 Gen2 JBOD, ~$300
+- **Enclosure**: TerraMaster D6-320, 6-bay USB 3.2 Gen2 JBOD, ~$300 — *rated* Gen2; see the note below on the negotiated rate
 - **Primary backup**: 2x Seagate Exos 22TB (ST22000NM000C-3WC103), CMR, factory recertified ~$250 each — added second drive 2026-05-06 to form a BTRFS RAID-1 mirror
 - **Recovery drives**: 2x Seagate Barracuda 2TB (ST2000DM008), SMR, same batch March 2021 (the previous 5x 2TB pool was consolidated when dasRaid0 moved to internal SATA in 2026-04-06)
 - **Total raw capacity**: ~48 TB (2x 22TB + 2x 2TB)
 - **Total cost**: ~$800 (~$550 prior to second 22TB)
+
+> **"Gen2" is the ceiling, not a guarantee — check the negotiated rate.** Between
+> 2026-08-19 and 2026-08-28 the host's SuperSpeed USB tree went dark and every DAS
+> bay silently re-negotiated down to **480 Mbit/s (USB 2.0, roughly 40 MB/s)**.
+> Backups still completed and still reported success; nothing flagged it for nine
+> days. The enclosure's specification did not change, and no document that states
+> the specification could have told anyone. Read the negotiated speed instead:
+>
+> ```bash
+> # Mbit/s actually negotiated, per USB device. Expect 10000 for the enclosure.
+> for d in /sys/bus/usb/devices/*/; do
+>   [ -f "$d/speed" ] && [ -f "$d/product" ] || continue
+>   printf '%-28s %s Mbit/s\n' "$(cat "$d/product")" "$(cat "$d/speed")"
+> done | sort -u
+> ```
+>
+> Confirmed back at **10000 Mbit/s (10 Gbit/s)** on 2026-08-31. See
+> [`THROUGHPUT-BASELINE.md`](THROUGHPUT-BASELINE.md) for measured figures, and note
+> the counter-intuitive finding recorded there: **throughput alone does not detect
+> this fault.** The link speed is the signal.
 
 ### Drive Allocation (2026-05-06)
 
