@@ -40,10 +40,21 @@ re-derivation: `@tmp`, `@var-tmp` (ephemeral), `@cache` and `coredumps` (listed 
 `[doctor].exclude`), and every `.snapshots/` tree (snapper's own, and nested inside
 its parent for the same reason described above).
 
-**The reverse direction is also a defect.** A `subvolume` line naming something
-that no longer exists makes btrbk print `WARNING: Skipping subvolume … Failed to
-fetch subvolume detail` and **continue with rc=0** — a warning nothing surfaces and
-no exit code carries. Remove the entry when the subvolume goes. Note that doing so
+**The reverse direction is also a defect, and it is LOUD, not silent.** A
+`subvolume` line naming something that no longer exists makes btrbk print
+`WARNING: Skipping subvolume … Failed to fetch subvolume detail` and **exit 10**.
+Measured 2026-09-01 against an isolated config whose only defect was a missing
+subvolume: `btrbk dryrun` → 10, `btrbk list snapshots` → 10. `run_btrbk()` turns
+that into `record_op btrbk FAIL`, so **the emailed report says the backup FAILED**
+even though every other subvolume was backed up correctly. The run itself still
+exits 0 per the `18p` split, so systemd stays green and sentinel does not thrash.
+
+An earlier draft of this section said btrbk continues with `rc=0` and that "no exit
+code carries" — that is wrong in the dangerous direction, because it reads as
+"harmless until someone tidies it up" when the real cost is a false FAILURE on every
+report until the entry is removed. False failures are how real ones get ignored.
+
+Remove the entry when the subvolume goes. Note that doing so
 *orphans* whatever snapshots that subvolume already has on the target: btrbk only
 prunes what is configured, so they persist unmanaged rather than aging out. That is
 usually what you want for a deleted project, but it is a decision, not a default.
