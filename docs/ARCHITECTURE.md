@@ -112,6 +112,30 @@ targets are named explicitly — which the GUI always does — so `bd DAS-Backup
 was reachable from the GUI for as long as the GUI has existed
 (`bd DAS-Backup-Manager-aea`).
 
+**Sources are verified too, since 0.7.22.1.** `verify_sources_before_write()` runs
+between `mount_sources` and `create_snapshot_dirs` — the latter being the first
+thing in the run that writes to a source path. Per source it requires a real
+mountpoint, a filesystem UUID matching what the source's `device` resolves to, and
+`FSROOT=/`, the top-level view that `mount -o subvolid=5` produces and that
+btrbk.conf's subvolume paths are relative to.
+
+The mountpoint check is not redundant with the UUID check, and the reason is worth
+keeping: the `nvme` source's filesystem **is** the root filesystem — the source is
+merely its `subvolid=5` view — so on a bare `/.btrfs-nvme` the fallthrough resolves
+to the same UUID and a UUID-only guard passes. Verified on the live host: with
+`mountpoint -q /.btrfs-nvme` false, `findmnt --target` still reported the expected
+UUID. A regression case exists specifically to go red if anyone "simplifies" the
+guard down to the UUID comparison.
+
+Two sources declare `device` as a path rather than `UUID=`, and for those this is a
+**consistency check, not an identity check** — the expected UUID is resolved from the
+device node at verification time, which cannot detect that the path now refers to a
+different disk. `/dev/nvme1n1p2` is also one leg of a two-device RAID-1, so it names
+a *member*, not a filesystem. The remedy is a config change (declare them by `UUID=`),
+not a code change; until then the mountpoint check is their only guarantee — and it is
+the one that catches the defect this guard was written for
+(`bd DAS-Backup-Manager-zlv`).
+
 ### Scrub Pipeline
 
 ```

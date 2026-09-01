@@ -8,10 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`verify_sources_before_write()` in `scripts/backup-run.sh`** — the source-side counterpart to
+  `verify_targets_before_btrbk`, called between `mount_sources` and `create_snapshot_dirs`, which is
+  the first writer to a source path. Per source it requires a real mountpoint, a filesystem UUID
+  matching what the source's `device` resolves to, and `FSROOT=/` (the top-level view
+  `mount -o subvolid=5` produces). Aborts the run on any violation. Sources previously got only
+  `mountpoint -q` while targets got full UUID/serial verification — and an empty
+  `/.btrfs-hdd/.btrbk-snapshots` on the NVMe root **dated 2026-05-17** proved
+  `create_snapshot_dirs()` had already run once against an unmounted source
+  (bd `DAS-Backup-Manager-zlv`)
+- **`source-tarball` job in `.github/workflows/release-packages.yml`** — builds
+  `das-backup-manager-<version>.tar.gz` plus its `.sha256` and feeds them through the existing
+  `upload-release` collection. Without it the artifact set depended on *which route* cut the
+  release: `/git-release` produces those two files, a hand-cut tag does not, and nothing reports the
+  difference — v0.7.22.0 shipped 9 assets instead of 11 while all six jobs reported success. Uses
+  `git archive --format=tar | gzip -n` so the archive is byte-reproducible, which also means the two
+  producers can never pair one producer's tarball with the other's checksum
+  (bd `DAS-Backup-Manager-vlv`)
 
 ### Changed
+- **Non-fatal failures across `indexer/src` now log instead of vanishing** (9 sites, bd
+  `DAS-Backup-Manager-8wx`): the helper's background `IndexStats` refresh, DB-directory creation,
+  `--remove-db` when the config will not load, `systemctl disable`/`daemon-reload` results, manifest
+  removal, prefix resolution during uninstall, and `mount.rs`'s `read_dir` which read *could not
+  look* as *empty* — a plain file at a mount path failed `ENOTDIR` and produced no log line at all
 
 ### Fixed
+- **A corrupt `btrfs scrub` status record parsed as a CLEAN scrub** (`indexer/src/scrub.rs`). A
+  recognised status key whose value would not parse fell back to `0`, and `0` on
+  `uncorrectable_errors` reads as *no damage* — so a truncated or corrupted
+  `scrub.status.<uuid>` yielded `is_clean() == true`, no FAILURE email, and a green
+  `btrdasd health`. Now `ScrubError::StatusMalformed`; unknown *keys* are still ignored, preserving
+  the forward-compatibility contract
+- **An unmeasurable backup target reported 0 % used and could never raise the disk-full alarm**
+  (`indexer/src/health.rs`). A mounted target whose capacity could not be read returned `(0, 0)`,
+  and `determine_status` skips its >95 % critical check when `total_bytes == 0`. The one target
+  nobody could measure was the only one that could never warn. Now `Option<(u64, u64)>`, with `None`
+  on a mounted target raising a warning
+- **`setup --modify` could overwrite the config it was asked to modify** (`indexer/src/setup/mod.rs`).
+  `Config::load(..).ok()` collapsed *no config yet* and *config I cannot parse* into `None`; the
+  second sent the wizard to defaults and the installer then wrote those defaults over the operator's
+  file — every target, serial and retention setting gone, silently
+- **`uninstall` reported success while removing nothing** (`indexer/src/setup/installer.rs`). An
+  unreadable manifest returned a bare `0` and every `remove_file` error was dropped, so an uninstall
+  that removed nothing, or left half the tree on a read-only `/usr`, still printed
+  "Removed 0 files." and "Uninstall complete."
+- **`resolve_fs_label` could silently rename a filesystem** (`scripts/das-partition-drives.sh`).
+  `blkid`'s empty output conflates *no LABEL* with *blkid could not tell me*; on the second reading
+  the caller went on to **write** the fallback label — the exact renaming that function exists to
+  prevent. Now split by exit status: `0` found, `2` genuinely unlabelled, anything else fails closed
+  (bd `DAS-Backup-Manager-76g`)
 
 ## [0.7.22.0] - 2026-09-01
 

@@ -238,9 +238,16 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
   NVMe/SATA scrubs belong to the system-scope `btrfs-scrub@` timers and may run in
   parallel with each other and with this engine; the DAS targets are scrubbed sequentially
   in `[scrub].targets` order (shared USB path).
-- Schedule (since 2026-08-02): `[scrub].on_calendar = *-*-01 03:05:00` — deliberately trails
-  the 03:00 backup so the blocking maintenance flock starts the scrub the moment the backup
-  finishes; an overrunning scrub HOLDS the next backup until done (defer, never skip).
+- Schedule (since 2026-08-02): `[scrub].on_calendar = *-*-01 03:05:00`. This expresses a
+  **preference** for backup-first; it is not a guarantee, and reading it as one is a mistake
+  that has been made. `das-backup.timer` carries `RandomizedDelaySec=1800`, so the backup starts
+  anywhere in 03:00–03:30 while the scrub fires at a fixed 03:05 — the backup wins the lock only
+  when its delay lands in the first five minutes of thirty, roughly one time in six.
+  **Both orders are correct.** What the design guarantees is not sequence but the two-lock
+  interlock below: whichever job takes the maintenance lock first runs, the other blocks on
+  `flock` and starts automatically the instant it is released — an overrunning scrub HOLDS the
+  next backup until done (defer, never skip), a user-confirmed invariant. Observed 2026-09-01:
+  scrub 03:05:03, backup 03:16:52, backup deferred behind the full pass and run on release.
 
 ## Sentinel Interaction — `cachyos-sentinel` Auto-Restarts Failed Services
 - `sentinel-core` (project at `/hddRaid1/ClaudeCodeProjects/cachyos-sentinel/`) monitors all systemd services and auto-remediates ones it sees in `failed` state by re-issuing `systemctl start`. **This includes `das-backup.service`** — confirmed 2026-05-11 by journal evidence (`sentinel-core` WARN log immediately followed by `systemd Starting DAS Backup` within the same second of a manual kill).

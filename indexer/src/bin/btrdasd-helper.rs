@@ -1609,35 +1609,31 @@ impl HelperInterface {
             }
             let cache_inner = cache.clone();
             let path_inner = db_path.clone();
-            let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let db = Database::open(&path_inner).map_err(|e| format!("open: {e}"))?;
-                let stats = db.get_stats().map_err(|e| format!("stats: {e}"))?;
-                let meta = std::fs::metadata(&path_inner).map_err(|e| format!("stat: {e}"))?;
-                let db_size_bytes = meta.len();
-                let mtime_nanos = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as i128)
-                    .unwrap_or(0);
-                let json = serde_json::json!({
-                    "snapshots": stats.snapshot_count,
-                    "files": stats.file_count,
-                    "spans": stats.span_count,
-                    "db_size_bytes": db_size_bytes,
-                })
-                .to_string();
-                cache_inner.blocking_lock().insert(
-                    path_inner.clone(),
-                    StatsCacheEntry {
-                        db_mtime_nanos: mtime_nanos,
-                        db_size_bytes,
-                        json,
-                    },
-                );
+            let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let entry = compute_stats_entry(&path_inner)?;
+                cache_inner
+                    .blocking_lock()
+                    .insert(path_inner.clone(), entry);
                 Ok(())
             })
             .await;
+            // `let _ = ... .await` here discarded BOTH the task error and the
+            // refresh error. A refresh that cannot open the DB leaves the stale
+            // entry in place, and index_stats then re-fires a refresh on every
+            // single call — failing every time, in total silence, while the GUI
+            // Health Dashboard serves an index snapshot from before the failure
+            // and dates it with nothing (bd DAS-Backup-Manager-8wx).
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!(
+                    "btrdasd-helper: IndexStats refresh for {db_path} FAILED ({e}) — \
+                     the cached value is now stale and will keep being served"
+                ),
+                Err(e) => eprintln!(
+                    "btrdasd-helper: IndexStats refresh task for {db_path} panicked ({e}) — \
+                     the cached value is now stale and will keep being served"
+                ),
+            }
             in_flight.lock().await.remove(&db_path);
         });
     }
@@ -1653,6 +1649,36 @@ fn sender_from_header(header: &zbus::message::Header<'_>) -> Result<String, fdo:
         .sender()
         .map(|s| s.to_string())
         .ok_or_else(|| fdo::Error::Failed("Missing sender in D-Bus message header".to_string()))
+}
+
+/// Recompute the IndexStats cache entry for `db_path`.
+///
+/// Returns the failure instead of a fabricated entry, so a caller can say WHY
+/// the number on screen stopped moving. Extracted from `spawn_stats_refresh`,
+/// where its errors used to be discarded wholesale.
+fn compute_stats_entry(db_path: &str) -> Result<StatsCacheEntry, String> {
+    let db = Database::open(db_path).map_err(|e| format!("open: {e}"))?;
+    let stats = db.get_stats().map_err(|e| format!("stats: {e}"))?;
+    let meta = std::fs::metadata(db_path).map_err(|e| format!("stat: {e}"))?;
+    let db_size_bytes = meta.len();
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    let json = serde_json::json!({
+        "snapshots": stats.snapshot_count,
+        "files": stats.file_count,
+        "spans": stats.span_count,
+        "db_size_bytes": db_size_bytes,
+    })
+    .to_string();
+    Ok(StatsCacheEntry {
+        db_mtime_nanos: mtime_nanos,
+        db_size_bytes,
+        json,
+    })
 }
 
 /// Emit a JobFinished signal from outside the interface method context.
@@ -1781,4 +1807,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("btrdasd-helper: shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refresh must produce a NAMED failure, not nothing. Its result used
+    /// to be dropped by `let _ = ..`, which is why a DB the helper could no
+    /// longer open showed up as an index that had simply stopped changing.
+    #[test]
+    fn compute_stats_entry_reports_a_database_it_cannot_open() {
+        let err = match compute_stats_entry("/nonexistent-8wx-dir/backup-index.db") {
+            Err(e) => e,
+            Ok(_) => panic!("a database that cannot be opened must be an error"),
+        };
+        assert!(
+            err.starts_with("open:") || err.starts_with("stat:"),
+            "the error must name the step that failed, got: {err}"
+        );
+
+        // Positive control: a real database still computes, so the check cannot
+        // be passing by failing on everything.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-index.db");
+        drop(Database::open(&path).expect("create a real index"));
+        let entry = compute_stats_entry(&path.to_string_lossy())
+            .expect("a real database must compute an entry");
+        assert!(entry.json.contains("\"snapshots\""), "json: {}", entry.json);
+        assert!(entry.db_size_bytes > 0, "an opened DB has a nonzero size");
+    }
 }

@@ -94,6 +94,85 @@ status: `0` found, `2` genuinely unlabelled, anything else fails closed. Two
 regression cases in `tests/test_esp_label_derivation.sh`, both observed RED
 against the pre-fix code with `guard did NOT fire (exit 0)`.
 
+### Rust inventory, triaged 2026-09-01 (bd `8wx`)
+
+All **236** hits of the Rust grep below were classified — 223 in production
+code, 13 inside `#[cfg(test)]` modules. **200 (a) / 16 (b) / 20 (c)**, counting
+grep hits rather than defect sites (one defect can span seventeen lines).
+
+The (a) shapes, each legitimate because the substituted value is the **cautious**
+one. A future audit is a diff against this table:
+
+| Shape | Substitutes | Why cautious |
+|:--|:--|:--|
+| `Command::new(..).output().ok()?` on `blkid` / `findmnt` / `smartctl` / `btrfs` / `which` / `systemctl` | `None`, `"unknown"`, `"N/A"` | probe for optional tooling; never a fabricated measurement |
+| `parse().ok()?` inside a fn returning `Option` (timestamps, subvol ids, `hh:mm`, lsblk rows) | `None` → the row/answer is skipped | an unparseable input is dropped, never guessed |
+| `.map(..).unwrap_or(false)` on `mountpoint -q`, `systemctl is-enabled`, `read_dir` | "not mounted", "not enabled" | sends callers into mount/refuse/warn — the safe branch |
+| `Err(_) => return false` in `health::is_mountpoint` | "not a mountpoint" | the canonical case; drives `verify_write_targets` into refusal |
+| `.unwrap_or("<none>" / "-" / "N/A" / "unknown")` in report and CLI table rendering | a placeholder cell | display only; no decision reads it |
+| `.await.unwrap_or_else(\|e\| Err(format!("… panicked: {e}")))` on every helper job | a reported failure | converts a panic into an honest `JobFinished(success=false)` |
+| `let _ = child.kill()` / `umount` / `remove_file` **on a path already returning Err** | nothing | the outcome is already being reported; `MountGuard::drop` is the backstop |
+| `let _ = HelperInterface::job_*(..)` D-Bus signal emission | nothing | fire-and-forget telemetry from a detached task, nothing downstream reads it |
+| `canonicalize().unwrap_or_else(\|_\| literal)` in `check_source_allowed` | the unresolved root | strictly **narrows** the allow-list: a canonical path can never start with a symlinked prefix, so the fallback can only refuse more |
+| `env::var(..).unwrap_or_else(\|_\| default)` (`EDITOR`, `DAS_SCRUB_STATE`, `DAS_REPORT_TO`) | the documented default | configuration, not error suppression |
+| `Option::unwrap_or` on a genuinely-absent map/vec entry (`serials.first()`, `target_subdirs.first()`) | a documented default | no error exists to swallow |
+| `let _ = conn.execute_batch("PRAGMA optimize")` in `Drop` | nothing | `Drop` cannot propagate, and the data is already committed |
+| bare `remove_dir(dir)` as a "delete it if it is now empty" sweep | nothing | failing **is** the normal outcome when the operator left files there |
+| `SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(0)` | epoch 0 | only reachable with a pre-1970 clock; 0 reads as "ancient", the cautious side of every freshness check — see the caveat below |
+
+Four **(c)** correctness bugs were found and fixed, each with a counter-test
+observed RED against the pre-fix code:
+
+- `scrub.rs` — a **recognised** counter with a non-numeric value fell back to
+  `0`, and `0` on `uncorrectable_errors` is "no damage": a truncated or
+  corrupted `scrub.status.<uuid>` record parsed as `finished: true`, all
+  counters zero, `is_clean()` **true**. No FAILURE email, health green. Unknown
+  *keys* are still ignored — that is the forward-compat contract and it is
+  separately tested.
+- `health.rs` — a **mounted** target whose capacity could not be read reported
+  `(0, 0)`, and `determine_status` skips its `>95 %` escalation when
+  `total_bytes == 0`. The one target nobody could measure was the one target
+  that could never raise the disk-full alarm, drawn as 0 % used. Measurement is
+  now `measure_target_usage() -> Option`, and `None` on a mounted target pushes
+  a warning.
+- `setup/mod.rs` — `setup --modify` used `Config::load(..).ok()`, collapsing
+  "no config yet" and "config I cannot parse" into `None`. The second sent the
+  wizard to its defaults and `install()` then wrote those defaults over the file
+  the operator asked to *modify*. Now `Ok(None)` means absent, and unreadable is
+  an error.
+- `installer.rs` — `uninstall_from_manifest` dropped every `remove_file` error
+  via `.is_ok()` and returned a bare `0` for an unreadable manifest, so an
+  uninstall that removed nothing printed "Removed 0 files." and "Uninstall
+  complete." It now returns `(count, problems)`.
+
+The **(b)** fixes: the helper's background `IndexStats` refresh (its whole
+result was `let _ = ..`, so a DB it could no longer open served a permanently
+stale dashboard in silence), the install-time DB-directory creation, the
+uninstall paths that leave timers enabled or files behind, and
+`verify_write_targets` reading "could not list this path" as "empty, nothing to
+see" — a plain FILE at a mount point failed `read_dir` with `ENOTDIR` and
+produced no log line at all.
+
+Two things deliberately left, named so they are not re-litigated:
+
+- **`serde_json::to_string(..).unwrap_or_else(\|_\| "[]")`** in four helper
+  D-Bus methods. Wrong direction — "[]" tells the GUI *there is nothing there* —
+  but `serde_json::Value` cannot hold an unserializable value (no NaN, no
+  non-string keys), so it is unreachable and **no counter-test can be
+  constructed**. Left rather than changed untested. If any of these ever
+  serialises a raw `f64`, it becomes a live defect.
+- **`scanner.rs`'s `Err(_) => (0, 0)`** for a file whose metadata will not read.
+  The `0` size and mtime land in the index and the span logic reads them as a
+  real measurement — but the entry is counted in `errors` and surfaced, and the
+  row must carry two `i64`s. Skipping the entry instead is a behaviour change to
+  the indexer that wants its own verification cycle. **Flagged, not fixed.**
+
+Caveat on the `unwrap_or(0)` clock reads (`main.rs:759`, `health.rs:657`,
+`btrdasd-helper.rs:1532`): the helper's is the one that inverts, because
+`now_secs - backup_secs` with `now_secs == 0` yields a *negative* age, which
+renders as "just backed up". Unreachable without a pre-1970 clock, so no test
+was written.
+
 ---
 
 ## Always a defect here

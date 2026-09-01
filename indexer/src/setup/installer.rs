@@ -213,9 +213,14 @@ pub fn install_to_prefix(
     }
     std::fs::write(manifest_path, manifest_entries.join("\n"))?;
 
-    // Create DB directory
-    if let Some(parent) = Path::new(&config.general.db_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // Create DB directory. Not fatal — `db_path` is absolute, so a prefixed
+    // (packaging or test) install legitimately cannot create it — but never
+    // silent either: `let _ =` here meant a read-only or full /var produced a
+    // clean "Installation complete" and the first indexer run then died on
+    // SQLITE_CANTOPEN with nothing in the install log to point at
+    // (bd DAS-Backup-Manager-8wx).
+    if let Err(e) = ensure_db_dir(&config.general.db_path) {
+        eprintln!("Warning: {e}");
     }
 
     // Files the previous install owned that this one no longer generates. Left
@@ -268,19 +273,48 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let db_path = Config::load(&PathBuf::from(CONFIG_FILE))
-        .ok()
-        .map(|c| c.general.db_path);
+    // A config that will not load means the DB location is unknown. Saying so
+    // matters when `--remove-db` was asked for: it used to be `.ok()`, so the
+    // request was silently dropped and the operator was told "Uninstall
+    // complete" with the database still on disk (bd DAS-Backup-Manager-8wx).
+    let db_path = match Config::load(&PathBuf::from(CONFIG_FILE)) {
+        Ok(c) => Some(c.general.db_path),
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read {CONFIG_FILE} ({e}) — the database location is \
+                 unknown and it will NOT be removed"
+            );
+            None
+        }
+    };
 
-    let _ = run_systemctl(&["disable", "--now", "das-backup.timer"]);
-    let _ = run_systemctl(&["disable", "--now", "das-backup-full.timer"]);
-    let _ = run_systemctl(&["disable", "--now", "das-scrub.timer"]);
-    let _ = run_systemctl(&["disable", "--now", "das-backup-doctor.timer"]);
+    // A timer left enabled after an uninstall keeps firing at 03:00 against
+    // files that are no longer there.
+    for unit in [
+        "das-backup.timer",
+        "das-backup-full.timer",
+        "das-scrub.timer",
+        "das-backup-doctor.timer",
+    ] {
+        if let Err(e) = run_systemctl(&["disable", "--now", unit]) {
+            eprintln!("Warning: {unit} may still be enabled: {e}");
+        }
+    }
 
-    let removed = uninstall_from_manifest(&manifest_path);
+    let (removed, problems) = uninstall_from_manifest(&manifest_path);
     println!("Removed {} files.", removed);
+    for p in &problems {
+        eprintln!("Warning: {p}");
+    }
 
-    let _ = std::fs::remove_file(&manifest_path);
+    if let Err(e) = std::fs::remove_file(&manifest_path) {
+        eprintln!(
+            "Warning: could not remove manifest {}: {e}",
+            manifest_path.display()
+        );
+    }
+    // Bare `remove_dir`: deliberately best-effort, because "the directory still
+    // has operator files in it" is the normal outcome, not a fault.
     let _ = std::fs::remove_dir(CONFIG_DIR);
 
     if remove_db
@@ -291,27 +325,61 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("Removed database: {}", db);
     }
 
-    let _ = run_systemctl(&["daemon-reload"]);
+    if let Err(e) = run_systemctl(&["daemon-reload"]) {
+        eprintln!("Warning: {e}");
+    }
 
     println!("Uninstall complete.");
     Ok(())
 }
 
-/// Remove all files listed in a manifest. Returns the count of files removed.
-pub fn uninstall_from_manifest(manifest_path: &Path) -> usize {
+/// Create the parent directory of `db_path`, describing the failure instead of
+/// discarding it.
+fn ensure_db_dir(db_path: &str) -> Result<(), String> {
+    let Some(parent) = Path::new(db_path).parent() else {
+        return Err(format!("database path '{db_path}' has no parent directory"));
+    };
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "could not create database directory {}: {e} — the indexer will fail to open {db_path}",
+            parent.display()
+        )
+    })
+}
+
+/// Remove all files listed in a manifest.
+///
+/// Returns `(files removed, problems)`. The problems are the point: this used
+/// to return a bare count, an unreadable manifest returned `0`, and every
+/// `remove_file` error was dropped by `.is_ok()` — so an uninstall that removed
+/// nothing, or that left half the tree behind on a read-only `/usr`, printed
+/// "Removed 0 files." and "Uninstall complete." and looked identical to one
+/// that had nothing left to do (bd DAS-Backup-Manager-8wx).
+pub fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
+    let mut problems: Vec<String> = Vec::new();
     let content = match std::fs::read_to_string(manifest_path) {
         Ok(c) => c,
-        Err(_) => return 0,
+        Err(e) => {
+            problems.push(format!(
+                "could not read manifest {}: {e} — NOTHING was removed",
+                manifest_path.display()
+            ));
+            return (0, problems);
+        }
     };
 
     let mut removed = 0;
     for line in content.lines() {
         let path = Path::new(line.trim());
-        if path.exists() && std::fs::remove_file(path).is_ok() {
-            removed += 1;
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(e) => problems.push(format!("could not remove {}: {e}", path.display())),
         }
     }
-    removed
+    (removed, problems)
 }
 
 /// Can we open a TCP connection to the configured mail relay?
@@ -543,23 +611,43 @@ pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> 
     uninstall(remove_db)?;
 
     // Phase 2: stop the helper service
-    let _ = run_systemctl(&["disable", "--now", "btrdasd-helper.service"]);
+    if let Err(e) = run_systemctl(&["disable", "--now", "btrdasd-helper.service"]) {
+        eprintln!("Warning: btrdasd-helper.service may still be enabled: {e}");
+    }
 
-    // Phase 3: determine install prefix from config (default /usr)
-    let prefix = Config::load(&PathBuf::from(CONFIG_FILE))
-        .ok()
-        .map(|c| c.general.install_prefix.clone())
-        .unwrap_or_else(|| "/usr".to_string());
+    // Phase 3: determine install prefix from config (default /usr).
+    // An unreadable config here does not mean "/usr" — it means we are guessing,
+    // and everything installed under a different prefix will silently survive
+    // the "full" uninstall (bd DAS-Backup-Manager-8wx).
+    let prefix = match Config::load(&PathBuf::from(CONFIG_FILE)) {
+        Ok(c) => c.general.install_prefix.clone(),
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read {CONFIG_FILE} ({e}) — assuming the default install \
+                 prefix /usr; files installed under any other prefix will be LEFT BEHIND"
+            );
+            "/usr".to_string()
+        }
+    };
 
     let paths = cmake_installed_paths(&prefix);
     let removed = remove_paths(&paths);
     println!("Removed {} cmake-installed files.", removed);
 
-    // Phase 4: clean up empty directories
-    let _ = std::fs::remove_dir_all(format!("{prefix}/lib/das-backup"));
+    // Phase 4: clean up directories
+    let libdir = format!("{prefix}/lib/das-backup");
+    if Path::new(&libdir).exists()
+        && let Err(e) = std::fs::remove_dir_all(&libdir)
+    {
+        eprintln!("Warning: could not remove {libdir}: {e}");
+    }
+    // Bare `remove_dir`: best-effort, and failing because the database is still
+    // there is the normal outcome.
     let _ = std::fs::remove_dir("/var/lib/das-backup");
 
-    let _ = run_systemctl(&["daemon-reload"]);
+    if let Err(e) = run_systemctl(&["daemon-reload"]) {
+        eprintln!("Warning: {e}");
+    }
 
     println!("Full uninstall complete.");
     Ok(())
@@ -942,9 +1030,86 @@ auth = "starttls""#,
         )
         .unwrap();
 
-        let removed = uninstall_from_manifest(&manifest);
+        let (removed, problems) = uninstall_from_manifest(&manifest);
         assert_eq!(removed, 2);
+        assert!(
+            problems.is_empty(),
+            "clean run reported problems: {problems:?}"
+        );
         assert!(!file1.exists());
         assert!(!file2.exists());
+    }
+
+    /// An uninstall that could not do its job must say so. Both halves used to
+    /// be silent: an unreadable manifest returned a bare `0`, and a file that
+    /// would not delete was dropped by `.is_ok()` — so "Removed N files." and
+    /// "Uninstall complete." were printed over a tree that was still installed.
+    #[test]
+    fn uninstall_from_manifest_reports_what_it_could_not_remove() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+
+        // (a) manifest that cannot be read — a directory, so this holds for
+        //     root too and needs no permission games.
+        let unreadable = base.join("manifest-is-a-dir");
+        std::fs::create_dir(&unreadable).unwrap();
+        let (removed, problems) = uninstall_from_manifest(&unreadable);
+        assert_eq!(removed, 0);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("could not read manifest")),
+            "an unreadable manifest must be reported, got: {problems:?}"
+        );
+
+        // (b) a listed entry that exists but cannot be removed by remove_file:
+        //     a non-empty directory fails EISDIR/ENOTEMPTY for root as well.
+        let undeletable = base.join("stubborn-dir");
+        std::fs::create_dir(&undeletable).unwrap();
+        std::fs::write(undeletable.join("child"), "x").unwrap();
+        let good = base.join("ordinary.txt");
+        std::fs::write(&good, "x").unwrap();
+        let manifest = base.join(".manifest2");
+        std::fs::write(
+            &manifest,
+            format!("{}\n{}", undeletable.display(), good.display()),
+        )
+        .unwrap();
+
+        let (removed, problems) = uninstall_from_manifest(&manifest);
+        // Positive control: the ordinary file WAS removed and counted, so the
+        // reporting cannot be passing by declaring everything a problem.
+        assert_eq!(removed, 1, "the ordinary file should still be removed");
+        assert!(!good.exists());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("could not remove") && p.contains("stubborn-dir")),
+            "an undeletable entry must be reported, got: {problems:?}"
+        );
+        assert!(undeletable.exists(), "it really was not removed");
+    }
+
+    /// `ensure_db_dir` describes its failure instead of discarding it.
+    #[test]
+    fn ensure_db_dir_reports_a_directory_it_cannot_create() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Positive control first: a creatable parent succeeds.
+        let ok_db = dir.path().join("var/lib/das-backup/backup-index.db");
+        ensure_db_dir(&ok_db.to_string_lossy()).expect("a creatable parent must succeed");
+        assert!(ok_db.parent().unwrap().is_dir());
+
+        // A FILE where the parent directory needs to be: create_dir_all fails
+        // ENOTDIR/EEXIST for root too.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let bad_db = blocker.join("nested/backup-index.db");
+        let err = ensure_db_dir(&bad_db.to_string_lossy())
+            .expect_err("a parent that cannot be created must be an error");
+        assert!(
+            err.contains("could not create database directory"),
+            "got: {err}"
+        );
     }
 }

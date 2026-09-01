@@ -594,24 +594,53 @@ pub fn parse_scrub_status(
             let value = value.trim();
             // Unknown keys are ignored so a btrfs-progs that adds counters
             // does not break parsing; the format version guards real changes.
-            let num = value.parse::<u64>().ok();
+            //
+            // A RECOGNISED key whose value will not parse is the opposite case
+            // and is refused. It used to fall back to 0, and 0 on an error
+            // counter reads as "no damage" — so a truncated or corrupted status
+            // record was reported as a CLEAN scrub: `is_clean()` true, no
+            // FAILURE email, health green. The one answer this parser must
+            // never fabricate (bd DAS-Backup-Manager-8wx).
+            let malformed = || ScrubError::StatusMalformed {
+                detail: format!("field '{key}' has non-numeric value '{value}'"),
+            };
             match key {
-                "read_errors" => dev.counters.read_errors = num.unwrap_or(0),
-                "csum_errors" => dev.counters.csum_errors = num.unwrap_or(0),
-                "verify_errors" => dev.counters.verify_errors = num.unwrap_or(0),
-                "super_errors" => dev.counters.super_errors = num.unwrap_or(0),
-                "malloc_errors" => dev.counters.malloc_errors = num.unwrap_or(0),
-                "uncorrectable_errors" => dev.counters.uncorrectable_errors = num.unwrap_or(0),
-                "corrected_errors" => dev.counters.corrected_errors = num.unwrap_or(0),
-                "no_csum" => dev.counters.no_csum = num.unwrap_or(0),
-                "csum_discards" => dev.counters.csum_discards = num.unwrap_or(0),
-                "data_bytes_scrubbed" => dev.data_bytes_scrubbed = num.unwrap_or(0),
-                "tree_bytes_scrubbed" => dev.tree_bytes_scrubbed = num.unwrap_or(0),
-                "t_start" => dev.t_start = value.parse::<i64>().unwrap_or(0),
-                "t_resumed" => dev.t_resumed = value.parse::<i64>().unwrap_or(0),
-                "duration" => dev.duration_secs = num.unwrap_or(0),
-                "canceled" => dev.canceled = num.unwrap_or(0) != 0,
-                "finished" => dev.finished = num.unwrap_or(0) != 0,
+                "read_errors" => {
+                    dev.counters.read_errors = value.parse().map_err(|_| malformed())?
+                }
+                "csum_errors" => {
+                    dev.counters.csum_errors = value.parse().map_err(|_| malformed())?
+                }
+                "verify_errors" => {
+                    dev.counters.verify_errors = value.parse().map_err(|_| malformed())?
+                }
+                "super_errors" => {
+                    dev.counters.super_errors = value.parse().map_err(|_| malformed())?
+                }
+                "malloc_errors" => {
+                    dev.counters.malloc_errors = value.parse().map_err(|_| malformed())?
+                }
+                "uncorrectable_errors" => {
+                    dev.counters.uncorrectable_errors = value.parse().map_err(|_| malformed())?
+                }
+                "corrected_errors" => {
+                    dev.counters.corrected_errors = value.parse().map_err(|_| malformed())?
+                }
+                "no_csum" => dev.counters.no_csum = value.parse().map_err(|_| malformed())?,
+                "csum_discards" => {
+                    dev.counters.csum_discards = value.parse().map_err(|_| malformed())?
+                }
+                "data_bytes_scrubbed" => {
+                    dev.data_bytes_scrubbed = value.parse().map_err(|_| malformed())?
+                }
+                "tree_bytes_scrubbed" => {
+                    dev.tree_bytes_scrubbed = value.parse().map_err(|_| malformed())?
+                }
+                "t_start" => dev.t_start = value.parse::<i64>().map_err(|_| malformed())?,
+                "t_resumed" => dev.t_resumed = value.parse::<i64>().map_err(|_| malformed())?,
+                "duration" => dev.duration_secs = value.parse().map_err(|_| malformed())?,
+                "canceled" => dev.canceled = value.parse::<u64>().map_err(|_| malformed())? != 0,
+                "finished" => dev.finished = value.parse::<u64>().map_err(|_| malformed())? != 0,
                 _ => {}
             }
         }
@@ -2293,6 +2322,47 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
         let rec = parse_scrub_status(content, "abc").unwrap();
         assert_eq!(rec.outcome(), ScrubOutcome::Finished);
         assert_eq!(rec.t_start(), 100);
+    }
+
+    /// A RECOGNISED key with a non-numeric value must be refused, never read
+    /// as 0. Before bd DAS-Backup-Manager-8wx every counter fell back to 0 on a
+    /// parse failure, so a truncated or corrupted status record parsed cleanly
+    /// and `is_clean()` returned TRUE — damage reported as a good scrub, no
+    /// FAILURE email, health green.
+    #[test]
+    fn rejects_non_numeric_value_on_a_recognised_counter() {
+        let corrupt = "scrub status:1\nabc:1|finished:1|canceled:0|uncorrectable_errors:1?7|t_start:100|duration:5\n";
+        let err = parse_scrub_status(corrupt, "abc")
+            .expect_err("a corrupt error counter must not parse as a clean scrub");
+        match err {
+            ScrubError::StatusMalformed { detail } => {
+                assert!(
+                    detail.contains("uncorrectable_errors") && detail.contains("1?7"),
+                    "detail should name the offending field and value, got: {detail}"
+                );
+            }
+            other => panic!("expected StatusMalformed, got {other:?}"),
+        }
+
+        // Positive control on the same record: with a parseable value it still
+        // parses and the count survives, so the guard cannot be passing by
+        // refusing everything.
+        let good = corrupt.replace("uncorrectable_errors:1?7", "uncorrectable_errors:17");
+        let rec = parse_scrub_status(&good, "abc").expect("a well-formed record must still parse");
+        assert_eq!(rec.counters().uncorrectable_errors, 17);
+        assert!(
+            !rec.is_clean(),
+            "17 uncorrectable errors is not a clean scrub"
+        );
+    }
+
+    /// The counterpart guard: a corrupt `finished`/`canceled` flag must not be
+    /// silently read as 0 either, because 0/0 is "still running", not "unknown".
+    #[test]
+    fn rejects_non_numeric_value_on_an_outcome_flag() {
+        let corrupt = "scrub status:1\nabc:1|finished:yes|canceled:0|t_start:100|duration:5\n";
+        let err = parse_scrub_status(corrupt, "abc").expect_err("'finished:yes' must not parse");
+        assert!(matches!(err, ScrubError::StatusMalformed { .. }), "{err:?}");
     }
 
     // --- resumed scrubs / freshness anchor --------------------------------

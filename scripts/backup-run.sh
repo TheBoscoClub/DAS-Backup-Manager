@@ -1,9 +1,26 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.4.1
-# Date: 2026-08-02
+# Version: 4.5.0
+# Date: 2026-09-01
 #
 # Features:
+#   - Source-side mount verification (v4.5.0): verify_sources_before_write(),
+#     called from main() between mount_sources() and create_snapshot_dirs().
+#     Targets have had verify_targets_before_btrbk() since bd
+#     DAS-Backup-Manager-9on; sources had only mount_sources()'s
+#     `mountpoint -q`-and-mount, with nothing checking WHAT got mounted. An
+#     empty /.btrfs-hdd/.btrbk-snapshots dated 2026-05-17 was found on the
+#     NVMe root filesystem, i.e. create_snapshot_dirs() had already run once
+#     against a bare mountpoint. The new guard requires every source volume to
+#     be a real mountpoint AND to carry the filesystem UUID its config `device`
+#     resolves to AND to be mounted at the top-level volume (FSROOT '/'). The
+#     mountpoint check is load-bearing and not redundant with the UUID check:
+#     for the `nvme` source the root filesystem IS the source filesystem, so
+#     `findmnt --target` returns a MATCHING UUID for a bare /.btrfs-nvme.
+#     Honest scope: a `device` given as a /dev path (live config: `nvme`,
+#     `nvme-vm`) is resolved through blkid at verification time, which is a
+#     consistency check, not an identity check — see the function header.
+#     Tracks bd DAS-Backup-Manager-zlv.
 #   - cleanup() guaranteed on every abort path (v4.4.1): 'trap cleanup ERR'
 #     (installed inside main(), no 'set -E'/errtrace) only ever fired for a
 #     failing command directly in main()'s own body — never for a set -e
@@ -641,6 +658,166 @@ mount_sources() {
             log_info "  Mounted $label at $mnt"
         fi
     done
+}
+
+# Verify EVERY configured source volume is a real mountpoint backed by the
+# filesystem config.toml declares for it, BEFORE anything writes to a source
+# path.
+#
+# The target-side twin of this guard (verify_targets_before_btrbk, below) has
+# existed since the May 2026 incident. Sources had nothing equivalent:
+# mount_sources() runs `mountpoint -q`, mounts if absent, logs success, and
+# nothing ever checked WHAT got mounted.
+#
+# That gap is not theoretical. An empty /.btrfs-hdd/.btrbk-snapshots directory
+# dated 2026-05-17 was found on the NVMe ROOT filesystem — proof that
+# create_snapshot_dirs() had run at least once while /.btrfs-hdd was unmounted,
+# writing to the bare mountpoint. It stayed bounded to an empty directory only
+# because btrbk then finds no source subvolumes and exits nonzero rather than
+# filling /. This script UNMOUNTS the source volumes at the end of every run,
+# so between runs these paths ARE bare and anything writing to them lands on
+# the root filesystem. Tracks bd DAS-Backup-Manager-zlv (source-side sibling of
+# bd DAS-Backup-Manager-9on).
+#
+# Two checks, and the ORDER matters:
+#
+#   1. `mountpoint -q` — the load-bearing one. A bare source mountpoint falls
+#      through to whatever filesystem contains it (the NVMe root, here), and
+#      `findmnt --target` on a bare path reports THAT filesystem's UUID quite
+#      happily. For the `nvme` source the root filesystem IS the source
+#      filesystem — /dev/nvme1n1p2 and / are both UUID=20b5fa7e-…, the source
+#      is just its subvolid=5 view — so check 2 below CANNOT tell "mounted"
+#      from "bare" there. Measured on this host with /.btrfs-nvme unmounted:
+#      `findmnt -n -o UUID --target /.btrfs-nvme` → 20b5fa7e-…, i.e. a UUID
+#      match on a bare directory. Only `mountpoint -q` distinguishes them. Do
+#      not drop or reorder this on the grounds that the UUID comparison
+#      subsumes it — for that source it does not.
+#
+#   2. Filesystem identity — the mounted UUID must match what the source's
+#      `device` resolves to, and the mount must be the top-level volume
+#      (FSROOT `/`), which is what `mount -o subvolid=5` in mount_sources()
+#      produces and what btrbk.conf's per-source subvolume paths are relative
+#      to. A mount rooted at a subvolume (`/@`, `/@home`, a named subvol)
+#      would resolve btrbk's declared paths against the wrong tree.
+#
+# HONEST SCOPE OF CHECK 2, by `device` form — this paragraph exists so nobody
+# later reads the path form as stronger than it is:
+#
+#   device = "UUID=<uuid>"  A genuine identity check. The expected UUID is
+#                           declared in config.toml and compared against the
+#                           filesystem actually mounted. Nothing the running
+#                           system does can move it. Seven of the nine live
+#                           sources are this form.
+#
+#   device = "/dev/..."     NOT an identity check. There is no stable
+#                           identifier in the config to compare against, so
+#                           the expected UUID is resolved FROM THE DEVICE NODE
+#                           AT VERIFICATION TIME via blkid. That proves the
+#                           mount is consistent with whatever disk sits at that
+#                           path right now; it cannot detect that the path now
+#                           refers to a different disk than the operator meant
+#                           (kernel device names are not stable — the whole
+#                           reason the target side and most sources use UUID=
+#                           form). The live config has two such sources,
+#                           `nvme` and `nvme-vm`, both /dev/nvme1n1p2 — which
+#                           is one LEG of a two-device BTRFS RAID-1, so blkid
+#                           there reports the filesystem UUID shared with
+#                           /dev/nvme0n1p2. The path therefore names a member,
+#                           not a filesystem, and a member is exactly what
+#                           kernel naming is free to reassign. Migrating both
+#                           to UUID=20b5fa7e-… would upgrade them to a real
+#                           identity check. Until then check 1 is the only
+#                           guarantee those two get — and check 1 is precisely
+#                           the one that catches the defect this guard was
+#                           written for.
+#
+# Fails CLOSED: an unresolvable device, a missing device, or a findmnt that
+# returns nothing is a violation, not a pass.
+#
+# Called from main() between mount_sources() and create_snapshot_dirs() —
+# see the call site for why that placement and not next to the target guard.
+verify_sources_before_write() {
+    log_info "Verifying every source volume is backed by its expected filesystem..."
+
+    local violations=()
+    local label
+    for label in "${!SOURCE_VOLUMES[@]}"; do
+        local mnt="${SOURCE_VOLUMES[$label]:-}"
+        local dev="${SOURCE_DEVICES[$label]:-}"
+
+        if [[ -z "$mnt" ]]; then
+            violations+=("$label: no volume path configured — cannot verify anything")
+            continue
+        fi
+
+        # Check 1 (see header): the ONLY check that catches a bare source
+        # mountpoint when the source filesystem and the root filesystem are
+        # the same filesystem.
+        if ! mountpoint -q "$mnt" 2>/dev/null; then
+            violations+=("$label: $mnt is NOT a mountpoint — writes here would land on the root filesystem")
+            continue
+        fi
+
+        # Expected filesystem UUID, and where it came from (kept for the log
+        # line so a reader can see at a glance which sources got the strong
+        # config-declared check and which got the weaker blkid resolution).
+        local expected_uuid="" uuid_source=""
+        if [[ "$dev" == UUID=* ]]; then
+            expected_uuid="${dev#UUID=}"
+            uuid_source="config"
+        elif [[ -n "$dev" ]]; then
+            expected_uuid=$(blkid -o value -s UUID "$dev" 2>/dev/null || true)
+            uuid_source="blkid $dev"
+            if [[ -z "$expected_uuid" ]]; then
+                violations+=("$label: device '$dev' has no resolvable filesystem UUID (blkid returned nothing) — cannot verify what is mounted at $mnt")
+                continue
+            fi
+        else
+            violations+=("$label: no device configured — cannot verify what is mounted at $mnt")
+            continue
+        fi
+
+        local mnt_line fs_uuid fs_root
+        mnt_line=$(findmnt -n -o UUID,FSROOT --target "$mnt" 2>/dev/null || true)
+        if [[ -z "$mnt_line" ]]; then
+            violations+=("$label: $mnt is a mountpoint but findmnt could not report its UUID/FSROOT")
+            continue
+        fi
+        read -r fs_uuid fs_root <<< "$mnt_line"
+
+        if [[ "$fs_uuid" != "$expected_uuid" ]]; then
+            violations+=("$label: $mnt has fs UUID '${fs_uuid:-<none>}', expected '$expected_uuid' (from $uuid_source) — a different filesystem is mounted here")
+            continue
+        fi
+
+        if [[ "$fs_root" != "/" ]]; then
+            violations+=("$label: $mnt is mounted at subvolume '$fs_root', expected the top-level volume '/' (mount -o subvolid=5) — btrbk's declared subvolume paths would resolve against the wrong tree")
+            continue
+        fi
+
+        log_info "  $label: OK ($mnt → UUID=$fs_uuid, subvol=$fs_root, expected from $uuid_source)"
+    done
+
+    if (( ${#violations[@]} > 0 )); then
+        log_error "============================================================"
+        log_error "ABORTING — refusing to write to source volumes. Source verification failed:"
+        log_error ""
+        local v
+        for v in "${violations[@]}"; do
+            log_error "  - $v"
+        done
+        log_error ""
+        log_error "Continuing would let create_snapshot_dirs() and btrbk write to a bare"
+        log_error "mountpoint on the root filesystem, or snapshot from the wrong filesystem."
+        log_error "An empty /.btrfs-hdd/.btrbk-snapshots dated 2026-05-17 was found on the"
+        log_error "NVMe root for exactly this reason. See bd DAS-Backup-Manager-zlv."
+        log_error "============================================================"
+        record_op "verify_sources" "FAIL" "${#violations[@]} violation(s)"
+        exit 1
+    fi
+
+    log_info "All source volumes verified — safe to create snapshot dirs and invoke btrbk."
+    record_op "verify_sources" "OK"
 }
 
 mount_targets() {
@@ -1555,7 +1732,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.4.1
+  backup-run.sh v4.5.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2005,6 +2182,24 @@ main() {
     set_io_scheduler
     create_mount_points
     mount_sources
+    # Source-side twin of verify_targets_before_btrbk (called further down,
+    # after mount_targets). Placement is deliberate and is NOT interchangeable
+    # with sitting beside the target guard:
+    #
+    #   - AFTER mount_sources, because that is the last thing in this script
+    #     that mounts a source; before it, a legitimately-unmounted source is
+    #     the normal state and refusing would abort every run.
+    #   - BEFORE create_snapshot_dirs, because create_snapshot_dirs() is the
+    #     FIRST writer to a source path, and is the exact function that left an
+    #     empty .btrbk-snapshots directory on the NVMe root when /.btrfs-hdd
+    #     was bare. Verifying next to the target guard instead would leave that
+    #     writer — the one with a proven artifact on disk — unguarded.
+    #
+    # Unconditional, dryrun included, matching verify_targets_before_btrbk:
+    # create_snapshot_dirs() runs in dryrun too, so the write exists there.
+    # An abort here is a could-not-execute case, which is why it exits
+    # nonzero — see the exit-code split at the end of main().
+    verify_sources_before_write
     create_snapshot_dirs
     mount_targets
     create_target_dirs
