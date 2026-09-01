@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.20.0
+**Version**: 0.7.21.0
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -131,6 +131,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including na
 - [Disaster Recovery Guide](docs/DISASTER-RECOVERY-GUIDE.md) — Step-by-step recovery procedures
 - [Storage Architecture & Recovery](docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md) — BTRFS RAID concepts, failure detection, recovery procedures
 - [DAS Bay Mapping](docs/DAS-BAY-MAPPING.md) — How to map and document physical drive locations
+- [Throughput Baseline](docs/THROUGHPUT-BASELINE.md) — What a healthy run looks like, and why link speed rather than throughput is the health signal
 - [Reference Examples](docs/examples/) — Author's hardware setup as a worked example
 
 ## License
