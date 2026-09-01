@@ -248,3 +248,31 @@ endif()
 if(BUILD_GUI)
     add_subdirectory(gui)
 endif()
+
+# =============================================================================
+# Shell regression suites
+# =============================================================================
+#
+# CTest is already included above. These two suites existed for months with no
+# runner at all -- `add_test` appeared exactly once in the repo (the GUI smoke
+# test) and CI's shellcheck job globbed only scripts/*.sh. A test nothing runs
+# has never been observed failing, and never being observed failing is the one
+# thing that stops a test being evidence.
+#
+# Both are self-contained: each extracts the function under test from the live
+# script with sed, stubs the surrounding globals, and writes only beneath a
+# mktemp directory. No root, no devices, no network -- safe in a container.
+if(BUILD_TESTING)
+    add_test(
+        NAME shell-create-snapshot-dirs
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_create_snapshot_dirs.sh
+    )
+    add_test(
+        NAME shell-esp-label-derivation
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_esp_label_derivation.sh
+    )
+    add_test(
+        NAME shell-backup-exit-semantics
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backup_exit_semantics.sh
+    )
+endif()

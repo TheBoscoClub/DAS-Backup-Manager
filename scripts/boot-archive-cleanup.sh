@@ -44,6 +44,17 @@ RETENTION_DAYS="$DAS_BOOT_ARCHIVE_RETENTION_DAYS"
 DRYRUN=false
 # All target mount points from config
 IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
+# Fail closed on an empty target list. A zero-element array makes the main loop
+# a no-op and the run then reports "cleanup complete" having examined nothing —
+# indistinguishable from a genuine clean prune.
+if [[ ${#ALL_TARGET_MOUNTS[@]} -eq 0 ]]; then
+    echo "ERROR: DAS_ALL_TARGET_MOUNTS is empty - no targets to examine (check $DAS_CONFIG)" >&2
+    exit 1
+fi
+
+# Failure accounting - the process exit status must reflect these (see main()).
+DELETE_ERRORS=0     # subvolume deletions that failed
+TARGET_FAILURES=0   # targets whose subvolume listing could not be obtained
 
 # Mount -> role map, built the same way backup-run.sh builds MOUNT_ROLES —
 # reused here so the pruner and the archiver agree on which targets are
@@ -95,7 +106,8 @@ cleanup_target() {
     local deleted=0 kept=0 errors=0
 
     if ! mountpoint -q "$mnt" 2>/dev/null; then
-        return
+        log_info "  Skipping $mnt (not mounted - nothing examined)"
+        return 0
     fi
 
     local label
@@ -115,13 +127,50 @@ cleanup_target() {
 
     local cutoff_epoch=$(( $(date '+%s') - (RETENTION_DAYS * 86400) ))
 
-    # List subvolumes matching archive pattern
+    # Obtain the subvolume listing FIRST and check that it succeeded. Feeding the
+    # loop directly from a process substitution hid listing failures completely:
+    # the loop body simply never ran, the counters stayed at zero, and the target
+    # reported "Deleted 0, kept 0, errors 0" — a listing failure is not a clean
+    # prune and must never be reportable as one.
+    local listing listing_stderr listing_err
+    listing_stderr=$(mktemp)
+    if ! listing=$(btrfs subvolume list "$mnt" 2>"$listing_stderr"); then
+        listing_err=$(tr '\n' ' ' < "$listing_stderr")
+        rm -f "$listing_stderr"
+        log_error "  [$label] Failed to list subvolumes: ${listing_err:-(no error output)}"
+        log_error "  [$label] Target NOT pruned - state unknown"
+        TARGET_FAILURES=$(( TARGET_FAILURES + 1 ))
+        return 0
+    fi
+    rm -f "$listing_stderr"
+
+    # Process archive subvolumes from the (successfully obtained) listing
     while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
         local subvol_path="${line##* }"  # last field is the path
         local subvol_name="${subvol_path##*/}"
 
         # Only process archive subvolumes
         [[ "$subvol_name" != *.archive.* ]] && continue
+
+        # This string is about to be handed to `btrfs subvolume delete`, so it
+        # must be validated first. "${line##* }" is a last-space-separated-field
+        # parse of human-readable output; anything that does not come back as a
+        # clean, relative, exactly-shaped archive path is skipped, never deleted.
+        # The first test cross-checks the last-field parse against the field
+        # `btrfs subvolume list` actually labels "path" — they differ when the
+        # line is malformed or the path itself contains a space, in which case
+        # the last-field parse names a DIFFERENT subvolume than the listing did.
+        if [[ "${line#*" path "}" != "$subvol_path" ]] \
+           || [[ "$subvol_path" == "$line" ]] \
+           || [[ "$subvol_path" == /* ]] \
+           || [[ "$subvol_path" == *".."* ]] \
+           || [[ ! "$subvol_path" =~ ^[A-Za-z0-9_@.+/-]+$ ]] \
+           || [[ ! "$subvol_name" =~ ^@[A-Za-z0-9_-]*\.archive\.[0-9]{8}T[0-9]{6}$ ]]; then
+            log_warn "  Unrecognized archive path - NOT deleted: $subvol_path"
+            continue
+        fi
 
         local archive_epoch
         archive_epoch=$(parse_archive_timestamp "$subvol_name")
@@ -135,24 +184,30 @@ cleanup_target() {
             if $DRYRUN; then
                 log_warn "  [DRYRUN] Would delete: $subvol_path ($age_days days old)"
             else
-                if btrfs subvolume delete "$mnt/$subvol_path" 2>/dev/null; then
+                local delete_err
+                # 2>&1 >/dev/null keeps stderr only: the errno text is the whole
+                # point of the failure line and used to be discarded.
+                if delete_err=$(btrfs subvolume delete "$mnt/$subvol_path" 2>&1 >/dev/null); then
                     log_info "  Deleted: $subvol_path ($age_days days old)"
                     (( deleted += 1 ))
                 else
-                    log_error "  Failed to delete: $subvol_path"
+                    log_error "  Failed to delete: $subvol_path: ${delete_err//$'\n'/ }"
                     (( errors += 1 ))
                 fi
             fi
         else
             (( kept += 1 ))
         fi
-    done < <(btrfs subvolume list "$mnt" 2>/dev/null)
+    done <<< "$listing"
+
+    DELETE_ERRORS=$(( DELETE_ERRORS + errors ))
 
     if $DRYRUN; then
         log_info "  [$label] Would keep $kept, found expired archives above"
     else
         log_info "  [$label] Deleted $deleted, kept $kept, errors $errors"
     fi
+    return 0
 }
 
 # ============================================================================
@@ -194,7 +249,17 @@ main() {
     done
 
     echo ""
+    # The exit status must reflect what actually happened. Ending on a log_info
+    # made every run exit 0, including runs where every target's listing failed
+    # or every deletion failed. Exit 0 still means "ran fine, nothing wrong" —
+    # including "ran fine, nothing to delete".
+    if (( TARGET_FAILURES > 0 || DELETE_ERRORS > 0 )); then
+        log_error "Boot archive cleanup FAILED: $DELETE_ERRORS deletion error(s), $TARGET_FAILURES target(s) not examined."
+        return 1
+    fi
+
     log_info "Boot archive cleanup complete."
+    return 0
 }
 
 main "$@"

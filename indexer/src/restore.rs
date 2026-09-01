@@ -525,8 +525,19 @@ fn restore_snapshot_recursive(
             continue;
         }
 
-        // Regular file
-        match std::fs::copy(entry.path(), &dest_path) {
+        // Regular file.
+        //
+        // copy_no_follow, NOT std::fs::copy: the latter opens the destination
+        // write-truncate, which FOLLOWS a symlink sitting at that path. That is
+        // the bd s05 hazard, and this path had been left out of that fix —
+        // restore_files used the guarded helper while restore_snapshot did not,
+        // even though this is the COMMON path (try_btrfs_send_receive falls back
+        // here for any snapshot that is not a receivable read-only subvolume).
+        // The D-Bus RestoreSnapshot method runs as root and allows /tmp by
+        // default, so a pre-planted link was enough to write snapshot content
+        // through it and defeat RESTORE_DENIED_ROOTS entirely.
+        // bd DAS-Backup-Manager-nsp (finding #3).
+        match copy_no_follow(entry.path(), &dest_path) {
             Ok(bytes) => {
                 bytes_restored += bytes;
                 files_restored += 1;
@@ -668,6 +679,40 @@ mod tests {
             std::fs::read_to_string(&victim).unwrap(),
             "original",
             "the symlink target must be untouched"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_recursive_does_not_follow_a_planted_symlink() {
+        // The isolated copy_no_follow test above passed for months while THIS
+        // path still called std::fs::copy — restore_files used the guarded
+        // helper and restore_snapshot did not. A guard is only as wide as the
+        // paths that call it, so the guarantee has to be asserted at the level
+        // an attacker actually reaches. bd DAS-Backup-Manager-nsp (finding #3).
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "payload.txt", "attacker content");
+        let dest = TempDir::new().unwrap();
+
+        let victim = dest.path().join("victim.txt");
+        std::fs::write(&victim, "original").unwrap();
+        std::os::unix::fs::symlink(&victim, dest.path().join("payload.txt")).unwrap();
+
+        let result = restore_snapshot_recursive(
+            snap.path(),
+            dest.path(),
+            &Instant::now(),
+            &crate::progress::NullProgress,
+        )
+        .expect("the walk itself should complete");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "root must not write snapshot content through a pre-planted symlink"
+        );
+        assert!(
+            !result.errors.is_empty(),
+            "refusing to follow the link must be REPORTED, not silently skipped"
         );
     }
 

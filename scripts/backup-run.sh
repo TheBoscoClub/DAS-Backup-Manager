@@ -282,6 +282,9 @@ LOG_FILE="$DAS_LOG_FILE"
 # holds no mail credential — the relay authenticates upstream by envelope sender
 # using a key readable only by root. See .claude/rules/backup.md §Email Reports.
 GROWTH_LOG="$DAS_GROWTH_LOG"
+# Machine-readable throughput history, one JSON object per run, beside the
+# growth log. bd DAS-Backup-Manager-6lr.
+DAS_THROUGHPUT_LOG="${DAS_THROUGHPUT_LOG:-$(dirname "$DAS_GROWTH_LOG")/throughput.jsonl}"
 LAST_REPORT="$DAS_LAST_REPORT"
 
 # All target mount points (space-separated string from config -> array)
@@ -323,6 +326,13 @@ BACKUP_FORCE_FULL="false"
 # cleanup() no-ops immediately (unmount_all/record_backup_run_in_db already
 # ran in main()'s own body for a clean run). bd DAS-Backup-Manager-oeo.
 SCRIPT_COMPLETED="false"
+# Targets configured but not present this run. Recorded so an absent
+# target produces a row in the report instead of merely being missing
+# from every section — an absent row is what nobody notices. bd nsp (c6).
+UNAVAILABLE_TARGETS=()
+# "false" when `btrbk list latest` itself failed, so an empty RAW is not
+# read as "nothing was sent". bd nsp (c4).
+BTRBK_LATEST_RAW_OK="true"
 # Set inside main() the moment this process actually OWNS the shared DAS
 # mountpoints — immediately after acquire_maintenance_lock() returns (see
 # the arming site in main() for the exact line and full rationale). Until
@@ -525,7 +535,16 @@ check_das_connected() {
                 log_error "    expected serials: ${serials_list:-<none>}"
                 log_error "    mount UUID:       ${uuid:-<unset>}"
             else
+                # An unavailable non-primary used to be logged once here and
+                # then be absent from EVERY report section -- throughput,
+                # capacity, growth and SMART all iterate over mounted targets
+                # only. The absence of a row was the entire signal, and an
+                # absent row is what nobody notices: a recovery drive could
+                # fall off the bus and every nightly email would still read
+                # ALL OPERATIONS SUCCESSFUL. bd nsp (c6).
                 log_warn "  $label ($role): no expected drives present — will skip"
+                record_op "target_${label}" "FAIL" "unavailable: no expected drive present and no mountable UUID"
+                UNAVAILABLE_TARGETS+=("$label")
             fi
         fi
     done
@@ -931,14 +950,42 @@ update_boot_subvolumes() {
         # (HHMM, no seconds) — verified live against real snapshot names
         # below, NOT hhmmss/6 digits. An optional "_N" collision suffix is
         # appended by btrbk if two snapshots land on the exact same minute.
-        local latest_root
-        latest_root=$(btrfs subvolume list "$mnt" 2>/dev/null | grep -E 'nvme/root-\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
-        local latest_home
-        latest_home=$(btrfs subvolume list "$mnt" 2>/dev/null | grep -E 'nvme/home\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
+        # The subvolume listing is captured ONCE, with its status checked,
+        # before anything is matched against it. Previously each grep ran off
+        # its own `btrfs subvolume list ... 2>/dev/null || true`, so a failed
+        # listing produced an empty string that was indistinguishable from
+        # "this target genuinely has no snapshots" — and the latter is the
+        # benign, skip-quietly branch. bd DAS-Backup-Manager-nsp (c2/c3).
+        local subvol_listing subvol_err
+        subvol_err="$(mktemp)"
+        if ! subvol_listing=$(btrfs subvolume list "$mnt" 2>"$subvol_err"); then
+            log_error "  [$label] Could not list subvolumes: $(tr '\n' ' ' <"$subvol_err")"
+            log_error "  [$label] Refusing to treat an unreadable target as 'no snapshots'"
+            rm -f "$subvol_err"
+            (( failed += 1 ))
+            continue
+        fi
+        rm -f "$subvol_err"
+
+        local latest_root latest_home
+        latest_root=$(printf '%s\n' "$subvol_listing" | grep -E 'nvme/root-\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
+        latest_home=$(printf '%s\n' "$subvol_listing" | grep -E 'nvme/home\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
 
         if [[ -z "$latest_root" || -z "$latest_home" ]]; then
-            log_warn "  [$label] No btrbk snapshots found, skipping"
-            (( skipped += 1 ))
+            # A target that HAS snapshots but matches neither pattern means the
+            # patterns above have drifted from btrbk.conf's snapshot_name --
+            # exactly the shape of bd 5ig on the Rust side, where a hardcoded
+            # "@" => "root" map stopped matching an on-disk "root-" prefix.
+            # That is a defect, not a skip, so it must not exit through the
+            # quiet branch.
+            if printf '%s\n' "$subvol_listing" | grep -qE '[0-9]{8}T[0-9]{4}'; then
+                log_error "  [$label] Target HAS btrbk-shaped snapshots but none matched the expected names."
+                log_error "  [$label] The name patterns in this function have drifted from /etc/btrbk/btrbk.conf."
+                (( failed += 1 ))
+            else
+                log_warn "  [$label] No btrbk snapshots found, skipping"
+                (( skipped += 1 ))
+            fi
             continue
         fi
 
@@ -1038,8 +1085,21 @@ run_archive_cleanup() {
     log_info "Running boot archive cleanup..."
     local cleanup_output
     if cleanup_output=$("$BOOT_ARCHIVE_CLEANUP_BIN" "${args[@]}" 2>&1); then
-        record_op "archive_cleanup" "OK" "$(echo "$cleanup_output" | tail -1)"
-        log_info "Boot archive cleanup completed"
+        # The detail used to be `tail -1` of human output, which is the
+        # CONSTANT string "Boot archive cleanup complete." -- a status field
+        # whose value never varies is not a status field. Require a real
+        # per-target summary line to be present before calling this OK.
+        # bd nsp (c10).
+        local cleanup_summary
+        cleanup_summary=$(printf '%s\n' "$cleanup_output" \
+            | grep -oE 'Deleted [0-9]+, kept [0-9]+, errors [0-9]+' | tr '\n' '; ') || true
+        if [[ -z "$cleanup_summary" ]]; then
+            log_warn "Boot archive cleanup exited 0 but printed no per-target summary — treating as FAIL"
+            record_op "archive_cleanup" "FAIL" "exit 0 with no summary line; pruner may have examined nothing"
+        else
+            record_op "archive_cleanup" "OK" "${cleanup_summary%; }"
+            log_info "Boot archive cleanup completed"
+        fi
     else
         local exit_code=$?
         log_warn "Boot archive cleanup failed (non-fatal): $cleanup_output"
@@ -1212,7 +1272,21 @@ capture_report_data() {
     # 2026-06-26 onward (bd DAS-Backup-Manager-oi0). `--format=raw` emits named
     # key='value' fields instead, so the counters no longer depend on how btrbk
     # chooses to lay out a table.
-    BTRBK_LATEST_RAW=$(btrbk -c "$DAS_BTRBK_CONF" --format=raw list latest 2>/dev/null) || true
+    #
+    # The status is captured rather than discarded: an empty RAW because the
+    # command FAILED and an empty RAW because nothing was sent both used to
+    # collapse into "0 created, 0 sent" alongside a --success DB row.
+    # bd DAS-Backup-Manager-nsp (c4).
+    local raw_err
+    raw_err="$(mktemp)"
+    if BTRBK_LATEST_RAW=$(btrbk -c "$DAS_BTRBK_CONF" --format=raw list latest 2>"$raw_err"); then
+        BTRBK_LATEST_RAW_OK="true"
+    else
+        BTRBK_LATEST_RAW_OK="false"
+        BTRBK_LATEST_RAW=""
+        log_warn "btrbk list latest failed — snapshot counters are UNKNOWN, not zero: $(tr '\n' ' ' <"$raw_err")"
+    fi
+    rm -f "$raw_err"
 }
 
 # Log throughput report for all targets
@@ -1252,6 +1326,51 @@ log_throughput() {
         local total_rate=$(( total_written / elapsed ))
         log_info "  ─────────────────────────────────────"
         log_info "  Total: $(format_bytes $total_written) @ $(format_bytes $total_rate)/s"
+
+        # ---- Machine-readable history (bd DAS-Backup-Manager-6lr) -----------
+        #
+        # The human report above was a producer with no consumer: emitted every
+        # run, read by nothing, compared across runs by nothing.
+        #
+        # It also records the negotiated USB link speed, and that field — NOT
+        # the throughput — is the one that detects a degraded bus. Measured
+        # over the nine days the DAS ran at 480 Mbit/s instead of 10 Gbit/s:
+        #
+        #     2026-08-28 degraded  40.52 GiB / 75m27s =  9.17 MiB/s
+        #     2026-08-29 restored   8.59 GiB / 13m22s = 10.97 MiB/s
+        #     2026-08-31 restored  13.00 GiB / 11m12s = 19.80 MiB/s
+        #
+        # 9.17 against 10.97 is inside ordinary run-to-run variation, so a
+        # throughput trend alone would never have flagged it. The enclosure is
+        # deliberately bound to usb-storage (BOT) rather than UAS by
+        # /etc/modprobe.d/terramaster-no-uas.conf; BOT issues one command at a
+        # time with no queuing, so above roughly Gen 1 the spindles and BOT are
+        # the limit, not the bus. That quirk is a correct stability trade and
+        # should stay — but it is exactly why link rate and transfer rate are
+        # only loosely coupled here.
+        local link_speed="unknown"
+        local d
+        for d in /sys/bus/usb/devices/*/; do
+            [[ -f "$d/speed" && -f "$d/product" ]] || continue
+            if [[ "$(cat "$d/product" 2>/dev/null)" == *TDAS* ]]; then
+                link_speed="$(cat "$d/speed" 2>/dev/null || echo unknown)"
+                break
+            fi
+        done
+
+        if [[ "$link_speed" != "unknown" && "$link_speed" -lt 5000 ]]; then
+            log_warn "  DAS USB link negotiated at ${link_speed} Mbit/s — expected 10000."
+            log_warn "  Backups will still succeed, just slower. Reseat the cable (power the"
+            log_warn "  enclosure down first — see docs/DAS-BAY-MAPPING.md)."
+            record_op "usb_link" "FAIL" "negotiated ${link_speed} Mbit/s, expected 10000"
+        fi
+
+        if [[ -n "${DAS_THROUGHPUT_LOG:-}" ]]; then
+            printf '{"ts":"%s","elapsed_s":%d,"bytes":%d,"bytes_per_s":%d,"usb_link_mbit_s":"%s"}\n' \
+                "$(date -Is)" "$elapsed" "$total_written" "$total_rate" "$link_speed" \
+                >> "$DAS_THROUGHPUT_LOG" \
+                || log_warn "Could not append to throughput log $DAS_THROUGHPUT_LOG"
+        fi
     fi
 }
 
@@ -1661,9 +1780,15 @@ record_backup_run_in_db() {
     # line). An empty BTRBK_LATEST (capture failed, or genuinely nothing to
     # report) leaves both counts at 0, matching the original's behavior when
     # the live btrbk call failed or produced no non-header output.
+    # -1 is the "unknown" sentinel: it is not a plausible count, so it cannot
+    # be mistaken for a real zero the way 0 was. bd nsp (c4/c5).
     local snaps_created=0
     local snaps_sent=0
-    if [[ -n "$BTRBK_LATEST_RAW" ]]; then
+    if [[ "${BTRBK_LATEST_RAW_OK:-true}" != "true" ]]; then
+        snaps_created=-1
+        snaps_sent=-1
+        record_op "btrbk_counters" "FAIL" "btrbk list latest failed; counts unknown"
+    elif [[ -n "$BTRBK_LATEST_RAW" ]]; then
         # One source subvolume yields one snapshot, replicated to N targets, so
         # the two counts are genuinely different numbers — the old code set
         # snaps_sent = snaps_created as a proxy, which was never right even while
@@ -1672,6 +1797,16 @@ record_backup_run_in_db() {
             | grep -o "snapshot_subvolume='[^']*'" | sort -u | grep -c . || true)
         snaps_sent=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
             | grep -c "target_subvolume='[^']" || true)
+
+        # A btrbk that exited 0 and produced output, yet yields zero parsed
+        # rows, means the field names changed -- the third occurrence of this
+        # class in this file (bd oi0, bd 06p/bug_008). Zero is not accepted
+        # silently; it is reported as a parse failure.
+        if (( snaps_created == 0 && snaps_sent == 0 )); then
+            log_warn "btrbk produced output but no snapshot_subvolume/target_subvolume fields parsed —"
+            log_warn "  the --format=raw field names have probably changed. Counters are unreliable."
+            record_op "btrbk_counters" "FAIL" "raw output present but no fields parsed"
+        fi
     fi
 
     # Collect errors from failed operations (newline-separated for DB storage)
@@ -1922,8 +2057,17 @@ main() {
         report=$(generate_report)
         echo ""
         echo "$report"
-        send_report "$report" "$overall_status" || \
-            log_warn "Email delivery failed — backup itself completed successfully"
+        # A delivery failure used to be logged and nothing else -- no
+        # record_op, so the DB row and the (undelivered) report both said the
+        # run was fine. Combined with the exit code below, an email outage was
+        # invisible to systemd, Sentinel, the GUI and the operator alike.
+        # The old message also asserted the backup "completed successfully"
+        # regardless of whether it had. bd nsp (b15).
+        if ! send_report "$report" "$overall_status"; then
+            log_warn "Email delivery failed (run status was: $overall_status)"
+            record_op "email" "FAIL" "delivery failed; report was written to $LAST_REPORT"
+            overall_status="FAILURE"
+        fi
 
         # Record backup run in the database for GUI history
         record_backup_run_in_db "$overall_status" "$force_full"
@@ -1944,11 +2088,41 @@ main() {
         log_info "Backup complete. DAS can be safely disconnected."
     fi
 
-    # Last statement of main(): marks the clean-completion path so the EXIT
-    # trap (cleanup()) no-ops instead of re-running unmount_all/record_
-    # backup_run_in_db, which main() has already run itself by this point on
-    # every reachable path (real-run and dryrun alike). bd DAS-Backup-Manager-oeo.
+    # Marks the clean-completion path so the EXIT trap (cleanup()) no-ops
+    # instead of re-running unmount_all/record_backup_run_in_db, which main()
+    # has already run itself by this point on every reachable path (real-run
+    # and dryrun alike). bd DAS-Backup-Manager-oeo.
     SCRIPT_COMPLETED="true"
+
+    # ---- Process exit code: DELIBERATE, and narrower than "did it all work"
+    #
+    # This used to be whatever `SCRIPT_COMPLETED="true"` returned, i.e. always
+    # 0 -- so btrbk could fail outright at 03:00 and `systemctl status` stayed
+    # green. bd nsp (c1).
+    #
+    # The exit code now follows the split bd DAS-Backup-Manager-18p established
+    # for the scrub engine, for the same reason: cachyos-sentinel restarts any
+    # unit it observes in `failed` state, and its limiter is 3 restarts per
+    # 600 s. A backup takes ~30 min, so repeated failures NEVER land three
+    # inside one 600 s window and the limiter can never engage. Exiting
+    # nonzero on an ordinary per-target failure would therefore buy visibility
+    # at the price of an unbounded retry loop against a broken target.
+    #
+    #   exit 0        the run EXECUTED. Per-target failures are surfaced by the
+    #                 email report, the `btrdasd health` view, the DB row and
+    #                 the log -- channels that do not trigger a restart.
+    #   exit nonzero  the run could NOT execute: config load, lock, no primary
+    #                 target, mount verification abort, or btrbk failing on
+    #                 every target. These fail in seconds, which is the shape
+    #                 the 3-per-600 s limiter can actually brake.
+    #
+    # Every `exit 1` earlier in this script is already a could-not-execute
+    # case, so they need no change.
+    if [[ "${OP_STATUS[btrbk]:-OK}" == "FAIL" ]]; then
+        log_error "btrbk did not run successfully — exiting nonzero so this run is not recorded as green"
+        return 1
+    fi
+    return 0
 }
 
 main "$@"

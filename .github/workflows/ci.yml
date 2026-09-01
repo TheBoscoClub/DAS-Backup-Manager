@@ -95,7 +95,7 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files=(scripts/*.sh)
+          files=(scripts/*.sh tests/*.sh)
           if [ ${#files[@]} -eq 0 ]; then
             echo "no shell scripts found — failing rather than silently passing"
             exit 1
