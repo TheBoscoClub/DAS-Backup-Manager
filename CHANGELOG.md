@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.7.21.0] - 2026-08-31
+
+### Added
 - **`tests/test_esp_label_derivation.sh`** — falsification suite for the new ESP-label logic in
   `scripts/das-partition-drives.sh`. Ten cases covering both directions: three that the derivation
   produces exactly the labels present on the live drives today, five that each guard actually
@@ -861,7 +869,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.20.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.21.0...HEAD
+[0.7.21.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.20.0...v0.7.21.0
 [0.7.20.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.1...v0.7.20.0
 [0.7.19.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.0...v0.7.19.1
 [0.7.19.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.18.0...v0.7.19.0
