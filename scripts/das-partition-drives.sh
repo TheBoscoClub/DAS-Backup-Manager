@@ -320,7 +320,21 @@ resolve_fs_label() {
     local dev="$1" role="$2" fallback="$3"
     local part existing
     part="$(btrfs_partition_for_role "$role")"
-    existing="$(blkid -s LABEL -o value "${dev}${part}" 2>/dev/null || true)"
+    # blkid's empty output conflates two very different answers: "this
+    # filesystem has no LABEL" and "blkid could not tell me". Both used to
+    # arrive here as an empty string, and the caller then went on to WRITE the
+    # fallback label -- so a transient blkid failure on a labelled drive would
+    # silently rename it, which is the exact renaming this function exists to
+    # prevent (bd DAS-Backup-Manager-5j7). Separate them by exit status:
+    # 0 = a label was found, 2 = nothing to report (genuinely unlabelled),
+    # anything else (4 = usage/other per blkid(8)) is an error and fails closed.
+    local blkid_rc
+    existing="$(blkid -s LABEL -o value "${dev}${part}" 2>/dev/null)" || blkid_rc=$?
+    blkid_rc=${blkid_rc:-0}
+    if (( blkid_rc != 0 && blkid_rc != 2 )); then
+        log_error "blkid failed on ${dev}${part} (exit $blkid_rc) — refusing to guess whether a label exists." >&2
+        return 1
+    fi
 
     if [[ -n "$existing" ]]; then
         printf 'preserved|%s' "$existing"

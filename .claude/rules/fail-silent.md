@@ -65,6 +65,35 @@ site, never the pattern.
    nonzero would produce an unbounded retry loop rather than an alert. Recorded
    in full under `bd DAS-Backup-Manager-18p` and in `backup.md`.
 
+### Bash inventory, triaged 2026-09-01 (bd `76g`)
+
+All 54 hits of the bash grep below were classified. Everything fell into these
+shapes, each legitimate because the substituted value is the **cautious** one —
+so a future audit is a diff against this list, not a re-read:
+
+| Shape | Substitutes | Why cautious |
+|:--|:--|:--|
+| `smartctl`/`blkid`/`findmnt`/`btrfs` probe → `unknown`, `?`, empty | "no reading" | never a fabricated measurement; `usb_link_mbit_s` stays a **string** for this reason |
+| `mountpoint -q … 2>/dev/null` | "not a mountpoint" | sends callers into skip/abort, which is the safe branch |
+| `btrfs filesystem label … \|\| echo "$mnt"` | the mount path | display-only fallback |
+| report gathering (`df`, `btrbk list latest`) → blank | "no data" | costs a report row, never a decision |
+| `date -d … \|\| echo 0` | epoch 0 | **explicitly handled**: `boot-archive-cleanup.sh` logs and `continue`s rather than deleting; the growth-log reader skips the entry |
+| `echo … > /sys/…/scheduler \|\| true` | kernel default | a performance hint, not correctness |
+
+Two of these were checked closely because a `0` sentinel on a **deletion** path
+would be the permissive direction. Both are safe: `parse_archive_timestamp`
+returning `0` reaches `if (( archive_epoch == 0 )); then log_warn; continue`, so
+an unparseable archive is **skipped, never pruned**.
+
+One real defect was found and fixed: `resolve_fs_label` in
+`das-partition-drives.sh` read `blkid`'s empty output as "unlabelled", which
+conflates *no LABEL* with *blkid could not tell me*. On the second reading the
+caller went on to **write** the fallback label — silently renaming a filesystem,
+the exact renaming that function exists to prevent (`bd 5j7`). Now split by exit
+status: `0` found, `2` genuinely unlabelled, anything else fails closed. Two
+regression cases in `tests/test_esp_label_derivation.sh`, both observed RED
+against the pre-fix code with `guard did NOT fire (exit 0)`.
+
 ---
 
 ## Always a defect here

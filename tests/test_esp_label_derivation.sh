@@ -137,6 +137,17 @@ accept "bootable role reads partition 2" \
      resolve_fs_label /dev/sdj mirror fb' \
     "preserved|PART:/dev/sdj2"
 
+refuse "a blkid ERROR is not read as 'unlabelled' — it fails closed" \
+    'blkid() { return 4; }
+     resolve_fs_label /dev/sdl primary "das-backup-would-rename-me" || exit 1
+     echo "SURVIVED-THE-GUARD"' \
+    "refusing to guess whether a label exists"
+refuse "the same error refused through read_fs_label" \
+    'blkid() { return 4; }
+     read_fs_label /dev/sdl primary "das-backup-would-rename-me" || exit 1
+     echo "SURVIVED-THE-GUARD"' \
+    "refusing to guess whether a label exists"
+
 refuse "blank drive with no fallback is refused, not silently unlabelled" \
     'blkid() { return 2; }
      resolve_fs_label /dev/sdz primary ""' \
