@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proving the guards stay silent on valid input. Failure cases assert on the specific guard's
   message, not merely on a nonzero exit — an earlier draft of the harness "passed" four cases on
   `command not found` and then on `unbound variable`, neither of which touched the code under test
+- **`docs/THROUGHPUT-BASELINE.md`** — the measured healthy-run baseline, and the reasoning for why
+  throughput is the wrong signal for the fault that motivated it. The enclosure ran at 480 Mbit/s
+  (link speed) for nine days while every backup completed and reported success; the aggregate write
+  rate either side of the repair was 9.17 MiB/s degraded against 10.97 MiB/s healthy, which is
+  inside ordinary run-to-run variation. Records the `throughput.jsonl` field dimensions, the
+  5000 Mbit/s alert threshold and why a degraded link warns rather than aborts, and the
+  re-cabling procedure
+- **`.claude/rules/fail-silent.md`** — which error suppressions are legitimate in this codebase and
+  which are always defects, so the next audit is a **diff** against a list rather than a re-read of
+  the tree. Organised around the one question that decides it: when a suppression swallows an error,
+  does the value it substitutes make the caller more cautious or less? `health::is_mountpoint`
+  returning `false` on an unreadable `/proc/mounts` is correct because `false` produces a refusal;
+  the identical `Err(_) => false` would be a defect where `false` meant "permitted"
+- **Counter-tests for all three privileged-path fixes below** — seven tests, each observed RED
+  against the pre-fix code and paired with a positive control so a function that refused
+  *everything* could not pass. Suite total 389 → 396
 
 ### Changed
 - **ESP and boot documentation now identifies entries by PARTUUID, never by firmware entry number**:
@@ -38,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SMART and device examples now use `/dev/disk/by-id/` paths instead of `/dev/sdX` letters** in
   `docs/examples/author-storage-reference.md` — the letters drifted with the board swap (`ZXA0MHSK`
   was `/dev/sda` in April and is `/dev/sdh` now) and drift again on every USB re-enumeration
+- **The `Index*` D-Bus methods no longer take a database path from the caller** — `IndexWalk`,
+  `IndexStats`, `IndexListSnapshots`, `IndexListFiles`, `IndexSearch`, `IndexBackupHistory` and
+  `IndexSnapshotPath` each lost their `db_path` argument and now resolve it from
+  `general.db_path` in the canonical config. This is a D-Bus signature change; the in-repo Plasma
+  GUI is the only client and ships with it. Follows the precedent set for the caller-supplied
+  config path in `bd DAS-Backup-Manager-wd7`. See **Security** below for why
+- **Removed the GUI's `--db` command-line option and its `DatabasePath` settings field**: with the
+  helper resolving the path itself, both would have been controls that silently did nothing — the
+  same fail-silent class being fixed elsewhere in this release. The `DatabasePath` field was
+  already inert, bound to a value nothing persisted or re-read. `m_dbPath` is gone from
+  `MainWindow`, `SnapshotWatcher`, `FileModel`, `SearchModel`, `SnapshotModel`, `BackupHistoryView`
+  and `IndexRunner`
 
 ### Fixed
 - **`scripts/das-partition-drives.sh` gave every bootable recovery drive the same ESP label** (v2.1.0):
@@ -72,6 +100,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-01-31. It is named in `esp-sync.sh`'s `is_unique_file()` so it was never mirrored; deleting it
   leaves `loader/random-seed` — per-ESP entropy, deliberately never copied — as the only difference
   between the primary and mirror ESPs
+- **`mount::ensure_targets_mounted` marked a target available on two failure paths**: both the
+  "could not create the mount point for a bind mount" branch and the "bind mount failed" branch set
+  `any_available = true` immediately after logging the failure — the second while its own message
+  read `btrbk may not find this target`. The flag's only job is to answer "did anything mount?",
+  and both failure paths answered yes. A discarded error is an invented success
+- **The Rust backup path had no equivalent of `verify_targets_before_btrbk`**: `scripts/backup-run.sh`
+  grew that guard after `bd DAS-Backup-Manager-9on`, when btrbk wrote to a bare mount point and
+  filled the NVMe root. Rust never did, and `run_backup` deliberately skips re-checking mount status
+  when targets are named explicitly — which the Plasma GUI **always** does, so the 9on failure mode
+  was fully reachable from the GUI. `mount::verify_write_targets()` now runs before btrbk on every
+  path including `--dry-run`, asserting each write target is a real mount point and, where
+  `mount_uuid` is configured, that the filesystem mounted there is the expected one. UUID is checked
+  rather than the device so a BTRFS RAID-1 array mounted degraded from one leg still passes.
+  Deliberately scoped: only targets btrbk will be told to write to are fatal; a stale bare directory
+  at a target not in this run is reported as a warning, since nothing will write there
+  (`bd DAS-Backup-Manager-aea`)
+- **`backup-verify.sh` showed `Unknown` for the RAID-1 partner drive**: the SMART display map was
+  keyed on `DAS_TARGET_n_SERIAL` — the legacy single-anchor serial — so only one member of the
+  22 TB RAID-1 pair was ever named, and `ZXA1R71M` rendered as `Unknown` while its health was being
+  read perfectly well. The map is now built from `DAS_TARGET_n_SERIALS`, falling back to the anchor
+  for configs written by a pre-0.7.13 `btrdasd`. Verified against the live config: the new map
+  carries all four drive serials, the old one carried three (`bd DAS-Backup-Manager-5b1`)
+
+### Security
+- **The `Index*` D-Bus methods were a root file-create-and-write at a caller-chosen path**
+  (`bd DAS-Backup-Manager-gko`): each took `db_path` from the caller and passed it to
+  `Database::open` as root. That is not a read — `Connection::open` creates the file when absent,
+  `journal_mode=wal` creates `-wal`/`-shm` sidecars beside it, and `execute_batch(SCHEMA_SQL)` plus
+  `migrate()` then write into it, so pointing a method at an existing SQLite database anywhere on
+  the host would open and **migrate** it. Polkit authorizes the action, never the path, and
+  `org.dasbackup.index.read` is `allow_active=yes` — so six of the seven methods needed **no
+  authentication prompt at all** from any active local session. The path is now resolved from the
+  canonical config and the parameter is gone from the interface entirely
+- **`RestoreFiles` and `RestoreSnapshot` never constrained where they read FROM**
+  (`bd DAS-Backup-Manager-7ra`): `bd DAS-Backup-Manager-s05` constrained the destination
+  (`allowed_roots`, `RESTORE_DENIED_ROOTS`, `O_NOFOLLOW`) but left the source unchecked, so an
+  authorized caller could have root copy any directory tree on the host — `/etc`, `/root`, another
+  user's home — into a permitted destination and then read it unprivileged. `check_source_allowed()`
+  now requires the snapshot to resolve inside a configured backup target before anything is read.
+  It fails closed on an empty target list, and resolves fully so a symlinked ancestor cannot smuggle
+  a read past it. `snapshot_source_roots()` admits both the configured mount and the live udisks2
+  mount (`/run/media/…`), because an indexed snapshot path can legitimately be either
 
 ## [0.7.20.0] - 2026-08-28
 

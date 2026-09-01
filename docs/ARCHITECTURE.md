@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.19.1
+**Version**: 0.7.21.0
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -25,7 +25,7 @@ do — and this project never touches filesystems that aren't backup media.
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (v0.7.19.1)
+## Component Overview (v0.7.21.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -59,7 +59,7 @@ The system has six major components:
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
 | Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 17 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
-| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). Since 0.7.20.0 no method accepts a config path from the caller — the daemon reads `CANONICAL_CONFIG` only |
+| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | FFI bridge | Rust 2024 | `libbuttered_dasd_ffi.so` | C-ABI shared library for GUI access to Rust library |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 10-step setup wizard with template generation |
@@ -84,6 +84,14 @@ The system has six major components:
 
 ESP synchronization to recovery drives was removed 2026-04-10 after the ESP-overwrite
 incident — see `.claude/rules/esp-safety.md`. `backup-run.sh` has no ESP/rsync step.
+
+Both orchestrators verify their targets before invoking btrbk, and they must:
+`backup-run.sh` via `verify_targets_before_btrbk()`, the Rust path (D-Bus/GUI and
+manual `btrdasd`) via `mount::verify_write_targets()`. The Rust guard was missing
+until 0.7.21.0, and `run_backup` deliberately skips re-checking mount status when
+targets are named explicitly — which the GUI always does — so `bd DAS-Backup-Manager-9on`
+was reachable from the GUI for as long as the GUI has existed
+(`bd DAS-Backup-Manager-aea`).
 
 ### Scrub Pipeline
 
@@ -320,11 +328,14 @@ Every install writes `/etc/das-backup/.manifest` — a plain-text list of genera
 
 ## Privilege Boundary
 
-`btrdasd-helper` is a root daemon on the system bus, reachable by unprivileged local clients. Polkit answers *may this caller perform this action* — it says nothing about *which object*. Three rules follow, all introduced in 0.7.20.0 after an independent review found each one violated:
+`btrdasd-helper` is a root daemon on the system bus, reachable by unprivileged local clients. Polkit answers *may this caller perform this action* — it says nothing about *which object*. Four rules follow. The first three were introduced in 0.7.20.0 after an independent review found each one violated; 0.7.21.0 found rule 1 violated a second time in a different parameter, and added rule 4:
 
-1. **No path arrives from the caller.** The daemon reads and writes exactly one configuration file, `CANONICAL_CONFIG`. Seventeen methods previously took a `config_path` and passed it to `Config::load`/`save` as root, so `ConfigGet` — whose action `org.dasbackup.config.read` the installed policy grants to any active session with **no prompt**, so the GUI can list sources at startup — doubled as an unauthenticated root-privileged read of any TOML-parseable file (`bd DAS-Backup-Manager-wd7`).
+1. **No path arrives from the caller.** The daemon reads and writes exactly one configuration file, `CANONICAL_CONFIG`, and opens exactly one index database, `canonical_db_path()` (resolved from `general.db_path` in that config). Seventeen methods previously took a `config_path` and passed it to `Config::load`/`save` as root, so `ConfigGet` — whose action `org.dasbackup.config.read` the installed policy grants to any active session with **no prompt**, so the GUI can list sources at startup — doubled as an unauthenticated root-privileged read of any TOML-parseable file (`bd DAS-Backup-Manager-wd7`).
+
+   The same defect survived one indirection further out until 0.7.21.0: seven `Index*` methods took a `db_path` and handed it to `Database::open` as root. That is **not a read** — `Connection::open` creates the file when absent, `journal_mode=wal` creates `-wal`/`-shm` sidecars, and `execute_batch(SCHEMA_SQL)` + `migrate()` write into it, so an existing SQLite database anywhere on the host would be opened and *migrated*. Six of the seven sit behind `org.dasbackup.index.read`, which is `allow_active=yes` — **no authentication prompt at all** (`bd DAS-Backup-Manager-gko`). Fixing one parameter did not fix the class; a path parameter on a root daemon is the defect, whatever it is called.
 2. **A destination is policy, not a parameter.** Restore paths are checked against `[restore] allowed_roots` and an unoverridable denylist before anything is created, and writes use `O_NOFOLLOW` (`bd DAS-Backup-Manager-s05`).
 3. **Authorization of an action is not authorization over an object.** `JobCancel` checks polkit *and* that the caller owns the job; job ids are broadcast on every progress signal, so the action check alone let any authorized client abort anyone's work (`bd DAS-Backup-Manager-h2s`).
+4. **A source is policy too, not just a destination.** Rule 2 constrained where a restore may *write* and left unconstrained where it may *read*, so an authorized caller could have root copy `/etc`, `/root`, or another user's home into a permitted destination and then read it unprivileged. `restore::check_source_allowed()` requires the snapshot to resolve inside a configured backup target before anything is read, and fails closed when no targets are configured (`bd DAS-Backup-Manager-7ra`).
 
 The daemon also participates in the same singleton + maintenance lock interlock as `backup-run.sh` and the scrub engine. It did not until 0.7.20.0: `bd DAS-Backup-Manager-pe6` fixed the CLI in 0.7.15.0 and never reached the daemon the GUI actually calls (`bd DAS-Backup-Manager-dca`).
 
@@ -401,6 +412,8 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 - **TOML configuration**: Deserialized via `serde` with strongly-typed structs — invalid config fails at parse time
 - **FTS5 queries**: The GUI auto-quotes search terms with `"` delimiters, preventing FTS5 syntax injection
 - **File paths**: All path operations use `std::path::PathBuf` (Rust) or `QString` (C++) — no raw C string manipulation
+- **Restore sources and destinations**: Both ends are checked against policy before anything is read or created, on the fully resolved path so a symlinked ancestor cannot smuggle either past the check — destinations against `[restore] allowed_roots` plus an unoverridable denylist, sources against the configured target mounts
+- **Backup write targets**: `mount::verify_write_targets()` asserts every target btrbk will be told to write to is a real mount point carrying the expected filesystem UUID, before btrbk is invoked. Writing to a bare mount point falls through to the underlying filesystem — normally the NVMe root — and fills it (`bd DAS-Backup-Manager-9on`)
 
 ### Efficiency
 

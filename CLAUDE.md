@@ -33,5 +33,6 @@ See `.claude/rules/` for project-specific rules:
 - `esp-safety.md` — **CRITICAL** — DAS ESP partition safety (never sync host ESP onto DAS drives)
 - `build.md` — CMake, Qt6/KF6, C++20 build conventions
 - `backup.md` — btrbk, DAS, retention, boot archival
+- `fail-silent.md` — which error suppressions are legitimate here, and which are always defects
 
 
