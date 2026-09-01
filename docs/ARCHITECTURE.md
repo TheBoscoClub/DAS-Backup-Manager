@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.22.0
+**Version**: 0.7.22.1
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -44,7 +44,7 @@ at that path. `ClaudeCodeProjects/powershell-scripts` had been in the same state
 for three weeks. See `.claude/rules/backup.md` for the reproduction and the
 per-filesystem command that finds coverage gaps.
 
-## Component Overview (v0.7.22.0)
+## Component Overview (v0.7.22.1)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

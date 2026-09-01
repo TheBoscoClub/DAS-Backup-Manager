@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.7.22.1] - 2026-09-01
+
+### Added
 - **`verify_sources_before_write()` in `scripts/backup-run.sh`** — the source-side counterpart to
   `verify_targets_before_btrbk`, called between `mount_sources` and `create_snapshot_dirs`, which is
   the first writer to a source path. Per source it requires a real mountpoint, a filesystem UUID
@@ -996,7 +1004,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.1...HEAD
+[0.7.22.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.0...v0.7.22.1
 [0.7.22.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.21.0...v0.7.22.0
 [0.7.21.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.20.0...v0.7.21.0
 [0.7.20.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.1...v0.7.20.0
