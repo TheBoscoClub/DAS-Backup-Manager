@@ -13,10 +13,6 @@ SettingsDialog::SettingsDialog(QWidget *parent, const QString &name, KCoreConfig
     auto *page = new QWidget(this);
     auto *layout = new QFormLayout(page);
 
-    m_dbPathEdit = new QLineEdit(page);
-    m_dbPathEdit->setObjectName(QStringLiteral("kcfg_DatabasePath"));
-    layout->addRow(i18n("Database path:"), m_dbPathEdit);
-
     m_watchPathEdit = new QLineEdit(page);
     m_watchPathEdit->setObjectName(QStringLiteral("kcfg_WatchPath"));
     layout->addRow(i18n("Watch path:"), m_watchPathEdit);

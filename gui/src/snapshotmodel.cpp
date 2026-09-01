@@ -7,10 +7,9 @@
 
 #include <algorithm>
 
-SnapshotModel::SnapshotModel(DBusClient *client, const QString &dbPath, QObject *parent)
+SnapshotModel::SnapshotModel(DBusClient *client, QObject *parent)
     : QAbstractItemModel(parent)
     , m_client(client)
-    , m_dbPath(dbPath)
 {
     connect(m_client, &DBusClient::indexListSnapshotsResult,
             this, &SnapshotModel::onSnapshotsReceived);
@@ -25,7 +24,7 @@ QString SnapshotModel::tsToDate(const QString &ts)
 
 void SnapshotModel::reload()
 {
-    m_client->indexListSnapshotsAsync(m_dbPath);
+    m_client->indexListSnapshotsAsync();
 }
 
 void SnapshotModel::onSnapshotsReceived(const QString &json)

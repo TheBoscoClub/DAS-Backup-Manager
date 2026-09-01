@@ -305,6 +305,28 @@ fn save_config(config: &Config) -> Result<(), fdo::Error> {
         .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
 }
 
+/// The one index database this daemon will open.
+///
+/// Every `Index*` method used to take the database path from the caller and
+/// hand it to `Database::open` as root. That is not a read: `Connection::open`
+/// creates the file when absent, `journal_mode=wal` creates `-wal`/`-shm`
+/// sidecars beside it, and `execute_batch(SCHEMA_SQL)` + `migrate()` then write
+/// into it. So the six read methods were a root file-create-and-write at a
+/// caller-chosen path, and pointed at an existing SQLite database anywhere on
+/// the host they would open and MIGRATE it.
+///
+/// Polkit authorizes the ACTION, never the PATH — and `org.dasbackup.index.read`
+/// is `allow_active=yes`, so this needed no authentication prompt at all
+/// (bd DAS-Backup-Manager-gko). Same defect as the caller-supplied config path
+/// fixed in bd DAS-Backup-Manager-wd7, one indirection further out.
+///
+/// Resolved from the canonical config rather than a constant so an
+/// administrator can still relocate the index — by editing a root-owned file,
+/// which is a privilege they already hold.
+fn canonical_db_path() -> Result<String, fdo::Error> {
+    Ok(load_config()?.general.db_path)
+}
+
 // ---------------------------------------------------------------------------
 // D-Bus interface
 // ---------------------------------------------------------------------------
@@ -671,7 +693,6 @@ impl HelperInterface {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         target_path: &str,
-        db_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index").await?;
@@ -684,7 +705,7 @@ impl HelperInterface {
         let jid = job_id.clone();
         let conn = self.conn.clone();
         let target_path = target_path.to_owned();
-        let db_path = db_path.to_owned();
+        let db_path = config.general.db_path.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
@@ -781,11 +802,10 @@ impl HelperInterface {
     async fn index_stats(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        db_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-        let db_path = db_path.to_owned();
+        let db_path = canonical_db_path()?;
 
         // Read the file's current mtime/size cheaply on a blocking thread.
         let probe_path = db_path.clone();
@@ -893,11 +913,10 @@ impl HelperInterface {
     async fn index_list_snapshots(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        db_path: &str,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-        let db_path = db_path.to_owned();
+        let db_path = canonical_db_path()?;
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let db = Database::open(&db_path)
                 .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
@@ -930,14 +949,13 @@ impl HelperInterface {
     async fn index_list_files(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        db_path: &str,
         snapshot_id: i64,
         limit: i64,
         offset: i64,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-        let db_path = db_path.to_owned();
+        let db_path = canonical_db_path()?;
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let db = Database::open(&db_path)
                 .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
@@ -983,13 +1001,12 @@ impl HelperInterface {
     async fn index_search(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        db_path: &str,
         query: &str,
         limit: i64,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-        let db_path = db_path.to_owned();
+        let db_path = canonical_db_path()?;
         let query = query.to_owned();
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let db = Database::open(&db_path)
@@ -1020,12 +1037,11 @@ impl HelperInterface {
     async fn index_backup_history(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        db_path: &str,
         limit: i64,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-        let db_path = db_path.to_owned();
+        let db_path = canonical_db_path()?;
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let db = Database::open(&db_path)
                 .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
@@ -1058,12 +1074,11 @@ impl HelperInterface {
     async fn index_snapshot_path(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        db_path: &str,
         snapshot_id: i64,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
-        let db_path = db_path.to_owned();
+        let db_path = canonical_db_path()?;
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let db = Database::open(&db_path)
                 .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
@@ -1109,6 +1124,7 @@ impl HelperInterface {
                     &file_refs,
                     Path::new(&dest),
                     &config.restore.allowed_roots,
+                    &restore::snapshot_source_roots(&config),
                     &progress,
                 ) {
                     Ok(r) => Ok((
@@ -1174,6 +1190,7 @@ impl HelperInterface {
                     Path::new(&snapshot),
                     Path::new(&dest),
                     &config.restore.allowed_roots,
+                    &restore::snapshot_source_roots(&config),
                     &progress,
                 ) {
                     Ok(r) => Ok((

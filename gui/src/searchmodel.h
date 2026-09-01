@@ -21,7 +21,7 @@ class SearchModel : public QAbstractTableModel
 public:
     enum Column { Path = 0, Name, Size, Modified, FirstSnapshot, LastSnapshot, ColumnCount };
 
-    explicit SearchModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
+    explicit SearchModel(DBusClient *client, QObject *parent = nullptr);
 
     void executeSearch(const QString &query, qint64 limit);
     void clear();
@@ -34,6 +34,5 @@ public:
 
 private:
     DBusClient *m_client;
-    QString m_dbPath;
     QVector<SearchResult> m_results;
 };

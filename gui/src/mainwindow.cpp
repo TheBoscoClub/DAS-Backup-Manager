@@ -44,14 +44,12 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-MainWindow::MainWindow(const QString &dbPath, QWidget *parent)
+MainWindow::MainWindow(QWidget *parent)
     : KXmlGuiWindow(parent)
-    , m_dbPath(dbPath)
 {
     m_dbusClient = new DBusClient(this);
     m_indexRunner = new IndexRunner(m_dbusClient, this);
     m_snapshotWatcher = new SnapshotWatcher(m_indexRunner, this);
-    m_snapshotWatcher->setDbPath(m_dbPath);
     m_restoreAction = new RestoreAction(this);
     connect(m_restoreAction, &RestoreAction::finished, this, [this](bool success, const QString &error) {
         if (success) {
@@ -139,7 +137,7 @@ void MainWindow::setupUi()
     m_stack->addWidget(m_backupRunPage); // index 1
 
     // Page 2: Backup History
-    m_backupHistoryPage = new BackupHistoryView(m_dbusClient, m_dbPath, this);
+    m_backupHistoryPage = new BackupHistoryView(m_dbusClient, this);
     m_stack->addWidget(m_backupHistoryPage); // index 2
 
     // Page 3: Config (opens ConfigDialog on selection)
@@ -212,9 +210,9 @@ void MainWindow::setupBrowsePage()
 {
     m_browsePage = new QWidget(this);
 
-    m_snapshotModel = new SnapshotModel(m_dbusClient, m_dbPath, this);
-    m_fileModel = new FileModel(m_dbusClient, m_dbPath, this);
-    m_searchModel = new SearchModel(m_dbusClient, m_dbPath, this);
+    m_snapshotModel = new SnapshotModel(m_dbusClient, this);
+    m_fileModel = new FileModel(m_dbusClient, this);
+    m_searchModel = new SearchModel(m_dbusClient, this);
 
     // Search bar with debounce
     m_searchBar = new QLineEdit(m_browsePage);
@@ -444,12 +442,12 @@ void MainWindow::triggerReindex()
 
     // Empty target path → D-Bus helper walks ALL mounted config targets
     statusBar()->showMessage(i18n("Re-indexing all targets..."));
-    m_indexRunner->run(QString(), m_dbPath);
+    m_indexRunner->run(QString());
 }
 
 void MainWindow::showStats()
 {
-    const QString json = m_dbusClient->indexStats(m_dbPath);
+    const QString json = m_dbusClient->indexStats();
     if (json.isEmpty()) {
         KMessageBox::error(this, i18n("Failed to load statistics."));
         return;
@@ -471,7 +469,7 @@ void MainWindow::updateStatusBar()
     m_statusState.pending = 3;
     m_statusLabel->setText(i18n("Loading..."));
 
-    m_dbusClient->indexStatsAsync(m_dbPath);
+    m_dbusClient->indexStatsAsync();
     m_dbusClient->scheduleGetAsync();
     m_dbusClient->healthQueryAsync();
 
@@ -562,7 +560,7 @@ void MainWindow::restoreSelectedFiles()
         return;
     }
 
-    QString snapshotPath = m_dbusClient->indexSnapshotPath(m_dbPath, m_currentSnapshotId);
+    QString snapshotPath = m_dbusClient->indexSnapshotPath(m_currentSnapshotId);
     if (snapshotPath.isEmpty()) {
         KMessageBox::error(this, i18n("Could not resolve snapshot path."));
         return;
@@ -626,7 +624,6 @@ void MainWindow::showSettings()
     }
 
     auto *config = new KConfigSkeleton(QString(), this);
-    config->addItemString(QStringLiteral("DatabasePath"), m_dbPath, m_dbPath);
 
     auto *dialog = new SettingsDialog(this, QStringLiteral("settings"), config);
     dialog->show();

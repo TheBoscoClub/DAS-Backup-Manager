@@ -29,11 +29,6 @@ void SnapshotWatcher::setWatchPath(const QString &path)
     }
 }
 
-void SnapshotWatcher::setDbPath(const QString &dbPath)
-{
-    m_dbPath = dbPath;
-}
-
 void SnapshotWatcher::setEnabled(bool enabled)
 {
     m_enabled = enabled;
@@ -64,7 +59,7 @@ void SnapshotWatcher::onDirectoryChanged(const QString &path)
 void SnapshotWatcher::triggerIndex()
 {
     if (m_runner && !m_runner->isRunning()) {
-        m_runner->run(m_watchPath, m_dbPath);
+        m_runner->run(m_watchPath);
         Q_EMIT indexingTriggered();
     }
 }

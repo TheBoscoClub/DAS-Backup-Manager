@@ -7,10 +7,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
-SearchModel::SearchModel(DBusClient *client, const QString &dbPath, QObject *parent)
+SearchModel::SearchModel(DBusClient *client, QObject *parent)
     : QAbstractTableModel(parent)
     , m_client(client)
-    , m_dbPath(dbPath)
 {
 }
 
@@ -19,7 +18,7 @@ void SearchModel::executeSearch(const QString &query, qint64 limit)
     beginResetModel();
     m_results.clear();
 
-    const QString json = m_client->indexSearch(m_dbPath, query, limit);
+    const QString json = m_client->indexSearch(query, limit);
     if (!json.isEmpty()) {
         const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
         for (const QJsonValue &v : arr) {

@@ -22,7 +22,7 @@ public:
     enum Column { Name = 0, Path, Size, Modified, Type, ColumnCount };
     enum Roles { FileIdRole = Qt::UserRole + 1, FilePathRole };
 
-    explicit FileModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
+    explicit FileModel(DBusClient *client, QObject *parent = nullptr);
 
     void loadSnapshot(qint64 snapshotId);
     void loadMore();
@@ -43,7 +43,6 @@ private:
     static constexpr qint64 PageSize = 10000;
 
     DBusClient *m_client;
-    QString m_dbPath;
     QVector<FileInfo> m_files;
     qint64 m_currentSnapshotId = -1;
     qint64 m_totalFiles = 0;

@@ -14,7 +14,6 @@ public:
     explicit SnapshotWatcher(IndexRunner *runner, QObject *parent = nullptr);
 
     void setWatchPath(const QString &path);
-    void setDbPath(const QString &dbPath);
     void setEnabled(bool enabled);
     [[nodiscard]] bool isEnabled() const;
 
@@ -31,7 +30,6 @@ private:
     IndexRunner *m_runner = nullptr;
     QTimer *m_delayTimer = nullptr;
     QString m_watchPath;
-    QString m_dbPath;
     bool m_enabled = false;
 
     static constexpr int IndexDelayMs = 30000;

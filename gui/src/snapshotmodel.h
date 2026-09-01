@@ -26,7 +26,7 @@ public:
         IsDateGroupRole,
     };
 
-    explicit SnapshotModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr);
+    explicit SnapshotModel(DBusClient *client, QObject *parent = nullptr);
 
     void reload();
     void setSortOrder(Qt::SortOrder order);
@@ -49,7 +49,6 @@ private:
     };
 
     DBusClient *m_client;
-    QString m_dbPath;
     QVector<SnapshotInfo> m_snapshots;
     QVector<DateGroup> m_groups;
 
