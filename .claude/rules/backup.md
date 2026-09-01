@@ -62,9 +62,32 @@ usually what you want for a deleted project, but it is a decision, not a default
 **Target scoping is part of the entry, not an afterthought.** Bulk data gets
 `target_labels = ["primary-22tb"]`; only system-recovery-relevant data goes to the
 two 2 TB recovery drives, which hold ~1.3 TB free each and exist to boot a machine,
-not to store media. `ssd-steam`, `ssd-vm`, `hdd-media`, `hdd-audiobooks` and
-`das-storage` all follow this. A source with `target_labels = []` fans out to *all
-three* targets — correct for `@`/`@home`/`@opt`, wrong for a growing VM image.
+not to store media. `ssd-steam`, `ssd-vm`, `nvme-vm`, `hdd-media`, `hdd-audiobooks`
+and `das-storage` all follow this. A source with `target_labels = []` fans out to
+*all three* targets — correct for `@`/`@home`/`@opt`, wrong for a growing VM image.
+
+**A bulk payload buried inside a broadly-scoped subvolume defeats the scoping, and
+the config cannot show you that it has.** `/var/lib/libvirt/images` was a plain
+directory inside `@`, so its 20 GB `test-vm-cachyos.qcow2` rode the `nvme` source
+(`target_labels = []`) to both recovery drives daily, and `config.toml` looked
+entirely correct throughout — scoping is declared per *subvolume*, and a directory
+has no entry to scope. It was moved to its own `@libvirt-images` subvolume on the
+same NVMe filesystem (2026-09-01), mounted at the same path via `/etc/fstab`, and
+declared as the `nvme-vm` source. Two details are load-bearing if this is ever
+redone:
+
+- `chattr +C` the subvolume **before** any file lands in it — NoCoW is inherited at
+  create time and cannot be applied retroactively to existing extents.
+- Copy with `cp --reflink=never`. A default `cp` within one BTRFS filesystem makes a
+  reflink, and reflinked extents are copy-on-write no matter what the `C` flag says,
+  so the "NoCoW" image would fragment exactly as before. Confirm by allocation, not
+  apparent size: `du -b` implies `--apparent-size` and cannot tell the two apart.
+
+Verified by booting the VM from the relocated image and getting a DHCP lease back
+from the guest agent — a running qemu process is not evidence the guest came up.
+Tracked as bd `DAS-Backup-Manager-fk5`.
+
+
 
 Incident that produced this section (2026-09-01): `@srv/VirtualMachines` was created
 2026-08-31 20:14 holding a 137 GB Windows 11 qcow2. It sat nested inside `@srv`,
@@ -118,7 +141,8 @@ Tracked as bd `DAS-Backup-Manager-tku` / `-rjc` / `-zm6`.
 `restore_files`/`restore_snapshot` run as root under `btrdasd-helper`, and until 0.7.20.0 they accepted **any** destination and followed symlinks at it (`bd DAS-Backup-Manager-s05`). Three controls now apply, and they are checked before any directory is created:
 
 - **`[restore] allowed_roots` in `config.toml`** — the roots a restore may write beneath. Defaults to `/home` and `/tmp`. Widen it here rather than in code.
-- **`RESTORE_DENIED_ROOTS` (`indexer/src/config.rs`)** — `/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/root`, `/var/lib`, `/var/spool`, `/dev`, `/proc`, `/sys`. **Checked first, and no configuration can override it** — listing one of these in `allowed_roots` does not enable it. These are the paths where a restored file becomes executable code or changes system identity; `.claude/rules/esp-safety.md` records what that costs.
+- **`RESTORE_DENIED_ROOTS` (`indexer/src/config.rs`)** — `/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/root`, `/var/lib`, `/var/spool`, `/dev`, `/proc`, `/sys`, `/srv/http`, `/srv/ftp`. **Checked first, and no configuration can override it** — listing one of these in `allowed_roots` does not enable it. These are the paths where a restored file becomes executable code or changes system identity; `.claude/rules/esp-safety.md` records what that costs. The two `/srv` entries are there for the same reason by a different route: they are the distro-default document roots, so a file restored into either is *served* to whoever can reach the listener.
+- **`/srv/VirtualMachines` was granted to `allowed_roots` on 2026-09-01** so the `ssd-vm` source can be restored in place — backing something up that cannot be restored is half a mechanism. Note the shape of the grant: a **subdirectory** of `/srv`, never `/srv` itself, and the two served roots were added to the denylist in the same change so that widening the grant to the parent later still cannot reach them. Comparison is component-wise, so `/srv/http-archive` is unaffected by the denial.
 - **`O_NOFOLLOW` on every write**, so a symlink pre-planted at the destination fails the open instead of being followed.
 
 Both roots are compared **after resolution**, so a symlinked ancestor cannot smuggle a write past them. Member paths are separately rejected if they are absolute or contain any non-literal component — one check, because the same string is joined onto both the source and the destination.
@@ -162,6 +186,8 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 - **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00; the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
 - **For intentional manual stops** of an in-progress backup (e.g. wrong targeting, debugging) — `systemctl stop das-backup.service` alone is insufficient: Sentinel will restart it within seconds. The correct sequence for a manual stop is `systemctl stop das-backup.service && systemctl mask das-backup.service`. Mask makes Sentinel's start attempt fail at the systemd layer (`unit is masked`), and Sentinel will log the failure rather than thrash on it. Unmask + re-enable timer to resume normal operation.
 - **If Sentinel's retries become unwanted** (e.g. persistent hardware fault causing thrashing), add an exclusion in Sentinel's runtime config at `/etc/sentinel/` — service-monitoring exclusion list. The das-backup unit files themselves are clean (no `Restart=`, no `OnFailure=`, no `OnUnitInactiveSec=`); Sentinel is the layer above.
+- **`das-backup-doctor.service` carries `SuccessExitStatus=1`, and that line is load-bearing.** `btrdasd doctor` exits 1 when it FINDS DRIFT — a successful check with a result, deliberately kept as a CLI contract (bd `DAS-Backup-Manager-01u`: "exit 1 is the whole point of the weekly timer"). systemd cannot tell a finding from a malfunction, so before this line it marked the unit `failed`, Sentinel restarted it, the restart failed identically, and Sentinel notified `"backup service das-backup-doctor.service last run failed: Result=exit-code"` — the operator was told the checker broke at the moment it worked, and that alert competed with the drift email carrying the real signal (observed 2026-08-31: run 13:47:34 → drift found → emailed → sentinel restart 13:47:57 → notification 13:48:08; same double-start on Aug 23). Bounded at 2 starts, because Sentinel gives up when the restart command itself fails — this was never the unbounded loop `18p` guards against, which is why the fix is a unit directive and not another exit-code narrowing.
+- **The two meanings that shared doctor exit 1 are now split** (bd `DAS-Backup-Manager-f6p`), because `SuccessExitStatus=1` would otherwise have swallowed both: **1** = drift found (a finding; unit succeeds), **3** = at least one volume failed to mount/list while others were checked (an operational fault; unit fails, and it outranks 1 when both occur — an incomplete check cannot assert its drift list is complete), **2** = could not run at all, **0** = clean or deferred. `not_clean()` is still the single source of truth for `format_report` and the `--email` trigger, exactly as `ScrubPass::success()` stayed authoritative for the scrub FAILURE email while `exit_code_for_pass` narrowed. What travels by email is unchanged; only how systemd reads the process is.
 - **`das-scrub.service` has the same clean profile** (no `Restart=`, no `OnFailure=`, no `OnUnitInactiveSec=` — verified in `/etc/systemd/system/das-scrub.service`) — the same safety analysis above applies: Sentinel only acts on a unit it observes in `failed` state, and it never touches `das-scrub.timer` itself (a timer unit doesn't go `failed` when its service exits nonzero; the *service* does, and only when `btrdasd scrub run` itself returns a nonzero exit — see the exit-code split below for exactly when that happens). The manual-stop caveat is identical too: `systemctl stop das-scrub.service` alone will not survive a Sentinel retry; mask it first.
 - **Scrub failure-retry loop (bd `DAS-Backup-Manager-18p`) — resolved DAS-side 2026-08-02, via an exit-code split, not a Sentinel change.** Sentinel's restart-rate limiter is 3 restarts per 600 s; a monthly scrub pass that finds real damage on failing hardware produces failures roughly 14–18 h apart (whenever the same broken filesystem gets scrubbed again), so every failure would get a fresh 600 s window and the limiter would never engage — Sentinel would retry-restart the whole multi-hour pass forever. The fix is entirely in this project: `btrdasd scrub run`'s process exit code no longer mirrors "did the pass find anything wrong" (`ScrubPass::success()`, still the source of truth for the FAILURE email and `btrdasd health` Critical escalation — those channels are unchanged). Instead (`exit_code_for_pass()` in `indexer/src/main.rs`):
   - **Exit 0 — "the pass ran."** Scrubbing was attempted on at least one target (i.e. `resolve_target_fsuuid` + `ensure_mounted` succeeded and a real `btrfs scrub start` was issued for it), *regardless* of what was found afterward — error counters, an aborted scrub, even an unmount failure post-scrub. A judgment call was made explicit here: a pass where *some* targets scrubbed and *some* could not be mounted is still exit 0, since scrubbing genuinely occurred and the skips are already surfaced via the email and `btrdasd scrub status`. A singleton-skip (another scrub already running) is also exit 0 — nothing went wrong, there was simply nothing to do.

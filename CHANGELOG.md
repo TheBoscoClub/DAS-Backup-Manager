@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than a re-derivation, and the target-scoping convention for bulk data
 - **`upgrade_rewrites_a_config_derived_file_newer_than_the_binary`** in `setup/installer.rs` —
   falsification for the guard scoping below; observed RED with the fix reverted
+- **`@libvirt-images` subvolume and the `nvme-vm` source** — `/var/lib/libvirt/images` was a plain
+  directory inside `@`, so its 20 GB `test-vm-cachyos.qcow2` rode the unscoped `nvme` source to
+  both 2 TB recovery drives daily. `config.toml` looked correct throughout, because scoping is
+  declared per *subvolume* and a directory has no entry to scope. Now its own NoCoW subvolume on
+  the same NVMe filesystem, mounted at the same path via `/etc/fstab`, scoped to `primary-22tb`.
+  Copied with `cp --reflink=never` so the image is genuinely NoCoW rather than sharing
+  copy-on-write extents with the original, and verified by booting the VM from the relocated image
+  and getting a DHCP lease back from the guest agent (bd `DAS-Backup-Manager-fk5`)
+- **`/srv/VirtualMachines` in `[restore] allowed_roots`** — the new `ssd-vm` source can now be
+  restored in place; backing up something that cannot be restored is half a mechanism. Granted as
+  a *subdirectory* of `/srv`, never `/srv` itself
+- **`/srv/http` and `/srv/ftp` in `RESTORE_DENIED_ROOTS`** — the distro-default document roots, so
+  a file restored into either is *served* to whoever can reach the listener. That is the same
+  "restored content becomes live" property the rest of the denylist guards, arriving by a network
+  path instead of an exec path. Added alongside the `/srv` grant above so widening it to the parent
+  later still cannot reach them; comparison is component-wise, so `/srv/http-archive` is unaffected
 
 ### Removed
 - **`ClaudeCodeProjects/Asus-DarkHero`** from the `hdd-projects` source — the subvolume was deleted
@@ -43,6 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Upgrade complete`. The guard is now scoped by `templates::is_embedded_script()` to the three
   embedded scripts, and the original `2lj` protection is unchanged
   (bd `DAS-Backup-Manager-bwt`)
+- **`das-backup-doctor.service` reported a service failure when the drift check had merely found
+  something**: `btrdasd doctor` exits 1 on drift, systemd cannot tell a finding from a
+  malfunction, so it marked the unit `failed`; cachyos-sentinel then restarted it, failed
+  identically, and notified `"backup service das-backup-doctor.service last run failed"`. The
+  operator was told the checker broke at the moment it worked, and that alert competed with the
+  drift email carrying the real signal. The CLI contract is deliberate (bd
+  `DAS-Backup-Manager-01u`) and is kept; the generated unit now carries `SuccessExitStatus=1`
+  (bd `DAS-Backup-Manager-f6p`)
+
+### Changed
+- **`btrdasd doctor` exit codes split 1 into 1 and 3**, so `SuccessExitStatus=1` can absolve the
+  benign case without also swallowing the real one: **1** = drift found (a finding), **3** = at
+  least one volume failed to mount/list while others were checked (an operational fault, and it
+  outranks 1 when both occur — an incomplete check cannot assert its drift list is complete),
+  **2** = could not run at all, **0** = clean or deferred. A script testing `-eq 1` for drift
+  becomes more precise, not broken. `not_clean()` remains the single source of truth for
+  `format_report` and the `--email` trigger, exactly as `ScrubPass::success()` stayed authoritative
+  for the scrub FAILURE email while `exit_code_for_pass` narrowed under `18p`
 
 ## [0.7.21.0] - 2026-08-31
 

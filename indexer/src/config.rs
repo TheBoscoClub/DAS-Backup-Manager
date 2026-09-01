@@ -69,6 +69,18 @@ impl Default for Restore {
 /// Listing one of these in `allowed_roots` does not enable it — the denylist is
 /// checked first and wins. These are the paths where a restored file becomes
 /// executable code or changes system identity.
+///
+/// `/srv/http` and `/srv/ftp` are here for the same reason rather than a
+/// different one: they are the distro-default document roots, so a file
+/// restored into either is *served* — published to whoever can reach the
+/// listener. That is the same "restored content becomes live" property the rest
+/// of this list guards, arriving by a network path instead of an exec path.
+/// They were added when `/srv/VirtualMachines` was granted to `allowed_roots`
+/// so that a VM image could be restored in place (bd DAS-Backup-Manager-tku):
+/// the grant is deliberately a *subdirectory* of `/srv` and never `/srv`
+/// itself, and these entries make sure that stays true even if someone later
+/// widens the allow-list to the parent. Comparison is component-wise, so
+/// `/srv/http-archive` is unaffected.
 pub const RESTORE_DENIED_ROOTS: &[&str] = &[
     "/bin",
     "/boot",
@@ -79,6 +91,8 @@ pub const RESTORE_DENIED_ROOTS: &[&str] = &[
     "/proc",
     "/root",
     "/sbin",
+    "/srv/ftp",
+    "/srv/http",
     "/sys",
     "/usr",
     "/var/lib",
