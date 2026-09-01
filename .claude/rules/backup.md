@@ -54,6 +54,17 @@ code carries" — that is wrong in the dangerous direction, because it reads as
 "harmless until someone tidies it up" when the real cost is a false FAILURE on every
 report until the entry is removed. False failures are how real ones get ignored.
 
+**The measurement error that produced it is worth more than the correction.** The
+original check was `btrbk … | grep … | head -20; echo "rc=$?"`, and `$?` after a
+pipeline is the exit status of its LAST command — `head`, which had every reason to
+succeed. btrbk's own status was discarded before it could be read. This is the same
+class `fail-silent.md` lists as always-a-defect (`local x=$(cmd)` masking `cmd`'s
+status, and SIGPIPE'd producers under `pipefail`), committed while writing the very
+section that documents it. Capture the producer's status explicitly —
+`${PIPESTATUS[0]}`, or run the command bare and grep a saved file — and confirm with
+a positive control: an *existing* subvolume in the same harness must yield 0, or the
+10 proves nothing about the missing one.
+
 Remove the entry when the subvolume goes. Note that doing so
 *orphans* whatever snapshots that subvolume already has on the target: btrbk only
 prunes what is configured, so they persist unmanaged rather than aging out. That is
