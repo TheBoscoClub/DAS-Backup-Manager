@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.21.0
+**Version**: 0.7.22.0
 
 ## Before You Begin
 
@@ -325,16 +325,32 @@ Snapshot names are read from `/etc/btrbk/btrbk.conf`, not derived from this sect
 
 Restores run as root under `btrdasd-helper`, so the destination is policy rather than a free parameter. Two rules apply on top of `allowed_roots`, and neither is configurable:
 
-- **A built-in denylist always wins.** `/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/root`, `/var/lib`, `/var/spool`, `/dev`, `/proc` and `/sys` are refused even if you list one in `allowed_roots` — the denylist is checked first. These are the paths where a restored file becomes executable code or changes system identity.
+- **A built-in denylist always wins.** `/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/root`, `/var/lib`, `/var/spool`, `/dev`, `/proc`, `/sys`, `/srv/http` and `/srv/ftp` are refused even if you list one in `allowed_roots` — the denylist is checked first. These are the paths where a restored file becomes executable code or changes system identity; the two `/srv` entries are the distro-default document roots, so a file restored into either is *served* to whoever can reach the listener. Comparison is component-wise, so a sibling such as `/srv/http-archive` is unaffected.
 - **Writes use `O_NOFOLLOW`**, so a symlink pre-planted at the destination fails the open rather than being followed.
 
 Both roots are compared after the path is resolved, so a symlinked ancestor cannot get around them. To restore somewhere else — an external drive, a staging area under `/mnt` — add that root here rather than working around the check.
+
+Grant a **subdirectory**, never a parent that also holds served or system content. This host adds `/srv/VirtualMachines` so the `ssd-vm` source can be restored in place — backing up something that cannot be restored is half a mechanism — and deliberately not `/srv`, which also contains the document roots denied above.
 
 ### `[doctor]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `exclude` | string[] | `[]` | Extra glob patterns excluded from `btrdasd doctor --check-drift` reporting, on top of the built-in exclusions |
+
+**Exit codes**, because systemd cannot tell a finding from a malfunction:
+
+| Code | Meaning | `das-backup-doctor.service` |
+|------|---------|------------------------------|
+| `0` | Ran clean, or deferred because a backup/scrub holds the maintenance lock | success |
+| `1` | **Drift found** — missing or stale subvolumes. A successful check *with a result* | **success**, via `SuccessExitStatus=1` |
+| `3` | At least one volume failed to mount/list while others were checked — those subvolumes went unexamined | **failed** |
+| `2` | Could not run at all — config load failure, lock I/O error, or every volume failed | **failed** |
+
+`3` outranks `1` when both occur: an incomplete check cannot assert that its drift list is complete. Without
+`SuccessExitStatus=1` systemd marked the unit `failed` on a mere finding, and cachyos-sentinel then restarted it and
+notified that the backup checker had failed — at the exact moment it had worked and had something to say. The finding
+itself travels by email (`--email`) and the journal report, not by the exit code.
 
 **Removed section**: `[esp]` (enabled, mirror, partitions, mount_points, hooks.enabled,
 hooks.type) — ESP/boot partition mirroring was removed from the codebase on 2026-04-10

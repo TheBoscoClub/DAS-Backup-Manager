@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.21.0
+**Version**: 0.7.22.0
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -25,7 +25,26 @@ do — and this project never touches filesystems that aren't backup media.
 
 Every architectural decision in this document — from the database schema to the installer templates — assumes DAS + BTRFS. This is not a general-purpose backup tool. Suggestions and contributions within this scope are very welcome.
 
-## Component Overview (v0.7.21.0)
+## Every Subvolume Must Be Declared — `btrfs send` Does Not Descend
+
+**A snapshot of a parent subvolume contains an empty directory wherever a child
+subvolume is mounted.** The stream carries nothing, the run reports success, and
+every observable signal agrees. This is the single easiest way to lose data with
+this system, so it is stated here rather than left to be rediscovered.
+
+Consequently `config.toml` declares each subvolume individually; being inside a
+directory that is already backed up counts for nothing. `btrdasd doctor
+--check-drift` exists to catch the omission, and the weekly timer is what makes
+it a control rather than a good intention.
+
+Found the hard way on 2026-09-01: `@srv/VirtualMachines`, created nested inside
+the already-backed-up `@srv`, held a 137 GB VM image that appeared in no backup
+for as long as it existed. A read-only snapshot of the parent showed **0 bytes**
+at that path. `ClaudeCodeProjects/powershell-scripts` had been in the same state
+for three weeks. See `.claude/rules/backup.md` for the reproduction and the
+per-filesystem command that finds coverage gaps.
+
+## Component Overview (v0.7.22.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -333,7 +352,7 @@ Every install writes `/etc/das-backup/.manifest` — a plain-text list of genera
 1. **No path arrives from the caller.** The daemon reads and writes exactly one configuration file, `CANONICAL_CONFIG`, and opens exactly one index database, `canonical_db_path()` (resolved from `general.db_path` in that config). Seventeen methods previously took a `config_path` and passed it to `Config::load`/`save` as root, so `ConfigGet` — whose action `org.dasbackup.config.read` the installed policy grants to any active session with **no prompt**, so the GUI can list sources at startup — doubled as an unauthenticated root-privileged read of any TOML-parseable file (`bd DAS-Backup-Manager-wd7`).
 
    The same defect survived one indirection further out until 0.7.21.0: seven `Index*` methods took a `db_path` and handed it to `Database::open` as root. That is **not a read** — `Connection::open` creates the file when absent, `journal_mode=wal` creates `-wal`/`-shm` sidecars, and `execute_batch(SCHEMA_SQL)` + `migrate()` write into it, so an existing SQLite database anywhere on the host would be opened and *migrated*. Six of the seven sit behind `org.dasbackup.index.read`, which is `allow_active=yes` — **no authentication prompt at all** (`bd DAS-Backup-Manager-gko`). Fixing one parameter did not fix the class; a path parameter on a root daemon is the defect, whatever it is called.
-2. **A destination is policy, not a parameter.** Restore paths are checked against `[restore] allowed_roots` and an unoverridable denylist before anything is created, and writes use `O_NOFOLLOW` (`bd DAS-Backup-Manager-s05`).
+2. **A destination is policy, not a parameter.** Restore paths are checked against `[restore] allowed_roots` and an unoverridable denylist before anything is created, and writes use `O_NOFOLLOW` (`bd DAS-Backup-Manager-s05`). The denylist covers the paths where a restored file becomes executable code or changes system identity, and since 0.7.22.0 also `/srv/http` and `/srv/ftp` — a file restored into a document root is *served*, which is the same property reached by a network path rather than an exec path.
 3. **Authorization of an action is not authorization over an object.** `JobCancel` checks polkit *and* that the caller owns the job; job ids are broadcast on every progress signal, so the action check alone let any authorized client abort anyone's work (`bd DAS-Backup-Manager-h2s`).
 4. **A source is policy too, not just a destination.** Rule 2 constrained where a restore may *write* and left unconstrained where it may *read*, so an authorized caller could have root copy `/etc`, `/root`, or another user's home into a permitted destination and then read it unprivileged. `restore::check_source_allowed()` requires the snapshot to resolve inside a configured backup target before anything is read, and fails closed when no targets are configured (`bd DAS-Backup-Manager-7ra`).
 

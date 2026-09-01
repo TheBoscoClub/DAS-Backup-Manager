@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.7.22.0] - 2026-09-01
+
+### Added
 - **Backup coverage for `/srv/VirtualMachines`** — new `ssd-vm` source in `config.toml` carrying
   the nested subvolume `@srv/VirtualMachines` (34 GiB, holds `win11pro.qcow2`), scoped to
   `target_labels = ["primary-22tb"]` so a growing VM image never lands on the two 2 TB recovery
@@ -942,7 +950,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.21.0...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.0...HEAD
+[0.7.22.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.21.0...v0.7.22.0
 [0.7.21.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.20.0...v0.7.21.0
 [0.7.20.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.1...v0.7.20.0
 [0.7.19.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.19.0...v0.7.19.1
