@@ -275,4 +275,8 @@ if(BUILD_TESTING)
         NAME shell-backup-exit-semantics
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backup_exit_semantics.sh
     )
+    add_test(
+        NAME shell-verify-sources
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_sources.sh
+    )
 endif()

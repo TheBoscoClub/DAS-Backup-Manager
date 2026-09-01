@@ -222,10 +222,61 @@ jobs:
           path: ButteredDASD-GUI.flatpak
 
   # ===========================================================================
+  # Source tarball (.tar.gz + .sha256)
+  #
+  # Not decoration: without this job the artifact set depends on WHICH ROUTE cut
+  # the release. The /git-release skill produces these two files while creating
+  # the release; a hand-cut `git tag && git push` does not, and nothing reports
+  # the difference — v0.7.22.0 shipped with 9 assets instead of 11 while all six
+  # jobs reported success (bd DAS-Backup-Manager-vlv). Making the workflow the
+  # producer means the artifact set is a property of the release rather than of
+  # the operator's route to it.
+  #
+  # GitHub's own auto-generated source archive is NOT a substitute: it publishes
+  # no checksum, upstream does not guarantee it byte-stable across regeneration,
+  # and it unpacks to a commit-sha prefix rather than the name-version/ prefix
+  # downstream packaging expects.
+  #
+  # `--format=tar | gzip -n` rather than `--format=tar.gz`: -n omits the
+  # timestamp from the gzip header, so the archive is byte-reproducible for a
+  # given tag. Measured both ways on 2026-09-01 and both happened to be stable,
+  # but that is git's internal gzip choice, not a promise — this makes it one.
+  # It also means that if /git-release uploads the same pair, the bytes match
+  # and the tarball can never end up paired with the other producer's checksum.
+  # ===========================================================================
+  source-tarball:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Build reproducible source tarball
+        env:
+          VERSION_TAG: ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          VERSION_NUM="${VERSION_TAG#v}"
+          NAME="das-backup-manager-${VERSION_NUM}"
+          git archive --format=tar --prefix="${NAME}/" "${VERSION_TAG}" | gzip -n > "${NAME}.tar.gz"
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          # Prove the checksum verifies rather than merely exists.
+          sha256sum -c "${NAME}.tar.gz.sha256"
+          echo "entries: $(tar tzf "${NAME}.tar.gz" | wc -l)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: source-tarball
+          path: |
+            das-backup-manager-*.tar.gz
+            das-backup-manager-*.tar.gz.sha256
+
+  # ===========================================================================
   # Collect all artifacts and attach to GitHub Release
   # ===========================================================================
   upload-release:
-    needs: [arch, debian, fedora, appimage, flatpak]
+    needs: [arch, debian, fedora, appimage, flatpak, source-tarball]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:

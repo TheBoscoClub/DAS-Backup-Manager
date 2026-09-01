@@ -507,19 +507,34 @@ pub fn verify_write_targets(
             // Not a write target this run. A bare non-empty directory here is
             // not dangerous now, but it is how 9on presented, so say so.
             if mount_path.exists() && !health::is_mountpoint(mount_path) {
-                let non_empty = std::fs::read_dir(mount_path)
-                    .map(|mut d| d.next().is_some())
-                    .unwrap_or(false);
-                if non_empty {
-                    progress.on_log(
+                match std::fs::read_dir(mount_path) {
+                    Ok(mut d) => {
+                        if d.next().is_some() {
+                            progress.on_log(
+                                crate::progress::LogLevel::Warning,
+                                &format!(
+                                    "Target '{}' is not part of this run, but '{}' is a non-empty \
+                                     bare directory — a previous run may have written to it \
+                                     (bd DAS-Backup-Manager-9on)",
+                                    target.label, target.mount
+                                ),
+                            );
+                        }
+                    }
+                    // `.unwrap_or(false)` here read "could not look" as "empty,
+                    // nothing to see", which is the one reading this check
+                    // exists to rule out — a plain FILE sitting at the mount
+                    // path fails read_dir with ENOTDIR and used to pass in
+                    // total silence (bd DAS-Backup-Manager-8wx).
+                    Err(e) => progress.on_log(
                         crate::progress::LogLevel::Warning,
                         &format!(
-                            "Target '{}' is not part of this run, but '{}' is a non-empty \
-                             bare directory — a previous run may have written to it \
-                             (bd DAS-Backup-Manager-9on)",
+                            "Target '{}' is not part of this run and '{}' exists but could not \
+                             be listed ({e}) — cannot rule out a previous run having written \
+                             to it (bd DAS-Backup-Manager-9on)",
                             target.label, target.mount
                         ),
-                    );
+                    ),
                 }
             }
             continue;
@@ -673,6 +688,51 @@ mod tests {
         let progress = TestProgress::new();
 
         assert!(verify_write_targets(&targets, &[], &progress).is_ok());
+    }
+
+    /// A non-write target whose mount path exists but cannot be LISTED must
+    /// say so. `read_dir(..).unwrap_or(false)` read "could not look" as
+    /// "empty — nothing to see", so a plain file sitting where a mount point
+    /// belongs (read_dir fails ENOTDIR) produced no log line at all — the
+    /// silence being indistinguishable from a clean, empty directory.
+    #[test]
+    fn verify_reports_a_non_write_target_it_cannot_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_at_mount = dir.path().join("mount-point-is-a-file");
+        std::fs::write(&file_at_mount, b"x").unwrap();
+        let path = file_at_mount.to_string_lossy().into_owned();
+        let targets = vec![target_at("not-in-this-run", &path, None)];
+        let progress = TestProgress::new();
+
+        // Still not fatal — it is not a write target this run.
+        assert!(verify_write_targets(&targets, &[], &progress).is_ok());
+
+        let logs = progress.logs.lock().unwrap();
+        let warned = logs.iter().any(|(lvl, msg)| {
+            *lvl == crate::progress::LogLevel::Warning
+                && msg.contains("could not be listed")
+                && msg.contains("not-in-this-run")
+        });
+        assert!(
+            warned,
+            "an unlistable target path must be reported, got logs: {logs:?}"
+        );
+    }
+
+    /// Positive control for the test above: an ordinary EMPTY directory is not
+    /// worth a word, so the check cannot be passing by warning about everything.
+    #[test]
+    fn verify_stays_quiet_about_an_empty_non_write_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().to_string_lossy().into_owned();
+        let targets = vec![target_at("not-in-this-run", &bare, None)];
+        let progress = TestProgress::new();
+
+        assert!(verify_write_targets(&targets, &[], &progress).is_ok());
+        assert!(
+            progress.logs.lock().unwrap().is_empty(),
+            "an empty bare directory must not produce any log line"
+        );
     }
 
     #[test]

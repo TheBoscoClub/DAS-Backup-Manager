@@ -484,6 +484,26 @@ pub fn find_any_mount(configured_path: &str, serial: &str, role: &TargetRole) ->
     find_mount_for_device(serial, role)
 }
 
+/// Measure `(total_bytes, used_bytes)` for a mounted target.
+///
+/// `btrfs filesystem usage --raw` first (it accounts for RAID profiles, which
+/// statvfs does not), then `statvfs(2)`. Returns `None` when neither can
+/// answer — never `(0, 0)`, which is a real reading a caller cannot tell from a
+/// missing one (bd DAS-Backup-Manager-8wx).
+pub fn measure_target_usage(mount: &str) -> Option<(u64, u64)> {
+    let btrfs_output = std::process::Command::new("btrfs")
+        .args(["filesystem", "usage", "--raw", mount])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+
+    match btrfs_output {
+        Some(output) => parse_btrfs_usage(&output).or_else(|| disk_space_statvfs(mount)),
+        None => disk_space_statvfs(mount),
+    }
+}
+
 /// Get disk space for `mount` using `statvfs(2)`.
 /// Returns `(total_bytes, used_bytes)` or `None` on error.
 fn disk_space_statvfs(mount: &str) -> Option<(u64, u64)> {
@@ -671,24 +691,25 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
         }
 
         // 2. Get disk space (using effective mount path)
-        let (total_bytes, used_bytes) = if mounted {
-            let btrfs_output = std::process::Command::new("btrfs")
-                .args(["filesystem", "usage", "--raw", &effective_path])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok());
-
-            if let Some(output) = btrfs_output {
-                parse_btrfs_usage(&output)
-                    .or_else(|| disk_space_statvfs(&effective_path))
-                    .unwrap_or((0, 0))
-            } else {
-                disk_space_statvfs(&effective_path).unwrap_or((0, 0))
-            }
+        let usage = if mounted {
+            measure_target_usage(&effective_path)
         } else {
-            (0, 0)
+            None
         };
+        // A mounted target whose capacity could not be read is NOT a target at
+        // 0 % — but that is exactly how it used to be reported, because both
+        // fallbacks ended in `.unwrap_or((0, 0))`. `determine_status` skips the
+        // >95 %-full escalation when `total_bytes == 0`, so the one target whose
+        // usage nobody could measure was also the one target that could never
+        // raise the disk-full alarm, and the GUI drew it as 0 % used
+        // (bd DAS-Backup-Manager-8wx).
+        if mounted && usage.is_none() {
+            warnings.push(format!(
+                "Target '{}': mounted at '{}' but its capacity could not be measured                  (`btrfs filesystem usage` and statvfs(2) both failed) — the disk-full                  check is DISABLED for this target and its usage is reported as unknown",
+                target.label, effective_path
+            ));
+        }
+        let (total_bytes, used_bytes) = usage.unwrap_or((0, 0));
 
         // 3. Get snapshot count (using effective mount path)
         let snapshot_count = if mounted {
@@ -1108,6 +1129,50 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         // A freshly-created temp directory is not a mount point
         assert!(!is_mountpoint(tmp.path()));
         fs::remove_dir_all(tmp.path()).ok();
+    }
+
+    /// A path that cannot be measured must report `None`, not `Some((0, 0))`.
+    /// The fabricated zero is what let an unmeasurable mounted target sail past
+    /// `determine_status`'s `total_bytes > 0` guard and render as 0 % used.
+    #[test]
+    fn measure_target_usage_returns_none_when_nothing_can_measure_it() {
+        // Neither `btrfs filesystem usage` nor statvfs(2) can answer for a path
+        // that does not exist.
+        let missing = "/nonexistent-das-backup-manager-8wx/target";
+        assert_eq!(
+            measure_target_usage(missing),
+            None,
+            "an unmeasurable path must be None, never a fabricated (0, 0)"
+        );
+
+        // Positive control: a path that DOES exist still yields a real reading,
+        // so the function cannot be passing by returning None for everything.
+        let (total, used) = measure_target_usage("/").expect("/ must be measurable via statvfs");
+        assert!(total > 0, "positive control: / reported total_bytes == 0");
+        assert!(used <= total, "used {used} exceeds total {total}");
+    }
+
+    /// The consequence the None above exists to prevent: a target reporting
+    /// `total_bytes == 0` is skipped by the disk-full escalation, so without an
+    /// accompanying warning an unmeasurable target reads as perfectly Healthy.
+    #[test]
+    fn unmeasurable_target_is_not_silently_healthy() {
+        let mut t = base_target_health(ScrubHealth::not_applicable());
+        t.mounted = true;
+        t.total_bytes = 0;
+        t.used_bytes = 0;
+        assert_eq!(
+            determine_status(std::slice::from_ref(&t), &[]),
+            HealthStatus::Healthy,
+            "documents the gap: total_bytes == 0 cannot trip the >95% check"
+        );
+        let warnings =
+            vec!["Target 't1': mounted but its capacity could not be measured".to_string()];
+        assert_eq!(
+            determine_status(&[t], &warnings),
+            HealthStatus::Warning,
+            "the warning is the only thing that keeps an unmeasurable target visible"
+        );
     }
 
     #[test]
