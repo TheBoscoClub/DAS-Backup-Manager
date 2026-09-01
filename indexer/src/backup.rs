@@ -2,6 +2,7 @@ use crate::config::{Config, TargetRole};
 use crate::db::Database;
 use crate::health;
 use crate::indexer;
+use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback};
 use crate::scrub;
 use std::io::BufRead;
@@ -1245,6 +1246,20 @@ pub fn run_backup(
     if effective_targets.is_empty() && !options.dry_run {
         return Err("No backup targets are mounted. Connect the DAS enclosure and mount targets before running.".into());
     }
+
+    // Verify every target btrbk will write to is backed by the filesystem we
+    // expect, BEFORE btrbk is invoked.
+    //
+    // The explicit-targets branch above deliberately trusts the caller's list
+    // rather than re-checking mount status, and the Plasma GUI always supplies
+    // that list — so without this, a target whose mount silently failed still
+    // reached btrbk, which then wrote to a bare mount point and filled the
+    // underlying filesystem (bd DAS-Backup-Manager-9on, made reachable from
+    // the GUI by the trust-the-caller shortcut, bd DAS-Backup-Manager-aea).
+    //
+    // Runs on dry-run too: a dry-run that would have written to the root
+    // filesystem is exactly the thing worth being told about.
+    mount::verify_write_targets(&config.targets, &effective_targets, progress)?;
 
     // Count enabled pipeline steps for the top-level stage announcement.
     let total_steps = {

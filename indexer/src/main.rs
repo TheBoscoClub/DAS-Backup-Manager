@@ -1762,6 +1762,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &file_refs,
                     &dest,
                     &cfg.restore.allowed_roots,
+                    &restore::snapshot_source_roots(&cfg),
                     &progress,
                 );
                 guard.unmount(&progress);
@@ -1798,6 +1799,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &snapshot,
                     &dest,
                     &cfg.restore.allowed_roots,
+                    &restore::snapshot_source_roots(&cfg),
                     &progress,
                 );
                 guard.unmount(&progress);

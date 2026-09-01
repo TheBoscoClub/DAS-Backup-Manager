@@ -159,6 +159,73 @@ pub fn check_dest_allowed(
     }
 }
 
+/// The directory roots a restore is permitted to read a snapshot FROM.
+///
+/// Both the configured mount point and whatever the target is *actually*
+/// mounted at, because udisks2 mounts the same filesystem at
+/// `/run/media/<user>/<label>` while the config names `/mnt/<label>`, and a
+/// snapshot path recorded in the index can legitimately be either.
+pub fn snapshot_source_roots(config: &crate::config::Config) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for t in &config.targets {
+        if !t.mount.is_empty() && !roots.contains(&t.mount) {
+            roots.push(t.mount.clone());
+        }
+        if let Some(actual) = crate::health::find_any_mount(&t.mount, &t.serial, &t.role)
+            && !roots.contains(&actual)
+        {
+            roots.push(actual);
+        }
+    }
+    roots
+}
+
+/// Refuse to read a restore SOURCE that is not inside a configured backup target.
+///
+/// `check_dest_allowed` constrains where a restore may write. Nothing
+/// constrained where it may READ: `restore_snapshot` and `restore_files` run as
+/// root under the D-Bus helper and took the snapshot path straight from the
+/// caller, so an authorized client could have root copy any directory tree on
+/// the host — `/etc`, `/root`, another user's home — into a permitted
+/// destination it can then read unprivileged (bd DAS-Backup-Manager-7ra).
+///
+/// Fails closed: an empty root list permits nothing, and the source must exist
+/// (a restore from a non-existent snapshot has nothing to do anyway), so the
+/// path is fully resolved and a symlinked ancestor cannot smuggle a read past
+/// the check.
+pub fn check_source_allowed(
+    snapshot: &Path,
+    source_roots: &[String],
+) -> Result<std::path::PathBuf, String> {
+    let resolved = snapshot
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve snapshot '{}': {e}", snapshot.display()))?;
+
+    if source_roots.is_empty() {
+        return Err(format!(
+            "Refusing to restore from '{}': no backup targets are configured",
+            resolved.display()
+        ));
+    }
+
+    let permitted = source_roots.iter().any(|root| {
+        let root_resolved = Path::new(root)
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(root).to_path_buf());
+        resolved.starts_with(&root_resolved)
+    });
+
+    if permitted {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "Refusing to restore from '{}': not inside any configured backup target ({})",
+            resolved.display(),
+            source_roots.join(", ")
+        ))
+    }
+}
+
 /// Reject a member path that could escape the snapshot or the destination.
 ///
 /// One check covers both directions, because the same string is joined onto
@@ -203,6 +270,7 @@ pub fn restore_files(
     file_paths: &[&str],
     dest: &Path,
     allowed_roots: &[String],
+    allowed_sources: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<RestoreResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
@@ -213,13 +281,10 @@ pub fn restore_files(
     // otherwise materialise inside a forbidden root.
     let dest = &check_dest_allowed(dest, allowed_roots)?;
 
-    // Resolve the snapshot root once. The old code compared a canonicalized
-    // `src` against a RAW `snapshot_path`, so on a udisks2 mount
-    // (/run/media/... vs /mnt/...) the two never shared a prefix and every
-    // legitimate restore was refused as traversal.
-    let snapshot_root = snapshot_path
-        .canonicalize()
-        .unwrap_or_else(|_| snapshot_path.to_path_buf());
+    // Source policy is checked for the same reason and at the same point: the
+    // snapshot path arrives from the caller and is read as root.
+    let snapshot_root = check_source_allowed(snapshot_path, allowed_sources)?;
+    let snapshot_path = snapshot_root.as_path();
 
     progress.on_stage("Restoring files", total);
     progress.on_log(
@@ -331,11 +396,14 @@ pub fn restore_snapshot(
     snapshot_path: &Path,
     dest: &Path,
     allowed_roots: &[String],
+    allowed_sources: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<RestoreResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
     let dest = &check_dest_allowed(dest, allowed_roots)?;
+    let snapshot_resolved = check_source_allowed(snapshot_path, allowed_sources)?;
+    let snapshot_path = snapshot_resolved.as_path();
 
     progress.on_stage("Restoring snapshot", 1);
     progress.on_log(
@@ -641,6 +709,7 @@ mod tests {
             &["../escape.txt", "ok.txt"],
             dest.path(),
             &test_roots(),
+            &test_sources(snap.path()),
             &progress,
         )
         .unwrap();
@@ -714,6 +783,86 @@ mod tests {
             !result.errors.is_empty(),
             "refusing to follow the link must be REPORTED, not silently skipped"
         );
+    }
+
+    /// A restore SOURCE outside every configured target must be refused, and
+    /// nothing may be copied.
+    ///
+    /// Counter-test for bd DAS-Backup-Manager-7ra: `restore_files` runs as root
+    /// under the D-Bus helper, so without this the snapshot argument was an
+    /// arbitrary root-read — copy `/etc` into an allowed root, then read it
+    /// unprivileged.
+    #[test]
+    fn source_policy_refuses_a_snapshot_outside_configured_targets() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "secret.txt", "sensitive");
+        let dest = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let progress = TestProgress::new();
+
+        let err = restore_files(
+            snap.path(),
+            &["secret.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(elsewhere.path()),
+            &progress,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("not inside any configured backup target"),
+            "{err}"
+        );
+        assert!(
+            !dest.path().join("secret.txt").exists(),
+            "the refusal must happen before anything is copied"
+        );
+    }
+
+    /// With no targets configured at all, nothing is a permitted source.
+    #[test]
+    fn source_policy_fails_closed_with_no_configured_targets() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "a.txt", "a");
+        let dest = TempDir::new().unwrap();
+        let progress = TestProgress::new();
+
+        let err = restore_snapshot(snap.path(), dest.path(), &test_roots(), &[], &progress)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("no backup targets are configured"), "{err}");
+    }
+
+    /// Positive control for the pair above: the very same call succeeds once the
+    /// snapshot's own directory is a permitted source. Without this, the two
+    /// refusal tests would still pass if the function refused everything.
+    #[test]
+    fn source_policy_permits_a_snapshot_inside_a_configured_target() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "a.txt", "a");
+        let dest = TempDir::new().unwrap();
+        let progress = TestProgress::new();
+
+        let result = restore_files(
+            snap.path(),
+            &["a.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(result.files_restored, 1);
+        assert!(dest.path().join("a.txt").exists());
+    }
+
+    /// Permit a specific snapshot directory as a restore SOURCE.
+    fn test_sources(snap: &Path) -> Vec<String> {
+        vec![snap.to_string_lossy().into_owned()]
     }
 
     /// Allow the platform temp root, wherever TMPDIR points.
@@ -840,6 +989,7 @@ mod tests {
             &["hello.txt", "data.bin"],
             dest.path(),
             &test_roots(),
+            &test_sources(snap.path()),
             &progress,
         )
         .unwrap();
@@ -869,6 +1019,7 @@ mod tests {
             &["docs/guide.txt", "docs/nested/deep.txt", "root.txt"],
             dest.path(),
             &test_roots(),
+            &test_sources(snap.path()),
             &progress,
         )
         .unwrap();
@@ -903,6 +1054,7 @@ mod tests {
             &["a.txt", "b.txt", "c.txt"],
             dest.path(),
             &test_roots(),
+            &test_sources(snap.path()),
             &progress,
         )
         .unwrap();

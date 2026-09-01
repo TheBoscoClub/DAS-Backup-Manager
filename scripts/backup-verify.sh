@@ -28,19 +28,30 @@ else
     exit 1
 fi
 
-# Build drive map from config targets (serial -> display name)
+# Build drive map from config targets (serial -> display name).
+#
+# Keyed on every member serial from DAS_TARGET_n_SERIALS, not just the legacy
+# single-anchor DAS_TARGET_n_SERIAL. A RAID-1 target has two member drives and
+# the anchor names only one of them, so the partner rendered as "Unknown" in
+# the SMART table while its health was being read perfectly well — the map was
+# what was wrong, not the measurement (bd DAS-Backup-Manager-5b1).
 declare -A DRIVE_MAP=()
 for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+    serials_var="DAS_TARGET_${i}_SERIALS"
     serial_var="DAS_TARGET_${i}_SERIAL"
     name_var="DAS_TARGET_${i}_DISPLAY_NAME"
     label_var="DAS_TARGET_${i}_LABEL"
-    mount_var="DAS_TARGET_${i}_MOUNT"
-    serial="${!serial_var}"
-    if [[ -n "${!name_var:-}" ]]; then
-        DRIVE_MAP[$serial]="${!name_var}"
-    else
-        DRIVE_MAP[$serial]="${!label_var}"
-    fi
+
+    display="${!name_var:-}"
+    [[ -n "$display" ]] || display="${!label_var:-}"
+
+    # Fall back to the anchor when SERIALS is absent (config written by a
+    # pre-0.7.13 btrdasd), so an older config still maps its one drive.
+    read -ra target_serials <<< "${!serials_var:-${!serial_var:-}}"
+    for serial in "${target_serials[@]}"; do
+        [[ -n "$serial" ]] || continue
+        DRIVE_MAP[$serial]="$display"
+    done
 done
 
 # Expected DAS drives (detected by USB transport)

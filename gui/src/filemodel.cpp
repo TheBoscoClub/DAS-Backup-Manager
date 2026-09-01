@@ -6,10 +6,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
-FileModel::FileModel(DBusClient *client, const QString &dbPath, QObject *parent)
+FileModel::FileModel(DBusClient *client, QObject *parent)
     : QAbstractTableModel(parent)
     , m_client(client)
-    , m_dbPath(dbPath)
 {
 }
 
@@ -20,7 +19,7 @@ void FileModel::loadSnapshot(qint64 snapshotId)
     m_currentSnapshotId = snapshotId;
     m_totalFiles = 0;
 
-    const QString json = m_client->indexListFiles(m_dbPath, snapshotId, PageSize, 0);
+    const QString json = m_client->indexListFiles(snapshotId, PageSize, 0);
     if (!json.isEmpty()) {
         const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
         m_totalFiles = root.value(QLatin1String("total")).toInteger();
@@ -48,7 +47,7 @@ void FileModel::loadMore()
 
     const qint64 currentOffset = m_files.size();
     const QString json = m_client->indexListFiles(
-        m_dbPath, m_currentSnapshotId, PageSize, currentOffset);
+        m_currentSnapshotId, PageSize, currentOffset);
     if (json.isEmpty())
         return;
 

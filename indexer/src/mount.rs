@@ -198,11 +198,11 @@ pub fn ensure_targets_mounted(
                 progress.on_log(
                     crate::progress::LogLevel::Warning,
                     &format!(
-                        "Failed to create mount point {} for bind mount: {e}",
-                        target.mount
+                        "Target '{}': could not create mount point {} for bind mount ({e}) \
+                         — skipping, this target is NOT available",
+                        target.label, target.mount
                     ),
                 );
-                any_available = true;
                 continue;
             }
             let status = Command::new("mount")
@@ -227,11 +227,11 @@ pub fn ensure_targets_mounted(
                     progress.on_log(
                         crate::progress::LogLevel::Warning,
                         &format!(
-                            "{}: bind mount {} → {} failed — btrbk may not find this target",
+                            "{}: bind mount {} → {} failed — skipping, this target is \
+                             NOT available",
                             target.label, actual, target.mount
                         ),
                     );
-                    any_available = true;
                 }
             }
             continue;
@@ -457,6 +457,133 @@ pub fn ensure_sources_mounted(config: &Config, progress: &dyn ProgressCallback) 
     guard
 }
 
+/// The BTRFS filesystem UUID of whatever is mounted at `path`, if anything.
+///
+/// Shells out to `findmnt` rather than reading the superblock so the answer is
+/// about the MOUNT, not about a device we hope is mounted there. Returns `None`
+/// when nothing is mounted at `path` or `findmnt` is unavailable.
+pub fn filesystem_uuid_at(path: &str) -> Option<String> {
+    let out = Command::new("findmnt")
+        .args(["-n", "-o", "UUID", "--target", path])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let uuid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if uuid.is_empty() { None } else { Some(uuid) }
+}
+
+/// Refuse to hand btrbk a target that is not backed by the filesystem we expect.
+///
+/// This is the Rust counterpart of `verify_targets_before_btrbk()` in
+/// `scripts/backup-run.sh`, and it exists for the same reason: writing to a
+/// **bare mount point** falls through to the underlying filesystem — normally
+/// the NVMe root — and fills it. That is not hypothetical; it happened in May
+/// 2026 when the original 22 TB drive was removed and a backup ran before the
+/// replacement was in place (bd DAS-Backup-Manager-9on).
+///
+/// The bash path grew this guard; the Rust path never did, so the incident
+/// stayed reachable from every caller that pre-mounts and then names its
+/// targets explicitly — which the Plasma GUI always does
+/// (bd DAS-Backup-Manager-aea).
+///
+/// Scope is deliberate: only targets btrbk will actually be told to write to
+/// are fatal. A configured target that is not part of this run cannot be
+/// written to, so a stale directory there is reported as a warning (it is
+/// evidence of a past leak worth looking at) but does not abort the run.
+pub fn verify_write_targets(
+    targets: &[crate::config::Target],
+    write_labels: &[String],
+    progress: &dyn ProgressCallback,
+) -> Result<(), String> {
+    let mut violations: Vec<String> = Vec::new();
+
+    for target in targets {
+        let will_write = write_labels.iter().any(|l| l == &target.label);
+        let mount_path = Path::new(&target.mount);
+
+        if !will_write {
+            // Not a write target this run. A bare non-empty directory here is
+            // not dangerous now, but it is how 9on presented, so say so.
+            if mount_path.exists() && !health::is_mountpoint(mount_path) {
+                let non_empty = std::fs::read_dir(mount_path)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false);
+                if non_empty {
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!(
+                            "Target '{}' is not part of this run, but '{}' is a non-empty \
+                             bare directory — a previous run may have written to it \
+                             (bd DAS-Backup-Manager-9on)",
+                            target.label, target.mount
+                        ),
+                    );
+                }
+            }
+            continue;
+        }
+
+        // A write target MUST be a real mount point.
+        if !health::is_mountpoint(mount_path) {
+            violations.push(format!(
+                "{} ({:?}): expected mounted but '{}' is NOT a mount point — writing here \
+                 would fill the underlying filesystem",
+                target.label, target.role, target.mount
+            ));
+            continue;
+        }
+
+        // And it must be the filesystem we expect, not merely *a* filesystem.
+        // UUID is preferred: it still matches when a BTRFS RAID-1 array is
+        // mounted degraded from a single leg, which a device check would not.
+        if let Some(expected) = target.mount_uuid.as_deref().filter(|u| !u.is_empty()) {
+            match filesystem_uuid_at(&target.mount) {
+                Some(actual) if actual == expected => {
+                    progress.on_log(
+                        crate::progress::LogLevel::Info,
+                        &format!(
+                            "  {}: OK ({} → UUID={})",
+                            target.label, target.mount, actual
+                        ),
+                    );
+                }
+                Some(actual) => violations.push(format!(
+                    "{}: '{}' has filesystem UUID '{}', expected '{}' — a different \
+                     filesystem is mounted here",
+                    target.label, target.mount, actual, expected
+                )),
+                None => violations.push(format!(
+                    "{}: could not determine the filesystem UUID mounted at '{}' \
+                     (expected '{}')",
+                    target.label, target.mount, expected
+                )),
+            }
+        } else {
+            // No UUID configured (legacy target). The mount-point check above
+            // is all the assurance available; say so rather than implying more.
+            progress.on_log(
+                crate::progress::LogLevel::Warning,
+                &format!(
+                    "Target '{}' has no mount_uuid configured — verified only that '{}' \
+                     is a mount point, not which filesystem it is",
+                    target.label, target.mount
+                ),
+            );
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to run btrbk — backup target verification failed:\n  - {}",
+            violations.join("\n  - ")
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -464,6 +591,89 @@ pub fn ensure_sources_mounted(config: &Config, progress: &dyn ProgressCallback) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::{Retention, Target};
+    use crate::progress::TestProgress;
+
+    fn target_at(label: &str, mount: &str, uuid: Option<&str>) -> Target {
+        Target {
+            label: label.into(),
+            serial: "TESTSERIAL".into(),
+            serials: vec!["TESTSERIAL".into()],
+            mount_uuid: uuid.map(|u| u.to_string()),
+            mount: mount.into(),
+            role: TargetRole::Primary,
+            retention: Retention {
+                weekly: 4,
+                monthly: 2,
+                daily: 7,
+                yearly: 1,
+            },
+            display_name: label.into(),
+        }
+    }
+
+    /// A write target that is NOT a mount point must abort the run.
+    ///
+    /// Counter-test for bd DAS-Backup-Manager-aea / 9on: handing btrbk a bare
+    /// directory makes it write through to the underlying filesystem — the
+    /// NVMe root — and fill it.
+    #[test]
+    fn verify_refuses_a_write_target_that_is_not_a_mountpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().to_string_lossy().into_owned();
+        let targets = vec![target_at("primary-22tb", &bare, None)];
+        let progress = TestProgress::new();
+
+        let err =
+            verify_write_targets(&targets, &["primary-22tb".to_string()], &progress).unwrap_err();
+
+        assert!(err.contains("NOT a mount point"), "{err}");
+        assert!(err.contains("primary-22tb"), "{err}");
+    }
+
+    /// Positive control: a real mount point passes. Without this, the refusal
+    /// test above would still pass if the function refused everything.
+    #[test]
+    fn verify_accepts_a_real_mountpoint_write_target() {
+        // /proc is a mount point in every Linux test environment.
+        let targets = vec![target_at("primary-22tb", "/proc", None)];
+        let progress = TestProgress::new();
+
+        assert!(verify_write_targets(&targets, &["primary-22tb".to_string()], &progress).is_ok());
+    }
+
+    /// A mount point carrying the WRONG filesystem must abort: the point of the
+    /// UUID check is that "something is mounted here" is not the question.
+    #[test]
+    fn verify_refuses_a_mountpoint_with_an_unexpected_filesystem_uuid() {
+        let targets = vec![target_at(
+            "primary-22tb",
+            "/proc",
+            Some("00000000-0000-0000-0000-000000000000"),
+        )];
+        let progress = TestProgress::new();
+
+        let err =
+            verify_write_targets(&targets, &["primary-22tb".to_string()], &progress).unwrap_err();
+
+        assert!(
+            err.contains("UUID") || err.contains("could not determine"),
+            "{err}"
+        );
+    }
+
+    /// A target that is not part of this run is never fatal — btrbk is not
+    /// being told to write there.
+    #[test]
+    fn verify_ignores_targets_that_are_not_write_targets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().to_string_lossy().into_owned();
+        let targets = vec![target_at("not-in-this-run", &bare, None)];
+        let progress = TestProgress::new();
+
+        assert!(verify_write_targets(&targets, &[], &progress).is_ok());
+    }
 
     #[test]
     fn partition_device_primary() {

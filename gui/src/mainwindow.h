@@ -34,7 +34,7 @@ class MainWindow : public KXmlGuiWindow
     Q_OBJECT
 
 public:
-    explicit MainWindow(const QString &dbPath, QWidget *parent = nullptr);
+    explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
 
 private Q_SLOTS:
@@ -98,7 +98,6 @@ private:
     QWidget *m_configPage = nullptr;
     HealthDashboard *m_healthDashboard = nullptr;
 
-    QString m_dbPath;
     qint64 m_currentSnapshotId = -1;
 
     // Async status bar state (collected as D-Bus results arrive)

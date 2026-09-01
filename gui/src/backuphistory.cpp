@@ -53,10 +53,9 @@ public:
         ColumnCount
     };
 
-    explicit BackupHistoryModel(DBusClient *client, const QString &dbPath, QObject *parent = nullptr)
+    explicit BackupHistoryModel(DBusClient *client, QObject *parent = nullptr)
         : QAbstractTableModel(parent)
         , m_client(client)
-        , m_dbPath(dbPath)
     {
     }
 
@@ -65,7 +64,7 @@ public:
         beginResetModel();
         m_runs.clear();
 
-        const QString json = m_client->indexBackupHistory(m_dbPath, 50);
+        const QString json = m_client->indexBackupHistory(50);
         if (!json.isEmpty()) {
             const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
             for (const QJsonValue &v : arr) {
@@ -204,7 +203,6 @@ private:
     }
 
     DBusClient *m_client;
-    QString m_dbPath;
     QVector<BackupRunInfo> m_runs;
 };
 
@@ -216,10 +214,9 @@ private:
 // BackupHistoryView
 // ---------------------------------------------------------------------------
 
-BackupHistoryView::BackupHistoryView(DBusClient *client, const QString &dbPath, QWidget *parent)
+BackupHistoryView::BackupHistoryView(DBusClient *client, QWidget *parent)
     : QWidget(parent)
     , m_client(client)
-    , m_dbPath(dbPath)
 {
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
@@ -232,7 +229,7 @@ BackupHistoryView::BackupHistoryView(DBusClient *client, const QString &dbPath, 
     title->setFont(titleFont);
     layout->addWidget(title);
 
-    m_model = new BackupHistoryModel(m_client, m_dbPath, this);
+    m_model = new BackupHistoryModel(m_client, this);
     m_model->reload();
 
     m_proxy = new QSortFilterProxyModel(this);

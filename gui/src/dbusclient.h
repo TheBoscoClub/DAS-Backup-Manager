@@ -25,8 +25,7 @@ public:
     void backupSnapshot(const QStringList &sources);
     void backupSend(const QStringList &targets);
     void backupBootArchive();
-    void indexWalk(const QString &targetPath,
-                   const QString &dbPath);
+    void indexWalk(const QString &targetPath);
     void restoreFiles(const QString &snapshot,
                       const QString &dest, const QStringList &files);
     void restoreSnapshot(const QString &snapshot,
@@ -51,17 +50,17 @@ public:
     // Async versions of slow methods (non-blocking, result via signal)
     void healthQueryAsync();
     void scheduleGetAsync();
-    void indexStatsAsync(const QString &dbPath);
-    void indexListSnapshotsAsync(const QString &dbPath);
+    void indexStatsAsync();
+    void indexListSnapshotsAsync();
 
     // Index read methods (read-only, no polkit auth for active sessions)
-    QString indexStats(const QString &dbPath);
-    QString indexListSnapshots(const QString &dbPath);
-    QString indexListFiles(const QString &dbPath, qint64 snapshotId,
+    QString indexStats();
+    QString indexListSnapshots();
+    QString indexListFiles(qint64 snapshotId,
                            qint64 limit = 10000, qint64 offset = 0);
-    QString indexSearch(const QString &dbPath, const QString &query, qint64 limit);
-    QString indexBackupHistory(const QString &dbPath, qint64 limit);
-    QString indexSnapshotPath(const QString &dbPath, qint64 snapshotId);
+    QString indexSearch(const QString &query, qint64 limit);
+    QString indexBackupHistory(qint64 limit);
+    QString indexSnapshotPath(qint64 snapshotId);
 
 Q_SIGNALS:
     void jobStarted(const QString &jobId, const QString &operation);
