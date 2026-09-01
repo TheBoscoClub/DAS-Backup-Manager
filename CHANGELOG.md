@@ -65,7 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same fail-silent class being fixed elsewhere in this release. The `DatabasePath` field was
   already inert, bound to a value nothing persisted or re-read. `m_dbPath` is gone from
   `MainWindow`, `SnapshotWatcher`, `FileModel`, `SearchModel`, `SnapshotModel`, `BackupHistoryView`
-  and `IndexRunner`
+  and `IndexRunner`. The GUI smoke suite's `fileModelHandlesAMissingDatabase` is renamed
+  `fileModelIsEmptyWithoutAReachableHelper` — its old premise (a nonexistent database path leaves an
+  empty model) is no longer expressible, and a test whose name asserts something it no longer checks
+  is worse than no test
 
 ### Fixed
 - **`scripts/das-partition-drives.sh` gave every bootable recovery drive the same ESP label** (v2.1.0):
