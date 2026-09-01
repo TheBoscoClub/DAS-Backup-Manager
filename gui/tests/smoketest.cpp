@@ -111,19 +111,24 @@ private Q_SLOTS:
         HealthDashboard health(&client);
         QVERIFY(health.metaObject() != nullptr);
 
-        BackupHistoryView history(&client, QStringLiteral("/nonexistent/index.db"));
+        BackupHistoryView history(&client);
         QVERIFY(history.metaObject() != nullptr);
 
         ProgressPanel progress(&client);
         QVERIFY(progress.metaObject() != nullptr);
     }
 
-    void fileModelHandlesAMissingDatabase()
+    void fileModelIsEmptyWithoutAReachableHelper()
     {
-        // A path that does not exist must leave an empty model, not throw or
-        // abort — the GUI opens before anyone has run a backup.
+        // An unreachable helper must leave an empty model, not throw or abort —
+        // the GUI opens before anyone has run a backup, and on a machine where
+        // btrdasd-helper is not installed at all.
+        //
+        // This used to pass a nonexistent database path. It cannot any more:
+        // the helper resolves the index path itself from the canonical config
+        // and no longer accepts one from the caller (bd DAS-Backup-Manager-gko).
         DBusClient client;
-        FileModel model(&client, QStringLiteral("/nonexistent/index.db"));
+        FileModel model(&client);
         QCOMPARE(model.rowCount(QModelIndex()), 0);
     }
 };
