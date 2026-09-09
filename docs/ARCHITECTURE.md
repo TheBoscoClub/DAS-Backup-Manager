@@ -144,9 +144,23 @@ the one that catches the defect this guard was written for
          │
          ├──▶ /run/das-scrub.lock         non-blocking singleton — a second pass skips, never queues
          ├──▶ /run/das-maintenance.lock   blocking, shared with backup-run.sh — deferral, not cancellation
-         ├──▶ mount + btrfs scrub start   sequential, per configured [scrub].targets
+         ├──▶ mount + resume-or-start     sequential, per configured [scrub].targets
          └──▶ /var/lib/das-backup/scrub-state.json   consumed by health checks
 ```
+
+**Resume-or-start** (bd `DAS-Backup-Manager-292`): each target does not blindly `btrfs scrub start`.
+`decide_scrub_start_mode` reads the prior `/var/lib/btrfs/scrub.status.<fsuuid>` record and, when it
+is `Aborted` (`canceled:0 finished:0` — what a reboot or an unmount that kills a scrub mid-write
+leaves behind) *and* the kernel confirms no scrub is running, issues `btrfs scrub resume -B` to
+continue from the saved position rather than restarting from zero. A `finished` or deliberately
+`canceled` record, a running scrub, or unreadable liveness all fall through to a plain start — the
+decision never acts on a guess. If `resume` finds no resumable state after all ("nothing to resume"),
+the runner falls back to `btrfs scrub start -B -f`, which also clears a genuinely stale record. This
+matters specifically because the DAS targets are unmounted between backup runs: the position record
+lives on the host root keyed by FS UUID, so it survives the unmount, and the next monthly pass
+finishes what an interruption left undone instead of silently abandoning it. The decision is a pure
+`decide_from(outcome, live_state)` function so every combination is unit-testable; end-to-end resume
+across an unmount/remount is proven by `indexer/tests/scrub_loopback.rs`.
 
 `das-scrub.service` is deliberately dumb (`Type=oneshot`, unbounded `TimeoutStartSec=infinity`,
 no `Conflicts=`, no `ExecStopPost` cancel, no `RuntimeMaxSec=`). All ordering against a running

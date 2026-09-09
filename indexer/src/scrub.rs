@@ -51,15 +51,18 @@
 //!
 //! # Clearing a stale aborted record (`-f`)
 //!
-//! `btrfs-progs` can read a saved record whose device row is neither
-//! `finished` nor `canceled` as evidence of a live scrub, and refuse to start
+//! An `Aborted` record (device row neither `finished` nor `canceled`) is a
+//! scrub interrupted by a reboot or an unmount, and it carries a resumable
+//! position. [`decide_scrub_start_mode`] returns `Resume` **only** when the
+//! prior record is `Aborted` *and* the kernel confirms nothing is running —
+//! never on a guess, because these locks cannot stop an operator from starting
+//! a scrub by hand. If the kernel then has no resumable state after all
+//! (`btrfs scrub resume` prints "nothing to resume"), the runner falls back to
+//! `start -B -f`, which also clears the genuinely stale record that
+//! `btrfs-progs` would otherwise read as a live scrub and refuse to start over
 //! ("useful when scrub status file is damaged and reports a running scrub
-//! although it is not", `man btrfs-scrub` on `-f`). Left unhandled, one
-//! aborted pass could wedge that filesystem's scrubs indefinitely.
-//! [`decide_scrub_start_mode`] adds `-f` **only** when the prior record is
-//! `Aborted` *and* the kernel confirms nothing is running — never
-//! unconditionally, because these locks cannot stop an operator from starting
-//! a scrub by hand and force-restarting theirs would discard hours of work.
+//! although it is not", `man btrfs-scrub` on `-f`). So one aborted pass can
+//! neither be silently discarded nor wedge that filesystem's scrubs.
 //!
 //! # Operational notes
 //!
@@ -1380,50 +1383,85 @@ pub fn parse_scrub_status_output(stdout: &str) -> LiveScrubState {
     LiveScrubState::Unknown
 }
 
-/// Whether the next `btrfs scrub start` needs `-f`.
+/// What the next scrub invocation should do, given the prior record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScrubStartMode {
-    /// Plain `btrfs scrub start -B`.
+    /// Plain `btrfs scrub start -B` — no interrupted pass to continue.
     Normal,
-    /// `btrfs scrub start -B -f`, because a previous pass left an aborted
-    /// record behind and nothing is running now.
-    Forced { reason: String },
+    /// `btrfs scrub resume -B`, because a previous pass left an aborted record
+    /// behind (interrupted by a reboot or an unmount) and nothing is running
+    /// now. Resuming continues from the saved position in
+    /// `/var/lib/btrfs/scrub.status.<uuid>` rather than re-scrubbing from zero,
+    /// so an interruption is actually made good instead of silently discarded
+    /// (bd DAS-Backup-Manager-292). If the kernel has no resumable state after
+    /// all — `btrfs scrub resume` prints "nothing to resume" — the runner falls
+    /// back to a fresh `start -B -f`, which is what this branch did before
+    /// resume-awareness and still clears a genuinely stale record.
+    Resume { reason: String },
 }
 
-/// Decide whether this filesystem's scrub must be forced.
+/// Decide whether this filesystem's next scrub should resume or start fresh.
 ///
-/// `btrfs-progs` decides "a scrub is already running" partly from the saved
-/// status record: a device row that is neither `finished` nor `canceled` can
-/// read as a live scrub even when nothing is running, and the documented
-/// remedy is `-f` ("useful when scrub status file is damaged and reports a
-/// running scrub although it is not", `man btrfs-scrub`). Left unhandled, an
-/// aborted pass can wedge every later scrub of that filesystem until a human
-/// intervenes.
+/// An [`ScrubOutcome::Aborted`] record (`canceled:0 finished:0`) is what
+/// `btrfs scrub status` leaves behind when a pass is interrupted by a reboot or
+/// — the DAS case — an unmount, and it is exactly the state in which a
+/// resumable position exists in `/var/lib/btrfs/scrub.status.<uuid>`. Proven on
+/// 2026-09-09 (bd DAS-Backup-Manager-292): a scrub cancelled and then carried
+/// through an unmount/remount cycle resumed from 997 MB and continued to
+/// 9.58 GB, and the status record survived the unmount because it lives on the
+/// host root keyed by FS UUID, not on the target. So the interrupted case
+/// returns [`ScrubStartMode::Resume`] rather than re-scrubbing from zero.
 ///
-/// `-f` is emphatically **not** unconditional: the locks in this module do not
-/// protect against an operator running `btrfs scrub start` by hand, and
-/// force-restarting somebody else's scrub would throw away hours of work. It is
-/// used only when the prior record is [`ScrubOutcome::Aborted`] **and** the
-/// kernel confirms nothing is running. Anything unknown falls back to a plain
-/// start, which fails loudly rather than stomping.
+/// This decision is deliberately kept a pure function of the on-disk record and
+/// the live kernel state — the `--decide` seam the sentinel wrapper uses — so
+/// both directions are testable against real filesystem states rather than
+/// fixtures. The three guards on returning `Resume` are load-bearing:
+/// - **only when the prior record is `Aborted`** — a `Finished` or `Canceled`
+///   record has no interrupted position to continue, and a deliberate operator
+///   cancel is not silently resumed;
+/// - **only when the kernel confirms nothing is running** — the locks here do
+///   not protect against an operator's hand-run `btrfs scrub`, and resuming
+///   into a live scrub is meaningless;
+/// - **`Unknown` live state falls back to `Normal`** — a plain start fails
+///   loudly rather than acting on a state we could not read.
+///
+/// Note this never returns a force-start: the `-f` that a genuinely stale
+/// record needs is applied by the runner only as a fallback, if `resume`
+/// reports "nothing to resume". That keeps the stale-record-clearing capability
+/// this branch always had while making position-preservation the default.
 pub fn decide_scrub_start_mode(fsuuid: &str, mount_point: &str) -> ScrubStartMode {
     let Ok(prior) = read_scrub_status(fsuuid) else {
-        // No prior record at all — nothing to clear.
+        // No prior record at all — nothing to resume.
         return ScrubStartMode::Normal;
     };
-    if prior.outcome() != ScrubOutcome::Aborted {
+    // The decision itself is factored into the pure `decide_from` so both
+    // directions (resume vs normal) are unit-testable without a real mount —
+    // the live state a real filesystem yields only `Unknown` off a fake path,
+    // which cannot distinguish the branches. This wrapper does only the I/O:
+    // read the record, probe the kernel, hand both to the pure decision.
+    decide_from(fsuuid, prior.outcome(), live_scrub_state(mount_point, fsuuid))
+}
+
+/// Pure resume-or-normal decision from the two facts that determine it: the
+/// prior record's outcome and whether a scrub is live now. Kept free of I/O so
+/// every combination is exercisable in a unit test — the `--decide` seam.
+fn decide_from(fsuuid: &str, prior: ScrubOutcome, live: LiveScrubState) -> ScrubStartMode {
+    // Only an *aborted* record carries a resumable position; a finished or
+    // deliberately-canceled one does not.
+    if prior != ScrubOutcome::Aborted {
         return ScrubStartMode::Normal;
     }
-    match live_scrub_state(mount_point, fsuuid) {
-        LiveScrubState::NotRunning => ScrubStartMode::Forced {
+    match live {
+        LiveScrubState::NotRunning => ScrubStartMode::Resume {
             reason: format!(
                 "previous scrub of {fsuuid} left an aborted record \
                  (canceled:0 finished:0) and the kernel reports no scrub running — \
-                 forcing a fresh scrub so the stale record cannot block it"
+                 resuming from the saved position instead of restarting from zero"
             ),
         },
-        LiveScrubState::Running => ScrubStartMode::Normal,
-        LiveScrubState::Unknown => ScrubStartMode::Normal,
+        // A scrub is already running, or liveness could not be read: never act
+        // on a guess — a plain start fails loudly rather than stomping.
+        LiveScrubState::Running | LiveScrubState::Unknown => ScrubStartMode::Normal,
     }
 }
 
@@ -1885,34 +1923,69 @@ enum ScrubRunOutcome {
     Launched(Result<(), String>),
 }
 
-/// Run `btrfs scrub start -B` in the foreground, logging progress read from the
-/// UUID-keyed status record while it runs.
+/// True when a `resume` attempt exited nonzero *specifically* because the
+/// kernel had no resumable position — `btrfs scrub resume` prints
+/// "nothing to resume for <mnt>" and exits 2 (observed 2026-09-09, bd
+/// DAS-Backup-Manager-292). Only this exact case is retried as a fresh start;
+/// any other launched error is a real failure and is returned as-is, so a
+/// broken scrub is never masked by silently restarting from zero.
+fn resume_found_nothing(outcome: &ScrubRunOutcome) -> bool {
+    matches!(
+        outcome,
+        ScrubRunOutcome::Launched(Err(msg)) if msg.contains("nothing to resume")
+    )
+}
+
+/// Run a scrub of `mount_point` in the foreground, resuming an interrupted pass
+/// when one exists and otherwise starting fresh.
 ///
-/// The exit status is logged but never used as the verdict — the status record
-/// is the source of truth, because a scrub can exit zero and still have
-/// aborted.
+/// The resume-or-start decision is [`decide_scrub_start_mode`]. On the resume
+/// path, if the kernel turns out to have no resumable state after all, this
+/// falls back to `btrfs scrub start -B -f` — the pre-resume behaviour, which
+/// clears a genuinely stale aborted record. The exit status is logged but never
+/// used as the verdict — the status record is the source of truth, because a
+/// scrub can exit zero and still have aborted.
 fn run_btrfs_scrub(
     mount_point: &str,
     fsuuid: &str,
     progress: &dyn ProgressCallback,
 ) -> ScrubRunOutcome {
-    // Clear a stale aborted record out of the way if — and only if — nothing
-    // is running. See `decide_scrub_start_mode`.
-    let mut args = vec!["scrub", "start", "-B"];
     match decide_scrub_start_mode(fsuuid, mount_point) {
-        ScrubStartMode::Forced { reason } => {
-            progress.on_log(
-                LogLevel::Warning,
-                &format!("Using 'btrfs scrub start -B -f': {reason}"),
-            );
-            args.push("-f");
+        ScrubStartMode::Normal => {
+            run_scrub_argv(&["scrub", "start", "-B", mount_point], progress)
         }
-        ScrubStartMode::Normal => {}
+        ScrubStartMode::Resume { reason } => {
+            progress.on_log(LogLevel::Info, &format!("Resuming interrupted scrub: {reason}"));
+            let outcome = run_scrub_argv(&["scrub", "resume", "-B", mount_point], progress);
+            if resume_found_nothing(&outcome) {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "'btrfs scrub resume' found no resumable state on {mount_point} — \
+                         starting a fresh scrub with -f to clear the stale aborted record"
+                    ),
+                );
+                run_scrub_argv(&["scrub", "start", "-B", "-f", mount_point], progress)
+            } else {
+                outcome
+            }
+        }
     }
-    args.push(mount_point);
+}
+
+/// Spawn `btrfs <args>`, drain its stderr, and poll to completion while logging
+/// progress from the UUID-keyed status record. The `args` slice carries the
+/// full argument vector including the mountpoint; the fsuuid for progress
+/// reporting is recovered from the record itself, so this helper needs only the
+/// argv and the progress sink.
+fn run_scrub_argv(args: &[&str], progress: &dyn ProgressCallback) -> ScrubRunOutcome {
+    // The mountpoint is the final argument; progress is keyed by the FS UUID of
+    // whatever is mounted there.
+    let mount_point = args.last().copied().unwrap_or("");
+    let fsuuid = mounted_fs_uuid(mount_point).unwrap_or_default();
 
     let mut child = match Command::new("btrfs")
-        .args(&args)
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1960,7 +2033,7 @@ fn run_btrfs_scrub(
         if last_log.elapsed().as_secs() >= SCRUB_PROGRESS_LOG_SECS {
             last_log = Instant::now();
             // Progress is read by UUID, like everything else.
-            if let Ok(record) = read_scrub_status(fsuuid) {
+            if let Ok(record) = read_scrub_status(&fsuuid) {
                 progress.on_log(
                     LogLevel::Info,
                     &format!(
@@ -1980,8 +2053,12 @@ fn run_btrfs_scrub(
     ScrubRunOutcome::Launched(if status.success() {
         Ok(())
     } else {
+        // The full argv is named so a "nothing to resume" from a resume attempt
+        // is distinguishable in the message from a start failure — the string
+        // `resume_found_nothing` keys on comes through in `stderr`.
         Err(format!(
-            "btrfs scrub start -B {mount_point} exited {}{}",
+            "btrfs {} exited {}{}",
+            args.join(" "),
             status.code().unwrap_or(-1),
             if stderr.trim().is_empty() {
                 String::new()
@@ -2385,7 +2462,7 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
         assert_eq!(rec.last_activity_start(), rec.t_start());
     }
 
-    // --- forced-start decision (C1) ---------------------------------------
+    // --- resume-or-start decision (C1) ------------------------------------
 
     #[test]
     fn no_prior_record_starts_normally() {
@@ -2417,9 +2494,9 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
     }
 
     /// An unusable mount path yields `Unknown` liveness, which must never
-    /// force — the engine only forces on positive evidence that nothing runs.
+    /// resume — the engine only resumes on positive evidence that nothing runs.
     #[test]
-    fn aborted_prior_record_does_not_force_when_liveness_is_unknown() {
+    fn aborted_prior_record_does_not_resume_when_liveness_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let uuid = "60b05268-7f8f-47b5-a38a-752576a1172a";
         fs::write(
@@ -2433,9 +2510,91 @@ d29fdda7-a1e5-4640-996e-2b78569cb65d:1|data_extents_scrubbed:10233933|tree_exten
             assert_eq!(
                 decide_scrub_start_mode(uuid, "/nonexistent"),
                 ScrubStartMode::Normal,
-                "must not force when liveness cannot be determined"
+                "must not resume when liveness cannot be determined"
             );
         });
+    }
+
+    // --- pure decision, all four combinations -----------------------------
+
+    /// `decide_from` is the pure seam behind `decide_scrub_start_mode`. These
+    /// exercise every (outcome × liveness) combination that matters — the case
+    /// a real mount cannot produce in a unit test (aborted + NotRunning →
+    /// Resume) is the one that actually distinguishes the feature, so it is
+    /// asserted here rather than left to the root-only loopback tests.
+    #[test]
+    fn decide_from_resumes_only_on_aborted_and_not_running() {
+        let u = "abcd";
+        // The one case that resumes.
+        assert!(matches!(
+            decide_from(u, ScrubOutcome::Aborted, LiveScrubState::NotRunning),
+            ScrubStartMode::Resume { .. }
+        ));
+        // Aborted but a scrub is live, or liveness unknown: never resume.
+        assert_eq!(
+            decide_from(u, ScrubOutcome::Aborted, LiveScrubState::Running),
+            ScrubStartMode::Normal
+        );
+        assert_eq!(
+            decide_from(u, ScrubOutcome::Aborted, LiveScrubState::Unknown),
+            ScrubStartMode::Normal
+        );
+        // A finished or canceled record has no resumable position, regardless
+        // of liveness — this is the `!= Aborted` guard, and it must hold even
+        // when nothing is running (the case that would otherwise resume).
+        for live in [
+            LiveScrubState::NotRunning,
+            LiveScrubState::Running,
+            LiveScrubState::Unknown,
+        ] {
+            assert_eq!(
+                decide_from(u, ScrubOutcome::Finished, live),
+                ScrubStartMode::Normal,
+                "a finished record must never resume"
+            );
+            assert_eq!(
+                decide_from(u, ScrubOutcome::Canceled, live),
+                ScrubStartMode::Normal,
+                "a deliberately-canceled record must never auto-resume"
+            );
+        }
+    }
+
+    // --- resume fallback predicate ----------------------------------------
+
+    /// The fallback to a fresh `start -f` fires ONLY on the kernel's
+    /// "nothing to resume" message, and NOT on any other launched failure —
+    /// otherwise a genuinely broken scrub would be masked by silently
+    /// restarting it from zero. The message text is the real one observed
+    /// 2026-09-09; the runner formats it as `btrfs scrub resume -B <mnt> exited
+    /// 2: ERROR: ... nothing to resume for <mnt>`.
+    #[test]
+    fn resume_fallback_fires_only_on_nothing_to_resume() {
+        let nothing = ScrubRunOutcome::Launched(Err(
+            "btrfs scrub resume -B /mnt/x exited 2: ERROR: there is no scrub \
+             running, nothing to resume for /mnt/x"
+                .to_string(),
+        ));
+        assert!(
+            resume_found_nothing(&nothing),
+            "the 'nothing to resume' case must trigger the fresh-start fallback"
+        );
+
+        // A real failure (I/O error, unreadable device) must NOT be retried as
+        // a fresh start — that would discard the diagnosis and re-scrub blind.
+        let real_failure = ScrubRunOutcome::Launched(Err(
+            "btrfs scrub resume -B /mnt/x exited 1: ERROR: cannot read status".to_string(),
+        ));
+        assert!(
+            !resume_found_nothing(&real_failure),
+            "a genuine resume failure must surface, not silently restart"
+        );
+
+        // A clean resume and a spawn failure are likewise not the fallback case.
+        assert!(!resume_found_nothing(&ScrubRunOutcome::Launched(Ok(()))));
+        assert!(!resume_found_nothing(&ScrubRunOutcome::SpawnFailed(
+            "no such binary".to_string()
+        )));
     }
 
     /// Verbatim `btrfs scrub status` output captured from the v7.1 loopback

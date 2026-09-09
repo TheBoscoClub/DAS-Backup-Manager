@@ -139,6 +139,14 @@ Adding `mnt-backup\x2d22tb.mount` would make it fire at the *start* of a backup,
 for the same USB bus, and then `unmount_all` fails silently per §4. Also note this unit currently
 only knows the **udisks** mountpoints, so it has never participated in a backup run at all.
 
+> **Resolved 2026-09-09 (bd `DAS-Backup-Manager-292`).** Resume is now native to the engine
+> (`decide_scrub_start_mode`, see `ARCHITECTURE.md` → Scrub Pipeline), so this mount-triggered unit is
+> **superseded, not extended** — a second resume path on one host would violate single-canonical-source.
+> It is NOT removed until the resume-aware `btrdasd` is deployed to production, because until then it is
+> the only thing that resumes the 22 TB array's scrub; removal is the post-deployment step tracked on
+> `-292`. It applies only to the one array and only on a udisks (file-manager) mount, so it does no harm
+> in the interim.
+
 ## 7. Time budget
 
 | Filesystem | Data | Scrub reads | Estimate |

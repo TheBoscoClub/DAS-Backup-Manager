@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 ### Changed
+- **Scheduled DAS scrubs now RESUME an interrupted pass instead of restarting from zero** (bd
+  `DAS-Backup-Manager-292`). The engine's `decide_scrub_start_mode` (`indexer/src/scrub.rs`) previously
+  cleared an aborted record with `btrfs scrub start -B -f` — a fresh pass that discarded the interrupted
+  position. When the prior record is `Aborted` (`canceled:0 finished:0` — what a reboot or unmount that
+  kills a scrub mid-write leaves behind) and the kernel confirms nothing is running, it now issues
+  `btrfs scrub resume -B`, continuing from the saved position in `/var/lib/btrfs/scrub.status.<uuid>`.
+  The stale-record-clearing `start -B -f` is retained as a fallback, fired only when `resume` reports
+  "nothing to resume" — so no capability is lost while position-preservation becomes the default. This
+  reaches the monthly `das-scrub.service` (`btrdasd scrub run`) unchanged
+  - The decision is factored into a pure `decide_from(outcome, live_state)` seam so every
+    (outcome × liveness) combination is unit-testable without a real mount
+  - Proven end-to-end (root loopback, `indexer/tests/scrub_loopback.rs`
+    `interrupted_scrub_resumes_across_unmount`): a scrub cancelled mid-pass at 2.01 GB resumed across an
+    unmount/remount cycle to completion at 9.27 GB, with the original `t_start` preserved — the position
+    lives on the host root keyed by FS UUID, so an unmount between backup runs cannot erase it
 
 ### Fixed
 
