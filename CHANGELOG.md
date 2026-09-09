@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 ### Changed
+
+### Fixed
+
+## [0.7.22.3] - 2026-09-09
+
+### Changed
 - **Scheduled DAS scrubs now RESUME an interrupted pass instead of restarting from zero** (bd
   `DAS-Backup-Manager-292`). The engine's `decide_scrub_start_mode` (`indexer/src/scrub.rs`) previously
   cleared an aborted record with `btrfs scrub start -B -f` — a fresh pass that discarded the interrupted
@@ -25,8 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `interrupted_scrub_resumes_across_unmount`): a scrub cancelled mid-pass at 2.01 GB resumed across an
     unmount/remount cycle to completion at 9.27 GB, with the original `t_start` preserved — the position
     lives on the host root keyed by FS UUID, so an unmount between backup runs cannot erase it
-
-### Fixed
 
 ## [0.7.22.2] - 2026-09-01
 
@@ -1039,7 +1043,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.2...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.3...HEAD
+[0.7.22.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.2...v0.7.22.3
 [0.7.22.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.1...v0.7.22.2
 [0.7.22.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.0...v0.7.22.1
 [0.7.22.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.21.0...v0.7.22.0
