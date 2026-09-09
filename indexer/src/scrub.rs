@@ -1439,7 +1439,11 @@ pub fn decide_scrub_start_mode(fsuuid: &str, mount_point: &str) -> ScrubStartMod
     // the live state a real filesystem yields only `Unknown` off a fake path,
     // which cannot distinguish the branches. This wrapper does only the I/O:
     // read the record, probe the kernel, hand both to the pure decision.
-    decide_from(fsuuid, prior.outcome(), live_scrub_state(mount_point, fsuuid))
+    decide_from(
+        fsuuid,
+        prior.outcome(),
+        live_scrub_state(mount_point, fsuuid),
+    )
 }
 
 /// Pure resume-or-normal decision from the two facts that determine it: the
@@ -1951,11 +1955,12 @@ fn run_btrfs_scrub(
     progress: &dyn ProgressCallback,
 ) -> ScrubRunOutcome {
     match decide_scrub_start_mode(fsuuid, mount_point) {
-        ScrubStartMode::Normal => {
-            run_scrub_argv(&["scrub", "start", "-B", mount_point], progress)
-        }
+        ScrubStartMode::Normal => run_scrub_argv(&["scrub", "start", "-B", mount_point], progress),
         ScrubStartMode::Resume { reason } => {
-            progress.on_log(LogLevel::Info, &format!("Resuming interrupted scrub: {reason}"));
+            progress.on_log(
+                LogLevel::Info,
+                &format!("Resuming interrupted scrub: {reason}"),
+            );
             let outcome = run_scrub_argv(&["scrub", "resume", "-B", mount_point], progress);
             if resume_found_nothing(&outcome) {
                 progress.on_log(

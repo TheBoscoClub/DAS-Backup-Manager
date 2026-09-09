@@ -79,7 +79,10 @@ impl Rig {
         let mount_point = dir.join("mnt");
         std::fs::create_dir_all(&mount_point).expect("create mount dir");
 
-        must("truncate", &["-s", &format!("{image_gib}G"), image.to_str().unwrap()]);
+        must(
+            "truncate",
+            &["-s", &format!("{image_gib}G"), image.to_str().unwrap()],
+        );
         let loop_dev = must("losetup", &["--find", "--show", image.to_str().unwrap()])
             .trim()
             .to_string();
