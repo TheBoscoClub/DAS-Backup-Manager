@@ -630,6 +630,29 @@ enum SubvolAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Adopt subvolumes that exist and are not excluded, retire entries
+    /// whose subvolume is gone. Expects the source volumes to be mounted.
+    Sync {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Print what would change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete the backups of retired subvolumes that are past their window.
+    /// Expects the targets to be mounted.
+    Expire {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Path to SQLite database
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: PathBuf,
+        /// Print what would be deleted and delete nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1134,6 +1157,104 @@ pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Save an edited config and regenerate btrbk.conf from it, or change
+/// neither. An entry that is in config.toml but not in btrbk.conf is not
+/// backed up, however it looks.
+fn save_config_and_btrbk_conf(
+    cfg: &Config,
+    config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_config_and_btrbk_conf_with(cfg, config_path, &|cfg, path| cfg.save(path))
+}
+
+type ConfigSaver<'a> = dyn Fn(&Config, &Path) -> Result<(), Box<dyn std::error::Error>> + 'a;
+
+/// `save_config_and_btrbk_conf` with the config save injectable, so a test can
+/// make that step fail in ways a real filesystem will not on demand.
+fn save_config_and_btrbk_conf_with(
+    cfg: &Config,
+    config_path: &Path,
+    save: &ConfigSaver<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let errors = cfg.validate();
+    if !errors.is_empty() {
+        return Err(errors.join("\n").into());
+    }
+    let conf_path = Path::new(&cfg.general.btrbk_conf);
+    // Absent is a state to restore (by removing what we write); unreadable is
+    // not, because then a failed save could not be undone. Refuse that case.
+    let previous = match std::fs::read_to_string(conf_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read {} to keep a rollback copy: {e}",
+                conf_path.display()
+            )
+            .into());
+        }
+    };
+    buttered_dasd::fsutil::write_atomic(
+        conf_path,
+        &buttered_dasd::btrbk_conf::render_btrbk_conf(cfg),
+    )?;
+    if let Err(e) = save(cfg, config_path) {
+        let rollback = match &previous {
+            Some(text) => buttered_dasd::fsutil::write_atomic(conf_path, text),
+            None => std::fs::remove_file(conf_path),
+        };
+        if let Err(re) = rollback {
+            return Err(format!(
+                "{e}; rolling back {} also failed: {re} — {} and {} may disagree",
+                conf_path.display(),
+                config_path.display(),
+                conf_path.display()
+            )
+            .into());
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Drop the index rows of snapshots `subvol expire` just deleted.
+/// Returns how many rows were pruned.
+fn prune_deleted_from_index(
+    db: &Path,
+    deleted: &[PathBuf],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let database = Database::open(db)?;
+    let ids: Vec<i64> = database
+        .list_snapshots()?
+        .into_iter()
+        .filter(|s| deleted.iter().any(|p| p.to_string_lossy() == s.path))
+        .map(|s| s.id)
+        .collect();
+    database.prune_snapshots(&ids)?;
+    Ok(ids.len())
+}
+
+/// Whether `backup run` exits nonzero: the run itself failed, or the subvolume
+/// sync before it did. A failed sync never stops the run; it only fails the
+/// command once the run has finished and been recorded.
+fn backup_run_failed(run_succeeded: bool, sync_failed: bool) -> bool {
+    !run_succeeded || sync_failed
+}
+
+/// Whether `subvol expire` failed overall: the expiry itself did, or snapshots
+/// are gone and the index still lists them. The database is not opened at all
+/// when nothing was deleted (it may not exist yet).
+fn expire_failed(outcome_failed: bool, deleted: &[PathBuf], db: &Path) -> bool {
+    let mut failed = outcome_failed;
+    if !deleted.is_empty()
+        && let Err(e) = prune_deleted_from_index(db, deleted)
+    {
+        eprintln!("Warning: deleted snapshots could not be removed from the index: {e}");
+        failed = true;
+    }
+    failed
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let json = cli.json;
@@ -1571,6 +1692,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
+                // The manual path gets the same guarantee as the scheduled
+                // one: a subvolume that exists is backed up by this run. The
+                // report goes to stderr so stdout stays what it was.
+                let sync_failed = match buttered_dasd::adopt::sync_subvolumes(
+                    &config,
+                    dry_run,
+                    &buttered_dasd::caldate::today(),
+                    &buttered_dasd::fsutil::SystemRunner,
+                    &buttered_dasd::health::is_mountpoint,
+                ) {
+                    Ok(outcome) => {
+                        eprint!(
+                            "{}",
+                            buttered_dasd::adopt::format_sync_report(&outcome, dry_run)
+                        );
+                        outcome.failed()
+                    }
+                    Err(e) => {
+                        eprintln!("Subvolume sync could not run: {e}");
+                        true
+                    }
+                };
+                // Sync may have rewritten config.toml; the run uses what is on disk.
+                let cfg = Config::load(&config)?;
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
                 guard.unmount(&progress);
@@ -1617,7 +1762,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  ERROR: {e}");
                     }
                 }
-                if !result.success {
+                // A failed sync does not stop the run; it fails the command once
+                // the run has finished and been recorded.
+                if backup_run_failed(result.success, sync_failed) {
                     std::process::exit(1);
                 }
             }
@@ -2010,8 +2157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let mut cfg = Config::load(&config)?;
                 subvol::add_subvolume(&mut cfg, &source, &name, manual_only)?;
-                let toml = cfg.to_toml()?;
-                std::fs::write(&config, toml)?;
+                save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Added subvolume '{name}' to source '{source}'.");
             }
             SubvolAction::Remove {
@@ -2021,8 +2167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let mut cfg = Config::load(&config)?;
                 subvol::remove_subvolume(&mut cfg, &source, &name)?;
-                let toml = cfg.to_toml()?;
-                std::fs::write(&config, toml)?;
+                save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Removed subvolume '{name}' from source '{source}'.");
             }
             SubvolAction::SetManual {
@@ -2032,8 +2177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let mut cfg = Config::load(&config)?;
                 subvol::set_manual(&mut cfg, &source, &name, true)?;
-                let toml = cfg.to_toml()?;
-                std::fs::write(&config, toml)?;
+                save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Subvolume '{name}' in source '{source}' set to manual-only.");
             }
             SubvolAction::SetAuto {
@@ -2043,9 +2187,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let mut cfg = Config::load(&config)?;
                 subvol::set_manual(&mut cfg, &source, &name, false)?;
-                let toml = cfg.to_toml()?;
-                std::fs::write(&config, toml)?;
+                save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Subvolume '{name}' in source '{source}' set to automatic.");
+            }
+            SubvolAction::Sync { config, dry_run } => {
+                let outcome = match buttered_dasd::adopt::sync_subvolumes(
+                    &config,
+                    dry_run,
+                    &buttered_dasd::caldate::today(),
+                    &buttered_dasd::fsutil::SystemRunner,
+                    &buttered_dasd::health::is_mountpoint,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                print!(
+                    "{}",
+                    buttered_dasd::adopt::format_sync_report(&outcome, dry_run)
+                );
+                if outcome.failed() {
+                    std::process::exit(1);
+                }
+            }
+            SubvolAction::Expire {
+                config,
+                db,
+                dry_run,
+            } => {
+                let outcome = match buttered_dasd::expire::expire_retired(
+                    &config,
+                    dry_run,
+                    &buttered_dasd::caldate::today(),
+                    &buttered_dasd::fsutil::SystemRunner,
+                    &buttered_dasd::health::is_mountpoint,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                print!(
+                    "{}",
+                    buttered_dasd::expire::format_expire_report(&outcome, dry_run)
+                );
+                if expire_failed(outcome.failed(), &outcome.deleted_paths(), &db) {
+                    std::process::exit(1);
+                }
             }
         },
 
@@ -2898,5 +3089,198 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             reason: "maintenance lock held".into(),
         };
         assert_eq!(exit_code_for_doctor(&outcome), 0);
+    }
+
+    // ---- subvol config editing: config.toml and btrbk.conf change together ----
+
+    fn saveable_config(dir: &Path) -> Config {
+        let text = format!(
+            r#"[general]
+version = "0.7.22"
+install_prefix = "/usr"
+db_path = "{db}"
+btrbk_conf = "{conf}"
+[init]
+system = "systemd"
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+[[source]]
+label = "s"
+volume = "/vol"
+device = "UUID=abc"
+[[source.subvolumes]]
+name = "@"
+[[target]]
+label = "t"
+serial = "X"
+mount = "/mnt/t"
+role = "primary"
+[target.retention]
+daily = 7
+[email]
+enabled = false
+[gui]
+enabled = false
+"#,
+            db = dir.join("index.db").display(),
+            conf = dir.join("btrbk.conf").display(),
+        );
+        Config::from_toml(&text).unwrap()
+    }
+
+    #[test]
+    fn save_writes_config_and_btrbk_conf_that_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.to_toml().unwrap(), cfg.to_toml().unwrap());
+        let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
+        assert_eq!(
+            conf,
+            buttered_dasd::btrbk_conf::render_btrbk_conf(&reloaded)
+        );
+    }
+
+    #[test]
+    fn save_of_an_invalid_config_writes_neither_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = saveable_config(dir.path());
+        cfg.schedule.incremental = "not a time".into();
+        assert!(!cfg.validate().is_empty(), "fixture must be invalid");
+        let config_path = dir.path().join("config.toml");
+        let err = save_config_and_btrbk_conf(&cfg, &config_path).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(!config_path.exists());
+        assert!(!dir.path().join("btrbk.conf").exists());
+    }
+
+    #[test]
+    fn failed_config_save_restores_the_previous_btrbk_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let conf_path = dir.path().join("btrbk.conf");
+        std::fs::write(&conf_path, "previous btrbk.conf\n").unwrap();
+        // Occupy the atomic writer's temp name so the config save fails.
+        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&conf_path).unwrap(),
+            "previous btrbk.conf\n"
+        );
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn failed_config_save_leaves_no_btrbk_conf_when_there_was_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
+        assert!(!dir.path().join("btrbk.conf").exists());
+    }
+
+    #[test]
+    fn a_failed_rollback_is_reported_and_names_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let conf_path = dir.path().join("btrbk.conf");
+        let config_path = dir.path().join("config.toml");
+        // The save fails and, on the way out, leaves a directory where the
+        // rollback needs a file: both the restore and the removal fail.
+        let sabotage = |_: &Config, _: &Path| -> Result<(), Box<dyn std::error::Error>> {
+            std::fs::remove_file(&conf_path).unwrap();
+            std::fs::create_dir(&conf_path).unwrap();
+            Err("save failed".into())
+        };
+
+        // Case 1: there was no previous btrbk.conf (rollback removes the file).
+        let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &sabotage).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("save failed"), "{msg}");
+        assert!(msg.contains("rolling back"), "{msg}");
+        assert!(
+            msg.contains("config.toml") && msg.contains("btrbk.conf"),
+            "{msg}"
+        );
+
+        // Case 2: there was one (rollback rewrites it, onto a directory).
+        std::fs::remove_dir(&conf_path).unwrap();
+        std::fs::write(&conf_path, "previous\n").unwrap();
+        let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &sabotage).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("save failed") && msg.contains("rolling back"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_previous_btrbk_conf_refuses_the_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        // A directory where the file belongs: not NotFound, and no text to restore.
+        std::fs::create_dir(dir.path().join("btrbk.conf")).unwrap();
+        let config_path = dir.path().join("config.toml");
+        let err = save_config_and_btrbk_conf(&cfg, &config_path).unwrap_err();
+        assert!(err.to_string().contains("rollback copy"), "{err}");
+        assert!(!config_path.exists());
+    }
+
+    // ---- subvol expire: the index follows the deletes ----
+
+    #[test]
+    fn expire_failed_does_not_open_the_database_when_nothing_was_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        assert!(!expire_failed(false, &[], &db));
+        assert!(!db.exists(), "the database must not be created");
+        assert!(
+            expire_failed(true, &[], &db),
+            "an expiry failure stays a failure"
+        );
+    }
+
+    #[test]
+    fn expire_failed_is_true_when_deleted_snapshots_cannot_be_pruned_from_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory is not a database.
+        let deleted = [PathBuf::from("/mnt/t/gone.20260101")];
+        assert!(expire_failed(false, &deleted, dir.path()));
+    }
+
+    #[test]
+    fn expire_prunes_exactly_the_deleted_snapshots_from_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.insert_snapshot("gone", "20260101", "s", "/mnt/t/gone.20260101")
+                .unwrap();
+            db.insert_snapshot("kept", "20260101", "s", "/mnt/t/kept.20260101")
+                .unwrap();
+        }
+        let deleted = [PathBuf::from("/mnt/t/gone.20260101")];
+        assert!(!expire_failed(false, &deleted, &db_path));
+
+        let left = Database::open(&db_path).unwrap().list_snapshots().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "/mnt/t/kept.20260101");
+    }
+
+    #[test]
+    fn backup_run_exit_is_failure_when_either_the_run_or_the_sync_failed() {
+        assert!(!backup_run_failed(true, false));
+        assert!(backup_run_failed(false, false));
+        assert!(backup_run_failed(true, true));
+        assert!(backup_run_failed(false, true));
     }
 }
