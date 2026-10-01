@@ -5,6 +5,7 @@ pub mod caldate;
 pub mod config;
 pub mod db;
 pub mod doctor;
+pub mod expire;
 pub mod forget;
 pub mod fsutil;
 pub mod health;
