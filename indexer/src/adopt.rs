@@ -286,18 +286,25 @@ fn unique_name(base: &str, taken: &HashSet<String>) -> String {
         .expect("more than 65 000 snapshot names share one base")
 }
 
-/// The config that results from carrying out `plan` on `today`.
-pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Config {
+/// The config that results from carrying out `plan` on `today`. A plan item
+/// that cannot be carried out — it names an entry or a volume the config does
+/// not have — is an error and no config is returned: a half-applied plan would
+/// look complete while leaving a subvolume unprotected.
+pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Result<Config, String> {
     let mut out = config.clone();
 
-    for reference in &plan.retire {
-        if let Some(entry) = entry_mut(&mut out, reference) {
-            entry.retired = Some(today.to_string());
-        }
-    }
-    for reference in &plan.revive {
-        if let Some(entry) = entry_mut(&mut out, reference) {
-            entry.retired = None;
+    for (verb, items, retired) in [
+        ("retire", &plan.retire, Some(today.to_string())),
+        ("revive", &plan.revive, None),
+    ] {
+        for reference in items {
+            let entry = entry_mut(&mut out, reference).ok_or_else(|| {
+                format!(
+                    "cannot {verb} '{}' in source '{}': no such entry",
+                    reference.name, reference.source_label
+                )
+            })?;
+            entry.retired = retired.clone();
         }
     }
 
@@ -310,44 +317,53 @@ pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Config {
         .collect();
 
     for adoption in &plan.adopt {
-        if !out.sources.iter().any(|s| s.label == adoption.source_label) {
-            let Some(model) = config.sources.iter().find(|s| s.volume == adoption.volume) else {
-                continue;
-            };
-            let primary: Vec<String> = config
-                .targets
-                .iter()
-                .filter(|t| t.role == TargetRole::Primary)
-                .map(|t| t.label.clone())
-                .take(1)
-                .collect();
-            out.sources.push(Source {
-                label: adoption.source_label.clone(),
-                volume: model.volume.clone(),
-                subvolumes: Vec::new(),
-                device: model.device.clone(),
-                snapshot_dir: model.snapshot_dir.clone(),
-                target_subdirs: vec![adoption.source_label.clone()],
-                target_labels: primary,
-            });
-        }
+        let index = match out
+            .sources
+            .iter()
+            .position(|s| s.label == adoption.source_label)
+        {
+            Some(index) => index,
+            None => {
+                let model = config
+                    .sources
+                    .iter()
+                    .find(|s| s.volume == adoption.volume)
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot adopt '{}': no source is configured for volume '{}'",
+                            adoption.name, adoption.volume
+                        )
+                    })?;
+                let primary: Vec<String> = config
+                    .targets
+                    .iter()
+                    .filter(|t| t.role == TargetRole::Primary)
+                    .map(|t| t.label.clone())
+                    .take(1)
+                    .collect();
+                out.sources.push(Source {
+                    label: adoption.source_label.clone(),
+                    volume: model.volume.clone(),
+                    subvolumes: Vec::new(),
+                    device: model.device.clone(),
+                    snapshot_dir: model.snapshot_dir.clone(),
+                    target_subdirs: vec![adoption.source_label.clone()],
+                    target_labels: primary,
+                });
+                out.sources.len() - 1
+            }
+        };
         let snapshot_name = unique_name(&algorithmic_snapshot_name(&adoption.name), &taken);
         taken.insert(snapshot_name.clone());
-        if let Some(source) = out
-            .sources
-            .iter_mut()
-            .find(|s| s.label == adoption.source_label)
-        {
-            source.subvolumes.push(SubvolConfig {
-                name: adoption.name.clone(),
-                manual_only: adoption.manual_only,
-                snapshot_name: Some(snapshot_name),
-                adopted: Some(today.to_string()),
-                retired: None,
-            });
-        }
+        out.sources[index].subvolumes.push(SubvolConfig {
+            name: adoption.name.clone(),
+            manual_only: adoption.manual_only,
+            snapshot_name: Some(snapshot_name),
+            adopted: Some(today.to_string()),
+            retired: None,
+        });
     }
-    out
+    Ok(out)
 }
 
 fn entry_mut<'a>(config: &'a mut Config, reference: &EntryRef) -> Option<&'a mut SubvolConfig> {
@@ -771,7 +787,7 @@ mod tests {
         );
         let c = config();
         let plan = plan_sync(&c, &l);
-        let out = apply_plan(&c, &plan, "2026-10-02");
+        let out = apply_plan(&c, &plan, "2026-10-02").expect("consistent plan");
 
         let ssd = &out.sources[0];
         let web = ssd
@@ -809,12 +825,13 @@ mod tests {
         let c = config();
         let mut l = all_present();
         l[0] = listing("/ssd", &["@srv", "@opt", "@srv/VirtualMachines", "@one"]);
-        let once = apply_plan(&c, &plan_sync(&c, &l), "2026-10-02");
+        let once = apply_plan(&c, &plan_sync(&c, &l), "2026-10-02").expect("consistent plan");
         l[0] = listing(
             "/ssd",
             &["@srv", "@opt", "@srv/VirtualMachines", "@one", "@two"],
         );
-        let twice = apply_plan(&once, &plan_sync(&once, &l), "2026-10-03");
+        let twice =
+            apply_plan(&once, &plan_sync(&once, &l), "2026-10-03").expect("consistent plan");
         assert_eq!(
             twice
                 .sources
@@ -840,7 +857,7 @@ mod tests {
             listing("/ssd", &["@srv", "@srv/VirtualMachines"]),
             listing("/hdd", &["bosco-media"]),
         ];
-        let retired = apply_plan(&c, &plan_sync(&c, &gone), "2026-10-02");
+        let retired = apply_plan(&c, &plan_sync(&c, &gone), "2026-10-02").expect("consistent plan");
         let opt = retired.sources[0]
             .subvolumes
             .iter()
@@ -848,7 +865,8 @@ mod tests {
             .unwrap();
         assert_eq!(opt.retired.as_deref(), Some("2026-10-02"));
 
-        let back = apply_plan(&retired, &plan_sync(&retired, &all_present()), "2026-10-09");
+        let back = apply_plan(&retired, &plan_sync(&retired, &all_present()), "2026-10-09")
+            .expect("consistent plan");
         let opt = back.sources[0]
             .subvolumes
             .iter()
@@ -872,7 +890,7 @@ mod tests {
         assert_eq!(plan.adopt[0].source_label, "media-adopted");
         assert!(plan.unplaceable.is_empty());
 
-        let out = apply_plan(&c, &plan, "2026-10-02");
+        let out = apply_plan(&c, &plan, "2026-10-02").expect("consistent plan");
         assert_eq!(out.sources.len(), 3, "no second adoption source");
         let names: Vec<_> = out.sources[2]
             .subvolumes
@@ -880,5 +898,57 @@ mod tests {
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(names, ["old", "fresh"]);
+    }
+
+    fn entry(label: &str, name: &str) -> EntryRef {
+        EntryRef {
+            source_label: label.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn apply_refuses_a_retire_or_revive_that_names_no_entry() {
+        let c = config();
+        for (kind, plan) in [
+            (
+                "retire",
+                SyncPlan {
+                    retire: vec![entry("ssd", "@nope")],
+                    ..Default::default()
+                },
+            ),
+            (
+                "revive",
+                SyncPlan {
+                    revive: vec![entry("ghost", "@opt")],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let why = apply_plan(&c, &plan, "2026-10-02").unwrap_err();
+            assert!(why.contains(kind), "{why}");
+            let item = &plan.retire.iter().chain(&plan.revive).next().unwrap();
+            assert!(
+                why.contains(&item.source_label) && why.contains(&item.name),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_refuses_an_adoption_on_a_volume_with_no_source() {
+        let plan = SyncPlan {
+            adopt: vec![Adoption {
+                volume: "/nowhere".into(),
+                name: "@lost".into(),
+                source_label: "nowhere-adopted".into(),
+                nested_under: None,
+                manual_only: false,
+            }],
+            ..Default::default()
+        };
+        let why = apply_plan(&config(), &plan, "2026-10-02").unwrap_err();
+        assert!(why.contains("@lost") && why.contains("/nowhere"), "{why}");
     }
 }
