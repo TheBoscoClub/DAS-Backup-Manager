@@ -1,9 +1,13 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.5.0
+# Version: 4.6.0
 # Date: 2026-09-01
 #
 # Features:
+#   - Subvolume sync (v4.6.0): sync_subvolumes() adopts new and retires
+#     vanished subvolumes before btrbk runs and reloads the config;
+#     expire_retired_subvolumes() deletes retired series past their window
+#     after btrbk. Neither can stop the backup; both are recorded in the report.
 #   - Source-side mount verification (v4.5.0): verify_sources_before_write(),
 #     called from main() between mount_sources() and create_snapshot_dirs().
 #     Targets have had verify_targets_before_btrbk() since bd
@@ -234,61 +238,85 @@ BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
 DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
 # Boot archive pruner — sibling script, same install directory as this one.
 BOOT_ARCHIVE_CLEANUP_BIN="${BOOT_ARCHIVE_CLEANUP_BIN:-/usr/lib/das-backup/boot-archive-cleanup.sh}"
+
+# Load the target/source configuration from config.toml via btrdasd. Called
+# once at startup and again after sync_subvolumes, because sync may add a
+# source (the per-volume adoption source) and every array below is built from
+# this output. Each array is redeclared empty so a reload never keeps an entry
+# the config no longer has.
+#
+# Scalars read at startup straight from the same output (LOG_FILE, GROWTH_LOG,
+# LAST_REPORT, ...) are NOT re-derived: sync never changes them, and moving the
+# log file mid-run would split one run's log in two.
+load_config_env() {
+    local env_text
+    if ! env_text="$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"; then
+        echo "ERROR: btrdasd could not read $DAS_CONFIG" >&2
+        return 1
+    fi
+    eval "$env_text"
+
+    # Build associative arrays from config
+    declare -gA DAS_SERIALS=()           # legacy: anchor serial per label
+    declare -gA DAS_SERIALS_LIST=()      # space-separated list of all expected serials
+    declare -gA TARGET_MOUNT_UUIDS=()    # BTRFS FS UUID for mount-by-UUID, "" if unset
+    declare -gA TARGET_MOUNTS=()
+    declare -gA TARGET_NAMES=()
+    declare -gA TARGET_ROLES=()
+    declare -gA MOUNT_ROLES=()
+    local i label_var serial_var serials_var uuid_var mount_var name_var role_var label name_val
+    for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+        label_var="DAS_TARGET_${i}_LABEL"
+        serial_var="DAS_TARGET_${i}_SERIAL"
+        serials_var="DAS_TARGET_${i}_SERIALS"
+        uuid_var="DAS_TARGET_${i}_MOUNT_UUID"
+        mount_var="DAS_TARGET_${i}_MOUNT"
+        name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+        role_var="DAS_TARGET_${i}_ROLE"
+        label="${!label_var}"
+        DAS_SERIALS[$label]="${!serial_var}"
+        # SERIALS list (new env var) — fall back to legacy single SERIAL when not emitted
+        DAS_SERIALS_LIST[$label]="${!serials_var:-${!serial_var}}"
+        TARGET_MOUNT_UUIDS[$label]="${!uuid_var:-}"
+        TARGET_MOUNTS[$label]="${!mount_var}"
+        TARGET_ROLES[$label]="${!role_var}"
+        MOUNT_ROLES[${!mount_var}]="${!role_var}"
+        name_val="${!name_var}"
+        if [[ -n "${name_val:-}" ]]; then
+            TARGET_NAMES[${!mount_var}]="$name_val"
+        else
+            TARGET_NAMES[${!mount_var}]="$label"
+        fi
+    done
+
+    # Source volumes and devices from config
+    declare -gA SOURCE_VOLUMES=()
+    declare -gA SOURCE_DEVICES=()
+    declare -gA SOURCE_SNAPSHOT_DIRS=()
+    local vol_var dev_var snap_var snap_val
+    for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
+        label_var="DAS_SOURCE_${i}_LABEL"
+        vol_var="DAS_SOURCE_${i}_VOLUME"
+        dev_var="DAS_SOURCE_${i}_DEVICE"
+        snap_var="DAS_SOURCE_${i}_SNAPSHOT_DIR"
+        SOURCE_VOLUMES[${!label_var}]="${!vol_var}"
+        SOURCE_DEVICES[${!label_var}]="${!dev_var}"
+        snap_val="${!snap_var}"
+        if [[ -n "${snap_val:-}" ]]; then
+            SOURCE_SNAPSHOT_DIRS[${!label_var}]="$snap_val"
+        fi
+    done
+
+    # All target mount points (space-separated string from config -> array)
+    IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
+}
+
 if [[ -x "$BTRDASD_BIN" ]]; then
-    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
+    load_config_env || exit 1
 else
     echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
     exit 1
 fi
-
-# Build associative arrays from config
-declare -A DAS_SERIALS=()           # legacy: anchor serial per label
-declare -A DAS_SERIALS_LIST=()      # space-separated list of all expected serials
-declare -A TARGET_MOUNT_UUIDS=()    # BTRFS FS UUID for mount-by-UUID, "" if unset
-declare -A TARGET_MOUNTS=()
-declare -A TARGET_NAMES=()
-declare -A TARGET_ROLES=()
-declare -A MOUNT_ROLES=()
-for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
-    label_var="DAS_TARGET_${i}_LABEL"
-    serial_var="DAS_TARGET_${i}_SERIAL"
-    serials_var="DAS_TARGET_${i}_SERIALS"
-    uuid_var="DAS_TARGET_${i}_MOUNT_UUID"
-    mount_var="DAS_TARGET_${i}_MOUNT"
-    name_var="DAS_TARGET_${i}_DISPLAY_NAME"
-    role_var="DAS_TARGET_${i}_ROLE"
-    label="${!label_var}"
-    DAS_SERIALS[$label]="${!serial_var}"
-    # SERIALS list (new env var) — fall back to legacy single SERIAL when not emitted
-    DAS_SERIALS_LIST[$label]="${!serials_var:-${!serial_var}}"
-    TARGET_MOUNT_UUIDS[$label]="${!uuid_var:-}"
-    TARGET_MOUNTS[$label]="${!mount_var}"
-    TARGET_ROLES[$label]="${!role_var}"
-    MOUNT_ROLES[${!mount_var}]="${!role_var}"
-    name_val="${!name_var}"
-    if [[ -n "${name_val:-}" ]]; then
-        TARGET_NAMES[${!mount_var}]="$name_val"
-    else
-        TARGET_NAMES[${!mount_var}]="$label"
-    fi
-done
-
-# Source volumes and devices from config
-declare -A SOURCE_VOLUMES=()
-declare -A SOURCE_DEVICES=()
-declare -A SOURCE_SNAPSHOT_DIRS=()
-for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
-    label_var="DAS_SOURCE_${i}_LABEL"
-    vol_var="DAS_SOURCE_${i}_VOLUME"
-    dev_var="DAS_SOURCE_${i}_DEVICE"
-    snap_var="DAS_SOURCE_${i}_SNAPSHOT_DIR"
-    SOURCE_VOLUMES[${!label_var}]="${!vol_var}"
-    SOURCE_DEVICES[${!label_var}]="${!dev_var}"
-    snap_val="${!snap_var}"
-    if [[ -n "${snap_val:-}" ]]; then
-        SOURCE_SNAPSHOT_DIRS[${!label_var}]="$snap_val"
-    fi
-done
 
 # Logging (now from config)
 LOG_FILE="$DAS_LOG_FILE"
@@ -303,9 +331,6 @@ GROWTH_LOG="$DAS_GROWTH_LOG"
 # growth log. bd DAS-Backup-Manager-6lr.
 DAS_THROUGHPUT_LOG="${DAS_THROUGHPUT_LOG:-$(dirname "$DAS_GROWTH_LOG")/throughput.jsonl}"
 LAST_REPORT="$DAS_LAST_REPORT"
-
-# All target mount points (space-separated string from config -> array)
-IFS=' ' read -ra ALL_TARGET_MOUNTS <<< "$DAS_ALL_TARGET_MOUNTS"
 
 # Throughput tracking (populated at runtime)
 declare -A USAGE_BEFORE=()
@@ -818,6 +843,64 @@ verify_sources_before_write() {
 
     log_info "All source volumes verified — safe to create snapshot dirs and invoke btrbk."
     record_op "verify_sources" "OK"
+}
+
+SUBVOL_SYNC_REPORT=""
+SUBVOL_EXPIRE_REPORT=""
+
+# Adopt subvolumes that exist and are not excluded; retire entries whose
+# subvolume is gone. Runs after verify_sources_before_write, so every source
+# volume is mounted and proven to be the expected filesystem.
+#
+# A failure here never stops the backup: the subvolumes already configured
+# must still be backed up. It is recorded, so the report says FAILURES
+# DETECTED and backup_runs.success is 0.
+sync_subvolumes() {
+    local mode="$1"
+    local args=(subvol sync --config "$DAS_CONFIG")
+    [[ "$mode" == "dryrun" ]] && args+=(--dry-run)
+
+    log_info "Syncing subvolumes with config..."
+    local rc=0
+    SUBVOL_SYNC_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        record_op "subvol_sync" "OK"
+    else
+        record_op "subvol_sync" "FAIL" "exit code $rc — see SUBVOLUME SYNC in the report"
+        log_error "Subvolume sync failed (exit $rc); continuing with the existing config"
+    fi
+    local line
+    while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_SYNC_REPORT"
+
+    # Sync may have added a source. Reload even after a failure: a partial
+    # success on one volume still changed the config.
+    if ! load_config_env; then
+        record_op "subvol_sync" "FAIL" "config could not be reloaded after sync"
+        log_error "Config could not be reloaded after subvolume sync"
+    fi
+    return 0
+}
+
+# Delete the backups of retired subvolumes that are past their window.
+# Runs after btrbk, while the targets are still mounted.
+expire_retired_subvolumes() {
+    local mode="$1"
+    local args=(subvol expire --config "$DAS_CONFIG" --db "$DAS_DB_PATH")
+    [[ "$mode" == "dryrun" ]] && args+=(--dry-run)
+
+    local rc=0
+    SUBVOL_EXPIRE_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        record_op "subvol_expire" "OK"
+    else
+        record_op "subvol_expire" "FAIL" "exit code $rc — see RETIRED SUBVOLUMES in the report"
+        log_error "Expiry of retired subvolumes failed (exit $rc)"
+    fi
+    if [[ -n "$SUBVOL_EXPIRE_REPORT" ]]; then
+        local line
+        while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_EXPIRE_REPORT"
+    fi
+    return 0
 }
 
 mount_targets() {
@@ -1694,6 +1777,18 @@ generate_report() {
     local elapsed_min=$(( elapsed / 60 ))
     local elapsed_sec=$(( elapsed % 60 ))
 
+    # Optional sections, built by concatenation (not $(...), which would strip
+    # the trailing newline). Each present section is wrapped in blank lines;
+    # with neither present the variable is empty and the heredoc keeps its one
+    # blank line between the operations list and THROUGHPUT.
+    local subvol_sections=""
+    if [[ -n "$SUBVOL_SYNC_REPORT" ]]; then
+        subvol_sections+=$'\n'"$SUBVOL_SYNC_REPORT"$'\n'
+    fi
+    if [[ -n "$SUBVOL_EXPIRE_REPORT" ]]; then
+        subvol_sections+=$'\n'"$SUBVOL_EXPIRE_REPORT"$'\n'
+    fi
+
     # Build the report
     cat <<-REPORT
 ===============================================================
@@ -1710,7 +1805,9 @@ BACKUP OPERATIONS
   Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
   Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
-
+  Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
+  Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
+${subvol_sections}
 THROUGHPUT
 ───────────────────────────────────────────────────────────────
 $(generate_throughput_section)
@@ -1732,7 +1829,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.5.0
+  backup-run.sh v4.6.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2200,6 +2297,10 @@ main() {
     # An abort here is a could-not-execute case, which is why it exits
     # nonzero — see the exit-code split at the end of main().
     verify_sources_before_write
+    # Between the source guard and the first source writer: sync needs every
+    # source mounted and verified, and it reloads the config, so a source it
+    # adds gets its snapshot and target directories created below.
+    sync_subvolumes "$mode"
     create_snapshot_dirs
     mount_targets
     create_target_dirs
@@ -2212,6 +2313,9 @@ main() {
     fi
 
     run_btrbk "$mode"
+
+    # Still before unmount_all: expiry deletes snapshots on the mounted targets.
+    expire_retired_subvolumes "$mode"
 
     if [[ "$mode" != "dryrun" ]]; then
         capture_usage "after"

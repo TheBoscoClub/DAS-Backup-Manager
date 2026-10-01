@@ -249,4 +249,8 @@ if(BUILD_TESTING)
         NAME shell-verify-sources
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_sources.sh
     )
+    add_test(
+        NAME shell-subvol-sync
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_subvol_sync.sh
+    )
 endif()
