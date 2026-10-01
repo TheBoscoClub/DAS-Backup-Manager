@@ -7,10 +7,13 @@
 //! `docs/superpowers/specs/2026-10-01-subvolume-reconcile-design.md`.
 
 use std::collections::HashSet;
+use std::path::Path;
+use std::process::Command;
 
 use crate::btrbk_conf::{algorithmic_snapshot_name, resolve_snapshot_names};
 use crate::config::{Config, Source, SubvolConfig, TargetRole};
 use crate::doctor::glob_match;
+use crate::fsutil::{CommandRunner, write_atomic};
 
 /// Whether `path` lies in a snapshot tree — Snapper's `.snapshots` or btrbk's
 /// `.btrbk-snapshots`, at any depth. Snapshots are not data to back up; they
@@ -44,10 +47,14 @@ pub fn excluding_pattern<'a>(path: &str, patterns: &'a [String]) -> Option<&'a s
 
 /// Subvolume paths from `btrfs subvolume list` output. Each line reads
 /// `ID 256 gen 100 top level 5 path <path>`; the path is everything after
-/// the first ` path `, because a path may itself contain spaces.
+/// the first ` path `, because a path may itself contain spaces. Only lines
+/// that start with `ID ` count — an error or warning that happens to contain
+/// ` path ` must not become a phantom subvolume — and a line with nothing
+/// after ` path ` is ignored.
 pub fn parse_subvolume_paths(stdout: &str) -> Vec<String> {
     stdout
         .lines()
+        .filter(|line| line.starts_with("ID "))
         .filter_map(|line| line.split_once(" path "))
         .map(|(_, path)| path.to_string())
         .filter(|path| !path.is_empty())
@@ -374,6 +381,249 @@ fn entry_mut<'a>(config: &'a mut Config, reference: &EntryRef) -> Option<&'a mut
         .subvolumes
         .iter_mut()
         .find(|e| e.name == reference.name)
+}
+
+fn run_stdout(runner: &dyn CommandRunner, program: &str, args: &[&str]) -> Result<String, String> {
+    let what = format!("{program} {}", args.join(" "));
+    match runner.output(Command::new(program).args(args)) {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => Err(format!(
+            "'{what}' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("'{what}' could not be run: {e}")),
+    }
+}
+
+/// List the subvolumes on one source volume, after proving the path is a
+/// real mountpoint holding the expected filesystem at its top level.
+///
+/// `btrfs subvolume list` on an unmounted directory answers for whatever
+/// filesystem the directory sits on, and succeeds. Believing that answer
+/// would retire every entry on the volume.
+pub fn list_volume(
+    runner: &dyn CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+    volume: &str,
+    device: &str,
+) -> VolumeListing {
+    let listed = (|| {
+        if !is_mountpoint(Path::new(volume)) {
+            return Err(format!("{volume} is not mounted"));
+        }
+        let expected = match device.strip_prefix("UUID=") {
+            Some(uuid) => uuid.to_string(),
+            None => {
+                let uuid = run_stdout(runner, "blkid", &["-s", "UUID", "-o", "value", device])?;
+                let uuid = uuid.trim().to_string();
+                if uuid.is_empty() {
+                    return Err(format!("blkid reported no UUID for {device}"));
+                }
+                uuid
+            }
+        };
+        let found = run_stdout(
+            runner,
+            "findmnt",
+            &["-n", "-o", "UUID,FSROOT", "--target", volume],
+        )?;
+        let mut fields = found.split_whitespace();
+        let (uuid, fsroot) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
+        if uuid != expected {
+            return Err(format!(
+                "{volume} holds filesystem '{uuid}', expected '{expected}'"
+            ));
+        }
+        if fsroot != "/" {
+            return Err(format!(
+                "{volume} is mounted at subvolume '{fsroot}', not at the filesystem's top level"
+            ));
+        }
+        let out = run_stdout(runner, "btrfs", &["subvolume", "list", volume])?;
+        Ok(parse_subvolume_paths(&out))
+    })();
+    normalize_listing(volume, listed)
+}
+
+/// What a sync did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub plan: SyncPlan,
+    /// Whether `config.toml` and `btrbk.conf` were replaced.
+    pub written: bool,
+    /// Why they were not, when the plan called for it.
+    pub write_error: Option<String>,
+}
+
+impl SyncOutcome {
+    pub fn failed(&self) -> bool {
+        self.plan.failed() || self.write_error.is_some()
+    }
+}
+
+/// Bring `config.toml` and `btrbk.conf` into line with the subvolumes on the
+/// already-mounted source volumes. Mounts and unmounts nothing.
+pub fn sync_subvolumes(
+    config_path: &Path,
+    dry_run: bool,
+    today: &str,
+    runner: &dyn CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+) -> Result<SyncOutcome, String> {
+    let config = Config::load(config_path)
+        .map_err(|e| format!("could not load {}: {e}", config_path.display()))?;
+
+    let mut listings: Vec<VolumeListing> = Vec::new();
+    for source in &config.sources {
+        if !listings.iter().any(|l| l.volume == source.volume) {
+            listings.push(list_volume(
+                runner,
+                is_mountpoint,
+                &source.volume,
+                &source.device,
+            ));
+        }
+    }
+
+    let plan = plan_sync(&config, &listings);
+    if dry_run || !plan.changes_config() {
+        return Ok(SyncOutcome {
+            plan,
+            written: false,
+            write_error: None,
+        });
+    }
+
+    let write_error = write_updated(&config, apply_plan(&config, &plan, today), config_path);
+    Ok(SyncOutcome {
+        written: write_error.is_none(),
+        plan,
+        write_error,
+    })
+}
+
+/// Replace `btrbk.conf` and `config.toml` together or not at all. Returns the
+/// reason when nothing was written (or, if the restore also failed, when the
+/// two files may disagree), `None` on success. A plan that could not be
+/// applied (`Err`) is refused like a failed write.
+fn write_updated(
+    config: &Config,
+    updated: Result<Config, String>,
+    config_path: &Path,
+) -> Option<String> {
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(why) => return Some(why),
+    };
+    let errors = updated.validate();
+    if !errors.is_empty() {
+        return Some(format!(
+            "the updated config is not valid: {}",
+            errors.join("; ")
+        ));
+    }
+    // btrbk.conf first: if it cannot be written, config.toml is left
+    // describing what btrbk will actually do.
+    let conf_path = Path::new(&updated.general.btrbk_conf);
+    if let Err(e) = write_atomic(conf_path, &crate::btrbk_conf::render_btrbk_conf(&updated)) {
+        return Some(format!("could not write {}: {e}", conf_path.display()));
+    }
+    if let Err(e) = updated.save(config_path) {
+        // Put btrbk.conf back so the two files still agree.
+        let restore = write_atomic(conf_path, &crate::btrbk_conf::render_btrbk_conf(config));
+        return Some(match restore {
+            Ok(()) => format!("could not write {}: {e}", config_path.display()),
+            Err(r) => format!(
+                "could not write {}: {e}; and {} could not be restored: {r}",
+                config_path.display(),
+                conf_path.display()
+            ),
+        });
+    }
+    None
+}
+
+/// The "SUBVOLUME SYNC" section of the run report.
+pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
+    let plan = &outcome.plan;
+    let mut r = String::from("SUBVOLUME SYNC\n");
+    if !plan.changes_config() && !plan.failed() && plan.skipped.is_empty() {
+        r.push_str("  No new, vanished or returning subvolumes.\n");
+        return r;
+    }
+    if let Some(why) = &outcome.write_error {
+        r.push_str(&format!("  CONFIG NOT UPDATED: {why}\n"));
+    }
+    let applied = outcome.written;
+    let heading = |done: &str, would: &str, not: &str| -> String {
+        if dry_run {
+            format!("  {would} (dry run, nothing written):\n")
+        } else if applied {
+            format!("  {done}:\n")
+        } else {
+            format!("  {not} (config could not be written):\n")
+        }
+    };
+    if !plan.adopt.is_empty() {
+        r.push_str(&heading(
+            "Adopted (now backed up)",
+            "Would adopt",
+            "NOT adopted",
+        ));
+        for a in &plan.adopt {
+            let how = match &a.nested_under {
+                Some(parent) => format!("as its parent {parent}"),
+                None => "primary target only".to_string(),
+            };
+            r.push_str(&format!(
+                "    {}  [{} -> source {}, {how}]\n",
+                a.name, a.volume, a.source_label
+            ));
+        }
+    }
+    if !plan.retire.is_empty() {
+        r.push_str(&heading(
+            "Retired (gone from disk; existing backups will expire)",
+            "Would retire",
+            "NOT retired",
+        ));
+        for e in &plan.retire {
+            r.push_str(&format!("    {}  [source {}]\n", e.name, e.source_label));
+        }
+    }
+    if !plan.revive.is_empty() {
+        r.push_str(&heading(
+            "Revived (back on disk)",
+            "Would revive",
+            "NOT revived",
+        ));
+        for e in &plan.revive {
+            r.push_str(&format!("    {}  [source {}]\n", e.name, e.source_label));
+        }
+    }
+    if !plan.skipped.is_empty() {
+        r.push_str("  Skipped:\n");
+        for s in &plan.skipped {
+            let why = match &s.reason {
+                SkipReason::SnapshotTree => "snapshot tree".to_string(),
+                SkipReason::Excluded { pattern } => format!("excluded by '{pattern}'"),
+            };
+            r.push_str(&format!("    {}  [{}, {why}]\n", s.name, s.volume));
+        }
+    }
+    if !plan.unplaceable.is_empty() {
+        r.push_str("  COULD NOT BE PLACED (not backed up):\n");
+        for u in &plan.unplaceable {
+            r.push_str(&format!("    {}  [{}: {}]\n", u.name, u.volume, u.why));
+        }
+    }
+    if !plan.failed_volumes.is_empty() {
+        r.push_str("  VOLUMES NOT READ (nothing adopted or retired there):\n");
+        for (volume, why) in &plan.failed_volumes {
+            r.push_str(&format!("    {volume}: {why}\n"));
+        }
+    }
+    r
 }
 
 #[cfg(test)]
@@ -950,5 +1200,578 @@ mod tests {
         };
         let why = apply_plan(&config(), &plan, "2026-10-02").unwrap_err();
         assert!(why.contains("@lost") && why.contains("/nowhere"), "{why}");
+    }
+
+    // --- Task 7: the sync shell ---
+
+    use crate::fsutil::testing::Scripted;
+
+    fn mounted(_: &Path) -> bool {
+        true
+    }
+    fn unmounted(_: &Path) -> bool {
+        false
+    }
+
+    fn healthy(volume: &str, uuid: &str, paths: &[&str]) -> Vec<(String, i32, String)> {
+        let list: String = paths
+            .iter()
+            .map(|p| format!("ID 1 gen 1 top level 5 path {p}\n"))
+            .collect();
+        vec![
+            (
+                format!("findmnt -n -o UUID,FSROOT --target {volume}"),
+                0,
+                format!("{uuid} /\n"),
+            ),
+            (format!("btrfs subvolume list {volume}"), 0, list),
+        ]
+    }
+
+    fn scripted(parts: Vec<Vec<(String, i32, String)>>) -> Scripted {
+        Scripted::from_owned(parts.into_iter().flatten().collect())
+    }
+
+    #[test]
+    fn parse_subvolume_paths_ignores_lines_that_are_not_listing_rows() {
+        let out = "ERROR: cannot access path foo\n\
+                   ID 256 gen 100 top level 5 path @\n\
+                   WARNING: some path bar\n\
+                   ID 257 gen 100 top level 5 path \n\
+                   ID 258 gen 100 top level 5 path @home\n\
+                   not ID 259 gen 1 top level 5 path sneaky\n";
+        assert_eq!(parse_subvolume_paths(out), ["@", "@home"]);
+    }
+
+    #[test]
+    fn list_volume_reads_a_mounted_top_level_volume_with_the_expected_uuid() {
+        let r = scripted(vec![healthy("/ssd", "abc", &["@", "a b"])]);
+        let l = list_volume(&r, &mounted, "/ssd", "UUID=abc");
+        assert_eq!(l.subvolumes.unwrap(), ["@", "a b"]);
+    }
+
+    #[test]
+    fn list_volume_refuses_an_unmounted_path_without_running_anything() {
+        let r = Scripted::new(&[]);
+        let l = list_volume(&r, &unmounted, "/ssd", "UUID=abc");
+        assert!(l.subvolumes.unwrap_err().contains("not mounted"));
+        assert!(r.calls().is_empty());
+    }
+
+    #[test]
+    fn wrong_uuid_volume_is_not_listed() {
+        let r = scripted(vec![healthy("/ssd", "OTHER", &["@"])]);
+        let l = list_volume(&r, &mounted, "/ssd", "UUID=abc");
+        let why = l.subvolumes.unwrap_err();
+        assert!(why.contains("OTHER") && why.contains("abc"), "{why}");
+        assert!(!r.calls().iter().any(|c| c.starts_with("btrfs")));
+    }
+
+    #[test]
+    fn list_volume_refuses_a_volume_not_mounted_at_its_top_level() {
+        let r = Scripted::new(&[("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc /@\n")]);
+        let why = list_volume(&r, &mounted, "/ssd", "UUID=abc")
+            .subvolumes
+            .unwrap_err();
+        assert!(why.contains("top level"), "{why}");
+        assert!(!r.calls().iter().any(|c| c.starts_with("btrfs")));
+    }
+
+    #[test]
+    fn list_volume_refuses_when_findmnt_names_no_filesystem_root() {
+        // Output with a UUID but no FSROOT must not pass as a top-level mount.
+        let r = Scripted::new(&[("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc\n")]);
+        let why = list_volume(&r, &mounted, "/ssd", "UUID=abc")
+            .subvolumes
+            .unwrap_err();
+        assert!(why.contains("top level"), "{why}");
+    }
+
+    #[test]
+    fn list_volume_refuses_when_findmnt_fails() {
+        let r = Scripted::new(&[("findmnt -n -o UUID,FSROOT --target /ssd", 1, "")]);
+        let why = list_volume(&r, &mounted, "/ssd", "UUID=abc")
+            .subvolumes
+            .unwrap_err();
+        assert!(why.contains("findmnt"), "{why}");
+        assert!(!r.calls().iter().any(|c| c.starts_with("btrfs")));
+    }
+
+    #[test]
+    fn list_volume_resolves_a_device_path_through_blkid() {
+        let mut parts = healthy("/nvme", "n1", &["@"]);
+        parts.push((
+            "blkid -s UUID -o value /dev/nvme1n1p2".into(),
+            0,
+            "n1\n".into(),
+        ));
+        let l = list_volume(&scripted(vec![parts]), &mounted, "/nvme", "/dev/nvme1n1p2");
+        assert_eq!(l.subvolumes.unwrap(), ["@"]);
+        // blkid failing means the expected UUID is unknown: refuse.
+        let l = list_volume(
+            &scripted(vec![healthy("/nvme", "n1", &["@"])]),
+            &mounted,
+            "/nvme",
+            "/dev/nvme1n1p2",
+        );
+        assert!(l.subvolumes.unwrap_err().contains("blkid"));
+    }
+
+    #[test]
+    fn list_volume_refuses_when_blkid_prints_nothing() {
+        // Exit 0 with empty output is not "no UUID is expected": refuse.
+        let mut parts = healthy("/nvme", "n1", &["@"]);
+        parts.push((
+            "blkid -s UUID -o value /dev/nvme1n1p2".into(),
+            0,
+            "\n".into(),
+        ));
+        let r = scripted(vec![parts]);
+        let why = list_volume(&r, &mounted, "/nvme", "/dev/nvme1n1p2")
+            .subvolumes
+            .unwrap_err();
+        assert!(why.contains("no UUID"), "{why}");
+        assert!(!r.calls().iter().any(|c| c.starts_with("btrfs")));
+    }
+
+    #[test]
+    fn list_volume_reports_a_failed_or_empty_btrfs_listing() {
+        let r = Scripted::new(&[
+            ("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc /\n"),
+            ("btrfs subvolume list /ssd", 1, ""),
+        ]);
+        assert!(
+            list_volume(&r, &mounted, "/ssd", "UUID=abc")
+                .subvolumes
+                .unwrap_err()
+                .contains("btrfs subvolume list")
+        );
+        let r = scripted(vec![healthy("/ssd", "abc", &[])]);
+        assert!(
+            list_volume(&r, &mounted, "/ssd", "UUID=abc")
+                .subvolumes
+                .unwrap_err()
+                .contains("no subvolumes")
+        );
+    }
+
+    /// A config on disk with one source, plus the path its btrbk.conf goes to.
+    fn on_disk_config(dir: &Path) -> std::path::PathBuf {
+        let mut c = config();
+        c.sources.truncate(1); // "ssd" on /ssd: @srv, @opt
+        c.sources[0].device = "UUID=abc".into();
+        c.general.btrbk_conf = dir.join("btrbk.conf").to_string_lossy().into_owned();
+        let path = dir.join("config.toml");
+        c.save(&path).unwrap();
+        std::fs::write(dir.join("btrbk.conf"), "OLD").unwrap();
+        path
+    }
+
+    #[test]
+    fn sync_writes_config_and_btrbk_conf_when_something_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(out.written && !out.failed(), "{:?}", out.write_error);
+        let saved = Config::load(&path).unwrap();
+        assert!(
+            saved.sources[0]
+                .subvolumes
+                .iter()
+                .any(|s| s.name == "@srv/web")
+        );
+        let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
+        assert!(
+            conf.contains("subvolume             @srv/web\n    snapshot_name       srv-web\n"),
+            "{conf}"
+        );
+    }
+
+    #[test]
+    fn sync_touches_nothing_when_nothing_changed_or_on_a_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let same = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &same, &mounted).unwrap();
+        assert!(!out.written);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let more = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &more, &mounted).unwrap();
+        assert!(!out.written);
+        assert_eq!(out.plan.adopt.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn sync_keeps_both_files_when_the_new_config_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Occupy the temp-file name so the atomic write fails.
+        std::fs::create_dir(dir.path().join(".btrbk.conf.tmp")).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(!out.written);
+        assert!(out.failed());
+        assert!(
+            out.write_error.as_deref().unwrap().contains("btrbk.conf"),
+            "{:?}",
+            out.write_error
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn sync_restores_btrbk_conf_when_config_toml_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let old = Config::load(&path).unwrap();
+        // btrbk.conf will write fine; the config.toml temp name is occupied.
+        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(!out.written && out.failed());
+        assert!(
+            out.write_error.as_deref().unwrap().contains("config.toml"),
+            "{:?}",
+            out.write_error
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // Restored from the OLD config, so it still agrees with config.toml.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            crate::btrbk_conf::render_btrbk_conf(&old)
+        );
+    }
+
+    #[test]
+    fn a_plan_that_could_not_be_applied_writes_nothing_and_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let old = Config::load(&path).unwrap();
+        let why = write_updated(&old, Err("cannot retire '@x'".into()), &path);
+        assert_eq!(why.as_deref(), Some("cannot retire '@x'"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn an_invalid_updated_config_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let old = Config::load(&path).unwrap();
+        let mut bad = old.clone();
+        bad.sources[0].device = String::new();
+        assert!(!bad.validate().is_empty(), "fixture must be invalid");
+        let why = write_updated(&old, Ok(bad), &path).unwrap();
+        assert!(why.contains("not valid"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn a_valid_updated_config_is_written_by_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let old = Config::load(&path).unwrap();
+        assert_eq!(write_updated(&old, Ok(old.clone()), &path), None);
+        assert_ne!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn sync_fails_when_a_volume_cannot_be_read_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let out =
+            sync_subvolumes(&path, false, "2026-10-02", &Scripted::new(&[]), &unmounted).unwrap();
+        assert!(out.failed() && !out.written);
+        assert_eq!(out.plan.failed_volumes.len(), 1);
+    }
+
+    #[test]
+    fn sync_errors_only_when_the_config_cannot_be_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = sync_subvolumes(
+            &dir.path().join("absent.toml"),
+            false,
+            "2026-10-02",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap_err();
+        assert!(err.contains("absent.toml"), "{err}");
+    }
+
+    #[test]
+    fn sync_lists_each_shared_volume_once() {
+        // Two sources on /ssd must cause one listing, not two.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.sources.truncate(2);
+        for s in &mut c.sources {
+            s.device = "UUID=abc".into();
+        }
+        c.general.btrbk_conf = dir.path().join("btrbk.conf").to_string_lossy().into_owned();
+        let path = dir.path().join("config.toml");
+        c.save(&path).unwrap();
+        let r = scripted(vec![healthy(
+            "/ssd",
+            "abc",
+            &["@srv", "@opt", "@srv/VirtualMachines"],
+        )]);
+        sync_subvolumes(&path, true, "2026-10-02", &r, &mounted).unwrap();
+        let lists = r.calls().iter().filter(|c| c.starts_with("btrfs")).count();
+        assert_eq!(lists, 1, "{:?}", r.calls());
+    }
+
+    #[test]
+    fn report_lists_every_decision_and_says_when_nothing_changed() {
+        let quiet = SyncOutcome {
+            plan: SyncPlan::default(),
+            written: false,
+            write_error: None,
+        };
+        assert_eq!(
+            format_sync_report(&quiet, false),
+            "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n"
+        );
+
+        let plan = SyncPlan {
+            adopt: vec![
+                Adoption {
+                    volume: "/ssd".into(),
+                    name: "@srv/web".into(),
+                    source_label: "ssd".into(),
+                    nested_under: Some("@srv".into()),
+                    manual_only: false,
+                },
+                Adoption {
+                    volume: "/ssd".into(),
+                    name: "@new".into(),
+                    source_label: "ssd-adopted".into(),
+                    nested_under: None,
+                    manual_only: false,
+                },
+            ],
+            retire: vec![EntryRef {
+                source_label: "ssd".into(),
+                name: "@opt".into(),
+            }],
+            revive: vec![EntryRef {
+                source_label: "ssd".into(),
+                name: "@old".into(),
+            }],
+            skipped: vec![Skip {
+                volume: "/ssd".into(),
+                name: "@cache/x".into(),
+                reason: SkipReason::Excluded {
+                    pattern: "@cache".into(),
+                },
+            }],
+            unplaceable: vec![Unplaceable {
+                volume: "/hdd".into(),
+                name: "top".into(),
+                why: "no primary".into(),
+            }],
+            failed_volumes: vec![("/nvme".into(), "not mounted".into())],
+        };
+        let text = format_sync_report(
+            &SyncOutcome {
+                plan,
+                written: true,
+                write_error: None,
+            },
+            false,
+        );
+        assert_eq!(
+            text,
+            "SUBVOLUME SYNC\n\
+             \x20 Adopted (now backed up):\n\
+             \x20   @srv/web  [/ssd -> source ssd, as its parent @srv]\n\
+             \x20   @new  [/ssd -> source ssd-adopted, primary target only]\n\
+             \x20 Retired (gone from disk; existing backups will expire):\n\
+             \x20   @opt  [source ssd]\n\
+             \x20 Revived (back on disk):\n\
+             \x20   @old  [source ssd]\n\
+             \x20 Skipped:\n\
+             \x20   @cache/x  [/ssd, excluded by '@cache']\n\
+             \x20 COULD NOT BE PLACED (not backed up):\n\
+             \x20   top  [/hdd: no primary]\n\
+             \x20 VOLUMES NOT READ (nothing adopted or retired there):\n\
+             \x20   /nvme: not mounted\n"
+        );
+    }
+
+    #[test]
+    fn report_marks_a_dry_run_and_a_failed_write() {
+        let plan = SyncPlan {
+            adopt: vec![Adoption {
+                volume: "/v".into(),
+                name: "a".into(),
+                source_label: "s".into(),
+                nested_under: None,
+                manual_only: false,
+            }],
+            ..Default::default()
+        };
+        let dry = format_sync_report(
+            &SyncOutcome {
+                plan: plan.clone(),
+                written: false,
+                write_error: None,
+            },
+            true,
+        );
+        assert!(
+            dry.contains("  Would adopt (dry run, nothing written):\n"),
+            "{dry}"
+        );
+        let bad = format_sync_report(
+            &SyncOutcome {
+                plan,
+                written: false,
+                write_error: Some("disk full".into()),
+            },
+            false,
+        );
+        assert!(bad.contains("  CONFIG NOT UPDATED: disk full\n"), "{bad}");
+        assert!(
+            bad.contains("  NOT adopted (config could not be written):\n"),
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn report_is_never_quiet_when_any_single_kind_of_finding_exists() {
+        let quiet = "No new, vanished or returning subvolumes";
+        let e = || EntryRef {
+            source_label: "s".into(),
+            name: "n".into(),
+        };
+        let each = [
+            SyncPlan {
+                retire: vec![e()],
+                ..Default::default()
+            },
+            SyncPlan {
+                revive: vec![e()],
+                ..Default::default()
+            },
+            SyncPlan {
+                skipped: vec![Skip {
+                    volume: "/v".into(),
+                    name: "n".into(),
+                    reason: SkipReason::SnapshotTree,
+                }],
+                ..Default::default()
+            },
+            SyncPlan {
+                unplaceable: vec![Unplaceable {
+                    volume: "/v".into(),
+                    name: "n".into(),
+                    why: "w".into(),
+                }],
+                ..Default::default()
+            },
+            SyncPlan {
+                failed_volumes: vec![("/v".into(), "w".into())],
+                ..Default::default()
+            },
+        ];
+        for plan in each {
+            let text = format_sync_report(
+                &SyncOutcome {
+                    plan: plan.clone(),
+                    written: true,
+                    write_error: None,
+                },
+                false,
+            );
+            assert!(!text.contains(quiet), "{plan:?}\n{text}");
+        }
+    }
+
+    #[test]
+    fn report_headings_follow_dry_run_then_written_then_not_written() {
+        let plan = SyncPlan {
+            retire: vec![EntryRef {
+                source_label: "s".into(),
+                name: "n".into(),
+            }],
+            revive: vec![EntryRef {
+                source_label: "s".into(),
+                name: "m".into(),
+            }],
+            skipped: vec![Skip {
+                volume: "/v".into(),
+                name: "k".into(),
+                reason: SkipReason::SnapshotTree,
+            }],
+            ..Default::default()
+        };
+        let render = |written: bool, dry: bool| {
+            format_sync_report(
+                &SyncOutcome {
+                    plan: plan.clone(),
+                    written,
+                    write_error: None,
+                },
+                dry,
+            )
+        };
+        // A dry run wins even if `written` were somehow set.
+        let dry = render(true, true);
+        assert!(
+            dry.contains("  Would retire (dry run, nothing written):\n"),
+            "{dry}"
+        );
+        assert!(
+            dry.contains("  Would revive (dry run, nothing written):\n"),
+            "{dry}"
+        );
+        let done = render(true, false);
+        assert!(
+            done.contains("  Retired (gone from disk; existing backups will expire):\n"),
+            "{done}"
+        );
+        assert!(done.contains("  Revived (back on disk):\n"), "{done}");
+        assert!(done.contains("    k  [/v, snapshot tree]\n"), "{done}");
+        let not = render(false, false);
+        assert!(
+            not.contains("  NOT retired (config could not be written):\n"),
+            "{not}"
+        );
+        assert!(
+            not.contains("  NOT revived (config could not be written):\n"),
+            "{not}"
+        );
     }
 }
