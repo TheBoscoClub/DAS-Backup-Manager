@@ -445,6 +445,42 @@ pub fn list_volume(
     normalize_listing(volume, listed)
 }
 
+/// One listing per distinct volume among the config's sources, in the order
+/// each first appears. Sources may share a volume while naming different
+/// devices, so EVERY distinct device named for a volume must verify; one that
+/// does not makes the whole volume unreadable, and the message names the
+/// source and device so the operator can see which entry is wrong.
+pub fn list_volumes(
+    config: &Config,
+    runner: &dyn CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+) -> Vec<VolumeListing> {
+    let mut listings: Vec<VolumeListing> = Vec::new();
+    let mut checked: Vec<(&str, &str)> = Vec::new();
+    for source in &config.sources {
+        let key = (source.volume.as_str(), source.device.as_str());
+        if checked.contains(&key) {
+            continue;
+        }
+        checked.push(key);
+        let mut listing = list_volume(runner, is_mountpoint, &source.volume, &source.device);
+        if let Err(why) = &listing.subvolumes {
+            listing.subvolumes = Err(format!(
+                "source '{}' names device '{}': {why}",
+                source.label, source.device
+            ));
+        }
+        match listings.iter_mut().find(|l| l.volume == source.volume) {
+            None => listings.push(listing),
+            // The first failure is the one reported; a later success never
+            // clears it.
+            Some(existing) if existing.subvolumes.is_ok() => *existing = listing,
+            Some(_) => {}
+        }
+    }
+    listings
+}
+
 /// What a sync did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
@@ -473,17 +509,7 @@ pub fn sync_subvolumes(
     let config = Config::load(config_path)
         .map_err(|e| format!("could not load {}: {e}", config_path.display()))?;
 
-    let mut listings: Vec<VolumeListing> = Vec::new();
-    for source in &config.sources {
-        if !listings.iter().any(|l| l.volume == source.volume) {
-            listings.push(list_volume(
-                runner,
-                is_mountpoint,
-                &source.volume,
-                &source.device,
-            ));
-        }
-    }
+    let listings = list_volumes(&config, runner, is_mountpoint);
 
     let plan = plan_sync(&config, &listings);
     if dry_run || !plan.changes_config() {
@@ -1772,6 +1798,137 @@ mod tests {
         assert!(
             not.contains("  NOT revived (config could not be written):\n"),
             "{not}"
+        );
+    }
+
+    // --- fix round 1: every device a volume's sources name must verify ---
+
+    /// `config()` with each source's device set, in source order
+    /// (ssd, ssd-vm, media).
+    fn config_with_devices(devices: &[&str]) -> Config {
+        let mut c = config();
+        for (source, device) in c.sources.iter_mut().zip(devices) {
+            source.device = (*device).into();
+        }
+        c
+    }
+
+    #[test]
+    fn list_volumes_lists_a_volume_once_when_its_sources_share_a_device() {
+        let c = config_with_devices(&["UUID=abc", "UUID=abc", "UUID=zzz"]);
+        let r = scripted(vec![
+            healthy("/ssd", "abc", &["@srv", "@opt"]),
+            healthy("/hdd", "zzz", &["bosco-media"]),
+        ]);
+        let l = list_volumes(&c, &r, &mounted);
+        assert_eq!(l.len(), 2);
+        assert_eq!(
+            (l[0].volume.as_str(), l[1].volume.as_str()),
+            ("/ssd", "/hdd")
+        );
+        assert_eq!(l[0].subvolumes.as_ref().unwrap(), &["@srv", "@opt"]);
+        let lists = r
+            .calls()
+            .iter()
+            .filter(|c| *c == "btrfs subvolume list /ssd")
+            .count();
+        assert_eq!(lists, 1, "{:?}", r.calls());
+    }
+
+    #[test]
+    fn list_volumes_fails_a_volume_when_a_later_source_names_another_filesystem() {
+        let c = config_with_devices(&["UUID=abc", "UUID=other", "UUID=zzz"]);
+        let r = scripted(vec![
+            healthy("/ssd", "abc", &["@srv", "@opt"]),
+            healthy("/hdd", "zzz", &["bosco-media"]),
+        ]);
+        let l = list_volumes(&c, &r, &mounted);
+        let why = l[0].subvolumes.as_ref().unwrap_err();
+        assert!(
+            why.contains("ssd-vm")
+                && why.contains("UUID=other")
+                && why.contains("expected 'other'"),
+            "{why}"
+        );
+        // The failure is confined to the volume it belongs to.
+        assert!(l[1].subvolumes.is_ok());
+    }
+
+    #[test]
+    fn a_mismatched_second_device_changes_nothing_through_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config_with_devices(&["UUID=abc", "UUID=other"]);
+        c.sources.truncate(2);
+        c.general.btrbk_conf = dir.path().join("btrbk.conf").to_string_lossy().into_owned();
+        let path = dir.path().join("config.toml");
+        c.save(&path).unwrap();
+        std::fs::write(dir.path().join("btrbk.conf"), "OLD").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Were the first device trusted, @new would be adopted and
+        // @srv/VirtualMachines (ssd-vm's) retired.
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@new"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(out.failed() && !out.written);
+        assert!(
+            out.plan.adopt.is_empty() && out.plan.retire.is_empty(),
+            "{:?}",
+            out.plan
+        );
+        assert_eq!(out.plan.failed_volumes.len(), 1);
+        assert!(out.plan.failed_volumes[0].1.contains("ssd-vm"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn list_volumes_accepts_two_spellings_of_the_same_filesystem() {
+        let c = config_with_devices(&["UUID=abc", "/dev/sdx", "UUID=zzz"]);
+        let mut parts = healthy("/ssd", "abc", &["@srv", "@opt"]);
+        parts.push(("blkid -s UUID -o value /dev/sdx".into(), 0, "abc\n".into()));
+        parts.extend(healthy("/hdd", "zzz", &["bosco-media"]));
+        let l = list_volumes(&c, &scripted(vec![parts]), &mounted);
+        assert_eq!(l[0].subvolumes.as_ref().unwrap(), &["@srv", "@opt"]);
+    }
+
+    #[test]
+    fn list_volumes_keeps_order_and_lists_the_healthy_volume_beside_a_failing_one() {
+        let c = config_with_devices(&["UUID=abc", "UUID=abc", "UUID=zzz"]);
+        // Nothing scripted for /ssd: it fails; /hdd is still read.
+        let r = scripted(vec![healthy("/hdd", "zzz", &["bosco-media"])]);
+        let l = list_volumes(&c, &r, &mounted);
+        assert_eq!(
+            (l[0].volume.as_str(), l[1].volume.as_str()),
+            ("/ssd", "/hdd")
+        );
+        assert!(l[0].subvolumes.is_err());
+        assert_eq!(l[1].subvolumes.as_ref().unwrap(), &["bosco-media"]);
+    }
+
+    #[test]
+    fn list_volumes_reports_the_first_failing_device_and_a_later_success_never_clears_it() {
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv"])]);
+        // First source wrong, second right: still an error, naming the first.
+        let c = config_with_devices(&["UUID=bad", "UUID=abc", "UUID=zzz"]);
+        let why = list_volumes(&c, &r, &mounted)[0]
+            .subvolumes
+            .clone()
+            .unwrap_err();
+        assert!(
+            why.contains("source 'ssd'") && why.contains("UUID=bad"),
+            "{why}"
+        );
+        // Both wrong: the first failure is the one reported.
+        let c = config_with_devices(&["UUID=bad", "UUID=worse", "UUID=zzz"]);
+        let why = list_volumes(&c, &r, &mounted)[0]
+            .subvolumes
+            .clone()
+            .unwrap_err();
+        assert!(
+            why.contains("UUID=bad") && !why.contains("UUID=worse"),
+            "{why}"
         );
     }
 }
