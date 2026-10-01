@@ -422,6 +422,7 @@ fn step_subvolumes(
                         name,
                         manual_only: false,
                         snapshot_name: None,
+                        ..Default::default()
                     })
                     .collect(),
                 device,
@@ -505,6 +506,7 @@ fn parse_subvol_list(input: &str) -> Vec<SubvolConfig> {
             name,
             manual_only: false,
             snapshot_name: None,
+            ..Default::default()
         })
         .collect()
 }

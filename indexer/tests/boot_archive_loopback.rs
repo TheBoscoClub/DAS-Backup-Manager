@@ -126,6 +126,7 @@ fn config_for(fs: &Loopback, snapshot_name: &str) -> (Config, tempfile::NamedTem
             name: "@".into(),
             manual_only: false,
             snapshot_name: None,
+            ..Default::default()
         }],
         device: "loop".into(),
         snapshot_dir: ".btrbk-snapshots".into(),

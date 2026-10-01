@@ -45,6 +45,7 @@ pub fn add_subvolume(
         name: name.to_string(),
         manual_only,
         snapshot_name: None,
+        ..Default::default()
     });
     Ok(())
 }
@@ -103,11 +104,13 @@ mod tests {
                     name: "@".into(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 },
                 SubvolConfig {
                     name: "@home".into(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 },
             ],
             device: "/dev/nvme0n1p2".into(),
@@ -122,6 +125,7 @@ mod tests {
                 name: "@opt".into(),
                 manual_only: false,
                 snapshot_name: None,
+                ..Default::default()
             }],
             device: "/dev/sdb".into(),
             snapshot_dir: ".btrbk-snapshots".into(),

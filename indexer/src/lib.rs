@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod doctor;
 pub mod forget;
+pub mod fsutil;
 pub mod health;
 pub mod indexer;
 pub mod mount;

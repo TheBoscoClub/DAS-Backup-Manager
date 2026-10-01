@@ -1695,6 +1695,7 @@ mod tests {
             },
             scrub: Scrub::default(),
             doctor: Doctor::default(),
+            subvolumes: crate::config::Subvolumes::default(),
             sources: vec![
                 Source {
                     label: "nvme-root".into(),
@@ -1704,11 +1705,13 @@ mod tests {
                             name: "@".into(),
                             manual_only: false,
                             snapshot_name: None,
+                            ..Default::default()
                         },
                         SubvolConfig {
                             name: "@home".into(),
                             manual_only: false,
                             snapshot_name: None,
+                            ..Default::default()
                         },
                     ],
                     device: "/dev/nvme0n1p2".into(),
@@ -1723,6 +1726,7 @@ mod tests {
                         name: "@special".into(),
                         manual_only: true,
                         snapshot_name: None,
+                        ..Default::default()
                     }],
                     device: "/dev/sdb".into(),
                     snapshot_dir: ".btrbk-snapshots".into(),
@@ -2178,6 +2182,7 @@ mod tests {
             name: "@".into(),
             manual_only: false,
             snapshot_name: None,
+            ..Default::default()
         }];
         config.sources[0].target_subdirs = vec!["nvme".into()];
         config.targets[0].mount = primary_dir.path().to_string_lossy().to_string();
