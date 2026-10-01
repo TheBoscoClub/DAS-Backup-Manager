@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
+use std::process::{Command, Output};
 
 /// Replace `path` with `contents` in one step: write a sibling temp file,
 /// flush it to disk, then rename it over the target. A reader sees the old
@@ -29,9 +30,40 @@ pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     result
 }
 
+/// Every external command `adopt` and `expire` run goes through this, so
+/// tests can script what `btrfs`, `findmnt` and `blkid` answer.
+pub trait CommandRunner {
+    fn output(&self, cmd: &mut Command) -> io::Result<Output>;
+}
+
+/// The real thing.
+pub struct SystemRunner;
+
+impl CommandRunner for SystemRunner {
+    fn output(&self, cmd: &mut Command) -> io::Result<Output> {
+        cmd.output()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_runner_captures_output_and_exit_status() {
+        let out = SystemRunner
+            .output(std::process::Command::new("sh").args(["-c", "printf hi; exit 3"]))
+            .unwrap();
+        assert_eq!(out.stdout, b"hi");
+        assert_eq!(out.status.code(), Some(3));
+        assert!(
+            SystemRunner
+                .output(&mut std::process::Command::new(
+                    "/nonexistent/das-no-such-binary"
+                ))
+                .is_err()
+        );
+    }
 
     #[test]
     fn write_atomic_refuses_when_the_directory_is_missing_and_changes_nothing() {

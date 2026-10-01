@@ -1,3 +1,4 @@
+pub mod adopt;
 pub mod backup;
 pub mod btrbk_conf;
 pub mod caldate;
