@@ -70,11 +70,17 @@ Rejected alternatives:
 
 | Unit | Kind | Responsibility |
 |---|---|---|
-| `reconcile_plan` (new module `indexer/src/adopt.rs`) | pure | config + per-volume subvolume listings → a plan: adopt / retire / revive / skip |
-| `apply_plan` | pure over `Config` | returns the new `Config`; assigns sources, snapshot names, dates |
-| `run_reconcile` | shell | lists subvolumes on mounted, verified volumes; saves config; regenerates `btrbk.conf`; returns a report |
-| `expire_retired` | shell over a pure selector | deletes retired series' snapshots that are past their window |
-| `btrdasd subvol reconcile` | CLI | entry point for `backup-run.sh`; `--dry-run` prints the plan and changes nothing |
+| `adopt::plan_sync` (new module `indexer/src/adopt.rs`) | pure | config + per-volume subvolume listings → a plan: adopt / retire / revive / skip |
+| `adopt::apply_plan` | pure over `Config` | returns the new `Config`; assigns sources, snapshot names, dates |
+| `adopt::sync_subvolumes` | shell | lists subvolumes on mounted, verified volumes; saves config; regenerates `btrbk.conf`; returns a report |
+| `expire::expire_retired` | shell over a pure selector | deletes retired series' snapshots that are past their window |
+| `btrdasd subvol sync` | CLI | entry point for `backup-run.sh`; `--dry-run` prints the plan and changes nothing |
+| `btrdasd subvol expire` | CLI | entry point for expiring retired subvolumes' backups after btrbk; `--dry-run` prints what would be deleted |
+
+The words "reconcile" and `btrdasd reconcile` already mean something else in
+this codebase (pruning index rows for snapshots that no longer exist), so the
+new step is called **sync** in code and CLI. This document's title keeps the
+design name.
 
 The planner reuses what `doctor.rs` already has: the guarded lister
 (`list_mounted_subvolumes`, which refuses a path that is not a real
@@ -93,7 +99,11 @@ mount_sources → verify_sources_before_write → RECONCILE → reload config en
 ```
 
 - It runs under the maintenance lock the run already holds.
-- It runs under `--dryrun` as `--dry-run`: the plan is printed, nothing is written.
+- Under `--dryrun` it runs as `subvol sync --dry-run`: the plan is printed, nothing is written.
+- Expiry is a second command, `subvol expire`, because it needs the targets mounted and sync runs before they are.
+- The Rust manual path verifies each source volume's filesystem UUID and that
+  it is mounted at its top level before listing it. The bash path already did
+  this in `verify_sources_before_write`; the Rust path did not.
 - The manual Rust path (`btrdasd backup run`) calls the same function before
   it invokes btrbk. There is no way to run a backup that skips reconcile.
 - `btrdasd subvol add` / `remove` regenerate `btrbk.conf` too, so the manual
@@ -114,18 +124,20 @@ skipped (5.4), is adopted:
   directory and target subdirectories. It also takes the ancestor's
   `manual_only` flag.
 - **Not nested** — it joins that volume's *adoption source*: a source named
-  `<first-source-label-of-the-volume>-adopted`, created by reconcile the first
-  time it is needed, with `target_labels` set to the primary target's label
-  and its own target subdirectory. Targets are chosen per source in this
-  codebase, which is why "primary only" is a source and not a flag.
+  `<first-source-label-of-the-volume>-adopted`, created by sync the first
+  time it is needed. It copies the volume, device and snapshot directory of
+  the first source declared for that volume, sets `target_labels` to the
+  primary target's label, and uses its own label as its target subdirectory.
+  Targets are chosen per source in this codebase, which is why "primary only"
+  is a source and not a flag.
 - If no target has the primary role, a non-nested subvolume cannot be placed.
   It is not adopted, the run is marked failed (5.6), and the report names it.
 
 Each adopted entry gets:
 
 - `snapshot_name`, written explicitly at adoption: the existing algorithmic
-  name, and if that collides with any name already in the config, the same
-  name with `-2`, `-3`, … appended. Existing names are never changed.
+  name, and if that collides with any snapshot name anywhere in the config,
+  the same name with `-2`, `-3`, … appended. Existing names are never changed.
 - `adopted = "YYYY-MM-DD"`.
 
 `Config::validate()` gains a check that rejects duplicate snapshot names
@@ -182,6 +194,10 @@ directory:
 - When no snapshot of a retired series remains anywhere, the entry is removed
   from the config.
 
+Windows are counted in whole days: a daily tier counts as 1 day, weekly as 7,
+monthly as 31, yearly as 366. The rounding is deliberate and errs toward
+keeping. Dates are UTC.
+
 **Revive.** If a retired entry's subvolume is present again, `retired` is
 cleared. btrbk decides whether the next send can be incremental.
 
@@ -201,6 +217,7 @@ Every failure is loud and none is treated as "nothing to do".
 | `config.toml` or `btrbk.conf` cannot be written, or the new config fails validation | Neither file is replaced. The run continues on the previous config and is marked failed. |
 | A non-nested subvolume cannot be placed (no primary target) | Not adopted; run marked failed; named in the report. |
 | A retired snapshot cannot be deleted | Reported; retried next run. |
+| A subvolume path contains a space | Read whole. The previous parser took the last word of the path; sync replaces it. |
 
 "Marked failed" means the report says `FAILURES DETECTED` and
 `backup_runs.success` is 0, as for any other failure. The exit-code contract
