@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod btrbk_conf;
 pub mod config;
 pub mod db;
 pub mod doctor;
