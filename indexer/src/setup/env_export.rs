@@ -340,4 +340,25 @@ mod tests {
         let result = kv("TEST", "it's a test");
         assert_eq!(result, "TEST='it'\\''s a test'\n");
     }
+
+    /// A retention of 0 means "not configured", and the key is left out so a
+    /// consumer's `${VAR:-default}` applies. 1 is a real setting and must be
+    /// exported — the boundary between the two is exactly 0.
+    #[test]
+    fn dump_env_omits_unset_daily_and_yearly_retention() {
+        let mut config = test_config();
+        let output = dump_env(&config);
+        // Target 1 has daily = 0 and yearly = 0.
+        assert!(!output.contains("DAS_TARGET_1_RETENTION_DAILY"));
+        assert!(!output.contains("DAS_TARGET_1_RETENTION_YEARLY"));
+        // Weekly and monthly are unconditional.
+        assert!(output.contains("DAS_TARGET_1_RETENTION_WEEKLY=4\n"));
+        assert!(output.contains("DAS_TARGET_1_RETENTION_MONTHLY=2\n"));
+
+        config.targets[1].retention.daily = 1;
+        config.targets[1].retention.yearly = 1;
+        let output = dump_env(&config);
+        assert!(output.contains("DAS_TARGET_1_RETENTION_DAILY=1\n"));
+        assert!(output.contains("DAS_TARGET_1_RETENTION_YEARLY=1\n"));
+    }
 }

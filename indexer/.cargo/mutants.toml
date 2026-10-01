@@ -1,11 +1,26 @@
 # cargo-mutants configuration.
 #
-# Run with:  cargo mutants --in-place --file src/db.rs --file src/reconcile.rs -- --lib
+# Run from indexer/, then score the run — cargo-mutants' own exit code is not
+# a result (it is 0 when every mutant was unviable, too):
+#
+#   git diff --relative origin/main -- . > mutants.diff
+#   env -u CARGO_TARGET_DIR cargo mutants --in-place --no-shuffle --in-diff mutants.diff
+#   env -u CARGO_TARGET_DIR python3 ../.github/scripts/mutants-gate.py
+#
+# CI does the same on every push, plus a weekly full-scope pass:
+# .github/workflows/mutants.yml.
 #
 # --in-place is REQUIRED in this crate. Without it cargo-mutants copies only the
 # crate directory, `setup/templates.rs`'s include_str!("../../../scripts/*.sh")
 # cannot resolve, and the run exits 0 having tested NOTHING — reporting success
-# for zero work done.
+# for zero work done. It mutates the working tree and restores it afterwards.
+# Run it on a COPY of the repo: besides uncommitted work being at risk, one
+# restore.rs mutant removes a destination check and the tests then restore
+# their fixture files (a.txt, payload.txt, link, ...) into the crate directory.
+#
+# The diff must be crate-relative (`--relative`, from indexer/). A repo-relative
+# one lists 0 mutants. Do not pass `-- --lib`: it skips the bin and integration
+# tests, and with them the tests that catch mutants in src/setup/.
 
 # Mutants deliberately not tested, each with a reason. This list is not a place
 # to park inconvenient failures: everything here must be untestable in principle,
@@ -27,8 +42,33 @@ exclude_re = [
     # and enables the host's timers; `check` reads `/etc/das-backup` and prints
     # to stdout. Neither can be called from a test without changing or
     # depending on the host. Only the whole-body replacement is excluded: the
-    # logic they call (`install_to_prefix`, `udisks_report`, `command_stdout`)
-    # is mutated and tested, and so is every other mutant inside them.
+    # logic they call (`install_to_prefix`, `install_schedule`, `check_with`,
+    # `udisks_report`, `command_stdout`) is mutated and tested.
     "replace install -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace check -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    # `upgrade`, `uninstall` and `uninstall_all` are the other three root-only
+    # entry points behind `btrdasd setup`, and the same reasoning applies. Each
+    # is now only the binding of its core to the host — `/etc/das-backup`, `/`
+    # and the real `systemctl` — so calling one from a test would rewrite or
+    # remove the live install and stop this host's timers. Only the whole-body
+    # replacement is excluded: the cores they call (`prepare_upgrade`,
+    # `uninstall_with`, `uninstall_all_with`, `install_schedule`) take their
+    # paths and their systemctl runner as arguments and are mutated and tested.
+    "replace upgrade -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    "replace uninstall -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    "replace uninstall_all -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    # `delete_subvolume` is the spawn of `btrfs subvolume delete` and nothing
+    # else: its only effect is a subvolume removed from a mounted BTRFS
+    # filesystem, which needs root and a real filesystem to observe. Only the
+    # whole-body replacement is excluded: the command it builds
+    # (`delete_command`) and its reading of the result (`delete_outcome`) are
+    # mutated and tested.
+    "replace delete_subvolume -> Result<\\(\\), String> with Ok\\(\\(\\)\\)",
+    # `detect_subvolumes` runs `btrfs subvolume list /`, which the kernel
+    # answers only for root and only on a host whose `/` is BTRFS. Run from a
+    # test it fails and returns the same empty list the mutant does, so no
+    # unprivileged, host-independent assertion can tell the two apart. Only
+    # the whole-body replacement is excluded: the code it is made of
+    # (`successful_stdout`, `parse_subvolume_output`) is mutated and tested.
+    "replace detect_subvolumes -> Vec<SubvolumeInfo> with vec!\\[\\]",
 ]

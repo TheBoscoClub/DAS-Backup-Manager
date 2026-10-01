@@ -184,11 +184,25 @@ fn collect<'a>(it: impl Iterator<Item = &'a Snapshot>) -> ForgetPlan {
 ///
 /// `btrfs subvolume delete` only — never `rm -rf`, and never a `ro` flip.
 pub fn delete_subvolume(path: &Path) -> Result<(), String> {
-    let out = std::process::Command::new("btrfs")
-        .args(["subvolume", "delete"])
-        .arg(path)
-        .output()
-        .map_err(|e| format!("could not run btrfs: {e}"))?;
+    delete_outcome(delete_command(path).output())
+}
+
+/// The exact command [`delete_subvolume`] runs. Kept apart from the spawn so
+/// the "delete only, nothing else" contract can be read back without a
+/// filesystem to delete from.
+fn delete_command(path: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("btrfs");
+    cmd.args(["subvolume", "delete"]).arg(path);
+    cmd
+}
+
+/// Turn what the spawn returned into the caller's verdict.
+///
+/// Only a zero exit status is a deletion. A spawn failure and a nonzero exit
+/// are both `Err`: the caller counts failures and keeps the index row for a
+/// snapshot that is still on disk, so neither may read as success.
+fn delete_outcome(spawned: std::io::Result<std::process::Output>) -> Result<(), String> {
+    let out = spawned.map_err(|e| format!("could not run btrfs: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -316,5 +330,73 @@ volume /.btrfs-hdd
         // `snapshot_dir` must not be read as a `snapshot_name`.
         let conf = "  snapshot_dir .btrbk-snapshots\n  snapshot_preserve_min 2d\n";
         assert!(parse_live_snapshot_names(conf).is_empty());
+    }
+
+    #[test]
+    fn live_names_are_read_from_the_file_btrbk_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        std::fs::write(
+            &conf,
+            "volume /.btrfs-nvme\n  subvolume @\n    snapshot_name root\n  subvolume @home\n    snapshot_name home\n",
+        )
+        .unwrap();
+        assert_eq!(
+            live_snapshot_names(&conf).unwrap(),
+            vec!["root".to_string(), "home".to_string()]
+        );
+
+        // A config declaring no series is an empty list, not a placeholder
+        // entry: the forget guard globs against every element.
+        let empty = dir.path().join("empty.conf");
+        std::fs::write(&empty, "timestamp_format long\n").unwrap();
+        assert_eq!(live_snapshot_names(&empty).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_unreadable_btrbk_conf_is_an_error_not_an_empty_live_list() {
+        // An empty list would mean "nothing is live", and `plan_forget` would
+        // then let a pattern take an active chain. The caller refuses to
+        // continue on Err, so Err is what an absent file must produce.
+        let dir = tempfile::tempdir().unwrap();
+        let err = live_snapshot_names(&dir.path().join("absent.conf")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn delete_runs_btrfs_subvolume_delete_on_exactly_the_given_path() {
+        let cmd = delete_command(Path::new("/mnt/t/projects/Proj.20260822"));
+        assert_eq!(cmd.get_program(), "btrfs");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            ["subvolume", "delete", "/mnt/t/projects/Proj.20260822"]
+        );
+    }
+
+    fn sh(script: &str) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .output()
+    }
+
+    #[test]
+    fn delete_outcome_is_success_only_on_a_zero_exit() {
+        // Stderr chatter on a successful delete is still a success.
+        assert_eq!(delete_outcome(sh("echo note >&2; exit 0")), Ok(()));
+        assert_eq!(
+            delete_outcome(sh(
+                "echo '  ERROR: Could not statfs: No such file  ' >&2; exit 1"
+            )),
+            Err("ERROR: Could not statfs: No such file".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_outcome_reports_a_tool_that_could_not_be_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = std::process::Command::new(dir.path().join("no-such-btrfs")).output();
+        let err = delete_outcome(spawned).unwrap_err();
+        assert!(err.starts_with("could not run btrfs: "), "got: {err}");
     }
 }

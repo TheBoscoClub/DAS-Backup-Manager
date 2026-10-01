@@ -1,0 +1,193 @@
+# Falsifiability gate — can the test suite fail?
+#
+# A passing test proves nothing on its own; it must also be capable of FAILING.
+# cargo-mutants injects a bug and checks that some test notices. A surviving
+# mutant IS a test that cannot fail (bd DAS-Backup-Manager-8bg).
+#
+# Four things specific to this repo. Dropping any of the first three makes the
+# run report green having tested nothing; dropping the fourth makes it red for
+# no reason:
+#
+#   1. --in-place is REQUIRED. `indexer/src/setup/templates.rs` embeds
+#      `../scripts/*.sh`, which sit outside the crate. Without --in-place
+#      cargo-mutants copies only `indexer/`, the unmutated build fails, and no
+#      mutant is tested. --in-place cannot be combined with -j.
+#   2. The diff must be CRATE-relative (`git diff --relative` from `indexer/`).
+#      A repo-relative diff reads `b/indexer/src/...`, matches nothing, and
+#      lists 0 mutants with exit 0.
+#   3. cargo-mutants exits 0 both when every mutant was caught and when every
+#      mutant failed to compile. `.github/scripts/mutants-gate.py` scores
+#      `outcomes.json` instead; its exit code is the result, not cargo-mutants'.
+#
+#   4. These jobs run on the runner VM, NOT in the archlinux container ci.yml
+#      uses. In that container every step is root and no mount has a UUID.
+#      The tests that prove `btrdasd setup` refuses a non-root caller, and that
+#      `filesystem_uuid_at` reaches the real findmnt, skip themselves there —
+#      so their mutants would survive and the gate would report coverage holes
+#      that do not exist. The VM runs unprivileged on a real filesystem.
+#
+# Known blind spot (cargo-mutants' own manual): the diff is matched against the
+# code under test, not the test code, so a commit that only guts tests passes
+# the incremental job. The scheduled full-scope job is what covers that.
+name: Mutants
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 4 * * 1' # Mondays 04:00 UTC — full-scope run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned: "latest" is not a version. Bump deliberately.
+  CARGO_MUTANTS_VERSION: 27.1.0
+
+jobs:
+  # ── Incremental: every push, scoped to the pushed commits' own diff ────────
+  incremental:
+    name: Falsifiability — this push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+
+      - name: Compute crate-relative diff
+        id: diff
+        working-directory: indexer
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # The whole push, not just its last commit. `before` is all zeros on
+          # a new branch and unknown after a force-push; fall back to HEAD~1.
+          BASE="$BEFORE"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE=HEAD~1
+          fi
+          if ! git rev-parse --verify -q "${BASE}^{commit}" >/dev/null; then
+            echo "no base commit — nothing to diff"
+            echo "listed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "diff base: $(git rev-parse --short "$BASE")"
+          git diff --relative "$BASE" HEAD -- . > mutants.diff
+          if [ ! -s mutants.diff ]; then
+            echo "no changes under indexer/"
+            echo "listed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          grep '^+++' mutants.diff || true
+
+          # Path sanity BEFORE trusting a zero count: every +++ path must
+          # resolve under indexer/ (deletions show /dev/null). One that does
+          # not means the diff is not crate-relative, and "0 mutants" would be
+          # a measurement of the wrong thing.
+          while read -r p; do
+            p="${p#b/}"
+            [ "$p" = "/dev/null" ] && continue
+            if [ ! -e "$p" ]; then
+              echo "::error::diff path '$p' does not resolve under indexer/ — diff is not crate-relative"
+              exit 1
+            fi
+          done < <(grep '^+++ ' mutants.diff | awk '{print $2}')
+
+          # A non-empty diff can still intersect zero mutants (comments, tests,
+          # formatting). cargo-mutants then writes no outcomes.json and the
+          # gate would rightly refuse the absent file. The paths are proven
+          # above, so a zero here is a measured fact; a list ERROR exits
+          # non-zero and stops the job.
+          LISTED=$(cargo mutants --list --in-diff mutants.diff | wc -l)
+          echo "listed=$LISTED" >> "$GITHUB_OUTPUT"
+          echo "mutants intersecting this push: $LISTED"
+
+      - name: Mutants
+        if: steps.diff.outputs.listed != '0'
+        working-directory: indexer
+        continue-on-error: true # the gate below decides, not this exit code
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo mutants --in-place --no-shuffle -vV --in-diff mutants.diff
+
+      - name: Gate — did this run verify anything?
+        if: steps.diff.outputs.listed != '0'
+        working-directory: indexer
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
+            --label "indexer incremental"
+
+      - name: Archive mutants.out
+        if: always() && steps.diff.outputs.listed != '0'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: mutants-incremental
+          path: indexer/mutants.out
+          if-no-files-found: ignore
+
+  # ── Scheduled: full scope over the code that must not be wrong ─────────────
+  #
+  # Diff-scoping never touches unchanged files, so without this the modules the
+  # whole system trusts would go unmutated indefinitely. Scope: everything that
+  # runs as root at install time (setup/), mounts and unmounts targets
+  # (mount.rs), deletes snapshots (forget.rs), decides where a restore may
+  # write (restore.rs), and holds the denied-roots policy (config.rs).
+  # Measured 2026-10-01: 500 mutants. Re-measure before widening:
+  #   cargo mutants --list --file '<glob>' | wc -l
+  # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
+  full-scope:
+    name: Falsifiability — security-critical scope
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+
+      - name: Mutants
+        working-directory: indexer
+        continue-on-error: true
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo mutants --in-place --no-shuffle \
+            --file 'src/setup/**/*.rs' \
+            --file src/mount.rs \
+            --file src/forget.rs \
+            --file src/restore.rs \
+            --file src/config.rs
+
+      # No --allow-zero-total: an empty result here means the globs are wrong.
+      - name: Gate — did this run verify anything?
+        working-directory: indexer
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
+            --label "indexer full-scope"
+
+      - name: Archive mutants.out
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: mutants-full-scope
+          path: indexer/mutants.out
+          if-no-files-found: ignore

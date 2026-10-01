@@ -1,0 +1,14 @@
+[codespell]
+# Run over tracked files only, so local scratch (CodeQL databases, session
+# records) is never scanned:   git ls-files -z -- . ':!.beads' | xargs -0 codespell
+# CI runs exactly that, with codespell pinned in .github/workflows/ci.yml.
+# check-hidden is required: without it .claude/ and .github/ are skipped
+# silently, even when named on the command line.
+check-hidden = true
+# .beads is bd's own export and is never hand-edited, so it is left out of the
+# file list above rather than skipped here (skip patterns do not match the
+# relative paths git prints).
+skip = *.png,*.svg,*.lock
+# Not prose: `ser` is a serializer binding in indexer/src, `goUp` a Qt slot in
+# gui/src/snapshotbrowser.h, and `UE` the roff URL-end macro in docs/btrdasd.1.
+ignore-words-list = ser,goup,ue

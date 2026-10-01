@@ -102,3 +102,26 @@ jobs:
           fi
           printf 'checking %s\n' "${files[@]}"
           shellcheck "${files[@]}"
+
+  spelling:
+    name: Spelling — codespell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Pinned: a new dictionary release must arrive as a change to this file,
+      # not as main turning red on its own. Settings live in .codespellrc.
+      - name: Install codespell
+        run: pipx install codespell==2.4.3
+
+      # Tracked files only, minus bd's export. `check-hidden` in .codespellrc
+      # is what makes .github/ and .claude/ part of this.
+      - name: codespell
+        run: |
+          count=$(git ls-files -- . ':!.beads' | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "no tracked files listed — failing rather than silently passing"
+            exit 1
+          fi
+          echo "checking $count files"
+          git ls-files -z -- . ':!.beads' | xargs -0 codespell

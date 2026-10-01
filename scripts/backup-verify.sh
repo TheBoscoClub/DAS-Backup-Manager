@@ -158,7 +158,7 @@ report_sector_attr() {
                 echo -e "  $label: ${YELLOW}$value${NC}"
                 return 0
             fi
-            echo -e "  $label: ${RED}UNKNOWN (unparseable value: $value)${NC}"
+            echo -e "  $label: ${RED}UNKNOWN (unparsable value: $value)${NC}"
             return 1
             ;;
     esac

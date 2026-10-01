@@ -470,7 +470,7 @@ pub struct Retention {
 // step, env export, shell script references) was a latent risk vector and
 // caused the daily backup to stop running on 2026-04-09 when dump-env
 // stopped emitting DAS_ESP_MOUNT_POINTS.
-// See .claude/rules/das-esp-safety.md for the full postmortem.
+// See .claude/rules/esp-safety.md for the full postmortem.
 // Old config.toml files with [esp] sections are silently ignored by serde.
 
 /// Report email settings.
@@ -1306,5 +1306,186 @@ enabled = false
         assert!(!cfg.sources[0].subvolumes[0].manual_only);
         assert_eq!(cfg.sources[0].subvolumes[1].name, "@root");
         assert!(cfg.sources[0].subvolumes[1].manual_only);
+    }
+
+    /// Minimal config carrying only the mandatory sections, plus whatever
+    /// optional sections a test appends. Parsing real TOML (rather than calling
+    /// the `default_*` fns) is the point: it exercises the `#[serde(default)]`
+    /// wiring an on-disk config.toml actually goes through.
+    fn minimal_toml(extra: &str) -> String {
+        format!(
+            r#"
+[general]
+version = "0.4.0"
+install_prefix = "/usr/local"
+db_path = "/var/lib/das-backup/backup-index.db"
+
+[init]
+system = "systemd"
+
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+
+[email]
+enabled = false
+
+[gui]
+enabled = false
+
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn restore_roots_default_when_section_absent() {
+        // The allow-list is a security policy (`.claude/rules/backup.md`
+        // §Restore Destination Policy): a config predating `[restore]` must
+        // permit exactly /home and /tmp. An empty list would refuse every
+        // restore; anything wider would let the root D-Bus helper write there.
+        let cfg = Config::from_toml(&minimal_toml("")).expect("parse without [restore]");
+        assert_eq!(cfg.restore.allowed_roots, vec!["/home", "/tmp"]);
+    }
+
+    #[test]
+    fn restore_roots_default_when_section_present_but_empty() {
+        // A bare `[restore]` header takes the field-level serde default rather
+        // than `Restore::default()`; both routes must agree on the policy.
+        let cfg = Config::from_toml(&minimal_toml("[restore]")).expect("parse bare [restore]");
+        assert_eq!(cfg.restore.allowed_roots, vec!["/home", "/tmp"]);
+    }
+
+    #[test]
+    fn restore_roots_explicit_value_replaces_default() {
+        let cfg = Config::from_toml(&minimal_toml(
+            "[restore]\nallowed_roots = [\"/home\", \"/tmp\", \"/srv/VirtualMachines\"]",
+        ))
+        .expect("parse explicit [restore]");
+        assert_eq!(
+            cfg.restore.allowed_roots,
+            vec!["/home", "/tmp", "/srv/VirtualMachines"]
+        );
+        // An explicit empty list is honoured as "nothing allowed", never
+        // silently widened back to the defaults.
+        let cfg = Config::from_toml(&minimal_toml("[restore]\nallowed_roots = []"))
+            .expect("parse empty allowed_roots");
+        assert!(cfg.restore.allowed_roots.is_empty());
+    }
+
+    #[test]
+    fn general_path_defaults_when_keys_absent() {
+        // backup-run.sh receives these via the env export and writes to them
+        // unconditionally: the report is saved to `last_report` BEFORE any send
+        // (`backup.md` §Email Reports) and `btrdasd health` reads `growth_log`.
+        // An empty default would turn both into writes to "".
+        let cfg = Config::from_toml(&minimal_toml("")).expect("parse minimal config");
+        assert_eq!(cfg.general.growth_log, "/var/lib/das-backup/growth.log");
+        assert_eq!(
+            cfg.general.last_report,
+            "/var/lib/das-backup/last-report.txt"
+        );
+    }
+
+    #[test]
+    fn boot_partial_section_fills_missing_keys_with_defaults() {
+        // A `[boot]` header with only some keys goes through the per-field
+        // serde defaults, not `Boot::default()`. Boot archival is on by default
+        // and archives are pruned after 60 days (`backup.md` §Targets and
+        // Retention); a retention of 0 or 1 would have the pruner delete
+        // archives almost as soon as they are made.
+        let cfg = Config::from_toml(&minimal_toml("[boot]\nsubvolumes = [\"@\"]"))
+            .expect("parse partial [boot]");
+        assert!(cfg.boot.enabled);
+        assert_eq!(cfg.boot.archive_retention_days, 60);
+        assert_eq!(cfg.boot.subvolumes, vec!["@"]);
+
+        let cfg = Config::from_toml(&minimal_toml("[boot]\nenabled = false"))
+            .expect("parse [boot] enabled=false");
+        assert!(!cfg.boot.enabled);
+        assert_eq!(cfg.boot.archive_retention_days, 60);
+        assert_eq!(cfg.boot.subvolumes, vec!["@", "@home"]);
+    }
+
+    #[test]
+    fn scrub_partial_section_stays_enabled() {
+        // Tuning one scrub key must not switch the monthly scrub off.
+        let cfg = Config::from_toml(&minimal_toml("[scrub]\nwarn_age_days = 30"))
+            .expect("parse partial [scrub]");
+        assert!(cfg.scrub.enabled);
+        assert_eq!(cfg.scrub.warn_age_days, 30);
+        assert_eq!(cfg.scrub.fail_age_days, 75);
+    }
+
+    fn target_with(serial_lines: &str) -> Target {
+        let toml = format!(
+            "label = \"primary\"\n{serial_lines}\nmount = \"/mnt/backup\"\nrole = \"primary\"\n[retention]\ndaily = 7\n"
+        );
+        toml::from_str(&toml).expect("target should parse")
+    }
+
+    #[test]
+    fn target_serial_precedence_table() {
+        // (toml lines, expected serials). `serials` wins when it names at least
+        // one drive; an EMPTY `serials` must not mask a legacy `serial`, and an
+        // empty `serial` must never become a one-element list holding "" —
+        // that would satisfy `validate()`'s "has an anchor" check and send
+        // consumers looking for a drive whose serial is the empty string.
+        let cases: &[(&str, &[&str])] = &[
+            ("serial = \"LEGACY\"", &["LEGACY"]),
+            ("serials = [\"A\", \"B\"]", &["A", "B"]),
+            ("serial = \"LEGACY\"\nserials = [\"A\", \"B\"]", &["A", "B"]),
+            ("serial = \"LEGACY\"\nserials = []", &["LEGACY"]),
+            ("serial = \"\"\nserials = [\"A\"]", &["A"]),
+            ("serial = \"\"\nserials = []", &[]),
+            ("serial = \"\"", &[]),
+            ("serials = []", &[]),
+            ("", &[]),
+        ];
+        for (lines, want) in cases {
+            let t = target_with(lines);
+            let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(t.serials, want, "serials for {lines:?}");
+            assert_eq!(
+                t.serial,
+                want.first().cloned().unwrap_or_default(),
+                "legacy serial for {lines:?}"
+            );
+            assert_eq!(t.effective_serials(), want, "effective for {lines:?}");
+        }
+    }
+
+    #[test]
+    fn target_with_only_empty_serials_fails_validation() {
+        // End to end: a target whose only anchors are empty must be refused.
+        let cfg = Config::from_toml(&minimal_toml(
+            "[[target]]\nlabel = \"naked\"\nserial = \"\"\nserials = []\nmount = \"/mnt/backup\"\nrole = \"primary\"\n[target.retention]\ndaily = 7",
+        ))
+        .expect("parse target with empty anchors");
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|e| e.contains("naked") && e.contains("mount_uuid")),
+            "empty serial + empty serials must not count as an anchor"
+        );
+    }
+
+    #[test]
+    fn parse_time_range_boundaries() {
+        // Valid clock range is 00:00..=23:59, inclusive at both ends.
+        assert_eq!(parse_time("00:00"), Ok((0, 0)));
+        assert_eq!(parse_time("22:58"), Ok((22, 58)));
+        assert_eq!(parse_time("23:59"), Ok((23, 59)));
+        assert_eq!(parse_time("23:00"), Ok((23, 0)));
+        assert_eq!(parse_time("00:59"), Ok((0, 59)));
+
+        let hour_err = parse_time("24:00").expect_err("hour 24 is out of range");
+        assert!(hour_err.contains("hour 24 out of range"), "{hour_err}");
+        assert!(parse_time("25:00").is_err());
+
+        let min_err = parse_time("00:60").expect_err("minute 60 is out of range");
+        assert!(min_err.contains("minute 60 out of range"), "{min_err}");
+        assert!(parse_time("00:61").is_err());
     }
 }
