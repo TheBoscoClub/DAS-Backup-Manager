@@ -54,6 +54,18 @@ pub fn render_btrbk_conf(config: &Config) -> String {
             continue;
         }
 
+        // Retired entries are not sent; a source left with none has no block.
+        let snap_names = resolve_snapshot_names(&source.subvolumes);
+        let live: Vec<(&SubvolConfig, &String)> = source
+            .subvolumes
+            .iter()
+            .zip(snap_names.iter())
+            .filter(|(sv, _)| sv.retired.is_none())
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+
         // Determine the target subdir for this source
         let subdir = source.target_subdirs.first().unwrap_or(&source.label);
 
@@ -83,10 +95,7 @@ pub fn render_btrbk_conf(config: &Config) -> String {
         }
         out.push('\n');
 
-        // Pre-compute snapshot names and detect collisions
-        let snap_names = resolve_snapshot_names(&source.subvolumes);
-
-        for (subvol, snap_name) in source.subvolumes.iter().zip(snap_names.iter()) {
+        for (subvol, snap_name) in live {
             out.push_str(&format!("  subvolume             {}\n", subvol.name));
             out.push_str(&format!("    snapshot_name       {snap_name}\n\n"));
         }
@@ -171,6 +180,27 @@ pub fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retired_entries_and_all_retired_sources_are_not_rendered() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes[0].retired = Some("2026-01-01".into());
+        let text = render_btrbk_conf(&cfg);
+        let gone = &cfg.sources[0].subvolumes[0].name;
+        assert!(
+            !text.contains(&format!("subvolume             {gone}\n")),
+            "{text}"
+        );
+
+        for sv in &mut cfg.sources[0].subvolumes {
+            sv.retired = Some("2026-01-01".into());
+        }
+        let text = render_btrbk_conf(&cfg);
+        assert!(
+            !text.contains(&format!("# {}\n", cfg.sources[0].label)),
+            "{text}"
+        );
+    }
     use super::*;
     use crate::config::Source;
 
@@ -185,11 +215,13 @@ mod tests {
                     name: "@".to_string(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 },
                 SubvolConfig {
                     name: "@home".to_string(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 },
             ],
             device: "/dev/nvme0n1p2".to_string(),
@@ -277,6 +309,7 @@ mod tests {
                 name: "ClaudeCodeProjects".to_string(),
                 manual_only: false,
                 snapshot_name: None,
+                ..Default::default()
             }],
             device: "/dev/sda".to_string(),
             snapshot_dir: "ClaudeCodeProjects/.btrbk-snapshots".into(),
@@ -296,6 +329,7 @@ mod tests {
             name: name.to_string(),
             manual_only: false,
             snapshot_name: snapshot_name.map(str::to_string),
+            ..Default::default()
         }
     }
 

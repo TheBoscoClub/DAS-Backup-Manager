@@ -921,6 +921,7 @@ mod tests {
                     name: (*n).into(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 })
                 .collect(),
             device: "/dev/fake".into(),

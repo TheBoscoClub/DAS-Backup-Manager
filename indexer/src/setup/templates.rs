@@ -548,11 +548,13 @@ mod tests {
                     name: "@".to_string(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 },
                 SubvolConfig {
                     name: "@home".to_string(),
                     manual_only: false,
                     snapshot_name: None,
+                    ..Default::default()
                 },
             ],
             device: "/dev/nvme0n1p2".to_string(),
