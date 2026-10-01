@@ -71,4 +71,12 @@ exclude_re = [
     # the whole-body replacement is excluded: the code it is made of
     # (`successful_stdout`, `parse_subvolume_output`) is mutated and tested.
     "replace detect_subvolumes -> Vec<SubvolumeInfo> with vec!\\[\\]",
+    # `perform_drift_check` is the drift check's host shell: it mounts the
+    # source volumes, lists them, hands the listings to `drift_from_listings`
+    # and unmounts. That needs root and real BTRFS volumes, so no unprivileged
+    # test can tell the real body from an empty report. Only the whole-body
+    # replacement is excluded. The shell must stay free of logic: everything
+    # that decides what is missing, stale or unreadable lives in
+    # `drift_from_listings`, which is mutated and tested.
+    "replace perform_drift_check -> DriftReport with Default::default\\(\\)",
 ]
