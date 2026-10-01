@@ -3389,7 +3389,7 @@ Expected: `FAIL: load_config_env not found in backup-run.sh`, exit 1.
 
 - [ ] **Step 3: Implement** in `scripts/backup-run.sh`
 
-Turn the top-level config load into a function and call it once at top level, so behaviour at startup is unchanged. Everything from the `eval "$("$BTRDASD_BIN" config dump-env …)"` line through the construction of `ALL_TARGET_MOUNTS` (lines 238-308) moves inside, with each associative array re-declared so a reload starts empty:
+Turn the top-level config load into a function and call it once at top level, so behaviour at startup is unchanged. Everything from the `eval "$("$BTRDASD_BIN" config dump-env …)"` line through the construction of `ALL_TARGET_MOUNTS` (lines 238-308) moves inside, with each associative array redeclared so a reload starts empty:
 
 ```bash
 # Load configuration from config.toml via btrdasd. Called once at startup and
