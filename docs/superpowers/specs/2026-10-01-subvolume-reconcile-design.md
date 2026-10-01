@@ -1,6 +1,6 @@
 # Subvolume reconcile — back up what exists, not what was listed
 
-- **Status:** design, awaiting operator review
+- **Status:** design; expiry rule confirmed by operator 2026-10-01
 - **Date:** 2026-10-01
 - **Applies to:** `btrdasd` 0.7.22.x → next minor
 - **Tracker:** bd `DAS-Backup-Manager-gte` (this work), bd `DAS-Backup-Manager-gya` (the incident)
@@ -46,6 +46,9 @@ contains it and its report says so.
    snapshot trees. No guessing from names.
 3. **A subvolume that disappears:** its entry is retired automatically and
    its existing backups expire under the target's retention.
+4. **What "expire" means:** the whole series is kept until the retirement
+   date plus the target's longest retention window, then deleted from that
+   target together (section 9).
 
 ## 4. Approach
 
@@ -280,10 +283,18 @@ reconcile leaves it alone afterwards.
   measure against, so retired series on it are kept and reported on every
   run, never deleted.
 
-## 9. Open point for review
+## 9. Expiry rule — decided (operator, 2026-10-01)
 
-Section 5.5 turns "let its backups expire under normal retention" into a
-concrete rule: keep everything until retirement date plus the target's
-longest window, then delete the series from that target. If what was meant
-is btrbk-style thinning, that is a larger piece of work and should be said
-now.
+Section 5.5's rule stands: a retired subvolume's snapshots are all kept until
+the retirement date plus that target's longest retention window, then deleted
+from that target together. With the live settings that is 7 days on each
+recovery drive and one year on the primary.
+
+btrbk-style thinning was considered and rejected. `btrbk prune` skips
+deletion when the source is not accessible, so thinning a retired series
+would mean a second implementation of btrbk's retention rules in this
+codebase: selective, per-snapshot deletion, running unattended on what is by
+then the only copy, and obliged to agree exactly with code we do not control.
+The whole-series rule makes one decision per target and errs toward keeping
+more. Its costs are accepted: more snapshots held for longer, and expiry as a
+single date per target instead of a gradual fade.
