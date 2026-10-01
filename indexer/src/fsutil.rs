@@ -59,6 +59,8 @@ pub(crate) mod testing {
     /// accident on a call it never expected.
     pub(crate) struct Scripted {
         answers: Vec<(String, i32, String)>,
+        /// Paths whose `btrfs subvolume delete` really removes the directory.
+        deletable: Vec<String>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -75,7 +77,18 @@ pub(crate) mod testing {
         pub(crate) fn from_owned(answers: Vec<(String, i32, String)>) -> Self {
             Self {
                 answers,
+                deletable: Vec::new(),
                 calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A runner where `btrfs subvolume delete <path>` for each listed path
+        /// removes that directory and exits 0, so a test can assert on what
+        /// remains. Every other command is unscripted (exit 1).
+        pub(crate) fn deleting(paths: Vec<String>) -> Self {
+            Self {
+                deletable: paths,
+                ..Self::from_owned(Vec::new())
             }
         }
 
@@ -93,6 +106,17 @@ pub(crate) mod testing {
                 .collect::<Vec<_>>()
                 .join(" ");
             self.calls.lock().unwrap().push(argv.clone());
+            if let Some(path) = argv
+                .strip_prefix("btrfs subvolume delete ")
+                .filter(|p| self.deletable.iter().any(|d| d == p))
+            {
+                std::fs::remove_dir_all(path)?;
+                return Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
             let (code, stdout) = self
                 .answers
                 .iter()
