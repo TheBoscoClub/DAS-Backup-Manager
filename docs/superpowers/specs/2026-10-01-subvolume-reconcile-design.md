@@ -276,7 +276,7 @@ reconcile leaves it alone afterwards.
   the target and its entry in the config. **Counter-test:** the same run with
   reconcile disabled must leave it absent. Then delete the subvolume, run
   again, observe retirement; advance past the window, observe expiry.
-- **On this host:** `subvol reconcile --dry-run` must report nothing to adopt
+- **On this host:** `subvol sync --dry-run` must report nothing to adopt
   (the two `gya` subvolumes were added by hand on 2026-10-01) and
   `@cache/stremio` skipped by `@cache`. The first subvolume created after
   deployment is the live proof.
