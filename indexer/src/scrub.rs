@@ -73,10 +73,10 @@
 //!   `backup-run.sh`'s `verify_targets_before_btrbk` checks the mounted
 //!   filesystem's UUID against the config, so a stray mount is surfaced by the
 //!   next backup rather than silently used.
-//! * **Double mounts alongside udisks are expected and tolerated.** The 22 TB
-//!   array is often also mounted at `/run/media/bosco/…` by the file manager —
-//!   that is what triggers `btrfs-scrub-resume-das-22tb.service` and is
-//!   deliberately not cleaned up. BTRFS permits the same filesystem at several
+//! * **A second mount elsewhere is tolerated.** `btrdasd setup` hides the
+//!   targets from udisks (bd `DAS-Backup-Manager-xqo`), so a file manager no
+//!   longer mounts them under `/run/media/…`; if some other mount exists
+//!   anyway it is not cleaned up. BTRFS permits the same filesystem at several
 //!   mount points; a scrub is per-filesystem, not per-mount, so it makes no
 //!   difference to this engine. If the configured mountpoint already holds the
 //!   *expected* UUID the engine reuses it and does **not** unmount it on the

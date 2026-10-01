@@ -48,6 +48,9 @@ The proof command, the gap-finding inventory loop and the incidents are in the r
   rate**: `cat /sys/bus/usb/devices/*/speed` must read `10000` (Mbit/s, link speed). It sat at
   `480` for nine days undetected. **Throughput does not reveal this** — only the link speed does.
 - Bay map: `docs/examples/author-bay-mapping.md`; generic guide `docs/DAS-BAY-MAPPING.md`.
+- **Targets are hidden from udisks** by the generated `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`
+  (rendered from `[[target]]` serials + `mount_uuid`; never hand-edit). `btrdasd setup --check` reads
+  back whether each attached target carries the flag. Nothing may mount them under `/run/media`.
 - Targets are mounted by `backup-run.sh`, never by fstab. The 22 TB primary is BTRFS RAID-1
   across two drives; the two 2 TB recovery drives are independent single-device filesystems.
 

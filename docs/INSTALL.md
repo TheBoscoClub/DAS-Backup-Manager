@@ -419,6 +419,7 @@ The installer creates the following files (tracked in `/etc/das-backup/.manifest
 | `/etc/systemd/system/das-scrub.timer` | Scheduled BTRFS scrub timer (systemd) — `OnCalendar` from `[scrub].on_calendar`, enabled only when `[scrub].enabled = true` |
 | `/etc/systemd/system/das-backup-doctor.service` | Subvolume drift detector service (systemd) — runs `btrdasd doctor --check-drift --email` |
 | `/etc/systemd/system/das-backup-doctor.timer` | Subvolume drift detector timer (systemd) — fixed `Sun 02:00`, always enabled |
+| `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | udev rule hiding every backup target from udisks2, so no desktop session automounts it — one line per `[[target]]` serial, plus one per `mount_uuid`. Generated on every init system; `btrdasd setup --check` reads back whether each attached target actually carries the flag |
 
 `${prefix}` is `[general].install_prefix` (default `/usr/local`, `/usr` on the live system
 here). There is no generated credential file and no credential of any kind —

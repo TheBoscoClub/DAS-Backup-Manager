@@ -496,6 +496,67 @@ pub fn render_cron_entry(config: &Config) -> Result<String, String> {
 // (/usr/local/bin/esp-sync.sh + /etc/pacman.d/hooks/esp-mirror.hook) outside
 // this project. See .claude/rules/das-esp-safety.md for the full postmortem.
 
+/// Where the udisks-ignore rule is installed.
+pub const UDEV_UDISKS_IGNORE_RULES: &str = "/etc/udev/rules.d/99-das-backup-udisks-ignore.rules";
+
+/// True when `value` can be interpolated into a udev `=="..."` match without
+/// changing what the rule means: no quote to end the string early, and none
+/// of udev's glob characters (`*?[]|`) to widen the match.
+pub fn is_udev_safe_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Generate the udev rule that hides every backup target from udisks2, and so
+/// from desktop automounters (bd `DAS-Backup-Manager-a10`, `-xqo`).
+///
+/// A target left visible is mounted read-write under `/run/media/<user>` at
+/// login — a second door onto a filesystem only `backup-run.sh` and `btrdasd`
+/// are meant to open. A multi-device target is worse: btrfs reports one member
+/// as the mount source, udisks believes the others are still unmounted, and
+/// each further login mounts them again.
+///
+/// Keyed on each configured drive serial, scoped to the btrfs partition so a
+/// recovery drive's own ESP is not matched, and additionally on `mount_uuid`
+/// where one is configured, which covers a replacement leg whose serial has
+/// not reached the config yet. A hand-written predecessor was keyed on the
+/// UUID alone and matched nothing for months after the filesystem was
+/// re-created; rendering from `config.toml` ties this rule to the identifiers
+/// the backup itself mounts by, so it cannot drift from them unnoticed.
+pub fn render_udev_udisks_ignore(config: &Config) -> String {
+    let mut out = format!(
+        "{GENERATED_HEADER}#\n\
+         # Hides the backup targets from udisks2 so no desktop session automounts them.\n\
+         # Verify with: sudo btrdasd setup --check\n"
+    );
+    for target in &config.targets {
+        out.push_str(&format!("\n# {}\n", target.label.replace('\n', " ")));
+        for serial in target.effective_serials() {
+            if is_udev_safe_value(&serial) {
+                out.push_str(&format!(
+                    "SUBSYSTEM==\"block\", ENV{{ID_SERIAL_SHORT}}==\"{serial}\", \
+                     ENV{{ID_FS_TYPE}}==\"btrfs\", ENV{{UDISKS_IGNORE}}=\"1\"\n"
+                ));
+            } else {
+                out.push_str("# SKIPPED a serial that is not safe to place in a udev match\n");
+            }
+        }
+        if let Some(uuid) = &target.mount_uuid {
+            if is_udev_safe_value(uuid) {
+                out.push_str(&format!(
+                    "SUBSYSTEM==\"block\", ENV{{ID_FS_UUID}}==\"{uuid}\", \
+                     ENV{{UDISKS_IGNORE}}=\"1\"\n"
+                ));
+            } else {
+                out.push_str("# SKIPPED a mount_uuid that is not safe to place in a udev match\n");
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // GeneratedFiles — aggregates all rendered files
 // ---------------------------------------------------------------------------
@@ -597,6 +658,12 @@ impl GeneratedFiles {
                 }
             }
         }
+
+        // Hide the targets from udisks2. Independent of the init system.
+        files.push((
+            UDEV_UDISKS_IGNORE_RULES.to_string(),
+            render_udev_udisks_ignore(config),
+        ));
 
         // No email config file is generated: this project stores no mail
         // credential. See the note above `render_cron_entry`'s neighbours and
@@ -909,5 +976,99 @@ mod tests {
         assert!(manifest.contains("das-scrub.timer"));
         assert!(manifest.contains("das-backup-doctor.service"));
         assert!(manifest.contains("das-backup-doctor.timer"));
+        assert!(manifest.contains(UDEV_UDISKS_IGNORE_RULES));
+    }
+
+    /// `test_config()` plus a RAID-1 target that carries a `mount_uuid`.
+    fn config_with_uuid_target() -> Config {
+        let mut config = test_config();
+        config.targets.push(Target {
+            label: "pair".to_string(),
+            serial: "ZXA1NYGZ".to_string(),
+            serials: vec!["ZXA1NYGZ".to_string(), "ZXA1R71M".to_string()],
+            mount_uuid: Some("b2dbe07d-40b9-422e-8ccf-ef4931c40457".to_string()),
+            mount: "/mnt/pair".to_string(),
+            role: TargetRole::Primary,
+            retention: Retention {
+                weekly: 0,
+                monthly: 0,
+                daily: 7,
+                yearly: 0,
+            },
+            display_name: String::new(),
+        });
+        config
+    }
+
+    #[test]
+    fn render_udev_udisks_ignore_keys_every_target_serial_and_uuid() {
+        // bd DAS-Backup-Manager-xqo: one line per configured serial (scoped to
+        // the btrfs partition, so a recovery drive's own ESP is not matched),
+        // plus one per configured filesystem UUID.
+        let result = render_udev_udisks_ignore(&config_with_uuid_target());
+        assert!(result.contains("# Generated by btrdasd setup"));
+        for serial in ["ZXA0LMAE", "ZXA1NYGZ", "ZXA1R71M"] {
+            let line = format!(
+                "SUBSYSTEM==\"block\", ENV{{ID_SERIAL_SHORT}}==\"{serial}\", \
+                 ENV{{ID_FS_TYPE}}==\"btrfs\", ENV{{UDISKS_IGNORE}}=\"1\"\n"
+            );
+            assert!(
+                result.contains(&line),
+                "missing serial rule for {serial}:\n{result}"
+            );
+        }
+        assert!(result.contains(
+            "SUBSYSTEM==\"block\", ENV{ID_FS_UUID}==\"b2dbe07d-40b9-422e-8ccf-ef4931c40457\", \
+             ENV{UDISKS_IGNORE}=\"1\"\n"
+        ));
+        // Three serials + one UUID: exactly four rules, nothing invented for
+        // the target that has no mount_uuid.
+        assert_eq!(result.matches("ENV{UDISKS_IGNORE}=\"1\"").count(), 4);
+    }
+
+    #[test]
+    fn render_udev_udisks_ignore_refuses_values_that_would_break_rule_syntax() {
+        // A serial or UUID is interpolated into a udev match string. One
+        // containing a quote would end the string early and turn the rest of
+        // the line into rule syntax, so it gets a comment, never a rule.
+        let mut config = test_config();
+        config.targets[0].serials = vec!["BAD\", ENV{X}==\"".to_string()];
+        config.targets[0].mount_uuid = Some("not a uuid\"".to_string());
+        let result = render_udev_udisks_ignore(&config);
+        assert_eq!(result.matches("ENV{UDISKS_IGNORE}=\"1\"").count(), 0);
+        assert!(!result.contains("BAD"));
+        assert_eq!(result.matches("# SKIPPED").count(), 2);
+    }
+
+    #[test]
+    fn udev_safe_value_accepts_serials_and_uuids_only() {
+        assert!(is_udev_safe_value("ZK208Q77"));
+        assert!(is_udev_safe_value("b2dbe07d-40b9-422e-8ccf-ef4931c40457"));
+        assert!(is_udev_safe_value("WD-WX12_A.3"));
+        assert!(!is_udev_safe_value(""));
+        assert!(!is_udev_safe_value("a\"b"));
+        assert!(!is_udev_safe_value("a b"));
+        assert!(!is_udev_safe_value("a*"));
+        assert!(!is_udev_safe_value("a|b"));
+    }
+
+    #[test]
+    fn generated_files_carry_the_udev_rule_under_every_init_system() {
+        // udisks does not care which init system is running.
+        for system in [
+            InitSystem::Systemd,
+            InitSystem::Sysvinit,
+            InitSystem::Openrc,
+        ] {
+            let mut config = test_config();
+            config.init.system = system;
+            let generated = GeneratedFiles::generate(&config);
+            let rule = generated
+                .files
+                .iter()
+                .find(|(p, _)| p == UDEV_UDISKS_IGNORE_RULES)
+                .map(|(_, c)| c.as_str());
+            assert_eq!(rule, Some(render_udev_udisks_ignore(&config).as_str()));
+        }
     }
 }

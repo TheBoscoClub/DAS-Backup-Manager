@@ -54,7 +54,7 @@ The two 22TB CMR drives in bays 2 and 5 form a single BTRFS RAID-1 filesystem. B
 - BTRFS UUID: `b2dbe07d-40b9-422e-8ccf-ef4931c40457`
 - Label: `das-backup-22tb`
 - Profiles: Data RAID-1, Metadata RAID-1, System RAID-1
-- Mount: `/mnt/backup-22tb` (production) / `/run/media/bosco/das-backup-22tb` (auto-mounted)
+- Mount: `/mnt/backup-22tb`, by `backup-run.sh` and `btrdasd` only. Hidden from udisks2 since 2026-10-01, so it no longer appears under `/run/media/bosco/`
 
 **Adding a second leg** (the 2026-05-06 conversion, for reference):
 ```bash

@@ -64,6 +64,6 @@ DAS backup drives are identifiable by:
 - Labels: `RECOV-ESP-1` / `RECOV-ESP-4` (ESP partitions on the bay 1 / bay 4 2TB drives; both were `BACKUP-ESP` historically), `das-backup-system-recovery-A`, `das-backup-system-recovery-B`, `das-backup-22tb`
 - Serials: `ZK208Q77` (bay 1), `ZXA1R71M` (bay 2, RMA replacement for failed `ZXA0LMAE` — installed 2026-05-15), `ZFL41DNY` (bay 4, was bay 3 prior to 2026-05-06), `ZXA1NYGZ` (bay 5, RAID-1 partner of `ZXA1R71M` in the 22TB array; added 2026-05-06 originally as partner of `ZXA0LMAE`)
 - Device paths: vary on reconnect (USB-attached TerraMaster D6-320 enclosure)
-- Mount points: `/mnt/backup-22tb`, `/run/media/bosco/das-*`
+- Mount points: `/mnt/backup-22tb`, `/mnt/backup-system-recovery-A`, `/mnt/backup-system-recovery-B` — mounted by `backup-run.sh` / `btrdasd` only. Hidden from udisks2 since 2026-10-01: a `/run/media/bosco/das-*` mount means the generated ignore rule is not applying (`sudo btrdasd setup --check`)
 
 Note: `dasRaid0` was relocated to internal SATA (2026-04-06) and is no longer in the DAS enclosure.

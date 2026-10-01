@@ -215,8 +215,9 @@ The `backup-run.sh` script always uses degraded mount options, so scheduled back
 sudo mkdir -p /mnt/backup-22tb
 sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 
-# Or, if udisks2 auto-mounted at /run/media/bosco/das-backup-22tb but failed
-# because of degraded state, force the explicit mount:
+# Or, on an install that predates the generated udisks-ignore rule, if udisks2
+# auto-mounted at /run/media/bosco/das-backup-22tb but failed because of
+# degraded state, force the explicit mount:
 sudo umount /run/media/bosco/das-backup-22tb 2>/dev/null
 sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 ```

@@ -17,4 +17,18 @@ exclude_re = [
     # empty one. Deleting the body would be a real (if minor) regression, which
     # is why it stays; it simply cannot be covered by a test.
     "<impl Drop for Database>::drop",
+    # `apply_udev_rules` reloads the host's udev rules and re-triggers every
+    # block device. Its only effect is on the running system's udev state,
+    # which needs root and cannot be observed from a unit test. The command
+    # runner it calls, `run_udevadm`, is mutated and tested.
+    "replace apply_udev_rules with \\(\\)",
+    # `install` and `check` are the root-only entry points behind `btrdasd
+    # setup`, which exits unless it is run as root. `install` writes under `/`
+    # and enables the host's timers; `check` reads `/etc/das-backup` and prints
+    # to stdout. Neither can be called from a test without changing or
+    # depending on the host. Only the whole-body replacement is excluded: the
+    # logic they call (`install_to_prefix`, `udisks_report`, `command_stdout`)
+    # is mutated and tested, and so is every other mutant inside them.
+    "replace install -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    "replace check -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
 ]

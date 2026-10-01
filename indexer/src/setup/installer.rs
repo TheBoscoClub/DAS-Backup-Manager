@@ -38,11 +38,171 @@ fn run_systemctl(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Run one `udevadm` verb, returning a description of the failure.
+fn run_udevadm(args: &[&str]) -> Result<(), String> {
+    match std::process::Command::new("udevadm").args(args).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("udevadm {} exited with {}", args.join(" "), st)),
+        Err(e) => Err(format!("udevadm {} could not be run: {e}", args.join(" "))),
+    }
+}
+
+/// Make the freshly written udisks-ignore rule take effect on devices that are
+/// already attached. Not fatal — the rule file is in place and applies on the
+/// next attach or boot — but never silent: until it applies, a desktop login
+/// can still automount the targets.
+fn apply_udev_rules() {
+    let steps: [&[&str]; 2] = [
+        &["control", "--reload"],
+        &["trigger", "--action=change", "--subsystem-match=block"],
+    ];
+    for args in steps {
+        if let Err(e) = run_udevadm(args) {
+            eprintln!(
+                "Warning: {e} — the udisks-ignore rule is installed but not yet \
+                 applied to attached drives; it takes effect on the next boot"
+            );
+            return;
+        }
+    }
+}
+
+/// How one backup target appears to udisks2, per `udevadm info --export-db`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TargetExposure {
+    pub label: String,
+    /// Member devices carrying `UDISKS_IGNORE=1`.
+    pub hidden: Vec<String>,
+    /// Member devices udisks2 can see, and a desktop session can automount.
+    pub exposed: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExposureVerdict {
+    Hidden,
+    Exposed,
+    /// No attached device matched. Says nothing about whether the rule works.
+    NotAttached,
+}
+
+impl TargetExposure {
+    pub fn verdict(&self) -> ExposureVerdict {
+        if !self.exposed.is_empty() {
+            ExposureVerdict::Exposed
+        } else if self.hidden.is_empty() {
+            ExposureVerdict::NotAttached
+        } else {
+            ExposureVerdict::Hidden
+        }
+    }
+}
+
+/// Sort every attached member device of every configured target into hidden
+/// or exposed. A device belongs to a target when it holds a btrfs filesystem
+/// and either its drive serial is one of the target's, or its filesystem UUID
+/// is the target's `mount_uuid` — the same two identities the generated rule
+/// matches on, read back from what udev actually applied.
+pub fn udisks_exposure(export_db: &str, config: &Config) -> Vec<TargetExposure> {
+    let mut found: Vec<TargetExposure> = config
+        .targets
+        .iter()
+        .map(|t| TargetExposure {
+            label: t.label.clone(),
+            hidden: Vec::new(),
+            exposed: Vec::new(),
+        })
+        .collect();
+
+    for record in export_db.split("\n\n") {
+        let prop = |key: &str| {
+            record
+                .lines()
+                .filter_map(|l| l.strip_prefix("E: "))
+                .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        };
+        if prop("SUBSYSTEM") != Some("block") || prop("ID_FS_TYPE") != Some("btrfs") {
+            continue;
+        }
+        let Some(devname) = prop("DEVNAME") else {
+            continue;
+        };
+        let serial = prop("ID_SERIAL_SHORT");
+        let uuid = prop("ID_FS_UUID");
+        let ignored = prop("UDISKS_IGNORE") == Some("1");
+
+        for (target, slot) in config.targets.iter().zip(found.iter_mut()) {
+            let by_serial =
+                serial.is_some_and(|s| target.effective_serials().iter().any(|t| t == s));
+            let by_uuid = uuid.is_some() && uuid == target.mount_uuid.as_deref();
+            if by_serial || by_uuid {
+                if ignored {
+                    slot.hidden.push(devname.to_string());
+                } else {
+                    slot.exposed.push(devname.to_string());
+                }
+            }
+        }
+    }
+    for slot in &mut found {
+        slot.hidden.sort();
+        slot.exposed.sort();
+    }
+    found
+}
+
+/// Run a command and return its stdout, or a description of why there is none.
+/// A command that ran and failed is an error, never an empty answer.
+fn command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => Err(format!(
+            "{program} {} exited with {}",
+            args.join(" "),
+            out.status
+        )),
+        Err(e) => Err(format!("{program} could not be run: {e}")),
+    }
+}
+
+/// The lines `setup --check` prints about udisks visibility, given the result
+/// of reading udev's database. A database that could not be read is reported
+/// as not checked — it must never read as "nothing exposed".
+pub fn udisks_report(export_db: Result<String, String>, config: &Config) -> Vec<String> {
+    let db = match export_db {
+        Ok(db) => db,
+        Err(e) => return vec![format!("udisks visibility NOT checked: {e}")],
+    };
+    let mut lines = Vec::new();
+    for t in udisks_exposure(&db, config) {
+        match t.verdict() {
+            ExposureVerdict::Hidden => lines.push(format!(
+                "Target {} hidden from udisks ({})",
+                t.label,
+                t.hidden.join(", ")
+            )),
+            ExposureVerdict::Exposed => {
+                lines.push(format!(
+                    "Target {} EXPOSED to udisks — a desktop login can automount {}",
+                    t.label,
+                    t.exposed.join(", ")
+                ));
+                lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
+            }
+            ExposureVerdict::NotAttached => lines.push(format!(
+                "Target {} not attached — udisks visibility could not be checked",
+                t.label
+            )),
+        }
+    }
+    lines
+}
+
 pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = PathBuf::from(CONFIG_FILE);
     let manifest_path = PathBuf::from(MANIFEST_FILE);
     let root = PathBuf::from("/");
     install_to_prefix(config, &root, &config_path, &manifest_path)?;
+    apply_udev_rules();
 
     // Enable systemd timers (only in real installs, not in install_to_prefix tests)
     if config.init.system == crate::setup::config::InitSystem::Systemd {
@@ -534,6 +694,13 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
         println!("No manifest found. Files may be from a manual install.");
     }
 
+    // Are the targets hidden from udisks2? Read back from udev rather than
+    // from the rule file: a rule that exists and matches nothing looks
+    // installed and does nothing (bd DAS-Backup-Manager-a10).
+    for line in udisks_report(command_stdout("udevadm", &["info", "--export-db"]), &config) {
+        println!("{line}");
+    }
+
     let deps = crate::setup::detect::check_dependencies(config.email.enabled);
     for dep in &deps {
         if let Some(path) = &dep.path {
@@ -674,6 +841,174 @@ mod tests {
         let config = Config::default();
         install_to_prefix(&config, dir, &config_path, &manifest_path).unwrap();
         (config_path, manifest_path)
+    }
+
+    /// Records trimmed from a real `udevadm info --export-db` (2026-10-01):
+    /// a recovery drive's ESP and btrfs partitions, both legs of the RAID-1
+    /// pair, and an unrelated optical drive.
+    fn export_db(sdj2_ignore: bool, sdl1_ignore: bool) -> String {
+        let ign = |on: bool| if on { "E: UDISKS_IGNORE=1\n" } else { "" };
+        format!(
+            "P: /devices/x/block/sdj/sdj1\nN: sdj1\nE: DEVNAME=/dev/sdj1\n\
+             E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=ZK208Q77\n\
+             E: ID_FS_UUID=6D15-0632\nE: ID_FS_TYPE=vfat\n\
+             \n\
+             P: /devices/x/block/sdj/sdj2\nN: sdj2\nE: DEVNAME=/dev/sdj2\n\
+             E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=ZK208Q77\n\
+             E: ID_FS_UUID=60b05268-7f8f-47b5-a38a-752576a1172a\nE: ID_FS_TYPE=btrfs\n{}\
+             \n\
+             P: /devices/x/block/sdi/sdi1\nN: sdi1\nE: DEVNAME=/dev/sdi1\n\
+             E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=ZXA1NYGZ\n\
+             E: ID_FS_UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457\nE: ID_FS_TYPE=btrfs\n\
+             E: UDISKS_IGNORE=1\n\
+             \n\
+             P: /devices/x/block/sdl/sdl1\nN: sdl1\nE: DEVNAME=/dev/sdl1\n\
+             E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=REPLACEMENT\n\
+             E: ID_FS_UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457\nE: ID_FS_TYPE=btrfs\n{}\
+             \n\
+             P: /devices/x/block/sr0\nN: sr0\nE: DEVNAME=/dev/sr0\n\
+             E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=USB_Storage\n",
+            ign(sdj2_ignore),
+            ign(sdl1_ignore),
+        )
+    }
+
+    fn exposure_target(label: &str, serials: &[&str], uuid: Option<&str>) -> Target {
+        Target {
+            label: label.to_string(),
+            serial: serials.first().map(|s| s.to_string()).unwrap_or_default(),
+            serials: serials.iter().map(|s| s.to_string()).collect(),
+            mount_uuid: uuid.map(str::to_string),
+            mount: format!("/mnt/{label}"),
+            role: TargetRole::Primary,
+            retention: Retention {
+                weekly: 0,
+                monthly: 0,
+                daily: 7,
+                yearly: 0,
+            },
+            display_name: String::new(),
+        }
+    }
+
+    fn exposure_config() -> Config {
+        let mut config = Config::default();
+        config
+            .targets
+            .push(exposure_target("recovery-A", &["ZK208Q77"], None));
+        config.targets.push(exposure_target(
+            "pair",
+            &["ZXA1NYGZ", "ZXA1R71M"],
+            Some("b2dbe07d-40b9-422e-8ccf-ef4931c40457"),
+        ));
+        config
+            .targets
+            .push(exposure_target("unplugged", &["NOTHERE"], None));
+        config
+    }
+
+    #[test]
+    fn udisks_exposure_reports_every_target_hidden_when_all_carry_the_flag() {
+        let found = udisks_exposure(&export_db(true, true), &exposure_config());
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].label, "recovery-A");
+        // The ESP on the same drive shares the serial but is not btrfs, so it
+        // is not this target's device.
+        assert_eq!(found[0].hidden, vec!["/dev/sdj2".to_string()]);
+        assert!(found[0].exposed.is_empty());
+        // sdl1's serial is not in the config: it is matched by filesystem UUID.
+        assert_eq!(
+            found[1].hidden,
+            vec!["/dev/sdi1".to_string(), "/dev/sdl1".to_string()]
+        );
+        assert!(found[1].exposed.is_empty());
+    }
+
+    #[test]
+    fn udisks_exposure_names_a_device_missing_the_flag() {
+        let found = udisks_exposure(&export_db(false, false), &exposure_config());
+        assert_eq!(found[0].exposed, vec!["/dev/sdj2".to_string()]);
+        assert!(found[0].hidden.is_empty());
+        assert_eq!(found[1].exposed, vec!["/dev/sdl1".to_string()]);
+        assert_eq!(found[1].hidden, vec!["/dev/sdi1".to_string()]);
+    }
+
+    #[test]
+    fn udisks_exposure_keeps_an_absent_target_distinct_from_a_hidden_one() {
+        // "No device matched" must not read as "nothing exposed".
+        let found = udisks_exposure(&export_db(true, true), &exposure_config());
+        assert_eq!(found[2].label, "unplugged");
+        assert!(found[2].hidden.is_empty() && found[2].exposed.is_empty());
+        assert_eq!(found[2].verdict(), ExposureVerdict::NotAttached);
+        assert_eq!(found[0].verdict(), ExposureVerdict::Hidden);
+        let exposed = udisks_exposure(&export_db(false, true), &exposure_config());
+        assert_eq!(exposed[0].verdict(), ExposureVerdict::Exposed);
+        // A target with one hidden leg and one exposed leg is exposed.
+        let half = udisks_exposure(&export_db(true, false), &exposure_config());
+        assert_eq!(half[1].verdict(), ExposureVerdict::Exposed);
+    }
+
+    #[test]
+    fn command_stdout_separates_output_from_a_failed_or_missing_command() {
+        assert_eq!(
+            command_stdout("sh", &["-c", "printf hello"]),
+            Ok("hello".to_string())
+        );
+        // Output printed before a failure is not an answer.
+        let err = command_stdout("sh", &["-c", "printf partial; exit 3"]).unwrap_err();
+        assert!(
+            err.contains("sh -c printf partial; exit 3 exited with"),
+            "{err}"
+        );
+        let err = command_stdout("/nonexistent/das-no-such-binary", &[]).unwrap_err();
+        assert!(err.contains("could not be run"), "{err}");
+    }
+
+    #[test]
+    fn udisks_report_says_hidden_exposed_or_absent_per_target() {
+        let lines = udisks_report(Ok(export_db(false, true)), &exposure_config());
+        assert_eq!(
+            lines,
+            vec![
+                "Target recovery-A EXPOSED to udisks — a desktop login can automount /dev/sdj2"
+                    .to_string(),
+                "  Fix with: sudo btrdasd setup --upgrade".to_string(),
+                "Target pair hidden from udisks (/dev/sdi1, /dev/sdl1)".to_string(),
+                "Target unplugged not attached — udisks visibility could not be checked"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn udisks_report_never_reads_an_unreadable_database_as_nothing_exposed() {
+        let lines = udisks_report(Err("udevadm exited with 1".to_string()), &exposure_config());
+        assert_eq!(
+            lines,
+            vec!["udisks visibility NOT checked: udevadm exited with 1".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_udevadm_reports_success_and_failure_differently() {
+        // Exercises the real binary: a verb it accepts, and one it rejects.
+        if crate::setup::detect::which("udevadm") {
+            assert_eq!(run_udevadm(&["--version"]), Ok(()));
+            let err = run_udevadm(&["no-such-verb"]).unwrap_err();
+            assert!(err.contains("udevadm no-such-verb exited with"), "{err}");
+        }
+    }
+
+    #[test]
+    fn install_writes_the_udev_rule_into_the_prefix_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, manifest_path) = install_into(dir.path());
+        let rule = dir
+            .path()
+            .join("etc/udev/rules.d/99-das-backup-udisks-ignore.rules");
+        assert!(rule.is_file());
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+        assert!(manifest.contains(&rule.to_string_lossy().to_string()));
     }
 
     #[test]

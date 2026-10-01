@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Semgrep CI workflow** (`.github/workflows/semgrep.yml`): runs `semgrep ci` — Code (SAST), Secrets and Supply Chain — diff-aware on pull requests, full on pushes to `main`, weekly on schedule and on manual dispatch, reporting to the Semgrep AppSec Platform (deployment `gjbr-pm-me`). Engine image pinned `tag@digest`; the sole credential is the Agent (CI) scoped `SEMGREP_APP_TOKEN` org secret — no GitHub App is installed and Semgrep is granted no code access
+- **`btrdasd setup` generates a udev rule hiding every backup target from udisks2** (`/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, bd `DAS-Backup-Manager-xqo`) — one `UDISKS_IGNORE` line per `[[target]]` drive serial, scoped to the btrfs partition, plus one per `mount_uuid`. `setup` reloads udev and re-triggers block devices after writing it, and the file is tracked in the manifest like every other generated file
+- **`btrdasd setup --check` reports whether each target is actually hidden from udisks** — read back from `udevadm info --export-db`, not from the rule file, and reporting `Hidden`, `EXPOSED` or `not attached` separately so an unplugged target is never counted as a hidden one
 
 ### Changed
 
 ### Fixed
+
+- **Backup targets were automounted read-write into the desktop session at every login** (bd `DAS-Backup-Manager-a10`) — the hand-installed udev rule meant to prevent it was keyed on a filesystem UUID that stopped existing when the 22 TB array was re-created, so it matched nothing and reported nothing. A multi-device target was mounted again on each further login, because btrfs reports one member as the mount source and udisks treats the others as unmounted. The rule is now generated from `config.toml`
 
 ## [0.7.22.3] - 2026-09-09
 
