@@ -62,7 +62,7 @@ jobs:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
       - name: Run semgrep ci
-        # --no-suppress-errors: an analysis error (unparseable file, rule fetch
+        # --no-suppress-errors: an analysis error (unparsable file, rule fetch
         # failure) is a coverage gap and must fail the job, not be summarised
         # away behind "no blocking findings".
         run: semgrep ci --no-suppress-errors

@@ -38,7 +38,7 @@ pub fn browse_snapshot(
     for entry in std::fs::read_dir(&browse_dir)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
-        // Use symlink_metadata so we don't follow symlinks for size/mtime
+        // DirEntry::metadata does not follow symlinks, so size/mtime are the link's own
         let metadata = entry.metadata()?;
 
         let size = if file_type.is_dir() {
@@ -75,14 +75,19 @@ pub fn browse_snapshot(
         });
     }
 
-    // Sort: directories first, then alphabetically by name (case-insensitive)
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+    entries.sort_by(browse_order);
+
+    Ok(entries)
+}
+
+/// Listing order for a browsed directory: directories first, then
+/// alphabetically by name (case-insensitive).
+fn browse_order(a: &BrowseEntry, b: &BrowseEntry) -> std::cmp::Ordering {
+    match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-
-    Ok(entries)
+    }
 }
 
 /// Restore specific files from a snapshot to a destination.
@@ -166,12 +171,24 @@ pub fn check_dest_allowed(
 /// `/run/media/<user>/<label>` while the config names `/mnt/<label>`, and a
 /// snapshot path recorded in the index can legitimately be either.
 pub fn snapshot_source_roots(config: &crate::config::Config) -> Vec<String> {
+    source_roots_with(&config.targets, |t| {
+        crate::health::find_any_mount(&t.mount, &t.serial, &t.role)
+    })
+}
+
+/// [`snapshot_source_roots`] with the "where is this target mounted right now"
+/// lookup supplied by the caller, so the list-building can be exercised without
+/// consulting the host's mount table.
+fn source_roots_with(
+    targets: &[crate::config::Target],
+    actual_mount: impl Fn(&crate::config::Target) -> Option<String>,
+) -> Vec<String> {
     let mut roots: Vec<String> = Vec::new();
-    for t in &config.targets {
+    for t in targets {
         if !t.mount.is_empty() && !roots.contains(&t.mount) {
             roots.push(t.mount.clone());
         }
-        if let Some(actual) = crate::health::find_any_mount(&t.mount, &t.serial, &t.role)
+        if let Some(actual) = actual_mount(t)
             && !roots.contains(&actual)
         {
             roots.push(actual);
@@ -346,7 +363,8 @@ pub fn restore_files(
                             errors.push(format!("Failed to create symlink '{}': {}", file_path, e));
                             continue;
                         }
-                        bytes_restored += 0; // symlinks have no payload size
+                        // A symlink counts as a restored file but has no
+                        // payload, so bytes_restored is left alone.
                         files_restored += 1;
                     }
                     Err(e) => {
@@ -399,8 +417,37 @@ pub fn restore_snapshot(
     allowed_sources: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<RestoreResult, Box<dyn std::error::Error>> {
-    let start = Instant::now();
+    restore_snapshot_with(
+        snapshot_path,
+        dest,
+        allowed_roots,
+        allowed_sources,
+        progress,
+        Instant::now(),
+        try_btrfs_send_receive,
+    )
+}
 
+/// [`restore_snapshot`] with its start time and its fast path supplied by the
+/// caller. The real fast path spawns `btrfs` as root; everything around it —
+/// both policy checks, the duration fill-in, the fallback to a recursive copy —
+/// is decided here and does not need it.
+fn restore_snapshot_with<F>(
+    snapshot_path: &Path,
+    dest: &Path,
+    allowed_roots: &[String],
+    allowed_sources: &[String],
+    progress: &dyn ProgressCallback,
+    start: Instant,
+    fast_path: F,
+) -> Result<RestoreResult, Box<dyn std::error::Error>>
+where
+    F: FnOnce(
+        &Path,
+        &Path,
+        &dyn ProgressCallback,
+    ) -> Result<RestoreResult, Box<dyn std::error::Error>>,
+{
     let dest = &check_dest_allowed(dest, allowed_roots)?;
     let snapshot_resolved = check_source_allowed(snapshot_path, allowed_sources)?;
     let snapshot_path = snapshot_resolved.as_path();
@@ -418,7 +465,7 @@ pub fn restore_snapshot(
     std::fs::create_dir_all(dest)?;
 
     // Attempt btrfs send | btrfs receive first (fast path for btrfs subvolumes)
-    let btrfs_result = try_btrfs_send_receive(snapshot_path, dest, progress);
+    let btrfs_result = fast_path(snapshot_path, dest, progress);
 
     match btrfs_result {
         Ok(result) => {
@@ -475,12 +522,7 @@ fn try_btrfs_send_receive(
     let send_status = send_child.wait()?;
     let recv_status = recv_child.wait()?;
 
-    if !send_status.success() {
-        return Err(format!("btrfs send exited with {}", send_status).into());
-    }
-    if !recv_status.success() {
-        return Err(format!("btrfs receive exited with {}", recv_status).into());
-    }
+    send_receive_outcome(send_status, recv_status)?;
 
     progress.on_log(LogLevel::Info, "btrfs send/receive completed successfully");
 
@@ -493,6 +535,22 @@ fn try_btrfs_send_receive(
         errors: Vec::new(),
         duration_secs: 0, // caller fills in
     })
+}
+
+/// Judge a finished `btrfs send | btrfs receive` pipeline: BOTH halves must
+/// have exited successfully. A receive that succeeded on a truncated stream
+/// from a failed send is not a restore, so the send is judged first.
+fn send_receive_outcome(
+    send_status: std::process::ExitStatus,
+    recv_status: std::process::ExitStatus,
+) -> Result<(), String> {
+    if !send_status.success() {
+        return Err(format!("btrfs send exited with {}", send_status));
+    }
+    if !recv_status.success() {
+        return Err(format!("btrfs receive exited with {}", recv_status));
+    }
+    Ok(())
 }
 
 /// Fallback: recursive copy of the snapshot directory tree.
@@ -1104,5 +1162,542 @@ mod tests {
         // Verify at least one log message was emitted
         let logs = progress.logs.lock().unwrap();
         assert!(!logs.is_empty(), "Expected at least one log message");
+    }
+
+    // --- progress recorder ------------------------------------------------
+    //
+    // `TestProgress` discards `on_progress`, and the per-file counter is part
+    // of what the GUI shows during a restore, so these tests record it.
+    #[derive(Default)]
+    struct Recorder {
+        stages: std::sync::Mutex<Vec<(String, u64)>>,
+        steps: std::sync::Mutex<Vec<(u64, u64, String)>>,
+        logs: std::sync::Mutex<Vec<(LogLevel, String)>>,
+        completed: std::sync::Mutex<Option<(bool, String)>>,
+    }
+
+    impl ProgressCallback for Recorder {
+        fn on_stage(&self, stage: &str, total_steps: u64) {
+            self.stages
+                .lock()
+                .unwrap()
+                .push((stage.to_string(), total_steps));
+        }
+        fn on_progress(&self, current: u64, total: u64, message: &str) {
+            self.steps
+                .lock()
+                .unwrap()
+                .push((current, total, message.to_string()));
+        }
+        fn on_throughput(&self, _: u64) {}
+        fn on_log(&self, level: LogLevel, message: &str) {
+            self.logs.lock().unwrap().push((level, message.to_string()));
+        }
+        fn on_complete(&self, success: bool, summary: &str) {
+            *self.completed.lock().unwrap() = Some((success, summary.to_string()));
+        }
+    }
+
+    fn browse_entry(name: &str, is_dir: bool) -> BrowseEntry {
+        BrowseEntry {
+            path: name.into(),
+            name: name.into(),
+            size: 0,
+            mtime: 0,
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn browse_order_puts_directories_first_whatever_their_names() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        // The directory sorts first even when its NAME sorts last, in both
+        // argument orders — read_dir order is arbitrary, so a listing test
+        // cannot be relied on to present the pair this way round.
+        let cases = [
+            (("zzz", true), ("aaa", false), Less),
+            (("aaa", false), ("zzz", true), Greater),
+            (("aaa", true), ("zzz", false), Less),
+            (("zzz", false), ("aaa", true), Greater),
+            // Same kind: by name, ignoring case.
+            (("Beta", true), ("alpha", true), Greater),
+            (("alpha", false), ("Beta", false), Less),
+            (("Same", false), ("same", false), Equal),
+        ];
+        for ((an, ad), (bn, bd), want) in cases {
+            assert_eq!(
+                browse_order(&browse_entry(an, ad), &browse_entry(bn, bd)),
+                want,
+                "{an} (dir={ad}) vs {bn} (dir={bd})"
+            );
+        }
+    }
+
+    fn target(mount: &str) -> crate::config::Target {
+        crate::config::Target {
+            label: "t".into(),
+            serial: String::new(),
+            serials: Vec::new(),
+            mount_uuid: None,
+            mount: mount.into(),
+            role: crate::config::TargetRole::Primary,
+            retention: crate::config::Retention::default(),
+            display_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn source_roots_list_configured_and_actual_mounts_once_each() {
+        // Configured path plus the udisks2-style path the target really sits at.
+        let roots = source_roots_with(&[target("/mnt/a")], |_| Some("/run/media/u/a".into()));
+        assert_eq!(roots, ["/mnt/a", "/run/media/u/a"]);
+
+        // Mounted exactly where configured: one root, not the same one twice.
+        let roots = source_roots_with(&[target("/mnt/a")], |t| Some(t.mount.clone()));
+        assert_eq!(roots, ["/mnt/a"]);
+
+        // Not mounted anywhere: the configured path is still a root.
+        let roots = source_roots_with(&[target("/mnt/a"), target("/mnt/b")], |_| None);
+        assert_eq!(roots, ["/mnt/a", "/mnt/b"]);
+
+        // Two targets sharing a mount path do not duplicate it.
+        let roots = source_roots_with(&[target("/mnt/a"), target("/mnt/a")], |_| None);
+        assert_eq!(roots, ["/mnt/a"]);
+    }
+
+    #[test]
+    fn source_roots_never_contain_an_empty_root() {
+        // An empty string as a source root would make `Path::new("")` a
+        // permitted prefix. A target with no mount configured contributes only
+        // where it is actually mounted — or nothing at all.
+        let none: Vec<String> = Vec::new();
+        assert_eq!(source_roots_with(&[target("")], |_| None), none);
+        assert_eq!(
+            source_roots_with(&[target("")], |_| Some("/run/media/u/x".into())),
+            ["/run/media/u/x"]
+        );
+        assert_eq!(source_roots_with(&[], |_| Some("/x".into())), none);
+    }
+
+    #[test]
+    fn snapshot_source_roots_reads_the_targets_from_the_config() {
+        // The path does not exist and the serial is empty, so the live-mount
+        // lookup answers None without consulting any drive on this host.
+        let mut cfg = crate::config::Config::default();
+        cfg.targets.clear();
+        cfg.targets
+            .push(target("/nonexistent-das-restore-test/primary"));
+        assert_eq!(
+            snapshot_source_roots(&cfg),
+            ["/nonexistent-das-restore-test/primary"]
+        );
+    }
+
+    #[test]
+    fn restore_files_counts_files_bytes_and_progress() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "a.txt", "12345");
+        write_file(snap.path(), "dir/b.txt", "1234567");
+        std::os::unix::fs::symlink("a.txt", snap.path().join("link")).unwrap();
+        let dest = TempDir::new().unwrap();
+        let progress = Recorder::default();
+
+        let result = restore_files(
+            snap.path(),
+            &["a.txt", "link", "dir/b.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &progress,
+        )
+        .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.files_restored, 3);
+        // 5 + 7: the symlink is restored as a link and carries no payload.
+        assert_eq!(result.bytes_restored, 12);
+        assert_eq!(
+            *progress.steps.lock().unwrap(),
+            [
+                (1, 3, "a.txt".to_string()),
+                (2, 3, "link".to_string()),
+                (3, 3, "dir/b.txt".to_string()),
+            ]
+        );
+        let (ok, summary) = progress.completed.lock().unwrap().clone().unwrap();
+        assert!(ok);
+        assert!(
+            summary.starts_with("Restored 3/3 files (12 bytes)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn restore_files_preserves_symlinks_as_symlinks() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "a.txt", "real content");
+        std::os::unix::fs::symlink("a.txt", snap.path().join("link")).unwrap();
+        // A dangling link is still a link worth restoring; copying THROUGH it
+        // would have nothing to read.
+        std::os::unix::fs::symlink("gone", snap.path().join("dangling")).unwrap();
+        let dest = TempDir::new().unwrap();
+        // A stale regular file already sitting where the link belongs.
+        write_file(dest.path(), "link", "stale");
+
+        let result = restore_files(
+            snap.path(),
+            &["link", "dangling"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.files_restored, 2);
+        assert_eq!(result.bytes_restored, 0);
+        for (name, want) in [("link", "a.txt"), ("dangling", "gone")] {
+            let restored = dest.path().join(name);
+            assert!(
+                fs::symlink_metadata(&restored)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name} must be restored as a symlink, not as a copy of its target"
+            );
+            assert_eq!(fs::read_link(&restored).unwrap(), Path::new(want));
+        }
+    }
+
+    #[test]
+    fn restore_files_does_not_write_through_a_symlink_planted_at_the_destination() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "payload.txt", "attacker content");
+        write_file(snap.path(), "ok.txt", "fine");
+        let dest = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("victim.txt");
+        fs::write(&victim, "original").unwrap();
+        std::os::unix::fs::symlink(&victim, dest.path().join("payload.txt")).unwrap();
+        let progress = Recorder::default();
+
+        let result = restore_files(
+            snap.path(),
+            &["payload.txt", "ok.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "original");
+        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.bytes_restored, 4);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("payload.txt"),
+            "{:?}",
+            result.errors
+        );
+        // Positive control: the member with nothing planted really was written.
+        assert_eq!(
+            fs::read_to_string(dest.path().join("ok.txt")).unwrap(),
+            "fine"
+        );
+        // A refused member reports no progress step; the next one keeps its
+        // own position in the request.
+        assert_eq!(
+            *progress.steps.lock().unwrap(),
+            [(2, 2, "ok.txt".to_string())]
+        );
+        let (ok, _) = progress.completed.lock().unwrap().clone().unwrap();
+        assert!(!ok, "a refused member must not be reported as success");
+    }
+
+    #[test]
+    fn restore_files_refuses_absolute_and_escaping_members() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "ok.txt", "fine");
+        let outside = TempDir::new().unwrap();
+        write_file(outside.path(), "secret.txt", "secret");
+        // A link inside the snapshot that resolves outside it.
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), snap.path().join("leak"))
+            .unwrap();
+        let dest = TempDir::new().unwrap();
+        let absolute = outside.path().join("secret.txt");
+
+        let result = restore_files(
+            snap.path(),
+            &[absolute.to_str().unwrap(), "./ok.txt", "leak", "ok.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.errors.len(), 3, "{:?}", result.errors);
+        assert!(result.errors.iter().all(|e| e.contains("traversal")));
+        let restored: Vec<_> = fs::read_dir(dest.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(restored, ["ok.txt"], "only the literal member is written");
+    }
+
+    #[test]
+    fn restore_files_creates_nothing_under_a_refused_destination() {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "a.txt", "a");
+        let parent = TempDir::new().unwrap();
+        let allowed = parent.path().join("allowed");
+        fs::create_dir(&allowed).unwrap();
+        // A link INSIDE the allowed root that leads out of it: the policy is
+        // applied after resolution, so the write must be refused.
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), allowed.join("door")).unwrap();
+        let roots = vec![
+            allowed
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+
+        let err = restore_files(
+            snap.path(),
+            &["a.txt"],
+            &allowed.join("door/new"),
+            &roots,
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("allowed_roots"), "{err}");
+        assert!(!outside.path().join("new").exists());
+
+        // Positive control: a not-yet-existing directory honestly under the
+        // root is created and written.
+        let result = restore_files(
+            snap.path(),
+            &["a.txt"],
+            &allowed.join("fresh/new"),
+            &roots,
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+        assert_eq!(result.files_restored, 1);
+        assert_eq!(
+            fs::read_to_string(allowed.join("fresh/new/a.txt")).unwrap(),
+            "a"
+        );
+    }
+
+    /// Two files, one symlink and more directories than non-directories, so a
+    /// progress total that counted the wrong kind of entry cannot agree.
+    fn snapshot_tree() -> TempDir {
+        let snap = TempDir::new().unwrap();
+        write_file(snap.path(), "a.txt", "123");
+        write_file(snap.path(), "sub/b.txt", "12345");
+        std::os::unix::fs::symlink("a.txt", snap.path().join("link")).unwrap();
+        fs::create_dir_all(snap.path().join("empty/nested")).unwrap();
+        snap
+    }
+
+    fn assert_tree_restored(dest: &Path) {
+        assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "123");
+        assert_eq!(fs::read_to_string(dest.join("sub/b.txt")).unwrap(), "12345");
+        assert!(dest.join("empty/nested").is_dir());
+        let link = dest.join("link");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("a.txt"));
+    }
+
+    #[test]
+    fn recursive_restore_counts_files_bytes_and_progress() {
+        let snap = snapshot_tree();
+        let dest = TempDir::new().unwrap();
+        let progress = Recorder::default();
+
+        let result =
+            restore_snapshot_recursive(snap.path(), dest.path(), &Instant::now(), &progress)
+                .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.files_restored, 3, "two files and the symlink");
+        assert_eq!(result.bytes_restored, 8, "3 + 5; the link has no payload");
+        assert_tree_restored(dest.path());
+
+        // One step per non-directory entry, numbered 1..=3 out of 3, whatever
+        // order the walk visits them in.
+        let steps = progress.steps.lock().unwrap();
+        let counters: Vec<(u64, u64)> = steps.iter().map(|(c, t, _)| (*c, *t)).collect();
+        assert_eq!(counters, [(1, 3), (2, 3), (3, 3)]);
+        let mut names: Vec<&str> = steps.iter().map(|(_, _, m)| m.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["a.txt", "link", "sub/b.txt"]);
+
+        let (ok, summary) = progress.completed.lock().unwrap().clone().unwrap();
+        assert!(ok);
+        assert!(
+            summary.contains("3 files, 8 bytes, 0 error(s)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_fills_in_the_duration_of_a_fast_path_restore() {
+        let snap = snapshot_tree();
+        let dest = TempDir::new().unwrap();
+        let progress = Recorder::default();
+        // The fast path cannot know when the restore began (it reports 0 and
+        // leaves the caller to fill it in), so a restore that started 90 s ago
+        // must not come back claiming to have taken no time.
+        let started = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(90))
+            .expect("the monotonic clock is more than 90 s old");
+
+        let result = restore_snapshot_with(
+            snap.path(),
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &progress,
+            started,
+            |_, _, _| {
+                Ok(RestoreResult {
+                    files_restored: 0,
+                    bytes_restored: 4096,
+                    errors: Vec::new(),
+                    duration_secs: 0,
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(
+            (90..150).contains(&result.duration_secs),
+            "duration_secs = {}",
+            result.duration_secs
+        );
+        assert_eq!(result.bytes_restored, 4096);
+        // The fast path succeeded, so the recursive copy must not have run too.
+        assert!(!dest.path().join("a.txt").exists());
+        let (ok, summary) = progress.completed.lock().unwrap().clone().unwrap();
+        assert!(ok);
+        assert!(
+            summary.contains("btrfs send/receive (4096 bytes)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_falls_back_to_a_recursive_copy_when_the_fast_path_fails() {
+        let snap = snapshot_tree();
+        let parent = TempDir::new().unwrap();
+        let dest = parent.path().join("not/yet/there");
+        let progress = Recorder::default();
+
+        let result = restore_snapshot_with(
+            snap.path(),
+            &dest,
+            &test_roots(),
+            &test_sources(snap.path()),
+            &progress,
+            Instant::now(),
+            |_, _, _| Err("btrfs send exited with exit status: 1".into()),
+        )
+        .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.files_restored, 3);
+        assert_eq!(result.bytes_restored, 8);
+        assert_tree_restored(&dest);
+        // The reason for the fallback must reach the operator.
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(level, msg)| *level == LogLevel::Warning
+                && msg.contains("exit status: 1")
+                && msg.contains("falling back to recursive copy")),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_checks_policy_before_the_fast_path_runs() {
+        let snap = snapshot_tree();
+        let dest = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let ran = std::cell::Cell::new(false);
+        let fast_path = |_: &Path, _: &Path, _: &dyn ProgressCallback| {
+            ran.set(true);
+            Err("unreachable".into())
+        };
+
+        let err = restore_snapshot_with(
+            snap.path(),
+            dest.path(),
+            &test_roots(),
+            &test_sources(elsewhere.path()),
+            &Recorder::default(),
+            Instant::now(),
+            fast_path,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("not inside any configured backup target"),
+            "{err}"
+        );
+        assert!(
+            !ran.get(),
+            "nothing may be read before the source is permitted"
+        );
+        assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn send_receive_needs_both_halves_to_succeed() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        // wait(2) status words: 0 is a clean exit, 1 << 8 is `exit 1`.
+        let ok = ExitStatus::from_raw(0);
+        let failed = ExitStatus::from_raw(1 << 8);
+        assert!(ok.success() && !failed.success(), "fixture sanity");
+
+        assert_eq!(send_receive_outcome(ok, ok), Ok(()));
+
+        let err = send_receive_outcome(failed, ok).unwrap_err();
+        assert!(err.starts_with("btrfs send exited with"), "{err}");
+
+        let err = send_receive_outcome(ok, failed).unwrap_err();
+        assert!(err.starts_with("btrfs receive exited with"), "{err}");
+
+        // Both failed: the send is the cause, the receive only its consequence.
+        let err = send_receive_outcome(failed, failed).unwrap_err();
+        assert!(err.starts_with("btrfs send exited with"), "{err}");
+    }
+
+    #[test]
+    fn count_dir_bytes_sums_regular_files_only() {
+        let dir = snapshot_tree();
+        // 3 + 5. Directories and the symlink (which is not followed, or a.txt
+        // would be counted twice) contribute nothing.
+        assert_eq!(count_dir_bytes(dir.path()), 8);
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(count_dir_bytes(empty.path()), 0);
+        assert_eq!(count_dir_bytes(&empty.path().join("absent")), 0);
     }
 }

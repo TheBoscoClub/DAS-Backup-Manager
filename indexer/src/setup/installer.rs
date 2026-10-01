@@ -11,28 +11,38 @@ use std::time::Duration;
 use crate::setup::config::Config;
 use crate::setup::templates::GeneratedFiles;
 
-const CONFIG_DIR: &str = "/etc/das-backup";
 const CONFIG_FILE: &str = "/etc/das-backup/config.toml";
 const MANIFEST_FILE: &str = "/etc/das-backup/.manifest";
 
-/// Install using system defaults (/etc, /).
-/// Run one `systemctl` verb, returning a description of the failure instead of
-/// discarding it.
+const SYSTEMCTL: &str = "systemctl";
+
+/// How the installer reaches the host's service manager: one `systemctl`
+/// invocation per call, given its arguments. A parameter rather than a direct
+/// call so the decisions built on it — which units, in which order, and what a
+/// failure does to the result — can be exercised without touching the host.
+type UnitRunner<'a> = &'a dyn Fn(&[&str]) -> Result<(), String>;
+
+/// Whether the configured mail relay answers. See `relay_reachable`.
+type RelayProbe<'a> = &'a dyn Fn(&Config) -> bool;
+
+/// Run a command for its exit status, returning a description of the failure
+/// instead of discarding it.
 ///
-/// Every call site used to be `let _ = Command::new("systemctl")...status()`,
-/// so `install()` returned `Ok(())` whether or not a single timer had been
-/// enabled. Installing the schedule is the entire purpose of the command: a
-/// masked unit, a malformed generated unit, or systemctl being unavailable
-/// produced a clean "install complete" and **no scheduled backup, no scheduled
-/// scrub, and no drift check ever running**, with nothing to surface it until
-/// someone noticed the absence of the 03:00 report.
+/// Every `systemctl` call site used to be
+/// `let _ = Command::new("systemctl")...status()`, so `install()` returned
+/// `Ok(())` whether or not a single timer had been enabled. Installing the
+/// schedule is the entire purpose of the command: a masked unit, a malformed
+/// generated unit, or systemctl being unavailable produced a clean "install
+/// complete" and **no scheduled backup, no scheduled scrub, and no drift check
+/// ever running**, with nothing to surface it until someone noticed the
+/// absence of the 03:00 report.
 /// bd DAS-Backup-Manager-nsp (finding #5).
-fn run_systemctl(args: &[&str]) -> Result<(), String> {
-    match std::process::Command::new("systemctl").args(args).status() {
+fn command_status(program: &str, args: &[&str]) -> Result<(), String> {
+    match std::process::Command::new(program).args(args).status() {
         Ok(st) if st.success() => Ok(()),
-        Ok(st) => Err(format!("systemctl {} exited with {}", args.join(" "), st)),
+        Ok(st) => Err(format!("{program} {} exited with {}", args.join(" "), st)),
         Err(e) => Err(format!(
-            "systemctl {} could not be run: {e}",
+            "{program} {} could not be run: {e}",
             args.join(" ")
         )),
     }
@@ -40,11 +50,7 @@ fn run_systemctl(args: &[&str]) -> Result<(), String> {
 
 /// Run one `udevadm` verb, returning a description of the failure.
 fn run_udevadm(args: &[&str]) -> Result<(), String> {
-    match std::process::Command::new("udevadm").args(args).status() {
-        Ok(st) if st.success() => Ok(()),
-        Ok(st) => Err(format!("udevadm {} exited with {}", args.join(" "), st)),
-        Err(e) => Err(format!("udevadm {} could not be run: {e}", args.join(" "))),
-    }
+    command_status("udevadm", args)
 }
 
 /// Make the freshly written udisks-ignore rule take effect on devices that are
@@ -197,28 +203,24 @@ pub fn udisks_report(export_db: Result<String, String>, config: &Config) -> Vec<
     lines
 }
 
+/// Install using system defaults (/etc, /).
 pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = PathBuf::from(CONFIG_FILE);
-    let manifest_path = PathBuf::from(MANIFEST_FILE);
-    let root = PathBuf::from("/");
-    install_to_prefix(config, &root, &config_path, &manifest_path)?;
+    install_to_prefix(
+        config,
+        Path::new("/"),
+        Path::new(CONFIG_FILE),
+        Path::new(MANIFEST_FILE),
+    )?;
     apply_udev_rules();
+    // Only in real installs — `install_to_prefix` never touches the host's units.
+    install_schedule(config, &|args| command_status(SYSTEMCTL, args))
+}
 
-    // Enable systemd timers (only in real installs, not in install_to_prefix tests)
+/// The `systemctl` invocations that put the schedule in place for `config`, in
+/// the order they must run. Empty on any init system but systemd: there the
+/// schedule is the generated cron entry, and there is no unit to enable.
+fn schedule_unit_operations(config: &Config) -> Vec<Vec<&'static str>> {
     if config.init.system == crate::setup::config::InitSystem::Systemd {
-        // Collected rather than discarded — see run_systemctl. A schedule that
-        // was not installed must not be reported as an install that succeeded.
-        let mut unit_errors: Vec<String> = Vec::new();
-        if let Err(e) = run_systemctl(&["daemon-reload"]) {
-            unit_errors.push(e);
-        }
-        if let Err(e) = run_systemctl(&["enable", "--now", "das-backup.timer"]) {
-            unit_errors.push(e);
-        }
-        if let Err(e) = run_systemctl(&["enable", "--now", "das-backup-full.timer"]) {
-            unit_errors.push(e);
-        }
-
         // das-scrub.service/.timer are always generated and installed (see
         // GeneratedFiles::generate), but the timer is only *enabled* when
         // `[scrub].enabled = true`. The scrub engine itself ignores
@@ -229,15 +231,11 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         // edit followed by `setup --upgrade` actually turns the timer off —
         // `enable --now`/`disable --now` are both idempotent no-ops if the
         // unit is already in the target state.
-        if config.scrub.enabled {
-            if let Err(e) = run_systemctl(&["enable", "--now", "das-scrub.timer"]) {
-                unit_errors.push(e);
-            }
+        let scrub_verb = if config.scrub.enabled {
+            "enable"
         } else {
-            if let Err(e) = run_systemctl(&["disable", "--now", "das-scrub.timer"]) {
-                unit_errors.push(e);
-            }
-        }
+            "disable"
+        };
 
         // das-backup-doctor.timer is always generated and always enabled —
         // unlike das-scrub, there is no `[doctor].enabled` config toggle
@@ -251,25 +249,45 @@ pub fn install(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         // have caught none of them any sooner than a human remembering to
         // look). If a future need for disabling it emerges, add
         // `[doctor].enabled` and gate this the same way scrub is gated above.
-        if let Err(e) = run_systemctl(&["enable", "--now", "das-backup-doctor.timer"]) {
-            unit_errors.push(e);
-        }
+        vec![
+            vec!["daemon-reload"],
+            vec!["enable", "--now", "das-backup.timer"],
+            vec!["enable", "--now", "das-backup-full.timer"],
+            vec![scrub_verb, "--now", "das-scrub.timer"],
+            vec!["enable", "--now", "das-backup-doctor.timer"],
+        ]
+    } else {
+        Vec::new()
+    }
+}
 
-        // A schedule that was not installed is not an install that succeeded.
-        // This is the entire point of finding #5: the command's purpose is to
-        // put the timers in place, so failing to do so must not be reported as
-        // success. Listed individually because "one timer failed" and "systemd
-        // is unreachable" need different operator responses.
-        if !unit_errors.is_empty() {
-            for e in &unit_errors {
-                eprintln!("ERROR: {e}");
-            }
-            return Err(format!(
-                "{} systemd unit operation(s) failed — the backup schedule is NOT fully installed",
-                unit_errors.len()
-            )
-            .into());
+/// Enable (or, for a disabled scrub, disable) the timers `config` calls for.
+///
+/// Every operation is attempted even after one fails, and the failures are
+/// collected rather than discarded — see `command_status`.
+fn install_schedule(
+    config: &Config,
+    systemctl: UnitRunner,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let unit_errors: Vec<String> = schedule_unit_operations(config)
+        .iter()
+        .filter_map(|op| systemctl(op).err())
+        .collect();
+
+    // A schedule that was not installed is not an install that succeeded.
+    // This is the entire point of finding #5: the command's purpose is to
+    // put the timers in place, so failing to do so must not be reported as
+    // success. Listed individually because "one timer failed" and "systemd
+    // is unreachable" need different operator responses.
+    if !unit_errors.is_empty() {
+        for e in &unit_errors {
+            eprintln!("ERROR: {e}");
         }
+        return Err(format!(
+            "{} systemd unit operation(s) failed — the backup schedule is NOT fully installed",
+            unit_errors.len()
+        )
+        .into());
     }
 
     Ok(())
@@ -424,7 +442,21 @@ pub fn install_to_prefix(
 
 /// Uninstall using system defaults.
 pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest_path = PathBuf::from(MANIFEST_FILE);
+    uninstall_with(
+        Path::new(CONFIG_FILE),
+        Path::new(MANIFEST_FILE),
+        remove_db,
+        &|args| command_status(SYSTEMCTL, args),
+    )
+}
+
+/// `uninstall` against an explicit config and manifest (for testing).
+fn uninstall_with(
+    config_path: &Path,
+    manifest_path: &Path,
+    remove_db: bool,
+    systemctl: UnitRunner,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !manifest_path.exists() {
         eprintln!(
             "No manifest found at {}. Nothing to uninstall.",
@@ -437,12 +469,13 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
     // matters when `--remove-db` was asked for: it used to be `.ok()`, so the
     // request was silently dropped and the operator was told "Uninstall
     // complete" with the database still on disk (bd DAS-Backup-Manager-8wx).
-    let db_path = match Config::load(&PathBuf::from(CONFIG_FILE)) {
+    let db_path = match Config::load(config_path) {
         Ok(c) => Some(c.general.db_path),
         Err(e) => {
             eprintln!(
-                "Warning: could not read {CONFIG_FILE} ({e}) — the database location is \
-                 unknown and it will NOT be removed"
+                "Warning: could not read {} ({e}) — the database location is \
+                 unknown and it will NOT be removed",
+                config_path.display()
             );
             None
         }
@@ -456,18 +489,18 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         "das-scrub.timer",
         "das-backup-doctor.timer",
     ] {
-        if let Err(e) = run_systemctl(&["disable", "--now", unit]) {
+        if let Err(e) = systemctl(&["disable", "--now", unit]) {
             eprintln!("Warning: {unit} may still be enabled: {e}");
         }
     }
 
-    let (removed, problems) = uninstall_from_manifest(&manifest_path);
+    let (removed, problems) = uninstall_from_manifest(manifest_path);
     println!("Removed {} files.", removed);
     for p in &problems {
         eprintln!("Warning: {p}");
     }
 
-    if let Err(e) = std::fs::remove_file(&manifest_path) {
+    if let Err(e) = std::fs::remove_file(manifest_path) {
         eprintln!(
             "Warning: could not remove manifest {}: {e}",
             manifest_path.display()
@@ -475,7 +508,9 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Bare `remove_dir`: deliberately best-effort, because "the directory still
     // has operator files in it" is the normal outcome, not a fault.
-    let _ = std::fs::remove_dir(CONFIG_DIR);
+    if let Some(config_dir) = config_path.parent() {
+        let _ = std::fs::remove_dir(config_dir);
+    }
 
     if remove_db
         && let Some(db) = db_path
@@ -485,7 +520,7 @@ pub fn uninstall(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("Removed database: {}", db);
     }
 
-    if let Err(e) = run_systemctl(&["daemon-reload"]) {
+    if let Err(e) = systemctl(&["daemon-reload"]) {
         eprintln!("Warning: {e}");
     }
 
@@ -590,7 +625,25 @@ fn migrate_config(config: &mut Config) -> Vec<String> {
 
 /// Upgrade: reload existing config, apply migrations, and regenerate all files.
 pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = PathBuf::from(CONFIG_FILE);
+    let config_path = Path::new(CONFIG_FILE);
+    let config = prepare_upgrade(config_path, &relay_reachable, &mut |line| {
+        println!("{line}")
+    })?;
+    println!("Regenerating files from {}...", config_path.display());
+    install(&config)?;
+    println!("Upgrade complete.");
+    Ok(())
+}
+
+/// Everything `upgrade` does before regenerating files: load the config at
+/// `config_path`, stamp it with this binary's version, migrate it, and write
+/// it back only if either changed it. Returns the config to install from.
+/// Progress and warnings go to `say`, one line per call.
+fn prepare_upgrade(
+    config_path: &Path,
+    relay_up: RelayProbe,
+    say: &mut dyn FnMut(String),
+) -> Result<Config, Box<dyn std::error::Error>> {
     if !config_path.exists() {
         return Err(format!(
             "No config found at {}. Run 'btrdasd setup' first.",
@@ -599,60 +652,85 @@ pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let mut config = Config::load(&config_path)?;
+    let mut config = Config::load(config_path)?;
     let old_version = config.general.version.clone();
     config.general.version = env!("CARGO_PKG_VERSION").to_string();
 
     let migrations = migrate_config(&mut config);
     for change in &migrations {
-        println!("Migrating config: {change}");
+        say(format!("Migrating config: {change}"));
     }
 
     if old_version != config.general.version || !migrations.is_empty() {
         if old_version != config.general.version {
-            println!(
+            say(format!(
                 "Updating config version: {} -> {}",
                 old_version, config.general.version
-            );
+            ));
         }
-        config.save(&config_path)?;
+        config.save(config_path)?;
     }
 
     // The relay is a hard dependency of email reporting now. Warn rather than
     // fail: a backup whose report cannot be sent is still a completed backup,
     // and the report is always written to disk regardless.
-    if config.email.enabled && !relay_reachable(&config) {
-        println!(
+    if config.email.enabled && !relay_up(&config) {
+        say(format!(
             "Warning: email is enabled but nothing is listening on {}:{}",
             config.email.smtp_host, config.email.smtp_port
-        );
-        println!("  Reports will be saved to disk but not delivered.");
-        println!("  Check the local mail relay: systemctl status postfix");
+        ));
+        say("  Reports will be saved to disk but not delivered.".to_string());
+        say("  Check the local mail relay: systemctl status postfix".to_string());
     }
-    println!("Regenerating files from {}...", config_path.display());
-    install(&config)?;
-    println!("Upgrade complete.");
-    Ok(())
+    Ok(config)
 }
 
 /// Check: validate config, verify manifest files, report dependency status.
 pub fn check() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = PathBuf::from(CONFIG_FILE);
+    check_with(
+        Path::new(CONFIG_FILE),
+        Path::new(MANIFEST_FILE),
+        &CheckProbes {
+            relay_up: &relay_reachable,
+            export_db: &|| command_stdout("udevadm", &["info", "--export-db"]),
+            dependencies: &crate::setup::detect::check_dependencies,
+        },
+        &mut |line| println!("{line}"),
+    )
+}
 
+/// What `check` has to ask the running host, as opposed to read from the
+/// config and manifest it is pointed at.
+struct CheckProbes<'a> {
+    relay_up: RelayProbe<'a>,
+    /// udev's database, as `udevadm info --export-db` prints it.
+    export_db: &'a dyn Fn() -> Result<String, String>,
+    /// Dependency lookup, given whether email is enabled.
+    dependencies: &'a dyn Fn(bool) -> Vec<crate::setup::detect::DepStatus>,
+}
+
+/// `check` against an explicit config and manifest, with the host probes
+/// supplied by the caller. The report goes to `say`, one line per call.
+fn check_with(
+    config_path: &Path,
+    manifest_path: &Path,
+    probes: &CheckProbes,
+    say: &mut dyn FnMut(String),
+) -> Result<(), Box<dyn std::error::Error>> {
     if !config_path.exists() {
-        println!("Config not found at {}", config_path.display());
-        println!("  Run: sudo btrdasd setup");
+        say(format!("Config not found at {}", config_path.display()));
+        say("  Run: sudo btrdasd setup".to_string());
         return Ok(());
     }
-    println!("Config found: {}", config_path.display());
+    say(format!("Config found: {}", config_path.display()));
 
-    let config = Config::load(&config_path)?;
+    let config = Config::load(config_path)?;
     let errors = config.validate();
     if errors.is_empty() {
-        println!("Config is valid");
+        say("Config is valid".to_string());
     } else {
         for err in &errors {
-            println!("Config error: {}", err);
+            say(format!("Config error: {}", err));
         }
     }
 
@@ -660,55 +738,60 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
     // report it here rather than letting the next backup discover it.
     if config.email.enabled {
         let relay = format!("{}:{}", config.email.smtp_host, config.email.smtp_port);
-        if relay_reachable(&config) {
-            println!("Mail relay reachable at {relay}");
+        if (probes.relay_up)(&config) {
+            say(format!("Mail relay reachable at {relay}"));
         } else {
-            println!("Mail relay UNREACHABLE at {relay}");
+            say(format!("Mail relay UNREACHABLE at {relay}"));
             if config.email.smtp_port == 1025 {
-                println!("  Port 1025 is Protonmail Bridge, which this version no longer uses.");
-                println!("  Fix with: sudo btrdasd setup --upgrade");
+                say(
+                    "  Port 1025 is Protonmail Bridge, which this version no longer uses."
+                        .to_string(),
+                );
+                say("  Fix with: sudo btrdasd setup --upgrade".to_string());
             } else {
-                println!("  Reports will be saved to disk but not delivered.");
+                say("  Reports will be saved to disk but not delivered.".to_string());
             }
         }
     }
 
-    let manifest_path = PathBuf::from(MANIFEST_FILE);
     if manifest_path.exists() {
-        let content = std::fs::read_to_string(&manifest_path)?;
+        let content = std::fs::read_to_string(manifest_path)?;
         let total = content.lines().count();
         let missing: Vec<&str> = content
             .lines()
             .filter(|line| !Path::new(line.trim()).exists())
             .collect();
         if missing.is_empty() {
-            println!("All {} generated files present", total);
+            say(format!("All {} generated files present", total));
         } else {
-            println!("{} of {} generated files missing:", missing.len(), total);
+            say(format!(
+                "{} of {} generated files missing:",
+                missing.len(),
+                total
+            ));
             for m in &missing {
-                println!("    {}", m);
+                say(format!("    {}", m));
             }
-            println!("  Fix with: sudo btrdasd setup --upgrade");
+            say("  Fix with: sudo btrdasd setup --upgrade".to_string());
         }
     } else {
-        println!("No manifest found. Files may be from a manual install.");
+        say("No manifest found. Files may be from a manual install.".to_string());
     }
 
     // Are the targets hidden from udisks2? Read back from udev rather than
     // from the rule file: a rule that exists and matches nothing looks
     // installed and does nothing (bd DAS-Backup-Manager-a10).
-    for line in udisks_report(command_stdout("udevadm", &["info", "--export-db"]), &config) {
-        println!("{line}");
+    for line in udisks_report((probes.export_db)(), &config) {
+        say(line);
     }
 
-    let deps = crate::setup::detect::check_dependencies(config.email.enabled);
-    for dep in &deps {
+    for dep in &(probes.dependencies)(config.email.enabled) {
         if let Some(path) = &dep.path {
-            println!("{} ({})", dep.name, path);
+            say(format!("{} ({})", dep.name, path));
         } else if dep.required {
-            println!("{} (required, not found)", dep.name);
+            say(format!("{} (required, not found)", dep.name));
         } else {
-            println!("{} (optional, not found)", dep.name);
+            say(format!("{} (optional, not found)", dep.name));
         }
     }
 
@@ -730,6 +813,11 @@ fn remove_paths(paths: &[String]) -> usize {
 
 /// Return the list of all files installed by `cmake --install`.
 /// The `prefix` is the install prefix (e.g., `/usr` or `/usr/local`).
+///
+/// Mirrors the `install()` rules in CMakeLists.txt and gui/CMakeLists.txt and
+/// must change with them. Every entry is a file this project installs — never
+/// a directory, least of all one shared with other software: the list is
+/// handed to `remove_file`.
 fn cmake_installed_paths(prefix: &str) -> Vec<String> {
     let p = |suffix: &str| format!("{prefix}/{suffix}");
     vec![
@@ -767,56 +855,94 @@ fn cmake_installed_paths(prefix: &str) -> Vec<String> {
         p("lib/das-backup/das-partition-drives.sh"),
         p("lib/das-backup/install-backup-timer.sh"),
         p("lib/das-backup/config/btrbk.conf"),
-        // Systemd units (cmake-installed templates)
-        "/lib/systemd/system/das-backup.service".to_string(),
-        "/lib/systemd/system/das-backup-full.service".to_string(),
-        "/lib/systemd/system/das-backup.timer".to_string(),
-        "/lib/systemd/system/das-backup-full.timer".to_string(),
-        "/lib/systemd/system/btrdasd-helper.service".to_string(),
+        // Systemd units (cmake-installed templates). Under the prefix like
+        // everything else: CMakeLists.txt gives them the relative destination
+        // `lib/systemd/system`. They were listed at a fixed
+        // `/lib/systemd/system`, which is the same place only for `/usr` on a
+        // merged-/usr host; for any other prefix it missed the installed units
+        // and named files this install never wrote.
+        p("lib/systemd/system/das-backup.service"),
+        p("lib/systemd/system/das-backup-full.service"),
+        p("lib/systemd/system/das-backup.timer"),
+        p("lib/systemd/system/das-backup-full.timer"),
+        p("lib/systemd/system/btrdasd-helper.service"),
     ]
+}
+
+/// Where an absolute path lands under `root`. With the real root, `/`, that
+/// is the path itself.
+fn under_root(root: &Path, absolute: &str) -> PathBuf {
+    root.join(absolute.trim_start_matches('/'))
 }
 
 /// Full uninstall: remove generated files (manifest), then cmake-installed files.
 pub fn uninstall_all(remove_db: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Phase 1: run the standard uninstall (manifest files, timers, config dir)
-    uninstall(remove_db)?;
+    uninstall_all_with(
+        Path::new("/"),
+        Path::new(CONFIG_FILE),
+        Path::new(MANIFEST_FILE),
+        remove_db,
+        &|args| command_status(SYSTEMCTL, args),
+    )
+}
 
-    // Phase 2: stop the helper service
-    if let Err(e) = run_systemctl(&["disable", "--now", "btrdasd-helper.service"]) {
-        eprintln!("Warning: btrdasd-helper.service may still be enabled: {e}");
-    }
-
-    // Phase 3: determine install prefix from config (default /usr).
+/// `uninstall_all` with the cmake-installed tree looked for under `root`
+/// (for testing). The manifest's entries and the database path are absolute
+/// and are used as written.
+fn uninstall_all_with(
+    root: &Path,
+    config_path: &Path,
+    manifest_path: &Path,
+    remove_db: bool,
+    systemctl: UnitRunner,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Determine the install prefix from config (default /usr) BEFORE anything
+    // is removed: the manifest lists config.toml, so phase 1 deletes it. Read
+    // afterwards, the load always failed and every full uninstall fell back to
+    // /usr — leaving an install under any other prefix in place.
     // An unreadable config here does not mean "/usr" — it means we are guessing,
     // and everything installed under a different prefix will silently survive
     // the "full" uninstall (bd DAS-Backup-Manager-8wx).
-    let prefix = match Config::load(&PathBuf::from(CONFIG_FILE)) {
-        Ok(c) => c.general.install_prefix.clone(),
+    let prefix = match Config::load(config_path) {
+        Ok(c) => c.general.install_prefix,
         Err(e) => {
             eprintln!(
-                "Warning: could not read {CONFIG_FILE} ({e}) — assuming the default install \
-                 prefix /usr; files installed under any other prefix will be LEFT BEHIND"
+                "Warning: could not read {} ({e}) — assuming the default install \
+                 prefix /usr; files installed under any other prefix will be LEFT BEHIND",
+                config_path.display()
             );
             "/usr".to_string()
         }
     };
 
-    let paths = cmake_installed_paths(&prefix);
+    // Phase 1: run the standard uninstall (manifest files, timers, config dir)
+    uninstall_with(config_path, manifest_path, remove_db, systemctl)?;
+
+    // Phase 2: stop the helper service
+    if let Err(e) = systemctl(&["disable", "--now", "btrdasd-helper.service"]) {
+        eprintln!("Warning: btrdasd-helper.service may still be enabled: {e}");
+    }
+
+    // Phase 3: remove the cmake-installed files under that prefix
+    let paths: Vec<String> = cmake_installed_paths(&prefix)
+        .iter()
+        .map(|p| under_root(root, p).to_string_lossy().into_owned())
+        .collect();
     let removed = remove_paths(&paths);
     println!("Removed {} cmake-installed files.", removed);
 
     // Phase 4: clean up directories
-    let libdir = format!("{prefix}/lib/das-backup");
-    if Path::new(&libdir).exists()
+    let libdir = under_root(root, &format!("{prefix}/lib/das-backup"));
+    if libdir.exists()
         && let Err(e) = std::fs::remove_dir_all(&libdir)
     {
-        eprintln!("Warning: could not remove {libdir}: {e}");
+        eprintln!("Warning: could not remove {}: {e}", libdir.display());
     }
     // Bare `remove_dir`: best-effort, and failing because the database is still
     // there is the normal outcome.
-    let _ = std::fs::remove_dir("/var/lib/das-backup");
+    let _ = std::fs::remove_dir(under_root(root, "/var/lib/das-backup"));
 
-    if let Err(e) = run_systemctl(&["daemon-reload"]) {
+    if let Err(e) = systemctl(&["daemon-reload"]) {
         eprintln!("Warning: {e}");
     }
 
@@ -1450,5 +1576,943 @@ auth = "starttls""#,
             err.contains("could not create database directory"),
             "got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Host seams: the runner, the schedule, and the cores of the root-only
+    // entry points, each driven against a throwaway directory.
+    // -----------------------------------------------------------------------
+
+    /// A config that passes `validate()`, installed entirely under `base`:
+    /// the database path is absolute, so it has to be pointed there too.
+    fn valid_config(base: &Path) -> Config {
+        let mut config = Config::default();
+        config.general.db_path = base
+            .join("var/lib/das-backup/backup-index.db")
+            .to_string_lossy()
+            .into_owned();
+        config.sources.push(Source {
+            label: "test".to_string(),
+            volume: "/test".to_string(),
+            subvolumes: vec![SubvolConfig {
+                name: "@".to_string(),
+                manual_only: false,
+                snapshot_name: None,
+            }],
+            device: "/dev/sda".to_string(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![],
+            target_labels: vec![],
+        });
+        config
+            .targets
+            .push(exposure_target("tgt", &["ABC123"], None));
+        config
+    }
+
+    fn installed_paths(base: &Path) -> (PathBuf, PathBuf) {
+        (
+            base.join("etc/das-backup/config.toml"),
+            base.join("etc/das-backup/.manifest"),
+        )
+    }
+
+    /// Install `config` under `base`, as `install` does under `/`.
+    fn install_config_into(config: &Config, base: &Path) -> (PathBuf, PathBuf) {
+        let (config_path, manifest_path) = installed_paths(base);
+        install_to_prefix(config, base, &config_path, &manifest_path).unwrap();
+        (config_path, manifest_path)
+    }
+
+    fn manifest_lines(manifest_path: &Path) -> Vec<String> {
+        std::fs::read_to_string(manifest_path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Stands in for `systemctl`: records every invocation, and fails the ones
+    /// whose arguments contain a string in `failing`.
+    struct FakeSystemctl {
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+        failing: Vec<&'static str>,
+    }
+
+    impl FakeSystemctl {
+        fn new(failing: &[&'static str]) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                failing: failing.to_vec(),
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|a| a.to_string()).collect());
+            if args.iter().any(|a| self.failing.contains(a)) {
+                Err(format!("systemctl {} exited with 1", args.join(" ")))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().iter().map(|c| c.join(" ")).collect()
+        }
+    }
+
+    const UNINSTALL_UNIT_CALLS: [&str; 5] = [
+        "disable --now das-backup.timer",
+        "disable --now das-backup-full.timer",
+        "disable --now das-scrub.timer",
+        "disable --now das-backup-doctor.timer",
+        "daemon-reload",
+    ];
+
+    #[test]
+    fn command_status_separates_success_from_a_failed_or_missing_command() {
+        assert_eq!(command_status("sh", &["-c", "exit 0"]), Ok(()));
+        // A command that ran and failed is the case finding #5 was about: it
+        // must not come back as Ok.
+        let err = command_status("sh", &["-c", "exit 3"]).unwrap_err();
+        assert!(err.contains("sh -c exit 3 exited with"), "{err}");
+        let err = command_status("/nonexistent/das-no-such-binary", &["enable"]).unwrap_err();
+        assert!(
+            err.contains("/nonexistent/das-no-such-binary enable could not be run"),
+            "{err}"
+        );
+    }
+
+    fn schedule_ops(config: &Config) -> Vec<String> {
+        schedule_unit_operations(config)
+            .iter()
+            .map(|op| op.join(" "))
+            .collect()
+    }
+
+    #[test]
+    fn schedule_enables_every_timer_and_the_scrub_timer_only_when_scrub_is_enabled() {
+        let mut config = Config::default();
+        config.init.system = InitSystem::Systemd;
+
+        config.scrub.enabled = true;
+        assert_eq!(
+            schedule_ops(&config),
+            vec![
+                "daemon-reload",
+                "enable --now das-backup.timer",
+                "enable --now das-backup-full.timer",
+                "enable --now das-scrub.timer",
+                "enable --now das-backup-doctor.timer",
+            ]
+        );
+
+        // bd DAS-Backup-Manager-atq: `enabled = false` must turn an already
+        // enabled scrub timer OFF, not merely leave it alone — and must not
+        // take the backup or doctor timers with it.
+        config.scrub.enabled = false;
+        assert_eq!(
+            schedule_ops(&config),
+            vec![
+                "daemon-reload",
+                "enable --now das-backup.timer",
+                "enable --now das-backup-full.timer",
+                "disable --now das-scrub.timer",
+                "enable --now das-backup-doctor.timer",
+            ]
+        );
+    }
+
+    #[test]
+    fn schedule_touches_no_systemd_unit_on_another_init_system() {
+        // There the schedule is the generated cron entry; systemctl may not
+        // even exist, and calling it would fail the whole install.
+        for system in [InitSystem::Openrc, InitSystem::Sysvinit] {
+            let mut config = Config::default();
+            config.init.system = system;
+            config.scrub.enabled = true;
+            assert_eq!(schedule_ops(&config), Vec::<String>::new());
+
+            let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
+            install_schedule(&config, &|args| systemctl.run(args))
+                .expect("nothing to run, so nothing can fail");
+            assert_eq!(systemctl.calls(), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn install_schedule_runs_every_operation_and_succeeds_when_all_do() {
+        let mut config = Config::default();
+        config.init.system = InitSystem::Systemd;
+        let systemctl = FakeSystemctl::new(&[]);
+
+        install_schedule(&config, &|args| systemctl.run(args)).expect("every operation succeeded");
+
+        assert_eq!(systemctl.calls(), schedule_ops(&config));
+        assert_eq!(systemctl.calls().len(), 5);
+    }
+
+    #[test]
+    fn install_schedule_fails_when_any_unit_operation_fails_but_still_attempts_the_rest() {
+        // Finding #5: a schedule that was not installed is not an install that
+        // succeeded. One failed timer must not stop the others being enabled,
+        // and must not be reported as success.
+        let mut config = Config::default();
+        config.init.system = InitSystem::Systemd;
+
+        let systemctl = FakeSystemctl::new(&["das-backup.timer"]);
+        let err = install_schedule(&config, &|args| systemctl.run(args))
+            .expect_err("a timer that could not be enabled must fail the install");
+        assert!(
+            err.to_string()
+                .starts_with("1 systemd unit operation(s) failed"),
+            "{err}"
+        );
+        assert_eq!(systemctl.calls(), schedule_ops(&config));
+
+        let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
+        let err = install_schedule(&config, &|args| systemctl.run(args)).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("5 systemd unit operation(s) failed"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("NOT fully installed"), "{err}");
+        assert_eq!(systemctl.calls(), schedule_ops(&config));
+    }
+
+    #[test]
+    fn install_makes_scripts_executable_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, manifest_path) = install_config_into(&valid_config(dir.path()), dir.path());
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let scripts = walk_installed_scripts(dir.path());
+        assert!(!scripts.is_empty());
+        for script in &scripts {
+            // systemd and cron exec these directly.
+            assert_eq!(mode(script), 0o755, "{}", script.display());
+        }
+        let mut others = 0;
+        for entry in manifest_lines(&manifest_path) {
+            let path = Path::new(&entry);
+            if !scripts.iter().any(|s| s == path) {
+                assert_eq!(mode(path) & 0o111, 0, "{entry} must not be executable");
+                others += 1;
+            }
+        }
+        assert!(others > 0, "the install also writes non-script files");
+    }
+
+    #[test]
+    fn upgrade_overwrites_a_script_exactly_as_old_as_the_binary() {
+        // The 2lj guard protects a script NEWER than the binary. One with the
+        // same mtime is not newer — nothing says the embedded copy is stale —
+        // so it is refreshed like any older file.
+        let dir = tempfile::tempdir().unwrap();
+        install_into(dir.path());
+        let script = walk_installed_scripts(dir.path())
+            .into_iter()
+            .next()
+            .expect("install should have produced at least one script");
+        let exe_mtime = std::fs::metadata(std::env::current_exe().unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(&script, b"same age as the binary\n").unwrap();
+        filetime::set_file_mtime(&script, filetime::FileTime::from_system_time(exe_mtime)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&script).unwrap().modified().unwrap(),
+            exe_mtime,
+            "fixture must sit exactly on the boundary"
+        );
+
+        install_into(dir.path());
+
+        assert_ne!(
+            std::fs::read(&script).unwrap(),
+            b"same age as the binary\n".to_vec(),
+            "a script no newer than the binary must be refreshed"
+        );
+    }
+
+    #[test]
+    fn upgrade_never_prunes_the_config_under_another_spelling_of_its_path() {
+        // The prune must compare paths, not strings: a manifest entry naming
+        // the config some other way is still the config, and removing it
+        // would leave the next backup with nothing to read.
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = install_into(dir.path());
+        let respelled = dir.path().join("etc/das-backup/./config.toml");
+        assert_ne!(respelled.to_string_lossy(), config_path.to_string_lossy());
+        let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        manifest.push('\n');
+        manifest.push_str(&respelled.to_string_lossy());
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        install_into(dir.path());
+
+        assert!(
+            config_path.exists(),
+            "the config was pruned as a stale file"
+        );
+    }
+
+    #[test]
+    fn uninstall_without_a_manifest_touches_nothing() {
+        // No manifest means this tool has nothing it can prove it installed.
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+        Config::default().save(&config_path).unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_with(&config_path, &manifest_path, true, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        assert_eq!(systemctl.calls(), Vec::<String>::new());
+        assert!(config_path.exists());
+    }
+
+    #[test]
+    fn uninstall_disables_the_timers_and_removes_what_the_manifest_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let installed = manifest_lines(&manifest_path);
+        assert!(installed.len() > 1);
+        let db = PathBuf::from(&config.general.db_path);
+        std::fs::write(&db, "index").unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_with(&config_path, &manifest_path, false, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        // A timer left enabled keeps firing at 03:00 against files that are
+        // gone, so all four are disabled, then systemd is told.
+        assert_eq!(systemctl.calls(), UNINSTALL_UNIT_CALLS);
+        for entry in &installed {
+            assert!(!Path::new(entry).exists(), "{entry} was left behind");
+        }
+        assert!(!manifest_path.exists());
+        assert!(
+            !config_path.parent().unwrap().exists(),
+            "an emptied config directory is removed"
+        );
+        // Not asked for, so the index survives.
+        assert!(db.exists());
+    }
+
+    #[test]
+    fn uninstall_removes_the_database_only_when_asked_and_keeps_operator_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let db = PathBuf::from(&config.general.db_path);
+        std::fs::write(&db, "index").unwrap();
+        let operator_file = config_path.parent().unwrap().join("notes.txt");
+        std::fs::write(&operator_file, "mine").unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_with(&config_path, &manifest_path, true, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        assert!(!db.exists(), "--remove-db was asked for");
+        assert!(!config_path.exists());
+        assert!(
+            operator_file.exists(),
+            "a file this tool did not install must survive the uninstall"
+        );
+    }
+
+    #[test]
+    fn uninstall_still_removes_the_files_when_systemctl_fails() {
+        // A unit that will not disable is a warning: refusing to remove the
+        // files as well would leave the host half-installed with no way out.
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) =
+            install_config_into(&valid_config(dir.path()), dir.path());
+        let installed = manifest_lines(&manifest_path);
+        let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
+
+        uninstall_with(&config_path, &manifest_path, false, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        assert_eq!(systemctl.calls(), UNINSTALL_UNIT_CALLS);
+        for entry in &installed {
+            assert!(!Path::new(entry).exists(), "{entry} was left behind");
+        }
+    }
+
+    fn relay_config(port: u16) -> Config {
+        let mut config = Config::default();
+        config.email.enabled = true;
+        config.email.smtp_host = "127.0.0.1".to_string();
+        config.email.smtp_port = port;
+        config
+    }
+
+    #[test]
+    fn relay_reachable_is_true_only_when_something_is_listening() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(relay_reachable(&relay_config(port)));
+
+        // A port that is certainly closed and stays closed: the local end of
+        // an established connection. Nothing listens on it, and while the
+        // stream is alive no other process can be handed it to listen on — a
+        // port that was merely released can be reused before the probe runs.
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let closed = client.local_addr().unwrap().port();
+        assert_ne!(closed, port);
+        assert!(!relay_reachable(&relay_config(closed)));
+    }
+
+    /// Run `prepare_upgrade`, returning its result and the lines it reported.
+    fn run_prepare_upgrade(
+        config_path: &Path,
+        relay_up: bool,
+    ) -> (Result<Config, String>, Vec<String>) {
+        let mut lines = Vec::new();
+        let result = prepare_upgrade(config_path, &|_| relay_up, &mut |l| lines.push(l))
+            .map_err(|e| e.to_string());
+        (result, lines)
+    }
+
+    #[test]
+    fn upgrade_refuses_to_run_without_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let (result, lines) = run_prepare_upgrade(&config_path, true);
+
+        assert_eq!(
+            result.unwrap_err(),
+            format!(
+                "No config found at {}. Run 'btrdasd setup' first.",
+                config_path.display()
+            )
+        );
+        assert!(lines.is_empty());
+        assert!(!config_path.exists(), "upgrade must not invent a config");
+    }
+
+    #[test]
+    fn upgrade_stamps_an_older_config_with_this_version_and_saves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.general.version = "0.0.1".to_string();
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+        let this = env!("CARGO_PKG_VERSION");
+
+        let (result, lines) = run_prepare_upgrade(&config_path, false);
+
+        assert_eq!(result.unwrap().general.version, this);
+        assert_eq!(
+            lines,
+            vec![format!("Updating config version: 0.0.1 -> {this}")]
+        );
+        assert_eq!(
+            Config::load(&config_path).unwrap().general.version,
+            this,
+            "the new version must reach the file, not just the returned config"
+        );
+    }
+
+    #[test]
+    fn upgrade_saves_a_migration_even_when_the_version_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = relay_config(1025);
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+
+        let (result, lines) = run_prepare_upgrade(&config_path, false);
+
+        assert_eq!(result.unwrap().email.smtp_port, 25);
+        // The version did not change, so no version line is reported.
+        assert_eq!(
+            lines,
+            vec![
+                "Migrating config: [email] smtp_port 1025 -> 25 \
+                 (Protonmail Bridge -> local mail relay)"
+                    .to_string()
+            ]
+        );
+        assert_eq!(Config::load(&config_path).unwrap().email.smtp_port, 25);
+    }
+
+    #[test]
+    fn upgrade_leaves_a_current_config_file_untouched() {
+        // Nothing changed, so the operator's file is not rewritten: a save
+        // would re-serialize it and drop everything that is not a setting.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+        let mut on_disk = std::fs::read_to_string(&config_path).unwrap();
+        on_disk.push_str("\n# operator note that a rewrite would drop\n");
+        std::fs::write(&config_path, &on_disk).unwrap();
+
+        let (result, lines) = run_prepare_upgrade(&config_path, false);
+
+        result.unwrap();
+        assert_eq!(lines, Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), on_disk);
+    }
+
+    #[test]
+    fn upgrade_warns_about_the_relay_only_when_email_is_enabled_and_it_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let warning = vec![
+            "Warning: email is enabled but nothing is listening on 127.0.0.1:2525".to_string(),
+            "  Reports will be saved to disk but not delivered.".to_string(),
+            "  Check the local mail relay: systemctl status postfix".to_string(),
+        ];
+
+        for (enabled, relay_up, expected) in [
+            (true, false, warning.clone()),
+            (true, true, Vec::new()),
+            // Email off: an unreachable relay is nobody's problem.
+            (false, false, Vec::new()),
+            (false, true, Vec::new()),
+        ] {
+            let mut config = relay_config(2525);
+            config.email.enabled = enabled;
+            config.save(&config_path).unwrap();
+
+            let (result, lines) = run_prepare_upgrade(&config_path, relay_up);
+
+            // A warning, never a failure: the upgrade goes ahead either way.
+            result.unwrap();
+            assert_eq!(lines, expected, "enabled={enabled} relay_up={relay_up}");
+        }
+    }
+
+    /// Run `check_with` with fixed answers from the host, returning the report.
+    fn run_check(
+        config_path: &Path,
+        manifest_path: &Path,
+        relay_up: bool,
+        export_db: Result<String, String>,
+    ) -> Vec<String> {
+        let dep =
+            |name: &str, required: bool, path: Option<&str>| crate::setup::detect::DepStatus {
+                name: name.to_string(),
+                required,
+                path: path.map(str::to_string),
+            };
+        let probes = CheckProbes {
+            relay_up: &|_| relay_up,
+            export_db: &|| export_db.clone(),
+            // `mailx` stands for "asked for only when email is enabled".
+            dependencies: &|email_enabled| {
+                let mut deps = vec![
+                    dep("btrbk", true, Some("/usr/bin/btrbk")),
+                    dep("smartctl", true, None),
+                    dep("mbuffer", false, None),
+                ];
+                if email_enabled {
+                    deps.push(dep("mailx", true, Some("/usr/bin/mailx")));
+                }
+                deps
+            },
+        };
+        let mut lines = Vec::new();
+        check_with(config_path, manifest_path, &probes, &mut |l| lines.push(l)).unwrap();
+        lines
+    }
+
+    #[test]
+    fn check_points_at_setup_when_there_is_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+
+        assert_eq!(
+            lines,
+            vec![
+                format!("Config not found at {}", config_path.display()),
+                "  Run: sudo btrdasd setup".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_reports_a_healthy_install_line_by_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = valid_config(dir.path());
+        config.email.enabled = true;
+        assert_eq!(config.validate(), Vec::<String>::new());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let total = manifest_lines(&manifest_path).len();
+
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+
+        assert_eq!(
+            lines,
+            vec![
+                format!("Config found: {}", config_path.display()),
+                "Config is valid".to_string(),
+                "Mail relay reachable at 127.0.0.1:25".to_string(),
+                format!("All {total} generated files present"),
+                "Target tgt not attached — udisks visibility could not be checked".to_string(),
+                "btrbk (/usr/bin/btrbk)".to_string(),
+                "smartctl (required, not found)".to_string(),
+                "mbuffer (optional, not found)".to_string(),
+                "mailx (/usr/bin/mailx)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_reports_config_errors_a_missing_manifest_and_an_unread_udev_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+        let mut config = Config::default();
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+        let errors = config.validate();
+        assert!(!errors.is_empty(), "a config with no source or target");
+
+        let lines = run_check(
+            &config_path,
+            &manifest_path,
+            false,
+            Err("udevadm info --export-db exited with 1".to_string()),
+        );
+
+        let mut expected = vec![format!("Config found: {}", config_path.display())];
+        expected.extend(errors.iter().map(|e| format!("Config error: {e}")));
+        // Email is off: the relay is not reported on at all, and the
+        // email-only dependency is not asked for.
+        expected.extend([
+            "No manifest found. Files may be from a manual install.".to_string(),
+            "udisks visibility NOT checked: udevadm info --export-db exited with 1".to_string(),
+            "btrbk (/usr/bin/btrbk)".to_string(),
+            "smartctl (required, not found)".to_string(),
+            "mbuffer (optional, not found)".to_string(),
+        ]);
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn check_explains_an_unreachable_relay_and_singles_out_the_bridge_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+        let relay_lines = |port: u16| -> Vec<String> {
+            relay_config(port).save(&config_path).unwrap();
+            run_check(&config_path, &manifest_path, false, Ok(String::new()))
+                .into_iter()
+                .skip_while(|l| !l.starts_with("Mail relay"))
+                .take_while(|l| !l.starts_with("No manifest"))
+                .collect()
+        };
+
+        // 1025 is Protonmail Bridge: the config predates the relay, and
+        // `--upgrade` migrates it.
+        assert_eq!(
+            relay_lines(1025),
+            vec![
+                "Mail relay UNREACHABLE at 127.0.0.1:1025",
+                "  Port 1025 is Protonmail Bridge, which this version no longer uses.",
+                "  Fix with: sudo btrdasd setup --upgrade",
+            ]
+        );
+        // Any other port: an upgrade would change nothing, so do not offer it.
+        assert_eq!(
+            relay_lines(25),
+            vec![
+                "Mail relay UNREACHABLE at 127.0.0.1:25",
+                "  Reports will be saved to disk but not delivered.",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_names_each_generated_file_that_has_gone_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) =
+            install_config_into(&valid_config(dir.path()), dir.path());
+        let installed = manifest_lines(&manifest_path);
+        let total = installed.len();
+        let gone = dir.path().join("etc/btrbk/btrbk.conf");
+        assert!(installed.contains(&gone.to_string_lossy().into_owned()));
+        std::fs::remove_file(&gone).unwrap();
+
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+
+        let at = lines
+            .iter()
+            .position(|l| l.contains("generated files"))
+            .expect("the manifest is always reported on");
+        assert_eq!(
+            lines[at..at + 3],
+            [
+                format!("1 of {total} generated files missing:"),
+                format!("    {}", gone.display()),
+                "  Fix with: sudo btrdasd setup --upgrade".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cmake_installed_paths_follow_the_install_prefix() {
+        let paths = cmake_installed_paths("/opt/das");
+        for expected in [
+            "/opt/das/bin/btrdasd",
+            "/opt/das/bin/btrdasd-gui",
+            "/opt/das/libexec/btrdasd-helper",
+            "/opt/das/lib/das-backup/backup-run.sh",
+            "/opt/das/share/man/man1/btrdasd.1",
+            // Legacy FFI artifacts from 0.7.22.1 and earlier: no longer
+            // installed, still cleaned up (bd DAS-Backup-Manager-5xo).
+            "/opt/das/lib/libbuttered_dasd_ffi.so",
+            "/opt/das/include/btrdasd_ffi.h",
+        ] {
+            assert!(paths.iter().any(|p| p == expected), "missing {expected}");
+        }
+        // Each entry is handed to remove_file, so each must be a full path.
+        for p in &paths {
+            assert!(p.starts_with('/') && p.len() > 1, "not absolute: {p:?}");
+        }
+        assert!(
+            cmake_installed_paths("/usr")
+                .iter()
+                .any(|p| p == "/usr/bin/btrdasd")
+        );
+    }
+
+    const UNINSTALL_ALL_UNIT_CALLS: [&str; 7] = [
+        "disable --now das-backup.timer",
+        "disable --now das-backup-full.timer",
+        "disable --now das-scrub.timer",
+        "disable --now das-backup-doctor.timer",
+        "daemon-reload",
+        "disable --now btrdasd-helper.service",
+        "daemon-reload",
+    ];
+
+    /// A fake cmake-installed tree under `root` for `prefix`: the CLI binary
+    /// and the script directory with a file the list does not name.
+    fn cmake_tree(root: &Path, prefix: &str) -> (PathBuf, PathBuf) {
+        let bin = under_root(root, &format!("{prefix}/bin/btrdasd"));
+        let libdir = under_root(root, &format!("{prefix}/lib/das-backup"));
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(&bin, "bin").unwrap();
+        std::fs::write(libdir.join("backup-run.sh"), "#!/bin/bash\n").unwrap();
+        std::fs::write(libdir.join("left-by-an-older-release.sh"), "#!/bin/bash\n").unwrap();
+        (bin, libdir)
+    }
+
+    #[test]
+    fn under_root_maps_an_absolute_path_into_the_root() {
+        assert_eq!(
+            under_root(Path::new("/"), "/usr/bin/btrdasd"),
+            PathBuf::from("/usr/bin/btrdasd")
+        );
+        assert_eq!(
+            under_root(Path::new("/tmp/pkg"), "/usr/bin/btrdasd"),
+            PathBuf::from("/tmp/pkg/usr/bin/btrdasd")
+        );
+    }
+
+    #[test]
+    fn uninstall_all_removes_the_cmake_tree_under_the_configured_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (config_path, manifest_path) = installed_paths(root);
+        let mut config = valid_config(root);
+        config.general.install_prefix = "/opt/das".to_string();
+        config.save(&config_path).unwrap();
+        let generated = root.join("etc/btrbk/btrbk.conf");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "generated").unwrap();
+        std::fs::write(&manifest_path, generated.to_string_lossy().as_bytes()).unwrap();
+
+        let (bin, libdir) = cmake_tree(root, "/opt/das");
+        let (other_prefix_bin, _) = cmake_tree(root, "/usr");
+        let state_dir = root.join("var/lib/das-backup");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_all_with(root, &config_path, &manifest_path, false, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        // The helper service is stopped as well as the timers.
+        assert_eq!(systemctl.calls(), UNINSTALL_ALL_UNIT_CALLS);
+        assert!(!generated.exists(), "phase 1 removes the manifest's files");
+        assert!(!bin.exists());
+        assert!(
+            !libdir.exists(),
+            "the script directory goes with its contents"
+        );
+        assert!(!state_dir.exists(), "an empty state directory is removed");
+        assert!(
+            other_prefix_bin.exists(),
+            "only the configured prefix is this install's to remove"
+        );
+    }
+
+    #[test]
+    fn uninstall_all_falls_back_to_usr_without_a_config_and_keeps_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (config_path, manifest_path) = installed_paths(root);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, "").unwrap();
+        let (bin, libdir) = cmake_tree(root, "/usr");
+        let db = root.join("var/lib/das-backup/backup-index.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, "index").unwrap();
+        // A helper service that will not stop is a warning, not a reason to
+        // leave the files installed.
+        let systemctl = FakeSystemctl::new(&["btrdasd-helper.service"]);
+
+        uninstall_all_with(root, &config_path, &manifest_path, true, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        assert_eq!(systemctl.calls(), UNINSTALL_ALL_UNIT_CALLS);
+        assert!(!bin.exists());
+        assert!(!libdir.exists());
+        // With no config the database location is unknown, so `--remove-db`
+        // removes nothing, and its directory is left because it is not empty.
+        assert!(db.exists());
+    }
+
+    /// Every file `cmake --install` writes for prefix `/usr`, read off the
+    /// `install()` rules in CMakeLists.txt and gui/CMakeLists.txt, plus the
+    /// two FFI artifacts older releases installed.
+    const CMAKE_PATHS_USR: [&str; 26] = [
+        "/usr/bin/btrdasd",
+        "/usr/bin/btrdasd-gui",
+        "/usr/libexec/btrdasd-helper",
+        "/usr/lib/libbuttered_dasd_ffi.so",
+        "/usr/include/btrdasd_ffi.h",
+        "/usr/share/dbus-1/system.d/org.dasbackup.Helper1.conf",
+        "/usr/share/dbus-1/system-services/org.dasbackup.Helper1.service",
+        "/usr/share/polkit-1/actions/org.dasbackup.policy",
+        "/usr/share/man/man1/btrdasd.1",
+        "/usr/share/bash-completion/completions/btrdasd",
+        "/usr/share/zsh/site-functions/_btrdasd",
+        "/usr/share/fish/vendor_completions.d/btrdasd.fish",
+        "/usr/share/applications/org.theboscoclub.btrdasd-gui.desktop",
+        "/usr/share/icons/hicolor/scalable/apps/btrdasd-gui.svg",
+        "/usr/share/kxmlgui5/btrdasd-gui/btrdasd-gui.rc",
+        "/usr/lib/das-backup/backup-run.sh",
+        "/usr/lib/das-backup/backup-verify.sh",
+        "/usr/lib/das-backup/boot-archive-cleanup.sh",
+        "/usr/lib/das-backup/das-partition-drives.sh",
+        "/usr/lib/das-backup/install-backup-timer.sh",
+        "/usr/lib/das-backup/config/btrbk.conf",
+        "/usr/lib/systemd/system/das-backup.service",
+        "/usr/lib/systemd/system/das-backup-full.service",
+        "/usr/lib/systemd/system/das-backup.timer",
+        "/usr/lib/systemd/system/das-backup-full.timer",
+        "/usr/lib/systemd/system/btrdasd-helper.service",
+    ];
+
+    #[test]
+    fn cmake_installed_paths_are_exactly_what_cmake_installs_for_the_prefix() {
+        assert_eq!(cmake_installed_paths("/usr"), CMAKE_PATHS_USR);
+
+        // CMakeLists.txt installs the units with a RELATIVE destination,
+        // `lib/systemd/system`, so they move with the prefix like everything
+        // else. A list that names them at a fixed `/lib/systemd/system` both
+        // misses the real files and reaches for ones this install never wrote.
+        let local: Vec<String> = CMAKE_PATHS_USR
+            .iter()
+            .map(|p| p.replacen("/usr/", "/usr/local/", 1))
+            .collect();
+        assert_eq!(cmake_installed_paths("/usr/local"), local);
+        for p in cmake_installed_paths("/usr/local") {
+            assert!(p.starts_with("/usr/local/"), "outside the prefix: {p}");
+        }
+    }
+
+    /// Every file under `dir`, for asserting a tree was left alone.
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .map(|e| e.unwrap().path().to_path_buf())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn uninstall_all_after_a_normal_install_uses_the_configured_prefix() {
+        // The manifest of a normal install lists config.toml, so phase 1
+        // deletes it. The prefix has to be read before that: read afterwards,
+        // every full uninstall fell back to /usr, left a /usr/local install in
+        // place, and removed whatever sat at the same paths under /usr.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = valid_config(root);
+        config.general.install_prefix = "/usr/local".to_string();
+        let (config_path, manifest_path) = install_config_into(&config, root);
+        assert!(
+            manifest_lines(&manifest_path).contains(&config_path.to_string_lossy().into_owned()),
+            "fixture: a normal install's manifest lists the config"
+        );
+
+        let (bin, libdir) = cmake_tree(root, "/usr/local");
+        let unit = root.join("usr/local/lib/systemd/system/das-backup.service");
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, "[Unit]\n").unwrap();
+
+        // The same paths under /usr, and the unit at the fixed location the
+        // list used to name: none of it is this install's.
+        cmake_tree(root, "/usr");
+        for decoy in [
+            "usr/lib/systemd/system/das-backup.service",
+            "lib/systemd/system/das-backup.service",
+        ] {
+            let decoy = root.join(decoy);
+            std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+            std::fs::write(&decoy, "[Unit]\n").unwrap();
+        }
+        let outside = |root: &Path| -> Vec<PathBuf> {
+            let mut all = files_under(&root.join("lib"));
+            all.extend(
+                files_under(&root.join("usr"))
+                    .into_iter()
+                    .filter(|p| !p.starts_with(root.join("usr/local"))),
+            );
+            all
+        };
+        let before = outside(root);
+        assert!(before.iter().any(|p| p.ends_with("usr/bin/btrdasd")));
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_all_with(root, &config_path, &manifest_path, false, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        assert!(!config_path.exists(), "fixture: phase 1 removed the config");
+        assert!(!bin.exists(), "the /usr/local binary was left behind");
+        assert!(!libdir.exists(), "the /usr/local script directory was left");
+        assert!(!unit.exists(), "the /usr/local unit was left behind");
+        assert_eq!(outside(root), before, "files outside the prefix changed");
     }
 }

@@ -160,7 +160,9 @@ fn format_retention(r: &Retention) -> String {
 
 /// Resolve snapshot names for a list of subvolumes, using explicit overrides
 /// where present and generating safe algorithmic names otherwise.
-/// Detects collisions and appends suffixes to disambiguate.
+/// On a collision the colliding names get a `root-` prefix. That does not
+/// separate two algorithmic names that both resolve the same way (`@home` and
+/// `home` both become `root-home`).
 fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
     use std::collections::HashMap;
 
@@ -494,7 +496,7 @@ pub fn render_cron_entry(config: &Config) -> Result<String, String> {
 // incident that wiped the DAS 2TB emergency recovery drives' independent OS
 // ESPs. NVMe-pair ESP mirroring is handled by a separate, unrelated mechanism
 // (/usr/local/bin/esp-sync.sh + /etc/pacman.d/hooks/esp-mirror.hook) outside
-// this project. See .claude/rules/das-esp-safety.md for the full postmortem.
+// this project. See .claude/rules/esp-safety.md for the full postmortem.
 
 /// Where the udisks-ignore rule is installed.
 pub const UDEV_UDISKS_IGNORE_RULES: &str = "/etc/udev/rules.d/99-das-backup-udisks-ignore.rules";
@@ -568,7 +570,8 @@ pub struct GeneratedFiles {
 
 impl GeneratedFiles {
     /// Generate all operational files from a Config. Includes systemd units OR cron
-    /// entries based on init system, plus btrbk.conf, backup-run.sh, email, and ESP hooks.
+    /// entries based on init system, plus btrbk.conf, the backup scripts and the udisks-ignore
+    /// udev rule. No email config and no ESP hook is generated.
     pub fn generate(config: &Config) -> Self {
         let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
         let mut files = Vec::new();
@@ -644,7 +647,7 @@ impl GeneratedFiles {
                 ));
             }
             InitSystem::Sysvinit | InitSystem::Openrc => {
-                // Fail closed: an unparseable schedule yields NO cron file
+                // Fail closed: an unparsable schedule yields NO cron file
                 // rather than one silently pinned to 03:00 Sunday. Unreachable
                 // via the normal flow — `Config::validate()` rejects a bad
                 // schedule before setup ever generates anything
@@ -796,6 +799,376 @@ mod tests {
         );
     }
 
+    fn subvol(name: &str, snapshot_name: Option<&str>) -> SubvolConfig {
+        SubvolConfig {
+            name: name.to_string(),
+            manual_only: false,
+            snapshot_name: snapshot_name.map(str::to_string),
+        }
+    }
+
+    fn retention(daily: u32, weekly: u32, monthly: u32, yearly: u32) -> Retention {
+        Retention {
+            weekly,
+            monthly,
+            daily,
+            yearly,
+        }
+    }
+
+    fn target(label: &str, mount: &str, role: TargetRole, retention: Retention) -> Target {
+        Target {
+            label: label.to_string(),
+            serial: String::new(),
+            serials: vec![],
+            mount_uuid: None,
+            mount: mount.to_string(),
+            role,
+            retention,
+            display_name: String::new(),
+        }
+    }
+
+    /// The shape of the author's deployment (`.claude/rules/backup.md`
+    /// §Targets and Retention): one long-retention primary that receives
+    /// everything, two short-retention recovery drives that receive only
+    /// system data, a system source that fans out to all three, and a bulk
+    /// source scoped to the primary alone.
+    fn multi_target_config() -> Config {
+        let targets = vec![
+            target(
+                "primary-22tb",
+                "/mnt/backup-22tb",
+                TargetRole::Primary,
+                retention(7, 4, 12, 1),
+            ),
+            target(
+                "system-recovery-A-2tb",
+                "/mnt/backup-system-recovery-A",
+                TargetRole::Mirror,
+                retention(7, 0, 0, 0),
+            ),
+            target(
+                "system-recovery-B-2tb",
+                "/mnt/backup-system-recovery-B",
+                TargetRole::Mirror,
+                retention(7, 0, 0, 0),
+            ),
+        ];
+        let sources = vec![
+            Source {
+                label: "nvme".to_string(),
+                volume: "/.btrfs-nvme".to_string(),
+                subvolumes: vec![
+                    subvol("@", None),
+                    subvol("@home", None),
+                    subvol("@root", None),
+                    subvol("@var/log", None),
+                ],
+                device: "/dev/nvme0n1p2".to_string(),
+                snapshot_dir: ".btrbk-snapshots".to_string(),
+                target_subdirs: vec!["nvme".to_string()],
+                target_labels: vec![],
+            },
+            Source {
+                label: "hdd-projects".to_string(),
+                volume: "/.btrfs-hdd".to_string(),
+                subvolumes: vec![
+                    subvol("ClaudeCodeProjects", None),
+                    subvol(
+                        "ClaudeCodeProjects/DAS-Backup-Manager",
+                        Some("das-backup-manager"),
+                    ),
+                ],
+                device: "/dev/sda".to_string(),
+                snapshot_dir: "ClaudeCodeProjects/.btrbk-snapshots".to_string(),
+                target_subdirs: vec![],
+                target_labels: vec!["primary-22tb".to_string()],
+            },
+            Source {
+                label: "retired".to_string(),
+                volume: "/.btrfs-retired".to_string(),
+                subvolumes: vec![subvol("data", None)],
+                device: "/dev/sdz".to_string(),
+                snapshot_dir: ".btrbk-snapshots".to_string(),
+                target_subdirs: vec![],
+                target_labels: vec!["no-such-target".to_string()],
+            },
+        ];
+        Config {
+            targets,
+            sources,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn render_btrbk_conf_renders_the_whole_file_for_a_multi_target_config() {
+        // Asserted in full because every line is load-bearing: the `target`
+        // lines decide which drive a subvolume is sent to, the
+        // `target_preserve` lines decide how long it is kept there, and
+        // `snapshot_name` is the on-disk identity of each send/receive chain.
+        let expected = concat!(
+            "# Generated by btrdasd setup — do not edit.\n",
+            "# Modify /etc/das-backup/config.toml and run: sudo btrdasd setup --upgrade\n",
+            "\n",
+            "# Global settings\n",
+            "transaction_log         /var/log/btrbk.log\n",
+            "stream_buffer           256m\n",
+            "stream_compress         zstd\n",
+            "lockfile                /var/lock/btrbk.lock\n",
+            "\n",
+            "# Source snapshots — minimal, for send reference\n",
+            "snapshot_preserve_min   latest\n",
+            "snapshot_preserve       2d\n",
+            "\n",
+            "# Default target retention (from primary-22tb)\n",
+            "target_preserve_min     latest\n",
+            "target_preserve         7d 4w 12m 1y\n",
+            "\n",
+            // target_labels = [] fans out to every target. The primary
+            // inherits the global retention; each recovery drive carries its
+            // own shorter one as an override.
+            "# nvme\n",
+            "volume /.btrfs-nvme\n",
+            "  snapshot_dir          .btrbk-snapshots\n",
+            "  target                /mnt/backup-22tb/nvme\n",
+            "  target                /mnt/backup-system-recovery-A/nvme\n",
+            "    target_preserve     7d\n",
+            "  target                /mnt/backup-system-recovery-B/nvme\n",
+            "    target_preserve     7d\n",
+            "\n",
+            // `@` and `@root` both strip to `root`; btrbk refuses two
+            // subvolumes that would write the same snapshot, so both are
+            // renamed. `forget::parse_subvol_snapshot_names` and
+            // `backup-run.sh` rely on exactly these two names.
+            "  subvolume             @\n",
+            "    snapshot_name       root-\n",
+            "\n",
+            "  subvolume             @home\n",
+            "    snapshot_name       home\n",
+            "\n",
+            "  subvolume             @root\n",
+            "    snapshot_name       root-root\n",
+            "\n",
+            "  subvolume             @var/log\n",
+            "    snapshot_name       var-log\n",
+            "\n",
+            // Scoped to the primary: bulk data must never reach the 2 TB
+            // recovery drives. No target_subdirs, so the label is the subdir.
+            "# hdd-projects\n",
+            "volume /.btrfs-hdd\n",
+            "  snapshot_dir          ClaudeCodeProjects/.btrbk-snapshots\n",
+            "  target                /mnt/backup-22tb/hdd-projects\n",
+            "\n",
+            "  subvolume             ClaudeCodeProjects\n",
+            "    snapshot_name       ClaudeCodeProjects\n",
+            "\n",
+            "  subvolume             ClaudeCodeProjects/DAS-Backup-Manager\n",
+            "    snapshot_name       das-backup-manager\n",
+            "\n",
+            // "retired" names a target that is not configured, so it gets no
+            // volume block at all: a block without a target line would make
+            // btrbk snapshot the source and send it nowhere.
+        );
+        assert_eq!(render_btrbk_conf(&multi_target_config()), expected);
+    }
+
+    #[test]
+    fn render_btrbk_conf_overrides_retention_only_where_it_differs_from_the_primary() {
+        // A mirror with the primary's own retention inherits the global
+        // `target_preserve`; repeating it per target would be noise that
+        // hides the overrides which do matter.
+        let mut config = multi_target_config();
+        config.targets[1].retention = config.targets[0].retention.clone();
+        let result = render_btrbk_conf(&config);
+        assert!(
+            result.contains(concat!(
+                "  target                /mnt/backup-22tb/nvme\n",
+                "  target                /mnt/backup-system-recovery-A/nvme\n",
+                "  target                /mnt/backup-system-recovery-B/nvme\n",
+                "    target_preserve     7d\n",
+                "\n",
+            )),
+            "{result}"
+        );
+        assert_eq!(result.matches("    target_preserve     ").count(), 1);
+    }
+
+    #[test]
+    fn render_btrbk_conf_scopes_a_source_to_a_mirror_alone() {
+        // target_labels selects by label, whatever the target's role.
+        let mut config = multi_target_config();
+        config.sources[0].target_labels = vec!["system-recovery-B-2tb".to_string()];
+        let result = render_btrbk_conf(&config);
+        assert!(
+            result.contains(concat!(
+                "volume /.btrfs-nvme\n",
+                "  snapshot_dir          .btrbk-snapshots\n",
+                "  target                /mnt/backup-system-recovery-B/nvme\n",
+                "    target_preserve     7d\n",
+                "\n",
+            )),
+            "{result}"
+        );
+        assert!(!result.contains("/mnt/backup-22tb/nvme"), "{result}");
+        assert!(
+            !result.contains("/mnt/backup-system-recovery-A/nvme"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn format_retention_emits_only_the_non_zero_periods() {
+        // A period the config leaves at zero is omitted, in the fixed order
+        // daily, weekly, monthly, yearly; 1 is the smallest count that must
+        // be rendered. This string is each target's whole retention policy.
+        let cases = [
+            (retention(7, 4, 12, 1), "7d 4w 12m 1y"),
+            (retention(1, 1, 1, 1), "1d 1w 1m 1y"),
+            (retention(7, 0, 0, 0), "7d"),
+            (retention(0, 4, 0, 0), "4w"),
+            (retention(0, 0, 12, 0), "12m"),
+            (retention(0, 0, 0, 1), "1y"),
+            (retention(1, 0, 0, 0), "1d"),
+            (retention(0, 1, 0, 0), "1w"),
+            (retention(0, 0, 1, 0), "1m"),
+            (retention(0, 4, 2, 0), "4w 2m"),
+            (retention(7, 0, 0, 2), "7d 2y"),
+            (retention(0, 4, 12, 4), "4w 12m 4y"),
+        ];
+        for (retention, expected) in cases {
+            assert_eq!(format_retention(&retention), expected, "{retention:?}");
+        }
+    }
+
+    #[test]
+    fn format_retention_falls_back_to_four_weeks_when_every_period_is_zero() {
+        // An all-zero retention must not leave `target_preserve` without an
+        // argument, nor render "0d 0w 0m 0y"; it gets the four-week fallback.
+        assert_eq!(format_retention(&retention(0, 0, 0, 0)), "4w");
+        assert_eq!(format_retention(&Retention::default()), "4w");
+    }
+
+    fn snapshot_names(subvols: &[(&str, Option<&str>)]) -> Vec<String> {
+        let subvols: Vec<SubvolConfig> = subvols
+            .iter()
+            .map(|(name, snapshot_name)| subvol(name, *snapshot_name))
+            .collect();
+        resolve_snapshot_names(&subvols)
+    }
+
+    #[test]
+    fn resolve_snapshot_names_leaves_unique_names_alone() {
+        // The name is the identity of an existing send/receive chain:
+        // renaming a subvolume that collides with nothing would strand every
+        // snapshot already taken of it.
+        assert_eq!(
+            snapshot_names(&[
+                ("@", None),
+                ("@home", None),
+                ("@var/log", None),
+                ("ClaudeCodeProjects", None),
+                ("Audiobooks", Some("books")),
+            ]),
+            ["root", "home", "var-log", "ClaudeCodeProjects", "books"]
+        );
+    }
+
+    #[test]
+    fn resolve_snapshot_names_renames_only_the_colliding_subvolumes() {
+        // The production case (bd DAS-Backup-Manager-5ig, -ycr): `@` and
+        // `@root` both strip to `root`. Their neighbours keep their names.
+        assert_eq!(
+            snapshot_names(&[
+                ("@", None),
+                ("@home", None),
+                ("@root", None),
+                ("@opt", None)
+            ]),
+            ["root-", "home", "root-root", "opt"]
+        );
+    }
+
+    #[test]
+    fn resolve_snapshot_names_never_rewrites_an_explicit_name() {
+        // An explicit snapshot_name is the operator's decision. When it
+        // collides with an algorithmic name, the algorithmic one moves.
+        assert_eq!(
+            snapshot_names(&[("@home", None), ("users", Some("home"))]),
+            ["root-home", "home"]
+        );
+        assert_eq!(
+            snapshot_names(&[("users", Some("home")), ("@home", None), ("@opt", None)]),
+            ["home", "root-home", "opt"]
+        );
+    }
+
+    #[test]
+    fn render_systemd_service_full_unit_test() {
+        let config = test_config();
+        assert_eq!(
+            render_systemd_service(&config, true),
+            concat!(
+                "# Generated by btrdasd setup — do not edit.\n",
+                "# Modify /etc/das-backup/config.toml and run: sudo btrdasd setup --upgrade\n",
+                "\n",
+                "[Unit]\n",
+                "Description=DAS Backup - Full BTRFS backup\n",
+                "After=local-fs.target\n",
+                "\n",
+                "[Service]\n",
+                "Type=oneshot\n",
+                "ExecStart=/usr/local/lib/das-backup/backup-run.sh --full\n",
+                "StandardOutput=journal\n",
+                "StandardError=journal\n",
+                "Nice=19\n",
+                "IOSchedulingClass=idle\n",
+                "TimeoutStartSec=infinity\n",
+                "\n",
+                "[Install]\n",
+                "WantedBy=multi-user.target\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_systemd_timer_full_puts_the_weekday_ahead_of_the_date() {
+        // systemd's OnCalendar grammar is `DayOfWeek Date Time`. "Sun 04:00"
+        // from config.toml has to become "Sun *-*-* 04:00:00"; the weekday
+        // anywhere else is rejected by systemd and the weekly full backup
+        // never fires.
+        let config = test_config();
+        assert_eq!(config.schedule.full, "Sun 04:00");
+        assert_eq!(
+            render_systemd_timer(&config, true),
+            concat!(
+                "# Generated by btrdasd setup — do not edit.\n",
+                "# Modify /etc/das-backup/config.toml and run: sudo btrdasd setup --upgrade\n",
+                "\n",
+                "[Unit]\n",
+                "Description=DAS Backup Timer - Weekly full backup\n",
+                "\n",
+                "[Timer]\n",
+                "OnCalendar=Sun *-*-* 04:00:00\n",
+                "RandomizedDelaySec=1800\n",
+                "Persistent=true\n",
+                "WakeSystem=false\n",
+                "\n",
+                "[Install]\n",
+                "WantedBy=timers.target\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_systemd_timer_full_without_a_weekday_fires_daily_at_that_time() {
+        let mut config = test_config();
+        config.schedule.full = "04:30".to_string();
+        let result = render_systemd_timer(&config, true);
+        assert!(result.contains("\nOnCalendar=*-*-* 04:30:00\n"), "{result}");
+    }
+
     #[test]
     fn render_systemd_service_test() {
         let config = test_config();
@@ -909,7 +1282,7 @@ mod tests {
     // silently-defaulted cron entry before the parsers returned Result:
     // "3 AM" became 03:00, and "Friday 04:00" became SUNDAY 04:00.
     #[test]
-    fn render_cron_entry_refuses_an_unparseable_time() {
+    fn render_cron_entry_refuses_an_unparsable_time() {
         let mut config = test_config();
         config.schedule.incremental = "3 AM".into();
         let err = render_cron_entry(&config).expect_err("must not silently default to 03:00");

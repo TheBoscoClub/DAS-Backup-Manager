@@ -86,7 +86,7 @@ so a future audit is a diff against this list, not a re-read:
 Two of these were checked closely because a `0` sentinel on a **deletion** path
 would be the permissive direction. Both are safe: `parse_archive_timestamp`
 returning `0` reaches `if (( archive_epoch == 0 )); then log_warn; continue`, so
-an unparseable archive is **skipped, never pruned**.
+an unparsable archive is **skipped, never pruned**.
 
 One real defect was found and fixed: `resolve_fs_label` in
 `das-partition-drives.sh` read `blkid`'s empty output as "unlabelled", which
@@ -109,7 +109,7 @@ one. A future audit is a diff against this table:
 | Shape | Substitutes | Why cautious |
 |:--|:--|:--|
 | `Command::new(..).output().ok()?` on `blkid` / `findmnt` / `smartctl` / `btrfs` / `which` / `systemctl` | `None`, `"unknown"`, `"N/A"` | probe for optional tooling; never a fabricated measurement |
-| `parse().ok()?` inside a fn returning `Option` (timestamps, subvol ids, `hh:mm`, lsblk rows) | `None` → the row/answer is skipped | an unparseable input is dropped, never guessed |
+| `parse().ok()?` inside a fn returning `Option` (timestamps, subvol ids, `hh:mm`, lsblk rows) | `None` → the row/answer is skipped | an unparsable input is dropped, never guessed |
 | `.map(..).unwrap_or(false)` on `mountpoint -q`, `systemctl is-enabled`, `read_dir` | "not mounted", "not enabled" | sends callers into mount/refuse/warn — the safe branch |
 | `Err(_) => return false` in `health::is_mountpoint` | "not a mountpoint" | the canonical case; drives `verify_write_targets` into refusal |
 | `.unwrap_or("<none>" / "-" / "N/A" / "unknown")` in report and CLI table rendering | a placeholder cell | display only; no decision reads it |

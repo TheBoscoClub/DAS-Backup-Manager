@@ -782,7 +782,7 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
         .map(|v| (v * mult as f64) as u64)
 }
 
-// sync_esp() removed 2026-04-12 — see .claude/rules/das-esp-safety.md.
+// sync_esp() removed 2026-04-12 — see .claude/rules/esp-safety.md.
 
 /// Best-effort parse of a size from a btrbk `>>>` or `***` output line.
 ///

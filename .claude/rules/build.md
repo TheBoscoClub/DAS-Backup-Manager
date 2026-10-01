@@ -34,6 +34,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 - Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - All database access through `db::Database` with prepared statements
 - Use `NewBackupRun` struct pattern for functions with >7 parameters
+- **Mutation testing gates every push** (`.github/workflows/mutants.yml`, scored by `.github/scripts/mutants-gate.py`) plus a weekly full scope over `setup/`, `mount.rs`, `forget.rs`, `restore.rs`, `config.rs`. New code that spawns a command or prompts must go through a seam a test can drive (`CommandRunner`, `Prompter`, the `*_with` cores), or its mutants survive. Local run: the header of `indexer/.cargo/mutants.toml` — `--in-place`, crate-relative diff, on a copy of the tree, never `-- --lib`
 
 ## SQLite
 - SQLite 3.51.2 with FTS5 extension

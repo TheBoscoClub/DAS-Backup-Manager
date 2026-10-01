@@ -34,63 +34,119 @@ pub struct SetupArgs {
     pub force: bool,
 }
 
+/// Where `btrdasd setup` reads and writes the host's configuration.
+const CONFIG_PATH: &str = "/etc/das-backup/config.toml";
+
 pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !nix_is_root() {
-        eprintln!("Error: btrdasd setup requires root privileges.");
-        eprintln!("Run: sudo btrdasd setup");
+    if let Err(msg) = require_root(effective_uid()) {
+        eprintln!("{msg}");
         std::process::exit(1);
     }
+    dispatch(&args, std::path::Path::new(CONFIG_PATH))
+}
 
+/// What one `btrdasd setup` invocation does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Check,
+    Uninstall,
+    UninstallAll,
+    Upgrade,
+    /// `--force` alone: reinstall from the existing config, no prompts.
+    ForceInstall,
+    Wizard {
+        modify: bool,
+    },
+}
+
+/// Pick the action for a flag combination.
+///
+/// The flags are not mutually exclusive on the command line, so the order here
+/// is the contract: the read-only `--check` outranks everything, and `--force`
+/// is an install of its own only when no other mode is named — next to
+/// `--uninstall`, `--uninstall-all` or `--upgrade` it is just their "no
+/// prompts" modifier.
+fn select_action(args: &SetupArgs) -> Action {
     if args.check {
-        installer::check()?;
+        Action::Check
     } else if args.uninstall {
-        let remove_db = if args.force {
-            false
-        } else {
-            dialoguer::Confirm::new()
-                .with_prompt("Also remove the backup database?")
-                .default(false)
-                .interact()?
-        };
-        installer::uninstall(remove_db)?;
+        Action::Uninstall
     } else if args.uninstall_all {
-        let remove_db = if args.force {
-            false
-        } else {
-            dialoguer::Confirm::new()
-                .with_prompt("Also remove the backup database?")
-                .default(false)
-                .interact()?
-        };
-        installer::uninstall_all(remove_db)?;
+        Action::UninstallAll
     } else if args.upgrade {
-        installer::upgrade()?;
+        Action::Upgrade
     } else if args.force {
-        // Non-interactive install: requires existing config
-        let config_path = std::path::PathBuf::from("/etc/das-backup/config.toml");
-        if !config_path.exists() {
-            return Err(
-                "Cannot run non-interactive install: no existing config found. \
-                 Run the interactive wizard first, or use --upgrade to regenerate."
-                    .into(),
-            );
-        }
-        let config = config::Config::load(&config_path)?;
-        installer::install(&config)?;
+        Action::ForceInstall
     } else {
-        // Fresh install or --modify
-        let existing = if args.modify {
-            load_existing_for_modify(&std::path::PathBuf::from("/etc/das-backup/config.toml"))?
-        } else {
-            None
-        };
+        Action::Wizard {
+            modify: args.modify,
+        }
+    }
+}
 
-        let sys = detect::SystemInfo::detect();
-        let config = wizard::run_wizard(&sys, existing)?;
-        installer::install(&config)?;
+fn dispatch(
+    args: &SetupArgs,
+    config_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ask_remove_db = || {
+        dialoguer::Confirm::new()
+            .with_prompt("Also remove the backup database?")
+            .default(false)
+            .interact()
+    };
+
+    match select_action(args) {
+        Action::Check => installer::check()?,
+        Action::Uninstall => installer::uninstall(remove_db_decision(args.force, ask_remove_db)?)?,
+        Action::UninstallAll => {
+            installer::uninstall_all(remove_db_decision(args.force, ask_remove_db)?)?
+        }
+        Action::Upgrade => installer::upgrade()?,
+        Action::ForceInstall => {
+            let config = load_existing_for_force(config_path)?;
+            installer::install(&config)?;
+        }
+        Action::Wizard { modify } => {
+            let existing = if modify {
+                load_existing_for_modify(config_path)?
+            } else {
+                None
+            };
+
+            let sys = detect::SystemInfo::detect();
+            let config = wizard::run_wizard(&sys, existing)?;
+            installer::install(&config)?;
+        }
     }
 
     Ok(())
+}
+
+/// Whether an uninstall also removes the backup database.
+///
+/// `--force` never does, and never asks: it is the non-interactive mode, and
+/// the database is the one thing an unattended uninstall must not be able to
+/// take with it. Otherwise the operator's answer stands, and a prompt that
+/// could not be shown stops the uninstall rather than standing in for one.
+fn remove_db_decision<E>(force: bool, ask: impl FnOnce() -> Result<bool, E>) -> Result<bool, E> {
+    if force { Ok(false) } else { ask() }
+}
+
+/// Load the config a non-interactive (`--force`) install regenerates from.
+///
+/// There is no wizard to fall back on, so a missing config is an error rather
+/// than a reason to install defaults.
+fn load_existing_for_force(
+    path: &std::path::Path,
+) -> Result<config::Config, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Err(
+            "Cannot run non-interactive install: no existing config found. \
+             Run the interactive wizard first, or use --upgrade to regenerate."
+                .into(),
+        );
+    }
+    config::Config::load(path)
 }
 
 /// Load the config `--modify` is meant to pre-fill the wizard with.
@@ -119,8 +175,20 @@ fn load_existing_for_modify(
     }
 }
 
-fn nix_is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+/// Refuse to run setup as anyone but root: every mode reads or writes
+/// root-owned paths, and failing halfway through an install is worse than not
+/// starting.
+fn require_root(euid: u32) -> Result<(), &'static str> {
+    if euid == 0 {
+        Ok(())
+    } else {
+        Err("Error: btrdasd setup requires root privileges.\nRun: sudo btrdasd setup")
+    }
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(test)]
@@ -150,7 +218,7 @@ mod tests {
         drop(f);
         let err = match load_existing_for_modify(&broken) {
             Err(e) => e,
-            Ok(_) => panic!("an unparseable existing config must be an error, not Ok(None)"),
+            Ok(_) => panic!("an unparsable existing config must be an error, not Ok(None)"),
         };
         let msg = err.to_string();
         assert!(
@@ -167,5 +235,162 @@ mod tests {
             .expect("a valid config must load")
             .expect("a valid config must be Some");
         assert_eq!(loaded.general.db_path, cfg.general.db_path);
+    }
+
+    fn args(flags: &[&str]) -> SetupArgs {
+        let mut a = SetupArgs {
+            modify: false,
+            upgrade: false,
+            uninstall: false,
+            uninstall_all: false,
+            check: false,
+            force: false,
+        };
+        for f in flags {
+            match *f {
+                "modify" => a.modify = true,
+                "upgrade" => a.upgrade = true,
+                "uninstall" => a.uninstall = true,
+                "uninstall_all" => a.uninstall_all = true,
+                "check" => a.check = true,
+                "force" => a.force = true,
+                other => panic!("unknown flag {other}"),
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn only_uid_zero_may_run_setup() {
+        assert_eq!(require_root(0), Ok(()));
+        for euid in [1, 952, 1000, u32::MAX] {
+            let msg = require_root(euid).expect_err("a non-root uid must be refused");
+            assert!(msg.contains("requires root privileges"), "got: {msg}");
+            assert!(msg.contains("sudo btrdasd setup"), "got: {msg}");
+        }
+    }
+
+    /// Checked against an independent reading of the same fact, so a wrong
+    /// answer cannot agree with itself.
+    #[test]
+    fn effective_uid_matches_what_the_kernel_reports() {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        // "Uid:\t<real>\t<effective>\t<saved>\t<fs>"
+        let from_proc: u32 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .expect("an effective uid in /proc/self/status")
+            .parse()
+            .unwrap();
+        assert_eq!(effective_uid(), from_proc);
+    }
+
+    #[test]
+    fn each_flag_selects_its_own_action() {
+        let cases: &[(&[&str], Action)] = &[
+            (&[], Action::Wizard { modify: false }),
+            (&["modify"], Action::Wizard { modify: true }),
+            (&["check"], Action::Check),
+            (&["uninstall"], Action::Uninstall),
+            (&["uninstall_all"], Action::UninstallAll),
+            (&["upgrade"], Action::Upgrade),
+            (&["force"], Action::ForceInstall),
+        ];
+        for (flags, want) in cases {
+            assert_eq!(select_action(&args(flags)), *want, "flags: {flags:?}");
+        }
+    }
+
+    #[test]
+    fn combined_flags_resolve_toward_the_least_destructive_mode() {
+        let cases: &[(&[&str], Action)] = &[
+            // --check changes nothing, and stays that way whatever it is
+            // combined with.
+            (
+                &[
+                    "check",
+                    "uninstall",
+                    "uninstall_all",
+                    "upgrade",
+                    "force",
+                    "modify",
+                ],
+                Action::Check,
+            ),
+            // --force beside another mode is that mode without prompts, never
+            // a reinstall.
+            (&["uninstall", "force"], Action::Uninstall),
+            (&["uninstall_all", "force"], Action::UninstallAll),
+            (&["upgrade", "force"], Action::Upgrade),
+            // --uninstall keeps the installed binaries; it wins over the
+            // variant that removes them.
+            (&["uninstall", "uninstall_all"], Action::Uninstall),
+            (&["uninstall_all", "upgrade"], Action::UninstallAll),
+            // --force is non-interactive: it must not open the wizard.
+            (&["force", "modify"], Action::ForceInstall),
+        ];
+        for (flags, want) in cases {
+            assert_eq!(select_action(&args(flags)), *want, "flags: {flags:?}");
+        }
+    }
+
+    #[test]
+    fn forced_uninstall_never_removes_the_database_and_never_prompts() {
+        let ask = || -> Result<bool, String> { panic!("--force must not prompt") };
+        assert_eq!(remove_db_decision(true, ask), Ok(false));
+    }
+
+    #[test]
+    fn interactive_uninstall_follows_the_operators_answer() {
+        assert_eq!(
+            remove_db_decision(false, || Ok::<_, String>(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            remove_db_decision(false, || Ok::<_, String>(false)),
+            Ok(false)
+        );
+        // No answer is not a "no": the uninstall stops instead.
+        assert_eq!(
+            remove_db_decision(false, || Err::<bool, _>("not a terminal".to_string())),
+            Err("not a terminal".to_string())
+        );
+    }
+
+    #[test]
+    fn force_install_needs_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("absent.toml");
+        let msg = match load_existing_for_force(&missing) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing config must not install defaults"),
+        };
+        assert!(msg.contains("no existing config found"), "got: {msg}");
+
+        // Positive control: the config that is there is the one installed from.
+        let good = dir.path().join("good.toml");
+        let mut cfg = config::Config::default();
+        cfg.general.db_path = "/var/lib/das-backup/force-test.db".to_string();
+        cfg.save(&good).unwrap();
+        let loaded = load_existing_for_force(&good).expect("an existing config must load");
+        assert_eq!(loaded.general.db_path, cfg.general.db_path);
+    }
+
+    /// Both refusals happen before the installer is reached, so these run
+    /// without touching the host.
+    #[test]
+    fn dispatch_stops_before_installing_when_the_config_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("absent.toml");
+        let err = dispatch(&args(&["force"]), &missing).unwrap_err();
+        assert!(err.to_string().contains("no existing config found"));
+
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "this is not = = valid toml [[[\n").unwrap();
+        let err = dispatch(&args(&["modify"]), &broken).unwrap_err();
+        assert!(err.to_string().contains("--modify: refusing to continue"));
     }
 }

@@ -3,8 +3,9 @@
 // System detection module — detect block devices, BTRFS subvolumes,
 // init system, package manager, and dependency availability.
 //
-// Design: parsing functions are pure and testable. Detection functions
-// call system commands and are NOT tested in unit tests.
+// Design: parsing functions are pure and take the command's output as input.
+// Detection functions are thin wrappers that spawn the command; the decision
+// of whether its output counts as an answer lives in `successful_stdout`.
 
 use serde::Deserialize;
 use std::process::Command;
@@ -31,11 +32,15 @@ impl BlockDevice {
     }
 
     /// Parse a human-readable size string like "512M", "22T", "2G" into bytes.
-    fn size_bytes(&self) -> u64 {
+    ///
+    /// lsblk's SIZE column counts in powers of 1024 whatever the suffix looks
+    /// like (a "2 TB" drive reads `1.8T`), so `K` is 1024 bytes here, not 1000.
+    ///
+    /// A size that cannot be read — empty, not a number, negative, or carrying
+    /// a unit this does not know — is `None`, never a number: a made-up byte
+    /// count is indistinguishable from a measured one.
+    fn size_bytes(&self) -> Option<u64> {
         let s = self.size.trim();
-        if s.is_empty() {
-            return 0;
-        }
 
         // Find where the numeric part ends and the suffix begins
         let (num_part, suffix) = match s.find(|c: char| c.is_ascii_alphabetic()) {
@@ -43,10 +48,10 @@ impl BlockDevice {
             None => (s, ""),
         };
 
-        let base: f64 = match num_part.parse() {
-            Ok(v) => v,
-            Err(_) => return 0,
-        };
+        let base: f64 = num_part.parse().ok()?;
+        if base < 0.0 {
+            return None;
+        }
 
         let multiplier: u64 = match suffix.to_uppercase().as_str() {
             "B" | "" => 1,
@@ -55,10 +60,10 @@ impl BlockDevice {
             "G" => 1024 * 1024 * 1024,
             "T" => 1024 * 1024 * 1024 * 1024,
             "P" => 1024 * 1024 * 1024 * 1024 * 1024,
-            _ => 1,
+            _ => return None,
         };
 
-        (base * multiplier as f64) as u64
+        Some((base * multiplier as f64) as u64)
     }
 }
 
@@ -98,17 +103,13 @@ pub fn parse_lsblk_output(json: &str) -> Result<Vec<BlockDevice>, serde_json::Er
 
 /// Run `lsblk` and return detected block devices.
 pub fn detect_block_devices() -> Vec<BlockDevice> {
-    let output = Command::new("lsblk")
-        .args(["--json", "-o", "NAME,SIZE,FSTYPE,SERIAL,MODEL,TRAN"])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let json = String::from_utf8_lossy(&out.stdout);
-            parse_lsblk_output(&json).unwrap_or_default()
-        }
-        _ => Vec::new(),
-    }
+    successful_stdout(Command::new("lsblk").args([
+        "--json",
+        "-o",
+        "NAME,SIZE,FSTYPE,SERIAL,MODEL,TRAN",
+    ]))
+    .map(|json| parse_lsblk_output(&json).unwrap_or_default())
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -153,17 +154,9 @@ pub fn parse_subvolume_output(output: &str) -> Vec<SubvolumeInfo> {
 
 /// Run `btrfs subvolume list /` and return detected subvolumes.
 pub fn detect_subvolumes() -> Vec<SubvolumeInfo> {
-    let output = Command::new("btrfs")
-        .args(["subvolume", "list", "/"])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            parse_subvolume_output(&text)
-        }
-        _ => Vec::new(),
-    }
+    successful_stdout(Command::new("btrfs").args(["subvolume", "list", "/"]))
+        .map(|text| parse_subvolume_output(&text))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +332,18 @@ impl SystemInfo {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The stdout of a command, only if it ran and exited successfully.
+///
+/// Whatever a failing command printed before it failed is not an answer, and
+/// neither is the silence of a command that could not be started: both are
+/// `None`, so the detectors above report nothing rather than something partial.
+fn successful_stdout(cmd: &mut Command) -> Option<String> {
+    match cmd.output() {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
+    }
+}
+
 /// Check if a binary is available on PATH.
 pub fn which(binary: &str) -> bool {
     Command::new("which")
@@ -480,5 +485,277 @@ ID 300 gen 500 top level 256 path @.archive.20260101T000000\n";
             detect_pkgmgr_from_binaries(true, true, true, true, true),
             PackageManager::Pacman
         );
+    }
+
+    fn sized(size: &str) -> BlockDevice {
+        BlockDevice {
+            name: "sdx".to_string(),
+            size: size.to_string(),
+            fstype: None,
+            serial: None,
+            model: None,
+            tran: None,
+        }
+    }
+
+    #[test]
+    fn size_bytes_counts_every_lsblk_unit_in_powers_of_1024() {
+        const K: u64 = 1024;
+        let cases: &[(&str, u64)] = &[
+            // No unit, or an explicit B, is already bytes.
+            ("0", 0),
+            ("512", 512),
+            ("512B", 512),
+            ("3K", 3 * K),
+            ("512M", 512 * K * K),
+            ("2G", 2 * K * K * K),
+            ("22T", 22 * K * K * K * K),
+            ("3P", 3 * K * K * K * K * K),
+            // Spelled out, so a slip in the constants above cannot hide one
+            // in the code: the 22 TB backup drives and a 2 GiB partition.
+            ("22T", 24_189_255_811_072),
+            ("2G", 2_147_483_648),
+            ("3P", 3_377_699_720_527_872),
+            // lsblk prints one decimal place: "55.5M", "931.5G", "1.8T".
+            ("1.5K", 1536),
+            ("55.5M", 58_195_968),
+            ("931.5G", 1_000_190_509_056),
+            ("0.5T", 549_755_813_888),
+            // Fractions of a byte are dropped, not rounded up.
+            ("1.8T", 1_979_120_929_996),
+            // Case and surrounding whitespace carry no meaning.
+            ("2g", 2_147_483_648),
+            ("  3K\n", 3 * K),
+            ("512b", 512),
+        ];
+        for &(size, bytes) in cases {
+            assert_eq!(sized(size).size_bytes(), Some(bytes), "size {size:?}");
+        }
+    }
+
+    #[test]
+    fn size_bytes_refuses_to_invent_a_number_for_an_unreadable_size() {
+        // lsblk reports a null size as "" (see `parse_lsblk_output`).
+        for size in [
+            "", "   ", "G", "abc", "1.2.3G", "1,5G", "-5G", "-1", "5X", "2GiB", "2 G", "1e3",
+        ] {
+            assert_eq!(sized(size).size_bytes(), None, "size {size:?}");
+        }
+    }
+
+    #[test]
+    fn parse_lsblk_keeps_every_field_and_maps_a_null_size_to_empty() {
+        // Trimmed from real `lsblk --json -o NAME,SIZE,FSTYPE,SERIAL,MODEL,TRAN`
+        // output; partitions arrive nested under "children" and are not devices.
+        let json = r#"{
+           "blockdevices": [
+              {
+                 "name": "loop2",
+                 "size": "4K",
+                 "fstype": "squashfs",
+                 "serial": null,
+                 "model": null,
+                 "tran": null
+              },{
+                 "name": "sdk",
+                 "size": "1.8T",
+                 "fstype": null,
+                 "serial": "ZK208Q77",
+                 "model": "ST2000DM008-2UB102",
+                 "tran": "usb",
+                 "children": [
+                    {
+                       "name": "sdk1",
+                       "size": "1.5G",
+                       "fstype": "vfat",
+                       "serial": null,
+                       "model": null,
+                       "tran": null
+                    }
+                 ]
+              },{
+                 "name": "sr0",
+                 "size": null,
+                 "fstype": null,
+                 "serial": null,
+                 "model": null,
+                 "tran": "sata"
+              }
+           ]
+        }"#;
+
+        let devices = parse_lsblk_output(json).expect("parse lsblk JSON");
+        let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["loop2", "sdk", "sr0"]);
+
+        assert_eq!(devices[0].size, "4K");
+        assert_eq!(devices[0].size_bytes(), Some(4096));
+        assert_eq!(devices[0].fstype.as_deref(), Some("squashfs"));
+        assert_eq!(devices[0].serial, None);
+        assert!(!devices[0].is_usb());
+
+        assert_eq!(devices[1].size, "1.8T");
+        assert_eq!(devices[1].fstype, None);
+        assert_eq!(devices[1].serial.as_deref(), Some("ZK208Q77"));
+        assert_eq!(devices[1].model.as_deref(), Some("ST2000DM008-2UB102"));
+        assert!(devices[1].is_usb());
+
+        assert_eq!(devices[2].size, "");
+        assert_eq!(devices[2].size_bytes(), None);
+    }
+
+    #[test]
+    fn parse_lsblk_rejects_text_that_is_not_lsblk_json() {
+        assert!(parse_lsblk_output("").is_err());
+        assert!(parse_lsblk_output("lsblk: not a block device").is_err());
+        assert!(parse_lsblk_output(r#"{"devices": []}"#).is_err());
+        assert!(
+            parse_lsblk_output(r#"{"blockdevices": []}"#)
+                .expect("an empty device list is valid")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_subvolume_skips_every_line_that_is_not_a_subvolume_row() {
+        let output = "\
+ID 256 gen 1000 top level 5 path @\n\
+\n\
+WARNING: this line has more than nine words in it path @bogus\n\
+XX 257 gen 999 top level 5 path @wrong-first-keyword\n\
+ID 258 gen 998 top level 5 name @wrong-eighth-keyword\n\
+ID 259 gen 997 top level 5 path\n\
+ID 260 gen 996 top level 5\n\
+ID 261\n\
+ID nan gen 995 top level 5 path @bad-id\n\
+ID 262 gen 994 top level nan path @bad-top-level\n\
+ID 263 gen 993 top level 256 path @home/bosco/My Documents\n";
+
+        let subs = parse_subvolume_output(output);
+        let rows: Vec<(u64, u64, &str)> = subs
+            .iter()
+            .map(|s| (s.id, s.top_level, s.name.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [(256, 5, "@"), (263, 256, "@home/bosco/My Documents")]
+        );
+        assert!(parse_subvolume_output("").is_empty());
+    }
+
+    #[test]
+    fn successful_stdout_is_none_unless_the_command_ran_and_exited_zero() {
+        assert_eq!(
+            successful_stdout(Command::new("sh").args(["-c", "printf 'ID 5\\n'"])),
+            Some("ID 5\n".to_string())
+        );
+        // Output printed before a failure is not an answer.
+        assert_eq!(
+            successful_stdout(Command::new("sh").args(["-c", "printf partial; exit 3"])),
+            None
+        );
+        assert_eq!(
+            successful_stdout(&mut Command::new("/nonexistent/das-no-such-binary")),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_block_devices_lists_the_disks_lsblk_reports() {
+        // Asked a second way: one bare name per whole device, no JSON involved.
+        let expected: Vec<String> = successful_stdout(Command::new("lsblk").args([
+            "--nodeps",
+            "--noheadings",
+            "-o",
+            "NAME",
+        ]))
+        .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default();
+
+        let found: Vec<String> = detect_block_devices().into_iter().map(|d| d.name).collect();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn install_cmd_is_the_non_interactive_form_for_each_package_manager() {
+        // The wizard prints these for the operator to run as-is, so each must
+        // be a complete command that will not stop to ask a question.
+        let pkgs = ["btrbk", "smartmontools"];
+        let cases = [
+            (
+                PackageManager::Pacman,
+                "pacman -S --noconfirm btrbk smartmontools",
+            ),
+            (
+                PackageManager::Apt,
+                "apt-get install -y btrbk smartmontools",
+            ),
+            (PackageManager::Dnf, "dnf install -y btrbk smartmontools"),
+            (
+                PackageManager::Zypper,
+                "zypper install -y btrbk smartmontools",
+            ),
+            (PackageManager::Apk, "apk add btrbk smartmontools"),
+            // No known manager: a comment, so pasting it into a shell runs nothing.
+            (
+                PackageManager::Unknown,
+                "# install manually: btrbk smartmontools",
+            ),
+        ];
+        for (mgr, expected) in cases {
+            assert_eq!(mgr.install_cmd(&pkgs), expected, "{mgr:?}");
+        }
+        assert_eq!(
+            PackageManager::Pacman.install_cmd(&["mbuffer"]),
+            "pacman -S --noconfirm mbuffer"
+        );
+    }
+
+    // A name no package installs.
+    const NO_SUCH_BINARY: &str = "das-no-such-binary-7f3a9c";
+
+    #[test]
+    fn which_finds_a_real_binary_and_not_a_missing_one() {
+        assert!(which("sh"));
+        assert!(!which(NO_SUCH_BINARY));
+    }
+
+    #[test]
+    fn which_path_is_the_binary_location_or_none_never_a_made_up_path() {
+        let sh = which_path("sh").expect("sh is on PATH");
+        assert!(sh.ends_with("/sh"), "{sh:?}");
+        assert!(std::path::Path::new(&sh).is_absolute(), "{sh:?}");
+        assert!(std::path::Path::new(&sh).is_file(), "{sh:?}");
+
+        assert_eq!(which_path(NO_SUCH_BINARY), None);
+    }
+
+    #[test]
+    fn check_dependencies_lists_each_tool_with_its_requirement_and_real_path() {
+        fn summary(deps: &[DepStatus]) -> Vec<(&str, bool)> {
+            deps.iter().map(|d| (d.name.as_str(), d.required)).collect()
+        }
+
+        // mbuffer only smooths the send stream; a backup runs without it.
+        let base = [
+            ("btrbk", true),
+            ("btrfs", true),
+            ("smartctl", true),
+            ("lsblk", true),
+            ("mbuffer", false),
+        ];
+        let without_email = check_dependencies(false);
+        assert_eq!(summary(&without_email), base);
+
+        // mailx is needed exactly when reports are to be mailed.
+        let with_email = check_dependencies(true);
+        let mut expected = base.to_vec();
+        expected.push(("mailx", true));
+        assert_eq!(summary(&with_email), expected);
+
+        // A dependency is reported present only where it really resolves.
+        for dep in &with_email {
+            assert_eq!(dep.path, which_path(&dep.name), "{}", dep.name);
+        }
     }
 }

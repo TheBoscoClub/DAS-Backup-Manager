@@ -229,7 +229,7 @@ pub enum ScrubError {
     Lock { path: String, detail: String },
     /// The state file could not be read or written.
     State { path: String, detail: String },
-    /// The state file holds unparseable JSON. Distinct from
+    /// The state file holds unparsable JSON. Distinct from
     /// [`ScrubError::State`] because the two demand opposite handling: a
     /// corrupt file may be quarantined and replaced, whereas an
     /// unreadable-but-intact file must never be overwritten. Reporting it does
@@ -260,7 +260,7 @@ impl fmt::Display for ScrubError {
             Self::Lock { path, detail } => write!(f, "Lock '{path}': {detail}"),
             Self::State { path, detail } => write!(f, "Scrub state '{path}': {detail}"),
             Self::StateCorrupt { path, detail } => {
-                write!(f, "Scrub state '{path}' is unparseable: {detail}")
+                write!(f, "Scrub state '{path}' is unparsable: {detail}")
             }
             Self::StatusMissing { path } => {
                 write!(f, "No scrub status record at '{path}'")
@@ -982,7 +982,7 @@ pub fn state_path() -> PathBuf {
 ///
 /// **Pure**: this never writes, renames, or deletes anything, so the
 /// unprivileged readers (health checks, the GUI) can call it freely and get an
-/// error that means exactly one thing. Unparseable JSON is reported as
+/// error that means exactly one thing. Unparsable JSON is reported as
 /// [`ScrubError::StateCorrupt`]; every other failure (EIO, EACCES, a file that
 /// is intact but momentarily unreadable) is [`ScrubError::State`] and the file
 /// must not be overwritten — doing so would destroy the `last_success_epoch`
@@ -1002,7 +1002,7 @@ pub fn load_state_from(path: &Path) -> Result<ScrubState, ScrubError> {
     })
 }
 
-/// Move an unparseable state file aside to `<path>.corrupt`, preserving the
+/// Move an unparsable state file aside to `<path>.corrupt`, preserving the
 /// evidence while freeing the canonical path for a fresh write.
 ///
 /// Root-only in practice (the state file lives under `/var/lib/das-backup`).
@@ -1161,7 +1161,7 @@ pub struct ScrubFsResult {
     pub mounted_by_engine: bool,
     /// Whether a real `btrfs scrub start` child process was confirmed to
     /// launch for this filesystem — `true` only once `Command::spawn()` has
-    /// actually succeeded, never set pre-emptively.
+    /// actually succeeded, never set preemptively.
     ///
     /// This is the authoritative "was a scrub genuinely attempted" signal
     /// consumed by the CLI's `exit_code_for_pass` (`bd
@@ -1638,7 +1638,7 @@ fn persist_pass(pass: &ScrubPass, progress: &dyn ProgressCallback) -> Result<Pat
             progress.on_log(
                 LogLevel::Warning,
                 &format!(
-                    "Scrub state file was unparseable ({detail}) — quarantined to {} and rebuilt",
+                    "Scrub state file was unparsable ({detail}) — quarantined to {} and rebuilt",
                     moved.display()
                 ),
             );
@@ -1713,7 +1713,7 @@ fn scrub_one_target(
     // outcome, but `result.started_epoch`/`result.scrub_launched` are
     // deliberately only stamped once `run_btrfs_scrub` confirms the child
     // process actually launched — see the doc comment on
-    // `ScrubFsResult::scrub_launched` for why a pre-emptive stamp here was a
+    // `ScrubFsResult::scrub_launched` for why a preemptive stamp here was a
     // bug (`bd DAS-Backup-Manager-18p` review).
     let scrub_started = now_epoch();
     match run_btrfs_scrub(&mount_point, &fsuuid, progress) {
@@ -2192,6 +2192,86 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
 mod tests {
     use super::*;
     use crate::progress::{NullProgress, TestProgress};
+
+    /// These strings are what the operator reads in the scrub report and the
+    /// journal, and each has to say which file or filesystem it is about: a
+    /// message that drops its path leaves nothing to act on.
+    #[test]
+    fn scrub_error_messages_name_what_went_wrong_and_where() {
+        let s = String::from;
+        let cases = [
+            (
+                ScrubError::NoTargets,
+                "No scrub targets configured ([scrub].targets is empty)",
+            ),
+            (
+                ScrubError::Lock {
+                    path: s("/run/das-scrub.lock"),
+                    detail: s("permission denied"),
+                },
+                "Lock '/run/das-scrub.lock': permission denied",
+            ),
+            (
+                ScrubError::State {
+                    path: s("/var/lib/das-backup/scrub-state.json"),
+                    detail: s("read-only file system"),
+                },
+                "Scrub state '/var/lib/das-backup/scrub-state.json': read-only file system",
+            ),
+            (
+                ScrubError::StateCorrupt {
+                    path: s("/var/lib/das-backup/scrub-state.json"),
+                    detail: s("expected value at line 1 column 1"),
+                },
+                "Scrub state '/var/lib/das-backup/scrub-state.json' is unparsable: \
+                 expected value at line 1 column 1",
+            ),
+            (
+                ScrubError::StatusMissing {
+                    path: s("/var/lib/btrfs/scrub.status.abc"),
+                },
+                "No scrub status record at '/var/lib/btrfs/scrub.status.abc'",
+            ),
+            (
+                ScrubError::StatusIo {
+                    path: s("/var/lib/btrfs/scrub.status.abc"),
+                    detail: s("permission denied"),
+                },
+                "Cannot read scrub status record '/var/lib/btrfs/scrub.status.abc': \
+                 permission denied",
+            ),
+            (
+                ScrubError::StatusMissingHeader,
+                "Scrub status record has no 'scrub status:<n>' header",
+            ),
+            (
+                ScrubError::StatusUnsupportedVersion { version: s("2") },
+                "Unsupported scrub status format version '2'",
+            ),
+            (
+                ScrubError::StatusUuidMismatch {
+                    expected: s("b2dbe07d"),
+                    found: s("60b05268"),
+                },
+                "Scrub status record is for filesystem '60b05268', expected 'b2dbe07d'",
+            ),
+            (
+                ScrubError::StatusNoDevices {
+                    fsuuid: s("b2dbe07d"),
+                },
+                "Scrub status record for 'b2dbe07d' has no device rows",
+            ),
+            (
+                ScrubError::StatusMalformed {
+                    detail: s("row 3 has 2 fields"),
+                },
+                "Malformed scrub status record: row 3 has 2 fields",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     /// Real record read from `/var/lib/btrfs/scrub.status.60b05268-…` on the
     /// author's host (recovery-A, scrubbed 2026-07-27 — the good pass that the
