@@ -253,3 +253,6 @@ Dockerfile
 # cargo-mutants working output (see bd DAS-Backup-Manager-bxl)
 mutants.out/
 mutants.out.old/
+
+# Self-interrogation gate log (machine-local audit trail) — never commit
+.claude-si-gate-log.md
