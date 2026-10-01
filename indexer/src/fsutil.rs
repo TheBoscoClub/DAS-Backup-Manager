@@ -45,6 +45,69 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// A scripted `CommandRunner` for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::CommandRunner;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, ExitStatus, Output};
+    use std::sync::Mutex;
+
+    /// Answers by the command's full argv, joined with single spaces. An
+    /// unscripted command exits 1 with no output, so a test cannot pass by
+    /// accident on a call it never expected.
+    pub(crate) struct Scripted {
+        answers: Vec<(String, i32, String)>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        pub(crate) fn new(answers: &[(&str, i32, &str)]) -> Self {
+            Self::from_owned(
+                answers
+                    .iter()
+                    .map(|(k, c, o)| (k.to_string(), *c, o.to_string()))
+                    .collect(),
+            )
+        }
+
+        pub(crate) fn from_owned(answers: Vec<(String, i32, String)>) -> Self {
+            Self {
+                answers,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every argv run so far, in order.
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for Scripted {
+        fn output(&self, cmd: &mut Command) -> io::Result<Output> {
+            let argv = std::iter::once(cmd.get_program())
+                .chain(cmd.get_args())
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.calls.lock().unwrap().push(argv.clone());
+            let (code, stdout) = self
+                .answers
+                .iter()
+                .find(|(k, _, _)| *k == argv)
+                .map(|(_, c, o)| (*c, o.clone()))
+                .unwrap_or((1, String::new()));
+            Ok(Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
