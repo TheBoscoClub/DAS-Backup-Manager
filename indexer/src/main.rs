@@ -2995,7 +2995,6 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             volume: "/.btrfs-hdd".into(),
             source_labels: vec!["hdd-projects".into()],
             name: "ClaudeCodeProjects/new-project".into(),
-            category: doctor::DriftCategory::Irreplaceable,
         });
         let outcome = doctor::DoctorOutcome::Ran(report);
         assert_eq!(exit_code_for_doctor(&outcome), 1);
@@ -3039,7 +3038,6 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             volume: "/.btrfs-hdd".into(),
             source_labels: vec!["hdd-projects".into()],
             name: "ClaudeCodeProjects/powershell-scripts".into(),
-            category: doctor::DriftCategory::Irreplaceable,
         });
         assert!(report.has_drift());
         let outcome = doctor::DoctorOutcome::Ran(report);

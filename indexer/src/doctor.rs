@@ -11,14 +11,20 @@
 //! - **Stale** — a `[[source]].subvolume` entry references a name that no longer
 //!   exists on disk (renamed or deleted project, never cleaned out of config).
 //!
+//! The backup run adopts new subvolumes by itself (`btrdasd subvol sync`), so a
+//! subvolume reported **missing** now means that step failed or has not run
+//! since the subvolume was created. The check uses the same listing
+//! ([`crate::adopt::list_volumes`]) and the same exclusion rules as sync, so
+//! the two cannot disagree about what a volume holds or what is left out.
+//!
 //! # Design: pure core, thin orchestration shell
 //!
-//! Every decision that can be made from data alone — parsing `btrfs subvolume
-//! list` output, applying exclusions, computing the missing/stale sets,
-//! categorizing a missing subvolume as irreplaceable vs. rebuildable, matching a
-//! glob pattern — is a pure function over `Vec<String>`/structs, fixture-tested
-//! below with no root privileges and no real btrfs filesystem. Only
-//! [`run_drift_check`] and its helpers touch locks, mounts, or spawn `btrfs`.
+//! Every decision that can be made from data alone — applying exclusions,
+//! computing the missing/stale sets, turning volume listings into a report,
+//! matching a glob pattern — is a pure function over `Vec<String>`/structs,
+//! fixture-tested below with no root privileges and no real btrfs filesystem.
+//! Only [`run_drift_check`] and its helpers touch locks, mounts, or spawn
+//! `btrfs`.
 //!
 //! # Why a real mountpoint check gates every `btrfs subvolume list` call
 //!
@@ -27,19 +33,16 @@
 //! `/.btrfs-ssd`) are plain empty directories on the host's root filesystem when
 //! unmounted, so an unmounted-and-unguarded call silently lists the *root
 //! filesystem's* subvolumes instead and returns a normal, successful-looking
-//! result — this was reproduced live while investigating this feature (`sudo
-//! btrfs subvolume list /.btrfs-hdd` on an unmounted `/.btrfs-hdd` returned the
-//! NVMe root filesystem's `@`/`@home`/`@root`/`@log`/... subvolumes). That is the
-//! same "bare mountpoint falls through to the parent filesystem" trap documented
-//! for backup targets in `.claude/rules/backup.md` (bd DAS-Backup-Manager-9on),
-//! applied to sources instead of targets. [`list_mounted_subvolumes`] therefore
-//! requires [`health::is_mountpoint`] to confirm the path is a real mountpoint
-//! before ever trusting `btrfs subvolume list`'s output for it — a silent
-//! wrong-filesystem read here would corrupt both the missing and stale sets.
+//! result. That is the same "bare mountpoint falls through to the parent
+//! filesystem" trap documented for backup targets in `.claude/rules/backup.md`
+//! (bd DAS-Backup-Manager-9on), applied to sources instead of targets.
+//! [`crate::adopt::list_volumes`] therefore requires a real mountpoint with the
+//! expected UUID before it trusts a listing — a silent wrong-filesystem read
+//! here would corrupt both the missing and stale sets.
 
 use std::path::Path;
-use std::process::Command;
 
+use crate::adopt::VolumeListing;
 use crate::config::Config;
 use crate::health;
 use crate::mount;
@@ -50,23 +53,6 @@ use crate::scrub;
 /// than queues (this is a fast, cheap, read-mostly check; queuing behind
 /// another instance would gain nothing).
 pub const DOCTOR_LOCK_PATH: &str = "/run/das-doctor.lock";
-
-/// Subvolume-name substrings (case-insensitive) that mark a missing subvolume
-/// as "probably rebuildable" rather than "likely irreplaceable". Deliberately a
-/// fixed, non-configurable list — `[doctor].exclude` is for suppressing drift
-/// reports entirely, this list only changes how a still-reported item is
-/// categorized.
-const REBUILDABLE_PATTERNS: &[&str] = &[
-    "cache",
-    "tmp",
-    "steam",
-    "docker",
-    "build",
-    "target",
-    "node_modules",
-    ".cargo",
-    "iso",
-];
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -114,18 +100,9 @@ impl From<scrub::ScrubError> for DoctorError {
 /// and the scrub engine (`scrub::acquire_locks`) — so those three are
 /// deadlock-free as a set even though this side never blocks.
 ///
-/// **This does not cover every backup code path.** The manual CLI
-/// subcommands `btrdasd backup run` / `snapshot` / `send` / `boot-archive`
-/// (`backup.rs`, invoked directly by an operator rather than through the
-/// scheduled systemd timer) take no lock at all — `backup.rs` has no
-/// reference to `MAINTENANCE_LOCK_PATH` or `scrub::FileLock` anywhere. A
-/// `btrdasd doctor` run and a concurrent manual `btrdasd backup` invocation
-/// can therefore both mount/unmount the same source volumes at once today;
-/// the maintenance lock only serializes doctor/scrub against the *scheduled*
-/// backup path. This is a real, currently-uncovered gap, not a design
-/// decision — closing it (having the manual backup subcommands take the same
-/// lock) is tracked separately (see bd DAS-Backup-Manager, manual-backup lock
-/// gap) rather than folded into this feature.
+/// **Manual backups take the same locks** through `backup::acquire_manual_locks`, so a
+/// `btrdasd doctor` run and a manual `btrdasd backup` invocation cannot mount or
+/// unmount the same source volumes at once (bd `pe6`).
 ///
 /// **Kill-signal case (documented, not handled by a signal handler).** A
 /// `SIGKILL` — e.g. `systemd` escalating past `das-backup-doctor.service`'s
@@ -181,7 +158,7 @@ fn try_acquire_locks() -> Result<LockAttempt, DoctorError> {
 }
 
 // ---------------------------------------------------------------------------
-// Pure core — glob matching, exclusion, categorization, drift computation
+// Pure core — glob matching, drift computation
 // ---------------------------------------------------------------------------
 
 /// Minimal shell-style glob match (`*` = any run of characters including none,
@@ -208,85 +185,22 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
     }
 }
 
-/// Whether `path` matches one of the built-in exclusions: inside a
-/// `.snapshots/` or `.btrbk-snapshots/` directory (Snapper-managed or btrbk's
-/// own — nested at any depth, e.g. `Audiobooks/.btrbk-snapshots/...`), or is
-/// exactly `@tmp` / `@var-tmp`.
-pub fn is_builtin_excluded(path: &str) -> bool {
-    let in_snapshot_dir = path
-        .split('/')
-        .any(|component| component == ".snapshots" || component == ".btrbk-snapshots");
-    in_snapshot_dir || path == "@tmp" || path == "@var-tmp"
-}
-
-/// Whether `path` matches any user-supplied `[doctor].exclude` glob pattern.
-pub fn is_user_excluded(path: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pat| glob_match(pat, path))
-}
-
-/// Category assigned to a missing (on-disk, not-in-config) subvolume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriftCategory {
-    /// No name match against [`REBUILDABLE_PATTERNS`] — treated as data that
-    /// cannot be regenerated (code, databases, configs, media).
-    Irreplaceable,
-    /// Name contains a rebuildable-pattern substring (cache, build output,
-    /// package manager state, ISOs) — still reported, but flagged as lower
-    /// priority to add to config.
-    Rebuildable,
-}
-
-/// Categorize a subvolume name by case-insensitive substring match against
-/// [`REBUILDABLE_PATTERNS`].
-pub fn categorize(name: &str) -> DriftCategory {
-    let lower = name.to_lowercase();
-    if REBUILDABLE_PATTERNS.iter().any(|pat| lower.contains(pat)) {
-        DriftCategory::Rebuildable
-    } else {
-        DriftCategory::Irreplaceable
-    }
-}
-
-/// Parse `btrfs subvolume list <mount>` stdout into subvolume paths (the last
-/// whitespace-delimited field of each line — the same parsing convention
-/// already used by `backup::find_latest_btrbk_snapshot`).
-pub fn parse_subvolume_list_output(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .filter_map(|line| line.split_whitespace().last())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Result of comparing an on-disk subvolume list against a configured list.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct DriftDiff {
-    /// On disk, not in config — `(name, category)`, sorted by name.
-    pub missing: Vec<(String, DriftCategory)>,
-    /// In config, not on disk — sorted by name.
-    pub stale: Vec<String>,
-}
-
-/// Compute missing/stale drift between an on-disk subvolume list and a
-/// configured subvolume list. `user_exclude` patterns (plus the built-in
-/// exclusions) are applied only to the *missing* side — an excluded on-disk
-/// path is simply invisible to this check, never reported either way. The
-/// *stale* side is never filtered: a configured entry that happens to match an
-/// exclude pattern is still a legitimate stale-config finding if it's absent
-/// on disk.
+/// On-disk subvolumes that sync should have adopted: not configured, not in
+/// a snapshot tree, not excluded.
 pub fn compute_missing(
     on_disk: &[String],
     configured: &[String],
-    user_exclude: &[String],
-) -> Vec<(String, DriftCategory)> {
-    let mut missing: Vec<(String, DriftCategory)> = on_disk
+    exclude: &[String],
+) -> Vec<String> {
+    let mut missing: Vec<String> = on_disk
         .iter()
-        .filter(|p| !is_builtin_excluded(p) && !is_user_excluded(p, user_exclude))
+        .filter(|p| !crate::adopt::in_snapshot_tree(p))
+        .filter(|p| crate::adopt::excluding_pattern(p, exclude).is_none())
         .filter(|p| !configured.contains(p))
-        .map(|p| (p.clone(), categorize(p)))
+        .cloned()
         .collect();
-    missing.sort_by(|a, b| a.0.cmp(&b.0));
-    missing.dedup_by(|a, b| a.0 == b.0);
+    missing.sort();
+    missing.dedup();
     missing
 }
 
@@ -339,7 +253,9 @@ pub fn group_sources_by_volume(config: &Config) -> Vec<VolumeGroup> {
             }
         };
         group.source_labels.push(source.label.clone());
-        for sv in &source.subvolumes {
+        // A retired entry is not backed up. If its subvolume is back on disk it
+        // must read as missing, because sync will revive it rather than ignore it.
+        for sv in source.subvolumes.iter().filter(|e| e.retired.is_none()) {
             if !group.configured.contains(&sv.name) {
                 group.configured.push(sv.name.clone());
             }
@@ -363,7 +279,6 @@ pub struct MissingSubvolume {
     /// `format_report`'s doc comment).
     pub source_labels: Vec<String>,
     pub name: String,
-    pub category: DriftCategory,
 }
 
 /// A stale (configured, not on-disk) subvolume, attributed to the specific
@@ -428,76 +343,57 @@ pub enum DoctorOutcome {
     Ran(DriftReport),
 }
 
-/// Run `btrfs subvolume list` against `mount_path`, requiring it to already be
-/// a real, live mountpoint (see the module doc comment for why this guard is
-/// safety-critical, not optional).
-fn list_mounted_subvolumes(mount_path: &str) -> Result<Vec<String>, String> {
-    if !health::is_mountpoint(Path::new(mount_path)) {
-        return Err(format!(
-            "{mount_path} is not mounted — refusing to run 'btrfs subvolume list' \
-             against it (an unmounted bare directory would silently list whatever \
-             filesystem it falls through to, not this source)"
-        ));
-    }
-    let output = Command::new("btrfs")
-        .args(["subvolume", "list", mount_path])
-        .output()
-        .map_err(|e| format!("failed to execute btrfs: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "'btrfs subvolume list {mount_path}' failed: {}",
-            stderr.trim()
-        ));
-    }
-    Ok(parse_subvolume_list_output(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
-}
-
-/// Mount sources, list + compare every configured volume, unmount, and build
-/// the report. Never returns `Err` — per-volume failures are recorded in
-/// [`DriftReport::volumes_failed`] instead, matching the scrub engine's
-/// "some targets fail, the pass still ran" philosophy (`exit_code_for_pass`
-/// in `main.rs`): a check that examined 3 of 4 volumes still ran.
-fn perform_drift_check(config: &Config, progress: &dyn ProgressCallback) -> DriftReport {
-    let mut guard = mount::ensure_sources_mounted(config, progress);
-
+/// Turn volume listings into a report. A volume whose listing failed, or that
+/// has no listing at all, is recorded in `volumes_failed` and nothing is
+/// computed for it: "could not look" must never read as "nothing missing".
+pub fn drift_from_listings(config: &Config, listings: &[VolumeListing]) -> DriftReport {
     let groups = group_sources_by_volume(config);
     let mut report = DriftReport::default();
     // volume -> on-disk list, so the per-source stale check below doesn't
-    // re-run `btrfs subvolume list` for volumes multiple sources share.
-    let mut on_disk_by_volume: Vec<(String, Vec<String>)> = Vec::new();
+    // need the listing again for volumes multiple sources share.
+    let mut on_disk_by_volume: Vec<(&str, &Vec<String>)> = Vec::new();
+    let exclude = config.exclude_patterns();
 
     for group in &groups {
-        match list_mounted_subvolumes(&group.volume) {
-            Ok(on_disk) => {
+        let listing = listings.iter().find(|l| l.volume == group.volume);
+        match listing.map(|l| &l.subvolumes) {
+            Some(Ok(on_disk)) => {
                 report.volumes_checked += 1;
-                let missing = compute_missing(&on_disk, &group.configured, &config.doctor.exclude);
-                for (name, category) in missing {
+                for name in compute_missing(on_disk, &group.configured, &exclude) {
                     report.missing.push(MissingSubvolume {
                         volume: group.volume.clone(),
                         source_labels: group.source_labels.clone(),
                         name,
-                        category,
                     });
                 }
-                on_disk_by_volume.push((group.volume.clone(), on_disk));
+                on_disk_by_volume.push((group.volume.as_str(), on_disk));
             }
-            Err(detail) => {
-                report.volumes_failed.push((group.volume.clone(), detail));
+            Some(Err(why)) => {
+                report
+                    .volumes_failed
+                    .push((group.volume.clone(), why.clone()));
+            }
+            None => {
+                report
+                    .volumes_failed
+                    .push((group.volume.clone(), "volume was not listed".to_string()));
             }
         }
     }
 
     // Stale check is per-source (each config entry belongs to exactly one
-    // source), using the already-fetched on-disk list for that source's
-    // volume — skipped entirely for a source whose volume failed above.
+    // source), skipped entirely for a source whose volume failed above. A
+    // retired entry is expected to be absent, so it is never stale.
     for source in &config.sources {
         let Some((_, on_disk)) = on_disk_by_volume.iter().find(|(v, _)| *v == source.volume) else {
             continue;
         };
-        let configured: Vec<String> = source.subvolumes.iter().map(|sv| sv.name.clone()).collect();
+        let configured: Vec<String> = source
+            .subvolumes
+            .iter()
+            .filter(|sv| sv.retired.is_none())
+            .map(|sv| sv.name.clone())
+            .collect();
         for name in compute_stale(on_disk, &configured) {
             report.stale.push(StaleSubvolume {
                 volume: source.volume.clone(),
@@ -506,7 +402,19 @@ fn perform_drift_check(config: &Config, progress: &dyn ProgressCallback) -> Drif
             });
         }
     }
+    report
+}
 
+/// Mount sources, list every configured volume, unmount, and build the
+/// report. Never returns `Err` — per-volume failures are recorded in
+/// [`DriftReport::volumes_failed`] instead, matching the scrub engine's
+/// "some targets fail, the pass still ran" philosophy (`exit_code_for_pass`
+/// in `main.rs`): a check that examined 3 of 4 volumes still ran.
+fn perform_drift_check(config: &Config, progress: &dyn ProgressCallback) -> DriftReport {
+    let mut guard = mount::ensure_sources_mounted(config, progress);
+    let listings =
+        crate::adopt::list_volumes(config, &crate::fsutil::SystemRunner, &health::is_mountpoint);
+    let report = drift_from_listings(config, &listings);
     guard.unmount(progress);
     report
 }
@@ -551,20 +459,15 @@ pub fn run_drift_check(
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
-
 /// Render a human-readable report, shared verbatim as both the console output
 /// and the email body (mirrors `scrub::format_scrub_report`'s approach — the
 /// mailer derives its subject status word from the literal string `FAILURE`
 /// appearing in the body, so the header below always contains it whenever the
 /// check found drift, a volume failure, or could not run at all).
 ///
-/// Deliberately does not try to pick a single `[[source]]` block to suggest
-/// adding a missing subvolume to when multiple sources share its volume — the
-/// four `/.btrfs-hdd` sources in the production config (`hdd-projects`,
-/// `hdd-media`, `hdd-system`, `hdd-audiobooks`) split that one filesystem by
-/// *purpose*, and only a human knows whether a newly-found subvolume is a new
-/// project, new media, or something else. The snippet instead lists every
-/// source label sharing the volume so the operator can pick.
+/// A missing subvolume is reported as a failure of the backup run's own
+/// adoption step, never as a to-do list: the fix is to find out why sync did
+/// not adopt it, not to edit `config.toml` by hand.
 pub fn format_report(report: &DriftReport) -> String {
     let sep = "═".repeat(63);
     let thin = "─".repeat(63);
@@ -605,65 +508,27 @@ pub fn format_report(report: &DriftReport) -> String {
     }
 
     if !report.missing.is_empty() {
-        let irreplaceable: Vec<&MissingSubvolume> = report
-            .missing
-            .iter()
-            .filter(|m| m.category == DriftCategory::Irreplaceable)
-            .collect();
-        let rebuildable: Vec<&MissingSubvolume> = report
-            .missing
-            .iter()
-            .filter(|m| m.category == DriftCategory::Rebuildable)
-            .collect();
-
-        if !irreplaceable.is_empty() {
+        r.push_str(&format!(
+            "\nNOT BACKED UP — the backup run should have adopted these\n{thin}\n"
+        ));
+        for m in &report.missing {
             r.push_str(&format!(
-                "\nMISSING — LIKELY IRREPLACEABLE (add to config)\n{thin}\n"
+                "  {}  (volume {}, source(s): {})\n",
+                m.name,
+                m.volume,
+                m.source_labels.join(", ")
             ));
-            for m in &irreplaceable {
-                r.push_str(&format!(
-                    "  {}  (volume {}, source(s): {})\n",
-                    m.name,
-                    m.volume,
-                    m.source_labels.join(", ")
-                ));
-            }
         }
-        if !rebuildable.is_empty() {
-            r.push_str(&format!(
-                "\nMISSING — PROBABLY REBUILDABLE (review before adding)\n{thin}\n"
-            ));
-            for m in &rebuildable {
-                r.push_str(&format!(
-                    "  {}  (volume {}, source(s): {})\n",
-                    m.name,
-                    m.volume,
-                    m.source_labels.join(", ")
-                ));
-            }
-        }
-
-        if !irreplaceable.is_empty() {
-            r.push_str(&format!(
-                "\nSUGGESTED config.toml ADDITIONS (irreplaceable set — pick the \
-                 appropriate [[source]] block per volume)\n{thin}\n"
-            ));
-            for m in &irreplaceable {
-                r.push_str(&format!(
-                    "  # volume {} — add under one of: {}\n",
-                    m.volume,
-                    m.source_labels.join(", ")
-                ));
-                r.push_str("  [[source.subvolumes]]\n");
-                r.push_str(&format!("  name = \"{}\"\n", m.name));
-                r.push_str("  manual_only = false\n\n");
-            }
-        }
+        r.push_str(
+            "\n  The backup run adopts new subvolumes by itself. One appearing here means\n  \
+             that step failed or has not run since the subvolume was created. See what\n  \
+             it would do with:  sudo btrdasd subvol sync --dry-run\n",
+        );
     }
 
     if !report.stale.is_empty() {
         r.push_str(&format!(
-            "\nSTALE CONFIG ENTRIES (configured, not found on disk)\n{thin}\n"
+            "\nSTALE CONFIG ENTRIES (configured, not retired, not found on disk)\n{thin}\n"
         ));
         for s in &report.stale {
             r.push_str(&format!(
@@ -685,6 +550,10 @@ pub fn format_report(report: &DriftReport) -> String {
 mod tests {
     use super::*;
     use crate::config::{Source, SubvolConfig};
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|x| (*x).to_string()).collect()
+    }
 
     // -- glob_match --------------------------------------------------------
 
@@ -721,191 +590,77 @@ mod tests {
         assert!(!glob_match("*foo*bar*", "xxfooyy"));
     }
 
-    // -- is_builtin_excluded ------------------------------------------------
-
-    #[test]
-    fn builtin_excludes_snapshots_dir() {
-        assert!(is_builtin_excluded(".snapshots/4460/snapshot"));
-        assert!(is_builtin_excluded("@root/.snapshots/3811/snapshot"));
-        assert!(is_builtin_excluded(".snapshots"));
-    }
-
-    #[test]
-    fn builtin_excludes_btrbk_snapshots_dir_nested() {
-        assert!(is_builtin_excluded(".btrbk-snapshots/root.20260801T0325"));
-        assert!(is_builtin_excluded(
-            "Audiobooks/.btrbk-snapshots/foo.20260101T0000"
-        ));
-        assert!(is_builtin_excluded(".btrbk-snapshots"));
-    }
-
-    #[test]
-    fn builtin_excludes_tmp_subvols() {
-        assert!(is_builtin_excluded("@tmp"));
-        assert!(is_builtin_excluded("@var-tmp"));
-        // Substring, not exact match, must NOT be excluded — only the exact
-        // top-level names are built-in exclusions.
-        assert!(!is_builtin_excluded("@tmpfiles-extra"));
-    }
-
-    #[test]
-    fn builtin_does_not_exclude_ordinary_paths() {
-        assert!(!is_builtin_excluded(
-            "ClaudeCodeProjects/DAS-Backup-Manager"
-        ));
-        assert!(!is_builtin_excluded("@docker"));
-    }
-
-    // -- is_user_excluded ----------------------------------------------------
-
-    #[test]
-    fn user_exclude_patterns() {
-        let patterns = vec!["*.cache".to_string(), "Downloads/*".to_string()];
-        assert!(is_user_excluded("build.cache", &patterns));
-        assert!(is_user_excluded("Downloads/movie.iso", &patterns));
-        assert!(!is_user_excluded("ClaudeCodeProjects/foo", &patterns));
-    }
-
-    #[test]
-    fn user_exclude_empty_excludes_nothing() {
-        assert!(!is_user_excluded("anything", &[]));
-    }
-
-    // -- categorize -----------------------------------------------------------
-
-    #[test]
-    fn categorize_rebuildable_patterns() {
-        assert_eq!(categorize("@docker"), DriftCategory::Rebuildable);
-        assert_eq!(categorize("SteamLibrary"), DriftCategory::Rebuildable);
-        assert_eq!(categorize("build-cache"), DriftCategory::Rebuildable);
-        assert_eq!(categorize("ISOs"), DriftCategory::Rebuildable);
-        assert_eq!(categorize("node_modules"), DriftCategory::Rebuildable);
-        assert_eq!(categorize(".cargo"), DriftCategory::Rebuildable);
-        assert_eq!(categorize("target"), DriftCategory::Rebuildable);
-    }
-
-    #[test]
-    fn categorize_case_insensitive() {
-        assert_eq!(categorize("STEAM-library"), DriftCategory::Rebuildable);
-        assert_eq!(categorize("Build-Output"), DriftCategory::Rebuildable);
-    }
-
-    #[test]
-    fn categorize_irreplaceable_by_default() {
-        assert_eq!(
-            categorize("ClaudeCodeProjects/DAS-Backup-Manager"),
-            DriftCategory::Irreplaceable
-        );
-        assert_eq!(categorize("@audiobooks-db"), DriftCategory::Irreplaceable);
-        assert_eq!(categorize("bosco-media"), DriftCategory::Irreplaceable);
-    }
-
-    // -- parse_subvolume_list_output ------------------------------------------
-
-    #[test]
-    fn parse_subvolume_list_basic() {
-        let stdout = "ID 257 gen 1342848 top level 5 path @home\n\
-                       ID 829 gen 1342847 top level 5 path @\n";
-        let paths = parse_subvolume_list_output(stdout);
-        assert_eq!(paths, vec!["@home", "@"]);
-    }
-
-    #[test]
-    fn parse_subvolume_list_nested_paths() {
-        let stdout = "ID 100 gen 1 top level 5 path ClaudeCodeProjects\n\
-                       ID 101 gen 1 top level 100 path ClaudeCodeProjects/foo\n";
-        let paths = parse_subvolume_list_output(stdout);
-        assert_eq!(paths, vec!["ClaudeCodeProjects", "ClaudeCodeProjects/foo"]);
-    }
-
-    #[test]
-    fn parse_subvolume_list_empty() {
-        assert!(parse_subvolume_list_output("").is_empty());
-    }
-
     // -- compute_missing / compute_stale -------------------------------------
 
     #[test]
+    fn compute_missing_uses_the_same_rules_as_sync() {
+        let on_disk = s(&[
+            "@",
+            "@home",
+            "@cache/stremio",
+            "@steam",
+            ".snapshots/1/snapshot",
+            "@tmp",
+            "new",
+        ]);
+        let configured = s(&["@", "@home"]);
+        let exclude = s(&["@tmp", "@var-tmp", "@cache"]);
+        // "@steam" is reported: a name that looks rebuildable is no longer a
+        // reason to leave a subvolume out.
+        assert_eq!(
+            compute_missing(&on_disk, &configured, &exclude),
+            s(&["@steam", "new"])
+        );
+    }
+
+    #[test]
     fn compute_missing_finds_new_subvolumes() {
-        let on_disk = vec![
-            "@".to_string(),
-            "@home".to_string(),
-            "ClaudeCodeProjects/new-project".to_string(),
-        ];
-        let configured = vec!["@".to_string(), "@home".to_string()];
-        let missing = compute_missing(&on_disk, &configured, &[]);
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].0, "ClaudeCodeProjects/new-project");
-        assert_eq!(missing[0].1, DriftCategory::Irreplaceable);
+        let on_disk = s(&["@", "@home", "ClaudeCodeProjects/new-project"]);
+        let configured = s(&["@", "@home"]);
+        assert_eq!(
+            compute_missing(&on_disk, &configured, &[]),
+            s(&["ClaudeCodeProjects/new-project"])
+        );
     }
 
     #[test]
-    fn compute_missing_excludes_builtins() {
-        let on_disk = vec![
-            "@".to_string(),
-            ".snapshots/1/snapshot".to_string(),
-            ".btrbk-snapshots/foo.20260101".to_string(),
-            "@tmp".to_string(),
-            "@var-tmp".to_string(),
-        ];
-        let configured = vec!["@".to_string()];
-        let missing = compute_missing(&on_disk, &configured, &[]);
-        assert!(missing.is_empty(), "expected no drift, got {missing:?}");
+    fn compute_missing_never_reports_snapshot_trees() {
+        let on_disk = s(&[
+            "@",
+            ".snapshots/1/snapshot",
+            "Audiobooks/.btrbk-snapshots/foo.20260101",
+            ".btrbk-snapshots",
+        ]);
+        assert!(compute_missing(&on_disk, &s(&["@"]), &[]).is_empty());
     }
 
     #[test]
-    fn compute_missing_excludes_user_patterns() {
-        let on_disk = vec!["@".to_string(), "scratch.cache".to_string()];
-        let configured = vec!["@".to_string()];
-        let missing = compute_missing(&on_disk, &configured, &["*.cache".to_string()]);
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn compute_missing_categorizes_rebuildable_separately() {
-        let on_disk = vec![
-            "@".to_string(),
-            "ClaudeCodeProjects/foo".to_string(),
-            "SteamLibrary".to_string(),
-        ];
-        let configured = vec!["@".to_string()];
-        let missing = compute_missing(&on_disk, &configured, &[]);
-        assert_eq!(missing.len(), 2);
-        let steam = missing.iter().find(|(n, _)| n == "SteamLibrary").unwrap();
-        assert_eq!(steam.1, DriftCategory::Rebuildable);
-        let proj = missing
-            .iter()
-            .find(|(n, _)| n == "ClaudeCodeProjects/foo")
-            .unwrap();
-        assert_eq!(proj.1, DriftCategory::Irreplaceable);
+    fn compute_missing_excludes_user_patterns_and_what_is_nested_under_them() {
+        let on_disk = s(&["@", "scratch.cache", "scratch.cache/inner"]);
+        let missing = compute_missing(&on_disk, &s(&["@"]), &s(&["*.cache"]));
+        assert!(missing.is_empty(), "{missing:?}");
     }
 
     #[test]
     fn compute_missing_sorted_and_deduped() {
-        let on_disk = vec!["zeta".to_string(), "alpha".to_string(), "alpha".to_string()];
-        let missing = compute_missing(&on_disk, &[], &[]);
-        assert_eq!(
-            missing.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-            vec!["alpha", "zeta"]
-        );
+        let on_disk = s(&["zeta", "alpha", "alpha"]);
+        assert_eq!(compute_missing(&on_disk, &[], &[]), s(&["alpha", "zeta"]));
     }
 
     #[test]
     fn compute_stale_finds_removed_subvolumes() {
-        let on_disk = vec!["@".to_string(), "@home".to_string()];
-        let configured = vec![
-            "@".to_string(),
-            "@home".to_string(),
-            "@deleted-project".to_string(),
-        ];
-        let stale = compute_stale(&on_disk, &configured);
-        assert_eq!(stale, vec!["@deleted-project"]);
+        let on_disk = s(&["@", "@home"]);
+        let configured = s(&["@", "@home", "@deleted-project"]);
+        assert_eq!(
+            compute_stale(&on_disk, &configured),
+            s(&["@deleted-project"])
+        );
     }
 
     #[test]
     fn compute_stale_empty_when_all_present() {
-        let on_disk = vec!["@".to_string(), "@home".to_string()];
-        let configured = vec!["@".to_string(), "@home".to_string()];
+        let on_disk = s(&["@", "@home"]);
+        let configured = s(&["@", "@home"]);
         assert!(compute_stale(&on_disk, &configured).is_empty());
     }
 
@@ -928,6 +683,21 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
             target_labels: vec![],
+        }
+    }
+
+    /// One source on `/.btrfs-hdd` holding `@a` and `@b`.
+    fn test_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.sources
+            .push(source("hdd", "/.btrfs-hdd", &["@a", "@b"]));
+        cfg
+    }
+
+    fn listing(volume: &str, subvolumes: Result<Vec<String>, String>) -> VolumeListing {
+        VolumeListing {
+            volume: volume.into(),
+            subvolumes,
         }
     }
 
@@ -966,6 +736,146 @@ mod tests {
         assert!(group_sources_by_volume(&cfg).is_empty());
     }
 
+    #[test]
+    fn a_retired_entry_is_neither_configured_nor_stale() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes[0].retired = Some("2026-10-01".into());
+        let gone = cfg.sources[0].subvolumes[0].name.clone();
+        let groups = group_sources_by_volume(&cfg);
+        assert!(!groups[0].configured.contains(&gone));
+        assert!(groups[0].configured.contains(&"@b".to_string()));
+
+        // Through the same grouped list the drift check uses: the retired,
+        // absent entry is not stale; a live, absent one still is.
+        let on_disk = s(&["@other"]);
+        assert_eq!(compute_stale(&on_disk, &groups[0].configured), s(&["@b"]));
+    }
+
+    // -- drift_from_listings ---------------------------------------------------
+
+    #[test]
+    fn drift_from_listings_reports_missing_and_stale() {
+        let cfg = test_config();
+        let listings = [listing(
+            "/.btrfs-hdd",
+            Ok(s(&["@a", "@new", ".snapshots/1/snapshot"])),
+        )];
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(report.volumes_checked, 1);
+        assert!(report.volumes_failed.is_empty());
+        assert_eq!(
+            report.missing,
+            vec![MissingSubvolume {
+                volume: "/.btrfs-hdd".into(),
+                source_labels: vec!["hdd".into()],
+                name: "@new".into(),
+            }]
+        );
+        assert_eq!(
+            report.stale,
+            vec![StaleSubvolume {
+                volume: "/.btrfs-hdd".into(),
+                source_label: "hdd".into(),
+                name: "@b".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn drift_from_listings_uses_the_configured_excludes() {
+        let mut cfg = test_config();
+        cfg.subvolumes.exclude = s(&["@cache"]);
+        cfg.doctor.exclude = s(&["scratch*"]);
+        let listings = [listing(
+            "/.btrfs-hdd",
+            Ok(s(&["@a", "@b", "@tmp", "@var-tmp", "@cache/x", "scratch1"])),
+        )];
+        let report = drift_from_listings(&cfg, &listings);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+    }
+
+    #[test]
+    fn drift_from_listings_failed_listing_computes_nothing_for_that_volume() {
+        let cfg = test_config();
+        let listings = [listing(
+            "/.btrfs-hdd",
+            Err("source 'hdd' names device 'x': bad".into()),
+        )];
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(report.volumes_checked, 0);
+        assert_eq!(
+            report.volumes_failed,
+            vec![(
+                "/.btrfs-hdd".to_string(),
+                "source 'hdd' names device 'x': bad".to_string()
+            )]
+        );
+        // Unlisted must not read as "everything configured is stale".
+        assert!(report.missing.is_empty());
+        assert!(report.stale.is_empty());
+        assert!(report.not_clean());
+        assert!(!report.ran());
+    }
+
+    #[test]
+    fn drift_from_listings_a_volume_with_no_listing_is_failed() {
+        let cfg = test_config();
+        let report = drift_from_listings(&cfg, &[]);
+        assert_eq!(
+            report.volumes_failed,
+            vec![(
+                "/.btrfs-hdd".to_string(),
+                "volume was not listed".to_string()
+            )]
+        );
+        assert!(report.stale.is_empty());
+        assert_eq!(report.volumes_checked, 0);
+    }
+
+    #[test]
+    fn drift_from_listings_one_failed_volume_does_not_hide_another() {
+        let mut cfg = test_config();
+        cfg.sources.push(source("nvme", "/.btrfs-nvme", &["@"]));
+        let listings = [
+            listing("/.btrfs-hdd", Err("not mounted".into())),
+            listing("/.btrfs-nvme", Ok(s(&["@", "@extra"]))),
+        ];
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(report.volumes_checked, 1);
+        assert_eq!(report.volumes_failed.len(), 1);
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].name, "@extra");
+    }
+
+    #[test]
+    fn a_retired_entry_whose_subvolume_is_back_is_missing_until_sync_revives_it() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes[0].retired = Some("2026-10-01".into());
+        // "@a" is present again; only a retired entry names it.
+        let listings = [listing("/.btrfs-hdd", Ok(s(&["@a", "@b"])))];
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(
+            report
+                .missing
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["@a"]
+        );
+        assert!(report.stale.is_empty());
+    }
+
+    #[test]
+    fn a_retired_absent_entry_is_not_stale_but_a_live_absent_one_is() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes[0].retired = Some("2026-10-01".into());
+        // Neither "@a" (retired) nor "@b" (live) is on disk.
+        let listings = [listing("/.btrfs-hdd", Ok(s(&["@other"])))];
+        let report = drift_from_listings(&cfg, &listings);
+        let stale: Vec<&str> = report.stale.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(stale, vec!["@b"]);
+    }
+
     // -- DriftReport ----------------------------------------------------------
 
     #[test]
@@ -982,7 +892,6 @@ mod tests {
             volume: "/.btrfs-hdd".into(),
             source_labels: vec!["hdd-projects".into()],
             name: "new-project".into(),
-            category: DriftCategory::Irreplaceable,
         });
         assert!(report.has_drift());
     }
@@ -1007,27 +916,56 @@ mod tests {
         let text = format_report(&report);
         assert!(text.contains("NO DRIFT — CLEAN"));
         assert!(!text.contains("FAILURE"));
+        assert!(!text.contains("NOT BACKED UP"));
     }
 
     #[test]
-    fn format_report_drift_contains_failure_word() {
-        let mut report = DriftReport {
+    fn format_report_names_missing_as_a_sync_failure_and_suggests_no_hand_edit() {
+        let report = DriftReport {
             volumes_checked: 1,
+            volumes_failed: Vec::new(),
+            missing: vec![MissingSubvolume {
+                volume: "/.btrfs-hdd".into(),
+                source_labels: vec!["hdd-media".into()],
+                name: "bosco-media/video".into(),
+            }],
+            stale: Vec::new(),
+        };
+        let text = format_report(&report);
+        assert!(
+            text.contains("  Status: DRIFT DETECTED — FAILURE\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT BACKED UP — the backup run should have adopted these\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  bosco-media/video  (volume /.btrfs-hdd, source(s): hdd-media)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sudo btrdasd subvol sync --dry-run"),
+            "{text}"
+        );
+        assert!(!text.contains("SUGGESTED config.toml ADDITIONS"), "{text}");
+        assert!(!text.contains("REBUILDABLE"), "{text}");
+        assert!(!text.contains("[[source.subvolumes]]"), "{text}");
+    }
+
+    #[test]
+    fn format_report_lists_every_source_label_of_a_shared_volume() {
+        let report = DriftReport {
+            volumes_checked: 1,
+            missing: vec![MissingSubvolume {
+                volume: "/.btrfs-hdd".into(),
+                source_labels: vec!["hdd-projects".into(), "hdd-media".into()],
+                name: "ClaudeCodeProjects/new-project".into(),
+            }],
             ..Default::default()
         };
-        report.missing.push(MissingSubvolume {
-            volume: "/.btrfs-hdd".into(),
-            source_labels: vec!["hdd-projects".into(), "hdd-media".into()],
-            name: "ClaudeCodeProjects/new-project".into(),
-            category: DriftCategory::Irreplaceable,
-        });
         let text = format_report(&report);
-        assert!(text.contains("FAILURE"));
-        assert!(text.contains("DRIFT DETECTED"));
-        assert!(text.contains("ClaudeCodeProjects/new-project"));
-        assert!(text.contains("hdd-projects, hdd-media"));
-        assert!(text.contains("[[source.subvolumes]]"));
-        assert!(text.contains("name = \"ClaudeCodeProjects/new-project\""));
+        assert!(text.contains("hdd-projects, hdd-media"), "{text}");
     }
 
     #[test]
@@ -1038,25 +976,8 @@ mod tests {
             .push(("/.btrfs-hdd".into(), "not mounted".into()));
         let text = format_report(&report);
         assert!(text.contains("COULD NOT RUN — FAILURE"));
+        assert!(text.contains("VOLUMES NOT CHECKED"));
         assert!(!report.ran());
-    }
-
-    #[test]
-    fn format_report_separates_rebuildable_from_irreplaceable() {
-        let mut report = DriftReport {
-            volumes_checked: 1,
-            ..Default::default()
-        };
-        report.missing.push(MissingSubvolume {
-            volume: "/.btrfs-hdd".into(),
-            source_labels: vec!["hdd-media".into()],
-            name: "SteamLibrary2".into(),
-            category: DriftCategory::Rebuildable,
-        });
-        let text = format_report(&report);
-        assert!(text.contains("PROBABLY REBUILDABLE"));
-        // Rebuildable items must not get a suggested-diff snippet.
-        assert!(!text.contains("name = \"SteamLibrary2\""));
     }
 
     #[test]
@@ -1071,7 +992,10 @@ mod tests {
             name: "ClaudeCodeProjects/deleted-project".into(),
         });
         let text = format_report(&report);
-        assert!(text.contains("STALE CONFIG ENTRIES"));
+        assert!(
+            text.contains("STALE CONFIG ENTRIES (configured, not retired, not found on disk)"),
+            "{text}"
+        );
         assert!(text.contains("ClaudeCodeProjects/deleted-project"));
         assert!(text.contains("hdd-projects"));
     }
@@ -1107,16 +1031,5 @@ mod tests {
         let result = try_acquire_locks_at(&singleton, &maintenance).unwrap();
         assert!(matches!(result, LockAttempt::MaintenanceBusy));
         drop(held);
-    }
-
-    // -- list_mounted_subvolumes guard (no real btrfs needed) ------------------
-
-    #[test]
-    fn list_mounted_subvolumes_rejects_non_mountpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        // `dir` is a real directory but not a mountpoint of anything.
-        let result = list_mounted_subvolumes(dir.path().to_str().unwrap());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not mounted"));
     }
 }
