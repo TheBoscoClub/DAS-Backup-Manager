@@ -132,6 +132,13 @@ pub enum LocationState {
         count: usize,
         example: String,
     },
+    /// A live entry uses the same snapshot name in this same directory, so
+    /// its snapshots cannot be told apart from this retired series'. Nothing
+    /// is deleted here.
+    Shared {
+        source_label: String,
+        name: String,
+    },
     Empty,
 }
 
@@ -150,6 +157,8 @@ pub struct RetiredReport {
     pub retired: String,
     pub locations: Vec<LocationReport>,
     pub removed_from_config: bool,
+    /// Why an otherwise removable entry was kept, worded for the report.
+    pub kept_reason: Option<String>,
 }
 
 pub struct ExpireOutcome {
@@ -189,6 +198,59 @@ fn targets_of<'a>(config: &'a Config, source: &Source) -> Vec<&'a Target> {
         .collect()
 }
 
+/// The first LIVE entry, in any source accepted by `same_place`, that
+/// resolves to `snapshot_name`. Names are resolved within the entry's own
+/// source, as btrbk will see them.
+fn live_user_of(
+    config: &Config,
+    snapshot_name: &str,
+    same_place: impl Fn(&Source) -> bool,
+) -> Option<(String, String)> {
+    config
+        .sources
+        .iter()
+        .filter(|other| same_place(other))
+        .find_map(|other| {
+            let names = resolve_snapshot_names(&other.subvolumes);
+            other
+                .subvolumes
+                .iter()
+                .zip(names)
+                .find(|(e, n)| e.retired.is_none() && n == snapshot_name)
+                .map(|(e, _)| (other.label.clone(), e.name.clone()))
+        })
+}
+
+fn target_subdir(source: &Source) -> &String {
+    source.target_subdirs.first().unwrap_or(&source.label)
+}
+
+/// Every entry name of a directory, or why the listing cannot be trusted. A
+/// read error part-way, or a name that is not valid UTF-8, would otherwise
+/// make a directory look emptier than it is, and an "empty" location lets the
+/// entry leave the config.
+fn collect_names(
+    entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
+    dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for entry in entries {
+        let name =
+            entry.map_err(|e| format!("{} could not be read completely: {e}", dir.display()))?;
+        match name.into_string() {
+            Ok(name) => names.push(name),
+            Err(raw) => {
+                return Err(format!(
+                    "{} holds an entry whose name is not valid UTF-8 ({})",
+                    dir.display(),
+                    raw.to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(names)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn examine(
     place: String,
@@ -201,6 +263,7 @@ fn examine(
     dry_run: bool,
     runner: &dyn CommandRunner,
     is_mountpoint: &dyn Fn(&Path) -> bool,
+    shared_with: Option<(String, String)>,
 ) -> LocationReport {
     let report = |state| LocationReport {
         place: place.clone(),
@@ -213,11 +276,16 @@ fn examine(
             mount_root.display()
         )));
     }
+    // A live series in this very directory: its snapshots carry the same
+    // names, so nothing here can be attributed to the retired one alone.
+    if let Some((source_label, name)) = shared_with {
+        return report(LocationState::Shared { source_label, name });
+    }
     let entries: Vec<String> = match std::fs::read_dir(dir) {
-        Ok(read) => read
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect(),
+        Ok(read) => match collect_names(read.map(|e| e.map(|e| e.file_name())), dir) {
+            Ok(names) => names,
+            Err(why) => return report(LocationState::Unreachable(why)),
+        },
         // A target that never received this source has no such directory.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => {
@@ -312,7 +380,7 @@ pub fn expire_retired(
                 continue;
             };
             let targets = targets_of(&config, source);
-            let subdir = source.target_subdirs.first().unwrap_or(&source.label);
+            let subdir = target_subdir(source);
             let mut locations = Vec::new();
             for target in &targets {
                 let root = Path::new(&target.mount);
@@ -327,6 +395,12 @@ pub fn expire_retired(
                     dry_run,
                     runner,
                     is_mountpoint,
+                    live_user_of(&config, &snapshot_name, |other| {
+                        target_subdir(other) == subdir
+                            && targets_of(&config, other)
+                                .iter()
+                                .any(|t| t.label == target.label)
+                    }),
                 ));
             }
             // Source-side snapshots only exist to be sent. Once the shortest
@@ -347,6 +421,9 @@ pub fn expire_retired(
                 dry_run,
                 runner,
                 is_mountpoint,
+                live_user_of(&config, &snapshot_name, |other| {
+                    other.volume == source.volume && other.snapshot_dir == source.snapshot_dir
+                }),
             ));
             entries.push(RetiredReport {
                 source_label: source.label.clone(),
@@ -355,23 +432,50 @@ pub fn expire_retired(
                 retired,
                 locations,
                 removed_from_config: false,
+                // Nothing was examined on any target, so "empty everywhere"
+                // would only mean the source side is empty.
+                kept_reason: targets.is_empty().then(|| {
+                    format!(
+                        "no configured target receives source {} — entry kept",
+                        source.label
+                    )
+                }),
             });
         }
     }
 
-    let mut config_error = None;
-    if !dry_run {
-        let mut updated = config.clone();
-        for report in &mut entries {
-            let gone_everywhere = report.locations.iter().all(|l| {
+    // An entry is removable when nothing of its own remains in any location.
+    let removable = |r: &RetiredReport| {
+        r.kept_reason.is_none()
+            && r.locations.iter().all(|l| {
                 matches!(
                     l.state,
-                    LocationState::Empty | LocationState::Deleted { .. }
+                    LocationState::Empty
+                        | LocationState::Deleted { .. }
+                        | LocationState::Shared { .. }
                 )
-            });
-            if !gone_everywhere {
-                continue;
-            }
+            })
+    };
+    let mut candidates: Vec<usize> = (0..entries.len())
+        .filter(|&i| removable(&entries[i]))
+        .collect();
+    // The config never loses its last entry: validation rejects a config with
+    // none, and an empty one would hide that expiry ever ran. Keep the last
+    // candidate in config order.
+    let total: usize = config.sources.iter().map(|s| s.subvolumes.len()).sum();
+    if candidates.len() == total
+        && let Some(last) = candidates.pop()
+    {
+        entries[last].kept_reason =
+            Some("no backups remain — entry kept because it is the last one in the config".into());
+    }
+
+    let mut config_error = None;
+    if !dry_run && !candidates.is_empty() {
+        let mut updated = config.clone();
+        let mut touched: Vec<String> = Vec::new();
+        for &i in &candidates {
+            let report = &entries[i];
             if let Some(source) = updated
                 .sources
                 .iter_mut()
@@ -380,18 +484,19 @@ pub fn expire_retired(
                 source
                     .subvolumes
                     .retain(|e| !(e.name == report.name && e.retired.is_some()));
-                report.removed_from_config = true;
+                touched.push(report.source_label.clone());
+                entries[i].removed_from_config = true;
             }
         }
-        if entries.iter().any(|e| e.removed_from_config) {
-            // A source left with no entries at all would fail validation;
-            // drop it with its last entry.
-            updated.sources.retain(|s| !s.subvolumes.is_empty());
-            if let Err(e) = updated.save(config_path) {
-                config_error = Some(format!("could not write {}: {e}", config_path.display()));
-                for report in &mut entries {
-                    report.removed_from_config = false;
-                }
+        // A source this run emptied would fail validation; drop it with its
+        // last entry. One that was already empty is not this run's to touch.
+        updated
+            .sources
+            .retain(|s| !(s.subvolumes.is_empty() && touched.contains(&s.label)));
+        if let Err(e) = updated.save(config_path) {
+            config_error = Some(format!("could not write {}: {e}", config_path.display()));
+            for report in &mut entries {
+                report.removed_from_config = false;
             }
         }
     }
@@ -442,6 +547,9 @@ pub fn format_expire_report(outcome: &ExpireOutcome, dry_run: bool) -> String {
                 LocationState::DeleteFailed { deleted, errors } => {
                     format!("DELETE FAILED after {deleted}: {}", errors.join("; "))
                 }
+                LocationState::Shared { source_label, name } => format!(
+                    "series name also used by live entry {name} (source {source_label}) — nothing deleted here"
+                ),
                 LocationState::Unrecognised { count, example } => format!(
                     "{count} {} named like this series not recognised as btrbk snapshots (e.g. {example}) — nothing deleted here",
                     if *count == 1 { "entry" } else { "entries" }
@@ -451,6 +559,9 @@ pub fn format_expire_report(outcome: &ExpireOutcome, dry_run: bool) -> String {
         }
         if entry.removed_from_config {
             r.push_str("    no backups remain — entry removed from config\n");
+        }
+        if let Some(why) = &entry.kept_reason {
+            r.push_str(&format!("    {why}\n"));
         }
     }
     if let Some(why) = &outcome.config_error {
@@ -720,6 +831,32 @@ mod tests {
                 .iter()
                 .flat_map(|s| s.subvolumes.iter().map(|e| e.name.clone()))
                 .collect()
+        }
+    }
+
+    fn live(name: &str) -> SubvolConfig {
+        SubvolConfig {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A second source holding one entry, sending to every target.
+    fn other_source(
+        label: &str,
+        volume: String,
+        snapshot_dir: &str,
+        subdir: &str,
+        entry: SubvolConfig,
+    ) -> Source {
+        Source {
+            label: label.into(),
+            volume,
+            subvolumes: vec![entry],
+            device: "UUID=def".into(),
+            snapshot_dir: snapshot_dir.into(),
+            target_subdirs: vec![subdir.into()],
+            target_labels: Vec::new(),
         }
     }
 
@@ -1158,30 +1295,25 @@ mod tests {
 
     #[test]
     fn a_live_entry_is_never_removed_even_if_its_name_matches_a_retired_one() {
-        // The same name in another source: only the retired one goes.
+        // The same name in another source on the same volume and snapshot
+        // directory: only the retired entry goes, and the live series'
+        // snapshots on disk are not touched.
         let rig = rig();
         rig.edit(|c| {
-            c.sources.push(Source {
-                label: "other".into(),
-                volume: c.sources[0].volume.clone(),
-                subvolumes: vec![SubvolConfig {
-                    name: "@opt".into(),
-                    ..Default::default()
-                }],
-                device: "UUID=def".into(),
-                snapshot_dir: ".btrbk-snapshots".into(),
-                target_subdirs: vec!["other".into()],
-                target_labels: Vec::new(),
-            });
+            let volume = c.sources[0].volume.clone();
+            c.sources.push(other_source(
+                "other",
+                volume,
+                ".btrbk-snapshots",
+                "other",
+                live("@opt"),
+            ));
         });
-        let out = expire_retired(
-            &rig.config_path,
-            false,
-            "2028-01-01",
-            &Scripted::new(&[]),
-            &mounted,
-        )
-        .unwrap();
+        let live_snap = rig.snap("vol/.btrbk-snapshots", "opt.20280101T0000");
+        let runner = rig.deleting(&[&live_snap]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(live_snap.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert_eq!(out.entries.len(), 1, "only the retired entry is examined");
         let saved = Config::load(&rig.config_path).unwrap();
         assert_eq!(saved.sources[0].subvolumes.len(), 1);
@@ -1227,34 +1359,6 @@ mod tests {
         );
         assert_eq!(rig.saved_names(), ["@srv"]);
         assert!(saved.validate().is_empty(), "{:?}", saved.validate());
-    }
-
-    #[test]
-    fn removing_the_last_entry_of_the_last_source_leaves_a_config_validate_rejects() {
-        // Finding, not a decision: nothing here stops the config from losing
-        // its last source. The file still loads, but `validate` (run by setup)
-        // refuses it. Pinned so a change to this behaviour is deliberate.
-        let rig = rig();
-        rig.edit(|c| drop(c.sources[0].subvolumes.remove(0)));
-        let out = expire_retired(
-            &rig.config_path,
-            false,
-            "2030-01-01",
-            &Scripted::new(&[]),
-            &mounted,
-        )
-        .unwrap();
-        assert!(out.entries[0].removed_from_config);
-        let saved = Config::load(&rig.config_path).unwrap();
-        assert!(saved.sources.is_empty());
-        assert!(
-            saved
-                .validate()
-                .iter()
-                .any(|e| e.contains("No backup sources")),
-            "{:?}",
-            saved.validate()
-        );
     }
 
     #[test]
@@ -1309,6 +1413,7 @@ mod tests {
                     deleted_paths: Vec::new(),
                 }],
                 removed_from_config: false,
+                kept_reason: None,
             }],
             config_error: None,
         };
@@ -1414,6 +1519,7 @@ mod tests {
                     ),
                 ],
                 removed_from_config: true,
+                kept_reason: None,
             }],
             config_error: Some("disk full".into()),
         };
@@ -1577,6 +1683,7 @@ mod tests {
                     },
                 ],
                 removed_from_config: false,
+                kept_reason: None,
             }],
             config_error: None,
         };
@@ -1591,6 +1698,398 @@ mod tests {
             text.contains(
                 "    target small: 3 entries named like this series not recognised as btrbk snapshots (e.g. opt.20261001T1421.partial) — nothing deleted here\n"
             ),
+            "{text}"
+        );
+    }
+
+    // ---- fix round 1, finding 1: a live series sharing the name ----
+
+    fn shared(label: &str, name: &str) -> LocationState {
+        LocationState::Shared {
+            source_label: label.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_live_series_sharing_the_source_directory_is_never_deleted() {
+        let rig = rig();
+        rig.edit(|c| {
+            let volume = c.sources[0].volume.clone();
+            c.sources.push(other_source(
+                "other",
+                volume,
+                ".btrbk-snapshots",
+                "other",
+                live("@opt"),
+            ));
+        });
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&src]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(src.exists(), "the live series' send parent");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert_eq!(states(&out)[2], shared("other", "@opt"));
+        assert!(!out.failed());
+    }
+
+    #[test]
+    fn a_live_series_sharing_a_target_directory_by_explicit_snapshot_name_is_never_deleted() {
+        let rig = rig();
+        let vol2 = rig.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig.edit(|c| {
+            c.sources.push(other_source(
+                "other",
+                vol2,
+                ".btrbk-snapshots",
+                "ssd",
+                SubvolConfig {
+                    name: "@live".into(),
+                    snapshot_name: Some("opt".into()),
+                    ..Default::default()
+                },
+            ));
+        });
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &big]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(small.exists() && big.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert_eq!(
+            states(&out),
+            vec![
+                shared("other", "@live"),
+                shared("other", "@live"),
+                LocationState::Empty
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shared_source_directory_does_not_stop_the_unshared_targets_expiring() {
+        let rig = rig();
+        rig.edit(|c| {
+            let volume = c.sources[0].volume.clone();
+            c.sources.push(other_source(
+                "other",
+                volume,
+                ".btrbk-snapshots",
+                "other",
+                live("@opt"),
+            ));
+        });
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &big, &src]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(!small.exists() && !big.exists());
+        assert!(src.exists());
+        assert_eq!(
+            states(&out),
+            vec![
+                LocationState::Deleted { count: 1 },
+                LocationState::Deleted { count: 1 },
+                shared("other", "@opt")
+            ]
+        );
+        assert!(out.entries[0].removed_from_config);
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_same_name_live_entry_elsewhere_does_not_block_normal_expiry() {
+        // Different volume, different target subdirectory: nothing is shared.
+        let rig = rig();
+        let vol2 = rig.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig.edit(|c| {
+            c.sources.push(other_source(
+                "other",
+                vol2,
+                ".btrbk-snapshots",
+                "other",
+                live("@opt"),
+            ));
+        });
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &big, &src]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(!small.exists() && !big.exists() && !src.exists());
+        assert!(out.entries[0].removed_from_config);
+        assert_eq!(runner.calls().len(), 3);
+    }
+
+    #[test]
+    fn the_same_volume_with_a_different_snapshot_dir_is_not_shared() {
+        let rig = rig();
+        rig.edit(|c| {
+            let volume = c.sources[0].volume.clone();
+            c.sources.push(other_source(
+                "other",
+                volume,
+                ".other-snaps",
+                "other",
+                live("@opt"),
+            ));
+        });
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&src]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(!src.exists());
+        assert_eq!(states(&out)[2], LocationState::Deleted { count: 1 });
+    }
+
+    #[test]
+    fn a_live_entry_whose_source_sends_to_other_targets_does_not_share_this_one() {
+        // Same name, same subdirectory string, but it only sends to `big`:
+        // `small/ssd` is nobody else's.
+        let rig = rig();
+        let vol2 = rig.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig.edit(|c| {
+            let mut other = other_source("other", vol2, ".btrbk-snapshots", "ssd", live("@opt"));
+            other.target_labels = vec!["big".into()];
+            c.sources.push(other);
+        });
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &big]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(big.exists(), "shared with the live entry");
+        assert!(
+            !small.exists(),
+            "not shared: the live source never sends here"
+        );
+        assert_eq!(states(&out)[0], shared("other", "@opt"));
+        assert_eq!(states(&out)[1], LocationState::Deleted { count: 1 });
+    }
+
+    #[test]
+    fn report_line_for_a_shared_location() {
+        let out = ExpireOutcome {
+            entries: vec![RetiredReport {
+                source_label: "ssd".into(),
+                name: "@opt".into(),
+                snapshot_name: "opt".into(),
+                retired: "2026-10-01".into(),
+                locations: vec![LocationReport {
+                    place: "target big".into(),
+                    state: shared("other", "@opt"),
+                    deleted_paths: Vec::new(),
+                }],
+                removed_from_config: false,
+                kept_reason: None,
+            }],
+            config_error: None,
+        };
+        assert!(
+            format_expire_report(&out, false).contains(
+                "    target big: series name also used by live entry @opt (source other) — nothing deleted here\n"
+            ),
+        );
+    }
+
+    // ---- fix round 1, finding 2 and rulings 17 and 18 ----
+
+    #[test]
+    fn a_directory_entry_that_is_not_utf8_makes_the_location_unreachable() {
+        use std::os::unix::ffi::OsStrExt;
+        let rig = rig();
+        let old = rig.snap("small/ssd", "opt.20200101T0000");
+        let odd = rig
+            .dir
+            .path()
+            .join("small/ssd")
+            .join(std::ffi::OsStr::from_bytes(b"opt.20200101T0000\xff"));
+        std::fs::write(&odd, "x").unwrap();
+        let runner = rig.deleting(&[&old]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(old.exists() && odd.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        match &states(&out)[1] {
+            LocationState::Unreachable(why) => {
+                assert!(why.contains("not valid UTF-8"), "{why}");
+                assert!(why.contains("opt.20200101T0000\u{FFFD}"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!out.entries[0].removed_from_config);
+        assert!(!out.failed());
+        assert!(rig.saved_names().contains(&"@opt".to_string()));
+    }
+
+    #[test]
+    fn collect_names_fails_on_any_read_error_or_non_utf8_name() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let dir = Path::new("/d");
+        let ok: Vec<std::io::Result<OsString>> = vec![Ok("a".into()), Ok("b".into())];
+        assert_eq!(collect_names(ok.into_iter(), dir).unwrap(), ["a", "b"]);
+
+        let broken: Vec<std::io::Result<OsString>> = vec![
+            Ok("a".into()),
+            Err(std::io::Error::other("disk went away")),
+            Ok("b".into()),
+        ];
+        let why = collect_names(broken.into_iter(), dir).unwrap_err();
+        assert!(
+            why.contains("/d") && why.contains("disk went away"),
+            "{why}"
+        );
+
+        let odd: Vec<std::io::Result<OsString>> = vec![Ok(OsString::from_vec(b"x\xfey".to_vec()))];
+        let why = collect_names(odd.into_iter(), dir).unwrap_err();
+        assert!(
+            why.contains("not valid UTF-8") && why.contains("x\u{FFFD}y"),
+            "{why}"
+        );
+        assert!(collect_names(std::iter::empty(), dir).unwrap().is_empty());
+    }
+
+    /// The rig with `@srv` removed, so `@opt` is the only entry in the config.
+    fn rig_with_only_the_retired_entry() -> Rig {
+        let rig = rig();
+        rig.edit(|c| drop(c.sources[0].subvolumes.remove(0)));
+        rig
+    }
+
+    const LAST_ONE: &str =
+        "    no backups remain — entry kept because it is the last one in the config\n";
+
+    #[test]
+    fn the_last_entry_of_the_config_is_never_removed() {
+        let rig = rig_with_only_the_retired_entry();
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2030-01-01",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap();
+        let entry = &out.entries[0];
+        assert!(!entry.removed_from_config);
+        assert!(entry.kept_reason.is_some());
+        assert!(!out.failed());
+        let saved = Config::load(&rig.config_path).unwrap();
+        assert_eq!(saved.sources.len(), 1);
+        assert_eq!(rig.saved_names(), ["@opt"]);
+        assert!(
+            saved
+                .validate()
+                .iter()
+                .all(|e| !e.contains("No backup sources"))
+        );
+        let text = format_expire_report(&out, false);
+        assert!(text.contains(LAST_ONE), "{text}");
+        assert!(!text.contains("entry removed from config"), "{text}");
+    }
+
+    #[test]
+    fn with_two_expired_entries_in_one_source_exactly_the_last_in_config_order_is_kept() {
+        let rig = rig_with_only_the_retired_entry();
+        rig.edit(|c| {
+            c.sources[0].subvolumes.push(SubvolConfig {
+                name: "@opt2".into(),
+                retired: Some("2026-10-01".into()),
+                ..Default::default()
+            })
+        });
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2030-01-01",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap();
+        assert_eq!(out.entries.len(), 2);
+        assert!(out.entries[0].removed_from_config);
+        assert!(out.entries[0].kept_reason.is_none());
+        assert!(!out.entries[1].removed_from_config);
+        assert!(out.entries[1].kept_reason.is_some());
+        assert_eq!(rig.saved_names(), ["@opt2"]);
+    }
+
+    #[test]
+    fn a_live_entry_elsewhere_means_the_retired_one_is_not_the_last() {
+        let rig = rig_with_only_the_retired_entry();
+        rig.edit(|c| {
+            let volume = c.sources[0].volume.clone();
+            c.sources
+                .push(other_source("other", volume, ".x", "other", live("@keep")));
+        });
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2030-01-01",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap();
+        assert!(out.entries[0].removed_from_config);
+        assert_eq!(rig.saved_names(), ["@keep"]);
+    }
+
+    #[test]
+    fn a_source_that_was_already_empty_is_left_alone() {
+        let rig = rig();
+        rig.edit(|c| {
+            c.sources.push(Source {
+                label: "empty".into(),
+                subvolumes: Vec::new(),
+                ..other_source(
+                    "empty",
+                    c.sources[0].volume.clone(),
+                    ".y",
+                    "empty",
+                    live("@x"),
+                )
+            })
+        });
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2030-01-01",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap();
+        assert!(out.entries[0].removed_from_config);
+        let saved = Config::load(&rig.config_path).unwrap();
+        assert_eq!(
+            saved
+                .sources
+                .iter()
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>(),
+            ["ssd", "empty"]
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_source_sends_to_no_configured_target_is_kept() {
+        let rig = rig();
+        rig.edit(|c| c.sources[0].target_labels = vec!["no-such-target".into()]);
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2030-01-01",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap();
+        let entry = &out.entries[0];
+        assert_eq!(entry.locations.len(), 1, "only the source side");
+        assert_eq!(entry.locations[0].state, LocationState::Empty);
+        assert!(!entry.removed_from_config);
+        assert!(!out.failed());
+        assert!(rig.saved_names().contains(&"@opt".to_string()));
+        let text = format_expire_report(&out, false);
+        assert!(
+            text.contains("    no configured target receives source ssd — entry kept\n"),
             "{text}"
         );
     }
