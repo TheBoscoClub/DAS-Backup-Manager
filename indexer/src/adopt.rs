@@ -481,14 +481,33 @@ pub fn list_volumes(
     listings
 }
 
+/// Whether `btrbk.conf` said what `config.toml` renders to. Checked on every
+/// sync whose plan leaves `config.toml` alone: an entry can reach
+/// `config.toml` without passing through sync (the GUI helper, a hand edit),
+/// and until `btrbk.conf` names it, it is not backed up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BtrbkConf {
+    /// Matched, or the plan rewrote both files anyway.
+    #[default]
+    Current,
+    /// Did not match and was replaced.
+    Regenerated,
+    /// Does not match; a real run would replace it.
+    WouldRegenerate,
+    /// Does not match and was left as it is: the sync failed (a volume was
+    /// not read), or the replacement could not be written (`write_error`).
+    OutOfDate,
+}
+
 /// What a sync did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncOutcome {
     pub plan: SyncPlan,
     /// Whether `config.toml` and `btrbk.conf` were replaced.
     pub written: bool,
     /// Why they were not, when the plan called for it.
     pub write_error: Option<String>,
+    pub btrbk_conf: BtrbkConf,
 }
 
 impl SyncOutcome {
@@ -512,11 +531,19 @@ pub fn sync_subvolumes(
     let listings = list_volumes(&config, runner, is_mountpoint);
 
     let plan = plan_sync(&config, &listings);
-    if dry_run || !plan.changes_config() {
+    if !plan.changes_config() {
+        let (btrbk_conf, write_error) = bring_btrbk_conf_into_line(&config, dry_run, plan.failed());
         return Ok(SyncOutcome {
             plan,
             written: false,
-            write_error: None,
+            write_error,
+            btrbk_conf,
+        });
+    }
+    if dry_run {
+        return Ok(SyncOutcome {
+            plan,
+            ..Default::default()
         });
     }
 
@@ -525,7 +552,50 @@ pub fn sync_subvolumes(
         written: write_error.is_none(),
         plan,
         write_error,
+        btrbk_conf: BtrbkConf::Current,
     })
+}
+
+/// Make `btrbk.conf` say what `config.toml` renders to, when nothing else in
+/// this sync rewrites it. Anything but an exact match — a different text, a
+/// missing file, an unreadable one — counts as out of date. Nothing is written
+/// on a dry run, nor while the sync has failed: then the state of the volumes
+/// is in doubt and sync changes neither file. Returns the state and, when the
+/// replacement could not be made, why.
+fn bring_btrbk_conf_into_line(
+    config: &Config,
+    dry_run: bool,
+    sync_failed: bool,
+) -> (BtrbkConf, Option<String>) {
+    let conf_path = Path::new(&config.general.btrbk_conf);
+    let rendered = crate::btrbk_conf::render_btrbk_conf(config);
+    if std::fs::read_to_string(conf_path).is_ok_and(|text| text == rendered) {
+        return (BtrbkConf::Current, None);
+    }
+    if sync_failed {
+        return (BtrbkConf::OutOfDate, None);
+    }
+    if dry_run {
+        return (BtrbkConf::WouldRegenerate, None);
+    }
+    let errors = config.validate();
+    if !errors.is_empty() {
+        return (
+            BtrbkConf::OutOfDate,
+            Some(format!(
+                "config.toml is not valid, so {} was not regenerated from it: {}",
+                conf_path.display(),
+                errors.join("; ")
+            )),
+        );
+    }
+    match write_atomic(conf_path, &rendered) {
+        Ok(()) => (BtrbkConf::Regenerated, None),
+        Err(e) => (
+            BtrbkConf::OutOfDate,
+            Some(format!("could not write {}: {e}", conf_path.display())),
+        ),
+    }
 }
 
 /// Replace `btrbk.conf` and `config.toml` together or not at all. Returns the
@@ -575,12 +645,29 @@ fn write_updated(
 pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
     let plan = &outcome.plan;
     let mut r = String::from("SUBVOLUME SYNC\n");
-    if !plan.changes_config() && !plan.failed() && plan.skipped.is_empty() {
+    if !plan.changes_config()
+        && !plan.failed()
+        && plan.skipped.is_empty()
+        && outcome.write_error.is_none()
+        && outcome.btrbk_conf == BtrbkConf::Current
+    {
         r.push_str("  No new, vanished or returning subvolumes.\n");
         return r;
     }
     if let Some(why) = &outcome.write_error {
         r.push_str(&format!("  CONFIG NOT UPDATED: {why}\n"));
+    }
+    match outcome.btrbk_conf {
+        BtrbkConf::Current => {}
+        BtrbkConf::Regenerated => r.push_str(
+            "  btrbk.conf was out of date with config.toml and has been regenerated.\n",
+        ),
+        BtrbkConf::WouldRegenerate => r.push_str(
+            "  btrbk.conf is out of date with config.toml and would be regenerated (dry run, nothing written).\n",
+        ),
+        BtrbkConf::OutOfDate => r.push_str(
+            "  btrbk.conf is out of date with config.toml and was NOT regenerated.\n",
+        ),
     }
     let applied = outcome.written;
     let heading = |done: &str, would: &str, not: &str| -> String {
@@ -1421,21 +1508,206 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
         let before = std::fs::read_to_string(&path).unwrap();
+        // "Nothing changed" includes btrbk.conf already saying what
+        // config.toml renders to; an out-of-date one is regenerated (see
+        // sync_regenerates_a_btrbk_conf_that_lacks_a_configured_entry).
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        std::fs::write(dir.path().join("btrbk.conf"), &rendered).unwrap();
 
         let same = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
         let out = sync_subvolumes(&path, false, "2026-10-02", &same, &mounted).unwrap();
         assert!(!out.written);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
-            "OLD"
+            rendered
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
+        std::fs::write(dir.path().join("btrbk.conf"), "OLD").unwrap();
         let more = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
         let out = sync_subvolumes(&path, true, "2026-10-02", &more, &mounted).unwrap();
         assert!(!out.written);
         assert_eq!(out.plan.adopt.len(), 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+    }
+
+    // --- btrbk.conf follows config.toml on every run, not only on changes ---
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn sync_regenerates_a_btrbk_conf_that_lacks_a_configured_entry() {
+        // An entry that reached config.toml some other way (the GUI helper, a
+        // hand edit) and never reached btrbk.conf: nothing to adopt, but the
+        // entry is not backed up until btrbk.conf names it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let conf = dir.path().join("btrbk.conf");
+        let mut without = Config::load(&path).unwrap();
+        without.sources[0].subvolumes.retain(|e| e.name != "@opt");
+        std::fs::write(&conf, crate::btrbk_conf::render_btrbk_conf(&without)).unwrap();
+        assert!(!std::fs::read_to_string(&conf).unwrap().contains("@opt"));
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(!out.plan.changes_config(), "{:?}", out.plan);
+        assert!(!out.failed(), "{:?}", out.write_error);
+        assert_eq!(out.btrbk_conf, BtrbkConf::Regenerated);
+        let written = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(
+            written,
+            crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap())
+        );
+        assert!(
+            written.contains("subvolume             @opt\n"),
+            "{written}"
+        );
+        // config.toml itself is not rewritten.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let text = format_sync_report(&out, false);
+        assert_eq!(
+            text,
+            "SUBVOLUME SYNC\n  btrbk.conf was out of date with config.toml and has been regenerated.\n"
+        );
+    }
+
+    #[test]
+    fn sync_writes_a_btrbk_conf_that_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let conf = dir.path().join("btrbk.conf");
+        std::fs::remove_file(&conf).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert_eq!(out.btrbk_conf, BtrbkConf::Regenerated);
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap())
+        );
+    }
+
+    #[test]
+    fn sync_leaves_an_up_to_date_btrbk_conf_alone_and_says_nothing_about_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let conf = dir.path().join("btrbk.conf");
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        std::fs::write(&conf, &rendered).unwrap();
+        let ino = inode(&conf);
+
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert_eq!(out.btrbk_conf, BtrbkConf::Current);
+        // An atomic replace makes a new inode; the same one means no write.
+        assert_eq!(inode(&conf), ino);
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), rendered);
+        assert_eq!(
+            format_sync_report(&out, false),
+            "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_reports_an_out_of_date_btrbk_conf_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let conf = dir.path().join("btrbk.conf");
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r, &mounted).unwrap();
+        assert_eq!(out.btrbk_conf, BtrbkConf::WouldRegenerate);
+        assert!(!out.failed());
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "OLD");
+        let text = format_sync_report(&out, true);
+        assert!(
+            text.contains(
+                "  btrbk.conf is out of date with config.toml and would be regenerated (dry run, nothing written).\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("No new, vanished"), "{text}");
+    }
+
+    #[test]
+    fn a_btrbk_conf_that_cannot_be_regenerated_fails_the_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Occupy the temp-file name so the atomic write fails.
+        std::fs::create_dir(dir.path().join(".btrbk.conf.tmp")).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(out.failed());
+        assert_eq!(out.btrbk_conf, BtrbkConf::OutOfDate);
+        assert!(
+            out.write_error.as_deref().unwrap().contains("btrbk.conf"),
+            "{:?}",
+            out.write_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let text = format_sync_report(&out, false);
+        assert!(
+            text.contains("  CONFIG NOT UPDATED: could not write"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  btrbk.conf is out of date with config.toml and was NOT regenerated.\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_reports_an_out_of_date_btrbk_conf_but_does_not_touch_it() {
+        // While a volume cannot be read, sync changes neither file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let out =
+            sync_subvolumes(&path, false, "2026-10-02", &Scripted::new(&[]), &unmounted).unwrap();
+        assert!(out.failed());
+        assert_eq!(out.btrbk_conf, BtrbkConf::OutOfDate);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+            "OLD"
+        );
+        let text = format_sync_report(&out, false);
+        assert!(
+            text.contains(
+                "  btrbk.conf is out of date with config.toml and was NOT regenerated.\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_config_toml_is_not_rendered_into_btrbk_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        // Valid enough to load and list, not valid enough to act on.
+        let mut c = Config::load(&path).unwrap();
+        c.schedule.incremental = "not a time".into();
+        assert!(!c.validate().is_empty(), "fixture must be invalid");
+        c.save(&path).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(out.failed());
+        assert!(
+            out.write_error.as_deref().unwrap().contains("not valid"),
+            "{:?}",
+            out.write_error
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
             "OLD"
@@ -1586,6 +1858,7 @@ mod tests {
             plan: SyncPlan::default(),
             written: false,
             write_error: None,
+            btrbk_conf: BtrbkConf::Current,
         };
         assert_eq!(
             format_sync_report(&quiet, false),
@@ -1636,6 +1909,7 @@ mod tests {
                 plan,
                 written: true,
                 write_error: None,
+                btrbk_conf: BtrbkConf::Current,
             },
             false,
         );
@@ -1675,6 +1949,7 @@ mod tests {
                 plan: plan.clone(),
                 written: false,
                 write_error: None,
+                btrbk_conf: BtrbkConf::Current,
             },
             true,
         );
@@ -1687,6 +1962,7 @@ mod tests {
                 plan,
                 written: false,
                 write_error: Some("disk full".into()),
+                btrbk_conf: BtrbkConf::Current,
             },
             false,
         );
@@ -1740,6 +2016,7 @@ mod tests {
                     plan: plan.clone(),
                     written: true,
                     write_error: None,
+                    btrbk_conf: BtrbkConf::Current,
                 },
                 false,
             );
@@ -1771,6 +2048,7 @@ mod tests {
                     plan: plan.clone(),
                     written,
                     write_error: None,
+                    btrbk_conf: BtrbkConf::Current,
                 },
                 dry,
             )
