@@ -53,6 +53,97 @@ pub fn format_report_with_sync(
     config: &Config,
     sync: Option<&SyncSection>,
 ) -> String {
+    format_report_from(result, sync, &capture_report_data(config))
+}
+
+/// The report sections that read the mounted targets — disk capacity, SMART,
+/// `btrbk list latest` — rendered while the targets are still mounted. A
+/// backup job captures this BEFORE it unmounts and builds the report after,
+/// so an unmount failure is in the report and the capacity table is not
+/// empty — what `capture_report_data` + `unmount_all` do in `backup-run.sh`
+/// (bd DAS-Backup-Manager-ecg, -h4t).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportData {
+    /// `DISK CAPACITY` (and `SMART STATUS`) sections.
+    pub capacity_and_smart: String,
+    /// `LATEST SNAPSHOTS` section.
+    pub latest_snapshots: String,
+}
+
+/// Capture [`ReportData`] from the live system. Call while mounted. Only
+/// the two queries live here; what they become is decided by
+/// [`render_capacity_and_smart`] and [`render_latest_snapshots`].
+pub fn capture_report_data(config: &Config) -> ReportData {
+    let health = crate::health::get_health(config).ok();
+    let latest = Command::new("btrbk")
+        .args(["-c", &config.general.btrbk_conf, "list", "latest"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    ReportData {
+        capacity_and_smart: render_capacity_and_smart(health.as_ref()),
+        latest_snapshots: render_latest_snapshots(latest.as_deref()),
+    }
+}
+
+/// `DISK CAPACITY` (mounted targets only) and `SMART STATUS` (every target),
+/// or a note that health data was unavailable.
+pub fn render_capacity_and_smart(health: Option<&crate::health::HealthReport>) -> String {
+    let thin = "─".repeat(63);
+    let mut r = String::new();
+    r.push_str(&format!("\nDISK CAPACITY\n{thin}\n"));
+    r.push_str("  Target                   Used       Avail      Use%\n");
+    let Some(health) = health else {
+        r.push_str("  (health data unavailable)\n");
+        return r;
+    };
+    for th in health.targets.iter().filter(|t| t.mounted) {
+        let avail = th.total_bytes.saturating_sub(th.used_bytes);
+        r.push_str(&format!(
+            "  {:<25}{:<11}{:<11}{:.0}%\n",
+            th.label,
+            format_bytes(th.used_bytes),
+            format_bytes(avail),
+            th.usage_percent(),
+        ));
+    }
+    r.push_str(&format!("\nSMART STATUS\n{thin}\n"));
+    for th in &health.targets {
+        let smart = th.smart_status.as_deref().unwrap_or("N/A");
+        let temp = th
+            .temperature_c
+            .map(|t| format!("{t}°C"))
+            .unwrap_or_else(|| "N/A".to_string());
+        let hours = th
+            .power_on_hours
+            .map(|h| format!("{h}h"))
+            .unwrap_or_else(|| "N/A".to_string());
+        r.push_str(&format!(
+            "  {:<25}{:<11}{:<8}{:<8}{}\n",
+            th.label, th.serial, smart, temp, hours
+        ));
+    }
+    r
+}
+
+/// `LATEST SNAPSHOTS` from `btrbk list latest` output, its header line
+/// dropped; an empty section when btrbk could not answer.
+pub fn render_latest_snapshots(btrbk_list_latest: Option<&str>) -> String {
+    let thin = "─".repeat(63);
+    let mut r = format!("\nLATEST SNAPSHOTS\n{thin}\n");
+    for line in btrbk_list_latest.unwrap_or("").lines().skip(1) {
+        r.push_str(&format!("  {line}\n"));
+    }
+    r
+}
+
+/// The report for `result`, with the mount-dependent sections from `data`.
+pub fn format_report_from(
+    result: &BackupResult,
+    sync: Option<&SyncSection>,
+    data: &ReportData,
+) -> String {
     let sep = "═".repeat(63);
     let thin = "─".repeat(63);
 
@@ -132,66 +223,10 @@ pub fn format_report_with_sync(
         r.push_str("  (no data transferred)\n");
     }
 
-    // Disk Capacity — query live health data.
-    r.push_str(&format!("\nDISK CAPACITY\n{thin}\n"));
-    r.push_str("  Target                   Used       Avail      Use%\n");
-    if let Ok(health) = crate::health::get_health(config) {
-        for th in &health.targets {
-            if !th.mounted {
-                continue;
-            }
-            let avail = th.total_bytes.saturating_sub(th.used_bytes);
-            r.push_str(&format!(
-                "  {:<25}{:<11}{:<11}{:.0}%\n",
-                th.label,
-                format_bytes(th.used_bytes),
-                format_bytes(avail),
-                th.usage_percent(),
-            ));
-        }
-
-        // SMART Status
-        r.push_str(&format!("\nSMART STATUS\n{thin}\n"));
-        for th in &health.targets {
-            let smart = th.smart_status.as_deref().unwrap_or("N/A");
-            let temp = th
-                .temperature_c
-                .map(|t| format!("{t}°C"))
-                .unwrap_or_else(|| "N/A".to_string());
-            let hours = th
-                .power_on_hours
-                .map(|h| format!("{h}h"))
-                .unwrap_or_else(|| "N/A".to_string());
-            r.push_str(&format!(
-                "  {:<25}{:<11}{:<8}{:<8}{}\n",
-                th.label, th.serial, smart, temp, hours
-            ));
-        }
-    } else {
-        r.push_str("  (health data unavailable)\n");
-    }
-
-    // Latest Snapshots — run btrbk list latest.
-    r.push_str(&format!("\nLATEST SNAPSHOTS\n{thin}\n"));
-    if let Ok(output) = Command::new("btrbk")
-        .args(["-c", &config.general.btrbk_conf, "list", "latest"])
-        .output()
-        .and_then(|o| {
-            if o.status.success() {
-                Ok(o)
-            } else {
-                Err(std::io::Error::other("btrbk failed"))
-            }
-        })
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for (i, line) in stdout.lines().enumerate() {
-            if i == 0 {
-                continue; // skip header
-            }
-            r.push_str(&format!("  {line}\n"));
-        }
-    }
+    // Capacity, SMART and latest snapshots, as captured while the targets
+    // were still mounted.
+    r.push_str(&data.capacity_and_smart);
+    r.push_str(&data.latest_snapshots);
 
     // Errors
     if !result.errors.is_empty() {
@@ -581,5 +616,64 @@ mod tests {
         assert!(report.contains("ERRORS"));
         assert!(report.contains("btrbk failed"));
         assert!(report.contains("target not mounted"));
+    }
+
+    fn target_health(label: &str, mounted: bool) -> crate::health::TargetHealth {
+        crate::health::TargetHealth {
+            label: label.into(),
+            serial: format!("SER-{label}"),
+            mounted,
+            total_bytes: 4 * 1024 * 1024 * 1024,
+            used_bytes: 1024 * 1024 * 1024,
+            snapshot_count: 3,
+            smart_status: Some("PASSED".into()),
+            temperature_c: Some(31),
+            power_on_hours: None,
+            errors: None,
+            scrub: crate::health::ScrubHealth::not_applicable(),
+        }
+    }
+
+    #[test]
+    fn capacity_lists_mounted_targets_and_smart_lists_all() {
+        let health = crate::health::HealthReport {
+            status: crate::health::HealthStatus::Healthy,
+            targets: vec![target_health("up", true), target_health("down", false)],
+            last_backup: None,
+            growth_points: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let text = render_capacity_and_smart(Some(&health));
+        let (capacity, smart) = text.split_once("SMART STATUS").unwrap();
+        assert!(
+            capacity.contains("  up                       1.00 GiB   3.00 GiB   25%\n"),
+            "{text}"
+        );
+        assert!(
+            !capacity.contains("down"),
+            "an unmounted target has no capacity row: {text}"
+        );
+        assert!(
+            smart.contains("  up                       SER-up     PASSED  31°C    N/A\n"),
+            "{text}"
+        );
+        assert!(smart.contains("  down "), "{text}");
+        let none = render_capacity_and_smart(None);
+        assert!(none.contains("(health data unavailable)"), "{none}");
+        assert!(!none.contains("SMART STATUS"), "{none}");
+    }
+
+    #[test]
+    fn latest_snapshots_drop_the_header_line() {
+        let out = "SOURCE_SUBVOLUME  SNAPSHOT  STATUS  TARGET\n/v/@  /v/.s/root-.1  -  /t/nvme/root-.1\n/v/@d  /v/.s/d.1  -  /t/nvme/d.1\n";
+        let text = render_latest_snapshots(Some(out));
+        assert!(text.starts_with("\nLATEST SNAPSHOTS\n"), "{text}");
+        assert!(!text.contains("SOURCE_SUBVOLUME"), "{text}");
+        assert!(
+            text.contains("  /v/@  /v/.s/root-.1  -  /t/nvme/root-.1\n"),
+            "{text}"
+        );
+        assert!(text.contains("  /v/@d  /v/.s/d.1"), "{text}");
+        assert!(render_latest_snapshots(None).ends_with("─\n"));
     }
 }

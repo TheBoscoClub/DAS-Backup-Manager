@@ -358,7 +358,9 @@ impl HelperInterface {
             dry_run,
             boot_archive: config.boot.enabled,
             index_after: true,
-            send_report: config.email.enabled,
+            // Written to [general].last_report every run, mailed only when
+            // [email] is enabled (backup::deliver_report).
+            send_report: true,
             ..Default::default()
         };
 
