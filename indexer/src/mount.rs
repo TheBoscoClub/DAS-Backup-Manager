@@ -12,6 +12,7 @@ use std::panic::RefUnwindSafe;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{Config, TargetRole};
 use crate::health;
@@ -90,6 +91,9 @@ trait CommandRunner: Send + Sync + RefUnwindSafe {
     fn status(&self, cmd: &mut Command) -> io::Result<ExitStatus>;
     /// Run to completion, capturing stdout and stderr.
     fn output(&self, cmd: &mut Command) -> io::Result<Output>;
+    /// Wait between two attempts of a command (an unmount retry). Here so
+    /// that tests, which never run the real commands, never really wait.
+    fn pause(&self, how_long: Duration);
 }
 
 /// Runs commands for real.
@@ -102,6 +106,10 @@ impl CommandRunner for SystemRunner {
 
     fn output(&self, cmd: &mut Command) -> io::Result<Output> {
         cmd.output()
+    }
+
+    fn pause(&self, how_long: Duration) {
+        std::thread::sleep(how_long);
     }
 }
 
@@ -131,6 +139,43 @@ pub struct MountGuard {
     runner: Arc<dyn CommandRunner>,
 }
 
+/// How many times an unmount is tried before the mount point is reported as
+/// still mounted. A target is commonly "busy" for a moment after a job ends
+/// — a dry run mounts and unmounts it seconds apart — and the busy state
+/// was observed to clear by itself (bd DAS-Backup-Manager-5oc).
+pub const UMOUNT_ATTEMPTS: u32 = 5;
+
+/// The wait between two unmount attempts.
+pub const UMOUNT_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// The error a job reports for mount points it could not release, or `None`
+/// when everything was released. Every caller of [`MountGuard::unmount`]
+/// turns a non-empty list into a failure with this text, so the operator
+/// reads the same words wherever it happens.
+pub fn still_mounted_error(still_mounted: &[String]) -> Option<String> {
+    (!still_mounted.is_empty()).then(|| format!("still mounted: {}", still_mounted.join(", ")))
+}
+
+/// `Err("still mounted: …")` when anything is left mounted — for a caller
+/// whose result is a `Result`.
+pub fn require_released(still_mounted: &[String]) -> Result<(), String> {
+    still_mounted_error(still_mounted).map_or(Ok(()), Err)
+}
+
+/// A job's result, failed if anything it mounted is still mounted. A job
+/// that had already failed keeps its own error, with the mount points
+/// appended.
+pub fn fail_if_still_mounted<T>(
+    result: Result<T, String>,
+    still_mounted: &[String],
+) -> Result<T, String> {
+    match (result, still_mounted_error(still_mounted)) {
+        (result, None) => result,
+        (Ok(_), Some(e)) => Err(e),
+        (Err(why), Some(e)) => Err(format!("{why}; {e}")),
+    }
+}
+
 impl MountGuard {
     fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
@@ -139,43 +184,63 @@ impl MountGuard {
         }
     }
 
-    /// Explicitly unmount all targets this guard mounted, with progress
-    /// reporting. Prefer calling this over relying on `Drop` so that unmount
-    /// errors can be logged.
-    pub fn unmount(&mut self, progress: &dyn ProgressCallback) {
+    /// `umount` one mount point, up to [`UMOUNT_ATTEMPTS`] times with
+    /// [`UMOUNT_RETRY_PAUSE`] between attempts. `Err` carries why the last
+    /// attempt failed; `retrying` is told about each earlier one.
+    fn release(&self, mount_point: &str, mut retrying: impl FnMut(&str)) -> Result<(), String> {
+        let mut why = String::new();
+        for attempt in 1..=UMOUNT_ATTEMPTS {
+            if attempt > 1 {
+                retrying(&format!(
+                    "{mount_point}: {why} (attempt {} of {UMOUNT_ATTEMPTS}) — retrying",
+                    attempt - 1
+                ));
+                self.runner.pause(UMOUNT_RETRY_PAUSE);
+            }
+            why = match self.runner.status(Command::new("umount").arg(mount_point)) {
+                Ok(s) if s.success() => return Ok(()),
+                Ok(s) => format!("umount exited with code {}", s.code().unwrap_or(-1)),
+                Err(e) => format!("umount failed to run: {e}"),
+            };
+        }
+        Err(why)
+    }
+
+    /// Unmount everything this guard mounted, last-mounted first, retrying
+    /// each, with progress reporting. Returns the mount points that are STILL
+    /// MOUNTED after every attempt — the caller must fail its job on a
+    /// non-empty list ([`still_mounted_error`]): a backup target left mounted
+    /// is exposed, and the job is not a success. Prefer this over relying on
+    /// `Drop`, which can only print.
+    #[must_use = "a mount point left mounted must fail the job (see still_mounted_error)"]
+    pub fn unmount(&mut self, progress: &dyn ProgressCallback) -> Vec<String> {
+        let mut still_mounted = Vec::new();
         if self.newly_mounted.is_empty() {
-            return;
+            return still_mounted;
         }
         let total = self.newly_mounted.len() as u64;
         progress.on_stage("Unmounting targets", total);
-        // Unmount in reverse order (LIFO)
-        for (i, mount_point) in self.newly_mounted.drain(..).rev().enumerate() {
-            let status = self.runner.status(Command::new("umount").arg(&mount_point));
-            match status {
-                Ok(s) if s.success() => {
-                    progress.on_progress(
-                        (i + 1) as u64,
-                        total,
-                        &format!("Unmounted {mount_point}"),
-                    );
+        let held: Vec<String> = self.newly_mounted.drain(..).rev().collect();
+        for (i, mount_point) in held.into_iter().enumerate() {
+            let released = self.release(&mount_point, |msg| {
+                progress.on_log(crate::progress::LogLevel::Warning, msg);
+            });
+            match released {
+                Ok(()) => {
+                    progress.on_progress((i + 1) as u64, total, &format!("Unmounted {mount_point}"))
                 }
-                Ok(s) => {
+                Err(why) => {
                     progress.on_log(
-                        crate::progress::LogLevel::Warning,
+                        crate::progress::LogLevel::Error,
                         &format!(
-                            "umount {mount_point} exited with code {}",
-                            s.code().unwrap_or(-1)
+                            "{mount_point} is still mounted: {why} after {UMOUNT_ATTEMPTS} attempts"
                         ),
                     );
-                }
-                Err(e) => {
-                    progress.on_log(
-                        crate::progress::LogLevel::Warning,
-                        &format!("umount {mount_point} failed: {e}"),
-                    );
+                    still_mounted.push(mount_point);
                 }
             }
         }
+        still_mounted
     }
 
     /// How many mount points this guard is responsible for.
@@ -183,25 +248,25 @@ impl MountGuard {
         self.newly_mounted.len()
     }
 
-    /// Unmount everything still held, in reverse order, and return one message
-    /// per mount point that could not be unmounted. `Drop` has nowhere to send
-    /// these but stderr; they are returned rather than printed here so that
-    /// "a failed unmount is reported, a clean one is not" can be tested.
+    /// Unmount everything still held, in reverse order and with the same
+    /// retries as [`MountGuard::unmount`], and return one message per mount
+    /// point left mounted. `Drop` has nowhere to send these but stderr; they
+    /// are returned rather than printed here so that "a failed unmount is
+    /// reported, a clean one is not" can be tested.
     fn unmount_remaining(&mut self) -> Vec<String> {
-        let mut failures = Vec::new();
-        for mount_point in self.newly_mounted.drain(..).rev() {
-            match self.runner.status(Command::new("umount").arg(&mount_point)) {
-                Ok(s) if s.success() => {}
-                Ok(s) => failures.push(format!(
-                    "MountGuard::drop: umount {mount_point} exited {} — target left mounted",
-                    s.code().unwrap_or(-1)
-                )),
-                Err(e) => failures.push(format!(
-                    "MountGuard::drop: umount {mount_point} failed to run: {e}"
-                )),
-            }
-        }
-        failures
+        let held: Vec<String> = self.newly_mounted.drain(..).rev().collect();
+        held.into_iter()
+            .filter_map(|mount_point| {
+                self.release(&mount_point, |msg| eprintln!("MountGuard::drop: {msg}"))
+                    .err()
+                    .map(|why| {
+                        format!(
+                            "MountGuard::drop: {mount_point} is still mounted: {why} after \
+                             {UMOUNT_ATTEMPTS} attempts"
+                        )
+                    })
+            })
+            .collect()
     }
 }
 
@@ -805,6 +870,9 @@ mod tests {
         /// Exits 32 having left a file at this path — a mount that failed
         /// but did not leave its mount point as it found it.
         FailLeavingFile(String),
+        /// Exits with these codes on successive calls, then the last one for
+        /// every call after.
+        Seq(&'static [i32]),
     }
 
     impl Reply {
@@ -852,6 +920,10 @@ mod tests {
         /// Mount points of every scripted `mount` that succeeded and has not
         /// been `umount`ed since, so the host's mount table can follow.
         mounted: Mutex<Vec<String>>,
+        /// How many times each `Seq` rule has answered.
+        seq_pos: Mutex<std::collections::HashMap<String, usize>>,
+        /// Every pause asked for, in order; none is really taken.
+        pauses: Mutex<Vec<Duration>>,
     }
 
     impl ScriptedRunner {
@@ -867,6 +939,8 @@ mod tests {
                     .map(|(key, reply)| (key.to_string(), reply.clone()))
                     .collect(),
                 mounted: Mutex::new(Vec::new()),
+                seq_pos: Mutex::new(std::collections::HashMap::new()),
+                pauses: Mutex::new(Vec::new()),
             })
         }
 
@@ -877,12 +951,21 @@ mod tests {
         fn run(&self, captured: bool, cmd: &Command) -> io::Result<Output> {
             let mut argv = vec![cmd.get_program().to_string_lossy().into_owned()];
             argv.extend(cmd.get_args().map(|a| a.to_string_lossy().into_owned()));
-            let reply = self
+            let reply = match self
                 .rules
                 .iter()
                 .find(|(key, _)| argv.iter().any(|a| a == key))
-                .map(|(_, reply)| reply.clone())
-                .unwrap_or_else(Reply::ok);
+            {
+                Some((key, Reply::Seq(codes))) => {
+                    let mut pos = self.seq_pos.lock().unwrap();
+                    let n = pos.entry(key.clone()).or_insert(0);
+                    let code = codes[(*n).min(codes.len() - 1)];
+                    *n += 1;
+                    Reply::exit(code)
+                }
+                Some((_, reply)) => reply.clone(),
+                None => Reply::ok(),
+            };
             if matches!(reply, Reply::Exit { code: 0, .. })
                 && let Some(mount_point) = argv.last()
             {
@@ -905,6 +988,7 @@ mod tests {
                     stdout: stdout.as_bytes().to_vec(),
                     stderr: stderr.as_bytes().to_vec(),
                 }),
+                Reply::Seq(_) => unreachable!("resolved to an exit above"),
                 Reply::CannotRun => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "scripted: no such program",
@@ -928,6 +1012,10 @@ mod tests {
 
         fn output(&self, cmd: &mut Command) -> io::Result<Output> {
             self.run(true, cmd)
+        }
+
+        fn pause(&self, how_long: Duration) {
+            self.pauses.lock().unwrap().push(how_long);
         }
     }
 
@@ -1207,7 +1295,7 @@ mod tests {
         let progress = Recorder::default();
         let mut guard = guard_holding(&runner, &["/t/first", "/t/second"]);
 
-        guard.unmount(&progress);
+        assert!(guard.unmount(&progress).is_empty());
 
         assert_eq!(
             runner.calls(),
@@ -1231,11 +1319,12 @@ mod tests {
         assert_eq!(runner.calls().len(), 2, "Drop must not unmount twice");
     }
 
-    /// A umount that fails is a warning, never a progress step: reporting
-    /// "Unmounted X" for a target that is still mounted is how the next run's
-    /// mount-point reasoning goes wrong.
+    /// A umount that never succeeds is retried, then reported as still
+    /// mounted — an error, never a progress step: reporting "Unmounted X" for
+    /// a target that is still mounted is how the next run's mount-point
+    /// reasoning goes wrong.
     #[test]
-    fn unmount_warns_about_each_mount_point_it_could_not_release() {
+    fn unmount_returns_each_mount_point_it_could_not_release() {
         let runner = ScriptedRunner::with_rules(&[
             ("/t/busy", Reply::exit(32)),
             ("/t/norun", Reply::CannotRun),
@@ -1243,20 +1332,135 @@ mod tests {
         let progress = Recorder::default();
         let mut guard = guard_holding(&runner, &["/t/busy", "/t/norun"]);
 
-        guard.unmount(&progress);
+        let still = guard.unmount(&progress);
 
-        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(still, vec!["/t/norun".to_string(), "/t/busy".to_string()]);
+        let attempts = UMOUNT_ATTEMPTS as usize;
+        assert_eq!(runner.calls().len(), 2 * attempts);
+        assert_eq!(
+            *runner.pauses.lock().unwrap(),
+            vec![UMOUNT_RETRY_PAUSE; 2 * (attempts - 1)],
+            "a pause between attempts, none after the last"
+        );
         assert!(progress.steps().is_empty(), "{:?}", progress.steps());
         let logs = progress.logs();
-        assert_eq!(logs.len(), 2, "{logs:?}");
-        assert_eq!(logs[0].0, LogLevel::Warning);
-        assert!(logs[0].1.contains("umount /t/norun failed:"), "{logs:?}");
+        let errors: Vec<&String> = logs
+            .iter()
+            .filter(|(l, _)| *l == LogLevel::Error)
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(errors.len(), 2, "{logs:?}");
+        assert!(
+            errors[0].starts_with("/t/norun is still mounted: umount failed to run:"),
+            "{logs:?}"
+        );
         assert_eq!(
-            logs[1],
-            (
-                LogLevel::Warning,
-                "umount /t/busy exited with code 32".to_string()
-            )
+            errors[1],
+            "/t/busy is still mounted: umount exited with code 32 after 5 attempts"
+        );
+        assert_eq!(
+            logs.iter().filter(|(l, _)| *l == LogLevel::Warning).count(),
+            2 * (attempts - 1),
+            "one warning per retried attempt: {logs:?}"
+        );
+        assert_eq!(guard.count(), 0);
+        drop(guard);
+        assert_eq!(
+            runner.calls().len(),
+            2 * attempts,
+            "Drop must not retry again"
+        );
+    }
+
+    /// A target busy for a moment is released on a later attempt, and the
+    /// job sees nothing left mounted.
+    #[test]
+    fn a_target_busy_twice_is_released_on_the_third_attempt() {
+        let runner = ScriptedRunner::with_rules(&[("/t/busy", Reply::Seq(&[32, 32, 0]))]);
+        let progress = Recorder::default();
+        let mut guard = guard_holding(&runner, &["/t/busy"]);
+
+        let still = guard.unmount(&progress);
+
+        assert!(still.is_empty(), "{still:?}");
+        assert_eq!(
+            runner.calls(),
+            vec![status_call(&["umount", "/t/busy"]); 3],
+            "stops trying once it succeeds"
+        );
+        assert_eq!(*runner.pauses.lock().unwrap(), vec![UMOUNT_RETRY_PAUSE; 2]);
+        assert_eq!(
+            progress.steps(),
+            vec![(1, 1, "Unmounted /t/busy".to_string())]
+        );
+        assert_eq!(
+            progress.logs(),
+            vec![
+                (
+                    LogLevel::Warning,
+                    "/t/busy: umount exited with code 32 (attempt 1 of 5) — retrying".to_string()
+                ),
+                (
+                    LogLevel::Warning,
+                    "/t/busy: umount exited with code 32 (attempt 2 of 5) — retrying".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Busy on every attempt but the last still counts as released; busy on
+    /// the last too is not.
+    #[test]
+    fn the_fifth_attempt_is_the_last_one() {
+        let runner = ScriptedRunner::with_rules(&[("/t/late", Reply::Seq(&[32, 32, 32, 32, 0]))]);
+        let mut guard = guard_holding(&runner, &["/t/late"]);
+        assert!(guard.unmount(&Recorder::default()).is_empty());
+        assert_eq!(runner.calls().len(), 5);
+
+        let runner =
+            ScriptedRunner::with_rules(&[("/t/never", Reply::Seq(&[32, 32, 32, 32, 32, 0]))]);
+        let mut guard = guard_holding(&runner, &["/t/never"]);
+        assert_eq!(
+            guard.unmount(&Recorder::default()),
+            vec!["/t/never".to_string()]
+        );
+        assert_eq!(runner.calls().len(), 5, "no sixth attempt");
+    }
+
+    #[test]
+    fn a_clean_unmount_takes_no_pause() {
+        let runner = ScriptedRunner::succeeding();
+        let mut guard = guard_holding(&runner, &["/t/a", "/t/b"]);
+        assert!(guard.unmount(&Recorder::default()).is_empty());
+        assert!(runner.pauses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn still_mounted_error_names_every_path_or_nothing() {
+        assert_eq!(still_mounted_error(&[]), None);
+        assert_eq!(
+            still_mounted_error(&["/mnt/a".into(), "/mnt/b".into()]).as_deref(),
+            Some("still mounted: /mnt/a, /mnt/b")
+        );
+    }
+
+    #[test]
+    fn the_real_runner_really_pauses() {
+        let start = std::time::Instant::now();
+        SystemRunner.pause(Duration::from_millis(60));
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        assert!(UMOUNT_RETRY_PAUSE >= Duration::from_secs(1));
+    }
+
+    /// What a backup job sees through `backup::Release`: the same list.
+    #[test]
+    fn release_reports_what_unmount_could_not_release() {
+        use crate::backup::Release;
+        let runner = ScriptedRunner::with_rules(&[("/t/busy", Reply::exit(32))]);
+        let mut guard = guard_holding(&runner, &["/t/busy", "/t/fine"]);
+        assert_eq!(
+            Release::release(&mut guard, &Recorder::default()),
+            vec!["/t/busy".to_string()]
         );
     }
 
@@ -1266,7 +1470,7 @@ mod tests {
         let progress = Recorder::default();
         let mut guard = MountGuard::new(runner.clone());
 
-        guard.unmount(&progress);
+        assert!(guard.unmount(&progress).is_empty());
         drop(guard);
 
         assert!(runner.calls().is_empty());
@@ -1291,27 +1495,31 @@ mod tests {
     }
 
     /// What Drop prints: nothing for a clean unmount, one line for each mount
-    /// point left behind.
+    /// point left behind after every attempt.
     #[test]
     fn unmount_remaining_reports_only_the_failures() {
         let runner = ScriptedRunner::with_rules(&[
             ("/t/busy", Reply::exit(32)),
             ("/t/norun", Reply::CannotRun),
+            ("/t/flaky", Reply::Seq(&[32, 0])),
         ]);
-        let mut guard = guard_holding(&runner, &["/t/busy", "/t/fine", "/t/norun"]);
+        let mut guard = guard_holding(&runner, &["/t/busy", "/t/fine", "/t/flaky", "/t/norun"]);
 
         let failures = guard.unmount_remaining();
 
-        assert_eq!(runner.calls().len(), 3);
+        let attempts = UMOUNT_ATTEMPTS as usize;
+        assert_eq!(runner.calls().len(), 2 * attempts + 1 + 2);
+        assert_eq!(runner.pauses.lock().unwrap().len(), 2 * (attempts - 1) + 1);
         assert_eq!(guard.count(), 0);
         assert_eq!(failures.len(), 2, "{failures:?}");
         assert!(
-            failures[0].starts_with("MountGuard::drop: umount /t/norun failed to run:"),
+            failures[0]
+                .starts_with("MountGuard::drop: /t/norun is still mounted: umount failed to run:"),
             "{failures:?}"
         );
         assert_eq!(
             failures[1],
-            "MountGuard::drop: umount /t/busy exited 32 — target left mounted"
+            "MountGuard::drop: /t/busy is still mounted: umount exited with code 32 after 5 attempts"
         );
 
         let clean = ScriptedRunner::succeeding();
@@ -2915,5 +3123,29 @@ mod tests {
         let result = ensure_targets_mounted(&config, &progress);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fail_if_still_mounted_keeps_a_clean_result_and_fails_a_dirty_one() {
+        let none: &[String] = &[];
+        let held = ["/mnt/t".to_string()];
+        assert_eq!(fail_if_still_mounted(Ok::<i32, String>(7), none), Ok(7));
+        assert_eq!(
+            fail_if_still_mounted(Err::<i32, String>("boom".into()), none),
+            Err("boom".to_string())
+        );
+        assert_eq!(
+            fail_if_still_mounted(Ok::<i32, String>(7), &held),
+            Err("still mounted: /mnt/t".to_string())
+        );
+        assert_eq!(
+            fail_if_still_mounted(Err::<i32, String>("boom".into()), &held),
+            Err("boom; still mounted: /mnt/t".to_string())
+        );
+        assert_eq!(require_released(none), Ok(()));
+        assert_eq!(
+            require_released(&held),
+            Err("still mounted: /mnt/t".to_string())
+        );
     }
 }

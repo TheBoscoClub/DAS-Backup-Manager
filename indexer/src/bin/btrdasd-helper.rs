@@ -24,17 +24,14 @@ use zbus::{Connection, interface};
 
 use buttered_dasd::backup::{self, BackupLockAttempt, BackupMode, BackupOptions};
 use buttered_dasd::btrbk_conf;
-use buttered_dasd::caldate;
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
-use buttered_dasd::fsutil::SystemRunner;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
 use buttered_dasd::progress::{
     LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
 };
-use buttered_dasd::report;
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
 use buttered_dasd::subvol;
@@ -385,94 +382,22 @@ impl HelperInterface {
         let jid = job_id.clone();
 
         let handle = tokio::spawn(async move {
-            let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                // Join the same two-lock interlock as the scheduled path and the
-                // CLI: singleton (non-blocking — a second backup is redundant,
-                // not late) then the shared maintenance lock (blocking — a scrub
-                // is a peer operation and this should wait for it). Without it
-                // a GUI backup could run concurrently with the 03:00 timer or a
-                // live scrub, and MountGuard::Drop could unmount a target out
-                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
-                // fixed this for main.rs in 0.7.15.0 and never reached the
-                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(progress) {
-                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
-                    Ok(BackupLockAttempt::AlreadyRunning) => {
-                        return Err("A backup is already running — declined".to_string());
-                    }
-                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
-                };
-                let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                // A GUI backup syncs exactly as the CLI and the timer do: a
-                // subvolume that exists is backed up by this run. The section
-                // reaches the GUI through the job log.
-                let (config, sync) = backup::sync_before_backup(
-                    Path::new(CANONICAL_CONFIG),
-                    options.dry_run,
-                    &caldate::today(),
-                    &SystemRunner,
-                    &health::is_mountpoint,
-                    progress,
+            // The same job the CLI runs (`backup::run_backup_job`): the
+            // two-lock interlock (bd DAS-Backup-Manager-pe6, -dca), subvolume
+            // sync (its section reaches the GUI through the job log), mounts,
+            // btrbk, unmount — a target left mounted fails the run
+            // (bd DAS-Backup-Manager-5oc) — report and record.
+            let (success, summary) = tokio::task::spawn_blocking(move || {
+                backup::run_backup_job(
+                    &backup::SystemBackupHost::new(Path::new(CANONICAL_CONFIG)),
+                    config,
+                    options,
+                    &*progress,
                 )
-                .map_err(|e| format!("Config could not be reloaded after subvolume sync: {e}"))?;
-                // Same rule as the CLI: a failed sync never stops the run,
-                // but the run's result, record and report all say it failed.
-                let sync_failed = sync.failed;
-                let mut options = options;
-                options.subvolume_sync = Some(sync);
-                let mut guard = mount::ensure_targets_mounted(&config, progress)
-                    .map_err(|e| format!("Mount failed: {e}"))?;
-
-                let res = match backup::run_backup(&config, &options, progress) {
-                    Ok(r) => {
-                        // Record the backup run in the database for history (skip dry runs).
-                        if !options.dry_run {
-                            match Database::open(&config.general.db_path) {
-                                Ok(db) => {
-                                    if let Err(e) = report::record_backup_run(&db, &r) {
-                                        progress.on_log(
-                                            LogLevel::Warning,
-                                            &format!("Failed to record backup history: {e}"),
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    progress.on_log(
-                                        LogLevel::Warning,
-                                        &format!("Failed to open DB for history: {e}"),
-                                    );
-                                }
-                            }
-                        }
-                        Ok((
-                            r.success,
-                            format!(
-                                "Backup complete: {} snapshots created, {} sent{}",
-                                r.snapshots_created,
-                                r.snapshots_sent,
-                                if sync_failed {
-                                    " — SUBVOLUME SYNC FAILED, see the log"
-                                } else {
-                                    ""
-                                }
-                            ),
-                        ))
-                    }
-                    Err(e) => Err(format!("Backup failed: {e}")),
-                };
-
-                guard.unmount(progress);
-                source_guard.unmount(progress);
-                res
+                .finish_line(dry_run)
             })
             .await
-            .unwrap_or_else(|e| Err(format!("Backup task panicked: {e}")));
-
-            let (success, summary) = match result {
-                Ok((s, msg)) => (s, msg),
-                Err(msg) => (false, msg),
-            };
+            .unwrap_or_else(|e| (false, format!("Backup task panicked: {e}")));
 
             finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
@@ -526,8 +451,8 @@ impl HelperInterface {
                     Ok(n) => Ok(format!("{n} snapshots created")),
                     Err(e) => Err(format!("Snapshot failed: {e}")),
                 };
-                source_guard.unmount(progress);
-                res
+                let still_mounted = source_guard.unmount(progress);
+                mount::fail_if_still_mounted(res, &still_mounted)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Snapshot task panicked: {e}")));
@@ -596,9 +521,9 @@ impl HelperInterface {
                     Err(e) => Err(format!("Send failed: {e}")),
                 };
 
-                guard.unmount(progress);
-                source_guard.unmount(progress);
-                res
+                let mut still_mounted = guard.unmount(progress);
+                still_mounted.extend(source_guard.unmount(progress));
+                mount::fail_if_still_mounted(res, &still_mounted)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Send task panicked: {e}")));
@@ -669,8 +594,8 @@ impl HelperInterface {
                     Err(e) => Err(format!("Boot archive failed: {e}")),
                 };
 
-                guard.unmount(progress);
-                res
+                let still_mounted = guard.unmount(progress);
+                mount::fail_if_still_mounted(res, &still_mounted)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Boot archive task panicked: {e}")));
@@ -758,9 +683,9 @@ impl HelperInterface {
                     }
                 }
 
-                guard.unmount(progress);
+                let still_mounted = guard.unmount(progress);
 
-                if !errors.is_empty() && total_indexed == 0 {
+                let res = if !errors.is_empty() && total_indexed == 0 {
                     Err(format!("Indexing failed: {}", errors.join("; ")))
                 } else {
                     let mut msg = format!(
@@ -770,7 +695,8 @@ impl HelperInterface {
                         msg.push_str(&format!(" [warnings: {}]", errors.join("; ")));
                     }
                     Ok(msg)
-                }
+                };
+                mount::fail_if_still_mounted(res, &still_mounted)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));
@@ -1147,8 +1073,8 @@ impl HelperInterface {
                     Err(e) => Err(format!("Restore failed: {e}")),
                 };
 
-                guard.unmount(progress);
-                res
+                let still_mounted = guard.unmount(progress);
+                mount::fail_if_still_mounted(res, &still_mounted)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Restore task panicked: {e}")));
@@ -1214,8 +1140,8 @@ impl HelperInterface {
                     Err(e) => Err(format!("Snapshot restore failed: {e}")),
                 };
 
-                guard.unmount(progress);
-                res
+                let still_mounted = guard.unmount(progress);
+                mount::fail_if_still_mounted(res, &still_mounted)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Snapshot restore task panicked: {e}")));

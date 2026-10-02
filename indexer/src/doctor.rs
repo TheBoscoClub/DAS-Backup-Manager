@@ -302,6 +302,9 @@ pub struct DriftReport {
     pub volumes_failed: Vec<(String, String)>,
     pub missing: Vec<MissingSubvolume>,
     pub stale: Vec<StaleSubvolume>,
+    /// Volumes this check mounted and could not unmount again (bd
+    /// DAS-Backup-Manager-5oc).
+    pub left_mounted: Vec<String>,
 }
 
 impl DriftReport {
@@ -331,7 +334,7 @@ impl DriftReport {
     /// failure email while still exiting 0). Any future third state must be
     /// added here, not at a call site.
     pub fn not_clean(&self) -> bool {
-        self.has_drift() || !self.volumes_failed.is_empty()
+        self.has_drift() || !self.volumes_failed.is_empty() || !self.left_mounted.is_empty()
     }
 }
 
@@ -415,8 +418,8 @@ fn perform_drift_check(config: &Config, progress: &dyn ProgressCallback) -> Drif
     let mut guard = mount::ensure_sources_mounted(config, progress);
     let listings =
         crate::adopt::list_volumes(config, &crate::fsutil::SystemRunner, &health::is_mountpoint);
-    let report = drift_from_listings(config, &listings);
-    guard.unmount(progress);
+    let mut report = drift_from_listings(config, &listings);
+    report.left_mounted = guard.unmount(progress);
     report
 }
 
@@ -536,6 +539,15 @@ pub fn format_report(report: &DriftReport) -> String {
                 "  {}  (source: {}, volume: {})\n",
                 s.name, s.source_label, s.volume
             ));
+        }
+    }
+
+    if !report.left_mounted.is_empty() {
+        r.push_str(&format!(
+            "\nLEFT MOUNTED — the check mounted these and could not unmount them\n{thin}\n"
+        ));
+        for volume in &report.left_mounted {
+            r.push_str(&format!("  {volume}\n"));
         }
     }
 
@@ -931,6 +943,7 @@ mod tests {
                 name: "bosco-media/video".into(),
             }],
             stale: Vec::new(),
+            left_mounted: Vec::new(),
         };
         let text = format_report(&report);
         assert!(
@@ -1032,5 +1045,29 @@ mod tests {
         let result = try_acquire_locks_at(&singleton, &maintenance).unwrap();
         assert!(matches!(result, LockAttempt::MaintenanceBusy));
         drop(held);
+    }
+
+    #[test]
+    fn a_volume_left_mounted_makes_the_check_not_clean_and_is_reported() {
+        let clean = DriftReport {
+            volumes_checked: 2,
+            ..Default::default()
+        };
+        assert!(!clean.not_clean());
+        assert!(!format_report(&clean).contains("LEFT MOUNTED"));
+
+        let report = DriftReport {
+            volumes_checked: 2,
+            left_mounted: vec!["/.btrfs-nvme".into()],
+            ..Default::default()
+        };
+        assert!(report.not_clean());
+        let text = format_report(&report);
+        assert!(text.contains("Status: DRIFT DETECTED — FAILURE"), "{text}");
+        assert!(
+            text.contains("LEFT MOUNTED — the check mounted these and could not unmount them"),
+            "{text}"
+        );
+        assert!(text.contains("\n  /.btrfs-nvme\n"), "{text}");
     }
 }

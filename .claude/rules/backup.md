@@ -149,7 +149,7 @@ Checked before any directory is created, both roots compared **after resolution*
   - `backup-run.sh` and `btrdasd scrub run`: **0** = the run/pass executed, whatever it found;
     **nonzero** = it could not start at all. Findings travel by email and `btrdasd health`.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
-    volume failed to mount/list (outranks 1). `das-backup-doctor.service` carries
+    volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.
 - Sentinel matches unit names by exact string — no globs. Prefer single non-template units.
 

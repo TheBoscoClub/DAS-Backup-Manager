@@ -157,7 +157,7 @@ where
             Ok((plan, deleted, failures))
         })();
 
-    guard.unmount(&progress);
+    let still_mounted = guard.unmount(&progress);
     let (plan, deleted, failures) = outcome?;
 
     if json {
@@ -186,6 +186,7 @@ where
             }
         }
     }
+    mount::require_released(&still_mounted)?;
     Ok(())
 }
 
@@ -1120,7 +1121,9 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
 /// - `Ran` with at least one volume that failed to mount/list is **3** — those
 ///   subvolumes went unexamined. That is an operational fault, not a finding,
 ///   so the generated unit lets it fail. It outranks drift when both occur:
-///   an incomplete check cannot assert that its drift list is complete.
+///   an incomplete check cannot assert that its drift list is complete. A
+///   volume the check mounted and could not unmount again is the same kind
+///   of operational fault (bd DAS-Backup-Manager-5oc) and is 3 as well.
 /// - `Ran` cleanly with drift is **1** — a successful check with a result.
 ///   `render_systemd_doctor_service` pairs this with `SuccessExitStatus=1`.
 /// - Otherwise 0.
@@ -1142,7 +1145,7 @@ pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
         doctor::DoctorOutcome::Ran(report) => {
             if !report.ran() {
                 2
-            } else if !report.volumes_failed.is_empty() {
+            } else if !report.volumes_failed.is_empty() || !report.left_mounted.is_empty() {
                 3
             } else if report.has_drift() {
                 1
@@ -1210,7 +1213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Reconcile while the targets are still mounted — the prune is only
             // ever safe under a verified mountpoint (bd DAS-Backup-Manager-cu8).
             let reconciled = run_reconcile(&database, &cfg, false);
-            guard.unmount(&progress);
+            let still_mounted = guard.unmount(&progress);
             let result = result?;
             if json {
                 println!(
@@ -1243,6 +1246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            mount::require_released(&still_mounted)?;
         }
         Commands::Forget {
             pattern,
@@ -1329,7 +1333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(per_target)
             })();
 
-            guard.unmount(&progress);
+            let still_mounted = guard.unmount(&progress);
             let per_target = outcome?;
 
             let total: usize = per_target.iter().map(|(_, i, _, _)| i).sum();
@@ -1369,6 +1373,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("Total newly indexed: {total}");
             }
+            mount::require_released(&still_mounted)?;
         }
         Commands::Reconcile {
             db,
@@ -1449,7 +1454,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 (plan, stats)
             });
-            guard.unmount(&progress);
+            let still_mounted = guard.unmount(&progress);
 
             let (plan, stats) = outcome?;
             let stats = stats?;
@@ -1495,6 +1500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            mount::require_released(&still_mounted)?;
         }
         Commands::Search { query, db, limit } => {
             let database = Database::open(&db)?;
@@ -1607,7 +1613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 targets,
             } => {
                 let cfg = Config::load(&config)?;
-                let mut options = BackupOptions {
+                let options = BackupOptions {
                     mode: if full {
                         Some(BackupMode::Full)
                     } else {
@@ -1622,49 +1628,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 };
                 let progress = CliProgress;
-                // Manual backups mount and unmount the DAS filesystems, so they
-                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
-                let _locks = match backup::acquire_manual_locks(&progress)? {
-                    BackupLockAttempt::Acquired(locks) => locks,
-                    BackupLockAttempt::AlreadyRunning => {
+                // The same job the GUI runs (`backup::run_backup_job`): the
+                // interlock (bd DAS-Backup-Manager-pe6), subvolume sync, mounts,
+                // btrbk, unmount, report, record. The sync report goes to the
+                // progress log (stderr), so stdout stays what it was.
+                let outcome = backup::run_backup_job(
+                    &backup::SystemBackupHost::new(&config),
+                    cfg,
+                    options,
+                    &progress,
+                );
+                let result = match outcome {
+                    backup::BackupJobOutcome::Declined => {
                         println!("A backup is already running — declining.");
                         return Ok(());
                     }
+                    backup::BackupJobOutcome::NotRun(e) => return Err(e.into()),
+                    backup::BackupJobOutcome::Ran(result) => result,
                 };
-                let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                // The manual path gets the same guarantee as the scheduled
-                // one: a subvolume that exists is backed up by this run. The
-                // report goes to the progress log (stderr), so stdout stays
-                // what it was.
-                let (cfg, sync) = backup::sync_before_backup(
-                    &config,
-                    dry_run,
-                    &buttered_dasd::caldate::today(),
-                    &buttered_dasd::fsutil::SystemRunner,
-                    &buttered_dasd::health::is_mountpoint,
-                    &progress,
-                )?;
-                // A failed sync fails the run's result, record and report.
-                options.subvolume_sync = Some(sync);
-                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-                let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
-                guard.unmount(&progress);
-                source_guard.unmount(&progress);
-                let result = result?;
-
-                // Record the backup run in the database (skip dry runs)
-                if !options.dry_run {
-                    match Database::open(&cfg.general.db_path) {
-                        Ok(db) => {
-                            if let Err(e) = report::record_backup_run(&db, &result) {
-                                eprintln!("  [WARN]  Failed to record backup history: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  [WARN]  Failed to open DB for history: {e}");
-                        }
-                    }
-                }
+                progress.on_complete(result.success, &backup::backup_summary(&result, dry_run));
 
                 if json {
                     println!(
@@ -1692,8 +1674,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  ERROR: {e}");
                     }
                 }
-                // A failed sync did not stop the run; it is in the result, so
-                // the command fails once the run has finished and been recorded.
+                // A failed sync or a target left mounted did not stop the run;
+                // it is in the result, so the command fails once the run has
+                // finished and been recorded.
                 if let Some(code) = backup_run_exit_code(result.success) {
                     std::process::exit(code);
                 }
@@ -1712,8 +1695,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let count = buttered_dasd::backup::create_snapshots(&cfg, &sources, &progress)?;
-                source_guard.unmount(&progress);
+                let sources_still_mounted = source_guard.unmount(&progress);
                 println!("Created {count} snapshots");
+                mount::require_released(&sources_still_mounted)?;
             }
             BackupAction::Send { config, targets } => {
                 let cfg = Config::load(&config)?;
@@ -1731,10 +1715,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result =
                     buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, false, &progress);
-                guard.unmount(&progress);
-                source_guard.unmount(&progress);
+                let mut still_mounted = guard.unmount(&progress);
+                still_mounted.extend(source_guard.unmount(&progress));
                 let (sent, bytes) = result?;
                 println!("Sent {sent} snapshots ({})", report::format_bytes(bytes));
+                mount::require_released(&still_mounted)?;
             }
             BackupAction::BootArchive { config } => {
                 let cfg = Config::load(&config)?;
@@ -1750,7 +1735,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::archive_boot(&cfg, &progress);
-                guard.unmount(&progress);
+                let still_mounted = guard.unmount(&progress);
                 let archived = result?;
                 if archived {
                     println!("Boot subvolumes archived successfully");
@@ -1759,6 +1744,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "No boot subvolumes to archive (boot archival disabled or no targets mounted)"
                     );
                 }
+                mount::require_released(&still_mounted)?;
             }
             BackupAction::Report { db, limit } => {
                 let database = Database::open(&db)?;
@@ -1861,7 +1847,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &restore::snapshot_source_roots(&cfg),
                     &progress,
                 );
-                guard.unmount(&progress);
+                let still_mounted = guard.unmount(&progress);
                 let result = result?;
                 if json {
                     println!(
@@ -1882,6 +1868,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  ERROR: {e}");
                     }
                 }
+                mount::require_released(&still_mounted)?;
             }
             RestoreAction::Snapshot {
                 snapshot,
@@ -1898,7 +1885,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &restore::snapshot_source_roots(&cfg),
                     &progress,
                 );
-                guard.unmount(&progress);
+                let still_mounted = guard.unmount(&progress);
                 let result = result?;
                 if json {
                     println!(
@@ -1919,6 +1906,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  ERROR: {e}");
                     }
                 }
+                mount::require_released(&still_mounted)?;
             }
             RestoreAction::Browse {
                 snapshot,
@@ -1929,7 +1917,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let progress = CliProgress;
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let entries = restore::browse_snapshot(&snapshot, prefix.as_deref());
-                guard.unmount(&progress);
+                let still_mounted = guard.unmount(&progress);
                 let entries = entries?;
                 if json {
                     print!("[");
@@ -1963,6 +1951,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     println!("({} entries)", entries.len());
                 }
+                mount::require_released(&still_mounted)?;
             }
         },
 
@@ -2952,6 +2941,44 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert!(report.not_clean());
         let outcome = doctor::DoctorOutcome::Ran(report);
         assert_eq!(exit_code_for_doctor(&outcome), 3);
+    }
+
+    /// `forget` and `purge` fail when their config cannot be read, before
+    /// any lock, mount or deletion — never a silent success.
+    #[test]
+    fn run_deletion_fails_on_a_config_it_cannot_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_deletion(
+            "/nonexistent/index.db",
+            &dir.path().join("absent.toml"),
+            false,
+            true,
+            "forget",
+            |_| -> Result<forget::ForgetPlan, forget::ForgetRefusal> {
+                panic!("nothing may be selected without a config")
+            },
+        )
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn exit_code_for_doctor_volume_left_mounted_is_an_operational_fault() {
+        let report = doctor::DriftReport {
+            volumes_checked: 3,
+            left_mounted: vec!["/.btrfs-nvme".into()],
+            missing: vec![doctor::MissingSubvolume {
+                volume: "/.btrfs-nvme".into(),
+                source_labels: vec!["nvme".into()],
+                name: "@new".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_code_for_doctor(&doctor::DoctorOutcome::Ran(report)),
+            3,
+            "left mounted outranks drift, like an unexamined volume"
+        );
     }
 
     #[test]
