@@ -512,6 +512,12 @@ pub struct SyncOutcome {
     /// cannot be trusted (`caldate::untrusted_clock`). Adoption and revival
     /// do not depend on the date and go ahead.
     pub retire_refused: Option<String>,
+    /// On a dry run only: the `btrbk.conf` the same sync would leave in
+    /// place if it were real — `None` when that would be no readable file.
+    /// `backup-run.sh --dryrun` hands it to `btrbk dryrun`, which would
+    /// otherwise read the un-updated file and trip on an entry the real run
+    /// retires first (bd DAS-Backup-Manager-g17).
+    pub planned_btrbk_conf: Option<String>,
 }
 
 impl SyncOutcome {
@@ -554,18 +560,36 @@ pub fn sync_subvolumes(
     if !to_apply.changes_config() {
         let (btrbk_conf, write_error) =
             bring_btrbk_conf_into_line(&config, dry_run, to_apply.failed());
+        let planned_btrbk_conf = dry_run.then(|| match btrbk_conf {
+            // What a real run would regenerate it to — if config.toml is
+            // valid; otherwise it would be left as it is.
+            BtrbkConf::WouldRegenerate if config.validate().is_empty() => {
+                Some(crate::btrbk_conf::render_btrbk_conf(&config))
+            }
+            _ => current_btrbk_conf(&config),
+        });
         return Ok(SyncOutcome {
             plan,
             written: false,
             write_error,
             btrbk_conf,
             retire_refused,
+            planned_btrbk_conf: planned_btrbk_conf.flatten(),
         });
     }
     if dry_run {
+        // A real run writes both files from the updated config — unless it
+        // cannot be applied or does not validate, and then neither.
+        let planned_btrbk_conf = match apply_plan(&config, &to_apply, today) {
+            Ok(updated) if updated.validate().is_empty() => {
+                Some(crate::btrbk_conf::render_btrbk_conf(&updated))
+            }
+            _ => current_btrbk_conf(&config),
+        };
         return Ok(SyncOutcome {
             plan,
             retire_refused,
+            planned_btrbk_conf,
             ..Default::default()
         });
     }
@@ -577,7 +601,34 @@ pub fn sync_subvolumes(
         write_error,
         btrbk_conf: BtrbkConf::Current,
         retire_refused,
+        planned_btrbk_conf: None,
     })
+}
+
+/// The `btrbk.conf` on disk now, or `None` when there is none to read.
+fn current_btrbk_conf(config: &Config) -> Option<String> {
+    std::fs::read_to_string(&config.general.btrbk_conf).ok()
+}
+
+/// Write a dry run's planned `btrbk.conf` into `path`, a file the caller
+/// already created (`mktemp`, mode 600). The file is never created here and
+/// a symlink is refused, so only that file can be written. `Err` when there
+/// is no plan to write — not a dry run, or no readable file would result.
+pub fn write_planned_btrbk_conf(outcome: &SyncOutcome, path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let text = outcome.planned_btrbk_conf.as_deref().ok_or_else(|| {
+        "no btrbk.conf to render: the run would leave none that can be read".to_string()
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 /// Make `btrbk.conf` say what `config.toml` renders to, when nothing else in
@@ -1528,6 +1579,161 @@ mod tests {
         path
     }
 
+    // --- the btrbk.conf a dry run plans (bd DAS-Backup-Manager-g17) -------
+
+    fn files(dir: &Path) -> (String, String) {
+        (
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            std::fs::read_to_string(dir.join("btrbk.conf")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_dry_run_plans_the_btrbk_conf_without_a_retired_entry_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let current = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        std::fs::write(dir.path().join("btrbk.conf"), &current).unwrap();
+        assert!(
+            current.contains("subvolume             @opt\n"),
+            "{current}"
+        );
+        let before = files(dir.path());
+
+        // @opt is gone from disk: the real run would retire it first.
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r, &mounted).unwrap();
+
+        assert_eq!(out.plan.retire.len(), 1, "{:?}", out.plan);
+        let planned = out.planned_btrbk_conf.as_deref().unwrap();
+        assert!(!planned.contains("@opt"), "{planned}");
+        assert!(
+            planned.contains("subvolume             @srv\n"),
+            "{planned}"
+        );
+        assert_eq!(files(dir.path()), before, "a dry run writes nothing");
+
+        // And it is exactly what the real run then writes.
+        let real = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(real.written, "{:?}", real.write_error);
+        assert_eq!(real.planned_btrbk_conf, None, "only a dry run plans");
+        assert_eq!(files(dir.path()).1, planned);
+    }
+
+    #[test]
+    fn a_dry_run_plans_the_btrbk_conf_with_an_adopted_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r, &mounted).unwrap();
+        let planned = out.planned_btrbk_conf.unwrap();
+        assert!(
+            planned.contains("subvolume             @srv/web\n    snapshot_name       srv-web\n"),
+            "{planned}"
+        );
+        assert_eq!(files(dir.path()).1, "OLD");
+    }
+
+    #[test]
+    fn a_dry_run_with_nothing_to_change_plans_the_file_a_real_run_would_leave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        let r = || scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+
+        // Out of date ("OLD"): a real run would regenerate it.
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r(), &mounted).unwrap();
+        assert_eq!(out.planned_btrbk_conf.as_deref(), Some(rendered.as_str()));
+
+        // Hand-edited but current in what it says: left as it is.
+        std::fs::write(dir.path().join("btrbk.conf"), &rendered).unwrap();
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r(), &mounted).unwrap();
+        assert_eq!(out.planned_btrbk_conf.as_deref(), Some(rendered.as_str()));
+    }
+
+    #[test]
+    fn a_failed_dry_run_plans_the_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        // The volume is not mounted: nothing is read, a real run writes nothing.
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r, &unmounted).unwrap();
+        assert!(out.failed());
+        assert_eq!(out.planned_btrbk_conf.as_deref(), Some("OLD"));
+
+        // Nothing readable to leave: no plan.
+        std::fs::remove_file(dir.path().join("btrbk.conf")).unwrap();
+        let out = sync_subvolumes(&path, true, "2026-10-02", &r, &unmounted).unwrap();
+        assert_eq!(out.planned_btrbk_conf, None);
+    }
+
+    #[test]
+    fn an_untrusted_clock_plans_no_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv"])]);
+        let out = sync_subvolumes(&path, true, "2025-06-01", &r, &mounted).unwrap();
+        assert!(out.retire_refused.is_some());
+        let planned = out.planned_btrbk_conf.unwrap();
+        assert!(
+            planned.contains("subvolume             @opt\n"),
+            "a run that may not retire still sends @opt: {planned}"
+        );
+    }
+
+    /// A config.toml that does not validate is never rendered into btrbk.conf
+    /// by a real run, so a dry run plans the file as it is.
+    #[test]
+    fn an_invalid_config_plans_the_btrbk_conf_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let mut c = Config::load(&path).unwrap();
+        c.email.enabled = true;
+        c.email.smtp_port = 0;
+        assert!(!c.validate().is_empty());
+        c.save(&path).unwrap();
+
+        // Nothing to change, btrbk.conf out of date ("OLD").
+        let same = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &same, &mounted).unwrap();
+        assert_eq!(out.planned_btrbk_conf.as_deref(), Some("OLD"));
+
+        // A pending adoption into a config that would not validate either.
+        let more = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-02", &more, &mounted).unwrap();
+        assert_eq!(out.plan.adopt.len(), 1);
+        assert_eq!(out.planned_btrbk_conf.as_deref(), Some("OLD"));
+    }
+
+    #[test]
+    fn write_planned_btrbk_conf_fills_only_an_existing_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = SyncOutcome {
+            planned_btrbk_conf: Some("PLANNED\n".into()),
+            ..Default::default()
+        };
+        let target = dir.path().join("tmp.conf");
+        std::fs::write(&target, "previous contents, longer than the plan").unwrap();
+        write_planned_btrbk_conf(&planned, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "PLANNED\n");
+
+        let absent = dir.path().join("absent.conf");
+        assert!(write_planned_btrbk_conf(&planned, &absent).is_err());
+        assert!(!absent.exists(), "never created");
+
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let link = dir.path().join("link.conf");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(write_planned_btrbk_conf(&planned, &link).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+
+        let none = SyncOutcome::default();
+        let err = write_planned_btrbk_conf(&none, &target).unwrap_err();
+        assert!(err.contains("no btrbk.conf to render"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "PLANNED\n");
+    }
+
     #[test]
     fn sync_writes_config_and_btrbk_conf_when_something_changed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1906,6 +2112,7 @@ mod tests {
             write_error: None,
             btrbk_conf: BtrbkConf::Current,
             retire_refused: None,
+            planned_btrbk_conf: None,
         };
         assert_eq!(
             format_sync_report(&quiet, false),
@@ -1958,6 +2165,7 @@ mod tests {
                 write_error: None,
                 btrbk_conf: BtrbkConf::Current,
                 retire_refused: None,
+                planned_btrbk_conf: None,
             },
             false,
         );
@@ -1999,6 +2207,7 @@ mod tests {
                 write_error: None,
                 btrbk_conf: BtrbkConf::Current,
                 retire_refused: None,
+                planned_btrbk_conf: None,
             },
             true,
         );
@@ -2013,6 +2222,7 @@ mod tests {
                 write_error: Some("disk full".into()),
                 btrbk_conf: BtrbkConf::Current,
                 retire_refused: None,
+                planned_btrbk_conf: None,
             },
             false,
         );
@@ -2068,6 +2278,7 @@ mod tests {
                     write_error: None,
                     btrbk_conf: BtrbkConf::Current,
                     retire_refused: None,
+                    planned_btrbk_conf: None,
                 },
                 false,
             );
@@ -2101,6 +2312,7 @@ mod tests {
                     write_error: None,
                     btrbk_conf: BtrbkConf::Current,
                     retire_refused: None,
+                    planned_btrbk_conf: None,
                 },
                 dry,
             )

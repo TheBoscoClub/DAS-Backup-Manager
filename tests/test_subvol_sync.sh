@@ -10,7 +10,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report; do
+for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report run_btrbk cleanup create_target_dirs; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -59,7 +59,17 @@ case "$1 $2" in
         echo "DAS_ALL_TARGET_MOUNTS='${mounts# }'"
         echo "DAS_BTRBK_CONF='/etc/btrbk/btrbk.conf'"
         ;;
-    "subvol sync")   cat "$here/sync_out";   exit "$(cat "$here/sync_rc")" ;;
+    "subvol sync")
+        # --render-btrbk-conf PATH: write the planned btrbk.conf there, as the
+        # real command does, when the test supplies one.
+        prev=""
+        for a in "$@"; do
+            if [[ "$prev" == "--render-btrbk-conf" && -f "$here/render_out" ]]; then
+                cat "$here/render_out" >"$a"
+            fi
+            prev="$a"
+        done
+        cat "$here/sync_out"; exit "$(cat "$here/sync_rc")" ;;
     "subvol expire") cat "$here/expire_out"; exit "$(cat "$here/expire_rc")" ;;
 esac
 STUB
@@ -174,6 +184,101 @@ printf 'SUBVOLUME SYNC\n' >"$WORK/sync_out"
 sync_subvolumes dryrun
 check "dry run passes --dry-run" "$(grep -c -- 'subvol sync .*--dry-run' "$WORK/calls")" "1"
 
+# --- dry run: btrbk dryrun reads the btrbk.conf sync plans (g17) ------------
+# A stub btrbk records which config it was given, and whether that file still
+# exists at the time; the real btrbk.conf must never be what a dry run reads
+# while sync has a plan.
+# shellcheck disable=SC2329  # called by the extracted run_btrbk
+btrbk() { echo "$*" >>"$WORK/btrbk_calls"; [[ "$2" == "$WORK"/* && -f "$2" ]] && cp "$2" "$WORK/btrbk_saw"; return 0; }
+# The config reload inside sync resets DAS_BTRBK_CONF from the stub's
+# dump-env; the file below stands for the real one and must not change.
+REAL_CONF="$WORK/btrbk.conf"
+echo "REAL CONF WITH @gone" >"$REAL_CONF"
+export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
+real_sum="$(sha256sum "$REAL_CONF")"
+
+# Pending retirement: sync plans a btrbk.conf without the dead entry.
+: >"$WORK/calls"; : >"$WORK/btrbk_calls"; rm -f "$WORK/btrbk_saw"
+printf 'SUBVOLUME SYNC\n  Would retire (dry run, nothing written):\n    @gone\n' >"$WORK/sync_out"; echo 0 >"$WORK/sync_rc"
+echo "PLANNED CONF WITHOUT @gone" >"$WORK/render_out"
+DRYRUN_BTRBK_CONF=""
+sync_subvolumes dryrun
+check "dry run asks sync to render the planned btrbk.conf" \
+    "$(grep -c -- 'subvol sync .*--dry-run --render-btrbk-conf '"$TMPDIR"'/das-backup-dryrun-btrbk\.' "$WORK/calls")" "1"
+check "the temp file is mode 600" "$(stat -c %a "$DRYRUN_BTRBK_CONF")" "600"
+run_btrbk dryrun
+check "btrbk dryrun is given the temp conf" "$(cat "$WORK/btrbk_calls")" "-c $DRYRUN_BTRBK_CONF dryrun"
+check "and it held the planned config" "$(cat "$WORK/btrbk_saw")" "PLANNED CONF WITHOUT @gone"
+check "the real btrbk.conf is byte-identical" "$(sha256sum "$REAL_CONF")" "$real_sum"
+planned_file="$DRYRUN_BTRBK_CONF"
+# shellcheck disable=SC2034  # read by the extracted cleanup
+( SCRIPT_COMPLETED="true"; cleanup ) || true
+check "the EXIT trap removes the temp conf" "$([[ -e "$planned_file" ]] && echo yes || echo no)" "no"
+
+# Nothing pending: the planned file is just the current one; still works.
+: >"$WORK/btrbk_calls"; DRYRUN_BTRBK_CONF=""
+printf 'SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n' >"$WORK/sync_out"
+cp "$REAL_CONF" "$WORK/render_out"
+sync_subvolumes dryrun
+run_btrbk dryrun
+check "nothing pending: btrbk still reads a temp conf" "$(grep -c -- "-c $TMPDIR/das-backup-dryrun-btrbk\." "$WORK/btrbk_calls")" "1"
+check "nothing pending: btrbk dryrun recorded OK" "${OP_STATUS[btrbk]}" "OK"
+# shellcheck disable=SC2034  # read by the extracted cleanup
+( SCRIPT_COMPLETED="true"; cleanup ) || true
+
+# Sync rendered nothing (no readable btrbk.conf would be left): fall back to
+# the current file, and leave no empty temp file behind.
+: >"$WORK/btrbk_calls"; DRYRUN_BTRBK_CONF=""; rm -f "$WORK/render_out"; : >"$WORK/log"
+sync_subvolumes dryrun
+check "no render: the variable is cleared" "$DRYRUN_BTRBK_CONF" ""
+check "no render: no temp file is left" "$(find "$TMPDIR" -name 'das-backup-dryrun-btrbk.*' | wc -l)" "0"
+check "no render: it is said" "$(grep -c 'rendered no btrbk.conf' "$WORK/log")" "1"
+run_btrbk dryrun
+check "no render: btrbk dryrun reads the current conf" "$(cat "$WORK/btrbk_calls")" "-c $DAS_BTRBK_CONF dryrun"
+
+# A real run never renders and never uses a temp conf.
+: >"$WORK/calls"; : >"$WORK/btrbk_calls"; DRYRUN_BTRBK_CONF=""
+echo "PLANNED" >"$WORK/render_out"
+sync_subvolumes run
+check "real run: no --render-btrbk-conf" "$(grep -c -- '--render-btrbk-conf' "$WORK/calls" || true)" "0"
+check "real run: no temp file made" "$(find "$TMPDIR" -name 'das-backup-dryrun-btrbk.*' | wc -l)" "0"
+run_btrbk run
+check "real run: btrbk run reads the real conf" "$(cat "$WORK/btrbk_calls")" "-c $DAS_BTRBK_CONF run"
+rm -f "$WORK/render_out"
+unset -f btrbk
+unset TMPDIR
+
+# --- dry run: a pending adoption's new target directory ------------------------
+# The planned btrbk.conf sends @new to <mnt>/nvme-adopted, which the current
+# config does not name. The real run creates it after its reload; the dry run
+# must too, or btrbk dryrun fails on it. Only under a mounted target.
+# shellcheck disable=SC2329  # called by the extracted create_target_dirs
+mountpoint() { [[ "${!#}" == "$WORK/mnt/t0" ]]; }
+mkdir -p "$WORK/mnt/t0" "$WORK/mnt/t1"
+# Read by the extracted create_target_dirs through indirect expansion.
+# shellcheck disable=SC2034
+DAS_SOURCE_COUNT=1
+# shellcheck disable=SC2034
+DAS_SOURCE_0_TARGET_SUBDIRS="nvme"
+# shellcheck disable=SC2034
+DAS_TARGET_COUNT=2
+# shellcheck disable=SC2034
+DAS_TARGET_0_MOUNT="$WORK/mnt/t0"
+# shellcheck disable=SC2034
+DAS_TARGET_1_MOUNT="$WORK/mnt/t1"
+printf 'volume /.btrfs-nvme\n  target                %s\n  target                %s\n  target                %s\n  target                %s\n' \
+    "$WORK/mnt/t0/nvme" "$WORK/mnt/t0/nvme-adopted" "$WORK/mnt/t1/nvme-adopted" "$WORK/mnt/t0/../escape" >"$WORK/planned.conf"
+DRYRUN_BTRBK_CONF=""
+create_target_dirs
+check "no plan: only the configured subdir" "$(find "$WORK/mnt/t0" -mindepth 1 -printf '%f ')" "nvme "
+DRYRUN_BTRBK_CONF="$WORK/planned.conf"
+create_target_dirs
+check "plan: the adopted subdir on the mounted target" "$([[ -d "$WORK/mnt/t0/nvme-adopted" ]] && echo yes || echo no)" "yes"
+check "plan: nothing on an unmounted target" "$(find "$WORK/mnt/t1" -mindepth 1 | wc -l)" "0"
+check "plan: no path that climbs out of the target" "$([[ -e "$WORK/mnt/escape" ]] && echo yes || echo no)" "no"
+DRYRUN_BTRBK_CONF=""
+unset -f mountpoint
+
 # --- expire -----------------------------------------------------------------
 : >"$WORK/calls"
 printf 'RETIRED SUBVOLUMES\n  @opt\n' >"$WORK/expire_out"; echo 0 >"$WORK/expire_rc"
@@ -266,7 +371,7 @@ SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
     "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Retired expiry        OK  (n/a)||"
-check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.6.1' <<<"$report")" "1"
+check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.7.0' <<<"$report")" "1"
 
 if [[ $fails -eq 0 ]]; then
     echo "ALL SUBVOL SYNC SHELL TESTS PASSED"

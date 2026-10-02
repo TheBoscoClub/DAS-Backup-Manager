@@ -1,9 +1,17 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.6.1
+# Version: 4.7.0
 # Date: 2026-10-02
 #
 # Features:
+#   - Dry run sees the planned btrbk.conf (v4.7.0): in --dryrun, sync renders
+#     the btrbk.conf the real run would leave into a mktemp file
+#     (`subvol sync --dry-run --render-btrbk-conf`), `btrbk dryrun` reads that
+#     one, and the EXIT trap removes it. A pending retirement no longer makes
+#     the dry run fail on an entry the real run retires first; config.toml
+#     and btrbk.conf are untouched. create_target_dirs also creates the
+#     target directory a pending adoption's new source sends to, as the real
+#     run does after its reload (bd DAS-Backup-Manager-g17).
 #   - Unmount retry (v4.6.1): unmount_all() tries each DAS target up to
 #     UMOUNT_ATTEMPTS times, UMOUNT_RETRY_PAUSE seconds apart, before it
 #     records the unmount as FAILED — a target is often busy for a moment
@@ -851,6 +859,9 @@ verify_sources_before_write() {
 
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
+# Dry run only: the btrbk.conf the real run would leave, rendered by sync into
+# a mktemp file (mode 600) that `btrbk dryrun` reads. Removed by cleanup().
+DRYRUN_BTRBK_CONF=""
 
 # Adopt subvolumes that exist and are not excluded; retire entries whose
 # subvolume is gone. Runs after verify_sources_before_write, so every source
@@ -862,11 +873,27 @@ SUBVOL_EXPIRE_REPORT=""
 sync_subvolumes() {
     local mode="$1"
     local args=(subvol sync --config "$DAS_CONFIG")
-    [[ "$mode" == "dryrun" ]] && args+=(--dry-run)
+    if [[ "$mode" == "dryrun" ]]; then
+        args+=(--dry-run)
+        # Nothing is written in a dry run, so the btrbk.conf on disk still
+        # names what the real run would retire first. btrbk dryrun reads the
+        # file sync plans instead (bd DAS-Backup-Manager-g17).
+        if DRYRUN_BTRBK_CONF="$(mktemp --tmpdir das-backup-dryrun-btrbk.XXXXXX)"; then
+            args+=(--render-btrbk-conf "$DRYRUN_BTRBK_CONF")
+        else
+            DRYRUN_BTRBK_CONF=""
+            log_warn "Could not create a temporary btrbk.conf — the dry run uses the current one"
+        fi
+    fi
 
     log_info "Syncing subvolumes with config..."
     local rc=0
     SUBVOL_SYNC_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    if [[ -n "${DRYRUN_BTRBK_CONF:-}" && ! -s "$DRYRUN_BTRBK_CONF" ]]; then
+        log_warn "Sync rendered no btrbk.conf for the dry run — btrbk dryrun uses the current one"
+        rm -f -- "$DRYRUN_BTRBK_CONF"
+        DRYRUN_BTRBK_CONF=""
+    fi
     if [[ $rc -eq 0 ]]; then
         record_op "subvol_sync" "OK"
     else
@@ -1063,6 +1090,20 @@ create_target_dirs() {
         for subdir in "${all_subdirs[@]}"; do
             mkdir -p "$mnt/$subdir"
         done
+
+        # Dry run: the planned btrbk.conf may send a pending adoption to a
+        # target directory the current config does not name yet (a new
+        # <source>-adopted source). The real run creates it here, after its
+        # config reload; create it for the dry run too, or btrbk dryrun fails
+        # on a path the real run would have (bd DAS-Backup-Manager-g17). Only
+        # `target` lines under this mounted target are used.
+        if [[ -n "${DRYRUN_BTRBK_CONF:-}" && -f "$DRYRUN_BTRBK_CONF" ]]; then
+            local kw path _rest
+            while read -r kw path _rest; do
+                [[ "$kw" == "target" && "$path" == "$mnt"/* && "$path" != *"/.."* ]] || continue
+                mkdir -p "$path"
+            done <"$DRYRUN_BTRBK_CONF"
+        fi
     done
 }
 
@@ -1181,7 +1222,10 @@ run_btrbk() {
         # — a stale source entry in config.toml made this a real, reproducible
         # failure until the config was fixed). Soft-fail instead, matching
         # every other btrbk-adjacent operation in this script.
-        if btrbk -c "$DAS_BTRBK_CONF" dryrun; then
+        # The btrbk.conf sync planned for this run when there is one; the
+        # real run will have written exactly that before btrbk starts.
+        local conf="${DRYRUN_BTRBK_CONF:-$DAS_BTRBK_CONF}"
+        if btrbk -c "$conf" dryrun; then
             record_op "btrbk" "OK" "dryrun"
             log_info "btrbk dryrun completed"
         else
@@ -1896,7 +1940,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.6.1
+  backup-run.sh v4.7.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2200,6 +2244,12 @@ cleanup() {
     # on exit — 0 for a normal fall-through completion of the script, or the
     # nonzero status from whatever `exit N` / set -e abort fired the trap.
     local rc=$?
+
+    # The dry run's planned btrbk.conf goes on every exit path, before either
+    # early return below.
+    if [[ -n "${DRYRUN_BTRBK_CONF:-}" ]]; then
+        rm -f -- "$DRYRUN_BTRBK_CONF"
+    fi
 
     # Two independent reasons the recovery body below must NOT run — both
     # exit silently (no log line), explicit `exit "$rc"` (not fallthrough)
