@@ -20,23 +20,26 @@ against this, and `setup` takes neither lock. Check first, every time:
 pgrep -f 'lib/das-backup/backup-run.sh' && echo "WAIT — do not install"
 ```
 
-Editing `btrbk.conf` mid-run is not safe: sync rewrites it, before btrbk starts, whenever it changes the
-config. `config.toml` is read again after sync, so a mid-run edit takes effect then. Edit between runs.
+Editing `btrbk.conf` mid-run is not safe: sync rewrites it, before btrbk starts, whenever it differs from
+config.toml. `config.toml` is read again after sync, so a mid-run edit takes effect then. Edit between runs.
 
 ## Nested Subvolumes Need Their Own Config Entry — The Run Writes It
 - **`btrfs send` does not descend into nested subvolumes.** A parent's snapshot holds an empty
   directory where a child subvolume sits, and the run reports success. Every subvolume still
   needs its own entry — **the backup run writes it** (`btrdasd subvol sync`: `backup-run.sh` calls
-  it after verifying the sources and again re-verifies them; `btrdasd backup run` calls it too).
+  it after verifying the sources and again re-verifies them; `btrdasd backup run` and the GUI
+  helper call it too).
 - Left out only by `[subvolumes].exclude` (pattern names the subvolume **without a trailing slash**
   and covers everything nested under it; `@tmp`, `@var-tmp` built in; `[doctor].exclude` still
-  merged) or a `.snapshots` / `.btrbk-snapshots` path component. Every skip is in the run report.
+  merged) or a `.snapshots` / `.btrbk-snapshots` path component. Every exclusion is in the run
+  report (snapshot trees counted).
 - A volume is read only if every device its sources name verifies (mountpoint, UUID, top level);
   otherwise nothing on it is adopted or retired and the run is marked failed.
 - A gone subvolume's entry is **retired**, not an error: it leaves `btrbk.conf`. `subvol expire`
   (after btrbk) deletes its snapshots per target once retirement + that target's longest
-  retention window has passed. No retention, unmounted, unreadable, shared directory, or
-  unrecognised names: kept and reported. The last config entry and an entry sending nowhere stay.
+  retention window has passed. No retention, unmounted, unreadable, shared directory,
+  unrecognised names, subvolume back, snapshot newer than retirement, clock < 2026, sync
+  failed: kept and reported. The last config entry and an entry sending nowhere stay.
 - A **Missing** or **Stale** finding from the weekly drift check now means sync itself failed.
 - **Target scoping is part of the entry.** Bulk data gets `target_labels = ["primary-22tb"]`;
   only system-recovery data goes to the two 2 TB recovery drives. `target_labels = []` fans out

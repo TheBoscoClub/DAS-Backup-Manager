@@ -37,7 +37,7 @@ pgrep -f 'lib/das-backup/backup-run.sh' && echo "WAIT — do not install"
 Config edits are no longer inert mid-run (before 2026-10-01 each file was read once at startup).
 `backup-run.sh` reads `config.toml` again after `subvol sync`, so an edit made before that point is
 picked up (and the sources are re-verified against it), and sync rewrites `btrbk.conf`
-before btrbk starts whenever its plan changes the config (not on every run). btrbk reads its config once, so an edit after it starts changes nothing for
+before btrbk starts whenever it differs from what `config.toml` renders to (not on a dry run or a failed sync). btrbk reads its config once, so an edit after it starts changes nothing for
 that run. Edit between runs. The three **executing shell scripts** must additionally never be
 rewritten underneath themselves.
 
@@ -55,7 +55,8 @@ entries must exist at all, and the history of the manual regime; the mechanism's
 - **Where it runs.** `backup-run.sh` (v4.6.0) calls sync after `verify_sources_before_write`,
   reloads its config, **re-verifies the sources** (sync may have added a source — an `-adopted` one — that
   the first verification never saw, and `create_snapshot_dirs` is the next writer), runs btrbk, then `subvol expire` directly after it.
-  `btrdasd backup run` runs sync after mounting sources and before btrbk. A sync or expire failure
+  `btrdasd backup run` and the D-Bus helper (GUI backups) run it through one library function,
+  `backup::sync_before_backup`, after mounting sources and before btrbk; neither runs expiry. A sync or expire failure
   is recorded (report `FAILURES DETECTED`, `backup_runs.success` 0) and never stops the backup of
   what is already configured, which is why mid-run edits of `config.toml` now take effect (at the
   reload) and `btrbk.conf` is rewritten under btrbk's feet before it starts.
@@ -78,6 +79,18 @@ entries must exist at all, and the history of the manual regime; the mechanism's
   with no retention: kept and reported. Source-side snapshots use the shortest window of the
   targets. The entry is removed only when every location is empty, deleted or shared — never the
   last config entry, never one whose source sends to no target, never on a dry run.
+- **A wrong date costs a late deletion, never an early one** (final review, Rulings 26–27). A
+  location whose newest series snapshot is dated more than a day after `retired` is kept
+  (`RetiredBeforeNewest`: the clock was wrong at retirement, or the date was edited; one day is
+  allowed because snapshot names are local time and `retired` is UTC). A retired entry whose
+  subvolume exists again on its mounted source volume is kept everywhere until sync revives it.
+  `caldate::untrusted_clock` refuses a clock before 2026-01-01: sync stamps no retirement (adoption
+  goes on), expiry deletes nothing; both fail loudly. `backup-run.sh` passes `--dry-run` to
+  expire when that run's sync failed. Units carry `Wants=`/`After=time-sync.target`, a courtesy
+  only — the floor is the guard.
+- **btrbk.conf drift.** Every non-dry sync that did not fail compares `btrbk.conf` with what
+  `config.toml` renders to and regenerates it on any difference (the helper's config writes and
+  hand edits used to leave it stale, and the entry was silently not backed up).
 - **Drift check.** `doctor --check-drift` uses the same listing and exclusions; one section, "NOT
   BACKED UP — the backup run should have adopted these". Mutation scope: the five new modules are
   in the weekly full scope; the one exclusion is the `perform_drift_check` host shell in `doctor.rs`.

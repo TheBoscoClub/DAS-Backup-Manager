@@ -95,11 +95,11 @@ The system has six major components:
 2. backup-run.sh (orchestrator)
          │
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
-         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml + btrbk.conf when the plan changes them
+         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml when the plan changes it, and btrbk.conf whenever it differs from what config.toml renders to
          │                                   (then: reload config, verify_sources_before_write() again for any source sync added)
          ├──▶ create snapshot dirs, mount targets, verify_targets_before_btrbk()
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
-         ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted
+         ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
          ├──▶ update_boot_subvolumes()     → archives + recreates @/@home boot subvolumes (--full runs)
          ├──▶ btrdasd walk                 → indexes new snapshots into SQLite
          ├──▶ boot-archive-cleanup.sh      → prunes expired @.archive.*/@home.archive.* snapshots
