@@ -420,8 +420,6 @@ fn step_subvolumes(
                     .into_iter()
                     .map(|name| SubvolConfig {
                         name,
-                        manual_only: false,
-                        snapshot_name: None,
                         ..Default::default()
                     })
                     .collect(),
@@ -504,8 +502,6 @@ fn parse_subvol_list(input: &str) -> Vec<SubvolConfig> {
         .filter(|s| !s.is_empty())
         .map(|name| SubvolConfig {
             name,
-            manual_only: false,
-            snapshot_name: None,
             ..Default::default()
         })
         .collect()
