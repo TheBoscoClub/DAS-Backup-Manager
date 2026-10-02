@@ -228,6 +228,17 @@ which *was* backed up daily and successfully, and the VM was in none of it.
 `ClaudeCodeProjects/powershell-scripts` had been in the same state for three weeks.
 Tracked as bd `DAS-Backup-Manager-tku` / `-rjc` / `-zm6`.
 
+### Accepted scoping exception — `ISOs` and `SteamLibrary-local` (operator decision 2026-10-02)
+Both live in the `hdd-system` source (`target_labels = []`), so they are sent to the two 2 TB
+recovery drives as well as the primary, which the scoping rule says bulk data should not be.
+Measured 2026-10-02: `ISOs` 9.0 GiB, `SteamLibrary-local` 5.4 GiB, against about 1.25 TiB free on
+each recovery drive. Moving them to a primary-only source would start a fresh full send of both,
+retire the old entries, and leave their recovery-drive snapshots as orphans until the 7-day
+retention aged them out — churn in two snapshot series for no space gained. The operator chose to
+leave them. Conditions of the exception: they stay small and static. Anything that grows, or any
+new bulk subvolume, follows the rule (`target_labels = ["primary-22tb"]`); `config.toml` cannot
+carry this note because `Config::save` drops comments (bd a53).
+
 ## DAS Enclosure (Author's Setup)
 - TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — **Gen2 is the rating; always check the
   negotiated rate.** `cat /sys/bus/usb/devices/*/speed` should read `10000` (Mbit/s) for the

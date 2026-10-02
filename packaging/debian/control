@@ -14,7 +14,7 @@ Package: das-backup-manager
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}, btrbk, btrfs-progs,
  smartmontools, bash, util-linux,
- qt6-base-dev, libqt6charts6t64,
+ libqt6charts6t64,
  libkf6coreaddons6, libkf6i18n6, libkf6xmlgui6,
  libkf6configwidgets6, libkf6iconthemes6, libkf6crash6, libkf6kio6,
  libkf6notifications6, libkf6statusnotifieritem6

@@ -43,6 +43,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 - **Target scoping is part of the entry.** Bulk data gets `target_labels = ["primary-22tb"]`;
   only system-recovery data goes to the two 2 TB recovery drives. `target_labels = []` fans out
   to all three targets — right for `@`/`@home`/`@opt`, wrong for a growing VM image.
+  **Accepted exception (2026-10-02):** `ISOs` and `SteamLibrary-local` stay in `hdd-system` and
+  reach the recovery drives — small and static; reasoning in the reference. Not a precedent.
 - A bulk payload inside a broadly-scoped subvolume defeats scoping invisibly (a directory has no
   entry to scope). Give it its own subvolume: `chattr +C` **before** any file lands, and copy
   with `cp --reflink=never`.
