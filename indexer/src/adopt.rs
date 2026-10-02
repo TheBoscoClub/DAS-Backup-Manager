@@ -745,12 +745,30 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
     }
     if !plan.skipped.is_empty() {
         r.push_str("  Skipped:\n");
+        // An exclusion is a decision someone made, so each one is named with
+        // its pattern. Snapshot trees hold one subvolume per retained
+        // snapshot, so naming each would bury the lines that matter; they
+        // are counted per volume instead.
+        let mut trees: Vec<(&str, usize)> = Vec::new();
         for s in &plan.skipped {
-            let why = match &s.reason {
-                SkipReason::SnapshotTree => "snapshot tree".to_string(),
-                SkipReason::Excluded { pattern } => format!("excluded by '{pattern}'"),
-            };
-            r.push_str(&format!("    {}  [{}, {why}]\n", s.name, s.volume));
+            match &s.reason {
+                SkipReason::Excluded { pattern } => r.push_str(&format!(
+                    "    {}  [{}, excluded by '{pattern}']\n",
+                    s.name, s.volume
+                )),
+                SkipReason::SnapshotTree => {
+                    match trees.iter_mut().find(|(v, _)| *v == s.volume.as_str()) {
+                        Some((_, n)) => *n += 1,
+                        None => trees.push((&s.volume, 1)),
+                    }
+                }
+            }
+        }
+        for (volume, n) in trees {
+            let what = if n == 1 { "subvolume" } else { "subvolumes" };
+            r.push_str(&format!(
+                "    {n} {what} inside snapshot trees skipped on {volume}\n"
+            ));
         }
     }
     if !plan.unplaceable.is_empty() {
@@ -2102,7 +2120,10 @@ mod tests {
             "{done}"
         );
         assert!(done.contains("  Revived (back on disk):\n"), "{done}");
-        assert!(done.contains("    k  [/v, snapshot tree]\n"), "{done}");
+        assert!(
+            done.contains("    1 subvolume inside snapshot trees skipped on /v\n"),
+            "{done}"
+        );
         let not = render(false, false);
         assert!(
             not.contains("  NOT retired (config could not be written):\n"),
@@ -2291,5 +2312,58 @@ mod tests {
             saved.sources[0].subvolumes[1].retired.as_deref(),
             Some("2026-01-01")
         );
+    }
+
+    // --- snapshot-tree skips are counted, exclusions itemised (Ruling 28) ---
+
+    #[test]
+    fn snapshot_tree_skips_are_one_count_per_volume_and_exclusions_stay_itemised() {
+        let skip = |volume: &str, name: &str, reason: SkipReason| Skip {
+            volume: volume.into(),
+            name: name.into(),
+            reason,
+        };
+        let tree = || SkipReason::SnapshotTree;
+        let plan = SyncPlan {
+            skipped: vec![
+                skip(
+                    "/ssd",
+                    "@cache/x",
+                    SkipReason::Excluded {
+                        pattern: "@cache".into(),
+                    },
+                ),
+                skip("/ssd", ".btrbk-snapshots/srv.20261001", tree()),
+                skip("/ssd", ".btrbk-snapshots/srv.20261002", tree()),
+                skip("/hdd", ".snapshots/1/snapshot", tree()),
+                skip("/ssd", "@srv/.snapshots/1/snapshot", tree()),
+                skip(
+                    "/hdd",
+                    "@tmp",
+                    SkipReason::Excluded {
+                        pattern: "@tmp".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        let text = format_sync_report(
+            &SyncOutcome {
+                plan,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(
+            text,
+            "SUBVOLUME SYNC\n\
+             \x20 Skipped:\n\
+             \x20   @cache/x  [/ssd, excluded by '@cache']\n\
+             \x20   @tmp  [/hdd, excluded by '@tmp']\n\
+             \x20   3 subvolumes inside snapshot trees skipped on /ssd\n\
+             \x20   1 subvolume inside snapshot trees skipped on /hdd\n"
+        );
+        // No snapshot name is listed any more.
+        assert!(!text.contains("srv.2026"), "{text}");
     }
 }
