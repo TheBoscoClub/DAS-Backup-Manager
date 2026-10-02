@@ -1663,21 +1663,25 @@ pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
     summary
 }
 
-/// Write the run report to `[general].last_report` and email it, when the
-/// caller asked for a report and `[email]` is enabled. Returns whether the
-/// email was sent. Email failure is non-fatal — the backup data is safe —
-/// and is logged, not added to the run's errors.
+/// Write the run report to `[general].last_report` when the caller asked
+/// for a report, and email it when `[email]` is enabled too — the report is
+/// written whether or not it is mailed, as `backup-run.sh` writes
+/// `$LAST_REPORT` before any send. `data` is what was captured while the
+/// targets were mounted. Returns whether the email was sent. Email failure
+/// is non-fatal — the backup data is safe — and is logged, not added to the
+/// run's errors.
 pub fn deliver_report(
     config: &Config,
     options: &BackupOptions,
     result: &BackupResult,
+    data: &crate::report::ReportData,
     progress: &dyn ProgressCallback,
 ) -> bool {
-    if !emails_report(options, config) {
+    if !options.send_report {
         return false;
     }
     let report_text =
-        crate::report::format_report_with_sync(result, config, options.subvolume_sync.as_ref());
+        crate::report::format_report_from(result, options.subvolume_sync.as_ref(), data);
     if let Err(e) = std::fs::write(&config.general.last_report, &report_text) {
         progress.on_log(
             LogLevel::Warning,
@@ -1686,6 +1690,9 @@ pub fn deliver_report(
                 config.general.last_report
             ),
         );
+    }
+    if !emails_report(options, config) {
+        return false;
     }
     match crate::report::send_email_report(&report_text, config) {
         Ok(()) => {
@@ -1744,12 +1751,16 @@ pub trait BackupJobHost {
         options: &BackupOptions,
         progress: &dyn ProgressCallback,
     ) -> Result<BackupResult, String>;
+    /// The report sections that read the mounted targets. Called while they
+    /// are still mounted.
+    fn capture_report(&self, config: &Config) -> crate::report::ReportData;
     /// Write and email the report; whether the email went out.
     fn report(
         &self,
         config: &Config,
         options: &BackupOptions,
         result: &BackupResult,
+        data: &crate::report::ReportData,
         progress: &dyn ProgressCallback,
     ) -> bool;
     /// Add the run to `backup_runs`.
@@ -1833,6 +1844,11 @@ pub fn run_backup_job(
         }
     };
     let ran = host.run(&config, &options, progress);
+    // Capacity, SMART and the latest snapshots are read now, while the
+    // targets are mounted; the report itself is built after the unmount so
+    // it can say what was left mounted (backup-run.sh: capture_report_data,
+    // then unmount_all).
+    let captured = (!options.dry_run && ran.is_ok()).then(|| host.capture_report(&config));
     let mut still_mounted = targets.release(progress);
     still_mounted.extend(sources.release(progress));
     let mut result = match ran {
@@ -1849,8 +1865,8 @@ pub fn run_backup_job(
         result.errors.push(e);
         result.success = false;
     }
-    if !options.dry_run {
-        result.report_sent = host.report(&config, &options, &result, progress);
+    if let Some(captured) = &captured {
+        result.report_sent = host.report(&config, &options, &result, captured, progress);
         if let Err(e) = host.record(&config, &result) {
             progress.on_log(
                 LogLevel::Warning,
@@ -1932,14 +1948,19 @@ impl BackupJobHost for SystemBackupHost {
         run_backup(config, options, progress).map_err(|e| e.to_string())
     }
 
+    fn capture_report(&self, config: &Config) -> crate::report::ReportData {
+        crate::report::capture_report_data(config)
+    }
+
     fn report(
         &self,
         config: &Config,
         options: &BackupOptions,
         result: &BackupResult,
+        data: &crate::report::ReportData,
         progress: &dyn ProgressCallback,
     ) -> bool {
-        deliver_report(config, options, result, progress)
+        deliver_report(config, options, result, data, progress)
     }
 
     fn record(&self, config: &Config, result: &BackupResult) -> Result<(), String> {
@@ -2816,6 +2837,7 @@ mod tests {
         run: Result<(), String>,
         recorded: std::sync::Mutex<Vec<BackupResult>>,
         reported: std::sync::Mutex<Vec<BackupResult>>,
+        report_texts: std::sync::Mutex<Vec<String>>,
         record_fails: bool,
     }
 
@@ -2830,6 +2852,7 @@ mod tests {
                 run: Ok(()),
                 recorded: std::sync::Mutex::new(Vec::new()),
                 reported: std::sync::Mutex::new(Vec::new()),
+                report_texts: std::sync::Mutex::new(Vec::new()),
                 record_fails: false,
             }
         }
@@ -2959,15 +2982,31 @@ mod tests {
                 duration_secs: 1,
             })
         }
+        fn capture_report(&self, _: &Config) -> crate::report::ReportData {
+            self.step("capture report");
+            crate::report::ReportData {
+                capacity_and_smart: "\nDISK CAPACITY\n  primary-loop  1 GiB\n".into(),
+                latest_snapshots: "\nLATEST SNAPSHOTS\n  root-.20261002\n".into(),
+            }
+        }
         fn report(
             &self,
             _: &Config,
-            _: &BackupOptions,
+            options: &BackupOptions,
             result: &BackupResult,
+            data: &crate::report::ReportData,
             _: &dyn ProgressCallback,
         ) -> bool {
             self.step("report");
             self.reported.lock().unwrap().push(copy_result(result));
+            self.report_texts
+                .lock()
+                .unwrap()
+                .push(crate::report::format_report_from(
+                    result,
+                    options.subvolume_sync.as_ref(),
+                    data,
+                ));
             true
         }
         fn record(&self, _: &Config, result: &BackupResult) -> Result<(), String> {
@@ -3004,6 +3043,7 @@ mod tests {
                 "sync dry_run=false before=0.6.0",
                 "mount targets (after-sync)",
                 "run (after-sync, sync failed=Some(false))",
+                "capture report",
                 "release targets",
                 "release sources",
                 "report",
@@ -3055,6 +3095,59 @@ mod tests {
                 .iter()
                 .any(|(l, m)| *l == LogLevel::Error && m == "still mounted: /mnt/backup-22tb")
         );
+    }
+
+    /// The report is built after the unmount from what was captured BEFORE
+    /// it: a cleanly unmounted run's report carries the capacity rows and
+    /// the latest snapshots, and a still-mounted failure reaches the same
+    /// report (bd DAS-Backup-Manager-h4t review).
+    #[test]
+    fn the_report_carries_what_was_captured_while_mounted_and_the_unmount_result() {
+        let host = FakeHost::default();
+        let _ = job(&host, false);
+        let steps = host.steps();
+        let pos = |s: &str| steps.iter().position(|x| x == s).unwrap();
+        assert!(pos("capture report") < pos("release targets"), "{steps:?}");
+        assert!(pos("release sources") < pos("report"), "{steps:?}");
+        let text = host.report_texts.lock().unwrap()[0].clone();
+        assert!(
+            text.contains("DISK CAPACITY\n  primary-loop  1 GiB"),
+            "{text}"
+        );
+        assert!(
+            text.contains("LATEST SNAPSHOTS\n  root-.20261002"),
+            "{text}"
+        );
+        assert!(text.contains("ALL OPERATIONS SUCCESSFUL"), "{text}");
+
+        let left = FakeHost {
+            targets: Ok(vec!["/mnt/backup-22tb".into()]),
+            ..Default::default()
+        };
+        let _ = job(&left, false);
+        let text = left.report_texts.lock().unwrap()[0].clone();
+        assert!(text.contains("FAILURES DETECTED"), "{text}");
+        assert!(
+            text.contains("  - still mounted: /mnt/backup-22tb"),
+            "{text}"
+        );
+        assert!(
+            text.contains("DISK CAPACITY\n  primary-loop  1 GiB"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_captured_for_a_dry_run_or_a_run_that_could_not_start() {
+        let host = FakeHost::default();
+        let _ = job(&host, true);
+        assert!(!host.steps().contains(&"capture report".to_string()));
+        let failed = FakeHost {
+            run: Err("Refusing to run btrbk".into()),
+            ..Default::default()
+        };
+        let _ = job(&failed, false);
+        assert!(!failed.steps().contains(&"capture report".to_string()));
     }
 
     #[test]
@@ -3310,7 +3403,7 @@ mod tests {
     }
 
     #[test]
-    fn system_host_writes_the_report_only_when_asked_and_enabled() {
+    fn system_host_writes_the_report_when_asked_and_mails_it_only_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let host = system_host(dir.path());
         let mut config = make_test_config();
@@ -3319,13 +3412,29 @@ mod tests {
         let progress = TestProgress::new();
         let result = result_with(false, 1, 1, 0);
 
+        let data = crate::report::ReportData {
+            capacity_and_smart: "\nDISK CAPACITY\n  t  CAPTURED\n".into(),
+            latest_snapshots: "\nLATEST SNAPSHOTS\n  CAPTURED-SNAP\n".into(),
+        };
+        // Not asked for: nothing written.
+        config.email.enabled = true;
+        let not_asked = BackupOptions::default();
+        assert!(!host.report(&config, &not_asked, &result, &data, &progress));
+        assert!(!report.exists(), "no report asked for: none written");
+
+        // Asked for, email disabled: written (as backup-run.sh does), not mailed.
         config.email.enabled = false;
         let ask = BackupOptions {
             send_report: true,
             ..Default::default()
         };
-        assert!(!host.report(&config, &ask, &result, &progress));
-        assert!(!report.exists(), "email disabled: no report written");
+        assert!(!host.report(&config, &ask, &result, &data, &progress));
+        let text = std::fs::read_to_string(&report).unwrap();
+        assert!(
+            text.contains("CAPTURED-SNAP") && text.contains("t  CAPTURED"),
+            "{text}"
+        );
+        std::fs::remove_file(&report).unwrap();
 
         config.email.enabled = true;
         // No recipient, and nothing listens on that port: the email cannot be
@@ -3334,7 +3443,7 @@ mod tests {
         config.email.to = String::new();
         config.email.smtp_port = 1;
         config.email.smtp_host = "127.0.0.1".into();
-        assert!(!host.report(&config, &ask, &result, &progress));
+        assert!(!host.report(&config, &ask, &result, &data, &progress));
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("a"), "{text}");
     }
