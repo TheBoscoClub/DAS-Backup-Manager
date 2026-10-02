@@ -266,7 +266,7 @@ SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
     "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Retired expiry        OK  (n/a)||"
-check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.6.0' <<<"$report")" "1"
+check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.6.1' <<<"$report")" "1"
 
 if [[ $fails -eq 0 ]]; then
     echo "ALL SUBVOL SYNC SHELL TESTS PASSED"

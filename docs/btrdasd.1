@@ -317,7 +317,11 @@ updated config.toml. A backup started from the GUI runs the same step. A sync
 failure does not stop the run; the run goes on with what is already configured,
 is recorded as failed in the backup history and the report (which carries the
 .B "SUBVOLUME SYNC"
-section), and exits non-zero at the end. This command does not
+section), and exits non-zero at the end. A target or source volume the run
+mounted and cannot unmount again (each is tried five times, two seconds
+apart) fails the run the same way: the error reads
+.BR "still mounted:"
+followed by the paths. This command does not
 expire retired backups
 .RB ( backup\-run.sh
 does, with
@@ -966,13 +970,7 @@ delay a real backup or scrub for.
 means no drift was found, or the check deferred because a lock was held
 (never treated as a failure).
 .B 1
-means the run was
-.I not clean
-\(em drift was found (missing or stale subvolumes),
-.B OR
-at least one configured volume failed to mount or list while others were
-checked successfully (that volume's subvolumes went unchecked, itself a
-finding this exit code surfaces rather than silently ignores). Unlike
+means drift was found (missing or stale subvolumes). Unlike
 .B "btrdasd scrub run" ,
 this genuinely surfaces through the exit code, because a drift check has no
 Sentinel multi-hour-retry hazard to protect against.
@@ -980,6 +978,12 @@ Sentinel multi-hour-retry hazard to protect against.
 means the check could not run at all: a config load failure, a lock I/O
 error, or every configured source volume failed to mount or list (nothing
 was ever examined).
+.B 3
+means at least one configured volume failed to mount or list while others
+were checked (that volume's subvolumes went unchecked), or a volume the check
+mounted could not be unmounted again (listed under
+.BR "LEFT MOUNTED" ).
+It outranks 1: an incomplete check cannot claim its drift list is complete.
 .PP
 .B btrdasd doctor
 .RB [ \-\-check\-drift ]
@@ -1034,7 +1038,10 @@ Print version information and exit.
 Successful operation.
 .TP
 .B 1
-An error occurred (backup failure, validation error, missing configuration, etc.).
+An error occurred (backup failure, validation error, missing configuration, a
+mount point the command mounted and could not unmount again, etc.).
+.B "btrdasd doctor"
+also uses 2 and 3; see its section.
 .SH EXAMPLES
 Run a full backup pipeline:
 .PP

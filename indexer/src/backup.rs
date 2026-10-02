@@ -1234,7 +1234,6 @@ pub fn run_backup(
     let mut bytes_sent: u64 = 0;
     let mut boot_archived = false;
     let mut indexed = false;
-    let mut report_sent = false;
 
     // ---------- Resolve effective sources ----------
 
@@ -1374,7 +1373,6 @@ pub fn run_backup(
             );
         }
 
-        let summary = format!("DRY RUN ({mode}) completed — no changes made");
         let success = errors.is_empty();
         let result = BackupResult {
             success,
@@ -1389,7 +1387,6 @@ pub fn run_backup(
             errors,
             duration_secs: start.elapsed().as_secs(),
         };
-        progress.on_complete(success, &summary);
         return Ok(result);
     }
 
@@ -1587,83 +1584,10 @@ pub fn run_backup(
         }
     }
 
-    // Step (e): Email report
-    if emails_report(options, config) {
-        let report_text = crate::report::format_report_with_sync(
-            &BackupResult {
-                success: errors.is_empty(),
-                mode,
-                snapshots_created,
-                snapshots_sent,
-                snapshots_cleaned: 0,
-                bytes_sent,
-                boot_archived,
-                indexed,
-                report_sent: false,
-                errors: errors.clone(),
-                duration_secs: start.elapsed().as_secs(),
-            },
-            config,
-            options.subvolume_sync.as_ref(),
-        );
-
-        // Save report to last_report file for later viewing.
-        if let Err(e) = std::fs::write(&config.general.last_report, &report_text) {
-            progress.on_log(
-                LogLevel::Warning,
-                &format!(
-                    "Failed to save report to {}: {e}",
-                    config.general.last_report
-                ),
-            );
-        }
-
-        match crate::report::send_email_report(&report_text, config) {
-            Ok(()) => {
-                progress.on_log(LogLevel::Info, "Email report sent successfully");
-                report_sent = true;
-            }
-            Err(e) => {
-                // Email failure is non-fatal — the backup data is safe.
-                // Log as warning but don't push to errors vec, which would
-                // mark the entire backup as "Failed" in the history.
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!("Failed to send email report (non-fatal): {e}"),
-                );
-            }
-        }
-    }
-
+    // The report is written and emailed by `run_backup_job`, after the
+    // targets are unmounted, so an unmount failure is in it — the order
+    // `backup-run.sh` uses (bd DAS-Backup-Manager-ecg, -5oc).
     let success = errors.is_empty();
-    let nothing_to_do = success
-        && snapshots_created == 0
-        && snapshots_sent == 0
-        && snapshots_cleaned == 0
-        && !options.dry_run;
-
-    let summary = if nothing_to_do {
-        format!("Backup ({mode}): nothing to do — all snapshots up to date")
-    } else {
-        let cleaned_msg = if snapshots_cleaned > 0 {
-            format!(", {} cleaned up", snapshots_cleaned)
-        } else {
-            String::new()
-        };
-        format!(
-            "Backup {status} ({mode}): {snaps} snapshots created, {sent} sent{cleaned}, boot archived: {boot}",
-            status = if success {
-                "succeeded"
-            } else {
-                "completed with errors"
-            },
-            snaps = snapshots_created,
-            sent = snapshots_sent,
-            cleaned = cleaned_msg,
-            boot = boot_archived,
-        )
-    };
-
     let result = BackupResult {
         success,
         mode,
@@ -1673,13 +1597,348 @@ pub fn run_backup(
         bytes_sent,
         boot_archived,
         indexed,
-        report_sent,
+        report_sent: false,
         errors,
         duration_secs: start.elapsed().as_secs(),
     };
 
-    progress.on_complete(result.success, &summary);
     Ok(result)
+}
+
+/// The one-line outcome of a backup run, as the CLI prints it and the GUI
+/// shows it when the job ends.
+pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
+    let mode = result.mode;
+    if dry_run {
+        return if result.success {
+            format!("DRY RUN ({mode}) completed — no changes made")
+        } else {
+            format!(
+                "DRY RUN ({mode}) FAILED — no changes made: {}",
+                result.errors.join("; ")
+            )
+        };
+    }
+    if result.success
+        && result.snapshots_created == 0
+        && result.snapshots_sent == 0
+        && result.snapshots_cleaned == 0
+    {
+        return format!("Backup ({mode}): nothing to do — all snapshots up to date");
+    }
+    let cleaned = if result.snapshots_cleaned > 0 {
+        format!(", {} cleaned up", result.snapshots_cleaned)
+    } else {
+        String::new()
+    };
+    let status = if result.success {
+        "succeeded"
+    } else {
+        "completed with errors"
+    };
+    let mut summary = format!(
+        "Backup {status} ({mode}): {} snapshots created, {} sent{cleaned}, boot archived: {}",
+        result.snapshots_created, result.snapshots_sent, result.boot_archived,
+    );
+    if !result.success {
+        summary.push_str(&format!(" — {}", result.errors.join("; ")));
+    }
+    summary
+}
+
+/// Write the run report to `[general].last_report` and email it, when the
+/// caller asked for a report and `[email]` is enabled. Returns whether the
+/// email was sent. Email failure is non-fatal — the backup data is safe —
+/// and is logged, not added to the run's errors.
+pub fn deliver_report(
+    config: &Config,
+    options: &BackupOptions,
+    result: &BackupResult,
+    progress: &dyn ProgressCallback,
+) -> bool {
+    if !emails_report(options, config) {
+        return false;
+    }
+    let report_text =
+        crate::report::format_report_with_sync(result, config, options.subvolume_sync.as_ref());
+    if let Err(e) = std::fs::write(&config.general.last_report, &report_text) {
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "Failed to save report to {}: {e}",
+                config.general.last_report
+            ),
+        );
+    }
+    match crate::report::send_email_report(&report_text, config) {
+        Ok(()) => {
+            progress.on_log(LogLevel::Info, "Email report sent successfully");
+            true
+        }
+        Err(e) => {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("Failed to send email report (non-fatal): {e}"),
+            );
+            false
+        }
+    }
+}
+
+/// Something a backup job mounted and must give back: [`mount::MountGuard`]
+/// in production. Returns what is still mounted afterwards.
+pub trait Release {
+    fn release(&mut self, progress: &dyn ProgressCallback) -> Vec<String>;
+}
+
+impl Release for mount::MountGuard {
+    fn release(&mut self, progress: &dyn ProgressCallback) -> Vec<String> {
+        self.unmount(progress)
+    }
+}
+
+/// The host-facing steps of a backup job. [`run_backup_job`] decides the
+/// order, what a failure means and what is recorded; [`SystemBackupHost`]
+/// does each step for real, and tests script them.
+pub trait BackupJobHost {
+    /// `Ok(None)`: another backup holds the singleton lock. The returned
+    /// value holds the locks until it is dropped.
+    fn acquire_locks(
+        &self,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Option<Box<dyn std::any::Any>>, String>;
+    fn mount_sources(&self, config: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release>;
+    /// The subvolume sync, and the config the rest of the run uses. `Err`
+    /// when the config cannot be loaded after sync.
+    fn sync(
+        &self,
+        dry_run: bool,
+        progress: &dyn ProgressCallback,
+    ) -> Result<(Config, SyncSection), String>;
+    fn mount_targets(
+        &self,
+        config: &Config,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Box<dyn Release>, String>;
+    fn run(
+        &self,
+        config: &Config,
+        options: &BackupOptions,
+        progress: &dyn ProgressCallback,
+    ) -> Result<BackupResult, String>;
+    /// Write and email the report; whether the email went out.
+    fn report(
+        &self,
+        config: &Config,
+        options: &BackupOptions,
+        result: &BackupResult,
+        progress: &dyn ProgressCallback,
+    ) -> bool;
+    /// Add the run to `backup_runs`.
+    fn record(&self, config: &Config, result: &BackupResult) -> Result<(), String>;
+}
+
+/// How a backup job ended.
+#[derive(Debug)]
+pub enum BackupJobOutcome {
+    /// Another backup holds the singleton lock — declined, not queued.
+    Declined,
+    /// The job could not run: locks, mounts, target verification, or btrbk
+    /// could not be started. Nothing is recorded — the same cases in which
+    /// `backup-run.sh` exits before it records a run.
+    NotRun(String),
+    /// The job ran. Recorded in `backup_runs` (unless a dry run); its
+    /// `success` says whether everything worked.
+    Ran(BackupResult),
+}
+
+impl BackupJobOutcome {
+    pub fn success(&self) -> bool {
+        matches!(self, Self::Ran(r) if r.success)
+    }
+
+    /// Whether the job succeeded, and the line that says how it ended — what
+    /// the GUI shows when the job finishes.
+    pub fn finish_line(&self, dry_run: bool) -> (bool, String) {
+        match self {
+            Self::Declined => (false, "A backup is already running — declined".to_string()),
+            Self::NotRun(why) => (false, why.clone()),
+            Self::Ran(result) => (result.success, backup_summary(result, dry_run)),
+        }
+    }
+}
+
+/// A failure message with the mount points left mounted appended.
+fn with_still_mounted(msg: String, still_mounted: &[String]) -> String {
+    match mount::still_mounted_error(still_mounted) {
+        Some(e) => format!("{msg}; {e}"),
+        None => msg,
+    }
+}
+
+/// Run one backup job, whoever starts it — `btrdasd backup run` and the GUI
+/// (D-Bus helper) both come through here, so they cannot drift apart:
+/// locks (decline if a backup is running, wait for a scrub), mount the
+/// sources, sync subvolumes, mount the targets, run btrbk, unmount, then
+/// report and record.
+///
+/// A mount point that cannot be released fails the run: its error says
+/// `still mounted: <paths>`, and it is in the report and in `backup_runs`
+/// (bd DAS-Backup-Manager-5oc). The report is built after the unmount for
+/// that reason, as `backup-run.sh` does.
+pub fn run_backup_job(
+    host: &dyn BackupJobHost,
+    config: Config,
+    mut options: BackupOptions,
+    progress: &dyn ProgressCallback,
+) -> BackupJobOutcome {
+    let _locks = match host.acquire_locks(progress) {
+        Ok(Some(locks)) => locks,
+        Ok(None) => return BackupJobOutcome::Declined,
+        Err(e) => {
+            return BackupJobOutcome::NotRun(format!("Could not acquire backup locks: {e}"));
+        }
+    };
+    let mut sources = host.mount_sources(&config, progress);
+    // Same rule on every path: a failed sync never stops the run, but the
+    // run's result, record and report all say it failed.
+    let (config, sync) = match host.sync(options.dry_run, progress) {
+        Ok(synced) => synced,
+        Err(e) => {
+            let still = sources.release(progress);
+            return BackupJobOutcome::NotRun(with_still_mounted(
+                format!("Config could not be reloaded after subvolume sync: {e}"),
+                &still,
+            ));
+        }
+    };
+    options.subvolume_sync = Some(sync);
+    let mut targets = match host.mount_targets(&config, progress) {
+        Ok(targets) => targets,
+        Err(e) => {
+            let still = sources.release(progress);
+            return BackupJobOutcome::NotRun(with_still_mounted(
+                format!("Mount failed: {e}"),
+                &still,
+            ));
+        }
+    };
+    let ran = host.run(&config, &options, progress);
+    let mut still_mounted = targets.release(progress);
+    still_mounted.extend(sources.release(progress));
+    let mut result = match ran {
+        Ok(result) => result,
+        Err(e) => {
+            return BackupJobOutcome::NotRun(with_still_mounted(
+                format!("Backup failed: {e}"),
+                &still_mounted,
+            ));
+        }
+    };
+    if let Some(e) = mount::still_mounted_error(&still_mounted) {
+        progress.on_log(LogLevel::Error, &e);
+        result.errors.push(e);
+        result.success = false;
+    }
+    if !options.dry_run {
+        result.report_sent = host.report(&config, &options, &result, progress);
+        if let Err(e) = host.record(&config, &result) {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("Failed to record backup history: {e}"),
+            );
+        }
+    }
+    BackupJobOutcome::Ran(result)
+}
+
+/// [`BackupJobHost`] on this machine.
+pub struct SystemBackupHost {
+    /// The config file sync rewrites and the run reloads.
+    pub config_path: std::path::PathBuf,
+    pub singleton_lock: std::path::PathBuf,
+    pub maintenance_lock: std::path::PathBuf,
+}
+
+impl SystemBackupHost {
+    /// The production host: the given config, the production lock files.
+    pub fn new(config_path: &Path) -> Self {
+        Self {
+            config_path: config_path.to_path_buf(),
+            singleton_lock: BACKUP_LOCK_PATH.into(),
+            maintenance_lock: scrub::MAINTENANCE_LOCK_PATH.into(),
+        }
+    }
+}
+
+impl BackupJobHost for SystemBackupHost {
+    fn acquire_locks(
+        &self,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Option<Box<dyn std::any::Any>>, String> {
+        match acquire_manual_locks_at(&self.singleton_lock, &self.maintenance_lock, progress) {
+            Ok(BackupLockAttempt::Acquired(locks)) => Ok(Some(locks)),
+            Ok(BackupLockAttempt::AlreadyRunning) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn mount_sources(&self, config: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release> {
+        Box::new(mount::ensure_sources_mounted(config, progress))
+    }
+
+    fn sync(
+        &self,
+        dry_run: bool,
+        progress: &dyn ProgressCallback,
+    ) -> Result<(Config, SyncSection), String> {
+        sync_before_backup(
+            &self.config_path,
+            dry_run,
+            &crate::caldate::today(),
+            &crate::fsutil::SystemRunner,
+            &health::is_mountpoint,
+            progress,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn mount_targets(
+        &self,
+        config: &Config,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Box<dyn Release>, String> {
+        mount::ensure_targets_mounted(config, progress)
+            .map(|guard| Box::new(guard) as Box<dyn Release>)
+            .map_err(|e| e.to_string())
+    }
+
+    fn run(
+        &self,
+        config: &Config,
+        options: &BackupOptions,
+        progress: &dyn ProgressCallback,
+    ) -> Result<BackupResult, String> {
+        run_backup(config, options, progress).map_err(|e| e.to_string())
+    }
+
+    fn report(
+        &self,
+        config: &Config,
+        options: &BackupOptions,
+        result: &BackupResult,
+        progress: &dyn ProgressCallback,
+    ) -> bool {
+        deliver_report(config, options, result, progress)
+    }
+
+    fn record(&self, config: &Config, result: &BackupResult) -> Result<(), String> {
+        let db = Database::open(&config.general.db_path)
+            .map_err(|e| format!("cannot open {}: {e}", config.general.db_path))?;
+        crate::report::record_backup_run(&db, result)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1961,12 +2220,11 @@ mod tests {
             "expected DRY RUN log message, got: {logs:?}"
         );
 
-        // Verify on_complete was called with success.
-        let completed = progress.completed.lock().unwrap();
-        assert!(completed.is_some(), "on_complete must have been called");
+        // run_backup is a step of a job, not the job: it does not end it.
+        // `run_backup_job`'s caller does, once (bd DAS-Backup-Manager-6bp).
         assert!(
-            completed.as_ref().unwrap().0,
-            "on_complete must report success"
+            progress.completed.lock().unwrap().is_none(),
+            "run_backup must not call on_complete"
         );
     }
 
@@ -2441,7 +2699,7 @@ mod tests {
             "{:?}",
             result.errors
         );
-        assert!(!progress.completed.lock().unwrap().as_ref().unwrap().0);
+        assert!(progress.completed.lock().unwrap().is_none());
 
         let db = Database::open(":memory:").unwrap();
         crate::report::record_backup_run(&db, &result).unwrap();
@@ -2489,5 +2747,589 @@ mod tests {
             };
             assert_eq!(emails_report(&options, &config), want, "{send} {enabled}");
         }
+    }
+
+    // --- run_backup_job: one job for the CLI and the GUI ------------------
+
+    /// A scripted host. Every step it is asked to do is appended to `steps`.
+    struct FakeHost {
+        steps: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        locks: Result<bool, String>,
+        sync: Result<bool, String>,
+        targets: Result<Vec<String>, String>,
+        sources_left: Vec<String>,
+        run: Result<(), String>,
+        recorded: std::sync::Mutex<Vec<BackupResult>>,
+        reported: std::sync::Mutex<Vec<BackupResult>>,
+        record_fails: bool,
+    }
+
+    impl Default for FakeHost {
+        fn default() -> Self {
+            Self {
+                steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                locks: Ok(true),
+                sync: Ok(false),
+                targets: Ok(Vec::new()),
+                sources_left: Vec::new(),
+                run: Ok(()),
+                recorded: std::sync::Mutex::new(Vec::new()),
+                reported: std::sync::Mutex::new(Vec::new()),
+                record_fails: false,
+            }
+        }
+    }
+
+    impl FakeHost {
+        fn step(&self, s: &str) {
+            self.steps.lock().unwrap().push(s.to_string());
+        }
+        fn steps(&self) -> Vec<String> {
+            self.steps.lock().unwrap().clone()
+        }
+    }
+
+    /// What a fake mount leaves behind when released; logs its release.
+    struct FakeMounts {
+        name: &'static str,
+        left: Vec<String>,
+        steps: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Release for FakeMounts {
+        fn release(&mut self, _: &dyn ProgressCallback) -> Vec<String> {
+            self.steps
+                .lock()
+                .unwrap()
+                .push(format!("release {}", self.name));
+            std::mem::take(&mut self.left)
+        }
+    }
+
+    fn copy_result(r: &BackupResult) -> BackupResult {
+        BackupResult {
+            success: r.success,
+            mode: r.mode,
+            snapshots_created: r.snapshots_created,
+            snapshots_sent: r.snapshots_sent,
+            snapshots_cleaned: r.snapshots_cleaned,
+            bytes_sent: r.bytes_sent,
+            boot_archived: r.boot_archived,
+            indexed: r.indexed,
+            report_sent: r.report_sent,
+            errors: r.errors.clone(),
+            duration_secs: r.duration_secs,
+        }
+    }
+
+    impl BackupJobHost for FakeHost {
+        fn acquire_locks(
+            &self,
+            _: &dyn ProgressCallback,
+        ) -> Result<Option<Box<dyn std::any::Any>>, String> {
+            self.step("locks");
+            self.locks
+                .clone()
+                .map(|got| got.then(|| Box::new(()) as Box<dyn std::any::Any>))
+        }
+        fn mount_sources(&self, _: &Config, _: &dyn ProgressCallback) -> Box<dyn Release> {
+            self.step("mount sources");
+            Box::new(FakeMounts {
+                name: "sources",
+                left: self.sources_left.clone(),
+                steps: self.steps.clone(),
+            })
+        }
+        fn sync(
+            &self,
+            dry_run: bool,
+            _: &dyn ProgressCallback,
+        ) -> Result<(Config, SyncSection), String> {
+            self.step(&format!("sync dry_run={dry_run}"));
+            let failed = self.sync.clone()?;
+            let mut config = make_test_config();
+            config.general.version = "after-sync".into();
+            Ok((
+                config,
+                SyncSection {
+                    report: "SUBVOLUME SYNC\n".into(),
+                    failed,
+                },
+            ))
+        }
+        fn mount_targets(
+            &self,
+            config: &Config,
+            _: &dyn ProgressCallback,
+        ) -> Result<Box<dyn Release>, String> {
+            self.step(&format!("mount targets ({})", config.general.version));
+            self.targets.clone().map(|left| {
+                Box::new(FakeMounts {
+                    name: "targets",
+                    left,
+                    steps: self.steps.clone(),
+                }) as Box<dyn Release>
+            })
+        }
+        fn run(
+            &self,
+            config: &Config,
+            options: &BackupOptions,
+            _: &dyn ProgressCallback,
+        ) -> Result<BackupResult, String> {
+            self.step(&format!(
+                "run ({}, sync failed={:?})",
+                config.general.version,
+                options.subvolume_sync.as_ref().map(|s| s.failed)
+            ));
+            self.run.clone()?;
+            let mut errors = Vec::new();
+            if options.subvolume_sync.as_ref().is_some_and(|s| s.failed) {
+                errors.push("Subvolume sync failed".to_string());
+            }
+            Ok(BackupResult {
+                success: errors.is_empty(),
+                mode: BackupMode::Incremental,
+                snapshots_created: 2,
+                snapshots_sent: 2,
+                snapshots_cleaned: 0,
+                bytes_sent: 10,
+                boot_archived: false,
+                indexed: true,
+                report_sent: false,
+                errors,
+                duration_secs: 1,
+            })
+        }
+        fn report(
+            &self,
+            _: &Config,
+            _: &BackupOptions,
+            result: &BackupResult,
+            _: &dyn ProgressCallback,
+        ) -> bool {
+            self.step("report");
+            self.reported.lock().unwrap().push(copy_result(result));
+            true
+        }
+        fn record(&self, _: &Config, result: &BackupResult) -> Result<(), String> {
+            self.step("record");
+            self.recorded.lock().unwrap().push(copy_result(result));
+            if self.record_fails {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn job(host: &FakeHost, dry_run: bool) -> (BackupJobOutcome, TestProgress) {
+        let progress = TestProgress::new();
+        let options = BackupOptions {
+            dry_run,
+            ..Default::default()
+        };
+        let outcome = run_backup_job(host, make_test_config(), options, &progress);
+        (outcome, progress)
+    }
+
+    #[test]
+    fn a_clean_job_runs_every_step_in_order_and_records_success() {
+        let host = FakeHost::default();
+        let (outcome, progress) = job(&host, false);
+        assert!(outcome.success(), "{outcome:?}");
+        assert_eq!(
+            host.steps(),
+            vec![
+                "locks",
+                "mount sources",
+                "sync dry_run=false",
+                "mount targets (after-sync)",
+                "run (after-sync, sync failed=Some(false))",
+                "release targets",
+                "release sources",
+                "report",
+                "record",
+            ]
+        );
+        let BackupJobOutcome::Ran(result) = outcome else {
+            panic!()
+        };
+        assert!(result.report_sent, "what report() returned");
+        assert!(host.recorded.lock().unwrap()[0].success);
+        assert!(
+            progress.completed.lock().unwrap().is_none(),
+            "the caller ends the job"
+        );
+    }
+
+    #[test]
+    fn a_target_left_mounted_fails_the_job_its_record_and_its_report() {
+        let host = FakeHost {
+            targets: Ok(vec!["/mnt/backup-22tb".into()]),
+            ..Default::default()
+        };
+        let (outcome, progress) = job(&host, false);
+        assert!(!outcome.success());
+        let (ok, line) = outcome.finish_line(false);
+        assert!(!ok);
+        assert!(line.contains("still mounted: /mnt/backup-22tb"), "{line}");
+        for (what, results) in [("record", &host.recorded), ("report", &host.reported)] {
+            let results = results.lock().unwrap();
+            assert!(!results[0].success, "{what}");
+            assert!(
+                results[0]
+                    .errors
+                    .contains(&"still mounted: /mnt/backup-22tb".to_string()),
+                "{what}: {:?}",
+                results[0].errors
+            );
+        }
+        // The report comes after the unmount, so it can say so.
+        let steps = host.steps();
+        let pos = |s: &str| steps.iter().position(|x| x == s).unwrap();
+        assert!(pos("release targets") < pos("report"), "{steps:?}");
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Error && m == "still mounted: /mnt/backup-22tb")
+        );
+    }
+
+    #[test]
+    fn a_source_left_mounted_fails_the_job_too() {
+        let host = FakeHost {
+            sources_left: vec!["/.btrfs-nvme".into()],
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        let BackupJobOutcome::Ran(result) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(!result.success);
+        assert_eq!(
+            result.errors,
+            vec!["still mounted: /.btrfs-nvme".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_dry_run_left_mounted_fails_but_records_and_reports_nothing() {
+        // The incident: a dry run from the GUI left the 22 TB target mounted
+        // and reported success.
+        let host = FakeHost {
+            targets: Ok(vec!["/mnt/backup-22tb".into()]),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, true);
+        let (ok, line) = outcome.finish_line(true);
+        assert!(!ok);
+        assert!(line.starts_with("DRY RUN (incremental) FAILED"), "{line}");
+        assert!(line.contains("still mounted: /mnt/backup-22tb"), "{line}");
+        assert!(host.recorded.lock().unwrap().is_empty());
+        assert!(host.reported.lock().unwrap().is_empty());
+        assert!(host.steps().contains(&"sync dry_run=true".to_string()));
+    }
+
+    #[test]
+    fn a_failed_sync_runs_the_backup_and_fails_it() {
+        let host = FakeHost {
+            sync: Ok(true),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(!outcome.success());
+        assert!(
+            host.steps()
+                .contains(&"run (after-sync, sync failed=Some(true))".to_string())
+        );
+        assert!(!host.recorded.lock().unwrap()[0].success);
+    }
+
+    #[test]
+    fn another_backup_running_declines_before_touching_anything() {
+        let host = FakeHost {
+            locks: Ok(false),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(matches!(outcome, BackupJobOutcome::Declined));
+        assert_eq!(host.steps(), vec!["locks"]);
+        assert_eq!(
+            outcome.finish_line(false),
+            (false, "A backup is already running — declined".to_string())
+        );
+    }
+
+    #[test]
+    fn a_lock_error_does_not_run() {
+        let host = FakeHost {
+            locks: Err("permission denied".into()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        let BackupJobOutcome::NotRun(why) = outcome else {
+            panic!()
+        };
+        assert_eq!(why, "Could not acquire backup locks: permission denied");
+        assert_eq!(host.steps(), vec!["locks"]);
+    }
+
+    #[test]
+    fn no_target_mounted_is_not_run_and_the_sources_are_released() {
+        let host = FakeHost {
+            targets: Err("No DAS drives found".into()),
+            sources_left: vec!["/.btrfs-nvme".into()],
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        let BackupJobOutcome::NotRun(why) = &outcome else {
+            panic!()
+        };
+        assert_eq!(
+            why,
+            "Mount failed: No DAS drives found; still mounted: /.btrfs-nvme"
+        );
+        assert_eq!(outcome.finish_line(false), (false, why.clone()));
+        assert!(host.steps().contains(&"release sources".to_string()));
+        assert!(!host.steps().contains(&"record".to_string()));
+    }
+
+    #[test]
+    fn a_backup_that_cannot_start_is_not_run_and_releases_everything() {
+        let host = FakeHost {
+            run: Err("Refusing to run btrbk".into()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        let BackupJobOutcome::NotRun(why) = outcome else {
+            panic!()
+        };
+        assert_eq!(why, "Backup failed: Refusing to run btrbk");
+        let steps = host.steps();
+        assert!(steps.contains(&"release targets".to_string()), "{steps:?}");
+        assert!(steps.contains(&"release sources".to_string()), "{steps:?}");
+        assert!(!steps.contains(&"record".to_string()), "{steps:?}");
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_reloaded_is_not_run() {
+        let host = FakeHost {
+            sync: Err("absent.toml".into()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        let BackupJobOutcome::NotRun(why) = outcome else {
+            panic!()
+        };
+        assert_eq!(
+            why,
+            "Config could not be reloaded after subvolume sync: absent.toml"
+        );
+        assert!(host.steps().contains(&"release sources".to_string()));
+    }
+
+    #[test]
+    fn a_record_that_fails_is_a_warning_not_a_failed_run() {
+        let host = FakeHost {
+            record_fails: true,
+            ..Default::default()
+        };
+        let (outcome, progress) = job(&host, false);
+        assert!(outcome.success());
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Warning
+                    && m == "Failed to record backup history: disk full")
+        );
+    }
+
+    fn result_with(success: bool, created: usize, sent: usize, cleaned: usize) -> BackupResult {
+        BackupResult {
+            success,
+            mode: BackupMode::Full,
+            snapshots_created: created,
+            snapshots_sent: sent,
+            snapshots_cleaned: cleaned,
+            bytes_sent: 0,
+            boot_archived: true,
+            indexed: false,
+            report_sent: false,
+            errors: if success {
+                Vec::new()
+            } else {
+                vec!["a".into(), "b".into()]
+            },
+            duration_secs: 0,
+        }
+    }
+
+    #[test]
+    fn backup_summary_says_what_happened() {
+        assert_eq!(
+            backup_summary(&result_with(true, 0, 0, 0), true),
+            "DRY RUN (full) completed — no changes made"
+        );
+        assert_eq!(
+            backup_summary(&result_with(false, 0, 0, 0), true),
+            "DRY RUN (full) FAILED — no changes made: a; b"
+        );
+        assert_eq!(
+            backup_summary(&result_with(true, 0, 0, 0), false),
+            "Backup (full): nothing to do — all snapshots up to date"
+        );
+        assert_eq!(
+            backup_summary(&result_with(true, 2, 0, 0), false),
+            "Backup succeeded (full): 2 snapshots created, 0 sent, boot archived: true"
+        );
+        assert_eq!(
+            backup_summary(&result_with(true, 0, 3, 0), false),
+            "Backup succeeded (full): 0 snapshots created, 3 sent, boot archived: true"
+        );
+        assert_eq!(
+            backup_summary(&result_with(true, 0, 0, 4), false),
+            "Backup succeeded (full): 0 snapshots created, 0 sent, 4 cleaned up, boot archived: true"
+        );
+        assert_eq!(
+            backup_summary(&result_with(false, 0, 0, 0), false),
+            "Backup completed with errors (full): 0 snapshots created, 0 sent, boot archived: true — a; b"
+        );
+    }
+
+    // --- SystemBackupHost: the steps that need no root ----------------------
+
+    fn system_host(dir: &Path) -> SystemBackupHost {
+        SystemBackupHost {
+            config_path: dir.join("config.toml"),
+            singleton_lock: dir.join("backup.lock"),
+            maintenance_lock: dir.join("maintenance.lock"),
+        }
+    }
+
+    #[test]
+    fn system_host_uses_the_production_locks_by_default() {
+        let host = SystemBackupHost::new(Path::new("/etc/das-backup/config.toml"));
+        assert_eq!(host.config_path, Path::new("/etc/das-backup/config.toml"));
+        assert_eq!(host.singleton_lock, Path::new(BACKUP_LOCK_PATH));
+        assert_eq!(
+            host.maintenance_lock,
+            Path::new(scrub::MAINTENANCE_LOCK_PATH)
+        );
+    }
+
+    #[test]
+    fn system_host_takes_the_locks_and_declines_while_they_are_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        let progress = TestProgress::new();
+        let held = host.acquire_locks(&progress).unwrap();
+        assert!(held.is_some(), "free locks are taken");
+        assert!(
+            host.acquire_locks(&progress).unwrap().is_none(),
+            "a second backup declines"
+        );
+        drop(held);
+        assert!(host.acquire_locks(&progress).unwrap().is_some());
+        let bad = SystemBackupHost {
+            // A directory cannot be opened as a lock file.
+            singleton_lock: dir.path().to_path_buf(),
+            ..system_host(dir.path())
+        };
+        assert!(bad.acquire_locks(&progress).is_err());
+    }
+
+    #[test]
+    fn system_host_records_the_run_in_backup_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        let mut config = make_test_config();
+        config.general.db_path = dir.path().join("index.db").to_string_lossy().into_owned();
+        host.record(&config, &result_with(false, 1, 1, 0)).unwrap();
+        let db = Database::open(&config.general.db_path).unwrap();
+        let history = crate::report::get_backup_history(&db, 5).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].success);
+
+        config.general.db_path = dir
+            .path()
+            .join("no/such/dir/index.db")
+            .to_string_lossy()
+            .into_owned();
+        assert!(host.record(&config, &result_with(true, 0, 0, 0)).is_err());
+    }
+
+    #[test]
+    fn system_host_writes_the_report_only_when_asked_and_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        let mut config = make_test_config();
+        let report = dir.path().join("last-report.txt");
+        config.general.last_report = report.to_string_lossy().into_owned();
+        let progress = TestProgress::new();
+        let result = result_with(false, 1, 1, 0);
+
+        config.email.enabled = false;
+        let ask = BackupOptions {
+            send_report: true,
+            ..Default::default()
+        };
+        assert!(!host.report(&config, &ask, &result, &progress));
+        assert!(!report.exists(), "email disabled: no report written");
+
+        config.email.enabled = true;
+        // No recipient, and nothing listens on that port: the email cannot be
+        // sent (and nothing ever leaves this machine) — but the report is
+        // written first, and the failure is a warning.
+        config.email.to = String::new();
+        config.email.smtp_port = 1;
+        config.email.smtp_host = "127.0.0.1".into();
+        assert!(!host.report(&config, &ask, &result, &progress));
+        let text = std::fs::read_to_string(&report).unwrap();
+        assert!(text.contains("a"), "{text}");
+    }
+
+    #[test]
+    fn system_host_mounts_nothing_for_a_config_without_targets_and_runs_a_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        let mut config = make_test_config();
+        config.targets.clear();
+        let progress = TestProgress::new();
+        let mut targets = host.mount_targets(&config, &progress).unwrap();
+        assert!(targets.release(&progress).is_empty());
+
+        let options = BackupOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let result = host.run(&make_test_config(), &options, &progress).unwrap();
+        assert!(result.success);
+        let mut nothing = make_test_config();
+        nothing.targets[0].mount = "/nonexistent/das/mount".into();
+        assert!(
+            host.run(&nothing, &BackupOptions::default(), &progress)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn system_host_syncs_the_config_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        let progress = TestProgress::new();
+        // No config there: the reload fails.
+        assert!(host.sync(true, &progress).is_err());
+        assert_eq!(sync_fixture(dir.path()), host.config_path);
+        // A dry run of sync against this host's real volumes: whatever it
+        // finds, it loads the config back.
+        let (config, _) = host.sync(true, &progress).unwrap();
+        assert!(!config.sources.is_empty());
     }
 }

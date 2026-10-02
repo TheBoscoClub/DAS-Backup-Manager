@@ -1,9 +1,13 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.6.0
-# Date: 2026-09-01
+# Version: 4.6.1
+# Date: 2026-10-02
 #
 # Features:
+#   - Unmount retry (v4.6.1): unmount_all() tries each DAS target up to
+#     UMOUNT_ATTEMPTS times, UMOUNT_RETRY_PAUSE seconds apart, before it
+#     records the unmount as FAILED — a target is often busy for a moment
+#     after btrbk (bd DAS-Backup-Manager-5oc). umount's own message is logged.
 #   - Subvolume sync (v4.6.0): sync_subvolumes() adopts new and retires
 #     vanished subvolumes before btrbk runs and reloads the config;
 #     expire_retired_subvolumes() deletes retired series past their window
@@ -1407,6 +1411,29 @@ run_archive_cleanup() {
     fi
 }
 
+# The same budget as the Rust path (mount.rs UMOUNT_ATTEMPTS / _RETRY_PAUSE).
+UMOUNT_ATTEMPTS=5
+UMOUNT_RETRY_PAUSE=2
+
+# umount one DAS target, retrying while it is busy. Returns 0 once it is
+# unmounted, 1 after the last attempt failed; every failed attempt is logged
+# with umount's own message.
+umount_with_retry() {
+    local mnt="$1" attempt err
+    for (( attempt = 1; attempt <= UMOUNT_ATTEMPTS; attempt++ )); do
+        if err="$(umount "$mnt" 2>&1)"; then
+            return 0
+        fi
+        if (( attempt < UMOUNT_ATTEMPTS )); then
+            log_warn "  umount $mnt failed (attempt $attempt of $UMOUNT_ATTEMPTS): ${err:-no message} — retrying in ${UMOUNT_RETRY_PAUSE}s"
+            sleep "$UMOUNT_RETRY_PAUSE"
+        else
+            log_error "  umount $mnt failed (attempt $attempt of $UMOUNT_ATTEMPTS): ${err:-no message}"
+        fi
+    done
+    return 1
+}
+
 unmount_all() {
     log_info "Unmounting volumes..."
 
@@ -1425,7 +1452,7 @@ unmount_all() {
         if ! mountpoint -q "$mnt" 2>/dev/null; then
             continue
         fi
-        if ! umount "$mnt" 2>/dev/null; then
+        if ! umount_with_retry "$mnt"; then
             log_error "  Failed to unmount $mnt"
             failed_mounts+=("$mnt")
         fi
@@ -1869,7 +1896,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.6.0
+  backup-run.sh v4.6.1
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
