@@ -26,6 +26,10 @@ pub struct TargetHealth {
     pub mounted: bool,
     pub total_bytes: u64,
     pub used_bytes: u64,
+    /// Whether `total_bytes`/`used_bytes` were measured. When not, both are
+    /// 0 for the JSON consumers, and a report must say "unknown" rather than
+    /// print the zeros as a reading (fail-silent.md "always a defect" #1).
+    pub usage_known: bool,
     pub snapshot_count: usize,
     pub smart_status: Option<String>,
     pub temperature_c: Option<i32>,
@@ -893,6 +897,7 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             mounted,
             total_bytes,
             used_bytes,
+            usage_known: usage.is_some(),
             snapshot_count,
             smart_status,
             temperature_c,
@@ -1013,6 +1018,7 @@ mod tests {
             mounted: true,
             total_bytes: 1_000_000,
             used_bytes: 250_000,
+            usage_known: true,
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
             temperature_c: Some(32),
@@ -1032,6 +1038,7 @@ mod tests {
             mounted: false,
             total_bytes: 0,
             used_bytes: 0,
+            usage_known: true,
             snapshot_count: 0,
             smart_status: None,
             temperature_c: None,
@@ -1260,6 +1267,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 mounted: true,
                 total_bytes: 1_000_000_000,
                 used_bytes: 500_000_000, // 50%
+                usage_known: true,
                 snapshot_count: 10,
                 smart_status: Some("PASSED".into()),
                 temperature_c: None,
@@ -1273,6 +1281,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 mounted: true,
                 total_bytes: 2_000_000_000,
                 used_bytes: 800_000_000, // 40%
+                usage_known: true,
                 snapshot_count: 5,
                 smart_status: Some("PASSED".into()),
                 temperature_c: None,
@@ -1293,6 +1302,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             mounted: true,
             total_bytes: 1_000_000_000,
             used_bytes: 900_000_000, // 90% — warning threshold
+            usage_known: true,
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
             temperature_c: None,
@@ -1312,6 +1322,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             mounted: true,
             total_bytes: 1_000_000_000,
             used_bytes: 300_000_000, // 30% — usage fine
+            usage_known: true,
             snapshot_count: 10,
             smart_status: Some("FAILED".into()), // SMART failure → Critical
             temperature_c: None,
@@ -1334,6 +1345,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             mounted: true,
             total_bytes: 1_000_000_000,
             used_bytes: 970_000_000, // 97% — critical threshold
+            usage_known: true,
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
             temperature_c: None,
@@ -1587,6 +1599,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             mounted: true,
             total_bytes: 1_000_000_000,
             used_bytes: 100_000_000, // 10% — fine on its own
+            usage_known: true,
             snapshot_count: 10,
             smart_status: Some("PASSED".into()),
             temperature_c: None,

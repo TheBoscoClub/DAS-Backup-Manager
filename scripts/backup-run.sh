@@ -1,9 +1,11 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.7.0
+# Version: 4.7.1
 # Date: 2026-10-02
 #
 # Features:
+#   - Report honesty (v4.7.1): a failed `btrbk list latest` shows as
+#     "(unavailable: …)" in LATEST SNAPSHOTS, not "(none yet)".
 #   - Dry run sees the planned btrbk.conf (v4.7.0): in --dryrun, sync renders
 #     the btrbk.conf the real run would leave into a mktemp file
 #     (`subvol sync --dry-run --render-btrbk-conf`), `btrbk dryrun` reads that
@@ -1646,7 +1648,15 @@ capture_report_data() {
     # ${BTRBK_LATEST:-  (none yet)} already handles empty. Caught live by
     # the bd DAS-Backup-Manager-ecg verification harness, which reproduced
     # exactly this abort against a deliberately-broken btrbk config.
-    BTRBK_LATEST=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>/dev/null | awk 'NR>1{printf "  %s\n", $0}') || true
+    #
+    # A FAILED listing is not an empty one: the report says it is unavailable
+    # and why, instead of "(none yet)" (bd DAS-Backup-Manager-h4t).
+    local latest_err
+    latest_err="$(mktemp)"
+    if ! BTRBK_LATEST=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>"$latest_err" | awk 'NR>1{printf "  %s\n", $0}'); then
+        BTRBK_LATEST="  (unavailable: btrbk list latest failed: $(head -n1 "$latest_err"))"
+    fi
+    rm -f "$latest_err"
 
     # Machine-readable copy for the DB counters. The human table's STATUS column
     # is presentation, not API: btrbk 0.32.7 renders it as "-" for every row and
@@ -1952,7 +1962,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.7.0
+  backup-run.sh v4.7.1
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
