@@ -10,7 +10,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report run_btrbk cleanup create_target_dirs; do
+for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report run_btrbk cleanup create_target_dirs make_target_dir; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -272,8 +272,18 @@ DRYRUN_BTRBK_CONF=""
 create_target_dirs
 check "no plan: only the configured subdir" "$(find "$WORK/mnt/t0" -mindepth 1 -printf '%f ')" "nvme "
 DRYRUN_BTRBK_CONF="$WORK/planned.conf"
+: >"$WORK/log"
+# shellcheck disable=SC2329  # called by the extracted make_target_dir
+log_info() { echo "INFO: $*" >>"$WORK/log"; }
 create_target_dirs
 check "plan: the adopted subdir on the mounted target" "$([[ -d "$WORK/mnt/t0/nvme-adopted" ]] && echo yes || echo no)" "yes"
+check "plan: the directory it created is logged" "$(grep -c "Created target directory $WORK/mnt/t0/nvme-adopted" "$WORK/log")" "1"
+check "plan: an existing directory is not logged again" "$(grep -c "Created target directory $WORK/mnt/t0/nvme\$" "$WORK/log" || true)" "0"
+# shellcheck disable=SC2329
+log_info() { :; }
+check "main: target directories are made only after the targets are verified" \
+    "$(awk '/^main\(\) \{/,/^}/' "$SCRIPT" | grep -n -E '^    (verify_targets_before_btrbk|create_target_dirs)$' | cut -d: -f2 | tr -d ' ' | tr '\n' ' ')" \
+    "verify_targets_before_btrbk create_target_dirs "
 check "plan: nothing on an unmounted target" "$(find "$WORK/mnt/t1" -mindepth 1 | wc -l)" "0"
 check "plan: no path that climbs out of the target" "$([[ -e "$WORK/mnt/escape" ]] && echo yes || echo no)" "no"
 DRYRUN_BTRBK_CONF=""

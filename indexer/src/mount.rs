@@ -361,6 +361,16 @@ fn ensure_targets_mounted_with(
                 total,
                 &format!("{} already mounted", target.label),
             );
+            // Not this run's to unmount — say so, so a target an earlier run
+            // failed to unmount is visible rather than quietly reused.
+            progress.on_log(
+                crate::progress::LogLevel::Warning,
+                &format!(
+                    "Target '{}': {} was already mounted before this run and will be \
+                     left mounted",
+                    target.label, target.mount
+                ),
+            );
             continue;
         }
 
@@ -718,6 +728,84 @@ fn ensure_sources_mounted_with(
     }
 
     guard
+}
+
+/// Create the directory each write target receives into, as
+/// `render_btrbk_conf` names it — after the targets are mounted and verified
+/// and after sync reloaded the config, so a source sync just adopted (a new
+/// `<source>-adopted`) gets its directory on this run, as `create_target_dirs`
+/// does in `backup-run.sh` (bd DAS-Backup-Manager-arx). Only under a target
+/// that is a mount point; a subdirectory that is empty, absolute or climbs
+/// with `..` is refused. Each directory created is logged. `Err` lists every
+/// directory that could not be made: btrbk would skip that target, so the
+/// run must say it failed.
+///
+/// Only the first `target_subdirs` entry of a source is created, because it
+/// is the only one the renderer uses; `backup-run.sh` creates every entry.
+pub fn create_target_dirs(
+    config: &Config,
+    write_labels: &[String],
+    progress: &dyn ProgressCallback,
+) -> Result<(), String> {
+    create_target_dirs_with(config, write_labels, progress, &HOST_PROBES)
+}
+
+/// [`create_target_dirs`] against an explicit host.
+fn create_target_dirs_with(
+    config: &Config,
+    write_labels: &[String],
+    progress: &dyn ProgressCallback,
+    probes: &MountProbes<'_>,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (target, subdir) in crate::btrbk_conf::target_dirs(config) {
+        if !write_labels.contains(&target.label) {
+            continue;
+        }
+        let relative = Path::new(subdir);
+        let plain = !subdir.is_empty()
+            && relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            failures.push(format!(
+                "{}: target subdirectory '{subdir}' is not a plain relative path — not created",
+                target.label
+            ));
+            continue;
+        }
+        let mount = Path::new(&target.mount);
+        if !(probes.is_mountpoint)(mount) {
+            failures.push(format!(
+                "{}: '{}' is not a mount point — '{subdir}' not created there",
+                target.label, target.mount
+            ));
+            continue;
+        }
+        let dir = mount.join(relative);
+        if dir.is_dir() {
+            continue;
+        }
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => progress.on_log(
+                crate::progress::LogLevel::Info,
+                &format!("Target '{}': created {}", target.label, dir.display()),
+            ),
+            Err(e) => failures.push(format!(
+                "{}: could not create {} ({e})",
+                target.label,
+                dir.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Target directories missing — btrbk will skip these targets:\n  - {}",
+            failures.join("\n  - ")
+        ))
+    }
 }
 
 /// The BTRFS filesystem UUID of whatever is mounted at `path`, if anything.
@@ -1617,6 +1705,18 @@ mod tests {
                 (2, 2, "beta already mounted".to_string()),
             ]
         );
+        let logs = progress.logs();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        for (log, (label, mnt)) in logs.iter().zip([("alpha", &a), ("beta", &b)]) {
+            assert_eq!(log.0, LogLevel::Warning);
+            assert_eq!(
+                log.1,
+                format!(
+                    "Target '{label}': {mnt} was already mounted before this run and will be \
+                     left mounted"
+                )
+            );
+        }
     }
 
     /// A directory that merely EXISTS at the mount path is not a mounted
@@ -2905,6 +3005,109 @@ mod tests {
     // -----------------------------------------------------------------------
     // filesystem_uuid_at
     // -----------------------------------------------------------------------
+
+    // --- create_target_dirs (bd DAS-Backup-Manager-arx review) -------------
+
+    fn dirs_config(scratch: &Scratch, subdirs: Vec<String>) -> Config {
+        let mut src = source("nvme-adopted", "UUID=abc", "/.btrfs-nvme");
+        src.target_subdirs = subdirs;
+        src.subvolumes = vec![crate::config::SubvolConfig {
+            name: "@new".into(),
+            ..Default::default()
+        }];
+        config_with(
+            vec![target_at("t", &scratch.mkdir("mnt/t"), Some("u"))],
+            vec![src],
+        )
+    }
+
+    fn create_dirs(
+        host: &Host,
+        config: &Config,
+        labels: &[&str],
+        progress: &Recorder,
+    ) -> Result<(), String> {
+        let runner = ScriptedRunner::succeeding();
+        let labels: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
+        host.with_probes(&runner, |p| {
+            create_target_dirs_with(config, &labels, progress, p)
+        })
+    }
+
+    #[test]
+    fn a_freshly_mounted_target_gets_the_directory_it_receives_into() {
+        let scratch = Scratch::new();
+        let config = dirs_config(&scratch, vec!["nvme-adopted".into(), "second".into()]);
+        let host = Host {
+            mountpoints: vec![PathBuf::from(scratch.path("mnt/t"))],
+            ..Host::default()
+        };
+        let progress = Recorder::default();
+        create_dirs(&host, &config, &["t"], &progress).unwrap();
+        assert!(Path::new(&scratch.path("mnt/t/nvme-adopted")).is_dir());
+        assert!(
+            !Path::new(&scratch.path("mnt/t/second")).exists(),
+            "only the subdirectory the renderer uses"
+        );
+        progress.assert_only_log(LogLevel::Info, &["Target 't': created", "nvme-adopted"]);
+
+        // Already there: nothing logged.
+        let again = Recorder::default();
+        create_dirs(&host, &config, &["t"], &again).unwrap();
+        assert!(again.logs().is_empty());
+    }
+
+    #[test]
+    fn nothing_is_created_under_a_bare_directory_and_the_run_is_told() {
+        let scratch = Scratch::new();
+        let config = dirs_config(&scratch, vec!["nvme-adopted".into()]);
+        // mnt/t exists but is NOT a mount point: the bare-mountpoint trap.
+        let err = create_dirs(&Host::default(), &config, &["t"], &Recorder::default()).unwrap_err();
+        assert!(err.contains("is not a mount point"), "{err}");
+        assert!(!Path::new(&scratch.path("mnt/t/nvme-adopted")).exists());
+    }
+
+    #[test]
+    fn a_target_not_written_this_run_is_left_alone() {
+        let scratch = Scratch::new();
+        let config = dirs_config(&scratch, vec!["nvme-adopted".into()]);
+        create_dirs(&Host::default(), &config, &[], &Recorder::default()).unwrap();
+        assert!(!Path::new(&scratch.path("mnt/t/nvme-adopted")).exists());
+    }
+
+    #[test]
+    fn a_subdirectory_that_is_absolute_or_climbs_is_refused() {
+        let scratch = Scratch::new();
+        let host = Host {
+            mountpoints: vec![PathBuf::from(scratch.path("mnt/t"))],
+            ..Host::default()
+        };
+        for bad in ["../escape", "/abs", "a/../../b", "./x"] {
+            let config = dirs_config(&scratch, vec![bad.to_string()]);
+            let err = create_dirs(&host, &config, &["t"], &Recorder::default()).unwrap_err();
+            assert!(err.contains("not a plain relative path"), "{bad}: {err}");
+        }
+        assert!(!Path::new(&scratch.path("mnt/escape")).exists());
+        // A nested plain path is fine.
+        let config = dirs_config(&scratch, vec!["a/b".into()]);
+        create_dirs(&host, &config, &["t"], &Recorder::default()).unwrap();
+        assert!(Path::new(&scratch.path("mnt/t/a/b")).is_dir());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_created_fails_loudly() {
+        let scratch = Scratch::new();
+        let config = dirs_config(&scratch, vec!["nvme-adopted".into()]);
+        // A file where the directory belongs.
+        std::fs::write(scratch.path("mnt/t/nvme-adopted"), b"x").unwrap();
+        let host = Host {
+            mountpoints: vec![PathBuf::from(scratch.path("mnt/t"))],
+            ..Host::default()
+        };
+        let err = create_dirs(&host, &config, &["t"], &Recorder::default()).unwrap_err();
+        assert!(err.starts_with("Target directories missing"), "{err}");
+        assert!(err.contains("t: could not create"), "{err}");
+    }
 
     #[test]
     fn filesystem_uuid_is_read_from_findmnt_and_absent_on_any_failure() {

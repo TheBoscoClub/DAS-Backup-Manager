@@ -331,7 +331,11 @@ section), and exits non-zero at the end. A target or source volume the run
 mounted and cannot unmount again (each is tried five times, two seconds
 apart) fails the run the same way: the error reads
 .BR "still mounted:"
-followed by the paths. This command does not
+followed by the paths. Once the targets are mounted and verified, the run
+creates the directory each one receives into (the first
+.I target_subdirs
+entry of each source, or its label), logging each one it creates, on a dry
+run too; a directory that cannot be created fails the run. This command does not
 expire retired backups
 .RB ( backup\-run.sh
 does, with
@@ -733,7 +737,8 @@ into a temporary file, and
 .B "btrbk dryrun"
 reads that file: the btrbk.conf the real run would have written by then, so a
 pending retirement or adoption is previewed as it will happen (the target
-directory a new adopted source sends to is created, as the real run does).
+directory a new adopted source sends to is created and logged, as the real
+run does).
 .PP
 Prints a
 .B "SUBVOLUME SYNC"
