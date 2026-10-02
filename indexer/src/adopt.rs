@@ -529,8 +529,10 @@ pub fn sync_subvolumes(
 }
 
 /// Replace `btrbk.conf` and `config.toml` together or not at all. Returns the
-/// reason when nothing was written (or, if the restore also failed, when the
-/// two files may disagree), `None` on success. A plan that could not be
+/// reason when nothing was written (or, if the rollback also failed, when the
+/// two files may disagree), `None` on success. If saving `config.toml` fails
+/// after `btrbk.conf` was replaced, the rollback re-renders `btrbk.conf` from
+/// the old config; it does not restore the original bytes. A plan that could not be
 /// applied (`Err`) is refused like a failed write.
 fn write_updated(
     config: &Config,

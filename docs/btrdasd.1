@@ -537,7 +537,10 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .\"
 .SS subvol add
-Add a subvolume to a source.
+Add a subvolume to a source. Validates the whole configuration, then saves
+config.toml and regenerates
+.I /etc/btrbk/btrbk.conf
+together (each replaced atomically), or changes neither file.
 .PP
 .B btrdasd subvol add
 .I SOURCE NAME
@@ -560,7 +563,9 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .\"
 .SS subvol remove
-Remove a subvolume from a source.
+Remove a subvolume from a source. Validates and saves config.toml and
+regenerates btrbk.conf together, as
+.BR "subvol add" .
 .PP
 .B btrdasd subvol remove
 .I SOURCE NAME
@@ -615,6 +620,134 @@ Subvolume name.
 Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
+.\"
+.\"
+.SS subvol sync
+Adopt new subvolumes and retire vanished ones. Every
+.B backup\-run.sh
+run calls this after verifying the source volumes and before btrbk, and
+.B "btrdasd backup run"
+calls it too, so creating a subvolume is enough to have it backed up.
+.PP
+Each subvolume that exists on a source volume and is not excluded gets a
+.I [[source.subvolumes]]
+entry. A nested subvolume joins its nearest configured ancestor's source and
+takes that source's targets. One with no configured ancestor goes to the
+primary target only, through a per\-volume
+.I <source>\-adopted
+source. An entry whose subvolume is gone is marked
+.I retired
+and leaves btrbk.conf (see
+.BR "subvol expire" ).
+A retired entry whose subvolume returns is revived.
+.PP
+Excluded are: anything under a
+.I .snapshots
+or
+.I .btrbk\-snapshots
+directory, the built\-in
+.B @tmp
+and
+.B @var\-tmp ,
+and the patterns in
+.I [subvolumes].exclude
+(the older
+.I [doctor].exclude
+is still read and merged). A pattern
+.RI ( * / ? ;
+.I *
+also matches
+.IR / )
+names the subvolume
+.B without
+a trailing slash and also covers everything nested under it:
+.I @cache
+excludes
+.I @cache/x
+as well, while
+.I @cache/
+excludes nothing.
+.PP
+A volume is read only if every device its sources name is a real mountpoint
+holding the expected filesystem UUID, mounted at its top level. Otherwise
+nothing on that volume is adopted or retired, and the run is marked failed.
+config.toml and btrbk.conf are replaced together or not at all.
+.PP
+Prints a
+.B "SUBVOLUME SYNC"
+report: what was adopted, retired or revived, every skip with its pattern,
+and any subvolume that could not be placed.
+.PP
+.B btrdasd subvol sync
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-dry\-run ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-dry\-run
+Print the plan and write nothing.
+.PP
+Exit status:
+.B 0
+sync ran and nothing failed;
+.B 1
+something failed (a volume was not read, a subvolume could not be placed, or
+the files could not be written);
+.B 2
+the configuration could not be loaded.
+.\"
+.SS subvol expire
+Delete the backups of retired subvolumes whose window has passed. Run by
+.B backup\-run.sh
+directly after btrbk, while the targets are mounted.
+.PP
+For each target the retired entry's source sends to, its snapshots are kept
+until the retirement date plus that target's longest retention window (daily
+x1, weekly x7, monthly x31, yearly x366 days), then all deleted from that
+target together. A target with no retention configured keeps them and says
+so. Nothing is deleted from a location that is not a mountpoint or cannot be
+read completely, that is also used by a live entry of the same series name,
+or that holds names resembling the series that are not recognised btrbk
+snapshots. The entry leaves config.toml only once nothing remains to expire
+(never if it is the last entry, or its source sends to no target, and never
+on a dry run). The search index is pruned of the deleted snapshots.
+.PP
+Prints a
+.B "RETIRED SUBVOLUMES"
+report, or nothing when no entry is retired.
+.PP
+.B btrdasd subvol expire
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-dry\-run ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-db " PATH"
+Path to the SQLite index database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.B \-\-dry\-run
+Print what would be deleted and delete nothing.
+.PP
+Exit status:
+.B 0
+ran and nothing failed;
+.B 1
+something failed, including deleted snapshots that could not be removed from
+the index;
+.B 2
+the configuration could not be loaded.
 .\"
 .SS health
 Show backup system health \(em drive status, SMART diagnostics,
@@ -734,24 +867,27 @@ directory at any depth, and the
 .B @tmp
 /
 .B @var\-tmp
-ephemeral subvolumes. An optional
+ephemeral subvolumes. The
+.I [subvolumes].exclude
+list, and the older
 .I [doctor].exclude
-list of shell-style glob patterns
-.RI ( * / ? )
-in config.toml adds further exclusions on top.
+(both shell-style glob patterns
+.RI ( * / ? ),
+merged), add further exclusions on top; the same rules as
+.BR "subvol sync" ,
+including that a pattern names a subvolume without a trailing slash and covers
+everything nested under it.
 .PP
-Missing subvolumes (on disk, not in config) are split into
-.B "likely irreplaceable"
-(add to config) and
-.B "probably rebuildable"
-(cache/build/package-manager-state names \(em review before adding), and a
-ready-to-paste
-.I [[source.subvolumes]]
-snippet is printed for the irreplaceable set. When multiple sources share a
-volume, every source label sharing it is listed rather than guessing which
-one a new subvolume belongs under \(em only a human knows whether a new
-top-level directory is a new project, new media, or something else. Stale
-config entries (configured, no longer on disk) are reported separately.
+Missing subvolumes (on disk, not configured by a live entry, not excluded)
+are reported in one section,
+.BR "NOT BACKED UP" ,
+because the backup run adopts new subvolumes itself
+.RB ( "subvol sync" ):
+a finding means that step failed or has not run since the subvolume appeared,
+and the report advises
+.BR "btrdasd subvol sync \-\-dry\-run" .
+A retired entry is neither configured nor stale. Stale config entries
+(configured, not retired, no longer on disk) are reported separately.
 .PP
 .B Locking:
 non-blocking only \(em a drift check that finds either its own singleton lock

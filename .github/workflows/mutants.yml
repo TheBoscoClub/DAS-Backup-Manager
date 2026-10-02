@@ -147,8 +147,11 @@ jobs:
   # whole system trusts would go unmutated indefinitely. Scope: everything that
   # runs as root at install time (setup/), mounts and unmounts targets
   # (mount.rs), deletes snapshots (forget.rs), decides where a restore may
-  # write (restore.rs), and holds the denied-roots policy (config.rs).
-  # Measured 2026-10-01: 500 mutants. Re-measure before widening:
+  # write (restore.rs), holds the denied-roots policy (config.rs), and, since
+  # subvolume sync, decides what is backed up and what is deleted (adopt.rs,
+  # expire.rs, with btrbk_conf.rs, caldate.rs and fsutil.rs under them).
+  # Measured 2026-10-01: 899 mutants, including the five subvolume-sync
+  # modules. Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
   full-scope:
@@ -175,7 +178,12 @@ jobs:
             --file src/mount.rs \
             --file src/forget.rs \
             --file src/restore.rs \
-            --file src/config.rs
+            --file src/config.rs \
+            --file src/adopt.rs \
+            --file src/expire.rs \
+            --file src/btrbk_conf.rs \
+            --file src/caldate.rs \
+            --file src/fsutil.rs
 
       # No --allow-zero-total: an empty result here means the globs are wrong.
       - name: Gate — did this run verify anything?

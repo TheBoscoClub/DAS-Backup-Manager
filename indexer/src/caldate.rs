@@ -26,8 +26,9 @@ pub fn day_number(date: &str) -> Option<i64> {
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
     }
-    // `get` rather than indexing: a multibyte character straddling a slice
-    // boundary must be a `None`, not a panic.
+    // Defensive: after the length check above, bytes 4 and 7 are ASCII `-`, so
+    // these ranges always fall on character boundaries. `get` rather than
+    // indexing keeps a future change to that check from turning into a panic.
     let digits = |s: Option<&str>| -> Option<i64> {
         let s = s?;
         s.bytes()
