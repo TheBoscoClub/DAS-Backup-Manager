@@ -218,6 +218,22 @@ impl Rig {
         .expect("config must load")
     }
 
+    /// `btrbk run` without asserting on the exit status: (success, output).
+    fn btrbk_try(&self) -> (bool, String) {
+        run("btrbk", &["-c", self.btrbk_conf.to_str().unwrap(), "run"])
+    }
+
+    /// Directory names inside the source's snapshot directory, sorted.
+    fn source_side_snapshots(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.src.mount.join(".btrbk-snapshots"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     fn btrbk_run(&self) {
         let out = must("btrbk", &["-c", self.btrbk_conf.to_str().unwrap(), "run"]);
         eprintln!("btrbk run: {} line(s) of output", out.lines().count());
@@ -255,8 +271,8 @@ fn a_subvolume_created_after_setup_is_backed_up_by_the_next_run() {
         "before sync only @data may be backed up: {before:?}"
     );
     assert!(
-        rig.target_snapshots("src-adopted").is_empty(),
-        "nothing may be on the adoption target before sync"
+        !rig.tgt_path("src-adopted").exists(),
+        "the adoption target directory must not exist before sync"
     );
 
     let outcome = rig.sync("2026-10-02");
@@ -332,11 +348,30 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
     assert!(snaps.iter().any(|n| n.starts_with("keeper.")), "{snaps:?}");
 
     rig.btrfs(&["subvolume", "delete", &rig.src_path("doomed")]);
+    // Counter-direction: with the dead entry still in btrbk.conf, btrbk
+    // fails (it exits 10 on a subvolume that no longer exists). This is what
+    // retirement exists to prevent.
+    let (ok, text) = rig.btrbk_try();
+    assert!(
+        !ok,
+        "btrbk must fail while the dead entry is still configured: {text}"
+    );
+    assert!(
+        std::fs::read_to_string(&rig.btrbk_conf)
+            .unwrap()
+            .contains("doomed")
+    );
     let outcome = rig.sync("2026-10-03");
     assert!(outcome.written && !outcome.failed(), "{outcome:?}");
     assert_eq!(outcome.plan.retire.len(), 1, "{:?}", outcome.plan);
     assert_eq!(outcome.plan.retire[0].name, "doomed");
-    // Must not exit 10 on the retired entry (`must` asserts exit 0).
+    assert!(
+        !std::fs::read_to_string(&rig.btrbk_conf)
+            .unwrap()
+            .contains("doomed"),
+        "the regenerated btrbk.conf must no longer name the retired subvolume"
+    );
+    // Now btrbk must not fail on it (`must` asserts exit 0).
     rig.btrbk_run();
 
     // Inside the 7-day window (retired 2026-10-03, kept through 2026-10-10).
@@ -361,6 +396,14 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
         "the retired entry stays in the config inside the window"
     );
 
+    assert!(
+        rig.source_side_snapshots()
+            .iter()
+            .any(|n| n.starts_with("doomed.")),
+        "source-side doomed.* must exist before the window passes: {:?}",
+        rig.source_side_snapshots()
+    );
+
     // Past it: gone from the target and from the source side, and the entry
     // with them. The live neighbour is untouched.
     let late = rig.expire("2026-10-11");
@@ -372,11 +415,7 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
         "is deleted after the window: {left:?}"
     );
     assert!(left.iter().any(|n| n.starts_with("keeper.")), "{left:?}");
-    let source_side: Vec<String> = std::fs::read_dir(rig.src.mount.join(".btrbk-snapshots"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+    let source_side = rig.source_side_snapshots();
     assert!(
         !source_side.iter().any(|n| n.starts_with("doomed.")),
         "source-side snapshots expire too: {source_side:?}"
@@ -392,6 +431,18 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
     rig.btrbk_run();
 }
 
+// What this detects: loss of the WHOLE defence. The refusal has four layers in
+// `adopt::list_volume` (mountpoint, filesystem UUID, top-level mount, a
+// successful non-empty `btrfs subvolume list`), and any one of them alone
+// refuses this case, so this test only goes red when the mountpoint, UUID and
+// top-level checks are all removed (verified on the VM). Each layer is pinned
+// individually by the unit tests in `adopt.rs`:
+// `list_volume_refuses_an_unmounted_path_without_running_anything`,
+// `wrong_uuid_volume_is_not_listed`,
+// `list_volume_refuses_a_volume_not_mounted_at_its_top_level`,
+// `list_volume_refuses_when_findmnt_names_no_filesystem_root` and
+// `empty_listing_is_a_failed_listing` (each goes red when only its own layer
+// is removed, checked on a scratch copy).
 #[test]
 #[ignore = "requires root and loop devices"]
 fn sync_refuses_an_unmounted_source_volume_and_changes_nothing() {
