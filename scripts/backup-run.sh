@@ -898,18 +898,43 @@ sync_subvolumes() {
 
 # Delete the backups of retired subvolumes that are past their window.
 # Runs after btrbk, while the targets are still mounted.
+#
+# When this run's sync failed it could not look at every volume, so a retired
+# subvolume may exist again and be waiting for sync to revive it. Expiry must
+# not outrun that: it runs as a dry run, deletes nothing, and the report says
+# so. The sync failure already marks the run failed.
 expire_retired_subvolumes() {
     local mode="$1"
     local args=(subvol expire --config "$DAS_CONFIG" --db "$DAS_DB_PATH")
-    [[ "$mode" == "dryrun" ]] && args+=(--dry-run)
+    local held_back="false"
+    if [[ "$mode" == "dryrun" ]]; then
+        args+=(--dry-run)
+    elif [[ "${OP_STATUS[subvol_sync]:-}" == "FAIL" ]]; then
+        args+=(--dry-run)
+        held_back="true"
+        log_warn "Subvolume sync failed this run — retired subvolumes are not expired (dry run only)"
+    fi
 
     local rc=0
     SUBVOL_EXPIRE_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
-    if [[ $rc -eq 0 ]]; then
-        record_op "subvol_expire" "OK"
-    else
+    if [[ $rc -ne 0 ]]; then
         record_op "subvol_expire" "FAIL" "exit code $rc — see RETIRED SUBVOLUMES in the report"
         log_error "Expiry of retired subvolumes failed (exit $rc)"
+    elif [[ "$held_back" == "true" ]]; then
+        record_op "subvol_expire" "SKIP" "not performed: subvolume sync failed this run (dry run shown)"
+    else
+        record_op "subvol_expire" "OK"
+    fi
+    if [[ "$held_back" == "true" && -n "$SUBVOL_EXPIRE_REPORT" ]]; then
+        # After the section's header line, before the dry-run lines.
+        local header rest
+        header="${SUBVOL_EXPIRE_REPORT%%$'\n'*}"
+        rest="${SUBVOL_EXPIRE_REPORT#*$'\n'}"
+        [[ "$rest" == "$SUBVOL_EXPIRE_REPORT" ]] && rest=""
+        SUBVOL_EXPIRE_REPORT="$header"$'\n'"  EXPIRY NOT PERFORMED: subvolume sync failed this run; nothing was deleted (dry run shown)"
+        if [[ -n "$rest" ]]; then
+            SUBVOL_EXPIRE_REPORT+=$'\n'"$rest"
+        fi
     fi
     if [[ -n "$SUBVOL_EXPIRE_REPORT" ]]; then
         local line

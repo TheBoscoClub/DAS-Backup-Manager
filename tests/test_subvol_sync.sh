@@ -177,6 +177,7 @@ check "dry run passes --dry-run" "$(grep -c -- 'subvol sync .*--dry-run' "$WORK/
 # --- expire -----------------------------------------------------------------
 : >"$WORK/calls"
 printf 'RETIRED SUBVOLUMES\n  @opt\n' >"$WORK/expire_out"; echo 0 >"$WORK/expire_rc"
+OP_STATUS[subvol_sync]=OK
 expire_retired_subvolumes run
 check "clean expire records OK" "${OP_STATUS[subvol_expire]}" "OK"
 check "expire passes the db" "$(grep -c -- "--db $DAS_DB_PATH" "$WORK/calls")" "1"
@@ -193,6 +194,40 @@ check "bare expire call under set -e survives a failing expire" "ok" "ok"
 : >"$WORK/expire_out"; echo 0 >"$WORK/expire_rc"
 expire_retired_subvolumes run
 check "empty expire report is empty" "$SUBVOL_EXPIRE_REPORT" ""
+
+# --- expire after a failed sync: shown, never performed ----------------------
+# Sync could not look at the volumes, so a retired subvolume may exist again;
+# expiry must not outrun it (Ruling 27).
+OP_STATUS=([subvol_sync]=FAIL)
+: >"$WORK/calls"
+printf 'RETIRED SUBVOLUMES\n  @opt\n    target t: would delete 2 snapshots (window passed)\n' >"$WORK/expire_out"
+echo 0 >"$WORK/expire_rc"
+expire_retired_subvolumes run
+check "failed sync: expire runs as a dry run" "$(grep -c -- 'subvol expire .*--dry-run' "$WORK/calls")" "1"
+check "failed sync: expire is recorded as not performed" "${OP_STATUS[subvol_expire]}" "SKIP"
+check "failed sync: the detail says why" "${OP_STATUS[subvol_expire_detail]}" \
+    "not performed: subvolume sync failed this run (dry run shown)"
+check "failed sync: the section says expiry was not performed" \
+    "$(sed -n 2p <<<"$SUBVOL_EXPIRE_REPORT")" \
+    "  EXPIRY NOT PERFORMED: subvolume sync failed this run; nothing was deleted (dry run shown)"
+check "failed sync: the dry-run lines follow" "$(sed -n 3p <<<"$SUBVOL_EXPIRE_REPORT")" "  @opt"
+printf 'RETIRED SUBVOLUMES\n' >"$WORK/expire_out"
+expire_retired_subvolumes run
+check "failed sync, header-only section: note added, nothing else" "$SUBVOL_EXPIRE_REPORT" \
+    $'RETIRED SUBVOLUMES\n  EXPIRY NOT PERFORMED: subvolume sync failed this run; nothing was deleted (dry run shown)'
+echo 1 >"$WORK/expire_rc"
+expire_retired_subvolumes run
+check "failed sync and a failing dry-run expire still records FAIL" "${OP_STATUS[subvol_expire]}" "FAIL"
+: >"$WORK/expire_out"; echo 0 >"$WORK/expire_rc"
+expire_retired_subvolumes run
+check "failed sync, nothing retired: no section" "$SUBVOL_EXPIRE_REPORT" ""
+check "failed sync, nothing retired: still recorded as not performed" "${OP_STATUS[subvol_expire]}" "SKIP"
+# Counter-direction: once sync is OK again, expiry is real.
+OP_STATUS=([subvol_sync]=OK)
+: >"$WORK/calls"
+expire_retired_subvolumes run
+check "sync OK: expire is real" "$(grep -c -- '--dry-run' "$WORK/calls" || true)" "0"
+check "sync OK: recorded OK" "${OP_STATUS[subvol_expire]}" "OK"
 
 # --- report layout ----------------------------------------------------------
 # generate_report's helpers and host probes are stubbed; only the layout of the
