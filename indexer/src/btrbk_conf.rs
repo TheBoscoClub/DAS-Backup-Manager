@@ -3,6 +3,8 @@
 //! Lives in the library, not in `setup/`, because the backup run itself
 //! regenerates this file when it adopts or retires a subvolume (`adopt.rs`).
 
+use std::path::Path;
+
 use crate::config::{Config, Retention, SubvolConfig, Target, TargetRole};
 
 pub const GENERATED_HEADER: &str = "\
@@ -176,6 +178,65 @@ pub fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
     }
 
     names
+}
+
+/// Save an edited config and regenerate btrbk.conf from it, or change
+/// neither. Every path that edits `config.toml` outside a sync — the CLI's
+/// `subvol` commands and every D-Bus helper method that saves — goes through
+/// this, so the two files cannot drift apart by that route. An entry that is in config.toml but not in btrbk.conf is not
+/// backed up, however it looks.
+pub fn save_config_and_btrbk_conf(
+    cfg: &Config,
+    config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_config_and_btrbk_conf_with(cfg, config_path, &|cfg, path| cfg.save(path))
+}
+
+type ConfigSaver<'a> = dyn Fn(&Config, &Path) -> Result<(), Box<dyn std::error::Error>> + 'a;
+
+/// `save_config_and_btrbk_conf` with the config save injectable, so a test can
+/// make that step fail in ways a real filesystem will not on demand.
+fn save_config_and_btrbk_conf_with(
+    cfg: &Config,
+    config_path: &Path,
+    save: &ConfigSaver<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let errors = cfg.validate();
+    if !errors.is_empty() {
+        return Err(errors.join("\n").into());
+    }
+    let conf_path = Path::new(&cfg.general.btrbk_conf);
+    // Absent is a state to restore (by removing what we write); unreadable is
+    // not, because then a failed save could not be undone. Refuse that case.
+    let previous = match std::fs::read_to_string(conf_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read {} to keep a rollback copy: {e}",
+                conf_path.display()
+            )
+            .into());
+        }
+    };
+    crate::fsutil::write_atomic(conf_path, &render_btrbk_conf(cfg))?;
+    if let Err(e) = save(cfg, config_path) {
+        let rollback = match &previous {
+            Some(text) => crate::fsutil::write_atomic(conf_path, text),
+            None => std::fs::remove_file(conf_path),
+        };
+        if let Err(re) = rollback {
+            return Err(format!(
+                "{e}; rolling back {} also failed: {re} — {} and {} may disagree",
+                conf_path.display(),
+                config_path.display(),
+                conf_path.display()
+            )
+            .into());
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -628,5 +689,146 @@ mod tests {
             snapshot_names(&[("users", Some("home")), ("@home", None), ("@opt", None)]),
             ["home", "root-home", "opt"]
         );
+    }
+
+    // ---- subvol config editing: config.toml and btrbk.conf change together ----
+
+    fn saveable_config(dir: &Path) -> Config {
+        let text = format!(
+            r#"[general]
+version = "0.7.22"
+install_prefix = "/usr"
+db_path = "{db}"
+btrbk_conf = "{conf}"
+[init]
+system = "systemd"
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+[[source]]
+label = "s"
+volume = "/vol"
+device = "UUID=abc"
+[[source.subvolumes]]
+name = "@"
+[[target]]
+label = "t"
+serial = "X"
+mount = "/mnt/t"
+role = "primary"
+[target.retention]
+daily = 7
+[email]
+enabled = false
+[gui]
+enabled = false
+"#,
+            db = dir.join("index.db").display(),
+            conf = dir.join("btrbk.conf").display(),
+        );
+        Config::from_toml(&text).unwrap()
+    }
+
+    #[test]
+    fn save_writes_config_and_btrbk_conf_that_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.to_toml().unwrap(), cfg.to_toml().unwrap());
+        let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
+        assert_eq!(conf, render_btrbk_conf(&reloaded));
+    }
+
+    #[test]
+    fn save_of_an_invalid_config_writes_neither_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = saveable_config(dir.path());
+        cfg.schedule.incremental = "not a time".into();
+        assert!(!cfg.validate().is_empty(), "fixture must be invalid");
+        let config_path = dir.path().join("config.toml");
+        let err = save_config_and_btrbk_conf(&cfg, &config_path).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(!config_path.exists());
+        assert!(!dir.path().join("btrbk.conf").exists());
+    }
+
+    #[test]
+    fn failed_config_save_restores_the_previous_btrbk_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let conf_path = dir.path().join("btrbk.conf");
+        std::fs::write(&conf_path, "previous btrbk.conf\n").unwrap();
+        // Occupy the atomic writer's temp name so the config save fails.
+        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&conf_path).unwrap(),
+            "previous btrbk.conf\n"
+        );
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn failed_config_save_leaves_no_btrbk_conf_when_there_was_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
+        assert!(!dir.path().join("btrbk.conf").exists());
+    }
+
+    #[test]
+    fn a_failed_rollback_is_reported_and_names_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let conf_path = dir.path().join("btrbk.conf");
+        let config_path = dir.path().join("config.toml");
+        // The save fails and, on the way out, leaves a directory where the
+        // rollback needs a file: both the restore and the removal fail.
+        let sabotage = |_: &Config, _: &Path| -> Result<(), Box<dyn std::error::Error>> {
+            std::fs::remove_file(&conf_path).unwrap();
+            std::fs::create_dir(&conf_path).unwrap();
+            Err("save failed".into())
+        };
+
+        // Case 1: there was no previous btrbk.conf (rollback removes the file).
+        let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &sabotage).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("save failed"), "{msg}");
+        assert!(msg.contains("rolling back"), "{msg}");
+        assert!(
+            msg.contains("config.toml") && msg.contains("btrbk.conf"),
+            "{msg}"
+        );
+
+        // Case 2: there was one (rollback rewrites it, onto a directory).
+        std::fs::remove_dir(&conf_path).unwrap();
+        std::fs::write(&conf_path, "previous\n").unwrap();
+        let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &sabotage).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("save failed") && msg.contains("rolling back"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_previous_btrbk_conf_refuses_the_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        // A directory where the file belongs: not NotFound, and no text to restore.
+        std::fs::create_dir(dir.path().join("btrbk.conf")).unwrap();
+        let config_path = dir.path().join("config.toml");
+        let err = save_config_and_btrbk_conf(&cfg, &config_path).unwrap_err();
+        assert!(err.to_string().contains("rollback copy"), "{err}");
+        assert!(!config_path.exists());
     }
 }
