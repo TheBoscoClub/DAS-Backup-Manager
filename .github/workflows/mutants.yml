@@ -149,11 +149,18 @@ jobs:
   # (mount.rs), deletes snapshots (forget.rs), decides where a restore may
   # write (restore.rs), holds the denied-roots policy (config.rs), and, since
   # subvolume sync, decides what is backed up and what is deleted (adopt.rs,
-  # expire.rs, with btrbk_conf.rs, caldate.rs and fsutil.rs under them).
+  # expire.rs, with btrbk_conf.rs, caldate.rs and fsutil.rs under them), and
+  # orders every GUI job's progress and its one JobFinished (progress.rs).
   # Measured 2026-10-01: 899 mutants, including the five subvolume-sync
   # modules. Time: the previous scope (554 mutants) took 11 minutes locally and
-  # 40 on the GitHub runner, about 3.6 times slower; this scope takes 35 minutes
+  # 40 on the GitHub runner, about 3.6 times slower; that scope took 35 minutes
   # locally, so about 2 hours on the runner, hence timeout-minutes 300.
+  # Re-measured 2026-10-02: 1018 mutants (999 + progress.rs 19), about 37
+  # minutes locally, about 2.3 hours on the runner. backup.rs (243 mutants,
+  # 13 minutes locally with progress.rs) would still fit the time, but is NOT
+  # in scope: 152 of its mutants survive — its btrbk-spawning steps
+  # (create_snapshots, send_snapshots, run_full_pipeline, run_backup's live
+  # path) have no test seam yet — so adding it would only turn this job red.
   # Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
@@ -186,7 +193,8 @@ jobs:
             --file src/expire.rs \
             --file src/btrbk_conf.rs \
             --file src/caldate.rs \
-            --file src/fsutil.rs
+            --file src/fsutil.rs \
+            --file src/progress.rs
 
       # No --allow-zero-total: an empty result here means the globs are wrong.
       - name: Gate — did this run verify anything?
