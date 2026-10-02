@@ -1,4 +1,4 @@
-use crate::backup::BackupResult;
+use crate::backup::{BackupResult, SyncSection};
 use crate::config::Config;
 use crate::db::{Database, NewBackupRun};
 
@@ -42,6 +42,17 @@ pub struct BackupRun {
 /// consumer reads `LAST_REPORT` or matches these section strings — so the
 /// divergence is a documentation question, not a compatibility one.
 pub fn format_report(result: &BackupResult, config: &Config) -> String {
+    format_report_with_sync(result, config, None)
+}
+
+/// `format_report` for a run that began with a subvolume sync: its status
+/// joins the operations list and its section follows it, where
+/// `backup-run.sh` puts them.
+pub fn format_report_with_sync(
+    result: &BackupResult,
+    config: &Config,
+    sync: Option<&SyncSection>,
+) -> String {
     let sep = "═".repeat(63);
     let thin = "─".repeat(63);
 
@@ -101,6 +112,12 @@ pub fn format_report(result: &BackupResult, config: &Config) -> String {
     ));
     r.push_str(&format!("  Boot subvolumes       {boot_status}\n"));
     r.push_str(&format!("  Content indexer       {index_status}\n"));
+    if let Some(sync) = sync {
+        let status = if sync.failed { "FAIL" } else { "OK" };
+        r.push_str(&format!("  Subvolume sync        {status}\n"));
+        r.push('\n');
+        r.push_str(&sync.report);
+    }
 
     // Throughput — simple summary from result data.
     r.push_str(&format!("\nTHROUGHPUT\n{thin}\n"));
@@ -460,6 +477,56 @@ mod tests {
         assert!(report.contains("DISK CAPACITY"));
         assert!(report.contains("SMART STATUS"));
         assert!(!report.contains("ERRORS"));
+    }
+
+    #[test]
+    fn the_report_carries_the_subvolume_sync_section_and_its_status() {
+        let result = BackupResult {
+            success: false,
+            mode: BackupMode::Incremental,
+            snapshots_created: 1,
+            snapshots_sent: 1,
+            snapshots_cleaned: 0,
+            bytes_sent: 0,
+            boot_archived: false,
+            indexed: false,
+            report_sent: false,
+            errors: vec!["Subvolume sync failed — see SUBVOLUME SYNC in the report".into()],
+            duration_secs: 1,
+        };
+        let sync = crate::backup::SyncSection {
+            report: "SUBVOLUME SYNC\n  VOLUMES NOT READ (nothing adopted or retired there):\n    /ssd: not mounted\n".into(),
+            failed: true,
+        };
+        let cfg = Config::default();
+        let report = format_report_with_sync(&result, &cfg, Some(&sync));
+        assert!(report.contains("FAILURES DETECTED"), "{report}");
+        assert!(
+            report.contains("  Subvolume sync        FAIL\n"),
+            "{report}"
+        );
+        // The section sits between the operations and THROUGHPUT, as in the
+        // report backup-run.sh writes.
+        let ops = report.find("BACKUP OPERATIONS").unwrap();
+        let section = report.find("\nSUBVOLUME SYNC\n").expect("section present");
+        let throughput = report.find("\nTHROUGHPUT\n").unwrap();
+        assert!(ops < section && section < throughput, "{report}");
+        assert!(report.contains("    /ssd: not mounted\n"), "{report}");
+
+        let ok = crate::backup::SyncSection {
+            report: "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n".into(),
+            failed: false,
+        };
+        let report = format_report_with_sync(&result, &cfg, Some(&ok));
+        assert!(report.contains("  Subvolume sync        OK\n"), "{report}");
+        // Without a sync (other callers) neither the line nor the section.
+        let result = BackupResult {
+            errors: vec![],
+            ..result
+        };
+        let report = format_report(&result, &cfg);
+        assert!(!report.contains("Subvolume sync"), "{report}");
+        assert!(!report.contains("SUBVOLUME SYNC"), "{report}");
     }
 
     #[test]

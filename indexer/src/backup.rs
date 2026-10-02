@@ -127,6 +127,10 @@ pub struct BackupOptions {
     pub index_after: bool,
     /// Send an email report after backup.
     pub send_report: bool,
+    /// The subvolume sync that started this run (`sync_before_backup`). A
+    /// failed one fails the run — in its result, its `backup_runs` row and
+    /// its report — and its section is carried into the report.
+    pub subvolume_sync: Option<SyncSection>,
 }
 
 /// Result of a completed backup run.
@@ -1216,6 +1220,9 @@ pub fn run_backup(
     let start = std::time::Instant::now();
 
     let mut errors: Vec<String> = Vec::new();
+    if options.subvolume_sync.as_ref().is_some_and(|s| s.failed) {
+        errors.push("Subvolume sync failed — see SUBVOLUME SYNC in the report".into());
+    }
     let mut snapshots_created: usize = 0;
     let mut snapshots_sent: usize = 0;
     let mut bytes_sent: u64 = 0;
@@ -1362,8 +1369,9 @@ pub fn run_backup(
         }
 
         let summary = format!("DRY RUN ({mode}) completed — no changes made");
+        let success = errors.is_empty();
         let result = BackupResult {
-            success: true,
+            success,
             mode,
             snapshots_created: 0,
             snapshots_sent: 0,
@@ -1372,10 +1380,10 @@ pub fn run_backup(
             boot_archived: false,
             indexed: false,
             report_sent: false,
-            errors: Vec::new(),
+            errors,
             duration_secs: start.elapsed().as_secs(),
         };
-        progress.on_complete(true, &summary);
+        progress.on_complete(success, &summary);
         return Ok(result);
     }
 
@@ -1575,7 +1583,7 @@ pub fn run_backup(
 
     // Step (e): Email report
     if options.send_report && config.email.enabled {
-        let report_text = crate::report::format_report(
+        let report_text = crate::report::format_report_with_sync(
             &BackupResult {
                 success: errors.is_empty(),
                 mode,
@@ -1590,6 +1598,7 @@ pub fn run_backup(
                 duration_secs: start.elapsed().as_secs(),
             },
             config,
+            options.subvolume_sync.as_ref(),
         );
 
         // Save report to last_report file for later viewing.
@@ -2396,5 +2405,65 @@ mod tests {
                 .any(|(level, msg)| *level == LogLevel::Error && msg.contains("absent.toml")),
             "{logs:?}"
         );
+    }
+
+    // --- a failed sync is a failed run, in the record and in the report ---
+
+    fn failed_sync() -> SyncSection {
+        SyncSection {
+            report: "SUBVOLUME SYNC\n  VOLUMES NOT READ (nothing adopted or retired there):\n    /ssd: not mounted\n".into(),
+            failed: true,
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_makes_the_run_fail_and_is_recorded_as_a_failure() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            dry_run: true,
+            subvolume_sync: Some(failed_sync()),
+            ..Default::default()
+        };
+        let progress = TestProgress::new();
+        let result = run_backup(&config, &options, &progress).unwrap();
+        assert!(!result.success, "a failed sync must fail the run");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("Subvolume sync failed")),
+            "{:?}",
+            result.errors
+        );
+        assert!(!progress.completed.lock().unwrap().as_ref().unwrap().0);
+
+        let db = Database::open(":memory:").unwrap();
+        crate::report::record_backup_run(&db, &result).unwrap();
+        let history = crate::report::get_backup_history(&db, 1).unwrap();
+        assert!(!history[0].success, "backup_runs.success must be 0");
+        assert!(
+            history[0]
+                .errors
+                .iter()
+                .any(|e| e.contains("SUBVOLUME SYNC")),
+            "{:?}",
+            history[0].errors
+        );
+    }
+
+    #[test]
+    fn a_clean_sync_leaves_the_run_successful() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            dry_run: true,
+            subvolume_sync: Some(SyncSection {
+                report: "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n".into(),
+                failed: false,
+            }),
+            ..Default::default()
+        };
+        let result = run_backup(&config, &options, &TestProgress::new()).unwrap();
+        assert!(result.success, "{:?}", result.errors);
+        assert!(result.errors.is_empty());
     }
 }
