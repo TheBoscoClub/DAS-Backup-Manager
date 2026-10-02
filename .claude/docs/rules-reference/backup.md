@@ -79,16 +79,18 @@ entries must exist at all, and the history of the manual regime; the mechanism's
   with no retention: kept and reported. Source-side snapshots use the shortest window of the
   targets. The entry is removed only when every location is empty, deleted or shared — never the
   last config entry, never one whose source sends to no target, never on a dry run.
-- **A wrong date costs a late deletion, never an early one** (final review, Rulings 26–27). A
+- **A wrong date mostly costs a late deletion** (final review, Rulings 26–27). A
   location whose newest series snapshot is dated more than a day after `retired` is kept
   (`RetiredBeforeNewest`: the clock was wrong at retirement, or the date was edited; one day is
   allowed because snapshot names are local time and `retired` is UTC). A retired entry whose
-  subvolume exists again on its mounted source volume is kept everywhere until sync revives it.
+  source volume is not mounted, or has a path of that name, is kept everywhere (until sync revives it
+  or the path goes). A clock that wrongly reads far in the future at expiry time is NOT detected and
+  would expire retired series early; live subvolumes are never touched by expiry.
   `caldate::untrusted_clock` refuses a clock before 2026-01-01: sync stamps no retirement (adoption
   goes on), expiry deletes nothing; both fail loudly. `backup-run.sh` passes `--dry-run` to
   expire when that run's sync failed. Units carry `Wants=`/`After=time-sync.target`, a courtesy
   only — the floor is the guard.
-- **btrbk.conf drift.** Every non-dry sync that did not fail compares `btrbk.conf` with what
+- **btrbk.conf drift.** A non-dry sync whose plan changes nothing, and that did not fail, compares `btrbk.conf` with what
   `config.toml` renders to and regenerates it on any difference (the helper's config writes and
   hand edits used to leave it stale, and the entry was silently not backed up).
 - **Drift check.** `doctor --check-drift` uses the same listing and exclusions; one section, "NOT

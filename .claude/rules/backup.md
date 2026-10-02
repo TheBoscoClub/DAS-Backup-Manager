@@ -38,7 +38,7 @@ config.toml. `config.toml` is read again after sync, so a mid-run edit takes eff
 - A gone subvolume's entry is **retired**, not an error: it leaves `btrbk.conf`. `subvol expire`
   (after btrbk) deletes its snapshots per target once retirement + that target's longest
   retention window has passed. No retention, unmounted, unreadable, shared directory,
-  unrecognised names, subvolume back, snapshot newer than retirement, clock < 2026, sync
+  unrecognised names, source unmounted, name back, snapshot newer than retirement, clock < 2026, sync
   failed: kept and reported. The last config entry and an entry sending nowhere stay.
 - A **Missing** or **Stale** finding from the weekly drift check now means sync itself failed.
 - **Target scoping is part of the entry.** Bulk data gets `target_labels = ["primary-22tb"]`;

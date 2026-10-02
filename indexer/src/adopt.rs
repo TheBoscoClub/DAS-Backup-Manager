@@ -583,8 +583,9 @@ pub fn sync_subvolumes(
 /// Make `btrbk.conf` say what `config.toml` renders to, when nothing else in
 /// this sync rewrites it. Anything but an exact match — a different text, a
 /// missing file, an unreadable one — counts as out of date. Nothing is written
-/// on a dry run, nor while the sync has failed: then the state of the volumes
-/// is in doubt and sync changes neither file. Returns the state and, when the
+/// on a dry run, nor while the sync has failed (a volume was not read): the
+/// file is then left alone and reported out of date. A plan that itself
+/// changes the config never comes here; it writes both files regardless. Returns the state and, when the
 /// replacement could not be made, why.
 fn bring_btrbk_conf_into_line(
     config: &Config,
