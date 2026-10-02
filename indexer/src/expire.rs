@@ -529,7 +529,10 @@ pub fn format_expire_report(outcome: &ExpireOutcome, dry_run: bool) -> String {
                     count,
                     expires: Some(date),
                 } => {
-                    format!("{count} {} kept until {date}", plural(*count))
+                    format!(
+                        "{count} {} kept, deleted on or after {date}",
+                        plural(*count)
+                    )
                 }
                 LocationState::Kept {
                     count,
@@ -1476,7 +1479,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("no snapshots"), "{text}");
-        assert!(text.contains("1 snapshot kept until 2026-10-09"), "{text}");
+        assert!(
+            text.contains("1 snapshot kept, deleted on or after 2026-10-09"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1527,7 +1533,7 @@ mod tests {
         for line in [
             "    a: not reachable (gone); nothing changed\n",
             "    b: no snapshots\n",
-            "    c: 2 snapshots kept until 2027-01-01\n",
+            "    c: 2 snapshots kept, deleted on or after 2027-01-01\n",
             "    d: 1 snapshot KEPT — no retention window to measure against\n",
             "    e: deleted 2 snapshots (window passed)\n",
             "    f: DELETE FAILED after 1: x; y\n",
