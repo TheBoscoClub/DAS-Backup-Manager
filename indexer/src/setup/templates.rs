@@ -58,6 +58,10 @@ pub fn is_embedded_script(path: &str) -> bool {
 /// hours — before it can proceed. A finite `TimeoutStartSec` would SIGKILL the
 /// backup mid-wait. The maintenance lock is the correctness mechanism against
 /// overlap, not a timeout (user decision 2026-07-27, bd DAS-Backup-Manager-b6f).
+///
+/// Ordered after `time-sync.target`: the run dates retirements and expires
+/// retired backups by the clock. This ordering is a courtesy, not the guard —
+/// `caldate::untrusted_clock` refuses a date before 2026 whatever the order.
 pub fn render_systemd_service(config: &Config, full: bool) -> String {
     let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
     let desc = if full {
@@ -72,6 +76,8 @@ pub fn render_systemd_service(config: &Config, full: bool) -> String {
          [Unit]\n\
          Description={desc}\n\
          After=local-fs.target\n\
+         Wants=time-sync.target\n\
+         After=time-sync.target\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -159,6 +165,8 @@ pub fn render_systemd_scrub_service(config: &Config) -> String {
          [Unit]\n\
          Description=DAS Backup - Scheduled BTRFS scrub of backup targets\n\
          After=local-fs.target\n\
+         Wants=time-sync.target\n\
+         After=time-sync.target\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -592,6 +600,8 @@ mod tests {
                 "[Unit]\n",
                 "Description=DAS Backup - Full BTRFS backup\n",
                 "After=local-fs.target\n",
+                "Wants=time-sync.target\n",
+                "After=time-sync.target\n",
                 "\n",
                 "[Service]\n",
                 "Type=oneshot\n",
@@ -680,6 +690,7 @@ mod tests {
     fn render_systemd_scrub_service_test() {
         let config = test_config();
         let result = render_systemd_scrub_service(&config);
+        assert!(result.contains("\nWants=time-sync.target\nAfter=time-sync.target\n"));
         assert!(result.contains("Type=oneshot"));
         assert!(result.contains("ExecStart=/usr/local/bin/btrdasd scrub run"));
         assert!(result.contains("TimeoutStartSec=infinity"));

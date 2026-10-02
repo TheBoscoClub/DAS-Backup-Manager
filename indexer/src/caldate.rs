@@ -73,15 +73,34 @@ pub fn date_of(day: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Today's date in UTC.
+/// Today's date in UTC. Callers that act on it check `untrusted_clock`.
 pub fn today() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        // A clock before 1970 is a broken clock; day 0 makes every retired
-        // series look freshly retired, so nothing is expired on its account.
+        // A clock before 1970 is a broken clock. Day 0 is 1970-01-01, which
+        // `untrusted_clock` refuses, so nothing is retired or expired by it.
         .unwrap_or(0);
     date_of(secs.div_euclid(86_400))
+}
+
+/// The earliest date this code accepts from the system clock. Nothing was
+/// retired before this feature existed, so an earlier reading is a clock
+/// that was never set, or was reset — a dead RTC battery reads 1970.
+pub const EARLIEST_TRUSTED_DATE: &str = "2026-01-01";
+
+/// Why `today` cannot be trusted to date a retirement or an expiry, or
+/// `None` if it can. A wrong clock must cost a late deletion, never an early
+/// one: sync refuses to stamp a retirement with it and expiry refuses to
+/// delete by it. An unreadable `today` is not reported here — no comparison
+/// against it ever finds a series expired.
+pub fn untrusted_clock(today: &str) -> Option<String> {
+    let floor = day_number(EARLIEST_TRUSTED_DATE)?;
+    (day_number(today)? < floor).then(|| {
+        format!(
+            "the system clock reads {today}, before {EARLIEST_TRUSTED_DATE} — it cannot be trusted to date a retirement or an expiry"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -238,5 +257,18 @@ mod tests {
         ] {
             assert_eq!(day_number(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_clock_before_2026_is_not_trusted_and_names_the_date() {
+        for early in ["1970-01-01", "2025-12-31"] {
+            let why = untrusted_clock(early).expect(early);
+            assert!(why.contains(early) && why.contains("2026-01-01"), "{why}");
+        }
+        assert_eq!(untrusted_clock("2026-01-01"), None);
+        assert_eq!(untrusted_clock("2026-10-02"), None);
+        // An unreadable date is refused where it is used (it never compares
+        // as expired), so it is not this check's to report.
+        assert_eq!(untrusted_clock("garbage"), None);
     }
 }

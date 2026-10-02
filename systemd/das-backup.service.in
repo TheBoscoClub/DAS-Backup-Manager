@@ -2,6 +2,9 @@
 Description=DAS Backup - BTRFS incremental backup to DAS enclosure
 Documentation=https://github.com/TheBoscoClub/DAS-Backup-Manager
 After=local-fs.target
+# Retirement and expiry are dated by the clock (see caldate::untrusted_clock).
+Wants=time-sync.target
+After=time-sync.target
 # Only run if DAS is likely connected (btrdasd setup configures the actual glob)
 ConditionPathExistsGlob=/dev/disk/by-id/usb-*
 
