@@ -3473,6 +3473,17 @@ mod tests {
             "{text}"
         );
         std::fs::remove_file(&report).unwrap();
+        let tried_to_mail = |p: &TestProgress| {
+            p.logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, m)| m.starts_with("Failed to send email report"))
+        };
+        assert!(
+            !tried_to_mail(&progress),
+            "email disabled: no send is tried"
+        );
 
         config.email.enabled = true;
         // No recipient, and nothing listens on that port: the email cannot be
@@ -3482,6 +3493,7 @@ mod tests {
         config.email.smtp_port = 1;
         config.email.smtp_host = "127.0.0.1".into();
         assert!(!host.report(&config, &ask, &result, &data, &progress));
+        assert!(tried_to_mail(&progress), "email enabled: the send is tried");
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("a"), "{text}");
     }
