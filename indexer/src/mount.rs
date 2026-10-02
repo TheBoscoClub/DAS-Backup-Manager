@@ -1,7 +1,8 @@
 //! Auto-mount and unmount DAS backup targets.
 //!
-//! Provides [`ensure_targets_mounted`] which resolves target drive serials to
-//! block devices, mounts any that are not already mounted, and returns a
+//! Provides [`ensure_targets_mounted`] which finds each target by its
+//! `mount_uuid` or its drive serials, mounts any that are not already
+//! mounted, and returns a
 //! [`MountGuard`] whose [`Drop`] implementation unmounts only the targets that
 //! *this* call mounted — never interfering with mounts managed by the bash
 //! scripts or by the user.
@@ -121,12 +122,15 @@ struct MountProbes<'a> {
     is_mountpoint: &'a dyn Fn(&Path) -> bool,
     find_mount_for_device: &'a dyn Fn(&str, &TargetRole) -> Option<String>,
     device_from_serial: &'a dyn Fn(&str) -> Option<String>,
+    /// A device holding the filesystem with this UUID (`blkid -U`).
+    device_for_uuid: &'a dyn Fn(&str) -> Option<String>,
 }
 
 const HOST_PROBES: MountProbes<'static> = MountProbes {
     is_mountpoint: &health::is_mountpoint,
     find_mount_for_device: &health::find_mount_for_device,
     device_from_serial: &health::device_from_serial,
+    device_for_uuid: &health::device_for_fs_uuid,
 };
 
 /// RAII guard that unmounts targets on drop.
@@ -311,10 +315,12 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 ///
 /// For each target in `config.targets`:
 /// 1. Skip if already mounted (checked via `/proc/mounts`).
-/// 2. Resolve the serial number to a block device via `/dev/disk/by-id/`.
-/// 3. Determine the partition device based on target role.
-/// 4. `mkdir -p` the mount point, then `mount -t btrfs -o <opts>`.
-/// 5. Track newly-mounted targets in the returned [`MountGuard`].
+/// 2. With `mount_uuid` set: available when any configured serial is present
+///    or a filesystem with that UUID is (`blkid -U`), and mounted as
+///    `UUID=<uuid>`, falling back to the serial's partition. Without it:
+///    the first present serial's partition for the target's role.
+/// 3. `mkdir -p` the mount point, then `mount -t btrfs -o <opts>`.
+/// 4. Track newly-mounted targets in the returned [`MountGuard`].
 ///
 /// Returns `Err(MountError::NoDrivesFound)` only if **no** targets could be
 /// mounted *and* no targets were already mounted. Individual mount failures
@@ -414,30 +420,44 @@ fn ensure_targets_mounted_with(
             continue;
         }
 
-        // Resolve serial → /dev/sdX
-        let dev = match (probes.device_from_serial)(&target.serial) {
-            Some(d) => d,
-            None => {
-                progress.on_log(
-                    crate::progress::LogLevel::Warning,
-                    &format!(
-                        "Target '{}': drive serial '{}' not found — skipping",
-                        target.label, target.serial
-                    ),
-                );
-                continue;
-            }
-        };
+        // Find the target the way `backup-run.sh` does (check_das_connected,
+        // mount_targets; bd DAS-Backup-Manager-arx). With `mount_uuid` set it
+        // is AVAILABLE when any configured serial is present OR a filesystem
+        // with that UUID is on this host, and it is mounted BY UUID — BTRFS
+        // assembles a RAID-1 from whichever member is present. Without it,
+        // the legacy route: the first configured serial present, and the
+        // partition its role names. Only identities the config names are
+        // looked up; nothing is enumerated.
+        let serials = target.effective_serials();
+        let serial_dev = serials.iter().find_map(|s| (probes.device_from_serial)(s));
+        let uuid = target.mount_uuid.as_deref().filter(|u| !u.is_empty());
+        let by_uuid =
+            uuid.filter(|u| serial_dev.is_some() || (probes.device_for_uuid)(u).is_some());
+        let part_dev = serial_dev
+            .as_deref()
+            .map(|dev| partition_device(dev, &target.role));
+        let part_dev = part_dev.filter(|p| Path::new(p).exists());
 
-        // Determine partition device
-        let part_dev = partition_device(&dev, &target.role);
-        if !Path::new(&part_dev).exists() {
+        if by_uuid.is_none() && part_dev.is_none() {
+            let why = match (uuid, &serial_dev) {
+                (Some(u), _) => format!(
+                    "no configured drive (serials {}) is present and no filesystem has \
+                     UUID {u}",
+                    if serials.is_empty() {
+                        "none".to_string()
+                    } else {
+                        serials.join(", ")
+                    }
+                ),
+                (None, Some(dev)) => format!(
+                    "partition '{}' not found",
+                    partition_device(dev, &target.role)
+                ),
+                (None, None) => format!("drive serial '{}' not found", serials.join(", ")),
+            };
             progress.on_log(
                 crate::progress::LogLevel::Warning,
-                &format!(
-                    "Target '{}': partition '{}' not found — skipping",
-                    target.label, part_dev
-                ),
+                &format!("Target '{}': {why} — skipping", target.label),
             );
             continue;
         }
@@ -455,48 +475,67 @@ fn ensure_targets_mounted_with(
             continue;
         }
 
-        // Build mount command
-        let mut cmd = Command::new("mount");
-        cmd.args(["-t", "btrfs"]);
-        if !config.das.mount_opts.is_empty() {
-            cmd.args(["-o", &config.das.mount_opts]);
+        // By UUID first when configured; the partition of a present serial
+        // is the fallback, as in backup-run.sh.
+        let mut devices: Vec<String> = Vec::new();
+        if let Some(u) = by_uuid {
+            devices.push(format!("UUID={u}"));
         }
-        cmd.arg(&part_dev).arg(&target.mount);
-
-        let mount_result = guard.runner.output(&mut cmd);
-        let mounted = match mount_result {
-            Ok(output) if output.status.success() => {
-                any_available = true;
-                guard.newly_mounted.push(target.mount.clone());
-                progress.on_progress(
-                    (i + 1) as u64,
-                    total,
-                    &format!("Mounted {} at {}", target.label, target.mount),
-                );
-                true
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+        devices.extend(part_dev);
+        let mut mounted = false;
+        for (n, dev) in devices.iter().enumerate() {
+            if n > 0 {
                 progress.on_log(
                     crate::progress::LogLevel::Warning,
                     &format!(
-                        "Target '{}': mount {} → {} failed: {}",
-                        target.label,
-                        part_dev,
-                        target.mount,
-                        stderr.trim()
+                        "Target '{}': falling back to the device-based mount ({dev})",
+                        target.label
                     ),
                 );
-                false
             }
-            Err(e) => {
-                progress.on_log(
-                    crate::progress::LogLevel::Warning,
-                    &format!("Target '{}': failed to execute mount: {e}", target.label),
-                );
-                false
+            let mut cmd = Command::new("mount");
+            cmd.args(["-t", "btrfs"]);
+            if !config.das.mount_opts.is_empty() {
+                cmd.args(["-o", &config.das.mount_opts]);
             }
-        };
+            cmd.arg(dev).arg(&target.mount);
+            match guard.runner.output(&mut cmd) {
+                Ok(output) if output.status.success() => {
+                    any_available = true;
+                    guard.newly_mounted.push(target.mount.clone());
+                    progress.on_progress(
+                        (i + 1) as u64,
+                        total,
+                        &if dev.starts_with("UUID=") {
+                            format!("Mounted {} at {} ({dev})", target.label, target.mount)
+                        } else {
+                            format!("Mounted {} at {}", target.label, target.mount)
+                        },
+                    );
+                    mounted = true;
+                    break;
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!(
+                            "Target '{}': mount {} → {} failed: {}",
+                            target.label,
+                            dev,
+                            target.mount,
+                            stderr.trim()
+                        ),
+                    );
+                }
+                Err(e) => {
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!("Target '{}': failed to execute mount: {e}", target.label),
+                    );
+                }
+            }
+        }
         if created && !mounted {
             remove_created_mount_point(
                 &format!("Target '{}'", target.label),
@@ -1030,6 +1069,8 @@ mod tests {
         mounted_elsewhere: Vec<(String, String)>,
         /// serial → whole-disk device path
         devices: Vec<(String, String)>,
+        /// filesystem UUID → a device holding it (`blkid -U`)
+        uuids: Vec<(String, String)>,
     }
 
     impl Host {
@@ -1059,10 +1100,17 @@ mod tests {
                     .find(|(s, _)| s == serial)
                     .map(|(_, dev)| dev.clone())
             };
+            let device_for_uuid = |uuid: &str| {
+                self.uuids
+                    .iter()
+                    .find(|(u, _)| u == uuid)
+                    .map(|(_, dev)| dev.clone())
+            };
             f(&MountProbes {
                 is_mountpoint: &is_mountpoint,
                 find_mount_for_device: &find_mount_for_device,
                 device_from_serial: &device_from_serial,
+                device_for_uuid: &device_for_uuid,
             })
         }
 
@@ -1805,6 +1853,225 @@ mod tests {
         assert!(
             !Path::new(&mnt).exists(),
             "no bare mount point may be left behind for an absent drive"
+        );
+    }
+
+    /// A target identified by `mount_uuid` only: no configured serial is
+    /// present (a loop device, a replacement drive), but the filesystem is —
+    /// it is mounted BY UUID, as backup-run.sh does (bd DAS-Backup-Manager-arx).
+    #[test]
+    fn a_target_with_only_its_uuid_present_is_mounted_by_uuid() {
+        let scratch = Scratch::new();
+        let mnt = scratch.path("mnt/t");
+        let mut t = target_at("loop", &mnt, Some("u-loop"));
+        t.serial = String::new();
+        t.serials = Vec::new();
+        let mut config = config_with(vec![t], Vec::new());
+        config.das.mount_opts = "noatime,degraded".into();
+        let host = Host {
+            uuids: vec![("u-loop".into(), "/dev/loop7".into())],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        assert_eq!(
+            runner.calls(),
+            vec![output_call(&[
+                "mount",
+                "-t",
+                "btrfs",
+                "-o",
+                "noatime,degraded",
+                "UUID=u-loop",
+                &mnt
+            ])]
+        );
+        assert_eq!(guard.count(), 1, "the guard owns what it mounted");
+        assert_eq!(
+            progress.steps(),
+            vec![(1, 1, format!("Mounted loop at {mnt} (UUID=u-loop)"))]
+        );
+        assert!(progress.logs().is_empty(), "{:?}", progress.logs());
+    }
+
+    /// With a serial present the UUID need not resolve on its own, and the
+    /// mount is still by UUID (a degraded RAID-1 assembles from either leg).
+    #[test]
+    fn a_target_with_a_uuid_and_a_present_serial_is_mounted_by_uuid() {
+        let scratch = Scratch::new();
+        let (mut config, host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        assert_eq!(
+            runner.calls(),
+            vec![output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt])]
+        );
+        assert_eq!(guard.count(), 1);
+    }
+
+    /// Any configured serial counts, not only the first — a RAID-1 pair with
+    /// its first member gone is still found by its second.
+    #[test]
+    fn the_second_serial_of_a_pair_is_enough() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, part, mnt) = attached_primary(&scratch);
+        config.targets[0].serial = "SER-GONE".into();
+        config.targets[0].serials = vec!["SER-GONE".into(), "SER-P".into()];
+        host.devices = vec![("SER-P".into(), scratch.path("dev/sdb"))];
+        let runner = ScriptedRunner::succeeding();
+
+        let _guard = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .unwrap();
+
+        assert_eq!(
+            runner.calls(),
+            vec![output_call(&["mount", "-t", "btrfs", &part, &mnt])]
+        );
+    }
+
+    /// Neither a configured serial nor the UUID: skipped with a warning that
+    /// names both, nothing created or mounted, and NoDrivesFound when it was
+    /// the only target.
+    #[test]
+    fn a_target_with_neither_its_uuid_nor_a_serial_present_is_skipped() {
+        let scratch = Scratch::new();
+        let mnt = scratch.path("mnt/t");
+        let config = config_with(vec![target_at("gone", &mnt, Some("u-gone"))], Vec::new());
+        let host = Host {
+            uuids: vec![("u-other".into(), "/dev/sdz1".into())],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(matches!(result, Err(MountError::NoDrivesFound)));
+        assert!(runner.calls().is_empty());
+        progress.assert_only_log(
+            LogLevel::Warning,
+            &[
+                "Target 'gone': no configured drive (serials TESTSERIAL) is present",
+                "no filesystem has UUID u-gone — skipping",
+            ],
+        );
+        assert!(!Path::new(&mnt).exists());
+    }
+
+    #[test]
+    fn a_uuid_target_with_no_serials_says_so_when_skipped() {
+        let scratch = Scratch::new();
+        let mut t = target_at("bare", &scratch.path("mnt/t"), Some("u-x"));
+        t.serial = String::new();
+        t.serials = Vec::new();
+        let progress = Recorder::default();
+        let result = Host::default().mount_targets(
+            &config_with(vec![t], Vec::new()),
+            &progress,
+            &ScriptedRunner::succeeding(),
+        );
+        assert!(matches!(result, Err(MountError::NoDrivesFound)));
+        progress.assert_only_log(LogLevel::Warning, &["(serials none)"]);
+    }
+
+    /// The UUID mount fails but a configured drive is present: its partition
+    /// is mounted instead, as backup-run.sh falls back.
+    #[test]
+    fn a_failed_uuid_mount_falls_back_to_the_serial_partition() {
+        let scratch = Scratch::new();
+        let (mut config, host, part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        let runner = ScriptedRunner::with_rules(&[("UUID=u-p", Reply::exit(32))]);
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        assert_eq!(
+            runner.calls(),
+            vec![
+                output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt]),
+                output_call(&["mount", "-t", "btrfs", &part, &mnt]),
+            ]
+        );
+        assert_eq!(guard.count(), 1);
+        let logs = progress.logs();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert!(logs[0].1.contains("mount UUID=u-p"), "{logs:?}");
+        assert!(
+            logs[1].1.contains("falling back to the device-based mount"),
+            "{logs:?}"
+        );
+    }
+
+    /// The UUID mount fails and there is nothing to fall back to: the target
+    /// is not available and the mount point created for it is removed.
+    #[test]
+    fn a_failed_uuid_mount_with_no_drive_leaves_the_target_unavailable() {
+        let scratch = Scratch::new();
+        let mnt = scratch.path("mnt/t");
+        let config = config_with(vec![target_at("loop", &mnt, Some("u-loop"))], Vec::new());
+        let host = Host {
+            uuids: vec![("u-loop".into(), "/dev/loop7".into())],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::with_rules(&[("UUID=u-loop", Reply::exit(32))]);
+
+        let result = host.mount_targets(&config, &Recorder::default(), &runner);
+
+        assert!(matches!(result, Err(MountError::NoDrivesFound)));
+        assert_eq!(runner.calls().len(), 1);
+        assert!(!Path::new(&mnt).exists());
+    }
+
+    /// A mirror (recovery drive) found by UUID is mounted by UUID — the
+    /// filesystem, never partition 1, which is its own OS's ESP.
+    #[test]
+    fn a_mirror_found_by_uuid_is_mounted_by_uuid_not_by_partition() {
+        let scratch = Scratch::new();
+        let mnt = scratch.path("mnt/recovery");
+        let mut t = target("recovery-A", "SER-M", &mnt, TargetRole::Mirror);
+        t.mount_uuid = Some("u-rec".into());
+        let host = Host {
+            uuids: vec![("u-rec".into(), "/dev/sdc2".into())],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+
+        let _guard = host
+            .mount_targets(
+                &config_with(vec![t], Vec::new()),
+                &Recorder::default(),
+                &runner,
+            )
+            .unwrap();
+
+        assert_eq!(
+            runner.calls(),
+            vec![output_call(&["mount", "-t", "btrfs", "UUID=u-rec", &mnt])]
+        );
+    }
+
+    /// An empty `mount_uuid` is no UUID: the legacy serial route.
+    #[test]
+    fn an_empty_mount_uuid_is_the_serial_route() {
+        let scratch = Scratch::new();
+        let (mut config, host, part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some(String::new());
+        let runner = ScriptedRunner::succeeding();
+        let _guard = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .unwrap();
+        assert_eq!(
+            runner.calls(),
+            vec![output_call(&["mount", "-t", "btrfs", &part, &mnt])]
         );
     }
 
