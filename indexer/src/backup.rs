@@ -1173,21 +1173,27 @@ pub struct SyncSection {
 
 /// The first step of every backup, whoever starts it: bring `config.toml` and
 /// `btrbk.conf` into line with the subvolumes on the (already mounted)
-/// sources, then reload the config sync may have rewritten. `btrdasd backup
-/// run` and the D-Bus helper behind the GUI both call this, so no route into
-/// a backup skips sync (spec §5.2). A failed sync does not stop the run — the
-/// subvolumes already configured must still be backed up — but it is logged
-/// at error level and the caller must end the run as failed. `Err` only when
-/// the config cannot be loaded after sync.
+/// sources, then reload the config sync may have rewritten. Every backup job
+/// (`run_backup_job`, behind `btrdasd backup run` and the GUI) calls this, so
+/// no route into a backup skips sync (spec §5.2). A failed sync does not stop
+/// the run — the subvolumes already configured must still be backed up — but
+/// it is logged at error level and the run ends failed.
+///
+/// Nor does a config that cannot be reloaded after sync: the run goes on
+/// with `before`, the config it loaded before sync, and the section says so
+/// and is failed — as `backup-run.sh` continues with its existing config
+/// and records the sync as FAIL. It used to abort the Rust/GUI run before
+/// anything was recorded (bd DAS-Backup-Manager-h4t).
 pub fn sync_before_backup(
     config_path: &Path,
+    before: &Config,
     dry_run: bool,
     today: &str,
     runner: &dyn crate::fsutil::CommandRunner,
     is_mountpoint: &dyn Fn(&Path) -> bool,
     progress: &dyn ProgressCallback,
-) -> Result<(Config, SyncSection), Box<dyn std::error::Error>> {
-    let section =
+) -> (Config, SyncSection) {
+    let mut section =
         match crate::adopt::sync_subvolumes(config_path, dry_run, today, runner, is_mountpoint) {
             Ok(outcome) => SyncSection {
                 report: crate::adopt::format_sync_report(&outcome, dry_run),
@@ -1198,6 +1204,18 @@ pub fn sync_before_backup(
                 failed: true,
             },
         };
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            section.report.push_str(&format!(
+                "  CONFIG NOT RELOADED after sync ({}: {e}) — this run uses the config \
+                 loaded before sync\n",
+                config_path.display()
+            ));
+            section.failed = true;
+            before.clone()
+        }
+    };
     let level = if section.failed {
         LogLevel::Error
     } else {
@@ -1206,8 +1224,7 @@ pub fn sync_before_backup(
     for line in section.report.lines() {
         progress.on_log(level, line);
     }
-    let config = Config::load(config_path)?;
-    Ok((config, section))
+    (config, section)
 }
 
 /// Whether the run writes and emails its report: the caller asked for it and
@@ -1708,13 +1725,14 @@ pub trait BackupJobHost {
         progress: &dyn ProgressCallback,
     ) -> Result<Option<Box<dyn std::any::Any>>, String>;
     fn mount_sources(&self, config: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release>;
-    /// The subvolume sync, and the config the rest of the run uses. `Err`
-    /// when the config cannot be loaded after sync.
+    /// The subvolume sync, and the config the rest of the run uses —
+    /// `before` when the config cannot be reloaded after sync.
     fn sync(
         &self,
+        before: &Config,
         dry_run: bool,
         progress: &dyn ProgressCallback,
-    ) -> Result<(Config, SyncSection), String>;
+    ) -> (Config, SyncSection);
     fn mount_targets(
         &self,
         config: &Config,
@@ -1802,16 +1820,7 @@ pub fn run_backup_job(
     let mut sources = host.mount_sources(&config, progress);
     // Same rule on every path: a failed sync never stops the run, but the
     // run's result, record and report all say it failed.
-    let (config, sync) = match host.sync(options.dry_run, progress) {
-        Ok(synced) => synced,
-        Err(e) => {
-            let still = sources.release(progress);
-            return BackupJobOutcome::NotRun(with_still_mounted(
-                format!("Config could not be reloaded after subvolume sync: {e}"),
-                &still,
-            ));
-        }
-    };
+    let (config, sync) = host.sync(&config, options.dry_run, progress);
     options.subvolume_sync = Some(sync);
     let mut targets = match host.mount_targets(&config, progress) {
         Ok(targets) => targets,
@@ -1889,18 +1898,19 @@ impl BackupJobHost for SystemBackupHost {
 
     fn sync(
         &self,
+        before: &Config,
         dry_run: bool,
         progress: &dyn ProgressCallback,
-    ) -> Result<(Config, SyncSection), String> {
+    ) -> (Config, SyncSection) {
         sync_before_backup(
             &self.config_path,
+            before,
             dry_run,
             &crate::caldate::today(),
             &crate::fsutil::SystemRunner,
             &health::is_mountpoint,
             progress,
         )
-        .map_err(|e| e.to_string())
     }
 
     fn mount_targets(
@@ -2591,13 +2601,13 @@ mod tests {
         let progress = TestProgress::new();
         let (config, sync) = sync_before_backup(
             &path,
+            &make_test_config(),
             false,
             "2026-10-02",
             &listing(&["@srv", "@new"]),
             &|_| true,
             &progress,
-        )
-        .unwrap();
+        );
         assert!(!sync.failed, "{}", sync.report);
         assert!(
             sync.report.starts_with("SUBVOLUME SYNC\n"),
@@ -2632,13 +2642,13 @@ mod tests {
         // The volume is not mounted: nothing may be read, the run must fail.
         let (_, sync) = sync_before_backup(
             &path,
+            &make_test_config(),
             false,
             "2026-10-02",
             &listing(&["@srv"]),
             &|_| false,
             &progress,
-        )
-        .unwrap();
+        );
         assert!(sync.failed, "{}", sync.report);
         assert!(sync.report.contains("VOLUMES NOT READ"), "{}", sync.report);
         let logs = progress.logs.lock().unwrap();
@@ -2649,26 +2659,71 @@ mod tests {
         );
     }
 
+    /// Before: a config that could not be loaded after sync was an `Err`,
+    /// and the run stopped before anything was recorded. Now the run goes on
+    /// with the config it had, and the sync section is failed and says why.
     #[test]
-    fn sync_before_backup_fails_when_the_config_cannot_be_loaded() {
+    fn a_config_that_cannot_be_reloaded_after_sync_fails_the_section_not_the_run() {
         let dir = tempfile::tempdir().unwrap();
         let progress = TestProgress::new();
-        let result = sync_before_backup(
+        let mut before = make_test_config();
+        before.general.version = "loaded-before-sync".into();
+        let (config, sync) = sync_before_backup(
             &dir.path().join("absent.toml"),
+            &before,
             false,
             "2026-10-02",
             &listing(&["@srv"]),
             &|_| true,
             &progress,
         );
-        assert!(result.is_err());
-        // The reason still reaches the progress log, and as an error.
+        assert_eq!(config.general.version, "loaded-before-sync");
+        assert!(sync.failed);
+        assert!(
+            sync.report.contains("  CONFIG NOT RELOADED after sync ("),
+            "{}",
+            sync.report
+        );
+        assert!(
+            sync.report.contains("absent.toml")
+                && sync
+                    .report
+                    .contains("— this run uses the config loaded before sync"),
+            "{}",
+            sync.report
+        );
+        // The reason reaches the progress log, as an error.
         let logs = progress.logs.lock().unwrap();
         assert!(
-            logs.iter()
-                .any(|(level, msg)| *level == LogLevel::Error && msg.contains("absent.toml")),
+            logs.iter().any(
+                |(level, msg)| *level == LogLevel::Error && msg.contains("CONFIG NOT RELOADED")
+            ),
             "{logs:?}"
         );
+    }
+
+    #[test]
+    fn a_reloaded_config_is_the_one_on_disk_not_the_one_from_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let mut before = make_test_config();
+        before.general.version = "loaded-before-sync".into();
+        let (config, sync) = sync_before_backup(
+            &path,
+            &before,
+            true,
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| true,
+            &TestProgress::new(),
+        );
+        assert!(!sync.failed, "{}", sync.report);
+        assert!(
+            !sync.report.contains("CONFIG NOT RELOADED"),
+            "{}",
+            sync.report
+        );
+        assert_ne!(config.general.version, "loaded-before-sync");
     }
 
     // --- a failed sync is a failed run, in the record and in the report ---
@@ -2755,7 +2810,7 @@ mod tests {
     struct FakeHost {
         steps: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         locks: Result<bool, String>,
-        sync: Result<bool, String>,
+        sync_failed: bool,
         targets: Result<Vec<String>, String>,
         sources_left: Vec<String>,
         run: Result<(), String>,
@@ -2769,7 +2824,7 @@ mod tests {
             Self {
                 steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 locks: Ok(true),
-                sync: Ok(false),
+                sync_failed: false,
                 targets: Ok(Vec::new()),
                 sources_left: Vec::new(),
                 run: Ok(()),
@@ -2842,20 +2897,23 @@ mod tests {
         }
         fn sync(
             &self,
+            before: &Config,
             dry_run: bool,
             _: &dyn ProgressCallback,
-        ) -> Result<(Config, SyncSection), String> {
-            self.step(&format!("sync dry_run={dry_run}"));
-            let failed = self.sync.clone()?;
+        ) -> (Config, SyncSection) {
+            self.step(&format!(
+                "sync dry_run={dry_run} before={}",
+                before.general.version
+            ));
             let mut config = make_test_config();
             config.general.version = "after-sync".into();
-            Ok((
+            (
                 config,
                 SyncSection {
                     report: "SUBVOLUME SYNC\n".into(),
-                    failed,
+                    failed: self.sync_failed,
                 },
-            ))
+            )
         }
         fn mount_targets(
             &self,
@@ -2943,7 +3001,7 @@ mod tests {
             vec![
                 "locks",
                 "mount sources",
-                "sync dry_run=false",
+                "sync dry_run=false before=0.6.0",
                 "mount targets (after-sync)",
                 "run (after-sync, sync failed=Some(false))",
                 "release targets",
@@ -3031,13 +3089,16 @@ mod tests {
         assert!(line.contains("still mounted: /mnt/backup-22tb"), "{line}");
         assert!(host.recorded.lock().unwrap().is_empty());
         assert!(host.reported.lock().unwrap().is_empty());
-        assert!(host.steps().contains(&"sync dry_run=true".to_string()));
+        assert!(
+            host.steps()
+                .contains(&"sync dry_run=true before=0.6.0".to_string())
+        );
     }
 
     #[test]
     fn a_failed_sync_runs_the_backup_and_fails_it() {
         let host = FakeHost {
-            sync: Ok(true),
+            sync_failed: true,
             ..Default::default()
         };
         let (outcome, _) = job(&host, false);
@@ -3113,23 +3174,6 @@ mod tests {
         assert!(steps.contains(&"release targets".to_string()), "{steps:?}");
         assert!(steps.contains(&"release sources".to_string()), "{steps:?}");
         assert!(!steps.contains(&"record".to_string()), "{steps:?}");
-    }
-
-    #[test]
-    fn a_config_that_cannot_be_reloaded_is_not_run() {
-        let host = FakeHost {
-            sync: Err("absent.toml".into()),
-            ..Default::default()
-        };
-        let (outcome, _) = job(&host, false);
-        let BackupJobOutcome::NotRun(why) = outcome else {
-            panic!()
-        };
-        assert_eq!(
-            why,
-            "Config could not be reloaded after subvolume sync: absent.toml"
-        );
-        assert!(host.steps().contains(&"release sources".to_string()));
     }
 
     #[test]
@@ -3324,12 +3368,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = system_host(dir.path());
         let progress = TestProgress::new();
-        // No config there: the reload fails.
-        assert!(host.sync(true, &progress).is_err());
+        let mut before = make_test_config();
+        before.general.version = "before".into();
+        // No config there: the run keeps the config it had, and fails sync.
+        let (config, sync) = host.sync(&before, true, &progress);
+        assert_eq!(config.general.version, "before");
+        assert!(sync.failed);
         assert_eq!(sync_fixture(dir.path()), host.config_path);
         // A dry run of sync against this host's real volumes: whatever it
-        // finds, it loads the config back.
-        let (config, _) = host.sync(true, &progress).unwrap();
-        assert!(!config.sources.is_empty());
+        // finds, it loads the config back from the file.
+        let (config, _) = host.sync(&before, true, &progress);
+        assert_ne!(config.general.version, "before");
+        assert_eq!(config.sources[0].volume, "/ssd");
     }
 }

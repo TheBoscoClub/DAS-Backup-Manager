@@ -7,6 +7,18 @@ pub enum LogLevel {
     Error,
 }
 
+impl LogLevel {
+    /// The level word the GUI's job log reads (`JobLog`'s `level`).
+    pub fn word(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warning => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
 /// Callback trait for reporting progress from long-running operations.
 /// Implementations must be Send + Sync for use across threads.
 pub trait ProgressCallback: Send + Sync {
@@ -428,5 +440,14 @@ mod tests {
         assert_eq!(ProgressEvent::percent(3, 0), 0);
         assert_eq!(ProgressEvent::percent(0, 7), 0);
         assert_eq!(ProgressEvent::percent(u64::MAX, u64::MAX), 100);
+    }
+
+    #[test]
+    fn level_words_are_what_the_gui_colours_by() {
+        // gui/src/progresspanel.cpp matches "warn"/"warning" and "error".
+        assert_eq!(LogLevel::Debug.word(), "debug");
+        assert_eq!(LogLevel::Info.word(), "info");
+        assert_eq!(LogLevel::Warning.word(), "warn");
+        assert_eq!(LogLevel::Error.word(), "error");
     }
 }

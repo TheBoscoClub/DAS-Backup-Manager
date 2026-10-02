@@ -1679,4 +1679,89 @@ enabled = false
         assert!(min_err.contains("minute 60 out of range"), "{min_err}");
         assert!(parse_time("00:61").is_err());
     }
+
+    /// The GUI's config editor shows `Config::to_toml()` (the helper's
+    /// `config_get`) and sends the edited text back whole (`config_set`,
+    /// `Config::from_toml`). Every field sync writes must survive that round
+    /// trip untouched, or a GUI save would put a retired entry back into
+    /// btrbk.conf (bd DAS-Backup-Manager-h4t item 5).
+    #[test]
+    fn the_gui_round_trip_keeps_retired_adopted_snapshot_name_and_excludes() {
+        let toml = r#"
+[general]
+version = "0.7.22"
+install_prefix = "/usr"
+db_path = "/tmp/test.db"
+[init]
+system = "systemd"
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+[subvolumes]
+exclude = ["@cache", "srv/scratch*"]
+[doctor]
+exclude = ["@old"]
+[[source]]
+label = "nvme"
+volume = "/.btrfs-nvme"
+device = "/dev/nvme0n1p2"
+subvolumes = [
+  "@",
+  { name = "@srv", snapshot_name = "srv-a", adopted = "2026-10-01" },
+  { name = "@gone", snapshot_name = "gone", retired = "2026-10-02", manual_only = true },
+]
+[[target]]
+label = "t"
+serials = ["X"]
+mount_uuid = "u-1"
+mount = "/mnt/t"
+role = "primary"
+[target.retention]
+weekly = 4
+[email]
+enabled = false
+[gui]
+enabled = false
+"#;
+        let before = Config::from_toml(toml).unwrap();
+        let shown = before.to_toml().unwrap();
+        let after = Config::from_toml(&shown).unwrap();
+        type Entry = (String, bool, Option<String>, Option<String>, Option<String>);
+        let entries = |c: &Config| -> Vec<Entry> {
+            c.sources[0]
+                .subvolumes
+                .iter()
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.manual_only,
+                        e.snapshot_name.clone(),
+                        e.adopted.clone(),
+                        e.retired.clone(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(entries(&after), entries(&before));
+        assert_eq!(
+            entries(&after)[2],
+            (
+                "@gone".to_string(),
+                true,
+                Some("gone".to_string()),
+                None,
+                Some("2026-10-02".to_string())
+            )
+        );
+        assert_eq!(after.subvolumes.exclude, vec!["@cache", "srv/scratch*"]);
+        assert_eq!(after.doctor.exclude, vec!["@old"]);
+        assert_eq!(after.targets[0].mount_uuid.as_deref(), Some("u-1"));
+        assert_eq!(after.targets[0].serials, vec!["X"]);
+        assert_eq!(
+            after.to_toml().unwrap(),
+            shown,
+            "a second round trip changes nothing"
+        );
+    }
 }
