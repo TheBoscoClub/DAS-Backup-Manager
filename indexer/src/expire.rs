@@ -420,6 +420,25 @@ pub fn expire_retired(
             let Some(retired) = entry.retired.clone() else {
                 continue;
             };
+            // Back on its (mounted) source volume: sync will revive it, and
+            // until it has, none of its backups may go. Sync may have failed
+            // to read the volume this run, or not run at all.
+            let volume = Path::new(&source.volume);
+            if is_mountpoint(volume) && volume.join(&entry.name).exists() {
+                entries.push(RetiredReport {
+                    source_label: source.label.clone(),
+                    name: entry.name.clone(),
+                    snapshot_name,
+                    retired,
+                    locations: Vec::new(),
+                    removed_from_config: false,
+                    kept_reason: Some(
+                        "subvolume exists again; waiting for sync to revive it — nothing deleted"
+                            .into(),
+                    ),
+                });
+                continue;
+            }
             let targets = targets_of(&config, source);
             let subdir = target_subdir(source);
             let mut locations = Vec::new();
@@ -2244,5 +2263,55 @@ mod tests {
         .unwrap();
         assert!(!out.failed());
         assert_eq!(format_expire_report(&out, false), "");
+    }
+
+    // --- expiry never outruns a sync that could not look ---
+
+    #[test]
+    fn a_retired_subvolume_that_exists_again_is_kept_everywhere() {
+        let rig = rig();
+        // The subvolume is back on the (mounted) source volume; this run's
+        // sync has not revived it (it failed, or has not run).
+        std::fs::create_dir_all(rig.dir.path().join("vol/@opt")).unwrap();
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let source = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &source]);
+        let out = expire_retired(&rig.config_path, false, "2026-12-01", &runner, &mounted).unwrap();
+        assert!(small.exists() && source.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        let entry = &out.entries[0];
+        assert!(entry.locations.is_empty(), "{:?}", entry.locations);
+        assert!(!entry.removed_from_config);
+        assert!(rig.saved_names().contains(&"@opt".to_string()));
+        assert!(
+            !out.failed(),
+            "keeping is not a failure; the sync failure is"
+        );
+        let text = format_expire_report(&out, false);
+        assert!(
+            text.contains(
+                "    subvolume exists again; waiting for sync to revive it — nothing deleted\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_path_under_an_unmounted_volume_is_not_taken_for_a_returned_subvolume() {
+        // An unmounted volume's directory says nothing about the filesystem
+        // that belongs there, so it is not evidence either way; expiry goes
+        // on as before (and the source side is unreachable).
+        let rig = rig();
+        std::fs::create_dir_all(rig.dir.path().join("vol/@opt")).unwrap();
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small]);
+        let vol = rig.dir.path().join("vol");
+        let not_vol = move |p: &Path| p != vol;
+        let out = expire_retired(&rig.config_path, false, "2026-12-01", &runner, &not_vol).unwrap();
+        assert!(!small.exists(), "the target-side series still expires");
+        assert_eq!(
+            out.entries[0].locations[1].state,
+            LocationState::Deleted { count: 1 }
+        );
     }
 }
