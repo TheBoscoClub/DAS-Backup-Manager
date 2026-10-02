@@ -102,9 +102,17 @@ pub trait ProgressSink: Send + 'static {
 /// step whose caller may still unmount, record and report. Its summary is
 /// delivered as a log line, and only [`OrderedProgress::finish`] sends
 /// `Finished`.
+///
+/// Cancellation (`cancel`) is a rule of this queue too: once a job is
+/// cancelled its client has stopped listening for progress, so stage,
+/// progress and log events are dropped — but the end is never dropped.
+/// `finish` still sends exactly one `Finished`, failed and saying the job was
+/// cancelled, when the work really stops. Cancelling does not stop the work;
+/// the caller decides whether it can.
 pub struct OrderedProgress {
     tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<ProgressEvent>>>,
     drain: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl OrderedProgress {
@@ -118,10 +126,25 @@ impl OrderedProgress {
         Self {
             tx: std::sync::Mutex::new(Some(tx)),
             drain: std::sync::Mutex::new(Some(drain)),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
+    /// The job's client cancelled it: drop its progress from now on, and end
+    /// it as cancelled when `finish` is called.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn send(&self, event: ProgressEvent) {
+        if self.is_cancelled() {
+            return;
+        }
         let guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = guard.as_ref() {
             // Fails only when the drain thread is gone, i.e. the sink
@@ -136,10 +159,20 @@ impl OrderedProgress {
     pub fn finish(&self, success: bool, summary: &str) {
         let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(tx) = tx else { return };
-        let _ = tx.send(ProgressEvent::Finished {
-            success,
-            summary: summary.to_owned(),
-        });
+        let event = if self.is_cancelled() {
+            ProgressEvent::Finished {
+                success: false,
+                summary: format!(
+                    "cancelled — the job has stopped; it had got as far as: {summary}"
+                ),
+            }
+        } else {
+            ProgressEvent::Finished {
+                success,
+                summary: summary.to_owned(),
+            }
+        };
+        let _ = tx.send(event);
         drop(tx);
         let drain = self.drain.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(drain) = drain
@@ -449,5 +482,47 @@ mod tests {
         assert_eq!(LogLevel::Info.word(), "info");
         assert_eq!(LogLevel::Warning.word(), "warn");
         assert_eq!(LogLevel::Error.word(), "error");
+    }
+
+    #[test]
+    fn a_cancelled_job_drops_its_progress_but_ends_exactly_once_as_cancelled() {
+        let (progress, got) = collecting(None);
+        progress.on_log(LogLevel::Info, "before");
+        assert!(!progress.is_cancelled());
+        progress.cancel();
+        assert!(progress.is_cancelled());
+        progress.on_log(LogLevel::Info, "after");
+        progress.on_stage("Sending", 1);
+        progress.on_progress(1, 1, "sent");
+        progress.on_complete(true, "Backup succeeded");
+        // The work reports success when it really stops; the client asked
+        // for it to be cancelled, so it ends failed and says so.
+        progress.finish(true, "Backup succeeded");
+        progress.finish(true, "again");
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![
+                log_msg("before"),
+                ProgressEvent::Finished {
+                    success: false,
+                    summary: "cancelled — the job has stopped; it had got as far as: \
+                              Backup succeeded"
+                        .into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_not_cancelled_ends_with_its_own_result() {
+        let (progress, got) = collecting(None);
+        progress.finish(false, "Mount failed");
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![ProgressEvent::Finished {
+                success: false,
+                summary: "Mount failed".into()
+            }]
+        );
     }
 }

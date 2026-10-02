@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
@@ -35,39 +34,19 @@ use buttered_dasd::schedule;
 use buttered_dasd::subvol;
 
 // ---------------------------------------------------------------------------
-// Cancellation token (simple AtomicBool-based, avoids tokio-util dependency)
-// ---------------------------------------------------------------------------
-
-/// A simple cancellation flag shared between the job spawner and the worker.
-#[derive(Clone)]
-struct CancelFlag(Arc<AtomicBool>);
-
-impl CancelFlag {
-    fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Job tracking
 // ---------------------------------------------------------------------------
 
-/// Live jobs, keyed by id: `(task handle, cancel flag, owning D-Bus sender)`.
+/// Live jobs, keyed by id: `(task handle, the job's progress queue, owning
+/// D-Bus sender)`. The queue is also how a job is cancelled
+/// (`OrderedProgress::cancel`).
 ///
 /// The sender is what makes `job_cancel` authorizable. Without it the map held
 /// no notion of ownership at all, so a polkit check for
 /// `org.dasbackup.backup` — a question about the CALLER, not about the JOB —
 /// was the only gate, and any authorized caller could abort anyone's in-flight
 /// backup or restore (bd DAS-Backup-Manager-h2s).
-type JobEntry = (JoinHandle<()>, CancelFlag, String);
+type JobEntry = (JoinHandle<()>, Arc<OrderedProgress>, String);
 type JobMap = Arc<Mutex<HashMap<String, JobEntry>>>;
 
 /// Cache of IndexStats JSON keyed by DB path.  Cold COUNT(*) on a 13.7M-row
@@ -115,7 +94,6 @@ fn new_job_id() -> String {
 struct DbusSink {
     conn: Connection,
     job_id: String,
-    cancel: CancelFlag,
     runtime: tokio::runtime::Handle,
 }
 
@@ -124,11 +102,6 @@ impl ProgressSink for DbusSink {
         if let ProgressEvent::Log { level, message } = &event {
             // The journal keeps every line, for post-mortem debugging.
             eprintln!("[{}] {message}", level.word());
-        }
-        // A cancelled job was aborted at its caller's request; nothing more
-        // of it is sent, as before.
-        if self.cancel.is_cancelled() {
-            return;
         }
         let conn = &self.conn;
         let job_id = self.job_id.as_str();
@@ -165,11 +138,10 @@ impl ProgressSink for DbusSink {
 }
 
 /// A job's progress: its events reach the GUI in order, through one queue.
-fn job_progress(conn: &Connection, job_id: &str, cancel: &CancelFlag) -> Arc<OrderedProgress> {
+fn job_progress(conn: &Connection, job_id: &str) -> Arc<OrderedProgress> {
     Arc::new(OrderedProgress::new(DbusSink {
         conn: conn.clone(),
         job_id: job_id.to_owned(),
-        cancel: cancel.clone(),
         runtime: tokio::runtime::Handle::current(),
     }))
 }
@@ -365,8 +337,8 @@ impl HelperInterface {
         };
 
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -411,8 +383,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -474,8 +446,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -544,8 +516,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -620,8 +592,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -1028,8 +1000,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -1097,8 +1069,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let job_id = new_job_id();
-        let cancel = CancelFlag::new();
-        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
@@ -1505,7 +1477,7 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
-        let mut jobs = self.jobs.lock().await;
+        let jobs = self.jobs.lock().await;
         // Ownership is a property of the JOB, and polkit only answered a
         // question about the caller. Check both.
         match jobs.get(job_id) {
@@ -1513,10 +1485,16 @@ impl HelperInterface {
             Some((_, _, owner)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
                 "Job '{job_id}' belongs to another client"
             ))),
-            Some(_) => {
-                let (handle, cancel, _) = jobs.remove(job_id).expect("checked present above");
-                cancel.cancel();
-                handle.abort();
+            // The work is NOT aborted: aborting the task only stopped the
+            // job from ever sending JobFinished while its blocking work went
+            // on as root, holding the backup locks. The job is marked
+            // cancelled — its progress is no longer sent — and it ends with
+            // exactly one JobFinished(false, "cancelled …") when the work
+            // really stops and its locks are released. Nothing in the
+            // library checks for cancellation, so a running btrbk send is
+            // not interrupted.
+            Some((_, progress, _)) => {
+                progress.cancel();
                 Ok(true)
             }
         }
@@ -1720,9 +1698,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut active_jobs = jobs.lock().await;
         let entries: Vec<(String, JobEntry)> = active_jobs.drain().collect();
-        for (id, (handle, cancel, _owner)) in entries {
+        for (id, (handle, progress, _owner)) in entries {
             eprintln!("btrdasd-helper: cancelling job {id}");
-            cancel.cancel();
+            progress.cancel();
             handle.abort();
         }
     }
