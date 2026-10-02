@@ -19,7 +19,9 @@
 # the "busy twice" target is recorded FAILED, so the retry is what makes the
 # first case pass.
 
-set -uo pipefail
+# The shell options backup-run.sh itself runs under: a function that let a
+# failing command escape would abort the backup there, and must abort here.
+set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
@@ -85,7 +87,7 @@ check "busy twice: target really unmounted" "$([[ -e "$WORK/mounted/backup-22tb"
 # --- busy forever ---------------------------------------------------------------
 setup
 echo 99 >"$WORK/busy/backup-22tb"
-unmount_all
+unmount_all  # bare, as in main(): under set -e a non-zero return ends this test
 check "busy forever: unmount recorded FAIL" "${OP_STATUS[unmount]}" "FAIL"
 check "busy forever: the detail names the mount point" "${OP_STATUS[unmount_detail]}" "/mnt/backup-22tb"
 check "busy forever: exactly five attempts" "$(calls /mnt/backup-22tb)" "5"
