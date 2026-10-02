@@ -640,6 +640,11 @@ enum SubvolAction {
         /// Print what would change and write nothing
         #[arg(long)]
         dry_run: bool,
+        /// With --dry-run: also write the btrbk.conf the real run would leave
+        /// into PATH, an existing file (never created; a symlink is refused).
+        /// `backup-run.sh --dryrun` points `btrbk dryrun` at it
+        #[arg(long, requires = "dry_run", value_name = "PATH")]
+        render_btrbk_conf: Option<PathBuf>,
     },
     /// Delete the backups of retired subvolumes that are past their window.
     /// Expects the targets to be mounted.
@@ -2109,7 +2114,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Subvolume '{name}' in source '{source}' set to automatic.");
             }
-            SubvolAction::Sync { config, dry_run } => {
+            SubvolAction::Sync {
+                config,
+                dry_run,
+                render_btrbk_conf,
+            } => {
                 let outcome = match buttered_dasd::adopt::sync_subvolumes(
                     &config,
                     dry_run,
@@ -2127,7 +2136,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "{}",
                     buttered_dasd::adopt::format_sync_report(&outcome, dry_run)
                 );
-                if outcome.failed() {
+                let mut failed = outcome.failed();
+                if let Some(path) = &render_btrbk_conf
+                    && let Err(e) = buttered_dasd::adopt::write_planned_btrbk_conf(&outcome, path)
+                {
+                    eprintln!("Error: {e}");
+                    failed = true;
+                }
+                if failed {
                     std::process::exit(1);
                 }
             }

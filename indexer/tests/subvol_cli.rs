@@ -186,3 +186,68 @@ fn subvol_expire_prints_nothing_and_exits_zero_when_nothing_is_retired() {
     );
     assert!(out.stdout.is_empty());
 }
+
+/// `subvol sync --dry-run --render-btrbk-conf` writes the btrbk.conf the real
+/// run would leave into an existing file, and nothing else (bd
+/// DAS-Backup-Manager-g17). `/vol` is not mounted here, so nothing is read,
+/// the sync fails, and the real run would leave btrbk.conf as it is.
+#[test]
+fn sync_dry_run_renders_the_planned_btrbk_conf_into_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let config_s = config.to_str().unwrap();
+    std::fs::write(dir.path().join("btrbk.conf"), "CURRENT\n").unwrap();
+    let before = std::fs::read_to_string(&config).unwrap();
+    let render = dir.path().join("planned.conf");
+    std::fs::write(&render, "").unwrap();
+    let render_s = render.to_str().unwrap();
+
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--config",
+        config_s,
+        "--dry-run",
+        "--render-btrbk-conf",
+        render_s,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "the volume was not read");
+    assert_eq!(std::fs::read_to_string(&render).unwrap(), "CURRENT\n");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
+        "CURRENT\n"
+    );
+
+    // Not without --dry-run: a real sync writes the real file.
+    std::fs::write(&render, "").unwrap();
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--config",
+        config_s,
+        "--render-btrbk-conf",
+        render_s,
+    ]);
+    assert_eq!(out.status.code(), Some(2), "clap refuses the flag alone");
+    assert_eq!(std::fs::read_to_string(&render).unwrap(), "");
+
+    // Nothing readable would be left: no file to render, and the command fails.
+    std::fs::remove_file(dir.path().join("btrbk.conf")).unwrap();
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--config",
+        config_s,
+        "--dry-run",
+        "--render-btrbk-conf",
+        render_s,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no btrbk.conf to render"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&render).unwrap(), "");
+}

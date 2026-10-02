@@ -728,7 +728,12 @@ the whole configuration with
 and so on; existing names never change. Under
 .B backup\-run.sh \-\-dryrun
 this step runs as
-.BR "subvol sync \-\-dry\-run" .
+.B "subvol sync \-\-dry\-run \-\-render\-btrbk\-conf"
+into a temporary file, and
+.B "btrbk dryrun"
+reads that file: the btrbk.conf the real run would have written by then, so a
+pending retirement or adoption is previewed as it will happen (the target
+directory a new adopted source sends to is created, as the real run does).
 .PP
 Prints a
 .B "SUBVOLUME SYNC"
@@ -741,7 +746,9 @@ report says so and the sync fails.
 .B btrdasd subvol sync
 .RB [ \-\-config
 .IR PATH ]
-.RB [ \-\-dry\-run ]
+.RB [ \-\-dry\-run
+.RB [ \-\-render\-btrbk\-conf
+.IR PATH ]]
 .TP
 .BI \-\-config " PATH"
 Path to config.toml.
@@ -750,14 +757,22 @@ Default:
 .TP
 .B \-\-dry\-run
 Print the plan and write nothing.
+.TP
+.BI \-\-render\-btrbk\-conf " PATH"
+Only with
+.BR \-\-dry\-run :
+write the btrbk.conf the real run would leave in place into
+.IR PATH ,
+which must already exist as a regular file (it is never created, and a
+symlink is refused). config.toml and the real btrbk.conf are not touched.
 .PP
 Exit status:
 .B 0
 sync ran and nothing failed;
 .B 1
 something failed (a volume was not read, a subvolume could not be placed,
-the files could not be written, or a retirement was refused because of the
-clock);
+the files could not be written, a retirement was refused because of the
+clock, or there was no btrbk.conf to render);
 .B 2
 the configuration could not be loaded.
 .\"
