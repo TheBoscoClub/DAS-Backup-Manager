@@ -420,11 +420,23 @@ pub fn expire_retired(
             let Some(retired) = entry.retired.clone() else {
                 continue;
             };
-            // Back on its (mounted) source volume: sync will revive it, and
-            // until it has, none of its backups may go. Sync may have failed
-            // to read the volume this run, or not run at all.
+            // Sync may have failed to read the volume this run, or not run at
+            // all, so before deleting anything the source must be looked at.
+            // An unmounted volume cannot be: its directory says nothing about
+            // the filesystem that belongs there, so keep and say why.
             let volume = Path::new(&source.volume);
-            if is_mountpoint(volume) && volume.join(&entry.name).exists() {
+            let keep = if !is_mountpoint(volume) {
+                Some("source not mounted — cannot tell whether the subvolume is back")
+            } else if volume.join(&entry.name).exists() {
+                // A plain directory of that name also lands here: it is kept
+                // either way, and sync revives the entry only for a subvolume.
+                Some(
+                    "a path with this name exists on the source again; kept until sync revives the entry or the path is removed",
+                )
+            } else {
+                None
+            };
+            if let Some(why) = keep {
                 entries.push(RetiredReport {
                     source_label: source.label.clone(),
                     name: entry.name.clone(),
@@ -432,10 +444,7 @@ pub fn expire_retired(
                     retired,
                     locations: Vec::new(),
                     removed_from_config: false,
-                    kept_reason: Some(
-                        "subvolume exists again; waiting for sync to revive it — nothing deleted"
-                            .into(),
-                    ),
+                    kept_reason: Some(why.into()),
                 });
                 continue;
             }
@@ -1064,24 +1073,25 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20200101T0000");
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20200101T0000");
         let small_mount = rig.dir.path().join("small");
-        let vol = rig.dir.path().join("vol");
         let checked = std::sync::Mutex::new(Vec::new());
+        // The source volume stays mounted: an unmounted source keeps the
+        // whole entry before any location is examined (see the test below).
         let mounted_but = |p: &Path| {
             checked.lock().unwrap().push(p.to_path_buf());
-            p != small_mount.as_path() && p != vol.as_path()
+            p != small_mount.as_path()
         };
         let runner = rig.deleting(&[&small, &src]);
         let out =
             expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted_but).unwrap();
-        assert!(small.exists() && src.exists());
-        assert!(runner.calls().is_empty());
+        assert!(small.exists(), "the unmounted target is untouched");
+        assert!(!src.exists(), "the mounted source side still expires");
+        assert_eq!(runner.calls().len(), 1, "{:?}", runner.calls());
         let s = states(&out);
         assert!(matches!(s[1], LocationState::Unreachable(_)), "{s:?}");
-        assert!(matches!(s[2], LocationState::Unreachable(_)), "{s:?}");
+        assert_eq!(s[2], LocationState::Deleted { count: 1 });
         assert_eq!(s[0], LocationState::Empty);
         assert!(!out.entries[0].removed_from_config);
-        let checked = checked.lock().unwrap();
-        assert!(checked.contains(&small_mount) && checked.contains(&vol));
+        assert!(checked.lock().unwrap().contains(&small_mount));
     }
 
     #[test]
@@ -2290,28 +2300,51 @@ mod tests {
         let text = format_expire_report(&out, false);
         assert!(
             text.contains(
-                "    subvolume exists again; waiting for sync to revive it — nothing deleted\n"
+                "    a path with this name exists on the source again; kept until sync revives the entry or the path is removed\n"
             ),
             "{text}"
         );
     }
 
     #[test]
-    fn a_path_under_an_unmounted_volume_is_not_taken_for_a_returned_subvolume() {
-        // An unmounted volume's directory says nothing about the filesystem
-        // that belongs there, so it is not evidence either way; expiry goes
-        // on as before (and the source side is unreachable).
+    fn an_unmounted_source_keeps_every_retired_backup_and_says_why() {
+        // With the source volume unmounted nobody can look at it, so nobody
+        // can say the subvolume is not back: keep, delete nothing, and keep
+        // the entry in the config — even with the window long past.
         let rig = rig();
-        std::fs::create_dir_all(rig.dir.path().join("vol/@opt")).unwrap();
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&small]);
         let vol = rig.dir.path().join("vol");
         let not_vol = move |p: &Path| p != vol;
-        let out = expire_retired(&rig.config_path, false, "2026-12-01", &runner, &not_vol).unwrap();
-        assert!(!small.exists(), "the target-side series still expires");
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &not_vol).unwrap();
+        assert!(small.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(out.deleted_paths().is_empty());
+        let entry = &out.entries[0];
+        assert!(entry.locations.is_empty(), "{:?}", entry.locations);
+        assert!(!entry.removed_from_config);
+        assert!(rig.saved_names().contains(&"@opt".to_string()));
+        assert!(!out.failed(), "a keep is not a failure");
+        let text = format_expire_report(&out, false);
+        assert!(
+            text.contains("    source not mounted — cannot tell whether the subvolume is back\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_mounted_source_without_the_subvolume_still_expires() {
+        // Counter-test: the same window, the source mounted and the
+        // subvolume absent — this is the case that must still delete.
+        let rig = rig();
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small]);
+        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(!small.exists());
         assert_eq!(
             out.entries[0].locations[1].state,
             LocationState::Deleted { count: 1 }
         );
+        assert!(out.entries[0].kept_reason.is_none());
     }
 }
