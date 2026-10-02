@@ -165,6 +165,9 @@ is visible in one place.
 
 Every skipped subvolume is listed in the run report with the reason and, for
 an exclude match, the pattern. An exclusion is never invisible.
+(Amended at the final review, Ruling 28: snapshot-tree skips are reported as
+one count line per volume, not one line each; exclude-list skips stay
+itemised with their pattern.)
 
 ### 5.5 Retire, expire, revive
 
