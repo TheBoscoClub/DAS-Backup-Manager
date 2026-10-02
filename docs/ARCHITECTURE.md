@@ -33,9 +33,12 @@ every observable signal agrees. This is the single easiest way to lose data with
 this system, so it is stated here rather than left to be rediscovered.
 
 Consequently `config.toml` declares each subvolume individually; being inside a
-directory that is already backed up counts for nothing. `btrdasd doctor
---check-drift` exists to catch the omission, and the weekly timer is what makes
-it a control rather than a good intention.
+directory that is already backed up counts for nothing. Since 2026-10-01 the
+backup run writes those entries itself (`btrdasd subvol sync`), so the
+declaration cannot be forgotten. `btrdasd doctor --check-drift` stays as an
+independent alarm on that mechanism: a subvolume it reports as missing means
+sync failed, and the weekly timer is what makes it a control rather than a
+good intention.
 
 Found the hard way on 2026-09-01: `@srv/VirtualMachines`, created nested inside
 the already-backed-up `@srv`, held a 137 GB VM image that appeared in no backup
@@ -75,7 +78,7 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 |-----------|----------|--------|---------|
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 17 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 21 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
@@ -91,7 +94,9 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
+         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml + btrbk.conf; sources re-verified after the reload
          ├──▶ btrbk run                    → creates BTRFS snapshots on backup targets
+         ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window
          ├──▶ btrbk run (full)             → weekly full backup with send/receive
          ├──▶ update_boot_subvolumes()     → archives + recreates @/@home boot subvolumes (--full runs)
          ├──▶ btrdasd walk                 → indexes new snapshots into SQLite
@@ -333,8 +338,9 @@ wizard → Config struct → config.toml (save)
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
 | `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
 | `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
-| `doctor` | exclude[] | Subvolume drift detector exclusions (`btrdasd doctor --check-drift`) |
-| `source[]` | label, subvolume, mount_point, subvolumes[] | BTRFS sources |
+| `doctor` | exclude[] | Older exclusion list, still read and merged with `[subvolumes].exclude` |
+| `subvolumes` | exclude[] | Glob patterns the backup run must not adopt (`btrdasd subvol sync`); a pattern also covers everything nested under it |
+| `source[]` | label, subvolume, mount_point, subvolumes[] (name, manual_only, snapshot_name, adopted, retired) | BTRFS sources; `adopted` / `retired` dates are written by the backup run |
 | `target[]` | label, device, mount_point, role, retention | Backup targets |
 | `email` | enabled, smtp_host, smtp_port, from, to, tls | Email reports |
 | `gui` | install (bool) | GUI installation toggle |
@@ -515,10 +521,15 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Module | File | Lines | Purpose |
 |--------|------|-------|---------|
+| `adopt` | `src/adopt.rs` | ~1940 | Subvolume sync: lists each verified source volume, adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
 | `backup` | `src/backup.rs` | ~1750 | btrbk snapshot/send orchestration with volume deduplication |
+| `btrbk_conf` | `src/btrbk_conf.rs` | ~630 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
+| `caldate` | `src/caldate.rs` | ~240 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates |
 | `config` | `src/config.rs` | ~1080 | TOML config types, DAS/source/target models |
 | `db` | `src/db.rs` | ~1090 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
 | `doctor` | `src/doctor.rs` | ~1120 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
+| `expire` | `src/expire.rs` | ~2100 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
+| `fsutil` | `src/fsutil.rs` | ~170 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `health` | `src/health.rs` | ~1550 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
 | `indexer` | `src/indexer.rs` | ~510 | Snapshot discovery, span logic, walk orchestration |
 | `mount` | `src/mount.rs` | ~510 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |

@@ -3,8 +3,9 @@
 //! Finds two classes of drift between `config.toml` and what actually exists on
 //! each source filesystem:
 //!
-//! - **Missing** — a subvolume exists on disk but no `[[source]].subvolume` entry
-//!   references it. This is the dangerous case: the 2026-05-17 audit found ~30
+//! - **Missing** — a subvolume exists on disk but no live `[[source]].subvolume`
+//!   entry references it (an entry marked `retired` does not count: it is not
+//!   backed up, so a subvolume whose only entry is retired is missing). This is the dangerous case: the 2026-05-17 audit found ~30
 //!   subvolumes (all of `ClaudeCodeProjects/*`, audiobook app state, `@docker`,
 //!   `@hibp`, Steam libraries, ISOs) silently never backed up, because daily
 //!   backups of the *configured* subvolumes kept succeeding and masked the gap.

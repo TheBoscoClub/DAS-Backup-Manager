@@ -29,7 +29,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 
 ## Rust (buttered_dasd library + btrdasd CLI)
 - Rust 2024 edition, `cargo clippy` and `cargo fmt` before committing
-- Library crate `buttered_dasd` exports 16 public modules (`backup`, `config`, `db`, `doctor`, `forget`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line — it said 15 and listed `ffi` while omitting `forget` and `reconcile`, so it was wrong in both directions at once
+- Library crate `buttered_dasd` exports 21 public modules (`adopt`, `backup`, `btrbk_conf`, `caldate`, `config`, `db`, `doctor`, `expire`, `forget`, `fsutil`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line — it once said 15 and listed `ffi` while omitting `forget` and `reconcile`, so it was wrong in both directions at once
 - Use `LazyLock<Regex>` for compile-once regex patterns (not per-call `Regex::new()`)
 - Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - All database access through `db::Database` with prepared statements

@@ -94,7 +94,7 @@ volume is mounted and proven to be the expected filesystem by UUID) and
 before `create_snapshot_dirs`:
 
 ```
-mount_sources → verify_sources_before_write → RECONCILE → reload config env
+mount_sources → verify_sources_before_write → SYNC → reload config env
 → create_snapshot_dirs → mount_targets → … → run_btrbk → … → EXPIRE RETIRED
 ```
 
@@ -105,7 +105,7 @@ mount_sources → verify_sources_before_write → RECONCILE → reload config en
   it is mounted at its top level before listing it. The bash path already did
   this in `verify_sources_before_write`; the Rust path did not.
 - The manual Rust path (`btrdasd backup run`) calls the same function before
-  it invokes btrbk. There is no way to run a backup that skips reconcile.
+  it invokes btrbk. There is no way to run a backup that skips sync.
 - `btrdasd subvol add` / `remove` regenerate `btrbk.conf` too, so the manual
   route stops being a two-step trap.
 

@@ -332,11 +332,30 @@ Both roots are compared after the path is resolved, so a symlinked ancestor cann
 
 Grant a **subdirectory**, never a parent that also holds served or system content. This host adds `/srv/VirtualMachines` so the `ssd-vm` source can be restored in place — backing up something that cannot be restored is half a mechanism — and deliberately not `/srv`, which also contains the document roots denied above.
 
+### `[subvolumes]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `exclude` | string[] | `[]` | Glob patterns (`*`, `?`; `*` also matches `/`) for subvolumes the backup run must not adopt, on top of the built-in `@tmp` and `@var-tmp` |
+
+Every backup run adopts each subvolume that exists on a source volume and is not excluded (`btrdasd subvol sync`, run before btrbk), so creating a subvolume is enough to have it backed up. A pattern names the subvolume **without a trailing slash** and also covers everything nested under it: `@cache` excludes `@cache` and `@cache/anything`, while `@cache/` matches nothing. Anything under a `.snapshots` or `.btrbk-snapshots` directory is always skipped. A subvolume that has its own `[[source.subvolumes]]` entry is never skipped by a pattern. Every adoption and every skip, with the pattern that caused it, is listed in the run report; `sudo btrdasd subvol sync --dry-run` prints the same plan and changes nothing.
+
+Two optional dates on a `[[source.subvolumes]]` entry are written by the run and never need editing by hand:
+
+| Field | Description |
+|-------|-------------|
+| `adopted` | `YYYY-MM-DD` (UTC) the run added the entry. Absent on hand-written entries |
+| `retired` | `YYYY-MM-DD` (UTC) the subvolume was found gone. A retired entry is left out of `btrbk.conf`; `btrdasd subvol expire` deletes its backups from each target once the retirement date plus that target's longest retention window has passed (a target with no retention keeps them and says so), then removes the entry. The field is cleared if the subvolume comes back |
+
+An adopted entry with no configured parent subvolume goes to the primary target only, through a per-volume `<source>-adopted` source. Edit `target_labels` there if more targets are wanted.
+
 ### `[doctor]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exclude` | string[] | `[]` | Extra glob patterns excluded from `btrdasd doctor --check-drift` reporting, on top of the built-in exclusions |
+| `exclude` | string[] | `[]` | Still read, and merged with `[subvolumes].exclude`, so existing configs keep working. Prefer `[subvolumes].exclude` — it governs adoption as well as `btrdasd doctor --check-drift` |
+
+Because the backup run adopts new subvolumes itself, a **missing** or **stale** finding from the drift check now means the sync step failed or has not run since the subvolume appeared; the report advises `sudo btrdasd subvol sync --dry-run`.
 
 **Exit codes**, because systemd cannot tell a finding from a malfunction:
 

@@ -34,15 +34,54 @@ Check before deploying, every time:
 pgrep -f 'lib/das-backup/backup-run.sh' && echo "WAIT — do not install"
 ```
 
-Ordinary config edits are unaffected: `/etc/das-backup/config.toml` is read once at
-startup, and `/etc/btrbk/btrbk.conf` is read once by btrbk at startup. Editing either
-mid-run changes nothing about the run in flight. It is only the three **executing
-shell scripts** that must not be rewritten underneath themselves.
+Config edits are no longer inert mid-run (before 2026-10-01 each file was read once at startup).
+`backup-run.sh` reads `config.toml` again after `subvol sync`, so an edit made before that point is
+picked up (and the sources are re-verified against it), and sync itself rewrites `btrbk.conf`
+before btrbk starts. btrbk reads its config once, so an edit after it starts changes nothing for
+that run. Edit between runs. The three **executing shell scripts** must additionally never be
+rewritten underneath themselves.
 
 Found 2026-09-01 while deploying during a live run; the deploy was deferred rather
 than risked.
 
-## Nested Subvolumes Need Their Own Config Entry — Always
+## Nested Subvolumes Need Their Own Config Entry — The Run Writes It
+
+**Since the subvolume-sync work (bd `DAS-Backup-Manager-gte`, 2026-10-01) nobody writes these
+entries by hand.** `btrdasd subvol sync` adopts every subvolume that exists on a source volume and
+is not excluded, and retires entries whose subvolume is gone. The paragraphs below are why the
+entries must exist at all, and the history of the manual regime; the mechanism's design is
+`docs/superpowers/specs/2026-10-01-subvolume-reconcile-design.md`. Facts a maintainer needs:
+
+- **Where it runs.** `backup-run.sh` (v4.6.0) calls sync after `verify_sources_before_write`,
+  reloads its config, **re-verifies the sources** (sync may have added a source — an `-adopted` one — that
+  the first verification never saw, and `create_snapshot_dirs` is the next writer), runs btrbk, then `subvol expire` directly after it.
+  `btrdasd backup run` runs sync after mounting sources and before btrbk. A sync or expire failure
+  is recorded (report `FAILURES DETECTED`, `backup_runs.success` 0) and never stops the backup of
+  what is already configured, which is why mid-run edits of `config.toml` now take effect (at the
+  reload) and `btrbk.conf` is rewritten under btrbk's feet before it starts.
+- **A volume is listed only if every device its sources name verifies** — real mountpoint, expected
+  UUID, top-level mount. A volume that does not is "not read": nothing on it is adopted, retired
+  or revived, because an absent listing must never read as "everything was deleted". An empty
+  listing counts as not read. Only listing lines starting `ID ` are parsed; paths may hold spaces.
+- **Placement.** Nested under a live entry: joins the nearest such ancestor's source and inherits
+  its targets and `manual_only`. Otherwise it joins the volume's `<first-source>-adopted` source,
+  which sends to the primary target only (no primary target: not adopted, run failed, named in the
+  report). Snapshot names are made unique across the whole config and never change afterwards.
+- **Exclusion.** Patterns (`*`, `?`; `*` also matches `/`) name the subvolume without a trailing
+  slash — `@cache/` excludes nothing — and cover everything nested under it. A configured
+  subvolume is never skipped. `config.toml` and `btrbk.conf` are replaced together or not at all.
+- **Expiry safety, per location** (each target directory, then the source snapshot directory):
+  not a mountpoint, unreadable, or non-UTF-8 name: "not reachable", nothing changed. Another live
+  entry using the same series name in the same directory: nothing deleted there. Names like the
+  series that are not recognised btrbk snapshot names (a `long-iso` timestamp with an offset is
+  one; the generated config never sets `timestamp_format`): nothing deleted, entry kept. A target
+  with no retention: kept and reported. Source-side snapshots use the shortest window of the
+  targets. The entry is removed only when every location is empty, deleted or shared — never the
+  last config entry, never one whose source sends to no target, never on a dry run.
+- **Drift check.** `doctor --check-drift` uses the same listing and exclusions; one section, "NOT
+  BACKED UP — the backup run should have adopted these". Mutation scope: the five new modules are
+  in the weekly full scope; the one exclusion is the `perform_drift_check` host shell in `doctor.rs`.
+
 
 **`btrfs send` does not descend into nested subvolumes.** A snapshot of a parent
 subvolume contains an *empty directory* wherever a child subvolume is mounted, so
@@ -50,8 +89,8 @@ the stream ships nothing and the run reports success. This is the single easiest
 way to lose data in this system, because every observable signal says the backup
 worked.
 
-Every subvolume gets its own `[[source.subvolumes]]` entry in `config.toml`. Being
-inside a directory that is already backed up counts for nothing.
+Every subvolume gets its own `[[source.subvolumes]]` entry in `config.toml` (written by sync
+since 2026-10-01). Being inside a directory that is already backed up counts for nothing.
 
 **Proof, if it is ever doubted again** — run this against any parent/child pair:
 
@@ -61,7 +100,7 @@ sudo du -sb /.btrfs-ssd/.btrbk-snapshots/PROOF/VirtualMachines/   # 0, while the
 sudo btrfs subvolume delete /.btrfs-ssd/.btrbk-snapshots/PROOF
 ```
 
-**Finding the gaps** — the whole inventory, per filesystem, is one command per
+**Finding the gaps** — `sudo btrdasd subvol sync --dry-run` now prints it. The manual inventory, per filesystem, is one command per
 source volume. Compare it against `config.toml`; anything present on disk and
 absent from the config is unbacked-up right now:
 
@@ -77,7 +116,7 @@ re-derivation: `@tmp`, `@var-tmp` (ephemeral), `@cache` and `coredumps` (listed 
 `[doctor].exclude`), and every `.snapshots/` tree (snapper's own, and nested inside
 its parent for the same reason described above).
 
-**The reverse direction is also a defect, and it is LOUD, not silent.** A
+**Historical (manual regime, before sync): the reverse direction was also a defect, and it was LOUD, not silent.** A retired entry no longer reaches `btrbk.conf`, so this cannot recur through sync. A
 `subvolume` line naming something that no longer exists makes btrbk print
 `WARNING: Skipping subvolume … Failed to fetch subvolume detail` and **exit 10**.
 Measured 2026-09-01 against an isolated config whose only defect was a missing
