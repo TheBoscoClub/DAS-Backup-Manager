@@ -28,7 +28,9 @@ use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
-use buttered_dasd::progress::{OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink};
+use buttered_dasd::progress::{
+    LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
+};
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
 use buttered_dasd::subvol;
@@ -98,11 +100,13 @@ struct DbusSink {
 }
 
 impl ProgressSink for DbusSink {
+    /// Every log line, cancelled job or not: stderr is the journal, the
+    /// record of what the work did after its client stopped listening.
+    fn journal(&mut self, level: LogLevel, message: &str) {
+        eprintln!("[{}] {message}", level.word());
+    }
+
     fn emit(&mut self, event: ProgressEvent) {
-        if let ProgressEvent::Log { level, message } = &event {
-            // The journal keeps every line, for post-mortem debugging.
-            eprintln!("[{}] {message}", level.word());
-        }
         let conn = &self.conn;
         let job_id = self.job_id.as_str();
         let sent = self.runtime.block_on(async move {
