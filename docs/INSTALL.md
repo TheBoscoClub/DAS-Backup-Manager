@@ -338,16 +338,20 @@ Grant a **subdirectory**, never a parent that also holds served or system conten
 |-------|------|---------|-------------|
 | `exclude` | string[] | `[]` | Glob patterns (`*`, `?`; `*` also matches `/`) for subvolumes the backup run must not adopt, on top of the built-in `@tmp` and `@var-tmp` |
 
-Every backup run adopts each subvolume that exists on a source volume and is not excluded (`btrdasd subvol sync`, run before btrbk), so creating a subvolume is enough to have it backed up. A pattern names the subvolume **without a trailing slash** and also covers everything nested under it: `@cache` excludes `@cache` and `@cache/anything`, while `@cache/` matches nothing. Anything under a `.snapshots` or `.btrbk-snapshots` directory is always skipped. A subvolume that has its own `[[source.subvolumes]]` entry is never skipped by a pattern. Every adoption and every skip, with the pattern that caused it, is listed in the run report; `sudo btrdasd subvol sync --dry-run` prints the same plan and changes nothing.
+Every backup run adopts each subvolume that exists on a source volume and is not excluded (`btrdasd subvol sync`, run before btrbk), so creating a subvolume is enough to have it backed up. A pattern names the subvolume **without a trailing slash** and also covers everything nested under it: `@cache` excludes `@cache` and `@cache/anything`, while `@cache/` matches nothing. Anything under a `.snapshots` or `.btrbk-snapshots` directory is always skipped. A subvolume that has its own `[[source.subvolumes]]` entry is never skipped by a pattern. Every adoption and every skip, with the pattern that caused it, is listed in the run report; `sudo btrdasd subvol sync --dry-run` prints the same plan and changes nothing, and `backup-run.sh --dryrun` runs the sync step that way. `btrdasd backup run` runs the same sync before btrbk; a sync failure does not stop that run, which exits non-zero at the end.
+
+`/etc/btrbk/btrbk.conf` is generated from `config.toml`. Sync rewrites it only when the plan changes the configuration (not on every run); `btrdasd subvol add` / `remove` / `set-manual` / `set-auto` and `btrdasd setup --upgrade` rewrite it too. A hand edit is lost the next time any of them does — change `config.toml` instead.
 
 Two optional dates on a `[[source.subvolumes]]` entry are written by the run and never need editing by hand:
 
 | Field | Description |
 |-------|-------------|
 | `adopted` | `YYYY-MM-DD` (UTC) the run added the entry. Absent on hand-written entries |
-| `retired` | `YYYY-MM-DD` (UTC) the subvolume was found gone. A retired entry is left out of `btrbk.conf`; `btrdasd subvol expire` deletes its backups from each target once the retirement date plus that target's longest retention window has passed (a target with no retention keeps them and says so), then removes the entry. The field is cleared if the subvolume comes back |
+| `retired` | `YYYY-MM-DD` (UTC) the subvolume was found gone. A retired entry is left out of `btrbk.conf`; `btrdasd subvol expire` deletes its snapshots once the retirement date plus the retention window has passed — per target the longest window of that target, on the source side the shortest of the targets' windows; a target with no retention keeps them and says so — then removes the entry. The field is cleared if the subvolume comes back |
 
-An adopted entry with no configured parent subvolume goes to the primary target only, through a per-volume `<source>-adopted` source. Edit `target_labels` there if more targets are wanted.
+A subvolume nested under a configured one joins that ancestor's source, so it takes the ancestor's targets, snapshot directory, target subdirectory and `manual_only` flag. One with no configured ancestor goes through the volume's `<first-source-label>-adopted` source, created on first need: it takes `device` and `snapshot_dir` from the first source on that volume, uses its own label as the target subdirectory, and sends to the primary target only (edit `target_labels` there if more targets are wanted). Each adopted entry gets an explicit `snapshot_name`: the name btrbk would have derived, made unique across the whole config with `-2`, `-3`, … Existing names never change.
+
+`btrdasd subvol expire` looks for a retired entry's snapshots in each *location*: every target directory its source sends to, and the source's own snapshot directory. On a target they go once the retirement date plus that target's longest retention window has passed; on the source side, once the retirement date plus the **shortest** of the targets' windows has passed.
 
 ### `[doctor]`
 

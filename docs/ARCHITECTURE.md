@@ -94,10 +94,12 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
-         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml + btrbk.conf; sources re-verified after the reload
-         ├──▶ btrbk run                    → creates BTRFS snapshots on backup targets
-         ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window
-         ├──▶ btrbk run (full)             → weekly full backup with send/receive
+         ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
+         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml + btrbk.conf when the plan changes them
+         │                                   (then: reload config, verify_sources_before_write() again for any source sync added)
+         ├──▶ create snapshot dirs, mount targets, verify_targets_before_btrbk()
+         ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
+         ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted
          ├──▶ update_boot_subvolumes()     → archives + recreates @/@home boot subvolumes (--full runs)
          ├──▶ btrdasd walk                 → indexes new snapshots into SQLite
          ├──▶ boot-archive-cleanup.sh      → prunes expired @.archive.*/@home.archive.* snapshots
@@ -530,10 +532,12 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 | `doctor` | `src/doctor.rs` | ~1120 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
 | `expire` | `src/expire.rs` | ~2100 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
 | `fsutil` | `src/fsutil.rs` | ~170 | Atomic file replacement and the `CommandRunner` seam for host commands |
+| `forget` | `src/forget.rs` | ~400 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
 | `health` | `src/health.rs` | ~1550 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
 | `indexer` | `src/indexer.rs` | ~510 | Snapshot discovery, span logic, walk orchestration |
 | `mount` | `src/mount.rs` | ~510 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |
 | `progress` | `src/progress.rs` | ~115 | Progress reporting trait and D-Bus signal bridge |
+| `reconcile` | `src/reconcile.rs` | ~380 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
 | `report` | `src/report.rs` | ~610 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~760 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |

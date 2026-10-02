@@ -20,8 +20,8 @@ against this, and `setup` takes neither lock. Check first, every time:
 pgrep -f 'lib/das-backup/backup-run.sh' && echo "WAIT — do not install"
 ```
 
-Editing `btrbk.conf` mid-run is not safe: sync rewrites it before btrbk starts. `config.toml` is read
-again after sync, so a mid-run edit takes effect then (sources are re-verified). Edit between runs.
+Editing `btrbk.conf` mid-run is not safe: sync rewrites it, before btrbk starts, whenever it changes the
+config. `config.toml` is read again after sync, so a mid-run edit takes effect then. Edit between runs.
 
 ## Nested Subvolumes Need Their Own Config Entry — The Run Writes It
 - **`btrfs send` does not descend into nested subvolumes.** A parent's snapshot holds an empty

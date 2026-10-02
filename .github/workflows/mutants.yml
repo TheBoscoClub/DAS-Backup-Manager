@@ -151,14 +151,17 @@ jobs:
   # subvolume sync, decides what is backed up and what is deleted (adopt.rs,
   # expire.rs, with btrbk_conf.rs, caldate.rs and fsutil.rs under them).
   # Measured 2026-10-01: 899 mutants, including the five subvolume-sync
-  # modules. Re-measure before widening:
+  # modules. Time: the previous scope (554 mutants) took 11 minutes locally and
+  # 40 on the GitHub runner, about 3.6 times slower; this scope takes 35 minutes
+  # locally, so about 2 hours on the runner, hence timeout-minutes 300.
+  # Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
   full-scope:
     name: Falsifiability — security-critical scope
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7.0.1
 

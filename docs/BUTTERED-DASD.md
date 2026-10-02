@@ -44,7 +44,23 @@ backup-run.sh                   btrdasd CLI
 
 | Module | File | Purpose |
 |--------|------|---------|
+| `adopt` | `src/adopt.rs` | Subvolume sync: adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
+| `backup` | `src/backup.rs` | btrbk snapshot/send orchestration with volume deduplication |
+| `btrbk_conf` | `src/btrbk_conf.rs` | `btrbk.conf` renderer, shared by `setup`, the `subvol` commands and sync |
+| `caldate` | `src/caldate.rs` | Whole-day `YYYY-MM-DD` calendar arithmetic for adoption, retirement and expiry |
+| `config` | `src/config.rs` | TOML config types and validation, DAS/source/target models |
 | `db` | `src/db.rs` | SQLite connection, schema, CRUD, FTS5 search |
+| `doctor` | `src/doctor.rs` | Subvolume drift detector (`btrdasd doctor --check-drift`) |
+| `expire` | `src/expire.rs` | Expiry of retired subvolumes' backups per target and location (`btrdasd subvol expire`) |
+| `fsutil` | `src/fsutil.rs` | Atomic file replacement and the `CommandRunner` seam for host commands |
+| `health` | `src/health.rs` | Drive health (SMART), mountpoint checks, serial to device resolution, scrub health |
+| `mount` | `src/mount.rs` | Auto-mount/unmount of targets and sources with RAII `MountGuard` |
+| `progress` | `src/progress.rs` | Progress reporting trait and D-Bus signal bridge |
+| `report` | `src/report.rs` | Backup report formatting |
+| `restore` | `src/restore.rs` | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and a denylist |
+| `schedule` | `src/schedule.rs` | systemd timer management (show/set/enable/disable) |
+| `scrub` | `src/scrub.rs` | Scheduled BTRFS scrub engine for the DAS filesystems |
+| `subvol` | `src/subvol.rs` | Subvolume CRUD operations (`btrdasd subvol add/remove/set-manual/set-auto`) |
 | `scanner` | `src/scanner.rs` | Filesystem traversal with walkdir |
 | `indexer` | `src/indexer.rs` | Snapshot discovery, span logic, walk orchestration |
 | `reconcile` | `src/reconcile.rs` | Prune index rows for snapshots gone from disk; mountpoint-gated |

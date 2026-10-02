@@ -36,8 +36,8 @@ pgrep -f 'lib/das-backup/backup-run.sh' && echo "WAIT — do not install"
 
 Config edits are no longer inert mid-run (before 2026-10-01 each file was read once at startup).
 `backup-run.sh` reads `config.toml` again after `subvol sync`, so an edit made before that point is
-picked up (and the sources are re-verified against it), and sync itself rewrites `btrbk.conf`
-before btrbk starts. btrbk reads its config once, so an edit after it starts changes nothing for
+picked up (and the sources are re-verified against it), and sync rewrites `btrbk.conf`
+before btrbk starts whenever its plan changes the config (not on every run). btrbk reads its config once, so an edit after it starts changes nothing for
 that run. Edit between runs. The three **executing shell scripts** must additionally never be
 rewritten underneath themselves.
 
