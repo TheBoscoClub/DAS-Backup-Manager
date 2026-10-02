@@ -1,6 +1,6 @@
 .\" btrdasd(1) man page
 .\" Generated from clap CLI definitions in indexer/src/main.rs
-.TH BTRDASD 1 "2026-08-24" "0.7.19.0" "DAS Backup Manager"
+.TH BTRDASD 1 "2026-10-02" "0.7.22.3" "DAS Backup Manager"
 .SH NAME
 btrdasd \- DAS Backup Manager indexer and orchestrator
 .SH SYNOPSIS
@@ -12,14 +12,38 @@ btrdasd \- DAS Backup Manager indexer and orchestrator
 .B btrdasd
 (ButteredDASD) manages BTRFS backups to Direct-Attached Storage (DAS).
 It provides btrbk orchestration, content indexing with FTS5 full-text search,
-health monitoring, schedule management, scheduled BTRFS scrub, subvolume
-drift detection, and backup history tracking.
+health monitoring, schedule management, scheduled BTRFS scrub, automatic
+adoption and retirement of subvolumes, subvolume drift detection, and backup
+history tracking.
 .PP
 Progress messages are printed to stderr so that stdout remains
 machine-parseable.
 When the global
 .B \-\-json
 flag is given, all read commands emit JSON output on stdout.
+.PP
+Commands that read or write the backup targets
+.RB ( walk ,
+.BR reindex ,
+.BR reconcile ,
+.BR forget ,
+.BR purge ,
+.B backup
+and
+.BR restore )
+mount the targets themselves and unmount what they mounted afterwards. A
+target is found by its
+.B mount_uuid
+(a filesystem with that UUID, as
+.B "blkid \-U"
+reports it) or by one of its drive serials, and is mounted as
+.BI UUID= uuid
+when
+.B mount_uuid
+is set. A busy mount point is unmounted again up to five times, two seconds
+apart; one still mounted after that fails the command with an error that reads
+.B "still mounted:"
+followed by the paths.
 .SH COMMANDS
 .SS walk
 Index all new snapshots on a backup target.
@@ -27,6 +51,8 @@ Index all new snapshots on a backup target.
 .B btrdasd walk
 .I TARGET
 .RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-config
 .IR PATH ]
 .TP
 .I TARGET
@@ -36,6 +62,15 @@ Path to backup target mount point.
 Path to SQLite database.
 Default:
 .IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used to mount the targets.
+Default:
+.IR /etc/das\-backup/config.toml .
+.PP
+The targets are mounted for the walk, the same pass as
+.B btrdasd reconcile
+runs while they are still mounted, and they are unmounted afterwards.
 .\"
 .SS search
 Full-text search across indexed files using FTS5.
@@ -102,8 +137,15 @@ inward to the nearest surviving snapshot of the same series rather than being
 deleted, so a file is never dropped from snapshots that still exist.
 .PP
 Targets are mounted for the duration of the pass and unmounted afterward.
+.B btrdasd reconcile
+takes the maintenance interlock without waiting: while a backup, scrub or
+other maintenance pass holds it, the command prints
+.B Deferred
+and exits 0, changing nothing.
 .B btrdasd walk
-runs the same pass automatically while targets are still mounted.
+also runs the prune automatically while targets are still mounted, but takes
+no lock, so that pass is never deferred (see
+.BR FILES ).
 .PP
 .B btrdasd reconcile
 .RB [ \-\-db
@@ -111,6 +153,9 @@ runs the same pass automatically while targets are still mounted.
 .RB [ \-\-config
 .IR PATH ]
 .RB [ \-\-dry\-run ]
+.RB [ \-\-forget\-root
+.IR PATH ]
+.RB [ \-\-repair ]
 .TP
 .BI \-\-db " PATH"
 Path to SQLite database.
@@ -124,6 +169,21 @@ Default:
 .TP
 .B \-\-dry\-run
 Report what would be removed without changing anything.
+.TP
+.BI \-\-forget\-root " PATH"
+First drop every index row recorded under
+.IR PATH ,
+a mount path that is no longer a configured target (one retired by a rename,
+for example). Such rows can never be reconciled, because that root is never
+mounted again. A
+.I PATH
+that is a configured target is refused, and nothing else is done.
+.TP
+.B \-\-repair
+First delete spans whose endpoints name snapshots that do not exist, and the
+files left with no span. Needed on an index carrying such rows, because foreign
+keys are enforced and they cannot be rewritten. Has no effect with
+.BR \-\-dry\-run .
 .\"
 .SS reindex
 Re-index every mounted backup target.
@@ -143,12 +203,28 @@ Without
 this is an incremental top-up across every mounted target, indexing only
 snapshots not already present.
 .PP
+The targets are mounted for the duration and unmounted afterwards. Like
+.BR reconcile ,
+it defers (prints
+.BR Deferred ,
+exits 0) while the maintenance interlock is held.
+.PP
 .B btrdasd reindex
 .RB [ \-\-db
 .IR PATH ]
 .RB [ \-\-config
 .IR PATH ]
 .RB [ \-\-rebuild ]
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used for target mount points.
+Default:
+.IR /etc/das\-backup/config.toml .
 .TP
 .B \-\-rebuild
 Discard the index and rebuild it. Takes hours on a large target set.
@@ -171,7 +247,15 @@ are read from
 the file btrbk itself uses, rather than re-derived from
 .IR config.toml ,
 so the guard cannot disagree with reality. Without that file the command exits
-rather than proceeding unguarded.
+with status 2 rather than proceeding unguarded. A refusal, or a pattern that
+matches nothing, exits 1.
+.PP
+The snapshots are found through the index and deleted with
+.BR "btrfs subvolume delete" ;
+their index rows are then pruned. The targets are mounted for the duration,
+and the command defers (prints
+.BR Deferred ,
+exits 0) while the maintenance interlock is held.
 .PP
 .B btrdasd forget
 .I PATTERN
@@ -183,8 +267,29 @@ rather than proceeding unguarded.
 .RB [ \-\-btrbk\-conf
 .IR PATH ]
 .TP
+.I PATTERN
+Glob over the snapshot series name
+.RI ( * / ? ),
+for example
+.IR Projects\-old\-name .
+.TP
 .B \-\-dry\-run
 Print the plan without deleting anything.
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used to mount the targets.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-btrbk\-conf " PATH"
+btrbk configuration read for the series still being backed up.
+Default:
+.IR /etc/btrbk/btrbk.conf .
 .\"
 .SS purge
 Delete every snapshot containing files matching a path pattern.
@@ -214,8 +319,25 @@ for.
 .RB [ \-\-config
 .IR PATH ]
 .TP
+.I PATH_PATTERN
+SQLite
+.B GLOB
+over the file path within a snapshot (case-sensitive), for example
+.IR *id_rsa .
+Only files the index knows about are matched.
+.TP
 .B \-\-dry\-run
 Print the plan without deleting anything.
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used to mount the targets.
+Default:
+.IR /etc/das\-backup/config.toml .
 .\"
 .SS setup
 Interactive setup wizard \(em configure backup sources, targets, and scheduling.
@@ -241,9 +363,12 @@ Remove all generated files, disable timers, and optionally remove the database.
 .TP
 .B \-\-uninstall\-all
 Remove ALL installed files: generated configs (same as \-\-uninstall), plus
-cmake-installed binaries (btrdasd, btrdasd\-gui, btrdasd\-helper), FFI library,
+cmake-installed binaries (btrdasd, btrdasd\-gui, btrdasd\-helper), the backup
+scripts under
+.IR /usr/lib/das\-backup ,
 D\-Bus configs, polkit policy, systemd units, man page, shell completions,
-desktop entry, and icon. Prompts whether to remove the backup database.
+desktop entry, icon, and the FFI library and header that releases up to
+0.7.22.1 installed. Prompts whether to remove the backup database.
 .TP
 .B \-\-force
 Non-interactive mode: skip all prompts and never remove or overwrite the
@@ -254,7 +379,14 @@ CI/CD pipelines.
 .TP
 .B \-\-check
 Validate the configuration and dependencies, report issues,
-but change nothing. A target with no
+but change nothing. It reports whether the configuration is valid, whether the
+mail relay is reachable (when email is enabled), whether every generated file is present, and, for each
+attached target, whether udev actually hides its drives from udisks (read back
+from
+.BR "udevadm info \-\-export\-db" ,
+not from the rule file; an exposed target is reported with the fix). It exits 0
+whatever it finds, unless the configuration cannot be loaded at all. Takes
+precedence over every other flag. A target with no
 .B mount_uuid
 is reported, with the UUID udev knows for its drive when it is attached and
 the line to add to its
@@ -340,6 +472,18 @@ expire retired backups
 .RB ( backup\-run.sh
 does, with
 .BR "subvol expire" ).
+When
+.B [boot].enabled
+is set, every run of this command, incremental or full, archives the boot
+subvolumes on each non-mirror target and replaces them from the latest
+snapshot;
+.B backup\-run.sh
+replaces an existing one only on a full run.
+.PP
+If another backup already holds the singleton lock, the command prints that it
+declines and exits 0; it waits for a running scrub. A run that could not start
+(locks, mounting, target verification, btrbk) exits 1 and is not recorded. A run
+that started and failed is recorded and reported, then exits 1.
 .PP
 .B btrdasd backup run
 .RB [ \-\-config
@@ -357,21 +501,37 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .TP
 .B \-\-dry\-run
-Preview only \(em do not execute any operations.
+Preview: takes the locks, mounts and verifies the sources and targets, and runs
+the sync as
+.BR "subvol sync \-\-dry\-run" ,
+but creates, sends, archives and indexes nothing, and neither reports nor
+records the run. A missing target directory is still created and logged, as
+above.
 .TP
 .B \-\-full
-Run a full backup instead of incremental.
+Run a full backup instead of incremental:
+.B "btrbk run"
+in place of
+.B "btrbk snapshot"
+followed by
+.BR "btrbk resume" .
+Both apply the retention policy.
 .TP
 .BI \-\-sources " LABELS"
 Comma-separated source labels to back up.
-Default: all non-manual sources.
+Default: every source with at least one subvolume that is not manual-only.
 .TP
 .BI \-\-targets " LABELS"
 Comma-separated target labels to send to.
 Default: all mounted targets.
 .\"
 .SS backup snapshot
-Create snapshots without sending them to targets.
+Create snapshots without sending them to targets
+.RB ( "btrbk snapshot" ).
+Like the other manual
+.B backup
+commands below, it declines (exit 0) while another backup holds the singleton
+lock, and waits for a running scrub.
 .PP
 .B btrdasd backup snapshot
 .RB [ \-\-config
@@ -389,7 +549,9 @@ Comma-separated source labels.
 Default: all.
 .\"
 .SS backup send
-Send existing snapshots to targets.
+Send existing snapshots to targets
+.RB ( "btrbk resume" ,
+which also applies the retention policy).
 .PP
 .B btrdasd backup send
 .RB [ \-\-config
@@ -407,7 +569,15 @@ Comma-separated target labels.
 Default: all mounted.
 .\"
 .SS backup boot\-archive
-Archive boot subvolumes on backup targets.
+Archive boot subvolumes on backup targets: on each non-mirror target, each
+subvolume in
+.B [boot].subvolumes
+is snapshotted read-only to
+.IB name .archive. timestamp
+and then replaced from its latest btrbk snapshot. Mirror targets, which carry
+their own operating system, are skipped. Snapshot names are read from
+.IR /etc/btrbk/btrbk.conf ;
+if it cannot be read, nothing is done.
 .PP
 .B btrdasd backup boot\-archive
 .RB [ \-\-config
@@ -436,12 +606,96 @@ Default:
 Number of recent runs to show.
 Default: 10.
 .\"
+.SS backup record\-run
+Record a completed backup run in the backup history. Used by
+.BR backup\-run.sh ;
+not normally run by hand.
+.PP
+.B btrdasd backup record\-run
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-success ]
+.RB [ \-\-mode
+.IR MODE ]
+.RB [ \-\-snaps\-created
+.IR N ]
+.RB [ \-\-snaps\-sent
+.IR N ]
+.RB [ \-\-bytes\-sent
+.IR N ]
+.RB [ \-\-duration\-secs
+.IR N ]
+.RB [ \-\-errors
+.IR TEXT ]
+.TP
+.BI \-\-db " PATH"
+Path to SQLite database.
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.B \-\-success
+Record the run as successful; without it the run is recorded as failed.
+.TP
+.BI \-\-mode " MODE"
+.B incremental
+or
+.BR full .
+Default:
+.BR incremental .
+.TP
+.BI \-\-snaps\-created " N"
+Number of snapshots created. Default: 0.
+.TP
+.BI \-\-snaps\-sent " N"
+Number of snapshots sent to targets. Default: 0.
+.TP
+.BI \-\-bytes\-sent " N"
+Bytes sent to targets. Default: 0.
+.TP
+.BI \-\-duration\-secs " N"
+Duration in seconds. Default: 0.
+.TP
+.BI \-\-errors " TEXT"
+Error messages, one per line. Default: none.
+.\"
 .SS restore file
 Restore specific files from a snapshot.
+.PP
+Every
+.B restore
+command mounts the targets for its duration. For
+.B restore file
+and
+.BR "restore snapshot" ,
+the snapshot must lie under a target's mount point, and the destination
+must lie under one of
+.B [restore].allowed_roots
+in config.toml (default
+.I /home
+and
+.IR /tmp ),
+and never under a system path such as
+.IR /etc ,
+.IR /usr ,
+.IR /boot ,
+.I /var/lib
+or the served roots
+.I /srv/http
+and
+.IR /srv/ftp ,
+which no configuration can allow. Both are compared after symlinks are
+resolved, before any directory is created; files are written without following
+symlinks, and a member path that is absolute or contains a
+.I .\&
+or
+.I ..\&
+component is rejected.
 .PP
 .B btrdasd restore file
 .I SNAPSHOT DEST FILE
 .RI [ FILE .\|.\|.]
+.RB [ \-\-config
+.IR PATH ]
 .TP
 .I SNAPSHOT
 Path to the snapshot directory.
@@ -451,18 +705,30 @@ Destination directory for restored files.
 .TP
 .I FILE
 One or more file paths relative to the snapshot root (at least one required).
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used to mount the targets and for
+.BR [restore].allowed_roots .
+Default:
+.IR /etc/das\-backup/config.toml .
 .\"
 .SS restore snapshot
 Restore an entire snapshot using btrfs send/receive or recursive copy.
 .PP
 .B btrdasd restore snapshot
 .I SNAPSHOT DEST
+.RB [ \-\-config
+.IR PATH ]
 .TP
 .I SNAPSHOT
 Path to the snapshot directory.
 .TP
 .I DEST
 Destination directory.
+.TP
+.BI \-\-config " PATH"
+As for
+.BR "restore file" .
 .\"
 .SS restore browse
 Browse files in a snapshot directory.
@@ -471,12 +737,19 @@ Browse files in a snapshot directory.
 .I SNAPSHOT
 .RB [ \-\-prefix
 .IR PATH ]
+.RB [ \-\-config
+.IR PATH ]
 .TP
 .I SNAPSHOT
 Path to the snapshot directory.
 .TP
 .BI \-\-prefix " PATH"
 Optional subdirectory prefix to browse within the snapshot.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, used to mount the targets.
+Default:
+.IR /etc/das\-backup/config.toml .
 .\"
 .SS schedule show
 Show the current backup schedule, including next run times.
@@ -491,7 +764,12 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .\"
 .SS schedule set
-Update schedule settings.
+Update schedule settings in config.toml. Only config.toml is written; the
+timer units change at the next
+.BR "btrdasd setup \-\-upgrade" .
+This command does not validate what it writes: check the result with
+.B "btrdasd config validate"
+before the next backup run.
 .PP
 .B btrdasd schedule set
 .RB [ \-\-config
@@ -512,14 +790,39 @@ Default:
 Incremental backup time in HH:MM format.
 .TP
 .BI \-\-full " SCHEDULE"
-Full backup schedule in systemd calendar format
-(e.g., "Sun *\-*\-* 04:00:00").
+Full backup schedule as
+.RI \(dq Day " HH:MM" \(dq,
+where
+.I Day
+is one of
+.BR Sun ,
+.BR Mon ,
+.BR Tue ,
+.BR Wed ,
+.BR Thu ,
+.B Fri
+or
+.B Sat
+(e.g., "Sun 04:00"); a bare
+.I HH:MM
+means Sunday. A systemd calendar expression such as "Sun *\-*\-* 04:00:00" is
+not accepted by validation.
 .TP
 .BI \-\-delay " MINUTES"
-Randomized delay in minutes before starting.
+Randomized delay in minutes before starting
+.RB ( [schedule].randomized_delay_min ).
 .\"
 .SS schedule enable
-Enable scheduled backups via systemd timers.
+Enable scheduled backups:
+.B "systemctl enable \-\-now"
+for
+.I das\-backup.timer
+and
+.I das\-backup\-full.timer
+(with OpenRC,
+.BR "rc\-update add das\-backup" ;
+with SysV init, the generated cron entry). The scrub and drift-check timers
+are not affected.
 .PP
 .B btrdasd schedule enable
 .RB [ \-\-config
@@ -531,7 +834,8 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .\"
 .SS schedule disable
-Disable scheduled backups.
+Disable scheduled backups (the same two timers, with
+.BR "systemctl disable \-\-now" ).
 .PP
 .B btrdasd schedule disable
 .RB [ \-\-config
@@ -555,7 +859,12 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .\"
 .SS subvol list
-List all configured subvolumes across all sources.
+List all configured subvolumes across all sources. Retired entries are listed
+too, and are not marked as retired;
+.B "btrdasd config show"
+shows their
+.B retired
+date.
 .PP
 .B btrdasd subvol list
 .RB [ \-\-config
@@ -596,6 +905,16 @@ Default:
 Remove a subvolume from a source. Validates and saves config.toml and
 regenerates btrbk.conf together, as
 .BR "subvol add" .
+.PP
+Removing the entry of a subvolume that still exists does not stop it being
+backed up: the next
+.B "subvol sync"
+(every backup run) adopts it again. To leave a subvolume out, add a pattern
+to
+.B [subvolumes].exclude
+instead. The snapshots the removed entry already made are not expired by
+.BR "subvol expire" ,
+which only handles retired entries.
 .PP
 .B btrdasd subvol remove
 .I SOURCE NAME
@@ -664,11 +983,18 @@ entry. A nested subvolume joins its nearest configured ancestor's source and
 takes that source's targets. One with no configured ancestor goes to the
 primary target only, through a per\-volume
 .I <source>\-adopted
-source. An entry whose subvolume is gone is marked
+source. An adopted entry records the date in
+.IR adopted .
+An entry whose subvolume is gone is marked
 .I retired
-and leaves btrbk.conf (see
+with the current date (UTC) and leaves btrbk.conf (see
 .BR "subvol expire" ).
 A retired entry whose subvolume returns is revived.
+Sync mounts nothing: the source volumes must already be mounted, as
+.B backup\-run.sh
+and
+.B "btrdasd backup run"
+arrange.
 .PP
 Excluded are: anything under a
 .I .snapshots
@@ -677,7 +1003,7 @@ or
 directory, the built\-in
 .B @tmp
 and
-.B @var\-tmp ,
+.BR @var\-tmp ,
 and the patterns in
 .I [subvolumes].exclude
 (the older
@@ -792,10 +1118,13 @@ every target directory its source sends to, and the source's own snapshot
 directory. On a target they are kept
 until the retirement date plus that target's longest retention window (daily
 x1, weekly x7, monthly x31, yearly x366 days), then all deleted from that
-target together. On the source side they are kept until the retirement date
+target together; until then the report reads
+.RI \(dq N " snapshots kept, deleted on or after " YYYY\-MM\-DD \(dq.
+On the source side they are kept until the retirement date
 plus the shortest of the targets' windows, then deleted. A target with no
 retention configured keeps them and says
-so. Nothing is deleted from a location that is not a mountpoint or cannot be
+so. Expiry mounts nothing; a location whose mount point is not mounted is
+reported as not reachable and left alone. Nothing is deleted from a location that is not a mountpoint or cannot be
 read completely, that is also used by a live entry of the same series name,
 or that holds names resembling the series that are not recognised btrbk
 snapshots; nor at a location whose newest snapshot of the series is dated
@@ -811,7 +1140,8 @@ runs this command with
 .B \-\-dry\-run
 only. The entry leaves config.toml only once nothing remains to expire
 (never if it is the last entry, or its source sends to no target, and never
-on a dry run). The search index is pruned of the deleted snapshots.
+on a dry run); a source left with no entries by that leaves with it. The
+search index is pruned of the deleted snapshots.
 .PP
 Prints a
 .B "RETIRED SUBVOLUMES"
@@ -862,9 +1192,21 @@ Default:
 .SS scrub run
 Run a full scrub pass now: acquire locks, mount each configured scrub
 target by filesystem UUID, run
-.BR "btrfs scrub start -B" ,
+.BR "btrfs scrub start \-B" ,
 parse the result, unmount, persist state, and email a report \(em the
-same path the scheduled systemd timer uses.
+same path the scheduled systemd timer uses. A filesystem whose last scrub was
+interrupted, with nothing scrubbing it now, is resumed with
+.B "btrfs scrub resume \-B"
+instead, falling back to
+.B "btrfs scrub start \-B \-f"
+when there is nothing to resume. The targets are scrubbed one at a time, in
+.B [scrub].targets
+order.
+.PP
+If another scrub pass holds
+.IR /run/das\-scrub.lock ,
+this one is skipped (exit 0). The shared maintenance lock is waited for, so a
+pass started during a backup begins when the backup ends.
 .PP
 This runs even when
 .B [scrub].enabled
@@ -888,7 +1230,7 @@ could
 .I not
 run at all: a config load failure, a lock-file I/O error, or every
 target failing before any scrub was attempted. This split (bd
-.B DAS\-Backup\-Manager\-18p )
+.BR DAS\-Backup\-Manager\-18p )
 exists so a Sentinel-monitored systemd unit never retry-loops a real
 multi-hour scrub over failing hardware just because it found damage
 \(em only a genuine can't-even-start failure, which fails in seconds,
@@ -912,10 +1254,10 @@ Resolved by filesystem UUID, never by mount path, so this works while
 the DAS filesystems are unmounted. Reads the engine's persisted state
 .RI ( /var/lib/das\-backup/scrub\-state.json )
 when an entry exists, falling back to the raw btrfs record
-.I (/var/lib/btrfs/scrub.status.<fsuuid>)
+.RI ( /var/lib/btrfs/scrub.status. <fsuuid> )
 for a filesystem with scrub history predating this CLI or the state
 file. A target with neither source is reported as
-.B "NEVER SCRUBBED" ,
+.BR "NEVER SCRUBBED" ,
 not an error.
 .PP
 .B btrdasd scrub status
@@ -934,7 +1276,8 @@ Manual operator action only \(em the scrub interlock never cancels a
 pass automatically. Locates the actively-scrubbing filesystem via the
 engine's lock and live kernel state, then issues
 .B "btrfs scrub cancel"
-against it. A no-op (clean exit, no error) when no scrub is running.
+against it. A no-op (clean exit, no error) when no scrub is running. Exits 1
+if the cancel fails.
 .PP
 .B btrdasd scrub cancel
 .RB [ \-\-config
@@ -944,6 +1287,7 @@ against it. A no-op (clean exit, no error) when no scrub is running.
 Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
+.\"
 .SS doctor
 Subvolume drift detector \(em find source subvolumes that exist on disk but
 aren't backed up, and configured subvolumes that no longer exist on disk.
@@ -955,11 +1299,15 @@ volume), mounts it if needed, runs
 .BR "btrfs subvolume list" ,
 and compares the result against every
 .I [[source]].subvolume
-name configured for that volume. Built-in exclusions (never configurable)
+name configured for that volume. The listing is the one
+.B "subvol sync"
+uses: a volume is listed only if every device its sources name is a real
+mountpoint holding the expected filesystem UUID at its top level, and an empty
+listing counts as a failure. Built-in exclusions (never configurable)
 skip anything under a
 .I .snapshots/
 or
-.I .btrbk-snapshots/
+.I .btrbk\-snapshots/
 directory at any depth, and the
 .B @tmp
 /
@@ -1001,7 +1349,7 @@ means no drift was found, or the check deferred because a lock was held
 (never treated as a failure).
 .B 1
 means drift was found (missing or stale subvolumes). Unlike
-.B "btrdasd scrub run" ,
+.BR "btrdasd scrub run" ,
 this genuinely surfaces through the exit code, because a drift check has no
 Sentinel multi-hour-retry hazard to protect against.
 .B 2
@@ -1057,21 +1405,64 @@ or
 Produce machine-readable JSON output on all read commands.
 This flag is global and may be placed before any subcommand.
 .TP
-.B \-\-help
+.BR \-h ", " \-\-help
 Print help information and exit.
 .TP
-.B \-\-version
-Print version information and exit.
+.BR \-V ", " \-\-version
+Print version information and exit. The version printed is the Rust crate's
+three-part version (for example
+.B 0.7.22
+for release 0.7.22.3).
 .SH EXIT STATUS
 .TP
 .B 0
-Successful operation.
+Successful operation. Also: a command that found its lock held and deferred or
+declined
+.RB ( backup ,
+.BR reconcile ,
+.BR reindex ,
+.BR forget ,
+.BR purge ,
+.BR doctor ,
+.BR "scrub run" ),
+and a scrub pass that ran, whatever it found.
 .TP
 .B 1
 An error occurred (backup failure, validation error, missing configuration, a
 mount point the command mounted and could not unmount again, etc.).
+.TP
+.B 2
+The command line could not be parsed. Also used by
+.B forget
+(no readable btrbk.conf),
+.B "subvol sync"
+and
+.B "subvol expire"
+(configuration could not be loaded), and
+.B doctor
+(could not run).
+.TP
+.B 3
 .B "btrdasd doctor"
-also uses 2 and 3; see its section.
+only: the check ran but some volume went unexamined; see its section.
+.SH ENVIRONMENT
+.TP
+.B EDITOR
+Editor for
+.BR "config edit" .
+Default:
+.BR vi .
+.TP
+.BR DAS_REPORT_TO ", " DAS_REPORT_FROM
+Override the report recipient and sender address
+.RB ( [email].to ,
+.BR [email].from )
+for the emails this program sends. Meant for testing: the sender selects the
+mail relay's upstream credential.
+.TP
+.BR DAS_SCRUB_STATE ", " DAS_BTRFS_STATUS_DIR
+Override the scrub state file and the directory of btrfs scrub status
+records. Meant for tests only.
 .SH EXAMPLES
 Run a full backup pipeline:
 .PP
@@ -1089,11 +1480,29 @@ btrdasd backup run \-\-dry\-run
 .fi
 .RE
 .PP
-Run a full (non-incremental) backup of specific sources to specific targets:
+Run a full (non-incremental) backup of specific sources to specific targets
+(labels as configured in config.toml):
 .PP
 .RS
 .nf
-btrdasd backup run \-\-full \-\-sources root,home \-\-targets das\-22tb
+btrdasd backup run \-\-full \-\-sources nvme,ssd \-\-targets primary\-22tb
+.fi
+.RE
+.PP
+Preview which subvolumes the next backup would adopt or retire:
+.PP
+.RS
+.nf
+sudo btrdasd subvol sync \-\-dry\-run
+.fi
+.RE
+.PP
+Preview what expiry of retired subvolumes would delete (targets must be
+mounted):
+.PP
+.RS
+.nf
+sudo btrdasd subvol expire \-\-dry\-run
 .fi
 .RE
 .PP
@@ -1117,15 +1526,16 @@ Browse a snapshot directory:
 .PP
 .RS
 .nf
-btrdasd restore browse /mnt/backup/root.20260228T030000
+btrdasd restore browse /mnt/backup\-22tb/nvme/home.20260228T0300
 .fi
 .RE
 .PP
-Restore specific files from a snapshot:
+Restore specific files from a snapshot (the destination must be under
+.BR [restore].allowed_roots ):
 .PP
 .RS
 .nf
-btrdasd restore file /mnt/backup/root.20260228T030000 /tmp/restored etc/fstab etc/btrbk/btrbk.conf
+btrdasd restore file /mnt/backup\-22tb/nvme/home.20260228T0300 /tmp/restored user/.bashrc user/.config/kdeglobals
 .fi
 .RE
 .PP
@@ -1181,7 +1591,7 @@ Index snapshots on a backup target:
 .PP
 .RS
 .nf
-btrdasd walk /mnt/backup
+btrdasd walk /mnt/backup\-22tb
 .fi
 .RE
 .PP
@@ -1190,6 +1600,16 @@ Run the interactive setup wizard:
 .RS
 .nf
 sudo btrdasd setup
+.fi
+.RE
+.PP
+Check the installation, including whether the targets are hidden from udisks
+and which targets lack a
+.BR mount_uuid :
+.PP
+.RS
+.nf
+sudo btrdasd setup \-\-check
 .fi
 .RE
 .PP
@@ -1217,12 +1637,55 @@ SQLite database with FTS5 content index and backup history.
 Main configuration file for sources, targets, schedule, and email settings.
 .TP
 .I /etc/btrbk/btrbk.conf
-btrbk configuration file (generated by
+btrbk configuration file, generated from config.toml by
+.BR "btrdasd setup" ,
+.B "subvol sync"
+(every backup run), the
+.B subvol
+commands that change an entry, and the GUI. Do not edit it by hand.
+.TP
+.I /etc/das\-backup/.manifest
+The files
 .B btrdasd setup
-from config.toml).
+generated, one per line; read by
+.B \-\-check
+and
+.BR \-\-uninstall .
+.TP
+.I /etc/udev/rules.d/99\-das\-backup\-udisks\-ignore.rules
+Generated udev rule that hides the backup targets from udisks, matched on the
+targets' drive serials and
+.BR mount_uuid .
 .TP
 .I /var/lib/das\-backup/growth.log
-Disk usage growth log for trend monitoring.
+Disk usage growth log for trend monitoring, appended by
+.B backup\-run.sh
+and read by
+.BR "btrdasd health" .
+.TP
+.I /var/lib/das\-backup/last\-report.txt
+The last backup report, written before it is emailed
+.RB ( [general].last_report ).
+.TP
+.IR /run/das\-backup.lock ", " /run/das\-scrub.lock ", " /run/das\-reconcile.lock ", " /run/das\-doctor.lock
+Singleton locks: one backup, scrub, reconcile pass (also taken by
+.B reindex
+and
+.BR forget / purge )
+or drift check at a time.
+.TP
+.I /run/das\-maintenance.lock
+Shared maintenance lock held by backups, scrubs,
+.BR reconcile ,
+.BR reindex ,
+.BR forget ,
+.B purge
+and the drift check, so they never overlap. Backups and scrubs wait for it; the
+others defer.
+.B walk
+and
+.B restore
+take no lock.
 .TP
 .I /var/lib/das\-backup/scrub\-state.json
 Persisted scrub state, keyed by filesystem UUID (mode 644). Absent until
@@ -1231,8 +1694,7 @@ the first
 completes.
 .TP
 .I /var/lib/btrfs/scrub.status.<fsuuid>
-Raw btrfs scrub status record for one filesystem, written by
-.BR btrfs-progs (8).
+Raw btrfs scrub status record for one filesystem, written by btrfs\-progs.
 Read directly by
 .B btrdasd scrub status
 as a fallback when no state-file entry exists.
@@ -1241,8 +1703,10 @@ as a fallback when no state-file entry exists.
 .BR btrfs (8),
 .BR btrfs\-send (8),
 .BR btrfs\-receive (8),
+.BR btrfs\-scrub (8),
 .BR btrfs\-subvolume (8),
-.BR smartctl (8)
+.BR smartctl (8),
+.BR udisks (8)
 .SH AUTHORS
 TheBoscoClub
 .UR https://github.com/TheBoscoClub/DAS-Backup-Manager

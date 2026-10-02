@@ -26,6 +26,14 @@ If you discover a security vulnerability in this project, please report it respo
 
 ## Security Audit Tools
 
+### Rust Code
+
+| Tool | Purpose | Command |
+|------|---------|---------|
+| **clippy** | Lints, warnings as errors (CI) | `cargo clippy --all-targets --features dbus -- -D warnings` |
+| **cargo-mutants** | Mutation testing gates every push (`.github/workflows/mutants.yml`) | see `indexer/.cargo/mutants.toml` |
+| **semgrep** | Static analysis in CI (`.github/workflows/semgrep.yml`) | `semgrep ci` |
+
 ### C++ Code
 
 | Tool | Purpose | Command |
