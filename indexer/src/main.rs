@@ -1174,6 +1174,13 @@ fn prune_deleted_from_index(
     Ok(ids.len())
 }
 
+/// The exit status `backup run` ends with, if not 0: 1 when the run failed —
+/// including when only the subvolume sync before it did, which `run_backup`
+/// folds into the result.
+fn backup_run_exit_code(run_succeeded: bool) -> Option<i32> {
+    (!run_succeeded).then_some(1)
+}
+
 /// Whether `subvol expire` failed overall: the expiry itself did, or snapshots
 /// are gone and the index still lists them. The database is not opened at all
 /// when nothing was deleted (it may not exist yet).
@@ -1687,8 +1694,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // A failed sync did not stop the run; it is in the result, so
                 // the command fails once the run has finished and been recorded.
-                if !result.success {
-                    std::process::exit(1);
+                if let Some(code) = backup_run_exit_code(result.success) {
+                    std::process::exit(code);
                 }
             }
             BackupAction::Snapshot { config, sources } => {
@@ -3051,5 +3058,11 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let left = Database::open(&db_path).unwrap().list_snapshots().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].path, "/mnt/t/kept.20260101");
+    }
+
+    #[test]
+    fn backup_run_exits_non_zero_exactly_when_the_run_failed() {
+        assert_eq!(backup_run_exit_code(true), None);
+        assert_eq!(backup_run_exit_code(false), Some(1));
     }
 }

@@ -79,4 +79,16 @@ exclude_re = [
     # that decides what is missing, stale or unreadable lives in
     # `drift_from_listings`, which is mutated and tested.
     "replace perform_drift_check -> DriftReport with Default::default\\(\\)",
+    # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with
+    # `--features dbus`, and cargo-mutants builds without features: a mutant
+    # there is never compiled, so it "survives" without having been tested.
+    # These four mutants (three patterns) are the helper's shells around
+    # library code — a polkit-gated method needing a live system bus, and the
+    # save of the root-owned canonical config. Their logic is in the library
+    # and is mutated there: `backup::sync_before_backup`,
+    # `btrbk_conf::save_config_and_btrbk_conf` and
+    # `btrbk_conf::refuse_moving_btrbk_conf`. Keep the shells logic-free.
+    "replace save_config -> Result<\\(\\), fdo::Error> with Ok\\(\\(\\)\\)",
+    "replace HelperInterface::backup_run -> fdo::Result<String> with ",
+    "replace HelperInterface::config_set -> fdo::Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]

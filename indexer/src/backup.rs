@@ -1210,6 +1210,12 @@ pub fn sync_before_backup(
     Ok((config, section))
 }
 
+/// Whether the run writes and emails its report: the caller asked for it and
+/// `[email]` is enabled.
+fn emails_report(options: &BackupOptions, config: &Config) -> bool {
+    options.send_report && config.email.enabled
+}
+
 /// Run a backup with the given options. Calls btrbk under the hood.
 /// The caller must ensure this runs with appropriate privileges (root).
 pub fn run_backup(
@@ -1582,7 +1588,7 @@ pub fn run_backup(
     }
 
     // Step (e): Email report
-    if options.send_report && config.email.enabled {
+    if emails_report(options, config) {
         let report_text = crate::report::format_report_with_sync(
             &BackupResult {
                 success: errors.is_empty(),
@@ -2465,5 +2471,23 @@ mod tests {
         let result = run_backup(&config, &options, &TestProgress::new()).unwrap();
         assert!(result.success, "{:?}", result.errors);
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn the_report_is_emailed_only_when_asked_for_and_email_is_enabled() {
+        let mut config = make_test_config();
+        for (send, enabled, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            config.email.enabled = enabled;
+            let options = BackupOptions {
+                send_report: send,
+                ..Default::default()
+            };
+            assert_eq!(emails_report(&options, &config), want, "{send} {enabled}");
+        }
     }
 }

@@ -239,6 +239,21 @@ fn save_config_and_btrbk_conf_with(
     Ok(())
 }
 
+/// Refuse a config, submitted from outside, that moves `general.btrbk_conf`.
+/// Saving it writes `btrbk.conf` as root at the path the config names, so a
+/// caller-supplied config must not choose where that write lands (the D-Bus
+/// helper's polkit check authorizes the action, never the path). Moving the
+/// file is a root edit of `config.toml`.
+pub fn refuse_moving_btrbk_conf(current: &Config, submitted: &Config) -> Result<(), String> {
+    if submitted.general.btrbk_conf == current.general.btrbk_conf {
+        return Ok(());
+    }
+    Err(format!(
+        "general.btrbk_conf cannot be changed this way (is '{}', submitted '{}'); edit config.toml as root",
+        current.general.btrbk_conf, submitted.general.btrbk_conf
+    ))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -830,5 +845,15 @@ enabled = false
         let err = save_config_and_btrbk_conf(&cfg, &config_path).unwrap_err();
         assert!(err.to_string().contains("rollback copy"), "{err}");
         assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn a_submitted_config_may_not_move_btrbk_conf() {
+        let current = Config::default();
+        assert_eq!(refuse_moving_btrbk_conf(&current, &current.clone()), Ok(()));
+        let mut moved = current.clone();
+        moved.general.btrbk_conf = "/usr/lib/anything-root-owned".into();
+        let err = refuse_moving_btrbk_conf(&current, &moved).unwrap_err();
+        assert!(err.contains("anything-root-owned"), "{err}");
     }
 }
