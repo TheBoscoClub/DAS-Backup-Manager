@@ -2366,4 +2366,26 @@ mod tests {
         // No snapshot name is listed any more.
         assert!(!text.contains("srv.2026"), "{text}");
     }
+
+    #[test]
+    fn an_untrusted_clock_refuses_retirement_on_every_return_path() {
+        // Retirement alone (nothing else changes the config), and a dry run
+        // that would also adopt: both must carry the refusal and fail.
+        for (dry_run, listed) in [(false, &["@srv"][..]), (true, &["@srv", "@srv/web"][..])] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = on_disk_config(dir.path());
+            let before = std::fs::read_to_string(&path).unwrap();
+            let r = scripted(vec![healthy("/ssd", "abc", listed)]);
+            let out = sync_subvolumes(&path, dry_run, "1970-01-01", &r, &mounted).unwrap();
+            assert!(
+                out.retire_refused
+                    .as_deref()
+                    .is_some_and(|w| w.contains("1970-01-01")),
+                "dry_run={dry_run}: {out:?}"
+            );
+            assert!(out.failed(), "dry_run={dry_run}");
+            assert!(!out.written, "dry_run={dry_run}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
 }

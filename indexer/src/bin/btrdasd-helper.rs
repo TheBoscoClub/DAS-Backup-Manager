@@ -310,22 +310,6 @@ fn save_config(config: &Config) -> Result<(), fdo::Error> {
         .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
 }
 
-/// Refuse a submitted config that moves `general.btrbk_conf`. Saving writes
-/// `btrbk.conf` as root at the path the config names, and polkit authorizes
-/// the action, never the path (the reasoning of `CANONICAL_CONFIG`): a
-/// caller-supplied TOML must not choose where root writes. Moving the file is
-/// a root edit of `config.toml`.
-fn refuse_btrbk_conf_move(current: &Config, submitted: &Config) -> Result<(), fdo::Error> {
-    if submitted.general.btrbk_conf == current.general.btrbk_conf {
-        return Ok(());
-    }
-    Err(fdo::Error::Failed(format!(
-        "general.btrbk_conf cannot be changed through the helper (is '{}', submitted '{}'); \
-         edit {CANONICAL_CONFIG} as root",
-        current.general.btrbk_conf, submitted.general.btrbk_conf
-    )))
-}
-
 /// The one index database this daemon will open.
 ///
 /// Every `Index*` method used to take the database path from the caller and
@@ -1308,7 +1292,10 @@ impl HelperInterface {
                 errors.join("; ")
             )));
         }
-        refuse_btrbk_conf_move(&load_config()?, &config)?;
+        // Saving writes btrbk.conf as root at the path the config names, and
+        // polkit authorizes the action, never the path (see CANONICAL_CONFIG).
+        btrbk_conf::refuse_moving_btrbk_conf(&load_config()?, &config)
+            .map_err(fdo::Error::Failed)?;
 
         save_config(&config)
     }
@@ -1881,15 +1868,5 @@ mod tests {
             .expect("a real database must compute an entry");
         assert!(entry.json.contains("\"snapshots\""), "json: {}", entry.json);
         assert!(entry.db_size_bytes > 0, "an opened DB has a nonzero size");
-    }
-
-    #[test]
-    fn a_submitted_config_may_not_move_btrbk_conf() {
-        let current = Config::default();
-        assert!(refuse_btrbk_conf_move(&current, &current.clone()).is_ok());
-        let mut moved = current.clone();
-        moved.general.btrbk_conf = "/usr/lib/anything-root-owned".into();
-        let err = refuse_btrbk_conf_move(&current, &moved).unwrap_err();
-        assert!(err.to_string().contains("anything-root-owned"), "{err}");
     }
 }
