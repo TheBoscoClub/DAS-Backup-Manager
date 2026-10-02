@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI's job log showed the helper's lines out of order, and every backup ended twice** (bd `DAS-Backup-Manager-6bp`) — `btrdasd-helper` spawned one task per progress event to emit its D-Bus signal, so lines a job wrote together could overtake each other (a retired subvolume appeared under "Skipped"), and `JobFinished` was sent once by the library's `on_complete` and again by the helper, in either order. Every job's events now go through one queue drained by one thread (`progress::OrderedProgress`), and `JobFinished` is sent exactly once, after the job's last line; the library's own completion summary arrives as a log line
 - **A target with no display name aborted `backup-run.sh`'s config load under `set -u`** (`DAS_TARGET_<n>_DISPLAY_NAME` unbound) — it now falls back to the target's label
 - **Subvolume paths containing a space were misread** — the listing parser took the last word of the path; it now keeps everything after `path ` on lines starting `ID `
 - **`btrdasd backup run` did not check that a source volume held the expected filesystem** before using it; it now verifies the UUID and that the volume is mounted at its top level, as `backup-run.sh` already did

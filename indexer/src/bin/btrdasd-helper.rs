@@ -31,7 +31,9 @@ use buttered_dasd::fsutil::SystemRunner;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
-use buttered_dasd::progress::{LogLevel, ProgressCallback};
+use buttered_dasd::progress::{
+    LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
+};
 use buttered_dasd::report;
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
@@ -111,115 +113,87 @@ fn new_job_id() -> String {
 // D-Bus progress bridge
 // ---------------------------------------------------------------------------
 
-/// A `ProgressCallback` implementation that emits D-Bus signals for each
-/// progress event.  Holds a connection and job_id so it can send signals
-/// without access to the interface object.
-struct DbusProgress {
+/// Delivers a job's progress events as D-Bus signals. Only the emission is
+/// here: the ordering — one queue per job, drained by one thread, ending with
+/// exactly one `JobFinished` — is `progress::OrderedProgress`, in the library
+/// where it is tested (bd DAS-Backup-Manager-6bp).
+struct DbusSink {
     conn: Connection,
     job_id: String,
     cancel: CancelFlag,
+    runtime: tokio::runtime::Handle,
 }
 
-impl DbusProgress {
-    fn new(conn: Connection, job_id: String, cancel: CancelFlag) -> Self {
-        Self {
-            conn,
-            job_id,
-            cancel,
+impl ProgressSink for DbusSink {
+    fn emit(&mut self, event: ProgressEvent) {
+        if let ProgressEvent::Log { level, message } = &event {
+            // The journal keeps every line, for post-mortem debugging.
+            eprintln!("[{}] {message}", level_name(*level));
+        }
+        // A cancelled job was aborted at its caller's request; nothing more
+        // of it is sent, as before.
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let conn = &self.conn;
+        let job_id = self.job_id.as_str();
+        let sent = self.runtime.block_on(async move {
+            let iface = conn
+                .object_server()
+                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
+                .await?;
+            let ctxt = iface.signal_emitter();
+            match event {
+                ProgressEvent::Stage { stage, .. } => {
+                    HelperInterface::job_progress(ctxt, job_id, &stage, 0, "").await
+                }
+                ProgressEvent::Progress {
+                    current,
+                    total,
+                    message,
+                } => {
+                    let percent = ProgressEvent::percent(current, total);
+                    HelperInterface::job_progress(ctxt, job_id, "progress", percent, &message).await
+                }
+                ProgressEvent::Log { level, message } => {
+                    HelperInterface::job_log(ctxt, job_id, level_name(level), &message).await
+                }
+                ProgressEvent::Finished { success, summary } => {
+                    HelperInterface::job_finished(ctxt, job_id, success, &summary).await
+                }
+            }
+        });
+        if let Err(e) = sent {
+            eprintln!("btrdasd-helper: job {job_id}: signal not sent: {e}");
         }
     }
 }
 
-impl ProgressCallback for DbusProgress {
-    fn on_stage(&self, stage: &str, _total_steps: u64) {
-        if self.cancel.is_cancelled() {
-            return;
-        }
-        let conn = self.conn.clone();
-        let job_id = self.job_id.clone();
-        let stage = stage.to_owned();
-        tokio::spawn(async move {
-            let iface_ref = conn
-                .object_server()
-                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
-                .await;
-            if let Ok(iface) = iface_ref {
-                let ctxt = iface.signal_emitter();
-                let _ = HelperInterface::job_progress(ctxt, &job_id, &stage, 0, "").await;
-            }
-        });
+/// The level word the GUI's log view reads.
+fn level_name(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warning => "warn",
+        LogLevel::Error => "error",
     }
+}
 
-    fn on_progress(&self, current: u64, total: u64, message: &str) {
-        if self.cancel.is_cancelled() {
-            return;
-        }
-        let percent = (current * 100)
-            .checked_div(total)
-            .map(|p| p.min(100) as i32)
-            .unwrap_or(0);
-        let conn = self.conn.clone();
-        let job_id = self.job_id.clone();
-        let msg = message.to_owned();
-        tokio::spawn(async move {
-            let iface_ref = conn
-                .object_server()
-                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
-                .await;
-            if let Ok(iface) = iface_ref {
-                let ctxt = iface.signal_emitter();
-                let _ =
-                    HelperInterface::job_progress(ctxt, &job_id, "progress", percent, &msg).await;
-            }
-        });
-    }
+/// A job's progress: its events reach the GUI in order, through one queue.
+fn job_progress(conn: &Connection, job_id: &str, cancel: &CancelFlag) -> Arc<OrderedProgress> {
+    Arc::new(OrderedProgress::new(DbusSink {
+        conn: conn.clone(),
+        job_id: job_id.to_owned(),
+        cancel: cancel.clone(),
+        runtime: tokio::runtime::Handle::current(),
+    }))
+}
 
-    fn on_throughput(&self, _bytes_per_sec: u64) {
-        // Throughput is informational; folded into progress messages if needed.
-    }
-
-    fn on_log(&self, level: LogLevel, message: &str) {
-        if self.cancel.is_cancelled() {
-            return;
-        }
-        let level_str = match level {
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warning => "warn",
-            LogLevel::Error => "error",
-        };
-        // Also log to stderr (journald) for post-mortem debugging.
-        eprintln!("[{level_str}] {message}");
-        let conn = self.conn.clone();
-        let job_id = self.job_id.clone();
-        let lvl = level_str.to_owned();
-        let msg = message.to_owned();
-        tokio::spawn(async move {
-            let iface_ref = conn
-                .object_server()
-                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
-                .await;
-            if let Ok(iface) = iface_ref {
-                let ctxt = iface.signal_emitter();
-                let _ = HelperInterface::job_log(ctxt, &job_id, &lvl, &msg).await;
-            }
-        });
-    }
-
-    fn on_complete(&self, success: bool, summary: &str) {
-        let conn = self.conn.clone();
-        let job_id = self.job_id.clone();
-        let summ = summary.to_owned();
-        tokio::spawn(async move {
-            let iface_ref = conn
-                .object_server()
-                .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
-                .await;
-            if let Ok(iface) = iface_ref {
-                let ctxt = iface.signal_emitter();
-                let _ = HelperInterface::job_finished(ctxt, &job_id, success, &summ).await;
-            }
-        });
+/// End a job: `JobFinished` goes out once, after every line the job logged.
+async fn finish_job(progress: Arc<OrderedProgress>, success: bool, summary: String) {
+    // `finish` waits for the queue to drain; keep that off the async workers.
+    if let Err(e) = tokio::task::spawn_blocking(move || progress.finish(success, &summary)).await {
+        eprintln!("btrdasd-helper: finishing a job panicked: {e}");
     }
 }
 
@@ -405,13 +379,14 @@ impl HelperInterface {
 
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
+                let progress = &*progress;
                 // Join the same two-lock interlock as the scheduled path and the
                 // CLI: singleton (non-blocking — a second backup is redundant,
                 // not late) then the shared maintenance lock (blocking — a scrub
@@ -421,14 +396,14 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(&progress) {
+                let _locks = match backup::acquire_manual_locks(progress) {
                     Ok(BackupLockAttempt::Acquired(locks)) => locks,
                     Ok(BackupLockAttempt::AlreadyRunning) => {
                         return Err("A backup is already running — declined".to_string());
                     }
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
-                let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
+                let mut source_guard = mount::ensure_sources_mounted(&config, progress);
                 // A GUI backup syncs exactly as the CLI and the timer do: a
                 // subvolume that exists is backed up by this run. The section
                 // reaches the GUI through the job log.
@@ -438,7 +413,7 @@ impl HelperInterface {
                     &caldate::today(),
                     &SystemRunner,
                     &health::is_mountpoint,
-                    &progress,
+                    progress,
                 )
                 .map_err(|e| format!("Config could not be reloaded after subvolume sync: {e}"))?;
                 // Same rule as the CLI: a failed sync never stops the run,
@@ -446,10 +421,10 @@ impl HelperInterface {
                 let sync_failed = sync.failed;
                 let mut options = options;
                 options.subvolume_sync = Some(sync);
-                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                let mut guard = mount::ensure_targets_mounted(&config, progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
-                let res = match backup::run_backup(&config, &options, &progress) {
+                let res = match backup::run_backup(&config, &options, progress) {
                     Ok(r) => {
                         // Record the backup run in the database for history (skip dry runs).
                         if !options.dry_run {
@@ -487,8 +462,8 @@ impl HelperInterface {
                     Err(e) => Err(format!("Backup failed: {e}")),
                 };
 
-                guard.unmount(&progress);
-                source_guard.unmount(&progress);
+                guard.unmount(progress);
+                source_guard.unmount(progress);
                 res
             })
             .await
@@ -499,7 +474,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -522,13 +497,14 @@ impl HelperInterface {
         let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                let progress = &*progress;
                 // Join the same two-lock interlock as the scheduled path and the
                 // CLI: singleton (non-blocking — a second backup is redundant,
                 // not late) then the shared maintenance lock (blocking — a scrub
@@ -538,19 +514,19 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(&progress) {
+                let _locks = match backup::acquire_manual_locks(progress) {
                     Ok(BackupLockAttempt::Acquired(locks)) => locks,
                     Ok(BackupLockAttempt::AlreadyRunning) => {
                         return Err("A backup is already running — declined".to_string());
                     }
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
-                let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
-                let res = match backup::create_snapshots(&config, &sources, &progress) {
+                let mut source_guard = mount::ensure_sources_mounted(&config, progress);
+                let res = match backup::create_snapshots(&config, &sources, progress) {
                     Ok(n) => Ok(format!("{n} snapshots created")),
                     Err(e) => Err(format!("Snapshot failed: {e}")),
                 };
-                source_guard.unmount(&progress);
+                source_guard.unmount(progress);
                 res
             })
             .await
@@ -561,7 +537,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -584,15 +560,16 @@ impl HelperInterface {
         let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
         // Send from all sources to the specified targets.
         let sources: Vec<String> = Vec::new();
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                let progress = &*progress;
                 // Join the same two-lock interlock as the scheduled path and the
                 // CLI: singleton (non-blocking — a second backup is redundant,
                 // not late) then the shared maintenance lock (blocking — a scrub
@@ -602,25 +579,25 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(&progress) {
+                let _locks = match backup::acquire_manual_locks(progress) {
                     Ok(BackupLockAttempt::Acquired(locks)) => locks,
                     Ok(BackupLockAttempt::AlreadyRunning) => {
                         return Err("A backup is already running — declined".to_string());
                     }
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
-                let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
-                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                let mut source_guard = mount::ensure_sources_mounted(&config, progress);
+                let mut guard = mount::ensure_targets_mounted(&config, progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
-                let res =
-                    match backup::send_snapshots(&config, &sources, &targets, false, &progress) {
-                        Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
-                        Err(e) => Err(format!("Send failed: {e}")),
-                    };
+                let res = match backup::send_snapshots(&config, &sources, &targets, false, progress)
+                {
+                    Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
+                    Err(e) => Err(format!("Send failed: {e}")),
+                };
 
-                guard.unmount(&progress);
-                source_guard.unmount(&progress);
+                guard.unmount(progress);
+                source_guard.unmount(progress);
                 res
             })
             .await
@@ -631,7 +608,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -653,13 +630,14 @@ impl HelperInterface {
         let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+                let progress = &*progress;
                 // Join the same two-lock interlock as the scheduled path and the
                 // CLI: singleton (non-blocking — a second backup is redundant,
                 // not late) then the shared maintenance lock (blocking — a scrub
@@ -669,17 +647,17 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(&progress) {
+                let _locks = match backup::acquire_manual_locks(progress) {
                     Ok(BackupLockAttempt::Acquired(locks)) => locks,
                     Ok(BackupLockAttempt::AlreadyRunning) => {
                         return Err("A backup is already running — declined".to_string());
                     }
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
-                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                let mut guard = mount::ensure_targets_mounted(&config, progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
-                let res = match backup::archive_boot(&config, &progress) {
+                let res = match backup::archive_boot(&config, progress) {
                     Ok(archived) => {
                         let msg = if archived {
                             "Boot subvolumes archived"
@@ -691,7 +669,7 @@ impl HelperInterface {
                     Err(e) => Err(format!("Boot archive failed: {e}")),
                 };
 
-                guard.unmount(&progress);
+                guard.unmount(progress);
                 res
             })
             .await
@@ -702,7 +680,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -728,16 +706,17 @@ impl HelperInterface {
         let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
         let target_path = target_path.to_owned();
         let db_path = config.general.db_path.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                let progress = &*progress;
+                let mut guard = mount::ensure_targets_mounted(&config, progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
@@ -779,7 +758,7 @@ impl HelperInterface {
                     }
                 }
 
-                guard.unmount(&progress);
+                guard.unmount(progress);
 
                 if !errors.is_empty() && total_indexed == 0 {
                     Err(format!("Indexing failed: {}", errors.join("; ")))
@@ -801,7 +780,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -1134,16 +1113,17 @@ impl HelperInterface {
         let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
         let snapshot = snapshot.to_owned();
         let dest = dest.to_owned();
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                let progress = &*progress;
+                let mut guard = mount::ensure_targets_mounted(&config, progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
@@ -1153,7 +1133,7 @@ impl HelperInterface {
                     Path::new(&dest),
                     &config.restore.allowed_roots,
                     &restore::snapshot_source_roots(&config),
-                    &progress,
+                    progress,
                 ) {
                     Ok(r) => Ok((
                         r.errors.is_empty(),
@@ -1167,7 +1147,7 @@ impl HelperInterface {
                     Err(e) => Err(format!("Restore failed: {e}")),
                 };
 
-                guard.unmount(&progress);
+                guard.unmount(progress);
                 res
             })
             .await
@@ -1178,7 +1158,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -1202,16 +1182,17 @@ impl HelperInterface {
         let config = load_config()?;
         let job_id = new_job_id();
         let cancel = CancelFlag::new();
-        let progress = DbusProgress::new(self.conn.clone(), job_id.clone(), cancel.clone());
+        let progress = job_progress(&self.conn, &job_id, &cancel);
+        let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        let conn = self.conn.clone();
         let snapshot = snapshot.to_owned();
         let dest = dest.to_owned();
 
         let handle = tokio::spawn(async move {
             let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                let mut guard = mount::ensure_targets_mounted(&config, &progress)
+                let progress = &*progress;
+                let mut guard = mount::ensure_targets_mounted(&config, progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let res = match restore::restore_snapshot(
@@ -1219,7 +1200,7 @@ impl HelperInterface {
                     Path::new(&dest),
                     &config.restore.allowed_roots,
                     &restore::snapshot_source_roots(&config),
-                    &progress,
+                    progress,
                 ) {
                     Ok(r) => Ok((
                         r.errors.is_empty(),
@@ -1233,7 +1214,7 @@ impl HelperInterface {
                     Err(e) => Err(format!("Snapshot restore failed: {e}")),
                 };
 
-                guard.unmount(&progress);
+                guard.unmount(progress);
                 res
             })
             .await
@@ -1244,7 +1225,7 @@ impl HelperInterface {
                 Err(msg) => (false, msg),
             };
 
-            emit_job_finished(&conn, &jid, success, &summary).await;
+            finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
         });
 
@@ -1711,18 +1692,6 @@ fn compute_stats_entry(db_path: &str) -> Result<StatsCacheEntry, String> {
         db_size_bytes,
         json,
     })
-}
-
-/// Emit a JobFinished signal from outside the interface method context.
-async fn emit_job_finished(conn: &Connection, job_id: &str, success: bool, summary: &str) {
-    let iface_ref = conn
-        .object_server()
-        .interface::<_, HelperInterface>("/org/dasbackup/Helper1")
-        .await;
-    if let Ok(iface) = iface_ref {
-        let ctxt = iface.signal_emitter();
-        let _ = HelperInterface::job_finished(ctxt, job_id, success, summary).await;
-    }
 }
 
 // ---------------------------------------------------------------------------
