@@ -567,6 +567,24 @@ fn step_targets(
             _ => TargetRole::Mirror,
         };
 
+        // Record the filesystem's UUID when the drive is attached, so the
+        // target is found and verified by filesystem, not only by serial
+        // (bd DAS-Backup-Manager-arx).
+        let mount_uuid = (sys.fs_uuid_for)(&serial, &role);
+        match &mount_uuid {
+            Some(uuid) => say!(
+                p,
+                "  {} filesystem UUID {uuid} recorded as mount_uuid",
+                style("✓").green()
+            ),
+            None => say!(
+                p,
+                "  {} no BTRFS filesystem found on drive {serial} — mount_uuid not recorded; \
+                 setup --check will report it",
+                style("Note:").yellow()
+            ),
+        }
+
         let weekly: u32 = p.input("Retention: weeks to keep", Some(4_u32))?;
 
         let monthly: u32 = p.input("Retention: months to keep", Some(2_u32))?;
@@ -575,7 +593,7 @@ fn step_targets(
             label,
             serials: vec![serial.clone()],
             serial,
-            mount_uuid: None,
+            mount_uuid,
             mount,
             role,
             retention: Retention {
@@ -1217,6 +1235,7 @@ mod tests {
             init_system: InitSystemDetected::Systemd,
             package_manager: PackageManager::Pacman,
             deps: Vec::new(),
+            fs_uuid_for: |_, _| None,
         }
     }
 
@@ -1734,6 +1753,47 @@ mod tests {
         p.assert_said("Note: No USB/DAS devices detected. Enter manually.");
         p.assert_not_said("Detected USB/DAS devices:");
         assert!(config.targets.is_empty());
+    }
+
+    /// A new target whose drive is attached gets its filesystem's UUID as
+    /// `mount_uuid`, looked up for the serial and role typed; one whose drive
+    /// is not gets none, and the wizard says so (bd DAS-Backup-Manager-arx).
+    #[test]
+    fn targets_record_the_filesystem_uuid_when_the_drive_is_attached() {
+        fn lookup(serial: &str, role: &TargetRole) -> Option<String> {
+            (serial == "ZK208Q77" && *role == TargetRole::Mirror).then(|| "60b0-rec".to_string())
+        }
+        let mut sys = bare_system();
+        sys.fs_uuid_for = lookup;
+        let mut config = Config::default();
+        let mut p = Script::new(vec![
+            Reply::Accept,
+            Reply::Text("recovery-A"),
+            Reply::Text("ZK208Q77"),
+            Reply::Text("/mnt/backup-system-recovery-A"),
+            Reply::Select(1),
+            Reply::Accept,
+            Reply::Accept,
+            Reply::Confirm(true),
+            Reply::Text("absent"),
+            Reply::Text("NOTHERE"),
+            Reply::Text("/mnt/absent"),
+            Reply::Accept,
+            Reply::Accept,
+            Reply::Accept,
+            Reply::Accept,
+        ]);
+
+        step_targets(&mut p, &sys, &mut config).unwrap();
+
+        p.assert_finished();
+        assert_eq!(config.targets[0].mount_uuid.as_deref(), Some("60b0-rec"));
+        assert_eq!(config.targets[1].mount_uuid, None);
+        p.assert_said("✓ filesystem UUID 60b0-rec recorded as mount_uuid");
+        p.assert_said(
+            "Note: no BTRFS filesystem found on drive NOTHERE — mount_uuid not recorded; \
+             setup --check will report it",
+        );
     }
 
     #[test]

@@ -393,6 +393,82 @@ pub fn parse_smartctl_details(json_str: &str) -> Option<SmartDetails> {
     })
 }
 
+/// The block device holding the filesystem whose UUID is `uuid`, if this host
+/// has one — `blkid -U`, the same question `backup-run.sh` asks. This looks
+/// up ONE identity named in the config; it never lists filesystems. For a
+/// multi-device BTRFS filesystem any one member answers. `None` when the UUID
+/// is empty, nothing has it, or `blkid` cannot answer — the target is then
+/// not available, which is the cautious reading.
+pub fn device_for_fs_uuid(uuid: &str) -> Option<String> {
+    device_for_fs_uuid_with(&crate::fsutil::SystemRunner, uuid)
+}
+
+/// [`device_for_fs_uuid`] with `blkid` run by `runner`.
+pub fn device_for_fs_uuid_with(
+    runner: &dyn crate::fsutil::CommandRunner,
+    uuid: &str,
+) -> Option<String> {
+    if uuid.is_empty() {
+        return None;
+    }
+    let out = runner
+        .output(std::process::Command::new("blkid").args(["-U", uuid]))
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    dev.starts_with("/dev/").then_some(dev)
+}
+
+/// The UUID of the BTRFS filesystem on the partition a target of `role` uses
+/// on the drive with `serial` — what `btrdasd setup` records as a new
+/// target's `mount_uuid`. One lookup by the identities the operator typed;
+/// `None` when the drive is absent or that partition is not BTRFS (a
+/// recovery drive's partition 1 is its own ESP and is never offered).
+pub fn btrfs_uuid_for_serial(serial: &str, role: &TargetRole) -> Option<String> {
+    btrfs_uuid_for_serial_with(
+        &crate::fsutil::SystemRunner,
+        &device_from_serial,
+        serial,
+        role,
+    )
+}
+
+/// [`btrfs_uuid_for_serial`] with the drive lookup and `blkid` supplied.
+pub fn btrfs_uuid_for_serial_with(
+    runner: &dyn crate::fsutil::CommandRunner,
+    device_from_serial: &dyn Fn(&str) -> Option<String>,
+    serial: &str,
+    role: &TargetRole,
+) -> Option<String> {
+    let dev = device_from_serial(serial)?;
+    btrfs_uuid_of_with(runner, &crate::mount::partition_device(&dev, role))
+}
+
+/// The filesystem UUID of `device` if it holds BTRFS, per `blkid -o export`.
+pub fn btrfs_uuid_of_with(
+    runner: &dyn crate::fsutil::CommandRunner,
+    device: &str,
+) -> Option<String> {
+    let out = runner
+        .output(std::process::Command::new("blkid").args(["-o", "export", device]))
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+    };
+    (field("TYPE") == Some("btrfs"))
+        .then(|| field("UUID"))
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// Attempt to find the block device path whose serial number contains `serial`.
 ///
 /// Walks `/dev/disk/by-id/` looking for symlinks whose name includes the
@@ -1613,5 +1689,142 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         assert_eq!(h.status, ScrubHealthStatus::Ok);
         assert_eq!(h.fsuuid.as_deref(), Some(fsuuid.as_str()));
         assert_eq!(h.age_days, Some(5));
+    }
+
+    #[test]
+    fn device_for_fs_uuid_reads_blkid_and_is_absent_on_any_failure() {
+        use crate::fsutil::testing::Scripted;
+        let runner = Scripted::new(&[
+            ("blkid -U u-1", 0, "/dev/sdc1\n"),
+            ("blkid -U u-2", 2, ""),
+            ("blkid -U u-3", 0, "\n"),
+            ("blkid -U u-4", 0, "garbage\n"),
+        ]);
+        assert_eq!(
+            device_for_fs_uuid_with(&runner, "u-1").as_deref(),
+            Some("/dev/sdc1")
+        );
+        assert_eq!(
+            device_for_fs_uuid_with(&runner, "u-2"),
+            None,
+            "no such UUID"
+        );
+        assert_eq!(
+            device_for_fs_uuid_with(&runner, "u-3"),
+            None,
+            "empty answer"
+        );
+        assert_eq!(
+            device_for_fs_uuid_with(&runner, "u-4"),
+            None,
+            "not a device"
+        );
+        assert_eq!(
+            device_for_fs_uuid_with(&runner, "u-5"),
+            None,
+            "unscripted: exit 1"
+        );
+        assert_eq!(device_for_fs_uuid_with(&runner, ""), None);
+        assert_eq!(runner.calls().len(), 5, "an empty UUID runs nothing");
+    }
+
+    #[test]
+    fn device_for_fs_uuid_finds_the_root_filesystem_on_this_machine() {
+        // The one identity every machine has: whatever `/` is. Read-only.
+        let Ok(out) = std::process::Command::new("findmnt")
+            .args(["-n", "-o", "UUID", "/"])
+            .output()
+        else {
+            return;
+        };
+        let uuid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if uuid.is_empty() || !Path::new(&format!("/dev/disk/by-uuid/{uuid}")).exists() {
+            return; // a container root (overlay) has no UUID to look up
+        }
+        let dev = device_for_fs_uuid(&uuid).expect("blkid -U must find the root filesystem");
+        assert!(dev.starts_with("/dev/"), "{dev}");
+        assert_eq!(
+            device_for_fs_uuid("00000000-0000-0000-0000-000000000000"),
+            None
+        );
+    }
+
+    #[test]
+    fn btrfs_uuid_of_reads_only_a_btrfs_filesystem() {
+        use crate::fsutil::testing::Scripted;
+        let runner = Scripted::new(&[
+            (
+                "blkid -o export /dev/sdc2",
+                0,
+                "DEVNAME=/dev/sdc2\nUUID=60b0\nUUID_SUB=x\nTYPE=btrfs\n",
+            ),
+            (
+                "blkid -o export /dev/sdc1",
+                0,
+                "DEVNAME=/dev/sdc1\nUUID=6D15-0632\nTYPE=vfat\n",
+            ),
+            ("blkid -o export /dev/sdd1", 0, "TYPE=btrfs\n"),
+            ("blkid -o export /dev/sde1", 2, "TYPE=btrfs\nUUID=zz\n"),
+            ("blkid -o export /dev/sdf1", 0, "TYPE=btrfs\nUUID=\n"),
+        ]);
+        assert_eq!(
+            btrfs_uuid_of_with(&runner, "/dev/sdc2").as_deref(),
+            Some("60b0")
+        );
+        assert_eq!(
+            btrfs_uuid_of_with(&runner, "/dev/sdc1"),
+            None,
+            "an ESP is never offered"
+        );
+        assert_eq!(
+            btrfs_uuid_of_with(&runner, "/dev/sdd1"),
+            None,
+            "no UUID line"
+        );
+        assert_eq!(
+            btrfs_uuid_of_with(&runner, "/dev/sde1"),
+            None,
+            "blkid failed"
+        );
+        assert_eq!(btrfs_uuid_of_with(&runner, "/dev/sdf1"), None, "empty UUID");
+        assert_eq!(btrfs_uuid_of_with(&runner, "/dev/none"), None, "unscripted");
+    }
+
+    #[test]
+    fn btrfs_uuid_for_serial_reads_the_partition_the_role_uses() {
+        use crate::fsutil::testing::Scripted;
+        let runner = Scripted::new(&[
+            (
+                "blkid -o export /dev/sdc1",
+                0,
+                "UUID=6D15-0632\nTYPE=vfat\n",
+            ),
+            ("blkid -o export /dev/sdc2", 0, "UUID=60b0\nTYPE=btrfs\n"),
+            ("blkid -o export /dev/sdd1", 0, "UUID=b2db\nTYPE=btrfs\n"),
+        ]);
+        let lookup = |serial: &str| match serial {
+            "REC" => Some("/dev/sdc".to_string()),
+            "PRI" => Some("/dev/sdd".to_string()),
+            _ => None,
+        };
+        let uuid = |serial, role| btrfs_uuid_for_serial_with(&runner, &lookup, serial, role);
+        assert_eq!(uuid("REC", &TargetRole::Mirror).as_deref(), Some("60b0"));
+        assert_eq!(
+            uuid("REC", &TargetRole::Primary),
+            None,
+            "partition 1 is the ESP"
+        );
+        assert_eq!(uuid("PRI", &TargetRole::Primary).as_deref(), Some("b2db"));
+        assert_eq!(uuid("GONE", &TargetRole::Primary), None);
+        assert_eq!(runner.calls().len(), 3, "an absent drive runs nothing");
+    }
+
+    #[test]
+    fn btrfs_uuid_for_serial_is_absent_for_a_drive_that_is_not_here() {
+        assert_eq!(
+            btrfs_uuid_for_serial("DAS-NO-SUCH-SERIAL-XYZ", &TargetRole::Primary),
+            None
+        );
+        assert_eq!(btrfs_uuid_for_serial("", &TargetRole::Mirror), None);
     }
 }

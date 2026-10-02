@@ -254,7 +254,17 @@ CI/CD pipelines.
 .TP
 .B \-\-check
 Validate the configuration and dependencies, report issues,
-but change nothing.
+but change nothing. A target with no
+.B mount_uuid
+is reported, with the UUID udev knows for its drive when it is attached and
+the line to add to its
+.B [[target]]
+\(em without one, the CLI and GUI find the target by drive serial only and
+verify only that its mount path is a mount point. The setup wizard records
+.B mount_uuid
+for a new target whose drive is attached;
+.B \-\-upgrade
+never adds it to an existing config.
 .\"
 .SS config dump\-env
 Print shell-sourceable KEY=VALUE pairs from the configuration.

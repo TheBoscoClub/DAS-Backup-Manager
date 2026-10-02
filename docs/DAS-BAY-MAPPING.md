@@ -112,7 +112,11 @@ yearly = 0
 lists both member serials (operator advisory only: a missing member logs a warning but
 does not abort, since a degraded RAID-1 array still mounts from any present leg). For a
 multi-device target you can also set `mount_uuid` to mount by the filesystem's BTRFS UUID
-directly instead of resolving a device from `serials`.
+directly instead of resolving a device from `serials`. With `mount_uuid` set, `backup-run.sh`,
+`btrdasd backup run` and the GUI all treat the target as present when any listed serial is
+attached or a filesystem with that UUID is on the host, mount it by UUID and verify the mount
+by UUID. The setup wizard records it for a new target whose drive is attached;
+`sudo btrdasd setup --check` reports every target without one and prints the UUID to add.
 
 The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
 

@@ -156,6 +156,74 @@ pub fn udisks_exposure(export_db: &str, config: &Config) -> Vec<TargetExposure> 
     found
 }
 
+/// The BTRFS filesystem UUIDs udev reports on the drives carrying any of
+/// `serials` — the identity a target without `mount_uuid` would be given.
+/// Read from udev's database for the serials the config names; nothing is
+/// enumerated or acted on. Only BTRFS is considered, so a recovery drive's
+/// own ESP can never be offered.
+fn btrfs_uuids_for_serials(export_db: &str, serials: &[String]) -> Vec<String> {
+    let mut uuids: Vec<String> = Vec::new();
+    for record in export_db.split("\n\n") {
+        let prop = |key: &str| {
+            record
+                .lines()
+                .filter_map(|l| l.strip_prefix("E: "))
+                .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        };
+        if prop("SUBSYSTEM") != Some("block") || prop("ID_FS_TYPE") != Some("btrfs") {
+            continue;
+        }
+        let ours = prop("ID_SERIAL_SHORT").is_some_and(|s| serials.iter().any(|t| t == s));
+        if let (true, Some(uuid)) = (ours, prop("ID_FS_UUID"))
+            && !uuids.iter().any(|u| u == uuid)
+        {
+            uuids.push(uuid.to_string());
+        }
+    }
+    uuids
+}
+
+/// The lines `setup --check` prints about targets that have no `mount_uuid`
+/// (bd DAS-Backup-Manager-9v2, -arx). Without one, the CLI and the GUI find
+/// the target by drive serial only and verify only that its mount path is a
+/// mount point, not which filesystem is mounted there. Where udev knows the
+/// target's filesystem, the line to add is printed; `setup` never writes it
+/// into an existing config by itself.
+pub fn mount_uuid_report(export_db: &Result<String, String>, config: &Config) -> Vec<String> {
+    let mut lines = Vec::new();
+    for target in config
+        .targets
+        .iter()
+        .filter(|t| t.mount_uuid.as_deref().is_none_or(str::is_empty))
+    {
+        lines.push(format!(
+            "Target {} has no mount_uuid — found by drive serial only, and verified only \
+             as a mount point, not as its filesystem",
+            target.label
+        ));
+        let serials = target.effective_serials();
+        let hint = match export_db {
+            Err(e) => format!("  Its filesystem UUID could not be looked up: {e}"),
+            Ok(db) => match btrfs_uuids_for_serials(db, &serials).as_slice() {
+                [] => "  Its drive is not attached (or holds no BTRFS filesystem) — attach it \
+                       and run setup --check again to read its UUID"
+                    .to_string(),
+                [uuid] => format!(
+                    "  Its filesystem has UUID {uuid} — add  mount_uuid = \"{uuid}\"  to its \
+                     [[target]] in config.toml"
+                ),
+                many => format!(
+                    "  Its drives carry more than one BTRFS filesystem ({}) — set mount_uuid \
+                     by hand",
+                    many.join(", ")
+                ),
+            },
+        };
+        lines.push(hint);
+    }
+    lines
+}
+
 /// Run a command and return its stdout, or a description of why there is none.
 /// A command that ran and failed is an error, never an empty answer.
 fn command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
@@ -781,7 +849,11 @@ fn check_with(
     // Are the targets hidden from udisks2? Read back from udev rather than
     // from the rule file: a rule that exists and matches nothing looks
     // installed and does nothing (bd DAS-Backup-Manager-a10).
-    for line in udisks_report((probes.export_db)(), &config) {
+    let export_db = (probes.export_db)();
+    for line in mount_uuid_report(&export_db, &config) {
+        say(line);
+    }
+    for line in udisks_report(export_db, &config) {
         say(line);
     }
 
@@ -1104,6 +1176,75 @@ mod tests {
                     .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn mount_uuid_report_names_each_target_without_one_and_the_uuid_to_add() {
+        let mut config = exposure_config();
+        config
+            .targets
+            .push(exposure_target("blank", &["ZK208Q77"], Some("")));
+        let lines = mount_uuid_report(&Ok(export_db(true, true)), &config);
+        assert_eq!(
+            lines,
+            vec![
+                "Target recovery-A has no mount_uuid — found by drive serial only, and \
+                 verified only as a mount point, not as its filesystem"
+                    .to_string(),
+                // The ESP on the same drive (vfat) is never offered.
+                "  Its filesystem has UUID 60b05268-7f8f-47b5-a38a-752576a1172a — add  \
+                 mount_uuid = \"60b05268-7f8f-47b5-a38a-752576a1172a\"  to its [[target]] in \
+                 config.toml"
+                    .to_string(),
+                "Target unplugged has no mount_uuid — found by drive serial only, and \
+                 verified only as a mount point, not as its filesystem"
+                    .to_string(),
+                "  Its drive is not attached (or holds no BTRFS filesystem) — attach it and \
+                 run setup --check again to read its UUID"
+                    .to_string(),
+                "Target blank has no mount_uuid — found by drive serial only, and verified \
+                 only as a mount point, not as its filesystem"
+                    .to_string(),
+                "  Its filesystem has UUID 60b05268-7f8f-47b5-a38a-752576a1172a — add  \
+                 mount_uuid = \"60b05268-7f8f-47b5-a38a-752576a1172a\"  to its [[target]] in \
+                 config.toml"
+                    .to_string(),
+            ],
+            "the pair carries a mount_uuid and is not mentioned"
+        );
+    }
+
+    #[test]
+    fn mount_uuid_report_never_guesses_between_two_filesystems() {
+        let mut config = Config::default();
+        config
+            .targets
+            .push(exposure_target("mixed", &["ZK208Q77", "ZXA1NYGZ"], None));
+        let lines = mount_uuid_report(&Ok(export_db(true, true)), &config);
+        assert_eq!(
+            lines[1],
+            "  Its drives carry more than one BTRFS filesystem \
+             (60b05268-7f8f-47b5-a38a-752576a1172a, b2dbe07d-40b9-422e-8ccf-ef4931c40457) — \
+             set mount_uuid by hand"
+        );
+        let lines = mount_uuid_report(&Err("udevadm exited with 1".into()), &config);
+        assert_eq!(
+            lines[1],
+            "  Its filesystem UUID could not be looked up: udevadm exited with 1"
+        );
+        assert!(mount_uuid_report(&Ok(export_db(true, true)), &Config::default()).is_empty());
+    }
+
+    #[test]
+    fn btrfs_uuids_for_serials_reads_each_uuid_once() {
+        let db = export_db(true, true);
+        assert_eq!(
+            btrfs_uuids_for_serials(&db, &["ZXA1NYGZ".into(), "REPLACEMENT".into()]),
+            vec!["b2dbe07d-40b9-422e-8ccf-ef4931c40457".to_string()],
+            "two legs of one RAID-1 are one filesystem"
+        );
+        assert!(btrfs_uuids_for_serials(&db, &["NOTHERE".into()]).is_empty());
+        assert!(btrfs_uuids_for_serials(&db, &[]).is_empty());
     }
 
     #[test]
@@ -2172,6 +2313,12 @@ auth = "starttls""#,
                 "Config is valid".to_string(),
                 "Mail relay reachable at 127.0.0.1:25".to_string(),
                 format!("All {total} generated files present"),
+                "Target tgt has no mount_uuid — found by drive serial only, and verified only \
+                 as a mount point, not as its filesystem"
+                    .to_string(),
+                "  Its drive is not attached (or holds no BTRFS filesystem) — attach it and run \
+                 setup --check again to read its UUID"
+                    .to_string(),
                 "Target tgt not attached — udisks visibility could not be checked".to_string(),
                 "btrbk (/usr/bin/btrbk)".to_string(),
                 "smartctl (required, not found)".to_string(),

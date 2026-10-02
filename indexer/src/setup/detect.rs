@@ -7,6 +7,7 @@
 // Detection functions are thin wrappers that spawn the command; the decision
 // of whether its output counts as an answer lives in `successful_stdout`.
 
+use buttered_dasd::config::TargetRole;
 use serde::Deserialize;
 use std::process::Command;
 
@@ -313,6 +314,11 @@ pub struct SystemInfo {
     pub init_system: InitSystemDetected,
     pub package_manager: PackageManager,
     pub deps: Vec<DepStatus>,
+    /// The BTRFS filesystem UUID on the partition a target of this role uses
+    /// on the drive with this serial — recorded as a new target's
+    /// `mount_uuid`. A lookup, not detection: the wizard asks it once per
+    /// serial the operator types.
+    pub fs_uuid_for: fn(&str, &TargetRole) -> Option<String>,
 }
 
 impl SystemInfo {
@@ -324,6 +330,7 @@ impl SystemInfo {
             init_system: detect_init_system(),
             package_manager: detect_package_manager(),
             deps: check_dependencies(false),
+            fs_uuid_for: buttered_dasd::health::btrfs_uuid_for_serial,
         }
     }
 }
