@@ -60,9 +60,12 @@ per-filesystem command that finds coverage gaps.
 │       │    └────────────────┬──────────────┘                │
 │  ┌────┴─────────────────────┴──────────────────────┐        │
 │  │          libbuttered_dasd (Rust library)         │        │
-│  │  indexer │ config │ backup │ restore │ schedule   │        │
-│  │  db      │ health │ subvol │ progress│ report     │        │
-│  │  mount   │ doctor │ scrub  │ scanner │ restore    │        │
+│  │  adopt      │ backup     │ btrbk_conf │ caldate   │        │
+│  │  config     │ db         │ doctor     │ expire    │        │
+│  │  forget     │ fsutil     │ health     │ indexer   │        │
+│  │  mount      │ progress   │ reconcile  │ report    │        │
+│  │  restore    │ scanner    │ schedule   │ scrub     │        │
+│  │  subvol                                           │        │
 │  └──────────────────────┬───────────────────────────┘        │
 │                         │ D-Bus (org.dasbackup.Helper1)      │
 │  ┌──────────────────────┴────────────────────────┐           │
@@ -82,7 +85,7 @@ The system has six major components:
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
-| Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 10-step setup wizard with template generation |
+| Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 9-step setup wizard with template generation |
 
 ## Data Flow
 
@@ -94,17 +97,40 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
+         ├──▶ singleton lock (/run/das-backup.lock), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
          ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml when the plan changes it, and btrbk.conf whenever it differs from what config.toml renders to
-         │                                   (then: reload config, verify_sources_before_write() again for any source sync added)
-         ├──▶ create snapshot dirs, mount targets, verify_targets_before_btrbk()
+         │                                   (then: reload config, verify_sources_before_write() again for any source sync added;
+         │                                    under --dryrun nothing is written and btrbk reads a temporary rendered btrbk.conf instead)
+         ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
-         ├──▶ update_boot_subvolumes()     → archives + recreates @/@home boot subvolumes (--full runs)
-         ├──▶ btrdasd walk                 → indexes new snapshots into SQLite
-         ├──▶ boot-archive-cleanup.sh      → prunes expired @.archive.*/@home.archive.* snapshots
-         └──▶ mailx                        → sends email report (local relay, 127.0.0.1:25)
+         ├──▶ update_boot_subvolumes()     → creates missing @/@home on non-mirror targets; archives + recreates them only on --full runs
+         ├──▶ btrdasd walk                 → indexes new snapshots on the primary target into SQLite
+         ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
+         ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted
+         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report
+         ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25); report also written to last_report
+         └──▶ btrdasd backup record-run    → adds the run to backup_runs
 ```
+
+A `--dryrun` stops after the expiry preview: it previews the archive pruner and
+unmounts, and sends, records and archives nothing. It may create a missing, empty
+target directory (for example for a pending adoption), as the real run would.
+
+`btrdasd backup run` and the GUI (through `btrdasd-helper`'s `BackupRun`) run the same
+job through one library entry point, `backup::run_backup_job`: locks (decline if a
+backup holds the singleton, wait for the maintenance lock), mount sources, subvolume
+sync, mount targets (`mount::verify_write_targets()` before btrbk), `run_backup`, capture
+the report data while mounted, unmount (same 5 × 2 s retry; a mount point left mounted
+fails the run with `still mounted: …`), then report and record. A failed sync never
+stops the run, but marks it failed in the result, the report and `backup_runs`. These
+steps run only in `backup-run.sh`, which the timers start: `btrdasd subvol expire`,
+the boot-archive pruner, the growth log, and the throughput log with its USB link
+check (see `THROUGHPUT-BASELINE.md`). In the helper, a job's
+progress goes through one ordered queue (`progress::OrderedProgress`) and ends with
+exactly one `JobFinished`; `JobCancel` stops the reporting, not the work — a running
+btrbk send is not interrupted, and the locks are held until it ends.
 
 ESP synchronization to recovery drives was removed 2026-04-10 after the ESP-overwrite
 incident — see `.claude/rules/esp-safety.md`. `backup-run.sh` has no ESP/rsync step.
@@ -215,7 +241,8 @@ btrdasd walk /mnt/backup-target
          ├──▶ discover_snapshots()       Scan target for source/name.timestamp dirs
          │         │                     Parse dirname with regex: ^(.+)\.(\d{8}T\d{4,6})$
          │         ▼
-         │    Filter out already-indexed snapshots (by path in DB)
+         │    Filter out already-indexed snapshots (by source, name and timestamp —
+         │    a copy on another target is recorded in snapshot_targets, not re-indexed)
          │
          ├──▶ For each new snapshot:
          │         │
@@ -260,15 +287,19 @@ btrdasd-gui
 
 ### Schema
 
-The SQLite database at `/var/lib/das-backup/backup-index.db` uses four core tables plus an FTS5 virtual table:
+The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 3, kept in
+`PRAGMA user_version`) uses four index tables, two history tables and an FTS5 virtual table:
 
 ```sql
 snapshots (id PK, name, ts, source, path UNIQUE, indexed_at)
-files     (id PK, path, name, size, mtime, type)
+files     (id PK, series, path, name, size, mtime, type)  -- UNIQUE(series, path); series = snapshot name + source
 spans     (file_id FK, first_snap FK, last_snap FK, PK(file_id, first_snap))
 snapshot_targets (snapshot_id FK ON DELETE CASCADE, target_root, path,
                   PK(snapshot_id, target_root))   -- schema v3, which targets hold a snapshot
 files_fts (FTS5 virtual: name, path — synced via triggers)
+backup_runs  (id PK, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent,
+              duration_secs, errors)              -- run history, read by the GUI
+target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_count)
 ```
 
 ### Span-Based Deduplication
@@ -305,8 +336,11 @@ Three triggers keep the FTS5 index consistent:
 | `idx_snapshots_ts` | (ts) | Chronological ordering |
 | `idx_spans_file_id` | (file_id) | Lookup spans for a file |
 | `idx_files_name` | (name) | Direct file name lookups |
-| `idx_files_path` | (path) UNIQUE | File deduplication |
+| `idx_files_series_path` | (series, path) UNIQUE | File deduplication within one subvolume series |
 | `idx_spans_last` | (last_snap) | Span extension queries |
+| `idx_snapshot_targets_snap` | (snapshot_id) | Which targets hold a snapshot |
+| `idx_backup_runs_ts` | (timestamp) | Run history ordering |
+| `idx_target_usage_label_ts` | (target_label, timestamp) | Usage history per target |
 
 ### Concurrent Access
 
@@ -325,7 +359,7 @@ The installer uses a TOML configuration file (`/etc/das-backup/config.toml`) as 
 wizard → Config struct → config.toml (save)
                               │
                               ▼
-                    templates::generate() → GeneratedFiles
+                    GeneratedFiles::generate()
                               │
                               ▼
                     installer::install() → write files + manifest
@@ -335,17 +369,19 @@ wizard → Config struct → config.toml (save)
 
 | Section | Fields | Purpose |
 |---------|--------|---------|
-| `general` | version, install_prefix, db_path | Global settings |
+| `general` | version, install_prefix, db_path, log_file, growth_log, last_report, btrbk_conf | Global settings |
 | `init` | system (systemd/sysvinit/openrc) | Init system selection |
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
+| `das` | model_pattern, io_scheduler, mount_opts | DAS enclosure match, I/O scheduler, target mount options |
 | `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
 | `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
 | `doctor` | exclude[] | Older exclusion list, still read and merged with `[subvolumes].exclude` |
 | `subvolumes` | exclude[] | Glob patterns the backup run must not adopt (`btrdasd subvol sync`); a pattern also covers everything nested under it |
-| `source[]` | label, subvolume, mount_point, subvolumes[] (name, manual_only, snapshot_name, adopted, retired) | BTRFS sources; `adopted` / `retired` dates are written by the backup run |
-| `target[]` | label, device, mount_point, role, retention | Backup targets |
-| `email` | enabled, smtp_host, smtp_port, from, to, tls | Email reports |
-| `gui` | install (bool) | GUI installation toggle |
+| `restore` | allowed_roots[] | Where a restore may write (an unoverridable denylist is checked first) |
+| `source[]` | label, volume, device, snapshot_dir, target_subdirs[], target_labels[], subvolumes[] (name, manual_only, snapshot_name, adopted, retired) | BTRFS sources; `adopted` / `retired` dates are written by the backup run; empty `target_labels` = every target |
+| `target[]` | label, serials[], mount_uuid, mount, role (primary/mirror), display_name, retention (daily, weekly, monthly, yearly) | Backup targets; mounted by `mount_uuid` when set, else by serial |
+| `email` | enabled, smtp_host, smtp_port, from, to | Email reports |
+| `gui` | enabled (bool) | GUI installation toggle |
 
 **Removed section**: `[esp]` (enabled, source_path, method, packages[]) — ESP/boot mirroring
 was removed from the codebase in two steps: the orphan hook generator on 2026-04-10, then the
@@ -358,9 +394,11 @@ Templates are rendered programmatically (no external template files):
 
 | Function | Output | Description |
 |----------|--------|-------------|
-| `render_btrbk_conf()` | `btrbk.conf` | Per-source volume blocks with target retention |
-| `render_systemd_service()` | `.service` unit | ExecStart with full flag support |
-| `render_systemd_timer()` | `.timer` unit | OnCalendar with RandomizedDelaySec |
+| `btrbk_conf::render_btrbk_conf()` | `btrbk.conf` | Per-source volume blocks with target retention; retired entries are left out. In the library because the backup run, the `subvol` commands and the GUI helper's saves regenerate it too |
+| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support; OnCalendar with RandomizedDelaySec |
+| `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
+| `render_systemd_doctor_service()` / `render_systemd_doctor_timer()` | `das-backup-doctor.{service,timer}` | Weekly drift check, `SuccessExitStatus=1` |
+| `render_udev_udisks_ignore()` | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | Hides every target from udisks2 by serial and `mount_uuid` |
 | `render_cron_entry()` | cron lines | For sysvinit/OpenRC systems |
 | embedded scripts (`include_str!`) | `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh` | Real production scripts installed flat at `${prefix}/lib/das-backup/` (same layout as cmake's install) |
 
@@ -368,6 +406,22 @@ No email config file is generated because this project stores no mail
 credential: reports are submitted unauthenticated to the local relay named by
 `[email].smtp_host`/`smtp_port`. ESP sync hook generation was removed
 2026-04-10 (see `.claude/rules/esp-safety.md`).
+
+The generated units land in `/etc/systemd/system/`. Every service is ordered
+`After=local-fs.target`; the backup and scrub services are also ordered after
+`time-sync.target`, because retirement and expiry dates come from the clock.
+On this host (live config, 2026-10-02):
+
+| Unit | Schedule | Runs |
+|------|----------|------|
+| `das-backup.timer` | daily 03:00, up to 30 min random delay | `backup-run.sh` |
+| `das-backup-full.timer` | Sunday 04:00, up to 30 min random delay | `backup-run.sh --full` |
+| `das-scrub.timer` | 1st of the month 03:05, no random delay | `btrdasd scrub run` |
+| `das-backup-doctor.timer` | Sunday 02:00 | `btrdasd doctor --check-drift --email` |
+
+All four timers are `Persistent=true`. `btrdasd-helper.service` (`Type=dbus`,
+bus name `org.dasbackup.Helper1`) is installed by CMake, not generated; it is
+enabled on this host and is also D-Bus-activatable.
 
 ### System Detection
 
@@ -377,8 +431,8 @@ The `detect` module auto-discovers the host environment:
 |-----------|--------|--------|
 | Block devices | `lsblk --json` parsing | USB/SATA/NVMe devices with size, serial, partitions |
 | BTRFS subvolumes | `btrfs subvolume list` parsing | Subvolume paths and IDs |
-| Init system | Binary existence checks (`/sbin/init`, `/sbin/openrc-init`) | systemd/sysvinit/openrc |
-| Package manager | Binary existence checks | pacman/apt/dnf/zypper |
+| Init system | `which systemctl`, `which rc-service`, `/etc/init.d` existence | systemd/openrc/sysvinit (systemd if none match) |
+| Package manager | Binary existence checks | pacman/apt/dnf/zypper/apk |
 | Dependencies | `which` checks for btrbk, btrfs, smartctl, etc. | Missing dependency report |
 
 ### Manifest Tracking
@@ -386,7 +440,7 @@ The `detect` module auto-discovers the host environment:
 Every install writes `/etc/das-backup/.manifest` — a plain-text list of generated file paths. This enables:
 - `--uninstall`: Remove exactly the files that were installed
 - `--upgrade`: Regenerate the same files from updated config
-- `--check`: Verify all manifest files exist and match
+- `--check`: Verify all manifest files exist (presence only, not content), alongside config validation, relay reachability, targets without `mount_uuid`, the udisks hiding read back from udev, and dependencies
 
 
 ## Privilege Boundary
@@ -400,7 +454,7 @@ Every install writes `/etc/das-backup/.manifest` — a plain-text list of genera
 3. **Authorization of an action is not authorization over an object.** `JobCancel` checks polkit *and* that the caller owns the job; job ids are broadcast on every progress signal, so the action check alone let any authorized client abort anyone's work (`bd DAS-Backup-Manager-h2s`).
 4. **A source is policy too, not just a destination.** Rule 2 constrained where a restore may *write* and left unconstrained where it may *read*, so an authorized caller could have root copy `/etc`, `/root`, or another user's home into a permitted destination and then read it unprivileged. `restore::check_source_allowed()` requires the snapshot to resolve inside a configured backup target before anything is read, and fails closed when no targets are configured (`bd DAS-Backup-Manager-7ra`).
 
-The daemon also participates in the same singleton + maintenance lock interlock as `backup-run.sh` and the scrub engine. It did not until 0.7.20.0: `bd DAS-Backup-Manager-pe6` fixed the CLI in 0.7.15.0 and never reached the daemon the GUI actually calls (`bd DAS-Backup-Manager-dca`).
+The daemon also participates in the same singleton + maintenance lock interlock as `backup-run.sh` and the scrub engine. It did not until 0.7.20.0: `bd DAS-Backup-Manager-pe6` fixed the CLI in 0.7.15.0 and never reached the daemon the GUI actually calls (`bd DAS-Backup-Manager-dca`). The singleton locks are `/run/das-backup.lock` (backup, any path), `/run/das-scrub.lock`, `/run/das-doctor.lock` and `/run/das-reconcile.lock`, all non-blocking. Every side takes its singleton first, then the shared `/run/das-maintenance.lock`: backup and scrub wait for it, doctor and reconcile defer if it is held.
 
 ## Build System
 
@@ -423,12 +477,10 @@ option(BUILD_HELPER  "Build btrdasd-helper D-Bus daemon"        ON)
 
 ### Memory Safety
 
-**Rust for the indexer**: The content indexer processes untrusted filesystem data (file paths, names, sizes from backup snapshots). Rust eliminates buffer overflows, use-after-free, and data races at compile time. The only `unsafe` code is a single `libc::geteuid()` call for root detection in the setup module.
+**Rust for the indexer**: The content indexer processes untrusted filesystem data (file paths, names, sizes from backup snapshots). Rust eliminates buffer overflows, use-after-free, and data races at compile time. `unsafe` is confined to single-call `libc` FFI wrappers — `geteuid`, `flock`, `statvfs`, `syncfs`, `gethostname`, `time`/`localtime_r` — plus `std::env::set_var`/`remove_var` in tests; `btrdasd-helper` has none.
 
-**C++20 RAII for the GUI**: The GUI uses Qt6/KF6 which requires C++. All GUI components use:
-- Smart pointers (`QScopedPointer`, `std::unique_ptr`) — no raw `new`/`delete` leaks
-- Qt parent-child ownership model for widget lifetime
-- RAII database connections with UUID-based connection names
+**C++20 for the GUI**: The GUI uses Qt6/KF6 which requires C++. It holds no database connection and no privileged code — everything goes through `DBusClient`. Its components use:
+- Qt parent-child ownership for widget and object lifetime (objects are created with `new` and a parent, and released with `deleteLater()`; the one manual `delete` frees layout items Qt has handed back from a layout)
 - Compiled with `-Wall -Wextra -Wpedantic -Werror` — zero warnings policy
 
 **Bash scripts**: All scripts use `set -euo pipefail` for fail-fast behavior.
@@ -442,14 +494,7 @@ Every database operation uses parameterized prepared statements exclusively:
 conn.query_row("SELECT id FROM snapshots WHERE path = ?1", params![path], |row| row.get(0))
 ```
 
-```cpp
-// C++ (QSqlQuery) — bound parameters
-QSqlQuery q(m_db);
-q.prepare("SELECT path, name, size, mtime FROM files WHERE id IN (SELECT file_id FROM spans WHERE first_snap <= ? AND last_snap >= ?)");
-q.addBindValue(snapshotId);
-q.addBindValue(snapshotId);
-```
-
+The GUI issues no SQL at all; every query runs in the Rust library, behind `btrdasd-helper`.
 No string concatenation is used to build SQL queries anywhere in the codebase.
 
 ### File Permission Hardening
@@ -458,20 +503,20 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 |------|------|-------|--------|
 | `/etc/das-backup/config.toml` | `0o644` | root | No secrets — mail submission is unauthenticated; the relay's upstream key lives in `/etc/postfix/sasl_passwd` (root-only) |
 | Generated scripts | `0o755` | root | Executable by system |
-| `/var/lib/das-backup/backup-index.db` | `0o644` | root | Readable by GUI, writable by indexer |
+| `/var/lib/das-backup/backup-index.db` | `0o644` | root | Writable by the indexer (root); readable by any local user — the GUI itself reads it only through `btrdasd-helper` |
 
 ### Database Integrity
 
 - **WAL journal mode**: Prevents corruption from concurrent access, provides atomic commits
 - **Foreign keys enabled**: `PRAGMA foreign_keys = ON` enforces referential integrity between spans/files/snapshots
-- **PRAGMA optimize on close**: Both Rust (`Drop` impl) and C++ (`~Database`) run `PRAGMA optimize` to maintain query planner statistics
-- **Unique constraints**: File paths and snapshot paths have unique indexes preventing duplicates
+- **PRAGMA optimize on close**: the Rust `Database` `Drop` impl runs `PRAGMA optimize` to maintain query planner statistics (the GUI has no database connection)
+- **Unique constraints**: File paths (per subvolume series) and snapshot paths have unique indexes preventing duplicates
 
 ### Input Validation
 
 - **Snapshot names**: Validated with regex `^(.+)\.(\d{8}T\d{4,6})$` — rejects malformed directories
 - **TOML configuration**: Deserialized via `serde` with strongly-typed structs — invalid config fails at parse time
-- **FTS5 queries**: The GUI auto-quotes search terms with `"` delimiters, preventing FTS5 syntax injection
+- **FTS5 queries**: `Database::search` wraps a bare search term in `"` delimiters so punctuation is literal; a query containing `*`, `:` or `"` is passed through as FTS5 syntax. Either way it is a bound parameter, so a malformed query is an FTS5 error, never SQL
 - **File paths**: All path operations use `std::path::PathBuf` (Rust) or `QString` (C++) — no raw C string manipulation
 - **Restore sources and destinations**: Both ends are checked against policy before anything is read or created, on the fully resolved path so a symlinked ancestor cannot smuggle either past the check — destinations against `[restore] allowed_roots` plus an unoverridable denylist, sources against the configured target mounts
 - **Backup write targets**: `mount::verify_write_targets()` asserts every target btrbk will be told to write to is a real mount point carrying the expected filesystem UUID, before btrbk is invoked. Writing to a bare mount point falls through to the underlying filesystem — normally the NVMe root — and fills it (`bd DAS-Backup-Manager-9on`)
@@ -479,15 +524,15 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 ### Efficiency
 
 - **Span-based deduplication**: A file unchanged across 100 snapshots = 1 file row + 1 span row (not 100 rows)
-- **Incremental indexing**: `btrdasd walk` skips already-indexed snapshots (checked by path in DB)
-- **Performance indexes**: 6 targeted indexes for common query patterns (see Database Architecture)
+- **Incremental indexing**: `btrdasd walk` skips already-indexed snapshots (checked by source, name and timestamp)
+- **Performance indexes**: 9 targeted indexes for common query patterns (see Database Architecture)
 - **Bundled SQLite**: Compiled from source with FTS5 enabled — no dependency on system SQLite version
 
 ### Stability
 
 - **Soft-fail indexing**: In `backup-run.sh`, indexing errors are logged but never abort the backup. The backup pipeline always completes regardless of indexer state.
 - **Error propagation**: Rust `?` operator propagates errors cleanly up the call chain with descriptive error types
-- **Graceful degradation**: The GUI opens the database read-only. If the DB doesn't exist or is locked, the GUI still launches with an empty state.
+- **Graceful degradation**: The GUI has no database connection of its own. If `btrdasd-helper` cannot be reached, `DBusClient` reports it once and the GUI still launches with an empty state.
 
 ### Privacy
 
@@ -508,14 +553,14 @@ The backup index database stores file paths (e.g., `/home/user/Documents/tax-ret
 
 ```toml
 # In indexer/Cargo.toml, replace:
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # With:
-rusqlite = { version = "0.38", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 ```
 
-This requires a passphrase on every database open (both indexer and GUI), adds approximately 30% query overhead, and increases the binary size.
+This requires a passphrase on every database open (the indexer and `btrdasd-helper`), adds approximately 30% query overhead, and increases the binary size.
 
-**Recommendation**: Not enabled by default. Most backup systems (btrbk, rsnapshot, restic, borgbackup) do not encrypt their metadata indexes. The database is local-only and root-readable. For users with high-sensitivity requirements (e.g., shared systems, compliance mandates), the SQLCipher path is documented and straightforward to enable.
+**Recommendation**: Not enabled by default. Most backup systems (btrbk, rsnapshot, restic, borgbackup) do not encrypt their metadata indexes. The database is local-only; at mode `0644` it is readable by every local user, not only root. For users with high-sensitivity requirements (e.g., shared systems, compliance mandates), the SQLCipher path is documented and straightforward to enable.
 
 ## Module Reference
 
@@ -523,34 +568,36 @@ This requires a passphrase on every database open (both indexer and GUI), adds a
 
 | Module | File | Lines | Purpose |
 |--------|------|-------|---------|
-| `adopt` | `src/adopt.rs` | ~1940 | Subvolume sync: lists each verified source volume, adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
-| `backup` | `src/backup.rs` | ~1750 | btrbk snapshot/send orchestration with volume deduplication |
-| `btrbk_conf` | `src/btrbk_conf.rs` | ~630 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
-| `caldate` | `src/caldate.rs` | ~240 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates |
-| `config` | `src/config.rs` | ~1080 | TOML config types, DAS/source/target models |
-| `db` | `src/db.rs` | ~1090 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
-| `doctor` | `src/doctor.rs` | ~1120 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
-| `expire` | `src/expire.rs` | ~2100 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
+| `adopt` | `src/adopt.rs` | ~2600 | Subvolume sync: lists each verified source volume, adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
+| `backup` | `src/backup.rs` | ~3620 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
+| `btrbk_conf` | `src/btrbk_conf.rs` | ~1030 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
+| `caldate` | `src/caldate.rs` | ~270 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates |
+| `config` | `src/config.rs` | ~1770 | TOML config types, DAS/source/target models |
+| `db` | `src/db.rs` | ~2580 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
+| `doctor` | `src/doctor.rs` | ~1070 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
+| `expire` | `src/expire.rs` | ~2350 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
 | `fsutil` | `src/fsutil.rs` | ~170 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `forget` | `src/forget.rs` | ~400 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
-| `health` | `src/health.rs` | ~1550 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
-| `indexer` | `src/indexer.rs` | ~510 | Snapshot discovery, span logic, walk orchestration |
-| `mount` | `src/mount.rs` | ~510 | Auto-mount/unmount with RAII `MountGuard`, serial resolution |
-| `progress` | `src/progress.rs` | ~115 | Progress reporting trait and D-Bus signal bridge |
+| `health` | `src/health.rs` | ~1840 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
+| `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
+| `mount` | `src/mount.rs` | ~3620 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` |
+| `progress` | `src/progress.rs` | ~610 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~380 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
-| `report` | `src/report.rs` | ~610 | Backup report formatting |
-| `restore` | `src/restore.rs` | ~760 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
+| `report` | `src/report.rs` | ~770 | Backup report formatting |
+| `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
-| `scrub` | `src/scrub.rs` | ~2850 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
-| `subvol` | `src/subvol.rs` | ~210 | Subvolume CRUD operations |
-| `main` | `src/main.rs` | ~2340 | CLI entry point with clap subcommands |
+| `scrub` | `src/scrub.rs` | ~3160 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
+| `subvol` | `src/subvol.rs` | ~215 | Subvolume CRUD operations |
+| `main` | `src/main.rs` | ~3110 | CLI entry point with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
-| `setup/config` | `src/setup/config.rs` | — | TOML config types with serde |
+| `setup/config` | `src/setup/config.rs` | — | Re-export of the library's `config` types |
+| `setup/env_export` | `src/setup/env_export.rs` | — | `btrdasd config dump-env`: config as shell `DAS_*` variables for the scripts |
 | `setup/detect` | `src/setup/detect.rs` | — | System detection (devices, init, packages) |
-| `setup/templates` | `src/setup/templates.rs` | — | Render btrbk.conf, systemd, cron, scripts |
+| `setup/templates` | `src/setup/templates.rs` | — | Render systemd units, cron, the udisks-ignore udev rule; embed the scripts (btrbk.conf comes from `btrbk_conf`) |
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
-| `setup/wizard` | `src/setup/wizard.rs` | — | 10-step interactive dialoguer wizard |
+| `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
+| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 23 methods, 3 signals, polkit checks, job ownership |
 
 ### KDE Plasma GUI (`gui/src/`)
 
@@ -581,12 +628,15 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 
 ### Tests
 
+Counts from `cargo test --features dbus -- --list` and `gui/tests/smoketest.cpp` at 0.7.22.3
+(2026-10-02); re-run that command rather than trusting these numbers.
+
 | Suite | Count | Framework |
 |-------|-------|-----------|
-| Rust unit tests | 267 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 15 `pub mod`s) |
-| Rust CLI tests | 21 | `#[cfg(test)]` module in `main.rs` (`btrdasd` binary, not part of the lib crate) |
-| Rust setup tests | 26 | `#[cfg(test)]` modules in `setup/` (binary-only, declared from `main.rs`) |
-| Rust integration tests | 9 | `indexer/tests/integration_test.rs` |
-| Rust loopback tests (manual, root-gated) | 2 | `indexer/tests/scrub_loopback.rs` — `#[ignore]`d; real loop-device BTRFS + `btrfs scrub`, not run by plain `cargo test` |
-| C++ GUI tests | 0 | None currently — the 4 QTest suites (`gui/tests/*.cpp`) were removed 2026-03-01 as orphaned references to a deleted `database.h`; `Qt6::Test` is still linked by `gui/CMakeLists.txt` but nothing uses it |
-| **Total** | **323 Rust (325 incl. manual) + 0 Qt** | |
+| Rust unit tests | 661 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 21 `pub mod`s) |
+| Rust CLI + setup tests | 178 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
+| D-Bus helper tests | 1 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
+| Rust integration tests | 16 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (6), `setup_requires_root.rs` (1) |
+| Rust loopback tests (manual, root-gated) | 8 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (3), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
+| C++ GUI smoke tests | 6 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper. The click-simulation suites were removed 2026-03-01 |
+| **Total** | **856 Rust (864 incl. manual) + 6 Qt** | |

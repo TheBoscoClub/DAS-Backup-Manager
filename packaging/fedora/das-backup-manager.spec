@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.20.0
+Version:        0.7.22.3
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -9,7 +9,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  rust cargo cmake >= 3.25 extra-cmake-modules gcc-c++
 BuildRequires:  systemd-rpm-macros
-BuildRequires:  cmake(Qt6Core) cmake(Qt6Widgets) cmake(Qt6Sql)
+BuildRequires:  cmake(Qt6Core) cmake(Qt6Widgets) cmake(Qt6DBus)
 BuildRequires:  cmake(KF6CoreAddons) cmake(KF6I18n) cmake(KF6XmlGui)
 BuildRequires:  cmake(KF6ConfigWidgets) cmake(KF6IconThemes) cmake(KF6Crash) cmake(KF6KIO)
 BuildRequires:  cmake(KF6Notifications) cmake(KF6StatusNotifierItem)

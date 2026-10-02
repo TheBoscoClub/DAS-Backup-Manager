@@ -31,8 +31,19 @@ concurrency lock and there is no lock here — `setup` takes neither
 Check before deploying, every time:
 
 ```bash
-pgrep -f 'lib/das-backup/backup-run.sh' && echo "WAIT — do not install"
+if systemctl is-active -q das-backup.service das-backup-full.service || ! flock -n /run/das-backup.lock true; then echo "WAIT — do not install"; fi
 ```
+
+`is-active -q` with several units succeeds if any one is active, which covers the daily and the
+weekly full run (both execute `backup-run.sh`); the lock covers a run started by hand with `sudo`
+and a CLI or GUI backup, all of which hold `/run/das-backup.lock`. `flock -n … true` needs no root
+(it opens the file read-only), so it reports a held lock without taking part in it. After a reboot
+the file does not exist until the first backup, `flock` cannot create it as an ordinary user and
+the check prints WAIT — a false alarm, in the safe direction. The earlier check,
+`pgrep -f 'lib/das-backup/backup-run.sh'`, matched its own command line whenever it was run through
+`sh -c` or `ssh`, so it said WAIT with no backup running and could never be trusted to say go.
+Verified 2026-10-02: idle host → no output; the same check against a scratch lock file held by
+`flock <file> sleep 3` → `WAIT`.
 
 Config edits are no longer inert mid-run (before 2026-10-01 each file was read once at startup).
 `backup-run.sh` reads `config.toml` again after `subvol sync`, so an edit made before that point is
@@ -140,8 +151,10 @@ Measured 2026-09-01 against an isolated config whose only defect was a missing
 subvolume: `btrbk dryrun` → 10, `btrbk list snapshots` → 10. `run_btrbk()` turns
 that into `record_op btrbk FAIL`, so **the report's `Status:` becomes `FAILURES
 DETECTED` and `backup_runs.success` is written 0**, even though every other
-subvolume was backed up correctly. The run itself still exits 0 per the `18p`
-split, so systemd stays green and sentinel does not thrash.
+subvolume was backed up correctly. The run itself then exits 1: since 0.7.21.0 `backup-run.sh`
+returns nonzero whenever btrbk did (`OP_STATUS[btrbk]` FAIL), so the unit is marked failed. (An
+earlier version of this paragraph said the run still exited 0 per the `18p` split; that was not
+true of any release after 2026-08-31 — see the Sentinel section.)
 
 **Measured both shapes, because the first measurement did not settle it.** A
 config whose *only* subvolume is missing exits 10 — but so does one with a
@@ -224,14 +237,15 @@ Tracked as bd `DAS-Backup-Manager-tku` / `-rjc` / `-zm6`.
   run, which is inside normal run-to-run variation. Only the link speed distinguishes them
   (bd `DAS-Backup-Manager-6lr`)
 - Bay map: see `docs/examples/author-bay-mapping.md`. Generic guide: `docs/DAS-BAY-MAPPING.md`
-- DAS must be powered on; targets are mounted by `backup-run.sh` (not auto-mounted via fstab)
+- DAS must be powered on; targets are mounted by this project's jobs — `backup-run.sh`, `btrdasd` (backup, scrub, restore and the other commands that need a target) and the GUI's helper — never auto-mounted via fstab or udisks
+- Every target is found and mounted by its `mount_uuid` (`blkid -U`, `mount UUID=…`), with the drive serials as the fallback; all three production targets carry one as of 2026-10-02 (bd `DAS-Backup-Manager-9v2`). `btrdasd setup --check` names any target without it
 - Drives are BTRFS-formatted; the 22TB primary backup target is BTRFS RAID-1 across two drives (since 2026-05-06), the 2TB recovery drives are independent single-device filesystems
 
 ## Targets and Retention (per `/etc/das-backup/config.toml`)
 - **`primary-22tb`** — 22TB Exos RAID-1 across bays 2 (`ZXA1R71M`, RMA replacement installed 2026-05-15) + 5 (`ZXA1NYGZ`), label `das-backup-22tb`, uuid `b2dbe07d-40b9-422e-8ccf-ef4931c40457`, mount `/mnt/backup-22tb`. Retention: `daily=7, weekly=4, monthly=12, yearly=1`. Receives all source streams (NVMe, SSD, ssd-steam, ssd-vm, hdd-projects, hdd-media, hdd-system, hdd-audiobooks, das-storage) — and is the *only* target for the bulk ones, per the scoping rule above. The original bay-2 drive (`ZXA0LMAE`) failed and was RMA'd; the 2026-05-07 post-RMA rebuild used `mkfs.btrfs` single by mistake and was restored to RAID-1 on 2026-05-15/16 via `btrfs device add` + `balance -dconvert=raid1 -mconvert=raid1 -sconvert=raid1` (see bd `DAS-Backup-Manager-453`).
-- **`system-recovery-A-2tb`** — 2TB SMR bay 1 (`ZK208Q77`), label `das-backup-system-recovery-A`, mount `/mnt/backup-system-recovery-A`. Retention: `daily=7`. Independent recovery copy (not a RAID mirror) — each 2TB drive has its own BTRFS filesystem, UUID, and ESP, and can boot CachyOS standalone.
-- **`system-recovery-B-2tb`** — 2TB SMR bay 4 (`ZFL41DNY`), label `das-backup-system-recovery-B`, mount `/mnt/backup-system-recovery-B`. Retention: `daily=7`. Independent recovery copy (peer of `system-recovery-A-2tb`, not a RAID mirror).
-- Boot archives: 60 day retention (was 1 year prior to 2026-08-01), pruned by `boot-archive-cleanup.sh`, which runs automatically at the end of every backup (daily and full) while targets are still mounted — added 2026-08-01; previously the script was installed but nothing invoked it, so retention was unenforced (bd `DAS-Backup-Manager-64h`)
+- **`system-recovery-A-2tb`** — 2TB SMR bay 1 (`ZK208Q77`), label `das-backup-system-recovery-A`, `mount_uuid` `60b05268-7f8f-47b5-a38a-752576a1172a`, mount `/mnt/backup-system-recovery-A`. Retention: `daily=7`. Independent recovery copy (not a RAID mirror) — each 2TB drive has its own BTRFS filesystem, UUID, and ESP, and can boot CachyOS standalone.
+- **`system-recovery-B-2tb`** — 2TB SMR bay 4 (`ZFL41DNY`), label `das-backup-system-recovery-B`, `mount_uuid` `7c7ae72d-09d6-4086-b249-1ac60f21b73b`, mount `/mnt/backup-system-recovery-B`. Retention: `daily=7`. Independent recovery copy (peer of `system-recovery-A-2tb`, not a RAID mirror).
+- Boot archives: 60 day retention (was 1 year prior to 2026-08-01), pruned by `boot-archive-cleanup.sh`, which `backup-run.sh` runs automatically at the end of every run (daily and full) while targets are still mounted — a CLI or GUI backup (`backup::run_backup_job`) does not run it — added 2026-08-01; previously the script was installed but nothing invoked it, so retention was unenforced (bd `DAS-Backup-Manager-64h`)
 
 ## Mount Options for the RAID-1 Primary Target
 - `DAS_MOUNT_OPTS` (set from `[das].mount_opts` in config.toml) includes `degraded` so a single-leg failure of the 22TB RAID-1 array does not block backups, restores, or recovery
@@ -248,7 +262,7 @@ Tracked as bd `DAS-Backup-Manager-tku` / `-rjc` / `-zm6`.
 - **The pruner (`boot-archive-cleanup.sh`, v2.1.0+) also skips `role=mirror` targets entirely**, for the same reason and with the same log wording, built from the same `MOUNT_ROLES` map (sourced from `btrdasd config dump-env`'s per-target `ROLE` field) that `backup-run.sh` already uses. Before this fix, a `@.archive.*` snapshot left on a mirror by an `am1`-affected manual run could be the **last surviving copy** of that mirror's independent install once past the 60-day retention window — the pruner would have deleted it. It never will now.
 - **Historical archives from before this fix are not retroactively cleaned up.** Any `@.archive.*`/`@home.archive.*` snapshots already present on `system-recovery-A-2tb`/`system-recovery-B-2tb` from May/June 2026 manual runs (from when `archive_boot()` had no mirror skip) persist until manually reviewed and removed — they are not touched by this change in either direction.
 - Archives are read-only snapshots on the backup target
-- The pruner (`boot-archive-cleanup.sh`) runs at the end of every backup, daily and full alike, while targets are still mounted — see the retention line above. It only ever deletes `@.archive.*` / `@home.archive.*` snapshots past retention on non-mirror targets; it never touches the live `@`/`@home`, btrbk-managed snapshots, or anything on a `role=mirror` target.
+- The pruner (`boot-archive-cleanup.sh`) runs at the end of every `backup-run.sh` run, daily and full alike, while targets are still mounted — see the retention line above. It only ever deletes `@.archive.*` / `@home.archive.*` snapshots past retention on non-mirror targets; it never touches the live `@`/`@home`, btrbk-managed snapshots, or anything on a `role=mirror` target.
 
 ### Delete vs mutate — send/receive chain safety
 - Deleting a *target* snapshot is harmless while at least one common pair survives (source snapshot UUID == target Received UUID) — that is what `target_preserve` does daily; only clearing one side entirely forces a full re-send.
@@ -274,7 +288,7 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 - **TLS**: none on the submission hop, by design — it is loopback-only plaintext. The certificate-verified TLS leg is the relay's (`smtp_tls_security_level = secure` to `[smtp.resend.com]:587`). The old `ssl-verify=ignore` existed solely for Bridge's self-signed loopback cert and is gone
 - **`smtp-auth=none` is REQUIRED on every mailx invocation.** s-nail defaults to demanding a password for any `smtp://` mta and aborts with `A password is necessary for smtp authentication` (exit 4) without it — removing the auth flags wholesale breaks every report
 - **Never redirect mailx stderr to `/dev/null`.** A successful submission emits nothing on stderr (measured 2026-08-06); the `2>/dev/null` removed in this migration claimed to hide "s-nail v14 deprecation warnings" that do not exist, and cost every failure its diagnosis — the log read `Failed to email report` with no cause for two years
-- **Reports include**: btrbk status, throughput, archive/cleanup counts, indexing status, SMART summary, growth trend
+- **Reports include**: btrbk status, subvolume sync (adopted, retired, skipped) and retired-subvolume expiry, throughput, archive/cleanup counts, indexing status, disk capacity, SMART summary, latest snapshots, growth trend
 - **Transport**: plain SMTP to the local relay at `127.0.0.1:25`, no auth, no TLS. Store-and-forward: if the uplink or the provider is down, mail queues on the host and retries for days rather than being lost. The report is written to `$LAST_REPORT` **before** any send is attempted, so a relay outage costs delivery, never the report itself
 - **Unattended (no-session) delivery is PROVEN in production — do not re-test it.** `hvf` was closed 2026-08-25 on journal evidence, not on a staged test. Two boots delivered the report hours before that boot's first graphical login (sessions do not survive a reboot, so none had existed since power-on): boot 08-16 09:26:37 sent `2026-08-17 03:53:48` against first login `07:06:38`; boot 08-17 22:41:23 sent `2026-08-18 03:49:09` against first login `06:45:19`. `backup-run.sh` logged `Report emailed to gjbr@pm.me via smtp://127.0.0.1:25`, Postfix carried queue `8E80214919D2` to `status=sent (250 fa9dd9ed-…)`, and Protonmail Bridge was not merely idle but unable to start (`start-limit-hit` — the KWallet guard refusing a locked wallet), so no `:1025` listener existed at send time. To re-derive: correlate `New session '<n>' of user 'bosco' with class 'user'` against `journalctl -u postfix | grep 'from=<das-backup'`. **Trap**: logind *quotes* the session id, so a `New session [0-9]+` pattern silently matches nothing and reports "no login" for every boot; and `graphical-session.target` is reached spuriously via the `foot-server.socket` ordering cycle, so it is not evidence of a login — `class 'user'` is
 - **Failure diagnosis**: `journalctl -u das-backup` for the consumer side; `journalctl -u postfix` and `mailq` for the relay. A `status=sent` in the Postfix log means the provider accepted it — **not** that it reached the inbox. Spam filing is invisible from this host at every observable point (API 200, `status=sent`, queue drains), so inbox placement is verified by looking, once, per recipient
@@ -310,7 +324,7 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 
 ## Sentinel Interaction — `cachyos-sentinel` Auto-Restarts Failed Services
 - `sentinel-core` (project at `/hddRaid1/ClaudeCodeProjects/cachyos-sentinel/`) monitors all systemd services and auto-remediates ones it sees in `failed` state by re-issuing `systemctl start`. **This includes `das-backup.service`** — confirmed 2026-05-11 by journal evidence (`sentinel-core` WARN log immediately followed by `systemd Starting DAS Backup` within the same second of a manual kill).
-- **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00; the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
+- **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00 plus a randomised delay of up to 30 minutes (`RandomizedDelaySec=1800`); the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
 - **For intentional manual stops** of an in-progress backup (e.g. wrong targeting, debugging) — `systemctl stop das-backup.service` alone is insufficient: Sentinel will restart it within seconds. The correct sequence for a manual stop is `systemctl stop das-backup.service && systemctl mask das-backup.service`. Mask makes Sentinel's start attempt fail at the systemd layer (`unit is masked`), and Sentinel will log the failure rather than thrash on it. Unmask + re-enable timer to resume normal operation.
 - **If Sentinel's retries become unwanted** (e.g. persistent hardware fault causing thrashing), add an exclusion in Sentinel's runtime config at `/etc/sentinel/` — service-monitoring exclusion list. The das-backup unit files themselves are clean (no `Restart=`, no `OnFailure=`, no `OnUnitInactiveSec=`); Sentinel is the layer above.
 - **`das-backup-doctor.service` carries `SuccessExitStatus=1`, and that line is load-bearing.** `btrdasd doctor` exits 1 when it FINDS DRIFT — a successful check with a result, deliberately kept as a CLI contract (bd `DAS-Backup-Manager-01u`: "exit 1 is the whole point of the weekly timer"). systemd cannot tell a finding from a malfunction, so before this line it marked the unit `failed`, Sentinel restarted it, the restart failed identically, and Sentinel notified `"backup service das-backup-doctor.service last run failed: Result=exit-code"` — the operator was told the checker broke at the moment it worked, and that alert competed with the drift email carrying the real signal (observed 2026-08-31: run 13:47:34 → drift found → emailed → sentinel restart 13:47:57 → notification 13:48:08; same double-start on Aug 23). Bounded at 2 starts, because Sentinel gives up when the restart command itself fails — this was never the unbounded loop `18p` guards against, which is why the fix is a unit directive and not another exit-code narrowing.
@@ -321,6 +335,7 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
   - **Exit nonzero — "the pass could not even start."** Config load failure, lock-file IO error, or *every* target failing before any scrub was attempted (e.g. all targets unresolvable/unmountable) — the `ScrubError::NoTargets` case and friends. These fail in seconds, which is exactly the failure-loop shape Sentinel's 3/600s limiter *can* brake.
   - Sentinel's unit matching (`assert_unit_safe`, `never_touch.units`) is **exact string equality — no globs**. Template instances like `btrfs-scrub@*.service` are not expressible, and any future per-filesystem or lifecycle-tied scrub units would each need hand-listing, with new ones silently unprotected until added. Prefer single non-template units (like today's `das-scrub.service`) where Sentinel interaction matters.
   - Do not rely on Sentinel's rate limiter to brake failure loops whose period exceeds ~10 minutes — it structurally cannot. That is precisely why this fix could not be "let Sentinel handle it": no rate-limiter tuning fixes a limiter that never sees three failures inside its window in the first place.
+  - **`backup-run.sh` does not follow the same split for btrbk.** Its `main()` returns 1 whenever `OP_STATUS[btrbk]` is FAIL, i.e. whenever btrbk exited nonzero (`54c46ac`, 0.7.21.0), while the comment above that line says nonzero is reserved for "btrbk failing on every target". btrbk's own `exit_status()` returns 10 when **any** subsection is aborted, so — by reading btrbk's source, not by a host run — one target btrbk cannot reach probably fails the whole unit, and Sentinel would then restart a ~30-minute job. Not reproduced on the host; recorded here so nobody reads the comment as the behaviour
   - `das-scrub.service`'s generated unit file (`render_systemd_scrub_service` in `indexer/src/setup/templates.rs`) carries a one-line `# Exit semantics: ...` comment above `ExecStart=` so `systemctl cat das-scrub.service` documents this on its own, without sending a reader to the Rust source.
 
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
@@ -337,7 +352,9 @@ Two layers of defense, both implemented in `scripts/backup-run.sh` v4.2.2+:
    - If `available=false`: `$mnt` must NOT exist on disk
    - Any violation aborts the run with a clear error listing each affected target
 
-Both layers run unconditionally — `--dryrun` includes them. The verify function records `OP_STATUS[verify_targets]` so failures appear in the email report.
+Both layers run unconditionally — `--dryrun` includes them. The verify function records `OP_STATUS[verify_targets]` so failures appear in the email report. Since v4.7.0 `create_target_dirs` runs only after `verify_targets_before_btrbk`, so no target directory is made under an unproven path; the source-side twin is `verify_sources_before_write` (v4.5.0, bd `DAS-Backup-Manager-zlv`).
+
+**The Rust path (`btrdasd backup run`, GUI backups) has the same guard**: `backup::run_backup` calls `mount::verify_write_targets` before btrbk — every target it will write to must be a mountpoint carrying the expected UUID or serial, and a stale directory at an unavailable target's mount point is refused (bd `DAS-Backup-Manager-aea`).
 
 **Cross-references:**
 - `bd DAS-Backup-Manager-9on` — failure-mode writeup and incident notes
@@ -356,5 +373,7 @@ Deadlock-freedom depends only on both sides **acquiring** in the same order (sin
 Backup side: `acquire_maintenance_lock()` in `backup-run.sh` (v4.3.0+), called from `main()` right after the singleton lock succeeds and before any mount work (`create_mount_points` is the first mounter). A short non-blocking probe runs first; if still held, logs `"DAS maintenance lock held (scrub in progress?) — waiting..."`, blocks, then logs the total wait duration and records `OP_STATUS["lock_wait"]="OK"` with the duration — surfaced as a "Maintenance lock" row in the email report. Scrub side: `scrub::acquire_locks()` / `ScrubLocks` (`indexer/src/scrub.rs`), same lock path constant `MAINTENANCE_LOCK_PATH`, same announce-then-block pattern (plus a 15-minute re-announce loop the bash side does not replicate — a single wait-start + acquired-with-duration pair was judged sufficient there).
 
 This design replaced an earlier proposal (a pre-unmount scrub cancel/wait guard) that was abandoned before implementation: with a genuine mutual-hold lock, backup and scrub can never overlap in the first place, so there is nothing to cancel.
+
+**`reconcile` and `doctor` join the interlock differently.** Each has its own singleton (`/run/das-reconcile.lock`, `/run/das-doctor.lock`) and takes the maintenance lock **non-blocking**, in the same singleton-then-maintenance order: if a backup or scrub holds it they defer (exit 0 for doctor) instead of waiting. CLI and GUI backups take `/run/das-backup.lock` and wait on the maintenance lock exactly as `backup-run.sh` does (`backup::acquire_manual_locks`, bd `DAS-Backup-Manager-pe6`).
 
 `/run` is tmpfs, so neither lock can go stale across a reboot. Tracks `bd DAS-Backup-Manager-b6f` (backup side) and the scrub engine's own two-lock design (`bd DAS-Backup-Manager-212`).

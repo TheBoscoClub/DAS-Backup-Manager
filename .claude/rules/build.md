@@ -15,13 +15,13 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 - Use `std::filesystem` for all path operations
 
 ## CMake
-- Minimum CMake 3.25 (for Qt6 support), target 4.2.3
+- Minimum CMake 3.25 (for Qt6 support); host has 4.4.3
 - Use ECM (Extra CMake Modules) for KDE integration
 - Use `target_link_libraries` with PRIVATE/PUBLIC correctly
 - Build type: RelWithDebInfo for dev, Release for install
 
 ## Qt6 / KF6
-- Qt6 6.10.2, KDE Frameworks 6 (6.23.0)
+- Minimum Qt 6.6 / KF 6.0 (`gui/CMakeLists.txt`); host has Qt 6.11.2, KF 6.30.0
 - Use KXmlGuiWindow for main window (KDE HIG compliance)
 - Use KAboutData for application metadata
 - Use KIO for file operations (restore)
@@ -29,7 +29,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 
 ## Rust (buttered_dasd library + btrdasd CLI)
 - Rust 2024 edition, `cargo clippy` and `cargo fmt` before committing
-- Library crate `buttered_dasd` exports 21 public modules (`adopt`, `backup`, `btrbk_conf`, `caldate`, `config`, `db`, `doctor`, `expire`, `forget`, `fsutil`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line — it once said 15 and listed `ffi` while omitting `forget` and `reconcile`, so it was wrong in both directions at once
+- Library crate `buttered_dasd` exports 21 public modules (`adopt`, `backup`, `btrbk_conf`, `caldate`, `config`, `db`, `doctor`, `expire`, `forget`, `fsutil`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line
 - Use `LazyLock<Regex>` for compile-once regex patterns (not per-call `Regex::new()`)
 - Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - All database access through `db::Database` with prepared statements
@@ -37,7 +37,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 - **Mutation testing gates every push** (`.github/workflows/mutants.yml`, scored by `.github/scripts/mutants-gate.py`) plus a weekly full scope (its files are listed in the workflow). New code that spawns a command or prompts must go through a seam a test can drive (`CommandRunner`, `Prompter`, the `*_with` cores), or its mutants survive. Local run: the header of `indexer/.cargo/mutants.toml` — `--in-place`, crate-relative diff, on a copy of the tree, never `-- --lib`
 
 ## SQLite
-- SQLite 3.51.2 with FTS5 extension
+- SQLite 3.53.2, bundled by rusqlite (libsqlite3-sys 0.38.2), with FTS5
 - Use prepared statements exclusively (no string concatenation)
 - WAL journal mode for concurrent read/write
 - Use PRAGMA optimize on close

@@ -10,7 +10,7 @@ in *this* tree are deliberate and correct, which are defects, and how to tell
 them apart — so the next audit is a **diff against this list**, not a re-read of
 the whole tree.
 
-Tracks `bd DAS-Backup-Manager-nsp`.
+Tracked by `bd DAS-Backup-Manager-nsp` (closed).
 
 ---
 
@@ -39,11 +39,13 @@ site, never the pattern.
 
 ## Legitimate in this tree (do not re-file these)
 
-1. **Best-effort unmount on an error path already being reported.**
-   `guard.unmount(&progress)` in the D-Bus helper's job closures runs while an
-   error is on its way to `emit_job_finished`. An unmount failure there cannot
-   change the outcome already being reported, and `MountGuard::drop` is the
-   backstop. Logged, not propagated.
+1. **`MountGuard::drop`'s unmount is best-effort.** It is the backstop for a
+   guard nobody released, and `Drop` cannot propagate, so it logs. It is no
+   longer the model for explicit unmounts: since bd `DAS-Backup-Manager-5oc`
+   `MountGuard::unmount` retries a busy mount point five times, two seconds
+   apart, and returns what it could not release, and every job — the helper's
+   job closures included (`mount::fail_if_still_mounted`) — fails with
+   `still mounted: …` rather than logging and reporting success.
 
 2. **Indexing errors do not abort a backup.** Documented soft-fail: the backup
    is the product, the index is a convenience over it. An index that failed to
@@ -61,9 +63,12 @@ site, never the pattern.
    excluded** — the failure branches must not mark it available. Two of them
    did, and that was `bd DAS-Backup-Manager-aea`.
 
-5. **`backup-run.sh` exits 0 on per-target failure.** Deliberate, and NOT to be
-   "fixed" without reading the reasoning: nonzero means *the run could not
-   execute at all*. A multi-hour job never produces three failures inside
+5. **`backup-run.sh` exits 0 on a per-target failure that btrbk survives.**
+   Deliberate, and NOT to be "fixed" without reading the reasoning: nonzero
+   means *the run could not execute at all* — with one exception the code
+   makes and its own comment understates: `main()` returns 1 whenever btrbk
+   exited nonzero, and btrbk exits 10 when any one target is aborted (see
+   `backup.md` §Sentinel Interaction). A multi-hour job never produces three failures inside
    cachyos-sentinel's 600-second restart-limiter window, so a per-target
    nonzero would produce an unbounded retry loop rather than an alert. Recorded
    in full under `bd DAS-Backup-Manager-18p` and in `backup.md`.
@@ -159,7 +164,7 @@ produced no log line at all.
 Two things deliberately left, named so they are not re-litigated:
 
 - **`serde_json::to_string(..).unwrap_or_else(\|_\| "[]")`** in four helper
-  D-Bus methods. Wrong direction — "[]" tells the GUI *there is nothing there* —
+  D-Bus methods (three as of 2026-10-02). Wrong direction — "[]" tells the GUI *there is nothing there* —
   but `serde_json::Value` cannot hold an unserializable value (no NaN, no
   non-string keys), so it is unreachable and **no counter-test can be
   constructed**. Left rather than changed untested. If any of these ever
@@ -171,7 +176,7 @@ Two things deliberately left, named so they are not re-litigated:
   the indexer that wants its own verification cycle. **Flagged, not fixed.**
 
 Caveat on the `unwrap_or(0)` clock reads (`main.rs:759`, `health.rs:657`,
-`btrdasd-helper.rs:1532`): the helper's is the one that inverts, because
+`btrdasd-helper.rs:1532` — line numbers as of 2026-09-01; they have moved since): the helper's is the one that inverts, because
 `now_secs - backup_secs` with `now_secs == 0` yields a *negative* age, which
 renders as "just backed up". Unreachable without a pre-1970 clock, so no test
 was written.

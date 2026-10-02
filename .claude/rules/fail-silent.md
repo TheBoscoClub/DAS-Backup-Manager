@@ -7,7 +7,7 @@ restated here. This file records the project-specific judgment, so the next audi
 The full triaged inventories (54 bash hits, 236 Rust hits, shape by shape), the defects they
 found, and the two deliberately-unfixed cases are in `.claude/docs/rules-reference/fail-silent.md`,
 which is NOT auto-loaded. **Read it before auditing suppressions or filing one as a defect** —
-most candidates are already classified there. Tracks `bd DAS-Backup-Manager-nsp`.
+most candidates are already classified there. Audit: `bd DAS-Backup-Manager-nsp` (closed).
 
 ## The test: which direction does the substituted default point?
 
@@ -27,15 +27,15 @@ never the pattern.**
 
 ## Legitimate in this tree (do not re-file these)
 
-1. **Best-effort unmount on an error path already being reported** — `MountGuard::drop` is the
-   backstop. Logged, not propagated.
+1. **`MountGuard::drop`'s unmount** — backstop, logged only; an explicit `unmount()` that
+   leaves a mount fails its job (`5oc`).
 2. **Indexing errors do not abort a backup** — but the failure must still reach the report.
 3. **Probing for optional tooling** (`findmnt`, `smartctl`, `btrfs`, `blkid`) resolves to
    `None`/`unknown`, never to a fabricated measurement.
 4. **Per-target mount failure is logged and the run continues** — legitimate *only because the
    target is then excluded*. A failure branch must never mark it available (`bd aea`).
-5. **`backup-run.sh` exits 0 on per-target failure** — deliberate; see `backup.md`
-   §Sentinel Interaction (`bd 18p`). Do not "fix" it.
+5. **`backup-run.sh` exits 0 on a failure btrbk survives** — deliberate; see `backup.md`
+   §Sentinel Interaction (`bd 18p`). A btrbk failure exits 1.
 6. Display-only fallbacks, documented config defaults, fire-and-forget D-Bus signals, and
    errors discarded in `Drop` or on a path already returning `Err`.
 

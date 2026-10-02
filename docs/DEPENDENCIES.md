@@ -11,19 +11,19 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 
 | Crate | Version (locked) | Purpose | License |
 |-------|-----------------|---------|---------|
-| `rusqlite` | 0.40.1 | SQLite bindings with FTS5 support; uses `bundled` feature to compile SQLite from source | MIT |
-| `clap` | 4.6.4 | Command-line argument parsing with derive macros (`derive` feature) | MIT / Apache-2.0 |
+| `rusqlite` | 0.40.2 | SQLite bindings with FTS5 support; uses `bundled` feature to compile SQLite from source | MIT |
+| `clap` | 4.6.7 | Command-line argument parsing with derive macros (`derive` feature) | MIT / Apache-2.0 |
 | `walkdir` | 2.5.0 | Recursive directory traversal for snapshot indexing | Unlicense / MIT |
 | `regex` | 1.13.1 | Pattern matching for snapshot path filtering | MIT / Apache-2.0 |
 | `serde` | 1.0.229 | Serialization/deserialization framework with `derive` feature for TOML config | MIT / Apache-2.0 |
-| `toml` | 1.1.3 | TOML parser and serializer for installer configuration | MIT / Apache-2.0 |
+| `toml` | 1.1.6 | TOML parser and serializer for installer configuration | MIT / Apache-2.0 |
 | `dialoguer` | 0.12.0 | Interactive terminal prompts with `fuzzy-select` feature for setup wizard | MIT |
-| `console` | 0.16.4 | Terminal styling and interaction (used by dialoguer) | MIT |
+| `console` | 0.16.6 | Terminal styling and interaction (used by dialoguer) | MIT |
 | `libc` | 0.2.189 | Low-level C bindings for `geteuid()` root detection in setup module | MIT / Apache-2.0 |
-| `serde_json` | 1.0.151 | JSON parsing for `lsblk --json` output in system detection and FFI interchange | MIT / Apache-2.0 |
-| `clap_complete` | 4.6.8 | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
-| `tokio` | 1.53.1 | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation | MIT |
-| `zbus` | 5.18.0 | D-Bus implementation for `btrdasd-helper` system bus daemon | MIT |
+| `serde_json` | 1.0.151 | JSON parsing for `lsblk --json` output in system detection and for SMART/health readings and the scrub state file | MIT / Apache-2.0 |
+| `clap_complete` | 4.6.11 | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
+| `tokio` | 1.53.1 | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation (optional, `dbus` feature) | MIT |
+| `zbus` | 5.19.0 | D-Bus implementation for `btrdasd-helper` system bus daemon (optional, `dbus` feature) | MIT |
 
 ### Dev Dependencies (test only)
 
@@ -36,8 +36,8 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 
 | Crate | Version | Role |
 |-------|---------|------|
-| `libsqlite3-sys` | 0.38.1 | Low-level SQLite FFI; compiles bundled SQLite via the `cc` crate |
-| `clap_derive` | 4.6.4 | Proc-macro backend for clap derive API |
+| `libsqlite3-sys` | 0.38.2 | Low-level SQLite FFI; compiles bundled SQLite via the `cc` crate |
+| `clap_derive` | 4.6.7 | Proc-macro backend for clap derive API |
 | `regex-automata` | 0.4.16 | DFA/NFA engine underlying the `regex` crate |
 | `aho-corasick` | 1.1.4 | Multi-pattern string search used by `regex` |
 | `toml_edit` | 0.23.10 | TOML document model underlying the `toml` crate |
@@ -66,6 +66,8 @@ are automatically installed; they must be present before running the scripts.
 | `parted` / `mkfs.btrfs` / `mkfs.fat` | system | `das-partition-drives.sh` | Initial drive partitioning and formatting (one-time setup only) |
 | `mbuffer` | system (optional) | `btrbk` (via config) | Buffered stream transfers with progress; btrbk uses it if configured |
 | `lsblk` | system (util-linux) | `btrdasd setup` | Block device detection via JSON output |
+| `blkid` / `findmnt` | system (util-linux) | `backup-run.sh`, `btrdasd` (mount, doctor, scrub) | Finds a target by `mount_uuid` (`blkid -U`) and checks what is mounted where |
+| `udevadm` | system (udev) | `btrdasd setup` | Applies and reads back the generated rule that hides backup targets from udisks2 |
 
 ### Init System Support
 
@@ -104,7 +106,7 @@ Required to compile the `btrdasd` indexer binary from source.
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Rust toolchain | **1.87 or later** | Cargo.toml specifies `edition = "2024"`. The `let_chains` feature used by the setup module requires Rust 1.87+. Tested with 1.93.1. |
+| Rust toolchain | **1.88 or later** | Cargo.toml specifies `edition = "2024"` and no `rust-version`. 1.88 (needs let-chains, used in the library and CLI; not compile-tested below 1.98.1). |
 | `cargo` | ships with Rust | Package manager and build system |
 | `cc` (C compiler, gcc/clang) | system | Required by `libsqlite3-sys` to compile bundled SQLite from C source |
 | `pkg-config` | system | Used by `libsqlite3-sys` to locate system SQLite if the `bundled` feature is removed |
@@ -112,13 +114,17 @@ Required to compile the `btrdasd` indexer binary from source.
 ### Build Command
 
 ```bash
-cargo build --release --manifest-path indexer/Cargo.toml
-# Output: indexer/target/release/btrdasd
-# Install to: /usr/local/bin/btrdasd
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
+cmake --build build
+# Output: build/cargo-target/release/btrdasd (and btrdasd-helper)
+sudo cmake --install build   # installs to ${CMAKE_INSTALL_PREFIX}/bin (default /usr/local/bin)
 ```
 
+CMake runs cargo with `--target-dir build/cargo-target`; the install step reads the binaries from there, so avoid a bare `cargo build` in this tree. The helper is built with `--features dbus` (pulls in `zbus` and `tokio`); the `btrdasd` CLI alone has no D-Bus or async dependency.
+
 No `rust-toolchain.toml` is present; the stable channel is assumed. The
-minimum required version is Rust 1.87 due to `let_chains` in edition 2024.
+minimum is Rust 1.88 (needs let-chains; not compile-tested below 1.98.1) — inferred
+from the code, since `Cargo.toml` declares no `rust-version`.
 
 ---
 
@@ -129,9 +135,9 @@ needed when building with `BUILD_GUI=ON` (the default).
 
 | Dependency | Version Target | Purpose | License |
 |-----------|---------------|---------|---------|
-| Qt6 | 6.6+ (tested 6.10.2) | UI framework: Core, Widgets, DBus, Charts (growth trendline) | LGPL-3.0 |
-| KDE Frameworks 6 (KF6) | 6.0+ (tested 6.23.0) | KXmlGuiWindow, KAboutData, KIO for restore operations, KDE HIG compliance | LGPL-2.1 / LGPL-3.0 |
-| CMake | >= 3.25 (tested 4.2.3) | Build system for the Qt/KF6 C++20 GUI component | BSD-3-Clause |
+| Qt6 | 6.6+ (tested 6.11.2) | UI framework: Core, Widgets, DBus, Charts (growth trendline) | LGPL-3.0 |
+| KDE Frameworks 6 (KF6) | 6.0+ (tested 6.30.0) | KXmlGuiWindow, KAboutData, KIO for restore operations, KDE HIG compliance | LGPL-2.1 / LGPL-3.0 |
+| CMake | >= 3.25 (tested 4.4.3) | Build system for the Qt/KF6 C++20 GUI component | BSD-3-Clause |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros and platform integration | BSD-2-Clause |
 
 ### KF6 Modules Used
@@ -151,7 +157,7 @@ needed when building with `BUILD_GUI=ON` (the default).
 The GUI links against `Qt6::DBus` for all communication with `btrdasd-helper` — every read
 and write goes through D-Bus. There is no `Qt6::Sql` dependency and no direct database
 connection: the previous read-only `QSqlDatabase` wrapper (`database.h/cpp`) was removed
-when the GUI's models were rewired onto `DBusClient` exclusively. `Qt6::Test` is still
-found under `BUILD_TESTING` for `ECMAddTests`, but no test target currently uses it (see
-the Tests section of `docs/ARCHITECTURE.md`).
+when the GUI's models were rewired onto `DBusClient` exclusively. `Qt6::Test` is
+found only under `BUILD_TESTING`, where the `gui-smoketest` target (`gui/tests/smoketest.cpp`,
+run on the offscreen platform) links it (see the Tests section of `docs/ARCHITECTURE.md`).
 

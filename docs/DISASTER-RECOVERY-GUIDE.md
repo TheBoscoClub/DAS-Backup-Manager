@@ -45,8 +45,8 @@ This guide is written for users with minimal technical experience. Follow each s
 
 Your DAS bay mapping (see [DAS-BAY-MAPPING.md](DAS-BAY-MAPPING.md)) documents which bay holds which drive. A typical configuration might include:
 
-- **Bootable recovery drive(s)**: Drives with an ESP + bootable OS installation
-- **Primary backup drive**: Large-capacity drive receiving all btrbk snapshots
+- **Bootable recovery drive(s)**: Drives with an ESP + their own, independent OS installation (role `mirror` in `config.toml`). They are **not** a copy of your system and nothing writes your system's ESP onto them
+- **Primary backup drive**: Large-capacity drive (or BTRFS RAID-1 pair) receiving all btrbk snapshots (role `primary`)
 - **General storage**: Optional expendable-data drives
 
 ### What's Backed Up
@@ -55,7 +55,15 @@ Your backup targets are defined in `/etc/das-backup/config.toml`. Common categor
 
 - **System backup**: OS, applications, home folder, system configuration
 - **Data backup**: Projects, documents, media source files
-- **Recovery drives**: Bootable OS clone that can boot independently from DAS
+- **Recovery drives**: An independent bootable OS on each drive; they also receive the btrbk snapshots of every source whose `target_labels` is empty (`[]`), with their own (usually short) retention
+
+### Where Each Backup Lives on a Target
+
+Every snapshot sits at `<target mount>/<source target_subdir>/<snapshot_name>.<YYYYMMDDTHHMM>`, where `target_subdir` and `snapshot_name` come from `/etc/btrbk/btrbk.conf` (generated from `config.toml`; `btrdasd subvol list` shows the entries). On the author's system, for example, `@` is `/mnt/backup-22tb/nvme/root-.20261002T1500` and `@home` is `/mnt/backup-22tb/nvme/home.20261002T1500`. Two snapshots in the same minute get a `_1`, `_2`, … suffix.
+
+- **Subvolumes adopted automatically**: every backup run adopts new subvolumes. One nested inside a configured subvolume joins that entry's source (same directory, same targets). Any other lands in a source named `<first source on that volume>-adopted`, sent to the **primary target only** — look under `<primary mount>/<first-source>-adopted/` (e.g. `/mnt/backup-22tb/ssd-adopted/`).
+- **Retired subvolumes**: when a subvolume disappears its entry is marked `retired` and no new snapshots are taken, but its last snapshots stay on each target and are restorable until that target's longest retention window has passed since the retirement date; then the run deletes them.
+- **Boot copies (primary target only)**: the top level of the primary target holds writable `@` and `@home` made from the latest `root-`/`home` snapshots (rebuilt on full runs), plus `@.archive.<TS>` / `@home.archive.<TS>` of the ones they replaced (kept 60 days by default). On a recovery drive, `@` and `@home` are that drive's **own** OS — never restore your system from them.
 
 ### Backup Schedule
 
@@ -114,6 +122,8 @@ In the boot menu, look for entries corresponding to your DAS drives. They will t
 
 Select either one and press **Enter**.
 
+Firmware boot entries are numbered by the firmware and renumbered whenever its NVRAM is reset (a motherboard swap does this), and auto-created entries are often all named `UEFI OS`. Never record or follow a recovery step by entry number: identify each recovery drive's ESP by its PARTUUID or label (`efibootmgr -v` on a running system prints the PARTUUID of every entry; `lsblk -o NAME,SERIAL,LABEL,PARTUUID` maps it to a drive).
+
 ### Step 4: Choose Rescue Environment
 
 Your bootloader menu will appear with options configured during setup. Select the rescue or recovery entry.
@@ -150,7 +160,7 @@ Use the credentials you configured for the recovery environment.
 **What to do**:
 1. Boot into Rescue Mode (see [Booting into Rescue Mode](#booting-into-rescue-mode)), or boot from a Linux live USB
 2. You can either:
-   - **Option 1**: Boot directly from DAS backup (temporary, slow over USB)
+   - **Option 1**: Boot a recovery drive's own OS from the DAS and work from there (temporary, slow over USB)
    - **Option 2**: Restore backup to new internal drives (permanent fix)
 
 See [Full System Restoration](#full-system-restoration) for detailed steps.
@@ -177,7 +187,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 **Applies if** your primary backup is a BTRFS RAID-1 across two large drives (in this setup: 22TB Exos drives in DAS bays 2 and 5, sharing BTRFS UUID `b2dbe07d-40b9-422e-8ccf-ef4931c40457`).
 
 **Symptoms**:
-- Email backup report warns that the array is degraded or that one leg has SMART errors
+- The backup log (`journalctl -u das-backup`) says `primary-22tb: present=[…] missing=[…] — RAID-1 degraded, proceeding`. As of `backup-run.sh` v4.7.1 the emailed report has no line of its own for this and its SMART section shows one serial per target, so a clean-looking email does not prove both legs are present
 - `sudo btrfs filesystem show /mnt/backup-22tb` says `*** Some devices missing`
 - `sudo btrfs device stats /mnt/backup-22tb` shows non-zero error counters on one leg
 
@@ -194,7 +204,7 @@ sudo btrfs filesystem show /mnt/backup-22tb
 # Output looks like:
 #   Label: 'das-backup-22tb' uuid: b2dbe07d-40b9-422e-8ccf-ef4931c40457
 #       Total devices 2 FS bytes used X.XTiB
-#       devid    1 size 20.01TiB used Y path /dev/sdk1
+#       devid    1 size 20.01TiB used Y path /dev/sdX1
 #       devid    2 size 0 used 0 path MISSING
 # (the "MISSING" line — note that devid number)
 
@@ -208,29 +218,34 @@ Cross-reference the device serial against your bay map (`docs/examples/author-ba
 
 #### Step 2: Mount the array degraded if it failed to mount
 
-The `backup-run.sh` script always uses degraded mount options, so scheduled backups continue. For interactive use:
+The `backup-run.sh` script always mounts by UUID with `[das].mount_opts` (which include `degraded`), so scheduled backups continue. For interactive use, mount the same way:
 
 ```bash
+# Is a backup, scrub, reconcile or doctor run holding the DAS? They mount and
+# unmount this target themselves, and all hold this lock while they do.
+sudo flock -n /run/das-maintenance.lock true || echo "WAIT"
+
 # If /mnt/backup-22tb is not currently mounted
 sudo mkdir -p /mnt/backup-22tb
-sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
-
-# Or, on an install that predates the generated udisks-ignore rule, if udisks2
-# auto-mounted at /run/media/bosco/das-backup-22tb but failed because of
-# degraded state, force the explicit mount:
-sudo umount /run/media/bosco/das-backup-22tb 2>/dev/null
-sudo mount -o degraded UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
+sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=120,nossd,degraded \
+    UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
 ```
+
+A backup that starts while you have it mounted uses your mount and unmounts it when it finishes; unmount it yourself when you are done.
+
+The backup targets are hidden from udisks by the generated rule `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, so no desktop session mounts them and nothing should appear under `/run/media`. If one does, the rule is not applying: unmount it and run `sudo btrdasd setup --check`.
 
 #### Step 3: Verify SMART on the surviving leg
 
 Before relying on the surviving drive for days while the replacement is sourced and rebuilt:
 
 ```bash
-sudo smartctl -a -d sat /dev/<surviving-leg>     # Quick attribute view
-sudo smartctl -t short -d sat /dev/<surviving-leg>  # 2-min sanity test
+# Address the drive by serial, never by /dev/sdX letter (letters change on every reconnect)
+SURV=/dev/disk/by-id/ata-ST22000NM000C-3WC103_<surviving-serial>
+sudo smartctl -a -d sat "$SURV"          # Quick attribute view
+sudo smartctl -t short -d sat "$SURV"    # 2-min sanity test
 # Optional: full extended test (~38h, runs in firmware, no host I/O hit)
-sudo smartctl -t long -d sat /dev/<surviving-leg>
+sudo smartctl -t long -d sat "$SURV"
 ```
 
 If the surviving drive shows reallocated sectors or pending sectors, copy the most critical recent snapshots elsewhere immediately — running degraded on a marginal drive is a one-failure-from-data-loss situation.
@@ -244,11 +259,12 @@ If the surviving drive shows reallocated sectors or pending sectors, copy the mo
 When the new drive arrives, run a full SMART extended test (~38 hours) before committing data:
 
 ```bash
-sudo smartctl -i -d sat /dev/<new-drive>           # Confirm capacity matches
-sudo smartctl -t short -d sat /dev/<new-drive>     # 2-min DOA check
-sudo smartctl -t long  -d sat /dev/<new-drive>     # 38h extended test
+NEW=/dev/disk/by-id/ata-<model>_<new-serial>   # from: ls /dev/disk/by-id/ | grep -v part
+sudo smartctl -i -d sat "$NEW"           # Confirm capacity matches
+sudo smartctl -t short -d sat "$NEW"     # 2-min DOA check
+sudo smartctl -t long  -d sat "$NEW"     # 38h extended test
 # Wait for completion, then:
-sudo smartctl -l selftest -d sat /dev/<new-drive>
+sudo smartctl -l selftest -d sat "$NEW"
 # All tests should show "Completed without error"
 ```
 
@@ -260,16 +276,16 @@ Use your bay map to identify the failed drive's bay before pulling. The DAS does
 
 #### Step 6: Partition the new drive identically
 
-The replacement must have a GPT partition that exactly matches the surviving leg's geometry. Replace `/dev/sdNEW` with the new drive's device letter (find via `lsblk -o NAME,SIZE,SERIAL,TRAN`):
+The replacement must have a GPT partition that exactly matches the surviving leg's geometry. Address it by its serial (`$NEW` from Step 4) — `--zap-all` on the wrong drive destroys it, and `/dev/sdX` letters move on every reconnect. Confirm with `lsblk -o NAME,SIZE,SERIAL,TRAN` that the serial is the new drive's and that it has no partitions:
 
 ```bash
-sudo sgdisk --zap-all /dev/sdNEW
+sudo sgdisk --zap-all "$NEW"
 sudo sgdisk --new=1:2048:42970644446 --typecode=1:8300 \
-    --change-name=1:das-backup-22tb /dev/sdNEW
-sudo partprobe /dev/sdNEW
+    --change-name=1:das-backup-22tb "$NEW"
+sudo partprobe "$NEW"
 ```
 
-Verify with `sudo sgdisk --print /dev/sdNEW` — the partition should be sectors 2048–42970644446, 20.0 TiB, type 8300, name `das-backup-22tb`.
+Verify with `sudo sgdisk --print "$NEW"` — the partition should be sectors 2048–42970644446, 20.0 TiB, type 8300, name `das-backup-22tb`. Its partition is `"$NEW"-part1`.
 
 #### Step 7: Replace the failed device in the array
 
@@ -278,7 +294,7 @@ Verify with `sudo sgdisk --print /dev/sdNEW` — the partition should be sectors
 MISSING_DEVID=<number from "MISSING" line>
 
 # Start the replace — runs in background by default
-sudo btrfs replace start "$MISSING_DEVID" /dev/sdNEW1 /mnt/backup-22tb
+sudo btrfs replace start "$MISSING_DEVID" "$NEW"-part1 /mnt/backup-22tb
 
 # Monitor (recover takes ~24-48 hours for ~5 TiB over USB)
 watch -n 60 sudo btrfs replace status /mnt/backup-22tb
@@ -286,9 +302,18 @@ watch -n 60 sudo btrfs replace status /mnt/backup-22tb
 
 `btrfs replace` reads from the surviving leg, writes to the new device, and updates the superblock. It is online — backups can continue running concurrently (slower).
 
-#### Step 8: Restore RAID-1 across single-profile chunks
+#### Step 8: Scrub, then restore RAID-1 across single-profile chunks
 
-Any data that was written while the array was degraded is in `single` profile chunks. Convert them back to RAID-1:
+First scrub, so every block is verified (and repaired from its good copy) before anything is rewritten:
+
+```bash
+# Full read of every block on both legs, repairs any checksum mismatches
+sudo btrfs scrub start -B /mnt/backup-22tb
+sudo btrfs scrub status /mnt/backup-22tb
+# "Error summary: no errors found" is what you want
+```
+
+Then convert: any data that was written while the array was degraded is in `single` profile chunks.
 
 ```bash
 # `soft` filter only touches chunks that aren't already RAID-1
@@ -299,14 +324,9 @@ sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft \
 sudo btrfs balance status /mnt/backup-22tb
 ```
 
-#### Step 9: Verify integrity and reset counters
+#### Step 9: Verify and reset counters
 
 ```bash
-# Full read of every block on both legs, repairs any checksum mismatches
-sudo btrfs scrub start -B /mnt/backup-22tb
-sudo btrfs scrub status /mnt/backup-22tb
-# "Error summary: no errors found" is what you want
-
 # Confirm all error counters are zero
 sudo btrfs device stats /mnt/backup-22tb
 
@@ -318,9 +338,13 @@ sudo btrfs filesystem df /mnt/backup-22tb
 # Expect: Data, RAID1 / Metadata, RAID1 / System, RAID1 (no `single` lines)
 ```
 
-#### Step 10: Update bay map and CHANGELOG
+Unmount it when you are done (`sudo umount /mnt/backup-22tb`); the next backup mounts it itself.
 
-Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (from `sudo blkid /dev/sdNEW1`). Update CHANGELOG.md to record the replacement date and the failure cause.
+#### Step 10: Update the config, bay map and CHANGELOG
+
+Replace the failed serial with the new one in the target's `serials` in `/etc/das-backup/config.toml`, then run `sudo btrdasd setup --upgrade` (it regenerates the udisks-ignore rule from the serials) and `sudo btrdasd setup --check`. The filesystem UUID, and so `mount_uuid`, does not change with a `btrfs replace`.
+
+Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (from `sudo blkid "$NEW"-part1`). Update CHANGELOG.md to record the replacement date and the failure cause.
 
 ---
 
@@ -345,14 +369,17 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
 
 5. **Identify the new drive**:
    ```bash
-   lsblk
+   lsblk -d -o NAME,SIZE,MODEL,SERIAL
    ```
-   The new drive will show with no partitions.
+   The new drive will show with no partitions. Pick it by **serial**: NVMe names (`nvme0n1`, `nvme1n1`) can swap between boots just like `/dev/sdX` letters.
 
-6. **Partition the new drive** (replace `<new-drive>` with actual device, e.g., `/dev/nvme0n1`):
+6. **Partition the new drive** (replace `<new-drive>` with the device you just matched by serial):
    ```bash
    # Clone partition table from surviving drive
-   sudo sfdisk -d /dev/<surviving-drive> | sudo sfdisk /dev/<new-drive>
+   # sfdisk -d carries the disk GUID (label-id:) and every partition's uuid=, and
+   # sfdisk applies them: drop both so the new drive gets fresh PARTUUIDs instead of
+   # duplicating the survivor's (PARTUUIDs identify the ESPs and their firmware entries)
+   sudo sfdisk -d /dev/<surviving-drive> | sed '/^label-id/d; s/, *uuid=[^,]*//' | sudo sfdisk /dev/<new-drive>
 
    # Or create manually:
    sudo parted /dev/<new-drive> mklabel gpt
@@ -360,34 +387,47 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    sudo parted /dev/<new-drive> set 1 esp on
    sudo parted /dev/<new-drive> mkpart primary 4GiB 100%
 
-   # Format ESP
-   sudo mkfs.fat -F32 /dev/<new-drive-esp-partition>
+   # Format the ESP with the label your fstab and ESP-mirroring expect
+   # (author's system: EFI on the boot drive, EFI-BACKUP on the mirror)
+   sudo mkfs.fat -F32 -n <esp-label> /dev/<new-drive-esp-partition>
    ```
 
-7. **Add the new drive to the BTRFS array**:
+7. **Replace the missing device in the BTRFS array**:
    ```bash
-   # Mount the existing good drive (if not already mounted)
-   sudo mount /dev/<surviving-btrfs-partition> /mnt
+   # Mount the surviving drive degraded (if not already mounted)
+   sudo mount -o degraded /dev/<surviving-btrfs-partition> /mnt
 
-   # Add the new drive to the array
-   sudo btrfs device add /dev/<new-drive-btrfs-partition> /mnt
+   # Note the devid of the missing device
+   sudo btrfs filesystem show /mnt
 
-   # Start rebalancing to RAID1
-   sudo btrfs balance start -dconvert=raid1 -mconvert=raid1 /mnt
+   # Rebuild the missing copy onto the new partition
+   sudo btrfs replace start <missing-devid> /dev/<new-drive-btrfs-partition> /mnt
+
+   # Anything written while degraded is in `single` chunks: convert back
+   sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /mnt
    ```
 
-8. **Wait for balance to complete** (can take several hours):
+8. **Wait for the replace and balance to complete** (can take several hours):
    ```bash
+   sudo btrfs replace status /mnt
    sudo btrfs balance status /mnt
    ```
 
-9. **Copy boot files to new ESP**:
-   ```bash
-   sudo mkdir -p /mnt/boot
-   sudo mount /dev/<new-drive-esp-partition> /mnt/boot
-   sudo rsync -aHAXS /boot/ /mnt/boot/
-   sudo umount /mnt/boot
-   ```
+9. **Populate the new ESP** — never by hand-copying files from one ESP to another:
+   - If the new drive is the **mirror**, run your ESP-mirroring mechanism (author's system: `sudo /usr/local/bin/esp-sync.sh`, which only copies `/boot` → `/mnt/esp-backup`, removes from the mirror any file `/boot` lacks, and refuses any non-NVMe device).
+   - If it held the **primary** ESP (mounted at `/boot`), mount it there and reinstall instead. **`/boot` must be complete before the first sync**, because the sync deletes from the mirror — the ESP you just booted from — whatever `/boot` lacks, and on the author's system a pacman hook (`esp-mirror.hook`) runs that sync at the end of any kernel transaction. Put back first anything no package or generator writes (hand-written loader entries), then reinstall in ONE transaction every package that owns a file on the ESP — `amd-ucode` owns `/boot/amd-ucode.img`, not the kernel package — plus every installed kernel:
+     ```bash
+     sudo mount /boot                      # LABEL=EFI from fstab — now the new ESP
+     sudo bootctl install
+     # recreate hand-written loader entries in /boot/loader/entries/ now
+     # list the ESP-owning packages: pacman -Ql | grep ' /boot/' | awk '{print $1}' | sort -u
+     sudo pacman -S amd-ucode linux-cachyos   # add linux-cachyos-lts etc. if installed
+     sudo sdboot-manage gen
+     sudo /usr/local/bin/esp-sync.sh --dry-run   # must print no "would remove" line
+     sudo /usr/local/bin/esp-sync.sh
+     ```
+     The author's full sequence, including a preview taken before the transaction, is `examples/author-storage-reference.md` §5a Step 8.
+   - Never point any copy or sync at a DAS recovery drive's ESP: those boot their own independent OS.
 
 10. **Register UEFI boot entry for the new drive**:
     ```bash
@@ -396,7 +436,7 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
       --label "<your-boot-label>" --unicode
     ```
 
-11. **Update fstab** with new UUIDs if needed:
+11. **Update fstab** with new UUIDs if needed (an fstab that mounts the ESPs by `LABEL=`, as the author's does, needs no change when the new ESP got the same label):
     ```bash
     sudo blkid /dev/<new-drive-esp-partition>   # Get new ESP UUID
     sudo vim /etc/fstab                          # Update UUIDs
@@ -439,14 +479,17 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    sudo mount /dev/<drive1-btrfs-partition> /mnt/target
    ```
 
-5. **Mount the DAS backup**:
+5. **Mount the DAS backup** — the **primary** target, by filesystem UUID. Do not use a recovery drive's `@`/`@home`: those are that drive's own OS, not your system:
    ```bash
-   # Find your DAS backup drives
-   lsblk | grep sd
+   # Find the target's UUID (author's primary: das-backup-22tb, b2dbe07d-40b9-422e-8ccf-ef4931c40457)
+   lsblk -o NAME,SERIAL,LABEL,UUID
 
-   # Mount the backup (use the BTRFS partition, not ESP)
+   # Mount its top level read-only (degraded is harmless with both RAID-1 legs present)
    sudo mkdir -p /mnt/backup
-   sudo mount -o subvol=/@ /dev/<your-backup-drive-btrfs-partition> /mnt/backup
+   sudo mount -t btrfs -o ro,degraded UUID=<primary-target-uuid> /mnt/backup
+
+   # Pick the snapshot to restore from (newest last)
+   ls /mnt/backup/nvme/ | grep -E '^(root-|home)\.'
    ```
 
 6. **Restore the system**:
@@ -456,16 +499,16 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    sudo btrfs subvolume create /mnt/target/@home
    sudo btrfs subvolume create /mnt/target/@log
    sudo btrfs subvolume create /mnt/target/@root
-   # Add any other subvolumes from your configuration
+   # Add any other subvolumes from your configuration (`btrdasd subvol list`);
+   # a nested one (e.g. @/@audiobooks-db) is created inside its parent after the parent is restored
 
-   # Copy root data
-   sudo rsync -aAXHv --info=progress2 /mnt/backup/ /mnt/target/@/
+   # Copy root data from the chosen snapshot
+   sudo rsync -aAXHv --info=progress2 /mnt/backup/nvme/root-.<TIMESTAMP>/ /mnt/target/@/
 
-   # Mount and restore home (adjust subvolume name for your backup layout)
-   sudo mkdir -p /mnt/backup-home
-   sudo mount -o subvol=/@home /dev/<your-backup-drive-btrfs-partition> /mnt/backup-home
-   sudo rsync -aAXHv --info=progress2 /mnt/backup-home/ /mnt/target/@home/
+   # Restore home from the snapshot of the same time
+   sudo rsync -aAXHv --info=progress2 /mnt/backup/nvme/home.<TIMESTAMP>/ /mnt/target/@home/
    ```
+   The subvolume names above are the author's (`btrdasd subvol list` shows yours); a snapshot holds an empty directory where a nested subvolume sat, so restore each nested one from its own snapshot.
 
 7. **Install bootloader**:
    ```bash
@@ -495,6 +538,7 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
 9. **Unmount and reboot**:
    ```bash
    sudo umount -R /mnt/target
+   sudo umount /mnt/backup
    sudo reboot
    ```
 
@@ -695,7 +739,10 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    ```bash
    # CachyOS/Arch:
    pacman -S linux-cachyos    # or whichever kernel package you use
-   # This reinstalls the kernel AND regenerates initramfs
+   # This reinstalls the kernel AND regenerates initramfs. If the microcode image is
+   # missing too, put amd-ucode (or intel-ucode) in the SAME command: on the author's
+   # system a pacman hook then syncs /boot to the backup ESP and deletes there
+   # whatever /boot still lacks.
 
    # Debian/Ubuntu:
    apt install --reinstall linux-image-$(uname -r)
@@ -849,32 +896,33 @@ You don't always need a full system restore. Often you just need one file you ac
 
 ### Browse Backup Snapshots
 
-Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot is a frozen copy of a subvolume at a specific point in time.
+Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot is a frozen copy of a subvolume at a specific point in time. The primary target keeps the long history (author's: 7 daily, 4 weekly, 12 monthly, 1 yearly); a recovery drive keeps only its own short window (author's: 7 daily). See [Where Each Backup Lives on a Target](#where-each-backup-lives-on-a-target) for the directory layout, adopted subvolumes and retired ones.
 
-1. **Mount the backup drive** (if not already mounted):
+1. **Mount the backup drive** by filesystem UUID (if not already mounted). The targets are hidden from udisks, so a file manager will not offer them:
    ```bash
    sudo mkdir -p /mnt/backup
-   sudo mount /dev/<backup-partition> /mnt/backup
+   sudo mount -t btrfs -o ro,degraded UUID=<target-uuid> /mnt/backup
    ```
+   On a running system that also runs scheduled backups, check first that none is running (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`), and unmount when done.
 
 2. **List available snapshots**:
    ```bash
    # Show all subvolumes (snapshots are subvolumes)
    sudo btrfs subvolume list /mnt/backup | sort -k9
 
-   # Example output:
-   # ID 419 gen 763 top level 5 path nvme/root.20260228T0300
-   # ID 420 gen 766 top level 5 path nvme/root.20260302T0828
-   # ID 485 gen 1038 top level 5 path nvme/root.20260305T0809
+   # Example output (names in the author's layout; IDs illustrative):
+   # ID 41901 gen 763 top level 5 path nvme/root-.20260930T0306
+   # ID 42017 gen 766 top level 5 path nvme/root-.20261001T0312
+   # ID 42188 gen 1038 top level 5 path nvme/root-.20261002T1500
    # ...
    ```
-   The date is in the name: `root.20260302T0828` = root snapshot from March 2, 2026, 8:28 AM.
+   The date is in the name: `root-.20261002T1500` = snapshot of `@` from October 2, 2026, 15:00. The name before the dot is the entry's `snapshot_name` in `/etc/btrbk/btrbk.conf`.
 
 3. **Browse a specific snapshot**:
    ```bash
    # Mount a snapshot read-only
    sudo mkdir -p /mnt/snapshot
-   sudo mount -o subvol=nvme/root.20260302T0828,ro /dev/<backup-partition> /mnt/snapshot
+   sudo mount -t btrfs -o subvol=nvme/root-.20261002T1500,ro,degraded UUID=<target-uuid> /mnt/snapshot
 
    # Now browse it like a normal filesystem
    ls /mnt/snapshot/etc/
@@ -889,8 +937,10 @@ Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot i
 
 5. **When done, unmount**:
    ```bash
-   sudo umount /mnt/snapshot
+   sudo umount /mnt/snapshot /mnt/backup
    ```
+
+With `btrdasd` installed you can also list a snapshot without a second mount: `btrdasd restore browse /mnt/backup/nvme/root-.20261002T1500 --prefix etc/`.
 
 ### Restore a Single File
 
@@ -908,10 +958,12 @@ Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot i
    sudo cp -a /mnt/snapshot/path/to/file /mnt/broken/path/to/file
    ```
 
+   On a running system with `btrdasd`, `sudo btrdasd restore file <snapshot-path> <dest-dir> <path-in-snapshot>…` does the same, but only into an allowed root: `[restore] allowed_roots` in `config.toml` (default `/home` and `/tmp`; the author's also grants `/srv/VirtualMachines`), and never under a system path (`/bin`, `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/srv/ftp`, `/srv/http`, `/sys`, `/usr`, `/var/lib`, `/var/spool`), whatever the config says. Restore system files with `cp -a` as above.
+
 3. **To find which snapshot contains a specific file** (if you don't know the date):
    ```bash
    # Search across multiple snapshots
-   for snap in /mnt/backup/nvme/root.*/; do
+   for snap in /mnt/backup/nvme/root-.*/; do
      if [ -f "${snap}path/to/file" ]; then
        echo "Found in: $snap"
        ls -la "${snap}path/to/file"
@@ -935,24 +987,26 @@ Use this when you want to roll back an entire subvolume (root, home, etc.) to a 
 **Method 1: BTRFS send/receive (fast, preserves BTRFS metadata)**
 
 ```bash
-# 1. Mount backup drive
-sudo mount /dev/<backup-partition> /mnt/backup
+# 1. Mount backup drive (top level, by UUID)
+sudo mount -t btrfs -o ro,degraded UUID=<target-uuid> /mnt/backup
 
-# 2. Mount the target where you want to restore
-sudo mount /dev/<target-partition> /mnt/target
+# 2. Mount the top level of the filesystem you are restoring into
+sudo mount -o subvolid=5 /dev/<target-partition> /mnt/target
 
 # 3. Rename the current (broken) subvolume
 sudo mv /mnt/target/@ /mnt/target/@.broken
 
 # 4. Send the backup snapshot to the target
 #    (This is a fast BTRFS-native operation, not a file copy)
-sudo btrfs send /mnt/backup/nvme/root.20260302T0828 | sudo btrfs receive /mnt/target/
+sudo btrfs send /mnt/backup/nvme/root-.20261002T1500 | sudo btrfs receive /mnt/target/
 
-# 5. Rename the received snapshot to @
-sudo mv /mnt/target/root.20260302T0828 /mnt/target/@
+# 5. Make a WRITABLE snapshot of the received one, named @
+#    NEVER run `btrfs property set ... ro false` on a received snapshot: it
+#    permanently destroys its Received UUID and breaks incremental send/receive.
+sudo btrfs subvolume snapshot /mnt/target/root-.20261002T1500 /mnt/target/@
 
-# 6. Make it writable (snapshots are read-only by default)
-sudo btrfs property set /mnt/target/@ ro false
+# 6. Keep the read-only received copy until the restore is proven, then delete it
+#    sudo btrfs subvolume delete /mnt/target/root-.20261002T1500
 
 # 7. IMPORTANT: Update /etc/fstab in the restored subvolume
 #    The backup snapshot's fstab has the UUIDs from when it was taken.
@@ -970,7 +1024,7 @@ sudo umount /mnt/target /mnt/backup
 
 ```bash
 # Mount source snapshot and target
-sudo mount -o subvol=nvme/root.20260302T0828,ro /dev/<backup-partition> /mnt/snapshot
+sudo mount -t btrfs -o subvol=nvme/root-.20261002T1500,ro,degraded UUID=<backup-target-uuid> /mnt/snapshot
 sudo mount -o subvol=@ /dev/<target-partition> /mnt/target
 
 # Sync (--delete removes files that don't exist in the snapshot)
@@ -983,7 +1037,7 @@ sudo umount /mnt/snapshot /mnt/target
 **Important**: After restoring a root subvolume, always check and update:
 - `/etc/fstab` — UUIDs may not match current drives
 - Boot entries in `/boot/loader/entries/` — root UUID must be correct
-- Regenerate initramfs: `arch-chroot /mnt/target && mkinitcpio -P`
+- Regenerate initramfs, with the ESP mounted inside the restored root first — where `/boot` is the ESP (as on the author's system), skipping the mount writes the initramfs into the subvolume's own `/boot` directory, which the bootloader never reads. Method 1 (`/mnt/target` is the top level): `sudo mount LABEL=EFI /mnt/target/@/boot && sudo arch-chroot /mnt/target/@ mkinitcpio -P`. Method 2 (with the target mounted again): `sudo mount LABEL=EFI /mnt/target/boot && sudo arch-chroot /mnt/target mkinitcpio -P`. Use your primary ESP's label; unmount it before unmounting the target
 
 ---
 
@@ -1046,6 +1100,8 @@ dmesg | tail -50 | grep -i "usb\|sd"
 # 4. Try a different USB cable
 ```
 
+On the system that runs the backups, the backup targets never appear in a file manager or under `/run/media`: they are hidden from udisks on purpose. Look for them with `lsblk -o NAME,SERIAL,LABEL,UUID` and mount them by UUID. After reconnecting the enclosure, run `sudo btrfs device scan` so the two-drive primary is registered before mounting it.
+
 ---
 
 ## Reference Information
@@ -1099,11 +1155,11 @@ sudo btrfs filesystem show
 # List block devices with details
 lsblk -f
 
-# Check backup snapshot timestamps
-ls -la /mnt/backup/<snapshot-directory>/
+# Mount a backup target read-only, by filesystem UUID (safe)
+sudo mount -t btrfs -o ro,degraded UUID=<target-uuid> /mnt/backup
 
-# Mount backup read-only (safe)
-sudo mount -o ro,subvol=/@ /dev/<your-backup-partition> /mnt/backup
+# Check backup snapshot timestamps
+ls -la /mnt/backup/<target-subdir>/
 
 # Show configured backup targets
 btrdasd config show
@@ -1120,4 +1176,4 @@ btrdasd config show
 
 ---
 
-*Backup system version: 0.7.21.0*
+*Backup system version: 0.7.22.3*

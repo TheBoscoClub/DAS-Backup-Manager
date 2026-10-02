@@ -32,11 +32,11 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Email Reports** — Automated backup status reports with throughput metrics and SMART status
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
 - **Auto-Mount/Unmount** — RAII `MountGuard` finds each target by its `mount_uuid` or drive serial (the same rule as `backup-run.sh`), auto-mounts BTRFS partitions before operations, and unmounts on completion, retrying a busy target; one it cannot release fails the operation with `still mounted: <path>` (all D-Bus methods and CLI commands)
+- **Targets Hidden From Desktop Automount** — a generated udev rule marks every backup target as ignored by udisks2, so nothing mounts it under `/run/media`; only the backup run and `btrdasd` mount targets (`btrdasd setup --check` reads back whether each attached target carries the flag)
 - **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 23 methods for backup, restore, config, schedule, health, and index read operations
-- **FFI Bridge** (`libbuttered_dasd_ffi.so`) — C-ABI shared library for GUI access to Rust library functions
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 full backup management application with sidebar navigation, Dolphin-style file browser, backup operations, health dashboard, config editor, first-run wizard, desktop notifications, and system tray
 - **USB SMART Passthrough** — Health queries use `-d sat` for USB-attached DAS drives to read SMART data through USB-SATA bridges
-- **Interactive Installer** (`btrdasd setup`) — 10-step wizard with 5 modes: install, modify, upgrade, uninstall, check
+- **Interactive Installer** (`btrdasd setup`) — 9-step wizard with 5 modes: install, modify, upgrade, uninstall, check
 - **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
 - **Native Packaging** — Packaging recipes for Arch (PKGBUILD), Debian/Ubuntu (dpkg), Fedora (RPM), Flatpak, and Snap — all build-tested on their respective distributions before each release
@@ -44,13 +44,13 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 | Component | Description | Status |
 |-----------|-------------|--------|
-| `scripts/backup-run.sh` | btrbk backup orchestrator with email reporting | Active (v4.4.1) |
+| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, email reporting | Active (v4.7.1) |
 | `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active (v3.0.0) |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active (v2.1.0) |
-| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v2.0.0) |
+| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v2.2.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
-| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon + FFI cdylib) | Active (v0.7.0+) |
+| `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
@@ -60,12 +60,10 @@ That said, suggestions, recommendations, and requests that fall within this narr
 DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
 ├── config/            # btrbk.conf reference template
-├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper + FFI
+├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper
 │   ├── src/           # Library modules (21): adopt, backup, btrbk_conf, caldate, config, db, doctor, expire, forget, fsutil, health, indexer, mount, progress, reconcile, report, restore, scanner, schedule, scrub, subvol
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 │   ├── src/bin/       # btrdasd-helper D-Bus daemon
-│   ├── src/ffi.rs     # C-ABI FFI bridge (extern "C" functions)
-│   ├── include/       # C header (btrdasd_ffi.h)
 │   └── completions/   # Shell completion installation instructions
 ├── gui/               # Qt6/KDE Plasma GUI (18 C++ components)
 │   └── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
@@ -73,7 +71,7 @@ DAS-Backup-Manager/
 ├── polkit/            # Polkit privilege escalation policy
 ├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap)
 ├── docs/              # Architecture, installation, dependencies, recovery, man page
-└── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER, BUILD_FFI)
+└── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER)
 ```
 
 ## Minimum Requirements
@@ -82,7 +80,7 @@ DAS-Backup-Manager/
 - DAS enclosure (any manufacturer, any interface -- USB, Thunderbolt, eSATA)
 - One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
 - btrbk 0.32+, smartmontools
-- Rust 1.87+ with Cargo (for building the indexer and installer)
+- Rust 1.88+ with Cargo (needs let-chains; not compile-tested below 1.98.1) for building the indexer and installer
 - **Optional**: Qt6 6.6+ (with Qt6::DBus), KDE Frameworks 6.0+ (with KNotifications, KStatusNotifierItem), CMake 3.25+ (for the GUI)
 
 ## Installation
@@ -90,7 +88,7 @@ DAS-Backup-Manager/
 ### Recommended: Full Build (CLI + GUI + Helper)
 
 ```bash
-# Build everything (Rust CLI, D-Bus helper, FFI library, KDE GUI)
+# Build everything (Rust CLI, D-Bus helper, KDE GUI)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
@@ -117,8 +115,8 @@ See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including na
 ## Design Philosophy
 
 - **Security-first**: Rust for the data pipeline (no buffer overflows, use-after-free, or data races). C++20 RAII with `-Werror` for the GUI. Exclusive prepared statements for all SQL.
-- **Memory safety**: Minimal `unsafe` in Rust (libc calls and FFI boundary). No raw pointers in C++ GUI code. Smart pointers exclusively.
-- **Efficiency**: Span-based deduplication compresses file presence across snapshots. Incremental indexing skips already-processed snapshots. Six targeted performance indexes.
+- **Memory safety**: Minimal `unsafe` in Rust (single-call libc wrappers: `time`/`localtime_r`, `gethostname`, `statvfs`, `syncfs`, `flock`, `geteuid`). No raw pointers in C++ GUI code. Smart pointers exclusively.
+- **Efficiency**: Span-based deduplication compresses file presence across snapshots. Incremental indexing skips already-processed snapshots. Nine targeted performance indexes.
 - **Stability**: Indexing errors never abort backups (soft-fail). GUI gracefully handles missing or locked databases.
 - **Privacy**: File metadata only — no file contents are ever read or stored. No telemetry or network connections.
 

@@ -63,10 +63,14 @@ figure.** They answer different questions and neither substitutes for the other.
 
 ## 3. Measured baseline
 
-All figures from `journalctl -u das-backup`. "Written" is bytes actually sent to
-the backup target; "elapsed" is wall-clock for the whole run.
+All figures from `journalctl -u das-backup`, measured on the dates shown.
+"Elapsed" is the wall-clock time of the btrbk send/receive phase, not of the
+whole run (mounting, indexing and reporting are outside it). "Written" is the
+growth in used space summed over every mounted target, so a stream sent to all
+three targets counts three times, and snapshots that btrbk's retention deleted
+in the same phase subtract from it.
 
-| Date | USB link speed | Elapsed (wall clock) | Written | Aggregate rate |
+| Date | USB link speed | Elapsed (btrbk phase) | Written | Aggregate rate |
 |:-----------|:-------------------|:---------------------|:-----------|:---------------|
 | 2026-08-26 | 480 Mbit/s | 1 h 10 m 37 s | not recorded | not recorded |
 | 2026-08-27 | 480 Mbit/s | 1 h 05 m 40 s | not recorded | not recorded |
@@ -87,8 +91,11 @@ recorded together below.
 
 ## 4. What the system now records
 
-Every backup appends one JSON object per run to
-**`/var/lib/das-backup/throughput.jsonl`**:
+Every `backup-run.sh` run that is not a dry run and whose targets grew appends
+one JSON object to **`/var/lib/das-backup/throughput.jsonl`** (a run that wrote
+nothing appends no line). Backups started with `btrdasd backup run` or from the
+GUI write no line and do not check the link — that check exists only in
+`backup-run.sh`, which the timers run:
 
 ```json
 {"ts":"2026-08-31T03:11:12-05:00","elapsed_s":672,"bytes":13958643712,"bytes_per_s":20766623,"usb_link_mbit_s":"10000"}
@@ -96,11 +103,14 @@ Every backup appends one JSON object per run to
 
 | Field | Dimension | Meaning |
 |:------------------|:------------------------|:------------------------------------|
-| `ts` | timestamp (ISO 8601) | when the run finished |
-| `elapsed_s` | seconds | wall-clock duration of the run |
-| `bytes` | bytes | total written to the backup target |
+| `ts` | timestamp (ISO 8601) | when the line was written |
+| `elapsed_s` | seconds | wall-clock duration of the btrbk phase |
+| `bytes` | bytes | growth in used space, summed over every mounted target |
 | `bytes_per_s` | bytes per second | aggregate write rate |
 | `usb_link_mbit_s` | megabits per second | negotiated USB link speed |
+
+The line is written right after the btrbk phase. Since `backup-run.sh` 4.6.0 that
+phase, as timed, also includes the retired-subvolume expiry that follows btrbk.
 
 `usb_link_mbit_s` is a **string**, so a run where the enclosure could not be
 identified records the literal `"unknown"` rather than a plausible-looking `0`.
@@ -112,12 +122,17 @@ greppable without a parser and a partial write can never corrupt earlier runs.
 
 ### The alert
 
-`backup-run.sh` records an operation status of `FAIL` for `usb_link` — surfaced
-as a row in the emailed report — whenever the negotiated link is **below
-5000 Mbit/s**. The threshold sits deliberately between the two real states:
-USB 3.0 Gen 1 is 5000 Mbit/s, Gen 2 is 10 000 Mbit/s, and USB 2.0 High Speed is
-480 Mbit/s. Anything at or under Gen 1 rates on this enclosure means the link
-did not come up as it should.
+`backup-run.sh` records an operation status of `FAIL` for `usb_link` whenever
+the negotiated link is **below 5000 Mbit/s**. That turns the emailed report's
+status line into `FAILURES DETECTED` and puts `usb_link: negotiated <N> Mbit/s,
+expected 10000` in the run's `backup_runs` errors, but the report has no row
+that names it: the reason is in the journal (`journalctl -u das-backup`), not in
+the email. The threshold sits between the two real states seen so far: USB 3.0
+Gen 1 is 5000 Mbit/s, Gen 2 is 10 000 Mbit/s, and USB 2.0 High Speed is 480
+Mbit/s. A link that comes up at Gen 1 (exactly 5000 Mbit/s) is still short of
+what this enclosure should negotiate, but it is **not** flagged — only a reading
+below 5000 Mbit/s is. The check reads the first enclosure device it finds, and
+runs only when the run wrote something.
 
 **The backup is not aborted.** A degraded link still produces a correct backup;
 it just takes longer. Failing the run would trade a slow backup for no backup,
@@ -144,7 +159,8 @@ The fix is physical and takes about a minute.
    done
    ```
 
-   Every line must read **10000 Mbit/s**. Four lines are expected — one per bay.
+   Every line must read **10000 Mbit/s**. Four lines are expected — one per occupied
+   bay (four of the six bays hold drives). On 2026-10-02 all four read 10000 Mbit/s.
 
 4. Re-scan multi-device filesystems before mounting anything, because USB
    re-enumeration deregisters them:

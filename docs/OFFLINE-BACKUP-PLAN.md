@@ -2,6 +2,17 @@
 
 This guide covers capacity estimation, drive selection, retention planning, and DAS enclosure requirements for a BTRFS backup system using btrbk.
 
+> **Status as of 2026-10-02.** The planning sections (Core Concepts through the
+> worksheet, and Risk Considerations) are general guidance, not a description of
+> this project's behaviour. **Backup Workflow** describes what the installed system
+> does today. In **Reference Example**, the hardware and bay allocation are current;
+> the capacity budget, the "What Is NOT Backed Up" list and the cost table are the
+> author's original plan from before 2026-05-06 and have been superseded — the live
+> config now also backs up VM images, Steam libraries, ISOs and media, mostly to the
+> primary target only (`ISOs` and `SteamLibrary-local`, in source `hdd-system`, go to
+> all three targets), and the recovery drives receive more than the OS subvolumes. Which subvolume goes to which target is in `/etc/btrbk/btrbk.conf`,
+> generated from `/etc/das-backup/config.toml`.
+
 ---
 
 ## Core Concepts
@@ -172,16 +183,19 @@ How much history do you want to keep?
 
 The `das-backup.timer` systemd unit (or cron job on sysvinit/OpenRC) runs nightly:
 
-1. `backup-run.sh` detects DAS drives by serial number
-2. Mounts source top-level volumes and all target drives
-3. Records pre-backup disk usage for throughput measurement
-4. Runs `btrbk run` -- creates snapshots and sends incremental deltas to all targets
-5. Records post-backup usage, logs per-target throughput
-6. Archives and recreates boot subvolumes on non-mirror targets (`--full` runs only; skips `role=mirror` targets)
-7. Prunes expired boot subvolume archives past `[boot].archive_retention_days`
-8. Records growth data point for trend analysis
-9. Generates and emails a backup report (if configured)
-10. Unmounts all volumes and cleans up
+1. `backup-run.sh` takes its locks (waiting if a scrub holds the maintenance lock) and checks that the DAS is connected
+2. Mounts the source top-level volumes and verifies each is the expected filesystem
+3. Syncs subvolumes with the config (`btrdasd subvol sync`): adopts new subvolumes, retires vanished ones, regenerates `btrbk.conf` when it differs
+4. Mounts the targets by filesystem UUID (`mount_uuid`), else by drive serial, and verifies each is the expected filesystem before anything writes to it
+5. Records pre-backup disk usage for throughput measurement
+6. Runs `btrbk run` -- creates snapshots and sends incremental deltas to the targets each source names
+7. Deletes the backups of retired subvolumes that are past their retention window (`btrdasd subvol expire`)
+8. Records post-backup usage, logs throughput and the negotiated USB link speed
+9. Creates missing boot subvolumes on non-mirror targets, and archives and recreates them on `--full` runs (skips `role=mirror` targets)
+10. Indexes the new snapshots (`btrdasd walk`) and records a growth data point
+11. Prunes expired boot subvolume archives past `[boot].archive_retention_days`
+12. Reads the report data while the targets are mounted, then unmounts them (each unmount retried 5 times, 2 s apart)
+13. Writes the report to `last_report`, emails it (if configured), and records the run in the database
 
 There is no ESP sync step — ESP/boot partition mirroring was removed from the codebase
 2026-04-10/12 (see `.claude/rules/esp-safety.md`).
@@ -194,13 +208,15 @@ There is no ESP sync step — ESP/boot partition mirroring was removed from the 
 ```bash
 sudo /usr/lib/das-backup/backup-run.sh                # incremental
 sudo /usr/lib/das-backup/backup-run.sh --dryrun       # preview
-sudo /usr/lib/das-backup/backup-run.sh --full         # force full send
+sudo /usr/lib/das-backup/backup-run.sh --full         # also archive + recreate boot subvolumes
 ```
 
 ### Recommended Schedule
 
-- **Nightly**: Automated incremental backup via systemd timer / cron
-- **Monthly**: Run SMART checks on all DAS drives (`backup-verify.sh`)
+- **Nightly**: Automated incremental backup via systemd timer / cron (`das-backup.timer`, 03:00; `das-backup-full.timer` adds the boot-subvolume step on Sundays)
+- **Weekly (automatic)**: Subvolume drift check (`das-backup-doctor.timer`, emails only when it finds drift)
+- **Monthly (automatic)**: BTRFS scrub of every backup target (`das-scrub.timer`, `btrdasd scrub run`)
+- **Monthly**: Run SMART checks on all DAS drives (`backup-verify.sh`, run by hand)
 - **Quarterly**: Test boot from DAS recovery drive (if applicable), verify restore capability
 - **As needed**: Check SMART extended test results on large drives
 
@@ -208,7 +224,8 @@ sudo /usr/lib/das-backup/backup-run.sh --full         # force full send
 
 After each backup, the report includes:
 
-- **Backup Operations** -- btrbk success/fail + duration, boot subvolume archive/cleanup status, unmount status
+- **Backup Operations** -- maintenance-lock wait, btrbk success/fail + duration, boot subvolume archive/cleanup status, unmount status, content indexer, subvolume sync, retired-subvolume expiry
+- **Subvolume Sync / Retired Subvolumes** -- what was adopted, retired, skipped or expired (when there is anything to say)
 - **Throughput** -- per-target data written and transfer rate
 - **Disk Capacity** -- used/available/percentage for all backup targets
 - **Growth Analysis** -- daily growth, 7-day average, 30-day average, capacity runway projection
@@ -267,22 +284,22 @@ Shingled Magnetic Recording (SMR) drives have poor random write performance once
 > the counter-intuitive finding recorded there: **throughput alone does not detect
 > this fault.** The link speed is the signal.
 
-### Drive Allocation (2026-05-06)
+### Drive Allocation (bays as of 2026-05-06; sources as of 2026-10-02)
 
 ```
 Bay 1 -- 2TB Barracuda: BOOTABLE RECOVERY #1
-  Independent ESP + bootable OS + btrbk NVMe/SSD snapshots
+  Independent ESP + bootable OS + btrbk snapshots of the nvme, ssd, projects and hdd-system sources
   Label: das-backup-system-recovery-A (serial ZK208Q77)
 
 Bay 2 -- 22TB Exos: PRIMARY BACKUP — RAID-1 leg 1 (serial ZXA1R71M, RMA replacement for failed ZXA0LMAE since 2026-05-15)
   Pairs with bay 5 in a single BTRFS RAID-1 filesystem
-  Receives all btrbk targets (NVMe, SSD, HDD projects, audiobooks, DAS storage)
+  Receives every source; the only target for the sources scoped to it (nvme-vm, ssd-steam, ssd-vm, hdd-media, hdd-audiobooks, das-storage)
   Retention: 7 daily + 4 weekly + 12 monthly + 1 yearly
 
 Bay 3 -- empty
 
 Bay 4 -- 2TB Barracuda: BOOTABLE RECOVERY #2 (moved from bay 3 on 2026-05-06)
-  Independent ESP + bootable OS + btrbk NVMe/SSD snapshots
+  Independent ESP + bootable OS + btrbk snapshots of the nvme, ssd, projects and hdd-system sources
   Label: das-backup-system-recovery-B (serial ZFL41DNY)
 
 Bay 5 -- 22TB Exos: PRIMARY BACKUP — RAID-1 leg 2 (serial ZXA1NYGZ)
@@ -302,7 +319,7 @@ The "Why Not BTRFS RAID on Backup Drives?" section above argues that backup driv
 
 For users who prefer the rotation-and-air-gap model, two-drive JBOD with manual rotation is still the right choice. RAID-1 is the trade-off you make when you want resilience against silent corruption and against single-drive failure during the multi-day replacement window for high-capacity drives.
 
-### Capacity Budget
+### Capacity Budget (original plan, before 2026-05-06)
 
 | Data Category | Size | Source |
 |---------------|------|--------|
@@ -312,7 +329,7 @@ For users who prefer the rotation-and-air-gap model, two-drive JBOD with manual 
 | HDD: Audiobook sources | ~509G | Original source files only |
 | **Total irreplaceable** | **~1 TiB** | |
 
-### What Is NOT Backed Up
+### What Is NOT Backed Up (original plan — superseded, see the status note at the top)
 
 | Category | Size | Reason |
 |----------|------|--------|
@@ -322,7 +339,7 @@ For users who prefer the rotation-and-air-gap model, two-drive JBOD with manual 
 | AI models | ~2T+ | Re-downloadable |
 | ISOs, caches, Snapper | Variable | Re-downloadable or auto-rebuilt |
 
-### Cost Analysis
+### Cost Analysis (original plan, before the second 22TB drive)
 
 | Item | Cost |
 |------|------|

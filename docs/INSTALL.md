@@ -10,7 +10,7 @@
 - DAS enclosure (any manufacturer, any interface -- USB, Thunderbolt, eSATA) in JBOD mode
 - One or more BTRFS-formatted drives (any technology: HDD, SSD, NVMe)
 - btrbk 0.32+, smartmontools
-- Rust 1.87+ with Cargo (for building btrdasd)
+- Rust 1.88+ with Cargo (needs let-chains; not compile-tested below 1.98.1) for building btrdasd
 
 ### Planning Your Backup
 
@@ -29,7 +29,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 
 | Dependency | Version | Purpose |
 |-----------|---------|---------|
-| Rust toolchain | **1.87+** | Edition 2024 with `let_chains` (stable since 1.87) |
+| Rust toolchain | **1.88+** | Edition 2024; needs let-chains (stable since 1.88); not compile-tested below 1.98.1 |
 | C compiler | gcc or clang | Required by `libsqlite3-sys` to build bundled SQLite |
 | btrbk | 0.32+ | BTRFS snapshot creation and send/receive |
 | btrfs-progs | system | BTRFS subvolume operations |
@@ -49,10 +49,10 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 
 | Dependency | Version | Purpose |
 |-----------|---------|---------|
-| Qt6 | 6.6+ (tested 6.10.2) | UI framework |
-| Qt6 Charts | 6.6+ (tested 6.10.2) | Growth trendline chart (`qt6-charts` package) |
-| KDE Frameworks 6 | 6.0+ (tested 6.23.0) | KXmlGuiWindow, KIO, KAboutData, Notifications, StatusNotifierItem |
-| CMake | 3.25+ (tested 4.2.3) | Build system for GUI component |
+| Qt6 | 6.6+ (tested 6.11.2) | UI framework |
+| Qt6 Charts | 6.6+ (tested 6.11.2) | Growth trendline chart (`qt6-charts` package) |
+| KDE Frameworks 6 | 6.0+ (tested 6.30.0) | KXmlGuiWindow, KIO, KAboutData, Notifications, StatusNotifierItem |
+| CMake | 3.25+ (tested 4.4.3) | Build system for GUI component |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros |
 
 ## Quick Start — Full Build (CLI + GUI + Helper)
@@ -60,7 +60,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 The recommended installation method builds all components and runs the setup wizard:
 
 ```bash
-# 1. Build everything (CLI, D-Bus helper, FFI library, KDE GUI)
+# 1. Build everything (CLI, D-Bus helper, KDE GUI)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
@@ -71,24 +71,24 @@ sudo cmake --install build
 sudo btrdasd setup
 ```
 
-This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon), `libbuttered_dasd_ffi.so` (FFI library), backup scripts, systemd units, D-Bus/polkit configs, shell completions, man page, and desktop entry.
+This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon), backup scripts, systemd units, D-Bus/polkit configs, shell completions, man page, and desktop entry.
 
 The wizard auto-detects the init system, package manager, and installed dependencies
-before it starts, then walks through the following on-screen steps (numbered `[1/10]`
-through `[10/10]` — step 4 was the ESP-mirroring step, removed 2026-04-12 along with all
-ESP sync code; the wizard's step counter still skips straight from `[3/10]` to `[5/10]`):
+before it starts, then walks through the following on-screen steps (numbered `[1/9]`
+through `[9/9]`; the ESP-mirroring step that once sat between targets and retention was
+removed 2026-04-12 along with all ESP sync code):
 
-1. **Checking Dependencies** `[1/10]` — verifies btrbk, btrfs, smartctl, etc. against the
+1. **Checking Dependencies** `[1/9]` — verifies btrbk, btrfs, smartctl, etc. against the
    auto-detected system info
-2. **Backup Sources (BTRFS Subvolumes)** `[2/10]` — choose BTRFS subvolumes to back up
-3. **Backup Targets** `[3/10]` — choose backup destination drives
-4. **Retention Policy** `[5/10]` — weekly and monthly snapshot counts per target
-5. **Backup Schedule** `[6/10]` — incremental and full backup times
-6. **Email Notifications** `[7/10]` — optional; relay host/port and the
+2. **Backup Sources (BTRFS Subvolumes)** `[2/9]` — choose BTRFS subvolumes to back up
+3. **Backup Targets** `[3/9]` — choose backup destination drives
+4. **Retention Policy** `[4/9]` — weekly and monthly snapshot counts per target
+5. **Backup Schedule** `[5/9]` — incremental and full backup times
+6. **Email Notifications** `[6/9]` — optional; relay host/port and the
    from/to addresses (no credentials are requested or stored)
-7. **Install Location** `[8/10]` — binary/script install prefix
-8. **KDE Plasma GUI** `[9/10]` — GUI desktop entry install toggle
-9. **Review Configuration** `[10/10]` — shows generated config, writes files
+7. **Install Location** `[7/9]` — binary/script install prefix
+8. **KDE Plasma GUI** `[8/9]` — GUI desktop entry install toggle
+9. **Review Configuration** `[9/9]` — shows generated config, writes files
 
 ## Installer Modes
 
@@ -98,7 +98,7 @@ ESP sync code; the wizard's step counter still skips straight from `[3/10]` to `
 sudo btrdasd setup
 ```
 
-Runs the full 10-step wizard, generates all configuration files, and enables backup timers.
+Runs the full 9-step wizard, generates all configuration files, and enables backup timers.
 
 ### Modify Existing Config
 
@@ -138,7 +138,7 @@ Prompts whether to also remove the backup database at `/var/lib/das-backup/backu
 sudo btrdasd setup --uninstall-all
 ```
 
-Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), FFI library, D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon. Prompts whether to remove the backup database.
+Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon. Prompts whether to remove the backup database.
 
 ### Non-Interactive Mode (`--force`)
 
@@ -182,7 +182,9 @@ sudo cmake --install build
 # Create database directory
 sudo mkdir -p /var/lib/das-backup
 
-# Configure btrbk manually
+# Configure btrbk manually. Note: once a config.toml exists, btrbk.conf is
+# generated from it and a hand edit is lost the next time sync or
+# `btrdasd setup --upgrade` runs (see [subvolumes] below).
 sudo cp config/btrbk.conf /etc/btrbk/btrbk.conf
 sudo vim /etc/btrbk/btrbk.conf  # edit for your drives
 
@@ -199,12 +201,12 @@ sudo systemctl enable --now das-backup.timer das-backup-full.timer
 If you don't have Qt6/KF6 installed or don't need the GUI:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF -DBUILD_FFI=OFF
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
 cmake --build build
 sudo cmake --install build
 ```
 
-This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit policy, and man page — everything except the GUI and FFI library.
+This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit policy, and man page — everything except the GUI.
 
 ## CMake Build Options
 
@@ -213,7 +215,6 @@ This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit
 | `BUILD_GUI` | `ON` | Build the KDE Plasma GUI (requires Qt6/KF6) |
 | `BUILD_INDEXER` | `ON` | Build the `btrdasd` Rust binary via cargo |
 | `BUILD_HELPER` | `ON` | Build the `btrdasd-helper` D-Bus daemon and install polkit/D-Bus config |
-| `BUILD_FFI` | `ON` | Build `libbuttered_dasd_ffi.so` C-ABI shared library (for GUI) |
 | `CMAKE_INSTALL_PREFIX` | `/usr/local` | Installation prefix for binaries and scripts |
 | `CMAKE_BUILD_TYPE` | (unset) | `Release`, `RelWithDebInfo`, or `Debug` |
 
@@ -226,13 +227,15 @@ cmake --build build
 
 This skips Qt6/KF6 entirely — no GUI libraries needed on the system.
 
-### Indexer-Only Build (cargo directly)
+### Indexer-Only Build (CLI without the helper)
 
 ```bash
-cd indexer
-cargo build --release
-# Binary at: indexer/target/release/btrdasd
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF -DBUILD_HELPER=OFF
+cmake --build build
+# Binary at: build/cargo-target/release/btrdasd
 ```
+
+Build through CMake rather than a bare `cargo build`: CMake passes `--target-dir build/cargo-target/`, which is where the install step looks for the binaries.
 
 ## Distribution Packages
 
@@ -254,7 +257,7 @@ cd packaging/arch
 makepkg -si
 ```
 
-**Minimum Rust version**: 1.87+ (for Rust edition 2024 and `let_chains`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
+**Minimum Rust version**: 1.88 (needs let-chains in edition 2024; not compile-tested below 1.98.1, and `Cargo.toml` declares no `rust-version`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
 
 
 ## Configuration Reference
@@ -265,7 +268,7 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `version` | string | `"0.7.21"` | Config format version (tracks `CARGO_PKG_VERSION`, the 3-part semver) |
+| `version` | string | the running build's `CARGO_PKG_VERSION` (3-part semver, e.g. `"0.7.22"`) | Config format version |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 | `log_file` | string | `"/var/log/das-backup.log"` | Backup log path |
@@ -287,25 +290,50 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 | `full` | string | `"Sun 04:00"` | Weekly full backup day and time |
 | `randomized_delay_min` | u32 | `30` | Random delay (minutes) to avoid I/O spikes |
 
+### `[das]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model_pattern` | string | `"TDAS"` | Drive model (spaces removed) that `backup-verify.sh` matches to identify DAS drives |
+| `io_scheduler` | string | `"mq-deadline"` | I/O scheduler `backup-run.sh` sets on the DAS drives during a run |
+| `mount_opts` | string | `""` (none) | Mount options for every backup-target mount, by `backup-run.sh` and by `btrdasd` (`MountGuard`) alike |
+
 ### `[[source]]` (array)
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `label` | string | Human-readable name (e.g., `"nvme-root"`) |
-| `volume` | string | BTRFS volume mount point (e.g., `"/.btrfs-nvme"`) |
-| `subvolumes` | string[] | Subvolumes to snapshot (e.g., `["@", "@home"]`) |
-| `device` | string | Block device path (e.g., `"/dev/nvme0n1p2"`) |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `label` | string | — | Human-readable name (e.g., `"nvme-root"`) |
+| `volume` | string | — | BTRFS volume mount point (e.g., `"/.btrfs-nvme"`) |
+| `device` | string | — | Block device path (e.g., `"/dev/nvme0n1p2"`) |
+| `snapshot_dir` | string | `".btrbk-snapshots"` | Directory on the source volume that holds btrbk's local snapshots |
+| `target_subdirs` | string[] | `[]` | Subdirectory on each target this source sends into |
+| `target_labels` | string[] | `[]` (all targets) | `[[target]].label` values this source sends to; bulk data should name only the primary |
+
+Subvolumes are an array of tables, `[[source.subvolumes]]`, one per subvolume (a bare string such as `"@"` is also accepted):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | — | Subvolume path on the volume (e.g., `"@home"`) |
+| `manual_only` | bool | `false` | Flag set by `btrdasd subvol set-manual` / `set-auto` and inherited by nested adoptions. Not consulted by `btrbk.conf` rendering or `backup-run.sh`, so it does not keep a subvolume out of scheduled backups; `btrdasd backup run` (with no `--sources`) skips a source only when every one of its subvolumes is manual-only (tracked as bd `9ry`) |
+| `snapshot_name` | string | derived | Overrides the snapshot name btrbk would derive (adopted entries always carry one) |
+| `adopted`, `retired` | date | absent | Written by the backup run; see `[subvolumes]` below |
 
 ### `[[target]]` (array)
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `label` | string | Human-readable name (e.g., `"primary-22tb"`) |
-| `serial` | string | Drive serial for identification |
+| `serials` | string[] | Expected drive serials: one for a single drive, two for a RAID-1 pair. A legacy single `serial = "…"` is still read. Advisory — a missing serial warns, it does not abort |
+| `mount_uuid` | string | BTRFS filesystem UUID. When set, the target is found and mounted by UUID on both the script and the CLI/GUI path, tolerating the loss of one RAID-1 member; `btrdasd setup --check` reports targets that lack it. A target needs at least one of `serial`, `serials`, `mount_uuid` |
 | `mount` | string | Mount point (e.g., `"/mnt/backup-22tb"`) |
 | `role` | enum | `"primary"` or `"mirror"` |
+| `display_name` | string | Optional human-readable name for the target (e.g., `"22TB Exos RAID-1 (Bays 2+5)"`) |
+| `retention.daily` | u32 | Number of daily snapshots to retain |
 | `retention.weekly` | u32 | Number of weekly snapshots to retain |
 | `retention.monthly` | u32 | Number of monthly snapshots to retain |
+| `retention.yearly` | u32 | Number of yearly snapshots to retain |
+
+Each retention count defaults to `0` when omitted. Targets are mounted by `backup-run.sh` or `btrdasd` for the duration of an operation and unmounted afterwards (a busy unmount is retried 5 times, 2 seconds apart; a target that is still mounted at the end fails the job with `still mounted: <path>`) — never by `/etc/fstab`.
 
 ### `[boot]`
 
@@ -451,7 +479,7 @@ here). There is no generated credential file and no credential of any kind —
 mail submission is unauthenticated to a local relay. ESP pacman hook generation
 was removed 2026-04-10; no ESP hook file is ever generated.
 
-For sysvinit/OpenRC systems, cron entries replace systemd units.
+The backup and scrub services are ordered after `time-sync.target` (retirement and expiry dates depend on a correct clock). For sysvinit/OpenRC systems, cron entries replace systemd units.
 
 ## Verifying the Installation
 

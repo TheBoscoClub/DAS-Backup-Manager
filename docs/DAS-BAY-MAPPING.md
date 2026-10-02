@@ -15,28 +15,32 @@ Linux assigns device letters (`/dev/sda`, `/dev/sdb`, etc.) based on detection o
 
 ### Step 1: Identify drives by I/O activity
 
-Generate sustained I/O on one drive at a time and watch which bay's LED blinks:
+Generate sustained I/O on one drive at a time and watch which bay's LED blinks. Address each drive by its serial-bearing `by-id` name, so the serial you record is the one that blinked:
 
 ```bash
-# Replace /dev/sdX with each DAS drive letter in turn
-sudo dd if=/dev/sdX of=/dev/null bs=1M count=2000 status=progress
+# List the DAS drives with their serials
+lsblk -d -o NAME,SIZE,MODEL,SERIAL,TRAN
+ls /dev/disk/by-id/ | grep -v -- -part
+
+# Read from one drive at a time (read-only)
+sudo dd if=/dev/disk/by-id/ata-<model>_<serial> of=/dev/null bs=1M count=2000 status=progress
 ```
 
 While this runs, one bay's activity LED will blink rapidly. Record which bay it is.
 
 ### Step 2: Match serial numbers
 
-For each drive, retrieve the serial number:
+For each drive, confirm the serial number:
 
 ```bash
 # SATA drives
-sudo smartctl -i /dev/sdX | grep "Serial Number"
+sudo smartctl -i /dev/disk/by-id/ata-<model>_<serial> | grep "Serial Number"
 
 # NVMe drives (if your DAS supports NVMe)
-sudo smartctl -i /dev/nvmeXn1 | grep "Serial Number"
+sudo smartctl -i /dev/disk/by-id/nvme-<model>_<serial> | grep "Serial Number"
 ```
 
-You can also use `btrdasd config show` to display all detected target serials from your configuration.
+You can also use `btrdasd config show` to display the target serials in your configuration.
 
 ### Step 3: Record your mapping
 
@@ -76,9 +80,9 @@ Common drive roles in a DAS backup configuration:
 
 | Role | Description |
 |------|-------------|
-| **Primary Backup** | Main btrbk target -- receives all snapshot send/receive streams |
-| **Bootable Recovery** | Has an ESP partition + bootable OS -- can boot the system independently |
-| **Mirror** | Redundant copy of another backup target |
+| **Primary Backup** | `role = "primary"` -- main btrbk target, receives all snapshot send/receive streams, including subvolumes adopted with no configured parent; holds the refreshed `@`/`@home` and their archives |
+| **Bootable Recovery** | Has an ESP partition + its own, independent bootable OS. Configure it as `role = "mirror"`; nothing may ever write your system's ESP onto it |
+| **Mirror** | `role = "mirror"` -- secondary target receiving the streams of sources whose `target_labels` is empty, with its own retention. The boot-subvolume refresh and archive pruning never touch it |
 | **General Storage** | Non-critical data (RAID0 or single-drive) |
 | **Cold Spare** | Unused drive kept ready as a replacement |
 
@@ -98,6 +102,7 @@ Each `[[target]]` entry in `/etc/das-backup/config.toml` identifies a drive by s
 [[target]]
 label = "primary-backup"
 serials = ["<your-drive-serial>"]
+mount_uuid = "<filesystem-uuid>"
 mount = "/mnt/backup-primary"
 role = "primary"
 
@@ -110,15 +115,17 @@ yearly = 0
 
 `serials` takes an array — a single-drive target lists one serial, a BTRFS RAID-1 target
 lists both member serials (operator advisory only: a missing member logs a warning but
-does not abort, since a degraded RAID-1 array still mounts from any present leg). For a
-multi-device target you can also set `mount_uuid` to mount by the filesystem's BTRFS UUID
-directly instead of resolving a device from `serials`. With `mount_uuid` set, `backup-run.sh`,
+does not abort, since a degraded RAID-1 array still mounts from any present leg). Set
+`mount_uuid` to mount by the filesystem's BTRFS UUID directly instead of resolving a device
+from `serials` — every target on the author's system has one. With `mount_uuid` set, `backup-run.sh`,
 `btrdasd backup run` and the GUI all treat the target as present when any listed serial is
 attached or a filesystem with that UUID is on the host, mount it by UUID and verify the mount
 by UUID. The setup wizard records it for a new target whose drive is attached;
 `sudo btrdasd setup --check` reports every target without one and prints the UUID to add.
 
 The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
+
+`btrdasd setup` also renders the serials and `mount_uuid` into `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, which hides the targets from udisks so no desktop session mounts them under `/run/media`. After changing a serial (a replaced drive), run `sudo btrdasd setup --upgrade` to regenerate it; `sudo btrdasd setup --check` confirms each attached target carries the flag.
 
 
 ## Re-cabling and moving the enclosure — POWER IT DOWN FIRST
@@ -128,12 +135,18 @@ cable.** Pulling the cable on a live enclosure is not a hot-unplug the filesyste
 can absorb.
 
 ```bash
-# 1. Stop and mask the backup unit so nothing (and no watchdog) restarts it mid-move.
-sudo systemctl stop das-backup.service
-sudo systemctl mask das-backup.service      # cachyos-sentinel WILL restart it otherwise
+# 1. Stop and mask the units that mount the enclosure so nothing (and no watchdog)
+#    starts them mid-move.
+sudo systemctl stop das-backup.service das-backup-full.service das-scrub.service
+sudo systemctl mask das-backup.service das-backup-full.service das-scrub.service  # cachyos-sentinel WILL restart them otherwise
+#    A job started from the GUI runs in btrdasd-helper, not in these units, and masking
+#    does not stop it. Both checks must print nothing; WAIT means a job still holds the DAS:
+sudo flock -n /run/das-backup.lock true || echo "WAIT: a backup is running"
+sudo flock -n /run/das-maintenance.lock true || echo "WAIT: a backup, scrub, reconcile or doctor run holds the DAS"
 
-# 2. Unmount everything the enclosure backs, including any udisks mounts a file
-#    manager opened. Confirm NOTHING is left mounted before touching the cable.
+# 2. Unmount everything the enclosure backs. Nothing should be under /run/media
+#    (targets are hidden from udisks); a match there means the rule is not applying.
+#    Confirm NOTHING is left mounted before touching the cable.
 sudo umount /mnt/backup-22tb /mnt/backup-system-recovery-A /mnt/backup-system-recovery-B 2>/dev/null
 mount | grep -E 'backup-22tb|backup-system-recovery|/run/media/bosco/das-' || echo "clear"
 
@@ -149,7 +162,7 @@ for d in /sys/bus/usb/devices/*/; do
 done | sort -u        # enclosure should read 10000
 
 # 6. Unmask and resume.
-sudo systemctl unmask das-backup.service
+sudo systemctl unmask das-backup.service das-backup-full.service das-scrub.service
 ```
 
 **What happens if you skip this.** On 2026-08-28 15:03 the cable was pulled while
@@ -172,4 +185,4 @@ makes the restart fail at the systemd layer instead. See
 
 ## Reference Example
 
-See [examples/author-bay-mapping.md](examples/author-bay-mapping.md) for a fully documented 6-bay TerraMaster D6-320 configuration with specific drive models, serials, RAID0 arrays, and bootable recovery drives.
+See [examples/author-bay-mapping.md](examples/author-bay-mapping.md) for a fully documented 6-bay TerraMaster D6-320 configuration with specific drive models, serials, a BTRFS RAID-1 primary pair, and two bootable recovery drives.

@@ -34,8 +34,8 @@ to:
 3. **NEVER include DAS drives in any ESP mirroring, backup, or sync operation**
 4. **The DAS ESPs are TOTALLY independent** of the host system's ESP — they boot their own OS installations
 5. **esp-sync.sh and any ESP sync hooks MUST only operate on**:
-   - Primary ESP: `/dev/nvme0n1p3` (LABEL=EFI, mounted at /boot)
-   - Backup ESP: `/dev/nvme1n1p3` (LABEL=EFI-BACKUP, mounted at /mnt/esp-backup)
+   - Primary ESP: LABEL=EFI, mounted at /boot (`nvme1n1p3` on 2026-10-02 — NVMe numbers are not stable)
+   - Backup ESP: LABEL=EFI-BACKUP, mounted at /mnt/esp-backup
 
 ### 2026-03-05 Incident — Root Cause (identified 2026-04-10)
 
@@ -54,7 +54,7 @@ The emergency response disabled `[esp] enabled = false` in `config.toml` but lef
 - It **enumerates nothing.** Source and destination are the hardcoded constants `/boot` and `/mnt/esp-backup`. There is no discovery loop, which is the single most important difference from the deleted 2026-03-05 code — that one searched for ESP-shaped partitions and acted on whatever it found.
 - `validate_device()` cross-checks that the device mounted at each path is the same device the expected LABEL resolves to, and `die`s with `REFUSING to sync` on mismatch.
 - **It hard-blocks any resolved device not matching `/dev/nvme*`.** This is the load-bearing guard, and it is why the ESP relabel above changed nothing about safety: the DAS ESPs are USB-attached `/dev/sd*` and are refused on device class, not on their name. Labels can be renamed with `fatlabel`; a bus class cannot be renamed into existence.
-- It is **not** an `rsync --delete`, despite what several docs claimed for months. It walks `/boot`, compares `md5sum` per file, `cp -a`s only what differs, and skips `loader/random-seed`, `loader/.#bootctl*` and `test-sync-trigger` via `is_unique_file()`.
+- It copies `/boot` → `/mnt/esp-backup` per file by `md5sum` and **deletes from the backup any file `/boot` lacks**, except `is_unique_file()`'s (`loader/random-seed`, `loader/.#bootctl*`, `test-sync-trigger`). `/boot` must be complete before it runs; `--dry-run` previews.
 
 **Bootloader installation on the primary ESP** (`bootctl install`, creating or reordering NVRAM entries for `LABEL=EFI`) is CachyOS-Kernel's, not this project's — see `~/.claude/rules/esp-ownership.md` "Where the boundary actually falls". This project owns ESP *partition lifecycle* and every cross-ESP operation; it does not own boot configuration confined to `/boot`.
 

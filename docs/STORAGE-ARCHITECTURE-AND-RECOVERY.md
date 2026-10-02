@@ -283,7 +283,10 @@ If your primary boot drive fails but you have a mirrored ESP:
 
 4. **Install replacement drive** and clone partition table from surviving drive:
    ```bash
-   sudo sfdisk -d /dev/<surviving-drive> | sudo sfdisk /dev/<new-drive>
+   # sfdisk -d carries the disk GUID (label-id:) and every partition's uuid=, and
+   # sfdisk applies them: drop both so the new drive gets fresh PARTUUIDs instead of
+   # duplicating the survivor's (PARTUUIDs identify the ESPs and their firmware entries)
+   sudo sfdisk -d /dev/<surviving-drive> | sed '/^label-id/d; s/, *uuid=[^,]*//' | sudo sfdisk /dev/<new-drive>
    ```
 
 5. **Create partitions on new drive**:
@@ -291,15 +294,16 @@ If your primary boot drive fails but you have a mirrored ESP:
    # Swap (if applicable)
    sudo mkswap /dev/<new-drive-swap-partition>
 
-   # ESP
-   sudo mkfs.vfat -F32 /dev/<new-drive-esp-partition>
-
-   # Sync ESP contents
-   sudo mkdir -p /mnt/new-esp
-   sudo mount /dev/<new-drive-esp-partition> /mnt/new-esp
-   sudo rsync -aHAXS /boot/ /mnt/new-esp/
-   sudo umount /mnt/new-esp
+   # ESP — the new drive replaces the PRIMARY, so it takes the primary ESP's label.
+   # Never the backup label: two partitions with one label make `blkid -t LABEL=`
+   # resolve arbitrarily, and the ESP sync finds its ESPs exactly that way.
+   sudo mkfs.vfat -F32 -n <primary-esp-label> /dev/<new-drive-esp-partition>
    ```
+
+   Confirm `<new-drive>` by serial (`lsblk -o NAME,SERIAL,PARTUUID`) before every
+   write: device letters change, and a USB backup enclosure may hold ESPs that belong
+   to other, independent operating systems. Populate the new ESP by reinstalling onto
+   it (step 9), not by copying files by hand.
 
 6. **Replace the failed BTRFS device**:
    ```bash
@@ -320,10 +324,30 @@ If your primary boot drive fails but you have a mirrored ESP:
    sudo vim /etc/fstab                     # Update UUIDs
    ```
 
-9. **Verify ESP sync**:
+9. **Populate the new primary ESP, then refresh the mirror.** The ESP sync copies only
+   primary → backup and refuses to run with nothing mounted at the primary mount point,
+   so it cannot fill a new primary. Reinstall onto it instead. **The primary must be
+   complete before the first sync**: the author's `esp-sync.sh` deletes from the backup
+   ESP — the one you booted from — every file the primary lacks, and its pacman hook runs
+   that sync at the end of any kernel transaction. So put back first anything no package
+   or generator writes (hand-written loader entries), then reinstall in ONE transaction
+   every package that owns a file on the ESP (microcode images are owned by the microcode
+   package, not the kernel) plus every installed kernel:
    ```bash
-   sudo /usr/local/bin/esp-sync.sh   # Or your ESP sync script
+   sudo mount <primary-esp-mount-point>   # e.g. /boot, via its fstab entry
+   sudo bootctl install
+   # recreate hand-written loader entries in <primary-esp-mount-point>/loader/entries/ now
+   # list the ESP-owning packages: pacman -Ql | grep ' /boot/' | awk '{print $1}' | sort -u
+   sudo pacman -S amd-ucode linux-cachyos   # your microcode + every kernel package
+   sudo sdboot-manage gen                    # or your distribution's entry generator
+   sudo /usr/local/bin/esp-sync.sh --dry-run # author's script: must print no "would remove" line
+   sudo /usr/local/bin/esp-sync.sh           # Or your ESP sync script
    ```
+
+   DAS-Backup-Manager itself never syncs or mirrors an ESP (removed 2026-04-10/12). The
+   ESP sync is host tooling, and it must name its two ESPs explicitly — never one that
+   finds ESPs by partition type or filesystem, which will also find the ESPs on DAS
+   recovery drives.
 
 ### 5b. Data Drive Failure (No ESP)
 
@@ -376,6 +400,24 @@ rsync -avP /mnt/recovery/ /path/to/safe/location/
 # If mount fails:
 sudo btrfs rescue super-recover /dev/<surviving-drive>
 ```
+
+### 5d. What DAS-Backup-Manager Does While a Drive Is Failing
+
+- **Backup targets** are mounted by the backup job only, by their filesystem UUID
+  (`[[target]] mount_uuid`), else by drive serial — never by fstab, never by device
+  letter, and never by udisks (a generated udev rule hides them). A RAID-1 target with
+  `degraded` in `[das].mount_opts` keeps receiving backups on one leg; data written
+  while degraded lands as `single` chunks, so after the replace run a scrub and then
+  `btrfs balance start -dconvert=raid1 -mconvert=raid1`. Do not hand-mount a target to
+  work on it while a backup or scrub could start; stop and mask the timers first.
+- **Source volumes** that fail to mount or verify are not read by the subvolume sync:
+  nothing on them is adopted or retired, and the run is marked failed. A subvolume is
+  retired only when its volume was read and the subvolume is gone.
+- **A retired subvolume's backups are deleted later, not at once**: `btrdasd subvol
+  expire` removes them per target once the retirement date plus that target's longest
+  retention window has passed. To restore a subvolume that was deleted by mistake, do
+  it inside that window. If the subvolume exists again (restored or re-created), the
+  next sync revives the entry.
 
 ---
 
@@ -464,7 +506,7 @@ sudo btrfs replace start <devid> /dev/<new> /mp -B       # Start replacement
 sudo btrfs replace status /mountpoint                     # Check progress
 
 # --- PARTITION CLONING (boot drives) ---
-sudo sfdisk -d /dev/<source> | sudo sfdisk /dev/<dest>   # Clone layout
+sudo sfdisk -d /dev/<source> | sed '/^label-id/d; s/, *uuid=[^,]*//' | sudo sfdisk /dev/<dest>   # Clone layout, fresh GUIDs
 sudo mkswap /dev/<swap-partition>                          # Create swap
 sudo mkfs.vfat -F32 /dev/<esp-partition>                   # Create ESP
 
@@ -488,4 +530,4 @@ sudo btrfs scrub start -B /mountpoint  # Full integrity check
 
 ## Reference Example
 
-See [examples/author-storage-reference.md](examples/author-storage-reference.md) for a fully documented CachyOS system with NVMe RAID-1, SSD RAID-1, HDD RAID-1, complete UUIDs, PARTUUIDs, serial numbers, and detailed recovery procedures for each array.
+See [examples/author-storage-reference.md](examples/author-storage-reference.md) for a fully documented CachyOS system with NVMe RAID-1, an SSD pool striped by design (RAID-0 data, RAID-1 metadata), HDD RAID-1, complete UUIDs, PARTUUIDs, serial numbers, and detailed recovery procedures for each array.

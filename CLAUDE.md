@@ -6,25 +6,25 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 
 - **PUBLIC REPO** — TheBoscoClub/DAS-Backup-Manager on GitHub. Push allowed.
 - **Rust** — Library (`buttered_dasd`) + CLI (`btrdasd`): Rust 2024 edition, rusqlite 0.40 (bundled FTS5), clap 4.6, walkdir 2.5
-- **C++20** — GUI (`btrdasd-gui`): Qt6 6.10.2, KF6 6.23.0, CMake 4.2.3
+- **C++20** — GUI (`btrdasd-gui`): Qt6 6.11.2, KF6 6.30.0, CMake 4.4.3 (installed; minimums Qt 6.6, KF 6.0, CMake 3.25)
 - **BTRFS RAID-1** — Backup targets on HDD RAID-1 and DAS enclosure
 
 ## Key Paths
 
 - **Backup DB**: `/var/lib/das-backup/backup-index.db`
-- **btrbk config**: `/etc/btrbk/btrbk.conf`
+- **Config**: `/etc/das-backup/config.toml` (source of truth); **btrbk config** `/etc/btrbk/btrbk.conf` is generated from it — never hand-edit
 - **Email transport**: local mail relay at `127.0.0.1:25`, unauthenticated. This project stores **no** mail credential — see `.claude/rules/backup.md` §Email Reports
 - **Growth log**: `/var/lib/das-backup/growth.log`
 
 ## Build
 
 ```bash
-# Indexer (Rust)
-cd indexer && cargo build --release && cargo test
-
-# Scripts/systemd (CMake)
+# Everything — Rust is built by CMake into build/cargo-target/; never a bare `cargo build`
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+
+# Rust tests (target dir on tmpfs, not the array)
+cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 ```
 
 ## Detailed Rules

@@ -4,6 +4,24 @@
 2026-08-01. This document is kept as the historical design record; it is no longer the source of
 truth for current behavior. See `ARCHITECTURE.md`'s "Scrub Pipeline" section for how the shipped
 system actually works (engine, state file, health integration, systemd units).
+
+> **Status as of 2026-10-02 — what shipped, against what §6–§9 below propose.**
+>
+> - **Implemented, in a different shape from §6 Option B:** not a scrub phase inside
+>   `backup-run.sh`, but a separate `btrdasd scrub run` engine with its own `das-scrub.timer`
+>   (monthly, `*-*-01 03:05:00`), sequential over `[scrub].targets`, one **unbounded** pass per
+>   month (no time box), kept off a running backup by the blocking `/run/das-maintenance.lock`.
+>   `[scrub]` has `enabled`, `on_calendar`, `targets`, `warn_age_days`, `fail_age_days` — no
+>   `interval` or `max_duration`. `btrdasd scrub run|status|cancel` exists, and `btrdasd health`
+>   (and the GUI) warn and fail on scrub age and errors (§9 questions 1, 2 and 4 are answered by
+>   this).
+> - **Implemented later:** resume of an interrupted pass (2026-09-09, see the note in §6 Option C).
+> - **Superseded:** Option A was never built; the mount-triggered resume unit (Option C) was
+>   removed. §9 question 3's `parse_pbridge_smtp` no longer exists — reports go to the local relay.
+> - **No longer true:** §4's trap. `unmount_all()` now retries each unmount 5 times, 2 s apart,
+>   and records a failure (`Unmount targets FAIL`, "DAS is NOT safe to disconnect") instead of
+>   discarding it. §2, §3 and §7 describe the code and the drives as they were on 2026-07-27.
+
 **Written**: 2026-07-27
 **Origin**: investigated from the `CachyOS-Kernel` project while setting up host-wide scrub timers.
 That project deliberately stopped at the DAS boundary — the non-DAS filesystems now have scrub
