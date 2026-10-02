@@ -46,11 +46,22 @@ jobs:
         working-directory: indexer
         run: cargo clippy --all-targets -- -D warnings
 
+      # The D-Bus helper (btrdasd-helper, what the GUI calls) is built only
+      # with the `dbus` feature, so the steps above never compile it. zbus and
+      # tokio are pure Rust: no system packages beyond the toolchain.
+      - name: cargo clippy -D warnings (with the D-Bus helper)
+        working-directory: indexer
+        run: cargo clippy --all-targets --features dbus -- -D warnings
+
       # No --lib, no filtering: an integration binary's failure has been missed
       # before by a command that only printed the first result line.
       - name: cargo test
         working-directory: indexer
         run: cargo test
+
+      - name: cargo test (with the D-Bus helper)
+        working-directory: indexer
+        run: cargo test --features dbus
 
   build:
     name: Build — Rust library, CLI, and Qt6 GUI

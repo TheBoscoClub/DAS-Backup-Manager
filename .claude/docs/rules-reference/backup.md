@@ -55,11 +55,13 @@ entries must exist at all, and the history of the manual regime; the mechanism's
 - **Where it runs.** `backup-run.sh` (v4.6.0) calls sync after `verify_sources_before_write`,
   reloads its config, **re-verifies the sources** (sync may have added a source — an `-adopted` one — that
   the first verification never saw, and `create_snapshot_dirs` is the next writer), runs btrbk, then `subvol expire` directly after it.
-  `btrdasd backup run` and the D-Bus helper (GUI backups) run it through one library function,
-  `backup::sync_before_backup`, after mounting sources and before btrbk; neither runs expiry. A sync or expire failure
+  `btrdasd backup run` and the D-Bus helper (GUI backups) run the same job, `backup::run_backup_job`,
+  which calls `backup::sync_before_backup` after mounting sources and before btrbk; neither runs expiry. A sync or expire failure
   is recorded (report `FAILURES DETECTED`, `backup_runs.success` 0) and never stops the backup of
   what is already configured, which is why mid-run edits of `config.toml` now take effect (at the
-  reload) and `btrbk.conf` is rewritten under btrbk's feet before it starts.
+  reload) and `btrbk.conf` is rewritten under btrbk's feet before it starts. A config that cannot be
+  reloaded after sync does not stop it either, on any path: the run goes on with the config it had
+  and the sync is recorded as failed (the Rust path aborted unrecorded until bd `h4t`).
 - **A volume is listed only if every device its sources name verifies** — real mountpoint, expected
   UUID, top-level mount. A volume that does not is "not read": nothing on it is adopted, retired
   or revived, because an absent listing must never read as "everything was deleted". An empty

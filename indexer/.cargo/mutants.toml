@@ -79,16 +79,26 @@ exclude_re = [
     # that decides what is missing, stale or unreadable lives in
     # `drift_from_listings`, which is mutated and tested.
     "replace perform_drift_check -> DriftReport with Default::default\\(\\)",
-    # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with
-    # `--features dbus`, and cargo-mutants builds without features: a mutant
-    # there is never compiled, so it "survives" without having been tested.
-    # These four mutants (three patterns) are the helper's shells around
-    # library code — a polkit-gated method needing a live system bus, and the
-    # save of the root-owned canonical config. Their logic is in the library
-    # and is mutated there: `backup::sync_before_backup`,
-    # `btrbk_conf::save_config_and_btrbk_conf` and
-    # `btrbk_conf::refuse_moving_btrbk_conf`. Keep the shells logic-free.
-    "replace save_config -> Result<\\(\\), fdo::Error> with Ok\\(\\(\\)\\)",
-    "replace HelperInterface::backup_run -> fdo::Result<String> with ",
-    "replace HelperInterface::config_set -> fdo::Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `btrfs_uuid_for_serial` binds its core to the host: the real
+    # `/dev/disk/by-id` lookup and the real `blkid`. A test can only tell it
+    # from `None` with a real drive attached. Only the whole-body replacement
+    # is excluded: `btrfs_uuid_for_serial_with` and `btrfs_uuid_of_with` are
+    # mutated and tested with scripted answers.
+    "replace btrfs_uuid_for_serial -> Option<String> with None",
 ]
+
+# The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with
+# `--features dbus`, and these runs build without features: a mutant there is
+# never compiled, the unmutated tests pass, and it is scored "missed" without
+# having been tested at all. Building with `--features dbus` would compile it
+# but still not test it: what remains in the helper is D-Bus glue — polkit
+# calls, signal emission, `#[interface]` methods — that needs a live system bus,
+# and the ~150 mutants there (measured with `cargo mutants --list --features dbus
+# --file src/bin/btrdasd-helper.rs` before this exclusion) would survive by construction. So the
+# file is excluded whole, and the rule is the other half of the bargain: logic
+# does not live in the helper. Its decisions are library functions, mutated
+# here — `backup::run_backup_job` (the whole GUI backup), `backup::sync_before_backup`,
+# `progress::OrderedProgress` (event order, one JobFinished),
+# `mount::fail_if_still_mounted`, `btrbk_conf::refuse_moving_btrbk_conf_from`,
+# `btrbk_conf::save_config_and_btrbk_conf`. bd DAS-Backup-Manager-h4t.
+exclude_globs = ["src/bin/btrdasd-helper.rs"]

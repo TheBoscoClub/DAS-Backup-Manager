@@ -29,9 +29,7 @@ use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
-use buttered_dasd::progress::{
-    LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
-};
+use buttered_dasd::progress::{OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink};
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
 use buttered_dasd::subvol;
@@ -125,7 +123,7 @@ impl ProgressSink for DbusSink {
     fn emit(&mut self, event: ProgressEvent) {
         if let ProgressEvent::Log { level, message } = &event {
             // The journal keeps every line, for post-mortem debugging.
-            eprintln!("[{}] {message}", level_name(*level));
+            eprintln!("[{}] {message}", level.word());
         }
         // A cancelled job was aborted at its caller's request; nothing more
         // of it is sent, as before.
@@ -153,7 +151,7 @@ impl ProgressSink for DbusSink {
                     HelperInterface::job_progress(ctxt, job_id, "progress", percent, &message).await
                 }
                 ProgressEvent::Log { level, message } => {
-                    HelperInterface::job_log(ctxt, job_id, level_name(level), &message).await
+                    HelperInterface::job_log(ctxt, job_id, level.word(), &message).await
                 }
                 ProgressEvent::Finished { success, summary } => {
                     HelperInterface::job_finished(ctxt, job_id, success, &summary).await
@@ -163,16 +161,6 @@ impl ProgressSink for DbusSink {
         if let Err(e) = sent {
             eprintln!("btrdasd-helper: job {job_id}: signal not sent: {e}");
         }
-    }
-}
-
-/// The level word the GUI's log view reads.
-fn level_name(level: LogLevel) -> &'static str {
-    match level {
-        LogLevel::Debug => "debug",
-        LogLevel::Info => "info",
-        LogLevel::Warning => "warn",
-        LogLevel::Error => "error",
     }
 }
 
@@ -1201,8 +1189,13 @@ impl HelperInterface {
         }
         // Saving writes btrbk.conf as root at the path the config names, and
         // polkit authorizes the action, never the path (see CANONICAL_CONFIG).
-        btrbk_conf::refuse_moving_btrbk_conf(&load_config()?, &config)
-            .map_err(fdo::Error::Failed)?;
+        // A current config that does not load is compared with the default
+        // path instead, so the GUI can repair it.
+        btrbk_conf::refuse_moving_btrbk_conf_from(
+            Config::load(Path::new(CANONICAL_CONFIG)),
+            &config,
+        )
+        .map_err(fdo::Error::Failed)?;
 
         save_config(&config)
     }

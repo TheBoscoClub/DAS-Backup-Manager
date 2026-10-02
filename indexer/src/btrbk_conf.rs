@@ -254,6 +254,34 @@ pub fn refuse_moving_btrbk_conf(current: &Config, submitted: &Config) -> Result<
     ))
 }
 
+/// [`refuse_moving_btrbk_conf`] against the config currently on disk, which
+/// may not load. A `config.toml` that cannot be loaded must still be
+/// repairable from the GUI, so the submitted path is then compared with the
+/// default (`Config::default()`, `/etc/btrbk/btrbk.conf`) instead of refusing
+/// the save outright — still a path fixed in code, never one the caller
+/// chooses (bd DAS-Backup-Manager-h4t).
+pub fn refuse_moving_btrbk_conf_from<E: std::fmt::Display>(
+    current: Result<Config, E>,
+    submitted: &Config,
+) -> Result<(), String> {
+    match current {
+        Ok(current) => refuse_moving_btrbk_conf(&current, submitted),
+        Err(e) => {
+            let default = Config::default().general.btrbk_conf;
+            if submitted.general.btrbk_conf == default {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the current config cannot be loaded ({e}), so a config submitted to \
+                     repair it must keep general.btrbk_conf at the default '{default}' \
+                     (submitted '{}'); edit config.toml as root",
+                    submitted.general.btrbk_conf
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -855,5 +883,34 @@ enabled = false
         moved.general.btrbk_conf = "/usr/lib/anything-root-owned".into();
         let err = refuse_moving_btrbk_conf(&current, &moved).unwrap_err();
         assert!(err.contains("anything-root-owned"), "{err}");
+    }
+
+    #[test]
+    fn a_broken_current_config_can_be_repaired_at_the_default_btrbk_conf_only() {
+        let broken: Result<Config, String> = Err("expected `=`".into());
+        let submitted = Config::default();
+        assert_eq!(submitted.general.btrbk_conf, "/etc/btrbk/btrbk.conf");
+        assert_eq!(
+            refuse_moving_btrbk_conf_from(broken.clone(), &submitted),
+            Ok(()),
+            "a repair at the default path is accepted"
+        );
+        let mut moved = submitted.clone();
+        moved.general.btrbk_conf = "/usr/lib/anything-root-owned".into();
+        let err = refuse_moving_btrbk_conf_from(broken, &moved).unwrap_err();
+        assert!(err.contains("cannot be loaded (expected `=`)"), "{err}");
+        assert!(err.contains("anything-root-owned"), "{err}");
+        assert!(err.contains("'/etc/btrbk/btrbk.conf'"), "{err}");
+    }
+
+    #[test]
+    fn a_loadable_current_config_is_compared_as_before() {
+        let mut current = Config::default();
+        current.general.btrbk_conf = "/srv/btrbk.conf".into();
+        let ok: Result<Config, String> = Ok(current.clone());
+        assert_eq!(refuse_moving_btrbk_conf_from(ok.clone(), &current), Ok(()));
+        // The default path is NOT a free pass while the current config loads.
+        let err = refuse_moving_btrbk_conf_from(ok, &Config::default()).unwrap_err();
+        assert!(err.contains("is '/srv/btrbk.conf'"), "{err}");
     }
 }
