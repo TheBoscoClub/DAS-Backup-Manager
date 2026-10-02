@@ -1694,28 +1694,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 // The manual path gets the same guarantee as the scheduled
                 // one: a subvolume that exists is backed up by this run. The
-                // report goes to stderr so stdout stays what it was.
-                let sync_failed = match buttered_dasd::adopt::sync_subvolumes(
+                // report goes to the progress log (stderr), so stdout stays
+                // what it was.
+                let (cfg, sync) = backup::sync_before_backup(
                     &config,
                     dry_run,
                     &buttered_dasd::caldate::today(),
                     &buttered_dasd::fsutil::SystemRunner,
                     &buttered_dasd::health::is_mountpoint,
-                ) {
-                    Ok(outcome) => {
-                        eprint!(
-                            "{}",
-                            buttered_dasd::adopt::format_sync_report(&outcome, dry_run)
-                        );
-                        outcome.failed()
-                    }
-                    Err(e) => {
-                        eprintln!("Subvolume sync could not run: {e}");
-                        true
-                    }
-                };
-                // Sync may have rewritten config.toml; the run uses what is on disk.
-                let cfg = Config::load(&config)?;
+                    &progress,
+                )?;
+                let sync_failed = sync.failed;
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
                 guard.unmount(&progress);

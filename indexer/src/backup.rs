@@ -1157,6 +1157,55 @@ pub fn archive_boot(
     Ok(any_archived)
 }
 
+/// What the subvolume sync at the start of a backup run found, as the run
+/// report shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSection {
+    /// The "SUBVOLUME SYNC" section of the run report.
+    pub report: String,
+    /// Whether the run must end as failed on its account.
+    pub failed: bool,
+}
+
+/// The first step of every backup, whoever starts it: bring `config.toml` and
+/// `btrbk.conf` into line with the subvolumes on the (already mounted)
+/// sources, then reload the config sync may have rewritten. `btrdasd backup
+/// run` and the D-Bus helper behind the GUI both call this, so no route into
+/// a backup skips sync (spec §5.2). A failed sync does not stop the run — the
+/// subvolumes already configured must still be backed up — but it is logged
+/// at error level and the caller must end the run as failed. `Err` only when
+/// the config cannot be loaded after sync.
+pub fn sync_before_backup(
+    config_path: &Path,
+    dry_run: bool,
+    today: &str,
+    runner: &dyn crate::fsutil::CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+    progress: &dyn ProgressCallback,
+) -> Result<(Config, SyncSection), Box<dyn std::error::Error>> {
+    let section =
+        match crate::adopt::sync_subvolumes(config_path, dry_run, today, runner, is_mountpoint) {
+            Ok(outcome) => SyncSection {
+                report: crate::adopt::format_sync_report(&outcome, dry_run),
+                failed: outcome.failed(),
+            },
+            Err(e) => SyncSection {
+                report: format!("SUBVOLUME SYNC\n  SYNC COULD NOT RUN: {e}\n"),
+                failed: true,
+            },
+        };
+    let level = if section.failed {
+        LogLevel::Error
+    } else {
+        LogLevel::Info
+    };
+    for line in section.report.lines() {
+        progress.on_log(level, line);
+    }
+    let config = Config::load(config_path)?;
+    Ok((config, section))
+}
+
 /// Run a backup with the given options. Calls btrbk under the hood.
 /// The caller must ensure this runs with appropriate privileges (root).
 pub fn run_backup(
@@ -2227,6 +2276,125 @@ mod tests {
                     && msg.contains(&mirror_mount)
             }),
             "no archive/create/delete operation may reference the mirror mount, got: {logs:?}"
+        );
+    }
+
+    // --- the sync that starts every backup, from the CLI and the GUI alike ---
+
+    /// A config on disk: one source on `/ssd` holding `@srv`, one primary
+    /// target, btrbk.conf beside it. Returns the config path.
+    fn sync_fixture(dir: &Path) -> std::path::PathBuf {
+        let mut config = make_test_config();
+        config.sources.truncate(1);
+        config.sources[0].volume = "/ssd".into();
+        config.sources[0].device = "UUID=abc".into();
+        config.sources[0].subvolumes.truncate(1);
+        config.sources[0].subvolumes[0].name = "@srv".into();
+        config.general.btrbk_conf = dir.join("btrbk.conf").to_string_lossy().into_owned();
+        let path = dir.join("config.toml");
+        config.save(&path).unwrap();
+        path
+    }
+
+    fn listing(paths: &[&str]) -> crate::fsutil::testing::Scripted {
+        let list: String = paths
+            .iter()
+            .map(|p| format!("ID 1 gen 1 top level 5 path {p}\n"))
+            .collect();
+        crate::fsutil::testing::Scripted::from_owned(vec![
+            (
+                "findmnt -n -o UUID,FSROOT --target /ssd".into(),
+                0,
+                "abc /\n".into(),
+            ),
+            ("btrfs subvolume list /ssd".into(), 0, list),
+        ])
+    }
+
+    #[test]
+    fn sync_before_backup_adopts_reloads_and_logs_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let progress = TestProgress::new();
+        let (config, sync) = sync_before_backup(
+            &path,
+            false,
+            "2026-10-02",
+            &listing(&["@srv", "@new"]),
+            &|_| true,
+            &progress,
+        )
+        .unwrap();
+        assert!(!sync.failed, "{}", sync.report);
+        assert!(
+            sync.report.starts_with("SUBVOLUME SYNC\n"),
+            "{}",
+            sync.report
+        );
+        assert!(sync.report.contains("@new"), "{}", sync.report);
+        // The returned config is the one sync wrote, not the one before it.
+        assert!(
+            config
+                .sources
+                .iter()
+                .flat_map(|s| &s.subvolumes)
+                .any(|e| e.name == "@new"),
+            "the run must use the config sync wrote"
+        );
+        let logs = progress.logs.lock().unwrap();
+        for line in sync.report.lines() {
+            assert!(
+                logs.iter()
+                    .any(|(level, msg)| *level == LogLevel::Info && msg == line),
+                "report line {line:?} missing from the progress log: {logs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_before_backup_marks_a_failed_sync_and_logs_it_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let progress = TestProgress::new();
+        // The volume is not mounted: nothing may be read, the run must fail.
+        let (_, sync) = sync_before_backup(
+            &path,
+            false,
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| false,
+            &progress,
+        )
+        .unwrap();
+        assert!(sync.failed, "{}", sync.report);
+        assert!(sync.report.contains("VOLUMES NOT READ"), "{}", sync.report);
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(level, msg)| *level == LogLevel::Error && msg.contains("VOLUMES NOT READ")),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn sync_before_backup_fails_when_the_config_cannot_be_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = TestProgress::new();
+        let result = sync_before_backup(
+            &dir.path().join("absent.toml"),
+            false,
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| true,
+            &progress,
+        );
+        assert!(result.is_err());
+        // The reason still reaches the progress log, and as an error.
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(level, msg)| *level == LogLevel::Error && msg.contains("absent.toml")),
+            "{logs:?}"
         );
     }
 }
