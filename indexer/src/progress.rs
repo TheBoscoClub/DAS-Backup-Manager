@@ -85,6 +85,11 @@ impl ProgressEvent {
 /// Where an [`OrderedProgress`] delivers its events — for the D-Bus helper,
 /// the signal emitter. Called from one thread only, one event at a time.
 pub trait ProgressSink: Send + 'static {
+    /// Every log line of the job, in order, cancelled or not: the record an
+    /// operator reads afterwards (the helper's journal). Called before
+    /// `emit` for the same line.
+    fn journal(&mut self, level: LogLevel, message: &str);
+    /// Delivered to the job's client. After `cancel`, only `Finished`.
     fn emit(&mut self, event: ProgressEvent);
 }
 
@@ -104,23 +109,32 @@ pub trait ProgressSink: Send + 'static {
 /// `Finished`.
 ///
 /// Cancellation (`cancel`) is a rule of this queue too: once a job is
-/// cancelled its client has stopped listening for progress, so stage,
-/// progress and log events are dropped — but the end is never dropped.
+/// cancelled its client has stopped listening for progress, so stage and
+/// progress events are dropped and log lines are no longer sent to it — but
+/// every log line still reaches `ProgressSink::journal`, because the work
+/// goes on as root after a cancel and its record must not go silent, and the
+/// end is never dropped.
 /// `finish` still sends exactly one `Finished`, failed and saying the job was
 /// cancelled, when the work really stops. Cancelling does not stop the work;
 /// the caller decides whether it can.
 pub struct OrderedProgress {
-    tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<ProgressEvent>>>,
+    /// Each event, and whether it still goes to the client.
+    tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<(ProgressEvent, bool)>>>,
     drain: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl OrderedProgress {
     pub fn new(mut sink: impl ProgressSink) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<ProgressEvent>();
+        let (tx, rx) = std::sync::mpsc::channel::<(ProgressEvent, bool)>();
         let drain = std::thread::spawn(move || {
-            for event in rx {
-                sink.emit(event);
+            for (event, to_client) in rx {
+                if let ProgressEvent::Log { level, message } = &event {
+                    sink.journal(*level, message);
+                }
+                if to_client {
+                    sink.emit(event);
+                }
             }
         });
         Self {
@@ -130,8 +144,9 @@ impl OrderedProgress {
         }
     }
 
-    /// The job's client cancelled it: drop its progress from now on, and end
-    /// it as cancelled when `finish` is called.
+    /// The job's client cancelled it: stop sending it progress (log lines
+    /// still reach the journal), and end it as cancelled when `finish` is
+    /// called.
     pub fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -142,14 +157,17 @@ impl OrderedProgress {
     }
 
     fn send(&self, event: ProgressEvent) {
-        if self.is_cancelled() {
+        let to_client = !self.is_cancelled();
+        // A cancelled job's log lines still go to the journal; its stage
+        // and progress events go nowhere.
+        if !to_client && !matches!(event, ProgressEvent::Log { .. }) {
             return;
         }
         let guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = guard.as_ref() {
             // Fails only when the drain thread is gone, i.e. the sink
             // panicked; there is nobody left to deliver to.
-            let _ = tx.send(event);
+            let _ = tx.send((event, to_client));
         }
     }
 
@@ -172,7 +190,7 @@ impl OrderedProgress {
                 summary: summary.to_owned(),
             }
         };
-        let _ = tx.send(event);
+        let _ = tx.send((event, true));
         drop(tx);
         let drain = self.drain.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(drain) = drain
@@ -319,10 +337,18 @@ mod tests {
     /// order in.
     struct Collect {
         got: std::sync::Arc<std::sync::Mutex<Vec<ProgressEvent>>>,
+        journal: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         delay: Option<u64>,
     }
 
     impl ProgressSink for Collect {
+        fn journal(&mut self, level: LogLevel, message: &str) {
+            self.journal
+                .lock()
+                .unwrap()
+                .push(format!("[{}] {message}", level.word()));
+        }
+
         fn emit(&mut self, event: ProgressEvent) {
             if let Some(ms) = self.delay.as_mut() {
                 std::thread::sleep(std::time::Duration::from_millis(*ms));
@@ -341,6 +367,7 @@ mod tests {
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress = OrderedProgress::new(Collect {
             got: got.clone(),
+            journal: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             delay,
         });
         (progress, got)
@@ -524,5 +551,58 @@ mod tests {
                 summary: "Mount failed".into()
             }]
         );
+    }
+
+    type Shared<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    fn journalled() -> (OrderedProgress, Shared<ProgressEvent>, Shared<String>) {
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let journal = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = OrderedProgress::new(Collect {
+            got: got.clone(),
+            journal: journal.clone(),
+            delay: None,
+        });
+        (progress, got, journal)
+    }
+
+    #[test]
+    fn every_log_line_reaches_the_journal_and_the_client_when_not_cancelled() {
+        let (progress, got, journal) = journalled();
+        progress.on_log(LogLevel::Warning, "one");
+        progress.on_stage("Sending", 1);
+        progress.on_log(LogLevel::Info, "two");
+        progress.finish(true, "done");
+        assert_eq!(*journal.lock().unwrap(), vec!["[warn] one", "[info] two"]);
+        let got = got.lock().unwrap().clone();
+        assert_eq!(got.len(), 4, "{got:?}");
+    }
+
+    /// After a cancel the work goes on as root: its log lines must still
+    /// reach the journal, though the client hears only the end.
+    #[test]
+    fn a_cancelled_job_keeps_writing_to_the_journal_but_not_to_the_client() {
+        let (progress, got, journal) = journalled();
+        progress.on_log(LogLevel::Info, "before");
+        progress.cancel();
+        progress.on_log(LogLevel::Error, "after the cancel");
+        progress.on_stage("Sending", 1);
+        progress.on_complete(true, "Backup succeeded");
+        progress.finish(true, "Backup succeeded");
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec![
+                "[info] before",
+                "[error] after the cancel",
+                "[info] Backup succeeded"
+            ]
+        );
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], log_msg("before"));
+        assert!(matches!(
+            got[1],
+            ProgressEvent::Finished { success: false, .. }
+        ));
     }
 }
