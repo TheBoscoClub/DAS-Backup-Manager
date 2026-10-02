@@ -23,8 +23,10 @@ use zbus::object_server::SignalEmitter;
 use zbus::{Connection, interface};
 
 use buttered_dasd::backup::{self, BackupLockAttempt, BackupMode, BackupOptions};
+use buttered_dasd::caldate;
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
+use buttered_dasd::fsutil::SystemRunner;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
 use buttered_dasd::mount;
@@ -424,6 +426,18 @@ impl HelperInterface {
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&config, &progress);
+                // A GUI backup syncs exactly as the CLI and the timer do: a
+                // subvolume that exists is backed up by this run. The section
+                // reaches the GUI through the job log.
+                let (config, sync) = backup::sync_before_backup(
+                    Path::new(CANONICAL_CONFIG),
+                    options.dry_run,
+                    &caldate::today(),
+                    &SystemRunner,
+                    &health::is_mountpoint,
+                    &progress,
+                )
+                .map_err(|e| format!("Config could not be reloaded after subvolume sync: {e}"))?;
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
@@ -448,11 +462,19 @@ impl HelperInterface {
                                 }
                             }
                         }
+                        // Same rule as the CLI: a failed sync never stops the
+                        // run, but the job ends as failed.
                         Ok((
-                            r.success,
+                            r.success && !sync.failed,
                             format!(
-                                "Backup complete: {} snapshots created, {} sent",
-                                r.snapshots_created, r.snapshots_sent
+                                "Backup complete: {} snapshots created, {} sent{}",
+                                r.snapshots_created,
+                                r.snapshots_sent,
+                                if sync.failed {
+                                    " — SUBVOLUME SYNC FAILED, see the log"
+                                } else {
+                                    ""
+                                }
                             ),
                         ))
                     }
