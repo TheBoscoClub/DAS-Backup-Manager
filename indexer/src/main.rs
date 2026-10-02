@@ -1174,13 +1174,6 @@ fn prune_deleted_from_index(
     Ok(ids.len())
 }
 
-/// Whether `backup run` exits nonzero: the run itself failed, or the subvolume
-/// sync before it did. A failed sync never stops the run; it only fails the
-/// command once the run has finished and been recorded.
-fn backup_run_failed(run_succeeded: bool, sync_failed: bool) -> bool {
-    !run_succeeded || sync_failed
-}
-
 /// Whether `subvol expire` failed overall: the expiry itself did, or snapshots
 /// are gone and the index still lists them. The database is not opened at all
 /// when nothing was deleted (it may not exist yet).
@@ -1607,7 +1600,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 targets,
             } => {
                 let cfg = Config::load(&config)?;
-                let options = BackupOptions {
+                let mut options = BackupOptions {
                     mode: if full {
                         Some(BackupMode::Full)
                     } else {
@@ -1644,7 +1637,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &buttered_dasd::health::is_mountpoint,
                     &progress,
                 )?;
-                let sync_failed = sync.failed;
+                // A failed sync fails the run's result, record and report.
+                options.subvolume_sync = Some(sync);
                 let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
                 let result = buttered_dasd::backup::run_backup(&cfg, &options, &progress);
                 guard.unmount(&progress);
@@ -1691,9 +1685,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  ERROR: {e}");
                     }
                 }
-                // A failed sync does not stop the run; it fails the command once
-                // the run has finished and been recorded.
-                if backup_run_failed(result.success, sync_failed) {
+                // A failed sync did not stop the run; it is in the result, so
+                // the command fails once the run has finished and been recorded.
+                if !result.success {
                     std::process::exit(1);
                 }
             }
@@ -3057,13 +3051,5 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let left = Database::open(&db_path).unwrap().list_snapshots().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].path, "/mnt/t/kept.20260101");
-    }
-
-    #[test]
-    fn backup_run_exit_is_failure_when_either_the_run_or_the_sync_failed() {
-        assert!(!backup_run_failed(true, false));
-        assert!(backup_run_failed(false, false));
-        assert!(backup_run_failed(true, true));
-        assert!(backup_run_failed(false, true));
     }
 }

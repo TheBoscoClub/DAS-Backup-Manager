@@ -457,6 +457,11 @@ impl HelperInterface {
                     &progress,
                 )
                 .map_err(|e| format!("Config could not be reloaded after subvolume sync: {e}"))?;
+                // Same rule as the CLI: a failed sync never stops the run,
+                // but the run's result, record and report all say it failed.
+                let sync_failed = sync.failed;
+                let mut options = options;
+                options.subvolume_sync = Some(sync);
                 let mut guard = mount::ensure_targets_mounted(&config, &progress)
                     .map_err(|e| format!("Mount failed: {e}"))?;
 
@@ -481,15 +486,13 @@ impl HelperInterface {
                                 }
                             }
                         }
-                        // Same rule as the CLI: a failed sync never stops the
-                        // run, but the job ends as failed.
                         Ok((
-                            r.success && !sync.failed,
+                            r.success,
                             format!(
                                 "Backup complete: {} snapshots created, {} sent{}",
                                 r.snapshots_created,
                                 r.snapshots_sent,
-                                if sync.failed {
+                                if sync_failed {
                                     " — SUBVOLUME SYNC FAILED, see the log"
                                 } else {
                                     ""
