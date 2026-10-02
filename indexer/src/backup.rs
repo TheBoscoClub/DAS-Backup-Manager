@@ -1339,6 +1339,16 @@ pub fn run_backup(
     // filesystem is exactly the thing worth being told about.
     mount::verify_write_targets(&config.targets, &effective_targets, progress)?;
 
+    // Only now — targets mounted and verified, config reloaded after sync —
+    // create the directories btrbk receives into, so a source sync just
+    // adopted gets its target directory this run (bd DAS-Backup-Manager-arx).
+    // On a dry run too, as backup-run.sh's create_target_dirs does. A
+    // directory that cannot be made fails the run: btrbk would skip it.
+    if let Err(e) = mount::create_target_dirs(config, &effective_targets, progress) {
+        progress.on_log(LogLevel::Error, &e);
+        errors.push(e);
+    }
+
     // Count enabled pipeline steps for the top-level stage announcement.
     let total_steps = {
         let mut n = 0u64;
@@ -2070,7 +2080,10 @@ mod tests {
                     ],
                     device: "/dev/nvme0n1p2".into(),
                     snapshot_dir: ".btrbk-snapshots".into(),
-                    target_subdirs: vec![],
+                    // The target is /proc; `self` already exists there, so
+                    // the target-directory step has nothing to create and a
+                    // test never writes under a real mount point.
+                    target_subdirs: vec!["self".into()],
                     target_labels: vec![],
                 },
                 Source {
@@ -2084,7 +2097,10 @@ mod tests {
                     }],
                     device: "/dev/sdb".into(),
                     snapshot_dir: ".btrbk-snapshots".into(),
-                    target_subdirs: vec![],
+                    // The target is /proc; `self` already exists there, so
+                    // the target-directory step has nothing to create and a
+                    // test never writes under a real mount point.
+                    target_subdirs: vec!["self".into()],
                     target_labels: vec![],
                 },
             ],
@@ -2789,6 +2805,28 @@ mod tests {
             "{:?}",
             history[0].errors
         );
+    }
+
+    /// The run makes the directories btrbk receives into, after verifying the
+    /// targets, and a directory it cannot make fails the run (procfs refuses
+    /// every mkdir, so nothing is ever written here).
+    #[test]
+    fn a_target_directory_that_cannot_be_made_fails_the_run() {
+        let mut config = make_test_config();
+        config.sources[0].target_subdirs = vec!["das-test-cannot-exist".into()];
+        let options = BackupOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let progress = TestProgress::new();
+        let result = run_backup(&config, &options, &progress).unwrap();
+        assert!(!result.success);
+        assert!(
+            result.errors[0].starts_with("Target directories missing"),
+            "{:?}",
+            result.errors
+        );
+        assert!(result.errors[0].contains("das-test-cannot-exist"));
     }
 
     #[test]

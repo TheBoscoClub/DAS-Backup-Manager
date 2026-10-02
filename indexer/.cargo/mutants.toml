@@ -85,6 +85,13 @@ exclude_re = [
     # is excluded: `btrfs_uuid_for_serial_with` and `btrfs_uuid_of_with` are
     # mutated and tested with scripted answers.
     "replace btrfs_uuid_for_serial -> Option<String> with None",
+    # `device_for_fs_uuid` is the same kind of binding: `blkid -U` on the
+    # real host. Its one host test needs a root filesystem with a UUID and
+    # returns early in a container, so in CI nothing could tell these apart.
+    # Every decision is in `device_for_fs_uuid_with` (empty UUID, exit
+    # status, blank or non-device answer), mutated and tested with scripted
+    # answers. All three whole-body replacements are excluded.
+    "replace device_for_fs_uuid -> Option<String> with ",
 ]
 
 # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with

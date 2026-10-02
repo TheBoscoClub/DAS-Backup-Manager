@@ -11,7 +11,8 @@
 #     the dry run fail on an entry the real run retires first; config.toml
 #     and btrbk.conf are untouched. create_target_dirs also creates the
 #     target directory a pending adoption's new source sends to, as the real
-#     run does after its reload (bd DAS-Backup-Manager-g17).
+#     run does after its reload, logging each one, and now runs after
+#     verify_targets_before_btrbk (bd DAS-Backup-Manager-g17).
 #   - Unmount retry (v4.6.1): unmount_all() tries each DAS target up to
 #     UMOUNT_ATTEMPTS times, UMOUNT_RETRY_PAUSE seconds apart, before it
 #     records the unmount as FAILED — a target is often busy for a moment
@@ -1064,6 +1065,17 @@ create_snapshot_dirs() {
     done
 }
 
+# mkdir -p one target directory, saying so when it did not exist yet — on a
+# dry run too, where it is the one thing the run creates.
+make_target_dir() {
+    local dir="$1"
+    [[ -d "$dir" ]] && return 0
+    mkdir -p "$dir"
+    log_info "  Created target directory $dir"
+}
+
+# Runs after verify_targets_before_btrbk, so every directory is made inside a
+# target that is a real mount point holding the expected filesystem.
 create_target_dirs() {
     log_info "Creating target directory structure..."
 
@@ -1088,7 +1100,7 @@ create_target_dirs() {
         fi
 
         for subdir in "${all_subdirs[@]}"; do
-            mkdir -p "$mnt/$subdir"
+            make_target_dir "$mnt/$subdir"
         done
 
         # Dry run: the planned btrbk.conf may send a pending adoption to a
@@ -1101,7 +1113,7 @@ create_target_dirs() {
             local kw path _rest
             while read -r kw path _rest; do
                 [[ "$kw" == "target" && "$path" == "$mnt"/* && "$path" != *"/.."* ]] || continue
-                mkdir -p "$path"
+                make_target_dir "$path"
             done <"$DRYRUN_BTRBK_CONF"
         fi
     done
@@ -2352,7 +2364,9 @@ main() {
                 ;;
             *)
                 echo "Usage: $0 [--dryrun|-n] [--full|-f]"
-                echo "  --dryrun  Preview backup without making changes"
+                echo "  --dryrun  Preview the backup: changes no config and sends nothing;"
+                echo "            creates only missing empty target directories (e.g. for a"
+                echo "            pending adoption), as the real run would"
                 echo "  --full    Force recreation of boot subvolumes"
                 exit 1
                 ;;
@@ -2420,8 +2434,11 @@ main() {
     sync_subvolumes "$mode"
     create_snapshot_dirs
     mount_targets
-    create_target_dirs
+    # Directories only after verification: never under a path not proven to
+    # be the expected DAS filesystem (verification reads mount state only and
+    # needs none of them).
     verify_targets_before_btrbk
+    create_target_dirs
 
     if [[ "$mode" != "dryrun" ]]; then
         BACKUP_MODE_REAL="true"

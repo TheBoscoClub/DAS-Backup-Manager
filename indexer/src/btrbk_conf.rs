@@ -45,12 +45,7 @@ pub fn render_btrbk_conf(config: &Config) -> String {
 
     // One volume block per source, with all matching targets inline
     for source in &config.sources {
-        let targets: Vec<&Target> = config
-            .targets
-            .iter()
-            .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
-            .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
-            .collect();
+        let targets = source_targets(config, source);
 
         if targets.is_empty() {
             continue;
@@ -68,8 +63,7 @@ pub fn render_btrbk_conf(config: &Config) -> String {
             continue;
         }
 
-        // Determine the target subdir for this source
-        let subdir = source.target_subdirs.first().unwrap_or(&source.label);
+        let subdir = source_subdir(source);
 
         out.push_str(&format!("# {}\n", source.label));
         out.push_str(&format!("volume {}\n", source.volume));
@@ -237,6 +231,49 @@ fn save_config_and_btrbk_conf_with(
         return Err(e);
     }
     Ok(())
+}
+
+/// The targets a source's volume block sends to.
+fn source_targets<'a>(config: &'a Config, source: &crate::config::Source) -> Vec<&'a Target> {
+    config
+        .targets
+        .iter()
+        .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
+        .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
+        .collect()
+}
+
+/// The directory under each target a source's snapshots are sent to: the
+/// FIRST `target_subdirs` entry, else the source label. Further entries are
+/// not used by the renderer.
+fn source_subdir(source: &crate::config::Source) -> &str {
+    source
+        .target_subdirs
+        .first()
+        .map_or(source.label.as_str(), String::as_str)
+}
+
+/// Every `(target, subdirectory)` that `render_btrbk_conf` names in a
+/// `target` line — what must exist on a mounted target before btrbk runs.
+/// Sources with no live entry render no block and so need no directory.
+/// Each pair appears once.
+pub fn target_dirs(config: &Config) -> Vec<(&Target, &str)> {
+    let mut dirs: Vec<(&Target, &str)> = Vec::new();
+    for source in &config.sources {
+        if source.subvolumes.iter().all(|sv| sv.retired.is_some()) {
+            continue;
+        }
+        let subdir = source_subdir(source);
+        for target in source_targets(config, source) {
+            if !dirs
+                .iter()
+                .any(|(t, d)| t.label == target.label && *d == subdir)
+            {
+                dirs.push((target, subdir));
+            }
+        }
+    }
+    dirs
 }
 
 /// Refuse a config, submitted from outside, that moves `general.btrbk_conf`.
@@ -912,5 +949,81 @@ enabled = false
         // The default path is NOT a free pass while the current config loads.
         let err = refuse_moving_btrbk_conf_from(ok, &Config::default()).unwrap_err();
         assert!(err.contains("is '/srv/btrbk.conf'"), "{err}");
+    }
+
+    #[test]
+    fn target_dirs_are_exactly_the_target_lines_the_renderer_writes() {
+        let mut cfg = test_config();
+        // A second source: no subdirs (falls back to its label), sends to
+        // the first target only; a third with everything retired.
+        let mut extra = cfg.sources[0].clone();
+        extra.label = "extra".into();
+        extra.target_subdirs = Vec::new();
+        extra.target_labels = vec![cfg.targets[0].label.clone()];
+        cfg.sources.push(extra);
+        let mut gone = cfg.sources[0].clone();
+        gone.label = "gone".into();
+        gone.target_subdirs = vec!["gone-dir".into(), "unused".into()];
+        for sv in &mut gone.subvolumes {
+            sv.retired = Some("2026-01-01".into());
+        }
+        cfg.sources.push(gone);
+        cfg.sources[0].target_subdirs.push("second-unused".into());
+
+        let text = render_btrbk_conf(&cfg);
+        let rendered: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("target "))
+            .map(|p| p.trim().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let listed: Vec<String> = target_dirs(&cfg)
+            .into_iter()
+            .map(|(t, d)| format!("{}/{}", t.mount, d))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(listed, rendered);
+        assert!(listed.iter().any(|p| p.ends_with("/extra")), "{listed:?}");
+        assert!(
+            !listed
+                .iter()
+                .any(|p| p.contains("unused") || p.contains("gone-dir"))
+        );
+        assert_eq!(
+            target_dirs(&cfg).len(),
+            listed.len(),
+            "each pair once: {:?}",
+            target_dirs(&cfg)
+                .iter()
+                .map(|(t, d)| (&t.label, *d))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn target_dirs_keeps_one_entry_per_target_and_directory() {
+        let mut cfg = test_config();
+        let mut second = cfg.targets[0].clone();
+        second.label = "second".into();
+        second.mount = "/mnt/second".into();
+        cfg.targets.push(second);
+        // Two sources sharing one subdirectory: one entry per target.
+        let mut twin = cfg.sources[0].clone();
+        twin.label = "twin".into();
+        cfg.sources.push(twin);
+        let pairs: Vec<(String, String)> = target_dirs(&cfg)
+            .into_iter()
+            .map(|(t, d)| (t.label.clone(), d.to_string()))
+            .collect();
+        let sub = cfg.sources[0].target_subdirs[0].clone();
+        assert_eq!(
+            pairs,
+            vec![
+                (cfg.targets[0].label.clone(), sub.clone()),
+                ("second".to_string(), sub)
+            ]
+        );
     }
 }
