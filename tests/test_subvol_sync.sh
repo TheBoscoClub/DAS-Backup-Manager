@@ -16,6 +16,7 @@ for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op ge
     eval "$body"
 done
 
+# shellcheck disable=SC2329  # called by the eval-extracted functions
 log_info() { :; }; log_warn() { echo "WARN: $*" >>"$WORK/log"; }; log_error() { echo "ERROR: $*" >>"$WORK/log"; }
 declare -A OP_STATUS=()
 # shellcheck disable=SC2034  # read by the functions eval-extracted above
@@ -42,8 +43,20 @@ case "$1 $2" in
             echo "DAS_SOURCE_${i}_DEVICE='UUID=u$i'"
             echo "DAS_SOURCE_${i}_SNAPSHOT_DIR='.btrbk-snapshots'"
         done
-        echo "DAS_TARGET_COUNT=0"
-        echo "DAS_ALL_TARGET_MOUNTS=''"
+        # Targets deliberately carry NO DISPLAY_NAME: dump-env omits it when empty.
+        t=0; [[ -f "$here/target_count" ]] && t=$(cat "$here/target_count")
+        echo "DAS_TARGET_COUNT=$t"
+        mounts=""
+        for ((i = 0; i < t; i++)); do
+            echo "DAS_TARGET_${i}_LABEL='tgt$i'"
+            echo "DAS_TARGET_${i}_SERIAL='ser$i'"
+            echo "DAS_TARGET_${i}_SERIALS='ser$i'"
+            echo "DAS_TARGET_${i}_MOUNT_UUID=''"
+            echo "DAS_TARGET_${i}_MOUNT='/mnt/t$i'"
+            echo "DAS_TARGET_${i}_ROLE='primary'"
+            mounts="$mounts /mnt/t$i"
+        done
+        echo "DAS_ALL_TARGET_MOUNTS='${mounts# }'"
         echo "DAS_BTRBK_CONF='/etc/btrbk/btrbk.conf'"
         ;;
     "subvol sync")   cat "$here/sync_out";   exit "$(cat "$here/sync_rc")" ;;
@@ -66,12 +79,27 @@ echo 1 >"$WORK/source_count"
 load_config_env
 check "removed sources do not linger" "${#SOURCE_VOLUMES[@]}" "1"
 
+# --- load_config_env: targets, with no DISPLAY_NAME emitted -----------------
+echo 2 >"$WORK/target_count"
+rc=0; load_config_env || rc=$?
+check "targets without a display name load" "$rc" "0"
+check "target arrays filled" "${#TARGET_MOUNTS[@]}/${#ALL_TARGET_MOUNTS[@]}" "2/2"
+check "missing display name falls back to the label" "${TARGET_NAMES[/mnt/t1]:-}" "tgt1"
+echo 1 >"$WORK/target_count"
+load_config_env
+check "removed targets do not linger" "${#TARGET_MOUNTS[@]}/${#TARGET_NAMES[@]}/${#MOUNT_ROLES[@]}/${#ALL_TARGET_MOUNTS[@]}" "1/1/1/1"
+echo 0 >"$WORK/target_count"
+
 # --- load_config_env: unreadable config -------------------------------------
 touch "$WORK/env_fail"
 rc=0; load_config_env 2>"$WORK/err" || rc=$?
 check "unreadable config makes load_config_env return non-zero" "$rc" "1"
 check "unreadable config leaves an error on stderr" "$(grep -c 'could not read' "$WORK/err")" "1"
 rm -f "$WORK/env_fail"
+
+# verify_sources_before_write is the real one's stand-in here: count calls.
+verify_calls=0
+verify_sources_before_write() { verify_calls=$((verify_calls + 1)); }
 
 # --- sync: clean ------------------------------------------------------------
 : >"$WORK/calls"
@@ -82,6 +110,7 @@ check "clean sync records OK" "${OP_STATUS[subvol_sync]}" "OK"
 check "report captured" "$(head -n1 <<<"$SUBVOL_SYNC_REPORT")" "SUBVOLUME SYNC"
 check "config reloaded after sync" "${#SOURCE_VOLUMES[@]}" "2"
 check "real run passes no --dry-run" "$(grep -c -- '--dry-run' "$WORK/calls" || true)" "0"
+check "successful reload re-verifies the sources once" "$verify_calls" "1"
 
 # --- sync: failure does not stop the run -----------------------------------
 printf 'SUBVOLUME SYNC\n  VOLUMES NOT READ\n' >"$WORK/sync_out"; echo 1 >"$WORK/sync_rc"
@@ -107,11 +136,38 @@ check "exit 2 detail names the code" "${OP_STATUS[subvol_sync_detail]}" "exit co
 OP_STATUS=()
 printf 'SUBVOLUME SYNC\n  nothing to do\n' >"$WORK/sync_out"; echo 0 >"$WORK/sync_rc"
 touch "$WORK/env_fail"
+verify_calls=0
 rc=0; sync_subvolumes run 2>/dev/null || rc=$?
+check "failed reload does not re-verify" "$verify_calls" "0"
 check "reload failure still returns 0" "$rc" "0"
 check "reload failure overrides OK with FAIL" "${OP_STATUS[subvol_sync]}" "FAIL"
 check "reload failure detail" "${OP_STATUS[subvol_sync_detail]}" "config could not be reloaded after sync"
+# sync failed AND reload failed: both facts are kept.
+OP_STATUS=()
+printf 'SUBVOLUME SYNC\n  VOLUMES NOT READ\n' >"$WORK/sync_out"; echo 1 >"$WORK/sync_rc"
+sync_subvolumes run 2>/dev/null
+check "combined failure keeps the exit code and the reload failure" "${OP_STATUS[subvol_sync_detail]}" \
+    "exit code 1 — see SUBVOLUME SYNC in the report; config could not be reloaded after sync"
 rm -f "$WORK/env_fail"
+
+# --- sync: a failing re-verification is not swallowed ------------------------
+echo 0 >"$WORK/sync_rc"
+printf 'SUBVOLUME SYNC\n  nothing to do\n' >"$WORK/sync_out"
+rc=0
+# shellcheck disable=SC2329  # invoked by sync_subvolumes
+( verify_sources_before_write() { exit 1; }; sync_subvolumes run; echo "SURVIVED" >"$WORK/survived" ) || rc=$?
+check "failing re-verification aborts the run" "$rc" "1"
+check "nothing after the aborted sync ran" "$([[ -e "$WORK/survived" ]] && echo yes || echo no)" "no"
+
+# --- sync: an empty report logs nothing -------------------------------------
+: >"$WORK/log"; : >"$WORK/sync_out"
+# shellcheck disable=SC2329
+log_info() { echo "INFO: $*" >>"$WORK/log"; }
+sync_subvolumes run
+# shellcheck disable=SC2329
+log_info() { :; }
+check "empty sync report logs no report lines" "$(grep -c '^INFO:   *$' "$WORK/log" || true)" "0"
+printf 'SUBVOLUME SYNC\n' >"$WORK/sync_out"
 
 # --- sync: dry run ----------------------------------------------------------
 : >"$WORK/calls"; echo 0 >"$WORK/sync_rc"

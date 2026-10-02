@@ -281,7 +281,7 @@ load_config_env() {
         TARGET_MOUNTS[$label]="${!mount_var}"
         TARGET_ROLES[$label]="${!role_var}"
         MOUNT_ROLES[${!mount_var}]="${!role_var}"
-        name_val="${!name_var}"
+        name_val="${!name_var:-}"
         if [[ -n "${name_val:-}" ]]; then
             TARGET_NAMES[${!mount_var}]="$name_val"
         else
@@ -869,13 +869,28 @@ sync_subvolumes() {
         record_op "subvol_sync" "FAIL" "exit code $rc — see SUBVOLUME SYNC in the report"
         log_error "Subvolume sync failed (exit $rc); continuing with the existing config"
     fi
-    local line
-    while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_SYNC_REPORT"
+    if [[ -n "$SUBVOL_SYNC_REPORT" ]]; then
+        local line
+        while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_SYNC_REPORT"
+    fi
 
     # Sync may have added a source. Reload even after a failure: a partial
     # success on one volume still changed the config.
-    if ! load_config_env; then
-        record_op "subvol_sync" "FAIL" "config could not be reloaded after sync"
+    if load_config_env; then
+        # The reload can name a source that mount_sources and the first
+        # verify_sources_before_write never saw. create_snapshot_dirs is the
+        # next writer, so check again: a source on an unmounted volume must
+        # abort here, not leave an empty directory on the root filesystem.
+        # Only checks, writes nothing, so a second run is safe. It exits 1 on
+        # a violation, deliberately not swallowed.
+        verify_sources_before_write
+    else
+        # Keep the sync failure's own detail when there is one.
+        if [[ "${OP_STATUS[subvol_sync]}" == "FAIL" ]]; then
+            record_op "subvol_sync" "FAIL" "${OP_STATUS[subvol_sync_detail]}; config could not be reloaded after sync"
+        else
+            record_op "subvol_sync" "FAIL" "config could not be reloaded after sync"
+        fi
         log_error "Config could not be reloaded after subvolume sync"
     fi
     return 0
