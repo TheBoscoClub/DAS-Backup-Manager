@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::btrbk_conf::resolve_snapshot_names;
-use crate::caldate::{date_of, day_number};
+use crate::caldate::{date_of, day_number, untrusted_clock};
 use crate::config::{Config, Retention, Source, Target, TargetRole};
 use crate::fsutil::CommandRunner;
 
@@ -62,6 +62,14 @@ fn is_btrbk_timestamp(s: &str) -> bool {
         }
         None => stamp.len() == 8 && all_digits(stamp),
     }
+}
+
+/// The day number of the date a series snapshot's name carries
+/// (`<snapshot_name>.YYYYMMDD…`), or `None` if it carries none.
+fn snapshot_day(entry: &str, snapshot_name: &str) -> Option<i64> {
+    let stamp = entry.strip_prefix(snapshot_name)?.strip_prefix('.')?;
+    let (y, m, d) = (stamp.get(0..4)?, stamp.get(4..6)?, stamp.get(6..8)?);
+    day_number(&format!("{y}-{m}-{d}"))
 }
 
 /// The entries of a directory that are snapshots of exactly this series:
@@ -140,6 +148,13 @@ pub enum LocationState {
         name: String,
     },
     Empty,
+    /// The newest snapshot of the series is dated more than a day after the
+    /// retirement date, so that date is wrong — the clock was wrong when it
+    /// was stamped, or it was edited. Nothing is deleted here.
+    RetiredBeforeNewest {
+        count: usize,
+        newest: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +180,9 @@ pub struct ExpireOutcome {
     pub entries: Vec<RetiredReport>,
     /// Why a fully expired entry could not be removed from the config.
     pub config_error: Option<String>,
+    /// Why nothing was judged expired: the system clock cannot be trusted
+    /// (`caldate::untrusted_clock`). Set only when a retired entry exists.
+    pub clock_error: Option<String>,
 }
 
 impl ExpireOutcome {
@@ -172,6 +190,7 @@ impl ExpireOutcome {
     /// unreachable target is not a failure: targets are allowed to be absent.
     pub fn failed(&self) -> bool {
         self.config_error.is_some()
+            || self.clock_error.is_some()
             || self
                 .entries
                 .iter()
@@ -259,7 +278,7 @@ fn examine(
     snapshot_name: &str,
     retired: &str,
     window: Option<u32>,
-    today: &str,
+    today: Option<&str>,
     dry_run: bool,
     runner: &dyn CommandRunner,
     is_mountpoint: &dyn Fn(&Path) -> bool,
@@ -308,7 +327,26 @@ fn examine(
     if snapshots.is_empty() {
         return report(LocationState::Empty);
     }
-    let due = window.and_then(|w| is_expired(retired, w, today));
+    // Snapshot names carry local time and retirement dates UTC, so one day
+    // apart is ordinary. More than that means the retirement date is wrong,
+    // and a wrong date must never be the reason a backup is deleted.
+    let newest = snapshots
+        .iter()
+        .filter_map(|name| snapshot_day(name, snapshot_name))
+        .max();
+    if let (Some(newest), Some(retired_day)) = (newest, day_number(retired))
+        && newest > retired_day + 1
+    {
+        return report(LocationState::RetiredBeforeNewest {
+            count: snapshots.len(),
+            newest: date_of(newest),
+        });
+    }
+    // An untrusted clock decides nothing: the series is kept, with its date.
+    let due = match today {
+        Some(today) => window.and_then(|w| is_expired(retired, w, today)),
+        None => window.map(|_| false),
+    };
     if due != Some(true) {
         return report(LocationState::Kept {
             count: snapshots.len(),
@@ -371,6 +409,9 @@ pub fn expire_retired(
 ) -> Result<ExpireOutcome, String> {
     let config = Config::load(config_path)
         .map_err(|e| format!("could not load {}: {e}", config_path.display()))?;
+    let clock_error = untrusted_clock(today);
+    // `None`: nothing may be judged expired against this clock.
+    let trusted_today = clock_error.is_none().then_some(today);
     let mut entries = Vec::new();
 
     for source in &config.sources {
@@ -391,7 +432,7 @@ pub fn expire_retired(
                     &snapshot_name,
                     &retired,
                     longest_window_days(&target.retention),
-                    today,
+                    trusted_today,
                     dry_run,
                     runner,
                     is_mountpoint,
@@ -417,7 +458,7 @@ pub fn expire_retired(
                 &snapshot_name,
                 &retired,
                 shortest,
-                today,
+                trusted_today,
                 dry_run,
                 runner,
                 is_mountpoint,
@@ -501,6 +542,8 @@ pub fn expire_retired(
         }
     }
     Ok(ExpireOutcome {
+        // Only worth a failure when there was something it stopped.
+        clock_error: clock_error.filter(|_| !entries.is_empty()),
         entries,
         config_error,
     })
@@ -514,6 +557,9 @@ pub fn format_expire_report(outcome: &ExpireOutcome, dry_run: bool) -> String {
     }
     let plural = |n: usize| if n == 1 { "snapshot" } else { "snapshots" };
     let mut r = String::from("RETIRED SUBVOLUMES\n");
+    if let Some(why) = &outcome.clock_error {
+        r.push_str(&format!("  NOTHING DELETED: {why}\n"));
+    }
     for entry in &outcome.entries {
         r.push_str(&format!(
             "  {}  [source {}, retired {}, series '{}']\n",
@@ -552,6 +598,11 @@ pub fn format_expire_report(outcome: &ExpireOutcome, dry_run: bool) -> String {
                 }
                 LocationState::Shared { source_label, name } => format!(
                     "series name also used by live entry {name} (source {source_label}) — nothing deleted here"
+                ),
+                LocationState::RetiredBeforeNewest { count, newest } => format!(
+                    "{count} {} KEPT — the retirement date ({}) is earlier than this series' own newest snapshot ({newest}): the clock was wrong at retirement, or the date was edited",
+                    plural(*count),
+                    entry.retired
                 ),
                 LocationState::Unrecognised { count, example } => format!(
                     "{count} {} named like this series not recognised as btrbk snapshots (e.g. {example}) — nothing deleted here",
@@ -1419,6 +1470,7 @@ mod tests {
                 kept_reason: None,
             }],
             config_error: None,
+            clock_error: None,
         };
         for ok in [
             LocationState::Empty,
@@ -1528,6 +1580,7 @@ mod tests {
                 kept_reason: None,
             }],
             config_error: Some("disk full".into()),
+            clock_error: None,
         };
         let text = format_expire_report(&out, false);
         for line in [
@@ -1692,6 +1745,7 @@ mod tests {
                 kept_reason: None,
             }],
             config_error: None,
+            clock_error: None,
         };
         let text = format_expire_report(&one, false);
         assert!(
@@ -1889,6 +1943,7 @@ mod tests {
                 kept_reason: None,
             }],
             config_error: None,
+            clock_error: None,
         };
         assert!(
             format_expire_report(&out, false).contains(
@@ -2098,5 +2153,96 @@ mod tests {
             text.contains("    no configured target receives source ssd — entry kept\n"),
             "{text}"
         );
+    }
+
+    // --- a wrong clock must cost a late deletion, never an early one ---
+
+    #[test]
+    fn a_series_whose_newest_snapshot_postdates_its_retirement_is_kept() {
+        // Retired 2026-10-01, but a snapshot dated 2026-10-03 exists: the
+        // retirement date is wrong (clock, or hand edit). Long past the window.
+        let rig = rig();
+        let old = rig.snap("small/ssd", "opt.20260930T0323");
+        let new = rig.snap("small/ssd", "opt.20261003T0323");
+        let runner = rig.deleting(&[&old, &new]);
+        let out = expire_retired(&rig.config_path, false, "2027-12-01", &runner, &mounted).unwrap();
+        assert!(old.exists() && new.exists());
+        assert!(
+            !runner.calls().iter().any(|c| c.contains("small/ssd")),
+            "{:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            out.entries[0].locations[1].state,
+            LocationState::RetiredBeforeNewest {
+                count: 2,
+                newest: "2026-10-03".into()
+            }
+        );
+        assert!(!out.entries[0].removed_from_config);
+        assert!(rig.saved_names().contains(&"@opt".to_string()));
+        let text = format_expire_report(&out, false);
+        assert!(
+            text.contains(
+                "    target small: 2 snapshots KEPT — the retirement date (2026-10-01) is earlier than this series' own newest snapshot (2026-10-03): the clock was wrong at retirement, or the date was edited\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_dated_the_retirement_day_or_the_day_after_does_not_block_expiry() {
+        // Snapshot names carry local time, retirement dates are UTC: one day
+        // of difference is ordinary and must not keep anything.
+        for stamp in ["20261001T2350", "20261002T0010"] {
+            let rig = rig();
+            let snap = rig.snap("small/ssd", &format!("opt.{stamp}"));
+            let runner = rig.deleting(&[&snap]);
+            let out =
+                expire_retired(&rig.config_path, false, "2026-10-20", &runner, &mounted).unwrap();
+            assert!(!snap.exists(), "{stamp}: must be deleted");
+            assert_eq!(
+                out.entries[0].locations[1].state,
+                LocationState::Deleted { count: 1 },
+                "{stamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clock_before_2026_deletes_nothing_and_fails_loudly() {
+        let rig = rig();
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small]);
+        // A clock that wrapped to the epoch; and one that is merely early.
+        for today in ["1970-01-01", "2025-06-01"] {
+            let out = expire_retired(&rig.config_path, false, today, &runner, &mounted).unwrap();
+            assert!(small.exists(), "{today}");
+            assert!(out.failed(), "{today}");
+            assert!(out.deleted_paths().is_empty());
+            let text = format_expire_report(&out, false);
+            assert!(text.contains("  NOTHING DELETED: "), "{text}");
+            assert!(text.contains(today), "{text}");
+        }
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        // Control: with a real date the same snapshot goes.
+        let out = expire_retired(&rig.config_path, false, "2026-10-20", &runner, &mounted).unwrap();
+        assert!(!small.exists() && !out.failed());
+    }
+
+    #[test]
+    fn an_untrusted_clock_is_not_a_failure_when_nothing_is_retired() {
+        let rig = rig();
+        rig.edit(|c| c.sources[0].subvolumes[1].retired = None);
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "1970-01-01",
+            &Scripted::new(&[]),
+            &mounted,
+        )
+        .unwrap();
+        assert!(!out.failed());
+        assert_eq!(format_expire_report(&out, false), "");
     }
 }

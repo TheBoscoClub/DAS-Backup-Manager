@@ -508,11 +508,15 @@ pub struct SyncOutcome {
     /// Why they were not, when the plan called for it.
     pub write_error: Option<String>,
     pub btrbk_conf: BtrbkConf,
+    /// Why the retirements in the plan were not stamped: the system clock
+    /// cannot be trusted (`caldate::untrusted_clock`). Adoption and revival
+    /// do not depend on the date and go ahead.
+    pub retire_refused: Option<String>,
 }
 
 impl SyncOutcome {
     pub fn failed(&self) -> bool {
-        self.plan.failed() || self.write_error.is_some()
+        self.plan.failed() || self.write_error.is_some() || self.retire_refused.is_some()
     }
 }
 
@@ -531,28 +535,48 @@ pub fn sync_subvolumes(
     let listings = list_volumes(&config, runner, is_mountpoint);
 
     let plan = plan_sync(&config, &listings);
-    if !plan.changes_config() {
-        let (btrbk_conf, write_error) = bring_btrbk_conf_into_line(&config, dry_run, plan.failed());
+    // A retirement date starts the expiry clock, so a wrong one could delete
+    // backups early. With an untrusted clock the retirements are held back
+    // (and reported); the rest of the plan does not depend on the date.
+    let retire_refused = if plan.retire.is_empty() {
+        None
+    } else {
+        crate::caldate::untrusted_clock(today)
+    };
+    let to_apply = if retire_refused.is_some() {
+        SyncPlan {
+            retire: Vec::new(),
+            ..plan.clone()
+        }
+    } else {
+        plan.clone()
+    };
+    if !to_apply.changes_config() {
+        let (btrbk_conf, write_error) =
+            bring_btrbk_conf_into_line(&config, dry_run, to_apply.failed());
         return Ok(SyncOutcome {
             plan,
             written: false,
             write_error,
             btrbk_conf,
+            retire_refused,
         });
     }
     if dry_run {
         return Ok(SyncOutcome {
             plan,
+            retire_refused,
             ..Default::default()
         });
     }
 
-    let write_error = write_updated(&config, apply_plan(&config, &plan, today), config_path);
+    let write_error = write_updated(&config, apply_plan(&config, &to_apply, today), config_path);
     Ok(SyncOutcome {
         written: write_error.is_none(),
         plan,
         write_error,
         btrbk_conf: BtrbkConf::Current,
+        retire_refused,
     })
 }
 
@@ -697,11 +721,14 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
         }
     }
     if !plan.retire.is_empty() {
-        r.push_str(&heading(
-            "Retired (gone from disk; existing backups will expire)",
-            "Would retire",
-            "NOT retired",
-        ));
+        match &outcome.retire_refused {
+            Some(why) => r.push_str(&format!("  NOT retired ({why}):\n")),
+            None => r.push_str(&heading(
+                "Retired (gone from disk; existing backups will expire)",
+                "Would retire",
+                "NOT retired",
+            )),
+        }
         for e in &plan.retire {
             r.push_str(&format!("    {}  [source {}]\n", e.name, e.source_label));
         }
@@ -1859,6 +1886,7 @@ mod tests {
             written: false,
             write_error: None,
             btrbk_conf: BtrbkConf::Current,
+            retire_refused: None,
         };
         assert_eq!(
             format_sync_report(&quiet, false),
@@ -1910,6 +1938,7 @@ mod tests {
                 written: true,
                 write_error: None,
                 btrbk_conf: BtrbkConf::Current,
+                retire_refused: None,
             },
             false,
         );
@@ -1950,6 +1979,7 @@ mod tests {
                 written: false,
                 write_error: None,
                 btrbk_conf: BtrbkConf::Current,
+                retire_refused: None,
             },
             true,
         );
@@ -1963,6 +1993,7 @@ mod tests {
                 written: false,
                 write_error: Some("disk full".into()),
                 btrbk_conf: BtrbkConf::Current,
+                retire_refused: None,
             },
             false,
         );
@@ -2017,6 +2048,7 @@ mod tests {
                     written: true,
                     write_error: None,
                     btrbk_conf: BtrbkConf::Current,
+                    retire_refused: None,
                 },
                 false,
             );
@@ -2049,6 +2081,7 @@ mod tests {
                     written,
                     write_error: None,
                     btrbk_conf: BtrbkConf::Current,
+                    retire_refused: None,
                 },
                 dry,
             )
@@ -2209,6 +2242,54 @@ mod tests {
         assert!(
             why.contains("UUID=bad") && !why.contains("UUID=worse"),
             "{why}"
+        );
+    }
+
+    // --- a retirement is never stamped from a clock that cannot be trusted ---
+
+    #[test]
+    fn a_clock_before_2026_refuses_to_retire_but_still_adopts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        // @opt vanished, @srv/web appeared.
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@srv/web"])]);
+        let out = sync_subvolumes(&path, false, "1970-01-01", &r, &mounted).unwrap();
+        assert!(out.failed());
+        assert!(out.written, "{:?}", out.write_error);
+        let saved = Config::load(&path).unwrap();
+        let entry = |name: &str| {
+            saved.sources[0]
+                .subvolumes
+                .iter()
+                .find(|e| e.name == name)
+                .cloned()
+        };
+        assert_eq!(
+            entry("@opt").unwrap().retired,
+            None,
+            "no retirement stamped"
+        );
+        assert!(entry("@srv/web").is_some(), "adoption still happens");
+        let text = format_sync_report(&out, false);
+        assert!(
+            text.contains("  NOT retired (the system clock reads 1970-01-01"),
+            "{text}"
+        );
+        assert!(text.contains("    @opt  [source ssd]\n"), "{text}");
+        assert!(text.contains("  Adopted (now backed up):\n"), "{text}");
+    }
+
+    #[test]
+    fn a_trusted_clock_retires_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv"])]);
+        let out = sync_subvolumes(&path, false, "2026-01-01", &r, &mounted).unwrap();
+        assert!(!out.failed() && out.written, "{:?}", out.write_error);
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(
+            saved.sources[0].subvolumes[1].retired.as_deref(),
+            Some("2026-01-01")
         );
     }
 }
