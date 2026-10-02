@@ -1692,7 +1692,16 @@ pub fn deliver_report(
     }
     let report_text =
         crate::report::format_report_from(result, options.subvolume_sync.as_ref(), data);
-    if let Err(e) = std::fs::write(&config.general.last_report, &report_text) {
+    // The directory may not exist yet (backup-run.sh: `mkdir -p`). A plain
+    // write, not `fsutil::write_atomic`: that makes a new file, which does
+    // not keep an existing report's mode and owner.
+    let report_path = Path::new(&config.general.last_report);
+    if let Err(e) = report_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(report_path, &report_text))
+    {
         progress.on_log(
             LogLevel::Warning,
             &format!(
@@ -3445,7 +3454,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = system_host(dir.path());
         let mut config = make_test_config();
-        let report = dir.path().join("last-report.txt");
+        // In a directory that does not exist yet: it is created.
+        let report = dir.path().join("reports/last-report.txt");
         config.general.last_report = report.to_string_lossy().into_owned();
         let progress = TestProgress::new();
         let result = result_with(false, 1, 1, 0);
@@ -3496,6 +3506,69 @@ mod tests {
         assert!(tried_to_mail(&progress), "email enabled: the send is tried");
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("a"), "{text}");
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_written_is_a_warning_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = make_test_config();
+        // A file where the report's directory should be.
+        std::fs::write(dir.path().join("blocker"), b"x").unwrap();
+        let path = dir.path().join("blocker/last-report.txt");
+        config.general.last_report = path.to_string_lossy().into_owned();
+        config.email.enabled = false;
+        let options = BackupOptions {
+            send_report: true,
+            ..Default::default()
+        };
+        let data = crate::report::ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+        };
+        let progress = TestProgress::new();
+        assert!(!deliver_report(
+            &config,
+            &options,
+            &result_with(true, 1, 1, 0),
+            &data,
+            &progress
+        ));
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(l, m)| *l == LogLevel::Warning
+                && m.starts_with(&format!("Failed to save report to {}", path.display()))),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn an_existing_report_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-report.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut config = make_test_config();
+        config.general.last_report = path.to_string_lossy().into_owned();
+        config.email.enabled = false;
+        let options = BackupOptions {
+            send_report: true,
+            ..Default::default()
+        };
+        let data = crate::report::ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+        };
+        deliver_report(
+            &config,
+            &options,
+            &result_with(true, 1, 1, 0),
+            &data,
+            &TestProgress::new(),
+        );
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), "old");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 
     #[test]

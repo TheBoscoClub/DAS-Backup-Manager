@@ -10,7 +10,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report run_btrbk cleanup create_target_dirs make_target_dir; do
+for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -381,7 +381,32 @@ SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
     "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Retired expiry        OK  (n/a)||"
-check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.7.0' <<<"$report")" "1"
+check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.7.1' <<<"$report")" "1"
+
+# --- report: a failed btrbk listing is unavailable, not "none yet" -------------
+# capture_report_data under the script's own options; no target is mounted.
+# shellcheck disable=SC2329  # called by the extracted capture_report_data
+mountpoint() { return 1; }
+# shellcheck disable=SC2034  # read by the extracted capture_report_data
+ALL_TARGET_MOUNTS=()
+latest_case() {
+    # shellcheck disable=SC2329
+    btrbk() {
+        if [[ "$*" == *"--format=raw"* ]]; then return 0; fi
+        case "$2" in
+            ok) printf 'SOURCE SNAPSHOT\n/v/@ /v/.s/root-.1\n' ;;
+            empty) printf 'SOURCE SNAPSHOT\n' ;;
+            fail) echo "ERROR: Failed to lock" >&2; return 2 ;;
+        esac
+    }
+    DAS_BTRBK_CONF="$1"
+    ( set -euo pipefail; capture_report_data; printf '%s' "$BTRBK_LATEST" )
+}
+check "report: a listing is shown" "$(latest_case ok)" "  /v/@ /v/.s/root-.1"
+check "report: an empty listing stays empty (shown as none yet)" "$(latest_case empty)" ""
+check "report: a failed listing says so and why" "$(latest_case fail)" \
+    "  (unavailable: btrbk list latest failed: ERROR: Failed to lock)"
+unset -f btrbk mountpoint
 
 if [[ $fails -eq 0 ]]; then
     echo "ALL SUBVOL SYNC SHELL TESTS PASSED"

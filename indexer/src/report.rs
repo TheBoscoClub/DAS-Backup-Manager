@@ -75,15 +75,30 @@ pub struct ReportData {
 /// [`render_capacity_and_smart`] and [`render_latest_snapshots`].
 pub fn capture_report_data(config: &Config) -> ReportData {
     let health = crate::health::get_health(config).ok();
-    let latest = Command::new("btrbk")
-        .args(["-c", &config.general.btrbk_conf, "list", "latest"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let latest = latest_listing(
+        Command::new("btrbk")
+            .args(["-c", &config.general.btrbk_conf, "list", "latest"])
+            .output(),
+    );
     ReportData {
         capacity_and_smart: render_capacity_and_smart(health.as_ref()),
-        latest_snapshots: render_latest_snapshots(latest.as_deref()),
+        latest_snapshots: render_latest_snapshots(latest.as_deref().map_err(String::as_str)),
+    }
+}
+
+/// What `btrbk list latest` answered: its output, or why there is none.
+fn latest_listing(output: std::io::Result<std::process::Output>) -> Result<String, String> {
+    match output {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => Err(format!(
+            "btrbk list latest exited with {}: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        )),
+        Err(e) => Err(format!("btrbk could not be run: {e}")),
     }
 }
 
@@ -99,6 +114,14 @@ pub fn render_capacity_and_smart(health: Option<&crate::health::HealthReport>) -
         return r;
     };
     for th in health.targets.iter().filter(|t| t.mounted) {
+        // A usage that could not be measured is "unknown", never 0 B.
+        if !th.usage_known {
+            r.push_str(&format!(
+                "  {:<25}{:<11}{:<11}{}\n",
+                th.label, "unknown", "unknown", "unknown"
+            ));
+            continue;
+        }
         let avail = th.total_bytes.saturating_sub(th.used_bytes);
         r.push_str(&format!(
             "  {:<25}{:<11}{:<11}{:.0}%\n",
@@ -128,12 +151,18 @@ pub fn render_capacity_and_smart(health: Option<&crate::health::HealthReport>) -
 }
 
 /// `LATEST SNAPSHOTS` from `btrbk list latest` output, its header line
-/// dropped; an empty section when btrbk could not answer.
-pub fn render_latest_snapshots(btrbk_list_latest: Option<&str>) -> String {
+/// dropped; when btrbk could not answer, one line saying so and why — an
+/// empty section would read as "no snapshots".
+pub fn render_latest_snapshots(btrbk_list_latest: Result<&str, &str>) -> String {
     let thin = "─".repeat(63);
     let mut r = format!("\nLATEST SNAPSHOTS\n{thin}\n");
-    for line in btrbk_list_latest.unwrap_or("").lines().skip(1) {
-        r.push_str(&format!("  {line}\n"));
+    match btrbk_list_latest {
+        Ok(out) => {
+            for line in out.lines().skip(1) {
+                r.push_str(&format!("  {line}\n"));
+            }
+        }
+        Err(why) => r.push_str(&format!("  (unavailable: {why})\n")),
     }
     r
 }
@@ -625,6 +654,7 @@ mod tests {
             mounted,
             total_bytes: 4 * 1024 * 1024 * 1024,
             used_bytes: 1024 * 1024 * 1024,
+            usage_known: true,
             snapshot_count: 3,
             smart_status: Some("PASSED".into()),
             temperature_c: Some(31),
@@ -658,6 +688,27 @@ mod tests {
             "{text}"
         );
         assert!(smart.contains("  down "), "{text}");
+        // Measured, but genuinely empty: still a measurement.
+        let mut empty = target_health("empty", true);
+        empty.used_bytes = 0;
+        let mut unknown = target_health("unmeasured", true);
+        unknown.total_bytes = 0;
+        unknown.used_bytes = 0;
+        unknown.usage_known = false;
+        let health2 = crate::health::HealthReport {
+            targets: vec![empty, unknown],
+            ..health
+        };
+        let text = render_capacity_and_smart(Some(&health2));
+        assert!(
+            text.contains("  empty                    0 B        4.00 GiB   0%\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  unmeasured               unknown    unknown    unknown\n"),
+            "{text}"
+        );
+        assert!(!text.contains("unmeasured               0 B"), "{text}");
         let none = render_capacity_and_smart(None);
         assert!(none.contains("(health data unavailable)"), "{none}");
         assert!(!none.contains("SMART STATUS"), "{none}");
@@ -666,7 +717,7 @@ mod tests {
     #[test]
     fn latest_snapshots_drop_the_header_line() {
         let out = "SOURCE_SUBVOLUME  SNAPSHOT  STATUS  TARGET\n/v/@  /v/.s/root-.1  -  /t/nvme/root-.1\n/v/@d  /v/.s/d.1  -  /t/nvme/d.1\n";
-        let text = render_latest_snapshots(Some(out));
+        let text = render_latest_snapshots(Ok(out));
         assert!(text.starts_with("\nLATEST SNAPSHOTS\n"), "{text}");
         assert!(!text.contains("SOURCE_SUBVOLUME"), "{text}");
         assert!(
@@ -674,6 +725,42 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("  /v/@d  /v/.s/d.1"), "{text}");
-        assert!(render_latest_snapshots(None).ends_with("─\n"));
+        assert!(!text.contains("unavailable"), "{text}");
+        // btrbk answered, nothing listed: an empty section, no note.
+        assert!(render_latest_snapshots(Ok("HEADER\n")).ends_with("─\n"));
+    }
+
+    #[test]
+    fn latest_snapshots_say_when_btrbk_could_not_answer() {
+        let text = render_latest_snapshots(Err(
+            "btrbk list latest exited with exit status: 2: ERROR: lock",
+        ));
+        assert!(
+            text.ends_with(
+                "─\n  (unavailable: btrbk list latest exited with exit status: 2: ERROR: lock)\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn latest_listing_keeps_output_only_from_a_successful_run() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str, stderr: &str| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert_eq!(
+            latest_listing(out(0, "H\nrow\n", "")),
+            Ok("H\nrow\n".to_string())
+        );
+        let err = latest_listing(out(2, "H\nstale\n", "ERROR: lock\nmore")).unwrap_err();
+        assert!(err.starts_with("btrbk list latest exited with"), "{err}");
+        assert!(err.ends_with(": ERROR: lock"), "{err}");
+        let err = latest_listing(Err(std::io::Error::other("no such file"))).unwrap_err();
+        assert_eq!(err, "btrbk could not be run: no such file");
     }
 }
