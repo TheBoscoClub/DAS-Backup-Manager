@@ -28,7 +28,9 @@
 #          inherits the lock's descriptor: the claim AND the lock outlive this
 #          script if it is killed while the VM still runs. The lock's record
 #          names the holder, which is what holds it. A holder that dies while
-#          the VM runs is replaced at the next check.
+#          the VM runs is replaced at the next check, and tried for at every
+#          check until a claim holds again; a session that lost its claim at
+#          all ends with exit 5, saying whether it was taken again.
 #   - Only a role = "mirror" target: found by the serial config.toml gives
 #     it, the serial read back from the disk, and partition 2 carrying the
 #     filesystem config mounts that target by (mount_uuid). A serial that also
@@ -65,7 +67,8 @@
 #   4  the disk could not be returned completely (a detach, or the holder's
 #      exit, failed): the claim and the lock are KEPT; finish with session-end
 #   5  the session ended and the disk was given back, but something needs a
-#      look (see the summary): the drive re-enumerated during the session, a
+#      look (see the summary): the claim was lost while the VM ran (taken
+#      again or not), the drive re-enumerated during the session, a
 #      partition was mounted afterwards, or the device scan failed
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
@@ -152,6 +155,8 @@ HOLDER_LOSSES=0     # holders that died while the VM may have used the disk
 HOLDER_STARTS=0     # holders started this session (names their scopes)
 HOLDER_UNIT=""      # the current holder's scope unit
 REENUMERATED=false  # the by-id link led elsewhere during the session
+CLAIM_GAP=false     # the claim was lost and no claim holds yet
+HOLDER_RESULT="no holder left to stop" # what giving the disk back did with the holder
 ATTACHED=false      # the disk MAY be in the domain's definition (set before attaching)
 STARTED=false       # `virsh start` was attempted, so the guest may have written
 DONE=false          # nothing left for the trap to undo
@@ -767,16 +772,28 @@ keep_claim() {
     if holder_alive "$HOLDER_PID" "$DISK"; then
         return 0
     fi
+    # A holder found gone is one loss; trying again after a failed claim is not.
     if [[ -n "$old" ]]; then
         wait "$old" 2>/dev/null || rc=$?
+        HOLDER_LOSSES=$((HOLDER_LOSSES + 1))
+        HOLDER_PID=""
+        warn "the disk holder (pid $old, status $rc) is gone while the recovery OS may use $DISK -- claiming it again"
     fi
-    HOLDER_LOSSES=$((HOLDER_LOSSES + 1))
-    HOLDER_PID=""
-    warn "the disk holder (pid ${old:-none}, status $rc) is gone while the recovery OS may use $DISK -- claiming it again"
     if start_holder; then
+        if [[ "$CLAIM_GAP" == true ]]; then
+            warn "claimed $DISK again (holder pid $HOLDER_PID); until now nothing kept this host off it"
+        fi
+        CLAIM_GAP=false
         return 0
     fi
-    warn "COULD NOT CLAIM $DISK AGAIN ($HOLDER_FAILURE). If that is 'in use', something on this host has mounted the drive WHILE THE VM USES IT: unmount it at once. Until the recovery OS is off, only this script (pid $$) still holds the maintenance lock -- do not stop it."
+    # No holder: this process alone holds the lock now, so the record names it.
+    if [[ -n "$LOCK_FD" ]]; then
+        write_lock_record "$$"
+    fi
+    if [[ "$CLAIM_GAP" != true ]]; then
+        CLAIM_GAP=true
+        warn "COULD NOT CLAIM $DISK AGAIN ($HOLDER_FAILURE). If that is 'in use', something on this host has mounted the drive WHILE THE VM USES IT: unmount it at once. Until the recovery OS is off, only this script (pid $$) still holds the maintenance lock -- do not stop it. It tries again at every check."
+    fi
     return 1
 }
 
@@ -834,10 +851,13 @@ return_disk() {
         said="$(cat -- "$HOLDER_ERR" 2>/dev/null)" || said=""
         if [[ "$HOLDER_SIGNALLED" != true ]]; then
             warn "the disk holder (pid $HOLDER_PID) had already exited${said:+: $said}"
+            HOLDER_RESULT="the holder had already exited"
         elif ((rc == 0 || rc == 127)); then
             log "stopped the disk holder (pid $HOLDER_PID)${said:+: $said}"
+            HOLDER_RESULT="holder stopped"
         else
             warn "the disk holder (pid $HOLDER_PID) exited with status $rc${said:+: $said}"
+            HOLDER_RESULT="holder stopped (exit status $rc)"
         fi
         HOLDER_PID=""
     fi
@@ -846,8 +866,33 @@ return_disk() {
         check_left_unmounted
     fi
     release_lock
+    check_lock_let_go
     rm -f -- "$HOLDER_FILE" "$HOLDER_OUT" "$HOLDER_ERR" "$DISK_XML_FILE"
     return 0
+}
+
+# After a holder start that failed, whatever that start left running has the
+# lock's descriptor and would hold the lock with it -- and backups and scrubs
+# would wait for a process nobody knows about. So once the lock is let go,
+# look: a job that names itself in the record is a legitimate taker (given a
+# moment to write it); anything else is said as loudly as it deserves.
+check_lock_let_go() {
+    local i first
+    if [[ -z "$HOLDER_FAILURE" || -n "$LOCK_FD" ]]; then
+        return 0
+    fi
+    for ((i = 0; i < 10; i++)); do
+        if (flock -n 9) 9<"$MAINTENANCE_LOCK"; then
+            return 0
+        fi
+        first="$(head -n 1 -- "$MAINTENANCE_LOCK" 2>/dev/null)" || first=""
+        if [[ -n "$first" && "$first" != "recovery-os VM session $LABEL pid "* ]]; then
+            log "the DAS maintenance lock was taken at once by: $first"
+            return 0
+        fi
+        sleep 0.1
+    done
+    warn "THE MAINTENANCE LOCK IS STILL HELD after this session let it go, by no job that names itself: something left behind by the failed holder start may hold it, and backups and scrubs will wait for it. See who has it open: fuser -v $MAINTENANCE_LOCK"
 }
 
 # Another kernel wrote this filesystem: have the host's btrfs read it anew.
@@ -868,16 +913,36 @@ rescan_disk() {
     fi
 }
 
-check_left_unmounted() {
+# One device's mount state as the summary says it. Prints only that: the
+# warnings go to stderr.
+mount_state_of() {
     local mounted
-    if ! mounted="$(mounted_partitions "$DISK_DEV")"; then
-        warn "cannot list the mounts of $DISK_DEV"
-        MOUNT_RESULT="unknown: lsblk failed"
+    if ! mounted="$(mounted_partitions "$1")"; then
+        warn "cannot list the mounts of $1"
+        printf 'unknown: lsblk failed\n'
     elif [[ -n "$mounted" ]]; then
-        warn "after the session $DISK_DEV is mounted: $mounted"
-        MOUNT_RESULT="MOUNTED: $mounted"
+        warn "after the session $1 is mounted: $mounted"
+        printf 'MOUNTED: %s\n' "$mounted"
     else
-        MOUNT_RESULT="no partition mounted"
+        printf 'no partition mounted\n'
+    fi
+}
+
+check_left_unmounted() {
+    local now
+    if [[ "$REENUMERATED" != true ]]; then
+        MOUNT_RESULT="$(mount_state_of "$DISK_DEV")"
+        return 0
+    fi
+    # The drive came back under another name, and its old one may be another
+    # drive's by now: look at both, and say which is which.
+    MOUNT_RESULT="$(mount_state_of "$DISK_DEV") (old device $DISK_DEV)"
+    now="$(readlink -f -- "$DISK" 2>/dev/null)" || now=""
+    [[ -e "$DISK" ]] || now=""
+    if [[ -z "$now" ]]; then
+        MOUNT_RESULT+="; $DISK leads nowhere now"
+    elif [[ "$now" != "$DISK_DEV" ]]; then
+        MOUNT_RESULT+="; $(mount_state_of "$now") (current device $now)"
     fi
 }
 
@@ -894,6 +959,8 @@ The recovery OS keeps $DISK:
     this host can mount any partition of it;
   - it still holds $MAINTENANCE_LOCK, so backups and scrubs wait
     and the other jobs that mount targets defer.
+Never 'systemctl stop' ${HOLDER_UNIT:-the scope of the holder}: that ends the claim and the lock
+at once, and with this script gone nothing takes them again.
 Nothing was detached and nothing was destroyed. To finish:
   1. Open the console:  virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN
      Let the update finish, then power the recovery OS off from inside it.
@@ -1043,7 +1110,8 @@ wait_for_poweroff() {
 # 5 when a session ended, everything given back, but something needs a look;
 # else 0.
 session_status() {
-    if [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]]; then
+    if [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
+        ((HOLDER_LOSSES > 0)); then
         echo 5
     else
         echo 0
@@ -1121,24 +1189,30 @@ cmd_session() {
         exit 4
     fi
     DONE=true
-    local claim="held throughout" warnings=""
-    if ((HOLDER_LOSSES > 0)); then
+    local claim="held throughout" warnings=() w lines="" joined=""
+    if ((HOLDER_LOSSES > 0)) && [[ "$CLAIM_GAP" == true ]]; then
+        claim="LOST $HOLDER_LOSSES time(s); NOT claimed again -- see the warnings above"
+        warnings+=("the claim was lost and not taken again: until the recovery OS was off, nothing kept this host off the drive")
+    elif ((HOLDER_LOSSES > 0)); then
         claim="LOST $HOLDER_LOSSES time(s) and claimed again -- see the warnings above"
     fi
     if [[ "$REENUMERATED" == true ]]; then
-        warnings="the disk re-enumerated during the session; the claim was on the old device"
+        warnings+=("the disk re-enumerated during the session; the claim was on the old device")
     fi
+    for w in "${warnings[@]}"; do
+        lines+=$'\n'"  Warnings      $w"
+        joined+="; $w"
+    done
     cat <<EOF
 Session done -- $LABEL
   Disk          $DISK ($DISK_DEV)
   VM ran        $(format_duration $((SECONDS - VM_START))); whole session $(format_duration $((SECONDS - SESSION_START)))
   Claim         $claim
-  Given back    detached; holder stopped; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
-  Lock          released${warnings:+
-  Warnings      $warnings}
+  Given back    detached; $HOLDER_RESULT; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
+  Lock          released$lines
   Next          the next backup run reads the updated OS (RECOVERY OS in its report)
 EOF
-    logger -t "$LOG_TAG" -- "session for $LABEL done: claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT${warnings:+; $warnings}" || :
+    logger -t "$LOG_TAG" -- "session for $LABEL done: claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT$joined" || :
     exit "$(session_status)"
 }
 

@@ -32,6 +32,12 @@ cleanup() {
                 fi
             done <"$root/stub/holder.pids"
         fi
+        if [[ -f "$root/stub/orphan.pid" ]]; then
+            pid=$(<"$root/stub/orphan.pid")
+            if [[ "$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline")" == *"orphan-runner"* ]]; then
+                kill -KILL "$pid" 2>/dev/null || :
+            fi
+        fi
         rm -rf -- "$root"
     done
 }
@@ -158,7 +164,10 @@ case "$cmd" in
         if [[ -f "$S/domstate_fail" ]]; then echo "error: failed to connect to the hypervisor" >&2; exit 1; fi
         if [[ -f "$S/started" ]]; then
             # What the lock's record says while the session runs.
-            head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" >>"$S/lock.records"
+            line=$(head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock")
+            printf '%s\n' "$line" >>"$S/lock.records"
+            pid=${line##* pid }
+            if [[ "$line" == *" pid "* && -d "/proc/$pid" ]]; then echo alive; else echo dead; fi >>"$S/lock.records.alive"
             polls=$(($(cat "$S/polls" 2>/dev/null || echo 0) + 1))
             echo "$polls" >"$S/polls"
             # The drive re-enumerates at the second poll: its by-id link moves.
@@ -207,6 +216,8 @@ case "$cmd" in
         touch "$S/started"
         # The holder dies (killed, out of memory) once the VM runs.
         if [[ -f "$S/kill_holder_at_start" ]]; then kill -KILL "$(head -n 1 "$S/holder.pids")"; fi
+        # ...and from now on something keeps the drive busy.
+        if [[ -f "$S/busy_after_start" ]]; then touch "$S/hold_busy"; fi
         # Something on the host mounts a partition while the session runs.
         if [[ -f "$S/lsblk.mounts.sdj.after_start" ]]; then cp "$S/lsblk.mounts.sdj.after_start" "$S/lsblk.mounts.sdj"; fi
         echo "Domain 'recovery-os-updater' started"
@@ -312,6 +323,8 @@ case "${1:-} ${2:-}" in
         echo "$$" >>"$STUB/holder.pids"
         echo "hold-disk $dev" >>"$STUB/holder.calls"
         if [[ -f "$STUB/hold_busy" ]]; then
+            # Busy for one claim only.
+            if [[ -f "$STUB/busy_once" ]]; then rm -f "$STUB/hold_busy"; fi
             echo "Error: cannot hold $dev: $dev is in use — mounted or held by another program" >&2
             exit 2
         fi
@@ -379,6 +392,12 @@ STUB
     cat >"$T/bin/systemd-run" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >>"$STUB/systemd-run.calls"
+if [[ -f "$STUB/systemd_run_orphan" ]]; then
+    (exec -a "orphan-runner $STUB" sleep 30) &
+    echo $! >"$STUB/orphan.pid"
+    echo "Failed to start transient scope unit: Connection timed out" >&2
+    exit 1
+fi
 if [[ -f "$STUB/systemd_run_fail" ]]; then
     echo "Failed to start transient scope unit: Unit das-recovery-os-holder.scope already exists." >&2
     exit 1
@@ -807,6 +826,7 @@ check "session: no record left" "$(ls -A "$STATE")" ""
 has "session: console shown, through libvirt" "$OUT" "virt-viewer --connect qemu:///system --attach recovery-os-updater"
 has "session: summary" "$OUT" "Session done -- system-recovery-A-2tb"
 has "session: summary says no partition mounted" "$OUT" "no partition mounted"
+has "session: summary says the holder was stopped" "$OUT" "detached; holder stopped;"
 has "session: logged to the journal" "$(file "$S/logger.calls")" "-t das-recovery-os-vm -- attached $DISK_A"
 check "session: never destroyed" "$(file "$S/forbidden")" ""
 
@@ -842,6 +862,7 @@ check "SIGINT: the lock outlives the driver (inherited)" "$(lock_state)" "held"
 has "SIGINT: the disk is still the VM's" "$(file "$S/attached.xml")" "$DISK_A"
 has "SIGINT: says how to finish" "$OUT" "session-end system-recovery-A-2tb"
 matches "SIGINT: the record stays while the session holds the lock" "$(head -n 1 "$LOCK")" "$RECORD_A"
+has "SIGINT: never stop the holder's scope" "$OUT" "Never 'systemctl stop' das-recovery-os-holder-system-recovery-A-2tb.scope"
 check "SIGINT: the record names the holder, which outlives the driver" "$(head -n 1 "$LOCK")" \
     "recovery-os VM session system-recovery-A-2tb pid $pid"
 check "SIGINT: a reader sees the holder alive, not a finished session" "$(frb_reader)" \
@@ -947,7 +968,7 @@ touch "$S/kill_holder_at_start"
     echo "shut off"
 } >"$S/states.running"
 run_driver session A
-check "holder lost: the session still ends" "$RC" "0"
+check "holder lost: the session ends, flagged" "$RC" "5"
 has "holder lost: said so" "$OUT" "is gone while the recovery OS may use"
 check "holder lost: claimed again" "$(grep -c '^hold-disk' "$S/holder.calls")" "2"
 has "holder lost: the new holder holds the lock too" "$(events)" \
@@ -999,6 +1020,17 @@ check "systemd-run fails: refused" "$RC" "1"
 has "systemd-run fails: says why" "$OUT" "already exists"
 check "systemd-run fails: lock released" "$(lock_state)" "free"
 check "systemd-run fails: no record left" "$(ls -A "$STATE")" ""
+lacks "systemd-run fails: no alarm about the lock" "$OUT" "STILL HELD"
+
+fixture
+touch "$S/systemd_run_orphan"
+run_driver session A --dry-run
+check "an orphan keeps the lock: refused" "$RC" "1"
+has "an orphan keeps the lock: said loudly" "$OUT" "THE MAINTENANCE LOCK IS STILL HELD"
+check "an orphan keeps the lock: it does" "$(lock_state)" "held"
+kill -KILL "$(cat "$S/orphan.pid")" 2>/dev/null || :
+for ((i = 0; i < 100; i++)); do [[ "$(lock_state)" == free ]] && break; sleep 0.05; done
+check "an orphan keeps the lock: free once it is gone" "$(lock_state)" "free"
 
 fixture
 rm "$T/bin/systemd-run"
@@ -1025,6 +1057,37 @@ check "a label a unit name cannot carry: refused" "$RC" "1"
 has "a label a unit name cannot carry: says so" "$OUT" "characters a systemd unit name cannot carry"
 check "a label a unit name cannot carry: no lock taken" "$(file "$S/flock.calls")" ""
 
+echo "--- the claim is lost, and cannot be taken again"
+fixture
+touch "$S/kill_holder_at_start" "$S/busy_after_start"
+{
+    for ((i = 0; i < 6; i++)); do echo running; done
+    echo "shut off"
+} >"$S/states.running"
+run_driver session A
+check "claim gap: exit 5" "$RC" "5"
+has "claim gap: the summary says it was not taken again" "$OUT" "LOST 1 time(s); NOT claimed again"
+has "claim gap: a warning line says what that means" "$OUT" "the claim was lost and not taken again"
+lacks "claim gap: never said to be claimed again" "$OUT" "and claimed again"
+check "claim gap: one loss, however many tries" "$(grep -c 'is gone while the recovery OS may use' <<<"$OUT")" "1"
+check "claim gap: tried again at each check" "$(($(grep -c '^hold-disk' "$S/holder.calls") > 3))" "1"
+check "claim gap: the lock's record names a running process at the last check" "$(tail -n 1 "$S/lock.records.alive")" "alive"
+check "claim gap: lock free at the end" "$(lock_state)" "free"
+has "claim gap: no holder said to be stopped" "$OUT" "detached; no holder left to stop;"
+
+fixture
+touch "$S/kill_holder_at_start" "$S/busy_after_start" "$S/busy_once"
+{
+    for ((i = 0; i < 6; i++)); do echo running; done
+    echo "shut off"
+} >"$S/states.running"
+run_driver session A
+check "claim gap closed: exit 5" "$RC" "5"
+has "claim gap closed: claimed again" "$OUT" "LOST 1 time(s) and claimed again"
+lacks "claim gap closed: no gap in the summary" "$OUT" "NOT claimed again"
+check "claim gap closed: the record names the holder that closed it" "$(tail -n 1 "$S/lock.records")" \
+    "recovery-os VM session system-recovery-A-2tb pid $(tail -n 1 "$S/holder.pids")"
+
 echo "--- the drive re-enumerates during a session"
 fixture
 echo "$DISK_A ../../sdk" >"$S/reenumerate"
@@ -1036,7 +1099,20 @@ run_driver session A
 check "re-enumerated: exit 5" "$RC" "5"
 has "re-enumerated: said so at once" "$OUT" "re-enumerated during the session"
 has "re-enumerated: in the summary" "$OUT" "the claim was on the old device"
+has "re-enumerated: the old node's mounts, labelled as such" "$OUT" "(old device $T/dev/sdj)"
+has "re-enumerated: the current node checked too" "$OUT" "(current device $T/dev/sdk)"
 check "re-enumerated: everything given back" "$(lock_state)" "free"
+
+fixture
+echo "$DISK_A ../../sdk" >"$S/reenumerate"
+printf 'sdk \nsdk1 \nsdk2 /mnt/y\n' >"$S/lsblk.mounts.sdk"
+{
+    for ((i = 0; i < 6; i++)); do echo running; done
+    echo "shut off"
+} >"$S/states.running"
+run_driver session A
+check "re-enumerated, current node mounted: exit 5" "$RC" "5"
+has "re-enumerated, current node mounted: said" "$OUT" "MOUNTED: sdk2 on /mnt/y (current device $T/dev/sdk)"
 
 echo "--- a partition mounted when the session ends"
 fixture
