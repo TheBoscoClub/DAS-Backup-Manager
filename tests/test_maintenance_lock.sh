@@ -142,6 +142,23 @@ check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown hold
     cleanup
 )
 check "on exit: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
+# An abort once the lock is ours runs cleanup()'s recovery body: the record
+# still names the run while it unmounts, is emptied after, and the abort's
+# own exit status survives.
+rc=0
+(
+    set +e
+    exec 8<>"$LOCK"
+    flock 8
+    printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""
+    unmount_all() { record >"$WORK/during_unmount"; }
+    (exit 3)
+    cleanup
+) || rc=$?
+check "on abort: the record names the run while it unmounts" "$(cat "$WORK/during_unmount")" "backup-run.sh pid $$"
+check "on abort: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
+check "on abort: the abort's exit status is kept" "$rc" "3"
 printf 'btrdasd scrub run pid 77\n' >"$LOCK"
 (
     CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; DRYRUN_BTRBK_CONF=""

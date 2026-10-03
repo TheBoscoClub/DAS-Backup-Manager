@@ -1203,6 +1203,34 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
 /// "ran") and `has_drift() == false` — exit 0, while the printed report said
 /// `DRIFT DETECTED — FAILURE` and `--email` sent a failure email for the same
 /// run. The split below keeps that case nonzero; it moves it from 1 to 3.
+/// `btrdasd doctor --json`'s one line, built by serde: a deferral's reason
+/// carries the lock holder's record, which may hold any character, so it is
+/// never pasted into the text by hand. The keys keep their order, status first.
+fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "status", rename_all = "lowercase")]
+    enum Line<'a> {
+        Deferred {
+            reason: &'a str,
+        },
+        Ran {
+            volumes_checked: usize,
+            volumes_failed: usize,
+            missing: usize,
+            stale: usize,
+        },
+    }
+    serde_json::to_string(&match outcome {
+        doctor::DoctorOutcome::Deferred { reason } => Line::Deferred { reason },
+        doctor::DoctorOutcome::Ran(dr) => Line::Ran {
+            volumes_checked: dr.volumes_checked,
+            volumes_failed: dr.volumes_failed.len(),
+            missing: dr.missing.len(),
+            stale: dr.stale.len(),
+        },
+    })
+}
+
 pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
     match outcome {
         doctor::DoctorOutcome::Deferred { .. } => 0,
@@ -1392,12 +1420,13 @@ fn hold_for_cli(
             &site.path, fd,
         )?));
     }
-    if let Some((pid, record)) = maintenance::held_by_caller(&site.path)? {
-        return Err(maintenance::caller_holds_line(pid, &record).into());
-    }
     let never = || false;
-    match maintenance::wait_for(site, job, run.no_wait, &never, run.progress)? {
+    let callers = maintenance::Callers::of_this_process();
+    match maintenance::wait_for(site, job, run.no_wait, Some(&callers), &never, run.progress)? {
         maintenance::Waited::Held(held) => Ok(Some(held)),
+        maintenance::Waited::CallerHolds { pid, record } => {
+            Err(maintenance::caller_holds_line(pid, &record).into())
+        }
         maintenance::Waited::Deferred { holder } | maintenance::Waited::Cancelled { holder } => {
             if run.json {
                 println!(
@@ -2748,23 +2777,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match &outcome {
                 doctor::DoctorOutcome::Deferred { reason } => {
                     if json {
-                        println!(
-                            "{{\"status\":\"deferred\",\"reason\":\"{}\"}}",
-                            reason.replace('"', "\\\"")
-                        );
+                        println!("{}", doctor_json(&outcome)?);
                     } else {
                         println!("{reason}");
                     }
                 }
                 doctor::DoctorOutcome::Ran(dr) => {
                     if json {
-                        println!(
-                            "{{\"status\":\"ran\",\"volumes_checked\":{},\"volumes_failed\":{},\"missing\":{},\"stale\":{}}}",
-                            dr.volumes_checked,
-                            dr.volumes_failed.len(),
-                            dr.missing.len(),
-                            dr.stale.len(),
-                        );
+                        println!("{}", doctor_json(&outcome)?);
                     } else {
                         print!("{}", doctor::format_report(dr));
                     }
@@ -3377,6 +3397,61 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert!(!report.ran());
         let outcome = doctor::DoctorOutcome::Ran(report);
         assert_eq!(exit_code_for_doctor(&outcome), 2);
+    }
+
+    /// A deferral's reason carries the lock holder's record, which may hold a
+    /// backslash and quotes: the line must still be JSON, and give the reason
+    /// back exactly.
+    #[test]
+    fn doctor_json_gives_back_any_holder_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("das-maintenance.lock");
+        for record in [
+            format!(
+                r#"recovery-os VM session C:\vm "A" pid {}"#,
+                std::process::id()
+            ),
+            r#"odd \ "record" \"#.to_string(),
+        ] {
+            std::fs::write(&lock, format!("{record}\n")).unwrap();
+            let holder = buttered_dasd::maintenance::holder_of(&lock);
+            assert!(holder.contains('\\') && holder.contains('"'), "{holder}");
+            let reason = format!("DAS maintenance lock held by {holder} — skipping drift check");
+            let line = doctor_json(&doctor::DoctorOutcome::Deferred {
+                reason: reason.clone(),
+            })
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
+            assert_eq!(parsed["status"], "deferred", "{line}");
+            assert_eq!(parsed["reason"], reason.as_str(), "{line}");
+            assert!(
+                line.starts_with(r#"{"status":"deferred","reason":"#),
+                "{line}"
+            );
+        }
+    }
+
+    /// The line for a run that happened is what it was before the deferral
+    /// went through serde: same keys, same order.
+    #[test]
+    fn doctor_json_ran_line_is_unchanged() {
+        let mut report = doctor::DriftReport {
+            volumes_checked: 4,
+            volumes_failed: vec![("/.btrfs-hdd".into(), "not mounted".into())],
+            ..Default::default()
+        };
+        for name in ["a", "b"] {
+            report.missing.push(doctor::MissingSubvolume {
+                volume: "/.btrfs-nvme".into(),
+                source_labels: vec!["nvme".into()],
+                name: name.into(),
+            });
+        }
+        assert_eq!(
+            doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
+            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0}"#
+        );
     }
 
     #[test]

@@ -72,6 +72,38 @@ impl LockSite {
     }
 }
 
+/// Where a command's callers are found: a `/proc`, and the process to start
+/// from — the command's parent. [`wait_for`] refuses a lock that one of them
+/// holds without handing it down: it would never be let go while the command
+/// waits for it.
+#[derive(Debug, Clone)]
+pub struct Callers {
+    pub proc_root: PathBuf,
+    pub parent: u32,
+}
+
+impl Callers {
+    /// This process's callers, from `/proc`.
+    pub fn of_this_process() -> Self {
+        Self {
+            proc_root: PathBuf::from("/proc"),
+            parent: std::os::unix::process::parent_id(),
+        }
+    }
+
+    /// `(pid, record)` when the record in the lock file at `path` names one of
+    /// these callers. The record only names: whether the lock is held is the
+    /// asker's to know.
+    fn recorded_in(&self, path: &Path) -> Option<(u32, String)> {
+        // Display only, as for every reader of the record: unreadable is empty.
+        let record = record_line(&std::fs::read_to_string(path).unwrap_or_default());
+        let pid = record_pid(&record)?;
+        ancestors(&self.proc_root, self.parent)
+            .contains(&pid)
+            .then_some((pid, record))
+    }
+}
+
 /// Proof that this process holds the maintenance lock, for as long as the
 /// value lives. Everything that mounts a backup target requires one.
 #[derive(Debug)]
@@ -144,7 +176,9 @@ impl MaintenanceHeld {
     ///
     /// Not atomic: a holder that lets go between the second and third steps
     /// would let a descriptor that held nothing take the lock. The caller that
-    /// named it then holds it until it exits — the same as any holder.
+    /// named it then holds it until it exits, with no record — readers show
+    /// [`UNKNOWN_HOLDER`], and a backup waits on it. Inherent to `flock`, which
+    /// has no "lock only if held by this description".
     pub fn delegated_at(path: &Path, fd: RawFd) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
         let lock = path.display();
@@ -244,22 +278,38 @@ pub enum Waited {
     Deferred { holder: String },
     /// Cancelled while `holder` held it. Nothing was done.
     Cancelled { holder: String },
+    /// Held by one of the [`Callers`] — `pid`, recorded as `record` — that
+    /// did not hand its hold down: waiting would never end. Nothing was done.
+    CallerHolds { pid: u32, record: String },
 }
 
 /// Take the lock for an interactive job — `walk` and `restore`, from the CLI
-/// or the GUI: at once if it is free. Otherwise, with `no_wait`, return at
-/// once; without, log one line naming the holder and how to stop a scrub,
-/// then look again every `site.poll` until the lock is free or `cancelled()`
-/// says to stop. `job` is recorded as the holder once the lock is taken.
+/// or the GUI: at once if it is free. Otherwise, if it is held by one of
+/// `callers`, stop ([`Waited::CallerHolds`]); with `no_wait`, return at once;
+/// without, log one line naming the holder and how to stop a scrub, then look
+/// again every `site.poll` until the lock is free or `cancelled()` says to
+/// stop. `job` is recorded as the holder once the lock is taken. The lock is
+/// only ever taken to be kept: nothing here takes it to look and lets go.
 pub fn wait_for(
     site: &LockSite,
     job: &str,
     no_wait: bool,
+    callers: Option<&Callers>,
     cancelled: &dyn Fn() -> bool,
     progress: &dyn ProgressCallback,
 ) -> Result<Waited, ScrubError> {
     if let Some(held) = MaintenanceHeld::try_acquire_at(&site.path, job)? {
         return Ok(Waited::Held(held));
+    }
+    // Refused, so it is held — no probe needed to know. Held by a caller of
+    // this command, as its record says, it would never be let go while the
+    // command waited. Unless that caller let go since the refusal: so one
+    // more take, kept if it succeeds.
+    if let Some((pid, record)) = callers.and_then(|callers| callers.recorded_in(&site.path)) {
+        if let Some(held) = MaintenanceHeld::try_acquire_at(&site.path, job)? {
+            return Ok(Waited::Held(held));
+        }
+        return Ok(Waited::CallerHolds { pid, record });
     }
     let holder = holder_of(&site.path);
     if no_wait {
@@ -295,12 +345,15 @@ pub fn hold_for_job(
     progress: &OrderedProgress,
 ) -> Result<MaintenanceHeld, String> {
     let cancelled = || progress.is_cancelled();
-    match wait_for(site, job, false, &cancelled, progress) {
+    // No callers to check: the helper's are the service manager's.
+    match wait_for(site, job, false, None, &cancelled, progress) {
         Ok(Waited::Held(held)) => Ok(held),
-        // `Deferred` needs `no_wait`; either way nothing was done.
+        // `Deferred` needs `no_wait`, `CallerHolds` callers; either way
+        // nothing was done.
         Ok(Waited::Cancelled { holder } | Waited::Deferred { holder }) => Err(format!(
             "stopped waiting for the DAS maintenance lock, held by {holder}; nothing was mounted"
         )),
+        Ok(Waited::CallerHolds { pid, record }) => Err(caller_holds_line(pid, &record)),
         Err(e) => Err(format!("Could not take the DAS maintenance lock: {e}")),
     }
 }
@@ -357,41 +410,6 @@ fn record_pid(line: &str) -> Option<u32> {
 
 fn pid_is_running(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
-}
-
-/// `(pid, record)` when the process recorded as holding the lock is this
-/// process's own caller — its parent or a further ancestor — and the lock is
-/// held. A command that waited then would wait for its caller, which waits for
-/// the command: forever. The caller has to hand its hold down
-/// ([`DELEGATED_FD_ENV`]) instead.
-pub fn held_by_caller(path: &Path) -> Result<Option<(u32, String)>, ScrubError> {
-    held_by_caller_at(
-        path,
-        Path::new("/proc"),
-        std::os::unix::process::parent_id(),
-    )
-}
-
-/// [`held_by_caller`] with `/proc` at `proc_root`, from `parent` upwards.
-fn held_by_caller_at(
-    path: &Path,
-    proc_root: &Path,
-    parent: u32,
-) -> Result<Option<(u32, String)>, ScrubError> {
-    // Display only, as for every reader of the record: unreadable is empty.
-    let record = record_line(&std::fs::read_to_string(path).unwrap_or_default());
-    let Some(pid) = record_pid(&record) else {
-        return Ok(None);
-    };
-    if !ancestors(proc_root, parent).contains(&pid) {
-        return Ok(None);
-    }
-    // The record names; only the lock decides. A free lock is nobody's,
-    // whatever was last recorded — and the probe lets go when it drops.
-    if FileLock::try_acquire(path)?.is_some() {
-        return Ok(None);
-    }
-    Ok(Some((pid, record)))
 }
 
 /// `start` and its ancestors, up to but not including init, read from
@@ -611,6 +629,7 @@ mod tests {
                 &waiter_site,
                 "btrdasd walk",
                 false,
+                None,
                 &|| false,
                 &*waiter_logs,
             )
@@ -638,6 +657,7 @@ mod tests {
                 &waiter_site,
                 "btrdasd walk",
                 true,
+                None,
                 &|| false,
                 &*waiter_logs,
             ));
@@ -669,6 +689,7 @@ mod tests {
                 &waiter_site,
                 "btrdasd restore file",
                 false,
+                None,
                 &|| false,
                 &*waiter_logs,
             );
@@ -724,7 +745,7 @@ mod tests {
         let (waiter_site, waiter_cancel) = (site.clone(), cancel.clone());
         let waiter = std::thread::spawn(move || {
             let cancelled = || waiter_cancel.load(Ordering::SeqCst);
-            let waited = wait_for(&waiter_site, "job", false, &cancelled, &NullProgress);
+            let waited = wait_for(&waiter_site, "job", false, None, &cancelled, &NullProgress);
             tx.send(waited).unwrap();
         });
 
@@ -1022,37 +1043,170 @@ mod tests {
         assert_eq!(ancestors(looped.path(), 10), [10, 11], "a loop ends it");
     }
 
+    fn callers_from(proc: &tempfile::TempDir, parent: u32) -> Callers {
+        Callers {
+            proc_root: proc.path().to_path_buf(),
+            parent,
+        }
+    }
+
+    /// Held, and recorded by one of the callers: refused at once, with or
+    /// without `no_wait`, before any waiting line. Anyone else is deferred to
+    /// (or waited for) as before — and so is everyone when no callers are
+    /// given, as for the GUI's jobs.
     #[test]
-    fn a_lock_held_by_the_callers_own_ancestor_is_named_and_only_while_held() {
+    fn a_lock_held_by_a_caller_is_refused_at_once() {
         let (_dir, site) = scratch();
         let proc = fake_proc(&[(300, 200, "bash"), (200, 100, "bash"), (100, 1, "bash")]);
         let holder = holding_descriptor(&site.path);
-        let caller = |record: &str| {
+        let waited = |record: &str, no_wait: bool, callers: Option<Callers>| {
             std::fs::write(&site.path, format!("{record}\n")).unwrap();
-            held_by_caller_at(&site.path, proc.path(), 300).unwrap()
+            let logs = Arc::new(Logs::default());
+            let (waiter_site, waiter_logs) = (site.clone(), logs.clone());
+            // On a thread, so a wait where none belongs fails the test
+            // rather than hanging it.
+            let waited = within(STILL_WAITING, move || {
+                wait_for(
+                    &waiter_site,
+                    "btrdasd walk",
+                    no_wait,
+                    callers.as_ref(),
+                    &|| false,
+                    &*waiter_logs,
+                )
+            })
+            .unwrap_or_else(|| panic!("{record}: waited where it must not"))
+            .unwrap();
+            assert!(logs.lines().is_empty(), "{record}: {:?}", logs.lines());
+            assert_eq!(note(&site.path), format!("{record}\n"), "left alone");
+            waited
         };
-        assert_eq!(
-            caller("backup-run.sh pid 200"),
-            Some((200, "backup-run.sh pid 200".to_string()))
-        );
-        assert_eq!(
-            caller("backup-run.sh pid 300"),
-            Some((300, "backup-run.sh pid 300".into()))
-        );
-        assert_eq!(caller("btrdasd scrub run pid 777"), None, "not an ancestor");
-        assert_eq!(caller("x pid 1"), None, "init is past the end of the chain");
-        assert_eq!(caller("recovery-os VM session A"), None, "no pid, nobody");
-        drop(holder);
-        assert_eq!(
-            caller("backup-run.sh pid 200"),
-            None,
-            "a free lock is nobody's, whatever the record says"
-        );
+        for no_wait in [false, true] {
+            match waited(
+                "backup-run.sh pid 200",
+                no_wait,
+                Some(callers_from(&proc, 300)),
+            ) {
+                Waited::CallerHolds { pid, record } => {
+                    assert_eq!((pid, record.as_str()), (200, "backup-run.sh pid 200"));
+                }
+                other => panic!("expected CallerHolds, got {other:?}"),
+            }
+            assert!(
+                matches!(
+                    waited("x pid 300", no_wait, Some(callers_from(&proc, 300))),
+                    Waited::CallerHolds { pid: 300, .. }
+                ),
+                "the parent itself"
+            );
+        }
+        for record in [
+            "btrdasd scrub run pid 777",
+            "x pid 1",
+            "recovery-os VM session A",
+        ] {
+            assert!(
+                matches!(
+                    waited(record, true, Some(callers_from(&proc, 300))),
+                    Waited::Deferred { .. }
+                ),
+                "not a caller: {record}"
+            );
+        }
         assert!(
-            MaintenanceHeld::try_acquire_at(&site.path, "x")
-                .unwrap()
-                .is_some(),
-            "and looking left it free"
+            matches!(
+                waited("backup-run.sh pid 200", true, None),
+                Waited::Deferred { .. }
+            ),
+            "no callers given, none checked"
+        );
+        drop(holder);
+    }
+
+    /// A free lock is taken at the first attempt, which keeps it: nothing
+    /// probes it first, even when a stale record names one of the callers.
+    #[test]
+    fn a_free_lock_is_taken_once_whatever_the_record_names() {
+        let (_dir, site) = scratch();
+        let proc = fake_proc(&[(300, 200, "btrdasd"), (200, 100, "bash"), (100, 1, "bash")]);
+        // Left by a caller that has let go: nobody holds the lock.
+        std::fs::write(&site.path, "backup-run.sh pid 200\n").unwrap();
+        let callers = callers_from(&proc, 300);
+        let never = || false;
+        let waited = wait_for(
+            &site,
+            "btrdasd walk",
+            false,
+            Some(&callers),
+            &never,
+            &NullProgress,
+        )
+        .unwrap();
+        assert!(matches!(waited, Waited::Held(_)), "{waited:?}");
+        assert_eq!(
+            crate::scrub::opens::count(&site.path),
+            1,
+            "one attempt, which took it: never probed first"
+        );
+    }
+
+    /// A caller that lets go between the refused take and the reading of its
+    /// record is not mistaken for a holder: the lock is taken, and kept.
+    #[test]
+    fn a_caller_that_lets_go_meanwhile_is_not_mistaken_for_the_holder() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let (_dir, site) = scratch();
+        let proc = fake_proc(&[(300, 200, "btrdasd"), (100, 1, "bash")]);
+        // 200's stat is a FIFO: reading it blocks until the caller below
+        // answers — after the refused take and the record were read.
+        std::fs::create_dir(proc.path().join("200")).unwrap();
+        let stat = proc.path().join("200").join("stat");
+        let fifo_path = std::ffi::CString::new(stat.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo touches nothing else.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        std::fs::write(&site.path, "backup-run.sh pid 200\n").unwrap();
+        let holder = holding_descriptor(&site.path);
+        let caller = std::thread::spawn(move || {
+            // Once the waiter reads 200's stat, let go — then answer it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut fifo = loop {
+                match OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&stat)
+                {
+                    Ok(fifo) => break fifo,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("the caller's stat was never read: {e}"),
+                }
+            };
+            drop(holder);
+            fifo.write_all(b"200 (bash) S 100 200 200 0 -1 4194560 0 0\n")
+                .unwrap();
+        });
+        let (waiter_site, callers) = (site.clone(), callers_from(&proc, 300));
+        let waited = within(Duration::from_secs(20), move || {
+            wait_for(
+                &waiter_site,
+                "btrdasd walk",
+                false,
+                Some(&callers),
+                &|| false,
+                &NullProgress,
+            )
+        })
+        .expect("never waits for a caller")
+        .unwrap();
+        caller.join().unwrap();
+        assert!(matches!(waited, Waited::Held(_)), "{waited:?}");
+        assert_eq!(
+            crate::scrub::opens::count(&site.path),
+            2,
+            "refused once, then taken, and kept"
         );
     }
 
