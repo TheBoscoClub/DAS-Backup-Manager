@@ -2043,6 +2043,7 @@ mod tests {
     fn make_test_config() -> Config {
         Config {
             restore: crate::config::Restore::default(),
+            recovery_os: crate::config::RecoveryOs::default(),
             general: General {
                 version: "0.6.0".into(),
                 install_prefix: "/usr".into(),

@@ -72,6 +72,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 - **`system-recovery-B-2tb`** — bay 4, `ZFL41DNY`, label `das-backup-system-recovery-B`, mount
   `/mnt/backup-system-recovery-B`. Retention `daily=7`.
 - The recovery drives are independent bootable copies, **not** RAID mirrors of each other.
+- `recovery-os` reads their own OS under `@`, never writes: stale is WARN. Update booted, never chroot.
 - Boot archives: 60-day retention, pruned by `boot-archive-cleanup.sh` at the end of every
   `backup-run.sh` run (daily and full; not CLI/GUI runs) while targets are still mounted.
 

@@ -29,8 +29,9 @@ This guide is written for users with minimal technical experience. Follow each s
    - [Browse Backup Snapshots](#browse-backup-snapshots)
    - [Restore a Single File](#restore-a-single-file)
    - [Restore an Entire Subvolume](#restore-an-entire-subvolume)
-8. [Troubleshooting](#troubleshooting)
-9. [Reference Information](#reference-information)
+8. [Keeping the recovery OSes current](#keeping-the-recovery-oses-current)
+9. [Troubleshooting](#troubleshooting)
+10. [Reference Information](#reference-information)
 
 ---
 
@@ -1038,6 +1039,36 @@ sudo umount /mnt/snapshot /mnt/target
 - `/etc/fstab` — UUIDs may not match current drives
 - Boot entries in `/boot/loader/entries/` — root UUID must be correct
 - Regenerate initramfs, with the ESP mounted inside the restored root first — where `/boot` is the ESP (as on the author's system), skipping the mount writes the initramfs into the subvolume's own `/boot` directory, which the bootloader never reads. Method 1 (`/mnt/target` is the top level): `sudo mount LABEL=EFI /mnt/target/@/boot && sudo arch-chroot /mnt/target/@ mkinitcpio -P`. Method 2 (with the target mounted again): `sudo mount LABEL=EFI /mnt/target/boot && sudo arch-chroot /mnt/target mkinitcpio -P`. Use your primary ESP's label; unmount it before unmounting the target
+
+---
+
+## Keeping the recovery OSes current
+
+Each recovery drive boots its own independent OS. It is what you boot when the host cannot, so it has to mount and `btrfs receive` what the host's current kernel and btrfs-progs wrote: a kernel older than a filesystem feature the backups use refuses the mount or the receive. An install left alone for months also stops being able to update itself, because its keyring no longer verifies the packages it is offered.
+
+Every backup run reads each recovery OS (read-only) and adds a `RECOVERY OS` section to the report: last full upgrade and its age, newest kernel against the host's, btrfs-progs against the host's. Past `[recovery_os].max_age_days` (default 60), with a kernel series behind the host's, or with either unreadable, it says `STALE` and the run status reads `COMPLETED WITH WARNINGS`. `btrdasd health` shows the last reading between runs.
+
+To update one, boot it — never update it from the host:
+
+1. Boot the recovery drive (Steps 1–5 of [Booting into Rescue Mode](#booting-into-rescue-mode)) and log in.
+2. Refresh the keyrings first, on their own:
+
+   ```bash
+   sudo pacman -Sy archlinux-keyring cachyos-keyring
+   ```
+
+3. Then the full upgrade, straight after:
+
+   ```bash
+   sudo pacman -Su
+   ```
+
+4. Reboot into the same recovery drive and confirm it comes up — boot menu entry, kernel, login. Only then go back to the host.
+5. The next backup run reads the new state; `STALE` clears once the upgrade date is recent and the kernel series has caught up with the host's.
+
+Do one drive at a time, so one known-good recovery OS exists throughout.
+
+**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly what `.claude/rules/esp-safety.md` rule 1 forbids — the 2026-03-05 incident destroyed both recovery boot configurations this way. Doing the update in a virtual machine with the physical disk attached instead of rebooting the workstation is being evaluated.
 
 ---
 

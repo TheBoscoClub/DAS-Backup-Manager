@@ -453,6 +453,14 @@ Two behaviour changes landed with the 2026-08-06 relay migration:
 | `warn_age_days` | u32 | `45` | Days since a target's last successful scrub before health checks warn |
 | `fail_age_days` | u32 | `75` | Days since a target's last successful scrub before health checks fail |
 
+### `[recovery_os]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_age_days` | u32 | `60` | Days since a recovery OS's last full system upgrade before it is reported `STALE` |
+
+Every `role = "mirror"` target is taken to carry its own bootable install under `@`. After btrbk, while the targets are mounted, `backup-run.sh` runs `btrdasd recovery-os status`, which reads that install — never writes to it — and adds a `RECOVERY OS` section to the report: OS name, last full upgrade and its age in days, newest kernel against the host's running kernel, btrfs-progs against the host's, btrbk and das-backup-manager. A recovery OS is also `STALE`, whatever this setting, when its newest kernel's major.minor series is behind the host's, or when its upgrade date or kernel cannot be read — unknown is never shown as current. A stale one marks the operation `WARN`: the report status reads `COMPLETED WITH WARNINGS` and the subject `SUCCESS WITH WARNINGS`, while the run itself is still recorded as a success. The reading is kept in `/var/lib/das-backup/recovery-os.json`, so `btrdasd health` shows it between runs. Updating a recovery OS: `docs/DISASTER-RECOVERY-GUIDE.md`, "Keeping the recovery OSes current".
+
 ## Generated Files
 
 The installer creates the following files (tracked in `/etc/das-backup/.manifest`):

@@ -10,7 +10,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
+for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -359,6 +359,8 @@ BTRBK_START_TIME=0
 BTRBK_END_TIME=0
 # shellcheck disable=SC2034
 BTRBK_LATEST=""
+# shellcheck disable=SC2034
+RECOVERY_OS_REPORT=""
 OP_STATUS=([subvol_sync]=OK [subvol_expire]=OK)
 
 SUBVOL_SYNC_REPORT=$'SUBVOLUME SYNC\n  Adopted: @new'
@@ -380,8 +382,8 @@ check "no double blank line with both sections" "$(grep -c -Pzo '\n\n\n' <<<"$re
 SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
-    "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Retired expiry        OK  (n/a)||"
-check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.7.1' <<<"$report")" "1"
+    "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Recovery OS           N/A  (n/a)||"
+check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.8.0' <<<"$report")" "1"
 
 # --- report: a failed btrbk listing is unavailable, not "none yet" -------------
 # capture_report_data under the script's own options; no target is mounted.

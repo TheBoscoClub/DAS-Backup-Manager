@@ -26,6 +26,8 @@ pub struct Config {
     pub subvolumes: Subvolumes,
     #[serde(default)]
     pub restore: Restore,
+    #[serde(default)]
+    pub recovery_os: RecoveryOs,
     #[serde(default, rename = "source")]
     pub sources: Vec<Source>,
     #[serde(default, rename = "target")]
@@ -62,6 +64,30 @@ impl Default for Restore {
     fn default() -> Self {
         Self {
             allowed_roots: default_restore_roots(),
+        }
+    }
+}
+
+/// The independent operating systems on the `role = "mirror"` targets
+/// (`btrdasd recovery-os`, bd DAS-Backup-Manager-xd3). An absent section
+/// parses to the defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryOs {
+    /// Days since a recovery OS's last full system upgrade before the backup
+    /// report marks it STALE. A kernel series behind the host's, or an upgrade
+    /// date that cannot be read, is stale regardless of this.
+    #[serde(default = "default_recovery_os_max_age_days")]
+    pub max_age_days: u32,
+}
+
+fn default_recovery_os_max_age_days() -> u32 {
+    60
+}
+
+impl Default for RecoveryOs {
+    fn default() -> Self {
+        Self {
+            max_age_days: default_recovery_os_max_age_days(),
         }
     }
 }
@@ -593,6 +619,7 @@ impl Default for Config {
                 system: InitSystem::Systemd,
             },
             restore: Restore::default(),
+            recovery_os: RecoveryOs::default(),
             schedule: Schedule {
                 incremental: "03:00".into(),
                 full: "Sun 04:00".into(),
@@ -1002,6 +1029,26 @@ mod tests {
         assert_eq!(parsed.scrub.fail_age_days, 75);
         // [doctor] is optional — default config has no exclude patterns
         assert!(parsed.doctor.exclude.is_empty());
+    }
+
+    #[test]
+    fn recovery_os_defaults_to_60_days_and_round_trips() {
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(cfg.recovery_os.max_age_days, 60, "absent section");
+        let cfg = Config::from_toml(&minimal_toml("[recovery_os]\n")).unwrap();
+        assert_eq!(cfg.recovery_os.max_age_days, 60, "empty section");
+        let cfg = Config::from_toml(&minimal_toml("[recovery_os]\nmax_age_days = 30\n")).unwrap();
+        assert_eq!(cfg.recovery_os.max_age_days, 30);
+        let text = cfg.to_toml().unwrap();
+        assert!(
+            text.contains("[recovery_os]\nmax_age_days = 30\n"),
+            "{text}"
+        );
+        assert_eq!(
+            Config::from_toml(&text).unwrap().recovery_os.max_age_days,
+            30
+        );
+        assert!(Config::from_toml(&minimal_toml("[recovery_os]\nmax_age_days = -1\n")).is_err());
     }
 
     #[test]

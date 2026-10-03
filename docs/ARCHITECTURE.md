@@ -64,8 +64,8 @@ per-filesystem command that finds coverage gaps.
 │  │  config     │ db         │ doctor     │ expire    │        │
 │  │  forget     │ fsutil     │ health     │ indexer   │        │
 │  │  mount      │ progress   │ reconcile  │ report    │        │
-│  │  restore    │ scanner    │ schedule   │ scrub     │        │
-│  │  subvol                                           │        │
+│  │  recovery_os│ restore    │ scanner    │ schedule  │        │
+│  │  scrub      │ subvol                              │        │
 │  └──────────────────────┬───────────────────────────┘        │
 │                         │ D-Bus (org.dasbackup.Helper1)      │
 │  ┌──────────────────────┴────────────────────────┐           │
@@ -81,7 +81,7 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 |-----------|----------|--------|---------|
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 21 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 22 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
@@ -105,6 +105,7 @@ The system has six major components:
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
+         ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it); STALE is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun)
          ├──▶ update_boot_subvolumes()     → creates missing @/@home on non-mirror targets; archives + recreates them only on --full runs
          ├──▶ btrdasd walk                 → indexes new snapshots on the primary target into SQLite
          ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
@@ -114,7 +115,7 @@ The system has six major components:
          └──▶ btrdasd backup record-run    → adds the run to backup_runs
 ```
 
-A `--dryrun` stops after the expiry preview: it previews the archive pruner and
+A `--dryrun` stops after the expiry preview and the recovery OS check: it previews the archive pruner and
 unmounts, and sends, records and archives nothing. It may create a missing, empty
 target directory (for example for a pending adoption), as the real run would.
 
@@ -378,6 +379,7 @@ wizard → Config struct → config.toml (save)
 | `doctor` | exclude[] | Older exclusion list, still read and merged with `[subvolumes].exclude` |
 | `subvolumes` | exclude[] | Glob patterns the backup run must not adopt (`btrdasd subvol sync`); a pattern also covers everything nested under it |
 | `restore` | allowed_roots[] | Where a restore may write (an unoverridable denylist is checked first) |
+| `recovery_os` | max_age_days | Age past which a mirror target's own OS is reported STALE (`btrdasd recovery-os`) |
 | `source[]` | label, volume, device, snapshot_dir, target_subdirs[], target_labels[], subvolumes[] (name, manual_only, snapshot_name, adopted, retired) | BTRFS sources; `adopted` / `retired` dates are written by the backup run; empty `target_labels` = every target |
 | `target[]` | label, serials[], mount_uuid, mount, role (primary/mirror), display_name, retention (daily, weekly, monthly, yearly) | Backup targets; mounted by `mount_uuid` when set, else by serial |
 | `email` | enabled, smtp_host, smtp_port, from, to | Email reports |
@@ -572,24 +574,25 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `backup` | `src/backup.rs` | ~3620 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
 | `btrbk_conf` | `src/btrbk_conf.rs` | ~1030 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
 | `caldate` | `src/caldate.rs` | ~270 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates |
-| `config` | `src/config.rs` | ~1770 | TOML config types, DAS/source/target models |
+| `config` | `src/config.rs` | ~1810 | TOML config types, DAS/source/target models |
 | `db` | `src/db.rs` | ~2580 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
 | `doctor` | `src/doctor.rs` | ~1070 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
 | `expire` | `src/expire.rs` | ~2350 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
 | `fsutil` | `src/fsutil.rs` | ~170 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `forget` | `src/forget.rs` | ~400 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
-| `health` | `src/health.rs` | ~1840 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health |
+| `health` | `src/health.rs` | ~1860 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
 | `mount` | `src/mount.rs` | ~3620 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` |
 | `progress` | `src/progress.rs` | ~610 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~380 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
+| `recovery_os` | `src/recovery_os.rs` | ~1670 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` reads (`btrdasd recovery-os`) |
 | `report` | `src/report.rs` | ~770 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
 | `scrub` | `src/scrub.rs` | ~3160 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
 | `subvol` | `src/subvol.rs` | ~215 | Subvolume CRUD operations |
-| `main` | `src/main.rs` | ~3110 | CLI entry point with clap subcommands |
+| `main` | `src/main.rs` | ~3220 | CLI entry point with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
 | `setup/config` | `src/setup/config.rs` | — | Re-export of the library's `config` types |
 | `setup/env_export` | `src/setup/env_export.rs` | — | `btrdasd config dump-env`: config as shell `DAS_*` variables for the scripts |

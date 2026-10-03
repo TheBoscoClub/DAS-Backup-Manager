@@ -29,7 +29,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 
 ## Rust (buttered_dasd library + btrdasd CLI)
 - Rust 2024 edition, `cargo clippy` and `cargo fmt` before committing
-- Library crate `buttered_dasd` exports 21 public modules (`adopt`, `backup`, `btrbk_conf`, `caldate`, `config`, `db`, `doctor`, `expire`, `forget`, `fsutil`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line
+- Library crate `buttered_dasd` exports 22 public modules (`adopt`, `backup`, `btrbk_conf`, `caldate`, `config`, `db`, `doctor`, `expire`, `forget`, `fsutil`, `health`, `indexer`, `mount`, `progress`, `reconcile`, `recovery_os`, `report`, `restore`, `scanner`, `schedule`, `scrub`, `subvol`); `setup/` is binary-only. Verify with `grep -c '^pub mod ' indexer/src/lib.rs` rather than trusting this line
 - Use `LazyLock<Regex>` for compile-once regex patterns (not per-call `Regex::new()`)
 - Release profile: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
 - All database access through `db::Database` with prepared statements
