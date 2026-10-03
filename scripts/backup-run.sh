@@ -5,13 +5,13 @@
 #
 # Features:
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
-#     also exits 1 for a current recovery OS whose boot may run btrbk
-#     (btrbk.timer enabled beside a btrbk config, or one of the two unknown
-#     and the other not ruling it out), with a WARNING row in its block.
-#     check_recovery_os reads the section's Result
-#     and WARNING rows to say why it records WARN: "stale", "btrbk may run at
-#     boot", both, or "needs attention" when the section shows neither
-#     (bd DAS-Backup-Manager-1yg).
+#     also exits 1 for a current recovery OS whose boot may run btrbk —
+#     something enabled there (a unit, its timer, or cron) runs btrbk and its
+#     config is there, or that could not be told — with a WARNING row in its
+#     block. check_recovery_os reads the section's Result and WARNING rows to
+#     say why it records WARN: "stale", "btrbk may run at boot", both, or
+#     "needs attention" when the section shows neither; an OK detail says
+#     "nothing needs attention" (bd DAS-Backup-Manager-1yg).
 #   - Maintenance lock holder record and hand-down (v4.9.0): once it holds
 #     /run/das-maintenance.lock this run writes "backup-run.sh pid <pid>"
 #     into it (record_maintenance_holder), so a restore or index job that
@@ -1137,7 +1137,7 @@ check_recovery_os() {
             if (( inspected == 0 )); then
                 record_op "recovery_os" "OK" "nothing inspected${suffix}"
             else
-                record_op "recovery_os" "OK" "none stale${suffix}"
+                record_op "recovery_os" "OK" "nothing needs attention${suffix}"
             fi
             ;;
         1)
@@ -2743,8 +2743,9 @@ main() {
         capture_report_data
         unmount_all
 
-        # Only FAIL makes the run a failure; a WARN (a stale recovery OS)
-        # shows in the status line and the subject, not in backup_runs.
+        # Only FAIL makes the run a failure; a WARN (a recovery OS that is
+        # stale, or whose boot may run btrbk) shows in the status line and
+        # the subject, not in backup_runs.
         local overall_status
         overall_status="$(run_status)"
 
