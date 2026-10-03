@@ -1,9 +1,17 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.9.0
+# Version: 4.10.0
 # Date: 2026-10-03
 #
 # Features:
+#   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
+#     also exits 1 for a current recovery OS whose boot may run btrbk
+#     (btrbk.timer enabled beside a btrbk config, or one of the two unknown
+#     and the other not ruling it out), with a WARNING row in its block.
+#     check_recovery_os reads the section's Result
+#     and WARNING rows to say why it records WARN: "stale", "btrbk may run at
+#     boot", both, or "needs attention" when the section shows neither
+#     (bd DAS-Backup-Manager-1yg).
 #   - Maintenance lock holder record and hand-down (v4.9.0): once it holds
 #     /run/das-maintenance.lock this run writes "backup-run.sh pid <pid>"
 #     into it (record_maintenance_holder), so a restore or index job that
@@ -1079,16 +1087,18 @@ expire_retired_subvolumes() {
 }
 
 # Read the independent OS on each mounted role=mirror target and say whether
-# it has fallen behind the host. Runs after btrbk, while the targets are still
-# mounted: the backup comes first, and nothing here can delay or change it.
-# The command only reads under <mount>/@; the one file it writes is the state
-# record on the host, and not in a dry run.
+# it has fallen behind the host, and whether booting it would run btrbk. Runs
+# after btrbk, while the targets are still mounted: the backup comes first,
+# and nothing here can delay or change it. The command only reads under
+# <mount>/@; the one file it writes is the state record on the host, and not
+# in a dry run.
 #
-#   exit 0  every inspected OS is current           -> OK
-#   exit 1  at least one is stale                   -> WARN (the run succeeded)
-#   other   the check could not be done              -> FAIL, with the reason
+#   exit 0  every inspected OS is current, no WARNING  -> OK
+#   exit 1  at least one needs attention: STALE, or    -> WARN (the run succeeded)
+#           a WARNING row (btrbk may run at its boot)
+#   other   the check could not be done                 -> FAIL, with the reason
 #
-# Never stops the run.
+# The WARN detail says which, from the section's own rows. Never stops the run.
 check_recovery_os() {
     local mode="$1"
     local args=(recovery-os status --config "$DAS_CONFIG")
@@ -1110,11 +1120,14 @@ check_recovery_os() {
     fi
     local first_err="${err%%$'\n'*}"
 
-    # Which drives were not looked at, and whether any was: read from the
-    # section the command printed (awk exits 0 on no match).
-    local not_mounted inspected suffix=""
+    # Which drives were not looked at, whether any was, and what an exit 1
+    # was for: read from the section the command printed (awk exits 0 on no
+    # match).
+    local not_mounted inspected stale warned suffix="" why=""
     not_mounted="$(awk '/^  .*  not mounted$/ { sub(/^  /, ""); sub(/  not mounted$/, ""); printf "%s%s", sep, $0; sep = ", " }' <<<"$RECOVERY_OS_REPORT")"
     inspected="$(awk '/^    Result  / { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
+    stale="$(awk '/^    Result  +STALE/ { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
+    warned="$(awk '/^    WARNING  / { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
     if [[ -n "$not_mounted" ]]; then
         suffix="; not mounted: $not_mounted"
     fi
@@ -1128,8 +1141,22 @@ check_recovery_os() {
             fi
             ;;
         1)
-            record_op "recovery_os" "WARN" "stale — see RECOVERY OS in the report${suffix}"
-            log_warn "A recovery OS is behind the host — see RECOVERY OS in the report"
+            # Exit 1 is "needs attention": a stale OS, a WARNING row (btrbk
+            # may run when that OS boots), or both. A section that shows
+            # neither still warns, without claiming which.
+            if (( stale > 0 )); then
+                why="stale"
+                log_warn "A recovery OS is behind the host — see RECOVERY OS in the report"
+            fi
+            if (( warned > 0 )); then
+                why="${why:+$why; }btrbk may run at boot"
+                log_warn "btrbk may run when a recovery OS boots — see RECOVERY OS in the report"
+            fi
+            if [[ -z "$why" ]]; then
+                why="needs attention"
+                log_warn "A recovery OS needs attention — see RECOVERY OS in the report"
+            fi
+            record_op "recovery_os" "WARN" "$why — see RECOVERY OS in the report${suffix}"
             ;;
         124)
             record_op "recovery_os" "FAIL" "recovery-os status timed out after ${RECOVERY_OS_TIMEOUT_SECS} s (drive stalled?)"
@@ -2179,7 +2206,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.9.0
+  backup-run.sh v4.10.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT

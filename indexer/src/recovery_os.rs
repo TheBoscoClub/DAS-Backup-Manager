@@ -6,7 +6,8 @@
 //! when the host cannot, so it must be able to mount and `btrfs receive` what
 //! the host's current kernel and btrfs-progs wrote — and it must still be able
 //! to update itself (an old keyring cannot). This module reads that install
-//! **read-only** and says when it is stale. It never writes under the root it
+//! **read-only** and says when it is stale, and when booting it would run
+//! btrbk (bd DAS-Backup-Manager-1yg). It never writes under the root it
 //! inspects — not even an access time: every open is `O_NOATIME`, and no
 //! symlink inside the root is followed, because following one updates the
 //! link's atime (and a link to an absolute path would report the HOST's files
@@ -50,6 +51,21 @@ const OS_RELEASE_FALLBACK: &str = "usr/lib/os-release";
 const MODULES: &str = "usr/lib/modules";
 const PACMAN_LOG: &str = "var/log/pacman.log";
 const PACMAN_LOCAL: &str = "var/lib/pacman/local";
+/// Where `systemctl enable` records what it enables.
+const SYSTEMD_SYSTEM: &str = "etc/systemd/system";
+/// The dependency directories `systemctl enable` fills from a unit's
+/// `[Install]` `WantedBy=`, `RequiredBy=` and `UpheldBy=` (systemd.unit(5)).
+const DEPENDENCY_DIRS: [&str; 3] = [".wants", ".requires", ".upholds"];
+/// The timer btrbk's package ships. Enabled, it runs `btrbk run` daily, and
+/// being `Persistent=true` it also runs straight after a boot that follows a
+/// missed day — which every boot of a recovery OS is.
+pub const BTRBK_TIMER: &str = "btrbk.timer";
+/// Where btrbk looks for its configuration, in its own order (btrbk 0.32's
+/// `@config_src`), relative to the root: `btrbk run` uses the first that
+/// exists, and with neither it stops with an error before doing anything.
+const BTRBK_CONFIGS: [&str; 2] = ["etc/btrbk.conf", "etc/btrbk/btrbk.conf"];
+/// What a reading holds before it is taken: unknown, never "none".
+const NOT_READ: &str = "not read";
 
 /// What was read from one recovery OS root.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -86,10 +102,73 @@ pub struct RecoveryOs {
     /// Whether pacman's database could be listed. When false, a package
     /// missing from `packages` is unknown, not "not installed".
     pub packages_read: bool,
+    /// The timers enabled under `etc/systemd/system`, by name.
+    pub enabled_timers: EnabledTimers,
+    /// The configuration btrbk would read if it ran in this OS.
+    pub btrbk_config: BtrbkConfig,
     /// Every item that is there but could not be read, as
     /// `<path relative to root>: <why>`. An absent item is not a problem: it
-    /// is recorded by the `*_read` flags and the `None`s alone.
+    /// is recorded by the `*_read` flags, the `None`s and the `Absent`s alone.
     pub problems: Vec<String>,
+}
+
+/// The timers `systemctl enable` has enabled in a recovery OS: the names
+/// ending `.timer` in the dependency directories under `etc/systemd/system`
+/// (`<unit>.wants/`, `.requires/`, `.upholds/`). Their entries are symlinks
+/// to unit files; only the names are read — never a link, never its target,
+/// which may not exist and, being absolute, would name the host's file.
+///
+/// Stored in the state file as `{"state": "listed", "names": [...]}`,
+/// `{"state": "absent"}` or `{"state": "unreadable", "reason": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EnabledTimers {
+    /// `etc/systemd/system` and every dependency directory in it were
+    /// listed: the timer names, sorted, each once — empty when none is
+    /// enabled.
+    Listed { names: Vec<String> },
+    /// There is no `etc/systemd/system`, so nothing is enabled there.
+    Absent,
+    /// It, or a dependency directory in it, is there and could not be
+    /// listed (permissions, I/O, a symlink): which timers are enabled is
+    /// unknown, never "none".
+    Unreadable { reason: String },
+}
+
+/// Not read is unknown: the cautious default, never "none".
+impl Default for EnabledTimers {
+    fn default() -> Self {
+        Self::Unreadable {
+            reason: NOT_READ.to_string(),
+        }
+    }
+}
+
+/// The configuration btrbk would read if it ran in a recovery OS: the first
+/// of `/etc/btrbk.conf` and `/etc/btrbk/btrbk.conf` that exists.
+///
+/// Stored in the state file as
+/// `{"state": "present", "path": "/etc/btrbk/btrbk.conf", "size_bytes": N}`,
+/// `{"state": "absent"}` or `{"state": "unreadable", "reason": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BtrbkConfig {
+    /// It exists: its path as that OS sees it, and its size in bytes.
+    Present { path: String, size_bytes: u64 },
+    /// Neither exists, so `btrbk run` would stop before doing anything.
+    Absent,
+    /// The one btrbk would look at first is there and could not be checked
+    /// (a symlink, not a regular file, a permission): unknown.
+    Unreadable { reason: String },
+}
+
+/// Not read is unknown: the cautious default, never "absent".
+impl Default for BtrbkConfig {
+    fn default() -> Self {
+        Self::Unreadable {
+            reason: NOT_READ.to_string(),
+        }
+    }
 }
 
 /// Why an item could not be read: it is not there, or it is there and
@@ -243,6 +322,136 @@ fn list_in_root(root: &Path, rel: &str) -> Result<Vec<String>, ReadErr> {
     Ok(names)
 }
 
+/// [`resolve_in_root`], and the item's own `lstat` — which writes nothing
+/// and never follows a link.
+fn lstat_in_root(root: &Path, rel: &str) -> Result<(PathBuf, fs::Metadata), ReadErr> {
+    let path = resolve_in_root(root, rel)?;
+    let meta = fs::symlink_metadata(&path).map_err(|e| io_error(rel, &e))?;
+    Ok((path, meta))
+}
+
+/// The timers enabled under `etc/systemd/system` ([`EnabledTimers`]).
+///
+/// Only directories are read, through [`dir_names_noatime`]: the entries'
+/// names are all that is taken, so no enabled unit's link is ever read or
+/// followed. A dependency directory is found by its name and checked with
+/// `lstat`; one that is a symlink is refused rather than followed, and as
+/// systemd would follow it, which timers are enabled is then unknown. A file
+/// with such a name enables nothing (systemd reads only directories).
+fn read_enabled_timers(root: &Path) -> EnabledTimers {
+    let dir = match resolve_in_root(root, SYSTEMD_SYSTEM) {
+        Ok(dir) => dir,
+        Err(ReadErr::Absent) => return EnabledTimers::Absent,
+        Err(ReadErr::Unreadable(reason)) => return EnabledTimers::Unreadable { reason },
+    };
+    let mut entries = match dir_names_noatime(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return match io_error(SYSTEMD_SYSTEM, &e) {
+                ReadErr::Absent => EnabledTimers::Absent,
+                ReadErr::Unreadable(reason) => EnabledTimers::Unreadable { reason },
+            };
+        }
+    };
+    entries.sort();
+    let mut names = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|e| DEPENDENCY_DIRS.iter().any(|suffix| e.ends_with(suffix)))
+    {
+        let rel = format!("{SYSTEMD_SYSTEM}/{entry}");
+        let path = match lstat_in_root(root, &rel) {
+            Ok((path, meta)) if meta.is_dir() => path,
+            // Not a directory, or gone since it was listed: enables nothing.
+            Ok(_) | Err(ReadErr::Absent) => continue,
+            Err(ReadErr::Unreadable(reason)) => return EnabledTimers::Unreadable { reason },
+        };
+        match dir_names_noatime(&path) {
+            Ok(units) => names.extend(units.into_iter().filter(|u| u.ends_with(".timer"))),
+            Err(e) => match io_error(&rel, &e) {
+                ReadErr::Absent => {}
+                ReadErr::Unreadable(reason) => return EnabledTimers::Unreadable { reason },
+            },
+        }
+    }
+    names.sort();
+    names.dedup();
+    EnabledTimers::Listed { names }
+}
+
+/// The configuration btrbk would read: the first of [`BTRBK_CONFIGS`] that
+/// exists ([`BtrbkConfig`]).
+///
+/// It is `lstat`ed, never opened, so its contents are not read. A config
+/// beside an enabled `btrbk.timer` is the whole signal: whatever it names,
+/// the advice is the same — look at it before booting this OS — so parsing
+/// another system's file would add risk and decide nothing. Anything there
+/// that is not a regular file, or a symlink (not followed), is unknown:
+/// btrbk would try to read it.
+fn read_btrbk_config(root: &Path) -> BtrbkConfig {
+    for rel in BTRBK_CONFIGS {
+        match lstat_in_root(root, rel) {
+            Err(ReadErr::Absent) => {}
+            Ok((_, meta)) if meta.is_file() => {
+                return BtrbkConfig::Present {
+                    path: format!("/{rel}"),
+                    size_bytes: meta.len(),
+                };
+            }
+            Ok(_) => {
+                return BtrbkConfig::Unreadable {
+                    reason: format!("{rel}: not a regular file"),
+                };
+            }
+            Err(ReadErr::Unreadable(reason)) => return BtrbkConfig::Unreadable { reason },
+        }
+    }
+    BtrbkConfig::Absent
+}
+
+/// Whether btrbk runs when this OS boots — on bare metal or in the update
+/// VM. It does when [`BTRBK_TIMER`] is enabled and a config exists: the
+/// timer's `Persistent=true` catches up the missed daily run right after
+/// boot, and `btrbk run` then applies that OS's own config and retention to
+/// whatever the config names — possibly the received backups on this very
+/// drive — and can delete snapshots. `None` when either half rules it out:
+/// the timer is not enabled, or there is no config (`btrbk run` stops with
+/// an error and touches nothing). When one half is unknown and the other
+/// does not rule it out, it MAY run, and says so: unknown never reads as
+/// safe. Not a staleness reason; see [`Assessment::warnings`].
+pub fn boot_warning(os: &RecoveryOs) -> Option<String> {
+    let timer = match &os.enabled_timers {
+        EnabledTimers::Listed { names } => Some(names.iter().any(|n| n == BTRBK_TIMER)),
+        EnabledTimers::Absent => Some(false),
+        EnabledTimers::Unreadable { .. } => None,
+    };
+    let config = match &os.btrbk_config {
+        BtrbkConfig::Present { path, .. } => Some(Some(path.as_str())),
+        BtrbkConfig::Absent => Some(None),
+        BtrbkConfig::Unreadable { .. } => None,
+    };
+    if timer == Some(false) || config == Some(None) {
+        return None;
+    }
+    let timer_text = match timer {
+        Some(_) => format!("{BTRBK_TIMER} enabled"),
+        None => "enabled timers unknown".to_string(),
+    };
+    let config_text = match config.flatten() {
+        Some(path) => format!("{path} present"),
+        None => "btrbk config unknown".to_string(),
+    };
+    let (verb, check) = if timer.is_some() && config.is_some() {
+        ("will", "its config")
+    } else {
+        ("may", "its timers and config")
+    };
+    Some(format!(
+        "btrbk {verb} run when this OS boots ({timer_text}, {config_text}): check {check} \
+         before booting it, on bare metal or in the update VM"
+    ))
+}
+
 fn unquote(v: &str) -> &str {
     let v = v.trim();
     for q in ['"', '\''] {
@@ -382,6 +591,14 @@ pub fn inspect(root: &Path) -> RecoveryOs {
         }
         Err(e) => unreadable(e, &mut os.problems),
     }
+    os.enabled_timers = read_enabled_timers(root);
+    if let EnabledTimers::Unreadable { reason } = &os.enabled_timers {
+        os.problems.push(reason.clone());
+    }
+    os.btrbk_config = read_btrbk_config(root);
+    if let BtrbkConfig::Unreadable { reason } = &os.btrbk_config {
+        os.problems.push(reason.clone());
+    }
     os
 }
 
@@ -487,6 +704,17 @@ pub struct Assessment {
     pub stale: bool,
     /// Why it is stale; empty exactly when it is current.
     pub reasons: Vec<String>,
+    /// What to look at before booting it, whatever its age: [`boot_warning`].
+    /// A warning does not make it stale.
+    pub warnings: Vec<String>,
+}
+
+impl Assessment {
+    /// Stale, or carrying a warning: what `recovery-os` exits 1 for, and
+    /// what the backup run marks WARN.
+    pub fn needs_attention(&self) -> bool {
+        self.stale || !self.warnings.is_empty()
+    }
 }
 
 /// The problem recorded for `rel`, if it was unreadable.
@@ -617,6 +845,7 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
         age_basis: age.map(|(_, basis)| basis),
         stale: !reasons.is_empty(),
         reasons,
+        warnings: boot_warning(os).into_iter().collect(),
     }
 }
 
@@ -627,8 +856,9 @@ pub enum DriveReport {
     NotMounted,
     /// The target is mounted but its OS root could not be read at all.
     Unreadable(String),
+    /// What was read, boxed so the other variants stay small.
     Inspected {
-        os: RecoveryOs,
+        os: Box<RecoveryOs>,
         assessment: Assessment,
     },
 }
@@ -672,7 +902,10 @@ pub fn inspect_drive(
     max_age_days: u32,
 ) -> DriveEntry {
     let report = match read_drive(root, host, today, max_age_days) {
-        Ok((os, assessment)) => DriveReport::Inspected { os, assessment },
+        Ok((os, assessment)) => DriveReport::Inspected {
+            os: Box::new(os),
+            assessment,
+        },
         Err(why) => DriveReport::Unreadable(why),
     };
     DriveEntry {
@@ -714,13 +947,14 @@ pub fn status_with(
         .collect()
 }
 
-/// 2 if any mounted drive's root was unreadable, else 1 if any is stale, else 0.
+/// 2 if any mounted drive's root was unreadable, else 1 if any needs
+/// attention — stale, or carrying a warning — else 0.
 pub fn exit_code(entries: &[DriveEntry]) -> i32 {
     entries
         .iter()
         .map(|e| match &e.report {
             DriveReport::Unreadable(_) => 2,
-            DriveReport::Inspected { assessment, .. } if assessment.stale => 1,
+            DriveReport::Inspected { assessment, .. } if assessment.needs_attention() => 1,
             _ => 0,
         })
         .max()
@@ -736,6 +970,43 @@ fn days(n: i64) -> String {
         "1 day".to_string()
     } else {
         format!("{n} days")
+    }
+}
+
+/// The `Enabled timers` row: the names, `none` (listed, or nothing there to
+/// list), or `unknown: <why>` — never `none` for what could not be read.
+fn timers_text(timers: &EnabledTimers) -> String {
+    match timers {
+        EnabledTimers::Listed { names } if names.is_empty() => "none".to_string(),
+        EnabledTimers::Listed { names } => names.join(", "),
+        EnabledTimers::Absent => format!("none: {SYSTEMD_SYSTEM} is absent"),
+        EnabledTimers::Unreadable { reason } => format!("unknown: {reason}"),
+    }
+}
+
+/// The timers in a `health` line: the reason, when unknown, is counted with
+/// the unreadable paths instead.
+fn timers_short(timers: &EnabledTimers) -> String {
+    match timers {
+        EnabledTimers::Unreadable { .. } => "unknown".to_string(),
+        EnabledTimers::Absent => "none".to_string(),
+        listed @ EnabledTimers::Listed { .. } => timers_text(listed),
+    }
+}
+
+/// The `btrbk config` row: the path btrbk would read and its size, `none`
+/// with both paths it looks at, or `unknown: <why>`.
+fn btrbk_config_text(config: &BtrbkConfig) -> String {
+    match config {
+        BtrbkConfig::Present { path, size_bytes } => {
+            let unit = if *size_bytes == 1 { "byte" } else { "bytes" };
+            format!("{path} ({size_bytes} {unit})")
+        }
+        BtrbkConfig::Absent => format!(
+            "none: /{} and /{} are absent",
+            BTRBK_CONFIGS[0], BTRBK_CONFIGS[1]
+        ),
+        BtrbkConfig::Unreadable { reason } => format!("unknown: {reason}"),
     }
 }
 
@@ -833,8 +1104,13 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                     "das-backup-manager",
                     &package_text(os, "das-backup-manager"),
                 ));
+                out.push_str(&row("Enabled timers", &timers_text(&os.enabled_timers)));
+                out.push_str(&row("btrbk config", &btrbk_config_text(&os.btrbk_config)));
                 for p in &os.problems {
                     out.push_str(&row("Could not read", p));
+                }
+                for w in &assessment.warnings {
+                    out.push_str(&row("WARNING", w));
                 }
                 out.push_str(&row("Result", &verdict(assessment)));
             }
@@ -859,8 +1135,9 @@ pub struct StoredDrive {
     pub error: Option<String>,
 }
 
-/// 2 since `installed` was added; a record of any other version is refused.
-const STATE_SCHEMA_VERSION: u32 = 2;
+/// 3 since `enabled_timers` and `btrbk_config` were added (2 added
+/// `installed`); a record of any other version is refused.
+const STATE_SCHEMA_VERSION: u32 = 3;
 
 /// The state file, overridable for tests and the VM rig via
 /// `DAS_RECOVERY_OS_STATE`.
@@ -915,7 +1192,7 @@ pub fn write_state(path: &Path, entries: &[DriveEntry], now_epoch: i64) -> Resul
             },
             DriveReport::Inspected { os, .. } => StoredDrive {
                 checked_epoch: now_epoch,
-                os: Some(os.clone()),
+                os: Some(RecoveryOs::clone(os)),
                 error: None,
             },
         };
@@ -943,12 +1220,31 @@ pub fn format_epoch_utc(epoch: i64) -> String {
 pub struct RecoveryHealth {
     /// One summary line per mirror target.
     pub lines: Vec<String>,
-    /// Stale, unreadable or never-checked drives; these make health WARNING.
+    /// Stale, unreadable or never-checked drives, and every [`boot_warning`];
+    /// these make health WARNING.
     pub warnings: Vec<String>,
 }
 
-/// `<label> (<when>): installed …, last full upgrade …, age …, kernel … —
-/// current|STALE: …`.
+/// One line per stale reason and boot warning of `label`'s reading.
+fn assessment_warnings(label: &str, a: &Assessment) -> Vec<String> {
+    let stale = a.stale.then(|| {
+        format!(
+            "Recovery OS on '{label}' is STALE: {}",
+            a.reasons.join("; ")
+        )
+    });
+    stale
+        .into_iter()
+        .chain(
+            a.warnings
+                .iter()
+                .map(|w| format!("Recovery OS on '{label}': {w}")),
+        )
+        .collect()
+}
+
+/// `<label> (<when>): installed …, last full upgrade …, age …, kernel …,
+/// enabled timers … — current|STALE: …`.
 fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
     let upgrade = upgrade_text(os);
     let kernel = or_unknown(newest_kernel(&os.kernels).map(String::as_str));
@@ -963,10 +1259,11 @@ fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
         n => format!("; {n} paths unreadable"),
     };
     format!(
-        "{label} ({when}): installed {}, last full upgrade {upgrade}, age {}, kernel {kernel} \
-         — {state}{unreadable}",
+        "{label} ({when}): installed {}, last full upgrade {upgrade}, age {}, kernel {kernel}, \
+         enabled timers {} — {state}{unreadable}",
         or_unknown(os.installed.as_deref()),
-        age_text(a)
+        age_text(a),
+        timers_short(&os.enabled_timers)
     )
 }
 
@@ -992,12 +1289,7 @@ pub fn health_with(
             match read_drive(&os_root(&t.mount), host(), today, max) {
                 Ok((os, assessment)) => {
                     h.lines.push(summary(label, "live", &os, &assessment));
-                    if assessment.stale {
-                        h.warnings.push(format!(
-                            "Recovery OS on '{label}' is STALE: {}",
-                            assessment.reasons.join("; ")
-                        ));
-                    }
+                    h.warnings.extend(assessment_warnings(label, &assessment));
                 }
                 Err(why) => {
                     h.lines
@@ -1038,12 +1330,7 @@ pub fn health_with(
                 let when = format_epoch_utc(*checked_epoch);
                 h.lines
                     .push(summary(label, &format!("as of {when}"), os, &a));
-                if a.stale {
-                    h.warnings.push(format!(
-                        "Recovery OS on '{label}' is STALE: {}",
-                        a.reasons.join("; ")
-                    ));
-                }
+                h.warnings.extend(assessment_warnings(label, &a));
             }
             Some(StoredDrive {
                 checked_epoch,
@@ -1068,7 +1355,8 @@ pub struct StatusRun {
     pub entries: Vec<DriveEntry>,
     /// Why the state file could not be written, when it could not.
     pub state_error: Option<String>,
-    /// 0 current, 1 stale, 2 a root or the state file could not be handled.
+    /// 0 nothing needs attention, 1 a drive is stale or carries a warning,
+    /// 2 a root or the state file could not be handled.
     pub code: i32,
 }
 
@@ -1096,7 +1384,8 @@ pub fn status_run_with(
 }
 
 /// One drive as JSON: `status` is `current`, `stale`, `unreadable` or
-/// `not_mounted`; `os` and `assessment` are null unless it was inspected.
+/// `not_mounted`; `os` and `assessment` are null unless it was inspected. A
+/// boot warning is in `assessment.warnings` and leaves `status` as it is.
 pub fn entry_json(entry: &DriveEntry) -> serde_json::Value {
     let (status, os, assessment, error) = match &entry.report {
         DriveReport::NotMounted => ("not_mounted", None, None, None),
@@ -1185,6 +1474,68 @@ mod tests {
         add_pkg(root, "vim-9.1-1", "vim", "9.1-1");
         // The ALPM_DB_VERSION file pacman keeps next to the entries.
         write(root, "var/lib/pacman/local/ALPM_DB_VERSION", "9\n");
+        // What `systemctl enable` leaves: one timer, one service, and an
+        // alias that is not a dependency directory. No btrbk config.
+        enable(root, "timers.target.wants", "fstrim.timer");
+        enable(root, "multi-user.target.wants", "sshd.service");
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/graphical.target",
+            root.join("etc/systemd/system/default.target"),
+        )
+        .unwrap();
+    }
+
+    /// Enable `unit` the way `systemctl enable` does: a symlink named after
+    /// it in the dependency directory `dir` under etc/systemd/system — here
+    /// to a path that exists nowhere, so anything that follows it fails.
+    fn enable(root: &Path, dir: &str, unit: &str) {
+        let deps = root.join(SYSTEMD_SYSTEM).join(dir);
+        fs::create_dir_all(&deps).unwrap();
+        std::os::unix::fs::symlink(
+            format!("/nonexistent/das-test/usr/lib/systemd/system/{unit}"),
+            deps.join(unit),
+        )
+        .unwrap();
+    }
+
+    const BTRBK_CONF_TEXT: &str =
+        "volume /mnt/btr_pool\n  target /mnt/backup-system-recovery-A\n  subvolume @\n";
+
+    /// btrbk.timer enabled and /etc/btrbk/btrbk.conf present: btrbk runs
+    /// when this OS boots.
+    fn arm_btrbk(root: &Path) {
+        enable(root, "timers.target.wants", BTRBK_TIMER);
+        write(root, "etc/btrbk/btrbk.conf", BTRBK_CONF_TEXT);
+    }
+
+    /// [`full_root`], upgraded yesterday: current against [`current_host`].
+    fn current_root(root: &Path) {
+        full_root(root);
+        write(
+            root,
+            "var/log/pacman.log",
+            &format!(
+                "[{d}T01:00:00+0000] [PACMAN] starting full system upgrade\n\
+                 [{d}T01:05:00+0000] [ALPM] transaction completed\n",
+                d = days_before(TODAY, 1)
+            ),
+        );
+        add_pkg(root, "btrfs-progs-6.10-1", "btrfs-progs", "6.17-1");
+    }
+
+    /// The host [`current_root`] is current against.
+    fn current_host() -> HostVersions {
+        host("6.12.3-1-cachyos")
+    }
+
+    const WILL_RUN: &str = "btrbk will run when this OS boots (btrbk.timer enabled, \
+         /etc/btrbk/btrbk.conf present): check its config before booting it, on bare metal \
+         or in the update VM";
+
+    fn listed(names: &[&str]) -> EnabledTimers {
+        EnabledTimers::Listed {
+            names: names.iter().map(|n| n.to_string()).collect(),
+        }
     }
 
     fn host(kernel: &str) -> HostVersions {
@@ -1204,6 +1555,8 @@ mod tests {
             kernels: kernels.iter().map(|k| k.to_string()).collect(),
             modules_read: true,
             packages_read: true,
+            enabled_timers: listed(&[]),
+            btrbk_config: BtrbkConfig::Absent,
             ..Default::default()
         }
     }
@@ -1243,6 +1596,8 @@ mod tests {
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .collect();
         assert_eq!(os.packages, want, "only watched names, matched exactly");
+        assert_eq!(os.enabled_timers, listed(&["fstrim.timer"]), "timers only");
+        assert_eq!(os.btrbk_config, BtrbkConfig::Absent);
         assert!(os.problems.is_empty(), "{:?}", os.problems);
     }
 
@@ -1269,12 +1624,18 @@ mod tests {
             return;
         };
         full_root(dir.path());
+        arm_btrbk(dir.path());
         let paths: Vec<PathBuf> = [
             "usr/lib/os-release",
             "var/log/pacman.log",
             "usr/lib/modules",
             "var/lib/pacman/local",
             "var/lib/pacman/local/btrbk-0.32.6-1/desc",
+            "etc/systemd/system",
+            "etc/systemd/system/timers.target.wants",
+            "etc/systemd/system/multi-user.target.wants",
+            "etc/btrbk",
+            "etc/btrbk/btrbk.conf",
         ]
         .iter()
         .map(|r| dir.path().join(r))
@@ -1283,9 +1644,21 @@ mod tests {
             filetime::set_file_atime(p, old).unwrap();
         }
         // Following a symlink updates the link's own atime; no open flag stops
-        // that, so the etc/os-release link must not be followed at all.
-        let link = dir.path().join("etc/os-release");
-        filetime::set_symlink_file_times(&link, old, old).unwrap();
+        // that, so no link may be followed at all: not etc/os-release, not
+        // an enabled unit, not an alias.
+        let links: Vec<PathBuf> = [
+            "etc/os-release",
+            "etc/systemd/system/timers.target.wants/btrbk.timer",
+            "etc/systemd/system/timers.target.wants/fstrim.timer",
+            "etc/systemd/system/multi-user.target.wants/sshd.service",
+            "etc/systemd/system/default.target",
+        ]
+        .iter()
+        .map(|r| dir.path().join(r))
+        .collect();
+        for link in &links {
+            filetime::set_symlink_file_times(link, old, old).unwrap();
+        }
         let os = inspect(dir.path());
         assert!(os.problems.is_empty(), "{:?}", os.problems);
         assert_eq!(
@@ -1298,13 +1671,30 @@ mod tests {
             Some("CachyOS"),
             "via usr/lib/os-release"
         );
+        assert_eq!(
+            os.enabled_timers,
+            listed(&["btrbk.timer", "fstrim.timer"]),
+            "it did list"
+        );
+        assert!(
+            matches!(os.btrbk_config, BtrbkConfig::Present { .. }),
+            "{:?}",
+            os.btrbk_config
+        );
         for p in &paths {
             let atime = filetime::FileTime::from_last_access_time(&fs::metadata(p).unwrap());
             assert_eq!(atime, old, "atime of {} changed", p.display());
         }
-        let atime =
-            filetime::FileTime::from_last_access_time(&fs::symlink_metadata(&link).unwrap());
-        assert_eq!(atime, old, "atime of the etc/os-release symlink changed");
+        for link in &links {
+            let atime =
+                filetime::FileTime::from_last_access_time(&fs::symlink_metadata(link).unwrap());
+            assert_eq!(
+                atime,
+                old,
+                "atime of the symlink {} changed",
+                link.display()
+            );
+        }
     }
 
     #[test]
@@ -1352,6 +1742,8 @@ mod tests {
             !os.packages_read,
             "an unread database is not 'nothing installed'"
         );
+        assert_eq!(os.enabled_timers, EnabledTimers::Absent);
+        assert_eq!(os.btrbk_config, BtrbkConfig::Absent);
         assert!(
             os.problems.is_empty(),
             "absent is not unreadable: {:?}",
@@ -1365,6 +1757,432 @@ mod tests {
                 "no kernel found: usr/lib/modules is absent"
             ]
         );
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+    }
+
+    // ---- enabled timers and the btrbk config (bd 1yg) ---------------------
+
+    #[test]
+    fn inspect_lists_enabled_timers_by_name_and_never_follows_them() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        arm_btrbk(dir.path());
+        // Wanted twice, wanted by another target, required, upheld.
+        enable(dir.path(), "multi-user.target.wants", "fstrim.timer");
+        enable(dir.path(), "multi-user.target.wants", "paccache.timer");
+        enable(
+            dir.path(),
+            "local-fs.target.requires",
+            "snapper-cleanup.timer",
+        );
+        enable(dir.path(), "graphical.target.upholds", "zz-upheld.timer");
+        // An empty dependency directory, and a file with such a name.
+        fs::create_dir_all(dir.path().join("etc/systemd/system/sockets.target.wants")).unwrap();
+        write(
+            dir.path(),
+            "etc/systemd/system/odd.target.wants",
+            "not a directory",
+        );
+        let link = dir
+            .path()
+            .join("etc/systemd/system/timers.target.wants/btrbk.timer");
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(
+            fs::metadata(&link).is_err(),
+            "the fixture's link is dangling: following it fails"
+        );
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.enabled_timers,
+            listed(&[
+                "btrbk.timer",
+                "fstrim.timer",
+                "paccache.timer",
+                "snapper-cleanup.timer",
+                "zz-upheld.timer"
+            ]),
+            "by name, sorted, each once, timers only"
+        );
+        assert_eq!(
+            os.btrbk_config,
+            BtrbkConfig::Present {
+                path: "/etc/btrbk/btrbk.conf".into(),
+                size_bytes: BTRBK_CONF_TEXT.len() as u64
+            }
+        );
+        assert!(os.problems.is_empty(), "{:?}", os.problems);
+    }
+
+    #[test]
+    fn btrbk_timer_and_a_config_warn_and_either_alone_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        current_root(dir.path());
+        let h = current_host();
+        let clean = assess(&inspect(dir.path()), &h, TODAY, 60);
+        assert!(
+            !clean.stale && clean.warnings.is_empty(),
+            "the fixture is current and quiet: {clean:?}"
+        );
+        assert!(!clean.needs_attention());
+
+        arm_btrbk(dir.path());
+        let a = assess(&inspect(dir.path()), &h, TODAY, 60);
+        assert_eq!(a.warnings, [WILL_RUN]);
+        assert!(!a.stale, "a warning is not staleness: {:?}", a.reasons);
+        assert!(a.needs_attention());
+
+        // No config: `btrbk run` stops before doing anything.
+        fs::remove_file(dir.path().join("etc/btrbk/btrbk.conf")).unwrap();
+        let a = assess(&inspect(dir.path()), &h, TODAY, 60);
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        assert!(!a.needs_attention());
+
+        // A config and no timer: nothing runs it at boot.
+        write(dir.path(), "etc/btrbk/btrbk.conf", BTRBK_CONF_TEXT);
+        fs::remove_file(
+            dir.path()
+                .join("etc/systemd/system/timers.target.wants/btrbk.timer"),
+        )
+        .unwrap();
+        let a = assess(&inspect(dir.path()), &h, TODAY, 60);
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+
+        // Enabled through another target's wants: it still runs.
+        enable(dir.path(), "multi-user.target.wants", BTRBK_TIMER);
+        let a = assess(&inspect(dir.path()), &h, TODAY, 60);
+        assert_eq!(a.warnings, [WILL_RUN]);
+
+        // A stale OS keeps both: the reasons and the warning.
+        let a = assess(&inspect(dir.path()), &host("7.2.8"), TODAY, 60);
+        assert!(a.stale);
+        assert_eq!(a.warnings, [WILL_RUN]);
+    }
+
+    #[test]
+    fn boot_warning_needs_both_halves_and_unknown_never_rules_it_out() {
+        let present = BtrbkConfig::Present {
+            path: "/etc/btrbk.conf".into(),
+            size_bytes: 9,
+        };
+        let timers_unknown = EnabledTimers::Unreadable { reason: "x".into() };
+        let config_unknown = BtrbkConfig::Unreadable { reason: "y".into() };
+        let warn = |t: &EnabledTimers, c: &BtrbkConfig| {
+            boot_warning(&RecoveryOs {
+                enabled_timers: t.clone(),
+                btrbk_config: c.clone(),
+                ..Default::default()
+            })
+        };
+        let armed = listed(&["btrbk.timer", "fstrim.timer"]);
+        assert_eq!(
+            warn(&armed, &present).as_deref(),
+            Some(
+                "btrbk will run when this OS boots (btrbk.timer enabled, /etc/btrbk.conf \
+                 present): check its config before booting it, on bare metal or in the update VM"
+            ),
+            "the path is the one btrbk would read"
+        );
+        assert_eq!(warn(&listed(&["fstrim.timer"]), &present), None);
+        assert_eq!(warn(&listed(&[]), &present), None);
+        assert_eq!(warn(&EnabledTimers::Absent, &present), None);
+        assert_eq!(
+            warn(&listed(&["my-btrbk.timer", "btrbk.timer.d"]), &present),
+            None,
+            "only btrbk.timer itself"
+        );
+        assert_eq!(warn(&armed, &BtrbkConfig::Absent), None);
+        assert_eq!(
+            warn(&timers_unknown, &BtrbkConfig::Absent),
+            None,
+            "no config: btrbk run stops at once"
+        );
+        assert_eq!(
+            warn(&listed(&["fstrim.timer"]), &config_unknown),
+            None,
+            "not enabled: nothing runs it"
+        );
+        assert_eq!(warn(&EnabledTimers::Absent, &config_unknown), None);
+        let may = |what: &str| {
+            format!(
+                "btrbk may run when this OS boots ({what}): check its timers and config \
+                 before booting it, on bare metal or in the update VM"
+            )
+        };
+        assert_eq!(
+            warn(&timers_unknown, &present),
+            Some(may("enabled timers unknown, /etc/btrbk.conf present"))
+        );
+        assert_eq!(
+            warn(&armed, &config_unknown),
+            Some(may("btrbk.timer enabled, btrbk config unknown"))
+        );
+        assert_eq!(
+            warn(&timers_unknown, &config_unknown),
+            Some(may("enabled timers unknown, btrbk config unknown"))
+        );
+        // Not read is unknown, never "none" or "absent".
+        let unread = RecoveryOs::default();
+        assert_eq!(
+            unread.enabled_timers,
+            EnabledTimers::Unreadable {
+                reason: "not read".into()
+            }
+        );
+        assert_eq!(
+            unread.btrbk_config,
+            BtrbkConfig::Unreadable {
+                reason: "not read".into()
+            }
+        );
+        assert_eq!(
+            boot_warning(&unread),
+            Some(may("enabled timers unknown, btrbk config unknown"))
+        );
+    }
+
+    #[test]
+    fn no_systemd_directory_is_none_and_a_quiet_one_is_none_too() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_enabled_timers(dir.path()), EnabledTimers::Absent);
+        fs::create_dir_all(dir.path().join(SYSTEMD_SYSTEM)).unwrap();
+        assert_eq!(read_enabled_timers(dir.path()), listed(&[]));
+        // Services and an empty timers.target.wants enable no timer.
+        enable(dir.path(), "multi-user.target.wants", "sshd.service");
+        fs::create_dir_all(dir.path().join("etc/systemd/system/timers.target.wants")).unwrap();
+        assert_eq!(read_enabled_timers(dir.path()), listed(&[]));
+        // A file where etc/systemd/system should be cannot be listed.
+        let file_root = tempfile::tempdir().unwrap();
+        write(file_root.path(), SYSTEMD_SYSTEM, "a file");
+        let got = read_enabled_timers(file_root.path());
+        assert!(
+            matches!(&got, EnabledTimers::Unreadable { reason }
+                if reason.starts_with("etc/systemd/system: ")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_timers_directory_that_cannot_be_listed_is_unknown_never_none() {
+        // SAFETY: geteuid() is always safe.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "SKIPPED: root lists a mode-000 directory anyway; \
+                 run unprivileged to see the refusal"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        current_root(dir.path());
+        arm_btrbk(dir.path());
+        let wants = dir.path().join("etc/systemd/system/timers.target.wants");
+        fs::set_permissions(&wants, fs::Permissions::from_mode(0o000)).unwrap();
+        let os = inspect(dir.path());
+        let h = current_host();
+        let e = inspect_drive("A", dir.path(), &h, TODAY, 60);
+        fs::set_permissions(&wants, fs::Permissions::from_mode(0o755)).unwrap();
+        let reason = "etc/systemd/system/timers.target.wants: Permission denied (os error 13)";
+        assert_eq!(
+            os.enabled_timers,
+            EnabledTimers::Unreadable {
+                reason: reason.into()
+            }
+        );
+        assert_eq!(os.problems, [reason]);
+        let a = assess(&os, &h, TODAY, 60);
+        assert_eq!(
+            a.warnings,
+            [
+                "btrbk may run when this OS boots (enabled timers unknown, /etc/btrbk/btrbk.conf \
+                 present): check its timers and config before booting it, on bare metal or in \
+                 the update VM"
+            ]
+        );
+        let text = format_section(std::slice::from_ref(&e), &h);
+        assert!(
+            text.contains(&format!("    Enabled timers      unknown: {reason}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("    Could not read      {reason}\n")),
+            "{text}"
+        );
+        assert!(!text.contains("Enabled timers      none"), "{text}");
+        assert_eq!(exit_code(std::slice::from_ref(&e)), 1);
+    }
+
+    #[test]
+    fn a_symlinked_dependency_directory_or_config_is_refused_not_followed() {
+        // Behind the links: what a follower would find.
+        let outside = tempfile::tempdir().unwrap();
+        enable(outside.path(), "timers.target.wants", BTRBK_TIMER);
+        write(outside.path(), "btrbk.conf", "volume /x\n");
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(SYSTEMD_SYSTEM)).unwrap();
+        let wants = dir.path().join("etc/systemd/system/timers.target.wants");
+        std::os::unix::fs::symlink(
+            outside
+                .path()
+                .join("etc/systemd/system/timers.target.wants"),
+            &wants,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("etc/btrbk")).unwrap();
+        let conf = dir.path().join("etc/btrbk/btrbk.conf");
+        std::os::unix::fs::symlink(outside.path().join("btrbk.conf"), &conf).unwrap();
+        let os = inspect(dir.path());
+        let wants_why = format!(
+            "etc/systemd/system/timers.target.wants: {} is a symlink, not followed",
+            wants.display()
+        );
+        let conf_why = format!(
+            "etc/btrbk/btrbk.conf: {} is a symlink, not followed",
+            conf.display()
+        );
+        assert_eq!(
+            os.enabled_timers,
+            EnabledTimers::Unreadable {
+                reason: wants_why.clone()
+            }
+        );
+        assert_eq!(
+            os.btrbk_config,
+            BtrbkConfig::Unreadable {
+                reason: conf_why.clone()
+            }
+        );
+        assert_eq!(os.problems, [wants_why, conf_why]);
+        // systemd and btrbk would follow them: both unknown, so it may run.
+        assert!(
+            boot_warning(&os)
+                .unwrap()
+                .contains("(enabled timers unknown, btrbk config unknown)")
+        );
+        // The same for etc/systemd/system itself.
+        let linked = tempfile::tempdir().unwrap();
+        fs::create_dir_all(linked.path().join("etc/systemd")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join(SYSTEMD_SYSTEM),
+            linked.path().join(SYSTEMD_SYSTEM),
+        )
+        .unwrap();
+        assert!(
+            matches!(read_enabled_timers(linked.path()), EnabledTimers::Unreadable { reason }
+                if reason.ends_with("is a symlink, not followed")),
+        );
+    }
+
+    #[test]
+    fn the_config_btrbk_reads_first_is_the_one_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "etc/btrbk.conf";
+        let second = "etc/btrbk/btrbk.conf";
+        assert_eq!(read_btrbk_config(dir.path()), BtrbkConfig::Absent);
+        write(dir.path(), second, BTRBK_CONF_TEXT);
+        let at_second = BtrbkConfig::Present {
+            path: "/etc/btrbk/btrbk.conf".into(),
+            size_bytes: BTRBK_CONF_TEXT.len() as u64,
+        };
+        assert_eq!(read_btrbk_config(dir.path()), at_second);
+        // btrbk 0.32 takes /etc/btrbk.conf when it exists, whatever else does.
+        write(dir.path(), first, "volume /a\n");
+        let at_first = BtrbkConfig::Present {
+            path: "/etc/btrbk.conf".into(),
+            size_bytes: 10,
+        };
+        assert_eq!(read_btrbk_config(dir.path()), at_first);
+        fs::remove_file(dir.path().join(second)).unwrap();
+        assert_eq!(read_btrbk_config(dir.path()), at_first);
+        // Empty is still a config btrbk takes.
+        write(dir.path(), first, "");
+        assert_eq!(
+            read_btrbk_config(dir.path()),
+            BtrbkConfig::Present {
+                path: "/etc/btrbk.conf".into(),
+                size_bytes: 0
+            }
+        );
+        // Something that is not a file where the first should be: btrbk would
+        // take it, so unknown — and the second is not consulted.
+        fs::remove_file(dir.path().join(first)).unwrap();
+        fs::create_dir(dir.path().join(first)).unwrap();
+        write(dir.path(), second, BTRBK_CONF_TEXT);
+        let not_file = BtrbkConfig::Unreadable {
+            reason: "etc/btrbk.conf: not a regular file".into(),
+        };
+        assert_eq!(read_btrbk_config(dir.path()), not_file);
+        let os = inspect(dir.path());
+        assert_eq!(os.btrbk_config, not_file);
+        assert!(
+            os.problems
+                .contains(&"etc/btrbk.conf: not a regular file".to_string()),
+            "{:?}",
+            os.problems
+        );
+        // The same for the second when the first is absent.
+        fs::remove_dir(dir.path().join(first)).unwrap();
+        fs::remove_file(dir.path().join(second)).unwrap();
+        fs::create_dir(dir.path().join(second)).unwrap();
+        assert_eq!(
+            read_btrbk_config(dir.path()),
+            BtrbkConfig::Unreadable {
+                reason: "etc/btrbk/btrbk.conf: not a regular file".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_stored_shapes_of_the_timers_and_the_config_are_the_documented_ones() {
+        // recovery-os-vm.sh reads these from the state file (bd 1yg).
+        use serde_json::{json, to_value};
+        let cases = [
+            (
+                to_value(listed(&["btrbk.timer"])).unwrap(),
+                json!({"state": "listed", "names": ["btrbk.timer"]}),
+            ),
+            (
+                to_value(EnabledTimers::Absent).unwrap(),
+                json!({"state": "absent"}),
+            ),
+            (
+                to_value(EnabledTimers::Unreadable { reason: "r".into() }).unwrap(),
+                json!({"state": "unreadable", "reason": "r"}),
+            ),
+            (
+                to_value(BtrbkConfig::Present {
+                    path: "/etc/btrbk/btrbk.conf".into(),
+                    size_bytes: 412,
+                })
+                .unwrap(),
+                json!({"state": "present", "path": "/etc/btrbk/btrbk.conf", "size_bytes": 412}),
+            ),
+            (
+                to_value(BtrbkConfig::Absent).unwrap(),
+                json!({"state": "absent"}),
+            ),
+            (
+                to_value(BtrbkConfig::Unreadable { reason: "r".into() }).unwrap(),
+                json!({"state": "unreadable", "reason": "r"}),
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+        assert_eq!(
+            serde_json::from_value::<EnabledTimers>(json!({"state": "listed", "names": []}))
+                .unwrap(),
+            listed(&[])
+        );
+        assert_eq!(
+            serde_json::from_value::<BtrbkConfig>(
+                json!({"state": "present", "path": "/etc/btrbk.conf", "size_bytes": 3})
+            )
+            .unwrap(),
+            BtrbkConfig::Present {
+                path: "/etc/btrbk.conf".into(),
+                size_bytes: 3
+            }
+        );
+        assert!(serde_json::from_value::<BtrbkConfig>(json!({"state": "maybe"})).is_err());
     }
 
     #[test]
@@ -2174,11 +2992,11 @@ mod tests {
             report,
         };
         let current = entry(DriveReport::Inspected {
-            os: RecoveryOs::default(),
+            os: Box::default(),
             assessment: Assessment::default(),
         });
         let stale = entry(DriveReport::Inspected {
-            os: RecoveryOs::default(),
+            os: Box::default(),
             assessment: Assessment {
                 stale: true,
                 ..Default::default()
@@ -2186,9 +3004,20 @@ mod tests {
         });
         let bad = entry(DriveReport::Unreadable("x".into()));
         let off = entry(DriveReport::NotMounted);
+        // Current, with a warning: it needs attention all the same.
+        let warned = entry(DriveReport::Inspected {
+            os: Box::default(),
+            assessment: Assessment {
+                warnings: vec![WILL_RUN.into()],
+                ..Default::default()
+            },
+        });
         assert_eq!(exit_code(&[]), 0);
         assert_eq!(exit_code(&[current.clone(), off.clone()]), 0);
         assert_eq!(exit_code(&[current.clone(), stale.clone()]), 1);
+        assert_eq!(exit_code(&[current.clone(), warned.clone()]), 1);
+        assert_eq!(exit_code(&[warned.clone(), off]), 1);
+        assert_eq!(exit_code(&[warned, bad.clone()]), 2);
         assert_eq!(exit_code(&[stale.clone(), bad.clone()]), 2);
         assert_eq!(exit_code(&[bad, stale]), 2);
     }
@@ -2214,6 +3043,8 @@ mod tests {
              \x20   btrfs-progs         6.10-1 (host 6.17-1)\n\
              \x20   btrbk               0.32.6-1\n\
              \x20   das-backup-manager  not installed\n\
+             \x20   Enabled timers      fstrim.timer\n\
+             \x20   btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n\
              \x20   Result              STALE — last full upgrade 202 days ago (limit 60); \
              kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2; \
              btrfs-progs 6.10-1 is older than the host's 6.17-1\n"
@@ -2236,12 +3067,15 @@ mod tests {
             "    btrfs-progs         unknown (host unknown)\n",
             "    btrbk               unknown\n",
             "    das-backup-manager  unknown\n",
+            "    Enabled timers      none: etc/systemd/system is absent\n",
+            "    btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n",
             "    Result              STALE — last upgrade unknown: var/log/pacman.log is absent; \
              no kernel found: usr/lib/modules is absent\n",
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
         assert!(!text.contains("Could not read"), "{text}");
+        assert!(!text.contains("WARNING"), "{text}");
         assert!(!text.contains(" 0 days"), "{text}");
 
         // Unreadable: there, but it could not be read — said as such.
@@ -2375,6 +3209,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_section_shows_the_timers_the_config_and_the_warning_before_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        current_root(dir.path());
+        arm_btrbk(dir.path());
+        let h = current_host();
+        let e = inspect_drive("A", dir.path(), &h, TODAY, 60);
+        let text = format_section(std::slice::from_ref(&e), &h);
+        let tail = format!(
+            "    das-backup-manager  not installed\n\
+             \x20   Enabled timers      btrbk.timer, fstrim.timer\n\
+             \x20   btrbk config        /etc/btrbk/btrbk.conf ({} bytes)\n\
+             \x20   WARNING             {WILL_RUN}\n\
+             \x20   Result              current\n",
+            BTRBK_CONF_TEXT.len()
+        );
+        assert!(text.ends_with(&tail), "{text}");
+        assert_eq!(
+            exit_code(std::slice::from_ref(&e)),
+            1,
+            "current, and still it needs attention"
+        );
+        let j = entry_json(&e);
+        assert_eq!(j["status"], "current", "a warning is not staleness");
+        assert_eq!(j["assessment"]["warnings"], serde_json::json!([WILL_RUN]));
+        assert_eq!(
+            j["os"]["enabled_timers"],
+            serde_json::json!({"state": "listed", "names": ["btrbk.timer", "fstrim.timer"]})
+        );
+        assert_eq!(
+            j["os"]["btrbk_config"],
+            serde_json::json!({
+                "state": "present",
+                "path": "/etc/btrbk/btrbk.conf",
+                "size_bytes": BTRBK_CONF_TEXT.len()
+            })
+        );
+
+        // Without the config: no WARNING row, nothing to attend to.
+        fs::remove_file(dir.path().join("etc/btrbk/btrbk.conf")).unwrap();
+        let e = inspect_drive("A", dir.path(), &h, TODAY, 60);
+        let text = format_section(std::slice::from_ref(&e), &h);
+        assert!(!text.contains("WARNING"), "{text}");
+        assert!(
+            text.contains(
+                "    btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(exit_code(std::slice::from_ref(&e)), 0);
+        assert_eq!(
+            entry_json(&e)["assessment"]["warnings"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn the_timers_and_config_rows_say_none_or_unknown_and_never_blank() {
+        assert_eq!(timers_text(&listed(&[])), "none");
+        assert_eq!(
+            timers_text(&listed(&["a.timer", "b.timer"])),
+            "a.timer, b.timer"
+        );
+        assert_eq!(
+            timers_text(&EnabledTimers::Absent),
+            "none: etc/systemd/system is absent"
+        );
+        assert_eq!(
+            timers_text(&EnabledTimers::Unreadable { reason: "r".into() }),
+            "unknown: r"
+        );
+        let present = |size_bytes| BtrbkConfig::Present {
+            path: "/etc/btrbk.conf".into(),
+            size_bytes,
+        };
+        assert_eq!(btrbk_config_text(&present(1)), "/etc/btrbk.conf (1 byte)");
+        assert_eq!(btrbk_config_text(&present(0)), "/etc/btrbk.conf (0 bytes)");
+        assert_eq!(
+            btrbk_config_text(&present(2048)),
+            "/etc/btrbk.conf (2048 bytes)"
+        );
+        assert_eq!(
+            btrbk_config_text(&BtrbkConfig::Absent),
+            "none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent"
+        );
+        assert_eq!(
+            btrbk_config_text(&BtrbkConfig::Unreadable { reason: "r".into() }),
+            "unknown: r"
+        );
+    }
+
     // ---- state and health -----------------------------------------------
 
     fn inspected(label: &str, root: &Path) -> DriveEntry {
@@ -2414,15 +3339,16 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         let st = load_state(&path).unwrap().unwrap();
-        assert_eq!(st.schema_version, 2);
+        assert_eq!(st.schema_version, 3);
         let DriveReport::Inspected { os, .. } = &a.report else {
             panic!()
         };
+        assert_eq!(os.enabled_timers, listed(&["fstrim.timer"]), "kept as read");
         assert_eq!(
             st.drives["A"],
             StoredDrive {
                 checked_epoch: 1000,
-                os: Some(os.clone()),
+                os: Some(RecoveryOs::clone(os)),
                 error: None
             }
         );
@@ -2516,11 +3442,12 @@ mod tests {
             h.lines,
             [
                 "A (live): installed 2026-01-02, last full upgrade 2026-03-14, age 202 days \
-                 since last applied upgrade, kernel 6.12.1-1-cachyos — STALE: last full upgrade 202 days ago (limit 60); kernel series 6.12 \
+                 since last applied upgrade, kernel 6.12.1-1-cachyos, enabled timers fstrim.timer \
+                 — STALE: last full upgrade 202 days ago (limit 60); kernel series 6.12 \
                  (6.12.1-1-cachyos) is behind the host's 7.2; btrfs-progs 6.10-1 is older \
                  than the host's 6.17-1",
                 "B (as of 2026-10-01 03:20 UTC): installed unknown, last full upgrade 2026-09-30, \
-                 age 2 days since last applied upgrade, kernel 7.2.1 — current",
+                 age 2 days since last applied upgrade, kernel 7.2.1, enabled timers none — current",
                 "C (as of 2026-10-01 03:20 UTC): OS root unreadable: not a directory",
                 "D: not mounted and never checked",
             ]
@@ -2605,7 +3532,8 @@ mod tests {
             h.lines,
             [
                 "B (as of 1970-01-01 00:00 UTC): installed unknown, last full upgrade 2026-10-02, \
-                 age 0 days since last applied upgrade, kernel 7.2.1 — current; 2 paths unreadable"
+                 age 0 days since last applied upgrade, kernel 7.2.1, enabled timers none — current; \
+                 2 paths unreadable"
             ]
         );
         os.problems.truncate(1);
@@ -2615,6 +3543,92 @@ mod tests {
         );
         os.problems.clear();
         assert!(summary("B", "live", &os, &Assessment::default()).ends_with("— current"));
+    }
+
+    #[test]
+    fn health_shows_the_enabled_timers_and_warns_when_btrbk_would_run_at_boot() {
+        let a = tempfile::tempdir().unwrap();
+        current_root(&a.path().join("@"));
+        arm_btrbk(&a.path().join("@"));
+        let cfg = mirror_config(&[
+            ("A", a.path().to_str().unwrap()),
+            ("B", "/nonexistent/b"),
+            ("C", "/nonexistent/c"),
+            ("D", "/nonexistent/d"),
+        ]);
+        let mut armed = os_with(Some(TODAY), &["7.2.1"]);
+        armed.enabled_timers = listed(&["btrbk.timer", "fstrim.timer"]);
+        armed.btrbk_config = BtrbkConfig::Present {
+            path: "/etc/btrbk/btrbk.conf".into(),
+            size_bytes: 120,
+        };
+        // Timers unknown, but no config: nothing to warn about.
+        let mut unknown = os_with(Some(TODAY), &["7.2.1"]);
+        unknown.enabled_timers = EnabledTimers::Unreadable {
+            reason: "etc/systemd/system: denied".into(),
+        };
+        unknown.problems = vec!["etc/systemd/system: denied".into()];
+        // Timers unknown beside a config: it may run.
+        let mut maybe = unknown.clone();
+        maybe.btrbk_config = BtrbkConfig::Present {
+            path: "/etc/btrbk.conf".into(),
+            size_bytes: 1,
+        };
+        let mut drives = BTreeMap::new();
+        for (label, os) in [("B", armed), ("C", unknown), ("D", maybe)] {
+            drives.insert(
+                label.to_string(),
+                StoredDrive {
+                    checked_epoch: 0,
+                    os: Some(os),
+                    error: None,
+                },
+            );
+        }
+        let state = Ok(Some(StoredState {
+            schema_version: STATE_SCHEMA_VERSION,
+            drives,
+        }));
+        let is_mounted = |p: &Path| p == a.path();
+        let h = health_with(&cfg, &state, &current_host, TODAY, &is_mounted);
+        let when = "as of 1970-01-01 00:00 UTC";
+        assert_eq!(
+            h.lines,
+            [
+                format!(
+                    "A (live): installed {d}, last full upgrade {d}, age 1 day since last \
+                     applied upgrade, kernel 6.12.1-1-cachyos, enabled timers btrbk.timer, \
+                     fstrim.timer — current",
+                    d = days_before(TODAY, 1)
+                ),
+                format!(
+                    "B ({when}): installed unknown, last full upgrade 2026-10-02, age 0 days \
+                     since last applied upgrade, kernel 7.2.1, enabled timers btrbk.timer, \
+                     fstrim.timer — current"
+                ),
+                format!(
+                    "C ({when}): installed unknown, last full upgrade 2026-10-02, age 0 days \
+                     since last applied upgrade, kernel 7.2.1, enabled timers unknown — current; \
+                     1 path unreadable"
+                ),
+                format!(
+                    "D ({when}): installed unknown, last full upgrade 2026-10-02, age 0 days \
+                     since last applied upgrade, kernel 7.2.1, enabled timers unknown — current; \
+                     1 path unreadable"
+                ),
+            ]
+        );
+        assert_eq!(
+            h.warnings,
+            [
+                format!("Recovery OS on 'A': {WILL_RUN}"),
+                format!("Recovery OS on 'B': {WILL_RUN}"),
+                "Recovery OS on 'D': btrbk may run when this OS boots (enabled timers unknown, \
+                 /etc/btrbk.conf present): check its timers and config before booting it, on \
+                 bare metal or in the update VM"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2783,8 +3797,8 @@ mod tests {
         assert_eq!(
             summary("A", "live", os, assessment),
             "A (live): installed 2026-04-12, last full upgrade none recorded, \
-             age 174 days since install, kernel 6.12.1-1-cachyos — STALE: never upgraded \
-             since install on 2026-04-12 (174 days)"
+             age 174 days since install, kernel 6.12.1-1-cachyos, enabled timers fstrim.timer \
+             — STALE: never upgraded since install on 2026-04-12 (174 days)"
         );
         // No age: said as unknown, never as a number, and JSON carries null.
         let unknown = upgrades("garbage\n");
@@ -2823,13 +3837,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recovery-os.json");
         let hint = format!("remove it to start over: rm -- '{}'", path.display());
-        let v1 = r#"{"schema_version":1,"drives":{}}"#;
-        fs::write(&path, v1).unwrap();
+        // Version 2, before the timers and the btrbk config, as the nightly
+        // run of 2026-10-03 wrote it.
+        let v2 = r#"{"schema_version":2,"drives":{"A":{"checked_epoch":1,"os":{"os_name":"Arch Linux","last_full_upgrade_applied":null,"last_full_upgrade_attempted":null,"last_attempt_completed":false,"installed":"2026-04-12","log_read":true,"modules_read":true,"kernels":["6.19.12-1-cachyos"],"packages":{"btrbk":"0.32.6-2"},"packages_read":true,"problems":[]},"error":null}}}"#;
+        fs::write(&path, v2).unwrap();
         let err = load_state(&path).unwrap_err();
         assert_eq!(
             err,
             format!(
-                "{}: record schema version 1, this btrdasd reads 2 — left as it is; {hint}",
+                "{}: record schema version 2, this btrdasd reads 3 — left as it is; {hint}",
                 path.display()
             )
         );
@@ -2840,24 +3856,37 @@ mod tests {
             report: DriveReport::NotMounted,
         };
         assert_eq!(write_state(&path, &[off], 5).unwrap_err(), err);
-        assert_eq!(fs::read_to_string(&path).unwrap(), v1);
-        // No version at all, or a newer one, is refused too.
+        assert_eq!(fs::read_to_string(&path).unwrap(), v2);
+        // Version 1, no version at all, or a newer one, is refused too.
+        fs::write(&path, r#"{"schema_version":1,"drives":{}}"#).unwrap();
+        assert!(load_state(&path).unwrap_err().ends_with(&hint));
         fs::write(&path, r#"{"drives":{}}"#).unwrap();
         assert!(
             load_state(&path)
                 .unwrap_err()
-                .contains(": record schema version none, this btrdasd reads 2 — "),
+                .contains(": record schema version none, this btrdasd reads 3 — "),
             "{:?}",
             load_state(&path)
         );
-        fs::write(&path, r#"{"schema_version":3,"drives":{}}"#).unwrap();
+        fs::write(&path, r#"{"schema_version":4,"drives":{}}"#).unwrap();
         assert!(load_state(&path).unwrap_err().ends_with(&hint));
+        // A version-2 drive record relabelled 3 lacks the new readings: corrupt.
+        fs::write(
+            &path,
+            v2.replace(r#""schema_version":2"#, r#""schema_version":3"#),
+        )
+        .unwrap();
+        let err = load_state(&path).unwrap_err();
+        assert!(
+            err.contains("missing field `enabled_timers`") && err.ends_with(&hint),
+            "{err}"
+        );
         // The current version loads.
-        fs::write(&path, r#"{"schema_version":2,"drives":{}}"#).unwrap();
+        fs::write(&path, r#"{"schema_version":3,"drives":{}}"#).unwrap();
         assert_eq!(
             load_state(&path),
             Ok(Some(StoredState {
-                schema_version: 2,
+                schema_version: 3,
                 drives: BTreeMap::new()
             }))
         );
