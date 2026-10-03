@@ -72,12 +72,7 @@ pub fn acquire_manual_locks_at(
     let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
         return Ok(BackupLockAttempt::AlreadyRunning);
     };
-    let maintenance = MaintenanceHeld::acquire_blocking_at(
-        maintenance_path,
-        job,
-        progress,
-        "DAS maintenance lock held (scrub in progress?) — waiting...",
-    )?;
+    let maintenance = MaintenanceHeld::acquire_blocking_at(maintenance_path, job, progress)?;
     Ok(BackupLockAttempt::Acquired(Box::new(BackupLocks {
         maintenance,
         _singleton: singleton,

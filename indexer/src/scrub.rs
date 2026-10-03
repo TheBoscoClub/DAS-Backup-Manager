@@ -796,11 +796,12 @@ impl FileLock {
     /// A short non-blocking probe runs first so that ordinary sub-second
     /// contention stays quiet; once the wait passes
     /// [`LOCK_WAIT_ANNOUNCE_SECS`] a visible line is logged and the call falls
-    /// through to a genuinely blocking `flock`.
+    /// through to a genuinely blocking `flock`. The line is built only then,
+    /// so it can say who holds the lock at that moment.
     pub fn acquire_blocking(
         path: impl AsRef<Path>,
         progress: &dyn ProgressCallback,
-        waiting_message: &str,
+        waiting_message: &dyn Fn() -> String,
     ) -> Result<FileLock, ScrubError> {
         let path = path.as_ref();
         if let Some(lock) = Self::try_acquire(path)? {
@@ -810,7 +811,8 @@ impl FileLock {
         if let Some(lock) = Self::try_acquire(path)? {
             return Ok(lock);
         }
-        progress.on_log(LogLevel::Info, waiting_message);
+        let waiting_message = waiting_message();
+        progress.on_log(LogLevel::Info, &waiting_message);
 
         // A blocking LOCK_EX only returns once held (or on a real error);
         // EINTR is retried inside `flock`. A scoped companion thread repeats
@@ -912,12 +914,8 @@ fn acquire_locks_at(
     let Some(singleton) = FileLock::try_acquire(singleton_path)? else {
         return Ok(None);
     };
-    let maintenance = MaintenanceHeld::acquire_blocking_at(
-        maintenance_path,
-        "btrdasd scrub run",
-        progress,
-        "waiting for DAS maintenance lock (backup in progress?)",
-    )?;
+    let maintenance =
+        MaintenanceHeld::acquire_blocking_at(maintenance_path, "btrdasd scrub run", progress)?;
     Ok(Some(ScrubLocks {
         maintenance,
         singleton,
@@ -2958,7 +2956,7 @@ Total to scrub:   401.28MiB\n";
         let path = dir.path().join("free.lock");
         let progress = TestProgress::new();
         let started = Instant::now();
-        let lock = FileLock::acquire_blocking(&path, &progress, "waiting").unwrap();
+        let lock = FileLock::acquire_blocking(&path, &progress, &|| "waiting".into()).unwrap();
         assert!(started.elapsed() < Duration::from_secs(LOCK_WAIT_ANNOUNCE_SECS));
         assert_eq!(lock.path(), path.as_path());
         // No wait announcement when there was no wait.

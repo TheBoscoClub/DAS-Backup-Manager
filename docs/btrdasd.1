@@ -101,6 +101,8 @@ while it already holds the lock, and hands its hold down through
 .B DAS_MAINTENANCE_LOCK_FD
 (see
 .BR ENVIRONMENT ).
+A command whose own caller holds the lock, and did not hand it down, fails at
+once, naming that caller, instead of waiting for it forever.
 .\"
 .SS search
 Full-text search across indexed files using FTS5.
@@ -1757,8 +1759,9 @@ end: the caller holds it until the command finishes.
 .B backup\-run.sh
 sets it for the
 .B walk
-it runs. It is checked, not trusted: the descriptor must be that file and must
-hold the lock, or the command fails.
+it runs. It is checked, not trusted: the descriptor must be that file, the lock
+must be held, and it must be held through that descriptor \(em or the command
+fails. A descriptor on a free lock is refused rather than allowed to take it.
 .TP
 .B DAS_RECOVERY_OS_STATE
 Override the recovery OS record
