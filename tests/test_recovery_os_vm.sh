@@ -175,7 +175,9 @@ case "$cmd" in
         ;;
     dumpxml)
         [[ -f "$S/defined" ]] || nodomain
-        printf "<domain type='kvm' id='1'>\n  <name>recovery-os-updater</name>\n  <devices>\n"
+        printf "<domain type='kvm' id='1'>\n  <name>recovery-os-updater</name>\n"
+        if [[ -f "$S/stored-os.xml" ]]; then cat "$S/stored-os.xml"; fi
+        printf "  <devices>\n"
         if [[ -f "$S/attached.xml" ]]; then sed 's/^/    /' "$S/attached.xml"; fi
         printf "  </devices>\n</domain>\n"
         ;;
@@ -216,6 +218,8 @@ case "$cmd" in
         ;;
     define)
         touch "$S/defined"
+        cp "${!#}" "$S/defined.xml"
+        rm -f "$S/stored-os.xml"
         echo "Domain 'recovery-os-updater' defined from ${!#}"
         ;;
     screenshot)
@@ -556,6 +560,14 @@ lacks "no VNC on a network address" "$(cat "$xml")" "<listen type='address'"
 has "the NVRAM comes from libvirt's template" "$(cat "$xml")" "<nvram template='"
 has "guest agent channel" "$(cat "$xml")" "name='org.qemu.guest_agent.0'"
 lacks "no disk of its own" "$(cat "$xml")" "<disk"
+# libvirt gives a domain defined with no boot element at all an os-level
+# <boot dev='hd'/>, which then refuses the disk's per-device <boot order='1'/>
+# when a session attaches it ("per-device boot elements cannot be used
+# together with os/boot elements") -- found on the real host.
+lacks "no boot device under <os>" "$(sed -n '/<os>/,/<\/os>/p' "$xml")" "<boot dev="
+has "the NIC carries a per-device boot order, after the disk" \
+    "$(sed -n '/<interface /,/<\/interface>/p' "$xml")" "<boot order='2'/>"
+lacks "boot order 1 is left for the disk" "$(cat "$xml")" "<boot order='1'/>"
 if command -v virt-xml-validate >/dev/null; then
     if virt-xml-validate "$xml" domain >/dev/null 2>&1; then pass "virt-xml-validate"; else fail "virt-xml-validate"; fi
 fi
@@ -1100,6 +1112,18 @@ printf 'BOOT-ENTRIES' >"$nv"
 run_driver define
 check "define again: exit 0" "$RC" "0"
 check "define again: NVRAM untouched" "$(file "$nv")" "BOOT-ENTRIES"
+
+# The domain on a host that defined it from a template without per-device
+# boot: libvirt stored an os-level boot device in it.
+fixture
+printf "  <os>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    <boot dev='hd'/>\n  </os>\n" >"$S/stored-os.xml"
+run_driver define
+check "define over a stored os-level boot: exit 0" "$RC" "0"
+has "define over a stored os-level boot: says it updates" "$OUT" "updating recovery-os-updater from $T/usr/lib/das-backup/libvirt/recovery-os-updater.xml"
+has "define over a stored os-level boot: redefined from the template" "$(file "$S/virsh.calls")" \
+    "define --validate $T/usr/lib/das-backup/libvirt/recovery-os-updater.xml"
+lacks "define over a stored os-level boot: what libvirt is handed has none" "$(file "$S/defined.xml")" "<boot dev="
+has "define over a stored os-level boot: what libvirt is handed boots per device" "$(file "$S/defined.xml")" "<boot order='2'/>"
 
 fixture
 printf 'running\n' >"$S/states"

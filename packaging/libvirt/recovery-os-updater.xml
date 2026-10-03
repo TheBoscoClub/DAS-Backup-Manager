@@ -40,8 +40,8 @@
     <!-- Three seconds at the firmware splash to press Esc for its menus
          (Boot Manager; Boot Maintenance Manager, then Boot From File), which
          is the way in when the firmware finds no bootloader on the disk.
-         There is no boot-device line here: the order comes from the disk's
-         own boot order 1, set when a session attaches it. -->
+         Never a boot-device line here: the boot order is per device, the
+         disk's 1 (set when a session attaches it) and the NIC's 2 below. -->
     <bootmenu enable='yes' timeout='3000'/>
   </os>
   <features>
@@ -76,9 +76,16 @@
     <!-- virtio NIC on the NAT network `default`, for the pacman mirrors. The
          guest loads virtio_net from its own module tree once its root is
          mounted; nothing earlier needs the network. -->
+    <!-- Boot order 2: the network only after the disk. It is here even more
+         for what it prevents: libvirt gives a domain defined with no boot
+         element at all an os-level boot device (hd), and an os-level boot
+         device refuses the disk's per-device boot order when a session
+         attaches it ("per-device boot elements cannot be used together with
+         os/boot elements"). -->
     <interface type='network'>
       <source network='default'/>
       <model type='virtio'/>
+      <boot order='2'/>
     </interface>
     <serial type='pty'>
       <target type='isa-serial' port='0'>
