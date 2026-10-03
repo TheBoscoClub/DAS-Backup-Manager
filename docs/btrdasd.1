@@ -1762,6 +1762,9 @@ sets it for the
 it runs. It is checked, not trusted: the descriptor must be that file, the lock
 must be held, and it must be held through that descriptor \(em or the command
 fails. A descriptor on a free lock is refused rather than allowed to take it.
+If the real holder lets go at the very moment of the check, a descriptor that
+held nothing may still end up holding the lock: its process then holds it,
+with no holder recorded, until it exits.
 .TP
 .B DAS_RECOVERY_OS_STATE
 Override the recovery OS record

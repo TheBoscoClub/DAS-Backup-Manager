@@ -709,8 +709,37 @@ pub struct FileLock {
     file: File,
 }
 
+/// Every lock file this process opened to lock it, by path, so a test can
+/// count the attempts on its own scratch lock — a free lock is taken at the
+/// first attempt, never probed first (`maintenance` tests).
+#[cfg(test)]
+pub(crate) mod opens {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static TAKEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(path: &Path) {
+        TAKEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_path_buf());
+    }
+
+    pub(crate) fn count(path: &Path) -> usize {
+        TAKEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|taken| taken.as_path() == path)
+            .count()
+    }
+}
+
 impl FileLock {
     fn open(path: &Path) -> Result<File, ScrubError> {
+        #[cfg(test)]
+        opens::record(path);
         if let Some(parent) = path.parent()
             && !parent.exists()
         {
