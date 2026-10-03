@@ -35,7 +35,10 @@ fn os_root(root: &Path, age: i64) {
     write(
         root,
         "var/log/pacman.log",
-        &format!("[{date}T03:00:00+0000] [PACMAN] starting full system upgrade\n"),
+        &format!(
+            "[{date}T03:00:00+0000] [PACMAN] starting full system upgrade\n\
+             [{date}T03:05:00+0000] [ALPM] transaction completed\n"
+        ),
     );
     write(
         root,
@@ -257,7 +260,7 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     os_root(&mnt.join("@"), 1);
     let cfg = config(dir.path(), &mnt);
     let state = dir.path().join("recovery-os.json");
-    let earlier = r#"{"schema_version":1,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade":"2026-01-01","kernels":["6.1.0"],"packages":{},"packages_read":true,"problems":[]},"error":null}}}"#;
+    let earlier = r#"{"schema_version":1,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade_applied":"2026-01-01","last_full_upgrade_attempted":"2026-01-01","last_attempt_completed":true,"log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{},"packages_read":true,"problems":[]},"error":null}}}"#;
     std::fs::write(&state, earlier).unwrap();
     let out = btrdasd(
         &[
@@ -298,6 +301,31 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     );
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no-dir"));
+    // A corrupt record is left alone, loudly, with the way out on one line.
+    std::fs::write(&state, "{not json").unwrap();
+    let out = btrdasd(
+        &[
+            "recovery-os",
+            "status",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--state-file",
+            state.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let first = err.lines().next().unwrap_or("");
+    assert!(
+        first.starts_with("Error: could not record the result: ")
+            && first.ends_with(&format!(
+                "remove it to start over: rm -- '{}'",
+                state.display()
+            )),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), "{not json");
 }
 
 #[test]
@@ -308,7 +336,7 @@ fn health_shows_the_stored_recovery_os_record_with_its_time() {
     // Checked 2026-10-03 03:20 UTC, upgraded long before: stale.
     let checked = day_number("2026-10-03").unwrap() * 86_400 + 3 * 3600 + 20 * 60;
     let record = format!(
-        r#"{{"schema_version":1,"drives":{{"recovery-A":{{"checked_epoch":{checked},"os":{{"os_name":"Old","last_full_upgrade":"2026-03-14","kernels":["6.1.0"],"packages":{{}},"packages_read":true,"problems":[]}},"error":null}}}}}}"#
+        r#"{{"schema_version":1,"drives":{{"recovery-A":{{"checked_epoch":{checked},"os":{{"os_name":"Old","last_full_upgrade_applied":"2026-03-14","last_full_upgrade_attempted":"2026-03-14","last_attempt_completed":true,"log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{{}},"packages_read":true,"problems":[]}},"error":null}}}}}}"#
     );
     std::fs::write(&state, record).unwrap();
     let out = btrdasd(&["health", "--config", cfg.to_str().unwrap()], Some(&state));

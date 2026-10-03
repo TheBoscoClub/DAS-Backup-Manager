@@ -1190,7 +1190,8 @@ while the target is mounted, otherwise the record the last backup run kept in
 .IR /var/lib/das\-backup/recovery\-os.json ,
 with the time it was taken and the age recomputed for today. Run it as root
 while the drives are mounted, or the live read reports the files it may not
-read without updating their access times. A stale, unreadable
+read without updating their access times; each line ends with the number of
+paths that could not be read, when there are any. A stale, unreadable
 or never\-checked recovery OS is also a warning, so the status reads
 .BR WARNING .
 .PP
@@ -1215,10 +1216,14 @@ to it. Read: the name in
 .IR etc/os\-release ,
 the kernels under
 .IR usr/lib/modules ,
-the date of the last
+the dates of the last full system upgrade attempted and the last one applied
+from
+.I var/log/pacman.log
+(an attempt is a
 .RB \(dq "starting full system upgrade" \(dq
-line in
-.IR var/log/pacman.log ,
+line, logged before anything is downloaded or verified; it was applied only if
+.RB \(dq "[ALPM] transaction completed" \(dq
+follows before the next pacman invocation starts),
 and the installed versions of btrfs\-progs, btrbk, linux\-cachyos and
 das\-backup\-manager from
 .I var/lib/pacman/local
@@ -1235,20 +1240,29 @@ the fallback
 .BR os\-release (5)
 names, when it is a link. A root that is itself a symlink is refused, and a
 file that is not a regular file is not opened.
-Whatever cannot be read prints as
+Whatever is there but cannot be read prints as
 .B unknown
 and is listed under
 .BR "Could not read" ;
-a package missing from a readable database prints as
+whatever is not there at all is said to be absent. A package missing from a
+readable database prints as
 .BR "not installed" .
 .PP
 The OS is
 .B STALE
-when its last full upgrade is more than
+when its last APPLIED full upgrade is more than
 .B [recovery_os].max_age_days
-old, or cannot be found, or is dated after today; or when its newest kernel's
-major.minor series is lower than the host's running kernel, or either kernel
-is unknown. An unknown age is never shown as a number.
+old, or cannot be found, or is dated after today; when a later attempt did not
+complete (shown as
+.BR "Last attempt" ,
+with both dates in the reason \(em typically an expired keyring); when its
+newest kernel's major.minor series is lower than the host's running kernel,
+or either kernel is unknown; or when its btrfs\-progs is older than the
+host's. The btrfs\-progs versions are compared only when both are plain dotted
+numbers (pkgrel ignored); otherwise the row says
+.B not compared
+and gives no verdict. The reason says whether an unknown item was absent or
+could not be read. An unknown age is never shown as a number.
 .PP
 .B btrdasd recovery\-os inspect
 .B \-\-root
@@ -1307,9 +1321,14 @@ as the root; the others print
 .BR "not mounted" .
 .B backup\-run.sh
 runs it after btrbk, while the targets are mounted, and records the result as
-an operation: exit 0 is OK, exit 1 is WARN (the report status reads
+an operation: exit 0 is OK (the detail names any mirror that was not mounted),
+exit 1 is WARN (the report status reads
 .BR "COMPLETED WITH WARNINGS" ,
-the run is still recorded as a success), anything else is FAIL.
+the run is still recorded as a success), anything else is FAIL. The script
+bounds the command with
+.B timeout
+(300 s, then KILL after 10 s more); a check that times out is a FAIL, and the
+run goes on to unmount and report.
 .PP
 .B btrdasd recovery\-os status
 .RB [ \-\-config
@@ -1329,11 +1348,14 @@ Record what was read from each drive in
 (JSON, replaced atomically, mode 644) for
 .BR "btrdasd health" .
 A drive that is not mounted keeps its earlier record. An existing file that
-cannot be read or parsed is left as it is and the command exits 2; remove it
-to start over.
+cannot be read or parsed is left as it is and the command exits 2, its error
+naming the file and the command that clears it; every later run fails the
+same way until it is removed.
 .B backup\-run.sh
 passes
-.IR /var/lib/das\-backup/recovery\-os.json ,
+.B $DAS_RECOVERY_OS_STATE
+(default
+.IR /var/lib/das\-backup/recovery\-os.json ),
 except on a dry run.
 .TP
 .B \-\-json
@@ -1634,7 +1656,9 @@ records. Meant for tests only.
 .B DAS_RECOVERY_OS_STATE
 Override the recovery OS record
 .B btrdasd health
-reads. Meant for tests only.
+reads, and the one
+.B backup\-run.sh
+writes. Meant for tests only.
 .SH EXAMPLES
 Run a full backup pipeline:
 .PP

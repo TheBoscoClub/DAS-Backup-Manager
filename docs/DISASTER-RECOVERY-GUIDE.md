@@ -1064,7 +1064,7 @@ To update one, boot it — never update it from the host:
    ```
 
 4. Reboot into the same recovery drive and confirm it comes up — boot menu entry, kernel, login. Only then go back to the host.
-5. The next backup run reads the new state; `STALE` clears once the upgrade date is recent and the kernel series has caught up with the host's.
+5. The next backup run reads the new state; `STALE` clears once the last *applied* upgrade is recent and the kernel series and btrfs-progs have caught up with the host's. An upgrade that failed or was declined shows as a `Last attempt … (did not complete)` — the report only counts one whose transaction completed.
 
 Do one drive at a time, so one known-good recovery OS exists throughout.
 

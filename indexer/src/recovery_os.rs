@@ -56,8 +56,23 @@ const PACMAN_LOCAL: &str = "var/lib/pacman/local";
 pub struct RecoveryOs {
     /// `PRETTY_NAME`, else `NAME`, from `etc/os-release`.
     pub os_name: Option<String>,
-    /// `YYYY-MM-DD` of the last `starting full system upgrade` in pacman's log.
-    pub last_full_upgrade: Option<String>,
+    /// `YYYY-MM-DD` of the last full system upgrade that was APPLIED: a
+    /// `starting full system upgrade` line in pacman's log followed by
+    /// `[ALPM] transaction completed` before the next invocation starts.
+    pub last_full_upgrade_applied: Option<String>,
+    /// `YYYY-MM-DD` of the last `starting full system upgrade` line, applied
+    /// or not. pacman logs it before resolving, downloading or checking
+    /// signatures, so an upgrade that failed (an expired keyring) or was
+    /// answered "n" still stamps it.
+    pub last_full_upgrade_attempted: Option<String>,
+    /// Whether that last attempt is the applied one.
+    pub last_attempt_completed: bool,
+    /// Whether `var/log/pacman.log` was read. When false, `problems` says why
+    /// if it was unreadable; with no problem for it, it is absent.
+    pub log_read: bool,
+    /// Whether `usr/lib/modules` was listed, with the same absent/unreadable
+    /// split as `log_read`.
+    pub modules_read: bool,
     /// Directory names under `usr/lib/modules`, sorted.
     pub kernels: Vec<String>,
     /// Name → version for the [`WATCHED_PACKAGES`] that are installed.
@@ -65,31 +80,52 @@ pub struct RecoveryOs {
     /// Whether pacman's database could be listed. When false, a package
     /// missing from `packages` is unknown, not "not installed".
     pub packages_read: bool,
-    /// Every item that could not be read, as `<path relative to root>: <why>`.
+    /// Every item that is there but could not be read, as
+    /// `<path relative to root>: <why>`. An absent item is not a problem: it
+    /// is recorded by the `*_read` flags and the `None`s alone.
     pub problems: Vec<String>,
+}
+
+/// Why an item could not be read: it is not there, or it is there and
+/// could not be read (permissions, I/O, a symlink, a FIFO).
+#[derive(Debug, Clone, PartialEq)]
+enum ReadErr {
+    Absent,
+    Unreadable(String),
 }
 
 /// `rel` under `root`, refusing every symlink on the way. Following a link
 /// updates the link's own access time — a write no open flag prevents — and
 /// refusing links also means no path can lead out of the root. Each component
 /// is checked with `lstat`, which writes nothing; a `..` or absolute component
-/// is refused.
-fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// is refused. A component that does not exist makes the item absent.
+fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, ReadErr> {
     let mut path = root.to_path_buf();
     for component in Path::new(rel).components() {
         let Component::Normal(name) = component else {
-            return Err(format!("{rel}: not a plain relative path"));
+            return Err(ReadErr::Unreadable(format!(
+                "{rel}: not a plain relative path"
+            )));
         };
         path.push(name);
-        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{rel}: {e}"))?;
+        let meta = fs::symlink_metadata(&path).map_err(|e| io_error(rel, &e))?;
         if meta.file_type().is_symlink() {
-            return Err(format!(
+            return Err(ReadErr::Unreadable(format!(
                 "{rel}: {} is a symlink, not followed",
                 path.display()
-            ));
+            )));
         }
     }
     Ok(path)
+}
+
+/// `NotFound` is absent; anything else is unreadable, said by [`open_error`].
+fn io_error(rel: &str, e: &std::io::Error) -> ReadErr {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        ReadErr::Absent
+    } else {
+        ReadErr::Unreadable(open_error(rel, e))
+    }
 }
 
 /// Why an open failed, said the way a reader can act on. `EPERM` from
@@ -131,17 +167,17 @@ fn open_noatime(path: &Path, flags: i32) -> std::io::Result<fs::File> {
 
 /// Read a regular file under `root`. A FIFO or device in its place is refused
 /// before it is opened, so a read can never block.
-fn read_in_root(root: &Path, rel: &str) -> Result<String, String> {
+fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
     let path = resolve_in_root(root, rel)?;
-    let meta = fs::metadata(&path).map_err(|e| format!("{rel}: {e}"))?;
+    let meta = fs::metadata(&path).map_err(|e| io_error(rel, &e))?;
     if !meta.is_file() {
-        return Err(format!("{rel}: not a regular file"));
+        return Err(ReadErr::Unreadable(format!("{rel}: not a regular file")));
     }
     let mut bytes = Vec::new();
     open_noatime(&path, FILE_FLAGS)
-        .map_err(|e| open_error(rel, &e))?
+        .map_err(|e| io_error(rel, &e))?
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("{rel}: {e}"))?;
+        .map_err(|e| ReadErr::Unreadable(format!("{rel}: {e}")))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -189,10 +225,10 @@ fn dir_names_noatime(path: &Path) -> std::io::Result<Vec<String>> {
 }
 
 /// The names of the subdirectories of a directory under `root`, sorted.
-fn list_in_root(root: &Path, rel: &str) -> Result<Vec<String>, String> {
+fn list_in_root(root: &Path, rel: &str) -> Result<Vec<String>, ReadErr> {
     let path = resolve_in_root(root, rel)?;
     let mut names: Vec<String> = dir_names_noatime(&path)
-        .map_err(|e| open_error(rel, &e))?
+        .map_err(|e| io_error(rel, &e))?
         .into_iter()
         // lstat: a stat would follow a symlinked entry and touch its atime.
         .filter(|n| fs::symlink_metadata(path.join(n)).is_ok_and(|m| m.is_dir()))
@@ -222,17 +258,46 @@ fn parse_os_release(text: &str) -> Option<String> {
     field("PRETTY_NAME").or_else(|| field("NAME"))
 }
 
-/// The date of the last full-upgrade line. pacman stamps each line
-/// `[YYYY-MM-DDTHH:MM:SS+ZZZZ]` (older logs `[YYYY-MM-DD HH:MM]`); a line whose
-/// date does not parse is skipped, never taken.
-fn parse_last_full_upgrade(log: &str) -> Option<String> {
-    log.lines()
-        .filter(|l| l.contains(UPGRADE_MARKER))
-        .filter_map(|l| {
-            let date = l.strip_prefix('[')?.get(..10)?;
-            day_number(date).map(|_| date.to_string())
-        })
-        .next_back()
+/// What pacman's log says about full system upgrades.
+#[derive(Debug, Default, PartialEq)]
+struct Upgrades {
+    applied: Option<String>,
+    attempted: Option<String>,
+    last_completed: bool,
+}
+
+/// The `YYYY-MM-DD` a pacman log line is stamped with: `[YYYY-MM-DDTHH:…]`
+/// (older logs `[YYYY-MM-DD HH:MM]`), or `None`.
+fn line_date(line: &str) -> Option<String> {
+    let date = line.strip_prefix('[')?.get(..10)?;
+    day_number(date).map(|_| date.to_string())
+}
+
+/// An attempt is a `starting full system upgrade` line; it was applied if
+/// `[ALPM] transaction completed` follows before the next invocation starts
+/// (pacman logs `Running '…'` at the start of every invocation) or the next
+/// `starting` line. A marker whose date does not parse is never taken, and
+/// closes the window so a later completion is not credited to an earlier one.
+fn parse_upgrades(log: &str) -> Upgrades {
+    let mut u = Upgrades::default();
+    let mut open: Option<String> = None;
+    for line in log.lines() {
+        if line.contains(UPGRADE_MARKER) {
+            open = line_date(line);
+            if let Some(date) = &open {
+                u.attempted = Some(date.clone());
+                u.last_completed = false;
+            }
+        } else if line.contains("[PACMAN] Running ") || line.contains("[PACMAN] starting ") {
+            open = None;
+        } else if line.contains("[ALPM] transaction completed")
+            && let Some(date) = open.take()
+        {
+            u.applied = Some(date);
+            u.last_completed = true;
+        }
+    }
+    u
 }
 
 /// `(%NAME%, %VERSION%)` from a pacman `desc` file.
@@ -246,27 +311,46 @@ fn parse_desc(text: &str) -> Option<(String, String)> {
 }
 
 /// Read a recovery OS root (`<mount>/@`). Pure reads; see the module doc.
+/// An absent item is left `None`/unread; an unreadable one is also listed in
+/// `problems`.
 pub fn inspect(root: &Path) -> RecoveryOs {
     let mut os = RecoveryOs::default();
+    let unreadable = |e: ReadErr, problems: &mut Vec<String>| {
+        if let ReadErr::Unreadable(why) = e {
+            problems.push(why);
+        }
+    };
     match read_in_root(root, OS_RELEASE)
         .or_else(|first| read_in_root(root, OS_RELEASE_FALLBACK).map_err(|second| [first, second]))
     {
         Ok(text) => os.os_name = parse_os_release(&text),
-        Err(both) => os.problems.extend(both),
+        Err(both) => both
+            .into_iter()
+            .for_each(|e| unreadable(e, &mut os.problems)),
     }
     match list_in_root(root, MODULES) {
-        Ok(names) => os.kernels = names,
-        Err(e) => os.problems.push(e),
+        Ok(names) => {
+            os.modules_read = true;
+            os.kernels = names;
+        }
+        Err(e) => unreadable(e, &mut os.problems),
     }
     match read_in_root(root, PACMAN_LOG) {
-        Ok(text) => os.last_full_upgrade = parse_last_full_upgrade(&text),
-        Err(e) => os.problems.push(e),
+        Ok(text) => {
+            let u = parse_upgrades(&text);
+            os.log_read = true;
+            os.last_full_upgrade_applied = u.applied;
+            os.last_full_upgrade_attempted = u.attempted;
+            os.last_attempt_completed = u.last_completed;
+        }
+        Err(e) => unreadable(e, &mut os.problems),
     }
     match list_in_root(root, PACMAN_LOCAL) {
         Ok(entries) => {
             os.packages_read = true;
             for entry in entries {
-                match read_in_root(root, &format!("{PACMAN_LOCAL}/{entry}/desc")) {
+                let rel = format!("{PACMAN_LOCAL}/{entry}/desc");
+                match read_in_root(root, &rel) {
                     Ok(text) => {
                         if let Some((name, version)) = parse_desc(&text)
                             && WATCHED_PACKAGES.contains(&name.as_str())
@@ -274,11 +358,14 @@ pub fn inspect(root: &Path) -> RecoveryOs {
                             os.packages.insert(name, version);
                         }
                     }
-                    Err(e) => os.problems.push(e),
+                    // An entry without its desc is a damaged database, not
+                    // an absent package: the entry might be a watched one.
+                    Err(ReadErr::Absent) => os.problems.push(format!("{rel}: absent")),
+                    Err(ReadErr::Unreadable(why)) => os.problems.push(why),
                 }
             }
         }
-        Err(e) => os.problems.push(e),
+        Err(e) => unreadable(e, &mut os.problems),
     }
     os
 }
@@ -345,6 +432,25 @@ pub fn host_versions() -> HostVersions {
     host_versions_with(&crate::fsutil::SystemRunner)
 }
 
+/// The upstream part of a pacman version (`6.10` of `6.10-1`) as numbers,
+/// or `None` when it is not purely dotted numerics (an epoch, `rc`, a git
+/// suffix). pacman's own `vercmp` handles those; this does not try to.
+fn dotted_numbers(version: &str) -> Option<Vec<u64>> {
+    let upstream = version.split_once('-').map_or(version, |(u, _)| u);
+    upstream.split('.').map(|p| p.parse().ok()).collect()
+}
+
+/// Whether the recovery OS's btrfs-progs is older than the host's: `None`
+/// (no verdict) unless both are known and both are dotted numerics. The
+/// pkgrel is not compared. Missing components count as 0 (`6.10` = `6.10.0`).
+fn btrfs_progs_older(recovery: Option<&str>, host: Option<&str>) -> Option<bool> {
+    let (mut r, mut h) = (dotted_numbers(recovery?)?, dotted_numbers(host?)?);
+    let len = r.len().max(h.len());
+    r.resize(len, 0);
+    h.resize(len, 0);
+    Some(r < h)
+}
+
 /// The verdict on one recovery OS.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Assessment {
@@ -355,16 +461,45 @@ pub struct Assessment {
     pub reasons: Vec<String>,
 }
 
-/// Stale when the last full upgrade is older than `max_age_days`, unknown, or
-/// dated after `today`; or when the newest kernel's series is behind the
-/// host's, or either kernel is unknown. Unknown is never current: the point
-/// is to nag.
+/// The problem recorded for `rel`, if it was unreadable.
+fn problem_for<'a>(os: &'a RecoveryOs, rel: &str) -> Option<&'a str> {
+    os.problems
+        .iter()
+        .map(String::as_str)
+        .find(|p| p.strip_prefix(rel).is_some_and(|r| r.starts_with(": ")))
+}
+
+/// Why an item was not read: it could not be (`<unreadable>: could not read
+/// <path>: <why>`), or it is not there (`<absent>: <path> is absent`).
+fn unread(os: &RecoveryOs, rel: &str, unreadable: &str, absent: &str) -> String {
+    match problem_for(os, rel) {
+        Some(why) => format!("{unreadable}: could not read {why}"),
+        None => format!("{absent}: {rel} is absent"),
+    }
+}
+
+/// Stale when the last APPLIED full upgrade is older than `max_age_days`,
+/// unknown, or dated after `today`; when a later attempt did not complete;
+/// when the newest kernel's series is behind the host's, or either kernel is
+/// unknown; or when btrfs-progs is older than the host's (when both versions
+/// can be compared). Unknown is never current: the point is to nag.
 pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u32) -> Assessment {
     let mut reasons = Vec::new();
     let mut age_days = None;
-    match os.last_full_upgrade.as_deref() {
-        None => reasons.push("last upgrade unknown".to_string()),
-        Some(date) => match (day_number(today), day_number(date)) {
+    let applied = os.last_full_upgrade_applied.as_deref();
+    let attempted = os.last_full_upgrade_attempted.as_deref();
+    match (applied, attempted) {
+        _ if !os.log_read => reasons.push(unread(
+            os,
+            PACMAN_LOG,
+            "last upgrade unknown",
+            "last upgrade unknown",
+        )),
+        (None, None) => reasons.push(format!("no full system upgrade recorded in {PACMAN_LOG}")),
+        (None, Some(a)) => reasons.push(format!(
+            "no full system upgrade ever completed (last attempt {a})"
+        )),
+        (Some(date), _) => match (day_number(today), day_number(date)) {
             (Some(t), Some(d)) if t < d => reasons.push(format!(
                 "last full upgrade {date} is after today ({today}) — check the clock"
             )),
@@ -380,8 +515,16 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
             _ => reasons.push("age unknown: today's date is unreadable".to_string()),
         },
     }
+    if let (Some(done), Some(tried), false) = (applied, attempted, os.last_attempt_completed) {
+        reasons.push(format!(
+            "last upgrade attempt {tried} did not complete; last applied {done}"
+        ));
+    }
     let host_series = host.kernel.as_deref().and_then(kernel_series);
     match (newest_kernel(&os.kernels), host_series) {
+        (None, _) if !os.modules_read => {
+            reasons.push(unread(os, MODULES, "kernels unknown", "no kernel found"))
+        }
         (None, _) if os.kernels.is_empty() => reasons.push("no kernel found".to_string()),
         (None, _) => reasons.push(format!(
             "kernel version unknown ({})",
@@ -397,6 +540,14 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
                 ));
             }
         }
+    }
+    let progs = os.packages.get("btrfs-progs").map(String::as_str);
+    if btrfs_progs_older(progs, host.btrfs_progs.as_deref()) == Some(true) {
+        reasons.push(format!(
+            "btrfs-progs {} is older than the host's {}",
+            or_unknown(progs),
+            or_unknown(host.btrfs_progs.as_deref())
+        ));
     }
     Assessment {
         age_days,
@@ -532,13 +683,38 @@ fn package_text(os: &RecoveryOs, name: &str) -> String {
     }
 }
 
-/// `2026-03-14 (202 days ago)`, `… (age unknown)` or `unknown`.
+/// `2026-03-14 (202 days ago)`, `… (age unknown)`; with no applied upgrade,
+/// `none recorded` / `none completed` when the log was read, else `unknown`.
 fn upgrade_text(os: &RecoveryOs, a: &Assessment, ago: &str) -> String {
-    match (os.last_full_upgrade.as_deref(), a.age_days) {
+    match (os.last_full_upgrade_applied.as_deref(), a.age_days) {
         (Some(d), Some(n)) => format!("{d} ({}{ago})", days(n)),
         (Some(d), None) => format!("{d} (age unknown)"),
-        (None, _) => "unknown".to_string(),
+        (None, _) if !os.log_read => "unknown".to_string(),
+        (None, _) if os.last_full_upgrade_attempted.is_some() => "none completed".to_string(),
+        (None, _) => "none recorded".to_string(),
     }
+}
+
+/// The last attempt, when it is not the applied upgrade.
+fn failed_attempt(os: &RecoveryOs) -> Option<&str> {
+    (!os.last_attempt_completed)
+        .then_some(os.last_full_upgrade_attempted.as_deref())
+        .flatten()
+}
+
+/// `6.10-1 (host 7.1-1)`, with `; not compared` when both are known but are
+/// not dotted numerics.
+fn progs_text(os: &RecoveryOs, host: &HostVersions) -> String {
+    let progs = os.packages.get("btrfs-progs").map(String::as_str);
+    let host_progs = host.btrfs_progs.as_deref();
+    let not_compared =
+        progs.is_some() && host_progs.is_some() && btrfs_progs_older(progs, host_progs).is_none();
+    format!(
+        "{} (host {}{})",
+        package_text(os, "btrfs-progs"),
+        or_unknown(host_progs),
+        if not_compared { "; not compared" } else { "" }
+    )
 }
 
 fn verdict(a: &Assessment) -> String {
@@ -556,7 +732,6 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
         out.push_str("  no role = \"mirror\" targets configured\n");
     }
     let host_kernel = or_unknown(host.kernel.as_deref());
-    let host_progs = or_unknown(host.btrfs_progs.as_deref());
     for e in entries {
         let root = e.root.display();
         match &e.report {
@@ -571,11 +746,11 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                 out.push_str(&format!("  {}  ({root})\n", e.label));
                 out.push_str(&row("OS", or_unknown(os.os_name.as_deref())));
                 out.push_str(&row("Last full upgrade", &upgrade));
+                if let Some(tried) = failed_attempt(os) {
+                    out.push_str(&row("Last attempt", &format!("{tried} (did not complete)")));
+                }
                 out.push_str(&row("Kernel", &format!("{kernel} (host {host_kernel})")));
-                out.push_str(&row(
-                    "btrfs-progs",
-                    &format!("{} (host {host_progs})", package_text(os, "btrfs-progs")),
-                ));
+                out.push_str(&row("btrfs-progs", &progs_text(os, host)));
                 out.push_str(&row("btrbk", &package_text(os, "btrbk")));
                 out.push_str(&row(
                     "das-backup-manager",
@@ -635,7 +810,14 @@ pub fn load_state(path: &Path) -> Result<Option<StoredState>, String> {
 /// is — overwriting it would lose the other drive's last reading. Written
 /// atomically, mode 0644 (`health` runs unprivileged).
 pub fn write_state(path: &Path, entries: &[DriveEntry], now_epoch: i64) -> Result<(), String> {
-    let mut state = load_state(path)?.unwrap_or_default();
+    let mut state = load_state(path)
+        .map_err(|e| {
+            format!(
+                "{e} — left as it is; remove it to start over: rm -- '{}'",
+                path.display()
+            )
+        })?
+        .unwrap_or_default();
     state.schema_version = STATE_SCHEMA_VERSION;
     for e in entries {
         let record = match &e.report {
@@ -688,7 +870,12 @@ fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
     } else {
         "current".to_string()
     };
-    format!("{label} ({when}): last full upgrade {upgrade}, kernel {kernel} — {state}")
+    let unreadable = match os.problems.len() {
+        0 => String::new(),
+        1 => "; 1 path unreadable".to_string(),
+        n => format!("; {n} paths unreadable"),
+    };
+    format!("{label} ({when}): last full upgrade {upgrade}, kernel {kernel} — {state}{unreadable}")
 }
 
 /// Live readings for mounted mirror targets, the stored record for the rest.
@@ -881,11 +1068,17 @@ mod tests {
         write(
             root,
             "var/log/pacman.log",
-            "[2026-01-02T10:00:00+0100] [PACMAN] starting full system upgrade\n\
+            "[2026-01-02T10:00:00+0100] [PACMAN] Running 'pacman -Syu'\n\
+             [2026-01-02T10:00:01+0100] [PACMAN] starting full system upgrade\n\
+             [2026-01-02T10:01:00+0100] [ALPM] transaction started\n\
              [2026-01-02T10:01:00+0100] [ALPM] upgraded foo (1-1 -> 2-1)\n\
+             [2026-01-02T10:01:30+0100] [ALPM] transaction completed\n\
              [2026-03-14T09:30:12+0100] [PACMAN] Running 'pacman -Syu'\n\
              [2026-03-14T09:30:15+0100] [PACMAN] starting full system upgrade\n\
-             [2026-03-20T11:00:00+0100] [PACMAN] Running 'pacman -S vim'\n",
+             [2026-03-14T09:31:00+0100] [ALPM] transaction started\n\
+             [2026-03-14T09:32:00+0100] [ALPM] transaction completed\n\
+             [2026-03-20T11:00:00+0100] [PACMAN] Running 'pacman -S vim'\n\
+             [2026-03-20T11:00:05+0100] [ALPM] transaction completed\n",
         );
         add_pkg(root, "btrfs-progs-6.10-1", "btrfs-progs", "6.10-1");
         add_pkg(root, "btrbk-0.32.6-1", "btrbk", "0.32.6-1");
@@ -912,8 +1105,12 @@ mod tests {
     fn os_with(upgrade: Option<&str>, kernels: &[&str]) -> RecoveryOs {
         RecoveryOs {
             os_name: Some("CachyOS".into()),
-            last_full_upgrade: upgrade.map(String::from),
+            last_full_upgrade_applied: upgrade.map(String::from),
+            last_full_upgrade_attempted: upgrade.map(String::from),
+            last_attempt_completed: upgrade.is_some(),
+            log_read: true,
             kernels: kernels.iter().map(|k| k.to_string()).collect(),
+            modules_read: true,
             packages_read: true,
             ..Default::default()
         }
@@ -931,7 +1128,13 @@ mod tests {
         full_root(dir.path());
         let os = inspect(dir.path());
         assert_eq!(os.os_name.as_deref(), Some("CachyOS"));
-        assert_eq!(os.last_full_upgrade.as_deref(), Some("2026-03-14"));
+        assert_eq!(os.last_full_upgrade_applied.as_deref(), Some("2026-03-14"));
+        assert_eq!(
+            os.last_full_upgrade_attempted.as_deref(),
+            Some("2026-03-14")
+        );
+        assert!(os.last_attempt_completed);
+        assert!(os.log_read && os.modules_read);
         assert_eq!(os.kernels, ["6.12.1-1-cachyos", "6.6.5-2-cachyos-lts"]);
         assert!(os.packages_read);
         let want: BTreeMap<String, String> = [
@@ -989,7 +1192,7 @@ mod tests {
         let os = inspect(dir.path());
         assert!(os.problems.is_empty(), "{:?}", os.problems);
         assert_eq!(
-            os.last_full_upgrade.as_deref(),
+            os.last_full_upgrade_applied.as_deref(),
             Some("2026-03-14"),
             "it did read"
         );
@@ -1010,21 +1213,26 @@ mod tests {
     #[test]
     fn a_file_that_needs_an_atime_update_to_read_is_refused() {
         // Unprivileged, a file someone else owns cannot be opened O_NOATIME.
-        // /etc/os-release is root's; as root (CI containers) there is nothing
-        // to refuse, so the case does not arise.
+        // /usr/lib/os-release is a regular, root-owned file on every
+        // distribution this runs on (/etc/os-release is usually a link to it).
+        // As root, or as its owner, there is nothing to refuse.
         use std::os::unix::fs::MetadataExt;
-        let meta = fs::metadata("/etc/os-release").unwrap();
+        let Ok(meta) = fs::symlink_metadata("/usr/lib/os-release") else {
+            eprintln!("SKIPPED: no /usr/lib/os-release on this system");
+            return;
+        };
         // SAFETY: geteuid() is always safe.
-        if unsafe { libc::geteuid() } == 0 || meta.uid() == unsafe { libc::geteuid() } {
-            eprintln!("SKIPPED: running as root or as the file's owner");
+        let euid = unsafe { libc::geteuid() };
+        if !meta.is_file() || euid == 0 || meta.uid() == euid {
+            eprintln!("SKIPPED: not a regular file, or running as root or its owner");
             return;
         }
         assert_eq!(
-            read_in_root(Path::new("/"), "etc/os-release"),
-            Err(
-                "etc/os-release: cannot be read without updating its access time (run as root)"
+            read_in_root(Path::new("/"), "usr/lib/os-release"),
+            Err(ReadErr::Unreadable(
+                "usr/lib/os-release: cannot be read without updating its access time (run as root)"
                     .into()
-            )
+            ))
         );
         assert_eq!(
             open_error("x", &std::io::Error::from_raw_os_error(libc::ENOENT)),
@@ -1033,33 +1241,66 @@ mod tests {
     }
 
     #[test]
-    fn inspect_of_an_empty_root_is_unknown_everywhere_and_says_why() {
+    fn inspect_of_an_empty_root_is_absent_everywhere_and_unreadable_nowhere() {
         let dir = tempfile::tempdir().unwrap();
         let os = inspect(dir.path());
         assert_eq!(os.os_name, None);
-        assert_eq!(os.last_full_upgrade, None);
+        assert_eq!(os.last_full_upgrade_applied, None);
+        assert_eq!(os.last_full_upgrade_attempted, None);
         assert!(os.kernels.is_empty());
         assert!(os.packages.is_empty());
+        assert!(!os.log_read && !os.modules_read);
         assert!(
             !os.packages_read,
             "an unread database is not 'nothing installed'"
         );
-        for rel in [
-            "etc/os-release",
-            "usr/lib/os-release",
-            "usr/lib/modules",
-            "var/log/pacman.log",
-            "var/lib/pacman/local",
-        ] {
-            assert!(
-                os.problems
-                    .iter()
-                    .any(|p| p.starts_with(&format!("{rel}: "))),
-                "{rel} missing from {:?}",
-                os.problems
-            );
-        }
-        assert_eq!(os.problems.len(), 5, "{:?}", os.problems);
+        assert!(
+            os.problems.is_empty(),
+            "absent is not unreadable: {:?}",
+            os.problems
+        );
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert_eq!(
+            a.reasons,
+            [
+                "last upgrade unknown: var/log/pacman.log is absent",
+                "no kernel found: usr/lib/modules is absent"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_item_is_reported_as_unreadable_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        // A directory where the log should be, a file where the modules are.
+        fs::remove_file(dir.path().join("var/log/pacman.log")).unwrap();
+        fs::create_dir(dir.path().join("var/log/pacman.log")).unwrap();
+        fs::remove_dir_all(dir.path().join("usr/lib/modules")).unwrap();
+        write(dir.path(), "usr/lib/modules", "not a directory");
+        let os = inspect(dir.path());
+        assert!(!os.log_read && !os.modules_read);
+        assert!(
+            os.problems
+                .contains(&"var/log/pacman.log: not a regular file".to_string()),
+            "{:?}",
+            os.problems
+        );
+        let modules_problem = os
+            .problems
+            .iter()
+            .find(|p| p.starts_with("usr/lib/modules: "))
+            .expect("modules problem")
+            .clone();
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert_eq!(
+            a.reasons[..2],
+            [
+                "last upgrade unknown: could not read var/log/pacman.log: not a regular file"
+                    .to_string(),
+                format!("kernels unknown: could not read {modules_problem}"),
+            ]
+        );
     }
 
     #[test]
@@ -1072,24 +1313,162 @@ mod tests {
             "[2026-03-14T09:30:12+0100] [PACMAN] Running 'pacman -S vim'\n",
         );
         let os = inspect(dir.path());
-        assert_eq!(os.last_full_upgrade, None);
+        assert_eq!(os.last_full_upgrade_applied, None);
+        assert_eq!(os.last_full_upgrade_attempted, None);
+        assert!(os.log_read);
         assert!(os.problems.is_empty(), "{:?}", os.problems);
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert_eq!(
+            a.reasons[0],
+            "no full system upgrade recorded in var/log/pacman.log"
+        );
+    }
+
+    fn upgrades(log: &str) -> RecoveryOs {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        write(dir.path(), "var/log/pacman.log", log);
+        inspect(dir.path())
+    }
+
+    #[test]
+    fn only_an_upgrade_whose_transaction_completed_counts_as_applied() {
+        // Applied, then a later attempt that never completed (a keyring
+        // failure, or answered "n").
+        let os = upgrades(
+            "[2026-03-14T09:30:12+0100] [PACMAN] Running 'pacman -Syu'\n\
+             [2026-03-14T09:30:15+0100] [PACMAN] starting full system upgrade\n\
+             [2026-03-14T09:31:00+0100] [ALPM] transaction started\n\
+             [2026-03-14T09:32:00+0100] [ALPM] transaction completed\n\
+             [2026-10-01T08:00:00+0200] [PACMAN] Running 'pacman -Syu'\n\
+             [2026-10-01T08:00:02+0200] [PACMAN] starting full system upgrade\n\
+             [2026-10-01T08:00:09+0200] [PACMAN] error: archlinux-keyring: signature is unknown trust\n",
+        );
+        assert_eq!(os.last_full_upgrade_applied.as_deref(), Some("2026-03-14"));
+        assert_eq!(
+            os.last_full_upgrade_attempted.as_deref(),
+            Some("2026-10-01")
+        );
+        assert!(!os.last_attempt_completed);
+
+        // Started but never completed: not applied.
+        let os = upgrades(
+            "[2026-03-14T09:30:15+0100] [PACMAN] starting full system upgrade\n\
+             [2026-03-14T09:31:00+0100] [ALPM] transaction started\n\
+             [2026-03-14T09:31:05+0100] [ALPM] upgraded foo (1-1 -> 2-1)\n",
+        );
+        assert_eq!(os.last_full_upgrade_applied, None);
+        assert_eq!(
+            os.last_full_upgrade_attempted.as_deref(),
+            Some("2026-03-14")
+        );
+
+        // A completion that belongs to a later invocation is not this one's.
+        let os = upgrades(
+            "[2026-03-14T09:30:15+0100] [PACMAN] starting full system upgrade\n\
+             [2026-03-14T09:40:00+0100] [PACMAN] Running 'pacman -S vim'\n\
+             [2026-03-14T09:40:05+0100] [ALPM] transaction completed\n",
+        );
+        assert_eq!(os.last_full_upgrade_applied, None);
+
+        // An undatable marker closes the window: a completion after it is not
+        // credited to the earlier marker.
+        let os = upgrades(
+            "[2026-03-14T09:30:15+0100] [PACMAN] starting full system upgrade\n\
+             [not-a-date] [PACMAN] starting full system upgrade\n\
+             [2026-03-14T09:40:05+0100] [ALPM] transaction completed\n",
+        );
+        assert_eq!(os.last_full_upgrade_applied, None);
+        assert_eq!(
+            os.last_full_upgrade_attempted.as_deref(),
+            Some("2026-03-14")
+        );
+    }
+
+    #[test]
+    fn a_failed_last_attempt_is_stale_and_says_both_dates() {
+        let mut os = os_with(Some(&days_before(TODAY, 3)), &["7.2.1"]);
+        os.last_full_upgrade_attempted = Some(TODAY.to_string());
+        os.last_attempt_completed = false;
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert!(a.stale);
+        assert_eq!(a.age_days, Some(3), "the age is the applied upgrade's");
+        assert_eq!(
+            a.reasons,
+            ["last upgrade attempt 2026-10-02 did not complete; last applied 2026-09-29"]
+        );
+        let mut never = os_with(None, &["7.2.1"]);
+        never.last_full_upgrade_attempted = Some("2026-10-01".into());
+        let a = assess(&never, &host("7.2.8"), TODAY, 60);
+        assert_eq!(a.age_days, None);
+        assert_eq!(
+            a.reasons,
+            ["no full system upgrade ever completed (last attempt 2026-10-01)"]
+        );
+    }
+
+    #[test]
+    fn btrfs_progs_older_than_the_host_is_stale_when_both_versions_are_numeric() {
+        let up = days_before(TODAY, 1);
+        let with = |v: &str, h: &str| {
+            let mut os = os_with(Some(&up), &["7.2.1"]);
+            os.packages.insert("btrfs-progs".into(), v.into());
+            let host = HostVersions {
+                kernel: Some("7.2.8".into()),
+                btrfs_progs: Some(h.into()),
+            };
+            assess(&os, &host, TODAY, 60)
+        };
+        assert_eq!(
+            with("6.10-1", "7.1-1").reasons,
+            ["btrfs-progs 6.10-1 is older than the host's 7.1-1"]
+        );
+        assert_eq!(with("6.10-1", "6.10.1-1").reasons.len(), 1, "6.10 < 6.10.1");
+        assert!(
+            with("7.1-1", "7.1-2").reasons.is_empty(),
+            "pkgrel is not compared"
+        );
+        assert!(with("7.2-1", "7.1-1").reasons.is_empty(), "newer is fine");
+        assert!(with("6.10.1-1", "6.10-1").reasons.is_empty());
+        assert!(
+            with("6.10.r3.gabc-1", "7.1-1").reasons.is_empty(),
+            "no verdict"
+        );
+        assert!(
+            with("1:6.0-1", "7.1-1").reasons.is_empty(),
+            "an epoch: no verdict"
+        );
+        assert!(with("6.10-1", "garbage").reasons.is_empty());
+        // Not installed or unknown: no verdict from this check.
+        let os = os_with(Some(&up), &["7.2.1"]);
+        assert!(assess(&os, &host("7.2.8"), TODAY, 60).reasons.is_empty());
+        assert_eq!(btrfs_progs_older(Some("6.10-1"), Some("7.1-1")), Some(true));
+        assert_eq!(btrfs_progs_older(Some("7.1-1"), Some("7.1-1")), Some(false));
+        assert_eq!(btrfs_progs_older(Some("x-1"), Some("7.1-1")), None);
+        assert_eq!(btrfs_progs_older(None, Some("7.1-1")), None);
+        assert_eq!(btrfs_progs_older(Some("7.1-1"), None), None);
     }
 
     #[test]
     fn the_old_log_date_format_and_stray_bytes_are_read() {
         let dir = tempfile::tempdir().unwrap();
         full_root(dir.path());
-        let mut bytes = b"[2019-05-01 10:22] [PACMAN] starting full system upgrade\n".to_vec();
+        let mut bytes = b"[2019-05-01 10:22] [PACMAN] starting full system upgrade\n\
+                              [2019-05-01 10:25] [ALPM] transaction completed\n"
+            .to_vec();
         bytes.extend_from_slice(
             b"\xff\xfe garbage\n[not-a-date] [PACMAN] starting full system upgrade\n",
         );
         fs::write(dir.path().join("var/log/pacman.log"), bytes).unwrap();
         let os = inspect(dir.path());
         assert_eq!(
-            os.last_full_upgrade.as_deref(),
+            os.last_full_upgrade_applied.as_deref(),
             Some("2019-05-01"),
             "an unparsable date is skipped, not taken"
+        );
+        assert_eq!(
+            os.last_full_upgrade_attempted.as_deref(),
+            Some("2019-05-01")
         );
     }
 
@@ -1141,7 +1520,7 @@ mod tests {
         )
         .unwrap();
         let os = inspect(dir.path());
-        assert_eq!(os.last_full_upgrade, None);
+        assert_eq!(os.last_full_upgrade_applied, None);
         let var_log = dir.path().join("var/log");
         assert!(
             os.problems.contains(&format!(
@@ -1154,11 +1533,15 @@ mod tests {
         assert_eq!(os.kernels, ["6.12.1-1-cachyos", "6.6.5-2-cachyos-lts"]);
         assert_eq!(
             resolve_in_root(dir.path(), "../etc/passwd"),
-            Err("../etc/passwd: not a plain relative path".into())
+            Err(ReadErr::Unreadable(
+                "../etc/passwd: not a plain relative path".into()
+            ))
         );
         assert_eq!(
             resolve_in_root(dir.path(), "/etc/passwd"),
-            Err("/etc/passwd: not a plain relative path".into())
+            Err(ReadErr::Unreadable(
+                "/etc/passwd: not a plain relative path".into()
+            ))
         );
         assert_eq!(
             resolve_in_root(dir.path(), "usr/lib"),
@@ -1242,7 +1625,10 @@ mod tests {
             .open(&log)
             .unwrap();
         writer.join().unwrap();
-        assert_eq!(os.last_full_upgrade, None, "the FIFO must not be read");
+        assert_eq!(
+            os.last_full_upgrade_attempted, None,
+            "the FIFO must not be read"
+        );
         assert!(
             os.problems
                 .iter()
@@ -1423,7 +1809,10 @@ mod tests {
         let a = assess(&os_with(None, &["7.2.1"]), &h, TODAY, 60);
         assert!(a.stale);
         assert_eq!(a.age_days, None, "no fabricated age");
-        assert_eq!(a.reasons, ["last upgrade unknown"]);
+        assert_eq!(
+            a.reasons,
+            ["no full system upgrade recorded in var/log/pacman.log"]
+        );
 
         let up = days_before(TODAY, 1);
         let a = assess(&os_with(Some(&up), &[]), &h, TODAY, 60);
@@ -1535,7 +1924,7 @@ mod tests {
         assert_eq!(labels, ["A", "B", "C"], "the primary is not a recovery OS");
         match &entries[0].report {
             DriveReport::Inspected { os, assessment } => {
-                assert_eq!(os.last_full_upgrade.as_deref(), Some("2026-03-14"));
+                assert_eq!(os.last_full_upgrade_applied.as_deref(), Some("2026-03-14"));
                 assert_eq!(assessment.age_days, Some(202));
                 assert!(assessment.stale);
             }
@@ -1596,13 +1985,15 @@ mod tests {
              \x20   btrbk               0.32.6-1\n\
              \x20   das-backup-manager  not installed\n\
              \x20   Result              STALE — last full upgrade 202 days ago (limit 60); \
-             kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2\n"
+             kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2; \
+             btrfs-progs 6.10-1 is older than the host's 6.17-1\n"
         );
         assert_eq!(text, want);
     }
 
     #[test]
-    fn the_section_says_unknown_never_blank_and_lists_what_it_could_not_read() {
+    fn the_section_says_unknown_never_blank_and_tells_absent_from_unreadable() {
+        // Absent: nothing there at all.
         let dir = tempfile::tempdir().unwrap();
         let e = inspect_drive("B", dir.path(), &HostVersions::default(), TODAY, 60);
         let text = format_section(&[e], &HostVersions::default());
@@ -1613,13 +2004,97 @@ mod tests {
             "    btrfs-progs         unknown (host unknown)\n",
             "    btrbk               unknown\n",
             "    das-backup-manager  unknown\n",
-            "    Could not read      etc/os-release: ",
-            "    Could not read      var/log/pacman.log: ",
-            "    Result              STALE — last upgrade unknown; no kernel found\n",
+            "    Result              STALE — last upgrade unknown: var/log/pacman.log is absent; \
+             no kernel found: usr/lib/modules is absent\n",
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
+        assert!(!text.contains("Could not read"), "{text}");
         assert!(!text.contains(" 0 days"), "{text}");
+
+        // Unreadable: there, but it could not be read — said as such.
+        full_root(dir.path());
+        fs::remove_file(dir.path().join("var/log/pacman.log")).unwrap();
+        fs::create_dir(dir.path().join("var/log/pacman.log")).unwrap();
+        let e = inspect_drive("B", dir.path(), &host("6.12.9"), TODAY, 60);
+        let text = format_section(&[e], &host("6.12.9"));
+        for line in [
+            "    Last full upgrade   unknown\n",
+            "    Could not read      var/log/pacman.log: not a regular file\n",
+            "    Result              STALE — last upgrade unknown: could not read \
+             var/log/pacman.log: not a regular file",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_section_shows_a_failed_last_attempt_beside_the_applied_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        let log = fs::read_to_string(dir.path().join("var/log/pacman.log")).unwrap();
+        write(
+            dir.path(),
+            "var/log/pacman.log",
+            &format!("{log}[2026-10-01T08:00:02+0200] [PACMAN] starting full system upgrade\n"),
+        );
+        let h = host("6.12.9");
+        let text = format_section(&[inspect_drive("A", dir.path(), &h, TODAY, 60)], &h);
+        assert!(
+            text.contains("    Last full upgrade   2026-03-14 (202 days ago)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    Last attempt        2026-10-01 (did not complete)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "last upgrade attempt 2026-10-01 did not complete; last applied 2026-03-14"
+            ),
+            "{text}"
+        );
+        // No such row when the last attempt completed.
+        let done = tempfile::tempdir().unwrap();
+        full_root(done.path());
+        let text = format_section(&[inspect_drive("A", done.path(), &h, TODAY, 60)], &h);
+        assert!(!text.contains("Last attempt"), "{text}");
+    }
+
+    #[test]
+    fn the_upgrade_row_says_none_recorded_none_completed_or_unknown() {
+        let h = host("7.2.8");
+        let row = |os: &RecoveryOs| {
+            let a = assess(os, &h, TODAY, 60);
+            upgrade_text(os, &a, " ago")
+        };
+        let mut os = os_with(None, &["7.2.1"]);
+        os.last_attempt_completed = false;
+        assert_eq!(row(&os), "none recorded", "log read, no upgrade in it");
+        os.last_full_upgrade_attempted = Some("2026-10-01".into());
+        assert_eq!(row(&os), "none completed", "log read, attempts only");
+        os.log_read = false;
+        assert_eq!(row(&os), "unknown", "log not read");
+        os.last_full_upgrade_attempted = None;
+        assert_eq!(row(&os), "unknown");
+    }
+
+    #[test]
+    fn a_btrfs_progs_pair_that_cannot_be_compared_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        add_pkg(
+            dir.path(),
+            "btrfs-progs-6.10-1",
+            "btrfs-progs",
+            "6.10.r3.gabc-1",
+        );
+        let h = host("6.12.9");
+        let text = format_section(&[inspect_drive("A", dir.path(), &h, TODAY, 60)], &h);
+        assert!(
+            text.contains("    btrfs-progs         6.10.r3.gabc-1 (host 6.17-1; not compared)\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1630,10 +2105,12 @@ mod tests {
             dir.path(),
             "var/log/pacman.log",
             &format!(
-                "[{}T01:00:00+0000] [PACMAN] starting full system upgrade\n",
-                days_before(TODAY, 1)
+                "[{d}T01:00:00+0000] [PACMAN] starting full system upgrade\n\
+                 [{d}T01:05:00+0000] [ALPM] transaction completed\n",
+                d = days_before(TODAY, 1)
             ),
         );
+        add_pkg(dir.path(), "btrfs-progs-6.10-1", "btrfs-progs", "6.17-1");
         let h = host("6.12.3-1-cachyos");
         let current = inspect_drive("A", dir.path(), &h, TODAY, 60);
         let off = DriveEntry {
@@ -1749,7 +2226,15 @@ mod tests {
             root: PathBuf::new(),
             report: DriveReport::NotMounted,
         };
-        assert!(write_state(&path, &[e], 5).is_err());
+        let err = write_state(&path, &[e], 5).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "remove it to start over: rm -- '{}'",
+                path.display()
+            )),
+            "{err}"
+        );
+        assert!(!err.contains('\n'), "one line, for the run report: {err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
         let as_dir = dir.path().join("d");
         fs::create_dir(&as_dir).unwrap();
@@ -1797,7 +2282,8 @@ mod tests {
             [
                 "A (live): last full upgrade 2026-03-14 (202 days), kernel 6.12.1-1-cachyos — \
                  STALE: last full upgrade 202 days ago (limit 60); kernel series 6.12 \
-                 (6.12.1-1-cachyos) is behind the host's 7.2",
+                 (6.12.1-1-cachyos) is behind the host's 7.2; btrfs-progs 6.10-1 is older \
+                 than the host's 6.17-1",
                 "B (as of 2026-10-01 03:20 UTC): last full upgrade 2026-09-30 (2 days), kernel 7.2.1 — current",
                 "C (as of 2026-10-01 03:20 UTC): OS root unreadable: not a directory",
                 "D: not mounted and never checked",
@@ -1807,7 +2293,8 @@ mod tests {
             h.warnings,
             [
                 "Recovery OS on 'A' is STALE: last full upgrade 202 days ago (limit 60); \
-                 kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2",
+                 kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2; \
+                 btrfs-progs 6.10-1 is older than the host's 6.17-1",
                 "Recovery OS on 'C' could not be read: not a directory",
                 "Recovery OS on 'D' has never been checked",
             ]
@@ -1857,6 +2344,41 @@ mod tests {
             health_with(&none, &Ok(None), &|| host("7.2.8"), TODAY, &|_| false),
             RecoveryHealth::default()
         );
+    }
+
+    #[test]
+    fn the_health_line_counts_what_could_not_be_read() {
+        let cfg = mirror_config(&[("B", "/nonexistent/b")]);
+        let mut os = os_with(Some(TODAY), &["7.2.1"]);
+        os.problems = vec!["var/log/x: denied".into(), "usr/lib/y: denied".into()];
+        let mut drives = BTreeMap::new();
+        drives.insert(
+            "B".into(),
+            StoredDrive {
+                checked_epoch: 0,
+                os: Some(os.clone()),
+                error: None,
+            },
+        );
+        let state = Ok(Some(StoredState {
+            schema_version: 1,
+            drives,
+        }));
+        let h = health_with(&cfg, &state, &|| host("7.2.8"), TODAY, &|_| false);
+        assert_eq!(
+            h.lines,
+            [
+                "B (as of 1970-01-01 00:00 UTC): last full upgrade 2026-10-02 (0 days), kernel 7.2.1 \
+              — current; 2 paths unreadable"
+            ]
+        );
+        os.problems.truncate(1);
+        assert!(
+            summary("B", "live", &os, &Assessment::default())
+                .ends_with("— current; 1 path unreadable")
+        );
+        os.problems.clear();
+        assert!(summary("B", "live", &os, &Assessment::default()).ends_with("— current"));
     }
 
     #[test]
@@ -1968,7 +2490,7 @@ mod tests {
         assert_eq!(j["label"], "A");
         assert_eq!(j["root"], dir.path().to_str().unwrap());
         assert_eq!(j["status"], "stale");
-        assert_eq!(j["os"]["last_full_upgrade"], "2026-03-14");
+        assert_eq!(j["os"]["last_full_upgrade_applied"], "2026-03-14");
         assert_eq!(j["assessment"]["age_days"], 202);
         assert_eq!(j["error"], serde_json::Value::Null);
 
