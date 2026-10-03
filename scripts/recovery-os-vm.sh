@@ -22,14 +22,24 @@
 #          device or by UUID, in any mount namespace -- while qemu's own
 #          non-exclusive open still works (proven on a test VM, bd
 #          DAS-Backup-Manager-frb). The holder runs in a session of its own
-#          and inherits the lock's descriptor, so the claim AND the lock
-#          outlive this script if it is killed while the VM still runs.
-#   - Only a role = "mirror" target, found by the serial config.toml gives
-#     it, read back from the disk itself. A serial that also belongs to a
-#     role = "primary" target is refused, whatever the mirror entry says.
-#   - SATA, not virtio: the recovery OS's initramfs was built on hardware
-#     with AHCI SATA and almost certainly lacks virtio drivers. On SATA its
-#     default boot entry finds its root without anyone touching a boot menu.
+#          (setsid: no Ctrl-C or hangup reaches it) and in a scope of its own
+#          (systemd-run --scope, outside the operator's login session, so
+#          ending that session or its user manager does not end it), and it
+#          inherits the lock's descriptor: the claim AND the lock outlive this
+#          script if it is killed while the VM still runs. The lock's record
+#          names the holder, which is what holds it. A holder that dies while
+#          the VM runs is replaced at the next check.
+#   - Only a role = "mirror" target: found by the serial config.toml gives
+#     it, the serial read back from the disk, and partition 2 carrying the
+#     filesystem config mounts that target by (mount_uuid). A serial that also
+#     belongs to a role = "primary" target is refused, whatever the mirror
+#     entry says.
+#   - SATA, not virtio: the recovery OS's initramfs almost certainly lacks
+#     virtio drivers. Its default image boots on SATA only if it was built
+#     with ahci (installed on a machine with an AHCI controller); one built
+#     with the drive already in the USB enclosure may lack it, and the first
+#     boot in the VM then needs the fallback entry -- the documented path,
+#     not a defect.
 #   - This script never destroys a running recovery OS -- it could be in the
 #     middle of an update. An interrupt or an expired --timeout leaves the
 #     VM, the claim and the lock as they are and says how to finish.
@@ -54,18 +64,22 @@
 #      a shutdown): the claim and the lock are KEPT; finish with session-end
 #   4  the disk could not be returned completely (a detach, or the holder's
 #      exit, failed): the claim and the lock are KEPT; finish with session-end
+#   5  the session ended and the disk was given back, but something needs a
+#      look (see the summary): the drive re-enumerated during the session, a
+#      partition was mounted afterwards, or the device scan failed
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
 # Test seams -- tests/test_recovery_os_vm.sh. Never set them in real use:
 #   DAS_RECOVERY_VM_TEST_ROOT   prefix for every host path this script reads
-#                               or writes (/run, /dev/disk/by-id, firmware,
-#                               NVRAM). With it set, the lock taken is NOT the
-#                               one backups and scrubs take; it is announced.
-#   DAS_RECOVERY_VM_TEST_LOOP   a loop device (major 7, checked with stat) to
-#                               lend instead of the drive. Only with a full
-#                               target label; it replaces the serial lookup
-#                               and nothing else.
+#                               or writes (/run, /dev/disk/by-id, /sys,
+#                               firmware). With it set, the lock taken is NOT
+#                               the one backups and scrubs take; it is announced.
+#   DAS_RECOVERY_VM_TEST_LOOP   a loop device (major 7, checked with stat)
+#                               backed by a regular file, to lend instead of the
+#                               drive. Only with a full target label; it
+#                               replaces the drive's identity checks (serial,
+#                               filesystem UUID) and nothing else.
 #   DAS_RECOVERY_VM_POLL_SECS (5), DAS_RECOVERY_VM_MINUTE_SECS (60),
 #   DAS_RECOVERY_VM_GRACE_SECS (600)   faster clocks
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
@@ -74,6 +88,8 @@ set -euo pipefail
 # No job control: the holder must start in this process group, so that
 # `setsid` gives it a session of its own without forking a second time.
 set +m
+# The holder's transient scope: <prefix>-<label>, -<n> for a replacement.
+readonly HOLDER_UNIT_PREFIX="das-recovery-os-holder"
 
 readonly DOMAIN="recovery-os-updater"
 readonly LIBVIRT_URI="qemu:///system"
@@ -101,6 +117,7 @@ readonly DOMAIN_XML="$SCRIPT_DIR/libvirt/$DOMAIN.xml"
 readonly MAINTENANCE_LOCK="$TEST_ROOT/run/das-maintenance.lock"
 readonly STATE_DIR="$TEST_ROOT/run/das-recovery-os-vm"
 readonly BY_ID="$TEST_ROOT/dev/disk/by-id"
+readonly SYS_BLOCK="$TEST_ROOT/sys/block"
 
 # How long the holder has to announce its claim (a spun-down disk may take
 # seconds to open), and to exit after SIGTERM. In tenths of a second.
@@ -110,7 +127,6 @@ readonly HOLDER_STOP_TICKS=100
 # Patterns, kept in variables so that =~ treats them as regular expressions.
 readonly NAME_RE="<name>([^<]+)</name>"
 readonly LOADER_RE="<loader [^>]*>([^<]+)</loader>"
-readonly NVRAM_RE="<nvram [^>]*>([^<]+)</nvram>"
 readonly TEMPLATE_RE="<nvram template='([^']+)'"
 readonly SOURCE_RE="<source (dev|file)='([^']*)'"
 readonly HELD_RE="^held (.+) pid ([0-9]+)$"
@@ -123,7 +139,7 @@ LABEL_EXPLICIT=false # given in full, not as a one-letter shorthand
 SERIAL=""
 DISK=""             # the whole-disk path lent to the VM (by-id, or the test loop)
 DISK_DEV=""         # what it resolved to (/dev/sdX) when the session began
-HOLDER_FILE=""      # record: holder pid, then the disk path
+HOLDER_FILE=""      # record: holder pid, the disk path, the holder's scope
 HOLDER_OUT=""       # the holder's stdout (its one `held` line)
 HOLDER_ERR=""       # the holder's stderr
 DISK_XML_FILE=""
@@ -133,6 +149,9 @@ HOLDER_STARTING=false
 HOLDER_SIGNALLED=false # stop_holder found it running and sent SIGTERM
 HOLDER_FAILURE=""   # why start_holder failed
 HOLDER_LOSSES=0     # holders that died while the VM may have used the disk
+HOLDER_STARTS=0     # holders started this session (names their scopes)
+HOLDER_UNIT=""      # the current holder's scope unit
+REENUMERATED=false  # the by-id link led elsewhere during the session
 ATTACHED=false      # the disk MAY be in the domain's definition (set before attaching)
 STARTED=false       # `virsh start` was attempted, so the guest may have written
 DONE=false          # nothing left for the trap to undo
@@ -185,8 +204,8 @@ whole disk passed through, to update it without rebooting the workstation.
 
 Exit status: 0 done; 1 refused, failed or interrupted, nothing held;
 2 usage; 3 the recovery OS is still running and keeps the disk and the lock;
-4 the disk could not be returned completely and is kept. Finish 3 and 4 with
-session-end.
+4 the disk could not be returned completely and is kept (finish 3 and 4 with
+session-end); 5 done and given back, but see the summary's warnings.
 EOF
 }
 
@@ -302,17 +321,20 @@ partition_path() {
     fi
 }
 
-# The holder record: line 1 the pid, line 2 the disk.
+# The holder record: line 1 the pid, line 2 the disk, line 3 the holder's
+# scope unit (absent in a record of a holder started some other way).
 read_record() {
     REC_PID=""
     REC_DEV=""
+    REC_UNIT=""
     { IFS= read -r REC_PID && IFS= read -r REC_DEV; } <"$1" 2>/dev/null || return 1
+    { IFS= read -r _ && IFS= read -r _ && IFS= read -r REC_UNIT; } <"$1" 2>/dev/null || REC_UNIT=""
     [[ "$REC_PID" =~ ^[0-9]+$ && -n "$REC_DEV" ]]
 }
 
 write_record() {
     local tmp="$HOLDER_FILE.tmp"
-    (umask 077 && printf '%s\n%s\n' "$1" "$DISK" >"$tmp")
+    (umask 077 && printf '%s\n%s\n%s\n' "$1" "$DISK" "$HOLDER_UNIT" >"$tmp")
     mv -f -- "$tmp" "$HOLDER_FILE"
 }
 
@@ -375,7 +397,7 @@ EOF
 
 # The targets from config.toml, through the same export backup-run.sh uses.
 load_targets() {
-    local env_text i label_var role_var serials_var serial_var label
+    local env_text i label_var role_var serials_var serial_var uuid_var label
     if ! env_text="$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"; then
         refuse "btrdasd could not read $DAS_CONFIG"
     fi
@@ -383,15 +405,18 @@ load_targets() {
     TARGET_LABELS=()
     declare -gA T_ROLE=()
     declare -gA T_SERIALS=()
+    declare -gA T_UUIDS=()
     for ((i = 0; i < DAS_TARGET_COUNT; i++)); do
         label_var="DAS_TARGET_${i}_LABEL"
         role_var="DAS_TARGET_${i}_ROLE"
         serials_var="DAS_TARGET_${i}_SERIALS"
         serial_var="DAS_TARGET_${i}_SERIAL"
+        uuid_var="DAS_TARGET_${i}_MOUNT_UUID"
         label="${!label_var}"
         TARGET_LABELS+=("$label")
         T_ROLE[$label]="${!role_var:-}"
         T_SERIALS[$label]="${!serials_var:-${!serial_var:-}}"
+        T_UUIDS[$label]="${!uuid_var:-}"
     done
 }
 
@@ -459,7 +484,7 @@ require_attachable_serial() {
 }
 
 resolve_test_loop() {
-    local kind out
+    local kind out backing_file backing
     if [[ "$LABEL_EXPLICIT" != true ]]; then
         refuse "DAS_RECOVERY_VM_TEST_LOOP needs the target's full label, not a shorthand"
     fi
@@ -473,6 +498,15 @@ resolve_test_loop() {
     out="$(lsblk -dnr -o TYPE -- "$DISK_DEV" 2>&1)" || refuse "lsblk cannot read $DISK_DEV: $out"
     if [[ "$out" != loop ]]; then
         refuse "$DISK_DEV is a '$out', not a whole loop device"
+    fi
+    # A loop over a real drive would be that drive under another name.
+    backing_file="$SYS_BLOCK/$(basename -- "$DISK_DEV")/loop/backing_file"
+    backing="$(head -n 1 -- "$backing_file" 2>/dev/null)" || backing=""
+    if [[ -z "$backing" ]]; then
+        refuse "$DISK_DEV has no backing file ($backing_file) -- the test hatch takes a loop over a regular file only"
+    fi
+    if [[ ! -f "$backing" ]]; then
+        refuse "$DISK_DEV is backed by $backing, not a regular file -- the test hatch takes a loop over a regular file only"
     fi
     warn "TEST HATCH (DAS_RECOVERY_VM_TEST_LOOP): lending $DISK instead of $LABEL's drive"
 }
@@ -511,6 +545,23 @@ resolve_disk() {
     fi
     if [[ "$serial" != "$SERIAL" ]]; then
         refuse "$DISK_DEV reports serial '${serial:-none}', not $SERIAL -- the by-id link does not lead to $LABEL's drive"
+    fi
+    check_filesystem_identity
+}
+
+# Partition 2 must carry the filesystem config mounts this target by: a
+# serial can be copied into the wrong entry by hand, a filesystem UUID read
+# off the disk cannot.
+check_filesystem_identity() {
+    local want=${T_UUIDS[$LABEL]} part part_dev got
+    if [[ -z "$want" ]]; then
+        refuse "'$LABEL' has no mount_uuid in $DAS_CONFIG, so the filesystem on its drive cannot be checked -- add it (sudo btrdasd setup --check prints the line to add)"
+    fi
+    part="$(partition_path "$DISK" 2)"
+    part_dev="$(readlink -f -- "$part")" || refuse "cannot resolve $part"
+    got="$(lsblk -nr -o UUID -- "$part_dev" 2>&1)" || refuse "lsblk cannot read $part_dev: $got"
+    if [[ "$got" != "$want" ]]; then
+        refuse "partition 2 of $DISK ($part_dev) carries filesystem ${got:-none}, not $want, the mount_uuid of '$LABEL' -- this is not $LABEL's drive"
     fi
 }
 
@@ -589,13 +640,19 @@ take_lock() {
         LOCK_FD=""
         refuse "the DAS maintenance lock $MAINTENANCE_LOCK is held by: ${holder:-(no holder line)} -- try again when it is free"
     fi
-    # One line naming the holder, as every holder of this lock writes it
-    # (indexer/src/maintenance.rs); a refused job prints it. Display only: a
-    # record that cannot be written costs the name, never the lock.
-    if ! printf 'recovery-os VM session %s pid %s\n' "$LABEL" "$$" >"$MAINTENANCE_LOCK"; then
-        warn "could not record this session as the holder of $MAINTENANCE_LOCK"
-    fi
+    write_lock_record "$$"
     log "took the DAS maintenance lock $MAINTENANCE_LOCK: backups and scrubs now wait for this session"
+}
+
+# The lock's record: one line naming the session and the process that holds
+# the lock (pid $1), as every holder of this lock writes it
+# (indexer/src/maintenance.rs); a refused job prints it. Only while the lock
+# is provably this session's. Display only: a record that cannot be written
+# costs the name, never the lock.
+write_lock_record() {
+    if ! printf 'recovery-os VM session %s pid %s\n' "$LABEL" "$1" >"$MAINTENANCE_LOCK"; then
+        warn "could not record pid $1 as the holder of $MAINTENANCE_LOCK"
+    fi
 }
 
 # Empty the lock's holder record. Only while the lock is provably this
@@ -618,41 +675,64 @@ release_lock() {
     fi
 }
 
-# Start the holder. 0 once it has announced its claim; 1 with HOLDER_FAILURE
-# set when it has not -- then nothing of it is left running, unless it will
-# not even stop (HOLDER_PID still set).
+# Start the holder. 0 once it has announced its claim -- HOLDER_PID is then
+# the pid its held line names; 1 with HOLDER_FAILURE set when it has not --
+# then nothing of it is left running, unless it will not even stop
+# (HOLDER_PID still set).
 start_holder() {
-    local i line="" why rc=0
+    local i line="" why rc=0 started held_pid="" unit
+    unit="$HOLDER_UNIT_PREFIX-$LABEL"
+    HOLDER_STARTS=$((HOLDER_STARTS + 1))
+    if ((HOLDER_STARTS > 1)); then
+        # A replacement: the scope of the holder it replaces may linger a moment.
+        unit+="-$HOLDER_STARTS"
+    fi
+    HOLDER_UNIT="$unit.scope"
     (umask 077 && : >"$HOLDER_OUT" && : >"$HOLDER_ERR")
     HOLDER_STARTING=true
-    # A session of its own: Ctrl-C or a hangup in this terminal must not end
-    # the claim. It inherits LOCK_FD on purpose: the lock lives as long as
-    # the claim does. Started in /, so a long-lived holder pins no
-    # directory this script was run from.
-    (cd / && exec setsid "$BTRDASD_BIN" recovery-os hold-disk --device "$DISK") \
+    # A session of its own (setsid): Ctrl-C or a hangup in this terminal must
+    # not end the claim. A scope of its own (systemd-run --scope, in
+    # system.slice): ending the operator's login session or user manager
+    # must not end it either. --scope runs the command in place -- the same
+    # process, so it inherits LOCK_FD, on purpose: the lock lives as long as
+    # the claim does. --expand-environment=no: the command line is used as
+    # written. Started in /, so a long-lived holder pins no directory.
+    (cd / && exec setsid systemd-run --scope --unit="$unit" --quiet --expand-environment=no \
+        -- "$BTRDASD_BIN" recovery-os hold-disk --device "$DISK") \
         </dev/null >"$HOLDER_OUT" 2>"$HOLDER_ERR" &
-    HOLDER_PID=$!
+    started=$!
+    HOLDER_PID=$started
     HOLDER_STARTING=false
     write_record "$HOLDER_PID"
     for ((i = 0; i < HOLDER_START_TICKS; i++)); do
         if IFS= read -r line <"$HOLDER_OUT" && [[ -n "$line" ]]; then
             break
         fi
-        if ! kill -0 "$HOLDER_PID" 2>/dev/null; then
+        if ! kill -0 "$started" 2>/dev/null; then
+            # One more look: it may have announced just before it ended.
+            IFS= read -r line <"$HOLDER_OUT" || :
             break
         fi
         sleep 0.1
     done
-    if [[ "$line" =~ $HELD_RE && "${BASH_REMATCH[1]}" == "$DISK" && "${BASH_REMATCH[2]}" == "$HOLDER_PID" ]]; then
-        log "holding $DISK exclusively (holder pid $HOLDER_PID): nothing on this host can mount it now"
+    # The holder is the process its line names -- with --scope the pid
+    # started, but nothing is assumed: a runner that forks leaves its own.
+    if [[ "$line" =~ $HELD_RE && "${BASH_REMATCH[1]}" == "$DISK" ]]; then
+        held_pid=${BASH_REMATCH[2]}
+    fi
+    if [[ -n "$held_pid" ]] && holder_alive "$held_pid" "$DISK"; then
+        HOLDER_PID=$held_pid
+        write_record "$HOLDER_PID"
+        record_lock_holder
+        log "holding $DISK exclusively (holder pid $HOLDER_PID, $HOLDER_UNIT): nothing on this host can mount it now"
         return 0
     fi
-    stop_holder "$HOLDER_PID" "$DISK" || :
-    if kill -0 "$HOLDER_PID" 2>/dev/null; then
-        HOLDER_FAILURE="it did not announce a hold within $((HOLDER_START_TICKS / 10))s and will not stop (pid $HOLDER_PID)"
+    stop_holder "$started" "$DISK" || :
+    if kill -0 "$started" 2>/dev/null; then
+        HOLDER_FAILURE="it did not announce a hold within $((HOLDER_START_TICKS / 10))s and will not stop (pid $started)"
         return 1
     fi
-    wait "$HOLDER_PID" 2>/dev/null || rc=$?
+    wait "$started" 2>/dev/null || rc=$?
     why="$(cat -- "$HOLDER_ERR" 2>/dev/null)" || why=""
     HOLDER_PID=""
     rm -f -- "$HOLDER_FILE"
@@ -660,12 +740,30 @@ start_holder() {
     return 1
 }
 
+# Point the lock's record at the holder: it holds the lock for as long as
+# the claim lasts and outlives this script, so it is the process a reader
+# must find running -- frb's readers name a holder whose recorded pid has
+# gone "no longer running". Only while this script holds the lock.
+record_lock_holder() {
+    if [[ -n "$LOCK_FD" ]]; then
+        write_lock_record "$HOLDER_PID"
+    fi
+}
+
 # The claim must last as long as the VM may use the disk. A holder that died
 # (killed, out of memory) is replaced at once: the VM's own open is not
 # exclusive, so a new claim succeeds -- unless something on the host has
 # mounted the drive meanwhile, which is then said as loudly as it deserves.
 keep_claim() {
-    local old=$HOLDER_PID rc=0
+    local old=$HOLDER_PID rc=0 now
+    # A USB disk that re-enumerated is another device now: the claim, and
+    # the VM's own open, are on the old one, which is gone.
+    now="$(readlink -f -- "$DISK" 2>/dev/null)" || now=""
+    [[ -e "$DISK" ]] || now=""
+    if [[ "$REENUMERATED" != true && "$now" != "$DISK_DEV" ]]; then
+        REENUMERATED=true
+        warn "$DISK now leads to ${now:-nothing}, not $DISK_DEV: the drive re-enumerated during the session, and the claim is on the old device. The recovery OS has most likely lost its disk; the maintenance lock still keeps this project's jobs off the drive"
+    fi
     if holder_alive "$HOLDER_PID" "$DISK"; then
         return 0
     fi
@@ -701,7 +799,7 @@ attach_disk() {
 # RETURN_FAILURE set, leaving the claim and the lock in place, when the disk
 # cannot be proven out of the domain or the holder will not stop.
 return_disk() {
-    local out rc=0 said
+    local out rc=0 said cleared=false
     if [[ "$ATTACHED" == true ]]; then
         if ! out="$(virsh_ detach-disk "$DOMAIN" "$DISK" --config 2>&1)"; then
             warn "virsh detach-disk: $out"
@@ -717,10 +815,17 @@ return_disk() {
     if [[ -n "$HOLDER_PID" ]]; then
         # session-end: this script holds no lock of its own, but a live
         # holder holds this session's, so the record in it is this session's.
+        # Emptied before the holder goes: once it has, the lock may be
+        # someone else's.
         if [[ -z "$LOCK_FD" ]] && holder_alive "$HOLDER_PID" "$DISK"; then
             clear_lock_record
+            cleared=true
         fi
         if ! stop_holder "$HOLDER_PID" "$DISK"; then
+            # It stays, and so does the lock it holds: name it again.
+            if [[ "$cleared" == true ]]; then
+                write_lock_record "$HOLDER_PID"
+            fi
             RETURN_FAILURE="the disk holder (pid $HOLDER_PID) did not exit within $((HOLDER_STOP_TICKS / 10))s of SIGTERM"
             return 1
         fi
@@ -790,7 +895,7 @@ The recovery OS keeps $DISK:
   - it still holds $MAINTENANCE_LOCK, so backups and scrubs wait
     and the other jobs that mount targets defer.
 Nothing was detached and nothing was destroyed. To finish:
-  1. Open the console:  virt-viewer --connect $LIBVIRT_URI $DOMAIN
+  1. Open the console:  virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN
      Let the update finish, then power the recovery OS off from inside it.
   2. Then run:          $SELF session-end $LABEL
 Only if it has hung, and accepting that an update in progress is cut short:
@@ -800,12 +905,27 @@ EOF
 
 keep_after_failure() {
     warn "could not give $DISK back completely: $RETURN_FAILURE"
-    cat >&2 <<EOF
+    if [[ -n "$HOLDER_PID" ]] && holder_alive "$HOLDER_PID" "$DISK"; then
+        cat >&2 <<EOF
 For safety the claim and the lock stay where they are: the disk holder
-(pid ${HOLDER_PID:-none}) still claims $DISK and still holds
+(pid $HOLDER_PID) still claims $DISK and still holds
 $MAINTENANCE_LOCK. Check '$SELF status', put right what failed, then run:
   $SELF session-end $LABEL
 EOF
+    elif [[ -n "$LOCK_FD" ]]; then
+        cat >&2 <<EOF
+Nothing more is undone, but the claim is gone: no disk holder runs. This
+process still holds $MAINTENANCE_LOCK, and the lock ends with it.
+Do not mount $DISK. Check '$SELF status', put right what failed, then run:
+  $SELF session-end $LABEL
+EOF
+    else
+        cat >&2 <<EOF
+Nothing more is undone, but the claim is gone: no disk holder runs, and with
+it went this session's hold on $MAINTENANCE_LOCK. Do not mount $DISK.
+Check '$SELF status', put right what failed, then run this again.
+EOF
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -920,12 +1040,30 @@ wait_for_poweroff() {
     done
 }
 
+# 5 when a session ended, everything given back, but something needs a look;
+# else 0.
+session_status() {
+    if [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]]; then
+        echo 5
+    else
+        echo 0
+    fi
+}
+
 cmd_session() {
-    local out display
+    local out
     parse_session_args "$@"
     require_root
+    # No fallback: a holder in the login session ends with it, taking the
+    # claim and the lock while the VM may still use the disk.
+    if ! command -v systemd-run >/dev/null; then
+        refuse "systemd-run is not available: the disk holder must run in a scope of its own, outside your login session, and there is no other way to put it there"
+    fi
     load_targets
     resolve_label "$TARGET_ARG"
+    if [[ ! "$LABEL" =~ ^[A-Za-z0-9:_.-]+$ ]]; then
+        refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
+    fi
     resolve_disk
     log "session for $LABEL: $DISK ($DISK_DEV)$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
     check_units
@@ -969,9 +1107,8 @@ cmd_session() {
     if ! out="$(virsh_ start "$DOMAIN" 2>&1)"; then
         refuse "virsh start failed: $out"
     fi
-    display="$(virsh_ vncdisplay "$DOMAIN" 2>&1)" || display="unknown ($display)"
     log "the recovery OS is booting from $DISK"
-    log "console: VNC $display -- virt-viewer --connect $LIBVIRT_URI $DOMAIN"
+    log "console: virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN (its VNC is a libvirt-private socket; '$SELF screenshot <file.png>' works too)"
     log "serial console: virsh --connect $LIBVIRT_URI console $DOMAIN"
 
     wait_for_poweroff
@@ -984,9 +1121,12 @@ cmd_session() {
         exit 4
     fi
     DONE=true
-    local claim="held throughout"
+    local claim="held throughout" warnings=""
     if ((HOLDER_LOSSES > 0)); then
         claim="LOST $HOLDER_LOSSES time(s) and claimed again -- see the warnings above"
+    fi
+    if [[ "$REENUMERATED" == true ]]; then
+        warnings="the disk re-enumerated during the session; the claim was on the old device"
     fi
     cat <<EOF
 Session done -- $LABEL
@@ -994,10 +1134,12 @@ Session done -- $LABEL
   VM ran        $(format_duration $((SECONDS - VM_START))); whole session $(format_duration $((SECONDS - SESSION_START)))
   Claim         $claim
   Given back    detached; holder stopped; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
-  Lock          released
+  Lock          released${warnings:+
+  Warnings      $warnings}
   Next          the next backup run reads the updated OS (RECOVERY OS in its report)
 EOF
-    logger -t "$LOG_TAG" -- "session for $LABEL done: claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT" || :
+    logger -t "$LOG_TAG" -- "session for $LABEL done: claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT${warnings:+; $warnings}" || :
+    exit "$(session_status)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1156,7 @@ cmd_session_end() {
     fi
     state="$(virsh_ domstate "$DOMAIN" 2>&1)" || refuse "cannot read the state of $DOMAIN: $state"
     if [[ "$state" != "shut off" ]]; then
-        refuse "$DOMAIN is $state -- session-end never stops a running recovery OS. Power it off from inside it (virt-viewer --connect $LIBVIRT_URI $DOMAIN), then run this again"
+        refuse "$DOMAIN is $state -- session-end never stops a running recovery OS. Power it off from inside it (virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN), then run this again"
     fi
     xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $xml"
     mapfile -t attached < <(disk_sources "$xml")
@@ -1042,13 +1184,14 @@ cmd_session_end() {
     fi
     log "session-end: $LABEL's disk is the host's again (btrfs device scan $SCAN_RESULT; $MOUNT_RESULT)"
     log "DAS maintenance lock: $(lock_report)"
+    exit "$(session_status)"
 }
 
 # ---------------------------------------------------------------------------
 # define, status, screenshot
 # ---------------------------------------------------------------------------
 cmd_define() {
-    local name loader nvram template state xml sources out
+    local name loader template state xml sources out
     require_root
     [[ -r "$DOMAIN_XML" ]] || refuse "the domain definition $DOMAIN_XML is missing -- install the project (cmake --install) first"
     name="$(xml_value "$NAME_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no domain"
@@ -1056,7 +1199,8 @@ cmd_define() {
         refuse "$DOMAIN_XML defines '$name', not $DOMAIN"
     fi
     loader="$(xml_value "$LOADER_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no firmware loader"
-    nvram="$(xml_value "$NVRAM_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no NVRAM file"
+    # libvirt creates the VM's variable store from this template at its first
+    # start, and keeps it afterwards; define never touches it.
     template="$(xml_value "$TEMPLATE_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no NVRAM template"
     [[ -r "$TEST_ROOT$loader" ]] || refuse "the UEFI firmware $loader is not installed (Arch: edk2-ovmf) -- $DOMAIN_XML names it"
     [[ -r "$TEST_ROOT$template" ]] || refuse "the UEFI variable template $template is not installed (Arch: edk2-ovmf)"
@@ -1079,12 +1223,6 @@ cmd_define() {
     if ! virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
         refuse "virsh define reported success, but $DOMAIN is not defined"
     fi
-    if [[ -e "$TEST_ROOT$nvram" ]]; then
-        log "kept this VM's UEFI variable store $nvram (boot entries made in it persist)"
-    else
-        install -D -m 0600 -- "$TEST_ROOT$template" "$TEST_ROOT$nvram" || refuse "could not create $nvram from $template"
-        log "created this VM's UEFI variable store $nvram from $template"
-    fi
 }
 
 cmd_status() {
@@ -1104,7 +1242,8 @@ cmd_status() {
         if ! read_record "$f"; then
             printf 'Holder            %s: unreadable record\n' "$(basename -- "$f" .holder)"
         elif holder_alive "$REC_PID" "$REC_DEV"; then
-            printf 'Holder            %s: pid %s, alive, claims %s\n' "$(basename -- "$f" .holder)" "$REC_PID" "$REC_DEV"
+            printf 'Holder            %s: pid %s, alive, claims %s%s\n' "$(basename -- "$f" .holder)" "$REC_PID" "$REC_DEV" \
+                "${REC_UNIT:+, scope $REC_UNIT: $(systemctl is-active "$REC_UNIT" 2>/dev/null || :)}"
         else
             printf 'Holder            %s: pid %s NOT RUNNING (stale record for %s)\n' "$(basename -- "$f" .holder)" "$REC_PID" "$REC_DEV"
         fi
@@ -1140,8 +1279,8 @@ cmd_screenshot() {
 # main
 # ---------------------------------------------------------------------------
 check_knobs() {
-    if [[ ! "$POLL_SECS" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$MINUTE_SECS" =~ ^[1-9][0-9]*$ || ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ ]]; then
-        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS and _GRACE_SECS take numbers\n' >&2
+    if [[ ! "$POLL_SECS" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$POLL_SECS" =~ [1-9] || ! "$MINUTE_SECS" =~ ^[1-9][0-9]*$ || ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS and _GRACE_SECS take numbers above 0\n' >&2
         exit 2
     fi
     if [[ -n "$TEST_ROOT" ]]; then

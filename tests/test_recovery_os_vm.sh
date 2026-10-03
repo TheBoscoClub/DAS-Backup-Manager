@@ -63,6 +63,10 @@ RECORD_A='^recovery-os VM session system-recovery-A-2tb pid [0-9]+$'
 
 DISK_A_NAME="ata-ST2000DM008-2FR102_ZK208Q77"
 DISK_B_NAME="ata-ST2000DM008-2FR102_ZFL41DNY"
+# The filesystems on the two drives' partitions 2 -- their mount_uuid, as on
+# this host.
+UUID_A="60b05268-7f8f-47b5-a38a-752576a1172a"
+UUID_B="7c7ae72d-09d6-4086-b249-1ac60f21b73b"
 
 # A fresh root: the installed layout, two recovery drives and one leg of the
 # primary pair, the domain defined and shut off, nothing running.
@@ -96,6 +100,8 @@ fixture() {
     printf 'disk ZFL41DNY\n' >"$S/lsblk.typeserial.sdk"
     printf 'disk ZXA1R71M\n' >"$S/lsblk.typeserial.sdm"
     printf 'part \n' >"$S/lsblk.typeserial.sdj1"
+    printf '%s\n' "$UUID_A" >"$S/lsblk.uuid.sdj2"
+    printf '%s\n' "$UUID_B" >"$S/lsblk.uuid.sdk2"
     touch "$S/defined"
     printf 'shut off\n' >"$S/states"
     printf 'running\nrunning\nrunning\nshut off\n' >"$S/states.running"
@@ -106,7 +112,8 @@ fixture() {
 
 # What `btrdasd config dump-env` prints for this host's three targets, in the
 # KEY='VALUE' form of indexer/src/setup/env_export.rs. $1 and $2 are the
-# serials of the two mirror targets, $3 the second one's label if not B's.
+# serials of the two mirror targets, $3 the second one's label if not B's, $4
+# the first one's mount_uuid if not its real one ('' for none).
 dump_env() {
     cat >"$S/dump-env" <<EOF
 DAS_VERSION='0.7.22.3'
@@ -120,13 +127,13 @@ DAS_TARGET_0_ROLE='primary'
 DAS_TARGET_1_LABEL='system-recovery-A-2tb'
 DAS_TARGET_1_SERIAL='${1%% *}'
 DAS_TARGET_1_SERIALS='$1'
-DAS_TARGET_1_MOUNT_UUID=''
+DAS_TARGET_1_MOUNT_UUID='${4-$UUID_A}'
 DAS_TARGET_1_MOUNT='/mnt/backup-system-recovery-A'
 DAS_TARGET_1_ROLE='mirror'
 DAS_TARGET_2_LABEL='${3:-system-recovery-B-2tb}'
 DAS_TARGET_2_SERIAL='$2'
 DAS_TARGET_2_SERIALS='$2'
-DAS_TARGET_2_MOUNT_UUID=''
+DAS_TARGET_2_MOUNT_UUID='$UUID_B'
 DAS_TARGET_2_MOUNT='/mnt/backup-system-recovery-B'
 DAS_TARGET_2_ROLE='mirror'
 EOF
@@ -149,6 +156,17 @@ case "$cmd" in
     domstate)
         [[ -f "$S/defined" ]] || nodomain
         if [[ -f "$S/domstate_fail" ]]; then echo "error: failed to connect to the hypervisor" >&2; exit 1; fi
+        if [[ -f "$S/started" ]]; then
+            # What the lock's record says while the session runs.
+            head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" >>"$S/lock.records"
+            polls=$(($(cat "$S/polls" 2>/dev/null || echo 0) + 1))
+            echo "$polls" >"$S/polls"
+            # The drive re-enumerates at the second poll: its by-id link moves.
+            if [[ -f "$S/reenumerate" && "$polls" == 2 ]]; then
+                read -r link target <"$S/reenumerate"
+                ln -sfn "$target" "$link"
+            fi
+        fi
         state=$(head -n 1 "$S/states")
         if (($(wc -l <"$S/states") > 1)); then
             tail -n +2 "$S/states" >"$S/states.next" && mv "$S/states.next" "$S/states"
@@ -181,8 +199,14 @@ case "$cmd" in
         ;;
     start)
         echo "virsh start" >>"$S/events"
+        head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" >"$S/lock.record.at_start"
         if [[ -f "$S/start_fail" ]]; then echo "error: Failed to start domain 'recovery-os-updater'" >&2; exit 1; fi
         cp "$S/states.running" "$S/states"
+        touch "$S/started"
+        # The holder dies (killed, out of memory) once the VM runs.
+        if [[ -f "$S/kill_holder_at_start" ]]; then kill -KILL "$(head -n 1 "$S/holder.pids")"; fi
+        # Something on the host mounts a partition while the session runs.
+        if [[ -f "$S/lsblk.mounts.sdj.after_start" ]]; then cp "$S/lsblk.mounts.sdj.after_start" "$S/lsblk.mounts.sdj"; fi
         echo "Domain 'recovery-os-updater' started"
         ;;
     shutdown)
@@ -190,7 +214,6 @@ case "$cmd" in
         if [[ -f "$S/states.after_shutdown" ]]; then cp "$S/states.after_shutdown" "$S/states"; fi
         echo "Domain 'recovery-os-updater' is being shutdown"
         ;;
-    vncdisplay) echo "127.0.0.1:0" ;;
     define)
         touch "$S/defined"
         echo "Domain 'recovery-os-updater' defined from ${!#}"
@@ -218,6 +241,9 @@ case "$*" in
         ;;
     *"-o TYPE "*)
         cat "$STUB/lsblk.type.$name" 2>/dev/null || { echo "lsblk: $dev: not a block device" >&2; exit 32; }
+        ;;
+    *"-o UUID "*)
+        cat "$STUB/lsblk.uuid.$name" 2>/dev/null || { echo "lsblk: $dev: not a block device" >&2; exit 32; }
         ;;
     *"-o NAME,MOUNTPOINTS"*)
         if [[ -f "$STUB/lsblk_mounts_fail" ]]; then echo "lsblk: $dev: failed to read" >&2; exit 1; fi
@@ -289,7 +315,8 @@ case "${1:-} ${2:-}" in
         read -r _ _ _ sid _ <<<"${stat##*) }"
         if [[ "$sid" == "$$" ]]; then echo "holder in its own session" >>"$STUB/events"; fi
         pwd >"$STUB/holder.cwd"
-        head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" >"$STUB/lock.record.at_hold"
+        # (no lock file at all when a test starts a holder by hand)
+        head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" 2>/dev/null >"$STUB/lock.record.at_hold" || :
         if "$REAL_FLOCK" -n "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" true; then
             echo "holder started (lock free)" >>"$STUB/events"
         else
@@ -305,13 +332,6 @@ case "${1:-} ${2:-}" in
             trap 'echo "holder released" >>"$STUB/events"; echo "released $dev on SIGTERM" >&2; exit 0' TERM INT HUP
         fi
         echo "held $dev pid $$"
-        # The first holder of a session dies after the seconds in this file,
-        # as a killed one would.
-        if [[ -f "$STUB/holder_dies_after" && "$(wc -l <"$STUB/holder.pids")" == 1 ]]; then
-            read -r -t "$(cat "$STUB/holder_dies_after")" -u 7 _ || :
-            echo "holder died" >>"$STUB/events"
-            kill -KILL $$
-        fi
         while :; do read -r -t 1 -u 7 _ || :; done
         ;;
     *) echo "stub btrdasd: unexpected $*" >&2; exit 99 ;;
@@ -347,13 +367,46 @@ printf '%s\n' "$*" >>"$STUB/flock.calls"
 exec "$REAL_FLOCK" "$@"
 STUB
 
+    # systemd-run --scope registers a transient scope holding its own pid and
+    # then execs the command in place: the same pid, every open descriptor
+    # kept (measured with a --user scope; see the 7wb report). The stub does
+    # the second half. Variants: it fails, or it forks (so the pid it leaves
+    # in $! is not the holder's).
+    cat >"$T/bin/systemd-run" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >>"$STUB/systemd-run.calls"
+if [[ -f "$STUB/systemd_run_fail" ]]; then
+    echo "Failed to start transient scope unit: Unit das-recovery-os-holder.scope already exists." >&2
+    exit 1
+fi
+scope=false unit=""
+while (($#)); do
+    case "$1" in
+        --scope) scope=true ;;
+        --unit=*) unit=${1#--unit=} ;;
+        --quiet | --expand-environment=no) ;;
+        --) shift; break ;;
+        *) echo "stub systemd-run: unexpected option $1" >&2; exit 98 ;;
+    esac
+    shift
+done
+if [[ "$scope" != true || -z "$unit" ]]; then echo "stub systemd-run: needs --scope and --unit" >&2; exit 98; fi
+echo active >"$STUB/unit.$unit.scope"
+if [[ -f "$STUB/systemd_run_forks" ]]; then
+    "$@" &
+    wait $!
+    exit $?
+fi
+exec "$@"
+STUB
+
     chmod +x "$T/bin/"*
 }
 
 driver_env() {
-    env PATH="$T/bin:$PATH" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
+    env PATH="${DRIVER_PATH:-$T/bin:$PATH}" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
-        DAS_RECOVERY_VM_POLL_SECS=0.05 DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS=1 \
+        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS=1 \
         ${LOOP:+DAS_RECOVERY_VM_TEST_LOOP="$LOOP"} "$@"
 }
 
@@ -365,11 +418,63 @@ run_driver() {
     OUT="$(driver_env timeout -k 5 60 bash "$DRIVER" "$@" 2>&1)" || RC=$?
 }
 
+# A PATH with the stubs and only the real tools the driver needs up to its
+# check for systemd-run -- none of which is systemd-run.
+minimal_path() {
+    local t
+    mkdir -p "$T/sysbin"
+    for t in bash env timeout readlink dirname basename cat head tr; do
+        ln -sf "$(command -v "$t")" "$T/sysbin/$t"
+    done
+    printf '%s' "$T/bin:$T/sysbin"
+}
+
+# How frb's readers name the lock's holder -- maintenance_holder() in its
+# backup-run.sh, holder_from_note() in its maintenance.rs: the record's first
+# line, and whether the pid it ends with still runs.
+frb_reader() {
+    local line="" pid
+    IFS= read -r line <"$LOCK" || :
+    if [[ -z "$line" ]]; then
+        echo "an unknown holder"
+        return
+    fi
+    pid="${line##* pid }"
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[0-9]+$ ]]; then
+        echo "an unknown holder (last recorded: $line)"
+    elif [[ -d "/proc/$pid" ]]; then
+        echo "$line"
+    else
+        echo "an unknown holder (the last recorded holder, $line, is no longer running)"
+    fi
+}
+
 lock_state() {
     if "$REAL_FLOCK" -n "$LOCK" true; then echo free; else echo held; fi
 }
 
 file() { cat "$1" 2>/dev/null || :; }
+
+# Another job holding the maintenance lock. The marker is written only once
+# its flock has succeeded -- inside an `if`, so set -e cannot end the
+# subshell before it sleeps -- and the tests wait for that marker, never for
+# a lock state that something else could produce.
+start_blocker() {
+    (
+        exec 9<>"$LOCK"
+        if "$REAL_FLOCK" -n 9; then : >"$S/blocker.locked"; fi
+        exec sleep 30
+    ) &
+    blocker=$!
+    for ((i = 0; i < 200; i++)); do [[ -e "$S/blocker.locked" ]] && break; sleep 0.05; done
+}
+blocker_holds() {
+    if [[ -e "$S/blocker.locked" ]]; then lock_state; else echo "the blocker never took the lock"; fi
+}
+stop_blocker() {
+    kill "$blocker" 2>/dev/null || :
+    wait "$blocker" 2>/dev/null || :
+}
 events() { tr '\n' '|' <"$S/events"; }
 holder_pid() { head -n 1 "$STATE/system-recovery-$1-2tb.holder" 2>/dev/null || :; }
 alive() {
@@ -396,7 +501,7 @@ run_interrupted() {
         sleep 0.05
     done
     sleep 0.2
-    kill -INT -- "-$dpid"
+    kill -INT -- "-$dpid" 2>/dev/null || echo "(the driver had exited before SIGINT)" >>"$T/driver.out"
     for ((i = 0; i < 600; i++)); do
         kill -0 "$dpid" 2>/dev/null || break
         sleep 0.05
@@ -431,6 +536,10 @@ run_driver session-end ''
 check "session-end with an empty label: exit 2" "$RC" "2"
 run_driver screenshot ''
 check "screenshot with an empty path: exit 2" "$RC" "2"
+POLL=0 run_driver session A --dry-run
+check "a poll interval of 0: exit 2" "$RC" "2"
+POLL=0.0 run_driver session A --dry-run
+check "a poll interval of 0.0: exit 2" "$RC" "2"
 run_driver --help
 check "--help: exit 0" "$RC" "0"
 has "--help: the commands" "$OUT" "session-end <A|B|label>"
@@ -442,7 +551,9 @@ check "domain name" "$(sed -n 's|.*<name>\(.*\)</name>.*|\1|p' "$xml")" \
     "$(sed -n 's/^readonly DOMAIN="\(.*\)"$/\1/p' "$REPO/scripts/recovery-os-vm.sh")"
 has "host CPU passed through" "$(cat "$xml")" "<cpu mode='host-passthrough'>"
 has "no Secure Boot" "$(cat "$xml")" "secure='no'"
-has "VNC on the loopback only" "$(cat "$xml")" "<listen type='address' address='127.0.0.1'/>"
+has "VNC only on a libvirt-private socket" "$(cat "$xml")" "<listen type='socket'/>"
+lacks "no VNC on a network address" "$(cat "$xml")" "<listen type='address'"
+has "the NVRAM comes from libvirt's template" "$(cat "$xml")" "<nvram template='"
 has "guest agent channel" "$(cat "$xml")" "name='org.qemu.guest_agent.0'"
 lacks "no disk of its own" "$(cat "$xml")" "<disk"
 if command -v virt-xml-validate >/dev/null; then
@@ -525,6 +636,21 @@ run_driver session A --dry-run
 check "disk reporting another serial: refused" "$RC" "1"
 has "serial mismatch: says so" "$OUT" "reports serial 'ZFL41DNY', not ZK208Q77"
 
+# The drive's filesystem must be the one config mounts that target by.
+fixture
+printf '%s\n' "ffffffff-0000-4000-8000-000000000000" >"$S/lsblk.uuid.sdj2"
+run_driver session A --dry-run
+check "partition 2 carrying another filesystem: refused" "$RC" "1"
+has "another filesystem: says which" "$OUT" "carries filesystem ffffffff-0000-4000-8000-000000000000, not $UUID_A"
+check "another filesystem: never held" "$(file "$S/holder.calls")" ""
+
+fixture
+dump_env ZK208Q77 ZFL41DNY system-recovery-B-2tb ""
+run_driver session A --dry-run
+check "a mirror without mount_uuid: refused" "$RC" "1"
+has "no mount_uuid: says how to get one" "$OUT" "has no mount_uuid"
+check "no mount_uuid: never held" "$(file "$S/holder.calls")" ""
+
 fixture
 touch "$S/dumpenv_fail"
 run_driver session A --dry-run
@@ -588,13 +714,14 @@ mkdir -p "$STATE"
 setsid env STUB="$S" REAL_FLOCK="$REAL_FLOCK" DAS_RECOVERY_VM_TEST_ROOT="$T" \
     "$T/bin/btrdasd" recovery-os hold-disk --device "$DISK_B" </dev/null >"$S/old.out" 2>&1 &
 old=$!
-for ((i = 0; i < 100; i++)); do [[ -s "$S/old.out" ]] && break; sleep 0.05; done
+for ((i = 0; i < 200; i++)); do grep -q '^held ' "$S/old.out" 2>/dev/null && break; sleep 0.05; done
+check "live holder: precondition, the old holder announced its hold" "$(grep -c '^held ' "$S/old.out" || :)" "1"
 printf '%s\n%s\n' "$old" "$DISK_B" >"$STATE/system-recovery-B-2tb.holder"
 run_driver session A --dry-run
 check "live holder: refused" "$RC" "1"
 has "live holder: says how to finish" "$OUT" "session-end system-recovery-B-2tb"
-kill -TERM "$old"
-wait "$old" || :
+kill -TERM "$old" 2>/dev/null || :
+wait "$old" 2>/dev/null || :
 run_driver session A --dry-run
 check "stale record (holder gone): removed, session goes on" "$RC" "0"
 has "stale record: said so" "$OUT" "removing the stale record"
@@ -602,13 +729,8 @@ has "stale record: said so" "$OUT" "removing the stale record"
 echo "--- the maintenance lock is held"
 fixture
 printf 'backup-run.sh pid 4242\n' >"$LOCK"
-(
-    exec 9<>"$LOCK"
-    "$REAL_FLOCK" -n 9
-    exec sleep 30
-) &
-blocker=$!
-for ((i = 0; i < 100; i++)); do [[ "$(lock_state)" == held ]] && break; sleep 0.05; done
+start_blocker
+check "lock held: precondition, another process holds the lock" "$(blocker_holds)" "held"
 run_driver session A --dry-run
 check "lock held: refused" "$RC" "1"
 has "lock held: prints the holder line" "$OUT" "held by: backup-run.sh pid 4242"
@@ -616,8 +738,7 @@ has "lock held: tried without waiting" "$(file "$S/flock.calls")" "-n"
 check "lock held: no holder started" "$(file "$S/holder.calls")" ""
 check "lock held: nothing attached" "$(file "$S/attach.log")" ""
 check "lock held: the holder's record left alone" "$(head -n 1 "$LOCK")" "backup-run.sh pid 4242"
-kill "$blocker"
-wait "$blocker" 2>/dev/null || :
+stop_blocker
 
 echo "--- the holder cannot claim the disk"
 fixture
@@ -660,6 +781,10 @@ check "session: events in order" "$(events)" \
 matches "session: the lock's record names the session while it holds" "$(file "$S/lock.record.at_hold")" "$RECORD_A"
 check "session: the record emptied before the lock was let go" "$(file "$LOCK")" ""
 check "session: the holder runs in /" "$(file "$S/holder.cwd")" "/"
+check "session: the holder runs in a scope of its own" "$(head -n 1 "$S/systemd-run.calls")" \
+    "--scope --unit=das-recovery-os-holder-system-recovery-A-2tb --quiet --expand-environment=no -- $T/bin/btrdasd recovery-os hold-disk --device $DISK_A"
+check "session: once it holds, the lock's record names the holder" "$(file "$S/lock.record.at_start")" \
+    "recovery-os VM session system-recovery-A-2tb pid $(head -n 1 "$S/holder.pids")"
 has "session: the claim held throughout" "$OUT" "Claim         held throughout"
 # One preflight read, then running x3 and shut off: polling stops at shut off.
 check "session: domstate polled until shut off" "$(grep -c '^domstate' "$S/virsh.calls")" "5"
@@ -667,7 +792,7 @@ has "session: state change logged" "$OUT" "domain state: running -> shut off"
 check "session: partition 2 rescanned" "$(file "$S/btrfs.calls")" "device scan $DISK_A-part2"
 check "session: lock released" "$(lock_state)" "free"
 check "session: no record left" "$(ls -A "$STATE")" ""
-has "session: console shown" "$OUT" "virt-viewer --connect qemu:///system recovery-os-updater"
+has "session: console shown, through libvirt" "$OUT" "virt-viewer --connect qemu:///system --attach recovery-os-updater"
 has "session: summary" "$OUT" "Session done -- system-recovery-A-2tb"
 has "session: summary says no partition mounted" "$OUT" "no partition mounted"
 has "session: logged to the journal" "$(file "$S/logger.calls")" "-t das-recovery-os-vm -- attached $DISK_A"
@@ -705,6 +830,10 @@ check "SIGINT: the lock outlives the driver (inherited)" "$(lock_state)" "held"
 has "SIGINT: the disk is still the VM's" "$(file "$S/attached.xml")" "$DISK_A"
 has "SIGINT: says how to finish" "$OUT" "session-end system-recovery-A-2tb"
 matches "SIGINT: the record stays while the session holds the lock" "$(head -n 1 "$LOCK")" "$RECORD_A"
+check "SIGINT: the record names the holder, which outlives the driver" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid"
+check "SIGINT: a reader sees the holder alive, not a finished session" "$(frb_reader)" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid"
 
 run_driver status
 check "status: exit 0" "$RC" "0"
@@ -712,6 +841,7 @@ has "status: domain state" "$OUT" "recovery-os-updater: running"
 has "status: attached disk" "$OUT" "Attached disk     $DISK_A"
 has "status: holder alive" "$OUT" "system-recovery-A-2tb: pid $pid, alive"
 has "status: lock holder" "$OUT" "held by: recovery-os VM session system-recovery-A-2tb"
+has "status: the holder's scope" "$OUT" "scope das-recovery-os-holder-system-recovery-A-2tb.scope: active"
 
 run_driver session-end A
 check "session-end while running: refused" "$RC" "1"
@@ -783,13 +913,23 @@ check "holder will not stop: exit 4" "$RC" "4"
 pid="$(holder_pid A)"
 check "holder will not stop: lock kept" "$(lock_state)" "held"
 has "holder will not stop: says so" "$OUT" "did not exit within"
-kill -KILL "$pid"
+check "holder will not stop: the record names it" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid"
+# session-end empties the record before it stops the holder (once the holder
+# is gone the lock may be someone else's); a holder that stays keeps the lock,
+# so the record must name it again.
+run_driver session-end A
+check "session-end, holder will not stop: exit 4" "$RC" "4"
+check "session-end, holder will not stop: lock kept" "$(lock_state)" "held"
+check "session-end, holder will not stop: the record names it again" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid"
+kill -KILL "$pid" 2>/dev/null || :
 for ((i = 0; i < 100; i++)); do [[ "$(lock_state)" == free ]] && break; sleep 0.05; done
 check "holder killed: the kernel drops the lock with it" "$(lock_state)" "free"
 
 echo "--- the holder dies while the recovery OS runs"
 fixture
-echo 0.3 >"$S/holder_dies_after"
+touch "$S/kill_holder_at_start"
 {
     for ((i = 0; i < 60; i++)); do echo running; done
     echo "shut off"
@@ -799,15 +939,19 @@ check "holder lost: the session still ends" "$RC" "0"
 has "holder lost: said so" "$OUT" "is gone while the recovery OS may use"
 check "holder lost: claimed again" "$(grep -c '^hold-disk' "$S/holder.calls")" "2"
 has "holder lost: the new holder holds the lock too" "$(events)" \
-    "holder died|holder in its own session|holder started (lock held)|"
+    "virsh start|holder in its own session|holder started (lock held)|"
 has "holder lost: then given back as usual" "$(events)" "virsh detach|holder released|btrfs scan (lock held)|"
 has "holder lost: the summary says so" "$OUT" "LOST 1 time(s) and claimed again"
+check "holder lost: the record names the new holder" "$(tail -n 1 "$S/lock.records")" \
+    "recovery-os VM session system-recovery-A-2tb pid $(sed -n 2p "$S/holder.pids")"
+has "holder lost: the new holder has a scope of its own" "$(sed -n 2p "$S/systemd-run.calls")" \
+    "--unit=das-recovery-os-holder-system-recovery-A-2tb-2 "
 check "holder lost: lock free at the end" "$(lock_state)" "free"
 
 # The holder dies, then the driver is interrupted before its next check: the
 # claim and the lock it leaves behind must be a live holder's, not nothing.
 fixture
-echo 0.05 >"$S/holder_dies_after"
+touch "$S/kill_holder_at_start"
 printf 'running\n' >"$S/states.running"
 POLL=2 run_interrupted session A
 check "holder lost, then SIGINT: exit 3" "$RC" "3"
@@ -826,20 +970,79 @@ fixture
 mkdir -p "$STATE"
 printf '%s\n%s\n' 999999999 "$DISK_A" >"$STATE/system-recovery-A-2tb.holder"
 printf 'btrdasd walk pid 777\n' >"$LOCK"
-(
-    exec 9<>"$LOCK"
-    "$REAL_FLOCK" -n 9
-    exec sleep 30
-) &
-blocker=$!
-for ((i = 0; i < 100; i++)); do [[ "$(lock_state)" == held ]] && break; sleep 0.05; done
+start_blocker
+check "session-end, holder gone: precondition, another process holds the lock" "$(blocker_holds)" "held"
 run_driver session-end A
 check "session-end, holder gone: exit 0" "$RC" "0"
 has "session-end, holder gone: said so" "$OUT" "had already exited"
 check "session-end, holder gone: another job's record left alone" "$(head -n 1 "$LOCK")" "btrdasd walk pid 777"
 check "session-end, holder gone: its record removed" "$(ls -A "$STATE")" ""
-kill "$blocker"
-wait "$blocker" 2>/dev/null || :
+stop_blocker
+
+echo "--- the holder's scope (systemd-run)"
+fixture
+touch "$S/systemd_run_fail"
+run_driver session A --dry-run
+check "systemd-run fails: refused" "$RC" "1"
+has "systemd-run fails: says why" "$OUT" "already exists"
+check "systemd-run fails: lock released" "$(lock_state)" "free"
+check "systemd-run fails: no record left" "$(ls -A "$STATE")" ""
+
+fixture
+rm "$T/bin/systemd-run"
+DRIVER_PATH="$(minimal_path)" run_driver session A --dry-run
+check "no systemd-run: refused, no fallback" "$RC" "1"
+has "no systemd-run: says so" "$OUT" "systemd-run is not available"
+check "no systemd-run: no lock taken" "$(file "$S/flock.calls")" ""
+
+# A runner that forks leaves its own pid in $!: the holder is the pid the
+# held line names, and that is the process stopped.
+fixture
+touch "$S/systemd_run_forks"
+run_driver session A --dry-run
+check "a runner that forks: exit 0" "$RC" "0"
+has "a runner that forks: the holder named by its line stopped" "$(events)" "holder released"
+check "a runner that forks: lock released" "$(lock_state)" "free"
+check "a runner that forks: no holder left running" "$(alive "$(head -n 1 "$S/holder.pids")")" "gone"
+
+# The holder's scope is named after the label.
+fixture
+dump_env ZK208Q77 ZFL41DNY "recovery B 2tb"
+run_driver session "recovery B 2tb" --dry-run
+check "a label a unit name cannot carry: refused" "$RC" "1"
+has "a label a unit name cannot carry: says so" "$OUT" "characters a systemd unit name cannot carry"
+check "a label a unit name cannot carry: no lock taken" "$(file "$S/flock.calls")" ""
+
+echo "--- the drive re-enumerates during a session"
+fixture
+echo "$DISK_A ../../sdk" >"$S/reenumerate"
+{
+    for ((i = 0; i < 6; i++)); do echo running; done
+    echo "shut off"
+} >"$S/states.running"
+run_driver session A
+check "re-enumerated: exit 5" "$RC" "5"
+has "re-enumerated: said so at once" "$OUT" "re-enumerated during the session"
+has "re-enumerated: in the summary" "$OUT" "the claim was on the old device"
+check "re-enumerated: everything given back" "$(lock_state)" "free"
+
+echo "--- a partition mounted when the session ends"
+fixture
+printf 'sdj \nsdj1 \nsdj2 /mnt/x\n' >"$S/lsblk.mounts.sdj.after_start"
+run_driver session A
+check "mounted after: exit 5" "$RC" "5"
+has "mounted after: in the summary" "$OUT" "MOUNTED: sdj2 on /mnt/x"
+
+echo "--- the disk cannot be given back, and the holder is gone"
+fixture
+mkdir -p "$STATE"
+printf '%s\n%s\n' 999999999 "$DISK_A" >"$STATE/system-recovery-A-2tb.holder"
+printf "<disk type='block' device='disk'>\n  <source dev='%s'/>\n</disk>\n" "$DISK_A" >"$S/attached.xml"
+touch "$S/detach_fail"
+run_driver session-end A
+check "detach fails, holder gone: exit 4" "$RC" "4"
+has "detach fails, holder gone: the claim is gone" "$OUT" "the claim is gone"
+lacks "detach fails, holder gone: no dead holder named as claiming" "$OUT" "still claims"
 
 echo "--- the test hatch (DAS_RECOVERY_VM_TEST_LOOP)"
 fixture
@@ -856,7 +1059,18 @@ fixture
 : >"$T/dev/loop7p2"
 echo "block special file:7" >"$S/stat.loop7"
 echo loop >"$S/lsblk.type.loop7"
+mkdir -p "$T/sys/block/loop7/loop"
+: >"$T/rv.img"
 LOOP="$T/dev/loop7"
+echo /dev/null >"$T/sys/block/loop7/loop/backing_file"
+run_driver session system-recovery-A-2tb --dry-run
+check "hatch: a loop backed by a device refused" "$RC" "1"
+has "hatch: says what backs it" "$OUT" "backed by /dev/null, not a regular file"
+rm "$T/sys/block/loop7/loop/backing_file"
+run_driver session system-recovery-A-2tb --dry-run
+check "hatch: a loop with no backing file refused" "$RC" "1"
+has "hatch: says it has none" "$OUT" "has no backing file"
+echo "$T/rv.img" >"$T/sys/block/loop7/loop/backing_file"
 run_driver session A --dry-run
 check "hatch: a shorthand refused" "$RC" "1"
 has "hatch: wants the full label" "$OUT" "needs the target's full label"
@@ -880,12 +1094,12 @@ run_driver define
 check "define new: exit 0" "$RC" "0"
 has "define new: validated against the schema" "$(file "$S/virsh.calls")" "define --validate $T/usr/lib/das-backup/libvirt/recovery-os-updater.xml"
 nv="$T/var/lib/libvirt/qemu/nvram/recovery-os-updater_VARS.fd"
-check "define new: NVRAM from the template" "$(file "$nv")" "VARS-TEMPLATE"
-check "define new: NVRAM mode 600" "$(command stat -c %a "$nv")" "600"
+check "define new: the NVRAM is libvirt's to create" "$(ls -A "$T/var/lib/libvirt/qemu/nvram" 2>/dev/null)" ""
+mkdir -p "$(dirname "$nv")"
 printf 'BOOT-ENTRIES' >"$nv"
 run_driver define
 check "define again: exit 0" "$RC" "0"
-check "define again: NVRAM kept" "$(file "$nv")" "BOOT-ENTRIES"
+check "define again: NVRAM untouched" "$(file "$nv")" "BOOT-ENTRIES"
 
 fixture
 printf 'running\n' >"$S/states"

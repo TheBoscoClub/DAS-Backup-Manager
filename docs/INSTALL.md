@@ -471,9 +471,9 @@ Every `role = "mirror"` target is taken to carry its own bootable install under 
 | File | Purpose |
 |------|---------|
 | `${prefix}/lib/das-backup/recovery-os-vm.sh` | Lends one `role = "mirror"` recovery drive, whole, to the libvirt domain `recovery-os-updater`, boots the drive's own OS there to be updated, and gives the disk back when it powers off (`define`, `session`, `session-end`, `status`, `screenshot`; `--help` for usage) |
-| `${prefix}/lib/das-backup/libvirt/recovery-os-updater.xml` | That domain's definition, the one source of it: UEFI without Secure Boot, the host's CPU passed through (CachyOS's packages need x86-64-v3/v4), 4 vCPUs, 8 GiB, no disk of its own, a virtio NIC on the NAT network `default`, VNC on 127.0.0.1, a serial console and a guest-agent channel |
+| `${prefix}/lib/das-backup/libvirt/recovery-os-updater.xml` | That domain's definition, the one source of it: UEFI without Secure Boot, the host's CPU passed through (CachyOS's packages need x86-64-v3/v4), 4 vCPUs, 8 GiB, no disk of its own, a virtio NIC on the NAT network `default`, VNC only on a libvirt-private socket (no network address), a serial console and a guest-agent channel |
 
-It needs libvirt with the QEMU/KVM driver running, the UEFI firmware at the paths the XML names — `/usr/share/edk2/x64/OVMF_CODE.4m.fd` and `OVMF_VARS.4m.fd`, Arch Linux's `edk2-ovmf`; `define` refuses when they are elsewhere — and libvirt's network `default` active (`sudo virsh net-start default && sudo virsh net-autostart default`). Run everything as root:
+It needs libvirt with the QEMU/KVM driver running, the UEFI firmware at the paths the XML names — `/usr/share/edk2/x64/OVMF_CODE.4m.fd` and `OVMF_VARS.4m.fd`, Arch Linux's `edk2-ovmf`; `define` refuses when they are elsewhere; libvirt creates the VM's own variable store from the second at its first start — libvirt's network `default` active (`sudo virsh net-start default && sudo virsh net-autostart default`), and systemd's `systemd-run`: the disk holder runs in a transient scope of its own, `das-recovery-os-holder-<label>.scope`, and a session refuses without it. Run everything as root:
 
 ```bash
 sudo /usr/lib/das-backup/recovery-os-vm.sh define            # once; again after the XML changes
@@ -481,7 +481,7 @@ sudo /usr/lib/das-backup/recovery-os-vm.sh session A --dry-run
 sudo /usr/lib/das-backup/recovery-os-vm.sh session A
 ```
 
-During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder in `/run/das-recovery-os-vm/`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
+During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder in `/run/das-recovery-os-vm/`. The console, from your desktop session: `virt-viewer --connect qemu:///system --attach recovery-os-updater`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
 
 `btrdasd setup --uninstall-all` removes the two files; the domain and its UEFI variable store belong to libvirt and stay — remove them with `sudo virsh undefine --nvram recovery-os-updater`.
 

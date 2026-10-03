@@ -33,8 +33,8 @@
     <type arch='x86_64' machine='q35'>hvm</type>
     <!-- UEFI without Secure Boot: the recovery OSes boot unsigned loaders.
          The firmware code is mapped read-only; the variable store is this
-         VM's own, copied from the template by `recovery-os-vm.sh define`
-         (libvirt would also create it at the first start). -->
+         VM's own, which libvirt creates from the template at the first start
+         and keeps afterwards. -->
     <loader readonly='yes' secure='no' type='pflash'>/usr/share/edk2/x64/OVMF_CODE.4m.fd</loader>
     <nvram template='/usr/share/edk2/x64/OVMF_VARS.4m.fd'>/var/lib/libvirt/qemu/nvram/recovery-os-updater_VARS.fd</nvram>
     <!-- Three seconds at the firmware splash to press Esc for its menus
@@ -96,9 +96,15 @@
          input reaches the guest through the PS/2 keyboard every q35 machine
          has, which the firmware and the kernel drive without modules. -->
     <input type='tablet' bus='usb'/>
-    <!-- VNC on the loopback interface only. -->
-    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'>
-      <listen type='address' address='127.0.0.1'/>
+    <!-- VNC only on a UNIX socket libvirt creates for this VM, which other
+         users cannot reach — never on a network address, where any local
+         user could attach to the console: a root shell, while the operator
+         is logged in, on a drive that holds the host's backups. virt-viewer
+         attaches through libvirt and its access control (the command is in
+         docs/DISASTER-RECOVERY-GUIDE.md); `virsh screenshot` reads the screen
+         through QEMU's monitor and works the same. -->
+    <graphics type='vnc'>
+      <listen type='socket'/>
     </graphics>
     <!-- Standard VGA, chosen for the stretch between the firmware and the
          guest's own root filesystem. The firmware drives it and hands a
