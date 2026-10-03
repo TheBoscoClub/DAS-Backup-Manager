@@ -132,8 +132,11 @@ enum LockAttempt {
     Acquired(DoctorLocks),
     /// Another `btrdasd doctor` invocation holds the singleton lock.
     SingletonBusy,
-    /// A backup or scrub pass holds the shared maintenance lock.
-    MaintenanceBusy,
+    /// Another job holds the shared maintenance lock — `holder`, as it
+    /// recorded itself ([`crate::maintenance::holder_of`]).
+    MaintenanceBusy {
+        holder: String,
+    },
 }
 
 fn try_acquire_locks_at(
@@ -145,7 +148,9 @@ fn try_acquire_locks_at(
     };
     let Some(maintenance) = MaintenanceHeld::try_acquire_at(maintenance_path, "btrdasd doctor")?
     else {
-        return Ok(LockAttempt::MaintenanceBusy);
+        return Ok(LockAttempt::MaintenanceBusy {
+            holder: crate::maintenance::holder_of(maintenance_path),
+        });
     };
     Ok(LockAttempt::Acquired(DoctorLocks {
         maintenance,
@@ -438,9 +443,8 @@ pub fn run_drift_check(
             progress.on_log(LogLevel::Info, &reason);
             Ok(DoctorOutcome::Deferred { reason })
         }
-        LockAttempt::MaintenanceBusy => {
-            let reason = "maintenance lock held (backup/scrub in progress?) — skipping drift check"
-                .to_string();
+        LockAttempt::MaintenanceBusy { holder } => {
+            let reason = format!("DAS maintenance lock held by {holder} — skipping drift check");
             progress.on_log(LogLevel::Info, &reason);
             Ok(DoctorOutcome::Deferred { reason })
         }
@@ -1048,9 +1052,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let singleton = dir.path().join("doctor.lock");
         let maintenance = dir.path().join("maintenance.lock");
-        let held = scrub::FileLock::try_acquire(&maintenance).unwrap().unwrap();
+        let held = MaintenanceHeld::try_acquire_at(&maintenance, "btrdasd restore browse")
+            .unwrap()
+            .unwrap();
         let result = try_acquire_locks_at(&singleton, &maintenance).unwrap();
-        assert!(matches!(result, LockAttempt::MaintenanceBusy));
+        let LockAttempt::MaintenanceBusy { holder } = result else {
+            panic!("the maintenance lock is held");
+        };
+        assert_eq!(
+            holder,
+            format!("btrdasd restore browse pid {}", std::process::id()),
+            "the holder is named, never guessed"
+        );
         drop(held);
     }
 

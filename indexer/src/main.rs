@@ -1370,7 +1370,9 @@ fn deferred_exit_code(ran: &Ran) -> Option<i32> {
 /// mounts anything (bd DAS-Backup-Manager-frb): the hold its caller handed
 /// down, if one is named; otherwise taken — waiting for it, after saying who
 /// holds it, unless `--no-wait`. `None` means deferred: the line is printed,
-/// and the command exits [`maintenance::DEFERRED_EXIT_CODE`].
+/// and the command exits [`maintenance::DEFERRED_EXIT_CODE`]. A lock held by
+/// the command's own caller that did not hand it down is an error at once:
+/// waiting for it would never end.
 fn hold_for_cli(
     job: &str,
     run: &Interactive<'_>,
@@ -1389,6 +1391,9 @@ fn hold_for_cli(
         return Ok(Some(maintenance::MaintenanceHeld::delegated_at(
             &site.path, fd,
         )?));
+    }
+    if let Some((pid, record)) = maintenance::held_by_caller(&site.path)? {
+        return Err(maintenance::caller_holds_line(pid, &record).into());
     }
     let never = || false;
     match maintenance::wait_for(site, job, run.no_wait, &never, run.progress)? {
@@ -1781,7 +1786,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconcile::LockAttempt::Acquired(locks) => locks,
                 reconcile::LockAttempt::Deferred(why) => {
                     if json {
-                        println!("{{\"deferred\":true,\"reason\":\"{why}\"}}");
+                        // The reason names the holder as it recorded itself:
+                        // escaped by serde, never pasted into JSON by hand.
+                        println!("{}", serde_json::json!({ "deferred": true, "reason": why }));
                     } else {
                         println!("Deferred — {why}");
                     }
@@ -3894,6 +3901,40 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The caller holds the lock (and recorded itself) but runs the command
+    /// without handing the hold down: waiting would wait for the caller, which
+    /// waits for the command. It fails at once instead, with or without
+    /// `--no-wait` — this test process's real parent stands in for the caller.
+    #[test]
+    fn a_command_whose_own_caller_holds_the_lock_fails_instead_of_waiting() {
+        let rig = LockRig::new();
+        let caller = std::os::unix::process::parent_id();
+        let lock = scrub::FileLock::try_acquire(rig.path("das-maintenance.lock"))
+            .unwrap()
+            .expect("the scratch lock is free");
+        std::fs::write(
+            rig.path("das-maintenance.lock"),
+            format!("backup-run.sh pid {caller}\n"),
+        )
+        .unwrap();
+        for no_wait in [false, true] {
+            let (out, logs) = run_cmd_within(&rig, Cmd::Walk, no_wait, None, STILL_WAITING);
+            let err = out
+                .expect("fails at once, never waits for its caller")
+                .expect_err("a lock its own caller holds must fail the command");
+            assert!(
+                err.contains(&format!(
+                    "held by my own caller (pid {caller}, backup-run.sh pid {caller})"
+                )),
+                "{err}"
+            );
+            assert!(err.contains("DAS_MAINTENANCE_LOCK_FD"), "{err}");
+            assert!(logs.waiting_lines().is_empty(), "no wait was announced");
+            assert!(!rig.path("index.db").exists(), "nothing ran");
+        }
+        drop(lock);
     }
 
     #[test]

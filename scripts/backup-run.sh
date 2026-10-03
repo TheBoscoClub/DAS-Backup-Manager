@@ -7,12 +7,15 @@
 #   - Maintenance lock holder record and hand-down (v4.9.0): once it holds
 #     /run/das-maintenance.lock this run writes "backup-run.sh pid <pid>"
 #     into it (record_maintenance_holder), so a restore or index job that
-#     finds the lock held can say what it waits for. The file is opened `<>`
-#     instead of `>`, which emptied the current holder's record while this
-#     run merely waited. `btrdasd walk` now takes the maintenance lock before
-#     it mounts the targets, so run_indexer hands it the lock this run holds
-#     (DAS_MAINTENANCE_LOCK_FD=8) — otherwise walk would wait for this run
-#     forever (bd DAS-Backup-Manager-frb).
+#     finds the lock held can say what it waits for, and cleanup() empties
+#     it again on the way out, while the lock is still held. The file is
+#     opened `<>` instead of `>`, which emptied the current holder's record
+#     while this run merely waited; a run that has to wait names the holder
+#     (maintenance_holder) instead of guessing at a scrub. `btrdasd walk` now
+#     takes the maintenance lock before it mounts the targets, so run_indexer
+#     hands it the lock this run holds (DAS_MAINTENANCE_LOCK_FD=8) —
+#     otherwise walk would wait for this run forever
+#     (bd DAS-Backup-Manager-frb).
 #   - Recovery OS check and a WARN level (v4.8.0): check_recovery_os() runs
 #     `btrdasd recovery-os status` after btrbk and expiry, while the targets
 #     are still mounted, and puts its RECOVERY OS section in the report. It
@@ -495,6 +498,13 @@ check_root() {
 # run holds anything, while it merely waits. flock(1) locks the open file
 # description whatever its mode, so the locking is unchanged (bd frb).
 acquire_maintenance_lock() {
+    # fd 8 is not close-on-exec, so every child this run starts inherits it
+    # and shares the hold: a child that outlives this run keeps the lock
+    # held until it exits too. Only run_indexer relies on that, and says so
+    # (DAS_MAINTENANCE_LOCK_FD=8 for `btrdasd walk`); for every other child
+    # the inheritance is incidental and harmless while children end before
+    # the run does. Never `flock -u 8` while a child may hold the
+    # description — that releases it for the child as well.
     exec 8<>"$MAINTENANCE_LOCKFILE"
     if flock -n 8; then
         record_maintenance_holder
@@ -508,7 +518,7 @@ acquire_maintenance_lock() {
         return
     fi
 
-    log_info "DAS maintenance lock held (scrub in progress?) — waiting..."
+    log_info "DAS maintenance lock held by $(maintenance_holder) — waiting..."
     local wait_start
     wait_start=$(date +%s)
 
@@ -525,10 +535,51 @@ acquire_maintenance_lock() {
 # itself, so a restore or index job that finds the lock held can say what it
 # waits for — as every holder in indexer/src/maintenance.rs does. Called only
 # while holding the lock. Display only: a failed write is logged, and the run
-# goes on. The record is left at exit; a reader sees that its pid has gone.
+# goes on. cleanup() empties it again (clear_maintenance_holder).
 record_maintenance_holder() {
     if ! printf 'backup-run.sh pid %s\n' "$$" >"$MAINTENANCE_LOCKFILE"; then
         log_warn "Could not record this run as the holder of $MAINTENANCE_LOCKFILE"
+    fi
+}
+
+# Empty this run's record, while fd 8 still holds the lock, so a finished run
+# is never named as the holder. Called by cleanup() only once the lock is
+# this run's (CLEANUP_ARMED); before that the record is another holder's.
+# Emptied, never removed: the file is the lock. Display only: a failure is
+# logged, and a reader then sees that the recorded pid has gone.
+clear_maintenance_holder() {
+    if ! : >"$MAINTENANCE_LOCKFILE"; then
+        log_warn "Could not empty the holder record in $MAINTENANCE_LOCKFILE"
+    fi
+}
+
+# Who holds the maintenance lock, as its holder recorded itself — the reading
+# `holder_of` in indexer/src/maintenance.rs gives, with the same four answers
+# (tests/test_maintenance_lock.sh pins them as that file's tests do): nothing
+# recorded; a record without a pid, which is only the last one recorded; a
+# record whose process has gone; and a live holder, named as recorded. First
+# line only, without control characters, at most 200 characters. Display
+# only: a file that cannot be read reads as nothing recorded.
+maintenance_holder() {
+    local line="" pid
+    if [[ -r "$MAINTENANCE_LOCKFILE" ]]; then
+        IFS= read -r line <"$MAINTENANCE_LOCKFILE" || true
+    fi
+    line="${line//[[:cntrl:]]/}"
+    line="${line:0:200}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ -z "$line" ]]; then
+        echo "an unknown holder"
+        return
+    fi
+    pid="${line##* pid }"
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[0-9]+$ ]]; then
+        echo "an unknown holder (last recorded: $line)"
+    elif [[ -d "/proc/$pid" ]]; then
+        echo "$line"
+    else
+        echo "an unknown holder (the last recorded holder, $line, is no longer running)"
     fi
 }
 
@@ -2463,7 +2514,14 @@ cleanup() {
     #      early return, nonzero for a usage error) is correct in both
     #      cases — neither is "abnormal termination of a run in progress"
     #      from this process's own perspective. bd DAS-Backup-Manager-oeo.
+    #
+    # Once the lock is this run's (CLEANUP_ARMED), its holder record is
+    # emptied on both ways out — here and after the recovery body below —
+    # while fd 8 still holds the lock (bd DAS-Backup-Manager-frb).
     if [[ "$SCRIPT_COMPLETED" == "true" || "$CLEANUP_ARMED" != "true" ]]; then
+        if [[ "$CLEANUP_ARMED" == "true" ]]; then
+            clear_maintenance_holder
+        fi
         exit "$rc"
     fi
 
@@ -2488,6 +2546,7 @@ cleanup() {
     # already handles its own per-mount failures internally, but a failure
     # here must never prevent the trailing `exit "$rc"` from running.
     unmount_all || true
+    clear_maintenance_holder
 
     # Explicit exit, not fallthrough: preserves the original abort status
     # ($rc) as the process's final exit code rather than letting it become

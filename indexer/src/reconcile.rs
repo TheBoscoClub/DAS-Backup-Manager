@@ -67,7 +67,7 @@ impl HoldsMaintenance for ReconcileLocks {
 pub enum LockAttempt {
     Acquired(Box<ReconcileLocks>),
     /// Another maintenance operation holds a lock — defer, do not queue.
-    Deferred(&'static str),
+    Deferred(String),
 }
 
 /// Try to take the standalone reconcile locks without blocking. `job`
@@ -83,13 +83,14 @@ pub fn try_acquire_locks_at(
 ) -> Result<LockAttempt, scrub::ScrubError> {
     let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
         return Ok(LockAttempt::Deferred(
-            "another reconcile is already running",
+            "another reconcile is already running".to_string(),
         ));
     };
     let Some(maintenance) = MaintenanceHeld::try_acquire_at(maintenance_path, job)? else {
-        return Ok(LockAttempt::Deferred(
-            "DAS maintenance lock held (backup or scrub in progress)",
-        ));
+        return Ok(LockAttempt::Deferred(format!(
+            "DAS maintenance lock held by {}",
+            crate::maintenance::holder_of(maintenance_path)
+        )));
     };
     Ok(LockAttempt::Acquired(Box::new(ReconcileLocks {
         maintenance,
@@ -352,11 +353,18 @@ mod tests {
         let singleton = dir.path().join("reconcile.lock");
         let maintenance = dir.path().join("maintenance.lock");
 
-        let held = scrub::FileLock::try_acquire(&maintenance).unwrap();
+        let held = MaintenanceHeld::try_acquire_at(&maintenance, "btrdasd scrub run").unwrap();
         assert!(held.is_some(), "fixture must actually hold the lock");
 
         match try_acquire_locks_at(&singleton, &maintenance, "btrdasd reconcile").unwrap() {
-            LockAttempt::Deferred(why) => assert!(why.contains("maintenance")),
+            LockAttempt::Deferred(why) => assert_eq!(
+                why,
+                format!(
+                    "DAS maintenance lock held by btrdasd scrub run pid {}",
+                    std::process::id()
+                ),
+                "the holder is named, never guessed"
+            ),
             LockAttempt::Acquired(_) => panic!("acquired while maintenance lock was held"),
         }
     }

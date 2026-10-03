@@ -99,8 +99,14 @@ impl MaintenanceHeld {
     /// recorded with this process's pid.
     fn owned(lock: FileLock, job: &str) -> Self {
         // Display only: a record that cannot be written costs the name,
-        // never the lock — a waiter then reads the holder as unknown.
-        let _ = lock.write_note(&format!("{job} pid {}\n", std::process::id()));
+        // never the lock — a waiter then reads the holder as unknown. Said,
+        // so the missing name has a reason.
+        if let Err(e) = lock.write_note(&format!("{job} pid {}\n", std::process::id())) {
+            eprintln!(
+                "warning: could not record {job} as the holder of {}: {e}",
+                lock.path().display()
+            );
+        }
         Self {
             path: lock.path().to_path_buf(),
             how: How::Owned(lock),
@@ -113,25 +119,32 @@ impl MaintenanceHeld {
         Ok(FileLock::try_acquire(path)?.map(|lock| Self::owned(lock, job)))
     }
 
-    /// Take the lock, waiting as long as it takes — backups and scrubs.
+    /// Take the lock, waiting as long as it takes — backups and scrubs. The
+    /// line it logs if it has to wait names the holder ([`blocked_line`]).
     pub fn acquire_blocking_at(
         path: &Path,
         job: &str,
         progress: &dyn ProgressCallback,
-        waiting_message: &str,
     ) -> Result<Self, ScrubError> {
-        FileLock::acquire_blocking(path, progress, waiting_message)
+        FileLock::acquire_blocking(path, progress, &|| blocked_line(path))
             .map(|lock| Self::owned(lock, job))
     }
 
     /// The lock as the process that started this one holds it: `fd` is that
     /// process's open descriptor on the lock file, inherited and named in
-    /// [`DELEGATED_FD_ENV`]. Proven, never believed: `fd` must be the lock
-    /// file itself (device and inode), and taking the lock through it must
-    /// succeed at once — which it does only for the open file description
-    /// that already holds it, or when nobody does. Anything else is an
+    /// [`DELEGATED_FD_ENV`]. Proven, never believed, in three steps: `fd` must
+    /// be the lock file itself (device and inode); the lock must be held — a
+    /// fresh open of the file cannot take it; and it must be held through
+    /// `fd` — taking it through a duplicate of `fd` succeeds at once, which it
+    /// does only for the open file description that holds it. A free lock is
+    /// refused rather than taken: a descriptor that held nothing must not end
+    /// up holding the lock for its owner's lifetime. Anything else is an
     /// error, never a fall-back to waiting: a command that waited for a lock
     /// its own parent holds would wait forever.
+    ///
+    /// Not atomic: a holder that lets go between the second and third steps
+    /// would let a descriptor that held nothing take the lock. The caller that
+    /// named it then holds it until it exits — the same as any holder.
     pub fn delegated_at(path: &Path, fd: RawFd) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
         let lock = path.display();
@@ -149,9 +162,19 @@ impl MaintenanceHeld {
         if got.st_dev != want.dev() || got.st_ino != want.ino() {
             return Err(format!("{DELEGATED_FD_ENV}={fd} is not {lock}"));
         }
-        // A duplicate of `fd` shares its open file description, so locking
-        // through it asks whether that description holds the lock (or can take
-        // it at once). Closing the duplicate releases nothing: the caller's
+        // A fresh open that can take the lock finds it free: then `fd` holds
+        // nothing. The probe lets go when it drops.
+        if FileLock::try_acquire(path)
+            .map_err(|e| format!("{DELEGATED_FD_ENV}={fd}: cannot look at {lock}: {e}"))?
+            .is_some()
+        {
+            return Err(format!(
+                "{DELEGATED_FD_ENV}={fd} does not hold {lock}: the lock is free"
+            ));
+        }
+        // Held, then — by whom? A duplicate of `fd` shares its open file
+        // description, so locking through it succeeds only if that description
+        // is the holder. Closing the duplicate releases nothing: the caller's
         // descriptor still refers to the description.
         // SAFETY: `fstat` above proved `fd` open, and nothing in this process
         // closes it during this one borrow.
@@ -189,8 +212,13 @@ impl Drop for MaintenanceHeld {
         // Empty the record while the lock is still held: once it is released
         // the next holder may already have written its own. Display only. A
         // delegated hold's record belongs to the process that holds it.
-        if let How::Owned(lock) = &self.how {
-            let _ = lock.clear_note();
+        if let How::Owned(lock) = &self.how
+            && let Err(e) = lock.clear_note()
+        {
+            eprintln!(
+                "warning: could not empty the holder record in {}: {e}",
+                lock.path().display()
+            );
         }
         // The `FileLock` is dropped after this, which releases the lock.
     }
@@ -278,9 +306,10 @@ pub fn hold_for_job(
 }
 
 /// Who holds the lock, as the holder recorded itself in the lock file — or
-/// [`UNKNOWN_HOLDER`] when nothing is recorded, or when the recorded process
-/// has exited (a holder that did not record itself, such as a plain
-/// `flock`, holds it after one that did).
+/// [`UNKNOWN_HOLDER`] when nothing is recorded; when the record carries no
+/// pid, so nothing says whether it still runs (shown as the last one
+/// recorded); or when the recorded process has exited (a holder that did not
+/// record itself, such as a plain `flock`, holds it after one that did).
 pub fn holder_of(path: &Path) -> String {
     // Display only: a record that cannot be read is an unknown holder, and
     // the caller waits, or defers, just the same.
@@ -292,6 +321,24 @@ pub fn holder_of(path: &Path) -> String {
 /// characters and cut to [`MAX_RECORD_CHARS`]. `running` says whether a pid
 /// is a live process.
 fn holder_from_note(note: &str, running: &dyn Fn(u32) -> bool) -> String {
+    let line = record_line(note);
+    if line.is_empty() {
+        return UNKNOWN_HOLDER.to_string();
+    }
+    // Every holder this project writes records its pid; a record without one
+    // cannot be checked, so it is only ever the last one recorded.
+    match record_pid(&line) {
+        Some(pid) if running(pid) => line,
+        Some(_) => {
+            format!("{UNKNOWN_HOLDER} (the last recorded holder, {line}, is no longer running)")
+        }
+        None => format!("{UNKNOWN_HOLDER} (last recorded: {line})"),
+    }
+}
+
+/// A record's first line, without control characters, cut to
+/// [`MAX_RECORD_CHARS`] and trimmed.
+fn record_line(note: &str) -> String {
     let line: String = note
         .lines()
         .next()
@@ -300,16 +347,7 @@ fn holder_from_note(note: &str, running: &dyn Fn(u32) -> bool) -> String {
         .filter(|c| !c.is_control())
         .take(MAX_RECORD_CHARS)
         .collect();
-    let line = line.trim();
-    if line.is_empty() {
-        return UNKNOWN_HOLDER.to_string();
-    }
-    match record_pid(line) {
-        Some(pid) if !running(pid) => {
-            format!("{UNKNOWN_HOLDER} (the last recorded holder, {line}, is no longer running)")
-        }
-        _ => line.to_string(),
-    }
+    line.trim().to_string()
 }
 
 /// The pid a record ends with — `… pid 4242`.
@@ -319,6 +357,86 @@ fn record_pid(line: &str) -> Option<u32> {
 
 fn pid_is_running(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// `(pid, record)` when the process recorded as holding the lock is this
+/// process's own caller — its parent or a further ancestor — and the lock is
+/// held. A command that waited then would wait for its caller, which waits for
+/// the command: forever. The caller has to hand its hold down
+/// ([`DELEGATED_FD_ENV`]) instead.
+pub fn held_by_caller(path: &Path) -> Result<Option<(u32, String)>, ScrubError> {
+    held_by_caller_at(
+        path,
+        Path::new("/proc"),
+        std::os::unix::process::parent_id(),
+    )
+}
+
+/// [`held_by_caller`] with `/proc` at `proc_root`, from `parent` upwards.
+fn held_by_caller_at(
+    path: &Path,
+    proc_root: &Path,
+    parent: u32,
+) -> Result<Option<(u32, String)>, ScrubError> {
+    // Display only, as for every reader of the record: unreadable is empty.
+    let record = record_line(&std::fs::read_to_string(path).unwrap_or_default());
+    let Some(pid) = record_pid(&record) else {
+        return Ok(None);
+    };
+    if !ancestors(proc_root, parent).contains(&pid) {
+        return Ok(None);
+    }
+    // The record names; only the lock decides. A free lock is nobody's,
+    // whatever was last recorded — and the probe lets go when it drops.
+    if FileLock::try_acquire(path)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some((pid, record)))
+}
+
+/// `start` and its ancestors, up to but not including init, read from
+/// `<proc_root>/<pid>/stat`. A process that cannot be read, or a loop, ends it.
+fn ancestors(proc_root: &Path, start: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut pid = start;
+    while pid > 1 && !chain.contains(&pid) {
+        chain.push(pid);
+        let Some(parent) = parent_of(proc_root, pid) else {
+            break;
+        };
+        pid = parent;
+    }
+    chain
+}
+
+/// The parent in `<proc_root>/<pid>/stat` — the field after the state, read
+/// after the last `)`, because the command name may hold spaces and both
+/// parentheses.
+fn parent_of(proc_root: &Path, pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Why a command refuses to wait for a lock its own caller holds.
+pub fn caller_holds_line(pid: u32, record: &str) -> String {
+    format!(
+        "the DAS maintenance lock is held by my own caller (pid {pid}, {record}); it must hand \
+         the hold down via {DELEGATED_FD_ENV}"
+    )
+}
+
+/// What a backup or a scrub logs while it waits for the lock.
+pub fn blocked_line(path: &Path) -> String {
+    format!(
+        "Waiting for the DAS maintenance lock {}, held by {}",
+        path.display(),
+        holder_of(path)
+    )
 }
 
 /// The line a job logs before it starts waiting.
@@ -473,13 +591,9 @@ mod tests {
     #[test]
     fn a_blocking_taker_records_itself_too() {
         let (_dir, site) = scratch();
-        let held = MaintenanceHeld::acquire_blocking_at(
-            &site.path,
-            "btrdasd scrub run",
-            &NullProgress,
-            "waiting",
-        )
-        .unwrap();
+        let held =
+            MaintenanceHeld::acquire_blocking_at(&site.path, "btrdasd scrub run", &NullProgress)
+                .unwrap();
         assert_eq!(note(&site.path), format!("{}\n", me("btrdasd scrub run")));
         drop(held);
         assert_eq!(note(&site.path), "");
@@ -774,14 +888,16 @@ mod tests {
     }
 
     #[test]
-    fn a_record_without_a_pid_is_shown_as_written() {
+    fn a_record_without_a_pid_is_only_the_last_recorded_holder() {
+        // Nothing says whether it still runs, so it is never presented as
+        // the holder — even where every pid would read as running.
         assert_eq!(
-            holder_from_note("recovery-os VM session A\n", &|_| false),
-            "recovery-os VM session A"
+            holder_from_note("recovery-os VM session A\n", &|_| true),
+            "an unknown holder (last recorded: recovery-os VM session A)"
         );
         assert_eq!(
-            holder_from_note("odd pid 4x\n", &|_| false),
-            "odd pid 4x",
+            holder_from_note("odd pid 4x\n", &|_| true),
+            "an unknown holder (last recorded: odd pid 4x)",
             "a pid that does not parse is no pid"
         );
     }
@@ -793,7 +909,10 @@ mod tests {
             "evil[2J name pid 7"
         );
         let long = "x".repeat(500);
-        assert_eq!(holder_from_note(&long, &|_| true), "x".repeat(200));
+        assert_eq!(
+            holder_from_note(&long, &|_| true),
+            format!("{UNKNOWN_HOLDER} (last recorded: {})", "x".repeat(200))
+        );
     }
 
     #[test]
@@ -850,6 +969,119 @@ mod tests {
         }
     }
 
+    /// A record that cannot be written costs the name, never the lock: the
+    /// hold is taken and kept, and the failure is said on stderr (both
+    /// `set_len` calls fail on a character device).
+    #[test]
+    fn a_record_that_cannot_be_written_still_leaves_the_lock_held() {
+        let full = Path::new("/dev/full");
+        let held = MaintenanceHeld::try_acquire_at(full, "btrdasd walk")
+            .unwrap()
+            .expect("nobody else locks /dev/full");
+        assert!(
+            FileLock::try_acquire(full).unwrap().is_none(),
+            "the hold is real although its record was not written"
+        );
+        drop(held);
+        assert!(FileLock::try_acquire(full).unwrap().is_some(), "and let go");
+    }
+
+    // --- the caller holds it --------------------------------------------------
+
+    /// A fake `/proc`: each `(pid, ppid, comm)` gets a `stat` line.
+    fn fake_proc(entries: &[(u32, u32, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (pid, ppid, comm) in entries {
+            let process = dir.path().join(pid.to_string());
+            std::fs::create_dir(&process).unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!("{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 4194560 0 0\n"),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_ancestry_runs_from_the_parent_up_to_init() {
+        let proc = fake_proc(&[
+            (300, 200, "btrdasd"),
+            (200, 100, "bash"),
+            (100, 1, "odd) S 9 (name"),
+            (1, 0, "systemd"),
+        ]);
+        assert_eq!(ancestors(proc.path(), 300), [300, 200, 100]);
+        assert_eq!(
+            parent_of(proc.path(), 100),
+            Some(1),
+            "the parent is read after the last ')' — a name may hold both"
+        );
+        assert_eq!(ancestors(proc.path(), 999), [999], "a gone process ends it");
+        let looped = fake_proc(&[(10, 11, "a"), (11, 10, "b")]);
+        assert_eq!(ancestors(looped.path(), 10), [10, 11], "a loop ends it");
+    }
+
+    #[test]
+    fn a_lock_held_by_the_callers_own_ancestor_is_named_and_only_while_held() {
+        let (_dir, site) = scratch();
+        let proc = fake_proc(&[(300, 200, "bash"), (200, 100, "bash"), (100, 1, "bash")]);
+        let holder = holding_descriptor(&site.path);
+        let caller = |record: &str| {
+            std::fs::write(&site.path, format!("{record}\n")).unwrap();
+            held_by_caller_at(&site.path, proc.path(), 300).unwrap()
+        };
+        assert_eq!(
+            caller("backup-run.sh pid 200"),
+            Some((200, "backup-run.sh pid 200".to_string()))
+        );
+        assert_eq!(
+            caller("backup-run.sh pid 300"),
+            Some((300, "backup-run.sh pid 300".into()))
+        );
+        assert_eq!(caller("btrdasd scrub run pid 777"), None, "not an ancestor");
+        assert_eq!(caller("x pid 1"), None, "init is past the end of the chain");
+        assert_eq!(caller("recovery-os VM session A"), None, "no pid, nobody");
+        drop(holder);
+        assert_eq!(
+            caller("backup-run.sh pid 200"),
+            None,
+            "a free lock is nobody's, whatever the record says"
+        );
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_some(),
+            "and looking left it free"
+        );
+    }
+
+    #[test]
+    fn the_caller_is_told_to_hand_the_hold_down() {
+        assert_eq!(
+            caller_holds_line(200, "backup-run.sh pid 200"),
+            "the DAS maintenance lock is held by my own caller (pid 200, backup-run.sh pid 200); \
+             it must hand the hold down via DAS_MAINTENANCE_LOCK_FD"
+        );
+    }
+
+    #[test]
+    fn a_backup_or_scrub_that_waits_names_the_holder() {
+        let (_dir, site) = scratch();
+        let held = MaintenanceHeld::try_acquire_at(&site.path, "btrdasd restore browse")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            blocked_line(&site.path),
+            format!(
+                "Waiting for the DAS maintenance lock {}, held by {}",
+                site.path.display(),
+                me("btrdasd restore browse")
+            )
+        );
+        drop(held);
+    }
+
     // --- a lock handed down ------------------------------------------------
 
     #[test]
@@ -891,6 +1123,26 @@ mod tests {
         let elsewhere = holding_descriptor(&dir.path().join("other.lock"));
         let err = MaintenanceHeld::delegated_at(&site.path, elsewhere.as_raw_fd()).unwrap_err();
         assert!(err.contains("is not"), "{err}");
+    }
+
+    /// A free lock is nobody's hold: proving a hold must not take the lock
+    /// through a descriptor that never held it, and must leave it free.
+    #[test]
+    fn a_descriptor_on_a_free_lock_is_refused_and_the_lock_stays_free() {
+        let (_dir, site) = scratch();
+        std::fs::write(&site.path, "").unwrap();
+        // Opened, never locked: a descriptor that holds nothing.
+        let bystander = OpenOptions::new().read(true).open(&site.path).unwrap();
+        let err = MaintenanceHeld::delegated_at(&site.path, bystander.as_raw_fd()).unwrap_err();
+        assert!(err.contains("does not hold"), "{err}");
+        assert!(err.contains("the lock is free"), "{err}");
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_some(),
+            "the lock must still be free for a fresh taker while that descriptor stays open"
+        );
+        drop(bystander);
     }
 
     #[test]
