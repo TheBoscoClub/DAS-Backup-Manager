@@ -8,8 +8,10 @@
 #     `btrdasd recovery-os status` after btrbk and expiry, while the targets
 #     are still mounted, and puts its RECOVERY OS section in the report. It
 #     reads each role=mirror drive's own OS under @ (never writes to the
-#     drive) and records the reading in $RECOVERY_OS_STATE for `btrdasd
-#     health` (not in a dry run). A stale OS records WARN: the status line
+#     drive, not even an access time) and records the reading in
+#     $DAS_RECOVERY_OS_STATE for `btrdasd health` (not in a dry run). The read
+#     is bounded by `timeout` (RECOVERY_OS_TIMEOUT_SECS, 300 s): a stalled
+#     drive costs a FAIL, never the run. A stale OS records WARN: the status line
 #     reads COMPLETED WITH WARNINGS and the subject SUCCESS WITH WARNINGS, but
 #     the run is recorded as a success, because the backup itself worked. A
 #     check that cannot run records FAIL. Neither stops the run
@@ -874,8 +876,14 @@ SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
 RECOVERY_OS_REPORT=""
 # Where the recovery OS check keeps its last reading for `btrdasd health`;
-# must match recovery_os::RECOVERY_OS_STATE_PATH.
-RECOVERY_OS_STATE="${RECOVERY_OS_STATE:-/var/lib/das-backup/recovery-os.json}"
+# the same variable btrdasd itself reads (`btrdasd health`), defaulting to
+# the same path as recovery_os's RECOVERY_OS_STATE_PATH.
+DAS_RECOVERY_OS_STATE="${DAS_RECOVERY_OS_STATE:-/var/lib/das-backup/recovery-os.json}"
+# Upper bound on reading the recovery OSes. A drive stalled in I/O must cost a
+# FAIL line, not the run: unmount and the report still have to happen. `-k 10`
+# follows the TERM with a KILL (a process stuck in uninterruptible I/O still
+# cannot be killed until the I/O returns; nothing in userspace can do that).
+RECOVERY_OS_TIMEOUT_SECS=300
 # Dry run only: the btrbk.conf the real run would leave, rendered by sync into
 # a mktemp file (mode 600) that `btrbk dryrun` reads. Removed by cleanup().
 DRYRUN_BTRBK_CONF=""
@@ -1006,29 +1014,48 @@ check_recovery_os() {
     local mode="$1"
     local args=(recovery-os status --config "$DAS_CONFIG")
     if [[ "$mode" != "dryrun" ]]; then
-        args+=(--state-file "$RECOVERY_OS_STATE")
+        args+=(--state-file "$DAS_RECOVERY_OS_STATE")
     fi
 
     log_info "Checking the recovery OSes..."
     local rc=0 errf="" err=""
+    local bounded=(timeout -k 10 "$RECOVERY_OS_TIMEOUT_SECS" "$BTRDASD_BIN" "${args[@]}")
     errf="$(mktemp --tmpdir das-recovery-os.XXXXXX)" || errf=""
     if [[ -n "$errf" ]]; then
-        RECOVERY_OS_REPORT="$("$BTRDASD_BIN" "${args[@]}" 2>"$errf")" || rc=$?
+        RECOVERY_OS_REPORT="$("${bounded[@]}" 2>"$errf")" || rc=$?
         err="$(<"$errf")"
         rm -f -- "$errf"
     else
         # No temp file: stderr goes to the journal instead of the detail.
-        RECOVERY_OS_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+        RECOVERY_OS_REPORT="$("${bounded[@]}")" || rc=$?
     fi
     local first_err="${err%%$'\n'*}"
 
+    # Which drives were not looked at, and whether any was: read from the
+    # section the command printed (awk exits 0 on no match).
+    local not_mounted inspected suffix=""
+    not_mounted="$(awk '/^  .*  not mounted$/ { sub(/^  /, ""); sub(/  not mounted$/, ""); printf "%s%s", sep, $0; sep = ", " }' <<<"$RECOVERY_OS_REPORT")"
+    inspected="$(awk '/^    Result  / { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
+    if [[ -n "$not_mounted" ]]; then
+        suffix="; not mounted: $not_mounted"
+    fi
+
     case "$rc" in
         0)
-            record_op "recovery_os" "OK" "none stale"
+            if (( inspected == 0 )); then
+                record_op "recovery_os" "OK" "nothing inspected${suffix}"
+            else
+                record_op "recovery_os" "OK" "none stale${suffix}"
+            fi
             ;;
         1)
-            record_op "recovery_os" "WARN" "stale — see RECOVERY OS in the report"
+            record_op "recovery_os" "WARN" "stale — see RECOVERY OS in the report${suffix}"
             log_warn "A recovery OS is behind the host — see RECOVERY OS in the report"
+            ;;
+        124)
+            record_op "recovery_os" "FAIL" "recovery-os status timed out after ${RECOVERY_OS_TIMEOUT_SECS} s (drive stalled?)"
+            log_error "The recovery OS check timed out after ${RECOVERY_OS_TIMEOUT_SECS} s (drive stalled?)"
+            RECOVERY_OS_REPORT="RECOVERY OS"$'\n'"  CHECK FAILED: ${OP_STATUS[recovery_os_detail]}"
             ;;
         *)
             record_op "recovery_os" "FAIL" "exit code $rc${first_err:+: $first_err}"

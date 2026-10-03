@@ -23,7 +23,9 @@ declare -A OP_STATUS=()
 # shellcheck disable=SC2034  # read by the functions eval-extracted above
 DAS_CONFIG="$WORK/config.toml"
 # shellcheck disable=SC2034
-RECOVERY_OS_STATE="$WORK/recovery-os.json"
+DAS_RECOVERY_OS_STATE="$WORK/recovery-os.json"
+# shellcheck disable=SC2034  # read by the extracted check_recovery_os
+RECOVERY_OS_TIMEOUT_SECS=300
 BTRDASD_BIN="$WORK/btrdasd"
 
 # Stub: output, stderr and exit code chosen by files in $WORK.
@@ -40,6 +42,18 @@ cat "$here/out"
 exit "$(cat "$here/rc")"
 STUB
 chmod +x "$BTRDASD_BIN"
+
+# Stub for coreutils timeout: records its arguments, then either reports a
+# timeout (124) or runs the command after its three option words (-k 10 N).
+# shellcheck disable=SC2329  # called by the extracted check_recovery_os
+timeout() {
+    echo "$*" >>"$WORK/timeout_calls"
+    if [[ -f "$WORK/time_out" ]]; then
+        return 124
+    fi
+    shift 3
+    "$@"
+}
 
 fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
@@ -62,16 +76,19 @@ BTRBK_LATEST=""
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
 
-reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; rm -f "$WORK/err" "$WORK/no_subcommand"; }
+reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; : >"$WORK/timeout_calls"; rm -f "$WORK/err" "$WORK/no_subcommand" "$WORK/time_out"; }
 
 # --- current ------------------------------------------------------------------
 reset
 printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK/out"; echo 0 >"$WORK/rc"
 check_recovery_os run
 check "current: OK" "${OP_STATUS[recovery_os]}" "OK"
+check "current: detail" "${OP_STATUS[recovery_os_detail]}" "none stale"
+check "the call is bounded by timeout -k 10 300" "$(cat "$WORK/timeout_calls")" \
+    "-k 10 300 $BTRDASD_BIN recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
 check "current: section captured" "$(head -n1 <<<"$RECOVERY_OS_REPORT")" "RECOVERY OS"
 check "real run records the state file" "$(cat "$WORK/calls")" \
-    "recovery-os status --config $DAS_CONFIG --state-file $RECOVERY_OS_STATE"
+    "recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
 check "current: run status SUCCESS" "$(run_status)" "SUCCESS"
 check "current: subject SUCCESS" "$(subject_status)" "SUCCESS"
 report="$(generate_report)"
@@ -132,8 +149,10 @@ check "unreadable: run FAILURE" "$(run_status)" "FAILURE"
 # --- a btrdasd without the subcommand -----------------------------------------
 reset
 touch "$WORK/no_subcommand"
+check "old binary: a bare call under set -e returns and the run continues" \
+    "$(set -e; check_recovery_os run; echo continued)" "continued"
+: >"$WORK/log"
 check_recovery_os run
-check "old binary: bare call under set -e survives" "ok" "ok"
 check "old binary: FAIL" "${OP_STATUS[recovery_os]}" "FAIL"
 check "old binary: detail" "${OP_STATUS[recovery_os_detail]}" \
     "exit code 2: error: unrecognized subcommand 'recovery-os'"
@@ -148,6 +167,50 @@ check_recovery_os run
 check "no binary: FAIL" "${OP_STATUS[recovery_os]}" "FAIL"
 check "no binary: detail names the exit code" "${OP_STATUS[recovery_os_detail]%%:*}" "exit code 127"
 BTRDASD_BIN="$WORK/btrdasd"
+
+# --- not mounted drives are named in the detail --------------------------------
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n  B  not mounted\n  C D  not mounted\n' >"$WORK/out"; echo 0 >"$WORK/rc"
+check_recovery_os run
+check "some unmounted: detail names them" "${OP_STATUS[recovery_os_detail]}" "none stale; not mounted: B, C D"
+printf 'RECOVERY OS\n  B  not mounted\n' >"$WORK/out"
+check_recovery_os run
+check "none mounted: nothing inspected, and which" "${OP_STATUS[recovery_os_detail]}" "nothing inspected; not mounted: B"
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              STALE — x\n  B  not mounted\n' >"$WORK/out"; echo 1 >"$WORK/rc"
+check_recovery_os run
+check "stale and unmounted: both said" "${OP_STATUS[recovery_os_detail]}" "stale — see RECOVERY OS in the report; not mounted: B"
+
+# --- a stalled read times out ----------------------------------------------------
+reset
+touch "$WORK/time_out"
+check "timeout: a bare call under set -e returns and the run continues" \
+    "$(set -e; check_recovery_os run; echo continued)" "continued"
+: >"$WORK/log"
+check_recovery_os run
+check "timeout: FAIL" "${OP_STATUS[recovery_os]}" "FAIL"
+check "timeout: detail" "${OP_STATUS[recovery_os_detail]}" "recovery-os status timed out after 300 s (drive stalled?)"
+check "timeout: the section says so" "$RECOVERY_OS_REPORT" \
+    $'RECOVERY OS\n  CHECK FAILED: recovery-os status timed out after 300 s (drive stalled?)'
+check "timeout: the run status is FAILURE, the exit rule is untouched" "$(run_status)" "FAILURE"
+check "timeout: logged as an error" "$(grep -c '^ERROR: .*timed out after 300 s' "$WORK/log")" "1"
+
+# --- a corrupt state file: the way out reaches the report ----------------------
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK/out"
+printf "Error: could not record the result: %s: expected value — left as it is; remove it to start over: rm -- '%s'\n" \
+    "$DAS_RECOVERY_OS_STATE" "$DAS_RECOVERY_OS_STATE" >"$WORK/err"
+echo 2 >"$WORK/rc"
+check_recovery_os run
+check "corrupt state: FAIL with the fix in the detail" "${OP_STATUS[recovery_os_detail]}" \
+    "exit code 2: Error: could not record the result: $DAS_RECOVERY_OS_STATE: expected value — left as it is; remove it to start over: rm -- '$DAS_RECOVERY_OS_STATE'"
+
+# --- one name for the state path --------------------------------------------------
+# shellcheck disable=SC2016
+check "the script defaults DAS_RECOVERY_OS_STATE, the name the Rust side reads" \
+    "$(grep -c '^DAS_RECOVERY_OS_STATE="${DAS_RECOVERY_OS_STATE:-/var/lib/das-backup/recovery-os.json}"$' "$SCRIPT")" "1"
+check "no other name for it remains" "$(grep -cE '(\$\{?|^)RECOVERY_OS_STATE([^_A-Z]|$)' "$SCRIPT" || true)" "0"
+# shellcheck disable=SC2016
+check "the timeout bound is 300 s" "$(grep -c '^RECOVERY_OS_TIMEOUT_SECS=300$' "$SCRIPT")" "1"
 
 # --- main(): wiring -------------------------------------------------------------
 main_body="$(awk '/^main\(\) \{/,/^}/' "$SCRIPT")"

@@ -705,6 +705,13 @@ impl Config {
             &self.schedule.full,
         ));
 
+        if self.recovery_os.max_age_days == 0 {
+            errors.push(
+                "recovery_os.max_age_days must be at least 1 (0 would mark every recovery OS stale)"
+                    .into(),
+            );
+        }
+
         if self.sources.is_empty() {
             errors.push("No backup sources defined — add at least one [[source]]".into());
         }
@@ -1049,6 +1056,25 @@ mod tests {
             30
         );
         assert!(Config::from_toml(&minimal_toml("[recovery_os]\nmax_age_days = -1\n")).is_err());
+    }
+
+    #[test]
+    fn validate_requires_a_recovery_os_age_of_at_least_one_day() {
+        let msg =
+            "recovery_os.max_age_days must be at least 1 (0 would mark every recovery OS stale)";
+        let mut cfg =
+            Config::from_toml(&minimal_toml("[recovery_os]\nmax_age_days = 0\n")).unwrap();
+        assert!(
+            cfg.validate().iter().any(|e| e == msg),
+            "{:?}",
+            cfg.validate()
+        );
+        cfg.recovery_os.max_age_days = 1;
+        assert!(
+            !cfg.validate().iter().any(|e| e.contains("max_age_days")),
+            "{:?}",
+            cfg.validate()
+        );
     }
 
     #[test]
