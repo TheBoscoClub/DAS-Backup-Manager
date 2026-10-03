@@ -624,6 +624,12 @@ Default:
 .\"
 .SS backup report
 Show the last backup reports from the database.
+A snapshot count the run could not take shows as
+.B unknown
+.RB ( null
+with
+.BR \-\-json ),
+never as 0.
 .PP
 .B btrdasd backup report
 .RB [ \-\-db
@@ -644,6 +650,14 @@ Default: 10.
 Record a completed backup run in the backup history. Used by
 .BR backup\-run.sh ;
 not normally run by hand.
+Give both snapshot counts, or
+.B \-\-counts\-unknown
+when the run could not count them: the history then stores them as unknown
+(NULL), and the history views show
+.BR unknown .
+A count is never made up: one count without the other, or a count with
+.BR \-\-counts\-unknown ,
+is refused, and a count cannot be negative.
 .PP
 .B btrdasd backup record\-run
 .RB [ \-\-db
@@ -651,10 +665,12 @@ not normally run by hand.
 .RB [ \-\-success ]
 .RB [ \-\-mode
 .IR MODE ]
-.RB [ \-\-snaps\-created
-.IR N ]
-.RB [ \-\-snaps\-sent
-.IR N ]
+.RB { \-\-snaps\-created
+.I N
+.B \-\-snaps\-sent
+.I N
+|
+.BR \-\-counts\-unknown }
 .RB [ \-\-bytes\-sent
 .IR N ]
 .RB [ \-\-duration\-secs
@@ -678,10 +694,24 @@ Default:
 .BR incremental .
 .TP
 .BI \-\-snaps\-created " N"
-Number of snapshots created. Default: 0.
+Number of snapshots created. Required unless
+.B \-\-counts\-unknown
+is given.
 .TP
 .BI \-\-snaps\-sent " N"
-Number of snapshots sent to targets. Default: 0.
+Number of snapshots sent to targets. Required unless
+.B \-\-counts\-unknown
+is given.
+.TP
+.B \-\-counts\-unknown
+The run could not count its snapshots \(em for
+.BR backup\-run.sh ,
+.B "btrbk list latest"
+failed, listed no field it knows, or the run ended before the counters were
+read. Both counts are recorded as unknown. Not with
+.B \-\-snaps\-created
+or
+.BR \-\-snaps\-sent .
 .TP
 .BI \-\-bytes\-sent " N"
 Bytes sent to targets. Default: 0.

@@ -11,11 +11,14 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QLabel>
 #include <QSortFilterProxyModel>
 #include <QTableView>
 #include <QVBoxLayout>
 #include <QVector>
+
+#include <optional>
 
 // ---------------------------------------------------------------------------
 // BackupRunInfo — local struct for parsed JSON backup history entries
@@ -27,14 +30,13 @@ struct BackupRunInfo {
     QString mode;
     bool success = false;
     qint64 durationSecs = 0;
-    qint64 snapsCreated = 0;
-    qint64 snapsSent = 0;
+    std::optional<qint64> snapsCreated; // no value: the run could not count
     qint64 bytesSent = 0;
     QStringList errors;
 };
 
 // ---------------------------------------------------------------------------
-// BackupHistoryModel — private table model backed by D-Bus indexBackupHistory
+// BackupHistoryModel — private table model over the helper's history JSON
 // ---------------------------------------------------------------------------
 
 class BackupHistoryModel : public QAbstractTableModel
@@ -42,6 +44,11 @@ class BackupHistoryModel : public QAbstractTableModel
     Q_OBJECT
 
 public:
+    // What the view sorts by: the shown value, except that the snapshot
+    // column sorts by number with "unknown" below every count, instead of
+    // comparing the text "unknown" with numbers.
+    static constexpr int SortRole = Qt::UserRole;
+
     enum Column {
         Timestamp = 0,
         Mode,
@@ -53,18 +60,16 @@ public:
         ColumnCount
     };
 
-    explicit BackupHistoryModel(DBusClient *client, QObject *parent = nullptr)
+    explicit BackupHistoryModel(QObject *parent = nullptr)
         : QAbstractTableModel(parent)
-        , m_client(client)
     {
     }
 
-    void reload()
+    void load(const QString &json)
     {
         beginResetModel();
         m_runs.clear();
 
-        const QString json = m_client->indexBackupHistory(50);
         if (!json.isEmpty()) {
             const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
             for (const QJsonValue &v : arr) {
@@ -80,8 +85,8 @@ public:
                     .mode = obj.value(QLatin1String("mode")).toString(),
                     .success = obj.value(QLatin1String("success")).toBool(),
                     .durationSecs = obj.value(QLatin1String("duration_secs")).toInteger(),
-                    .snapsCreated = obj.value(QLatin1String("snaps_created")).toInteger(),
-                    .snapsSent = obj.value(QLatin1String("snaps_sent")).toInteger(),
+                    .snapsCreated = BackupHistoryView::countFromJson(
+                        obj.value(QLatin1String("snaps_created"))),
                     .bytesSent = obj.value(QLatin1String("bytes_sent")).toInteger(),
                     .errors = errors,
                 });
@@ -106,6 +111,12 @@ public:
             return {};
 
         const BackupRunInfo &run = m_runs[index.row()];
+
+        if (role == SortRole) {
+            if (index.column() == SnapshotsCreated)
+                return run.snapsCreated.value_or(-1); // a sort key, never shown
+            role = Qt::DisplayRole;
+        }
 
         if (role == Qt::DecorationRole) {
             if (index.column() == Status) {
@@ -150,7 +161,9 @@ public:
             return run.success ? i18n("Success") : i18n("Failed");
 
         case SnapshotsCreated:
-            return run.snapsCreated;
+            if (run.snapsCreated)
+                return *run.snapsCreated;
+            return i18n("unknown");
 
         case Sent:
             if (run.bytesSent > 0)
@@ -202,7 +215,6 @@ private:
         return QStringLiteral("%1s").arg(seconds);
     }
 
-    DBusClient *m_client;
     QVector<BackupRunInfo> m_runs;
 };
 
@@ -229,12 +241,12 @@ BackupHistoryView::BackupHistoryView(DBusClient *client, QWidget *parent)
     title->setFont(titleFont);
     layout->addWidget(title);
 
-    m_model = new BackupHistoryModel(m_client, this);
-    m_model->reload();
+    m_model = new BackupHistoryModel(this);
+    refresh();
 
     m_proxy = new QSortFilterProxyModel(this);
     m_proxy->setSourceModel(m_model);
-    m_proxy->setSortRole(Qt::DisplayRole);
+    m_proxy->setSortRole(BackupHistoryModel::SortRole);
 
     m_view = new QTableView(this);
     m_view->setModel(m_proxy);
@@ -270,7 +282,25 @@ BackupHistoryView::BackupHistoryView(DBusClient *client, QWidget *parent)
             this, &BackupHistoryView::refresh);
 }
 
+std::optional<qint64> BackupHistoryView::countFromJson(const QJsonValue &value)
+{
+    // null: the run could not count. undefined: a helper that did not send
+    // the field. toInteger() would turn both into 0, a count of nothing.
+    if (value.isNull() || value.isUndefined() || !value.isDouble())
+        return std::nullopt;
+    // -1 for a number that is not a whole qint64; below 0 is no count either.
+    const qint64 count = value.toInteger(-1);
+    if (count < 0)
+        return std::nullopt;
+    return count;
+}
+
+void BackupHistoryView::showHistory(const QString &json)
+{
+    m_model->load(json);
+}
+
 void BackupHistoryView::refresh()
 {
-    m_model->reload();
+    showHistory(m_client->indexBackupHistory(50));
 }
