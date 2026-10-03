@@ -46,6 +46,7 @@ use std::path::Path;
 use crate::adopt::VolumeListing;
 use crate::config::Config;
 use crate::health;
+use crate::maintenance::MaintenanceHeld;
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback};
 use crate::scrub;
@@ -121,7 +122,7 @@ impl From<scrub::ScrubError> for DoctorError {
 /// nothing downstream breaks because of it.
 struct DoctorLocks {
     #[allow(dead_code)] // held only for its Drop (lock release) side effect
-    maintenance: scrub::FileLock,
+    maintenance: MaintenanceHeld,
     #[allow(dead_code)]
     singleton: scrub::FileLock,
 }
@@ -142,7 +143,8 @@ fn try_acquire_locks_at(
     let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
         return Ok(LockAttempt::SingletonBusy);
     };
-    let Some(maintenance) = scrub::FileLock::try_acquire(maintenance_path)? else {
+    let Some(maintenance) = MaintenanceHeld::try_acquire_at(maintenance_path, "btrdasd doctor")?
+    else {
         return Ok(LockAttempt::MaintenanceBusy);
     };
     Ok(LockAttempt::Acquired(DoctorLocks {
@@ -1023,6 +1025,11 @@ mod tests {
         let maintenance = dir.path().join("maintenance.lock");
         let result = try_acquire_locks_at(&singleton, &maintenance).unwrap();
         assert!(matches!(result, LockAttempt::Acquired(_)));
+        assert_eq!(
+            std::fs::read_to_string(&maintenance).unwrap(),
+            format!("btrdasd doctor pid {}\n", std::process::id()),
+            "the drift check is recorded as the maintenance lock's holder"
+        );
     }
 
     #[test]

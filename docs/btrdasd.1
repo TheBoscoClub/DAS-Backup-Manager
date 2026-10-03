@@ -1,6 +1,6 @@
 .\" btrdasd(1) man page
 .\" Generated from clap CLI definitions in indexer/src/main.rs
-.TH BTRDASD 1 "2026-10-02" "0.7.22.3" "DAS Backup Manager"
+.TH BTRDASD 1 "2026-10-03" "0.7.22.3" "DAS Backup Manager"
 .SH NAME
 btrdasd \- DAS Backup Manager indexer and orchestrator
 .SH SYNOPSIS
@@ -31,7 +31,9 @@ Commands that read or write the backup targets
 .B backup
 and
 .BR restore )
-mount the targets themselves and unmount what they mounted afterwards. A
+mount the targets themselves, after taking the DAS maintenance lock (see
+.BR FILES ),
+and unmount what they mounted afterwards. A
 target is found by its
 .B mount_uuid
 (a filesystem with that UUID, as
@@ -54,6 +56,7 @@ Index all new snapshots on a backup target.
 .IR PATH ]
 .RB [ \-\-config
 .IR PATH ]
+.RB [ \-\-no\-wait ]
 .TP
 .I TARGET
 Path to backup target mount point.
@@ -67,10 +70,37 @@ Default:
 Path to config.toml, used to mount the targets.
 Default:
 .IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-no\-wait
+Do not wait for the DAS maintenance lock: while another job holds it, print
+.B Deferred
+with the holder's name and exit 75, having mounted nothing (with
+.BR \-\-json :
+.BR {"deferred":true,"holder":"..."} ).
 .PP
 The targets are mounted for the walk, the same pass as
 .B btrdasd reconcile
 runs while they are still mounted, and they are unmounted afterwards.
+.PP
+Before it mounts anything,
+.B walk
+takes the DAS maintenance lock
+.RI ( /run/das\-maintenance.lock ).
+While a backup, scrub, restore or other job holds it,
+.B walk
+prints one line naming the holder, as the holder recorded itself in the lock
+file, and how to stop a scrub that cannot be waited for (stop and mask
+.BR das\-scrub.service ,
+unmask it afterwards), and then waits for the lock. A recovery drive lent to a
+virtual machine is held this way for the whole session: mounting its
+filesystem on the host as well would corrupt it.
+.B backup\-run.sh
+runs
+.B walk
+while it already holds the lock, and hands its hold down through
+.B DAS_MAINTENANCE_LOCK_FD
+(see
+.BR ENVIRONMENT ).
 .\"
 .SS search
 Full-text search across indexed files using FTS5.
@@ -143,9 +173,11 @@ other maintenance pass holds it, the command prints
 .B Deferred
 and exits 0, changing nothing.
 .B btrdasd walk
-also runs the prune automatically while targets are still mounted, but takes
-no lock, so that pass is never deferred (see
-.BR FILES ).
+also runs the prune automatically while targets are still mounted, under the
+maintenance lock
+.B walk
+holds; it waits for that lock rather than deferring (see
+.BR walk ).
 .PP
 .B btrdasd reconcile
 .RB [ \-\-db
@@ -663,7 +695,12 @@ Restore specific files from a snapshot.
 .PP
 Every
 .B restore
-command mounts the targets for its duration. For
+command mounts the targets for its duration, after taking the DAS maintenance
+lock exactly as
+.B walk
+does: it waits for the lock, saying who holds it, or with
+.B \-\-no\-wait
+exits 75 at once. For
 .B restore file
 and
 .BR "restore snapshot" ,
@@ -696,6 +733,7 @@ component is rejected.
 .RI [ FILE .\|.\|.]
 .RB [ \-\-config
 .IR PATH ]
+.RB [ \-\-no\-wait ]
 .TP
 .I SNAPSHOT
 Path to the snapshot directory.
@@ -711,6 +749,10 @@ Path to config.toml, used to mount the targets and for
 .BR [restore].allowed_roots .
 Default:
 .IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-no\-wait
+As for
+.BR walk .
 .\"
 .SS restore snapshot
 Restore an entire snapshot using btrfs send/receive or recursive copy.
@@ -719,6 +761,7 @@ Restore an entire snapshot using btrfs send/receive or recursive copy.
 .I SNAPSHOT DEST
 .RB [ \-\-config
 .IR PATH ]
+.RB [ \-\-no\-wait ]
 .TP
 .I SNAPSHOT
 Path to the snapshot directory.
@@ -729,6 +772,10 @@ Destination directory.
 .BI \-\-config " PATH"
 As for
 .BR "restore file" .
+.TP
+.B \-\-no\-wait
+As for
+.BR walk .
 .\"
 .SS restore browse
 Browse files in a snapshot directory.
@@ -739,6 +786,7 @@ Browse files in a snapshot directory.
 .IR PATH ]
 .RB [ \-\-config
 .IR PATH ]
+.RB [ \-\-no\-wait ]
 .TP
 .I SNAPSHOT
 Path to the snapshot directory.
@@ -750,6 +798,10 @@ Optional subdirectory prefix to browse within the snapshot.
 Path to config.toml, used to mount the targets.
 Default:
 .IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-no\-wait
+As for
+.BR walk .
 .\"
 .SS schedule show
 Show the current backup schedule, including next run times.
@@ -1665,6 +1717,15 @@ and
 .B 3
 .B "btrdasd doctor"
 only: the check ran but some volume went unexamined; see its section.
+.TP
+.B 75
+.B walk
+or a
+.B restore
+command run with
+.B \-\-no\-wait
+found the DAS maintenance lock held and deferred: nothing was mounted or
+changed. (EX_TEMPFAIL: try again later.)
 .SH ENVIRONMENT
 .TP
 .B EDITOR
@@ -1683,6 +1744,21 @@ mail relay's upstream credential.
 .BR DAS_SCRUB_STATE ", " DAS_BTRFS_STATUS_DIR
 Override the scrub state file and the directory of btrfs scrub status
 records. Meant for tests only.
+.TP
+.B DAS_MAINTENANCE_LOCK_FD
+The number of an open descriptor on
+.I /run/das\-maintenance.lock
+through which the calling process holds the lock.
+.B walk
+and the
+.B restore
+commands then use that hold instead of waiting for the lock, which would never
+end: the caller holds it until the command finishes.
+.B backup\-run.sh
+sets it for the
+.B walk
+it runs. It is checked, not trusted: the descriptor must be that file and must
+hold the lock, or the command fails.
 .TP
 .B DAS_RECOVERY_OS_STATE
 Override the recovery OS record
@@ -1902,17 +1978,23 @@ and
 or drift check at a time.
 .TP
 .I /run/das\-maintenance.lock
-Shared maintenance lock held by backups, scrubs,
+Shared maintenance lock held by every job that mounts the backup targets \(em
+backups, scrubs,
+.BR walk ,
+.BR restore ,
 .BR reconcile ,
 .BR reindex ,
 .BR forget ,
-.B purge
-and the drift check, so they never overlap. Backups and scrubs wait for it; the
-others defer.
+.BR purge ,
+the drift check, and the GUI's index and restore jobs \(em so they never
+overlap. Backups, scrubs,
 .B walk
 and
 .B restore
-take no lock.
+wait for it (a GUI job stops waiting when cancelled); the others defer.
+Whoever holds it writes one line into it naming itself, such as
+.BR "btrdasd restore browse pid 4242" ,
+and empties it again on release.
 .TP
 .I /var/lib/das\-backup/scrub\-state.json
 Persisted scrub state, keyed by filesystem UUID (mode 644). Absent until

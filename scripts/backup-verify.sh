@@ -1,7 +1,11 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.0.0
-# Date: 2026-02-21
+# Version: 3.1.0
+# Date: 2026-10-03
+#
+# 3.1.0: the maintenance lock is taken by take_maintenance_lock(), which
+# records this script as its holder and no longer empties the current
+# holder's record on open (bd DAS-Backup-Manager-frb).
 #
 # Checks:
 #   - SMART health on all DAS drives
@@ -304,6 +308,28 @@ check_smart_health() {
     fi
 }
 
+# Take the DAS maintenance lock without waiting, on fd 8 (held until this
+# script exits), and record this script as its holder — in the lock file, as
+# every holder does, so a job that finds the lock held can say what it waits
+# for. Returns non-zero, having said why, when the lock cannot be opened or is
+# held. Opened `<>`, not `>`: `>` would empty the current holder's record
+# (bd DAS-Backup-Manager-frb).
+take_maintenance_lock() {
+    local lock="$1"
+    if ! exec 8<>"$lock"; then
+        log_warn "Cannot open $lock — skipping btrbk/usage inspection"
+        return 1
+    fi
+    if ! flock -n 8; then
+        log_warn "DAS maintenance lock held (backup or scrub running) — skipping btrbk/usage inspection"
+        log_warn "  Re-run when the backup finishes; this section mounts the array read-only."
+        return 1
+    fi
+    if ! printf 'backup-verify.sh pid %s\n' "$$" >"$lock"; then
+        log_warn "Could not record backup-verify.sh as the holder of $lock"
+    fi
+}
+
 check_btrbk_status() {
     log_header "btrbk Backup Status"
 
@@ -357,12 +383,7 @@ check_btrbk_status() {
     #     single-leg failure does not block inspection. A verify tool that
     #     cannot look at a degraded array is useless exactly when it matters.
     local maint_lock="/run/das-maintenance.lock"
-    if [[ -n "$primary_dev" && -b "$primary_dev" ]] && ! exec 8>"$maint_lock"; then
-        log_warn "Cannot open $maint_lock — skipping btrbk/usage inspection"
-    elif [[ -n "$primary_dev" && -b "$primary_dev" ]] && ! flock -n 8; then
-        log_warn "DAS maintenance lock held (backup or scrub running) — skipping btrbk/usage inspection"
-        log_warn "  Re-run when the backup finishes; this section mounts the array read-only."
-    elif [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
+    if [[ -n "$primary_dev" && -b "$primary_dev" ]] && take_maintenance_lock "$maint_lock"; then
         mkdir -p "$primary_mount"
         local mount_stderr
         mount_stderr=$(mktemp)

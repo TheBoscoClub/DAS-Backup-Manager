@@ -27,6 +27,7 @@ use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
+use buttered_dasd::maintenance::{self, HoldsMaintenance, LockSite};
 use buttered_dasd::mount;
 use buttered_dasd::progress::{
     LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
@@ -355,7 +356,10 @@ impl HelperInterface {
             // (bd DAS-Backup-Manager-5oc) — report and record.
             let (success, summary) = tokio::task::spawn_blocking(move || {
                 backup::run_backup_job(
-                    &backup::SystemBackupHost::new(Path::new(CANONICAL_CONFIG)),
+                    &backup::SystemBackupHost::new(
+                        Path::new(CANONICAL_CONFIG),
+                        "btrdasd-helper BackupRun job",
+                    ),
                     config,
                     options,
                     &*progress,
@@ -405,7 +409,10 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(progress) {
+                let _locks = match backup::acquire_manual_locks(
+                    "btrdasd-helper BackupSnapshot job",
+                    progress,
+                ) {
                     Ok(BackupLockAttempt::Acquired(locks)) => locks,
                     Ok(BackupLockAttempt::AlreadyRunning) => {
                         return Err("A backup is already running — declined".to_string());
@@ -470,16 +477,18 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(progress) {
-                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
-                    Ok(BackupLockAttempt::AlreadyRunning) => {
-                        return Err("A backup is already running — declined".to_string());
-                    }
-                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
-                };
+                let locks =
+                    match backup::acquire_manual_locks("btrdasd-helper BackupSend job", progress) {
+                        Ok(BackupLockAttempt::Acquired(locks)) => locks,
+                        Ok(BackupLockAttempt::AlreadyRunning) => {
+                            return Err("A backup is already running — declined".to_string());
+                        }
+                        Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
+                    };
                 let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                let mut guard = mount::ensure_targets_mounted(&config, progress)
-                    .map_err(|e| format!("Mount failed: {e}"))?;
+                let mut guard =
+                    mount::ensure_targets_mounted(&config, progress, locks.maintenance())
+                        .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let res = match backup::send_snapshots(&config, &sources, &targets, false, progress)
                 {
@@ -538,15 +547,19 @@ impl HelperInterface {
                 // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
                 // fixed this for main.rs in 0.7.15.0 and never reached the
                 // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(progress) {
+                let locks = match backup::acquire_manual_locks(
+                    "btrdasd-helper BackupBootArchive job",
+                    progress,
+                ) {
                     Ok(BackupLockAttempt::Acquired(locks)) => locks,
                     Ok(BackupLockAttempt::AlreadyRunning) => {
                         return Err("A backup is already running — declined".to_string());
                     }
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
-                let mut guard = mount::ensure_targets_mounted(&config, progress)
-                    .map_err(|e| format!("Mount failed: {e}"))?;
+                let mut guard =
+                    mount::ensure_targets_mounted(&config, progress, locks.maintenance())
+                        .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let res = match backup::archive_boot(&config, progress) {
                     Ok(archived) => {
@@ -602,67 +615,10 @@ impl HelperInterface {
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
         let target_path = target_path.to_owned();
-        let db_path = config.general.db_path.clone();
 
         let handle = tokio::spawn(async move {
-            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                let mut guard = mount::ensure_targets_mounted(&config, progress)
-                    .map_err(|e| format!("Mount failed: {e}"))?;
-
-                let db = Database::open(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
-
-                // Collect target paths to walk (detect udisks2 mounts too)
-                let paths: Vec<String> = if target_path.is_empty() {
-                    config
-                        .targets
-                        .iter()
-                        .filter_map(|t| {
-                            health::find_any_mount(&t.mount, &t.serial, &t.role)
-                        })
-                        .collect()
-                } else {
-                    vec![target_path]
-                };
-
-                let mut total_discovered = 0usize;
-                let mut total_indexed = 0usize;
-                let mut total_skipped = 0usize;
-                let mut errors = Vec::new();
-
-                progress.on_stage("Indexing targets", paths.len() as u64);
-                for (i, path) in paths.iter().enumerate() {
-                    progress.on_progress(
-                        (i + 1) as u64,
-                        paths.len() as u64,
-                        &format!("Walking {path}"),
-                    );
-                    match indexer::walk(Path::new(path), &db) {
-                        Ok(r) => {
-                            total_discovered += r.snapshots_discovered;
-                            total_indexed += r.snapshots_indexed;
-                            total_skipped += r.snapshots_skipped;
-                        }
-                        Err(e) => {
-                            errors.push(format!("{path}: {e}"));
-                        }
-                    }
-                }
-
-                let still_mounted = guard.unmount(progress);
-
-                let res = if !errors.is_empty() && total_indexed == 0 {
-                    Err(format!("Indexing failed: {}", errors.join("; ")))
-                } else {
-                    let mut msg = format!(
-                        "Indexed {total_indexed} new snapshots ({total_discovered} discovered, {total_skipped} skipped)"
-                    );
-                    if !errors.is_empty() {
-                        msg.push_str(&format!(" [warnings: {}]", errors.join("; ")));
-                    }
-                    Ok(msg)
-                };
-                mount::fail_if_still_mounted(res, &still_mounted)
+            let result = tokio::task::spawn_blocking(move || {
+                index_walk_job(&config, &target_path, &LockSite::production(), &progress)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));
@@ -1013,34 +969,15 @@ impl HelperInterface {
         let dest = dest.to_owned();
 
         let handle = tokio::spawn(async move {
-            let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                let mut guard = mount::ensure_targets_mounted(&config, progress)
-                    .map_err(|e| format!("Mount failed: {e}"))?;
-
-                let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-                let res = match restore::restore_files(
-                    Path::new(&snapshot),
-                    &file_refs,
-                    Path::new(&dest),
-                    &config.restore.allowed_roots,
-                    &restore::snapshot_source_roots(&config),
-                    progress,
-                ) {
-                    Ok(r) => Ok((
-                        r.errors.is_empty(),
-                        format!(
-                            "Restored {} files ({} bytes), {} errors",
-                            r.files_restored,
-                            r.bytes_restored,
-                            r.errors.len()
-                        ),
-                    )),
-                    Err(e) => Err(format!("Restore failed: {e}")),
-                };
-
-                let still_mounted = guard.unmount(progress);
-                mount::fail_if_still_mounted(res, &still_mounted)
+            let result = tokio::task::spawn_blocking(move || {
+                restore_files_job(
+                    &config,
+                    &snapshot,
+                    &dest,
+                    &files,
+                    &LockSite::production(),
+                    &progress,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(format!("Restore task panicked: {e}")));
@@ -1082,32 +1019,14 @@ impl HelperInterface {
         let dest = dest.to_owned();
 
         let handle = tokio::spawn(async move {
-            let result: Result<(bool, String), String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                let mut guard = mount::ensure_targets_mounted(&config, progress)
-                    .map_err(|e| format!("Mount failed: {e}"))?;
-
-                let res = match restore::restore_snapshot(
-                    Path::new(&snapshot),
-                    Path::new(&dest),
-                    &config.restore.allowed_roots,
-                    &restore::snapshot_source_roots(&config),
-                    progress,
-                ) {
-                    Ok(r) => Ok((
-                        r.errors.is_empty(),
-                        format!(
-                            "Snapshot restored: {} files ({} bytes), {} errors",
-                            r.files_restored,
-                            r.bytes_restored,
-                            r.errors.len()
-                        ),
-                    )),
-                    Err(e) => Err(format!("Snapshot restore failed: {e}")),
-                };
-
-                let still_mounted = guard.unmount(progress);
-                mount::fail_if_still_mounted(res, &still_mounted)
+            let result = tokio::task::spawn_blocking(move || {
+                restore_snapshot_job(
+                    &config,
+                    &snapshot,
+                    &dest,
+                    &LockSite::production(),
+                    &progress,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(format!("Snapshot restore task panicked: {e}")));
@@ -1556,6 +1475,152 @@ impl HelperInterface {
 }
 
 // ---------------------------------------------------------------------------
+// The jobs that mount the backup targets
+//
+// Each waits for the DAS maintenance lock first (`maintenance::hold_for_job`,
+// which logs who holds it and stops waiting if the job is cancelled), so a
+// GUI index or restore never mounts a target another job is using — a backup,
+// a scrub, or a recovery drive lent to a VM (bd DAS-Backup-Manager-frb).
+// ---------------------------------------------------------------------------
+
+/// `IndexWalk`: index every mounted target, or only `target_path`.
+fn index_walk_job(
+    config: &Config,
+    target_path: &str,
+    site: &LockSite,
+    progress: &OrderedProgress,
+) -> Result<String, String> {
+    let held = maintenance::hold_for_job(site, "btrdasd-helper IndexWalk job", progress)?;
+    let mut guard = mount::ensure_targets_mounted(config, progress, &held)
+        .map_err(|e| format!("Mount failed: {e}"))?;
+
+    let db = Database::open(&config.general.db_path).map_err(|e| format!("DB open failed: {e}"))?;
+
+    // Collect target paths to walk (detect udisks2 mounts too)
+    let paths: Vec<String> = if target_path.is_empty() {
+        config
+            .targets
+            .iter()
+            .filter_map(|t| health::find_any_mount(&t.mount, &t.serial, &t.role))
+            .collect()
+    } else {
+        vec![target_path.to_owned()]
+    };
+
+    let mut total_discovered = 0usize;
+    let mut total_indexed = 0usize;
+    let mut total_skipped = 0usize;
+    let mut errors = Vec::new();
+
+    progress.on_stage("Indexing targets", paths.len() as u64);
+    for (i, path) in paths.iter().enumerate() {
+        progress.on_progress(
+            (i + 1) as u64,
+            paths.len() as u64,
+            &format!("Walking {path}"),
+        );
+        match indexer::walk(Path::new(path), &db) {
+            Ok(r) => {
+                total_discovered += r.snapshots_discovered;
+                total_indexed += r.snapshots_indexed;
+                total_skipped += r.snapshots_skipped;
+            }
+            Err(e) => {
+                errors.push(format!("{path}: {e}"));
+            }
+        }
+    }
+
+    let still_mounted = guard.unmount(progress);
+
+    let res = if !errors.is_empty() && total_indexed == 0 {
+        Err(format!("Indexing failed: {}", errors.join("; ")))
+    } else {
+        let mut msg = format!(
+            "Indexed {total_indexed} new snapshots ({total_discovered} discovered, {total_skipped} skipped)"
+        );
+        if !errors.is_empty() {
+            msg.push_str(&format!(" [warnings: {}]", errors.join("; ")));
+        }
+        Ok(msg)
+    };
+    mount::fail_if_still_mounted(res, &still_mounted)
+}
+
+/// `RestoreFiles`: restore `files` from `snapshot` into `dest`.
+fn restore_files_job(
+    config: &Config,
+    snapshot: &str,
+    dest: &str,
+    files: &[String],
+    site: &LockSite,
+    progress: &OrderedProgress,
+) -> Result<(bool, String), String> {
+    let held = maintenance::hold_for_job(site, "btrdasd-helper RestoreFiles job", progress)?;
+    let mut guard = mount::ensure_targets_mounted(config, progress, &held)
+        .map_err(|e| format!("Mount failed: {e}"))?;
+
+    let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let res = match restore::restore_files(
+        Path::new(snapshot),
+        &file_refs,
+        Path::new(dest),
+        &config.restore.allowed_roots,
+        &restore::snapshot_source_roots(config),
+        progress,
+    ) {
+        Ok(r) => Ok((
+            r.errors.is_empty(),
+            format!(
+                "Restored {} files ({} bytes), {} errors",
+                r.files_restored,
+                r.bytes_restored,
+                r.errors.len()
+            ),
+        )),
+        Err(e) => Err(format!("Restore failed: {e}")),
+    };
+
+    let still_mounted = guard.unmount(progress);
+    mount::fail_if_still_mounted(res, &still_mounted)
+}
+
+/// `RestoreSnapshot`: restore all of `snapshot` into `dest`.
+fn restore_snapshot_job(
+    config: &Config,
+    snapshot: &str,
+    dest: &str,
+    site: &LockSite,
+    progress: &OrderedProgress,
+) -> Result<(bool, String), String> {
+    let held = maintenance::hold_for_job(site, "btrdasd-helper RestoreSnapshot job", progress)?;
+    let mut guard = mount::ensure_targets_mounted(config, progress, &held)
+        .map_err(|e| format!("Mount failed: {e}"))?;
+
+    let res = match restore::restore_snapshot(
+        Path::new(snapshot),
+        Path::new(dest),
+        &config.restore.allowed_roots,
+        &restore::snapshot_source_roots(config),
+        progress,
+    ) {
+        Ok(r) => Ok((
+            r.errors.is_empty(),
+            format!(
+                "Snapshot restored: {} files ({} bytes), {} errors",
+                r.files_restored,
+                r.bytes_restored,
+                r.errors.len()
+            ),
+        )),
+        Err(e) => Err(format!("Snapshot restore failed: {e}")),
+    };
+
+    let still_mounted = guard.unmount(progress);
+    mount::fail_if_still_mounted(res, &still_mounted)
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -1740,5 +1805,283 @@ mod tests {
             .expect("a real database must compute an entry");
         assert!(entry.json.contains("\"snapshots\""), "json: {}", entry.json);
         assert!(entry.db_size_bytes > 0, "an opened DB has a nonzero size");
+    }
+
+    // --- the jobs that mount wait for the maintenance lock (bd DAS-Backup-Manager-frb)
+    //
+    // Each runs against a scratch lock and a config with no targets, so
+    // nothing is mounted. The restore jobs then stop at their source policy
+    // ("no backup targets are configured") — before anything is copied or
+    // `btrfs` is run — which is how a test sees that a job got past the lock.
+
+    use buttered_dasd::maintenance::MaintenanceHeld;
+    use buttered_dasd::progress::{OrderedProgress, ProgressEvent, ProgressSink};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    /// Long enough to be sure a job is blocked, not merely slow to start.
+    const STILL_WAITING: Duration = Duration::from_millis(300);
+    /// Ample for a job looking every 10 ms to notice a release or a cancel.
+    const NOTICES: Duration = Duration::from_secs(1);
+
+    type Sent = Arc<std::sync::Mutex<Vec<ProgressEvent>>>;
+
+    /// Keeps what the GUI would have been sent.
+    struct Gui(Sent);
+
+    impl ProgressSink for Gui {
+        fn journal(&mut self, _: LogLevel, _: &str) {}
+        fn emit(&mut self, event: ProgressEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn gui_progress() -> (Arc<OrderedProgress>, Sent) {
+        let sent: Sent = Arc::default();
+        (Arc::new(OrderedProgress::new(Gui(sent.clone()))), sent)
+    }
+
+    /// The waiting line, once the GUI has been sent it (within [`NOTICES`]).
+    fn waiting_line_sent(sent: &Sent) -> Option<String> {
+        let deadline = Instant::now() + NOTICES;
+        loop {
+            let line = sent.lock().unwrap().iter().find_map(|e| match e {
+                ProgressEvent::Log { message, .. }
+                    if message.starts_with("Waiting for the DAS maintenance lock") =>
+                {
+                    Some(message.clone())
+                }
+                _ => None,
+            });
+            if line.is_some() || Instant::now() > deadline {
+                return line;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A temp dir holding the lock file, the index, and a snapshot with one
+    /// file; a config with no targets that allows restores into the dir.
+    struct JobRig {
+        dir: tempfile::TempDir,
+        config: Config,
+    }
+
+    impl JobRig {
+        fn new() -> Arc<Self> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.general.db_path = dir.path().join("index.db").to_string_lossy().into_owned();
+            config.restore.allowed_roots = vec![dir.path().to_string_lossy().into_owned()];
+            std::fs::create_dir(dir.path().join("snap")).unwrap();
+            std::fs::write(dir.path().join("snap/hello.txt"), "hi").unwrap();
+            Arc::new(Self { dir, config })
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.path().join(name)
+        }
+
+        fn site(&self) -> LockSite {
+            LockSite {
+                path: self.path("das-maintenance.lock"),
+                poll: Duration::from_millis(10),
+            }
+        }
+
+        /// Another job takes the lock and records itself.
+        fn hold(&self) -> MaintenanceHeld {
+            MaintenanceHeld::try_acquire_at(&self.site().path, "test holder")
+                .unwrap()
+                .expect("the scratch lock is free")
+        }
+
+        fn nothing_done(&self) -> bool {
+            !self.path("index.db").exists() && !self.path("restored").exists()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Job {
+        IndexWalk,
+        RestoreFiles,
+        RestoreSnapshot,
+    }
+
+    /// Run one job on the rig: its summary, either way.
+    fn run_job(rig: &JobRig, job: Job, progress: &OrderedProgress) -> Result<String, String> {
+        let snap = rig.path("snap").to_string_lossy().into_owned();
+        let dest = rig.path("restored").to_string_lossy().into_owned();
+        let site = rig.site();
+        match job {
+            Job::IndexWalk => index_walk_job(&rig.config, "", &site, progress),
+            Job::RestoreFiles => restore_files_job(
+                &rig.config,
+                &snap,
+                &dest,
+                &["hello.txt".to_string()],
+                &site,
+                progress,
+            )
+            .map(|(_, summary)| summary),
+            Job::RestoreSnapshot => {
+                restore_snapshot_job(&rig.config, &snap, &dest, &site, progress)
+                    .map(|(_, summary)| summary)
+            }
+        }
+    }
+
+    /// Whether `out` is what the job does once it is past the lock.
+    #[track_caller]
+    fn assert_proceeded(job: Job, out: &Result<String, String>) {
+        match job {
+            Job::IndexWalk => assert_eq!(
+                out.as_deref(),
+                Ok("Indexed 0 new snapshots (0 discovered, 0 skipped)")
+            ),
+            Job::RestoreFiles | Job::RestoreSnapshot => assert!(
+                matches!(out, Err(e) if e.contains("no backup targets are configured")),
+                "{job:?} must reach its source policy, got {out:?}"
+            ),
+        }
+    }
+
+    fn takes_a_free_lock_at_once(job: Job) {
+        let rig = JobRig::new();
+        let (progress, sent) = gui_progress();
+        let started = Instant::now();
+        let out = run_job(&rig, job, &progress);
+        assert!(started.elapsed() < STILL_WAITING, "{:?}", started.elapsed());
+        assert_proceeded(job, &out);
+        progress.finish(true, "done");
+        assert!(
+            !sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Log { message, .. }
+                if message.starts_with("Waiting for"))),
+            "{job:?} announced a wait with nothing to wait for"
+        );
+        drop(rig.hold()); // released when done
+    }
+
+    fn waits_while_the_lock_is_held_then_proceeds(job: Job) {
+        let rig = JobRig::new();
+        let holder = rig.hold();
+        let (progress, sent) = gui_progress();
+        let (tx, rx) = mpsc::channel();
+        let (job_rig, job_progress) = (rig.clone(), progress.clone());
+        let worker = std::thread::spawn(move || {
+            tx.send(run_job(&job_rig, job, &job_progress)).unwrap();
+        });
+
+        assert!(
+            matches!(
+                rx.recv_timeout(STILL_WAITING),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "{job:?} must wait while another job holds the lock"
+        );
+        assert!(
+            rig.nothing_done(),
+            "{job:?} did work before it had the lock"
+        );
+        let line = waiting_line_sent(&sent).expect("the GUI is told what the job waits for");
+        assert!(
+            line.contains(&format!("held by test holder pid {}", std::process::id())),
+            "{line}"
+        );
+
+        drop(holder);
+        let out = rx
+            .recv_timeout(NOTICES)
+            .unwrap_or_else(|_| panic!("{job:?} must proceed once the lock is released"));
+        assert_proceeded(job, &out);
+        worker.join().unwrap();
+    }
+
+    fn stops_waiting_when_cancelled(job: Job) {
+        let rig = JobRig::new();
+        let holder = rig.hold();
+        let (progress, sent) = gui_progress();
+        let (tx, rx) = mpsc::channel();
+        let (job_rig, job_progress) = (rig.clone(), progress.clone());
+        let worker = std::thread::spawn(move || {
+            tx.send(run_job(&job_rig, job, &job_progress)).unwrap();
+        });
+        waiting_line_sent(&sent).expect("the job is waiting");
+
+        progress.cancel();
+        let summary = rx
+            .recv_timeout(NOTICES)
+            .unwrap_or_else(|_| panic!("{job:?}: a cancel must stop the wait"))
+            .expect_err("a job cancelled while waiting did nothing");
+        worker.join().unwrap();
+        assert_eq!(
+            summary,
+            format!(
+                "stopped waiting for the DAS maintenance lock, held by test holder pid {}; \
+                 nothing was mounted",
+                std::process::id()
+            )
+        );
+        assert!(rig.nothing_done(), "{job:?}");
+
+        // How the D-Bus method ends it: one JobFinished, failed, "cancelled".
+        progress.finish(false, &summary);
+        match sent.lock().unwrap().last() {
+            Some(ProgressEvent::Finished { success, summary }) => {
+                assert!(!success);
+                assert!(summary.starts_with("cancelled — "), "{summary}");
+            }
+            other => panic!("{job:?} must end with JobFinished, got {other:?}"),
+        }
+        drop(holder);
+    }
+
+    #[test]
+    fn index_walk_takes_a_free_lock_at_once() {
+        takes_a_free_lock_at_once(Job::IndexWalk);
+    }
+
+    #[test]
+    fn index_walk_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Job::IndexWalk);
+    }
+
+    #[test]
+    fn index_walk_stops_waiting_when_cancelled() {
+        stops_waiting_when_cancelled(Job::IndexWalk);
+    }
+
+    #[test]
+    fn restore_files_takes_a_free_lock_at_once() {
+        takes_a_free_lock_at_once(Job::RestoreFiles);
+    }
+
+    #[test]
+    fn restore_files_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Job::RestoreFiles);
+    }
+
+    #[test]
+    fn restore_files_stops_waiting_when_cancelled() {
+        stops_waiting_when_cancelled(Job::RestoreFiles);
+    }
+
+    #[test]
+    fn restore_snapshot_takes_a_free_lock_at_once() {
+        takes_a_free_lock_at_once(Job::RestoreSnapshot);
+    }
+
+    #[test]
+    fn restore_snapshot_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Job::RestoreSnapshot);
+    }
+
+    #[test]
+    fn restore_snapshot_stops_waiting_when_cancelled() {
+        stops_waiting_when_cancelled(Job::RestoreSnapshot);
     }
 }

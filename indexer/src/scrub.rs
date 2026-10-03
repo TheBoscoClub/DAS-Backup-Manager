@@ -187,6 +187,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount::partition_device;
 use crate::progress::{LogLevel, ProgressCallback};
 
@@ -728,7 +729,9 @@ impl FileLock {
             .map_err(|e| {
                 // `/run` is root-owned, so a permission error here almost
                 // always means the caller simply is not root. Say that,
-                // instead of surfacing a bare EACCES.
+                // instead of surfacing a bare EACCES. Not only the scrub
+                // opens these files: every job that mounts a backup target
+                // takes the maintenance lock (bd DAS-Backup-Manager-frb).
                 let denied = matches!(
                     e.raw_os_error(),
                     Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
@@ -736,10 +739,7 @@ impl FileLock {
                 // SAFETY: geteuid() is always safe.
                 let unprivileged = unsafe { libc::geteuid() } != 0;
                 let detail = if denied && unprivileged {
-                    format!(
-                        "cannot open lock file ({e}) — scrub must run as root \
-                         (try: sudo btrdasd scrub run)"
-                    )
+                    format!("cannot open lock file ({e}) — this command must run as root (sudo)")
                 } else {
                     format!("cannot open lock file: {e}")
                 };
@@ -849,6 +849,22 @@ impl FileLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Record in the lock file itself who holds the lock, replacing what an
+    /// earlier holder left, so a process that finds it held can say what it
+    /// is waiting for. Only the holder writes: every opener uses
+    /// `truncate(false)`, and `backup-run.sh` opens with `<>`, so nobody
+    /// waiting erases it.
+    pub(crate) fn write_note(&self, note: &str) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.set_len(0)?;
+        self.file.write_all_at(note.as_bytes(), 0)
+    }
+
+    /// Empty the lock file again — the holder is letting go.
+    pub(crate) fn clear_note(&self) -> std::io::Result<()> {
+        self.file.set_len(0)
+    }
 }
 
 impl Drop for FileLock {
@@ -868,7 +884,7 @@ impl Drop for FileLock {
 /// `backup-run.sh`'s, which is what makes the pair deadlock-free.
 #[derive(Debug)]
 pub struct ScrubLocks {
-    maintenance: FileLock,
+    maintenance: MaintenanceHeld,
     singleton: FileLock,
 }
 
@@ -879,9 +895,15 @@ impl ScrubLocks {
     }
 }
 
+impl HoldsMaintenance for ScrubLocks {
+    fn maintenance(&self) -> &MaintenanceHeld {
+        &self.maintenance
+    }
+}
+
 /// Acquire the singleton lock (non-blocking) then the maintenance lock
-/// (blocking). `Ok(None)` means another scrub pass is already running and this
-/// invocation must skip.
+/// (blocking), recorded as held by `btrdasd scrub run`. `Ok(None)` means
+/// another scrub pass is already running and this invocation must skip.
 fn acquire_locks_at(
     singleton_path: &Path,
     maintenance_path: &Path,
@@ -890,8 +912,9 @@ fn acquire_locks_at(
     let Some(singleton) = FileLock::try_acquire(singleton_path)? else {
         return Ok(None);
     };
-    let maintenance = FileLock::acquire_blocking(
+    let maintenance = MaintenanceHeld::acquire_blocking_at(
         maintenance_path,
+        "btrdasd scrub run",
         progress,
         "waiting for DAS maintenance lock (backup in progress?)",
     )?;
@@ -1528,7 +1551,7 @@ pub fn run_scrub_pass(
 
     let started_epoch = now_epoch();
 
-    let Some(_locks) = acquire_locks(progress)? else {
+    let Some(locks) = acquire_locks(progress)? else {
         progress.on_log(
             LogLevel::Info,
             &format!("Another scrub holds {SCRUB_LOCK_PATH} — skipping this invocation"),
@@ -1552,31 +1575,7 @@ pub fn run_scrub_pass(
         );
     }
 
-    let total = config.scrub.targets.len() as u64;
-    progress.on_stage("Scrubbing DAS filesystems", total);
-
-    let mut results = Vec::new();
-    // Sequential by construction: the three DAS filesystems share one USB bus.
-    for (i, label) in config.scrub.targets.iter().enumerate() {
-        progress.on_progress((i + 1) as u64, total, &format!("Scrubbing {label}"));
-        let result = scrub_one_target(config, label, progress);
-        if result.ok() {
-            progress.on_log(
-                LogLevel::Info,
-                &format!(
-                    "{label}: scrub finished cleanly ({} in {}s)",
-                    format_bytes(result.bytes_scrubbed),
-                    result.duration_secs
-                ),
-            );
-        } else {
-            progress.on_log(
-                LogLevel::Error,
-                &format!("{label}: scrub FAILED — {}", describe_failure(&result)),
-            );
-        }
-        results.push(result);
-    }
+    let results = scrub_targets_with(config, progress, locks.maintenance(), &scrub_one_target);
 
     let mut pass = ScrubPass {
         status: PassStatus::Completed,
@@ -1619,6 +1618,44 @@ pub fn run_scrub_pass(
     );
 
     Ok(pass)
+}
+
+/// Scrub every `[scrub].targets` entry in turn, under the maintenance lock
+/// `held` proves, with a progress step and a result line for each. `scrub_one`
+/// scrubs one target: [`scrub_one_target`] in production, a scripted result in
+/// tests.
+fn scrub_targets_with(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+    held: &MaintenanceHeld,
+    scrub_one: &dyn Fn(&Config, &str, &dyn ProgressCallback, &MaintenanceHeld) -> ScrubFsResult,
+) -> Vec<ScrubFsResult> {
+    let total = config.scrub.targets.len() as u64;
+    progress.on_stage("Scrubbing DAS filesystems", total);
+
+    let mut results = Vec::new();
+    // Sequential by construction: the three DAS filesystems share one USB bus.
+    for (i, label) in config.scrub.targets.iter().enumerate() {
+        progress.on_progress((i + 1) as u64, total, &format!("Scrubbing {label}"));
+        let result = scrub_one(config, label, progress, held);
+        if result.ok() {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "{label}: scrub finished cleanly ({} in {}s)",
+                    format_bytes(result.bytes_scrubbed),
+                    result.duration_secs
+                ),
+            );
+        } else {
+            progress.on_log(
+                LogLevel::Error,
+                &format!("{label}: scrub FAILED — {}", describe_failure(&result)),
+            );
+        }
+        results.push(result);
+    }
+    results
 }
 
 /// Merge a pass into the persisted state and write it back.
@@ -1673,11 +1710,13 @@ fn describe_failure(result: &ScrubFsResult) -> String {
     }
 }
 
-/// Mount, scrub, parse, unmount — one filesystem.
+/// Mount, scrub, parse, unmount — one filesystem, under the maintenance lock
+/// `held` proves.
 fn scrub_one_target(
     config: &Config,
     label: &str,
     progress: &dyn ProgressCallback,
+    held: &MaintenanceHeld,
 ) -> ScrubFsResult {
     let mut result = ScrubFsResult::new(label);
 
@@ -1700,7 +1739,13 @@ fn scrub_one_target(
     let mount_point = target.mount.clone();
 
     // --- mount ------------------------------------------------------------
-    match ensure_mounted(&mount_point, &fsuuid, &config.das.mount_opts, progress) {
+    match ensure_mounted(
+        &mount_point,
+        &fsuuid,
+        &config.das.mount_opts,
+        progress,
+        held,
+    ) {
         Ok(mounted_by_engine) => result.mounted_by_engine = mounted_by_engine,
         Err(e) => {
             result.errors.push(e);
@@ -1789,12 +1834,15 @@ fn scrub_one_target(
 ///
 /// Returns whether this call performed the mount (and therefore owns the
 /// unmount). Any filesystem found at the mount point that is *not* the expected
-/// one is an error — never an invitation to unmount it.
+/// one is an error — never an invitation to unmount it. `_held` is the proof
+/// that this process holds the maintenance lock, as for
+/// `mount::ensure_targets_mounted` (bd DAS-Backup-Manager-frb).
 fn ensure_mounted(
     mount_point: &str,
     fsuuid: &str,
     mount_opts: &str,
     progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
 ) -> Result<bool, String> {
     let path = Path::new(mount_point);
 
@@ -2825,6 +2873,37 @@ Total to scrub:   401.28MiB\n";
         assert!(FileLock::try_acquire(&path).unwrap().is_some());
     }
 
+    /// A lock file that cannot be opened says why, and says root is needed
+    /// only when root is what is missing.
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_names_root_only_when_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "").unwrap();
+        // Not a directory: root would fail the same way.
+        let err = FileLock::try_acquire(dir.path().join("file").join("lock"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot open lock file: "), "{err}");
+        assert!(!err.contains("must run as root"), "{err}");
+
+        // SAFETY: geteuid() is always safe. Root is never denied here.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping the denied half: running as root");
+            return;
+        }
+        let shut = dir.path().join("shut");
+        fs::create_dir(&shut).unwrap();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o500)).unwrap();
+        let err = FileLock::try_acquire(shut.join("lock"))
+            .unwrap_err()
+            .to_string();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            err.contains("— this command must run as root (sudo)"),
+            "{err}"
+        );
+    }
+
     /// Lock order is singleton → maintenance, and a held singleton short-
     /// circuits before the maintenance lock is ever touched.
     #[test]
@@ -2850,6 +2929,12 @@ Total to scrub:   401.28MiB\n";
         let (s, m) = locks.paths();
         assert_eq!(s, singleton.as_path());
         assert_eq!(m, maintenance.as_path());
+        assert_eq!(locks.maintenance().path(), maintenance.as_path());
+        assert_eq!(
+            fs::read_to_string(&maintenance).unwrap(),
+            format!("btrdasd scrub run pid {}\n", std::process::id()),
+            "the scrub is recorded as the maintenance lock's holder"
+        );
 
         // Both locks are held: a second pass skips.
         assert!(
@@ -2878,6 +2963,80 @@ Total to scrub:   401.28MiB\n";
         assert_eq!(lock.path(), path.as_path());
         // No wait announcement when there was no wait.
         assert!(progress.logs.lock().unwrap().is_empty());
+    }
+
+    // --- the pass loop -----------------------------------------------------
+
+    /// Records progress steps as well as stages and logs.
+    #[derive(Default)]
+    struct Steps {
+        stages: std::sync::Mutex<Vec<(String, u64)>>,
+        steps: std::sync::Mutex<Vec<(u64, u64, String)>>,
+        logs: std::sync::Mutex<Vec<(LogLevel, String)>>,
+    }
+
+    impl ProgressCallback for Steps {
+        fn on_stage(&self, stage: &str, total: u64) {
+            self.stages.lock().unwrap().push((stage.into(), total));
+        }
+        fn on_progress(&self, current: u64, total: u64, message: &str) {
+            self.steps
+                .lock()
+                .unwrap()
+                .push((current, total, message.into()));
+        }
+        fn on_throughput(&self, _: u64) {}
+        fn on_log(&self, level: LogLevel, message: &str) {
+            self.logs.lock().unwrap().push((level, message.into()));
+        }
+        fn on_complete(&self, _: bool, _: &str) {}
+    }
+
+    #[test]
+    fn a_pass_scrubs_every_target_in_order_with_a_step_and_a_line_each() {
+        let mut config = Config::default();
+        config.scrub.targets = vec!["primary-22tb".into(), "recovery-a".into()];
+        let progress = Steps::default();
+        let scrubbed = std::sync::Mutex::new(Vec::new());
+        let scrub_one = |_: &Config, label: &str, _: &dyn ProgressCallback, _: &MaintenanceHeld| {
+            scrubbed.lock().unwrap().push(label.to_string());
+            fs_result(label, "uuid", label == "primary-22tb", 1_000_400)
+        };
+
+        let results =
+            scrub_targets_with(&config, &progress, &MaintenanceHeld::assumed(), &scrub_one);
+
+        assert_eq!(*scrubbed.lock().unwrap(), ["primary-22tb", "recovery-a"]);
+        let labels: Vec<&str> = results.iter().map(|r| r.target_label.as_str()).collect();
+        assert_eq!(labels, ["primary-22tb", "recovery-a"]);
+        assert_eq!(
+            *progress.stages.lock().unwrap(),
+            [("Scrubbing DAS filesystems".to_string(), 2)]
+        );
+        assert_eq!(
+            *progress.steps.lock().unwrap(),
+            [
+                (1, 2, "Scrubbing primary-22tb".to_string()),
+                (2, 2, "Scrubbing recovery-a".to_string())
+            ]
+        );
+        let failed = &results[1];
+        assert_eq!(
+            *progress.logs.lock().unwrap(),
+            [
+                (
+                    LogLevel::Info,
+                    format!(
+                        "primary-22tb: scrub finished cleanly ({} in 100s)",
+                        format_bytes(4096)
+                    )
+                ),
+                (
+                    LogLevel::Error,
+                    format!("recovery-a: scrub FAILED — {}", describe_failure(failed))
+                )
+            ]
+        );
     }
 
     // --- state file ------------------------------------------------------

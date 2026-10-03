@@ -1,0 +1,905 @@
+//! The DAS maintenance interlock — `/run/das-maintenance.lock` — and
+//! [`MaintenanceHeld`], the proof that this process holds it.
+//!
+//! Every job that mounts a backup target takes this lock first, so no two of
+//! them mount, use and unmount the same targets at once
+//! (`.claude/rules/backup.md` §Maintenance Interlock). Mounting a target
+//! requires a [`MaintenanceHeld`] — `mount::ensure_targets_mounted` takes one —
+//! and the only ways to get one are to take the lock, or, for a command run by
+//! a process that holds it, to be handed that process's descriptor on it. A
+//! code path that skips the lock does not compile.
+//!
+//! It matters beyond tidiness (bd DAS-Backup-Manager-frb): a recovery drive
+//! lent to a VM is mounted read-write by the guest's kernel while the VM
+//! session holds this lock, and a host mount of that filesystem by a second
+//! kernel corrupts it.
+//!
+//! Whoever takes the lock writes one line into the lock file saying who it is
+//! (`btrdasd restore browse pid 4242`) and empties it again before letting go,
+//! so a job that finds the lock held can say what it is waiting for.
+
+use std::os::fd::RawFd;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::progress::{LogLevel, OrderedProgress, ProgressCallback};
+use crate::scrub::{FileLock, MAINTENANCE_LOCK_PATH, ScrubError};
+
+/// Exit code of `btrdasd walk` and the `restore` commands run with
+/// `--no-wait` while the lock is held: nothing was mounted or changed.
+/// `EX_TEMPFAIL` from sysexits.h — try again later.
+pub const DEFERRED_EXIT_CODE: i32 = 75;
+
+/// A process that holds the lock hands it to a command it runs by setting
+/// this to the number of its open descriptor on the lock file —
+/// `backup-run.sh` does, for `btrdasd walk`. Checked, never believed: see
+/// [`MaintenanceHeld::delegated_at`].
+pub const DELEGATED_FD_ENV: &str = "DAS_MAINTENANCE_LOCK_FD";
+
+/// How often a waiting job looks at the lock again, and at whether it has
+/// been cancelled.
+pub const WAIT_POLL: Duration = Duration::from_secs(1);
+
+/// The holder, when the lock file names nobody.
+pub const UNKNOWN_HOLDER: &str = "an unknown holder";
+
+/// A record longer than this is cut: it is shown to people, not parsed.
+const MAX_RECORD_CHARS: usize = 200;
+
+/// How to free the lock when a job cannot wait for a scrub —
+/// `.claude/rules/backup.md` §Sentinel Interaction: `cachyos-sentinel`
+/// restarts a stopped unit, so it is masked too, and unmasked once done.
+const STOP_A_SCRUB: &str = "If this cannot wait and a scrub holds it: systemctl stop \
+     das-scrub.service && systemctl mask das-scrub.service (stop alone is undone within \
+     seconds), then systemctl unmask das-scrub.service once done — the next scrub run \
+     resumes where this one stopped";
+
+/// Where the lock is and how often a waiting job looks at it again: the
+/// production lock in production, a scratch file in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockSite {
+    pub path: PathBuf,
+    pub poll: Duration,
+}
+
+impl LockSite {
+    /// `/run/das-maintenance.lock`, looked at every [`WAIT_POLL`].
+    pub fn production() -> Self {
+        Self {
+            path: PathBuf::from(MAINTENANCE_LOCK_PATH),
+            poll: WAIT_POLL,
+        }
+    }
+}
+
+/// Proof that this process holds the maintenance lock, for as long as the
+/// value lives. Everything that mounts a backup target requires one.
+#[derive(Debug)]
+pub struct MaintenanceHeld {
+    path: PathBuf,
+    how: How,
+}
+
+#[derive(Debug)]
+enum How {
+    /// This process took the lock. Its record is in the lock file; both go
+    /// on drop.
+    Owned(FileLock),
+    /// The process that started this one holds the lock and handed it down.
+    /// Never unlocked here: the open file description is shared with that
+    /// process, and unlocking it would release the lock it still relies on.
+    Delegated,
+    /// Test code that mounts nothing real.
+    #[cfg(test)]
+    Assumed,
+}
+
+impl MaintenanceHeld {
+    /// `job` names what took it — `btrdasd restore browse` — and is
+    /// recorded with this process's pid.
+    fn owned(lock: FileLock, job: &str) -> Self {
+        // Display only: a record that cannot be written costs the name,
+        // never the lock — a waiter then reads the holder as unknown.
+        let _ = lock.write_note(&format!("{job} pid {}\n", std::process::id()));
+        Self {
+            path: lock.path().to_path_buf(),
+            how: How::Owned(lock),
+        }
+    }
+
+    /// Take the lock if it is free; `None` when another holds it. For jobs
+    /// that defer rather than wait (reconcile, doctor).
+    pub fn try_acquire_at(path: &Path, job: &str) -> Result<Option<Self>, ScrubError> {
+        Ok(FileLock::try_acquire(path)?.map(|lock| Self::owned(lock, job)))
+    }
+
+    /// Take the lock, waiting as long as it takes — backups and scrubs.
+    pub fn acquire_blocking_at(
+        path: &Path,
+        job: &str,
+        progress: &dyn ProgressCallback,
+        waiting_message: &str,
+    ) -> Result<Self, ScrubError> {
+        FileLock::acquire_blocking(path, progress, waiting_message)
+            .map(|lock| Self::owned(lock, job))
+    }
+
+    /// The lock as the process that started this one holds it: `fd` is that
+    /// process's open descriptor on the lock file, inherited and named in
+    /// [`DELEGATED_FD_ENV`]. Proven, never believed: `fd` must be the lock
+    /// file itself (device and inode), and taking the lock through it must
+    /// succeed at once — which it does only for the open file description
+    /// that already holds it, or when nobody does. Anything else is an
+    /// error, never a fall-back to waiting: a command that waited for a lock
+    /// its own parent holds would wait forever.
+    pub fn delegated_at(path: &Path, fd: RawFd) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let lock = path.display();
+        let want = std::fs::metadata(path).map_err(|e| format!("cannot stat {lock}: {e}"))?;
+        // SAFETY: `fstat` writes one `stat` through a pointer to a zeroed
+        // one; a descriptor that is not open is EBADF, not undefined
+        // behaviour.
+        let mut got: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut got) } != 0 {
+            return Err(format!(
+                "{DELEGATED_FD_ENV}={fd} is not an open descriptor ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if got.st_dev != want.dev() || got.st_ino != want.ino() {
+            return Err(format!("{DELEGATED_FD_ENV}={fd} is not {lock}"));
+        }
+        // A duplicate of `fd` shares its open file description, so locking
+        // through it asks whether that description holds the lock (or can take
+        // it at once). Closing the duplicate releases nothing: the caller's
+        // descriptor still refers to the description.
+        // SAFETY: `fstat` above proved `fd` open, and nothing in this process
+        // closes it during this one borrow.
+        let shared = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map_err(|e| format!("{DELEGATED_FD_ENV}={fd} cannot be duplicated ({e})"))?;
+        if let Err(e) = std::fs::File::from(shared).try_lock() {
+            return Err(format!(
+                "{DELEGATED_FD_ENV}={fd} does not hold {lock} ({e})"
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            how: How::Delegated,
+        })
+    }
+
+    /// A proof for tests that mount nothing real.
+    #[cfg(test)]
+    pub(crate) fn assumed() -> Self {
+        Self {
+            path: PathBuf::from(MAINTENANCE_LOCK_PATH),
+            how: How::Assumed,
+        }
+    }
+
+    /// The lock file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for MaintenanceHeld {
+    fn drop(&mut self) {
+        // Empty the record while the lock is still held: once it is released
+        // the next holder may already have written its own. Display only. A
+        // delegated hold's record belongs to the process that holds it.
+        if let How::Owned(lock) = &self.how {
+            let _ = lock.clear_note();
+        }
+        // The `FileLock` is dropped after this, which releases the lock.
+    }
+}
+
+/// A set of locks that includes the maintenance lock.
+pub trait HoldsMaintenance {
+    fn maintenance(&self) -> &MaintenanceHeld;
+}
+
+impl HoldsMaintenance for MaintenanceHeld {
+    fn maintenance(&self) -> &MaintenanceHeld {
+        self
+    }
+}
+
+/// How a wait for the lock ended.
+#[derive(Debug)]
+pub enum Waited {
+    /// This process holds the lock now.
+    Held(MaintenanceHeld),
+    /// Asked not to wait, and `holder` holds it. Nothing was done.
+    Deferred { holder: String },
+    /// Cancelled while `holder` held it. Nothing was done.
+    Cancelled { holder: String },
+}
+
+/// Take the lock for an interactive job — `walk` and `restore`, from the CLI
+/// or the GUI: at once if it is free. Otherwise, with `no_wait`, return at
+/// once; without, log one line naming the holder and how to stop a scrub,
+/// then look again every `site.poll` until the lock is free or `cancelled()`
+/// says to stop. `job` is recorded as the holder once the lock is taken.
+pub fn wait_for(
+    site: &LockSite,
+    job: &str,
+    no_wait: bool,
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn ProgressCallback,
+) -> Result<Waited, ScrubError> {
+    if let Some(held) = MaintenanceHeld::try_acquire_at(&site.path, job)? {
+        return Ok(Waited::Held(held));
+    }
+    let holder = holder_of(&site.path);
+    if no_wait {
+        return Ok(Waited::Deferred { holder });
+    }
+    progress.on_log(LogLevel::Warning, &waiting_line(&site.path, &holder));
+    let started = Instant::now();
+    loop {
+        std::thread::sleep(site.poll);
+        if cancelled() {
+            return Ok(Waited::Cancelled { holder });
+        }
+        if let Some(held) = MaintenanceHeld::try_acquire_at(&site.path, job)? {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "DAS maintenance lock acquired after waiting {}s",
+                    started.elapsed().as_secs()
+                ),
+            );
+            return Ok(Waited::Held(held));
+        }
+    }
+}
+
+/// The lock for a GUI job (the D-Bus helper): [`wait_for`] it, and stop
+/// waiting as soon as the job is cancelled. Nothing is mounted yet, so this
+/// is the one point at which a cancel can act at once. `Err` is the job's
+/// summary.
+pub fn hold_for_job(
+    site: &LockSite,
+    job: &str,
+    progress: &OrderedProgress,
+) -> Result<MaintenanceHeld, String> {
+    let cancelled = || progress.is_cancelled();
+    match wait_for(site, job, false, &cancelled, progress) {
+        Ok(Waited::Held(held)) => Ok(held),
+        // `Deferred` needs `no_wait`; either way nothing was done.
+        Ok(Waited::Cancelled { holder } | Waited::Deferred { holder }) => Err(format!(
+            "stopped waiting for the DAS maintenance lock, held by {holder}; nothing was mounted"
+        )),
+        Err(e) => Err(format!("Could not take the DAS maintenance lock: {e}")),
+    }
+}
+
+/// Who holds the lock, as the holder recorded itself in the lock file — or
+/// [`UNKNOWN_HOLDER`] when nothing is recorded, or when the recorded process
+/// has exited (a holder that did not record itself, such as a plain
+/// `flock`, holds it after one that did).
+pub fn holder_of(path: &Path) -> String {
+    // Display only: a record that cannot be read is an unknown holder, and
+    // the caller waits, or defers, just the same.
+    let note = std::fs::read_to_string(path).unwrap_or_default();
+    holder_from_note(&note, &pid_is_running)
+}
+
+/// [`holder_of`] for a record already read: its first line, without control
+/// characters and cut to [`MAX_RECORD_CHARS`]. `running` says whether a pid
+/// is a live process.
+fn holder_from_note(note: &str, running: &dyn Fn(u32) -> bool) -> String {
+    let line: String = note
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_RECORD_CHARS)
+        .collect();
+    let line = line.trim();
+    if line.is_empty() {
+        return UNKNOWN_HOLDER.to_string();
+    }
+    match record_pid(line) {
+        Some(pid) if !running(pid) => {
+            format!("{UNKNOWN_HOLDER} (the last recorded holder, {line}, is no longer running)")
+        }
+        _ => line.to_string(),
+    }
+}
+
+/// The pid a record ends with — `… pid 4242`.
+fn record_pid(line: &str) -> Option<u32> {
+    line.rsplit_once(" pid ")?.1.parse().ok()
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The line a job logs before it starts waiting.
+pub fn waiting_line(path: &Path, holder: &str) -> String {
+    format!(
+        "Waiting for the DAS maintenance lock {}, held by {holder}; the backup targets are \
+         mounted once it is free. {STOP_A_SCRUB}",
+        path.display()
+    )
+}
+
+/// What `--no-wait` prints when the lock is held.
+pub fn deferred_line(path: &Path, holder: &str) -> String {
+    format!(
+        "Deferred — the DAS maintenance lock {} is held by {holder}; nothing was mounted \
+         (--no-wait, exit {DEFERRED_EXIT_CODE})",
+        path.display()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+
+    use crate::progress::{LogLevel, NullProgress, ProgressEvent, ProgressSink};
+
+    /// How often the scratch lock is looked at — short, so a test that waits
+    /// takes milliseconds.
+    const POLL: Duration = Duration::from_millis(10);
+    /// Long enough to be sure a waiter is blocked, not merely slow to start.
+    const STILL_WAITING: Duration = Duration::from_millis(300);
+    /// Ample for a waiter to notice a release or a cancel (it looks every
+    /// 10 ms).
+    const NOTICES: Duration = Duration::from_secs(1);
+
+    /// `f` on a thread: what it returned within `limit`, or `None` while it
+    /// still runs. A call that should not wait, but does, then fails its
+    /// test instead of hanging it.
+    fn within<T: Send + 'static>(
+        limit: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    fn scratch() -> (tempfile::TempDir, LockSite) {
+        let dir = tempfile::tempdir().unwrap();
+        let site = LockSite {
+            path: dir.path().join("das-maintenance.lock"),
+            poll: POLL,
+        };
+        (dir, site)
+    }
+
+    fn note(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    fn me(job: &str) -> String {
+        format!("{job} pid {}", std::process::id())
+    }
+
+    /// Records every log line with its level.
+    #[derive(Default)]
+    struct Logs(Mutex<Vec<(LogLevel, String)>>);
+
+    impl ProgressCallback for Logs {
+        fn on_stage(&self, _: &str, _: u64) {}
+        fn on_progress(&self, _: u64, _: u64, _: &str) {}
+        fn on_throughput(&self, _: u64) {}
+        fn on_log(&self, level: LogLevel, message: &str) {
+            self.0.lock().unwrap().push((level, message.to_string()));
+        }
+        fn on_complete(&self, _: bool, _: &str) {}
+    }
+
+    impl Logs {
+        fn lines(&self) -> Vec<(LogLevel, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A descriptor that holds the lock, as `backup-run.sh`'s fd 8 does.
+    fn holding_descriptor(path: &Path) -> std::fs::File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        // SAFETY: flock on a descriptor `file` owns.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the fixture must hold the lock");
+        file
+    }
+
+    // --- the site ----------------------------------------------------------
+
+    #[test]
+    fn the_production_site_is_the_shared_lock_looked_at_every_second() {
+        let site = LockSite::production();
+        assert_eq!(site.path, Path::new("/run/das-maintenance.lock"));
+        assert_eq!(site.poll, Duration::from_secs(1));
+    }
+
+    // --- taking the lock records the holder --------------------------------
+
+    #[test]
+    fn whoever_takes_the_lock_records_itself_and_clears_the_record_on_release() {
+        let (_dir, site) = scratch();
+        let held = MaintenanceHeld::try_acquire_at(&site.path, "btrdasd restore browse")
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(held.path(), site.path);
+        assert_eq!(
+            note(&site.path),
+            format!("{}\n", me("btrdasd restore browse"))
+        );
+
+        // It is really held, and a refused taker leaves the record alone.
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "btrdasd walk")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            note(&site.path),
+            format!("{}\n", me("btrdasd restore browse"))
+        );
+
+        drop(held);
+        assert_eq!(note(&site.path), "", "the record goes with the lock");
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "btrdasd walk")
+                .unwrap()
+                .is_some(),
+            "and the lock is free again"
+        );
+    }
+
+    #[test]
+    fn a_blocking_taker_records_itself_too() {
+        let (_dir, site) = scratch();
+        let held = MaintenanceHeld::acquire_blocking_at(
+            &site.path,
+            "btrdasd scrub run",
+            &NullProgress,
+            "waiting",
+        )
+        .unwrap();
+        assert_eq!(note(&site.path), format!("{}\n", me("btrdasd scrub run")));
+        drop(held);
+        assert_eq!(note(&site.path), "");
+    }
+
+    // --- waiting -----------------------------------------------------------
+
+    #[test]
+    fn a_free_lock_is_taken_at_once_without_a_waiting_line() {
+        let (_dir, site) = scratch();
+        let logs = Arc::new(Logs::default());
+        let (waiter_site, waiter_logs) = (site.clone(), logs.clone());
+        let waited = within(STILL_WAITING, move || {
+            wait_for(
+                &waiter_site,
+                "btrdasd walk",
+                false,
+                &|| false,
+                &*waiter_logs,
+            )
+        })
+        .expect("a free lock is taken at once")
+        .unwrap();
+        assert!(matches!(waited, Waited::Held(_)), "{waited:?}");
+        assert!(logs.lines().is_empty(), "{:?}", logs.lines());
+        assert_eq!(note(&site.path), format!("{}\n", me("btrdasd walk")));
+    }
+
+    #[test]
+    fn no_wait_defers_at_once_naming_the_holder_and_takes_nothing() {
+        let (_dir, site) = scratch();
+        let scrub = MaintenanceHeld::try_acquire_at(&site.path, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        // On a thread, so a wait where none belongs fails the test rather
+        // than hanging it.
+        let logs = Arc::new(Logs::default());
+        let (tx, rx) = mpsc::channel();
+        let (waiter_site, waiter_logs) = (site.clone(), logs.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(wait_for(
+                &waiter_site,
+                "btrdasd walk",
+                true,
+                &|| false,
+                &*waiter_logs,
+            ));
+        });
+        match rx
+            .recv_timeout(STILL_WAITING)
+            .expect("defers at once")
+            .unwrap()
+        {
+            Waited::Deferred { holder } => assert_eq!(holder, me("btrdasd scrub run")),
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+        assert!(logs.lines().is_empty(), "deferring announces no wait");
+        assert_eq!(note(&site.path), format!("{}\n", me("btrdasd scrub run")));
+        drop(scrub);
+    }
+
+    #[test]
+    fn a_held_lock_is_waited_for_and_taken_once_released() {
+        let (_dir, site) = scratch();
+        let scrub = MaintenanceHeld::try_acquire_at(&site.path, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let logs = Arc::new(Logs::default());
+        let (tx, rx) = mpsc::channel();
+        let (waiter_site, waiter_logs) = (site.clone(), logs.clone());
+        let waiter = std::thread::spawn(move || {
+            let waited = wait_for(
+                &waiter_site,
+                "btrdasd restore file",
+                false,
+                &|| false,
+                &*waiter_logs,
+            );
+            tx.send(waited).unwrap();
+        });
+
+        assert!(
+            matches!(
+                rx.recv_timeout(STILL_WAITING),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "must still be waiting while the lock is held"
+        );
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 1, "one line before waiting: {lines:?}");
+        assert_eq!(lines[0].0, LogLevel::Warning);
+        assert!(
+            lines[0]
+                .1
+                .contains(&format!("held by {}", me("btrdasd scrub run"))),
+            "{}",
+            lines[0].1
+        );
+
+        drop(scrub);
+        let waited = rx
+            .recv_timeout(NOTICES)
+            .expect("takes the lock once it is free")
+            .unwrap();
+        assert!(matches!(waited, Waited::Held(_)), "{waited:?}");
+        assert_eq!(
+            note(&site.path),
+            format!("{}\n", me("btrdasd restore file"))
+        );
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].1.contains("acquired after waiting"),
+            "{}",
+            lines[1].1
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_wait_stops_at_once_and_takes_nothing() {
+        let (_dir, site) = scratch();
+        let backup = MaintenanceHeld::try_acquire_at(&site.path, "backup-run.sh")
+            .unwrap()
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (waiter_site, waiter_cancel) = (site.clone(), cancel.clone());
+        let waiter = std::thread::spawn(move || {
+            let cancelled = || waiter_cancel.load(Ordering::SeqCst);
+            let waited = wait_for(&waiter_site, "job", false, &cancelled, &NullProgress);
+            tx.send(waited).unwrap();
+        });
+
+        assert!(matches!(
+            rx.recv_timeout(STILL_WAITING),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        cancel.store(true, Ordering::SeqCst);
+        match rx
+            .recv_timeout(NOTICES)
+            .expect("stops once cancelled")
+            .unwrap()
+        {
+            Waited::Cancelled { holder } => assert_eq!(holder, me("backup-run.sh")),
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        // The holder still holds it, and its record is intact.
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(note(&site.path), format!("{}\n", me("backup-run.sh")));
+        drop(backup);
+        waiter.join().unwrap();
+    }
+
+    // --- a GUI job ---------------------------------------------------------
+
+    /// Keeps what the job's client would have received.
+    struct Client(Arc<Mutex<Vec<ProgressEvent>>>);
+
+    impl ProgressSink for Client {
+        fn journal(&mut self, _: LogLevel, _: &str) {}
+        fn emit(&mut self, event: ProgressEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn gui_progress() -> (Arc<OrderedProgress>, Arc<Mutex<Vec<ProgressEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(OrderedProgress::new(Client(events.clone()))),
+            events,
+        )
+    }
+
+    #[test]
+    fn a_gui_job_takes_a_free_lock() {
+        let (_dir, site) = scratch();
+        let (progress, _) = gui_progress();
+        let job_site = site.clone();
+        let held = within(STILL_WAITING, move || {
+            hold_for_job(&job_site, "btrdasd-helper IndexWalk job", &progress)
+        })
+        .expect("a free lock is taken at once")
+        .unwrap();
+        assert_eq!(
+            note(&site.path),
+            format!("{}\n", me("btrdasd-helper IndexWalk job"))
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_cancelled_gui_job_stops_waiting_and_ends_cancelled() {
+        let (_dir, site) = scratch();
+        let scrub = MaintenanceHeld::try_acquire_at(&site.path, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let (progress, events) = gui_progress();
+        let (tx, rx) = mpsc::channel();
+        let (job_site, job_progress) = (site.clone(), progress.clone());
+        let job = std::thread::spawn(move || {
+            let held = hold_for_job(&job_site, "btrdasd-helper RestoreFiles job", &job_progress);
+            tx.send(held.map(|_| ())).unwrap();
+        });
+
+        assert!(matches!(
+            rx.recv_timeout(STILL_WAITING),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        progress.cancel();
+        let summary = rx
+            .recv_timeout(NOTICES)
+            .expect("stops waiting once cancelled")
+            .unwrap_err();
+        assert_eq!(
+            summary,
+            format!(
+                "stopped waiting for the DAS maintenance lock, held by {}; nothing was mounted",
+                me("btrdasd scrub run")
+            )
+        );
+        job.join().unwrap();
+        progress.finish(false, &summary);
+
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Log { message, .. }
+                if message.starts_with("Waiting for the DAS maintenance lock"))),
+            "the client saw the waiting line: {events:?}"
+        );
+        match events.last() {
+            Some(ProgressEvent::Finished { success, summary }) => {
+                assert!(!success);
+                assert!(summary.starts_with("cancelled — "), "{summary}");
+                assert!(summary.contains(&me("btrdasd scrub run")), "{summary}");
+            }
+            other => panic!("the job must end with Finished, got {other:?}"),
+        }
+        drop(scrub);
+    }
+
+    #[test]
+    fn a_gui_job_names_a_lock_it_cannot_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "").unwrap();
+        let site = LockSite {
+            path: dir.path().join("file").join("lock"),
+            poll: POLL,
+        };
+        let (progress, _) = gui_progress();
+        let err = within(STILL_WAITING, move || hold_for_job(&site, "job", &progress))
+            .expect("a lock that cannot be opened fails at once")
+            .unwrap_err();
+        assert!(
+            err.starts_with("Could not take the DAS maintenance lock: "),
+            "{err}"
+        );
+    }
+
+    // --- reading the record ------------------------------------------------
+
+    #[test]
+    fn an_empty_or_missing_record_is_an_unknown_holder() {
+        assert_eq!(holder_from_note("", &|_| true), UNKNOWN_HOLDER);
+        assert_eq!(holder_from_note("  \n  \n", &|_| true), UNKNOWN_HOLDER);
+        assert_eq!(
+            holder_of(Path::new("/nonexistent-frb/das-maintenance.lock")),
+            UNKNOWN_HOLDER
+        );
+    }
+
+    #[test]
+    fn a_record_whose_process_runs_names_it() {
+        assert_eq!(
+            holder_from_note("btrdasd scrub run pid 42\n", &|pid| pid == 42),
+            "btrdasd scrub run pid 42"
+        );
+    }
+
+    #[test]
+    fn a_record_whose_process_has_exited_is_not_presented_as_the_holder() {
+        assert_eq!(
+            holder_from_note("backup-run.sh pid 42\n", &|_| false),
+            "an unknown holder (the last recorded holder, backup-run.sh pid 42, is no longer running)"
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_pid_is_shown_as_written() {
+        assert_eq!(
+            holder_from_note("recovery-os VM session A\n", &|_| false),
+            "recovery-os VM session A"
+        );
+        assert_eq!(
+            holder_from_note("odd pid 4x\n", &|_| false),
+            "odd pid 4x",
+            "a pid that does not parse is no pid"
+        );
+    }
+
+    #[test]
+    fn only_the_first_line_is_read_without_control_characters_and_at_most_200_chars() {
+        assert_eq!(
+            holder_from_note("  evil\u{1b}[2J name pid 7\t\nsecond\n", &|_| true),
+            "evil[2J name pid 7"
+        );
+        let long = "x".repeat(500);
+        assert_eq!(holder_from_note(&long, &|_| true), "x".repeat(200));
+    }
+
+    #[test]
+    fn whether_a_process_runs_is_read_from_proc() {
+        assert!(pid_is_running(std::process::id()));
+        assert!(!pid_is_running(u32::MAX), "beyond pid_max, never a process");
+    }
+
+    #[test]
+    fn the_holder_is_read_from_the_lock_file() {
+        let (_dir, site) = scratch();
+        let held = MaintenanceHeld::try_acquire_at(&site.path, "btrdasd walk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(holder_of(&site.path), me("btrdasd walk"));
+        drop(held);
+        assert_eq!(holder_of(&site.path), UNKNOWN_HOLDER);
+    }
+
+    // --- what is said ------------------------------------------------------
+
+    #[test]
+    fn the_waiting_line_names_the_lock_the_holder_and_how_to_stop_a_scrub() {
+        let line = waiting_line(
+            Path::new("/run/das-maintenance.lock"),
+            "btrdasd scrub run pid 9",
+        );
+        for part in [
+            "Waiting for the DAS maintenance lock /run/das-maintenance.lock",
+            "held by btrdasd scrub run pid 9",
+            "systemctl stop das-scrub.service && systemctl mask das-scrub.service",
+            "stop alone is undone within seconds",
+            "systemctl unmask das-scrub.service",
+        ] {
+            assert!(line.contains(part), "{part:?} missing from: {line}");
+        }
+    }
+
+    #[test]
+    fn the_deferred_line_names_the_holder_and_the_exit_code() {
+        let line = deferred_line(
+            Path::new("/run/das-maintenance.lock"),
+            "btrdasd scrub run pid 9",
+        );
+        for part in [
+            "Deferred",
+            "/run/das-maintenance.lock",
+            "held by btrdasd scrub run pid 9",
+            "nothing was mounted",
+            "--no-wait",
+            "exit 75",
+        ] {
+            assert!(line.contains(part), "{part:?} missing from: {line}");
+        }
+    }
+
+    // --- a lock handed down ------------------------------------------------
+
+    #[test]
+    fn the_holders_own_descriptor_is_accepted_and_never_released_here() {
+        let (_dir, site) = scratch();
+        let parent = holding_descriptor(&site.path);
+        let held = MaintenanceHeld::delegated_at(&site.path, parent.as_raw_fd())
+            .expect("the holder's own descriptor proves the hold");
+        assert_eq!(held.path(), site.path);
+        drop(held);
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_none(),
+            "dropping the proof must not release the lock the parent holds"
+        );
+        drop(parent);
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_descriptor_that_does_not_hold_the_lock_is_refused() {
+        let (_dir, site) = scratch();
+        let holder = holding_descriptor(&site.path);
+        let bystander = OpenOptions::new().read(true).open(&site.path).unwrap();
+        let err = MaintenanceHeld::delegated_at(&site.path, bystander.as_raw_fd()).unwrap_err();
+        assert!(err.contains("does not hold"), "{err}");
+        drop(holder);
+    }
+
+    #[test]
+    fn a_descriptor_on_another_file_is_refused() {
+        let (dir, site) = scratch();
+        std::fs::write(&site.path, "").unwrap();
+        let elsewhere = holding_descriptor(&dir.path().join("other.lock"));
+        let err = MaintenanceHeld::delegated_at(&site.path, elsewhere.as_raw_fd()).unwrap_err();
+        assert!(err.contains("is not"), "{err}");
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_open_or_a_missing_lock_file_is_refused() {
+        let (_dir, site) = scratch();
+        let err = MaintenanceHeld::delegated_at(&site.path, 0).unwrap_err();
+        assert!(err.contains("cannot stat"), "{err}");
+        std::fs::write(&site.path, "").unwrap();
+        let err = MaintenanceHeld::delegated_at(&site.path, -1).unwrap_err();
+        assert!(err.contains("not an open descriptor"), "{err}");
+    }
+}

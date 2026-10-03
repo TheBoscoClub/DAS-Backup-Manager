@@ -2,6 +2,7 @@ use crate::config::{Config, TargetRole};
 use crate::db::Database;
 use crate::health;
 use crate::indexer;
+use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback};
 use crate::scrub;
@@ -21,10 +22,17 @@ use std::time::UNIX_EPOCH;
 /// running two backups over one set of targets.
 pub const BACKUP_LOCK_PATH: &str = "/run/das-backup.lock";
 
-/// Both locks a manual backup holds, released on drop.
+/// Both locks a manual backup holds, released on drop — maintenance first
+/// (fields drop in declaration order).
 pub struct BackupLocks {
-    _maintenance: scrub::FileLock,
+    maintenance: MaintenanceHeld,
     _singleton: scrub::FileLock,
+}
+
+impl HoldsMaintenance for BackupLocks {
+    fn maintenance(&self) -> &MaintenanceHeld {
+        &self.maintenance
+    }
 }
 
 /// Outcome of trying to take the manual-backup locks.
@@ -53,32 +61,38 @@ pub enum BackupLockAttempt {
 ///
 /// Acquisition order is singleton then maintenance, the same order used
 /// everywhere else; that shared order is what keeps the set deadlock-free.
+/// `job` (`btrdasd backup send`) is recorded in the maintenance lock file as
+/// its holder.
 pub fn acquire_manual_locks_at(
     singleton_path: &Path,
     maintenance_path: &Path,
+    job: &str,
     progress: &dyn ProgressCallback,
 ) -> Result<BackupLockAttempt, scrub::ScrubError> {
     let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
         return Ok(BackupLockAttempt::AlreadyRunning);
     };
-    let maintenance = scrub::FileLock::acquire_blocking(
+    let maintenance = MaintenanceHeld::acquire_blocking_at(
         maintenance_path,
+        job,
         progress,
         "DAS maintenance lock held (scrub in progress?) — waiting...",
     )?;
     Ok(BackupLockAttempt::Acquired(Box::new(BackupLocks {
-        _maintenance: maintenance,
+        maintenance,
         _singleton: singleton,
     })))
 }
 
 /// Take the manual-backup locks at their production paths.
 pub fn acquire_manual_locks(
+    job: &str,
     progress: &dyn ProgressCallback,
 ) -> Result<BackupLockAttempt, scrub::ScrubError> {
     acquire_manual_locks_at(
         Path::new(BACKUP_LOCK_PATH),
         Path::new(scrub::MAINTENANCE_LOCK_PATH),
+        job,
         progress,
     )
 }
@@ -1745,11 +1759,12 @@ impl Release for mount::MountGuard {
 /// does each step for real, and tests script them.
 pub trait BackupJobHost {
     /// `Ok(None)`: another backup holds the singleton lock. The returned
-    /// value holds the locks until it is dropped.
+    /// value holds the locks until it is dropped, and is the proof
+    /// `mount_targets` needs.
     fn acquire_locks(
         &self,
         progress: &dyn ProgressCallback,
-    ) -> Result<Option<Box<dyn std::any::Any>>, String>;
+    ) -> Result<Option<Box<dyn HoldsMaintenance>>, String>;
     fn mount_sources(&self, config: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release>;
     /// The subvolume sync, and the config the rest of the run uses —
     /// `before` when the config cannot be reloaded after sync.
@@ -1763,6 +1778,7 @@ pub trait BackupJobHost {
         &self,
         config: &Config,
         progress: &dyn ProgressCallback,
+        held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String>;
     fn run(
         &self,
@@ -1840,7 +1856,7 @@ pub fn run_backup_job(
     mut options: BackupOptions,
     progress: &dyn ProgressCallback,
 ) -> BackupJobOutcome {
-    let _locks = match host.acquire_locks(progress) {
+    let locks = match host.acquire_locks(progress) {
         Ok(Some(locks)) => locks,
         Ok(None) => return BackupJobOutcome::Declined,
         Err(e) => {
@@ -1852,7 +1868,7 @@ pub fn run_backup_job(
     // run's result, record and report all say it failed.
     let (config, sync) = host.sync(&config, options.dry_run, progress);
     options.subvolume_sync = Some(sync);
-    let mut targets = match host.mount_targets(&config, progress) {
+    let mut targets = match host.mount_targets(&config, progress, locks.maintenance()) {
         Ok(targets) => targets,
         Err(e) => {
             let still = sources.release(progress);
@@ -1902,15 +1918,19 @@ pub struct SystemBackupHost {
     pub config_path: std::path::PathBuf,
     pub singleton_lock: std::path::PathBuf,
     pub maintenance_lock: std::path::PathBuf,
+    /// Who runs the job — `btrdasd backup run`, or the GUI's — recorded in
+    /// the maintenance lock file while it holds the lock.
+    pub job: String,
 }
 
 impl SystemBackupHost {
     /// The production host: the given config, the production lock files.
-    pub fn new(config_path: &Path) -> Self {
+    pub fn new(config_path: &Path, job: &str) -> Self {
         Self {
             config_path: config_path.to_path_buf(),
             singleton_lock: BACKUP_LOCK_PATH.into(),
             maintenance_lock: scrub::MAINTENANCE_LOCK_PATH.into(),
+            job: job.to_string(),
         }
     }
 }
@@ -1919,8 +1939,13 @@ impl BackupJobHost for SystemBackupHost {
     fn acquire_locks(
         &self,
         progress: &dyn ProgressCallback,
-    ) -> Result<Option<Box<dyn std::any::Any>>, String> {
-        match acquire_manual_locks_at(&self.singleton_lock, &self.maintenance_lock, progress) {
+    ) -> Result<Option<Box<dyn HoldsMaintenance>>, String> {
+        match acquire_manual_locks_at(
+            &self.singleton_lock,
+            &self.maintenance_lock,
+            &self.job,
+            progress,
+        ) {
             Ok(BackupLockAttempt::Acquired(locks)) => Ok(Some(locks)),
             Ok(BackupLockAttempt::AlreadyRunning) => Ok(None),
             Err(e) => Err(e.to_string()),
@@ -1952,8 +1977,9 @@ impl BackupJobHost for SystemBackupHost {
         &self,
         config: &Config,
         progress: &dyn ProgressCallback,
+        held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String> {
-        mount::ensure_targets_mounted(config, progress)
+        mount::ensure_targets_mounted(config, progress, held)
             .map(|guard| Box::new(guard) as Box<dyn Release>)
             .map_err(|e| e.to_string())
     }
@@ -2012,7 +2038,9 @@ mod tests {
         assert!(held.is_some(), "fixture must hold the singleton");
 
         let progress = crate::progress::NullProgress;
-        match acquire_manual_locks_at(&singleton, &maintenance, &progress).unwrap() {
+        match acquire_manual_locks_at(&singleton, &maintenance, "btrdasd backup send", &progress)
+            .unwrap()
+        {
             BackupLockAttempt::AlreadyRunning => {}
             BackupLockAttempt::Acquired(_) => panic!("two backups acquired at once"),
         }
@@ -2021,15 +2049,24 @@ mod tests {
     #[test]
     fn manual_backup_acquires_when_nothing_is_held() {
         let dir = tempfile::tempdir().unwrap();
+        let maintenance = dir.path().join("maintenance.lock");
         let progress = crate::progress::NullProgress;
         match acquire_manual_locks_at(
             &dir.path().join("backup.lock"),
-            &dir.path().join("maintenance.lock"),
+            &maintenance,
+            "btrdasd backup send",
             &progress,
         )
         .unwrap()
         {
-            BackupLockAttempt::Acquired(_) => {}
+            BackupLockAttempt::Acquired(locks) => {
+                assert_eq!(locks.maintenance().path(), maintenance);
+                assert_eq!(
+                    std::fs::read_to_string(&maintenance).unwrap(),
+                    format!("btrdasd backup send pid {}\n", std::process::id()),
+                    "the job is recorded as the maintenance lock's holder"
+                );
+            }
             BackupLockAttempt::AlreadyRunning => panic!("declined with nothing held"),
         }
     }
@@ -2952,11 +2989,11 @@ mod tests {
         fn acquire_locks(
             &self,
             _: &dyn ProgressCallback,
-        ) -> Result<Option<Box<dyn std::any::Any>>, String> {
+        ) -> Result<Option<Box<dyn HoldsMaintenance>>, String> {
             self.step("locks");
-            self.locks
-                .clone()
-                .map(|got| got.then(|| Box::new(()) as Box<dyn std::any::Any>))
+            self.locks.clone().map(|got| {
+                got.then(|| Box::new(MaintenanceHeld::assumed()) as Box<dyn HoldsMaintenance>)
+            })
         }
         fn mount_sources(&self, _: &Config, _: &dyn ProgressCallback) -> Box<dyn Release> {
             self.step("mount sources");
@@ -2990,6 +3027,7 @@ mod tests {
             &self,
             config: &Config,
             _: &dyn ProgressCallback,
+            _: &MaintenanceHeld,
         ) -> Result<Box<dyn Release>, String> {
             self.step(&format!("mount targets ({})", config.general.version));
             self.targets.clone().map(|left| {
@@ -3395,18 +3433,23 @@ mod tests {
             config_path: dir.join("config.toml"),
             singleton_lock: dir.join("backup.lock"),
             maintenance_lock: dir.join("maintenance.lock"),
+            job: "btrdasd backup run".into(),
         }
     }
 
     #[test]
     fn system_host_uses_the_production_locks_by_default() {
-        let host = SystemBackupHost::new(Path::new("/etc/das-backup/config.toml"));
+        let host = SystemBackupHost::new(
+            Path::new("/etc/das-backup/config.toml"),
+            "btrdasd-helper BackupRun job",
+        );
         assert_eq!(host.config_path, Path::new("/etc/das-backup/config.toml"));
         assert_eq!(host.singleton_lock, Path::new(BACKUP_LOCK_PATH));
         assert_eq!(
             host.maintenance_lock,
             Path::new(scrub::MAINTENANCE_LOCK_PATH)
         );
+        assert_eq!(host.job, "btrdasd-helper BackupRun job");
     }
 
     #[test]
@@ -3416,6 +3459,16 @@ mod tests {
         let progress = TestProgress::new();
         let held = host.acquire_locks(&progress).unwrap();
         assert!(held.is_some(), "free locks are taken");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("maintenance.lock")).unwrap(),
+            format!("btrdasd backup run pid {}\n", std::process::id()),
+            "the job is recorded as the maintenance lock's holder"
+        );
+        assert_eq!(
+            held.as_ref().unwrap().maintenance().path(),
+            dir.path().join("maintenance.lock"),
+            "the proof mount_targets gets is the maintenance lock this host took"
+        );
         assert!(
             host.acquire_locks(&progress).unwrap().is_none(),
             "a second backup declines"
@@ -3579,7 +3632,9 @@ mod tests {
         let mut config = make_test_config();
         config.targets.clear();
         let progress = TestProgress::new();
-        let mut targets = host.mount_targets(&config, &progress).unwrap();
+        let mut targets = host
+            .mount_targets(&config, &progress, &MaintenanceHeld::assumed())
+            .unwrap();
         assert!(targets.release(&progress).is_empty());
 
         let options = BackupOptions {
