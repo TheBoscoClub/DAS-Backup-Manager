@@ -1046,7 +1046,7 @@ sudo umount /mnt/snapshot /mnt/target
 
 Each recovery drive boots its own independent OS. It is what you boot when the host cannot, so it has to mount and `btrfs receive` what the host's current kernel and btrfs-progs wrote: a kernel older than a filesystem feature the backups use refuses the mount or the receive. An install left alone for months also stops being able to update itself, because its keyring no longer verifies the packages it is offered.
 
-Every backup run reads each recovery OS (read-only) and adds a `RECOVERY OS` section to the report: last full upgrade and its age, newest kernel against the host's, btrfs-progs against the host's. Past `[recovery_os].max_age_days` (default 60), with a kernel series behind the host's, or with either unreadable, it says `STALE` and the run status reads `COMPLETED WITH WARNINGS`. `btrdasd health` shows the last reading between runs.
+Every backup run reads each recovery OS (read-only) and adds a `RECOVERY OS` section to the report: install date, last full upgrade and its age (counted from the install when it was never upgraded: `never upgraded since install on <date> (<N> days)`), newest kernel against the host's, btrfs-progs against the host's. Past `[recovery_os].max_age_days` (default 60), with a kernel series behind the host's, or with either unreadable, it says `STALE` and the run status reads `COMPLETED WITH WARNINGS`. `btrdasd health` shows the last reading between runs.
 
 To update one, boot it — never update it from the host:
 

@@ -260,7 +260,7 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     os_root(&mnt.join("@"), 1);
     let cfg = config(dir.path(), &mnt);
     let state = dir.path().join("recovery-os.json");
-    let earlier = r#"{"schema_version":1,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade_applied":"2026-01-01","last_full_upgrade_attempted":"2026-01-01","last_attempt_completed":true,"log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{},"packages_read":true,"problems":[]},"error":null}}}"#;
+    let earlier = r#"{"schema_version":2,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade_applied":"2026-01-01","last_full_upgrade_attempted":"2026-01-01","last_attempt_completed":true,"installed":"2025-12-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{},"packages_read":true,"problems":[]},"error":null}}}"#;
     std::fs::write(&state, earlier).unwrap();
     let out = btrdasd(
         &[
@@ -326,6 +326,108 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
         "{err}"
     );
     assert_eq!(std::fs::read_to_string(&state).unwrap(), "{not json");
+
+    // A record of the previous schema is refused the same way, naming its
+    // version, and left alone; `health` says so too.
+    let v1 = r#"{"schema_version":1,"drives":{}}"#;
+    std::fs::write(&state, v1).unwrap();
+    let out = btrdasd(
+        &[
+            "recovery-os",
+            "status",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--state-file",
+            state.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let want = format!(
+        "Error: could not record the result: {p}: record schema version 1, this btrdasd \
+         reads 2 — left as it is; remove it to start over: rm -- '{p}'",
+        p = state.display()
+    );
+    assert_eq!(err.lines().next(), Some(want.as_str()), "{err}");
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), v1);
+    let out = btrdasd(&["health", "--config", cfg.to_str().unwrap()], Some(&state));
+    let t = text(&out);
+    assert!(
+        t.contains(&format!(
+            "recovery-A: not mounted; stored record unreadable: {}: record schema version 1",
+            state.display()
+        )),
+        "{t}"
+    );
+}
+
+/// A root installed `age` days ago and never upgraded since, the way the
+/// production recovery OSes are: the log opens with the live ISO's
+/// `pacman -b` install.
+fn never_upgraded_root(root: &Path, age: i64) -> String {
+    let date = date_of(day_number(&today()).unwrap() - age);
+    write(root, "etc/os-release", "PRETTY_NAME=\"Fixture OS\"\n");
+    std::fs::create_dir_all(root.join("usr/lib/modules").join(host_kernel())).unwrap();
+    write(
+        root,
+        "var/log/pacman.log",
+        &format!(
+            "[{date}T23:23:05-0500] [PACMAN] Running 'pacman -b /mnt/var/lib/pacman -r /mnt -S base'\n\
+             [{date}T23:31:00-0500] [ALPM] transaction completed\n"
+        ),
+    );
+    date
+}
+
+#[test]
+fn inspect_ages_a_never_upgraded_install_from_its_install_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &dir.path().join("unmounted"));
+    let root = dir.path().join("os");
+    let inspect = |json: bool| {
+        let mut args = vec![];
+        if json {
+            args.push("--json");
+        }
+        args.extend([
+            "recovery-os",
+            "inspect",
+            "--root",
+            root.to_str().unwrap(),
+            "--label",
+            "A",
+            "--config",
+            cfg.to_str().unwrap(),
+        ]);
+        btrdasd(&args, None)
+    };
+    // Past the configured 30 days.
+    let date = never_upgraded_root(&root, 40);
+    let out = inspect(false);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let t = text(&out);
+    for line in [
+        format!("    Installed           {date}\n"),
+        "    Last full upgrade   none recorded\n".to_string(),
+        "    Age                 40 days since install\n".to_string(),
+        format!("STALE — never upgraded since install on {date} (40 days)"),
+    ] {
+        assert!(t.contains(&line), "missing {line:?} in\n{t}");
+    }
+    let j: serde_json::Value = serde_json::from_slice(&inspect(true).stdout).unwrap();
+    assert_eq!(j["os"]["installed"], date.as_str());
+    assert_eq!(j["assessment"]["age_days"], 40);
+    assert_eq!(j["assessment"]["age_basis"], "install");
+    // Within the limit it is current.
+    never_upgraded_root(&root, 10);
+    let out = inspect(false);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("    Age                 10 days since install\n"),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -336,13 +438,16 @@ fn health_shows_the_stored_recovery_os_record_with_its_time() {
     // Checked 2026-10-03 03:20 UTC, upgraded long before: stale.
     let checked = day_number("2026-10-03").unwrap() * 86_400 + 3 * 3600 + 20 * 60;
     let record = format!(
-        r#"{{"schema_version":1,"drives":{{"recovery-A":{{"checked_epoch":{checked},"os":{{"os_name":"Old","last_full_upgrade_applied":"2026-03-14","last_full_upgrade_attempted":"2026-03-14","last_attempt_completed":true,"log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{{}},"packages_read":true,"problems":[]}},"error":null}}}}}}"#
+        r#"{{"schema_version":2,"drives":{{"recovery-A":{{"checked_epoch":{checked},"os":{{"os_name":"Old","last_full_upgrade_applied":"2026-03-14","last_full_upgrade_attempted":"2026-03-14","last_attempt_completed":true,"installed":"2026-02-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{{}},"packages_read":true,"problems":[]}},"error":null}}}}}}"#
     );
     std::fs::write(&state, record).unwrap();
     let out = btrdasd(&["health", "--config", cfg.to_str().unwrap()], Some(&state));
     let t = text(&out);
     assert!(
-        t.contains("  recovery-A (as of 2026-10-03 03:20 UTC): last full upgrade 2026-03-14 ("),
+        t.contains(
+            "  recovery-A (as of 2026-10-03 03:20 UTC): installed 2026-02-01, \
+             last full upgrade 2026-03-14, age "
+        ),
         "{t}"
     );
     assert!(
@@ -356,10 +461,10 @@ fn health_shows_the_stored_recovery_os_record_with_its_time() {
     );
     let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(
-        j["recovery_os"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("recovery-A (as of 2026-10-03 03:20 UTC): last full upgrade 2026-03-14"),
+        j["recovery_os"][0].as_str().unwrap().starts_with(
+            "recovery-A (as of 2026-10-03 03:20 UTC): installed 2026-02-01, \
+                 last full upgrade 2026-03-14, age "
+        ),
         "{j}"
     );
 }
