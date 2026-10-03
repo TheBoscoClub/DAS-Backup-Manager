@@ -1,9 +1,18 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.8.0
-# Date: 2026-10-02
+# Version: 4.9.0
+# Date: 2026-10-03
 #
 # Features:
+#   - Maintenance lock holder record and hand-down (v4.9.0): once it holds
+#     /run/das-maintenance.lock this run writes "backup-run.sh pid <pid>"
+#     into it (record_maintenance_holder), so a restore or index job that
+#     finds the lock held can say what it waits for. The file is opened `<>`
+#     instead of `>`, which emptied the current holder's record while this
+#     run merely waited. `btrdasd walk` now takes the maintenance lock before
+#     it mounts the targets, so run_indexer hands it the lock this run holds
+#     (DAS_MAINTENANCE_LOCK_FD=8) — otherwise walk would wait for this run
+#     forever (bd DAS-Backup-Manager-frb).
 #   - Recovery OS check and a WARN level (v4.8.0): check_recovery_os() runs
 #     `btrdasd recovery-os status` after btrbk and expiry, while the targets
 #     are still mounted, and puts its RECOVERY OS section in the report. It
@@ -480,15 +489,22 @@ check_root() {
 # simplicity — a single "waiting" line plus the acquired-with-duration line
 # meets the brief's documented "at least" bar and keeps this function free
 # of background-job cleanup edge cases.
+#
+# Opened `<>`, not `>`: the file holds the current holder's record (see
+# record_maintenance_holder), and `>` would empty it on open — before this
+# run holds anything, while it merely waits. flock(1) locks the open file
+# description whatever its mode, so the locking is unchanged (bd frb).
 acquire_maintenance_lock() {
-    exec 8>"$MAINTENANCE_LOCKFILE"
+    exec 8<>"$MAINTENANCE_LOCKFILE"
     if flock -n 8; then
+        record_maintenance_holder
         return
     fi
 
     # Mirrors scrub.rs's LOCK_WAIT_ANNOUNCE_SECS=5s probe before announcing.
     sleep 5
     if flock -n 8; then
+        record_maintenance_holder
         return
     fi
 
@@ -497,11 +513,23 @@ acquire_maintenance_lock() {
     wait_start=$(date +%s)
 
     flock 8
+    record_maintenance_holder
 
     local wait_secs
     wait_secs=$(( $(date +%s) - wait_start ))
     log_info "DAS maintenance lock acquired after waiting ${wait_secs}s"
     record_op "lock_wait" "OK" "waited ${wait_secs}s for $MAINTENANCE_LOCKFILE"
+}
+
+# Record this run as the holder of the maintenance lock, in the lock file
+# itself, so a restore or index job that finds the lock held can say what it
+# waits for — as every holder in indexer/src/maintenance.rs does. Called only
+# while holding the lock. Display only: a failed write is logged, and the run
+# goes on. The record is left at exit; a reader sees that its pid has gone.
+record_maintenance_holder() {
+    if ! printf 'backup-run.sh pid %s\n' "$$" >"$MAINTENANCE_LOCKFILE"; then
+        log_warn "Could not record this run as the holder of $MAINTENANCE_LOCKFILE"
+    fi
 }
 
 # Find device by serial number
@@ -2009,7 +2037,12 @@ run_indexer() {
 
     log_info "Running content indexer..."
     local indexer_output
-    if indexer_output=$("$BTRDASD_BIN" walk "$primary_mount" --db "$DAS_DB_PATH" 2>&1); then
+    # `walk` takes the maintenance lock before it mounts anything, and this
+    # run holds it — on fd 8, which walk inherits. Naming that descriptor
+    # hands the hold down; without it walk would wait for this run, which
+    # waits for walk (bd DAS-Backup-Manager-frb). walk verifies the
+    # descriptor; it does not take the name on trust.
+    if indexer_output=$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" walk "$primary_mount" --db "$DAS_DB_PATH" 2>&1); then
         record_op "indexer" "OK"
         log_info "  $indexer_output"
     else
@@ -2095,7 +2128,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.8.0
+  backup-run.sh v4.9.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT

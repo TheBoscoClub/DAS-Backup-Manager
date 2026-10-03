@@ -222,8 +222,9 @@ Cross-reference the device serial against your bay map (`docs/examples/author-ba
 The `backup-run.sh` script always mounts by UUID with `[das].mount_opts` (which include `degraded`), so scheduled backups continue. For interactive use, mount the same way:
 
 ```bash
-# Is a backup, scrub, reconcile or doctor run holding the DAS? They mount and
-# unmount this target themselves, and all hold this lock while they do.
+# Is a backup, scrub, restore, index, reconcile or doctor run holding the DAS?
+# They mount and unmount this target themselves, and all hold this lock while
+# they do; `cat /run/das-maintenance.lock` shows what the holder recorded.
 sudo flock -n /run/das-maintenance.lock true || echo "WAIT"
 
 # If /mnt/backup-22tb is not currently mounted

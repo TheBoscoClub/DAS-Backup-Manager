@@ -63,9 +63,9 @@ per-filesystem command that finds coverage gaps.
 │  │  adopt      │ backup     │ btrbk_conf │ caldate   │        │
 │  │  config     │ db         │ doctor     │ expire    │        │
 │  │  forget     │ fsutil     │ health     │ indexer   │        │
-│  │  mount      │ progress   │ reconcile  │ report    │        │
-│  │  recovery_os│ restore    │ scanner    │ schedule  │        │
-│  │  scrub      │ subvol                              │        │
+│  │  maintenance│ mount      │ progress   │ reconcile │        │
+│  │  recovery_os│ report     │ restore    │ scanner   │        │
+│  │  schedule   │ scrub      │ subvol                 │        │
 │  └──────────────────────┬───────────────────────────┘        │
 │                         │ D-Bus (org.dasbackup.Helper1)      │
 │  ┌──────────────────────┴────────────────────────┐           │
@@ -456,7 +456,7 @@ Every install writes `/etc/das-backup/.manifest` — a plain-text list of genera
 3. **Authorization of an action is not authorization over an object.** `JobCancel` checks polkit *and* that the caller owns the job; job ids are broadcast on every progress signal, so the action check alone let any authorized client abort anyone's work (`bd DAS-Backup-Manager-h2s`).
 4. **A source is policy too, not just a destination.** Rule 2 constrained where a restore may *write* and left unconstrained where it may *read*, so an authorized caller could have root copy `/etc`, `/root`, or another user's home into a permitted destination and then read it unprivileged. `restore::check_source_allowed()` requires the snapshot to resolve inside a configured backup target before anything is read, and fails closed when no targets are configured (`bd DAS-Backup-Manager-7ra`).
 
-The daemon also participates in the same singleton + maintenance lock interlock as `backup-run.sh` and the scrub engine. It did not until 0.7.20.0: `bd DAS-Backup-Manager-pe6` fixed the CLI in 0.7.15.0 and never reached the daemon the GUI actually calls (`bd DAS-Backup-Manager-dca`). The singleton locks are `/run/das-backup.lock` (backup, any path), `/run/das-scrub.lock`, `/run/das-doctor.lock` and `/run/das-reconcile.lock`, all non-blocking. Every side takes its singleton first, then the shared `/run/das-maintenance.lock`: backup and scrub wait for it, doctor and reconcile defer if it is held.
+The daemon also participates in the same singleton + maintenance lock interlock as `backup-run.sh` and the scrub engine. It did not until 0.7.20.0: `bd DAS-Backup-Manager-pe6` fixed the CLI in 0.7.15.0 and never reached the daemon the GUI actually calls (`bd DAS-Backup-Manager-dca`). The singleton locks are `/run/das-backup.lock` (backup, any path), `/run/das-scrub.lock`, `/run/das-doctor.lock` and `/run/das-reconcile.lock`, all non-blocking. Every side takes its singleton first, then the shared `/run/das-maintenance.lock`: backup and scrub wait for it, doctor and reconcile defer if it is held. The `IndexWalk`, `RestoreFiles` and `RestoreSnapshot` jobs take only the maintenance lock, as the CLI's `walk` and `restore` do (`bd DAS-Backup-Manager-frb`): they wait for it, logging one line that names the holder, and a job cancelled while it waits ends `cancelled` at once, having mounted nothing. Mounting a target needs the proof that the lock is held — `mount::ensure_targets_mounted` takes a `maintenance::MaintenanceHeld` — so no path can skip it.
 
 ## Build System
 
@@ -571,7 +571,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | Module | File | Lines | Purpose |
 |--------|------|-------|---------|
 | `adopt` | `src/adopt.rs` | ~2600 | Subvolume sync: lists each verified source volume, adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
-| `backup` | `src/backup.rs` | ~3620 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
+| `backup` | `src/backup.rs` | ~3670 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
 | `btrbk_conf` | `src/btrbk_conf.rs` | ~1030 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
 | `caldate` | `src/caldate.rs` | ~270 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates |
 | `config` | `src/config.rs` | ~1810 | TOML config types, DAS/source/target models |
@@ -582,17 +582,18 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `forget` | `src/forget.rs` | ~400 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
 | `health` | `src/health.rs` | ~1860 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
-| `mount` | `src/mount.rs` | ~3620 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` |
+| `maintenance` | `src/maintenance.rs` | ~870 | The DAS maintenance lock: `MaintenanceHeld`, the proof every target mount requires; holder records; the wait of `walk`, `restore` and the GUI's index and restore jobs (`--no-wait`, cancel) |
+| `mount` | `src/mount.rs` | ~3640 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` |
 | `progress` | `src/progress.rs` | ~610 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
-| `reconcile` | `src/reconcile.rs` | ~380 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
+| `reconcile` | `src/reconcile.rs` | ~400 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
 | `recovery_os` | `src/recovery_os.rs` | ~2870 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` reads (`btrdasd recovery-os`) |
 | `report` | `src/report.rs` | ~770 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
-| `scrub` | `src/scrub.rs` | ~3160 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
+| `scrub` | `src/scrub.rs` | ~3200 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
 | `subvol` | `src/subvol.rs` | ~215 | Subvolume CRUD operations |
-| `main` | `src/main.rs` | ~3220 | CLI entry point with clap subcommands |
+| `main` | `src/main.rs` | ~3750 | CLI entry point with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
 | `setup/config` | `src/setup/config.rs` | — | Re-export of the library's `config` types |
 | `setup/env_export` | `src/setup/env_export.rs` | — | `btrdasd config dump-env`: config as shell `DAS_*` variables for the scripts |

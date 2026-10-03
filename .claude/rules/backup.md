@@ -170,6 +170,7 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
 1. **Singleton lock**, non-blocking: `/run/das-{backup,scrub,reconcile,doctor}.lock`. Held ⇒ skip.
 2. **Maintenance lock**: `/run/das-maintenance.lock`, shared by all sides and held for the whole
    operation. Backup and scrub **wait** for it, never skipped; `reconcile` and `doctor` defer.
+- **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`); `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75.
 
 **Always acquire in that order — singleton, then maintenance — never the reverse.** That
 ordering alone is what makes the pair deadlock-free; release order is irrelevant.

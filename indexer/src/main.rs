@@ -6,11 +6,12 @@ use buttered_dasd::db::Database;
 use buttered_dasd::forget;
 use buttered_dasd::health::{self, HealthStatus};
 use buttered_dasd::indexer;
+use buttered_dasd::maintenance::HoldsMaintenance;
 use buttered_dasd::mount;
 use buttered_dasd::progress::{LogLevel, ProgressCallback};
 use buttered_dasd::reconcile;
 use buttered_dasd::report;
-use buttered_dasd::{doctor, restore, schedule, scrub, subvol};
+use buttered_dasd::{doctor, maintenance, restore, schedule, scrub, subvol};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use std::path::{Path, PathBuf};
@@ -112,7 +113,7 @@ where
     let cfg = Config::load(config)?;
 
     // Deleting subvolumes on the targets is maintenance: same interlock.
-    let _locks = match reconcile::try_acquire_locks()? {
+    let locks = match reconcile::try_acquire_locks(&format!("btrdasd {verb}"))? {
         reconcile::LockAttempt::Acquired(locks) => locks,
         reconcile::LockAttempt::Deferred(why) => {
             println!("Deferred — {why}");
@@ -121,7 +122,7 @@ where
     };
 
     let progress = CliProgress;
-    let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+    let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
     let database = Database::open(db)?;
 
     let outcome =
@@ -211,6 +212,9 @@ fn run_reconcile(
 #[derive(Subcommand)]
 enum Commands {
     /// Index all new snapshots on a backup target
+    ///
+    /// Waits for the DAS maintenance lock before mounting the targets
+    /// (EXIT CODE 75 with --no-wait while it is held).
     Walk {
         /// Path to backup target mount point
         target: PathBuf,
@@ -220,6 +224,10 @@ enum Commands {
         /// Path to config.toml (for auto-mounting targets)
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+        /// Do not wait for the DAS maintenance lock: while a backup, scrub or
+        /// other job holds it, exit 75 at once without mounting anything
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Full-text search across indexed files
     Search {
@@ -509,6 +517,8 @@ enum BackupAction {
     },
 }
 
+// Every `restore` command waits for the DAS maintenance lock before it mounts
+// the targets (exit 75 with --no-wait while it is held).
 #[derive(Subcommand)]
 enum RestoreAction {
     /// Restore specific files from a snapshot
@@ -523,6 +533,10 @@ enum RestoreAction {
         /// Path to config.toml (for auto-mounting targets)
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+        /// Do not wait for the DAS maintenance lock: while a backup, scrub or
+        /// other job holds it, exit 75 at once without mounting anything
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Restore an entire snapshot (btrfs send/receive or recursive copy)
     Snapshot {
@@ -533,6 +547,10 @@ enum RestoreAction {
         /// Path to config.toml (for auto-mounting targets)
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+        /// Do not wait for the DAS maintenance lock: while a backup, scrub or
+        /// other job holds it, exit 75 at once without mounting anything
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Browse files in a snapshot directory
     Browse {
@@ -544,6 +562,10 @@ enum RestoreAction {
         /// Path to config.toml (for auto-mounting targets)
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+        /// Do not wait for the DAS maintenance lock: while a backup, scrub or
+        /// other job holds it, exit 75 at once without mounting anything
+        #[arg(long)]
+        no_wait: bool,
     },
 }
 
@@ -1298,55 +1320,324 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// walk and restore: the interactive commands that mount the targets
+// ---------------------------------------------------------------------------
+
+/// Where `walk` and the `restore` commands find the DAS maintenance lock, and
+/// the hold their caller may have handed down ([`maintenance::DELEGATED_FD_ENV`]).
+struct CliLock {
+    site: maintenance::LockSite,
+    delegated: Option<std::ffi::OsString>,
+}
+
+impl CliLock {
+    fn production() -> Self {
+        Self {
+            site: maintenance::LockSite::production(),
+            delegated: std::env::var_os(maintenance::DELEGATED_FD_ENV),
+        }
+    }
+}
+
+/// What `walk` and the `restore` commands are run with.
+struct Interactive<'a> {
+    json: bool,
+    /// Defer instead of waiting for the maintenance lock.
+    no_wait: bool,
+    lock: &'a CliLock,
+    progress: &'a dyn ProgressCallback,
+}
+
+/// How `walk` or a `restore` command ended, when it did not fail.
+#[derive(Debug, PartialEq, Eq)]
+enum Ran {
+    Done,
+    /// `--no-wait` and the lock was held: nothing was mounted.
+    Deferred,
+}
+
+/// The exit code that is not 0: [`maintenance::DEFERRED_EXIT_CODE`] after a
+/// deferral.
+fn deferred_exit_code(ran: &Ran) -> Option<i32> {
+    match ran {
+        Ran::Done => None,
+        Ran::Deferred => Some(maintenance::DEFERRED_EXIT_CODE),
+    }
+}
+
+/// The DAS maintenance lock for `walk` or a `restore` command, before it
+/// mounts anything (bd DAS-Backup-Manager-frb): the hold its caller handed
+/// down, if one is named; otherwise taken — waiting for it, after saying who
+/// holds it, unless `--no-wait`. `None` means deferred: the line is printed,
+/// and the command exits [`maintenance::DEFERRED_EXIT_CODE`].
+fn hold_for_cli(
+    job: &str,
+    run: &Interactive<'_>,
+) -> Result<Option<maintenance::MaintenanceHeld>, Box<dyn std::error::Error>> {
+    let site = &run.lock.site;
+    if let Some(raw) = &run.lock.delegated {
+        let fd = raw
+            .to_str()
+            .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "{}={raw:?} is not a descriptor number",
+                    maintenance::DELEGATED_FD_ENV
+                )
+            })?;
+        return Ok(Some(maintenance::MaintenanceHeld::delegated_at(
+            &site.path, fd,
+        )?));
+    }
+    let never = || false;
+    match maintenance::wait_for(site, job, run.no_wait, &never, run.progress)? {
+        maintenance::Waited::Held(held) => Ok(Some(held)),
+        maintenance::Waited::Deferred { holder } | maintenance::Waited::Cancelled { holder } => {
+            if run.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "deferred": true, "holder": holder })
+                );
+            } else {
+                println!("{}", maintenance::deferred_line(&site.path, &holder));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// `btrdasd walk`.
+fn cmd_walk(
+    target: &Path,
+    db: &str,
+    config: &Path,
+    run: &Interactive<'_>,
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let (json, progress) = (run.json, run.progress);
+    let cfg = Config::load(config)?;
+    let Some(held) = hold_for_cli("btrdasd walk", run)? else {
+        return Ok(Ran::Deferred);
+    };
+    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let database = Database::open(db)?;
+    let result = indexer::walk(target, &database);
+    // Reconcile while the targets are still mounted — the prune is only
+    // ever safe under a verified mountpoint (bd DAS-Backup-Manager-cu8).
+    let reconciled = run_reconcile(&database, &cfg, false);
+    let still_mounted = guard.unmount(progress);
+    let result = result?;
+    let (out, warning) = walk_report(json, &result, &reconciled);
+    print!("{out}");
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    mount::require_released(&still_mounted)?;
+    Ok(Ran::Done)
+}
+
+/// What `walk` prints on stdout, and the warning for stderr when the
+/// reconcile failed (text output only, as before).
+fn walk_report(
+    json: bool,
+    result: &indexer::WalkResult,
+    reconciled: &rusqlite::Result<reconcile::PruneStats>,
+) -> (String, Option<String>) {
+    if json {
+        let out = format!(
+            "{{\"discovered\":{},\"indexed\":{},\"skipped\":{}}}\n",
+            result.snapshots_discovered, result.snapshots_indexed, result.snapshots_skipped
+        );
+        return (out, None);
+    }
+    let mut out = format!(
+        "Discovered: {} snapshots\nIndexed:    {} new\nSkipped:    {} already indexed\n",
+        result.snapshots_discovered, result.snapshots_indexed, result.snapshots_skipped
+    );
+    let mut warning = None;
+    match reconciled {
+        Ok(stats) if stats.snapshots_removed > 0 => out.push_str(&format!(
+            "Reconciled: {} stale snapshots pruned ({} spans repaired, {} removed, {} files dropped)\n",
+            stats.snapshots_removed, stats.spans_repaired, stats.spans_removed, stats.files_removed
+        )),
+        Ok(_) => out.push_str("Reconciled: index already consistent\n"),
+        Err(e) => warning = Some(format!("Warning: reconcile failed: {e}")),
+    }
+    for r in &result.results {
+        out.push_str(&format!(
+            "  {} files ({} new, {} extended, {} changed, {} errors)\n",
+            r.files_total, r.files_new, r.files_extended, r.files_changed, r.scan_errors
+        ));
+    }
+    (out, warning)
+}
+
+/// What `restore file` and `restore snapshot` print on stdout, and the error
+/// lines for stderr (text output only, as before).
+fn restored_report(json: bool, result: &restore::RestoreResult) -> (String, Vec<String>) {
+    if json {
+        let out = format!(
+            "{{\"files_restored\":{},\"bytes_restored\":{},\"errors\":{},\"duration_secs\":{}}}\n",
+            result.files_restored,
+            result.bytes_restored,
+            result.errors.len(),
+            result.duration_secs
+        );
+        return (out, Vec::new());
+    }
+    let out = format!(
+        "Restored {} files ({}) in {}s\n",
+        result.files_restored,
+        report::format_bytes(result.bytes_restored),
+        result.duration_secs
+    );
+    let errors = result
+        .errors
+        .iter()
+        .map(|e| format!("  ERROR: {e}"))
+        .collect();
+    (out, errors)
+}
+
+/// `btrdasd restore file`.
+fn cmd_restore_file(
+    snapshot: &Path,
+    dest: &Path,
+    files: &[String],
+    config: &Path,
+    run: &Interactive<'_>,
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let (json, progress) = (run.json, run.progress);
+    let cfg = Config::load(config)?;
+    let Some(held) = hold_for_cli("btrdasd restore file", run)? else {
+        return Ok(Ran::Deferred);
+    };
+    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let result = restore::restore_files(
+        snapshot,
+        &file_refs,
+        dest,
+        &cfg.restore.allowed_roots,
+        &restore::snapshot_source_roots(&cfg),
+        progress,
+    );
+    let still_mounted = guard.unmount(progress);
+    let (out, errors) = restored_report(json, &result?);
+    print!("{out}");
+    for line in errors {
+        eprintln!("{line}");
+    }
+    mount::require_released(&still_mounted)?;
+    Ok(Ran::Done)
+}
+
+/// `btrdasd restore snapshot`.
+fn cmd_restore_snapshot(
+    snapshot: &Path,
+    dest: &Path,
+    config: &Path,
+    run: &Interactive<'_>,
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let (json, progress) = (run.json, run.progress);
+    let cfg = Config::load(config)?;
+    let Some(held) = hold_for_cli("btrdasd restore snapshot", run)? else {
+        return Ok(Ran::Deferred);
+    };
+    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let result = restore::restore_snapshot(
+        snapshot,
+        dest,
+        &cfg.restore.allowed_roots,
+        &restore::snapshot_source_roots(&cfg),
+        progress,
+    );
+    let still_mounted = guard.unmount(progress);
+    let (out, errors) = restored_report(json, &result?);
+    print!("{out}");
+    for line in errors {
+        eprintln!("{line}");
+    }
+    mount::require_released(&still_mounted)?;
+    Ok(Ran::Done)
+}
+
+/// `btrdasd restore browse`.
+fn cmd_restore_browse(
+    snapshot: &Path,
+    prefix: Option<&str>,
+    config: &Path,
+    run: &Interactive<'_>,
+) -> Result<Ran, Box<dyn std::error::Error>> {
+    let (json, progress) = (run.json, run.progress);
+    let cfg = Config::load(config)?;
+    let Some(held) = hold_for_cli("btrdasd restore browse", run)? else {
+        return Ok(Ran::Deferred);
+    };
+    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let entries = restore::browse_snapshot(snapshot, prefix);
+    let still_mounted = guard.unmount(progress);
+    print!("{}", browse_listing(json, &entries?));
+    mount::require_released(&still_mounted)?;
+    Ok(Ran::Done)
+}
+
+/// What `restore browse` prints.
+fn browse_listing(json: bool, entries: &[restore::BrowseEntry]) -> String {
+    if json {
+        let mut out = String::from("[");
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"path\":\"{}\",\"name\":\"{}\",\"size\":{},\"mtime\":{},\"is_dir\":{}}}",
+                e.path.replace('"', "\\\""),
+                e.name.replace('"', "\\\""),
+                e.size,
+                e.mtime,
+                e.is_dir
+            ));
+        }
+        out.push_str("]\n");
+        return out;
+    }
+    let mut out = String::new();
+    for e in entries {
+        let (type_char, size) = if e.is_dir {
+            ("d", "-".to_string())
+        } else {
+            ("-", report::format_bytes(e.size))
+        };
+        out.push_str(&format!("{type_char} {size:>12} {}\n", e.name));
+    }
+    out.push_str(&format!("({} entries)\n", entries.len()));
+    out
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let json = cli.json;
 
     match cli.command {
         // ----- Indexer commands (unchanged) -----
-        Commands::Walk { target, db, config } => {
-            let cfg = Config::load(&config)?;
-            let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-            let database = Database::open(&db)?;
-            let result = indexer::walk(&target, &database);
-            // Reconcile while the targets are still mounted — the prune is only
-            // ever safe under a verified mountpoint (bd DAS-Backup-Manager-cu8).
-            let reconciled = run_reconcile(&database, &cfg, false);
-            let still_mounted = guard.unmount(&progress);
-            let result = result?;
-            if json {
-                println!(
-                    "{{\"discovered\":{},\"indexed\":{},\"skipped\":{}}}",
-                    result.snapshots_discovered, result.snapshots_indexed, result.snapshots_skipped
-                );
-            } else {
-                println!("Discovered: {} snapshots", result.snapshots_discovered);
-                println!("Indexed:    {} new", result.snapshots_indexed);
-                println!("Skipped:    {} already indexed", result.snapshots_skipped);
-                match &reconciled {
-                    Ok(stats) if stats.snapshots_removed > 0 => println!(
-                        "Reconciled: {} stale snapshots pruned ({} spans repaired, {} removed, {} files dropped)",
-                        stats.snapshots_removed,
-                        stats.spans_repaired,
-                        stats.spans_removed,
-                        stats.files_removed
-                    ),
-                    Ok(_) => println!("Reconciled: index already consistent"),
-                    Err(e) => eprintln!("Warning: reconcile failed: {e}"),
-                }
-                for r in &result.results {
-                    println!(
-                        "  {} files ({} new, {} extended, {} changed, {} errors)",
-                        r.files_total,
-                        r.files_new,
-                        r.files_extended,
-                        r.files_changed,
-                        r.scan_errors
-                    );
-                }
+        Commands::Walk {
+            target,
+            db,
+            config,
+            no_wait,
+        } => {
+            let lock = CliLock::production();
+            let run = Interactive {
+                json,
+                no_wait,
+                lock: &lock,
+                progress: &CliProgress,
+            };
+            let ran = cmd_walk(&target, &db, &config, &run)?;
+            if let Some(code) = deferred_exit_code(&ran) {
+                std::process::exit(code);
             }
-            mount::require_released(&still_mounted)?;
         }
         Commands::Forget {
             pattern,
@@ -1397,7 +1688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Mounts the DAS targets for the duration, so it takes the same
             // non-blocking interlock as reconcile.
-            let _locks = match reconcile::try_acquire_locks()? {
+            let locks = match reconcile::try_acquire_locks("btrdasd reindex")? {
                 reconcile::LockAttempt::Acquired(locks) => locks,
                 reconcile::LockAttempt::Deferred(why) => {
                     println!("Deferred — {why}");
@@ -1406,7 +1697,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+            let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
             let database = Database::open(&db)?;
 
             let outcome = (|| -> Result<ReindexOutcome, Box<dyn std::error::Error>> {
@@ -1486,7 +1777,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // A standalone pass mounts the DAS targets, so it must respect the
             // maintenance interlock. Non-blocking: defer rather than delay a backup.
-            let _locks = match reconcile::try_acquire_locks()? {
+            let locks = match reconcile::try_acquire_locks("btrdasd reconcile")? {
                 reconcile::LockAttempt::Acquired(locks) => locks,
                 reconcile::LockAttempt::Deferred(why) => {
                     if json {
@@ -1499,7 +1790,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+            let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
             let database = Database::open(&db)?;
 
             if let Some(root) = &forget_root {
@@ -1733,7 +2024,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // btrbk, unmount, report, record. The sync report goes to the
                 // progress log (stderr), so stdout stays what it was.
                 let outcome = backup::run_backup_job(
-                    &backup::SystemBackupHost::new(&config),
+                    &backup::SystemBackupHost::new(&config, "btrdasd backup run"),
                     cfg,
                     options,
                     &progress,
@@ -1786,13 +2077,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let progress = CliProgress;
                 // Manual backups mount and unmount the DAS filesystems, so they
                 // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
-                let _locks = match backup::acquire_manual_locks(&progress)? {
-                    BackupLockAttempt::Acquired(locks) => locks,
-                    BackupLockAttempt::AlreadyRunning => {
-                        println!("A backup is already running — declining.");
-                        return Ok(());
-                    }
-                };
+                let _locks =
+                    match backup::acquire_manual_locks("btrdasd backup snapshot", &progress)? {
+                        BackupLockAttempt::Acquired(locks) => locks,
+                        BackupLockAttempt::AlreadyRunning => {
+                            println!("A backup is already running — declining.");
+                            return Ok(());
+                        }
+                    };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
                 let count = buttered_dasd::backup::create_snapshots(&cfg, &sources, &progress)?;
                 let sources_still_mounted = source_guard.unmount(&progress);
@@ -1804,7 +2096,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let progress = CliProgress;
                 // Manual backups mount and unmount the DAS filesystems, so they
                 // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
-                let _locks = match backup::acquire_manual_locks(&progress)? {
+                let locks = match backup::acquire_manual_locks("btrdasd backup send", &progress)? {
                     BackupLockAttempt::Acquired(locks) => locks,
                     BackupLockAttempt::AlreadyRunning => {
                         println!("A backup is already running — declining.");
@@ -1812,7 +2104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let mut guard =
+                    mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
                 let result =
                     buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, false, &progress);
                 let mut still_mounted = guard.unmount(&progress);
@@ -1826,14 +2119,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let progress = CliProgress;
                 // Manual backups mount and unmount the DAS filesystems, so they
                 // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
-                let _locks = match backup::acquire_manual_locks(&progress)? {
-                    BackupLockAttempt::Acquired(locks) => locks,
-                    BackupLockAttempt::AlreadyRunning => {
-                        println!("A backup is already running — declining.");
-                        return Ok(());
-                    }
-                };
-                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
+                let locks =
+                    match backup::acquire_manual_locks("btrdasd backup boot-archive", &progress)? {
+                        BackupLockAttempt::Acquired(locks) => locks,
+                        BackupLockAttempt::AlreadyRunning => {
+                            println!("A backup is already running — declining.");
+                            return Ok(());
+                        }
+                    };
+                let mut guard =
+                    mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
                 let result = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
                 let archived = result?;
@@ -1928,132 +2223,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
 
         // ----- Restore commands -----
-        Commands::Restore { action } => match action {
-            RestoreAction::File {
-                snapshot,
-                dest,
-                files,
-                config,
-            } => {
-                let cfg = Config::load(&config)?;
-                let progress = CliProgress;
-                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-                let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-                let result = restore::restore_files(
+        Commands::Restore { action } => {
+            let lock = CliLock::production();
+            let interactive = |no_wait| Interactive {
+                json,
+                no_wait,
+                lock: &lock,
+                progress: &CliProgress,
+            };
+            let ran = match action {
+                RestoreAction::File {
+                    snapshot,
+                    dest,
+                    files,
+                    config,
+                    no_wait,
+                } => cmd_restore_file(&snapshot, &dest, &files, &config, &interactive(no_wait))?,
+                RestoreAction::Snapshot {
+                    snapshot,
+                    dest,
+                    config,
+                    no_wait,
+                } => cmd_restore_snapshot(&snapshot, &dest, &config, &interactive(no_wait))?,
+                RestoreAction::Browse {
+                    snapshot,
+                    prefix,
+                    config,
+                    no_wait,
+                } => cmd_restore_browse(
                     &snapshot,
-                    &file_refs,
-                    &dest,
-                    &cfg.restore.allowed_roots,
-                    &restore::snapshot_source_roots(&cfg),
-                    &progress,
-                );
-                let still_mounted = guard.unmount(&progress);
-                let result = result?;
-                if json {
-                    println!(
-                        "{{\"files_restored\":{},\"bytes_restored\":{},\"errors\":{},\"duration_secs\":{}}}",
-                        result.files_restored,
-                        result.bytes_restored,
-                        result.errors.len(),
-                        result.duration_secs
-                    );
-                } else {
-                    println!(
-                        "Restored {} files ({}) in {}s",
-                        result.files_restored,
-                        report::format_bytes(result.bytes_restored),
-                        result.duration_secs
-                    );
-                    for e in &result.errors {
-                        eprintln!("  ERROR: {e}");
-                    }
-                }
-                mount::require_released(&still_mounted)?;
+                    prefix.as_deref(),
+                    &config,
+                    &interactive(no_wait),
+                )?,
+            };
+            if let Some(code) = deferred_exit_code(&ran) {
+                std::process::exit(code);
             }
-            RestoreAction::Snapshot {
-                snapshot,
-                dest,
-                config,
-            } => {
-                let cfg = Config::load(&config)?;
-                let progress = CliProgress;
-                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-                let result = restore::restore_snapshot(
-                    &snapshot,
-                    &dest,
-                    &cfg.restore.allowed_roots,
-                    &restore::snapshot_source_roots(&cfg),
-                    &progress,
-                );
-                let still_mounted = guard.unmount(&progress);
-                let result = result?;
-                if json {
-                    println!(
-                        "{{\"files_restored\":{},\"bytes_restored\":{},\"errors\":{},\"duration_secs\":{}}}",
-                        result.files_restored,
-                        result.bytes_restored,
-                        result.errors.len(),
-                        result.duration_secs
-                    );
-                } else {
-                    println!(
-                        "Restored {} files ({}) in {}s",
-                        result.files_restored,
-                        report::format_bytes(result.bytes_restored),
-                        result.duration_secs
-                    );
-                    for e in &result.errors {
-                        eprintln!("  ERROR: {e}");
-                    }
-                }
-                mount::require_released(&still_mounted)?;
-            }
-            RestoreAction::Browse {
-                snapshot,
-                prefix,
-                config,
-            } => {
-                let cfg = Config::load(&config)?;
-                let progress = CliProgress;
-                let mut guard = mount::ensure_targets_mounted(&cfg, &progress)?;
-                let entries = restore::browse_snapshot(&snapshot, prefix.as_deref());
-                let still_mounted = guard.unmount(&progress);
-                let entries = entries?;
-                if json {
-                    print!("[");
-                    for (i, e) in entries.iter().enumerate() {
-                        if i > 0 {
-                            print!(",");
-                        }
-                        print!(
-                            "{{\"path\":\"{}\",\"name\":\"{}\",\"size\":{},\"mtime\":{},\"is_dir\":{}}}",
-                            e.path.replace('"', "\\\""),
-                            e.name.replace('"', "\\\""),
-                            e.size,
-                            e.mtime,
-                            e.is_dir
-                        );
-                    }
-                    println!("]");
-                } else {
-                    for e in &entries {
-                        let type_char = if e.is_dir { "d" } else { "-" };
-                        println!(
-                            "{} {:>12} {}",
-                            type_char,
-                            if e.is_dir {
-                                "-".to_string()
-                            } else {
-                                report::format_bytes(e.size)
-                            },
-                            e.name
-                        );
-                    }
-                    println!("({} entries)", entries.len());
-                }
-                mount::require_released(&still_mounted)?;
-            }
-        },
+        }
 
         // ----- Schedule commands -----
         Commands::Schedule { action } => match action {
@@ -2848,7 +3055,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
                 // Only acceptable failure is a permissions error opening the
                 // real /run/das-scrub.lock path when not running as root.
                 assert!(
-                    e.contains("scrub must run as root")
+                    e.contains("this command must run as root")
                         || e.contains("could not check scrub lock"),
                     "unexpected error: {e}"
                 );
@@ -3218,5 +3425,493 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     fn backup_run_exits_non_zero_exactly_when_the_run_failed() {
         assert_eq!(backup_run_exit_code(true), None);
         assert_eq!(backup_run_exit_code(false), Some(1));
+    }
+
+    // --- walk and restore wait for the maintenance lock (bd DAS-Backup-Manager-frb)
+    //
+    // Each command runs against a scratch lock and a config with no targets,
+    // so its mount step mounts nothing. `restore file` and `restore snapshot`
+    // then stop at their source policy ("no backup targets are configured") —
+    // before anything is copied or `btrfs` is run — which is how a test sees
+    // that they got past the lock and the mount step.
+
+    use buttered_dasd::maintenance::{LockSite, MaintenanceHeld};
+    use std::sync::Arc;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    /// Long enough to be sure a command is blocked, not merely slow to start.
+    const STILL_WAITING: Duration = Duration::from_millis(300);
+    /// Ample for a command looking every 10 ms to notice a release.
+    const NOTICES: Duration = Duration::from_secs(1);
+
+    /// Every log line a command wrote.
+    #[derive(Default)]
+    struct Logged(Mutex<Vec<String>>);
+
+    impl ProgressCallback for Logged {
+        fn on_stage(&self, _: &str, _: u64) {}
+        fn on_progress(&self, _: u64, _: u64, _: &str) {}
+        fn on_throughput(&self, _: u64) {}
+        fn on_log(&self, _: LogLevel, message: &str) {
+            self.0.lock().unwrap().push(message.to_string());
+        }
+        fn on_complete(&self, _: bool, _: &str) {}
+    }
+
+    impl Logged {
+        fn waiting_lines(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("Waiting for the DAS maintenance lock"))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// A temp dir holding the lock file, a config with no targets that allows
+    /// restores into the dir, a snapshot with one file, and the index.
+    struct LockRig {
+        dir: tempfile::TempDir,
+    }
+
+    impl LockRig {
+        fn new() -> Arc<Self> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.restore.allowed_roots = vec![dir.path().to_string_lossy().into_owned()];
+            cfg.save(&dir.path().join("config.toml")).unwrap();
+            std::fs::create_dir(dir.path().join("snap")).unwrap();
+            std::fs::write(dir.path().join("snap/hello.txt"), "hi").unwrap();
+            Arc::new(Self { dir })
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        fn lock(&self, delegated: Option<&str>) -> CliLock {
+            CliLock {
+                site: LockSite {
+                    path: self.path("das-maintenance.lock"),
+                    poll: Duration::from_millis(10),
+                },
+                delegated: delegated.map(Into::into),
+            }
+        }
+
+        /// Another job takes the lock and records itself.
+        fn hold(&self) -> MaintenanceHeld {
+            MaintenanceHeld::try_acquire_at(&self.path("das-maintenance.lock"), "test holder")
+                .unwrap()
+                .expect("the scratch lock is free")
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Cmd {
+        Walk,
+        RestoreFile,
+        RestoreSnapshot,
+        RestoreBrowse,
+    }
+
+    /// Run one command on the rig; errors as text.
+    fn run_cmd(
+        rig: &LockRig,
+        cmd: Cmd,
+        no_wait: bool,
+        delegated: Option<&str>,
+        logs: &Logged,
+    ) -> Result<Ran, String> {
+        let lock = rig.lock(delegated);
+        let run = Interactive {
+            json: false,
+            no_wait,
+            lock: &lock,
+            progress: logs,
+        };
+        let config = rig.path("config.toml");
+        let (snap, dest) = (rig.path("snap"), rig.path("restored"));
+        match cmd {
+            Cmd::Walk => cmd_walk(
+                rig.dir.path(),
+                &rig.path("index.db").to_string_lossy(),
+                &config,
+                &run,
+            ),
+            Cmd::RestoreFile => {
+                cmd_restore_file(&snap, &dest, &["hello.txt".to_string()], &config, &run)
+            }
+            Cmd::RestoreSnapshot => cmd_restore_snapshot(&snap, &dest, &config, &run),
+            Cmd::RestoreBrowse => cmd_restore_browse(&snap, None, &config, &run),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// [`run_cmd`] on a thread: what it returned within `limit`, or `None`
+    /// while it is still running. A command that should not wait, but does,
+    /// then fails its test instead of hanging it.
+    fn run_cmd_within(
+        rig: &Arc<LockRig>,
+        cmd: Cmd,
+        no_wait: bool,
+        delegated: Option<String>,
+        limit: Duration,
+    ) -> (Option<Result<Ran, String>>, Arc<Logged>) {
+        let logs = Arc::new(Logged::default());
+        let (tx, rx) = mpsc::channel();
+        let (cmd_rig, cmd_logs) = (rig.clone(), logs.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(run_cmd(
+                &cmd_rig,
+                cmd,
+                no_wait,
+                delegated.as_deref(),
+                &cmd_logs,
+            ));
+        });
+        (rx.recv_timeout(limit).ok(), logs)
+    }
+
+    /// Whether `out` is what the command does once it is past the lock.
+    #[track_caller]
+    fn assert_proceeded(cmd: Cmd, out: &Result<Ran, String>) {
+        match cmd {
+            Cmd::Walk | Cmd::RestoreBrowse => assert_eq!(out, &Ok(Ran::Done), "{cmd:?}"),
+            Cmd::RestoreFile | Cmd::RestoreSnapshot => assert!(
+                matches!(out, Err(e) if e.contains("no backup targets are configured")),
+                "{cmd:?} must reach its source policy, got {out:?}"
+            ),
+        }
+    }
+
+    fn proceeds_at_once_when_the_lock_is_free(cmd: Cmd) {
+        let rig = LockRig::new();
+        let (out, logs) = run_cmd_within(&rig, cmd, false, None, STILL_WAITING);
+        let out = out.unwrap_or_else(|| panic!("{cmd:?} waited for a free lock"));
+        assert_proceeded(cmd, &out);
+        assert!(logs.waiting_lines().is_empty(), "nothing to wait for");
+        // It held the lock while it ran, and let it go when done.
+        assert!(rig.hold().path().exists());
+    }
+
+    fn waits_while_the_lock_is_held_then_proceeds(cmd: Cmd) {
+        let rig = LockRig::new();
+        let holder = rig.hold();
+        let logs = Arc::new(Logged::default());
+        let (tx, rx) = mpsc::channel();
+        let (cmd_rig, cmd_logs) = (rig.clone(), logs.clone());
+        let worker = std::thread::spawn(move || {
+            tx.send(run_cmd(&cmd_rig, cmd, false, None, &cmd_logs))
+                .unwrap();
+        });
+
+        assert!(
+            matches!(
+                rx.recv_timeout(STILL_WAITING),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "{cmd:?} must wait while another job holds the lock"
+        );
+        assert!(
+            !rig.path("index.db").exists() && !rig.path("restored").exists(),
+            "{cmd:?} did work before it had the lock"
+        );
+        let waiting = logs.waiting_lines();
+        assert_eq!(waiting.len(), 1, "{cmd:?}: {waiting:?}");
+        assert!(
+            waiting[0].contains(&format!("held by test holder pid {}", std::process::id())),
+            "{}",
+            waiting[0]
+        );
+
+        drop(holder);
+        let out = rx
+            .recv_timeout(NOTICES)
+            .unwrap_or_else(|_| panic!("{cmd:?} must proceed once the lock is released"));
+        assert_proceeded(cmd, &out);
+        worker.join().unwrap();
+    }
+
+    fn with_no_wait_defers_while_the_lock_is_held(cmd: Cmd) {
+        let rig = LockRig::new();
+        let holder = rig.hold();
+        let (out, logs) = run_cmd_within(&rig, cmd, true, None, STILL_WAITING);
+        assert_eq!(out, Some(Ok(Ran::Deferred)), "{cmd:?} must defer at once");
+        assert!(
+            logs.waiting_lines().is_empty(),
+            "deferring announces no wait"
+        );
+        assert!(
+            !rig.path("index.db").exists() && !rig.path("restored").exists(),
+            "{cmd:?} did work although it deferred"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn walk_proceeds_at_once_when_the_lock_is_free() {
+        proceeds_at_once_when_the_lock_is_free(Cmd::Walk);
+    }
+
+    #[test]
+    fn walk_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Cmd::Walk);
+    }
+
+    #[test]
+    fn walk_with_no_wait_defers_while_the_lock_is_held() {
+        with_no_wait_defers_while_the_lock_is_held(Cmd::Walk);
+    }
+
+    #[test]
+    fn restore_file_proceeds_at_once_when_the_lock_is_free() {
+        proceeds_at_once_when_the_lock_is_free(Cmd::RestoreFile);
+    }
+
+    #[test]
+    fn restore_file_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Cmd::RestoreFile);
+    }
+
+    #[test]
+    fn restore_file_with_no_wait_defers_while_the_lock_is_held() {
+        with_no_wait_defers_while_the_lock_is_held(Cmd::RestoreFile);
+    }
+
+    #[test]
+    fn restore_snapshot_proceeds_at_once_when_the_lock_is_free() {
+        proceeds_at_once_when_the_lock_is_free(Cmd::RestoreSnapshot);
+    }
+
+    #[test]
+    fn restore_snapshot_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Cmd::RestoreSnapshot);
+    }
+
+    #[test]
+    fn restore_snapshot_with_no_wait_defers_while_the_lock_is_held() {
+        with_no_wait_defers_while_the_lock_is_held(Cmd::RestoreSnapshot);
+    }
+
+    #[test]
+    fn restore_browse_proceeds_at_once_when_the_lock_is_free() {
+        proceeds_at_once_when_the_lock_is_free(Cmd::RestoreBrowse);
+    }
+
+    #[test]
+    fn restore_browse_waits_while_the_lock_is_held_then_proceeds() {
+        waits_while_the_lock_is_held_then_proceeds(Cmd::RestoreBrowse);
+    }
+
+    #[test]
+    fn restore_browse_with_no_wait_defers_while_the_lock_is_held() {
+        with_no_wait_defers_while_the_lock_is_held(Cmd::RestoreBrowse);
+    }
+
+    // --- what walk and restore print ------------------------------------------
+
+    fn walked(removed: usize) -> (indexer::WalkResult, rusqlite::Result<reconcile::PruneStats>) {
+        let result = indexer::WalkResult {
+            snapshots_discovered: 5,
+            snapshots_indexed: 2,
+            snapshots_skipped: 3,
+            presence_recorded: 3,
+            results: vec![indexer::IndexResult {
+                snapshot_id: 1,
+                files_total: 10,
+                files_new: 4,
+                files_extended: 3,
+                files_changed: 2,
+                scan_errors: 1,
+            }],
+        };
+        let stats = reconcile::PruneStats {
+            snapshots_removed: removed,
+            spans_repaired: 6,
+            spans_removed: 7,
+            files_removed: 8,
+        };
+        (result, Ok(stats))
+    }
+
+    #[test]
+    fn walk_prints_its_counts_the_reconcile_and_each_snapshot() {
+        let counts = "Discovered: 5 snapshots\nIndexed:    2 new\nSkipped:    3 already indexed\n";
+        let files = "  10 files (4 new, 3 extended, 2 changed, 1 errors)\n";
+        let (result, nothing_pruned) = walked(0);
+        assert_eq!(
+            walk_report(false, &result, &nothing_pruned),
+            (
+                format!("{counts}Reconciled: index already consistent\n{files}"),
+                None
+            )
+        );
+        let (result, one_pruned) = walked(1);
+        assert_eq!(
+            walk_report(false, &result, &one_pruned),
+            (
+                format!(
+                    "{counts}Reconciled: 1 stale snapshots pruned (6 spans repaired, 7 removed, \
+                     8 files dropped)\n{files}"
+                ),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn walk_warns_when_the_reconcile_failed_and_prints_json_alone() {
+        let (result, _) = walked(0);
+        let failed: rusqlite::Result<reconcile::PruneStats> =
+            Err(rusqlite::Error::QueryReturnedNoRows);
+        let (out, warning) = walk_report(false, &result, &failed);
+        assert!(!out.contains("Reconciled"), "{out}");
+        assert_eq!(
+            warning.as_deref(),
+            Some("Warning: reconcile failed: Query returned no rows")
+        );
+        assert_eq!(
+            walk_report(true, &result, &failed),
+            (
+                "{\"discovered\":5,\"indexed\":2,\"skipped\":3}\n".to_string(),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn restore_prints_a_summary_and_each_error() {
+        let result = restore::RestoreResult {
+            files_restored: 2,
+            bytes_restored: 2048,
+            errors: vec!["a: gone".into(), "b: denied".into()],
+            duration_secs: 3,
+        };
+        assert_eq!(
+            restored_report(false, &result),
+            (
+                format!("Restored 2 files ({}) in 3s\n", report::format_bytes(2048)),
+                vec![
+                    "  ERROR: a: gone".to_string(),
+                    "  ERROR: b: denied".to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            restored_report(true, &result),
+            (
+                "{\"files_restored\":2,\"bytes_restored\":2048,\"errors\":2,\"duration_secs\":3}\n"
+                    .to_string(),
+                Vec::<String>::new()
+            )
+        );
+    }
+
+    #[test]
+    fn browse_lists_the_entries_as_text_and_as_json() {
+        let entry = |name: &str, size: u64, mtime: i64, is_dir: bool| restore::BrowseEntry {
+            path: name.to_string(),
+            name: name.to_string(),
+            size,
+            mtime,
+            is_dir,
+        };
+        let entries = vec![
+            entry("etc", 0, 1, true),
+            entry("a\"b", 5, 2, false),
+            entry("c", 7, 3, false),
+        ];
+        assert_eq!(
+            browse_listing(false, &entries),
+            format!(
+                "d {:>12} etc\n- {:>12} a\"b\n- {:>12} c\n(3 entries)\n",
+                "-",
+                report::format_bytes(5),
+                report::format_bytes(7)
+            )
+        );
+        assert_eq!(
+            browse_listing(true, &entries),
+            r#"[{"path":"etc","name":"etc","size":0,"mtime":1,"is_dir":true},{"path":"a\"b","name":"a\"b","size":5,"mtime":2,"is_dir":false},{"path":"c","name":"c","size":7,"mtime":3,"is_dir":false}]"#
+                .to_string()
+                + "\n"
+        );
+        assert_eq!(browse_listing(true, &[]), "[]\n");
+        assert_eq!(browse_listing(false, &[]), "(0 entries)\n");
+    }
+
+    #[test]
+    fn forget_and_purge_fail_on_a_config_they_cannot_read() {
+        let out = run_deletion(
+            "/nonexistent-frb/index.db",
+            Path::new("/nonexistent-frb/config.toml"),
+            false,
+            true,
+            "forget",
+            |_| Err(forget::ForgetRefusal::NoMatch),
+        );
+        assert!(out.is_err(), "nothing can be done without the config");
+    }
+
+    #[test]
+    fn a_deferral_exits_75_and_a_finished_run_does_not() {
+        assert_eq!(deferred_exit_code(&Ran::Deferred), Some(75));
+        assert_eq!(deferred_exit_code(&Ran::Done), None);
+    }
+
+    /// `backup-run.sh` runs `walk` while it holds the lock on fd 8 and names
+    /// that descriptor; waiting there would wait for the caller forever.
+    #[test]
+    fn a_hold_handed_down_by_the_caller_is_used_instead_of_waiting() {
+        use std::os::fd::AsRawFd;
+        let rig = LockRig::new();
+        let parent = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(rig.path("das-maintenance.lock"))
+            .unwrap();
+        // SAFETY: flock on a descriptor `parent` owns.
+        let rc = unsafe { libc::flock(parent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the caller holds the lock");
+
+        let fd = parent.as_raw_fd().to_string();
+        let (out, logs) = run_cmd_within(&rig, Cmd::Walk, false, Some(fd), STILL_WAITING);
+        assert_eq!(
+            out,
+            Some(Ok(Ran::Done)),
+            "the handed-down hold is used at once"
+        );
+        assert!(logs.waiting_lines().is_empty());
+        // The caller's hold survives the command.
+        assert!(
+            MaintenanceHeld::try_acquire_at(&rig.path("das-maintenance.lock"), "x")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_hold_handed_down_that_does_not_hold_the_lock_fails_instead_of_waiting() {
+        use std::os::fd::AsRawFd;
+        let rig = LockRig::new();
+        let holder = rig.hold();
+        let bystander = std::fs::File::open(rig.path("das-maintenance.lock")).unwrap();
+        let fd = bystander.as_raw_fd().to_string();
+        for named in [fd.as_str(), "eight"] {
+            let (out, _) =
+                run_cmd_within(&rig, Cmd::Walk, false, Some(named.into()), STILL_WAITING);
+            let err = out
+                .expect("a hold that cannot be proven fails at once, never waits")
+                .expect_err("a hold that cannot be proven must fail");
+            assert!(err.contains("DAS_MAINTENANCE_LOCK_FD"), "{err}");
+            assert!(!rig.path("index.db").exists(), "nothing ran");
+        }
+        drop(holder);
     }
 }
