@@ -112,8 +112,13 @@ The system has six major components:
          ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted
          ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report
          ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25); report also written to last_report
-         └──▶ btrdasd backup record-run    → adds the run to backup_runs
+         └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown)
 ```
+
+The report goes out before the run is recorded, because the record carries the report's own
+outcome (a delivery failure fails the run). If recording then fails, the run is missing from the
+history, so the record step marks the run FAIL (`run_history`) and writes and sends the report
+again: `FAILURES DETECTED`, with a `RUN HISTORY` section saying the run is not recorded and why.
 
 A `--dryrun` stops after the expiry preview and the recovery OS check: it previews the archive pruner and
 unmounts, and sends, records and archives nothing. It may create a missing, empty
@@ -288,7 +293,7 @@ btrdasd-gui
 
 ### Schema
 
-The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 3, kept in
+The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 4, kept in
 `PRAGMA user_version`) uses four index tables, two history tables and an FTS5 virtual table:
 
 ```sql
@@ -299,7 +304,8 @@ snapshot_targets (snapshot_id FK ON DELETE CASCADE, target_root, path,
                   PK(snapshot_id, target_root))   -- schema v3, which targets hold a snapshot
 files_fts (FTS5 virtual: name, path — synced via triggers)
 backup_runs  (id PK, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent,
-              duration_secs, errors)              -- run history, read by the GUI
+              duration_secs, errors)              -- run history, read by the GUI; schema v4: a
+                                                  -- count the run could not take is NULL
 target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_count)
 ```
 

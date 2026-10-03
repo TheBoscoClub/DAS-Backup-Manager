@@ -151,7 +151,11 @@ Measured 2026-09-01 against an isolated config whose only defect was a missing
 subvolume: `btrbk dryrun` → 10, `btrbk list snapshots` → 10. `run_btrbk()` turns
 that into `record_op btrbk FAIL`, so **the report's `Status:` becomes `FAILURES
 DETECTED` and `backup_runs.success` is written 0**, even though every other
-subvolume was backed up correctly. The run itself then exits 1: since 0.7.21.0 `backup-run.sh`
+subvolume was backed up correctly. (Reliably only since bd `6wt`: whenever `btrbk list
+latest` failed as well — measured in the live absent-target run of 2026-10-02; not measured
+for this missing-subvolume shape — the "unknown" snapshot counts went to `record-run` as
+`-1`, the parser refused them, and the run left no `backup_runs` row at all. Unknown counts
+are now `--counts-unknown`, stored as NULL.) The run itself then exits 1: since 0.7.21.0 `backup-run.sh`
 returns nonzero whenever btrbk did (`OP_STATUS[btrbk]` FAIL), so the unit is marked failed. (An
 earlier version of this paragraph said the run still exited 0 per the `18p` split; that was not
 true of any release after 2026-08-31 — see the Sentinel section.)

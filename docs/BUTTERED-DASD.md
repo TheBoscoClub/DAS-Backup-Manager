@@ -79,7 +79,7 @@ backup-run.sh                   btrdasd CLI
 
 ### Tables
 
-**snapshots** — One row per indexed BTRFS snapshot (schema version 3, stored in `PRAGMA user_version`; an older database is migrated on open).
+**snapshots** — One row per indexed BTRFS snapshot (schema version 4, stored in `PRAGMA user_version`; an older database is migrated on open).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -120,7 +120,7 @@ backup-run.sh                   btrdasd CLI
 
 Primary key is `(snapshot_id, target_root)`.
 
-**backup_runs** — One row per recorded backup run (`timestamp`, `success`, `mode`, `snaps_created`, `snaps_sent`, `bytes_sent`, `duration_secs`, `errors`); written by `btrdasd backup record-run` and `btrdasd backup run`, read by the GUI history. **target_usage** — capacity samples per target label (`total_bytes`, `used_bytes`, `snapshot_count`) feeding the growth trend. Neither is touched by `reindex --rebuild`.
+**backup_runs** — One row per recorded backup run (`timestamp`, `success`, `mode`, `snaps_created`, `snaps_sent`, `bytes_sent`, `duration_secs`, `errors`); written by `btrdasd backup record-run` and `btrdasd backup run`, read by the GUI history. A snapshot count the run could not take is NULL — shown as `unknown`, never as 0 — since schema 4, whose migration rebuilds this table alone in one transaction, keeping every row, id and value; the one exception is a negative count, which is no measurement and becomes NULL (`record-run` never accepted one, so only a hand-written row could hold it). **target_usage** — capacity samples per target label (`total_bytes`, `used_bytes`, `snapshot_count`) feeding the growth trend. Neither is touched by `reindex --rebuild`.
 
 **files_fts** — FTS5 virtual table synced from `files` via triggers. Enables full-text search on file names and paths.
 

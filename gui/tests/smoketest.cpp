@@ -19,6 +19,11 @@
 
 #include <QTest>
 #include <QSignalSpy>
+#include <QAbstractItemModel>
+#include <QJsonValue>
+#include <QTableView>
+
+#include <optional>
 
 #include "../src/dbusclient.h"
 #include "../src/filemodel.h"
@@ -116,6 +121,72 @@ private Q_SLOTS:
 
         ProgressPanel progress(&client);
         QVERIFY(progress.metaObject() != nullptr);
+    }
+
+    // --- backup history: an unknown count is "unknown", never 0 -------------
+    //
+    // A run that could not count its snapshots is stored with NULL counts and
+    // reaches the GUI as JSON null (bd DAS-Backup-Manager-6wt). QJsonValue's
+    // toInteger() turns null into 0 — a count of nothing — so the view must
+    // tell them apart.
+
+    void countFromJsonTellsUnknownFromZero()
+    {
+        QCOMPARE(BackupHistoryView::countFromJson(QJsonValue(qint64(53))),
+                 std::optional<qint64>(53));
+        QCOMPARE(BackupHistoryView::countFromJson(QJsonValue(0)), std::optional<qint64>(0));
+        QVERIFY(!BackupHistoryView::countFromJson(QJsonValue(QJsonValue::Null)).has_value());
+        QVERIFY(!BackupHistoryView::countFromJson(QJsonValue(QJsonValue::Undefined)).has_value());
+        QVERIFY(!BackupHistoryView::countFromJson(QJsonValue(-1)).has_value());
+        QVERIFY(!BackupHistoryView::countFromJson(QJsonValue(2.5)).has_value());
+        QVERIFY(!BackupHistoryView::countFromJson(QJsonValue(QStringLiteral("5"))).has_value());
+    }
+
+    void historyShowsAnUnknownCountAsUnknown()
+    {
+        DBusClient client;
+        BackupHistoryView view(&client);
+        // The helper's JSON, newest first: a failed run that could not count,
+        // then two that did — 53 snapshots, and a measured 0.
+        view.showHistory(QStringLiteral(R"([
+            {"id": 290, "timestamp": 1791000000, "mode": "full", "success": false,
+             "duration_secs": 516, "snaps_created": null, "snaps_sent": null,
+             "bytes_sent": 0, "errors": ["btrbk: exit code 10"]},
+            {"id": 289, "timestamp": 1790900000, "mode": "incremental", "success": true,
+             "duration_secs": 300, "snaps_created": 53, "snaps_sent": 94,
+             "bytes_sent": 4096, "errors": []},
+            {"id": 288, "timestamp": 1790800000, "mode": "incremental", "success": true,
+             "duration_secs": 300, "snaps_created": 0, "snaps_sent": 0,
+             "bytes_sent": 0, "errors": []}
+        ])"));
+
+        const auto *table = view.findChild<QTableView *>();
+        QVERIFY(table != nullptr);
+        QAbstractItemModel *model = table->model();
+        QCOMPARE(model->rowCount(), 3);
+        int column = -1;
+        for (int c = 0; c < model->columnCount(); ++c) {
+            if (model->headerData(c, Qt::Horizontal).toString() == QStringLiteral("Snapshots"))
+                column = c;
+        }
+        QVERIFY(column >= 0);
+        const auto shown = [&] {
+            QStringList cells;
+            for (int r = 0; r < model->rowCount(); ++r)
+                cells << model->index(r, column).data().toString();
+            return cells;
+        };
+
+        // As the view opens: newest first.
+        QCOMPARE(shown(), (QStringList{QStringLiteral("unknown"), QStringLiteral("53"),
+                                       QStringLiteral("0")}));
+        // Sorted on the column: by number, with "unknown" below every count.
+        model->sort(column, Qt::AscendingOrder);
+        QCOMPARE(shown(), (QStringList{QStringLiteral("unknown"), QStringLiteral("0"),
+                                       QStringLiteral("53")}));
+        model->sort(column, Qt::DescendingOrder);
+        QCOMPARE(shown(), (QStringList{QStringLiteral("53"), QStringLiteral("0"),
+                                       QStringLiteral("unknown")}));
     }
 
     void fileModelIsEmptyWithoutAReachableHelper()
