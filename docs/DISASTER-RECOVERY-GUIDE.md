@@ -1048,7 +1048,126 @@ Each recovery drive boots its own independent OS. It is what you boot when the h
 
 Every backup run reads each recovery OS (read-only) and adds a `RECOVERY OS` section to the report: install date, last full upgrade and its age (counted from the install when it was never upgraded: `never upgraded since install on <date> (<N> days)`), newest kernel against the host's, btrfs-progs against the host's. Past `[recovery_os].max_age_days` (default 60), with a kernel series behind the host's, or with either unreadable, it says `STALE` and the run status reads `COMPLETED WITH WARNINGS`. `btrdasd health` shows the last reading between runs.
 
-To update one, boot it — never update it from the host:
+To update one, boot it — never update it from the host. There are two ways:
+
+- **In the `recovery-os-updater` VM**, without rebooting the workstation: the drive's own OS boots in a virtual machine that is lent the whole physical disk — [below](#in-the-recovery-os-updater-vm).
+- **On bare metal**: reboot the workstation into the recovery drive — [further below](#on-bare-metal).
+
+Either way, do one drive at a time, so one known-good recovery OS exists throughout. The next backup run reads the new state; `STALE` clears once the last *applied* upgrade is recent and the kernel series and btrfs-progs have caught up with the host's. An upgrade that failed or was declined shows as a `Last attempt … (did not complete)` — the report only counts one whose transaction completed.
+
+**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly what `.claude/rules/esp-safety.md` rule 1 forbids — the 2026-03-05 incident destroyed both recovery boot configurations this way. Booted — on bare metal or in the VM — every write, its ESP included, is made by the drive's own OS, which the rule permits.
+
+### In the recovery-os-updater VM
+
+#### What a session does, and what it guarantees
+
+`recovery-os-vm.sh session` lends one recovery drive to the VM for as long as the VM runs, then gives it back:
+
+1. **The right drive, and only a recovery drive.** It takes the serial that `config.toml` gives that `role = "mirror"` target, finds `/dev/disk/by-id/ata-*_<serial>` (exactly one), requires a whole disk, and reads the serial back from the disk itself. A serial that also belongs to a `role = "primary"` target is refused whatever the mirror entry says: no drive of the 22 TB pair is ever lent.
+2. **Only when nothing else has the drive.** It refuses while `das-backup`, `das-backup-full`, `das-scrub` or `das-backup-doctor` is running, while any partition of the drive is mounted on the host, while the VM is running or already has a disk, and while an earlier session's holder still runs.
+3. **The maintenance lock**, `/run/das-maintenance.lock`, taken without waiting and held for the whole session. A backup or scrub that starts meanwhile waits for it; the jobs that would otherwise mount a target defer. Its first line names the session — `recovery-os VM session <label> pid <pid>` — and a refusal elsewhere prints it.
+4. **The claim.** `btrdasd recovery-os hold-disk` holds the whole disk open exclusively (`O_EXCL`). While it does, the kernel refuses to mount any partition of the drive on the host — by device or by UUID, from any program — while the VM's own non-exclusive open still works. The holder runs in a session of its own and also holds the lock, so a closed terminal, a Ctrl-C or a killed script leaves the drive claimed and the backups waiting for as long as the VM may be using it. A holder that dies while the VM runs is replaced at the next check (the VM's own open does not stand in the way), and the summary says so.
+5. **SATA, not virtio.** The whole disk is attached as a SATA disk with boot order 1. The recovery OS's initramfs was built on real hardware with an AHCI SATA controller and almost certainly lacks the virtio drivers; on SATA its default boot entry finds its root unaided.
+6. **It waits** until the recovery OS powers itself off. Reboots inside the VM are part of the job.
+7. **Giving it back:** detach the disk, stop the holder, `btrfs device scan` the drive's partition 2 so the host's kernel reads what the other kernel wrote, check that no partition is mounted, release the lock, print a summary.
+
+The host never writes to the drive: no mount, no chroot, no copy. The script never forces off a running recovery OS — it could be in the middle of an update. Interrupted, or out of time, it leaves the VM, the claim and the lock in place and says how to finish (exit status 3).
+
+#### Running it
+
+As root. The script is in `/usr/lib/das-backup/` on a `/usr` install, `${prefix}/lib/das-backup/` otherwise; it needs libvirt with KVM, the UEFI firmware (`edk2-ovmf`) and libvirt's NAT network `default` — see [INSTALL.md](INSTALL.md#recovery-os-vm-optional). Once after installing, and again whenever an upgrade of this project changes the VM's definition (the VM must be shut off, with no disk):
+
+```bash
+sudo /usr/lib/das-backup/recovery-os-vm.sh define
+```
+
+Then for each drive in turn — `A` and `B` stand for the `role = "mirror"` targets whose labels contain that letter (`system-recovery-A-2tb`, `system-recovery-B-2tb`):
+
+```bash
+# Every check, the lock and the claim, taken and given back; nothing attached or booted
+sudo /usr/lib/das-backup/recovery-os-vm.sh session A --dry-run
+
+# The real session: boots drive A's own OS and waits until it powers off
+sudo /usr/lib/das-backup/recovery-os-vm.sh session A
+```
+
+It prints the console to open, from your desktop session:
+
+```bash
+virt-viewer --connect qemu:///system recovery-os-updater
+```
+
+Other commands:
+
+- `session A --timeout 120` — after 120 minutes, ask the recovery OS to shut down and wait 10 more; it is never forced off. If it is still running then, the session is left in place (exit status 3).
+- `status` — the VM's state, the disk it holds, the holder, and who holds the maintenance lock.
+- `screenshot screen.png` — the VM's screen, while it runs.
+- `session-end A` — finishes a session whose script was interrupted or killed (exit status 3 or 4), once the recovery OS is powered off: detaches, stops the holder (which releases the lock), rescans.
+
+#### The first update, at the VM console
+
+The first time is by hand at the console — it needs your login on the recovery OS. Steps 3 and 4 also prepare later sessions: the virtio drivers let the default boot entry run in a VM on any controller, and the guest agent allows the update to be automated.
+
+0. **A rollback point**, before anything changes:
+
+   ```bash
+   ROOTDEV=$(findmnt -no SOURCE / | sed 's/\[.*//')   # e.g. /dev/sda2 — the drive's own partition 2
+   sudo mount -o subvolid=5 "$ROOTDEV" /mnt
+   sudo btrfs subvolume snapshot -r /mnt/@ "/mnt/@.pre-update-$(date +%F)"
+   sudo umount /mnt
+   ```
+
+   It keeps the previous root's files. After the updated OS has booted well (step 5, or a later session), remove it the same way, so the old packages' blocks are freed:
+
+   ```bash
+   sudo mount -o subvolid=5 "$ROOTDEV" /mnt
+   sudo btrfs subvolume delete /mnt/@.pre-update-<date>
+   sudo umount /mnt
+   ```
+
+1. **Keyrings first**, on their own — an install left alone for months cannot verify today's packages without them:
+
+   ```bash
+   sudo pacman -Sy archlinux-keyring cachyos-keyring
+   ```
+
+2. **The full upgrade, straight after, plus the guest agent:**
+
+   ```bash
+   sudo pacman -Su qemu-guest-agent
+   ```
+
+3. **virtio drivers into the initramfs**, for later sessions. Find which tool builds it — `pacman -Qq mkinitcpio dracut 2>/dev/null` prints the one installed.
+
+   - mkinitcpio:
+
+     ```bash
+     echo 'MODULES+=(virtio_pci virtio_blk virtio_scsi virtio_net)' | sudo tee /etc/mkinitcpio.conf.d/90-virtio.conf
+     sudo mkinitcpio -P
+     ```
+
+   - dracut:
+
+     ```bash
+     echo 'add_drivers+=" virtio_pci virtio_blk virtio_scsi virtio_net "' | sudo tee /etc/dracut.conf.d/90-virtio.conf
+     ```
+
+     then rebuild every initramfs the way the install's own kernel updates do: reinstalling the kernel package runs exactly that hook, with the file names its boot entries expect — `sudo pacman -S linux-cachyos` (repeat for any other kernel `pacman -Qq | grep '^linux-cachyos'` lists).
+
+   The extra modules are harmless on bare metal: the same image still boots there.
+
+4. **Enable the guest agent:** `sudo systemctl enable qemu-guest-agent`. If systemd answers that the unit has no installation config, that is fine — it is then started by udev whenever the VM's agent channel appears.
+
+5. **Reboot inside the VM** (`sudo reboot`), log in again, and check that `uname -r` shows the new kernel — the version `pacman -Q linux-cachyos` reports. Then `sudo poweroff`: the session gives the disk back and prints its summary.
+
+If something goes wrong at the console:
+
+- **The default entry does not find its root** (an emergency shell, or "waiting for root device"): reboot, and at the boot menu pick the **fallback initramfs** entry — it is built without autodetection and carries every storage driver. Once booted, step 3 fixes the default entry for next time.
+- **The firmware finds no bootloader** ("No bootable option or device was found"): the VM's firmware starts with no boot entries of its own and looks for `EFI\BOOT\BOOTX64.EFI` on the drive's ESP. Restart the VM — `exit` at the UEFI shell, virt-viewer's Send key → Ctrl+Alt+Del, or `sudo virsh reset recovery-os-updater`, which is harmless while only the firmware runs — press **Esc** during the three-second splash, choose **Boot Maintenance Manager → Boot From File**, pick the drive's ESP and its loader (`EFI/systemd/systemd-bootx64.efi` for systemd-boot). Once booted, `sudo bootctl install` puts systemd-boot at the fallback path as well — the recovery OS writing its own ESP, from inside.
+- **An emergency shell over a missing mount**: an `/etc/fstab` line for something only the workstation has, without `nofail`. Add `nofail` to it, from the recovery OS itself.
+- **`virsh start failed: … network 'default' is not active`**: `sudo virsh net-start default && sudo virsh net-autostart default`, then run the session again — the failed start gave everything back.
+
+### On bare metal
 
 1. Boot the recovery drive (Steps 1–5 of [Booting into Rescue Mode](#booting-into-rescue-mode)) and log in.
 2. Refresh the keyrings first, on their own:
@@ -1064,11 +1183,6 @@ To update one, boot it — never update it from the host:
    ```
 
 4. Reboot into the same recovery drive and confirm it comes up — boot menu entry, kernel, login. Only then go back to the host.
-5. The next backup run reads the new state; `STALE` clears once the last *applied* upgrade is recent and the kernel series and btrfs-progs have caught up with the host's. An upgrade that failed or was declined shows as a `Last attempt … (did not complete)` — the report only counts one whose transaction completed.
-
-Do one drive at a time, so one known-good recovery OS exists throughout.
-
-**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly what `.claude/rules/esp-safety.md` rule 1 forbids — the 2026-03-05 incident destroyed both recovery boot configurations this way. Doing the update in a virtual machine with the physical disk attached instead of rebooting the workstation is being evaluated.
 
 ---
 

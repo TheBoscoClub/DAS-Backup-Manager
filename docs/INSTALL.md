@@ -44,6 +44,9 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | s-nail (mailx) | system | Email backup reports (when email reporting enabled) |
 | rsync | system | Manual disaster-recovery restores (see [Disaster Recovery Guide](DISASTER-RECOVERY-GUIDE.md)) — not used by any automated backup path |
 | mbuffer | system | Buffered btrbk stream transfers (improves throughput) |
+| libvirt, QEMU with KVM, edk2-ovmf | system (tested libvirt 12.8, QEMU 11.1.1) | The recovery-os-updater VM — see [Recovery OS VM](#recovery-os-vm-optional) |
+| virt-viewer | system | That VM's console |
+| ImageMagick (`magick`) | 7 | `recovery-os-vm.sh screenshot` |
 
 ### Optional (for GUI)
 
@@ -459,7 +462,28 @@ Two behaviour changes landed with the 2026-08-06 relay migration:
 |-------|------|---------|-------------|
 | `max_age_days` | u32 | `60` | Days since a recovery OS's last *applied* full system upgrade — or its install, when it was never upgraded — before it is reported `STALE`. At least 1 (`config validate` refuses 0) |
 
-Every `role = "mirror"` target is taken to carry its own bootable install under `@`. After btrbk, while the targets are mounted, `backup-run.sh` runs `btrdasd recovery-os status`, which reads that install — never writes to it — and adds a `RECOVERY OS` section to the report: OS name, install date (the first line of its pacman log), last full upgrade, its age in days and what that age is counted from — the last applied upgrade, or the install when there never was one, which reads `never upgraded since install on <date> (<N> days)` once it passes the limit — newest kernel against the host's running kernel, btrfs-progs against the host's, btrbk and das-backup-manager. An upgrade counts as applied only if pacman logged `[ALPM] transaction completed` after its `starting full system upgrade` line — the attempt is logged before anything is verified, so an upgrade that failed on an expired keyring is reported as an attempt that did not complete, beside the last applied one. A recovery OS is also `STALE`, whatever this setting, when its last attempt did not complete, when its newest kernel's major.minor series is behind the host's, when its btrfs-progs is older than the host's (compared only when both are plain dotted numbers), or when both its upgrade and install dates, or its kernel, are unknown — and the report says whether that item was absent or could not be read. Unknown is never shown as current. The check is bounded at 300 s; a stalled drive is a `FAIL`, and the run still unmounts and reports. A stale one marks the operation `WARN`: the report status reads `COMPLETED WITH WARNINGS` and the subject `SUCCESS WITH WARNINGS`, while the run itself is still recorded as a success. The reading is kept in `/var/lib/das-backup/recovery-os.json`, so `btrdasd health` shows it between runs. Updating a recovery OS: `docs/DISASTER-RECOVERY-GUIDE.md`, "Keeping the recovery OSes current".
+Every `role = "mirror"` target is taken to carry its own bootable install under `@`. After btrbk, while the targets are mounted, `backup-run.sh` runs `btrdasd recovery-os status`, which reads that install — never writes to it — and adds a `RECOVERY OS` section to the report: OS name, install date (the first line of its pacman log), last full upgrade, its age in days and what that age is counted from — the last applied upgrade, or the install when there never was one, which reads `never upgraded since install on <date> (<N> days)` once it passes the limit — newest kernel against the host's running kernel, btrfs-progs against the host's, btrbk and das-backup-manager. An upgrade counts as applied only if pacman logged `[ALPM] transaction completed` after its `starting full system upgrade` line — the attempt is logged before anything is verified, so an upgrade that failed on an expired keyring is reported as an attempt that did not complete, beside the last applied one. A recovery OS is also `STALE`, whatever this setting, when its last attempt did not complete, when its newest kernel's major.minor series is behind the host's, when its btrfs-progs is older than the host's (compared only when both are plain dotted numbers), or when both its upgrade and install dates, or its kernel, are unknown — and the report says whether that item was absent or could not be read. Unknown is never shown as current. The check is bounded at 300 s; a stalled drive is a `FAIL`, and the run still unmounts and reports. A stale one marks the operation `WARN`: the report status reads `COMPLETED WITH WARNINGS` and the subject `SUCCESS WITH WARNINGS`, while the run itself is still recorded as a success. The reading is kept in `/var/lib/das-backup/recovery-os.json`, so `btrdasd health` shows it between runs. Updating a recovery OS: `docs/DISASTER-RECOVERY-GUIDE.md`, "Keeping the recovery OSes current" — on bare metal, or in the VM below without rebooting the workstation.
+
+## Recovery OS VM (optional)
+
+`cmake --install` also installs these two files; the script, like the backup scripts, runs as root only:
+
+| File | Purpose |
+|------|---------|
+| `${prefix}/lib/das-backup/recovery-os-vm.sh` | Lends one `role = "mirror"` recovery drive, whole, to the libvirt domain `recovery-os-updater`, boots the drive's own OS there to be updated, and gives the disk back when it powers off (`define`, `session`, `session-end`, `status`, `screenshot`; `--help` for usage) |
+| `${prefix}/lib/das-backup/libvirt/recovery-os-updater.xml` | That domain's definition, the one source of it: UEFI without Secure Boot, the host's CPU passed through (CachyOS's packages need x86-64-v3/v4), 4 vCPUs, 8 GiB, no disk of its own, a virtio NIC on the NAT network `default`, VNC on 127.0.0.1, a serial console and a guest-agent channel |
+
+It needs libvirt with the QEMU/KVM driver running, the UEFI firmware at the paths the XML names — `/usr/share/edk2/x64/OVMF_CODE.4m.fd` and `OVMF_VARS.4m.fd`, Arch Linux's `edk2-ovmf`; `define` refuses when they are elsewhere — and libvirt's network `default` active (`sudo virsh net-start default && sudo virsh net-autostart default`). Run everything as root:
+
+```bash
+sudo /usr/lib/das-backup/recovery-os-vm.sh define            # once; again after the XML changes
+sudo /usr/lib/das-backup/recovery-os-vm.sh session A --dry-run
+sudo /usr/lib/das-backup/recovery-os-vm.sh session A
+```
+
+During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder in `/run/das-recovery-os-vm/`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
+
+`btrdasd setup --uninstall-all` removes the two files; the domain and its UEFI variable store belong to libvirt and stay — remove them with `sudo virsh undefine --nvram recovery-os-updater`.
 
 ## Generated Files
 

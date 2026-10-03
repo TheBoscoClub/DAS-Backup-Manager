@@ -586,6 +586,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `progress` | `src/progress.rs` | ~610 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~380 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
 | `recovery_os` | `src/recovery_os.rs` | ~2870 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` reads (`btrdasd recovery-os`) |
+| `recovery_os::hold_disk` | `src/recovery_os/hold_disk.rs` | ~760 | `btrdasd recovery-os hold-disk`: the `O_EXCL` claim on a whole recovery disk that keeps the host from mounting it while `scripts/recovery-os-vm.sh` has lent it to the `recovery-os-updater` VM; held until SIGTERM/SIGINT/SIGHUP |
 | `report` | `src/report.rs` | ~770 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |

@@ -696,6 +696,19 @@ enum RecoveryOsAction {
         #[arg(long, value_name = "PATH")]
         state_file: Option<PathBuf>,
     },
+    /// Internal: hold a whole recovery disk open with O_EXCL until SIGTERM,
+    /// SIGINT or SIGHUP, so the host cannot mount any partition of it while
+    /// the recovery-os-updater VM may have it (started by recovery-os-vm.sh)
+    ///
+    /// Prints one line, `held <path> pid <pid>`, once the claim is in place.
+    /// EXIT CODE: 0 released by one of those signals, 2 refused (not a block
+    /// device, in use, any other open error, or `--json`).
+    #[command(hide = true)]
+    HoldDisk {
+        /// The whole disk, e.g. /dev/disk/by-id/ata-<model>_<serial>
+        #[arg(long, value_name = "PATH")]
+        device: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1240,8 +1253,17 @@ fn expire_failed(outcome_failed: bool, deleted: &[PathBuf], db: &Path) -> bool {
     failed
 }
 
+/// `recovery-os hold-disk` prints one plain line for a script to read and has
+/// no JSON form, so the global `--json` is refused rather than ignored.
+fn hold_disk_json_refusal(json: bool) -> Option<&'static str> {
+    json.then_some(
+        "recovery-os hold-disk has no JSON output; it prints one line, `held <path> pid <pid>`",
+    )
+}
+
 /// `btrdasd recovery-os`: prints the section (or JSON) and returns the exit
-/// code — 0 current, 1 stale, 2 could not be checked.
+/// code — 0 current, 1 stale, 2 could not be checked. `hold-disk`: 0 released
+/// by a signal, 2 refused.
 fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
     use buttered_dasd::recovery_os as ros;
     let load = |config: &Path| {
@@ -1251,6 +1273,13 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
     };
     let today = buttered_dasd::caldate::today();
     match action {
+        RecoveryOsAction::HoldDisk { device } => {
+            if let Some(why) = hold_disk_json_refusal(json) {
+                eprintln!("Error: {why}");
+                return 2;
+            }
+            ros::hold_disk::run(&device)
+        }
         RecoveryOsAction::Inspect {
             root,
             label,
@@ -2632,6 +2661,63 @@ mod tests {
 
         // A bare "scrub" with no action must fail, not silently no-op.
         assert!(Cli::try_parse_from(["btrdasd", "scrub"]).is_err());
+    }
+
+    // ---- recovery-os hold-disk (bd DAS-Backup-Manager-7wb) ----
+
+    #[test]
+    fn recovery_os_hold_disk_parses_and_needs_a_device() {
+        let disk = "/dev/disk/by-id/ata-ST2000DM008-2FR102_ZK208Q77";
+        let cli =
+            Cli::try_parse_from(["btrdasd", "recovery-os", "hold-disk", "--device", disk]).unwrap();
+        match cli.command {
+            Commands::RecoveryOs {
+                action: RecoveryOsAction::HoldDisk { device },
+            } => assert_eq!(device, PathBuf::from(disk)),
+            _ => panic!("parsed as something other than recovery-os hold-disk"),
+        }
+        assert!(Cli::try_parse_from(["btrdasd", "recovery-os", "hold-disk"]).is_err());
+    }
+
+    /// An internal helper: documented in the man page, not offered in help.
+    #[test]
+    fn recovery_os_hold_disk_is_not_offered_in_the_help() {
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("recovery-os")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(
+            help.contains("inspect") && help.contains("status"),
+            "{help}"
+        );
+        assert!(!help.contains("hold-disk"), "{help}");
+    }
+
+    #[test]
+    fn recovery_os_hold_disk_refuses_json_and_anything_but_a_disk() {
+        assert!(hold_disk_json_refusal(true).is_some());
+        assert_eq!(hold_disk_json_refusal(false), None);
+        // In a thread of its own: a hold blocks the termination signals in
+        // the calling thread.
+        std::thread::spawn(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let device = dir.path().join("disk.img");
+            std::fs::write(&device, b"x").unwrap();
+            let hold = |json| {
+                run_recovery_os(
+                    RecoveryOsAction::HoldDisk {
+                        device: device.clone(),
+                    },
+                    json,
+                )
+            };
+            assert_eq!(hold(true), 2);
+            assert_eq!(hold(false), 2);
+        })
+        .join()
+        .unwrap();
     }
 
     fn set_env(key: &str, value: &std::path::Path) {
