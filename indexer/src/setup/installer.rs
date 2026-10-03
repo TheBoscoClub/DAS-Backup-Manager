@@ -926,7 +926,11 @@ fn cmake_installed_paths(prefix: &str) -> Vec<String> {
         p("lib/das-backup/boot-archive-cleanup.sh"),
         p("lib/das-backup/das-partition-drives.sh"),
         p("lib/das-backup/install-backup-timer.sh"),
+        p("lib/das-backup/recovery-os-vm.sh"),
         p("lib/das-backup/config/btrbk.conf"),
+        // The VM definition recovery-os-vm.sh defines the domain from. The
+        // domain itself, and its NVRAM, belong to libvirt and are left alone.
+        p("lib/das-backup/libvirt/recovery-os-updater.xml"),
         // Systemd units (cmake-installed templates). Under the prefix like
         // everything else: CMakeLists.txt gives them the relative destination
         // `lib/systemd/system`. They were listed at a fixed
@@ -2551,7 +2555,7 @@ auth = "starttls""#,
     /// Every file `cmake --install` writes for prefix `/usr`, read off the
     /// `install()` rules in CMakeLists.txt and gui/CMakeLists.txt, plus the
     /// two FFI artifacts older releases installed.
-    const CMAKE_PATHS_USR: [&str; 26] = [
+    const CMAKE_PATHS_USR: [&str; 28] = [
         "/usr/bin/btrdasd",
         "/usr/bin/btrdasd-gui",
         "/usr/libexec/btrdasd-helper",
@@ -2572,7 +2576,9 @@ auth = "starttls""#,
         "/usr/lib/das-backup/boot-archive-cleanup.sh",
         "/usr/lib/das-backup/das-partition-drives.sh",
         "/usr/lib/das-backup/install-backup-timer.sh",
+        "/usr/lib/das-backup/recovery-os-vm.sh",
         "/usr/lib/das-backup/config/btrbk.conf",
+        "/usr/lib/das-backup/libvirt/recovery-os-updater.xml",
         "/usr/lib/systemd/system/das-backup.service",
         "/usr/lib/systemd/system/das-backup-full.service",
         "/usr/lib/systemd/system/das-backup.timer",

@@ -1407,6 +1407,70 @@ a mounted target has no readable
 .IR @ ,
 the state file could not be written, or the configuration could not be loaded.
 .\"
+.SS recovery\-os hold\-disk
+An internal helper, not listed by
+.BR \-\-help :
+.B recovery\-os\-vm.sh
+starts it for the length of a session in which a recovery drive is lent to
+the
+.B recovery\-os\-updater
+virtual machine. It opens the whole disk read\-only with
+.BR O_EXCL ,
+an exclusive claim on the block device. While the claim stands, the kernel
+refuses to mount any partition of that disk on the host \(em by device or by
+UUID, in any mount namespace \(em while the virtual machine's own
+non\-exclusive open of the disk still works. Two kernels mounting one BTRFS
+filesystem corrupt it; this is what keeps the host's out. Conversely, a disk
+with any partition mounted cannot be claimed, so a hold that succeeds also
+proves that nothing on the host has the drive mounted.
+.PP
+Once the claim is in place it prints one line,
+.IR "held PATH pid PID" ,
+flushed, and then waits for
+.BR SIGTERM ,
+.B SIGINT
+or
+.B SIGHUP
+\(em blocked first, then given back their default disposition, so a parent
+that ignored one (a shell does SIGINT for every background job) cannot make
+it deaf to it. On one of them it closes the disk \(em the claim ends \(em says so on
+standard error and exits 0. It never reads standard input and never writes
+standard output again, so it does not end when the process that started it
+dies or closes its pipes. Ctrl\-C or a hangup in a terminal does reach it,
+though, unless it was started in a session of its own; the script starts it
+with
+.BR setsid (1)
+and lets it inherit its descriptor of
+.IR /run/das\-maintenance.lock ,
+so that the claim and the lock both outlive the script while the virtual
+machine may still be running. A
+.B SIGKILL
+ends the claim too: the kernel drops it with the descriptor.
+.PP
+.B btrdasd recovery\-os hold\-disk
+.B \-\-device
+.I PATH
+.TP
+.BI \-\-device " PATH"
+The whole disk, normally its
+.I /dev/disk/by\-id/ata\-MODEL_SERIAL
+link (followed).
+.PP
+.B \-\-json
+is refused: the output is one plain line for a script to read.
+.PP
+Exit status:
+.B 0
+released on one of those signals;
+.B 2
+refused \(em the path is not a block device (it is never opened then: an
+open of a FIFO would block), the disk is in use
+.RB ( EBUSY :
+mounted, or held by another program), any other open error, the device
+behind the path changed while it was being opened, the hold could not be
+announced on standard output, or
+.BR \-\-json .
+.\"
 .SS scrub run
 Run a full scrub pass now: acquire locks, mount each configured scrub
 target by filesystem UUID, run
@@ -1926,6 +1990,18 @@ target label (mode 644). Written by
 .BR "recovery\-os status \-\-state\-file" ,
 read by
 .BR "btrdasd health" .
+.TP
+.I /run/das\-recovery\-os\-vm/
+Kept by
+.B recovery\-os\-vm.sh
+while a recovery drive is lent to the
+.B recovery\-os\-updater
+virtual machine (mode 700): per target label, the
+.B "recovery\-os hold\-disk"
+process's pid and the disk it holds
+.RI ( LABEL .holder),
+that process's output, and the disk definition attached. Removed when the
+disk is given back.
 .TP
 .I /var/lib/btrfs/scrub.status.<fsuuid>
 Raw btrfs scrub status record for one filesystem, written by btrfs\-progs.

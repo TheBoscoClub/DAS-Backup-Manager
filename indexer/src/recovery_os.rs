@@ -15,6 +15,12 @@
 //!
 //! An item that cannot be read is `None` plus a `problems` entry, and an
 //! unknown upgrade date or kernel is stale — never a fabricated age.
+//!
+//! Updating one happens with that OS booted, never from the host: the
+//! [`hold_disk`] submodule keeps the host's hands off the drive while the
+//! recovery-os-updater VM has it (bd DAS-Backup-Manager-7wb).
+
+pub mod hold_disk;
 
 use std::collections::BTreeMap;
 use std::fs;

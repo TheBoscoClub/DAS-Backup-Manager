@@ -10,8 +10,14 @@ depends=('btrbk' 'btrfs-progs' 'smartmontools' 'bash' 'util-linux'
          'qt6-base' 'qt6-charts' 'kcoreaddons' 'ki18n' 'kxmlgui'
          'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio'
          'knotifications' 'kstatusnotifieritem' 'hicolor-icon-theme')
+# The last five are for recovery-os-vm.sh; its VM names edk2-ovmf's Arch paths.
 optdepends=('s-nail: email backup reports (mailx)'
-            'mbuffer: buffered btrbk stream transfers')
+            'mbuffer: buffered btrbk stream transfers'
+            'libvirt: recovery-os-vm.sh, a recovery drive updated in a VM'
+            'qemu-base: the recovery-os-updater VM'
+            'edk2-ovmf: UEFI firmware for the recovery-os-updater VM'
+            'virt-viewer: console of the recovery-os-updater VM'
+            'imagemagick: recovery-os-vm.sh screenshot')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
