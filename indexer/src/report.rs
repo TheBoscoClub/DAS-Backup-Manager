@@ -672,6 +672,7 @@ mod tests {
             last_backup: None,
             growth_points: Vec::new(),
             warnings: Vec::new(),
+            recovery_os: Vec::new(),
         };
         let text = render_capacity_and_smart(Some(&health));
         let (capacity, smart) = text.split_once("SMART STATUS").unwrap();

@@ -343,6 +343,16 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// The independent operating systems on the `role = "mirror"` recovery
+    /// drives: read them (never write) and say when they fall behind the host
+    ///
+    /// EXIT CODE: 0 every inspected OS is current (or none is mounted), 1 at
+    /// least one is STALE, 2 an OS root, the config or the state file could
+    /// not be handled.
+    RecoveryOs {
+        #[command(subcommand)]
+        action: RecoveryOsAction,
+    },
     /// Scheduled BTRFS scrub of the DAS backup filesystems
     Scrub {
         #[command(subcommand)]
@@ -658,6 +668,33 @@ enum SubvolAction {
         /// Print what would be deleted and delete nothing
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryOsAction {
+    /// Read one recovery OS root (the drive's `@`) and print its block
+    Inspect {
+        /// The OS root, e.g. /mnt/backup-system-recovery-A/@
+        #[arg(long)]
+        root: PathBuf,
+        /// Name to print for the drive
+        #[arg(long)]
+        label: String,
+        /// Path to config.toml (for [recovery_os] max_age_days)
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Read every mounted `role = "mirror"` target's OS and print the
+    /// RECOVERY OS report section; unmounted ones print `not mounted`
+    Status {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Record each inspected drive's reading here (atomically, mode 0644)
+        /// for `btrdasd health`; a drive not mounted keeps its earlier record
+        #[arg(long, value_name = "PATH")]
+        state_file: Option<PathBuf>,
     },
 }
 
@@ -1201,6 +1238,64 @@ fn expire_failed(outcome_failed: bool, deleted: &[PathBuf], db: &Path) -> bool {
         failed = true;
     }
     failed
+}
+
+/// `btrdasd recovery-os`: prints the section (or JSON) and returns the exit
+/// code — 0 current, 1 stale, 2 could not be checked.
+fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
+    use buttered_dasd::recovery_os as ros;
+    let load = |config: &Path| {
+        Config::load(config).map_err(|e| {
+            eprintln!("Error: cannot read {}: {e}", config.display());
+        })
+    };
+    let today = buttered_dasd::caldate::today();
+    match action {
+        RecoveryOsAction::Inspect {
+            root,
+            label,
+            config,
+        } => {
+            let Ok(cfg) = load(&config) else { return 2 };
+            let host = ros::host_versions();
+            let max = cfg.recovery_os.max_age_days;
+            let entry = ros::inspect_drive(&label, &root, &host, &today, max);
+            if json {
+                println!("{}", ros::entry_json(&entry));
+            } else {
+                print!(
+                    "{}",
+                    ros::format_section(std::slice::from_ref(&entry), &host)
+                );
+            }
+            ros::exit_code(std::slice::from_ref(&entry))
+        }
+        RecoveryOsAction::Status { config, state_file } => {
+            let Ok(cfg) = load(&config) else { return 2 };
+            let host = ros::host_versions();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let run = ros::status_run_with(
+                &cfg,
+                state_file.as_deref(),
+                &host,
+                &today,
+                now,
+                &health::is_mountpoint,
+            );
+            if json {
+                let all: Vec<_> = run.entries.iter().map(ros::entry_json).collect();
+                println!("{}", serde_json::Value::from(all));
+            } else {
+                print!("{}", ros::format_section(&run.entries, &host));
+            }
+            if let Some(e) = &run.state_error {
+                eprintln!("Error: could not record the result: {e}");
+            }
+            run.code
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2228,7 +2323,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map_or("null".to_string(), |e| e.to_string()),
                     );
                 }
-                print!("],\"warnings\":[");
+                print!(
+                    "],\"recovery_os\":{}",
+                    serde_json::Value::from(report.recovery_os.clone())
+                );
+                print!(",\"warnings\":[");
                 for (i, w) in report.warnings.iter().enumerate() {
                     if i > 0 {
                         print!(",");
@@ -2286,6 +2385,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         scrub_age
                     );
                 }
+                if !report.recovery_os.is_empty() {
+                    println!();
+                    println!("Recovery OS:");
+                    for line in &report.recovery_os {
+                        println!("  {line}");
+                    }
+                }
                 if !report.warnings.is_empty() {
                     println!();
                     println!("Warnings:");
@@ -2294,6 +2400,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+
+        // ----- Recovery OS commands -----
+        Commands::RecoveryOs { action } => {
+            std::process::exit(run_recovery_os(action, json));
         }
 
         // ----- Scrub commands -----

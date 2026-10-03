@@ -275,6 +275,9 @@ pub struct HealthReport {
     pub last_backup: Option<String>,
     pub growth_points: Vec<GrowthPoint>,
     pub warnings: Vec<String>,
+    /// One line per `role = "mirror"` target's OS (bd DAS-Backup-Manager-xd3).
+    /// A stale, unreadable or never-checked one is also in `warnings`.
+    pub recovery_os: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +932,18 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
         })
         .unwrap_or_default();
 
+    // 6b. Recovery OSes: read live while a drive is mounted, otherwise the
+    // record the last backup run kept. The host (uname, pacman) is probed only
+    // when there is a reading to compare it with.
+    let recovery = crate::recovery_os::health_with(
+        config,
+        &crate::recovery_os::load_state(&crate::recovery_os::state_path()),
+        &crate::recovery_os::host_versions,
+        &crate::caldate::today(),
+        &is_mountpoint,
+    );
+    warnings.extend(recovery.warnings);
+
     // 7. Determine overall status
     let status = determine_status(&target_healths, &warnings);
 
@@ -941,6 +956,7 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
         last_backup,
         growth_points,
         warnings,
+        recovery_os: recovery.lines,
     })
 }
 

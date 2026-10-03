@@ -1,9 +1,19 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.7.1
+# Version: 4.8.0
 # Date: 2026-10-02
 #
 # Features:
+#   - Recovery OS check and a WARN level (v4.8.0): check_recovery_os() runs
+#     `btrdasd recovery-os status` after btrbk and expiry, while the targets
+#     are still mounted, and puts its RECOVERY OS section in the report. It
+#     reads each role=mirror drive's own OS under @ (never writes to the
+#     drive) and records the reading in $RECOVERY_OS_STATE for `btrdasd
+#     health` (not in a dry run). A stale OS records WARN: the status line
+#     reads COMPLETED WITH WARNINGS and the subject SUCCESS WITH WARNINGS, but
+#     the run is recorded as a success, because the backup itself worked. A
+#     check that cannot run records FAIL. Neither stops the run
+#     (bd DAS-Backup-Manager-xd3).
 #   - Report honesty (v4.7.1): a failed `btrbk list latest` shows as
 #     "(unavailable: …)" in LATEST SNAPSHOTS, not "(none yet)".
 #   - Dry run sees the planned btrbk.conf (v4.7.0): in --dryrun, sync renders
@@ -862,6 +872,10 @@ verify_sources_before_write() {
 
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
+RECOVERY_OS_REPORT=""
+# Where the recovery OS check keeps its last reading for `btrdasd health`;
+# must match recovery_os::RECOVERY_OS_STATE_PATH.
+RECOVERY_OS_STATE="${RECOVERY_OS_STATE:-/var/lib/das-backup/recovery-os.json}"
 # Dry run only: the btrbk.conf the real run would leave, rendered by sync into
 # a mktemp file (mode 600) that `btrbk dryrun` reads. Removed by cleanup().
 DRYRUN_BTRBK_CONF=""
@@ -975,6 +989,97 @@ expire_retired_subvolumes() {
         while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_EXPIRE_REPORT"
     fi
     return 0
+}
+
+# Read the independent OS on each mounted role=mirror target and say whether
+# it has fallen behind the host. Runs after btrbk, while the targets are still
+# mounted: the backup comes first, and nothing here can delay or change it.
+# The command only reads under <mount>/@; the one file it writes is the state
+# record on the host, and not in a dry run.
+#
+#   exit 0  every inspected OS is current           -> OK
+#   exit 1  at least one is stale                   -> WARN (the run succeeded)
+#   other   the check could not be done              -> FAIL, with the reason
+#
+# Never stops the run.
+check_recovery_os() {
+    local mode="$1"
+    local args=(recovery-os status --config "$DAS_CONFIG")
+    if [[ "$mode" != "dryrun" ]]; then
+        args+=(--state-file "$RECOVERY_OS_STATE")
+    fi
+
+    log_info "Checking the recovery OSes..."
+    local rc=0 errf="" err=""
+    errf="$(mktemp --tmpdir das-recovery-os.XXXXXX)" || errf=""
+    if [[ -n "$errf" ]]; then
+        RECOVERY_OS_REPORT="$("$BTRDASD_BIN" "${args[@]}" 2>"$errf")" || rc=$?
+        err="$(<"$errf")"
+        rm -f -- "$errf"
+    else
+        # No temp file: stderr goes to the journal instead of the detail.
+        RECOVERY_OS_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    fi
+    local first_err="${err%%$'\n'*}"
+
+    case "$rc" in
+        0)
+            record_op "recovery_os" "OK" "none stale"
+            ;;
+        1)
+            record_op "recovery_os" "WARN" "stale — see RECOVERY OS in the report"
+            log_warn "A recovery OS is behind the host — see RECOVERY OS in the report"
+            ;;
+        *)
+            record_op "recovery_os" "FAIL" "exit code $rc${first_err:+: $first_err}"
+            log_error "The recovery OS check failed (exit $rc)${first_err:+: $first_err}"
+            if [[ -z "$RECOVERY_OS_REPORT" ]]; then
+                RECOVERY_OS_REPORT="RECOVERY OS"$'\n'"  CHECK FAILED: ${OP_STATUS[recovery_os_detail]}"
+            fi
+            ;;
+    esac
+    if [[ -n "$err" && "$err" != "$first_err" ]]; then
+        local line
+        while IFS= read -r line; do log_warn "  $line"; done <<<"$err"
+    fi
+    if [[ -n "$RECOVERY_OS_REPORT" ]]; then
+        local line
+        while IFS= read -r line; do log_info "  $line"; done <<<"$RECOVERY_OS_REPORT"
+    fi
+    return 0
+}
+
+# Whether any recorded operation has result $1.
+any_op_is() {
+    local want="$1" op
+    for op in "${!OP_STATUS[@]}"; do
+        if [[ "${OP_STATUS[$op]}" == "$want" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The status recorded for the run: FAILURE only when an operation FAILed. A
+# WARN is a finding about something other than this backup, so the run still
+# succeeded.
+run_status() {
+    if any_op_is FAIL; then
+        echo "FAILURE"
+    else
+        echo "SUCCESS"
+    fi
+}
+
+# The status for the email subject: the run status, with warnings said.
+subject_status() {
+    if any_op_is FAIL; then
+        echo "FAILURE"
+    elif any_op_is WARN; then
+        echo "SUCCESS WITH WARNINGS"
+    else
+        echo "SUCCESS"
+    fi
 }
 
 mount_targets() {
@@ -1897,14 +2002,11 @@ generate_report() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M')
     local overall_status="ALL OPERATIONS SUCCESSFUL"
-
-    # Check for any failures
-    for op in "${!OP_STATUS[@]}"; do
-        if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
-            overall_status="FAILURES DETECTED"
-            break
-        fi
-    done
+    if any_op_is FAIL; then
+        overall_status="FAILURES DETECTED"
+    elif any_op_is WARN; then
+        overall_status="COMPLETED WITH WARNINGS"
+    fi
 
     local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
     local elapsed_min=$(( elapsed / 60 ))
@@ -1920,6 +2022,9 @@ generate_report() {
     fi
     if [[ -n "$SUBVOL_EXPIRE_REPORT" ]]; then
         subvol_sections+=$'\n'"$SUBVOL_EXPIRE_REPORT"$'\n'
+    fi
+    if [[ -n "$RECOVERY_OS_REPORT" ]]; then
+        subvol_sections+=$'\n'"$RECOVERY_OS_REPORT"$'\n'
     fi
 
     # Build the report
@@ -1940,6 +2045,7 @@ BACKUP OPERATIONS
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
   Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
   Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
+  Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})
 ${subvol_sections}
 THROUGHPUT
 ───────────────────────────────────────────────────────────────
@@ -1962,7 +2068,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.7.1
+  backup-run.sh v4.8.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2460,6 +2566,9 @@ main() {
 
     # Still before unmount_all: expiry deletes snapshots on the mounted targets.
     expire_retired_subvolumes "$mode"
+    # Still before unmount_all: reads each recovery drive's OS. After btrbk so
+    # it can never delay or affect the backup itself.
+    check_recovery_os "$mode"
 
     if [[ "$mode" != "dryrun" ]]; then
         capture_usage "after"
@@ -2488,13 +2597,10 @@ main() {
         capture_report_data
         unmount_all
 
-        local overall_status="SUCCESS"
-        for op in "${!OP_STATUS[@]}"; do
-            if [[ "${OP_STATUS[$op]}" == "FAIL" ]]; then
-                overall_status="FAILURE"
-                break
-            fi
-        done
+        # Only FAIL makes the run a failure; a WARN (a stale recovery OS)
+        # shows in the status line and the subject, not in backup_runs.
+        local overall_status
+        overall_status="$(run_status)"
 
         local report
         report=$(generate_report)
@@ -2506,7 +2612,7 @@ main() {
         # invisible to systemd, Sentinel, the GUI and the operator alike.
         # The old message also asserted the backup "completed successfully"
         # regardless of whether it had. bd nsp (b15).
-        if ! send_report "$report" "$overall_status"; then
+        if ! send_report "$report" "$(subject_status)"; then
             log_warn "Email delivery failed (run status was: $overall_status)"
             record_op "email" "FAIL" "delivery failed; report was written to $LAST_REPORT"
             overall_status="FAILURE"

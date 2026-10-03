@@ -1180,6 +1180,20 @@ the configuration could not be loaded.
 Show backup system health \(em drive status, SMART diagnostics,
 disk usage, and growth trends.
 .PP
+With a
+.B "role = \(dqmirror\(dq"
+target configured it also prints a
+.B "Recovery OS"
+line per mirror target: read live from
+.I <mount>/@
+while the target is mounted, otherwise the record the last backup run kept in
+.IR /var/lib/das\-backup/recovery\-os.json ,
+with the time it was taken and the age recomputed for today. Run it as root
+while the drives are mounted, or the live read reports the files it may not
+read without updating their access times. A stale, unreadable
+or never\-checked recovery OS is also a warning, so the status reads
+.BR WARNING .
+.PP
 .B btrdasd health
 .RB [ \-\-config
 .IR PATH ]
@@ -1188,6 +1202,157 @@ disk usage, and growth trends.
 Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
+.\"
+.SS recovery\-os inspect
+Read one recovery OS root and print its
+.B "RECOVERY OS"
+block. Every
+.B "role = \(dqmirror\(dq"
+target carries its own bootable install under
+.I @
+on the filesystem that receives the backups; this reads it and never writes
+to it. Read: the name in
+.IR etc/os\-release ,
+the kernels under
+.IR usr/lib/modules ,
+the date of the last
+.RB \(dq "starting full system upgrade" \(dq
+line in
+.IR var/log/pacman.log ,
+and the installed versions of btrfs\-progs, btrbk, linux\-cachyos and
+das\-backup\-manager from
+.I var/lib/pacman/local
+(matched by the package's own name field). Not even an access time is
+written: files and directories are opened with
+.BR O_NOATIME ,
+which needs root or ownership of the file (without it the item is reported
+as unreadable rather than read), and no symlink inside the root is followed,
+since following one updates the link's access time. So
+.I etc/os\-release
+is read from
+.IR usr/lib/os\-release ,
+the fallback
+.BR os\-release (5)
+names, when it is a link. A root that is itself a symlink is refused, and a
+file that is not a regular file is not opened.
+Whatever cannot be read prints as
+.B unknown
+and is listed under
+.BR "Could not read" ;
+a package missing from a readable database prints as
+.BR "not installed" .
+.PP
+The OS is
+.B STALE
+when its last full upgrade is more than
+.B [recovery_os].max_age_days
+old, or cannot be found, or is dated after today; or when its newest kernel's
+major.minor series is lower than the host's running kernel, or either kernel
+is unknown. An unknown age is never shown as a number.
+.PP
+.B btrdasd recovery\-os inspect
+.B \-\-root
+.I PATH
+.B \-\-label
+.I NAME
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-json ]
+.TP
+.BI \-\-root " PATH"
+The OS root, e.g.
+.IR /mnt/backup\-system\-recovery\-A/@ .
+.TP
+.BI \-\-label " NAME"
+Name to print for the drive.
+.TP
+.BI \-\-config " PATH"
+Path to config.toml, read for
+.BR [recovery_os].max_age_days .
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-json
+Print one JSON object:
+.BR label ,
+.BR root ,
+.B status
+.RB ( current ,
+.BR stale ,
+.BR unreadable ),
+.BR error ,
+.B os
+and
+.BR assessment .
+.PP
+Exit status:
+.B 0
+current;
+.B 1
+stale;
+.B 2
+the root is not a directory, or the configuration could not be loaded.
+.\"
+.SS recovery\-os status
+Print the
+.B "RECOVERY OS"
+report section for every
+.B "role = \(dqmirror\(dq"
+target, in config order: each one that is mounted at its configured mount
+point is read as for
+.BR "recovery\-os inspect" ,
+with
+.I <mount>/@
+as the root; the others print
+.BR "not mounted" .
+.B backup\-run.sh
+runs it after btrbk, while the targets are mounted, and records the result as
+an operation: exit 0 is OK, exit 1 is WARN (the report status reads
+.BR "COMPLETED WITH WARNINGS" ,
+the run is still recorded as a success), anything else is FAIL.
+.PP
+.B btrdasd recovery\-os status
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-state\-file
+.IR PATH ]
+.RB [ \-\-json ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-state\-file " PATH"
+Record what was read from each drive in
+.I PATH
+(JSON, replaced atomically, mode 644) for
+.BR "btrdasd health" .
+A drive that is not mounted keeps its earlier record. An existing file that
+cannot be read or parsed is left as it is and the command exits 2; remove it
+to start over.
+.B backup\-run.sh
+passes
+.IR /var/lib/das\-backup/recovery\-os.json ,
+except on a dry run.
+.TP
+.B \-\-json
+Print a JSON array of the per\-drive objects described under
+.BR "recovery\-os inspect" ,
+with
+.B status
+also
+.BR not_mounted .
+.PP
+Exit status:
+.B 0
+every mounted recovery OS is current, or none is mounted;
+.B 1
+at least one is stale;
+.B 2
+a mounted target has no readable
+.IR @ ,
+the state file could not be written, or the configuration could not be loaded.
 .\"
 .SS scrub run
 Run a full scrub pass now: acquire locks, mount each configured scrub
@@ -1438,7 +1603,9 @@ The command line could not be parsed. Also used by
 .B "subvol sync"
 and
 .B "subvol expire"
-(configuration could not be loaded), and
+(configuration could not be loaded),
+.B recovery\-os
+(could not be checked; 1 there means a recovery OS is stale), and
 .B doctor
 (could not run).
 .TP
@@ -1463,6 +1630,11 @@ mail relay's upstream credential.
 .BR DAS_SCRUB_STATE ", " DAS_BTRFS_STATUS_DIR
 Override the scrub state file and the directory of btrfs scrub status
 records. Meant for tests only.
+.TP
+.B DAS_RECOVERY_OS_STATE
+Override the recovery OS record
+.B btrdasd health
+reads. Meant for tests only.
 .SH EXAMPLES
 Run a full backup pipeline:
 .PP
@@ -1692,6 +1864,13 @@ Persisted scrub state, keyed by filesystem UUID (mode 644). Absent until
 the first
 .B btrdasd scrub run
 completes.
+.TP
+.I /var/lib/das\-backup/recovery\-os.json
+What the last backup run read from each recovery drive's own OS, keyed by
+target label (mode 644). Written by
+.BR "recovery\-os status \-\-state\-file" ,
+read by
+.BR "btrdasd health" .
 .TP
 .I /var/lib/btrfs/scrub.status.<fsuuid>
 Raw btrfs scrub status record for one filesystem, written by btrfs\-progs.
