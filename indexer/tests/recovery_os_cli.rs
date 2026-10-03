@@ -260,7 +260,7 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     os_root(&mnt.join("@"), 1);
     let cfg = config(dir.path(), &mnt);
     let state = dir.path().join("recovery-os.json");
-    let earlier = r#"{"schema_version":3,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade_applied":"2026-01-01","last_full_upgrade_attempted":"2026-01-01","last_attempt_completed":true,"installed":"2025-12-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{},"packages_read":true,"enabled_timers":{"state":"listed","names":[]},"btrbk_config":{"state":"absent"},"problems":[]},"error":null}}}"#;
+    let earlier = r#"{"schema_version":3,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade_applied":"2026-01-01","last_full_upgrade_attempted":"2026-01-01","last_attempt_completed":true,"installed":"2025-12-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{},"packages_read":true,"enabled_units":{"state":"listed","units":[]},"btrbk_config":{"state":"absent"},"btrbk_at_boot":{"verdict":"no","reasons":[],"runners":[]},"problems":[]},"error":null}}}"#;
     std::fs::write(&state, earlier).unwrap();
     let out = btrdasd(
         &[
@@ -327,11 +327,59 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     );
     assert_eq!(std::fs::read_to_string(&state).unwrap(), "{not json");
 
-    // A record of the previous schema (2, before the timers and the btrbk
-    // config) is refused the same way, naming its version, and left alone;
-    // `health` says so too.
-    let v2 = r#"{"schema_version":2,"drives":{}}"#;
+    // A record of the previous schema (2, before the units and btrbk were
+    // read) is read with those readings "not read", and `health` says btrbk
+    // may run at that OS's boot until the drive is read again.
+    let v2 = r#"{"schema_version":2,"drives":{"recovery-A":{"checked_epoch":1790000000,"os":{"os_name":"Old","last_full_upgrade_applied":"2026-01-01","last_full_upgrade_attempted":"2026-01-01","last_attempt_completed":true,"installed":"2025-12-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{},"packages_read":true,"problems":[]},"error":null}}}"#;
     std::fs::write(&state, v2).unwrap();
+    let out = btrdasd(&["health", "--config", cfg.to_str().unwrap()], Some(&state));
+    let t = text(&out);
+    assert!(
+        t.contains(", enabled timers unknown, btrbk at boot may — "),
+        "{t}"
+    );
+    assert!(
+        t.contains(
+            "  - Recovery OS on 'recovery-A': btrbk may run when this OS boots — not read: check \
+             what it starts at boot and its btrbk config before booting it, on bare metal or in \
+             the update VM\n"
+        ),
+        "{t}"
+    );
+    // The next status run writes version 3, keeping that reading as it was.
+    let out = btrdasd(
+        &[
+            "recovery-os",
+            "status",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--state-file",
+            state.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(kept["schema_version"], 3);
+    assert_eq!(
+        kept["drives"]["recovery-A"]["checked_epoch"],
+        1790000000_i64
+    );
+    assert_eq!(
+        kept["drives"]["recovery-A"]["os"]["btrbk_at_boot"],
+        serde_json::json!({"verdict": "may", "reasons": ["not read"], "runners": []})
+    );
+
+    // Version 1 is refused the same way as a corrupt file, naming its
+    // version, and left alone; `health` says so too.
+    let v1 = r#"{"schema_version":1,"drives":{}}"#;
+    std::fs::write(&state, v1).unwrap();
     let out = btrdasd(
         &[
             "recovery-os",
@@ -346,33 +394,43 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     let want = format!(
-        "Error: could not record the result: {p}: record schema version 2, this btrdasd \
-         reads 3 — left as it is; remove it to start over: rm -- '{p}'",
+        "Error: could not record the result: {p}: record schema version 1, this btrdasd \
+         reads 2 and 3 — left as it is; remove it to start over: rm -- '{p}'",
         p = state.display()
     );
     assert_eq!(err.lines().next(), Some(want.as_str()), "{err}");
-    assert_eq!(std::fs::read_to_string(&state).unwrap(), v2);
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), v1);
     let out = btrdasd(&["health", "--config", cfg.to_str().unwrap()], Some(&state));
     let t = text(&out);
     assert!(
         t.contains(&format!(
-            "recovery-A: not mounted; stored record unreadable: {}: record schema version 2",
+            "recovery-A: not mounted; stored record unreadable: {}: record schema version 1",
             state.display()
         )),
         "{t}"
     );
 }
 
-/// btrbk.timer enabled the way `systemctl enable` leaves it — a symlink to a
-/// unit file that is not there to follow — beside /etc/btrbk/btrbk.conf: a
-/// current OS whose boot would run btrbk. Exit 1, the drive still `current`
-/// (bd DAS-Backup-Manager-1yg).
+/// btrbk's packaged units with its timer enabled the way `systemctl enable`
+/// leaves it — a symlink to a unit file that is not there to follow — beside
+/// /etc/btrbk/btrbk.conf: a current OS whose boot would run btrbk. Exit 1,
+/// the drive still `current` (bd DAS-Backup-Manager-1yg).
 #[test]
 fn inspect_warns_when_btrbk_would_run_at_boot_and_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(dir.path(), &dir.path().join("unmounted"));
     let root = dir.path().join("os");
     os_root(&root, 1);
+    write(
+        &root,
+        "usr/lib/systemd/system/btrbk.service",
+        "[Service]\nType=oneshot\nExecStart=/usr/bin/btrbk run\n",
+    );
+    write(
+        &root,
+        "usr/lib/systemd/system/btrbk.timer",
+        "[Timer]\nOnCalendar=daily\nPersistent=true\n",
+    );
     let wants = root.join("etc/systemd/system/timers.target.wants");
     std::fs::create_dir_all(&wants).unwrap();
     for unit in ["btrbk.timer", "fstrim.timer"] {
@@ -400,15 +458,19 @@ fn inspect_warns_when_btrbk_would_run_at_boot_and_exits_one() {
         ]);
         btrdasd(&args, None)
     };
-    let warning = "btrbk will run when this OS boots (btrbk.timer enabled, \
-                   /etc/btrbk/btrbk.conf present): check its config before booting it, on bare \
-                   metal or in the update VM";
+    let reason = "btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time \
+                  after boot, with /etc/btrbk/btrbk.conf present";
+    let warning = format!(
+        "btrbk will run when this OS boots — {reason}: check its config before booting it, on \
+         bare metal or in the update VM"
+    );
     let out = inspect(false);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     let t = text(&out);
     for line in [
-        "    Enabled timers      btrbk.timer, fstrim.timer\n".to_string(),
+        "    Enabled timers      btrbk.timer, fstrim.timer (etc)\n".to_string(),
         "    btrbk config        /etc/btrbk/btrbk.conf (17 bytes)\n".to_string(),
+        "    btrbk at boot       will\n".to_string(),
         format!("    WARNING             {warning}\n"),
         "    Result              current\n".to_string(),
     ] {
@@ -418,8 +480,22 @@ fn inspect_warns_when_btrbk_would_run_at_boot_and_exits_one() {
     assert_eq!(j["status"], "current");
     assert_eq!(j["assessment"]["warnings"], serde_json::json!([warning]));
     assert_eq!(
-        j["os"]["enabled_timers"],
-        serde_json::json!({"state": "listed", "names": ["btrbk.timer", "fstrim.timer"]})
+        j["os"]["btrbk_at_boot"],
+        serde_json::json!({
+            "verdict": "will",
+            "reasons": [reason],
+            "runners": [{
+                "source": "btrbk.service",
+                "via": "btrbk.timer",
+                "when": "at its next scheduled time after boot",
+                "config": null,
+                "config_present": true
+            }]
+        })
+    );
+    assert_eq!(
+        j["os"]["enabled_units"]["units"][0],
+        serde_json::json!({"name": "btrbk.timer", "dirs": ["etc/systemd/system/timers.target.wants"]})
     );
     assert_eq!(
         j["os"]["btrbk_config"],
@@ -431,6 +507,11 @@ fn inspect_warns_when_btrbk_would_run_at_boot_and_exits_one() {
     let out = inspect(false);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(!text(&out).contains("WARNING"), "{}", text(&out));
+    assert!(
+        text(&out).contains("    btrbk at boot       no — btrbk.timer starts btrbk.service, "),
+        "{}",
+        text(&out)
+    );
 }
 
 /// A root installed `age` days ago and never upgraded since, the way the
@@ -510,7 +591,7 @@ fn health_shows_the_stored_recovery_os_record_with_its_time() {
     // would run btrbk.
     let checked = day_number("2026-10-03").unwrap() * 86_400 + 3 * 3600 + 20 * 60;
     let record = format!(
-        r#"{{"schema_version":3,"drives":{{"recovery-A":{{"checked_epoch":{checked},"os":{{"os_name":"Old","last_full_upgrade_applied":"2026-03-14","last_full_upgrade_attempted":"2026-03-14","last_attempt_completed":true,"installed":"2026-02-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{{}},"packages_read":true,"enabled_timers":{{"state":"listed","names":["btrbk.timer","fstrim.timer"]}},"btrbk_config":{{"state":"present","path":"/etc/btrbk/btrbk.conf","size_bytes":412}},"problems":[]}},"error":null}}}}}}"#
+        r#"{{"schema_version":3,"drives":{{"recovery-A":{{"checked_epoch":{checked},"os":{{"os_name":"Old","last_full_upgrade_applied":"2026-03-14","last_full_upgrade_attempted":"2026-03-14","last_attempt_completed":true,"installed":"2026-02-01","log_read":true,"modules_read":true,"kernels":["6.1.0"],"packages":{{}},"packages_read":true,"enabled_units":{{"state":"listed","units":[{{"name":"btrbk.timer","dirs":["etc/systemd/system/timers.target.wants"]}},{{"name":"fstrim.timer","dirs":["etc/systemd/system/timers.target.wants"]}}]}},"btrbk_config":{{"state":"present","path":"/etc/btrbk/btrbk.conf","size_bytes":412}},"btrbk_at_boot":{{"verdict":"will","reasons":["btrbk.timer starts btrbk.service, which runs btrbk straight after boot (Persistent catch-up), with /etc/btrbk/btrbk.conf present"],"runners":[]}},"problems":[]}},"error":null}}}}}}"#
     );
     std::fs::write(&state, record).unwrap();
     let out = btrdasd(&["health", "--config", cfg.to_str().unwrap()], Some(&state));
@@ -527,14 +608,17 @@ fn health_shows_the_stored_recovery_os_record_with_its_time() {
         "{t}"
     );
     assert!(
-        t.contains(", kernel 6.1.0, enabled timers btrbk.timer, fstrim.timer — STALE: "),
+        t.contains(
+            ", kernel 6.1.0, enabled timers btrbk.timer, fstrim.timer, btrbk at boot will — STALE: "
+        ),
         "{t}"
     );
     assert!(
         t.contains(
-            "  - Recovery OS on 'recovery-A': btrbk will run when this OS boots (btrbk.timer \
-             enabled, /etc/btrbk/btrbk.conf present): check its config before booting it, on \
-             bare metal or in the update VM\n"
+            "  - Recovery OS on 'recovery-A': btrbk will run when this OS boots — btrbk.timer \
+             starts btrbk.service, which runs btrbk straight after boot (Persistent catch-up), \
+             with /etc/btrbk/btrbk.conf present: check its config before booting it, on bare \
+             metal or in the update VM\n"
         ),
         "{t}"
     );

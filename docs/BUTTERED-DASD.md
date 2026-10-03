@@ -56,7 +56,7 @@ backup-run.sh                   btrdasd CLI
 | `health` | `src/health.rs` | Drive health (SMART), mountpoint checks, serial to device resolution, scrub health |
 | `mount` | `src/mount.rs` | Auto-mount/unmount of targets and sources with RAII `MountGuard`; finds a target by `mount_uuid` or serial, retries a busy unmount, fails the operation if a target stays mounted |
 | `progress` | `src/progress.rs` | `ProgressCallback` trait and log levels shared by the CLI and the D-Bus helper (the helper turns events into ordered signals) |
-| `recovery_os` | `src/recovery_os.rs` | Read-only inspection of the independent OS on each mirror target: whether it has fallen behind the host, and whether booting it would run btrbk (its enabled timers and btrbk config) (`btrdasd recovery-os`) |
+| `recovery_os` | `src/recovery_os.rs` | Read-only inspection of the independent OS on each mirror target: whether it has fallen behind the host, and whether booting it would run btrbk (what its systemd trees and cron start, what those run, and the btrbk config each would use) (`btrdasd recovery-os`) |
 | `report` | `src/report.rs` | Backup report formatting |
 | `restore` | `src/restore.rs` | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and a denylist |
 | `schedule` | `src/schedule.rs` | systemd timer management (show/set/enable/disable) |

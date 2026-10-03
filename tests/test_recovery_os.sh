@@ -85,7 +85,7 @@ reset
 printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK/out"; echo 0 >"$WORK/rc"
 check_recovery_os run
 check "current: OK" "${OP_STATUS[recovery_os]}" "OK"
-check "current: detail" "${OP_STATUS[recovery_os_detail]}" "none stale"
+check "current: detail" "${OP_STATUS[recovery_os_detail]}" "nothing needs attention"
 check "the call is bounded by timeout -k 10 300" "$(cat "$WORK/timeout_calls")" \
     "-k 10 300 $BTRDASD_BIN recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
 check "current: section captured" "$(head -n1 <<<"$RECOVERY_OS_REPORT")" "RECOVERY OS"
@@ -137,9 +137,9 @@ check "FAIL outranks WARN: status line" "$(generate_report | grep -c '^  Status:
 
 # --- current, but btrbk would run when it boots (bd 1yg) -------------------------
 # Exit 1 with a current Result: the WARNING row is why, and the detail says so.
-boot_warning='btrbk will run when this OS boots (btrbk.timer enabled, /etc/btrbk/btrbk.conf present): check its config before booting it, on bare metal or in the update VM'
+boot_warning='btrbk will run when this OS boots — btrbk.timer starts btrbk.service, which runs btrbk straight after boot (Persistent catch-up), with /etc/btrbk/btrbk.conf present: check its config before booting it, on bare metal or in the update VM'
 reset
-printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Enabled timers      btrbk.timer\n    btrbk config        /etc/btrbk/btrbk.conf (412 bytes)\n    WARNING             %s\n    Result              current\n' \
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Enabled timers      btrbk.timer (etc)\n    btrbk config        /etc/btrbk/btrbk.conf (412 bytes)\n    btrbk at boot       will\n    WARNING             %s\n    Result              current\n' \
     "$boot_warning" >"$WORK/out"; echo 1 >"$WORK/rc"
 rc=0; check_recovery_os run || rc=$?
 check "boot warning: returns 0" "$rc" "0"
@@ -219,7 +219,7 @@ BTRDASD_BIN="$WORK/btrdasd"
 reset
 printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n  B  not mounted\n  C D  not mounted\n' >"$WORK/out"; echo 0 >"$WORK/rc"
 check_recovery_os run
-check "some unmounted: detail names them" "${OP_STATUS[recovery_os_detail]}" "none stale; not mounted: B, C D"
+check "some unmounted: detail names them" "${OP_STATUS[recovery_os_detail]}" "nothing needs attention; not mounted: B, C D"
 printf 'RECOVERY OS\n  B  not mounted\n' >"$WORK/out"
 check_recovery_os run
 check "none mounted: nothing inspected, and which" "${OP_STATUS[recovery_os_detail]}" "nothing inspected; not mounted: B"

@@ -105,7 +105,7 @@ The system has six major components:
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
-         ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it), its enabled timers and btrbk config included; STALE, or a WARNING that its boot may run btrbk, is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun)
+         ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it), including what it starts at boot and whether that runs btrbk; STALE, or a WARNING that its boot will or may run btrbk, is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun)
          ├──▶ update_boot_subvolumes()     → creates missing @/@home on non-mirror targets; archives + recreates them only on --full runs
          ├──▶ btrdasd walk                 → indexes new snapshots on the primary target into SQLite
          ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
