@@ -67,6 +67,12 @@ pub struct RecoveryOs {
     pub last_full_upgrade_attempted: Option<String>,
     /// Whether that last attempt is the applied one.
     pub last_attempt_completed: bool,
+    /// `YYYY-MM-DD` of the first line of pacman's log: when the OS was
+    /// installed (pacman's first entry is the `pacman -b /mnt/...` of the
+    /// install). `None` when the log was not read or its first line carries
+    /// no date. It is a log's age, so a rotated log would make it the date
+    /// of the rotation; pacman's log is not rotated on these installs.
+    pub installed: Option<String>,
     /// Whether `var/log/pacman.log` was read. When false, `problems` says why
     /// if it was unreadable; with no problem for it, it is absent.
     pub log_read: bool,
@@ -261,6 +267,7 @@ fn parse_os_release(text: &str) -> Option<String> {
 /// What pacman's log says about full system upgrades.
 #[derive(Debug, Default, PartialEq)]
 struct Upgrades {
+    installed: Option<String>,
     applied: Option<String>,
     attempted: Option<String>,
     last_completed: bool,
@@ -273,13 +280,20 @@ fn line_date(line: &str) -> Option<String> {
     day_number(date).map(|_| date.to_string())
 }
 
+/// The install date is the first line's: pacman's first entry on an install
+/// is its `pacman -b /mnt/...` from the live ISO. A first line without a date
+/// gives none; a later line's date is never taken for it.
+///
 /// An attempt is a `starting full system upgrade` line; it was applied if
 /// `[ALPM] transaction completed` follows before the next invocation starts
 /// (pacman logs `Running '…'` at the start of every invocation) or the next
 /// `starting` line. A marker whose date does not parse is never taken, and
 /// closes the window so a later completion is not credited to an earlier one.
 fn parse_upgrades(log: &str) -> Upgrades {
-    let mut u = Upgrades::default();
+    let mut u = Upgrades {
+        installed: log.lines().next().and_then(line_date),
+        ..Upgrades::default()
+    };
     let mut open: Option<String> = None;
     for line in log.lines() {
         if line.contains(UPGRADE_MARKER) {
@@ -339,6 +353,7 @@ pub fn inspect(root: &Path) -> RecoveryOs {
         Ok(text) => {
             let u = parse_upgrades(&text);
             os.log_read = true;
+            os.installed = u.installed;
             os.last_full_upgrade_applied = u.applied;
             os.last_full_upgrade_attempted = u.attempted;
             os.last_attempt_completed = u.last_completed;
@@ -451,11 +466,24 @@ fn btrfs_progs_older(recovery: Option<&str>, host: Option<&str>) -> Option<bool>
     Some(r < h)
 }
 
+/// What an age is counted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeBasis {
+    /// The last applied full upgrade.
+    LastAppliedUpgrade,
+    /// The install, when no full upgrade was ever applied.
+    Install,
+}
+
 /// The verdict on one recovery OS.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Assessment {
-    /// Whole days since the last full upgrade; `None` when unknown.
+    /// Whole days since the last applied full upgrade, else since the
+    /// install; `None` when neither is known.
     pub age_days: Option<i64>,
+    /// What `age_days` counts from; `None` exactly when it is `None`.
+    pub age_basis: Option<AgeBasis>,
     pub stale: bool,
     /// Why it is stale; empty exactly when it is current.
     pub reasons: Vec<String>,
@@ -478,42 +506,77 @@ fn unread(os: &RecoveryOs, rel: &str, unreadable: &str, absent: &str) -> String 
     }
 }
 
-/// Stale when the last APPLIED full upgrade is older than `max_age_days`,
-/// unknown, or dated after `today`; when a later attempt did not complete;
-/// when the newest kernel's series is behind the host's, or either kernel is
-/// unknown; or when btrfs-progs is older than the host's (when both versions
-/// can be compared). Unknown is never current: the point is to nag.
+/// Whole days from `date` (what it is the date `of`) to `today`, or why
+/// there is no age: the date is after today, or today does not parse.
+fn age_since(of: &str, date: &str, today: &str) -> Result<i64, String> {
+    match (day_number(today), day_number(date)) {
+        (Some(t), Some(d)) if t < d => Err(format!(
+            "{of} {date} is after today ({today}) — check the clock"
+        )),
+        (Some(t), Some(d)) => Ok(t - d),
+        _ => Err("age unknown: today's date is unreadable".to_string()),
+    }
+}
+
+/// Stale when the last APPLIED full upgrade — or, when none ever was, the
+/// install — is older than `max_age_days`, unknown, or dated after today;
+/// when a later attempt did not complete; when the newest kernel's series is
+/// behind the host's, or either kernel is unknown; or when btrfs-progs is
+/// older than the host's (when both versions can be compared). Unknown is
+/// never current: the point is to nag.
 pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u32) -> Assessment {
     let mut reasons = Vec::new();
-    let mut age_days = None;
+    let mut age = None;
     let applied = os.last_full_upgrade_applied.as_deref();
     let attempted = os.last_full_upgrade_attempted.as_deref();
-    match (applied, attempted) {
+    let installed = os.installed.as_deref();
+    let limit = i64::from(max_age_days);
+    match applied {
         _ if !os.log_read => reasons.push(unread(
             os,
             PACMAN_LOG,
             "last upgrade unknown",
             "last upgrade unknown",
         )),
-        (None, None) => reasons.push(format!("no full system upgrade recorded in {PACMAN_LOG}")),
-        (None, Some(a)) => reasons.push(format!(
-            "no full system upgrade ever completed (last attempt {a})"
-        )),
-        (Some(date), _) => match (day_number(today), day_number(date)) {
-            (Some(t), Some(d)) if t < d => reasons.push(format!(
-                "last full upgrade {date} is after today ({today}) — check the clock"
-            )),
-            (Some(t), Some(d)) => {
-                let age = t - d;
-                age_days = Some(age);
-                if age > i64::from(max_age_days) {
+        Some(date) => match age_since("last full upgrade", date, today) {
+            Ok(n) => {
+                age = Some((n, AgeBasis::LastAppliedUpgrade));
+                if n > limit {
                     reasons.push(format!(
-                        "last full upgrade {age} days ago (limit {max_age_days})"
+                        "last full upgrade {n} days ago (limit {max_age_days})"
                     ));
                 }
             }
-            _ => reasons.push("age unknown: today's date is unreadable".to_string()),
+            Err(why) => reasons.push(why),
         },
+        None => {
+            if let Some(date) = installed {
+                match age_since("install", date, today) {
+                    Ok(n) => {
+                        age = Some((n, AgeBasis::Install));
+                        if attempted.is_none() && n > limit {
+                            reasons.push(format!(
+                                "never upgraded since install on {date} ({})",
+                                days(n)
+                            ));
+                        }
+                    }
+                    Err(why) => reasons.push(why),
+                }
+            }
+            match (installed, attempted) {
+                (Some(i), Some(a)) => reasons.push(format!(
+                    "install {i}, never completed an upgrade; last attempt {a} did not complete"
+                )),
+                (None, Some(a)) => reasons.push(format!(
+                    "no full system upgrade ever completed (last attempt {a})"
+                )),
+                (None, None) => {
+                    reasons.push(format!("no full system upgrade recorded in {PACMAN_LOG}"))
+                }
+                (Some(_), None) => {}
+            }
+        }
     }
     if let (Some(done), Some(tried), false) = (applied, attempted, os.last_attempt_completed) {
         reasons.push(format!(
@@ -550,7 +613,8 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
         ));
     }
     Assessment {
-        age_days,
+        age_days: age.map(|(n, _)| n),
+        age_basis: age.map(|(_, basis)| basis),
         stale: !reasons.is_empty(),
         reasons,
     }
@@ -683,15 +747,26 @@ fn package_text(os: &RecoveryOs, name: &str) -> String {
     }
 }
 
-/// `2026-03-14 (202 days ago)`, `… (age unknown)`; with no applied upgrade,
-/// `none recorded` / `none completed` when the log was read, else `unknown`.
-fn upgrade_text(os: &RecoveryOs, a: &Assessment, ago: &str) -> String {
-    match (os.last_full_upgrade_applied.as_deref(), a.age_days) {
-        (Some(d), Some(n)) => format!("{d} ({}{ago})", days(n)),
-        (Some(d), None) => format!("{d} (age unknown)"),
-        (None, _) if !os.log_read => "unknown".to_string(),
-        (None, _) if os.last_full_upgrade_attempted.is_some() => "none completed".to_string(),
-        (None, _) => "none recorded".to_string(),
+/// `202 days since last applied upgrade`, `174 days since install`, or
+/// `unknown`.
+fn age_text(a: &Assessment) -> String {
+    match (a.age_days, a.age_basis) {
+        (Some(n), Some(AgeBasis::LastAppliedUpgrade)) => {
+            format!("{} since last applied upgrade", days(n))
+        }
+        (Some(n), Some(AgeBasis::Install)) => format!("{} since install", days(n)),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// The applied upgrade's date; with none, `none recorded` / `none completed`
+/// when the log was read, else `unknown`.
+fn upgrade_text(os: &RecoveryOs) -> String {
+    match os.last_full_upgrade_applied.as_deref() {
+        Some(d) => d.to_string(),
+        None if !os.log_read => "unknown".to_string(),
+        None if os.last_full_upgrade_attempted.is_some() => "none completed".to_string(),
+        None => "none recorded".to_string(),
     }
 }
 
@@ -740,15 +815,17 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                 out.push_str(&format!("  {}  ({root})  UNREADABLE: {why}\n", e.label));
             }
             DriveReport::Inspected { os, assessment } => {
-                let upgrade = upgrade_text(os, assessment, " ago");
+                let upgrade = upgrade_text(os);
                 let kernel = or_unknown(newest_kernel(&os.kernels).map(String::as_str));
                 let row = |k: &str, v: &str| format!("    {k:<20}{v}\n");
                 out.push_str(&format!("  {}  ({root})\n", e.label));
                 out.push_str(&row("OS", or_unknown(os.os_name.as_deref())));
+                out.push_str(&row("Installed", or_unknown(os.installed.as_deref())));
                 out.push_str(&row("Last full upgrade", &upgrade));
                 if let Some(tried) = failed_attempt(os) {
                     out.push_str(&row("Last attempt", &format!("{tried} (did not complete)")));
                 }
+                out.push_str(&row("Age", &age_text(assessment)));
                 out.push_str(&row("Kernel", &format!("{kernel} (host {host_kernel})")));
                 out.push_str(&row("btrfs-progs", &progs_text(os, host)));
                 out.push_str(&row("btrbk", &package_text(os, "btrbk")));
@@ -782,7 +859,8 @@ pub struct StoredDrive {
     pub error: Option<String>,
 }
 
-const STATE_SCHEMA_VERSION: u32 = 1;
+/// 2 since `installed` was added; a record of any other version is refused.
+const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// The state file, overridable for tests and the VM rig via
 /// `DAS_RECOVERY_OS_STATE`.
@@ -793,16 +871,31 @@ pub fn state_path() -> PathBuf {
     )
 }
 
-/// `Ok(None)` when there is no file yet; an unreadable or corrupt file is an
-/// error, never an empty record.
+/// `Ok(None)` when there is no file yet; an unreadable or corrupt file, or a
+/// record of another schema version, is an error — never an empty record —
+/// that names the file and the command that clears it.
 pub fn load_state(path: &Path) -> Result<Option<StoredState>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&text)
+    let fail = |why: String| {
+        let p = path.display();
+        format!("{p}: {why} — left as it is; remove it to start over: rm -- '{p}'")
+    };
+    let text = fs::read_to_string(path).map_err(|e| fail(e.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| fail(e.to_string()))?;
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(STATE_SCHEMA_VERSION)) {
+        return Err(fail(format!(
+            "record schema version {}, this btrdasd reads {STATE_SCHEMA_VERSION}",
+            version.map_or_else(|| "none".to_string(), |v| v.to_string())
+        )));
+    }
+    serde_json::from_value(value)
         .map(Some)
-        .map_err(|e| format!("{}: {e}", path.display()))
+        .map_err(|e| fail(e.to_string()))
 }
 
 /// Record this run's readings. A drive that was not mounted keeps its earlier
@@ -810,14 +903,7 @@ pub fn load_state(path: &Path) -> Result<Option<StoredState>, String> {
 /// is — overwriting it would lose the other drive's last reading. Written
 /// atomically, mode 0644 (`health` runs unprivileged).
 pub fn write_state(path: &Path, entries: &[DriveEntry], now_epoch: i64) -> Result<(), String> {
-    let mut state = load_state(path)
-        .map_err(|e| {
-            format!(
-                "{e} — left as it is; remove it to start over: rm -- '{}'",
-                path.display()
-            )
-        })?
-        .unwrap_or_default();
+    let mut state = load_state(path)?.unwrap_or_default();
     state.schema_version = STATE_SCHEMA_VERSION;
     for e in entries {
         let record = match &e.report {
@@ -861,9 +947,10 @@ pub struct RecoveryHealth {
     pub warnings: Vec<String>,
 }
 
-/// `<label> (<when>): last full upgrade …, kernel … — current|STALE: …`.
+/// `<label> (<when>): installed …, last full upgrade …, age …, kernel … —
+/// current|STALE: …`.
 fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
-    let upgrade = upgrade_text(os, a, "");
+    let upgrade = upgrade_text(os);
     let kernel = or_unknown(newest_kernel(&os.kernels).map(String::as_str));
     let state = if a.stale {
         format!("STALE: {}", a.reasons.join("; "))
@@ -875,7 +962,12 @@ fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
         1 => "; 1 path unreadable".to_string(),
         n => format!("; {n} paths unreadable"),
     };
-    format!("{label} ({when}): last full upgrade {upgrade}, kernel {kernel} — {state}{unreadable}")
+    format!(
+        "{label} ({when}): installed {}, last full upgrade {upgrade}, age {}, kernel {kernel} \
+         — {state}{unreadable}",
+        or_unknown(os.installed.as_deref()),
+        age_text(a)
+    )
 }
 
 /// Live readings for mounted mirror targets, the stored record for the rest.
@@ -1134,6 +1226,11 @@ mod tests {
             Some("2026-03-14")
         );
         assert!(os.last_attempt_completed);
+        assert_eq!(
+            os.installed.as_deref(),
+            Some("2026-01-02"),
+            "the first line"
+        );
         assert!(os.log_read && os.modules_read);
         assert_eq!(os.kernels, ["6.12.1-1-cachyos", "6.6.5-2-cachyos-lts"]);
         assert!(os.packages_read);
@@ -1247,6 +1344,7 @@ mod tests {
         assert_eq!(os.os_name, None);
         assert_eq!(os.last_full_upgrade_applied, None);
         assert_eq!(os.last_full_upgrade_attempted, None);
+        assert_eq!(os.installed, None);
         assert!(os.kernels.is_empty());
         assert!(os.packages.is_empty());
         assert!(!os.log_read && !os.modules_read);
@@ -1317,10 +1415,11 @@ mod tests {
         assert_eq!(os.last_full_upgrade_attempted, None);
         assert!(os.log_read);
         assert!(os.problems.is_empty(), "{:?}", os.problems);
+        assert_eq!(os.installed.as_deref(), Some("2026-03-14"));
         let a = assess(&os, &host("7.2.8"), TODAY, 60);
         assert_eq!(
             a.reasons[0],
-            "no full system upgrade recorded in var/log/pacman.log"
+            "never upgraded since install on 2026-03-14 (202 days)"
         );
     }
 
@@ -1404,6 +1503,134 @@ mod tests {
         assert_eq!(
             a.reasons,
             ["no full system upgrade ever completed (last attempt 2026-10-01)"]
+        );
+    }
+
+    /// The production recovery OSes' log: installed from the live ISO with
+    /// `pacman -b`, then never a full upgrade.
+    const NEVER_UPGRADED_LOG: &str = "\
+[2026-04-12T23:23:05-0500] [PACMAN] Running 'pacman -b /mnt/var/lib/pacman -r /mnt -S base'
+[2026-04-12T23:23:06-0500] [ALPM] transaction started
+[2026-04-12T23:30:00-0500] [ALPM] installed base (3-2)
+[2026-04-12T23:31:00-0500] [ALPM] transaction completed
+[2026-05-01T10:00:00-0500] [PACMAN] Running 'pacman -S vim'
+[2026-05-01T10:00:05-0500] [ALPM] transaction completed
+";
+
+    /// A host the full_root fixture is otherwise current against.
+    fn same_host() -> HostVersions {
+        HostVersions {
+            kernel: Some("6.12.9-1-cachyos".into()),
+            btrfs_progs: Some("6.10-1".into()),
+        }
+    }
+
+    fn install_plus(n: i64) -> String {
+        date_of(day_number("2026-04-12").unwrap() + n)
+    }
+
+    #[test]
+    fn a_never_upgraded_install_is_aged_from_its_install_date() {
+        let os = upgrades(NEVER_UPGRADED_LOG);
+        assert_eq!(os.installed.as_deref(), Some("2026-04-12"));
+        assert_eq!(os.last_full_upgrade_applied, None);
+        assert_eq!(os.last_full_upgrade_attempted, None);
+        let a = assess(&os, &same_host(), "2026-10-03", 60);
+        assert!(a.stale);
+        assert_eq!(a.age_days, Some(174));
+        assert_eq!(a.age_basis, Some(AgeBasis::Install));
+        assert_eq!(
+            a.reasons,
+            ["never upgraded since install on 2026-04-12 (174 days)"]
+        );
+        // Ten days after the install it is current: the same threshold.
+        let a = assess(&os, &same_host(), &install_plus(10), 60);
+        assert_eq!((a.age_days, a.stale), (Some(10), false), "{:?}", a.reasons);
+        assert_eq!(a.age_basis, Some(AgeBasis::Install));
+        assert!(!assess(&os, &same_host(), &install_plus(60), 60).stale);
+        assert_eq!(
+            assess(&os, &same_host(), &install_plus(61), 60).reasons,
+            ["never upgraded since install on 2026-04-12 (61 days)"]
+        );
+        // A kernel series behind the host's is stale whatever the age.
+        let a = assess(&os, &host("7.2.8"), &install_plus(10), 60);
+        assert!(a.stale);
+        assert_eq!(
+            a.reasons,
+            [
+                "kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2",
+                "btrfs-progs 6.10-1 is older than the host's 6.17-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_log_whose_first_line_has_no_date_has_no_install_date() {
+        let os = upgrades(&format!(
+            "garbage before the first entry\n{NEVER_UPGRADED_LOG}"
+        ));
+        assert_eq!(os.installed, None, "never a later line's date");
+        assert!(os.log_read);
+        let a = assess(&os, &same_host(), "2026-10-03", 60);
+        assert!(a.stale);
+        assert_eq!((a.age_days, a.age_basis), (None, None), "no fabricated age");
+        assert_eq!(
+            a.reasons,
+            ["no full system upgrade recorded in var/log/pacman.log"]
+        );
+        assert_eq!(upgrades("").installed, None, "an empty log");
+    }
+
+    #[test]
+    fn a_never_upgraded_install_with_a_failed_attempt_says_both() {
+        let os = upgrades(&format!(
+            "{NEVER_UPGRADED_LOG}\
+             [2026-09-30T08:00:00-0500] [PACMAN] Running 'pacman -Syu'\n\
+             [2026-09-30T08:00:02-0500] [PACMAN] starting full system upgrade\n\
+             [2026-09-30T08:00:09-0500] [PACMAN] error: archlinux-keyring: signature is unknown trust\n"
+        ));
+        assert_eq!(os.installed.as_deref(), Some("2026-04-12"));
+        let a = assess(&os, &same_host(), "2026-10-03", 60);
+        assert!(a.stale);
+        assert_eq!(
+            (a.age_days, a.age_basis),
+            (Some(174), Some(AgeBasis::Install))
+        );
+        assert_eq!(
+            a.reasons,
+            [
+                "install 2026-04-12, never completed an upgrade; last attempt 2026-09-30 did not complete"
+            ]
+        );
+        // Stale even when the install is recent: the attempt failed.
+        let a = assess(&os, &same_host(), &install_plus(10), 60);
+        assert!(a.stale);
+        assert_eq!(a.reasons.len(), 1, "{:?}", a.reasons);
+    }
+
+    #[test]
+    fn an_install_date_after_today_or_an_unreadable_today_has_no_age() {
+        let mut os = os_with(None, &["7.2.1"]);
+        os.installed = Some("2026-10-05".into());
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert!(a.stale);
+        assert_eq!((a.age_days, a.age_basis), (None, None));
+        assert_eq!(
+            a.reasons,
+            ["install 2026-10-05 is after today (2026-10-02) — check the clock"]
+        );
+        os.installed = Some("2026-10-01".into());
+        let a = assess(&os, &host("7.2.8"), "garbage", 60);
+        assert!(a.stale);
+        assert_eq!((a.age_days, a.age_basis), (None, None));
+        assert_eq!(a.reasons, ["age unknown: today's date is unreadable"]);
+        // An applied upgrade is the basis, however old the install.
+        let mut os = os_with(Some(&days_before(TODAY, 5)), &["7.2.1"]);
+        os.installed = Some("2020-01-01".into());
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert_eq!(
+            (a.age_days, a.age_basis, a.stale),
+            (Some(5), Some(AgeBasis::LastAppliedUpgrade), false)
         );
     }
 
@@ -1766,6 +1993,7 @@ mod tests {
         let a = at(61);
         assert!(a.stale);
         assert_eq!(a.age_days, Some(61));
+        assert_eq!(a.age_basis, Some(AgeBasis::LastAppliedUpgrade));
         assert_eq!(a.reasons, ["last full upgrade 61 days ago (limit 60)"]);
     }
 
@@ -1979,7 +2207,9 @@ mod tests {
             "RECOVERY OS\n\
              \x20 system-recovery-A-2tb  ({root})\n\
              \x20   OS                  CachyOS\n\
-             \x20   Last full upgrade   2026-03-14 (202 days ago)\n\
+             \x20   Installed           2026-01-02\n\
+             \x20   Last full upgrade   2026-03-14\n\
+             \x20   Age                 202 days since last applied upgrade\n\
              \x20   Kernel              6.12.1-1-cachyos (host 7.2.8-1-cachyos)\n\
              \x20   btrfs-progs         6.10-1 (host 6.17-1)\n\
              \x20   btrbk               0.32.6-1\n\
@@ -1999,7 +2229,9 @@ mod tests {
         let text = format_section(&[e], &HostVersions::default());
         for line in [
             "    OS                  unknown\n",
+            "    Installed           unknown\n",
             "    Last full upgrade   unknown\n",
+            "    Age                 unknown\n",
             "    Kernel              unknown (host unknown)\n",
             "    btrfs-progs         unknown (host unknown)\n",
             "    btrbk               unknown\n",
@@ -2041,11 +2273,11 @@ mod tests {
         let h = host("6.12.9");
         let text = format_section(&[inspect_drive("A", dir.path(), &h, TODAY, 60)], &h);
         assert!(
-            text.contains("    Last full upgrade   2026-03-14 (202 days ago)\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("    Last attempt        2026-10-01 (did not complete)\n"),
+            text.contains(
+                "    Last full upgrade   2026-03-14\n\
+                 \x20   Last attempt        2026-10-01 (did not complete)\n\
+                 \x20   Age                 202 days since last applied upgrade\n"
+            ),
             "{text}"
         );
         assert!(
@@ -2065,8 +2297,8 @@ mod tests {
     fn the_upgrade_row_says_none_recorded_none_completed_or_unknown() {
         let h = host("7.2.8");
         let row = |os: &RecoveryOs| {
-            let a = assess(os, &h, TODAY, 60);
-            upgrade_text(os, &a, " ago")
+            assert!(assess(os, &h, TODAY, 60).stale);
+            upgrade_text(os)
         };
         let mut os = os_with(None, &["7.2.1"]);
         os.last_attempt_completed = false;
@@ -2125,7 +2357,10 @@ mod tests {
         };
         let text = format_section(&[current, off, bad], &h);
         assert!(
-            text.contains("    Last full upgrade   2026-10-01 (1 day ago)\n"),
+            text.contains(
+                "    Last full upgrade   2026-10-01\n\
+                 \x20   Age                 1 day since last applied upgrade\n"
+            ),
             "{text}"
         );
         assert!(text.contains("    Result              current\n"), "{text}");
@@ -2179,7 +2414,7 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         let st = load_state(&path).unwrap().unwrap();
-        assert_eq!(st.schema_version, 1);
+        assert_eq!(st.schema_version, 2);
         let DriveReport::Inspected { os, .. } = &a.report else {
             panic!()
         };
@@ -2272,7 +2507,7 @@ mod tests {
             },
         );
         let state = Ok(Some(StoredState {
-            schema_version: 1,
+            schema_version: STATE_SCHEMA_VERSION,
             drives,
         }));
         let is_mounted = |p: &Path| p == a.path();
@@ -2280,11 +2515,12 @@ mod tests {
         assert_eq!(
             h.lines,
             [
-                "A (live): last full upgrade 2026-03-14 (202 days), kernel 6.12.1-1-cachyos — \
-                 STALE: last full upgrade 202 days ago (limit 60); kernel series 6.12 \
+                "A (live): installed 2026-01-02, last full upgrade 2026-03-14, age 202 days \
+                 since last applied upgrade, kernel 6.12.1-1-cachyos — STALE: last full upgrade 202 days ago (limit 60); kernel series 6.12 \
                  (6.12.1-1-cachyos) is behind the host's 7.2; btrfs-progs 6.10-1 is older \
                  than the host's 6.17-1",
-                "B (as of 2026-10-01 03:20 UTC): last full upgrade 2026-09-30 (2 days), kernel 7.2.1 — current",
+                "B (as of 2026-10-01 03:20 UTC): installed unknown, last full upgrade 2026-09-30, \
+                 age 2 days since last applied upgrade, kernel 7.2.1 — current",
                 "C (as of 2026-10-01 03:20 UTC): OS root unreadable: not a directory",
                 "D: not mounted and never checked",
             ]
@@ -2314,7 +2550,7 @@ mod tests {
             },
         );
         let state = Ok(Some(StoredState {
-            schema_version: 1,
+            schema_version: STATE_SCHEMA_VERSION,
             drives,
         }));
         let h = health_with(&cfg, &state, &|| host("7.2.8"), TODAY, &|_| false);
@@ -2361,15 +2597,15 @@ mod tests {
             },
         );
         let state = Ok(Some(StoredState {
-            schema_version: 1,
+            schema_version: STATE_SCHEMA_VERSION,
             drives,
         }));
         let h = health_with(&cfg, &state, &|| host("7.2.8"), TODAY, &|_| false);
         assert_eq!(
             h.lines,
             [
-                "B (as of 1970-01-01 00:00 UTC): last full upgrade 2026-10-02 (0 days), kernel 7.2.1 \
-              — current; 2 paths unreadable"
+                "B (as of 1970-01-01 00:00 UTC): installed unknown, last full upgrade 2026-10-02, \
+                 age 0 days since last applied upgrade, kernel 7.2.1 — current; 2 paths unreadable"
             ]
         );
         os.problems.truncate(1);
@@ -2407,7 +2643,7 @@ mod tests {
             );
         }
         let state = Ok(Some(StoredState {
-            schema_version: 1,
+            schema_version: STATE_SCHEMA_VERSION,
             drives,
         }));
         let h = health_with(&two, &state, &probe, TODAY, &|_| false);
@@ -2429,7 +2665,7 @@ mod tests {
             },
         );
         let state = Ok(Some(StoredState {
-            schema_version: 1,
+            schema_version: STATE_SCHEMA_VERSION,
             drives,
         }));
         let h = health_with(&cfg, &state, &|| host("7.2.8"), TODAY, &|_| false);
@@ -2492,6 +2728,8 @@ mod tests {
         assert_eq!(j["status"], "stale");
         assert_eq!(j["os"]["last_full_upgrade_applied"], "2026-03-14");
         assert_eq!(j["assessment"]["age_days"], 202);
+        assert_eq!(j["os"]["installed"], "2026-01-02");
+        assert_eq!(j["assessment"]["age_basis"], "last_applied_upgrade");
         assert_eq!(j["error"], serde_json::Value::Null);
 
         let mut current = e.clone();
@@ -2517,5 +2755,114 @@ mod tests {
             report: DriveReport::NotMounted,
         };
         assert_eq!(entry_json(&off)["status"], "not_mounted");
+    }
+
+    #[test]
+    fn the_section_and_health_say_never_upgraded_since_install() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        write(dir.path(), "var/log/pacman.log", NEVER_UPGRADED_LOG);
+        let h = same_host();
+        let e = inspect_drive("A", dir.path(), &h, "2026-10-03", 60);
+        let text = format_section(std::slice::from_ref(&e), &h);
+        for line in [
+            "    Installed           2026-04-12\n",
+            "    Last full upgrade   none recorded\n",
+            "    Age                 174 days since install\n",
+            "    Result              STALE — never upgraded since install on 2026-04-12 (174 days)\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+        let j = entry_json(&e);
+        assert_eq!(j["os"]["installed"], "2026-04-12");
+        assert_eq!(j["assessment"]["age_days"], 174);
+        assert_eq!(j["assessment"]["age_basis"], "install");
+        let DriveReport::Inspected { os, assessment } = &e.report else {
+            panic!("{e:?}")
+        };
+        assert_eq!(
+            summary("A", "live", os, assessment),
+            "A (live): installed 2026-04-12, last full upgrade none recorded, \
+             age 174 days since install, kernel 6.12.1-1-cachyos — STALE: never upgraded \
+             since install on 2026-04-12 (174 days)"
+        );
+        // No age: said as unknown, never as a number, and JSON carries null.
+        let unknown = upgrades("garbage\n");
+        let a = assess(&unknown, &h, "2026-10-03", 60);
+        assert_eq!(age_text(&a), "unknown");
+        assert_eq!(
+            serde_json::to_value(&a).unwrap()["age_basis"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn the_kernel_row_names_the_host_kernel_whichever_is_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        fs::create_dir_all(dir.path().join("usr/lib/modules/7.3.0-1-cachyos")).unwrap();
+        let newer_host = host("7.4.1-1-cachyos");
+        let older_host = host("7.2.8-1-cachyos");
+        for (h, want) in [
+            (
+                &newer_host,
+                "    Kernel              7.3.0-1-cachyos (host 7.4.1-1-cachyos)\n",
+            ),
+            (
+                &older_host,
+                "    Kernel              7.3.0-1-cachyos (host 7.2.8-1-cachyos)\n",
+            ),
+        ] {
+            let text = format_section(&[inspect_drive("A", dir.path(), h, TODAY, 60)], h);
+            assert!(text.contains(want), "missing {want:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_state_of_another_schema_version_is_refused_with_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-os.json");
+        let hint = format!("remove it to start over: rm -- '{}'", path.display());
+        let v1 = r#"{"schema_version":1,"drives":{}}"#;
+        fs::write(&path, v1).unwrap();
+        let err = load_state(&path).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "{}: record schema version 1, this btrdasd reads 2 — left as it is; {hint}",
+                path.display()
+            )
+        );
+        // The writer refuses it the same way and leaves it alone.
+        let off = DriveEntry {
+            label: "A".into(),
+            root: PathBuf::new(),
+            report: DriveReport::NotMounted,
+        };
+        assert_eq!(write_state(&path, &[off], 5).unwrap_err(), err);
+        assert_eq!(fs::read_to_string(&path).unwrap(), v1);
+        // No version at all, or a newer one, is refused too.
+        fs::write(&path, r#"{"drives":{}}"#).unwrap();
+        assert!(
+            load_state(&path)
+                .unwrap_err()
+                .contains(": record schema version none, this btrdasd reads 2 — "),
+            "{:?}",
+            load_state(&path)
+        );
+        fs::write(&path, r#"{"schema_version":3,"drives":{}}"#).unwrap();
+        assert!(load_state(&path).unwrap_err().ends_with(&hint));
+        // The current version loads.
+        fs::write(&path, r#"{"schema_version":2,"drives":{}}"#).unwrap();
+        assert_eq!(
+            load_state(&path),
+            Ok(Some(StoredState {
+                schema_version: 2,
+                drives: BTreeMap::new()
+            }))
+        );
+        // A corrupt file says the same way out from the loader itself.
+        fs::write(&path, "{not json").unwrap();
+        assert!(load_state(&path).unwrap_err().ends_with(&hint));
     }
 }

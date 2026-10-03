@@ -1216,10 +1216,14 @@ to it. Read: the name in
 .IR etc/os\-release ,
 the kernels under
 .IR usr/lib/modules ,
-the dates of the last full system upgrade attempted and the last one applied
-from
+the install date and the dates of the last full system upgrade attempted
+and the last one applied from
 .I var/log/pacman.log
-(an attempt is a
+(the install date is that of the log's first line \(em pacman's first entry
+on an install is its
+.B pacman \-b
+from the live ISO \(em and is unknown when that line carries no date; an
+attempt is a
 .RB \(dq "starting full system upgrade" \(dq
 line, logged before anything is downloaded or verified; it was applied only if
 .RB \(dq "[ALPM] transaction completed" \(dq
@@ -1252,10 +1256,26 @@ The OS is
 .B STALE
 when its last APPLIED full upgrade is more than
 .B [recovery_os].max_age_days
-old, or cannot be found, or is dated after today; when a later attempt did not
+old, or is dated after today. When no full upgrade was ever applied, the age
+is counted from the install date against the same limit, and the reason reads
+.RB \(dq "never upgraded since install on" " DATE " ( "N days" )\(dq;
+with neither date known it is
+.B STALE
+and no age is shown. The
+.B Age
+row says which date it counts from
+.RB ( "since last applied upgrade" " or " "since install" ),
+and the
+.B Installed
+row is shown for every drive. It is also
+.B STALE
+when a later attempt did not
 complete (shown as
 .BR "Last attempt" ,
-with both dates in the reason \(em typically an expired keyring); when its
+with both dates in the reason \(em typically an expired keyring; on an
+install never upgraded the reason reads
+.RB \(dq "install" " DATE" ", never completed an upgrade; last attempt" " DATE " "did not complete" \(dq);
+when its
 newest kernel's major.minor series is lower than the host's running kernel,
 or either kernel is unknown; or when its btrfs\-progs is older than the
 host's. The btrfs\-progs versions are compared only when both are plain dotted
@@ -1297,7 +1317,15 @@ Print one JSON object:
 .BR error ,
 .B os
 and
-.BR assessment .
+.B assessment
+(with
+.BR os.installed ,
+.B assessment.age_days
+and
+.BR assessment.age_basis :
+.BR last_applied_upgrade ,
+.BR install ,
+or null when there is no age).
 .PP
 Exit status:
 .B 0
@@ -1348,9 +1376,12 @@ Record what was read from each drive in
 (JSON, replaced atomically, mode 644) for
 .BR "btrdasd health" .
 A drive that is not mounted keeps its earlier record. An existing file that
-cannot be read or parsed is left as it is and the command exits 2, its error
-naming the file and the command that clears it; every later run fails the
-same way until it is removed.
+cannot be read or parsed, or that is not record schema version 2 (version 2
+added the install date), is left as it is and the command exits 2, its error
+naming the file, the version found and the command that clears it; every
+later run fails the same way until it is removed.
+.B btrdasd health
+reports such a record as unreadable.
 .B backup\-run.sh
 passes
 .B $DAS_RECOVERY_OS_STATE
