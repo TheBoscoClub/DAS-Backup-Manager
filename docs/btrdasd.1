@@ -1439,22 +1439,37 @@ standard output again, so it does not end when the process that started it
 dies or closes its pipes. Ctrl\-C or a hangup in a terminal does reach it,
 though, unless it was started in a session of its own; the script starts it
 with
-.BR setsid (1)
-and lets it inherit its descriptor of
+.BR setsid (1),
+in a transient systemd scope of its own
+.RB ( "systemd\-run \-\-scope" ,
+.IR das\-recovery\-os\-holder\- LABEL .scope ,
+outside the operator's login session, which can end without ending it), and
+lets it inherit its descriptor of
 .IR /run/das\-maintenance.lock ,
 so that the claim and the lock both outlive the script while the virtual
-machine may still be running. A
+machine may still be running. The lock's record then names this process, the
+one that holds it. A
 .B SIGKILL
 ends the claim too: the kernel drops it with the descriptor.
+.PP
+The claim says nothing about whether the recovery OS boots. When the virtual
+machine's firmware tries a network (PXE) boot or stops in its UEFI shell, the
+disk did not boot; the firmware can be pointed at the loader on the drive's
+ESP by hand, as
+.I docs/DISASTER\-RECOVERY\-GUIDE.md
+("In the recovery\-os\-updater VM") describes.
 .PP
 .B btrdasd recovery\-os hold\-disk
 .B \-\-device
 .I PATH
 .TP
 .BI \-\-device " PATH"
-The whole disk, normally its
+Any block device (a symbolic link is followed); anything else is refused. It
+does not check that the device is a whole disk \(em
+.B recovery\-os\-vm.sh
+passes only a whole disk, the drive's
 .I /dev/disk/by\-id/ata\-MODEL_SERIAL
-link (followed).
+link, and checks that itself.
 .PP
 .B \-\-json
 is refused: the output is one plain line for a script to read.
@@ -1998,7 +2013,7 @@ while a recovery drive is lent to the
 .B recovery\-os\-updater
 virtual machine (mode 700): per target label, the
 .B "recovery\-os hold\-disk"
-process's pid and the disk it holds
+process's pid, the disk it holds and its scope
 .RI ( LABEL .holder),
 that process's output, and the disk definition attached. Removed when the
 disk is given back.
