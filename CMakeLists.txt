@@ -261,4 +261,8 @@ if(BUILD_TESTING)
         NAME shell-recovery-os
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os.sh
     )
+    add_test(
+        NAME shell-maintenance-lock
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance_lock.sh
+    )
 endif()
