@@ -124,11 +124,31 @@ sed -e "s|^LOCKFILE=\"/run/das-backup.lock\"\$|LOCKFILE=\"$RUN_DIR/das-backup.lo
     "$SRC" >"$COPY"
 changed="$(diff "$SRC" "$COPY" | grep -c '^>')"
 [[ "$changed" == 3 ]] || harness_broken "the copy differs from $SRC in $changed lines, not 3"
-# The guard that matters: nothing outside a comment may still name the real
-# locks. If this ever fires, the copy is never run.
-if grep -v '^[[:space:]]*#' "$COPY" | grep -q '/run/das-'; then
-    harness_broken "the copy still names a /run/das- path outside a comment"
-fi
+# The guard that matters: nothing outside a comment may still name a real
+# lock. If this ever fires, the copy is never run.
+#
+# The copy's own locks are under $RUN_DIR, a /tmp path that itself ends in
+# .../run/das-*, so that prefix is taken out first: whatever "/run/das-" is
+# left can only be a real path. And the copy is read whole, with no pipe. The
+# guard this replaces, `grep -v '^#' | grep -q '/run/das-'`, matched the
+# sandbox's own paths, and under pipefail it read a grep -v killed by SIGPIPE
+# (grep -q quits at its first match; the copy is larger than a pipe) as "no
+# match": it never fired unloaded, and under load it aborted correct runs at
+# random (bd DAS-Backup-Manager-d1r round 3, item A).
+# 0: the copy names a real /run/das-* path; 1: it does not; 2: unreadable.
+copy_names_a_real_lock() { # copy_names_a_real_lock <copy> <the sandbox's run dir>
+    local code
+    code="$(grep -v '^[[:space:]]*#' "$1")" || return 2
+    code="${code//"$2/das-"/}"
+    [[ "$code" == *"/run/das-"* ]]
+}
+guard_rc=0
+copy_names_a_real_lock "$COPY" "$RUN_DIR" || guard_rc=$?
+case "$guard_rc" in
+1) ;;
+0) harness_broken "the copy still names a /run/das- path outside a comment" ;;
+*) harness_broken "cannot read the copy to check it: $COPY" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # PATH: stubs, and a whitelist of harmless tools
@@ -473,7 +493,9 @@ left_mounted() {
     m="$(cut -f1 "$STATE/mounted" | tr '\n' ' ')"
     echo "${m:-nothing}"
 }
-report_status() { sed -n 's/^  Status: //p' "$WORK/lib/last-report.txt" 2>/dev/null | head -n1; }
+# No pipe into an early-exiting reader in this suite (head, grep -q): under
+# pipefail a producer killed by SIGPIPE turns a match into "no match".
+report_status() { sed -n '/^  Status: /{s///p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
 recorded_as() {
     if [[ ! -f "$STATE/record_args" ]]; then
         echo "not recorded"
@@ -492,7 +514,7 @@ mail_body() { cat "$STATE/mail.$1.body" 2>/dev/null; }
 # The status in a subject: "[DAS Backup] <host> — <STATUS> — <date>".
 mail_status() { mail_subject "$1" | awk -F ' — ' '{ print $2 }'; }
 # The value after "  <label>:" in mail <n>.
-body_field() { mail_body "$1" | sed -n "s/^  $2: *//p" | head -n1; }
+body_field() { sed -n "/^  $2: */{s///p;q;}" "$STATE/mail.$1.body" 2>/dev/null; }
 record_calls() { if [[ -f "$STATE/record_calls" ]]; then wc -l <"$STATE/record_calls" | tr -d ' '; else echo 0; fi; }
 vector_has() { grep -qxF -- "$1" "$STATE/record_args" 2>/dev/null && echo yes || echo no; }
 # The value after <option> in the captured record-run vector.
@@ -570,7 +592,7 @@ expect_aborted() { # expect_aborted <name> <what the log says> <what aborted> <i
     check "$1: one mail" "$(mails)" "1"
     check "$1: it says ABORTED" "$(mail_status 1)" "ABORTED"
     check "$1: what aborted" "$(body_field 1 'What aborted')" "$3"
-    check "$1: why" "$(mail_body 1 | grep -qF -- "$4" && echo yes || echo no)" "yes"
+    check "$1: why" "$(grep -qF -- "$4" "$STATE/mail.1.body" 2>/dev/null && echo yes || echo no)" "yes"
     check "$1: nothing was backed up" "$(body_field 1 'Backed up')" \
         "nothing — the run stopped before btrbk started"
     check "$1: the log" "$(body_field 1 'Log')" "$WORK/log/das-backup.log"
