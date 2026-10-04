@@ -372,9 +372,11 @@ wizard → Config struct → config.toml (save)
                     installer::install() → write files + manifest
 ```
 
-Every file setup writes is replaced whole — `fsutil::write_atomic_mode`: a new file, its mode set
-first (scripts 0755, any other file the mode it had), renamed over the old one — so a backup already
-reading a script keeps the old file. Every mode that writes or removes these files (install,
+Every file setup writes is replaced whole — `fsutil::write_atomic_mode`, which every writer of
+`config.toml` and `btrbk.conf` uses too: a temp file of the write's own (`.NAME.PID.N.tmp`, made only
+under a free name), given its mode (scripts 0755, any other file the mode it had) and, written by
+root, the old file's owner and group, flushed, renamed over the old one, the directory flushed — so
+a backup already reading a script keeps the old file, and two writers never meet. Every mode that writes or removes these files (install,
 `--modify`, `--force`, `--upgrade`, `--uninstall`, `--uninstall-all`) does it holding
 `/run/das-backup.lock` and then `/run/das-maintenance.lock`, taken without waiting before the first
 write, or refuses with exit 75 on stderr, changing nothing; `--modify` also refuses when

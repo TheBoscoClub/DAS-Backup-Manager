@@ -667,10 +667,8 @@ fn bring_btrbk_conf_into_line(
     }
     match write_atomic(conf_path, &rendered) {
         Ok(()) => (BtrbkConf::Regenerated, None),
-        Err(e) => (
-            BtrbkConf::OutOfDate,
-            Some(format!("could not write {}: {e}", conf_path.display())),
-        ),
+        // The error names the file.
+        Err(e) => (BtrbkConf::OutOfDate, Some(e.to_string())),
     }
 }
 
@@ -699,22 +697,26 @@ fn write_updated(
     // btrbk.conf first: if it cannot be written, config.toml is left
     // describing what btrbk will actually do.
     let conf_path = Path::new(&updated.general.btrbk_conf);
+    // Each error names its own file.
     if let Err(e) = write_atomic(conf_path, &crate::btrbk_conf::render_btrbk_conf(&updated)) {
-        return Some(format!("could not write {}: {e}", conf_path.display()));
+        return Some(e.to_string());
     }
     if let Err(e) = updated.save(config_path) {
         // Put btrbk.conf back so the two files still agree.
         let restore = write_atomic(conf_path, &crate::btrbk_conf::render_btrbk_conf(config));
-        return Some(match restore {
-            Ok(()) => format!("could not write {}: {e}", config_path.display()),
-            Err(r) => format!(
-                "could not write {}: {e}; and {} could not be restored: {r}",
-                config_path.display(),
-                conf_path.display()
-            ),
-        });
+        return Some(not_saved(&*e, restore));
     }
     None
+}
+
+/// What a sync reports when `config.toml` could not be saved (`e`): that,
+/// and, when putting `btrbk.conf` back failed too (`restore`), that as well —
+/// the two files may then disagree. Both errors name their files.
+fn not_saved(e: &dyn std::fmt::Display, restore: std::io::Result<()>) -> String {
+    match restore {
+        Ok(()) => e.to_string(),
+        Err(r) => format!("{e}; and the restore failed too: {r}"),
+    }
 }
 
 /// The "SUBVOLUME SYNC" section of the run report.
@@ -1892,25 +1894,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
         let before = std::fs::read_to_string(&path).unwrap();
-        // Occupy the temp-file name so the atomic write fails.
-        std::fs::create_dir(dir.path().join(".btrbk.conf.tmp")).unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        crate::fsutil::testing::unreplaceable(&conf);
         let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
         let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
         assert!(out.failed());
         assert_eq!(out.btrbk_conf, BtrbkConf::OutOfDate);
+        let why = out.write_error.as_deref().unwrap();
         assert!(
-            out.write_error.as_deref().unwrap().contains("btrbk.conf"),
-            "{:?}",
-            out.write_error
+            why.starts_with(&format!("cannot write {}: ", conf.display())),
+            "{why}"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
-            "OLD"
+            why.matches(&conf.display().to_string()).count(),
+            1,
+            "the path, once: {why}"
         );
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "OLD");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let text = format_sync_report(&out, false);
         assert!(
-            text.contains("  CONFIG NOT UPDATED: could not write"),
+            text.contains(&format!(
+                "  CONFIG NOT UPDATED: cannot write {}: ",
+                conf.display()
+            )),
             "{text}"
         );
         assert!(
@@ -1971,22 +1978,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
         let before = std::fs::read_to_string(&path).unwrap();
-        // Occupy the temp-file name so the atomic write fails.
-        std::fs::create_dir(dir.path().join(".btrbk.conf.tmp")).unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        crate::fsutil::testing::unreplaceable(&conf);
         let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
         let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
         assert!(!out.written);
         assert!(out.failed());
+        let why = out.write_error.as_deref().unwrap();
         assert!(
-            out.write_error.as_deref().unwrap().contains("btrbk.conf"),
-            "{:?}",
-            out.write_error
+            why.starts_with(&format!("cannot write {}: ", conf.display())),
+            "{why}"
+        );
+        assert_eq!(
+            why.matches(&conf.display().to_string()).count(),
+            1,
+            "the path, once: {why}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "OLD");
+    }
+
+    #[test]
+    fn a_config_toml_that_cannot_be_saved_says_so_and_how_the_restore_went() {
+        let saved = "cannot write /etc/das-backup/config.toml: No space left on device";
+        assert_eq!(not_saved(&saved, Ok(())), saved);
+        let restore = std::io::Error::other("cannot write /etc/btrbk/btrbk.conf: Read-only");
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
-            "OLD"
+            not_saved(&saved, Err(restore)),
+            "cannot write /etc/das-backup/config.toml: No space left on device; and the \
+             restore failed too: cannot write /etc/btrbk/btrbk.conf: Read-only"
         );
+    }
+
+    #[test]
+    fn sync_keeps_the_mode_of_both_files_it_rewrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let conf = dir.path().join("btrbk.conf");
+        for (file, mode) in [(&path, 0o600), (&conf, 0o640)] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(out.written && !out.failed(), "{:?}", out.write_error);
+        for (file, mode) in [(&path, 0o600), (&conf, 0o640)] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "{}",
+                file.display()
+            );
+        }
     }
 
     #[test]
@@ -1995,15 +2038,20 @@ mod tests {
         let path = on_disk_config(dir.path());
         let before = std::fs::read_to_string(&path).unwrap();
         let old = Config::load(&path).unwrap();
-        // btrbk.conf will write fine; the config.toml temp name is occupied.
-        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
+        // btrbk.conf will write fine; config.toml cannot be replaced.
+        crate::fsutil::testing::unreplaceable(&path);
         let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@srv/web"])]);
         let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
         assert!(!out.written && out.failed());
+        let why = out.write_error.as_deref().unwrap();
         assert!(
-            out.write_error.as_deref().unwrap().contains("config.toml"),
-            "{:?}",
-            out.write_error
+            why.starts_with(&format!("cannot write {}: ", path.display())),
+            "{why}"
+        );
+        assert_eq!(
+            why.matches(&path.display().to_string()).count(),
+            1,
+            "the path, once: {why}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         // Restored from the OLD config, so it still agrees with config.toml.

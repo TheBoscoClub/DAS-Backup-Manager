@@ -186,8 +186,12 @@ fn dispatch(
         }
         Action::ForceInstall => {
             installer::under_setup_locks(&host.site, "btrdasd setup --force", |held| {
-                // Read under the locks: nothing can change it between this
-                // read and the write.
+                // Read under the locks, which keep out a backup run (its
+                // subvol sync and expiry write this file) and another setup.
+                // A writer that takes neither lock — the helper's ConfigSet
+                // and SubvolAdd, the `subvol` commands, an editor — can still
+                // change it before the write, and the last writer wins
+                // (bd DAS-Backup-Manager-lxw).
                 let config = load_existing_for_force(config_path)?;
                 (host.install)(&config, held).map(Ok)
             })?
@@ -208,8 +212,11 @@ fn dispatch(
             installer::under_setup_locks(&host.site, job, |held| {
                 // The wizard pre-filled what --modify read; anything written
                 // to the file since — the GUI, a subvol sync — would be lost
-                // under the answers. Compared under the locks, so nothing
-                // can land between this read and the write.
+                // under the answers. Compared under the locks, which keep out
+                // a backup run and another setup from here to the write; a
+                // writer that takes neither lock — the helper's ConfigSet and
+                // SubvolAdd, the `subvol` commands, an editor — can still land
+                // in between, and is then lost (bd DAS-Backup-Manager-lxw).
                 if let Some(read) = &read
                     && config_bytes(config_path)? != read.bytes
                 {

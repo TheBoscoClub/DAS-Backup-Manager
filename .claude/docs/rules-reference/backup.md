@@ -13,45 +13,69 @@
 Until bd `6wt` fix round 4 `setup` wrote `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
 **in place** — `std::fs::write` is `O_TRUNC` then write, same inode (this section said `cmake --install`
 did too; measured, it does not — see below). Bash does not
-load a script into memory; it reads incrementally from an open fd, fetching the next
-command only when it needs it, at the offset where the last one ended. Truncating the file
-under a running `backup-run.sh` means a read landing in that window sees **EOF**, which bash
-treats as the end of the script: it runs the `EXIT` trap, unmounts the targets, and the run
-**terminates early looking like a clean finish** — no boot-archive prune, no report, exit 0. A
-rewrite that landed while `main` ran let `main` finish and then had bash read the **new** file
-at the old offset: its tail, a stranger's commands, half a line (`command not found`, 127). The
-window is microseconds and the content is usually identical, so this will almost always appear
-to work. That is what makes it worth a rule instead of a comment.
+load a script into memory; it reads incrementally from an open fd, fetching the next top-level
+command only when it needs it, at the offset where the last one ended. **While `main` runs it
+reads nothing** — `main` was parsed whole before it was called — so a rewrite in place under a
+running `backup-run.sh` reaches it only when `main` returns, and bash then reads the **new** file
+at the old offset. Truncated or shorter, that read finds end of file: the script ends with
+`main`'s status, the run complete. Longer or different, bash runs the new file from there: its
+tail, a stranger's commands, half a line (`command not found`, 127). This section used to say a
+truncation made the run "terminate early … no boot-archive prune, no report, exit 0". Measured
+(fix round 5, the old last line `main "$@"`, `set -euo pipefail`, an `EXIT` trap; truncated,
+shortened or lengthened in place while `main` waited, three times each): `main` logged its prune
+and report every time and the trap saw 0 — nothing ended early. All a truncation can cut short is
+the parse before `main` is called. The window is microseconds and the content is usually
+identical, so this will almost always appear to work. That is what makes it worth a rule instead
+of a comment.
 
 **Since round 4, two things stop it:**
 
-- **`setup` writes atomically** — every file it writes, through `fsutil::write_atomic_mode`: a
-  new file beside the old, its mode set before a byte is written (scripts 0755, every other file
-  the mode it had), flushed, then renamed over the name. A running bash holds the old inode and
-  keeps reading the old file whole; a write that fails leaves the old file byte-identical and
-  names the path; a symlink at the path is written through (the link kept); anything planted at
-  the temp name is removed, never followed.
+- **`setup` writes atomically** — every file it writes, through `fsutil::write_atomic_mode`, as
+  every other writer of these files does (fix round 5): a new file beside the old, of its own —
+  `.NAME.PID.N.tmp`, created only under a name nothing holds, so concurrent writers never meet and
+  whatever stands there (a crash's leftover, anything planted) is passed over, never followed,
+  reused or removed — given its mode (scripts 0755, every other file the mode it had) and, written
+  by root, the old file's owner and group, flushed, renamed over the name, and the directory
+  flushed. A running bash holds the old inode and keeps reading the old file whole; a write that
+  fails leaves the old file byte-identical and names the path; a symlink at the path is written
+  through (the link kept), and one that names nothing fails the write. Not carried over: ACLs
+  and other extended attributes (the new file gets its directory's defaults). A crash between the
+  create and the rename leaves its `.NAME.PID.N.tmp` behind, and nothing removes it: a dot-name
+  ending `.tmp`, which systemd (no unit suffix), udev (`*.rules`) and cron (no dot-names, by its
+  source, not tested here) do not read.
 - **The three scripts end with `main "$@"; exit $?`** (`backup-run.sh` 4.9.2,
   `backup-verify.sh` 3.1.1, `boot-archive-cleanup.sh` 2.1.1). Bash parses that line whole before
   `main` runs, and once `main` returns it exits without reading again. `tests/test_script_rewrite.sh`
   reproduces the defect and its absence: a script blocked in `main` while its file is rewritten in
-  place — the same file longer, another script, a shorter one — exits with `main`'s status and
-  runs nothing else; with the old last line `main "$@"` the same rewrite ran the new file's tail
-  (exit 99) or its lines (exit 127). Any explicit `exit` after `main` makes shellcheck 0.11 stop
+  place — the same file longer, or another script — exits with `main`'s status and runs nothing
+  else; with the old last line `main "$@"` the same rewrite ran the new file's tail (exit 99) or
+  its lines (exit 127). Rewrites that end the same under either last line — `main` returning
+  nonzero, which `set -e` ends at once, or a file rewritten shorter — run under both and are
+  labelled controls: they cannot fail for want of the new line. Any explicit `exit` after `main` makes shellcheck 0.11 stop
   seeing the `EXIT` trap's handlers as called (SC2329): `cleanup`, `clear_maintenance_holder` and
   `backup-verify.sh`'s `clear_maintenance_record` carry a directive saying so.
 
 **`cmake --install` does not copy in place either** (CMake 4.4.3, measured 2026-10-03 with
 `file(INSTALL … TYPE PROGRAM)`, which `install(PROGRAMS)` becomes, watched by `inotifywait`: `DELETE`,
 `CREATE`, then the write; an fd opened before kept reading the old content, the new file had a new
-inode). So a run already going keeps its script. **What remains:** a run that *starts* in the
-instant between the unlink and the write finds the script missing (bash exits 127; the unit fails,
-loudly) or empty (bash exits 0 having done nothing — a run that reports success and did nothing);
-a run already going calls the *new* sibling scripts and `btrdasd` for its later steps, a mix of
-versions whose new binary migrates the database on its first open; a writer that does copy in place
-— a plain `cp` over the installed script — which the last line now defuses once `main` runs; and the
-check below cannot see a run started by hand (`sudo backup-run.sh`) in the sub-millisecond window
-before it takes `/run/das-backup.lock`.
+inode; the new file gets its execute bit only once its content is complete). So a run already
+going keeps its script. **What remains:**
+a run that *starts* while a script is being replaced. Every start here is a direct exec (systemd's
+`ExecStart=`, cron, `backup-run.sh` calling its siblings), and an exec in that instant mostly
+fails loudly: the file is missing (127) or not yet executable (126) — `203/EXEC` in systemd
+(measured for the second against a throwaway user oneshot). But after the kernel execs a script, bash opens it
+again **by its path** — measured: a file swapped during bash's own startup is the one that runs —
+so a start whose exec found the old file can open the new one while it is still empty, and **exit
+0 having done nothing**: a run that reports success. Measured on CMake 4.4.3 (2,000 installs of a
+565 KB script, four loops exec'ing it, 7,764 starts): 7,475 ran a whole script, 265 failed at the
+exec, 7 failed in bash's own open (127), 17 exited 0 having run nothing; no partly read script was
+seen. Polls of 1,588 and 1,437 starts (the review's, and its round-4 repeat) saw none of the 17 —
+too few starts landed between an exec and its open. Also remaining: a run already going calls the *new* sibling
+scripts and `btrdasd` for its later steps, a mix of versions whose new binary migrates the
+database on its first open; a writer that does copy in place — a plain `cp` over the installed
+script — which the last line now defuses once `main` runs; and the check below cannot see a run
+started by hand (`sudo backup-run.sh`) in the sub-millisecond window before it takes
+`/run/das-backup.lock`.
 
 **The `2lj` staleness guard was never a protection against this.** It skips an embedded script
 only when the on-disk copy is newer than the binary **AND its content differs**. Right after a

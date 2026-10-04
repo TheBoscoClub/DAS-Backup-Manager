@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -922,9 +922,10 @@ pub fn write_state(path: &Path, entries: &[DriveEntry], now_epoch: i64) -> Resul
         state.drives.insert(e.label.clone(), record);
     }
     let text = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-    crate::fsutil::write_atomic(path, &format!("{text}\n"))
-        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(0o644)))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    // 0644 whatever the file had (`health` runs unprivileged), set before the
+    // new file is renamed into place. The error names the file.
+    crate::fsutil::write_atomic_mode(path, format!("{text}\n").as_bytes(), Some(0o644))
+        .map_err(|e| e.to_string())
 }
 
 /// `YYYY-MM-DD HH:MM UTC`.
@@ -2447,7 +2448,38 @@ mod tests {
         assert_eq!(st.drives["A"].checked_epoch, 1000);
         assert_eq!(st.drives["B"].checked_epoch, 2000);
         assert_eq!(st.drives["B"].error, None);
-        assert!(!dir.path().join(".recovery-os.json.tmp").exists());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["recovery-os.json"], "no temp file left behind");
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_written_is_an_error_that_names_its_file_once() {
+        let roots = tempfile::tempdir().unwrap();
+        full_root(&roots.path().join("a"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-os.json");
+        let a = inspected("A", &roots.path().join("a"));
+        write_state(&path, std::slice::from_ref(&a), 1000).unwrap();
+        crate::fsutil::testing::unreplaceable(&path);
+
+        let err = write_state(&path, &[a], 2000).unwrap_err();
+
+        assert!(
+            err.starts_with(&format!("cannot write {}: ", path.display())),
+            "{err}"
+        );
+        assert_eq!(
+            err.matches(&path.display().to_string()).count(),
+            1,
+            "the path, once: {err}"
+        );
+        assert_eq!(
+            load_state(&path).unwrap().unwrap().drives["A"].checked_epoch,
+            1000
+        );
     }
 
     #[test]
