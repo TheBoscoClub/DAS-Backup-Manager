@@ -28,6 +28,10 @@
 # than ten minutes — would start a whole new backup each time, one roughly
 # every ten minutes until the drive came back.
 #
+# The singleton lock (bd DAS-Backup-Manager-ismb): only "held by another run"
+# is a skip (0); a lock file that cannot be opened, or a flock that fails for
+# any other reason, is "could not start" (1), and says why.
+#
 # How: the REAL script runs end to end — its EXIT trap, cleanup() and its
 # `main "$@"; exit $?` line included — from a copy in which exactly three lines
 # differ: the two lock paths point into a temp dir instead of /run, and the
@@ -118,6 +122,8 @@ for tool in awk basename cat cut date dirname flock grep head hostname mkdir mkt
     path="$(type -P "$tool")" || harness_broken "no $tool on this system"
     ln -s "$path" "$SYSBIN/$tool"
 done
+# The flock stub hands every call it does not fake to this one.
+REAL_FLOCK="$(type -P flock)"
 
 stub() { # stub <name>: the program text on stdin, with the common preamble
     {
@@ -297,6 +303,17 @@ cat >/dev/null
 printf '%s\n' "$*" >>"$S/calls/mailx"
 EOF
 
+# flock: fd 9 (the singleton lock) fails with the status in the flock9_rc
+# knob, as flock does for ENOLCK (71) — or as a flock that answers 1 to any
+# failure would; every other call is the real flock.
+stub flock <<'EOF'
+if [[ -f "$S/knobs/flock9_rc" && "${*: -1}" == 9 ]]; then
+    echo "flock: 9: No locks available (stub)" >&2
+    exit "$(cat "$S/knobs/flock9_rc")"
+fi
+exec "$(cat "$S/real_flock")" "$@"
+EOF
+
 stub boot-archive-cleanup.sh <<'EOF'
 echo "[das-backup-22tb] Deleted 0, kept 0, errors 0"
 EOF
@@ -353,6 +370,7 @@ fresh() {
     mkdir -p "$STATE/knobs" "$STATE/calls" "$WORK/mnt" "$WORK/etc" "$RUN_DIR" "$WORK/tmp" "$WORK/home"
     : >"$STATE/mounted"
     : >"$WORK/etc/btrbk.conf"
+    printf '%s\n' "$REAL_FLOCK" >"$STATE/real_flock"
     printf '%s\n' primary-uuid recovery-a-uuid >"$STATE/knobs/present_uuids"
     write_env
 }
@@ -610,6 +628,34 @@ fresh
 mkdir -p "$RUN_DIR/das-maintenance.lock" # a lock file that cannot be opened
 run_backup
 expect_not_started "the maintenance lock cannot be opened"
+
+# bd DAS-Backup-Manager-ismb: the singleton lock. Only "another run holds it"
+# is a skip; a lock that cannot be taken at all is "could not start", and the
+# run says why. Each of these used to exit 0 as a skip — every backup silently
+# disabled for as long as the lock file stayed broken.
+fresh
+mkdir -p "$RUN_DIR/das-backup.lock" # the lock file cannot be opened
+run_backup
+expect_not_started "the singleton lock file cannot be opened"
+check "singleton unopenable: says why" \
+    "$(grep -c "Cannot open the backup lock $RUN_DIR/das-backup.lock — could not start" "$STATE/out")" "1"
+check "singleton unopenable: no skip claimed" "$(grep -c 'skipping this invocation' "$STATE/out")" "0"
+check "singleton unopenable: the config was never read" "$(called btrdasd)" "no"
+
+fresh
+knob flock9_rc 71 # ENOLCK, as util-linux flock reports it
+run_backup
+expect_not_started "the singleton lock cannot be taken (flock exits 71)"
+check "flock 71: says why" \
+    "$(grep -c "Cannot lock $RUN_DIR/das-backup.lock (flock exit 71) — could not start" "$STATE/out")" "1"
+check "flock 71: no skip claimed" "$(grep -c 'skipping this invocation' "$STATE/out")" "0"
+
+fresh
+knob flock9_rc 1 # a flock that answers 1 to a failure that is not a held lock
+run_backup
+expect_not_started "the singleton lock cannot be taken (flock exits 1)"
+check "flock 1: says why" \
+    "$(grep -c "Cannot lock $RUN_DIR/das-backup.lock (flock exit 1) — could not start" "$STATE/out")" "1"
 
 # ---------------------------------------------------------------------------
 echo "== 0: a skip — another backup holds the singleton lock"
