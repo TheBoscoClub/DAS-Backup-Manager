@@ -1,7 +1,13 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.1.1
-# Date: 2026-10-03
+# Version: 3.1.2
+# Date: 2026-10-04
+#
+# 3.1.2: the SMART health line is matched by bash itself, `[[ ]]`. Under
+# pipefail, `echo "$health" | grep -q PASSED` read a PASSED followed by
+# more than 64 KiB of output as no match: grep quit at the match and echo
+# died of SIGPIPE (bd DAS-Backup-Manager-wkvz). A here-string would need a
+# pipe or a temp file, and with no fd to spare it reads "no match" as well.
 #
 # 3.1.1: the last line is `main "$@"; exit $?`, so a copy over this file
 # in place while it runs (a plain `cp`) cannot have bash read the new file
@@ -273,7 +279,11 @@ check_smart_health() {
         local health
         health=$(smartctl -H "$dev" 2>/dev/null | grep -E "SMART overall-health" || echo "UNKNOWN")
 
-        if echo "$health" | grep -q "PASSED"; then
+        # Matched by bash itself — no pipe, no file, no fd. A pipe into
+        # grep -q read a producer killed by SIGPIPE as "no match" under
+        # pipefail (bd DAS-Backup-Manager-wkvz), and a here-string reads a
+        # pipe or temp file it cannot make as "no match" too.
+        if [[ $health == *PASSED* ]]; then
             echo -e "  Health: ${GREEN}PASSED${NC}"
         else
             echo -e "  Health: ${RED}$health${NC}"

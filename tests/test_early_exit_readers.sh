@@ -1,0 +1,382 @@
+#!/bin/bash
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2329
+# SC2016: the lines extract() looks for are literal text, single-quoted so.
+# SC2030, SC2031: every LC_ALL set here is meant to stay in its subshell.
+# SC2034, SC2329: the globals and stub functions each case defines are read
+#   and called by the function it sourced, which shellcheck cannot see.
+# A reader that quits early after a pipe, under `set -o pipefail`
+# (bd DAS-Backup-Manager-wkvz).
+#
+#   if echo "$big" | grep -q PATTERN; then ...
+#
+# grep -q exits at its first match. A producer still writing then dies of
+# SIGPIPE (141), pipefail makes the pipeline 141, and the `if` reads that as
+# "no match". It takes input larger than a pipe (64 KiB) with a match before
+# its end — several lines, since grep reads to a line's end before it matches
+# (a single 70 KB line matched 100 of 100) — and then it happens every time
+# (measured: 141 in 100 of 100).
+#
+# Each of the four sites runs here as its script runs it: the real function,
+# extracted from the script, under the script's own `set -euo pipefail`, on
+# input over 64 KiB that matches on its FIRST line. Each must take the
+# matching branch. Every branch also runs on small input, so the fix is shown
+# to change nothing else.
+#
+#   backup-run.sh          update_boot_subvolumes  the drift check on a
+#                          target's subvolume listing (exposed: the primary
+#                          target's listing is near 64 KiB and grows)
+#   backup-verify.sh       check_smart_health      the SMART health line
+#   das-partition-drives.sh check_smart_tests      both self-test lines
+#
+# The last two are latent. smartctl -H prints one health line, and the
+# self-test status is cut to one line by `head -1` before it is tested, so
+# their own input never reaches 64 KiB in several lines. The large cases hand
+# the conditions the input they would need: for check_smart_tests by letting
+# `head` pass every line through.
+#
+# The sites are matched by bash itself (`[[ ]]`), not by a here-string: a
+# here-string needs a temp file (over 64 KiB) or a pipe, and when bash
+# cannot make one — /tmp full, no fd to spare — the `if` reads "no match"
+# just the same (round 4, N3). Both are tested below.
+#
+# Writes only beneath a mktemp directory. No root, no devices.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="$(mktemp -d)" && [[ -d "$WORK" ]] || {
+    echo "HARNESS BROKEN: no temp dir"
+    exit 2
+}
+trap 'rm -rf "${WORK:?}"' EXIT
+
+pass=0
+fail=0
+ok() {
+    echo "ok   $1"
+    pass=$((pass + 1))
+}
+bad() {
+    echo "FAIL $1"
+    fail=$((fail + 1))
+}
+check() { # check <name> <got> <want>
+    if [[ "$2" == "$3" ]]; then
+        ok "$1"
+    else
+        bad "$1 — got '$2', want '$3'"
+    fi
+}
+harness_broken() {
+    echo "HARNESS BROKEN: $*"
+    exit 2
+}
+
+# extract <script> <function> <a line the function must contain>: the
+# function's text, into $WORK/<function>.sh. A range that caught nothing, or
+# caught a function without the line under test, stops the suite.
+extract() {
+    local out="$WORK/$2.sh"
+    sed -n "/^$2() {/,/^}/p" "$ROOT/scripts/$1" >"$out"
+    [[ -s "$out" ]] || harness_broken "$2 not found in $1"
+    grep -qF -- "$3" "$out" || harness_broken "$2 in $1 no longer contains: $3"
+}
+
+# A file of <n> filler lines that match nothing below: no 8-digit date, and
+# none of the words the conditions look for.
+filler() { # filler <lines>
+    local i
+    for ((i = 0; i < $1; i++)); do
+        printf 'ID %06d gen 4242 top level 5 path data/plain-subvolume-%06d\n' "$i" "$i"
+    done
+}
+big_size_ok() { # big_size_ok <file>: over 64 KiB, or the case proves nothing
+    local n
+    n="$(wc -c <"$1")"
+    ((n > 65536)) || harness_broken "$1 is $n bytes, not over 64 KiB"
+}
+
+# ---------------------------------------------------------------------------
+echo "== backup-run.sh: update_boot_subvolumes, the drift check"
+# ---------------------------------------------------------------------------
+# A target whose listing HAS btrbk-shaped snapshots that match neither name
+# pattern is a drift, a FAIL; one with none is a quiet skip.
+extract backup-run.sh update_boot_subvolumes "Target HAS btrbk-shaped snapshots but none matched"
+extract backup-run.sh record_op 'OP_STATUS[$op]="$result"'
+
+run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/update_boot_subvolumes.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/record_op.sh"
+        LISTING="$1"
+        declare -A OP_STATUS=()
+        declare -A MOUNT_ROLES=([/mnt/t]=primary)
+        ALL_TARGET_MOUNTS=(/mnt/t)
+        mountpoint() { return 0; }
+        btrfs() {
+            case "$1 $2" in
+            "filesystem label") echo das-backup-test ;;
+            "subvolume list") cat "$LISTING" ;;
+            *)
+                echo "btrfs stub: unexpected: $*" >&2
+                return 99
+                ;;
+            esac
+        }
+        log_info() { echo "[INFO] $*"; }
+        log_warn() { echo "[WARN] $*"; }
+        log_error() { echo "[ERROR] $*"; }
+        # A full /tmp, as bash meets it: no file it writes may pass 4 KiB,
+        # and the write fails (SIGXFSZ ignored) instead of killing it.
+        if [[ "${2:-}" == tmp-full ]]; then
+            trap '' XFSZ
+            ulimit -f 4
+        fi
+        # A locale of the caller's choosing (BOOT_LOCALE), as a unit inherits
+        # the host's: under en_US.UTF-8 bash's regex [0-9] matches more.
+        if [[ -n "${BOOT_LOCALE:-}" ]]; then
+            export LC_ALL="$BOOT_LOCALE"
+        fi
+        update_boot_subvolumes true >"$WORK/boot.out" 2>&1
+        printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
+    )
+}
+DRIFTED='ID 300 gen 9 top level 5 path nvme/renamed-root.20261004T0300'
+
+{
+    echo "$DRIFTED"
+    filler 1500
+} >"$WORK/drift-big.txt"
+big_size_ok "$WORK/drift-big.txt"
+check "boot subvolumes, drift on line 1 of a listing over 64 KiB: FAIL" \
+    "$(run_boot_subvols "$WORK/drift-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, drift over 64 KiB: says it drifted" \
+    "$(grep -c 'HAS btrbk-shaped snapshots but none matched' "$WORK/boot.out")" "1"
+
+# The same listing with /tmp full: a here-string that large went to a temp
+# file, could not be written ("here-document: No space left on device"),
+# and the check read "no match" — the quiet branch again, 5 of 5 times
+# measured (round 4, N3). `[[ =~ ]]` writes nothing.
+check "boot subvolumes, drift over 64 KiB with /tmp full: still FAIL" \
+    "$(run_boot_subvols "$WORK/drift-big.txt" tmp-full)" "FAIL|0 updated, 1 failed"
+
+echo "$DRIFTED" >"$WORK/drift-small.txt"
+check "boot subvolumes, drift in a small listing: FAIL" \
+    "$(run_boot_subvols "$WORK/drift-small.txt")" "FAIL|0 updated, 1 failed"
+
+filler 1500 >"$WORK/none-big.txt"
+big_size_ok "$WORK/none-big.txt"
+check "boot subvolumes, no btrbk snapshots in a listing over 64 KiB: the quiet skip" \
+    "$(run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 1 skipped"
+check "boot subvolumes, no btrbk snapshots: says it skips" \
+    "$(grep -c 'No btrbk snapshots found, skipping' "$WORK/boot.out")" "1"
+
+# ---------------------------------------------------------------------------
+echo "== backup-verify.sh: check_smart_health, the health line"
+# ---------------------------------------------------------------------------
+extract backup-verify.sh check_smart_health 'all_passed=false'
+
+run_health() { # run_health <smartctl -H output file>: the verdict line
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/check_smart_health.sh"
+        HEALTH_OUT="$1"
+        RED="" GREEN="" YELLOW="" BLUE="" NC=""
+        DAS_DEVICES=(/dev/sdz)
+        declare -A DRIVE_MAP=([TESTSERIAL]="test drive")
+        SMART_FAILED=false
+        smartctl() {
+            case "$1" in
+            -H) cat "$HEALTH_OUT" ;;
+            -l) echo "# 1  Short offline       Completed without error       00%      1000         -" ;;
+            *) return 0 ;;
+            esac
+        }
+        read_drive_serial() { echo TESTSERIAL; }
+        smart_attr_raw() { echo 0; }
+        report_sector_attr() { return 0; }
+        format_attr() { echo "$1${2:-}"; }
+        log_header() { :; }
+        log_info() { echo "[INFO] $*"; }
+        log_warn() { echo "[WARN] $*"; }
+        check_smart_health >"$WORK/health.out" 2>&1
+        if [[ "$SMART_FAILED" == true ]]; then echo "issues"; else echo "passed"; fi
+    )
+}
+PASSED_LINE='SMART overall-health self-assessment test result: PASSED'
+
+{
+    echo "$PASSED_LINE"
+    for ((i = 0; i < 1500; i++)); do
+        printf 'SMART overall-health self-assessment test result: line %06d\n' "$i"
+    done
+} >"$WORK/health-big.txt"
+big_size_ok "$WORK/health-big.txt"
+check "SMART health, PASSED on line 1 of output over 64 KiB: passed" \
+    "$(run_health "$WORK/health-big.txt")" "passed"
+check "SMART health, over 64 KiB: the PASSED line" \
+    "$(grep -c '^  Health: PASSED$' "$WORK/health.out")" "1"
+
+echo "$PASSED_LINE" >"$WORK/health-passed.txt"
+check "SMART health, one PASSED line: passed" "$(run_health "$WORK/health-passed.txt")" "passed"
+echo 'SMART overall-health self-assessment test result: FAILED!' >"$WORK/health-failed.txt"
+check "SMART health, one FAILED line: issues" "$(run_health "$WORK/health-failed.txt")" "issues"
+: >"$WORK/health-none.txt"
+check "SMART health, no health line: issues" "$(run_health "$WORK/health-none.txt")" "issues"
+
+# ---------------------------------------------------------------------------
+echo "== das-partition-drives.sh: check_smart_tests, the self-test lines"
+# ---------------------------------------------------------------------------
+extract das-partition-drives.sh check_smart_tests 'all_complete=false'
+
+run_selftest() { # run_selftest <selftest log file> [passthrough]: "<rc>|<what it said>"
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/check_smart_tests.sh"
+        SELFTEST_OUT="$1"
+        RED="" GREEN="" YELLOW="" BLUE="" NC=""
+        declare -A DISCOVERED_DEVICES=([TESTSERIAL]=/dev/sdz)
+        declare -A TARGET_LABELS=([TESTSERIAL]=test-target)
+        smartctl() { cat "$SELFTEST_OUT"; }
+        # The function cuts the status to one line with `head -1`; to hand
+        # its conditions the input they would need, head passes every line.
+        if [[ "${2:-}" == passthrough ]]; then
+            head() { cat; }
+        fi
+        log_header() { :; }
+        log_info() { echo "[INFO] $*"; }
+        log_warn() { echo "[WARN] $*"; }
+        local_rc=0
+        check_smart_tests >"$WORK/selftest.out" 2>&1 || local_rc=$?
+        said="other"
+        grep -q 'Test still running' "$WORK/selftest.out" && said="running"
+        grep -q 'Test completed - PASSED' "$WORK/selftest.out" && said="completed"
+        echo "$local_rc|$said"
+    )
+}
+RUNNING='# 1  Short offline       Self-test routine in progress 90%      1000         -'
+COMPLETED='# 1  Short offline       Completed without error       00%      1000         -'
+# smartctl prints a running self-test two ways (its own strings, 7.5): ATA
+# "Self-test routine in progress", SCSI "Self test in progress ...". A drive
+# behind a SAT bridge prints the ATA form; a SAS drive, or a bridge without
+# SAT passthrough, the SCSI one. Both must hold the gate: narrowed to the ATA
+# wording, every check here stayed green (round 5, N7).
+RUNNING_SCSI='# 1  Background short  Self test in progress ...   -     NOW                 - [-   -    -]'
+
+for kind in RUNNING RUNNING_SCSI COMPLETED; do
+    {
+        echo "${!kind}"
+        for ((i = 0; i < 1500; i++)); do printf '# 1 filler line %06d of the self-test log, nothing to see\n' "$i"; done
+    } >"$WORK/selftest-$kind-big.txt"
+    big_size_ok "$WORK/selftest-$kind-big.txt"
+done
+check "self-test in progress on line 1 of input over 64 KiB: still running, not ready" \
+    "$(run_selftest "$WORK/selftest-RUNNING-big.txt" passthrough)" "1|running"
+check "SCSI self-test in progress on line 1 of input over 64 KiB: still running, not ready" \
+    "$(run_selftest "$WORK/selftest-RUNNING_SCSI-big.txt" passthrough)" "1|running"
+check "self-test completed on line 1 of input over 64 KiB: completed" \
+    "$(run_selftest "$WORK/selftest-COMPLETED-big.txt" passthrough)" "0|completed"
+
+echo "$RUNNING" >"$WORK/selftest-running.txt"
+check "self-test in progress: still running, not ready" "$(run_selftest "$WORK/selftest-running.txt")" "1|running"
+echo "$RUNNING_SCSI" >"$WORK/selftest-running-scsi.txt"
+check "SCSI self-test in progress: still running, not ready" \
+    "$(run_selftest "$WORK/selftest-running-scsi.txt")" "1|running"
+echo "$COMPLETED" >"$WORK/selftest-completed.txt"
+check "self-test completed: completed" "$(run_selftest "$WORK/selftest-completed.txt")" "0|completed"
+echo '# 1  Short offline       Aborted by host               90%      1000         -' >"$WORK/selftest-other.txt"
+check "self-test neither: shown as it is" "$(run_selftest "$WORK/selftest-other.txt")" "0|other"
+
+# ---------------------------------------------------------------------------
+echo "== each site's condition, as its script has it, with no fd to spare"
+# ---------------------------------------------------------------------------
+# A here-string needs a file or a pipe: bash writes one over 64 KiB to a temp
+# file and sends a smaller one down a pipe. With no fd left (ulimit -n 3) it
+# can make neither, says "cannot create temp file for here-document", and
+# the `if` reads "no match" — at the self-test site, "not running", the
+# permissive answer (round 4, N3; measured for every site). `[[ ]]` needs
+# no fd. Each condition is taken from its script.
+condition() { # condition <script> <ERE matching one if/elif line>: its condition
+    local line
+    line="$(grep -E -- "$2" "$ROOT/scripts/$1")" || harness_broken "no line in $1 matches: $2"
+    [[ "$line" != *$'\n'* ]] || harness_broken "more than one line in $1 matches: $2"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line#el}"
+    line="${line#if }"
+    printf '%s\n' "${line%; then}"
+}
+with_no_fd_to_spare() { # with_no_fd_to_spare <condition> <variable> <value>
+    (
+        set -euo pipefail
+        printf -v "$2" '%s' "$3"
+        ulimit -n 3
+        if eval "$1"; then echo match; else echo "no match"; fi
+    ) 2>/dev/null
+}
+check "no fd to spare: the drift check still sees a btrbk name" \
+    "$(with_no_fd_to_spare "$(condition backup-run.sh '^[[:space:]]*if .*\$subvol_listing')" \
+        subvol_listing "$(cat "$WORK/drift-big.txt")")" "match"
+check "no fd to spare: the SMART check still sees PASSED" \
+    "$(with_no_fd_to_spare "$(condition backup-verify.sh '^[[:space:]]*if .*PASSED')" \
+        health "$PASSED_LINE")" "match"
+check "no fd to spare: a running self-test still reads as running" \
+    "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*if .*\$status')" \
+        status "$RUNNING")" "match"
+check "no fd to spare: a running SCSI self-test still reads as running" \
+    "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*if .*\$status')" \
+        status "$RUNNING_SCSI")" "match"
+check "no fd to spare: a completed self-test still reads as completed" \
+    "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*elif .*\$status')" \
+        status "$COMPLETED")" "match"
+
+# ---------------------------------------------------------------------------
+echo "== the drift check's digits are ASCII digits, whatever the locale"
+# ---------------------------------------------------------------------------
+# grep's [0-9] matched ASCII digits only. Under en_US.UTF-8 — the host's
+# locale — bash's regex [0-9] also matches Arabic-Indic and fullwidth digits,
+# so a name like root.٢٠٢٦١٠٠٤T٠٣٠٠ read as btrbk-shaped (round 5, N5;
+# measured). [[:digit:]] is ASCII only: the old meaning exactly. Such a name
+# is no btrbk snapshot, so its target takes the quiet skip, as it did.
+NONASCII_ARABIC='ID 301 gen 9 top level 5 path nvme/renamed-root.٢٠٢٦١٠٠٤T٠٣٠٠'
+NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/renamed-root.２０２６１００４T０３００'
+# Only where the locale shows the difference: bash's own [0-9] must match a
+# non-ASCII digit there, or these checks could not fail.
+not_run=""
+probe_digit='٢'
+if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then
+    for name in NONASCII_ARABIC NONASCII_FULLWIDTH; do
+        printf '%s\n' "${!name}" >"$WORK/$name.txt"
+        check "en_US.UTF-8, the only btrbk-like name has non-ASCII digits ($name): the quiet skip" \
+            "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/$name.txt")" "OK|0 updated, 1 skipped"
+    done
+    check "en_US.UTF-8, an ASCII drifted name: still FAIL" \
+        "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/drift-small.txt")" "FAIL|0 updated, 1 failed"
+    drift_cond="$(condition backup-run.sh '^[[:space:]]*if .*\$subvol_listing')"
+    check "en_US.UTF-8: the drift condition on Arabic-Indic digits: no match" \
+        "$(export LC_ALL=en_US.UTF-8; subvol_listing="$NONASCII_ARABIC"; if eval "$drift_cond"; then echo match; else echo "no match"; fi)" "no match"
+else
+    not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "NOT RUN: $not_run"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== no producer | grep -q left in scripts/"
+# ---------------------------------------------------------------------------
+# Every `if`/`elif` that pipes into grep -q under these scripts' pipefail is
+# the shape above. None may come back; a comment may still quote one.
+left="$(awk '!/^[[:space:]]*#/ && /\|[[:space:]]*grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q/ { print FILENAME ":" FNR ": " $0 }' "$ROOT"/scripts/*.sh)"
+check "no 'producer | grep -q' in scripts/" "${left:-none}" "none"
+
+echo ""
+echo "passed=$pass failed=$fail"
+[[ -z "$not_run" ]] || echo "NOT RUN: $not_run"
+if ((fail == 0)); then
+    echo "EARLY-EXIT READERS SUITE GREEN"
+    exit 0
+fi
+exit 1
