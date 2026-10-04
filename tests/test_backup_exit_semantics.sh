@@ -75,6 +75,8 @@ WORK="$(mktemp -d)" && [[ -d "$WORK" ]] || {
 HOLDER_PID=""
 finish() {
     [[ -n "$HOLDER_PID" ]] && kill "$HOLDER_PID" 2>/dev/null && wait "$HOLDER_PID" 2>/dev/null
+    # A case that failed may have left the stub mailx's processes running.
+    declare -F reap_mail_stubs >/dev/null && reap_mail_stubs
     rm -rf "${WORK:?}"
 }
 trap finish EXIT
@@ -114,16 +116,20 @@ check() { # check <name> <got> <want>
 LOCK_LINE='LOCKFILE="/run/das-backup.lock"'
 MAINT_LINE='MAINTENANCE_LOCKFILE="/run/das-maintenance.lock"'
 ROOT_LINE='    if [[ $EUID -ne 0 ]]; then'
-for line in "$LOCK_LINE" "$MAINT_LINE" "$ROOT_LINE"; do
+# The bound on one mail send, shortened so a stalled relay costs this suite
+# seconds, not a minute a case.
+MAIL_LINE='MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10'
+for line in "$LOCK_LINE" "$MAINT_LINE" "$ROOT_LINE" "$MAIL_LINE"; do
     n="$(grep -cxF -- "$line" "$SRC")"
     [[ "$n" == 1 ]] || harness_broken "expected exactly one line '$line' in $SRC, found $n"
 done
 sed -e "s|^LOCKFILE=\"/run/das-backup.lock\"\$|LOCKFILE=\"$RUN_DIR/das-backup.lock\"|" \
     -e "s|^MAINTENANCE_LOCKFILE=\"/run/das-maintenance.lock\"\$|MAINTENANCE_LOCKFILE=\"$RUN_DIR/das-maintenance.lock\"|" \
     -e 's|^    if \[\[ \$EUID -ne 0 \]\]; then$|    if [[ ${DAS_TEST_EUID:?} -ne 0 ]]; then|' \
+    -e 's|^MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10$|MAIL_TIMEOUT_SECS=2 MAIL_KILL_AFTER_SECS=1|' \
     "$SRC" >"$COPY"
 changed="$(diff "$SRC" "$COPY" | grep -c '^>')"
-[[ "$changed" == 3 ]] || harness_broken "the copy differs from $SRC in $changed lines, not 3"
+[[ "$changed" == 4 ]] || harness_broken "the copy differs from $SRC in $changed lines, not 4"
 # The guard that matters: nothing outside a comment may still name a real
 # lock. If this ever fires, the copy is never run.
 #
@@ -155,7 +161,7 @@ esac
 # ---------------------------------------------------------------------------
 mkdir -p "$BIN" "$SYSBIN"
 for tool in awk basename cat cut date dirname flock grep head hostname mkdir mktemp mv \
-    rm rmdir sed sleep sort tail timeout touch tr wc; do
+    rm rmdir sed setsid sleep sort tail timeout touch tr wc; do
     path="$(type -P "$tool")" || harness_broken "no $tool on this system"
     ln -s "$path" "$SYSBIN/$tool"
 done
@@ -373,6 +379,24 @@ n=$(($(cat "$S/mail_count" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$S/mail_count"
 printf '%s\n' "$@" >"$S/mail.$n.args"
 cat >"$S/mail.$n.body"
+# A relay that took the connection and never answers: mailx waits on it, as
+# s-nail does (it has no read timeout), with a child of its own.
+if [[ -f "$S/knobs/mail_stalls" ]]; then
+    echo "$$" >"$S/mail_stall.pid"
+    sleep 3600 &
+    echo "$!" >"$S/mail_stall_child.pid"
+    wait
+fi
+# The same, with a helper that leaves the process group: no kill of mailx
+# reaches it, and whatever descriptors it inherited it keeps.
+if [[ -f "$S/knobs/mail_stall_escapes" ]]; then
+    echo "$$" >"$S/mail_stall.pid"
+    setsid sleep 3600 </dev/null >/dev/null 2>&1 &
+    echo "$!" >"$S/mail_escaped.pid"
+    sleep 3600 &
+    echo "$!" >"$S/mail_stall_child.pid"
+    wait
+fi
 rc="$(knob mail_rc 0)"
 [[ "$rc" == 0 ]] || echo "smtp-server: 127.0.0.1:25: Connection refused (stub)" >&2
 exit "$rc"
@@ -444,6 +468,7 @@ EOF
 # A new sandbox: nothing mounted, both targets present, every knob at its
 # default (every stub succeeds).
 fresh() {
+    reap_mail_stubs
     rm -rf "${STATE:?}" "${WORK:?}/mnt" "${WORK:?}/lib" "${WORK:?}/log" "${WORK:?}/etc" \
         "${RUN_DIR:?}" "${WORK:?}/tmp" "${WORK:?}/home"
     mkdir -p "$STATE/knobs" "$STATE/calls" "$WORK/mnt" "$WORK/etc" "$RUN_DIR" "$WORK/tmp" "$WORK/home"
@@ -484,6 +509,48 @@ run_backup() {
     "${CMD[@]}" >"$STATE/out" 2>&1
     RC=$?
     tripwire
+}
+# run_backup_within <deadline secs> [args...]: one run that might hang, under
+# a deadline of the suite's own; its status in RC (124 if the deadline ended
+# it), its wall time in seconds in ELAPSED.
+run_backup_within() {
+    local deadline="$1" start
+    shift
+    run_cmd "$@"
+    start=$SECONDS
+    timeout -k 5 "$deadline" "${CMD[@]}" >"$STATE/out" 2>&1
+    RC=$?
+    ELAPSED=$((SECONDS - start))
+    tripwire
+}
+# "yes" when both of the run's locks can be taken now — no process the run
+# left behind still holds either.
+locks_free() {
+    if "$REAL_FLOCK" -n "$RUN_DIR/das-backup.lock" true &&
+        "$REAL_FLOCK" -n "$RUN_DIR/das-maintenance.lock" true; then
+        echo yes
+    else
+        echo no
+    fi
+}
+# "yes" when none of the processes the stub mailx recorded is still alive.
+mail_stubs_gone() {
+    local f
+    for f in "$STATE/mail_stall.pid" "$STATE/mail_stall_child.pid"; do
+        [[ -f "$f" ]] && kill -0 "$(cat "$f")" 2>/dev/null && {
+            echo no
+            return
+        }
+    done
+    echo yes
+}
+# Ends whatever the stub mailx left running, the escaped helper included.
+reap_mail_stubs() {
+    local f
+    for f in "$STATE"/mail_*.pid; do
+        [[ -f "$f" ]] && kill "$(cat "$f")" 2>/dev/null
+    done
+    return 0
 }
 
 called() { [[ -s "$STATE/calls/$1" ]] && echo yes || echo no; }
@@ -893,6 +960,53 @@ check "dry run aborted: exit status" "$RC" "3"
 show_tail 3
 check "dry run aborted: no mail" "$(mails)" "0"
 check "dry run aborted: not recorded" "$(record_calls)" "0"
+
+# A relay that takes the connection and never answers costs the report, not
+# the run (round 3, M1). s-nail has no read timeout, so an unbounded mailx
+# kept the DAS mounted and both locks held for as long as the relay stayed
+# silent — a waiting scrub behind it, and the alert the very thing stuck.
+# Every send is bounded: in this copy TERM after 2 s, KILL 1 s later. The
+# suite's own deadline (30 s) only ends a run that hangs regardless.
+fresh
+knob mail_stalls 1
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup_within 30
+check "abort, relay stalls: exit status" "$RC" "3"
+show_tail 3
+check "abort, relay stalls: over within the bound" "$((ELAPSED <= 15))" "1"
+check "abort, relay stalls: the send was given its time" "$((ELAPSED >= 2))" "1"
+check "abort, relay stalls: says why it was not emailed" \
+    "$(grep -c 'did not answer within 2 s' "$STATE/out")" "1"
+check "abort, relay stalls: still recorded as failed" "$(recorded_as)" "failure"
+check "abort, relay stalls: nothing left mounted" "$(left_mounted)" "nothing"
+check "abort, relay stalls: both locks free" "$(locks_free)" "yes"
+check "abort, relay stalls: the stalled mailx is gone" "$(mail_stubs_gone)" "yes"
+
+fresh
+knob mail_stalls 1
+run_backup_within 30
+check "clean run, relay stalls: exit status (email FAILED)" "$RC" "3"
+show_tail 3
+check "clean run, relay stalls: over within the bound" "$((ELAPSED <= 15))" "1"
+check "clean run, relay stalls: says why it was not emailed" \
+    "$(grep -c 'did not answer within 2 s' "$STATE/out")" "1"
+check "clean run, relay stalls: recorded as failed" "$(recorded_as)" "failure"
+check "clean run, relay stalls: nothing left mounted" "$(left_mounted)" "nothing"
+check "clean run, relay stalls: both locks free" "$(locks_free)" "yes"
+check "clean run, relay stalls: the stalled mailx is gone" "$(mail_stubs_gone)" "yes"
+
+# A mail helper that leaves mailx's process group outlives the bound's kill;
+# it must not have inherited the run's locks (fds 8 and 9).
+fresh
+knob mail_stall_escapes 1
+run_backup_within 30
+check "clean run, mail helper escapes: exit status" "$RC" "3"
+show_tail 3
+check "clean run, mail helper escapes: over within the bound" "$((ELAPSED <= 15))" "1"
+check "clean run, mail helper escapes: the helper is still alive" \
+    "$(kill -0 "$(cat "$STATE/mail_escaped.pid" 2>/dev/null || echo 0)" 2>/dev/null && echo yes || echo no)" "yes"
+check "clean run, mail helper escapes: both locks free all the same" "$(locks_free)" "yes"
+reap_mail_stubs
 
 # ---------------------------------------------------------------------------
 echo "== 1: it could not start — nothing mounted, nothing sent"
