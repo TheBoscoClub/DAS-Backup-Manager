@@ -126,6 +126,8 @@ if(BUILD_TESTING)
     # runs, the panels it builds would ask the installed helper — root, on the
     # real system bus — for history and health from the live index. A system
     # bus address that cannot exist keeps every run on the unavailable path.
+    # Only through ctest: bin/gui-smoketest run by hand without it reaches the
+    # real system bus — set DBUS_SYSTEM_BUS_ADDRESS the same way first.
     set_tests_properties(gui-smoketest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen;DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent/btrdasd-gui-smoketest"
     )
