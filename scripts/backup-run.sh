@@ -50,7 +50,10 @@
 #     cannot end it before the unmount (round 3, M2). A last report that
 #     cannot be written is said, never "Report saved", and each line that
 #     says a report was not emailed names the journal when the file failed
-#     too (round 3, M3).
+#     too (round 3, M3). An abort names its step, never
+#     unexpanded command text: a source that will not mount says which,
+#     its device and mount's message; a set -e failure, the call chain it
+#     failed in (round 3, M4).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -365,8 +368,8 @@
 #   3        create_mount_points           an absent target still mounted that will not
 #                                          unmount; the bare-mountpoint guard (an absent
 #                                          target's directory is not empty)
-#   3        mount_sources                 a source volume that will not mount (set -e: mount's
-#                                          own status, made 3 by cleanup)
+#   3        mount_sources                 a source volume that will not mount: names the source,
+#                                          its device and mount's message (round 3, M4)
 #   3        verify_sources_before_write   a source volume is not the expected filesystem
 #                                          (called twice: before and after subvolume sync)
 #   3        verify_targets_before_btrbk   a target is not mounted (it failed to mount) or
@@ -395,7 +398,7 @@
 #
 # Every 3 above that ends before main()'s report — all but the end-of-main
 # row — is recorded as failed and sends one ABORTED report naming what
-# aborted (abort_reason; a set -e failure is named by its command), unless it
+# aborted (abort_reason; a set -e failure by the call chain it failed in), unless it
 # is a dry run (bd DAS-Backup-Manager-2my). A stop by a signal sends no
 # report — the unit then ends failed, which shows it — and is recorded as
 # failed ("stopped: by SIG…") only once the run holds the maintenance lock
@@ -989,15 +992,28 @@ create_mount_points() {
 mount_sources() {
     log_info "Mounting source top-level volumes..."
 
+    local label mnt dev mount_rc mount_err
+    local -a opts
     for label in "${!SOURCE_VOLUMES[@]}"; do
-        local mnt="${SOURCE_VOLUMES[$label]}"
-        local dev="${SOURCE_DEVICES[$label]}"
+        mnt="${SOURCE_VOLUMES[$label]}"
+        dev="${SOURCE_DEVICES[$label]}"
         if ! mountpoint -q "$mnt"; then
+            opts=(-o subvolid=5)
             if [[ "$dev" == UUID=* ]]; then
                 # UUID-based mount (stable across device letter changes)
-                mount -t btrfs -o subvolid=5 "$dev" "$mnt"
-            else
-                mount -o subvolid=5 "$dev" "$mnt"
+                opts=(-t btrfs -o subvolid=5)
+            fi
+            # A source that will not mount ends the run (3: a source's state
+            # the next start meets again), named: which source, its device
+            # and mount's own message. Left to set -e, the report and the
+            # history said only `mount -t btrfs -o subvolid=5 "$dev" "$mnt"`,
+            # unexpanded (bd DAS-Backup-Manager-d1r, round 3: M4).
+            mount_rc=0
+            mount_err="$(mount "${opts[@]}" "$dev" "$mnt" 2>&1)" || mount_rc=$?
+            if ((mount_rc != 0)); then
+                log_error "Cannot mount source $label ($dev) at $mnt — mount exited $mount_rc: ${mount_err:-no message}"
+                abort_reason "source mount" "$label: $dev at $mnt: mount exited $mount_rc: ${mount_err:-no message}"
+                exit 3
             fi
             log_info "  Mounted $label at $mnt"
         fi
@@ -2900,14 +2916,18 @@ abort_reason() {
 # `aborted: <what>: <why>`, the reason's lines joined with "; " — so the run
 # status, the history row's errors and the report all carry it. A command
 # that failed under set -e, with no abort_reason before it, is named by its
-# status ($1) and its text ($2: $BASH_COMMAND as the EXIT trap saw it).
+# status ($1) and the call chain it failed in ($2: "log < log_info < main",
+# innermost first) — the step. Never by $BASH_COMMAND: that is the command's
+# unexpanded source text, `mount ... "$dev" "$mnt"`, which named neither the
+# source nor the device (bd DAS-Backup-Manager-d1r, round 3: M4). Its own
+# message, if it wrote one, is in the journal.
 # Called only by cleanup(), the EXIT trap (SC2329: see clear_maintenance_holder).
 # shellcheck disable=SC2329
 note_abort() {
-    local rc="$1" cmd="$2"
+    local rc="$1" where="$2"
     if [[ -z "${ABORT_WHAT:-}" ]]; then
         ABORT_WHAT="a command that failed"
-        ABORT_REASON="exit status $rc: $cmd"
+        ABORT_REASON="exit status $rc${where:+ in $where}"
     fi
     local reason="${ABORT_REASON:-}"
     record_op "aborted" "FAIL" "$ABORT_WHAT: ${reason//$'\n'/; }"
@@ -3011,9 +3031,16 @@ cleanup() {
     # triggered this EXIT trap invocation BEFORE any other command in this
     # function can overwrite $? — main()'s own status (0 or 3) when it
     # completed, or the status of whatever `exit N`, set -e abort or signal
-    # trap fired the trap. $BASH_COMMAND is, here, the command that was
-    # running when the trap fired: for a set -e abort, the one that failed.
-    local rc=$? cmd="$BASH_COMMAND"
+    # trap fired the trap. FUNCNAME still holds the call chain the run was
+    # in when the trap fired — for a set -e abort, where the failing command
+    # ran (measured: the function it failed in is FUNCNAME[1]) — and is what
+    # names the step (note_abort; round 3, M4).
+    local rc=$? where="" fn
+    # From the caller up, leaving out bash's own last entry, "main" for the
+    # script's top level (this script's main() is the entry before it).
+    for fn in "${FUNCNAME[@]:1:${#FUNCNAME[@]}-2}"; do
+        where+="${where:+ < }$fn"
+    done
 
     # Best effort from here on, and the exit below is the only status. Under
     # set -e a command failing inside an EXIT trap ends bash at once with
@@ -3084,7 +3111,7 @@ cleanup() {
     if [[ -n "$STOP_SIGNAL" ]]; then
         record_op "stopped" "FAIL" "by SIG$STOP_SIGNAL (exit $status)"
     elif [[ "$status" == 3 ]]; then
-        note_abort "$rc" "$cmd"
+        note_abort "$rc" "$where"
     fi
 
     # Record the failed backup run if we were in a real backup and haven't

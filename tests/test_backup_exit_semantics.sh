@@ -857,11 +857,15 @@ check "no primary target: the targets not seen" "$(body_field 1 'Targets not see
 fresh
 knob mount_fails "$SOURCE_MNT"
 run_backup
-# Not an explicit exit in the script: `mount` fails (32) under set -e, and
-# cleanup() turns any status of a run that held the lock into 3, naming the
-# command that failed.
-expect_aborted "a source that fails to mount (set -e, mount exits 32)" "wrong fs type, bad option" \
-    "a command that failed" "exit status 32: mount "
+# mount_sources() aborts with 3 itself, naming the source, its device and
+# mount's own message (round 3, M4). It used to leave the failure to set -e,
+# and the report and the history then carried the unexpanded command —
+# `mount -t btrfs -o subvolid=5 "$dev" "$mnt"` — which names neither.
+expect_aborted "a source that fails to mount" "wrong fs type, bad option" "source mount" \
+    "nvme: UUID=source-uuid at $SOURCE_MNT: mount exited 32: mount: $SOURCE_MNT: wrong fs type, bad option, bad superblock (stub)"
+check "a source that fails to mount: no unexpanded text in the report" \
+    "$(grep -c '"\$' "$STATE/mail.1.body")" "0"
+check "a source that fails to mount: nor in the history" "$(vector_value --errors | grep -c '"\$')" "0"
 
 fresh
 knob wrong_fs_at "$SOURCE_MNT"
@@ -877,7 +881,16 @@ expect_aborted "verify_sources_before_write (wrong filesystem on a source)" \
 fresh
 knob break_log "$WORK/log/das-backup.log"
 run_backup
-expect_aborted "the log unwritable mid-run" "Is a directory" "a command that failed" "exit status 1: "
+# A set -e failure has no guard to name it: the reason is its status and the
+# call chain it failed in — here log() under one of the log_* helpers — not
+# the unexpanded command text (round 3, M4).
+expect_aborted "the log unwritable mid-run" "Is a directory" "a command that failed" "exit status 1 in log < log_"
+check "the log unwritable mid-run: the chain, innermost first, ends in main()" \
+    "$(grep -cE '^  Why: +exit status 1 in log < log_[a-z]+ < [a-z_]+ < main$' "$STATE/mail.1.body")" "1"
+check "the log unwritable mid-run: main() once — bash's own top-level entry left out" \
+    "$(grep -c 'main < main' "$STATE/mail.1.body")" "0"
+check "the log unwritable mid-run: no unexpanded text in the report" \
+    "$(grep -c '"\$' "$STATE/mail.1.body")" "0"
 
 # Two findings at once: both in the report — one beside "Why:", the other on
 # a line of its own below it — and both on the one `aborted:` line in the
