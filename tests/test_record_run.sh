@@ -123,7 +123,8 @@ check "known: two snapshots, three sends" "$(counts_words)" "--snaps-created 2 -
 check "known: bytes and duration" "$(vector | grep -A1 -e '^--bytes-sent$' -e '^--duration-secs$' | tr '\n' ' ')" "--bytes-sent 250 --duration-secs 300 "
 check "known: success flag" "$(vector | grep -c '^--success$')" "1"
 check "known: no --counts-unknown" "$(vector | grep -c '^--counts-unknown$' || true)" "0"
-check "known: no counter failure recorded" "${OP_STATUS[btrbk_counters]:-unset}" "unset"
+check "known: the counters recorded OK, with the counts" \
+    "${OP_STATUS[btrbk_counters]:-unset}|${OP_STATUS[btrbk_counters_detail]:-}" "OK|2 created, 3 sent"
 check "known: no errors argument" "$(vector | grep -c '^--errors$' || true)" "0"
 
 # --- btrbk listed nothing: a real zero, not unknown ---------------------------------
@@ -132,7 +133,8 @@ BTRBK_LATEST_RAW_OK=true
 record_run_args SUCCESS true
 check "empty listing: a measured zero" "$(counts_words)" "--snaps-created 0 --snaps-sent 0 "
 check "empty listing: full mode" "$(vector | sed -n 6p)" "full"
-check "empty listing: no counter failure" "${OP_STATUS[btrbk_counters]:-unset}" "unset"
+check "empty listing: OK, a measured zero" \
+    "${OP_STATUS[btrbk_counters]:-unset}|${OP_STATUS[btrbk_counters_detail]:-}" "OK|0 created, 0 sent"
 
 # --- the listing failed: unknown (the live 2026-10-02 case) --------------------------
 reset
@@ -187,9 +189,21 @@ reset
 BTRBK_LATEST_RAW_OK=true
 BTRBK_LATEST_RAW="$(raw_listing)"
 decide_run_counts
-check "bzw: counts known: no FAIL" "${OP_STATUS[btrbk_counters]:-unset}" "unset"
+check "bzw: counts known: OK" "${OP_STATUS[btrbk_counters]:-unset}" "OK"
 check "bzw: counts known: SUCCESS" "$(run_status)" "SUCCESS"
-check "bzw: counts known: the row reads OK" "$(generate_report | grep -c '^  Snapshot counts       OK  (counted)$')" "1"
+check "bzw: counts known: the row reads OK, with the counts" \
+    "$(generate_report | grep -c '^  Snapshot counts       OK  (2 created, 3 sent)$')" "1"
+
+# --- round 3, M6: a row nothing decided reads N/A, as every row does ---------
+# decide_run_counts records OK itself, with the counts. The row's default was
+# "OK (counted)", so a report built before the counts were decided would have
+# read as a success — the shape of the bzw defect.
+reset
+BTRBK_LATEST_RAW_OK=true
+BTRBK_LATEST_RAW="$(raw_listing)"
+check "M6: not decided yet: the row reads N/A" \
+    "$(generate_report | grep -c '^  Snapshot counts       N/A  (n/a)$')" "1"
+check "M6: not decided yet: never OK" "$(generate_report | grep -c '^  Snapshot counts       OK')" "0"
 
 # main() decides, then record_run_args decides again for its vector: the same
 # answer, and the unparsed-output warning only once.
