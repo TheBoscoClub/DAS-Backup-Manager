@@ -61,6 +61,9 @@
 #     A source that mounts with a warning (util-linux's "source write-
 #     protected, mounted read-only") logs it again, in the journal and the
 #     log file: M4's capture of mount's output dropped it (round 4, N1).
+#     With email off, a report that cannot be saved is a FAIL (exit 3, the
+#     history row says why): the journal has the only copy, where it used
+#     to end in exit 0 and a success row (round 4, N4).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -392,7 +395,8 @@
 #                                          the recovery OS check (not a stale OS: that is a
 #                                          WARN), boot subvolumes, archive cleanup, unmount,
 #                                          indexer, USB link speed, email delivery, the
-#                                          history record, the snapshot counters
+#                                          history record, the snapshot counters, a report
+#                                          saved nowhere (email off, the file unwritable)
 #   129 130 138 141 142 143
 #            wherever the run is           SIGHUP SIGINT SIGUSR1 SIGPIPE SIGALRM SIGTERM
 #                                          (`systemctl stop` sends TERM): the signal's own
@@ -2608,8 +2612,18 @@ send_report() {
     fi
 
     if [[ "${DAS_EMAIL_ENABLED:-false}" != "true" ]]; then
-        log_info "Email reporting disabled in config — not emailed; $(report_whereabouts)"
-        return 0
+        if [[ "$REPORT_SAVED" == "true" ]]; then
+            log_info "Email reporting disabled in config — not emailed; $(report_whereabouts)"
+            return 0
+        fi
+        # Saved nowhere and sent nowhere: the journal has the only copy. The
+        # operator's rule (3: the run began and something failed) makes that
+        # a failure, and the next run would meet the same full disk; it used
+        # to end in exit 0 and a success row (bd DAS-Backup-Manager-d1r,
+        # round 4: N4). A report failure, not an email one: email is off.
+        log_error "Email reporting disabled in config, and the report could not be saved: it is in the journal only"
+        record_op "report" "FAIL" "not saved to $LAST_REPORT, and email is disabled: the journal has the only copy"
+        return 1
     fi
 
     # Relay coordinates come from config via `btrdasd config dump-env`. Before
@@ -3380,8 +3394,12 @@ main() {
         # The old message also asserted the backup "completed successfully"
         # regardless of whether it had. bd nsp (b15).
         if ! send_report "$report" "$(subject_status)"; then
-            log_warn "Email delivery failed (run status was: $overall_status)"
-            record_op "email" "FAIL" "delivery failed; $(report_whereabouts)"
+            # With email off, send_report fails only when the report could
+            # not be saved either, and records that itself (round 4, N4).
+            if [[ "${DAS_EMAIL_ENABLED:-false}" == "true" ]]; then
+                log_warn "Email delivery failed (run status was: $overall_status)"
+                record_op "email" "FAIL" "delivery failed; $(report_whereabouts)"
+            fi
             overall_status="FAILURE"
         fi
         # From here an abort has a report already: cleanup() sends no

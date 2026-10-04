@@ -986,6 +986,44 @@ check "clean run, last report unwritable, relay down: the history says where it 
 check "clean run, last report unwritable, relay down: the journal has it" \
     "$(grep -c '^  DAS Backup Report — ' "$STATE/out")" "1"
 
+# Email disabled, and the last report cannot be saved either: the report went
+# nowhere that lasts — the journal has the only copy. Under the operator's
+# rule that is something that failed (3), not a run that went well: it used
+# to exit 0 with a success row (round 4, N4). The row says why, as a report
+# failure, not an email one.
+email_off() { sed -i 's/^DAS_EMAIL_ENABLED=true$/DAS_EMAIL_ENABLED=false/' "$STATE/env"; }
+fresh
+email_off
+mkdir -p "$WORK/lib/last-report.txt"
+run_backup
+check "email disabled, last report unwritable: exit status" "$RC" "3"
+show_tail 3
+check "email disabled, last report unwritable: recorded as failed" "$(recorded_as)" "failure"
+check "email disabled, last report unwritable: the history says why" \
+    "$(vector_value --errors | grep -cxF "report: not saved to $WORK/lib/last-report.txt, and email is disabled: the journal has the only copy")" "1"
+check "email disabled, last report unwritable: not an email failure" \
+    "$(vector_value --errors | grep -c '^email:')" "0"
+check "email disabled, last report unwritable: no mail" "$(mails)" "0"
+check "email disabled, last report unwritable: the journal has it" \
+    "$(grep -c '^  DAS Backup Report — ' "$STATE/out")" "1"
+check "email disabled, last report unwritable: says the journal has the only copy" \
+    "$(grep -c 'could not be saved: it is in the journal only' "$STATE/out")" "1"
+
+# ... and with the file writable, email disabled is a run that went well.
+fresh
+email_off
+run_backup
+check "email disabled, last report saved: exit status" "$RC" "0"
+show_tail 0
+check "email disabled, last report saved: report status" "$(report_status)" "ALL OPERATIONS SUCCESSFUL"
+check "email disabled, last report saved: recorded as a success" "$(recorded_as)" "success"
+check "email disabled, last report saved: nothing left mounted" "$(left_mounted)" "nothing"
+check "email disabled, last report saved: no mail" "$(mails)" "0"
+check "email disabled, last report saved: says where it is" \
+    "$(grep -c "Email reporting disabled in config — not emailed; it is in $WORK/lib/last-report.txt" "$STATE/out")" "1"
+check "email disabled, last report saved: no report failure" \
+    "$(vector_value --errors | grep -c '^report:')" "0"
+
 fresh
 knob wrong_fs_at "$PRIMARY_MNT"
 knob record_rc 2 # the history cannot be written
