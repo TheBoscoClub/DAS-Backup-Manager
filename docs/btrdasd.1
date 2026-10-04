@@ -2092,7 +2092,19 @@ What the last backup run read from each recovery drive's own OS, keyed by
 target label (mode 644). Written by
 .BR "recovery\-os status \-\-state\-file" ,
 read by
-.BR "btrdasd health" .
+.B "btrdasd health"
+and by
+.BR recovery\-os\-vm.sh ,
+which starts a session only when the drive's entry says btrbk will not run
+when its OS boots.
+.TP
+.I /var/lib/das\-backup/recovery\-os\-vm\-sessions
+When
+.B recovery\-os\-vm.sh
+last booted each recovery drive's OS in the virtual machine, one
+.I "LABEL SECONDS"
+line per target label (mode 644): written before the OS boots and again when
+the disk is given back. A boot record made before that time no longer counts.
 .TP
 .I /run/das\-recovery\-os\-vm/
 Kept by

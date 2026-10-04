@@ -42,6 +42,20 @@
 #     with the drive already in the USB enclosure may lack it, and the first
 #     boot in the VM then needs the fallback entry -- the documented path,
 #     not a defect.
+#   - Only an OS that will not run btrbk when it boots (bd 1yg): the drive
+#     holds the received backups on the same partition 2, and a btrbk run
+#     by that OS could delete or rewrite them. The nightly backup run
+#     records, per drive, what booting its OS would run (`btrdasd
+#     recovery-os status --state-file`, /var/lib/das-backup/recovery-os.json)
+#     and one verdict: will, may or no. A session goes on only when that
+#     record says no, is at most MAX_RECORD_AGE_DAYS old, and was made after
+#     this drive's last session (the OS may have changed in it; the time of
+#     each session is kept in recovery-os-vm-sessions beside the record,
+#     written before the OS boots and again when the disk is back).
+#     --accept-boot-record-risk lets a verdict, an age or a session through,
+#     loudly and into the summary -- never a record that is missing, of
+#     another schema, or says nothing about this drive. The rule that makes
+#     the verdict is btrdasd's; this only reads it (with jq).
 #   - This script never destroys a running recovery OS -- it could be in the
 #     middle of an update. An interrupt or an expired --timeout leaves the
 #     VM, the claim and the lock as they are and says how to finish.
@@ -51,6 +65,7 @@
 # Usage (as root):
 #   recovery-os-vm.sh define
 #   recovery-os-vm.sh session <A|B|label> [--dry-run] [--timeout <minutes>]
+#                             [--accept-boot-record-risk]
 #   recovery-os-vm.sh session-end <A|B|label>
 #   recovery-os-vm.sh status
 #   recovery-os-vm.sh screenshot <file.png>
@@ -69,7 +84,8 @@
 #   5  the session ended and the disk was given back, but something needs a
 #      look (see the summary): the claim was lost while the VM ran (taken
 #      again or not), the drive re-enumerated during the session, a
-#      partition was mounted afterwards, or the device scan failed
+#      partition was mounted afterwards, the device scan failed, or the
+#      boot-record check was overridden
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
@@ -83,6 +99,10 @@
 #                               drive. Only with a full target label; it
 #                               replaces the drive's identity checks (serial,
 #                               filesystem UUID) and nothing else.
+#   DAS_RECOVERY_OS_STATE       the boot record to read instead (and the session
+#                               times beside it). Only with the test hatch: the
+#                               record is what keeps a real drive's backups safe
+#                               from its own OS, and the hatch lends a loop file.
 #   DAS_RECOVERY_VM_POLL_SECS (5), DAS_RECOVERY_VM_MINUTE_SECS (60),
 #   DAS_RECOVERY_VM_GRACE_SECS (600)   faster clocks
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
@@ -122,6 +142,36 @@ readonly STATE_DIR="$TEST_ROOT/run/das-recovery-os-vm"
 readonly BY_ID="$TEST_ROOT/dev/disk/by-id"
 readonly SYS_BLOCK="$TEST_ROOT/sys/block"
 
+# The boot record (bd DAS-Backup-Manager-1yg): the schema this reads, and the
+# age past which it no longer describes the drive (the nightly run rewrites it
+# daily; a week of misses is not a record of today's OS).
+readonly OS_STATE_SCHEMA=3
+readonly MAX_RECORD_AGE_DAYS=8
+# One line per fact; every string cleaned of control characters, since unit
+# names and reasons come from the recovery OS itself.
+# shellcheck disable=SC2016 # jq's variables, not the shell's
+readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
+"schema\t\(.schema_version | clean)",
+(if .schema_version == 3 then
+   .drives[$label] as $d
+   | if $d == null then "entry\tnone"
+     else
+       "entry\tpresent",
+       "checked\t\($d.checked_epoch | clean)",
+       (if $d.error != null then "error\t\($d.error | clean)"
+        elif $d.os == null then "error\tno OS was inspected"
+        else empty end),
+       (if $d.os == null then empty else
+          "verdict\t\(($d.os.btrbk_at_boot.verdict // "") | clean)",
+          (($d.os.btrbk_at_boot.reasons // [])[] | "reason\t\(clean)"),
+          ($d.os.enabled_units as $u
+           | if $u == null then "units\tnot recorded"
+             elif $u.state == "listed" then "units\tlisted", (($u.units // [])[] | "unit\t\(.name | clean)")
+             else "units\t\(($u.state // "unknown") | clean)\(if $u.reason then ": " + ($u.reason | clean) else "" end)" end)
+        end)
+     end
+ else empty end)'
+
 # How long the holder has to announce its claim (a spun-down disk may take
 # seconds to open), and to exit after SIGTERM. In tenths of a second.
 readonly HOLDER_START_TICKS=300
@@ -157,6 +207,12 @@ HOLDER_UNIT=""      # the current holder's scope unit
 REENUMERATED=false  # the by-id link led elsewhere during the session
 CLAIM_GAP=false     # the claim was lost and no claim holds yet
 HOLDER_RESULT="no holder left to stop" # what giving the disk back did with the holder
+OS_STATE_FILE="$TEST_ROOT/var/lib/das-backup/recovery-os.json" # the boot record
+SESSIONS_FILE=""    # the session times, beside the boot record
+SESSIONS_FAILURE="" # why they could not be read or written
+LAST_SESSION=""     # this label's last session time, if one is recorded
+ACCEPT_BOOT_RISK=false
+BOOT_OVERRIDES=()   # what --accept-boot-record-risk let through
 ATTACHED=false      # the disk MAY be in the domain's definition (set before attaching)
 STARTED=false       # `virsh start` was attempted, so the guest may have written
 DONE=false          # nothing left for the trap to undo
@@ -200,8 +256,13 @@ whole disk passed through, to update it without rebooting the workstation.
                          $DOMAIN_XML
                          (it must be shut off, with no disk attached)
   session <A|B|label> [--dry-run] [--timeout <minutes>]
+          [--accept-boot-record-risk]
                          lend one role = "mirror" drive to the VM, boot it,
-                         wait until it powers off, give the disk back
+                         wait until it powers off, give the disk back --
+                         only when the nightly run's record says its OS
+                         will not run btrbk at boot, is fresh, and is newer
+                         than the drive's last session (the flag lets a
+                         verdict, an age or a session through, loudly)
   session-end <A|B|label>
                          finish a session whose driver died (VM shut off)
   status                 domain state, attached disk, holder, lock
@@ -631,6 +692,188 @@ check_no_live_holder() {
 }
 
 # ---------------------------------------------------------------------------
+# The boot record (bd DAS-Backup-Manager-1yg)
+# ---------------------------------------------------------------------------
+age_text() {
+    local s=$1
+    if ((s < 0)); then
+        printf 'in the future'
+    elif ((s >= 86400)); then
+        printf '%dd %dh ago' $((s / 86400)) $((s % 86400 / 3600))
+    else
+        printf '%dh %02dm ago' $((s / 3600)) $((s % 3600 / 60))
+    fi
+}
+
+utc() {
+    date -u -d "@$1" '+%Y-%m-%d %H:%M UTC'
+}
+
+# This label's last session time from SESSIONS_FILE into LAST_SESSION (empty
+# when none is recorded). 1, with SESSIONS_FAILURE set, when that cannot be
+# told: not a regular file, unreadable, or no time on this label's line.
+last_session_time() {
+    local lines label t
+    LAST_SESSION=""
+    SESSIONS_FAILURE=""
+    if [[ ! -e "$SESSIONS_FILE" && ! -L "$SESSIONS_FILE" ]]; then
+        return 0
+    fi
+    if [[ -L "$SESSIONS_FILE" || ! -f "$SESSIONS_FILE" ]]; then
+        SESSIONS_FAILURE="$SESSIONS_FILE is not a regular file"
+        return 1
+    fi
+    if ! lines="$(cat -- "$SESSIONS_FILE" 2>&1)"; then
+        SESSIONS_FAILURE="cannot read $SESSIONS_FILE: $lines"
+        return 1
+    fi
+    while read -r label t; do
+        [[ "$label" == "$LABEL" ]] || continue
+        if [[ ! "$t" =~ ^[0-9]+$ ]]; then
+            SESSIONS_FAILURE="$SESSIONS_FILE says '$label $t' -- not a time"
+            return 1
+        fi
+        LAST_SESSION=$t
+    done <<<"$lines"
+}
+
+# Record $1 (seconds since the epoch) as this label's session time: one line
+# per label, the file replaced whole, readable by all and written by its
+# owner (root) only. 1, with SESSIONS_FAILURE set, when it cannot be.
+record_session_time() {
+    local lines="" label t tmp
+    SESSIONS_FAILURE=""
+    if [[ -L "$SESSIONS_FILE" ]] || [[ -e "$SESSIONS_FILE" && ! -f "$SESSIONS_FILE" ]]; then
+        SESSIONS_FAILURE="$SESSIONS_FILE is not a regular file"
+        return 1
+    fi
+    if [[ -e "$SESSIONS_FILE" ]] && ! lines="$(cat -- "$SESSIONS_FILE" 2>&1)"; then
+        SESSIONS_FAILURE="cannot read $SESSIONS_FILE: $lines"
+        return 1
+    fi
+    tmp="$SESSIONS_FILE.new.$$"
+    if ! {
+        while read -r label t; do
+            [[ -n "$label" && "$label" != "$LABEL" ]] || continue
+            printf '%s %s\n' "$label" "$t"
+        done <<<"$lines"
+        printf '%s %s\n' "$LABEL" "$1"
+    } >"$tmp"; then
+        rm -f -- "$tmp"
+        SESSIONS_FAILURE="cannot write $tmp"
+        return 1
+    fi
+    if ! chmod 0644 -- "$tmp" || ! mv -f -- "$tmp" "$SESSIONS_FILE"; then
+        rm -f -- "$tmp"
+        SESSIONS_FAILURE="cannot put $tmp in place as $SESSIONS_FILE"
+        return 1
+    fi
+}
+
+# Read this drive's boot record and go on only when it says btrbk will not
+# run when its OS boots -- before anything is taken. The record's own facts
+# are shown whatever they say.
+check_boot_record() {
+    local file=$OS_STATE_FILE out rc=0 key value schemas=0 schema="" entry="" checked="" error=""
+    local verdict="" units_state="" when now age p problems=() reasons=() units=() hint
+    if [[ -n "${DAS_RECOVERY_OS_STATE:-}" ]]; then
+        if [[ -z "$TEST_LOOP" ]]; then
+            refuse "DAS_RECOVERY_OS_STATE is set: it points the boot-record check at another file, and is honoured only with the test hatch DAS_RECOVERY_VM_TEST_LOOP, which lends a loop file -- the record is what keeps a real drive's backups safe from its own OS"
+        fi
+        file=$DAS_RECOVERY_OS_STATE
+        warn "TEST: the boot record is read from $file (DAS_RECOVERY_OS_STATE)"
+    fi
+    OS_STATE_FILE=$file
+    SESSIONS_FILE="$(dirname -- "$file")/recovery-os-vm-sessions"
+    if [[ ! -e "$file" ]]; then
+        refuse "no boot record: $file does not exist. The nightly backup run writes it when it checks the recovery OSes -- let one run with this drive attached, then start again"
+    fi
+    # stderr first: a file that cannot be opened fails the < redirection.
+    out="$(jq -r --arg label "$LABEL" "$BOOT_RECORD_JQ" 2>&1 <"$file")" || rc=$?
+    if ((rc != 0)); then
+        refuse "the boot record $file cannot be read: ${out:-jq exit $rc}"
+    fi
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+            schema)
+                schemas=$((schemas + 1))
+                schema=$value
+                ;;
+            entry) entry=$value ;;
+            checked) checked=$value ;;
+            error) error=$value ;;
+            verdict) verdict=$value ;;
+            reason) reasons+=("$value") ;;
+            units) units_state=$value ;;
+            unit) units+=("$value") ;;
+        esac
+    done <<<"$out"
+    if ((schemas != 1)); then
+        refuse "the boot record $file is not one JSON document ($schemas found)"
+    fi
+    if [[ "$schema" != "$OS_STATE_SCHEMA" ]]; then
+        refuse "the boot record $file is schema $schema, not $OS_STATE_SCHEMA -- this script reads schema $OS_STATE_SCHEMA only (an older record has no btrbk-at-boot verdict); the next backup run writes it again"
+    fi
+    if [[ "$entry" != present ]]; then
+        refuse "the boot record $file has no entry for '$LABEL' -- the nightly backup run writes one when it checks this drive; let one run with it attached"
+    fi
+    if [[ ! "$checked" =~ ^[0-9]+$ ]]; then
+        refuse "the boot record for '$LABEL' has no check time ('$checked')"
+    fi
+    when="$(utc "$checked")"
+    now=$(date +%s)
+    age=$((now - checked))
+    if [[ -n "$error" ]]; then
+        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) has no inspected OS ($error)"
+    fi
+    if [[ "$verdict" != no && "$verdict" != will && "$verdict" != may ]]; then
+        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) has no btrbk-at-boot verdict ('$verdict')"
+    fi
+    log "boot record for $LABEL ($file, schema $schema):"
+    log "  checked        $when, $(age_text "$age")"
+    if [[ "$units_state" == listed ]]; then
+        log "  enabled units  $(IFS=,; p="${units[*]}"; printf '%s' "${p//,/, }") (${#units[@]})"
+    else
+        log "  enabled units  $units_state"
+    fi
+    log "  btrbk at boot  $verdict"
+    for p in "${reasons[@]}"; do
+        log "    - $p"
+    done
+
+    if [[ "$verdict" != no ]]; then
+        problems+=("btrbk $verdict run when this OS boots")
+    fi
+    if ((checked > now + 300)); then
+        problems+=("the record is dated in the future ($when): the clock of the run that wrote it, or this one, is wrong")
+    elif ((age > MAX_RECORD_AGE_DAYS * 86400)); then
+        problems+=("the record is $(age_text "$age" | sed 's/ ago$//') old, older than $MAX_RECORD_AGE_DAYS days: it no longer describes the drive")
+    fi
+    if ! last_session_time; then
+        problems+=("cannot tell when this drive's last VM session ended ($SESSIONS_FAILURE)")
+    elif [[ -n "$LAST_SESSION" ]] && ((checked <= LAST_SESSION)); then
+        problems+=("the record was made before this drive's last VM session ended ($(utc "$LAST_SESSION")): the OS may have changed in it")
+    fi
+    if ((${#problems[@]} == 0)); then
+        log "boot record: btrbk will not run when this OS boots"
+        return 0
+    fi
+    if [[ "$ACCEPT_BOOT_RISK" == true ]]; then
+        for p in "${problems[@]}"; do
+            warn "OVERRIDDEN (--accept-boot-record-risk): $p"
+            BOOT_OVERRIDES+=("$p")
+        done
+        return 0
+    fi
+    if [[ "$verdict" != no ]]; then
+        hint="fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again (boot it to rescue.target -- systemd.unit=rescue.target on its kernel line -- so that its timers and services do not start; see the disaster recovery guide)"
+    else
+        hint="let the next backup run, with this drive attached, record it again"
+    fi
+    refuse "$(IFS=';'; printf '%s' "${problems[*]}" | sed 's/;/; /g') (the record was checked $when, $(age_text "$age")) -- $hint"
+}
+
+# ---------------------------------------------------------------------------
 # Taking and giving back
 # ---------------------------------------------------------------------------
 take_lock() {
@@ -864,6 +1107,12 @@ return_disk() {
     if [[ "$STARTED" == true ]]; then
         rescan_disk
         check_left_unmounted
+        if [[ -z "$SESSIONS_FILE" ]]; then
+            SESSIONS_FILE="$(dirname -- "${DAS_RECOVERY_OS_STATE:-$OS_STATE_FILE}")/recovery-os-vm-sessions"
+        fi
+        if ! record_session_time "$(date +%s)"; then
+            warn "could not record the end of this session ($SESSIONS_FAILURE); its start is recorded, so the next session waits for a new boot record all the same"
+        fi
     fi
     release_lock
     check_lock_let_go
@@ -1038,6 +1287,7 @@ parse_session_args() {
     while (($#)); do
         case "$1" in
             --dry-run) DRY_RUN=true ;;
+            --accept-boot-record-risk) ACCEPT_BOOT_RISK=true ;;
             --timeout)
                 (($# >= 2)) || usage
                 TIMEOUT_MIN=$2
@@ -1111,7 +1361,7 @@ wait_for_poweroff() {
 # else 0.
 session_status() {
     if [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
-        ((HOLDER_LOSSES > 0)); then
+        ((HOLDER_LOSSES > 0 || ${#BOOT_OVERRIDES[@]} > 0)); then
         echo 5
     else
         echo 0
@@ -1127,11 +1377,15 @@ cmd_session() {
     if ! command -v systemd-run >/dev/null; then
         refuse "systemd-run is not available: the disk holder must run in a scope of its own, outside your login session, and there is no other way to put it there"
     fi
+    if ! command -v jq >/dev/null; then
+        refuse "jq is not installed: the boot-record check reads the record with it, and no session starts without that check"
+    fi
     load_targets
     resolve_label "$TARGET_ARG"
     if [[ ! "$LABEL" =~ ^[A-Za-z0-9:_.-]+$ ]]; then
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
     fi
+    check_boot_record
     resolve_disk
     log "session for $LABEL: $DISK ($DISK_DEV)$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
     check_units
@@ -1170,6 +1424,11 @@ cmd_session() {
     if [[ "$(readlink -f -- "$DISK")" != "$DISK_DEV" ]]; then
         refuse "$DISK no longer leads to $DISK_DEV (the drive re-enumerated) -- start again"
     fi
+    # From here on the OS may change, so a record made before now no longer
+    # describes it. Recorded first, or not booted at all.
+    if ! record_session_time "$(date +%s)"; then
+        refuse "cannot record the start of this session ($SESSIONS_FAILURE): without it, the next session could trust a boot record made before this one -- not booting"
+    fi
     STARTED=true
     VM_START=$SECONDS
     if ! out="$(virsh_ start "$DOMAIN" 2>&1)"; then
@@ -1199,6 +1458,9 @@ cmd_session() {
     if [[ "$REENUMERATED" == true ]]; then
         warnings+=("the disk re-enumerated during the session; the claim was on the old device")
     fi
+    for w in "${BOOT_OVERRIDES[@]}"; do
+        warnings+=("the boot-record check was overridden (--accept-boot-record-risk): $w")
+    done
     for w in "${warnings[@]}"; do
         lines+=$'\n'"  Warnings      $w"
         joined+="; $w"
