@@ -114,7 +114,15 @@ Re-opens the wizard with your current configuration pre-filled from `/etc/das-ba
 sudo btrdasd setup --upgrade
 ```
 
-Regenerates all files from the existing config without re-running the wizard. Use this after updating the `btrdasd` binary to ensure generated scripts match the new version.
+Regenerates all files from the existing config without re-running the wizard, then restarts the D-Bus helper (`btrdasd-helper.service`) so it runs the binary just installed — it runs as root for as long as the system does, and nothing else restarts it. Use this after updating the binaries (`cmake --install` or a package), never while a backup runs (see below).
+
+- If the DAS maintenance lock is held — a backup, restore or index job may be running in the helper — the helper is **not** restarted: the upgrade names the holder and the command to run once the job has finished, `sudo systemctl try-restart btrdasd-helper.service`.
+- A restart that fails, or a unit state or lock that cannot be read, ends the upgrade with an error saying so.
+- A helper that is not running is left alone: D-Bus starts it from the new binary when it is next needed. On an init system other than systemd, restart a running `btrdasd-helper` yourself.
+
+**Keep `btrdasd`, `btrdasd-helper` and the scripts at one version.** Since schema 4 the backup history stores a snapshot count a run could not take as unknown (NULL), and the first open by a schema-4 binary migrates the database to it. A `btrdasd` or `btrdasd-helper` built before schema 4 cannot read a run with unknown counts: its history fails with `InvalidColumnType(4, "snaps_created", Null)`, which the GUI shows as an error and an empty history — the reason the helper is restarted. Rolling back to such a binary needs the database as it was before the upgrade, or accepts that error while any such run is in the history (an old binary can still record runs).
+
+**Never install while a backup runs.** Besides the scripts being rewritten under a running `backup-run.sh`, the first open by a new binary migrates the database inside a write transaction that waits up to 30 s behind another writer, such as a running backup's indexer, and then fails that command with `database is locked` — leaving the database unchanged, for the next open to migrate.
 
 ### Uninstall
 

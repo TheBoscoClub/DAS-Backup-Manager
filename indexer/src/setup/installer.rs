@@ -25,6 +25,10 @@ type UnitRunner<'a> = &'a dyn Fn(&[&str]) -> Result<(), String>;
 /// Whether the configured mail relay answers. See `relay_reachable`.
 type RelayProbe<'a> = &'a dyn Fn(&Config) -> bool;
 
+/// Regenerate and install every managed file for a config — `install` on the
+/// host, a recorder in tests.
+type Installer<'a> = &'a dyn Fn(&Config) -> Result<(), Box<dyn std::error::Error>>;
+
 /// Run a command for its exit status, returning a description of the failure
 /// instead of discarding it.
 ///
@@ -691,16 +695,174 @@ fn migrate_config(config: &mut Config) -> Vec<String> {
     changes
 }
 
-/// Upgrade: reload existing config, apply migrations, and regenerate all files.
+/// Upgrade: reload existing config, apply migrations, regenerate all files,
+/// and restart the D-Bus helper onto the binary just installed.
 pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = Path::new(CONFIG_FILE);
-    let config = prepare_upgrade(config_path, &relay_reachable, &mut |line| {
-        println!("{line}")
-    })?;
-    println!("Regenerating files from {}...", config_path.display());
-    install(&config)?;
-    println!("Upgrade complete.");
+    let active_state = || {
+        command_stdout(
+            SYSTEMCTL,
+            &["show", "--property=ActiveState", "--value", HELPER_UNIT],
+        )
+    };
+    let maintenance_holder =
+        || maintenance_lock_holder(Path::new(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH));
+    let systemctl = |args: &[&str]| command_status(SYSTEMCTL, args);
+    upgrade_with(
+        Path::new(CONFIG_FILE),
+        &relay_reachable,
+        &install,
+        &HelperHost {
+            active_state: &active_state,
+            maintenance_holder: &maintenance_holder,
+            systemctl: &systemctl,
+        },
+        &mut |line| println!("{line}"),
+    )
+}
+
+/// `upgrade` against an explicit config path, with the host bound by the
+/// caller: `install` regenerates the files, `helper` reaches the D-Bus helper's
+/// unit and the maintenance lock. Progress goes to `say`, one line per call.
+fn upgrade_with(
+    config_path: &Path,
+    relay_up: RelayProbe,
+    install: Installer,
+    helper: &HelperHost,
+    say: &mut dyn FnMut(String),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = prepare_upgrade(config_path, relay_up, say)?;
+    say(format!(
+        "Regenerating files from {}...",
+        config_path.display()
+    ));
+    // The helper is restarted even when regenerating failed: what it runs is
+    // the binary `cmake --install` or the package already put in place, not
+    // anything written here, and left alone it keeps running the old one.
+    let installed = install(&config);
+    let restarted = restart_helper(&config, helper, say);
+    installed?;
+    restarted?;
+    say("Upgrade complete.".to_string());
     Ok(())
+}
+
+/// The D-Bus helper's unit.
+const HELPER_UNIT: &str = "btrdasd-helper.service";
+
+/// The command that restarts the helper once nothing needs it.
+const HELPER_RESTART_LATER: &str = "sudo systemctl try-restart btrdasd-helper.service";
+
+/// What restarting the D-Bus helper asks of the host.
+struct HelperHost<'a> {
+    /// The unit's `ActiveState`, as `systemctl show --value` prints it.
+    active_state: &'a dyn Fn() -> Result<String, String>,
+    /// Who holds the DAS maintenance lock — `None` when it is free, found by
+    /// taking it and letting go at once ([`maintenance_lock_holder`]).
+    maintenance_holder: &'a dyn Fn() -> Result<Option<String>, String>,
+    /// `systemctl`, one invocation per call.
+    systemctl: UnitRunner<'a>,
+}
+
+/// Restart the D-Bus helper so it runs the binary just installed.
+///
+/// `btrdasd-helper` runs as root for as long as the system does, and nothing
+/// else restarts it: an upgrade that leaves it running leaves the GUI on the
+/// old binary. An old one cannot read a run whose snapshot counts are unknown
+/// — NULL since schema 4 (bd DAS-Backup-Manager-6wt) — so the GUI history
+/// fails with an error and shows nothing, the very symptom the upgrade fixes.
+///
+/// Restarting kills whatever job the helper runs, and its mounts die with it.
+/// Every job that mounts a backup target holds the DAS maintenance lock, so
+/// the lock is looked at first, never kept: free, the helper is restarted;
+/// held, it is left alone and the command to run afterwards is said. Not
+/// knowing — the unit's state or the lock could not be read, or the restart
+/// failed — is an error: the helper may still be the old binary.
+fn restart_helper(
+    config: &Config,
+    host: &HelperHost,
+    say: &mut dyn FnMut(String),
+) -> Result<(), String> {
+    if config.init.system != crate::setup::config::InitSystem::Systemd {
+        say(format!(
+            "The D-Bus helper is not a systemd unit on this init system: if btrdasd-helper \
+             is running, restart it — it keeps running the binary it started with, and one \
+             older than {} cannot read a run whose snapshot counts are unknown.",
+            env!("CARGO_PKG_VERSION")
+        ));
+        return Ok(());
+    }
+    let not_restarted = || format!("{HELPER_UNIT} was not restarted — see above");
+    let state = match (host.active_state)() {
+        Ok(state) => state.trim().to_string(),
+        Err(e) => {
+            say(format!(
+                "ERROR: cannot tell whether {HELPER_UNIT} is running ({e}) — not restarted. \
+                 If it is running, restart it when no backup or restore job is: \
+                 {HELPER_RESTART_LATER}"
+            ));
+            return Err(not_restarted());
+        }
+    };
+    if !matches!(state.as_str(), "active" | "activating" | "reloading") {
+        say(format!(
+            "{HELPER_UNIT} is {state}: nothing to restart — D-Bus starts the helper from the \
+             new binary when it is next needed."
+        ));
+        return Ok(());
+    }
+    match (host.maintenance_holder)() {
+        Ok(None) => {}
+        Ok(Some(holder)) => {
+            say(format!(
+                "Warning: {HELPER_UNIT} NOT restarted: the DAS maintenance lock is held by \
+                 {holder} — a backup, restore or index job may be running in the helper."
+            ));
+            say(format!(
+                "  Until it is restarted the GUI history fails on a run whose snapshot counts \
+                 are unknown. When the job has finished, run: {HELPER_RESTART_LATER}"
+            ));
+            return Ok(());
+        }
+        Err(e) => {
+            say(format!(
+                "ERROR: cannot look at the DAS maintenance lock ({e}) — {HELPER_UNIT} not \
+                 restarted. Restart it when no backup or restore job is running: \
+                 {HELPER_RESTART_LATER}"
+            ));
+            return Err(not_restarted());
+        }
+    }
+    match (host.systemctl)(&["try-restart", HELPER_UNIT]) {
+        Ok(()) => {
+            say(format!(
+                "Restarted {HELPER_UNIT}: the D-Bus helper now runs the binary just installed."
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            say(format!(
+                "ERROR: could not restart {HELPER_UNIT} ({e}). The running helper is the old \
+                 binary, and the GUI history fails on a run whose snapshot counts are unknown. \
+                 See journalctl -u {HELPER_UNIT}, then run: sudo systemctl restart {HELPER_UNIT}"
+            ));
+            Err(not_restarted())
+        }
+    }
+}
+
+/// Who holds the DAS maintenance lock at `path`: `None` when it is free. The
+/// lock is taken and let go at once — never kept — with the record every
+/// holder writes, so a job that looks at it in that instant can say who it
+/// was.
+fn maintenance_lock_holder(path: &Path) -> Result<Option<String>, String> {
+    match buttered_dasd::maintenance::MaintenanceHeld::try_acquire_at(
+        path,
+        "btrdasd setup --upgrade",
+    ) {
+        Ok(Some(_released_at_once)) => Ok(None),
+        Ok(None) => Ok(Some(buttered_dasd::maintenance::holder_of(path))),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Everything `upgrade` does before regenerating files: load the config at
@@ -2243,6 +2405,341 @@ auth = "starttls""#,
             result.unwrap();
             assert_eq!(lines, expected, "enabled={enabled} relay_up={relay_up}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // bd DAS-Backup-Manager-6wt — an upgrade restarts the D-Bus helper
+    // -----------------------------------------------------------------
+
+    const HELD_BY: &str = "btrdasd-helper BackupRun job pid 4242";
+
+    /// Run `restart_helper` on a systemd config with the unit in `state`
+    /// (`Err` when it cannot be read) and the lock answering `lock`. Returns
+    /// the result, the lines said, the systemctl calls, and whether the lock
+    /// was looked at.
+    fn run_restart_helper(
+        init: crate::setup::config::InitSystem,
+        state: Result<&str, &str>,
+        lock: Result<Option<&str>, &str>,
+        failing: &[&'static str],
+    ) -> (Result<(), String>, Vec<String>, Vec<String>, bool) {
+        let mut config = Config::default();
+        config.init.system = init;
+        let systemctl = FakeSystemctl::new(failing);
+        let looked = std::cell::Cell::new(false);
+        let active_state = || state.map(str::to_string).map_err(str::to_string);
+        let maintenance_holder = || {
+            looked.set(true);
+            lock.map(|h| h.map(str::to_string)).map_err(str::to_string)
+        };
+        let run = |args: &[&str]| systemctl.run(args);
+        let mut lines = Vec::new();
+        let result = restart_helper(
+            &config,
+            &HelperHost {
+                active_state: &active_state,
+                maintenance_holder: &maintenance_holder,
+                systemctl: &run,
+            },
+            &mut |l| lines.push(l),
+        );
+        (result, lines, systemctl.calls(), looked.get())
+    }
+
+    use crate::setup::config::InitSystem;
+
+    #[test]
+    fn a_running_helper_is_restarted_when_the_maintenance_lock_is_free() {
+        for state in ["active", "activating", "reloading"] {
+            let (result, lines, calls, looked) =
+                run_restart_helper(InitSystem::Systemd, Ok(state), Ok(None), &[]);
+            assert_eq!(result, Ok(()), "{state}");
+            assert!(looked, "the lock must be looked at first ({state})");
+            assert_eq!(calls, vec!["try-restart btrdasd-helper.service"], "{state}");
+            assert_eq!(
+                lines,
+                vec![
+                    "Restarted btrdasd-helper.service: the D-Bus helper now runs the binary \
+                     just installed."
+                        .to_string()
+                ],
+                "{state}"
+            );
+        }
+        // `systemctl show --value` ends its answer with a newline.
+        let (result, _, calls, _) =
+            run_restart_helper(InitSystem::Systemd, Ok("active\n"), Ok(None), &[]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, vec!["try-restart btrdasd-helper.service"]);
+    }
+
+    #[test]
+    fn a_helper_holding_a_job_is_not_restarted_and_the_command_is_said() {
+        let (result, lines, calls, looked) =
+            run_restart_helper(InitSystem::Systemd, Ok("active"), Ok(Some(HELD_BY)), &[]);
+        assert_eq!(
+            result,
+            Ok(()),
+            "a job in progress is a reason to wait, not a failure"
+        );
+        assert!(looked);
+        assert_eq!(calls, Vec::<String>::new(), "nothing may be restarted");
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "Warning: btrdasd-helper.service NOT restarted: the DAS maintenance lock is \
+                     held by {HELD_BY} — a backup, restore or index job may be running in the \
+                     helper."
+                ),
+                "  Until it is restarted the GUI history fails on a run whose snapshot counts \
+                 are unknown. When the job has finished, run: sudo systemctl try-restart \
+                 btrdasd-helper.service"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restart_that_fails_is_an_error_and_says_so() {
+        let (result, lines, calls, _) = run_restart_helper(
+            InitSystem::Systemd,
+            Ok("active"),
+            Ok(None),
+            &["try-restart"],
+        );
+        assert_eq!(
+            result,
+            Err("btrdasd-helper.service was not restarted — see above".to_string())
+        );
+        assert_eq!(calls, vec!["try-restart btrdasd-helper.service"]);
+        assert_eq!(
+            lines,
+            vec![
+                "ERROR: could not restart btrdasd-helper.service (systemctl try-restart \
+                 btrdasd-helper.service exited with 1). The running helper is the old binary, \
+                 and the GUI history fails on a run whose snapshot counts are unknown. See \
+                 journalctl -u btrdasd-helper.service, then run: sudo systemctl restart \
+                 btrdasd-helper.service"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_helper_that_is_not_running_is_left_for_dbus_to_start() {
+        for state in ["inactive", "failed"] {
+            let (result, lines, calls, looked) =
+                run_restart_helper(InitSystem::Systemd, Ok(state), Ok(None), &[]);
+            assert_eq!(result, Ok(()), "{state}");
+            assert!(
+                !looked,
+                "no lock to look at for a helper that is not running"
+            );
+            assert_eq!(calls, Vec::<String>::new(), "{state}");
+            assert_eq!(
+                lines,
+                vec![format!(
+                    "btrdasd-helper.service is {state}: nothing to restart — D-Bus starts the \
+                     helper from the new binary when it is next needed."
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn not_knowing_whether_to_restart_is_an_error_and_restarts_nothing() {
+        let not_restarted = Err("btrdasd-helper.service was not restarted — see above".to_string());
+
+        let (result, lines, calls, looked) = run_restart_helper(
+            InitSystem::Systemd,
+            Err("systemctl could not be run: No such file or directory"),
+            Ok(None),
+            &[],
+        );
+        assert_eq!(result, not_restarted);
+        assert!(!looked);
+        assert_eq!(calls, Vec::<String>::new());
+        assert_eq!(
+            lines,
+            vec![
+                "ERROR: cannot tell whether btrdasd-helper.service is running (systemctl could \
+                 not be run: No such file or directory) — not restarted. If it is running, \
+                 restart it when no backup or restore job is: sudo systemctl try-restart \
+                 btrdasd-helper.service"
+                    .to_string()
+            ]
+        );
+
+        let (result, lines, calls, _) = run_restart_helper(
+            InitSystem::Systemd,
+            Ok("active"),
+            Err("cannot open lock file: Permission denied"),
+            &[],
+        );
+        assert_eq!(result, not_restarted);
+        assert_eq!(
+            calls,
+            Vec::<String>::new(),
+            "an unread lock is not a free one"
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "ERROR: cannot look at the DAS maintenance lock (cannot open lock file: \
+                 Permission denied) — btrdasd-helper.service not restarted. Restart it when no \
+                 backup or restore job is running: sudo systemctl try-restart \
+                 btrdasd-helper.service"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn without_systemd_the_operator_is_told_to_restart_the_helper() {
+        for init in [InitSystem::Sysvinit, InitSystem::Openrc] {
+            let (result, lines, calls, looked) =
+                run_restart_helper(init.clone(), Ok("active"), Ok(None), &[]);
+            assert_eq!(result, Ok(()));
+            assert!(!looked);
+            assert_eq!(calls, Vec::<String>::new(), "{init:?}");
+            assert_eq!(
+                lines,
+                vec![format!(
+                    "The D-Bus helper is not a systemd unit on this init system: if \
+                     btrdasd-helper is running, restart it — it keeps running the binary it \
+                     started with, and one older than {} cannot read a run whose snapshot \
+                     counts are unknown.",
+                    env!("CARGO_PKG_VERSION")
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn the_lock_probe_lets_go_at_once_and_names_a_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("das-maintenance.lock");
+
+        // Free: taken and let go, its record emptied again.
+        assert_eq!(maintenance_lock_holder(&lock), Ok(None));
+        assert!(
+            buttered_dasd::scrub::FileLock::try_acquire(&lock)
+                .unwrap()
+                .is_some(),
+            "the probe must not keep the lock"
+        );
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "");
+
+        // Held: named by the holder's own record, and left held.
+        let job = buttered_dasd::maintenance::MaintenanceHeld::try_acquire_at(&lock, "test job")
+            .unwrap()
+            .expect("the scratch lock is free");
+        assert_eq!(
+            maintenance_lock_holder(&lock),
+            Ok(Some(format!("test job pid {}", std::process::id())))
+        );
+        assert!(
+            buttered_dasd::scrub::FileLock::try_acquire(&lock)
+                .unwrap()
+                .is_none(),
+            "the holder must still hold it"
+        );
+        drop(job);
+
+        // A lock file that cannot exist is an error, never "free".
+        let err = maintenance_lock_holder(Path::new("/dev/null/das-maintenance.lock")).unwrap_err();
+        assert!(err.contains("/dev/null/das-maintenance.lock"), "{err}");
+    }
+
+    /// Run `upgrade_with` on a current config, `install` and `systemctl`
+    /// recorded in one sequence with every line said.
+    fn run_upgrade_with(
+        install_fails: bool,
+        failing: &[&'static str],
+    ) -> (Result<(), String>, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let install = |_: &Config| -> Result<(), Box<dyn std::error::Error>> {
+            seen.borrow_mut().push("install".to_string());
+            if install_fails {
+                Err("1 systemd unit operation(s) failed".into())
+            } else {
+                Ok(())
+            }
+        };
+        let active_state = || Ok("active".to_string());
+        let maintenance_holder = || Ok(None);
+        let systemctl = |args: &[&str]| {
+            seen.borrow_mut()
+                .push(format!("systemctl {}", args.join(" ")));
+            if args.iter().any(|a| failing.contains(a)) {
+                Err(format!("systemctl {} exited with 1", args.join(" ")))
+            } else {
+                Ok(())
+            }
+        };
+        let result = upgrade_with(
+            &config_path,
+            &|_| true,
+            &install,
+            &HelperHost {
+                active_state: &active_state,
+                maintenance_holder: &maintenance_holder,
+                systemctl: &systemctl,
+            },
+            &mut |line| seen.borrow_mut().push(line),
+        )
+        .map_err(|e| e.to_string());
+        (result, seen.into_inner())
+    }
+
+    #[test]
+    fn an_upgrade_regenerates_the_files_then_restarts_the_helper() {
+        let (result, seen) = run_upgrade_with(false, &[]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert!(seen[0].starts_with("Regenerating files from "), "{seen:?}");
+        assert_eq!(
+            seen[1..],
+            [
+                "install".to_string(),
+                "systemctl try-restart btrdasd-helper.service".to_string(),
+                "Restarted btrdasd-helper.service: the D-Bus helper now runs the binary just \
+                 installed."
+                    .to_string(),
+                "Upgrade complete.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_upgrade_restarts_the_helper_even_when_regenerating_failed() {
+        let (result, seen) = run_upgrade_with(true, &[]);
+        assert_eq!(
+            result,
+            Err("1 systemd unit operation(s) failed".to_string())
+        );
+        assert!(
+            seen.contains(&"systemctl try-restart btrdasd-helper.service".to_string()),
+            "{seen:?}"
+        );
+        assert!(!seen.contains(&"Upgrade complete.".to_string()), "{seen:?}");
+    }
+
+    #[test]
+    fn an_upgrade_whose_helper_restart_failed_is_not_complete() {
+        let (result, seen) = run_upgrade_with(false, &["try-restart"]);
+        assert_eq!(
+            result,
+            Err("btrdasd-helper.service was not restarted — see above".to_string())
+        );
+        assert!(!seen.contains(&"Upgrade complete.".to_string()), "{seen:?}");
     }
 
     /// Run `check_with` with fixed answers from the host, returning the report.
