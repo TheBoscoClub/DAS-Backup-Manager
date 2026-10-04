@@ -92,9 +92,14 @@ site, never the pattern.
    records the run as failed (`--counts-unknown`, `aborted: <what>: <why>` in
    the errors) and sends one ABORTED report through `send_report` — both best
    effort, neither able to change the status (`bd DAS-Backup-Manager-2my`).
-   Only then is the substituted "success" cautious on every path. The scrub's
-   split is `bd DAS-Backup-Manager-18p`; both are in `backup.md` §Sentinel
-   Interaction.
+   Only then is the substituted "success" cautious on the paths that matter —
+   every path but one: an abort *after* `main()`'s report went out (a log line
+   that cannot be written after the history row, say) exits 3 under a report
+   and a row that already say what they saw, SUCCESS if nothing else failed,
+   and only the journal's `status=3` and the log show it. That is a trace,
+   not an alert; it is narrow (the run's work was done and reported) and
+   stated in `backup.md` rather than claimed away. The scrub's split is
+   `bd DAS-Backup-Manager-18p`; both are in `backup.md` §Sentinel Interaction.
 
 ### Bash inventory, triaged 2026-09-01 (bd `76g`)
 

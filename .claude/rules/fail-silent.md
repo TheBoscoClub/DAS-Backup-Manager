@@ -38,7 +38,8 @@ never the pattern.**
    something failed** — deliberate, the doctor's rule; see `backup.md` §Sentinel Interaction
    (`bd d1r`). The failure travels by the report, the history row and the journal's `status=3`,
    never by a restart; only a run that could not start exits 1 and fails the unit. An abort
-   before the report stage sends one ABORTED report and records a failed row (`bd 2my`).
+   before the report stage sends one ABORTED report and records a failed row (`bd 2my`); one
+   after the report went out has only the journal's `status=3` and the log as its trace.
 6. Display-only fallbacks, documented config defaults, fire-and-forget D-Bus signals, and
    errors discarded in `Drop` or on a path already returning `Err`.
 

@@ -128,7 +128,10 @@ Checked before any directory is created, both roots compared **after resolution*
   `DAS_REPORT_FROM` override for testing.
 - **`smtp-auth=none` is REQUIRED on every mailx invocation**, or s-nail aborts with exit 4.
 - **Never redirect mailx stderr to `/dev/null`.**
-- The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only.
+- **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed: s-nail
+  has no read timeout, and a relay that never answers must cost the report, not the run.
+- The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only. A
+  write that fails is logged as such, and the not-emailed lines then name the journal instead.
 - **Unattended (no-session) delivery is proven in production — do not re-test it.**
 - Diagnose with `journalctl -u das-backup`, `journalctl -u postfix`, `mailq`. `status=sent` means
   the provider accepted it, not that it reached the inbox.
@@ -157,9 +160,12 @@ Checked before any directory is created, both roots compared **after resolution*
     start. Findings travel by email.
   - `backup-run.sh` (bd `d1r`): **0** = nothing FAILED (a WARN still 0); **3** = began its work and
     something FAILED, or it aborted on a target's or a source's state; **1** = could not start
-    (nothing mounted or sent). Both backup units carry `SuccessExitStatus=3`, and that line is load-bearing.
-  - A 3 is never silent: the report says FAILURES DETECTED, and an abort before the report sends
+    (nothing mounted or sent); **128+N** = stopped by HUP INT USR1 PIPE ALRM or TERM (129 130
+    138 141 142 143), the unit fails. Both backup units carry `SuccessExitStatus=3`, and that line is load-bearing.
+  - A 3 is not silent: the report says FAILURES DETECTED, and an abort before the report sends
     one **ABORTED** report (what, why, targets seen, log) and records a failed history row (bd `2my`).
+    The one exception: an abort *after* the report went out exits 3 under a report and a row that
+    already say what they saw — the journal's `status=3` and the log are its only trace.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.

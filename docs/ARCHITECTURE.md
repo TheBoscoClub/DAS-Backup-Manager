@@ -112,7 +112,8 @@ The system has six major components:
          ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted;
          │                                   decide_run_counts() then settles the snapshot counts, before the run status
          ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report
-         ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25); report also written to last_report
+         ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25), bounded: TERM after 60 s, KILL 10 s later;
+         │                                   report written to last_report first (a write that fails is logged, and the journal has it)
          └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown)
 ```
 
@@ -125,7 +126,9 @@ A run that aborts before its report (exit 3: no primary target, a target or sour
 verification, a command failing under `set -e`) never reaches those steps. Its EXIT trap,
 `cleanup()`, records it as failed (`--counts-unknown`, the reason in the errors), sends one short
 report with the subject `ABORTED` through the same relay path, and only then unmounts — the
-unmount can hang on a drive that went away. A dry run sends and records nothing.
+unmount can hang on a drive that went away. A dry run sends and records nothing. A stop by a
+signal (HUP, INT, USR1, PIPE, ALRM, TERM) keeps its own code (128 + its number), is recorded as
+a stop once the run holds the maintenance lock, and sends no report.
 
 A `--dryrun` stops after the expiry preview and the recovery OS check: it previews the archive pruner and
 unmounts, and sends, records and archives nothing. It may create a missing, empty
