@@ -700,9 +700,12 @@ pub fn read_scrub_status(fsuuid: &str) -> Result<ScrubStatusRecord, ScrubError> 
 
 /// An advisory `flock(2)` held for the lifetime of the value.
 ///
-/// The lock is released when the file descriptor closes on drop; an explicit
-/// `LOCK_UN` is issued first so the release is visible even if the `File` is
-/// leaked into a longer-lived structure.
+/// Let go on drop by an explicit `LOCK_UN`, then the close. The close alone
+/// would not let go while a copy of the descriptor lives, and a fork of this
+/// process copies every descriptor until its exec — every spawn does, std's
+/// `posix_spawn` included. `flock` lets go once every copy is closed, or at
+/// a `LOCK_UN` through any one of them (bd DAS-Backup-Manager-eu0). It also
+/// lets go if the `File` is leaked into a longer-lived structure.
 #[derive(Debug)]
 pub struct FileLock {
     path: PathBuf,
@@ -900,6 +903,8 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
+        // `LOCK_UN`, not the close alone: a fork's copy of the descriptor
+        // would hold the lock on (see the type's doc).
         // SAFETY: the fd is valid until `self.file` is dropped, immediately after.
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
@@ -2897,6 +2902,41 @@ Total to scrub:   401.28MiB\n";
         assert!(FileLock::try_acquire(&path).unwrap().is_none());
 
         drop(first);
+        assert!(FileLock::try_acquire(&path).unwrap().is_some());
+    }
+
+    /// Let go at once even while a copy of its descriptor lives on, as a fork
+    /// of this process holds every descriptor until its exec: closing alone
+    /// would leave the lock held by the copy (bd DAS-Backup-Manager-eu0). The
+    /// converse, a plain close, shows the copy would hold it.
+    #[test]
+    fn file_lock_is_released_on_drop_while_a_copy_of_its_descriptor_lives() {
+        use std::os::fd::AsFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.lock");
+
+        let lock = FileLock::try_acquire(&path).unwrap().unwrap();
+        let copy = lock.file.as_fd().try_clone_to_owned().unwrap();
+        drop(lock);
+        assert!(
+            FileLock::try_acquire(&path).unwrap().is_some(),
+            "released for good, whatever copies of its descriptor live"
+        );
+        drop(copy);
+
+        let plain = File::open(&path).unwrap();
+        // SAFETY: flock on a descriptor `plain` owns.
+        assert_eq!(
+            unsafe { libc::flock(plain.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let copy = plain.as_fd().try_clone_to_owned().unwrap();
+        drop(plain);
+        assert!(
+            FileLock::try_acquire(&path).unwrap().is_none(),
+            "closed but not unlocked: the copy holds the lock"
+        );
+        drop(copy);
         assert!(FileLock::try_acquire(&path).unwrap().is_some());
     }
 
