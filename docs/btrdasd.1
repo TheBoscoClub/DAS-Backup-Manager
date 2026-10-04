@@ -582,6 +582,15 @@ declines and exits 0; it waits for a running scrub. A run that could not start
 (locks, mounting, target verification, btrbk) exits 1 and is not recorded. A run
 that started and failed is recorded and reported, then exits 1.
 .PP
+.BR backup\-run.sh ,
+which the scheduled units run, follows a different rule: 0 when nothing
+failed, 3 when the run began its work and something failed or it aborted on a
+target's or a source's state (target verification and btrbk included), 1 only
+when it could not start. Its units count 3 as success
+.RB ( SuccessExitStatus=3 ),
+so a failure the next start would meet again does not restart a whole backup
+every ten minutes; the report, the history and the journal carry it.
+.PP
 .B btrdasd backup run
 .RB [ \-\-config
 .IR PATH ]

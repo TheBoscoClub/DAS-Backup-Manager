@@ -512,6 +512,17 @@ was removed 2026-04-10; no ESP hook file is ever generated.
 
 The backup and scrub services are ordered after `time-sync.target` (retirement and expiry dates depend on a correct clock). For sysvinit/OpenRC systems, cron entries replace systemd units.
 
+**Exit codes of `backup-run.sh`** (what `das-backup.service` and `das-backup-full.service` run), because a failure the next start would meet again must not restart a whole backup every ten minutes:
+
+| Code | Meaning | The unit |
+|------|---------|----------|
+| `0` | The run executed and nothing failed — warnings allowed (`COMPLETED WITH WARNINGS`). Also: skipped because another backup holds `/run/das-backup.lock` | success |
+| `3` | The run began its work and something **failed**: btrbk failed for some or all targets (it exits 10 when any one target aborts — one absent drive is enough), any operation failed (`FAILURES DETECTED`), or the run aborted on a target's or a source's state (no primary target, a target that will not mount or holds the wrong filesystem, a stale directory where an absent target mounts, a source that is not the expected filesystem) | **success**, via `SuccessExitStatus=3` |
+| `1` | Could not start: config unreadable, `btrdasd` missing, a bad argument, not root, the maintenance lock unusable. Nothing was mounted or sent | **failed** |
+| `130` / `143` | Stopped by SIGINT/SIGTERM — `systemctl stop` included | **failed** |
+
+Without `SuccessExitStatus=3` a run that failed this way left the unit `failed`, and cachyos-sentinel restarts any failed unit, at most 3 times per 600 s — a limit a ~25-minute backup never reaches, so one absent drive would start a new backup about every ten minutes until it came back. A failure travels by the report, the history and the journal (`status=3`) instead, and is not retried before the next timer fire. A run that aborts before its report stage sends no report and writes no history row: the journal and the run log are its only trace. `btrdasd backup run` and GUI backups are not run by these units; the CLI exits 1 for any failure. `sudo btrdasd setup --upgrade` writes the units with this line.
+
 ## Verifying the Installation
 
 ```bash

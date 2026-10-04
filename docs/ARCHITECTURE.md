@@ -415,7 +415,7 @@ Templates are rendered programmatically (no external template files):
 | Function | Output | Description |
 |----------|--------|-------------|
 | `btrbk_conf::render_btrbk_conf()` | `btrbk.conf` | Per-source volume blocks with target retention; retired entries are left out. In the library because the backup run, the `subvol` commands and the GUI helper's saves regenerate it too |
-| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support; OnCalendar with RandomizedDelaySec |
+| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support, `SuccessExitStatus=3` (a run that began and failed; the packaged `systemd/*.service.in` carry the same line); OnCalendar with RandomizedDelaySec |
 | `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
 | `render_systemd_doctor_service()` / `render_systemd_doctor_timer()` | `das-backup-doctor.{service,timer}` | Weekly drift check, `SuccessExitStatus=1` |
 | `render_udev_udisks_ignore()` | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | Hides every target from udisks2 by serial and `mount_uuid` |

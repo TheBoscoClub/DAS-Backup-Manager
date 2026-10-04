@@ -152,9 +152,13 @@ Checked before any directory is created, both roots compared **after resolution*
   stop alone is undone within seconds.
 - The unit files carry no `Restart=`, `OnFailure=` or `OnUnitInactiveSec=`. Keep it that way.
 - Sentinel's limiter is 3 restarts per 600 s and **cannot brake a failure loop slower than
-  ~10 minutes**. So exit codes mean "could not run", not "found a problem":
-  - `backup-run.sh` and `btrdasd scrub run`: **0** = the run/pass executed, whatever it found;
-    **nonzero** = it could not start at all, or (backup) btrbk exited nonzero. Findings travel by email.
+  ~10 minutes**, so a failure the next start would meet again must never leave a unit `failed`:
+  - `btrdasd scrub run`: **0** = the pass executed, whatever it found; **nonzero** = it could not
+    start. Findings travel by email.
+  - `backup-run.sh` (bd `d1r`): **0** = nothing FAILED (a WARN still 0); **3** = began its work and
+    something FAILED, or it aborted on a target's or a source's state — the journal carries it,
+    and the report if the run got that far; **1** = could not start (nothing mounted or sent).
+    Both backup units carry `SuccessExitStatus=3`, and that line is load-bearing.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.
@@ -168,7 +172,8 @@ Two layers, both unconditional and both run under `--dryrun`:
    for an unavailable one is `rmdir`'d if empty, and is a fatal ABORT if non-empty.
 2. **`verify_targets_before_btrbk`** — after mounting, before `run_btrbk`: an available target
    must be a real mountpoint whose UUID (or serial) matches `config.toml`; an unavailable
-   target's `$mnt` must not exist. Any violation aborts and is recorded in the report.
+   target's `$mnt` must not exist. Any violation aborts, exit 3. An abort sends no report and
+   writes no history row — the journal and the run log are its only trace (bd `2my`).
 
 Rust twin (CLI/GUI): `mount::verify_write_targets`.
 
