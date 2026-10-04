@@ -39,6 +39,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
+      # The container option above is the mount; this says so, or names why not.
+      - name: /tmp is noatime
+        run: |
+          findmnt -no OPTIONS /tmp | grep -qw noatime || {
+            echo "::error::/tmp is not mounted noatime ($(findmnt -no OPTIONS /tmp)): the recovery-OS tests would read no link"
+            exit 1
+          }
+
       - name: Install toolchain
         run: pacman -Syu --noconfirm base-devel rust
 
