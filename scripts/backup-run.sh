@@ -21,9 +21,11 @@
 #     of a run that held the maintenance lock into 3, so an implicit set -e
 #     abort (a source's `mount` failing with 32, say) cannot fall outside
 #     the rule, and it runs with errexit off: a log line it could not write
-#     used to end it with exit 1 and skip the unmount. Report, email and
-#     history are unchanged (bd DAS-Backup-Manager-d1r;
-#     tests/test_backup_exit_semantics.sh).
+#     used to end it with exit 1 and skip the unmount (bd
+#     DAS-Backup-Manager-d1r; tests/test_backup_exit_semantics.sh).
+#     Only a singleton lock another run holds is a skip (0): one that
+#     cannot be opened or taken is "could not start" (1) and says why, where
+#     it used to skip silently (bd DAS-Backup-Manager-ismb).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -316,10 +318,14 @@
 # Every exit path, and why it is what it is:
 #
 #   status   where                         when
-#   0        top level, singleton lock     another backup holds /run/das-backup.lock: a skip,
-#                                          not a failure (before the EXIT trap; touches nothing)
+#   0        top level, singleton lock     another backup holds /run/das-backup.lock
+#                                          (`flock -E 75` answers 75): a skip, not a failure
+#                                          (before the EXIT trap; touches nothing)
 #   1        top level, `exec 9>`          the lock file cannot be opened (not root, /run
-#                                          unwritable): bash exits 1 under set -e
+#                                          missing): says so (bd DAS-Backup-Manager-ismb)
+#   1        top level, flock              the lock cannot be taken for any other reason
+#                                          (ENOLCK: 71; a flock that answers 1 to anything):
+#                                          says so, with flock's status (ismb)
 #   1        top level                     btrdasd missing: a required tool
 #   1        top level, load_config_env    the config cannot be read
 #   1        top level, set -u             the config lacks a value this script reads
@@ -369,11 +375,27 @@ set -euo pipefail
 # progress. /run is tmpfs (auto-cleared at boot) so the lockfile can't go stale
 # across reboots. Exit 0 (not failure) when locked so that cachyos-sentinel
 # does not interpret a skipped concurrent fire as a unit failure needing retry.
+#
+# Only a lock another run HOLDS is a skip. A lock that cannot be opened or
+# taken at all — /run missing, no permission, ENOLCK — is "could not start",
+# exit 1, and says why: skipping with 0 then would disable every backup
+# without a word for as long as the lock stayed broken
+# (bd DAS-Backup-Manager-ismb). `-E 75` gives "held" a status no failure
+# returns: util-linux flock exits 64, 65 or 71 for its own errors, but a flock
+# that answers 1 to everything must not read as "held".
 LOCKFILE="/run/das-backup.lock"
-exec 9>"$LOCKFILE"
-if ! flock -n 9; then
+if ! exec 9>"$LOCKFILE"; then
+    echo "[ERROR] Cannot open the backup lock $LOCKFILE — could not start" >&2
+    exit 1
+fi
+lock_rc=0
+flock -n -E 75 9 || lock_rc=$?
+if ((lock_rc == 75)); then
     echo "[INFO] Another das-backup run holds $LOCKFILE — skipping this invocation" >&2
     exit 0
+elif ((lock_rc != 0)); then
+    echo "[ERROR] Cannot lock $LOCKFILE (flock exit $lock_rc) — could not start" >&2
+    exit 1
 fi
 # FD 9 stays open for the rest of the script; lock auto-releases when the
 # process exits (FD 9 closes), no explicit unlock needed.
