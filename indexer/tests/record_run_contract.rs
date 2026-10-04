@@ -25,7 +25,7 @@ const HARNESS: &str = r#"
 set -euo pipefail
 script="$1" setup="$2" status="$3" full="$4"
 extract() { sed -n "/^$1() {/,/^}/p" "$script"; }
-for fn in decide_run_counts record_run_args record_op; do
+for fn in decide_run_counts record_run_args record_op note_abort; do
     body="$(extract "$fn")"
     if [[ -z "$body" ]]; then
         echo "HARNESS BROKEN: $fn() not found in $script" >&2
@@ -253,6 +253,82 @@ BTRBK_END_TIME=1060";
     assert_eq!(
         got[0].errors,
         "btrbk_counters: not read — the run ended before the snapshot counters were taken"
+    );
+}
+
+/// The errors of the one row, sorted: `--errors` lists the failed operations in
+/// the order of a bash associative array, which is not an order.
+fn sorted_errors(db: &Path) -> Vec<String> {
+    let got = rows(db);
+    assert_eq!(got.len(), 1, "{got:?}");
+    let mut errors: Vec<String> = got[0].errors.lines().map(str::to_owned).collect();
+    errors.sort_unstable();
+    errors
+}
+
+#[test]
+fn an_aborted_run_is_recorded_as_failed_with_what_stopped_it() {
+    // bd DAS-Backup-Manager-2my: cleanup() records a run that aborted before
+    // its report. abort_reason() left what stopped it in ABORT_WHAT/ABORT_REASON
+    // (two violations here, so two lines), note_abort() turned that into an
+    // `aborted` FAIL, and capture_report_data never ran: the counts are unknown
+    // and btrbk ran for 0 s.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let state = r#"ALL_TARGET_MOUNTS=(/mnt/backup-22tb /mnt/backup-system-recovery-A)
+ABORT_WHAT='target verification'
+ABORT_REASON="$(printf '%s\n%s' "primary-22tb: /mnt/backup-22tb has fs UUID 'x', expected 'y' — different filesystem mounted here" "system-recovery-A-2tb: marked unavailable but /mnt/backup-system-recovery-A still exists (would let btrbk write to bare dir on /)")"
+note_abort 3 'exit 3'"#;
+
+    let vector = record_as_the_script_does(&db, state, "FAILURE", "true");
+
+    assert!(!vector.iter().any(|a| a == "--success"), "{vector:?}");
+    assert!(vector.iter().any(|a| a == "--counts-unknown"), "{vector:?}");
+    let got = rows(&db);
+    assert_eq!(
+        got.len(),
+        1,
+        "the aborted run must be in the history: {got:?}"
+    );
+    let row = &got[0];
+    assert_eq!(row.success, 0);
+    assert_eq!(row.mode, "full");
+    assert_eq!((row.snaps_created, row.snaps_sent), (None, None), "{row:?}");
+    assert_eq!(
+        (row.bytes_sent, row.duration_secs),
+        (0, 0),
+        "btrbk never ran"
+    );
+    assert_eq!(
+        sorted_errors(&db),
+        vec![
+            "aborted: target verification: primary-22tb: /mnt/backup-22tb has fs UUID 'x', \
+             expected 'y' — different filesystem mounted here; system-recovery-A-2tb: marked \
+             unavailable but /mnt/backup-system-recovery-A still exists (would let btrbk write \
+             to bare dir on /)",
+            "btrbk_counters: not read — the run ended before the snapshot counters were taken",
+        ]
+    );
+}
+
+#[test]
+fn an_implicit_abort_is_recorded_with_the_command_that_failed() {
+    // A command failing under set -e, with no abort_reason() before it: cleanup()
+    // hands note_abort() the status and $BASH_COMMAND. Quotes and `$` in the
+    // command travel as one argument, untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let state = r#"ALL_TARGET_MOUNTS=(/mnt/backup-22tb)
+note_abort 32 'mount -t btrfs -o subvolid=5 "$dev" "$mnt"'"#;
+
+    record_as_the_script_does(&db, state, "FAILURE", "false");
+
+    assert_eq!(
+        sorted_errors(&db),
+        vec![
+            r#"aborted: a command that failed: exit status 32: mount -t btrfs -o subvolid=5 "$dev" "$mnt""#,
+            "btrbk_counters: not read — the run ended before the snapshot counters were taken",
+        ]
     );
 }
 
