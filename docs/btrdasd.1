@@ -390,7 +390,19 @@ Re-open the wizard with the current configuration pre-filled.
 .TP
 .B \-\-upgrade
 Regenerate all managed files from the existing configuration
-(useful after a binary update).
+(useful after a binary update), then restart
+.B btrdasd\-helper.service
+when it is running, so the GUI is served by the new binary. While the DAS
+maintenance lock is held \(em a job may be running in the helper \(em it is not
+restarted: the holder is named, with the command to run once the job has
+finished. A restart that fails, or a unit state or lock that cannot be read,
+is an error. A binary from before schema 4 cannot read a run whose snapshot
+counts are unknown, so keep
+.BR btrdasd ,
+.B btrdasd\-helper
+and the scripts at one version, and never install while a backup runs: the
+first open by a new binary migrates the database and waits up to 30 seconds
+behind another writer, then fails.
 .TP
 .B \-\-uninstall
 Remove all generated files, disable timers, and optionally remove the database.
