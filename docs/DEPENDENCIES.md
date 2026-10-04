@@ -54,7 +54,7 @@ are automatically installed; they must be present before running the scripts.
 |------|-----------------|---------|---------|
 | `btrbk` | >= 0.32 (AUR/pacman) | `backup-run.sh`, `backup-verify.sh` | BTRFS snapshot creation and send/receive to DAS targets |
 | `btrfs-progs` | system (`btrfs` CLI) | `backup-run.sh`, `backup-verify.sh`, `btrdasd setup`, `btrdasd scrub`, `btrdasd doctor` | BTRFS subvolume operations, `btrfs scrub start`/`status`, subvolume listing for drift detection |
-| `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh`, `btrdasd health` | Drive serial number detection, SMART health, temperature, power-on hours |
+| `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh`, `das-partition-drives.sh`, `btrdasd health` | Drive serial number detection, SMART health, temperature, power-on hours; the self-test gate before partitioning (`das-partition-drives.sh --run` refuses unless every drive's most recent self-test passed: ATA `Completed without error`, SCSI `Completed`) |
 | `rsync` | system | Manual disaster-recovery restores only (see `docs/DISASTER-RECOVERY-GUIDE.md`) | Not used by any automated script — ESP synchronization was removed 2026-04-10/12 (`.claude/rules/esp-safety.md`) |
 | `s-nail` (mailx) | system | `backup-run.sh`, `indexer/src/report.rs` | Submits email backup reports to the local mail relay; invoked as `mailx` |
 | a local mail relay | system (optional) | `backup-run.sh`, `indexer/src/report.rs` | Anything accepting SMTP on `[email].smtp_host:smtp_port` — a Postfix null-client smarthost here. Required only when `[email].enabled = true`; without it reports are written to disk and the send is logged as failed |

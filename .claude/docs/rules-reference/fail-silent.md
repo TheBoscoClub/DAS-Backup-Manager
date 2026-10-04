@@ -130,6 +130,19 @@ status: `0` found, `2` genuinely unlabelled, anything else fails closed. Two
 regression cases in `tests/test_esp_label_derivation.sh`, both observed RED
 against the pre-fix code with `guard did NOT fire (exit 0)`.
 
+A second was found later, by review (bd `25r7`, `jgzx`, 2026-10-04), in the
+same script and of the table's first shape. `check_smart_tests` built its
+self-test status as `smartctl … 2>/dev/null | grep … | head -1 || echo "No
+tests"`, a probe resolving to "no reading". But its caller is the gate in front
+of `--run`, and the gate took everything except "in progress" as done: "No
+tests", a failed test and a drive smartctl could not read all went on to
+`YES-DESTROY`. The shape was cautious; the call site was not. Output and exit
+status are now read apart, and only a passed row passes. A capture bash cannot
+make (no fd to spare) returns 0 with nothing in it (bash 5.3, measured), so
+"no reading" must block by itself. The status matrix is in
+`tests/test_early_exit_readers.sh`, RED against 2.2.1 (rc 0 for every failed,
+aborted, never-run and unreadable drive).
+
 ### Rust inventory, triaged 2026-09-01 (bd `8wx`)
 
 All **236** hits of the Rust grep below were classified — 223 in production
