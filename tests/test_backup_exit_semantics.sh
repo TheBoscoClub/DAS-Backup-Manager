@@ -262,6 +262,11 @@ case " $* " in
     mode=run
     [[ " $* " == *" dryrun "* ]] && mode=dryrun
     if [[ -f "$S/knobs/btrbk_blocks" ]]; then
+        # Killing this sleep (a child of this pid) lets btrbk finish,
+        # successfully, at once. In the foreground, so a signal to the group
+        # reaches it: a background job of a non-interactive shell ignores
+        # SIGINT, and would outlive the run holding its descriptors.
+        echo "$$" >"$S/btrbk_stub.pid"
         : >"$S/btrbk_started"
         sleep 30
     fi
@@ -483,9 +488,12 @@ knob() { printf '%s\n' "$2" >"$STATE/knobs/$1"; }
 RUN_EUID=0
 RUN_BTRDASD="$BIN/btrdasd"
 RC=""
-# The command line of one run, into CMD: the copy, under `env -i`.
+# The command line of one run, into CMD: the copy, under `env -i`. SIGPIPE
+# starts at its default, as it does in a terminal: a shell cannot trap a
+# signal it inherited ignored, so a suite started with PIPE ignored would
+# otherwise test nothing about it (systemd starts units with PIPE ignored).
 run_cmd() {
-    CMD=(env -i
+    CMD=(env -i --default-signal=PIPE
         PATH="$BIN:$SYSBIN" HOME="$WORK/home" LC_ALL=C TMPDIR="$WORK/tmp"
         DAS_TEST_STATE="$STATE" DAS_TEST_EUID="$RUN_EUID"
         BTRDASD_BIN="$RUN_BTRDASD" DAS_CONFIG="$WORK/etc/config.toml"
@@ -1088,41 +1096,127 @@ check "singleton held: nothing mounted" "$(called mount)" "no"
 check "singleton held: no mail" "$(mails)" "0"
 
 # ---------------------------------------------------------------------------
-echo "== 130/143: stopped by a signal, as \`systemctl stop\` does (unchanged)"
+echo "== 129/130/138/141/142/143: stopped by a signal, as \`systemctl stop\` does"
 # ---------------------------------------------------------------------------
 # The whole process group gets the signal, as systemd's control-group kill
 # does, while btrbk runs. `exec` makes the background job the run itself, so
 # `wait` reports the run's status, not a subshell's death by the signal.
-run_signalled() { # run_signalled <signal>
-    run_cmd
+run_signalled() { # run_signalled <signal> [args...]
+    local sig="$1"
+    shift
+    run_cmd "$@"
     (
         set -m # the run gets its own process group
         { exec "${CMD[@]}"; } >"$STATE/out" 2>&1 &
         pid=$!
         for _ in $(seq 1 400); do [[ -e "$STATE/btrbk_started" ]] && break; sleep 0.05; done
-        kill "-$1" -- "-$pid"
+        kill "-$sig" -- "-$pid"
         wait "$pid"
     ) 2>/dev/null
     RC=$?
     tripwire
 }
-fresh
-knob btrbk_blocks 1
-run_signalled TERM
-check "SIGTERM while btrbk runs: exit status" "$RC" "143"
-show_tail 143
-check "SIGTERM: the run is recorded as failed" "$(recorded_as)" "failure"
-check "SIGTERM: nothing left mounted" "$(left_mounted)" "nothing"
-# A stop is not an abort: it is recorded, and the failed unit shows it; it
-# sends no ABORTED report.
-check "SIGTERM: no mail" "$(mails)" "0"
+# A stop is not a run's outcome: each signal keeps its own code (and the unit
+# ends failed, which shows it), the run is recorded as failed with the
+# signal named, and no report is sent — nothing anywhere says "exited 3".
+# HUP (a terminal hanging up), PIPE (a stream that went away), USR1 and ALRM
+# used to read as "a command that failed": exit 3 and an ABORTED mail, while
+# bash then died by the signal anyway (round 3, M2).
+for spec in TERM:143 INT:130 HUP:129 PIPE:141 USR1:138 ALRM:142; do
+    sig="${spec%%:*}" code="${spec#*:}"
+    fresh
+    knob btrbk_blocks 1
+    run_signalled "$sig"
+    check "SIG$sig while btrbk runs: exit status" "$RC" "$code"
+    show_tail "$code"
+    check "SIG$sig: cleanup() ran its recovery body" \
+        "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "1"
+    check "SIG$sig: recorded as failed" "$(recorded_as)" "failure"
+    check "SIG$sig: the stop in the errors" \
+        "$(vector_value --errors | grep -cxF "stopped: by SIG$sig (exit $code)")" "1"
+    check "SIG$sig: nothing left mounted" "$(left_mounted)" "nothing"
+    check "SIG$sig: no mail" "$(mails)" "0"
+    check "SIG$sig: nothing says exit 3" "$(grep -c 'exiting 3\|exited 3' "$STATE/out")" "0"
+done
 
+# The stream stdout writes to goes away mid-run (a terminal closed under
+# `| tee`, say): the run's next line raises SIGPIPE, a stop. cleanup()'s own
+# lines then fail as well; they must not end it before it records and
+# unmounts (it ignores PIPE from its first line). The log file keeps every
+# line either way.
 fresh
 knob btrbk_blocks 1
-run_signalled INT
-check "SIGINT while btrbk runs: exit status" "$RC" "130"
-show_tail 130
-check "SIGINT: no mail" "$(mails)" "0"
+run_cmd
+mkfifo "$WORK/stream"
+cat "$WORK/stream" >"$STATE/out" &
+reader=$!
+(
+    set -m
+    { exec "${CMD[@]}"; } >"$WORK/stream" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 400); do [[ -e "$STATE/btrbk_started" ]] && break; sleep 0.05; done
+    kill "$reader"                                        # the stream goes away
+    pkill -x -P "$(cat "$STATE/btrbk_stub.pid")" sleep    # btrbk finishes; the run writes again
+    wait "$pid"
+) 2>/dev/null
+RC=$?
+wait "$reader" 2>/dev/null
+rm -f "$WORK/stream"
+tripwire
+check "stdout gone mid-run: exit status (SIGPIPE)" "$RC" "141"
+check "stdout gone mid-run: recorded as failed" "$(recorded_as)" "failure"
+check "stdout gone mid-run: the stop in the errors" \
+    "$(vector_value --errors | grep -cxF "stopped: by SIGPIPE (exit 141)")" "1"
+check "stdout gone mid-run: nothing left mounted" "$(left_mounted)" "nothing"
+check "stdout gone mid-run: no mail" "$(mails)" "0"
+check "stdout gone mid-run: the log file has cleanup()'s line" \
+    "$(grep -c 'Cleaning up after abnormal termination' "$WORK/log/das-backup.log")" "1"
+
+# A stop in a dry run keeps its code too, and a dry run records nothing.
+fresh
+knob btrbk_blocks 1
+run_signalled TERM --dryrun
+check "SIGTERM in a dry run: exit status" "$RC" "143"
+show_tail 143
+check "SIGTERM in a dry run: not recorded" "$(record_calls)" "0"
+check "SIGTERM in a dry run: no mail" "$(mails)" "0"
+
+# A stop while the run waits behind another holder of the maintenance lock:
+# it had not begun (oeo), so its code is kept and nothing is recorded, sent
+# or unmounted — the stopped unit shows it.
+fresh
+(
+    exec 7<>"$RUN_DIR/das-maintenance.lock"
+    flock 7
+    printf 'btrdasd scrub run pid 77\n' >&7
+    : >"$STATE/mholding"
+    exec sleep 60 # the holder is this pid, so killing it releases the lock
+) &
+HOLDER_PID=$!
+for _ in $(seq 1 200); do [[ -e "$STATE/mholding" ]] && break; sleep 0.05; done
+run_cmd
+(
+    set -m
+    { exec "${CMD[@]}"; } >"$STATE/out" 2>&1 &
+    pid=$!
+    # Announced after its first 5 s probe.
+    for _ in $(seq 1 300); do grep -q 'waiting\.\.\.' "$STATE/out" 2>/dev/null && break; sleep 0.05; done
+    kill -TERM -- "-$pid"
+    wait "$pid"
+) 2>/dev/null
+RC=$?
+tripwire
+kill "$HOLDER_PID" 2>/dev/null
+wait "$HOLDER_PID" 2>/dev/null
+HOLDER_PID=""
+check "SIGTERM while waiting for the maintenance lock: exit status" "$RC" "143"
+show_tail 143
+check "SIGTERM while waiting: it was waiting" "$(grep -c 'waiting\.\.\.' "$STATE/out")" "1"
+check "SIGTERM while waiting: cleanup() skipped its recovery body" \
+    "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "0"
+check "SIGTERM while waiting: not recorded" "$(record_calls)" "0"
+check "SIGTERM while waiting: no mail" "$(mails)" "0"
+check "SIGTERM while waiting: nothing mounted" "$(called mount)" "no"
 
 # ---------------------------------------------------------------------------
 echo "== every exit path of a run that does not complete, by the rule"
@@ -1134,12 +1228,18 @@ if [[ -z "$body" ]]; then
 else
     eval "$body"
     for armed in false true; do
-        for rc in 0 1 2 32 127 130 143; do
-            case "$rc" in
-            130 | 143) want="$rc" ;;
-            *) want="$([[ "$armed" == true ]] && echo 3 || echo 1)" ;;
-            esac
-            check "abort_exit_status $rc, lock held=$armed" "$(abort_exit_status "$rc" "$armed")" "$want"
+        # No signal reached the run: a command's own status, whatever its
+        # number — a pipeline's SIGPIPE (141) or a child killed by TERM (143)
+        # is a command that failed, not a stop.
+        for rc in 0 1 2 32 127 129 130 138 141 142 143; do
+            want="$([[ "$armed" == true ]] && echo 3 || echo 1)"
+            check "abort_exit_status $rc, lock held=$armed, no signal" \
+                "$(abort_exit_status "$rc" "$armed" "")" "$want"
+        done
+        # A signal the run itself received keeps its code.
+        for spec in HUP:129 INT:130 USR1:138 PIPE:141 ALRM:142 TERM:143; do
+            check "abort_exit_status ${spec#*:}, lock held=$armed, SIG${spec%%:*}" \
+                "$(abort_exit_status "${spec#*:}" "$armed" "${spec%%:*}")" "${spec#*:}"
         done
     done
 fi
