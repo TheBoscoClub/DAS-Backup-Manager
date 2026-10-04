@@ -903,23 +903,7 @@ impl HelperInterface {
             let runs = db
                 .get_backup_history(limit as usize)
                 .map_err(|e| fdo::Error::Failed(format!("History query failed: {e}")))?;
-            let arr: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "id": r.id,
-                        "timestamp": r.timestamp,
-                        "mode": r.mode,
-                        "success": r.success,
-                        "duration_secs": r.duration_secs,
-                        "snaps_created": r.snaps_created,
-                        "snaps_sent": r.snaps_sent,
-                        "bytes_sent": r.bytes_sent,
-                        "errors": &r.errors,
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+            Ok(buttered_dasd::report::backup_history_json(&runs).to_string())
         })
         .await
         .map_err(|e| fdo::Error::Failed(format!("History task join failed: {e}")))?

@@ -499,12 +499,16 @@ enum BackupAction {
         /// Backup mode
         #[arg(long, default_value = "incremental", value_parser = ["incremental", "full"])]
         mode: String,
-        /// Number of snapshots created
-        #[arg(long, default_value = "0")]
-        snaps_created: usize,
-        /// Number of snapshots sent to targets
-        #[arg(long, default_value = "0")]
-        snaps_sent: usize,
+        /// Number of snapshots created (required unless --counts-unknown)
+        #[arg(long, required_unless_present = "counts_unknown")]
+        snaps_created: Option<u64>,
+        /// Number of snapshots sent to targets (required unless --counts-unknown)
+        #[arg(long, required_unless_present = "counts_unknown")]
+        snaps_sent: Option<u64>,
+        /// The run could not count its snapshots: record both counts as
+        /// unknown (NULL), never as a number
+        #[arg(long, conflicts_with_all = ["snaps_created", "snaps_sent"])]
+        counts_unknown: bool,
         /// Bytes sent to targets
         #[arg(long, default_value = "0")]
         bytes_sent: u64,
@@ -2193,8 +2197,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             run.mode,
                             run.success,
                             run.duration_secs,
-                            run.snaps_created,
-                            run.snaps_sent,
+                            serde_json::Value::from(run.snaps_created),
+                            serde_json::Value::from(run.snaps_sent),
                             run.bytes_sent
                         );
                     }
@@ -2214,8 +2218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             run.mode,
                             if run.success { "OK" } else { "FAIL" },
                             format!("{}s", run.duration_secs),
-                            run.snaps_created,
-                            run.snaps_sent
+                            report::format_count(run.snaps_created),
+                            report::format_count(run.snaps_sent)
                         );
                     }
                 }
@@ -2226,6 +2230,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode,
                 snaps_created,
                 snaps_sent,
+                // Said, never implied: clap takes either both counts or this
+                // flag and never both, so the counts are None exactly when it
+                // was given — the unknown the row then stores as NULL.
+                counts_unknown: _,
                 bytes_sent,
                 duration_secs,
                 errors,
@@ -2836,6 +2844,66 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `backup record-run` takes both counts, or `--counts-unknown` — never
+    /// both, never neither, never a negative number. `--snaps-created -1` was
+    /// refused as an unknown option, so a run whose counts were unknown was
+    /// not recorded at all (bd DAS-Backup-Manager-6wt).
+    #[test]
+    fn record_run_takes_both_counts_or_counts_unknown() {
+        use clap::error::ErrorKind;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["btrdasd", "backup", "record-run"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let counts = |cli: Cli| match cli.command {
+            Commands::Backup {
+                action:
+                    BackupAction::RecordRun {
+                        snaps_created,
+                        snaps_sent,
+                        counts_unknown,
+                        ..
+                    },
+            } => (snaps_created, snaps_sent, counts_unknown),
+            _ => panic!("not record-run"),
+        };
+        let kind = |extra: &[&str]| parse(extra).err().map(|e| e.kind());
+
+        assert_eq!(
+            counts(parse(&["--snaps-created", "53", "--snaps-sent", "94"]).unwrap()),
+            (Some(53), Some(94), false)
+        );
+        assert_eq!(
+            counts(parse(&["--snaps-created", "0", "--snaps-sent", "0"]).unwrap()),
+            (Some(0), Some(0), false),
+            "a measured zero is a count"
+        );
+        assert_eq!(
+            counts(parse(&["--counts-unknown"]).unwrap()),
+            (None, None, true)
+        );
+        assert_eq!(
+            kind(&["--counts-unknown", "--snaps-created", "1"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            kind(&["--counts-unknown", "--snaps-sent", "1"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(kind(&[]), Some(ErrorKind::MissingRequiredArgument));
+        assert_eq!(
+            kind(&["--snaps-created", "1"]),
+            Some(ErrorKind::MissingRequiredArgument)
+        );
+        assert_eq!(
+            kind(&["--snaps-sent", "1"]),
+            Some(ErrorKind::MissingRequiredArgument)
+        );
+        assert!(kind(&["--snaps-created", "-1", "--snaps-sent", "-1"]).is_some());
+        assert!(kind(&["--snaps-created=-1", "--snaps-sent=0"]).is_some());
     }
 
     #[test]

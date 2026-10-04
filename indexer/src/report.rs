@@ -1,6 +1,6 @@
 use crate::backup::{BackupResult, SyncSection};
 use crate::config::Config;
-use crate::db::{Database, NewBackupRun};
+use crate::db::{BackupRunRecord, Database, NewBackupRun};
 
 use std::process::{Command, Stdio};
 
@@ -11,11 +11,41 @@ pub struct BackupRun {
     pub timestamp: i64,
     pub success: bool,
     pub mode: String,
-    pub snapshots_created: usize,
-    pub snapshots_sent: usize,
+    /// `None`: the run could not count them.
+    pub snapshots_created: Option<u64>,
+    /// `None`: the run could not count them.
+    pub snapshots_sent: Option<u64>,
     pub bytes_sent: u64,
     pub duration_secs: u64,
     pub errors: Vec<String>,
+}
+
+/// A run count as the history shows it: the number, or `unknown` when the run
+/// could not count — never 0, which would read as nothing done
+/// (bd DAS-Backup-Manager-6wt).
+pub fn format_count(count: Option<u64>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |n| n.to_string())
+}
+
+/// The run history as the GUI reads it from the D-Bus helper
+/// (`IndexBackupHistory`): one object per run, in the order given. A count the
+/// run could not take is `null`, never 0 or -1; the GUI shows it as "unknown".
+pub fn backup_history_json(runs: &[BackupRunRecord]) -> serde_json::Value {
+    runs.iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "timestamp": r.timestamp,
+                "mode": r.mode,
+                "success": r.success,
+                "duration_secs": r.duration_secs,
+                "snaps_created": r.snaps_created,
+                "snaps_sent": r.snaps_sent,
+                "bytes_sent": r.bytes_sent,
+                "errors": r.errors,
+            })
+        })
+        .collect()
 }
 
 /// Generate a backup report for the Rust (manual `btrdasd backup run`) path.
@@ -320,8 +350,8 @@ pub fn record_backup_run(
         timestamp,
         success: result.success,
         mode: &mode_str,
-        snaps_created: result.snapshots_created,
-        snaps_sent: result.snapshots_sent,
+        snaps_created: Some(result.snapshots_created as u64),
+        snaps_sent: Some(result.snapshots_sent as u64),
         bytes_sent: result.bytes_sent,
         duration_secs: result.duration_secs,
         errors: &result.errors,
@@ -617,11 +647,69 @@ mod tests {
         assert_eq!(history[0].id, id);
         assert!(history[0].success);
         assert_eq!(history[0].mode, "incremental");
-        assert_eq!(history[0].snapshots_created, 3);
-        assert_eq!(history[0].snapshots_sent, 3);
+        assert_eq!(history[0].snapshots_created, Some(3));
+        assert_eq!(history[0].snapshots_sent, Some(3));
         assert_eq!(history[0].bytes_sent, 500_000);
         assert_eq!(history[0].duration_secs, 120);
         assert!(history[0].errors.is_empty());
+    }
+
+    #[test]
+    fn a_count_shows_as_its_number_or_unknown_never_as_zero() {
+        assert_eq!(format_count(Some(0)), "0");
+        assert_eq!(format_count(Some(53)), "53");
+        assert_eq!(format_count(None), "unknown");
+    }
+
+    #[test]
+    fn history_json_has_null_for_an_unknown_count_and_the_number_otherwise() {
+        let runs = [
+            BackupRunRecord {
+                id: 290,
+                timestamp: 1_791_000_000,
+                success: false,
+                mode: "full".into(),
+                snaps_created: None,
+                snaps_sent: None,
+                bytes_sent: 0,
+                duration_secs: 516,
+                errors: vec![
+                    "btrbk: exit code 10".into(),
+                    "btrbk_counters: btrbk list latest failed; counts unknown".into(),
+                ],
+            },
+            BackupRunRecord {
+                id: 289,
+                timestamp: 1_790_900_000,
+                success: true,
+                mode: "incremental".into(),
+                snaps_created: Some(0),
+                snaps_sent: Some(41),
+                bytes_sent: 4096,
+                duration_secs: 300,
+                errors: vec![],
+            },
+        ];
+        assert_eq!(
+            backup_history_json(&runs),
+            serde_json::json!([
+                {
+                    "id": 290, "timestamp": 1_791_000_000_i64, "mode": "full",
+                    "success": false, "duration_secs": 516, "snaps_created": null,
+                    "snaps_sent": null, "bytes_sent": 0,
+                    "errors": [
+                        "btrbk: exit code 10",
+                        "btrbk_counters: btrbk list latest failed; counts unknown"
+                    ]
+                },
+                {
+                    "id": 289, "timestamp": 1_790_900_000_i64, "mode": "incremental",
+                    "success": true, "duration_secs": 300, "snaps_created": 0,
+                    "snaps_sent": 41, "bytes_sent": 4096, "errors": []
+                }
+            ])
+        );
+        assert_eq!(backup_history_json(&[]), serde_json::json!([]));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #!/bin/bash
 # boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
-# Version: 2.1.0
-# Date: 2026-08-02
+# Version: 2.1.1
+# Date: 2026-10-03
 #
 # When backup-run.sh --full (or the Rust btrdasd manual path) recreates @ and
 # @home, it snapshots the old ones as @.archive.YYYYMMDDTHHMMSS before
@@ -10,6 +10,10 @@
 # via btrdasd. As of v4.2.4, backup-run.sh invokes this script automatically
 # at the end of every run (daily and full) while targets are still mounted —
 # it was previously installed but never called by anything (DAS-Backup-Manager-64h).
+#
+# v2.1.1: the last line is `main "$@"; exit $?`, so a copy over this file in
+# place while it runs (a plain `cp`) cannot have bash read the new file once
+# main returns; behaviour is otherwise unchanged (bd DAS-Backup-Manager-6wt).
 #
 # v2.1.0: role=mirror targets (e.g. the recovery-A/B 2TB drives, which carry a
 # genuinely independent OS install in their own @/@home) are skipped entirely.
@@ -262,4 +266,4 @@ main() {
     return 0
 }
 
-main "$@"
+main "$@"; exit $?

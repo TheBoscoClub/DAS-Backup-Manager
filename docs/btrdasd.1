@@ -390,7 +390,21 @@ Re-open the wizard with the current configuration pre-filled.
 .TP
 .B \-\-upgrade
 Regenerate all managed files from the existing configuration
-(useful after a binary update).
+(useful after a binary update), then restart
+.B btrdasd\-helper.service
+when it is running, so the GUI is served by the new binary. All of it is done
+holding setup's two locks (below); the restart may hold them for at most 300
+seconds, so no job can start mounting under it. A restart that fails or does
+not return in time, or a unit state that cannot be read, is an error (exit 1).
+On an init system other than systemd the helper is restarted by hand: the files
+are upgraded and the upgrade exits 3. Refused while a job holds a lock: exit 75,
+nothing written. Done: exit 0.
+A binary from before schema 4 cannot read a run whose snapshot
+counts are unknown, so keep
+.BR btrdasd ,
+.B btrdasd\-helper
+and the scripts at one version: the first open by a new binary migrates the
+database and waits up to 30 seconds behind another writer, then fails.
 .TP
 .B \-\-uninstall
 Remove all generated files, disable timers, and optionally remove the database.
@@ -431,6 +445,55 @@ verify only that its mount path is a mount point. The setup wizard records
 for a new target whose drive is attached;
 .B \-\-upgrade
 never adds it to an existing config.
+.PP
+Every mode that writes or removes installed files \(em the wizard,
+.BR \-\-modify ,
+.BR \-\-force ,
+.BR \-\-upgrade ,
+.B \-\-uninstall
+and
+.B \-\-uninstall\-all
+\(em first takes
+.I /run/das\-backup.lock
+and then
+.IR /run/das\-maintenance.lock ,
+without waiting, holds both until it is done, and lets them go however it ends.
+A backup holds the first from its start, also while it waits for the second;
+every job that mounts a backup target holds the second. If either is held,
+setup writes and removes nothing, says on standard error which lock is held
+and, for the second, by whom, and exits 75; run it again once that job has
+finished. The questions of the wizard and of an uninstall come first: the locks
+are taken once they are answered.
+.B \-\-force
+reads the configuration only once it holds them;
+.B \-\-modify
+compares the file with what it read before the wizard opened, and if anything
+else wrote it meanwhile it writes nothing and exits 75. While setup holds the
+locks, a backup started meanwhile \(em by the timer, too \(em finds
+.I /run/das\-backup.lock
+held and skips its run.
+.PP
+Every file setup writes is replaced whole: a new file, given its mode (scripts
+0755, any other file the mode it had) and, written by root, the old file's
+owner and group, before it is renamed over the old one. A
+backup already reading
+.I backup\-run.sh
+keeps reading the old file to its end, and a write that fails leaves the old
+file as it was and names it. The three scripts end with
+.BR "main \(dq$@\(dq; exit $?" ,
+so once a run is in
+.B main
+bash reads its file no more.
+.B cmake \-\-install
+takes neither lock: never run it while a backup runs. CMake 4.4.3 replaces each
+file by removing it and creating a new one, executable only once complete, so
+a run already going keeps its script, though it calls the new sibling scripts
+and
+.B btrdasd
+for its later steps. A run that starts in that instant mostly fails at once
+(systemd: 203/EXEC), but after the exec bash opens the script again by its
+path, so it can find the new one still empty and exit 0 having done nothing
+(measured: 17 of 7,764 starts made during 2,000 installs).
 .\"
 .SS config dump\-env
 Print shell-sourceable KEY=VALUE pairs from the configuration.
@@ -624,6 +687,12 @@ Default:
 .\"
 .SS backup report
 Show the last backup reports from the database.
+A snapshot count the run could not take shows as
+.B unknown
+.RB ( null
+with
+.BR \-\-json ),
+never as 0.
 .PP
 .B btrdasd backup report
 .RB [ \-\-db
@@ -644,6 +713,14 @@ Default: 10.
 Record a completed backup run in the backup history. Used by
 .BR backup\-run.sh ;
 not normally run by hand.
+Give both snapshot counts, or
+.B \-\-counts\-unknown
+when the run could not count them: the history then stores them as unknown
+(NULL), and the history views show
+.BR unknown .
+A count is never made up: one count without the other, or a count with
+.BR \-\-counts\-unknown ,
+is refused, and a count cannot be negative.
 .PP
 .B btrdasd backup record\-run
 .RB [ \-\-db
@@ -651,10 +728,12 @@ not normally run by hand.
 .RB [ \-\-success ]
 .RB [ \-\-mode
 .IR MODE ]
-.RB [ \-\-snaps\-created
-.IR N ]
-.RB [ \-\-snaps\-sent
-.IR N ]
+.RB { \-\-snaps\-created
+.I N
+.B \-\-snaps\-sent
+.I N
+|
+.BR \-\-counts\-unknown }
 .RB [ \-\-bytes\-sent
 .IR N ]
 .RB [ \-\-duration\-secs
@@ -678,10 +757,24 @@ Default:
 .BR incremental .
 .TP
 .BI \-\-snaps\-created " N"
-Number of snapshots created. Default: 0.
+Number of snapshots created. Required unless
+.B \-\-counts\-unknown
+is given.
 .TP
 .BI \-\-snaps\-sent " N"
-Number of snapshots sent to targets. Default: 0.
+Number of snapshots sent to targets. Required unless
+.B \-\-counts\-unknown
+is given.
+.TP
+.B \-\-counts\-unknown
+The run could not count its snapshots \(em for
+.BR backup\-run.sh ,
+.B "btrbk list latest"
+failed, listed no field it knows, or the run ended before the counters were
+read. Both counts are recorded as unknown. Not with
+.B \-\-snaps\-created
+or
+.BR \-\-snaps\-sent .
 .TP
 .BI \-\-bytes\-sent " N"
 Bytes sent to targets. Default: 0.
@@ -1701,7 +1794,9 @@ and a scrub pass that ran, whatever it found.
 .TP
 .B 1
 An error occurred (backup failure, validation error, missing configuration, a
-mount point the command mounted and could not unmount again, etc.).
+mount point the command mounted and could not unmount again, a
+.B "setup \-\-upgrade"
+whose helper restart failed, etc.).
 .TP
 .B 2
 The command line could not be parsed. Also used by
@@ -1717,8 +1812,13 @@ and
 (could not run).
 .TP
 .B 3
-.B "btrdasd doctor"
-only: the check ran but some volume went unexamined; see its section.
+.BR "btrdasd doctor" :
+the check ran but some volume went unexamined; see its section.
+.BR "btrdasd setup \-\-upgrade" :
+the files were upgraded, but
+.B btrdasd\-helper
+is yours to restart \(em the init system is not systemd, so setup can neither
+tell whether one runs nor restart it. This is not a failed install.
 .TP
 .B 75
 .B walk
@@ -1727,7 +1827,15 @@ or a
 command run with
 .B \-\-no\-wait
 found the DAS maintenance lock held and deferred: nothing was mounted or
-changed. (EX_TEMPFAIL: try again later.)
+changed.
+.B "btrdasd setup"
+in any mode that writes or removes installed files found
+.I /run/das\-backup.lock
+or the DAS maintenance lock held \(em a backup or another job was running \(em
+or, with
+.BR \-\-modify ,
+found the configuration file changed while the wizard was open: nothing was
+written or removed. (EX_TEMPFAIL: try again later.)
 .SH ENVIRONMENT
 .TP
 .B EDITOR

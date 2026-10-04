@@ -7,7 +7,9 @@ use std::time::Duration;
 /// 2 — `files` re-keyed on `(series, path)` (bd DAS-Backup-Manager-lc9).
 /// 3 — `snapshot_targets` records which targets hold each snapshot
 ///     (bd DAS-Backup-Manager-gt0).
-pub const SCHEMA_VERSION: i64 = 3;
+/// 4 — `backup_runs.snaps_created` / `snaps_sent` are NULL when the run could
+///     not count them (bd DAS-Backup-Manager-6wt).
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
 ///
@@ -25,7 +27,50 @@ pub fn series_key(name: &str, source: &str) -> String {
 /// subvolume name or source label, so the key needs no escaping.
 pub const SERIES_SEP: char = '\u{1f}';
 
-const SCHEMA_SQL: &str = r#"
+/// The `backup_runs` columns. `SCHEMA_SQL` creates a new table from them and
+/// the schema-4 migration rebuilds an old one from them, so the two cannot
+/// drift apart.
+macro_rules! backup_runs_columns {
+    () => {
+        "
+    id              INTEGER PRIMARY KEY,
+    timestamp       INTEGER NOT NULL,
+    success         INTEGER NOT NULL DEFAULT 0,
+    mode            TEXT NOT NULL DEFAULT 'incremental',
+    -- NULL when the run could not count them, never a number: a 0 reads as
+    -- nothing done, and a -1 is a sentinel every reader would have to know
+    -- (bd DAS-Backup-Manager-6wt).
+    snaps_created   INTEGER CHECK (snaps_created >= 0),
+    snaps_sent      INTEGER CHECK (snaps_sent >= 0),
+    bytes_sent      INTEGER NOT NULL DEFAULT 0,
+    duration_secs   INTEGER NOT NULL DEFAULT 0,
+    errors          TEXT NOT NULL DEFAULT ''
+"
+    };
+}
+
+/// Every `backup_runs` column, in order — the same in schema 3 and 4.
+const BACKUP_RUNS_COLUMNS: [&str; 9] = [
+    "id",
+    "timestamp",
+    "success",
+    "mode",
+    "snaps_created",
+    "snaps_sent",
+    "bytes_sent",
+    "duration_secs",
+    "errors",
+];
+
+/// The schema-4 `backup_runs`, built beside the old one by the migration.
+const BACKUP_RUNS_V4_TABLE: &str = concat!(
+    "CREATE TABLE backup_runs_v4 (",
+    backup_runs_columns!(),
+    ");"
+);
+
+const SCHEMA_SQL: &str = concat!(
+    r#"
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -111,17 +156,9 @@ CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
 END;
 
 -- Backup run history
-CREATE TABLE IF NOT EXISTS backup_runs (
-    id              INTEGER PRIMARY KEY,
-    timestamp       INTEGER NOT NULL,
-    success         INTEGER NOT NULL DEFAULT 0,
-    mode            TEXT NOT NULL DEFAULT 'incremental',
-    snaps_created   INTEGER NOT NULL DEFAULT 0,
-    snaps_sent      INTEGER NOT NULL DEFAULT 0,
-    bytes_sent      INTEGER NOT NULL DEFAULT 0,
-    duration_secs   INTEGER NOT NULL DEFAULT 0,
-    errors          TEXT NOT NULL DEFAULT ''
-);
+CREATE TABLE IF NOT EXISTS backup_runs ("#,
+    backup_runs_columns!(),
+    r#");
 
 CREATE INDEX IF NOT EXISTS idx_backup_runs_ts ON backup_runs(timestamp);
 
@@ -136,7 +173,8 @@ CREATE TABLE IF NOT EXISTS target_usage (
 );
 
 CREATE INDEX IF NOT EXISTS idx_target_usage_label_ts ON target_usage(target_label, timestamp);
-"#;
+"#
+);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -209,7 +247,7 @@ impl Database {
     /// get `series = ''`, which reproduces the old `UNIQUE(path)` behaviour exactly
     /// — the migration makes the schema correct, it does not repair the data. Only
     /// re-indexing populates real series values (`btrdasd reindex --rebuild`).
-    fn migrate(conn: &Connection) -> SqlResult<()> {
+    fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version >= SCHEMA_VERSION {
             return Ok(());
@@ -229,8 +267,116 @@ impl Database {
         // v2 -> v3: snapshot_targets. CREATE TABLE IF NOT EXISTS in SCHEMA_SQL
         // already made it, so nothing to add here — but the stamp must advance,
         // and existing rows carry no presence until the next walk records it.
+        // v3 -> v4: an unknown run count can be stored, as NULL.
+        Self::migrate_backup_runs_counts(conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    /// Schema 3 → 4: make `backup_runs.snaps_created` / `snaps_sent` nullable,
+    /// so a count a run could not take is stored as NULL rather than refused
+    /// (bd DAS-Backup-Manager-6wt).
+    ///
+    /// SQLite cannot drop NOT NULL from a column in place, so the table is
+    /// rebuilt the way SQLite documents ("Making Other Kinds Of Table Schema
+    /// Changes", lang_altertable.html): create the new table, copy every row
+    /// with its id, drop the old one, rename the new one, recreate the old
+    /// one's indexes and triggers. One IMMEDIATE transaction: a failure
+    /// anywhere leaves the v3 table exactly as it was, and a second process
+    /// opening the database at the same moment waits, then finds it done.
+    ///
+    /// Only `backup_runs` is touched, so the cost does not grow with the
+    /// content index. Every value is copied as it was except a negative count,
+    /// which is no measurement — only the "unknown" sentinel — and becomes
+    /// NULL. A real 0 stays 0.
+    ///
+    /// Idempotent by the table's shape, not by the stamp: a table whose counts
+    /// are already nullable is left alone whatever the stamp says (a crash
+    /// between this commit and the stamp, or `rebuild_content_tables` resetting
+    /// it). Refuses, changing nothing, to rebuild a table another table
+    /// references — the DROP would cascade into or break those rows; nothing
+    /// in this schema references it — or one with a column schema 3 never
+    /// had, whose data the copy would lose.
+    fn migrate_backup_runs_counts(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let not_null = tx
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('backup_runs')
+                 WHERE name IN ('snaps_created', 'snaps_sent') AND \"notnull\" = 1",
+            )?
+            .exists([])?;
+        if !not_null {
+            return Ok(());
+        }
+        let columns: Vec<String> = tx
+            .prepare("SELECT name FROM pragma_table_info('backup_runs') ORDER BY cid")?
+            .query_map([], |r| r.get(0))?
+            .collect::<SqlResult<_>>()?;
+        if columns != BACKUP_RUNS_COLUMNS {
+            return Err(migration_refused(format!(
+                "it has the columns ({}), not schema 3's ({}); \
+                 rebuilding it would lose the ones schema 4 does not have",
+                columns.join(", "),
+                BACKUP_RUNS_COLUMNS.join(", ")
+            )));
+        }
+        let referencing: Vec<String> = tx
+            .prepare(
+                "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+                 WHERE m.type = 'table' AND f.\"table\" = 'backup_runs' COLLATE NOCASE
+                 ORDER BY m.name",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<SqlResult<_>>()?;
+        if !referencing.is_empty() {
+            return Err(migration_refused(format!(
+                "table(s) {} reference it, and rebuilding it would cascade into \
+                 or break their rows",
+                referencing.join(", ")
+            )));
+        }
+        // What DROP TABLE takes with it, to put back on the new table.
+        let dependents: Vec<String> = tx
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                 WHERE tbl_name = 'backup_runs' AND type IN ('index', 'trigger')
+                   AND sql IS NOT NULL",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<SqlResult<_>>()?;
+
+        tx.execute_batch(BACKUP_RUNS_V4_TABLE)?;
+        let copied = tx.execute(
+            "INSERT INTO backup_runs_v4 (id, timestamp, success, mode, snaps_created,
+                 snaps_sent, bytes_sent, duration_secs, errors)
+             SELECT id, timestamp, success, mode,
+                    CASE WHEN snaps_created >= 0 THEN snaps_created END,
+                    CASE WHEN snaps_sent >= 0 THEN snaps_sent END,
+                    bytes_sent, duration_secs, errors
+             FROM backup_runs",
+            [],
+        )?;
+        let total: i64 = tx.query_row("SELECT COUNT(*) FROM backup_runs", [], |r| r.get(0))?;
+        if copied as i64 != total {
+            return Err(migration_refused(format!(
+                "copied {copied} of its {total} rows"
+            )));
+        }
+        tx.execute_batch("DROP TABLE backup_runs;")?;
+        // Between the DROP and the rename, a view naming backup_runs names
+        // nothing, and the current rename rules re-check every view and fail
+        // ("error in view …: no such table"). The legacy rules do not, and the
+        // view names the right table again once the rename is done.
+        let legacy: bool = tx.pragma_query_value(None, "legacy_alter_table", |r| r.get(0))?;
+        tx.pragma_update(None, "legacy_alter_table", true)?;
+        let renamed = tx.execute_batch("ALTER TABLE backup_runs_v4 RENAME TO backup_runs;");
+        tx.pragma_update(None, "legacy_alter_table", legacy)?;
+        renamed?;
+        for sql in &dependents {
+            tx.execute_batch(sql)?;
+        }
+        tx.commit()
     }
 
     pub fn insert_snapshot(
@@ -970,8 +1116,9 @@ impl Database {
     // Backup run history
     // -----------------------------------------------------------------
 
-    /// Record a completed backup run. Returns the new row ID.
-    pub fn insert_backup_run(&self, run: &NewBackupRun<'_>) -> SqlResult<i64> {
+    /// Record a completed backup run. Returns the new row ID. A count of
+    /// `None` is stored as NULL: the run could not count it.
+    pub fn insert_backup_run(&self, run: &NewBackupRun<'_>) -> Result<i64, rusqlite::Error> {
         let errors_str = run.errors.join("\n");
         self.conn.execute(
             "INSERT INTO backup_runs (timestamp, success, mode, snaps_created, snaps_sent, bytes_sent, duration_secs, errors)
@@ -980,8 +1127,8 @@ impl Database {
                 run.timestamp,
                 run.success as i32,
                 run.mode,
-                run.snaps_created as i64,
-                run.snaps_sent as i64,
+                count_to_sql(run.snaps_created)?,
+                count_to_sql(run.snaps_sent)?,
                 run.bytes_sent as i64,
                 run.duration_secs as i64,
                 errors_str,
@@ -991,7 +1138,10 @@ impl Database {
     }
 
     /// Get the most recent backup runs, ordered newest first.
-    pub fn get_backup_history(&self, limit: usize) -> SqlResult<Vec<BackupRunRecord>> {
+    pub fn get_backup_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<BackupRunRecord>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent, duration_secs, errors
              FROM backup_runs ORDER BY timestamp DESC LIMIT ?1",
@@ -1008,8 +1158,8 @@ impl Database {
                 timestamp: row.get(1)?,
                 success: row.get::<_, i32>(2)? != 0,
                 mode: row.get(3)?,
-                snaps_created: row.get::<_, i64>(4)? as usize,
-                snaps_sent: row.get::<_, i64>(5)? as usize,
+                snaps_created: count_from_sql(row, 4)?,
+                snaps_sent: count_from_sql(row, 5)?,
                 bytes_sent: row.get::<_, i64>(6)? as u64,
                 duration_secs: row.get::<_, i64>(7)? as u64,
                 errors,
@@ -1081,8 +1231,10 @@ pub struct NewBackupRun<'a> {
     pub timestamp: i64,
     pub success: bool,
     pub mode: &'a str,
-    pub snaps_created: usize,
-    pub snaps_sent: usize,
+    /// `None`: the run could not count them — stored as NULL, never as 0.
+    pub snaps_created: Option<u64>,
+    /// `None`: the run could not count them — stored as NULL, never as 0.
+    pub snaps_sent: Option<u64>,
     pub bytes_sent: u64,
     pub duration_secs: u64,
     pub errors: &'a [String],
@@ -1095,11 +1247,38 @@ pub struct BackupRunRecord {
     pub timestamp: i64,
     pub success: bool,
     pub mode: String,
-    pub snaps_created: usize,
-    pub snaps_sent: usize,
+    /// `None`: the run could not count them (NULL in the database).
+    pub snaps_created: Option<u64>,
+    /// `None`: the run could not count them (NULL in the database).
+    pub snaps_sent: Option<u64>,
     pub bytes_sent: u64,
     pub duration_secs: u64,
     pub errors: Vec<String>,
+}
+
+/// A run count as stored: NULL when it is not known. A count beyond what
+/// SQLite's 64-bit signed integer holds is refused, never wrapped negative.
+fn count_to_sql(count: Option<u64>) -> Result<Option<i64>, rusqlite::Error> {
+    count
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// A run count as read: NULL is "not known". A negative value cannot be
+/// stored (the column's CHECK), so one read back is an error, not a count.
+fn count_from_sql(row: &rusqlite::Row<'_>, idx: usize) -> Result<Option<u64>, rusqlite::Error> {
+    row.get::<_, Option<i64>>(idx)?
+        .map(|n| u64::try_from(n).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, n)))
+        .transpose()
+}
+
+/// Why the schema-4 migration declined to rebuild `backup_runs`.
+fn migration_refused(why: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(format!("cannot migrate backup_runs to schema 4: {why}")),
+    )
 }
 
 /// A target usage record from the database.
@@ -1283,8 +1462,8 @@ mod tests {
             timestamp: 1,
             success: true,
             mode: "incremental",
-            snaps_created: 1,
-            snaps_sent: 1,
+            snaps_created: Some(1),
+            snaps_sent: Some(1),
             bytes_sent: 1,
             duration_secs: 1,
             errors: &[],
@@ -2372,8 +2551,8 @@ mod tests {
                 timestamp: ts,
                 success: true,
                 mode: "incremental",
-                snaps_created: 5,
-                snaps_sent: 5,
+                snaps_created: Some(5),
+                snaps_sent: Some(5),
                 bytes_sent: 1_073_741_824,
                 duration_secs: 3600,
                 errors: &[],
@@ -2387,8 +2566,8 @@ mod tests {
         assert_eq!(history[0].timestamp, ts);
         assert!(history[0].success);
         assert_eq!(history[0].mode, "incremental");
-        assert_eq!(history[0].snaps_created, 5);
-        assert_eq!(history[0].snaps_sent, 5);
+        assert_eq!(history[0].snaps_created, Some(5));
+        assert_eq!(history[0].snaps_sent, Some(5));
         assert_eq!(history[0].bytes_sent, 1_073_741_824);
         assert_eq!(history[0].duration_secs, 3600);
         assert!(history[0].errors.is_empty());
@@ -2403,8 +2582,8 @@ mod tests {
                 timestamp: 1709000000,
                 success: false,
                 mode: "full",
-                snaps_created: 2,
-                snaps_sent: 0,
+                snaps_created: Some(2),
+                snaps_sent: Some(0),
                 bytes_sent: 0,
                 duration_secs: 60,
                 errors: &errors,
@@ -2427,8 +2606,8 @@ mod tests {
             timestamp: 1709000000,
             success: true,
             mode: "incremental",
-            snaps_created: 1,
-            snaps_sent: 1,
+            snaps_created: Some(1),
+            snaps_sent: Some(1),
             bytes_sent: 100,
             duration_secs: 10,
             errors: &[],
@@ -2438,8 +2617,8 @@ mod tests {
             timestamp: 1709100000,
             success: true,
             mode: "full",
-            snaps_created: 5,
-            snaps_sent: 5,
+            snaps_created: Some(5),
+            snaps_sent: Some(5),
             bytes_sent: 500,
             duration_secs: 60,
             errors: &[],
@@ -2450,8 +2629,8 @@ mod tests {
             timestamp: 1709200000,
             success: false,
             mode: "incremental",
-            snaps_created: 0,
-            snaps_sent: 0,
+            snaps_created: Some(0),
+            snaps_sent: Some(0),
             bytes_sent: 0,
             duration_secs: 5,
             errors: &errs,
@@ -2473,8 +2652,8 @@ mod tests {
                 timestamp: 1709000000 + i * 86400,
                 success: true,
                 mode: "incremental",
-                snaps_created: 1,
-                snaps_sent: 1,
+                snaps_created: Some(1),
+                snaps_sent: Some(1),
                 bytes_sent: 100,
                 duration_secs: 10,
                 errors: &[],
@@ -2483,6 +2662,557 @@ mod tests {
         }
         let history = db.get_backup_history(3).unwrap();
         assert_eq!(history.len(), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // bd DAS-Backup-Manager-6wt — schema 4: an unknown run count is NULL
+    // -----------------------------------------------------------------
+
+    fn run_with_counts(created: Option<u64>, sent: Option<u64>) -> NewBackupRun<'static> {
+        NewBackupRun {
+            timestamp: 1_791_000_000,
+            success: false,
+            mode: "incremental",
+            snaps_created: created,
+            snaps_sent: sent,
+            bytes_sent: 0,
+            duration_secs: 516,
+            errors: &[],
+        }
+    }
+
+    #[test]
+    fn an_unknown_count_is_stored_as_null_and_a_zero_as_zero() {
+        let db = Database::open(":memory:").unwrap();
+        let unknown = db.insert_backup_run(&run_with_counts(None, None)).unwrap();
+        let zero = db
+            .insert_backup_run(&run_with_counts(Some(0), Some(0)))
+            .unwrap();
+        let counted = db
+            .insert_backup_run(&run_with_counts(Some(53), Some(94)))
+            .unwrap();
+
+        let stored: Vec<(i64, Option<i64>, Option<i64>)> = db
+            .conn
+            .prepare("SELECT id, snaps_created, snaps_sent FROM backup_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                (unknown, None, None),
+                (zero, Some(0), Some(0)),
+                (counted, Some(53), Some(94))
+            ]
+        );
+
+        let read: Vec<(i64, Option<u64>, Option<u64>)> = db
+            .get_backup_history(10)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.snaps_created, r.snaps_sent))
+            .collect();
+        assert_eq!(read.len(), 3);
+        assert!(read.contains(&(unknown, None, None)), "{read:?}");
+        assert!(read.contains(&(zero, Some(0), Some(0))), "{read:?}");
+        assert!(read.contains(&(counted, Some(53), Some(94))), "{read:?}");
+    }
+
+    #[test]
+    fn a_count_too_large_to_store_is_refused_not_wrapped() {
+        let db = Database::open(":memory:").unwrap();
+        let too_big = u64::try_from(i64::MAX).unwrap() + 1;
+        assert!(
+            db.insert_backup_run(&run_with_counts(Some(too_big), Some(0)))
+                .is_err()
+        );
+        assert!(
+            db.insert_backup_run(&run_with_counts(Some(0), Some(too_big)))
+                .is_err()
+        );
+        let biggest = u64::try_from(i64::MAX).unwrap();
+        db.insert_backup_run(&run_with_counts(Some(biggest), Some(1)))
+            .unwrap();
+        let history = db.get_backup_history(10).unwrap();
+        assert_eq!(history.len(), 1, "a refused run must not leave a row");
+        assert_eq!(
+            (history[0].snaps_created, history[0].snaps_sent),
+            (Some(biggest), Some(1))
+        );
+    }
+
+    #[test]
+    fn a_negative_count_read_back_is_an_error_not_a_count() {
+        // The CHECK keeps one out; a row written around it must not read as
+        // a huge count, nor as "unknown".
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO backup_runs (timestamp, snaps_created, snaps_sent) VALUES (1, 3, -1)",
+                [],
+            )
+            .unwrap();
+        let err = db.get_backup_history(10).unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::IntegralValueOutOfRange(5, -1)),
+            "{err:?}"
+        );
+    }
+
+    /// `backup_runs` exactly as schema 3 created it (`SCHEMA_SQL` at 0e2ccb1).
+    const V3_BACKUP_RUNS: &str = "
+        CREATE TABLE backup_runs (
+            id              INTEGER PRIMARY KEY,
+            timestamp       INTEGER NOT NULL,
+            success         INTEGER NOT NULL DEFAULT 0,
+            mode            TEXT NOT NULL DEFAULT 'incremental',
+            snaps_created   INTEGER NOT NULL DEFAULT 0,
+            snaps_sent      INTEGER NOT NULL DEFAULT 0,
+            bytes_sent      INTEGER NOT NULL DEFAULT 0,
+            duration_secs   INTEGER NOT NULL DEFAULT 0,
+            errors          TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_backup_runs_ts ON backup_runs(timestamp);";
+
+    /// One `backup_runs` row, every column, as plain SQL reads it.
+    #[derive(Debug, Clone, PartialEq)]
+    struct RunRow {
+        id: i64,
+        timestamp: i64,
+        success: i64,
+        mode: String,
+        snaps_created: Option<i64>,
+        snaps_sent: Option<i64>,
+        bytes_sent: i64,
+        duration_secs: i64,
+        errors: String,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_row(
+        id: i64,
+        timestamp: i64,
+        success: i64,
+        mode: &str,
+        snaps_created: Option<i64>,
+        snaps_sent: Option<i64>,
+        bytes_sent: i64,
+        duration_secs: i64,
+        errors: &str,
+    ) -> RunRow {
+        RunRow {
+            id,
+            timestamp,
+            success,
+            mode: mode.into(),
+            snaps_created,
+            snaps_sent,
+            bytes_sent,
+            duration_secs,
+            errors: errors.into(),
+        }
+    }
+
+    fn run_rows(conn: &Connection) -> Vec<RunRow> {
+        conn.prepare(
+            "SELECT id, timestamp, success, mode, snaps_created, snaps_sent,
+                    bytes_sent, duration_secs, errors
+             FROM backup_runs ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok(RunRow {
+                id: r.get(0)?,
+                timestamp: r.get(1)?,
+                success: r.get(2)?,
+                mode: r.get(3)?,
+                snaps_created: r.get(4)?,
+                snaps_sent: r.get(5)?,
+                bytes_sent: r.get(6)?,
+                duration_secs: r.get(7)?,
+                errors: r.get(8)?,
+            })
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// The runs a v3 database could hold: ids with gaps, as production has
+    /// after deletions; a measured zero; a failed full run; and the one row a
+    /// v3 table can hold for "unknown", the -1 sentinel, which only a
+    /// hand-written INSERT could have put there (record-run refused it).
+    fn v3_runs() -> Vec<RunRow> {
+        vec![
+            run_row(5, 1_000, 1, "incremental", Some(0), Some(0), 0, 12, ""),
+            run_row(
+                9,
+                2_000,
+                0,
+                "full",
+                Some(53),
+                Some(94),
+                4_096,
+                516,
+                "btrbk: exit code 10\nusb_link: negotiated 480 Mbit/s",
+            ),
+            run_row(289, 3_000, 1, "incremental", Some(41), Some(41), 1, 300, ""),
+            run_row(290, 4_000, 0, "incremental", Some(-1), Some(-1), 0, 30, "x"),
+        ]
+    }
+
+    /// A schema-3 database at `path`: every other table as `SCHEMA_SQL` makes
+    /// it (none of them changed in v4), `backup_runs` in its v3 form holding
+    /// `runs`, a snapshot with a file, span and target row so referential
+    /// integrity has something to check afterwards, a capacity sample, and the
+    /// stamp at 3.
+    fn v3_fixture(path: &Path, runs: &[RunRow], extra_sql: &str) {
+        drop(Database::open(path).unwrap());
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!("DROP TABLE backup_runs; {V3_BACKUP_RUNS}"))
+            .unwrap();
+        for r in runs {
+            conn.execute(
+                "INSERT INTO backup_runs (id, timestamp, success, mode, snaps_created,
+                     snaps_sent, bytes_sent, duration_secs, errors)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    r.id,
+                    r.timestamp,
+                    r.success,
+                    r.mode,
+                    r.snaps_created,
+                    r.snaps_sent,
+                    r.bytes_sent,
+                    r.duration_secs,
+                    r.errors
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, name, ts, source, path, indexed_at)
+                 VALUES (1, 'root-', '20261002T0300', 'nvme', '/mnt/t/nvme/root-.20261002T0300', 1);
+             INSERT INTO files (id, series, path, name, size, mtime, type)
+                 VALUES (1, 'root-\u{1f}nvme', 'etc/fstab', 'fstab', 7, 1, 0);
+             INSERT INTO spans (file_id, first_snap, last_snap) VALUES (1, 1, 1);
+             INSERT INTO snapshot_targets (snapshot_id, target_root, path)
+                 VALUES (1, '/mnt/t', '/mnt/t/nvme/root-.20261002T0300');
+             INSERT INTO target_usage (timestamp, target_label, total_bytes, used_bytes, snapshot_count)
+                 VALUES (4000, 'primary-22tb', 22, 5, 150);",
+        )
+        .unwrap();
+        conn.execute_batch(extra_sql).unwrap();
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `notnull` of the two count columns, as `PRAGMA table_info` reports it.
+    fn counts_not_null(conn: &Connection) -> Vec<i64> {
+        conn.prepare(
+            "SELECT \"notnull\" FROM pragma_table_info('backup_runs')
+             WHERE name IN ('snaps_created', 'snaps_sent') ORDER BY cid",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// The page backup_runs' b-tree starts on: a rebuild moves it.
+    fn backup_runs_rootpage(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'backup_runs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migrating_v3_keeps_every_run_and_id_and_makes_only_the_unknown_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        v3_fixture(&path, &v3_runs(), "");
+
+        let db = Database::open(&path).expect("a v3 database must open and migrate");
+
+        assert_eq!(user_version(&db.conn), 4);
+        assert_eq!(
+            counts_not_null(&db.conn),
+            vec![0, 0],
+            "counts must be nullable"
+        );
+        // Every run, every id and every value as it was, the measured zero
+        // included — except the -1 sentinel, which becomes NULL.
+        let mut want = v3_runs();
+        want[3].snaps_created = None;
+        want[3].snaps_sent = None;
+        assert_eq!(run_rows(&db.conn), want);
+        // Nothing else touched, and nothing left dangling.
+        let others: (i64, i64, i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM snapshots), (SELECT COUNT(*) FROM files),
+                        (SELECT COUNT(*) FROM spans), (SELECT COUNT(*) FROM snapshot_targets),
+                        (SELECT COUNT(*) FROM target_usage)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(others, (1, 1, 1, 1, 1));
+        let violations = db
+            .conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .count();
+        assert_eq!(violations, 0, "the migration must not break a reference");
+        assert!(
+            db.conn
+                .prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_backup_runs_ts' AND tbl_name = 'backup_runs'")
+                .unwrap()
+                .exists([])
+                .unwrap(),
+            "the timestamp index must be back on the new table"
+        );
+        let leftovers = db
+            .conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name LIKE 'backup_runs_%'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!leftovers, "no half-built table may remain");
+        // The id space carries on where it was.
+        db.conn
+            .execute(
+                "INSERT INTO backup_runs (timestamp, snaps_created, snaps_sent) VALUES (5000, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.conn.last_insert_rowid(), 291);
+        // And a sentinel cannot come back.
+        let refused = db.conn.execute(
+            "INSERT INTO backup_runs (timestamp, snaps_created, snaps_sent) VALUES (6000, -1, 0)",
+            [],
+        );
+        assert!(refused.is_err(), "a negative count must be refused");
+    }
+
+    #[test]
+    fn opening_a_migrated_database_again_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        v3_fixture(&path, &v3_runs(), "");
+        let (rows, root) = {
+            let db = Database::open(&path).unwrap();
+            (run_rows(&db.conn), backup_runs_rootpage(&db.conn))
+        };
+
+        let db = Database::open(&path).expect("second open");
+        assert_eq!(
+            db.conn.total_changes(),
+            0,
+            "a second open must write no row"
+        );
+        assert_eq!(run_rows(&db.conn), rows);
+        assert_eq!(
+            backup_runs_rootpage(&db.conn),
+            root,
+            "rebuilt a second time"
+        );
+        assert_eq!(user_version(&db.conn), 4);
+    }
+
+    #[test]
+    fn a_stamp_left_behind_does_not_rebuild_the_table_again() {
+        // The table is rebuilt in its own transaction and the stamp comes after
+        // it: a crash in between, or `rebuild_content_tables` resetting the
+        // stamp to 0, must find the new table and leave it alone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        v3_fixture(&path, &v3_runs(), "");
+        let (rows, root) = {
+            let db = Database::open(&path).unwrap();
+            (run_rows(&db.conn), backup_runs_rootpage(&db.conn))
+        };
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 3i64)
+            .unwrap();
+
+        let db = Database::open(&path).expect("reopen at stamp 3");
+        assert_eq!(db.conn.total_changes(), 0);
+        assert_eq!(backup_runs_rootpage(&db.conn), root);
+        assert_eq!(user_version(&db.conn), 4);
+
+        db.rebuild_content_tables().unwrap();
+        assert_eq!(backup_runs_rootpage(&db.conn), root);
+        assert_eq!(run_rows(&db.conn), rows, "history must survive a rebuild");
+    }
+
+    #[test]
+    fn a_migration_that_fails_part_way_leaves_the_v3_table_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        // Rows wide enough that copying them needs more pages than the new
+        // table's root page alone.
+        let wide: Vec<RunRow> = (1..=8)
+            .map(|i| {
+                run_row(
+                    i,
+                    i * 100,
+                    1,
+                    "incremental",
+                    Some(i),
+                    Some(i),
+                    0,
+                    1,
+                    &"e".repeat(3_000),
+                )
+            })
+            .collect();
+        v3_fixture(&path, &wide, "");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let pages: i64 = conn
+                .pragma_query_value(None, "page_count", |r| r.get(0))
+                .unwrap();
+            // Room for one more page: the new table can be created, its rows
+            // cannot be copied into it.
+            conn.pragma_update(None, "max_page_count", pages + 1)
+                .unwrap();
+            let err = Database::migrate(&conn).expect_err("the copy must run out of room");
+            assert!(err.to_string().contains("full"), "{err}");
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), 3, "the stamp must not move");
+        assert_eq!(counts_not_null(&conn), vec![1, 1], "still the v3 table");
+        assert_eq!(run_rows(&conn), wide, "every run as it was");
+        let leftovers = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name LIKE 'backup_runs_%'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!leftovers, "no half-built table may remain");
+        drop(conn);
+        // And a later open, with room, migrates it.
+        let db = Database::open(&path).unwrap();
+        assert_eq!(counts_not_null(&db.conn), vec![0, 0]);
+        assert_eq!(run_rows(&db.conn), wide);
+    }
+
+    #[test]
+    fn a_view_and_a_trigger_on_backup_runs_survive_the_migration() {
+        // Neither is in our schema; both are what an operator might add, and the
+        // view would otherwise fail the rename ("error in view …: no such table").
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        v3_fixture(
+            &path,
+            &v3_runs(),
+            "CREATE VIEW recent_runs AS SELECT id, snaps_created FROM backup_runs;
+             CREATE TABLE run_log (run_id INTEGER);
+             CREATE TRIGGER log_run AFTER INSERT ON backup_runs
+                 BEGIN INSERT INTO run_log (run_id) VALUES (new.id); END;",
+        );
+
+        let db = Database::open(&path).expect("migrates with a view and a trigger present");
+        assert_eq!(counts_not_null(&db.conn), vec![0, 0]);
+        let through_view: Vec<(i64, Option<i64>)> = db
+            .conn
+            .prepare("SELECT id, snaps_created FROM recent_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            through_view,
+            vec![(5, Some(0)), (9, Some(53)), (289, Some(41)), (290, None)]
+        );
+        db.conn
+            .execute("INSERT INTO backup_runs (timestamp) VALUES (9000)", [])
+            .unwrap();
+        let logged: i64 = db
+            .conn
+            .query_row("SELECT run_id FROM run_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logged, 291, "the trigger must still fire on the new table");
+        let legacy: i64 = db
+            .conn
+            .pragma_query_value(None, "legacy_alter_table", |r| r.get(0))
+            .unwrap();
+        assert_eq!(legacy, 0, "legacy_alter_table must be put back");
+    }
+
+    #[test]
+    fn refuses_to_rebuild_a_backup_runs_another_table_references() {
+        // Rebuilding drops the table, which would cascade into, or break, any
+        // row that references it. Nothing in our schema does; if something
+        // does, stop and say so rather than guess.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        v3_fixture(
+            &path,
+            &v3_runs(),
+            "CREATE TABLE run_notes (
+                 run_id INTEGER REFERENCES backup_runs(id) ON DELETE CASCADE, note TEXT);
+             INSERT INTO run_notes VALUES (9, 'drive A pulled');",
+        );
+
+        let err = Database::open(&path).err().expect("must refuse");
+        assert!(err.to_string().contains("run_notes"), "{err}");
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), 3);
+        assert_eq!(counts_not_null(&conn), vec![1, 1]);
+        assert_eq!(run_rows(&conn), v3_runs());
+        let note: String = conn
+            .query_row("SELECT note FROM run_notes WHERE run_id = 9", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(note, "drive A pulled");
+    }
+
+    #[test]
+    fn refuses_to_rebuild_a_backup_runs_with_a_column_v3_never_had() {
+        // The rebuild copies the columns it knows; one it does not know would be
+        // dropped with its data.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        v3_fixture(
+            &path,
+            &v3_runs(),
+            "ALTER TABLE backup_runs ADD COLUMN host TEXT;
+             UPDATE backup_runs SET host = 'workstation';",
+        );
+
+        let err = Database::open(&path).err().expect("must refuse");
+        assert!(err.to_string().contains("host"), "{err}");
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), 3);
+        let hosts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM backup_runs WHERE host = 'workstation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hosts, 4);
     }
 
     // -----------------------------------------------------------------
