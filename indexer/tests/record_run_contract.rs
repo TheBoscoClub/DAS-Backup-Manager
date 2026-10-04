@@ -312,21 +312,23 @@ note_abort 3 'exit 3'"#;
 }
 
 #[test]
-fn an_implicit_abort_is_recorded_with_the_command_that_failed() {
-    // A command failing under set -e, with no abort_reason() before it: cleanup()
-    // hands note_abort() the status and $BASH_COMMAND. Quotes and `$` in the
-    // command travel as one argument, untouched.
+fn an_implicit_abort_is_recorded_with_where_it_failed() {
+    // A command failing under set -e, with no abort_reason() before it:
+    // cleanup() hands note_abort() the status and the call chain bash still
+    // holds — the step, never the unexpanded command text, which named
+    // neither the source nor the device (d1r round 3, M4). The chain travels
+    // as one argument, untouched.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     let state = r#"ALL_TARGET_MOUNTS=(/mnt/backup-22tb)
-note_abort 32 'mount -t btrfs -o subvolid=5 "$dev" "$mnt"'"#;
+note_abort 1 'log < log_info < sync_subvolumes < main'"#;
 
     record_as_the_script_does(&db, state, "FAILURE", "false");
 
     assert_eq!(
         sorted_errors(&db),
         vec![
-            r#"aborted: a command that failed: exit status 32: mount -t btrfs -o subvolid=5 "$dev" "$mnt""#,
+            "aborted: a command that failed: exit status 1 in log < log_info < sync_subvolumes < main",
             "btrbk_counters: not read — the run ended before the snapshot counters were taken",
         ]
     );
