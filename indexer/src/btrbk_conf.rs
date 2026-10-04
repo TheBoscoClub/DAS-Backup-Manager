@@ -214,17 +214,20 @@ fn save_config_and_btrbk_conf_with(
         }
     };
     crate::fsutil::write_atomic(conf_path, &render_btrbk_conf(cfg))?;
+    // Every error here names its own file; the messages add no path.
     if let Err(e) = save(cfg, config_path) {
         let rollback = match &previous {
             Some(text) => crate::fsutil::write_atomic(conf_path, text),
-            None => std::fs::remove_file(conf_path),
+            None => std::fs::remove_file(conf_path).map_err(|re| {
+                std::io::Error::new(
+                    re.kind(),
+                    format!("cannot remove {}: {re}", conf_path.display()),
+                )
+            }),
         };
         if let Err(re) = rollback {
             return Err(format!(
-                "{e}; rolling back {} also failed: {re} — {} and {} may disagree",
-                conf_path.display(),
-                config_path.display(),
-                conf_path.display()
+                "{e}; rolling back also failed: {re} — the two files may disagree"
             )
             .into());
         }
@@ -824,6 +827,30 @@ enabled = false
     }
 
     #[test]
+    fn save_keeps_the_mode_of_both_files_it_replaces() {
+        // The helper's ConfigSet and the CLI's subvol commands come here.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        let conf_path = dir.path().join("btrbk.conf");
+        for (path, mode) in [(&config_path, 0o600), (&conf_path, 0o640)] {
+            std::fs::write(path, "old").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+        for (path, mode) in [(&config_path, 0o600), (&conf_path, 0o640)] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "{}",
+                path.display()
+            );
+        }
+        assert_ne!(std::fs::read_to_string(&conf_path).unwrap(), "old");
+    }
+
+    #[test]
     fn save_of_an_invalid_config_writes_neither_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = saveable_config(dir.path());
@@ -842,9 +869,9 @@ enabled = false
         let cfg = saveable_config(dir.path());
         let conf_path = dir.path().join("btrbk.conf");
         std::fs::write(&conf_path, "previous btrbk.conf\n").unwrap();
-        // Occupy the atomic writer's temp name so the config save fails.
-        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
-        let config_path = dir.path().join("config.toml");
+        // The longest name a file can have: no temp file's name fits beside
+        // it, so the config save fails — for root too.
+        let config_path = dir.path().join(format!("{}.toml", "x".repeat(250)));
 
         assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
         assert_eq!(
@@ -858,8 +885,7 @@ enabled = false
     fn failed_config_save_leaves_no_btrbk_conf_when_there_was_none() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = saveable_config(dir.path());
-        std::fs::create_dir(dir.path().join(".config.toml.tmp")).unwrap();
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join(format!("{}.toml", "x".repeat(250)));
 
         assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
         assert!(!dir.path().join("btrbk.conf").exists());
@@ -871,23 +897,43 @@ enabled = false
         let cfg = saveable_config(dir.path());
         let conf_path = dir.path().join("btrbk.conf");
         let config_path = dir.path().join("config.toml");
-        // The save fails and, on the way out, leaves a directory where the
-        // rollback needs a file: both the restore and the removal fail.
-        let sabotage = |_: &Config, _: &Path| -> Result<(), Box<dyn std::error::Error>> {
+        // The save fails as `Config::save` does, naming its file, and on the
+        // way out leaves a directory where the rollback needs a file: both
+        // the restore and the removal fail.
+        let sabotage = |_: &Config, path: &Path| -> Result<(), Box<dyn std::error::Error>> {
             std::fs::remove_file(&conf_path).unwrap();
             std::fs::create_dir(&conf_path).unwrap();
-            Err("save failed".into())
+            Err(format!("cannot write {}: disk full", path.display()).into())
+        };
+        let once = |msg: &str| {
+            for path in [&config_path, &conf_path] {
+                assert_eq!(
+                    msg.matches(&path.display().to_string()).count(),
+                    1,
+                    "{} named once: {msg}",
+                    path.display()
+                );
+            }
         };
 
         // Case 1: there was no previous btrbk.conf (rollback removes the file).
         let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &sabotage).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("save failed"), "{msg}");
-        assert!(msg.contains("rolling back"), "{msg}");
         assert!(
-            msg.contains("config.toml") && msg.contains("btrbk.conf"),
+            msg.starts_with(&format!(
+                "cannot write {}: disk full; ",
+                config_path.display()
+            )),
             "{msg}"
         );
+        assert!(
+            msg.contains(&format!(
+                "rolling back also failed: cannot remove {}: ",
+                conf_path.display()
+            )),
+            "{msg}"
+        );
+        once(&msg);
 
         // Case 2: there was one (rollback rewrites it, onto a directory).
         std::fs::remove_dir(&conf_path).unwrap();
@@ -895,9 +941,13 @@ enabled = false
         let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &sabotage).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("save failed") && msg.contains("rolling back"),
+            msg.contains(&format!(
+                "rolling back also failed: cannot write {}: ",
+                conf_path.display()
+            )),
             "{msg}"
         );
+        once(&msg);
     }
 
     #[test]

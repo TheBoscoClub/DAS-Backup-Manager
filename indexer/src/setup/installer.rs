@@ -4,7 +4,6 @@
 #![allow(dead_code)]
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -489,12 +488,8 @@ fn install_to_prefix(
         // A new file renamed into place, never a rewrite of the old one: a
         // backup that has a script or btrbk.conf open keeps reading the old
         // file whole. Scripts are made executable; any other file keeps the
-        // mode it had.
-        let mode = if full_path.extension().and_then(|e| e.to_str()) == Some("sh") {
-            Some(0o755)
-        } else {
-            existing_mode(&full_path)
-        };
+        // mode it had, as `write_atomic` keeps it for every caller.
+        let mode = (full_path.extension().and_then(|e| e.to_str()) == Some("sh")).then_some(0o755);
         buttered_dasd::fsutil::write_atomic_mode(&full_path, content.as_bytes(), mode)?;
 
         manifest_entries.push(full_path.to_string_lossy().to_string());
@@ -504,11 +499,7 @@ fn install_to_prefix(
     if let Some(parent) = manifest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    buttered_dasd::fsutil::write_atomic_mode(
-        manifest_path,
-        manifest_entries.join("\n").as_bytes(),
-        existing_mode(manifest_path),
-    )?;
+    buttered_dasd::fsutil::write_atomic(manifest_path, &manifest_entries.join("\n"))?;
 
     // Create DB directory. Not fatal — `db_path` is absolute, so a prefixed
     // (packaging or test) install legitimately cannot create it — but never
@@ -557,15 +548,6 @@ fn install_to_prefix(
         manifest_entries.len()
     );
     Ok(())
-}
-
-/// The permission bits of the file at `path` — through a symlink, as a write
-/// goes — or `None` when there is no file there yet.
-fn existing_mode(path: &Path) -> Option<u32> {
-    std::fs::metadata(path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|meta| meta.permissions().mode() & 0o7777)
 }
 
 /// Uninstall using system defaults. `_held`: the caller holds setup's locks
@@ -1457,6 +1439,7 @@ fn uninstall_all_with(
 mod tests {
     use super::*;
     use crate::setup::config::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Install into a throwaway prefix and hand back the paths used.
     fn install_into(dir: &Path) -> (PathBuf, PathBuf) {
@@ -4146,15 +4129,48 @@ auth = "starttls""#,
     }
 
     #[test]
-    fn an_install_that_cannot_write_a_file_names_it_and_leaves_the_old_one() {
+    fn install_over_private_files_leaves_every_one_private() {
+        // The reviewer's probe: config.toml, btrbk.conf and a unit, made
+        // 0600, then installed over. The manifest too.
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let btrbk = dir.path().join("etc/btrbk/btrbk.conf");
+        let unit = dir.path().join("etc/systemd/system/das-backup.service");
+        let private = [&config_path, &btrbk, &unit, &manifest_path];
+        for path in private {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        date_back(dir.path());
+        let before: Vec<u64> = private.iter().map(|p| inode_of(p)).collect();
+
+        install_to_prefix(&config, dir.path(), &config_path, &manifest_path).unwrap();
+
+        for (path, inode) in private.iter().zip(before) {
+            assert_ne!(inode_of(path), inode, "{} replaced", path.display());
+            assert_eq!(mode_of(path), 0o600, "{} stays private", path.display());
+        }
+    }
+
+    /// Make the file at `path` impossible to replace — for root too — while
+    /// it still reads: it moves to the longest name a file can have, which
+    /// leaves no room for a temp file's name beside it, and a link at `path`
+    /// points there. A copy of the library's `fsutil::testing::unreplaceable`,
+    /// which this crate's tests cannot see.
+    fn unreplaceable(path: &Path) {
+        let real = path.with_file_name("x".repeat(255));
+        std::fs::rename(path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, path).unwrap();
+    }
+
+    #[test]
+    fn an_install_that_cannot_write_a_file_names_it_once_and_leaves_the_old_one() {
         let dir = tempfile::tempdir().unwrap();
         let config = valid_config(dir.path());
         let (config_path, manifest_path) = install_config_into(&config, dir.path());
         let btrbk = dir.path().join("etc/btrbk/btrbk.conf");
         std::fs::write(&btrbk, "# the old btrbk.conf\n").unwrap();
-        // A directory where its temp file goes makes that one write fail, for
-        // root too.
-        std::fs::create_dir(dir.path().join("etc/btrbk/.btrbk.conf.tmp")).unwrap();
+        unreplaceable(&btrbk);
 
         let err = install_to_prefix(&config, dir.path(), &config_path, &manifest_path)
             .unwrap_err()
@@ -4162,6 +4178,11 @@ auth = "starttls""#,
 
         assert!(
             err.starts_with(&format!("cannot write {}: ", btrbk.display())),
+            "{err}"
+        );
+        assert_eq!(
+            err.matches(&btrbk.display().to_string()).count(),
+            1,
             "{err}"
         );
         assert_eq!(

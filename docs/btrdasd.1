@@ -474,7 +474,8 @@ locks, a backup started meanwhile \(em by the timer, too \(em finds
 held and skips its run.
 .PP
 Every file setup writes is replaced whole: a new file, given its mode (scripts
-0755, any other file the mode it had) before it is renamed over the old one. A
+0755, any other file the mode it had) and, written by root, the old file's
+owner and group, before it is renamed over the old one. A
 backup already reading
 .I backup\-run.sh
 keeps reading the old file to its end, and a write that fails leaves the old
@@ -484,13 +485,15 @@ so once a run is in
 .B main
 bash reads its file no more.
 .B cmake \-\-install
-takes neither lock: never run it while a backup runs. It replaces each file by
-removing it and creating a new one, so a run already going keeps its script,
-but a run that starts in that instant finds the script missing or empty \(em
-empty, it exits 0 having done nothing \(em and a run already going calls the
-new sibling scripts and
+takes neither lock: never run it while a backup runs. CMake 4.4.3 replaces each
+file by removing it and creating a new one, executable only once complete, so
+a run already going keeps its script, though it calls the new sibling scripts
+and
 .B btrdasd
-for its later steps.
+for its later steps. A run that starts in that instant mostly fails at once
+(systemd: 203/EXEC), but after the exec bash opens the script again by its
+path, so it can find the new one still empty and exit 0 having done nothing
+(measured: 17 of 7,764 starts made during 2,000 installs).
 .\"
 .SS config dump\-env
 Print shell-sourceable KEY=VALUE pairs from the configuration.

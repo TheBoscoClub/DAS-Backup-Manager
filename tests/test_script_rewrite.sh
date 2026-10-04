@@ -17,12 +17,15 @@
 #
 # The experiment: a scratch script, `set -euo pipefail` like the real ones,
 # blocks inside main until told to go; the file is rewritten in place — the
-# same file longer, a different and longer script, a shorter one — then main
-# finishes. The exit status must be main's and nothing but main may run. The
-# control runs the same experiment with the old last line, `main "$@"`, and
-# must show the defect, or the experiment shows nothing. Last, each of the
-# three installed scripts must end with exactly that line: the experiment
-# proves the mechanism, the assertion proves the scripts use it.
+# same file longer, or a different and longer script — then main returns 0.
+# The exit status must be main's and nothing but main may run. The control
+# runs the same experiment with the old last line, `main "$@"`, and must show
+# the defect, or the experiment shows nothing. Rewrites that end the same
+# under either line — main returning nonzero, a file rewritten shorter — are
+# run under both and labelled controls: they cannot fail for want of the new
+# line. Last, each of the three installed scripts must end with exactly that
+# line: the experiment proves the mechanism, the assertion proves the scripts
+# use it.
 #
 # Writes only beneath a mktemp directory. No root, no devices, no network.
 
@@ -114,11 +117,25 @@ run_rewritten() {
 }
 
 echo "== with the last line '$FINAL', a rewrite in place during main changes nothing"
-for status in 0 7; do
+# These two are the claim. Each fails with the old last line: the control
+# below runs the same two rewrites with it and sees more than main run.
+for kind in longer different; do
+    check "main returns 0, file rewritten $kind" \
+        "$(run_rewritten "$FINAL" 0 "$kind")" "0|MAIN-DONE "
+done
+
+echo "== controls: the same result under either last line (they cannot fail for want of '$FINAL')"
+# A main that returns nonzero ends the script under `set -e` before bash reads
+# another byte, and a file rewritten shorter than bash's offset leaves it at
+# end of file — whichever line follows main. Run under both lines, they show
+# the new line takes nothing away; they prove nothing about what it adds.
+for last in "$FINAL" "$OLD"; do
     for kind in longer different shorter; do
-        check "main returns $status, file rewritten $kind" \
-            "$(run_rewritten "$FINAL" "$status" "$kind")" "$status|MAIN-DONE "
+        check "control, last line '$last': main returns 7, file rewritten $kind" \
+            "$(run_rewritten "$last" 7 "$kind")" "7|MAIN-DONE "
     done
+    check "control, last line '$last': main returns 0, file rewritten shorter" \
+        "$(run_rewritten "$last" 0 shorter)" "0|MAIN-DONE "
 done
 
 echo "== control: with the old last line '$OLD' the same rewrite runs the new file"
