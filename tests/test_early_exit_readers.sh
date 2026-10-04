@@ -261,8 +261,14 @@ run_selftest() { # run_selftest <selftest log file> [passthrough]: "<rc>|<what i
 }
 RUNNING='# 1  Short offline       Self-test routine in progress 90%      1000         -'
 COMPLETED='# 1  Short offline       Completed without error       00%      1000         -'
+# smartctl prints a running self-test two ways (its own strings, 7.5): ATA
+# "Self-test routine in progress", SCSI "Self test in progress ...". A drive
+# behind a SAT bridge prints the ATA form; a SAS drive, or a bridge without
+# SAT passthrough, the SCSI one. Both must hold the gate: narrowed to the ATA
+# wording, every check here stayed green (round 5, N7).
+RUNNING_SCSI='# 1  Background short  Self test in progress ...   -     NOW                 - [-   -    -]'
 
-for kind in RUNNING COMPLETED; do
+for kind in RUNNING RUNNING_SCSI COMPLETED; do
     {
         echo "${!kind}"
         for ((i = 0; i < 1500; i++)); do printf '# 1 filler line %06d of the self-test log, nothing to see\n' "$i"; done
@@ -271,11 +277,16 @@ for kind in RUNNING COMPLETED; do
 done
 check "self-test in progress on line 1 of input over 64 KiB: still running, not ready" \
     "$(run_selftest "$WORK/selftest-RUNNING-big.txt" passthrough)" "1|running"
+check "SCSI self-test in progress on line 1 of input over 64 KiB: still running, not ready" \
+    "$(run_selftest "$WORK/selftest-RUNNING_SCSI-big.txt" passthrough)" "1|running"
 check "self-test completed on line 1 of input over 64 KiB: completed" \
     "$(run_selftest "$WORK/selftest-COMPLETED-big.txt" passthrough)" "0|completed"
 
 echo "$RUNNING" >"$WORK/selftest-running.txt"
 check "self-test in progress: still running, not ready" "$(run_selftest "$WORK/selftest-running.txt")" "1|running"
+echo "$RUNNING_SCSI" >"$WORK/selftest-running-scsi.txt"
+check "SCSI self-test in progress: still running, not ready" \
+    "$(run_selftest "$WORK/selftest-running-scsi.txt")" "1|running"
 echo "$COMPLETED" >"$WORK/selftest-completed.txt"
 check "self-test completed: completed" "$(run_selftest "$WORK/selftest-completed.txt")" "0|completed"
 echo '# 1  Short offline       Aborted by host               90%      1000         -' >"$WORK/selftest-other.txt"
@@ -316,6 +327,9 @@ check "no fd to spare: the SMART check still sees PASSED" \
 check "no fd to spare: a running self-test still reads as running" \
     "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*if .*\$status')" \
         status "$RUNNING")" "match"
+check "no fd to spare: a running SCSI self-test still reads as running" \
+    "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*if .*\$status')" \
+        status "$RUNNING_SCSI")" "match"
 check "no fd to spare: a completed self-test still reads as completed" \
     "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*elif .*\$status')" \
         status "$COMPLETED")" "match"
