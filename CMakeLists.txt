@@ -262,6 +262,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os.sh
     )
     add_test(
+        NAME shell-maintenance-lock
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance_lock.sh
+    )
+    add_test(
         NAME shell-record-run
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_record_run.sh
     )
