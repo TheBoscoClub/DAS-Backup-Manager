@@ -345,9 +345,8 @@ check "sync OK: expire is real" "$(grep -c -- '--dry-run' "$WORK/calls" || true)
 check "sync OK: recorded OK" "${OP_STATUS[subvol_expire]}" "OK"
 
 # --- report layout ----------------------------------------------------------
-# generate_report's helpers and host probes are stubbed; only the layout of the
+# generate_report's helpers and host probe are stubbed; only the layout of the
 # new lines and optional sections is under test.
-hostname() { echo testhost; }
 systemctl() { :; }
 generate_throughput_section() { echo "  tp"; }
 generate_capacity_section() { echo "  cap"; }
