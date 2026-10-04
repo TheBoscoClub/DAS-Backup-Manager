@@ -198,9 +198,15 @@ pub struct BtrbkRunner {
     /// The unit, or the cron file (`etc/cron.d/backup`), whose command runs
     /// btrbk.
     pub source: String,
-    /// What starts it: the enabled timer or path unit, or the cron daemon's
-    /// unit; `None` for a unit enabled itself.
+    /// What starts it: the unit that pulls it in, or the timer, path or
+    /// socket unit that starts it, or the cron daemon's unit; `None` for a
+    /// unit enabled itself.
     pub via: Option<String>,
+    /// The script, named by an absolute path in its command and read one
+    /// level deep, whose line runs btrbk; `None` when the command itself
+    /// does. Missing from records written before scripts were read.
+    #[serde(default)]
+    pub script: Option<String>,
     /// When it runs once that OS is up.
     pub when: String,
     /// The `-c`/`--config` it passes, as written; `None` when it leaves btrbk
@@ -291,20 +297,24 @@ fn open_error(rel: &str, e: &std::io::Error) -> String {
     }
 }
 
-/// Open flags for a file: no access-time update, and never through a symlink
+/// Open flags for a file: no access-time update, never through a symlink
 /// (defence in depth behind `resolve_in_root`, against a link swapped in
-/// after its check).
+/// after its check), and never blocking — a FIFO swapped in after the `lstat`
+/// that would have refused it opens at once instead of waiting for a writer,
+/// and its `fstat` then refuses it ([`open_regular`]).
 ///
 /// The flags are single, distinct bits, so `+` is `|` here (asserted below).
 /// It is written `+` because a mutation test cannot tell `|` from `^` on
 /// disjoint bits — the same number — while every mutation of `+` changes it.
-const FILE_FLAGS: i32 = libc::O_NOATIME + libc::O_NOFOLLOW;
-/// The same for a directory, which must be one.
+const FILE_FLAGS: i32 = libc::O_NOATIME + libc::O_NOFOLLOW + libc::O_NONBLOCK;
+/// The same for a directory, which must be one: `O_DIRECTORY` refuses
+/// anything else before it is opened, so it cannot block either.
 const DIR_FLAGS: i32 = libc::O_NOATIME + libc::O_NOFOLLOW + libc::O_DIRECTORY;
 const _: () = assert!(
     libc::O_NOATIME & libc::O_NOFOLLOW == 0
         && libc::O_NOATIME & libc::O_DIRECTORY == 0
         && libc::O_NOFOLLOW & libc::O_DIRECTORY == 0
+        && libc::O_NONBLOCK & (libc::O_NOATIME | libc::O_NOFOLLOW) == 0
 );
 
 /// Open read-only with `flags` ([`FILE_FLAGS`] or [`DIR_FLAGS`]). Every read
@@ -317,17 +327,39 @@ fn open_noatime(path: &Path, flags: i32) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// Read a regular file under `root`. A FIFO or device in its place is refused
-/// before it is opened, so a read can never block.
-fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
+fn not_a_file(rel: &str) -> ReadErr {
+    ReadErr::Unreadable(format!("{rel}: not a regular file"))
+}
+
+/// Open a regular file under `root` for reading. A FIFO or a device in its
+/// place is refused twice: by its `lstat` before the open, so it is never
+/// opened, and by [`open_regular`] after it, for one swapped in between.
+fn open_in_root(root: &Path, rel: &str) -> Result<fs::File, ReadErr> {
     let path = resolve_in_root(root, rel)?;
-    let meta = fs::metadata(&path).map_err(|e| io_error(rel, &e))?;
-    if !meta.is_file() {
-        return Err(ReadErr::Unreadable(format!("{rel}: not a regular file")));
-    }
-    let mut bytes = Vec::new();
-    open_noatime(&path, FILE_FLAGS)
+    if !fs::symlink_metadata(&path)
         .map_err(|e| io_error(rel, &e))?
+        .is_file()
+    {
+        return Err(not_a_file(rel));
+    }
+    open_regular(&path, rel)
+}
+
+/// Open `path` with [`FILE_FLAGS`], which cannot block, and keep it only if
+/// the descriptor's own `fstat` says it is a regular file.
+fn open_regular(path: &Path, rel: &str) -> Result<fs::File, ReadErr> {
+    let file = open_noatime(path, FILE_FLAGS).map_err(|e| io_error(rel, &e))?;
+    if file.metadata().map_err(|e| io_error(rel, &e))?.is_file() {
+        Ok(file)
+    } else {
+        Err(not_a_file(rel))
+    }
+}
+
+/// Read a regular file under `root` ([`open_in_root`]).
+fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
+    let mut bytes = Vec::new();
+    open_in_root(root, rel)?
         .read_to_end(&mut bytes)
         .map_err(|e| ReadErr::Unreadable(format!("{rel}: {e}")))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -846,7 +878,7 @@ fn read_drive(
     Ok((os, assessment))
 }
 
-/// [`read_drive`] as a report entry; an unreadable root is
+/// `read_drive` as a report entry; an unreadable root is
 /// [`DriveReport::Unreadable`].
 pub fn inspect_drive(
     label: &str,
@@ -1157,7 +1189,7 @@ pub fn state_path() -> PathBuf {
 }
 
 /// `Ok(None)` when there is no file yet. A version-2 record loads with its
-/// missing readings "not read" ([`STATE_SCHEMA_READ`]). An unreadable or
+/// missing readings "not read" (`STATE_SCHEMA_READ`). An unreadable or
 /// corrupt file, or a record of any other version (older, newer, none), is an
 /// error — never an empty record — that names the file and the command that
 /// clears it.
@@ -1723,6 +1755,42 @@ mod tests {
             "0 3 * * * root /usr/bin/btrbk run\n",
         );
         write(&root, "etc/crontab", "SHELL=/bin/sh\n");
+        // What the walk reads past the enabled names: a target's pull, a
+        // socket's service, a script a command names (read whole), a binary
+        // it names (its first two bytes), a program link (never followed),
+        // and a path through Arch's /bin link (taken by name, never read).
+        enable(&root, ETC, "multi-user.target.wants", "backup.target");
+        write(
+            &root,
+            &format!("{ETC}/backup.target"),
+            "[Unit]\nWants=backup.service\n",
+        );
+        write(
+            &root,
+            &format!("{ETC}/backup.service"),
+            "[Service]\nExecStart=/usr/local/bin/backup.sh /usr/local/bin/tool \
+             /usr/local/bin/tool.sh /bin/wrap.sh\n",
+        );
+        write(
+            &root,
+            "usr/local/bin/backup.sh",
+            "#!/bin/sh\nexec btrbk -q run\n",
+        );
+        write(&root, "usr/local/bin/tool", "\x7fELF\x02\x01\x01\0");
+        std::os::unix::fs::symlink("backup.sh", root.join("usr/local/bin/tool.sh")).unwrap();
+        write(&root, "usr/bin/wrap.sh", "#!/bin/sh\ntrue\n");
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        enable(&root, VENDOR, "sockets.target.wants", "snap.socket");
+        write(
+            &root,
+            &format!("{VENDOR}/snap.socket"),
+            "[Socket]\nListenStream=/run/snap.sock\n",
+        );
+        write(
+            &root,
+            &format!("{VENDOR}/snap.service"),
+            "[Service]\nExecStart=/usr/bin/true\n",
+        );
         // An enabled name whose link leads to a real file outside the root:
         // a follower would read it (and believe its btrbk line) or stat it.
         let outside = dir.path().join("elsewhere.service");
@@ -1753,6 +1821,14 @@ mod tests {
             "etc/crontab",
             "etc/btrbk",
             "etc/btrbk/btrbk.conf",
+            "etc/systemd/system/backup.target",
+            "etc/systemd/system/backup.service",
+            "usr/local/bin/backup.sh",
+            "usr/local/bin/tool",
+            "usr/bin/wrap.sh",
+            "usr/lib/systemd/system/sockets.target.wants",
+            "usr/lib/systemd/system/snap.socket",
+            "usr/lib/systemd/system/snap.service",
         ]
         .iter()
         .map(|r| root.join(r))
@@ -1772,6 +1848,10 @@ mod tests {
             "etc/systemd/system/default.target",
             "usr/lib/systemd/system/timers.target.wants/shadow.timer",
             "usr/lib/systemd/system/dbus.service",
+            "etc/systemd/system/multi-user.target.wants/backup.target",
+            "usr/lib/systemd/system/sockets.target.wants/snap.socket",
+            "usr/local/bin/tool.sh",
+            "bin",
         ]
         .iter()
         .map(|r| root.join(r))
@@ -1804,35 +1884,64 @@ mod tests {
             units.iter().any(|u| u.name == "elsewhere.service"),
             "recorded by name: {units:?}"
         );
-        let sources: Vec<&str> = os
-            .btrbk_at_boot
-            .runners
+        let runners = &os.btrbk_at_boot.runners;
+        let sources: Vec<(&str, Option<&str>)> = runners
             .iter()
-            .map(|r| r.source.as_str())
+            .map(|r| (r.source.as_str(), r.script.as_deref()))
             .collect();
         assert_eq!(
             sources,
-            ["btrbk.service", "etc/cron.d/backup"],
-            "it did read units and cron, and not the file outside"
+            [
+                ("backup.service", Some("/usr/local/bin/backup.sh")),
+                ("btrbk.service", None),
+                ("etc/cron.d/backup", None)
+            ],
+            "it did read the units, the script and cron, and not the file outside: {runners:?}"
         );
         assert_eq!(
-            os.btrbk_at_boot.runners[0].when, "straight after boot (Persistent catch-up)",
-            "it did see the stamp"
+            runners[1].when, "straight after boot (Persistent catch-up)",
+            "it did see the stamp: {runners:?}"
         );
+        // Every change at once, with what a reader needs to tell a read by
+        // inspect from one by anything else on that filesystem (bd 1yg: one
+        // unexplained failure in 22 runs; 600 runs since did not reproduce it).
+        let now = filetime::FileTime::now();
+        let atime = |m: fs::Metadata| filetime::FileTime::from_last_access_time(&m);
+        let mut changed: Vec<String> = Vec::new();
         for p in &paths {
-            let atime = filetime::FileTime::from_last_access_time(&fs::metadata(p).unwrap());
-            assert_eq!(atime, old, "atime of {} changed", p.display());
+            let after = atime(fs::metadata(p).unwrap());
+            if after != old {
+                changed.push(format!("{}: {old:?} -> {after:?}", p.display()));
+            }
         }
         for link in &links {
-            let atime =
-                filetime::FileTime::from_last_access_time(&fs::symlink_metadata(link).unwrap());
-            assert_eq!(
-                atime,
-                old,
-                "atime of the symlink {} changed",
-                link.display()
-            );
+            let after = atime(fs::symlink_metadata(link).unwrap());
+            if after != old {
+                changed.push(format!("the link {}: {old:?} -> {after:?}", link.display()));
+            }
         }
+        assert!(
+            changed.is_empty(),
+            "{} access time(s) changed; now {now:?}; filesystem: {}\n{}",
+            changed.len(),
+            mount_of(dir.path()),
+            changed.join("\n")
+        );
+    }
+
+    /// The `/proc/self/mountinfo` line of the filesystem `path` is on — its
+    /// options decide when an access time moves — for a failure message.
+    fn mount_of(path: &Path) -> String {
+        fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| Some((line.split(' ').nth(4)?, line)))
+            .filter(|(point, _)| path.starts_with(point))
+            .max_by_key(|(point, _)| point.len())
+            .map_or_else(
+                || "not in /proc/self/mountinfo".into(),
+                |(_, line)| line.into(),
+            )
     }
 
     #[test]
@@ -1924,6 +2033,7 @@ mod tests {
             [BtrbkRunner {
                 source: "btrbk.service".into(),
                 via: Some("btrbk.timer".into()),
+                script: None,
                 when: "at its next scheduled time after boot".into(),
                 config: None,
                 config_present: Some(true),
@@ -2088,6 +2198,7 @@ mod tests {
                 runners: vec![BtrbkRunner {
                     source: "btrbk.service".into(),
                     via: Some("btrbk.timer".into()),
+                    script: Some("/usr/local/bin/backup.sh".into()),
                     when: "at every boot".into(),
                     config: Some("/opt/x.conf".into()),
                     config_present: Some(true),
@@ -2095,10 +2206,18 @@ mod tests {
             })
             .unwrap(),
             json!({"verdict": "will", "reasons": ["why"], "runners": [{
-                "source": "btrbk.service", "via": "btrbk.timer", "when": "at every boot",
+                "source": "btrbk.service", "via": "btrbk.timer",
+                "script": "/usr/local/bin/backup.sh", "when": "at every boot",
                 "config": "/opt/x.conf", "config_present": true
             }]})
         );
+        // A runner recorded before scripts were read has no `script`: none.
+        let old: BtrbkRunner = serde_json::from_value(json!({
+            "source": "btrbk.service", "via": null, "when": "at every boot",
+            "config": null, "config_present": true
+        }))
+        .unwrap();
+        assert_eq!(old.script, None);
         for (verdict, word) in [
             (BootVerdict::Will, "will"),
             (BootVerdict::May, "may"),
@@ -2562,6 +2681,48 @@ mod tests {
         assert_eq!(
             errno(open_noatime(&dir.path().join("dlink"), DIR_FLAGS)),
             Some(libc::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn a_file_is_opened_without_blocking_and_kept_only_if_its_fstat_is_regular() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f", "x");
+        // The descriptor really carries the flags: never blocking, no atime.
+        let file = open_noatime(&dir.path().join("f"), FILE_FLAGS).unwrap();
+        // SAFETY: F_GETFL only reads the status flags of an open descriptor.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK, "{flags:#o}");
+        assert_eq!(flags & libc::O_NOATIME, libc::O_NOATIME, "{flags:#o}");
+        assert!(open_regular(&dir.path().join("f"), "f").is_ok());
+        // A FIFO swapped in after the lstat that would have refused it: the
+        // open returns at once and its fstat refuses it. A writer stands by
+        // so that a regression blocks nothing; it is released either way.
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap())
+        });
+        let got = open_regular(&fifo, "fifo");
+        let _release = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            got.err(),
+            Some(ReadErr::Unreadable("fifo: not a regular file".into()))
+        );
+        // The whole read refuses it before opening it, by its lstat.
+        assert_eq!(
+            read_in_root(dir.path(), "fifo"),
+            Err(ReadErr::Unreadable("fifo: not a regular file".into()))
         );
     }
 
