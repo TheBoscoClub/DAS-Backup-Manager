@@ -164,20 +164,30 @@ jobs:
   # Widened 2026-10-03 (bd 1yg) by the recovery-OS reading, which decides
   # whether booting a recovery drive's own OS would run btrbk — the update
   # VM's driver refuses on anything but "no" — and reads that OS without
-  # writing to it: recovery_os.rs 216 mutants, recovery_os/**/*.rs 216, so
-  # 1457 in all (1025 before). Locally those 432 took 24 minutes (3.3 s each:
-  # build 1.8 + test 1.6; 399 caught, 33 unviable, 0 missed), about 86 on the
-  # runner at the 3.6 ratio above: about 3.75 hours for the job. Hence
-  # timeout-minutes 360, the ceiling for a GitHub-hosted job — the next
-  # widening has to split this job instead.
+  # writing to it. Re-measured for its fix round 3: 1681 mutants in all —
+  # recovery_os.rs 232, recovery_os/**/*.rs 424, the rest 1025 — about 73
+  # minutes locally (the recovery-OS ones 3.3 s each: build 1.8 + test 1.6;
+  # the rest 37 minutes, as above), so about 4.4 hours on the runner at the
+  # 3.6 ratio above: too near the 6-hour ceiling for one job, whose Mutants
+  # step is continue-on-error (a killed job would mean no gate that week).
+  # Hence two shards, round-robin so each gets its share of every module:
+  # 841 and 840 mutants, about 2.2 hours each, timeout-minutes 300. 7wb's
+  # recovery_os/hold_disk.rs (about 26 more) joins through the glob when it
+  # is merged.
   # Re-measure before widening:
-  #   cargo mutants --list --file '<glob>' | wc -l
+  #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/2)
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
   full-scope:
-    name: Falsifiability — security-critical scope
+    name: Falsifiability — security-critical scope (shard ${{ matrix.shard }}/2)
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -193,6 +203,7 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo mutants --in-place --no-shuffle \
+            --shard "$SHARD/2" --sharding round-robin \
             --file 'src/setup/**/*.rs' \
             --file src/mount.rs \
             --file src/forget.rs \
@@ -212,12 +223,12 @@ jobs:
         working-directory: indexer
         run: |
           python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
-            --label "indexer full-scope"
+            --label "indexer full-scope shard $SHARD/2"
 
       - name: Archive mutants.out
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: mutants-full-scope
+          name: mutants-full-scope-${{ matrix.shard }}
           path: indexer/mutants.out
           if-no-files-found: ignore
