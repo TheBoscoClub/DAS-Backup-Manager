@@ -57,6 +57,13 @@ exclude_re = [
     "replace upgrade -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace uninstall -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace uninstall_all -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    # `locked` binds `under_setup_locks` to the host's lock files,
+    # `/run/das-backup.lock` and `/run/das-maintenance.lock`, for those same
+    # root-only modes. Called from a test it would take a running backup's
+    # locks, or make the next backup skip its run. Only the whole-body
+    # replacement is excluded: `under_setup_locks` and `take_setup_locks` take
+    # their lock paths as arguments and are tested on scratch files.
+    "replace locked -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     # `delete_subvolume` is the spawn of `btrfs subvolume delete` and nothing
     # else: its only effect is a subvolume removed from a mounted BTRFS
     # filesystem, which needs root and a real filesystem to observe. Only the

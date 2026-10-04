@@ -95,16 +95,31 @@ fn dispatch(
             .interact()
     };
 
+    // Every mode that writes or removes installed files does so under setup's
+    // two locks, taken only once its questions are answered: held across a
+    // prompt, the backup singleton would make a backup the timer starts
+    // meanwhile skip its run. Refused, setup exits 75 having changed nothing
+    // (`installer::locked`; `--upgrade` takes them itself).
     match select_action(args) {
         Action::Check => installer::check()?,
-        Action::Uninstall => installer::uninstall(remove_db_decision(args.force, ask_remove_db)?)?,
+        Action::Uninstall => {
+            let remove_db = remove_db_decision(args.force, ask_remove_db)?;
+            installer::locked("btrdasd setup --uninstall", |held| {
+                installer::uninstall(remove_db, held)
+            })?
+        }
         Action::UninstallAll => {
-            installer::uninstall_all(remove_db_decision(args.force, ask_remove_db)?)?
+            let remove_db = remove_db_decision(args.force, ask_remove_db)?;
+            installer::locked("btrdasd setup --uninstall-all", |held| {
+                installer::uninstall_all(remove_db, held)
+            })?
         }
         Action::Upgrade => installer::upgrade()?,
         Action::ForceInstall => {
             let config = load_existing_for_force(config_path)?;
-            installer::install(&config)?;
+            installer::locked("btrdasd setup --force", |held| {
+                installer::install(&config, held)
+            })?;
         }
         Action::Wizard { modify } => {
             let existing = if modify {
@@ -115,7 +130,7 @@ fn dispatch(
 
             let sys = detect::SystemInfo::detect();
             let config = wizard::run_wizard(&sys, existing)?;
-            installer::install(&config)?;
+            installer::locked("btrdasd setup", |held| installer::install(&config, held))?;
         }
     }
 
