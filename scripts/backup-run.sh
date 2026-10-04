@@ -1,9 +1,29 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.9.2
-# Date: 2026-10-03
+# Version: 4.11.0
+# Date: 2026-10-04
 #
 # Features:
+#   - Exit status 0 / 3 / 1 (v4.11.0), operator decision C of 2026-10-04,
+#     the doctor's rule: 0 = the run executed and nothing FAILED (a WARN
+#     still exits 0); 3 = the run began its work and something FAILED or it
+#     aborted (btrbk nonzero for some or all targets, any FAIL operation, an
+#     abort on a target's or a source's state); 1 = it could not start
+#     (nothing mounted or sent). Both units list SuccessExitStatus=3, so
+#     systemd and cachyos-sentinel see success and never restart the run,
+#     while the journal still shows status=3. It used to exit 1 whenever
+#     btrbk exited nonzero, and btrbk exits 10 when any ONE target aborts
+#     (measured 2026-10-02, a run by hand with recovery drive A pulled:
+#     btrbk 10, this script 1). Under the unit that is `failed` on every
+#     run, and sentinel, which restarts a failed unit, would start a new
+#     ~25-minute backup about every ten minutes until the drive came back.
+#     Every exit path is in EXIT STATUS below. cleanup() turns any status
+#     of a run that held the maintenance lock into 3, so an implicit set -e
+#     abort (a source's `mount` failing with 32, say) cannot fall outside
+#     the rule, and it runs with errexit off: a log line it could not write
+#     used to end it with exit 1 and skip the unmount. Report, email and
+#     history are unchanged (bd DAS-Backup-Manager-d1r;
+#     tests/test_backup_exit_semantics.sh).
 #   - A rewrite of this file while main runs is never read (v4.9.2): the
 #     last line is `main "$@"; exit $?`. Bash reads a script as it runs, so
 #     a copy over this file in place — truncate and write the same inode, as
@@ -269,6 +289,68 @@
 #   sudo ./backup-run.sh              # Incremental backup
 #   sudo ./backup-run.sh --dryrun     # Preview only
 #   sudo ./backup-run.sh --full       # Force full backup (recreate boot subvols)
+#
+# EXIT STATUS (bd DAS-Backup-Manager-d1r, operator decision C, 2026-10-04)
+#
+#   0  the run executed and nothing FAILED. A WARN (a stale recovery OS:
+#      COMPLETED WITH WARNINGS) still exits 0.
+#   3  the run began its work — it holds the maintenance lock — and something
+#      FAILED, or it aborted. Whatever caused it will usually still be there
+#      ten minutes later (an absent drive, a target that will not mount), so
+#      both units list SuccessExitStatus=3: systemd and cachyos-sentinel see
+#      success and do not restart a whole backup for it. The journal still
+#      shows status=3, the report says FAILURES DETECTED and the history row
+#      says failed — for a run that got as far as its report.
+#   1  it could not start: nothing was mounted or sent. A unit that fails
+#      this way fails in seconds, which sentinel's 3-per-600 s limiter does
+#      brake.
+#
+# Every exit path, and why it is what it is:
+#
+#   status   where                         when
+#   0        top level, singleton lock     another backup holds /run/das-backup.lock: a skip,
+#                                          not a failure (before the EXIT trap; touches nothing)
+#   1        top level, `exec 9>`          the lock file cannot be opened (not root, /run
+#                                          unwritable): bash exits 1 under set -e
+#   1        top level                     btrdasd missing: a required tool
+#   1        top level, load_config_env    the config cannot be read
+#   1        top level, set -u             the config lacks a value this script reads
+#   1        main, argument parsing        an unknown argument (usage)
+#   1        main, check_root              not root
+#   1        main, before the lock         the log directory or file, or the maintenance lock
+#                                          file, unusable — any set -e abort before the
+#                                          maintenance lock is held (cleanup: abort_exit_status)
+#   3        check_das_connected           no primary target available: a target's state
+#   3        create_mount_points           an absent target still mounted that will not
+#                                          unmount; the bare-mountpoint guard (an absent
+#                                          target's directory is not empty)
+#   3        mount_sources                 a source volume that will not mount (set -e: mount's
+#                                          own status, made 3 by cleanup)
+#   3        verify_sources_before_write   a source volume is not the expected filesystem
+#                                          (called twice: before and after subvolume sync)
+#   3        verify_targets_before_btrbk   a target is not mounted (it failed to mount) or
+#                                          holds the wrong filesystem, or an absent target's
+#                                          directory exists
+#   3        anywhere once the lock is     any other command failing under set -e (a target
+#            held                          directory that cannot be made, say): the run began
+#                                          its work and stopped (cleanup: abort_exit_status)
+#   0        end of main                   no operation FAILED (completed_exit_status)
+#   3        end of main                   any operation FAILED: btrbk nonzero (10 when one
+#                                          target aborts, 1/2 when btrbk itself fails), an
+#                                          absent recovery target, subvolume sync or expiry,
+#                                          the recovery OS check (not a stale OS: that is a
+#                                          WARN), boot subvolumes, archive cleanup, unmount,
+#                                          indexer, USB link speed, email delivery, the
+#                                          history record, the snapshot counters
+#   130/143  wherever the run is           SIGINT/SIGTERM — `systemctl stop` sends TERM — kept
+#                                          as they are: a stop is not a run's outcome, and a
+#                                          stopped unit ends failed (stop it with mask, too)
+#
+# cleanup(), the EXIT trap, exits with exactly one of these: errexit is off
+# inside it, so nothing failing there (a log line it cannot write) can end it
+# early with a status of its own. A dry run follows the same rule.
+# `btrdasd backup run` (CLI, GUI) is not run by the units and keeps its own
+# codes: 0, or 1 for any failure.
 
 set -euo pipefail
 
@@ -730,10 +812,12 @@ check_das_connected() {
     done
 
     # Only abort when at least one primary was configured AND none are reachable.
+    # 3, not 1: the run holds the lock and has begun; the next start would
+    # find the DAS just as absent (EXIT STATUS, bd DAS-Backup-Manager-d1r).
     if [[ "$any_primary_configured" == "true" && "$any_primary_available" != "true" ]]; then
         log_error "No primary backup target is available — aborting"
         log_error "Is the DAS connected and powered on?"
-        exit 1
+        exit 3
     fi
 }
 
@@ -769,6 +853,8 @@ create_mount_points() {
     # mountpoint dir so btrbk's path is non-existent at write time
     # (btrbk fails fast and safely). If the dir is non-empty, that's
     # evidence a prior write hit the bare dir — refuse to proceed.
+    # Both refusals exit 3: a target's state, met again by the next start
+    # (EXIT STATUS, bd DAS-Backup-Manager-d1r).
     for label in "${!TARGET_MOUNTS[@]}"; do
         local mnt="${TARGET_MOUNTS[$label]}"
         local available="${TARGET_AVAILABLE[$label]:-false}"
@@ -787,7 +873,7 @@ create_mount_points() {
             log_warn "  $label is unavailable but $mnt is currently mounted — attempting umount"
             if ! umount "$mnt" 2>/dev/null; then
                 log_error "  $label: refusing to proceed — $mnt is mounted but target is marked unavailable"
-                exit 1
+                exit 3
             fi
         fi
 
@@ -800,7 +886,7 @@ create_mount_points() {
             log_error "  wrote data to a bare directory because the DAS target wasn't mounted."
             log_error "  Inspect $mnt manually, move/delete its contents (likely on /), and re-run."
             log_error "  See bd DAS-Backup-Manager-9on."
-            exit 1
+            exit 3
         fi
     done
 }
@@ -976,7 +1062,9 @@ verify_sources_before_write() {
         log_error "NVMe root for exactly this reason. See bd DAS-Backup-Manager-zlv."
         log_error "============================================================"
         record_op "verify_sources" "FAIL" "${#violations[@]} violation(s)"
-        exit 1
+        # 3: a source volume's state, met again by the next start (EXIT
+        # STATUS, bd DAS-Backup-Manager-d1r).
+        exit 3
     fi
 
     log_info "All source volumes verified — safe to create snapshot dirs and invoke btrbk."
@@ -1048,7 +1136,7 @@ sync_subvolumes() {
         # verify_sources_before_write never saw. create_snapshot_dirs is the
         # next writer, so check again: a source on an unmounted volume must
         # abort here, not leave an empty directory on the root filesystem.
-        # Only checks, writes nothing, so a second run is safe. It exits 1 on
+        # Only checks, writes nothing, so a second run is safe. It exits 3 on
         # a violation, deliberately not swallowed.
         verify_sources_before_write
     else
@@ -1460,7 +1548,9 @@ verify_targets_before_btrbk() {
         log_error "See bd DAS-Backup-Manager-9on for the full failure-mode writeup."
         log_error "============================================================"
         record_op "verify_targets" "FAIL" "${#violations[@]} violation(s)"
-        exit 1
+        # 3: a target's state — one that failed to mount included — met
+        # again by the next start (EXIT STATUS, bd DAS-Backup-Manager-d1r).
+        exit 3
     fi
 
     log_info "All backup targets verified — safe to invoke btrbk."
@@ -2219,7 +2309,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.9.2
+  backup-run.sh v4.11.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2516,8 +2606,8 @@ record_backup_run_in_db() {
     # A run that is not recorded is missing from `btrdasd backup report`, the
     # GUI history and everything else that reads backup_runs, which then show
     # the run before it as the latest. That is a FAIL, not a warning: the run
-    # status turns FAILURE and report_unrecorded_run says so in the report.
-    # Exit codes are untouched — they still follow btrbk alone.
+    # status turns FAILURE and report_unrecorded_run says so in the report,
+    # and the run exits 3 (EXIT STATUS).
     local record_err
     if record_err=$("$BTRDASD_BIN" "${RECORD_RUN_ARGS[@]}" 2>&1); then
         log_info "Backup run recorded in database"
@@ -2548,6 +2638,60 @@ report_unrecorded_run() {
 }
 
 # ============================================================================
+# EXIT STATUS — the rule and every path: EXIT STATUS in the header
+# ============================================================================
+
+# The status of a run that reached the end of main(): 3 when any operation
+# FAILED, else 0 — a WARN (a stale recovery OS) is not a failure. The same
+# test run_status() makes for the history row and generate_report() for its
+# status line, on the operations recorded by then. Three FAILs can come after
+# the report is built: email delivery (the history row then says FAILURE),
+# the history record itself (report_unrecorded_run sends the report again
+# saying so), and the snapshot counters (record_run_args, listed among the
+# history row's errors).
+completed_exit_status() {
+    if any_op_is FAIL; then
+        echo 3
+    else
+        echo 0
+    fi
+}
+
+# The status of a run that ends before main() completes — what cleanup()
+# exits with. $1 is the status bash is exiting with, $2 "true" once the run
+# holds the maintenance lock (CLEANUP_ARMED).
+#   130/143  SIGINT/SIGTERM stopped it: kept as they are.
+#   3        it held the lock, so it had begun its work. Whatever stopped it —
+#            an `exit 3`, or a command failing under set -e with its own
+#            status (a source's `mount` exits 32) — the run began and failed.
+#   1        it had not: it could not start.
+# Called only by cleanup(), the EXIT trap. shellcheck 0.11 stops seeing a
+# trap's handlers as called once the last line ends in `exit` (SC2329).
+# shellcheck disable=SC2329
+abort_exit_status() {
+    local rc="$1" armed="$2"
+    if (( rc == 130 || rc == 143 )); then
+        echo "$rc"
+    elif [[ "$armed" == "true" ]]; then
+        echo 3
+    else
+        echo 1
+    fi
+}
+
+# The operations that FAILED, sorted and comma-separated, for the line that
+# says why a run exits 3.
+failed_ops() {
+    local op names
+    names="$(for op in "${!OP_STATUS[@]}"; do
+        if [[ "$op" != *_detail && "${OP_STATUS[$op]}" == "FAIL" ]]; then
+            echo "$op"
+        fi
+    done | sort)"
+    echo "${names//$'\n'/, }"
+}
+
+# ============================================================================
 # CLEANUP
 # ============================================================================
 
@@ -2557,10 +2701,18 @@ report_unrecorded_run() {
 cleanup() {
     # First statement, unconditionally: capture the exit status that
     # triggered this EXIT trap invocation BEFORE any other command in this
-    # function can overwrite $?. This is the status cleanup() must preserve
-    # on exit — 0 for a normal fall-through completion of the script, or the
-    # nonzero status from whatever `exit N` / set -e abort fired the trap.
+    # function can overwrite $? — main()'s own status (0 or 3) when it
+    # completed, or the status of whatever `exit N`, set -e abort or signal
+    # trap fired the trap.
     local rc=$?
+
+    # Best effort from here on, and the exit below is the only status. Under
+    # set -e a command failing inside an EXIT trap ends bash at once with
+    # that command's own status (measured, bash 5.3): a log line this trap
+    # could not write — the log file unwritable mid-run, which is often what
+    # ended the run — made it exit 1 instead of the run's status and skip
+    # the unmount (bd DAS-Backup-Manager-d1r).
+    set +e
 
     # The dry run's planned btrbk.conf goes on every exit path, before either
     # early return below.
@@ -2568,68 +2720,68 @@ cleanup() {
         rm -f -- "$DRYRUN_BTRBK_CONF"
     fi
 
-    # Two independent reasons the recovery body below must NOT run — both
-    # exit silently (no log line), explicit `exit "$rc"` (not fallthrough)
-    # so this no-op path can never alter the process's final status:
-    #   1. SCRIPT_COMPLETED == "true": main() already ran unmount_all()/
-    #      record_backup_run_in_db() itself and reached its own last
-    #      statement — this is the ordinary clean-completion path.
-    #   2. CLEANUP_ARMED != "true": this process has not yet reached the
-    #      point where it actually owns the shared DAS mountpoints (see
-    #      CLEANUP_ARMED's definition in the globals block and its arming
-    #      site in main(), right after acquire_maintenance_lock()). The
-    #      EXIT trap is installed, and ALL_TARGET_MOUNTS is already
-    #      populated, well before main() is even entered — so WITHOUT this
-    #      gate, an abort as early as main()'s own argument-parsing usage
-    #      error (`exit 1` for an unrecognized flag) or a check_root()
-    #      failure would call unmount_all() over ALL_TARGET_MOUNTS before
-    #      this process holds /run/das-maintenance.lock. Those same
-    #      /mnt/backup-* paths are mounted by indexer/src/scrub.rs under
-    #      that identical lock's protection — scrub.rs's own doc comment
-    #      states the invariant this gate exists to preserve: "a backup can
-    #      never unmount a filesystem out from under a running scrub". A
-    #      preserves-the-exit-code silent exit here (0 for e.g. an orderly
-    #      early return, nonzero for a usage error) is correct in both
-    #      cases — neither is "abnormal termination of a run in progress"
-    #      from this process's own perspective. bd DAS-Backup-Manager-oeo.
+    # SCRIPT_COMPLETED == "true": main() already ran unmount_all()/
+    # record_backup_run_in_db() itself and reached its own last statement —
+    # the ordinary completion path. Exit silently with main()'s status
+    # (completed_exit_status), explicitly, so nothing here can alter it.
     #
     # Once the lock is this run's (CLEANUP_ARMED), its holder record is
-    # emptied on both ways out — here and after the recovery body below —
+    # emptied on every way out — here, and after the recovery body below —
     # while fd 8 still holds the lock (bd DAS-Backup-Manager-frb).
-    if [[ "$SCRIPT_COMPLETED" == "true" || "$CLEANUP_ARMED" != "true" ]]; then
+    if [[ "$SCRIPT_COMPLETED" == "true" ]]; then
         if [[ "$CLEANUP_ARMED" == "true" ]]; then
             clear_maintenance_holder
         fi
         exit "$rc"
     fi
 
-    log_warn "Cleaning up after abnormal termination (exit code $rc)..."
+    # main() did not complete. The status follows EXIT STATUS: 1 if the run
+    # never held the maintenance lock, 3 if it did, a signal's 130/143 kept
+    # (bd DAS-Backup-Manager-d1r).
+    local status
+    status="$(abort_exit_status "$rc" "$CLEANUP_ARMED")"
+
+    # CLEANUP_ARMED != "true": this process has not yet reached the point
+    # where it actually owns the shared DAS mountpoints (see CLEANUP_ARMED's
+    # definition in the globals block and its arming site in main(), right
+    # after acquire_maintenance_lock()). The EXIT trap is installed, and
+    # ALL_TARGET_MOUNTS is already populated, well before main() is even
+    # entered — so WITHOUT this gate, an abort as early as main()'s own
+    # argument-parsing usage error (`exit 1` for an unrecognized flag) or a
+    # check_root() failure would call unmount_all() over ALL_TARGET_MOUNTS
+    # before this process holds /run/das-maintenance.lock. Those same
+    # /mnt/backup-* paths are mounted by indexer/src/scrub.rs under that
+    # identical lock's protection — scrub.rs's own doc comment states the
+    # invariant this gate exists to preserve: "a backup can never unmount a
+    # filesystem out from under a running scrub". Such a run could not
+    # start, which is neither abnormal termination of a run in progress nor
+    # anything to clean up: it exits silently, 1 (or a signal's code).
+    # bd DAS-Backup-Manager-oeo.
+    if [[ "$CLEANUP_ARMED" != "true" ]]; then
+        exit "$status"
+    fi
+
+    log_warn "Cleaning up after abnormal termination (status $rc; exiting $status)..."
 
     # Record the failed backup run if we were in a real backup and haven't
-    # recorded yet. `|| true`: a failure inside record_backup_run_in_db must
-    # not itself abort cleanup() under set -e and skip unmount_all/exit "$rc"
-    # below — record_backup_run_in_db already soft-fails internally (its
-    # BTRDASD_BIN call is guarded by an `if`), this guard is defense in depth
-    # for cleanup() specifically, since cleanup() runs as an EXIT trap where
-    # there is no outer handler left to catch a set -e abort.
+    # recorded yet. Neither this nor unmount_all can cut the trap short and
+    # skip the exit below: errexit is off in here (set +e above), and each
+    # soft-fails internally as well.
     if [[ "$BACKUP_MODE_REAL" == "true" && "$BACKUP_RUN_RECORDED" == "false" ]]; then
         # Ensure end time is set (may not be if failure was during btrbk)
         if (( BTRBK_END_TIME == 0 )); then
             BTRBK_END_TIME=$(date +%s)
         fi
-        record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL" || true
+        record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL"
     fi
 
-    # `|| true`: same defense-in-depth rationale as above — unmount_all
-    # already handles its own per-mount failures internally, but a failure
-    # here must never prevent the trailing `exit "$rc"` from running.
-    unmount_all || true
+    unmount_all
     clear_maintenance_holder
 
-    # Explicit exit, not fallthrough: preserves the original abort status
-    # ($rc) as the process's final exit code rather than letting it become
-    # whatever unmount_all's last internal command happened to return.
-    exit "$rc"
+    # Explicit exit, not fallthrough: the run's status ($status) is the
+    # process's final exit code, never whatever unmount_all's last internal
+    # command happened to return.
+    exit "$status"
 }
 
 # Installed at top level (not inside main()) so it is active before main()
@@ -2738,8 +2890,8 @@ main() {
     #
     # Unconditional, dryrun included, matching verify_targets_before_btrbk:
     # create_snapshot_dirs() runs in dryrun too, so the write exists there.
-    # An abort here is a could-not-execute case, which is why it exits
-    # nonzero — see the exit-code split at the end of main().
+    # An abort here exits 3: the run began and stopped on a source volume's
+    # state (EXIT STATUS).
     verify_sources_before_write
     # Between the source guard and the first source writer: sync needs every
     # source mounted and verified, and it reloads the config, so a source it
@@ -2835,41 +2987,36 @@ main() {
         log_info "Backup complete. DAS can be safely disconnected."
     fi
 
-    # Marks the clean-completion path so the EXIT trap (cleanup()) no-ops
-    # instead of re-running unmount_all/record_backup_run_in_db, which main()
-    # has already run itself by this point on every reachable path (real-run
-    # and dryrun alike). bd DAS-Backup-Manager-oeo.
-    SCRIPT_COMPLETED="true"
-
-    # ---- Process exit code: DELIBERATE, and narrower than "did it all work"
+    # ---- Process exit status: 0 or 3 (EXIT STATUS in the header) ----------
     #
-    # This used to be whatever `SCRIPT_COMPLETED="true"` returned, i.e. always
-    # 0 -- so btrbk could fail outright at 03:00 and `systemctl status` stayed
-    # green. bd nsp (c1).
+    # It was once whatever `SCRIPT_COMPLETED="true"` returned, i.e. always 0,
+    # so btrbk could fail outright at 03:00 and `systemctl status` stayed
+    # green (bd nsp c1). Then it followed btrbk alone and was 1 whenever btrbk
+    # exited nonzero — and btrbk exits 10 when any ONE target aborts (measured
+    # 2026-10-02 by hand, recovery drive A pulled: btrbk 10, this script 1).
+    # Under the unit one absent drive is `failed` on every run, and
+    # cachyos-sentinel, which restarts a failed unit and whose limiter (3
+    # restarts per 600 s) cannot brake a loop slower than ten minutes, would
+    # start a whole new ~25-minute backup about every ten minutes until the
+    # drive came back (bd DAS-Backup-Manager-d1r).
     #
-    # The exit code now follows the split bd DAS-Backup-Manager-18p established
-    # for the scrub engine, for the same reason: cachyos-sentinel restarts any
-    # unit it observes in `failed` state, and its limiter is 3 restarts per
-    # 600 s. A backup takes ~30 min, so repeated failures NEVER land three
-    # inside one 600 s window and the limiter can never engage. Exiting
-    # nonzero on an ordinary per-target failure would therefore buy visibility
-    # at the price of an unbounded retry loop against a broken target.
-    #
-    #   exit 0        the run EXECUTED. Per-target failures are surfaced by the
-    #                 email report, the `btrdasd health` view, the DB row and
-    #                 the log -- channels that do not trigger a restart.
-    #   exit nonzero  the run could NOT execute: config load, lock, no primary
-    #                 target, mount verification abort, or btrbk failing on
-    #                 every target. These fail in seconds, which is the shape
-    #                 the 3-per-600 s limiter can actually brake.
-    #
-    # Every `exit 1` earlier in this script is already a could-not-execute
-    # case, so they need no change.
-    if [[ "${OP_STATUS[btrbk]:-OK}" == "FAIL" ]]; then
-        log_error "btrbk did not run successfully — exiting nonzero so this run is not recorded as green"
-        return 1
+    # Now 0 when no operation FAILED and 3 when any did — the operations the
+    # report and the history row are made from (completed_exit_status). The
+    # units list SuccessExitStatus=3, so a failure the next start would meet
+    # again never leaves them failed; it travels by the report, the history
+    # row and the journal's status=3, as 18p's split does for the scrub.
+    local status
+    status="$(completed_exit_status)"
+    if [[ "$status" != 0 ]]; then
+        log_error "This run had failures: $(failed_ops) — exit status $status"
     fi
-    return 0
+
+    # Marks the completion path so the EXIT trap (cleanup()) exits with this
+    # status instead of re-running unmount_all/record_backup_run_in_db, which
+    # main() has already run itself by this point on every reachable path
+    # (real-run and dryrun alike). bd DAS-Backup-Manager-oeo.
+    SCRIPT_COMPLETED="true"
+    return "$status"
 }
 
 main "$@"; exit $?

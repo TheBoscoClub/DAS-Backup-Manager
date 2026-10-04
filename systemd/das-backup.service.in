@@ -10,6 +10,21 @@ ConditionPathExistsGlob=/dev/disk/by-id/usb-*
 
 [Service]
 Type=oneshot
+# Exit semantics (bd DAS-Backup-Manager-d1r):
+#   0 = the run executed and nothing failed (a warning still exits 0), or it
+#       skipped because another backup was running.
+#   3 = the run began its work and something failed: btrbk failed for some or
+#       all targets, any operation failed, or it aborted on a target's or a
+#       source's state. The journal carries it, and the report and the history
+#       when the run got that far.
+#   1 = could not start: nothing was mounted or sent (config, btrdasd missing,
+#       arguments, not root, the maintenance lock).
+#   130/143 = stopped by SIGINT/SIGTERM.
+# SuccessExitStatus=3: what made a run fail is usually still there ten minutes
+# later (an absent drive). With the unit failed, cachyos-sentinel would start
+# a whole new backup about every ten minutes; its 3-per-600 s limiter cannot
+# brake a loop that slow. Exit 1 still fails the unit, in seconds.
+SuccessExitStatus=3
 ExecStart=@DAS_SCRIPT_DIR@/backup-run.sh
 StandardOutput=journal
 StandardError=journal
