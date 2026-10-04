@@ -56,6 +56,9 @@
 #     failed in (round 3, M4).
 #     The Snapshot counts row reads N/A until the counts are decided, like
 #     every other row; decide_run_counts records OK with them (round 3, M6).
+#     A source that mounts with a warning (util-linux's "source write-
+#     protected, mounted read-only") logs it again, in the journal and the
+#     log file: M4's capture of mount's output dropped it (round 4, N1).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -1016,6 +1019,13 @@ mount_sources() {
                 log_error "Cannot mount source $label ($dev) at $mnt — mount exited $mount_rc: ${mount_err:-no message}"
                 abort_reason "source mount" "$label: $dev at $mnt: mount exited $mount_rc: ${mount_err:-no message}"
                 exit 3
+            fi
+            # A mount that succeeds can still have something to say —
+            # util-linux's "source write-protected, mounted read-only" — and
+            # it used to reach the journal on its own. Captured above, it is
+            # passed on (bd DAS-Backup-Manager-d1r, round 4: N1).
+            if [[ -n "$mount_err" ]]; then
+                log_warn "  mount said, mounting $label ($dev) at $mnt: ${mount_err//$'\n'/; }"
             fi
             log_info "  Mounted $label at $mnt"
         fi

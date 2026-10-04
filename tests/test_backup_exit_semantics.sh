@@ -287,6 +287,10 @@ if listed mount_fails "$dst"; then
     echo "mount: $dst: wrong fs type, bad option, bad superblock (stub)" >&2
     exit 32
 fi
+# Mounted, with something to say about it, as util-linux says it.
+if listed mount_warns "$dst"; then
+    echo "mount: $dst: WARNING: source write-protected, mounted read-only." >&2
+fi
 uuid="${src#UUID=}"
 listed wrong_fs_at "$dst" && uuid="a-different-filesystem"
 printf '%s\t%s\t/\n' "$dst" "$uuid" >>"$S/mounted"
@@ -705,6 +709,22 @@ check "clean run: btrbk ran" "$(ran_btrbk)" "yes"
 check "clean run: the snapshot counts row" \
     "$(grep -c '^  Snapshot counts       OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
+check "clean run: a silent mount logs no mount warning" \
+    "$(grep -c 'WARN.*mount said' "$STATE/out")" "0"
+
+# A source that mounts with something to say — util-linux's "source
+# write-protected, mounted read-only" — still says it: mount_sources()
+# captures mount's output to name the device if it fails (round 3, M4), and
+# that capture dropped it on success, where it used to reach the journal
+# (round 4, N1). It is logged as a warning, in the journal and the log file.
+fresh
+knob mount_warns "$SOURCE_MNT"
+run_backup
+expect_completed "a source mounts with a warning" 0 "ALL OPERATIONS SUCCESSFUL" success
+check "a source mounts with a warning: in the journal, naming the source" \
+    "$(grep -c "WARN.*mount said, mounting nvme (UUID=source-uuid) at $SOURCE_MNT: mount: $SOURCE_MNT: WARNING: source write-protected, mounted read-only\." "$STATE/out")" "1"
+check "a source mounts with a warning: in the log file" \
+    "$(grep -c 'WARN.*mount said, mounting nvme .*source write-protected, mounted read-only' "$WORK/log/das-backup.log")" "1"
 
 fresh
 run_backup --full
