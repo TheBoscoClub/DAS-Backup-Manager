@@ -138,7 +138,7 @@ check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown hold
     exec 8<>"$LOCK"
     flock 8
     printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
-    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="true"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="true"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     cleanup
 )
 check "on exit: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
@@ -152,7 +152,7 @@ rc=0
     exec 8<>"$LOCK"
     flock 8
     printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
-    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     unmount_all() { record >"$WORK/during_unmount"; }
     (exit 1)
     cleanup
@@ -160,13 +160,28 @@ rc=0
 check "on abort: the record names the run while it unmounts" "$(cat "$WORK/during_unmount")" "backup-run.sh pid $$"
 check "on abort: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
 check "on abort: the run exits 3" "$rc" "3"
+# A stop the run itself received keeps the signal's code, lock held or not
+# (bd DAS-Backup-Manager-d1r round 3, M2).
+rc=0
+(
+    set +e
+    exec 8<>"$LOCK"
+    flock 8
+    printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL="HUP"
+    unmount_all() { :; }
+    (exit 129)
+    cleanup
+) || rc=$?
+check "on a stop: the run exits with the signal's code" "$rc" "129"
+check "on a stop: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
 printf 'btrdasd scrub run pid 77\n' >"$LOCK"
 rm -f "$WORK/during_unmount"
 rc=0
 (
     # Everything the recovery body reads is set, so it is the gate alone
     # that keeps the run away from unmount_all.
-    CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     unmount_all() { record >"$WORK/during_unmount"; }
     cleanup
 ) || rc=$?

@@ -43,6 +43,11 @@
 #     10 s later) and mailx runs without the lock fds: a relay that took the
 #     connection and never answered held the run, the DAS mounted and both
 #     locks held, for as long as it stayed silent (d1r round 3, M1).
+#     HUP, PIPE, USR1 and ALRM are trapped like INT and TERM: each keeps
+#     its own code and is recorded as a stop by name, where they read as
+#     "a command that failed" — exit 3, an ABORTED mail — and then killed
+#     the run anyway. cleanup() ignores PIPE, so a stdout that went away
+#     cannot end it before the unmount (round 3, M2).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -375,15 +380,24 @@
 #                                          WARN), boot subvolumes, archive cleanup, unmount,
 #                                          indexer, USB link speed, email delivery, the
 #                                          history record, the snapshot counters
-#   130/143  wherever the run is           SIGINT/SIGTERM — `systemctl stop` sends TERM — kept
-#                                          as they are: a stop is not a run's outcome, and a
-#                                          stopped unit ends failed (stop it with mask, too)
+#   129 130 138 141 142 143
+#            wherever the run is           SIGHUP SIGINT SIGUSR1 SIGPIPE SIGALRM SIGTERM
+#                                          (`systemctl stop` sends TERM): the signal's own
+#                                          code, kept — a stop is not a run's outcome, and a
+#                                          stopped unit ends failed (stop it with mask, too).
+#                                          A status that only looks like one — a pipeline's
+#                                          SIGPIPE 141, a child killed by TERM 143 — is a
+#                                          command that failed: 3 or 1, as above (STOP_SIGNAL
+#                                          tells them apart; round 3, M2)
 #
 # Every 3 above that ends before main()'s report — all but the end-of-main
 # row — is recorded as failed and sends one ABORTED report naming what
 # aborted (abort_reason; a set -e failure is named by its command), unless it
-# is a dry run (bd DAS-Backup-Manager-2my). A signal (130/143) is recorded,
-# but sends no report: the unit then ends failed, which shows it.
+# is a dry run (bd DAS-Backup-Manager-2my). A stop by a signal sends no
+# report — the unit then ends failed, which shows it — and is recorded as
+# failed ("stopped: by SIG…") only once the run holds the maintenance lock
+# and is not a dry run: stopped while it waits for the lock, it had not
+# begun (bd DAS-Backup-Manager-oeo).
 #
 # cleanup(), the EXIT trap, exits with exactly one of these: errexit is off
 # inside it, so nothing failing there (a log line it cannot write) can end it
@@ -2801,18 +2815,21 @@ completed_exit_status() {
 
 # The status of a run that ends before main() completes — what cleanup()
 # exits with. $1 is the status bash is exiting with, $2 "true" once the run
-# holds the maintenance lock (CLEANUP_ARMED).
-#   130/143  SIGINT/SIGTERM stopped it: kept as they are.
+# holds the maintenance lock (CLEANUP_ARMED), $3 the signal that stopped the
+# run (STOP_SIGNAL), or empty.
+#   $1       a signal stopped it (HUP INT USR1 PIPE ALRM TERM): the code its
+#            trap exited with, 128 + the signal's number, kept as it is.
 #   3        it held the lock, so it had begun its work. Whatever stopped it —
 #            an `exit 3`, or a command failing under set -e with its own
-#            status (a source's `mount` exits 32) — the run began and failed.
+#            status (a guard's 3, a pipeline's SIGPIPE 141, a child killed
+#            by TERM 143) — the run began and failed.
 #   1        it had not: it could not start.
 # Called only by cleanup(), the EXIT trap. shellcheck 0.11 stops seeing a
 # trap's handlers as called once the last line ends in `exit` (SC2329).
 # shellcheck disable=SC2329
 abort_exit_status() {
-    local rc="$1" armed="$2"
-    if (( rc == 130 || rc == 143 )); then
+    local rc="$1" armed="$2" signal="$3"
+    if [[ -n "$signal" ]]; then
         echo "$rc"
     elif [[ "$armed" == "true" ]]; then
         echo 3
@@ -2980,6 +2997,11 @@ cleanup() {
     # ended the run — made it exit 1 instead of the run's status and skip
     # the unmount (bd DAS-Backup-Manager-d1r).
     set +e
+    # Nor may a stdout that went away: with SIGPIPE trapped (or at its
+    # default) the first log line written to a gone stream would end this
+    # trap there, before the unmount. Ignored from here on, such a write just
+    # fails (bd DAS-Backup-Manager-d1r, round 3: M2).
+    trap '' PIPE
 
     # The dry run's planned btrbk.conf goes on every exit path, before either
     # early return below.
@@ -3002,11 +3024,11 @@ cleanup() {
         exit "$rc"
     fi
 
-    # main() did not complete. The status follows EXIT STATUS: 1 if the run
-    # never held the maintenance lock, 3 if it did, a signal's 130/143 kept
-    # (bd DAS-Backup-Manager-d1r).
+    # main() did not complete. The status follows EXIT STATUS: a signal's
+    # own code kept, else 1 if the run never held the maintenance lock and 3
+    # if it did (bd DAS-Backup-Manager-d1r).
     local status
-    status="$(abort_exit_status "$rc" "$CLEANUP_ARMED")"
+    status="$(abort_exit_status "$rc" "$CLEANUP_ARMED" "$STOP_SIGNAL")"
 
     # CLEANUP_ARMED != "true": this process has not yet reached the point
     # where it actually owns the shared DAS mountpoints (see CLEANUP_ARMED's
@@ -3030,9 +3052,13 @@ cleanup() {
 
     log_warn "Cleaning up after abnormal termination (status $rc; exiting $status)..."
 
-    # An abort (3): what stopped the run becomes an operation that FAILED, for
-    # the history row's errors and the ABORTED report (bd DAS-Backup-Manager-2my).
-    if [[ "$status" == 3 ]]; then
+    # What stopped the run becomes an operation that FAILED, for the history
+    # row's errors: a signal by name (it sends no report: its unit fails,
+    # which shows it — round 3, M2), an abort (3) with what and why, which
+    # the ABORTED report says too (bd DAS-Backup-Manager-2my).
+    if [[ -n "$STOP_SIGNAL" ]]; then
+        record_op "stopped" "FAIL" "by SIG$STOP_SIGNAL (exit $status)"
+    elif [[ "$status" == 3 ]]; then
         note_abort "$rc" "$cmd"
     fi
 
@@ -3049,8 +3075,9 @@ cleanup() {
     fi
 
     # And say so: one ABORTED report, unless main() sent its report already.
-    # Before the unmount, which can hang on a drive that went away. A stop
-    # (130/143) sends none: the unit then ends failed, and that shows it.
+    # Before the unmount, which can hang on a drive that went away. A stop by
+    # a signal is not a 3 and sends none: the unit then ends failed, and that
+    # shows it.
     if [[ "$status" == 3 && "$BACKUP_MODE_REAL" == "true" && "${REPORT_SENT:-false}" != "true" ]]; then
         send_abort_report "$status"
     fi
@@ -3073,10 +3100,11 @@ cleanup() {
 # unset variable if something aborts before main() starts. Replaces the old
 # `trap cleanup ERR` (installed inside main(), and only ever effective for a
 # failing command directly in main()'s own body — see the v4.4.1 header
-# note). `trap 'exit 130' INT`/`trap 'exit 143' TERM` convert SIGINT/SIGTERM
-# into an `exit` builtin call with the conventional 128+signum code, so they
-# route through this same EXIT trap instead of bash's default "kill without
-# running EXIT traps" behavior for unhandled fatal signals. A bare
+# note). The signal traps below turn each signal into an `exit` builtin call
+# with the conventional 128+signum code, so it routes through this same EXIT
+# trap with that status. Bash's default for an untrapped fatal signal is
+# worse than it looks: it runs the EXIT trap with whatever $? happened to be,
+# then dies by the signal (measured; round 3, M2). A bare
 # `trap 'exit' INT TERM` was tried first and rejected: `exit` with no
 # argument reuses whatever $? happened to be from the last command that ran
 # BEFORE the signal arrived (often 0, e.g. right after a successful
@@ -3087,9 +3115,34 @@ cleanup() {
 # explicit-code form was proven in the same harness to yield 143 for TERM /
 # 130 for INT regardless of the preceding command's status. See bd
 # DAS-Backup-Manager-oeo.
+#
+# Every signal that ends a run is trapped the same way, and records which it
+# was (bd DAS-Backup-Manager-d1r, round 3: M2). HUP (a terminal hanging up),
+# PIPE (the stream stdout writes to went away), USR1 and ALRM used to be
+# untrapped: bash ran this EXIT trap with $? 0 or 1, cleanup() made it 3 — "a
+# command that failed", an ABORTED mail saying the units count it as success
+# — and then bash died by the signal anyway, the unit failed. Now each keeps
+# its own code, 128 + its number, and STOP_SIGNAL is what tells a stop from a
+# command whose status merely looks like one: a pipeline's SIGPIPE under
+# pipefail exits 141, a child killed by TERM 143, and neither is a stop
+# (measured: in 800 runs with the whole group signalled, bash ran the trap
+# before set -e saw the child's status every time). systemd starts units with
+# SIGPIPE ignored (IgnoreSIGPIPE=yes), and a shell cannot trap a signal it
+# inherited ignored, so under the units PIPE never arrives at all.
+STOP_SIGNAL=""
+# Called only by the traps below (SC2329: see clear_maintenance_holder).
+# shellcheck disable=SC2329
+stop_on_signal() { # stop_on_signal <name> <exit code>
+    STOP_SIGNAL="$1"
+    exit "$2"
+}
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'stop_on_signal HUP 129' HUP
+trap 'stop_on_signal INT 130' INT
+trap 'stop_on_signal USR1 138' USR1
+trap 'stop_on_signal PIPE 141' PIPE
+trap 'stop_on_signal ALRM 142' ALRM
+trap 'stop_on_signal TERM 143' TERM
 
 # ============================================================================
 # MAIN
