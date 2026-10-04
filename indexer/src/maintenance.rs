@@ -480,7 +480,7 @@ mod tests {
     use super::*;
 
     use std::fs::OpenOptions;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
@@ -547,8 +547,40 @@ mod tests {
         }
     }
 
-    /// A descriptor that holds the lock, as `backup-run.sh`'s fd 8 does.
-    fn holding_descriptor(path: &Path) -> std::fs::File {
+    /// A descriptor that holds the lock, as `backup-run.sh`'s fd 8 does, and
+    /// lets go of it for good, as a holder in another process does: unlocked,
+    /// then closed. Closing alone would not do it here. A fork of this
+    /// process copies every descriptor until its exec, and any test's spawn
+    /// forks, so such a copy could hold the lock on after the close (bd
+    /// DAS-Backup-Manager-eu0) — which no fork of the waiter can do to a
+    /// holder in another process. `FileLock` lets go the same way.
+    struct Holding(std::fs::File);
+
+    impl Drop for Holding {
+        fn drop(&mut self) {
+            // SAFETY: flock on a descriptor `self.0` owns until just after.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
+    impl AsRawFd for Holding {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0.as_raw_fd()
+        }
+    }
+
+    impl AsFd for Holding {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
+
+    fn holding_descriptor(path: &Path) -> Holding {
+        Holding(locked_file(path))
+    }
+
+    /// A descriptor that holds the lock and lets go only when it closes.
+    fn locked_file(path: &Path) -> std::fs::File {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -560,6 +592,34 @@ mod tests {
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "the fixture must hold the lock");
         file
+    }
+
+    /// The fixture lets go for good even while a copy of its descriptor lives
+    /// on; the converse — a descriptor merely closed — is still held by the
+    /// copy, which is what made the test above flaky.
+    #[test]
+    fn a_holder_lets_go_even_while_a_fork_holds_a_copy_of_its_descriptor() {
+        let (_dir, site) = scratch();
+        let holder = holding_descriptor(&site.path);
+        let copy = holder.as_fd().try_clone_to_owned().unwrap();
+        drop(holder);
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_some(),
+            "let go for good"
+        );
+        drop(copy);
+        let closed_only = locked_file(&site.path);
+        let copy = closed_only.as_fd().try_clone_to_owned().unwrap();
+        drop(closed_only);
+        assert!(
+            MaintenanceHeld::try_acquire_at(&site.path, "x")
+                .unwrap()
+                .is_none(),
+            "merely closed: the copy holds it"
+        );
+        drop(copy);
     }
 
     // --- the site ----------------------------------------------------------
@@ -1150,10 +1210,12 @@ mod tests {
         );
     }
 
-    /// A caller that lets go between the refused take and the reading of its
-    /// record is not mistaken for a holder: the lock is taken, and kept.
-    #[test]
-    fn a_caller_that_lets_go_meanwhile_is_not_mistaken_for_the_holder() {
+    /// One run of a caller that lets go between the waiter's refused take and
+    /// its reading of the caller's record. With `fork_copy`, a duplicate of
+    /// the caller's descriptor — what a fork of this process holds until its
+    /// exec — outlives the letting go until the waiter has decided. What the
+    /// wait ended in, and how often the lock file was opened to take it.
+    fn caller_lets_go_meanwhile(fork_copy: bool) -> (Waited, usize) {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
@@ -1184,9 +1246,11 @@ mod tests {
                     Err(e) => panic!("the caller's stat was never read: {e}"),
                 }
             };
+            let copy = fork_copy.then(|| holder.as_fd().try_clone_to_owned().unwrap());
             drop(holder);
             fifo.write_all(b"200 (bash) S 100 200 200 0 -1 4194560 0 0\n")
                 .unwrap();
+            copy
         });
         let (waiter_site, callers) = (site.clone(), callers_from(&proc, 300));
         let waited = within(Duration::from_secs(20), move || {
@@ -1201,12 +1265,106 @@ mod tests {
         })
         .expect("never waits for a caller")
         .unwrap();
-        caller.join().unwrap();
+        // The copy, if any, lives until the waiter has decided.
+        drop(caller.join().unwrap());
+        (waited, crate::scrub::opens::count(&site.path))
+    }
+
+    /// A caller that lets go between the refused take and the reading of its
+    /// record is not mistaken for a holder: the lock is taken, and kept.
+    #[test]
+    fn a_caller_that_lets_go_meanwhile_is_not_mistaken_for_the_holder() {
+        let (waited, opens) = caller_lets_go_meanwhile(false);
         assert!(matches!(waited, Waited::Held(_)), "{waited:?}");
-        assert_eq!(
-            crate::scrub::opens::count(&site.path),
-            2,
-            "refused once, then taken, and kept"
+        assert_eq!(opens, 2, "refused once, then taken, and kept");
+    }
+
+    /// The same while a copy of the caller's descriptor lives on, as a fork
+    /// of this process holds every descriptor until its exec — any test's
+    /// spawn does (bd DAS-Backup-Manager-eu0). The caller let go of the lock,
+    /// not merely of one descriptor on it: still not mistaken for the holder.
+    #[test]
+    fn a_caller_that_lets_go_while_a_fork_holds_a_copy_is_not_mistaken_for_the_holder() {
+        let (waited, opens) = caller_lets_go_meanwhile(true);
+        assert!(matches!(waited, Waited::Held(_)), "{waited:?}");
+        assert_eq!(opens, 2, "refused once, then taken, and kept");
+    }
+
+    /// Spawns children in a tight loop until `stop`: `posix` as std spawns
+    /// them (`posix_spawn`), `fork` through a `pre_exec` hook, which makes
+    /// std fork and exec instead; `cpu` spins and spawns nothing. Either
+    /// spawn copies this process's whole descriptor table until the child's
+    /// exec. How many children it started.
+    fn spawner(kind: &str, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<u64> {
+        let kind = kind.to_string();
+        std::thread::spawn(move || {
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+            let mut spawned = 0;
+            while !stop.load(Ordering::Relaxed) {
+                if kind == "cpu" {
+                    std::hint::black_box((0..10_000u64).sum::<u64>());
+                    continue;
+                }
+                let mut cmd = Command::new("true");
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if kind == "fork" {
+                    // SAFETY: the hook does nothing at all, which is
+                    // async-signal-safe.
+                    unsafe { cmd.pre_exec(|| Ok(())) };
+                }
+                if cmd.status().is_ok() {
+                    spawned += 1;
+                }
+            }
+            spawned
+        })
+    }
+
+    /// The flaky shape measured (bd DAS-Backup-Manager-eu0): the run above,
+    /// `EU0_RUNS` times (default 1000), while threads of this process spawn
+    /// children — `EU0_SPAWNERS`, a comma list of [`spawner`] kinds (default
+    /// `posix,fork,posix,fork`; empty for none). Ignored: it measures, for
+    /// seconds. `cargo test --lib -- --ignored --nocapture
+    /// a_caller_letting_go_is_seen_to_let_go_while_this_process_spawns`
+    #[test]
+    #[ignore = "a measurement that runs for seconds; see its doc"]
+    fn a_caller_letting_go_is_seen_to_let_go_while_this_process_spawns() {
+        let runs: usize = std::env::var("EU0_RUNS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1000);
+        let kinds =
+            std::env::var("EU0_SPAWNERS").unwrap_or_else(|_| "posix,fork,posix,fork".to_string());
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = kinds
+            .split(',')
+            .filter(|k| !k.is_empty())
+            .map(|k| spawner(k, stop.clone()))
+            .collect();
+        let started = Instant::now();
+        let mut mistaken = Vec::new();
+        for _ in 0..runs {
+            match caller_lets_go_meanwhile(false) {
+                (Waited::Held(_), _) => {}
+                (other, _) => mistaken.push(format!("{other:?}")),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let spawned: u64 = spawners.into_iter().map(|t| t.join().unwrap()).sum();
+        eprintln!(
+            "eu0: {} of {runs} runs mistook the caller for the holder; spawners [{kinds}] \
+             started {spawned} children; {:.1} s",
+            mistaken.len(),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(
+            mistaken.is_empty(),
+            "{} of {runs}; the first: {}",
+            mistaken.len(),
+            mistaken[0]
         );
     }
 
