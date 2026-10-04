@@ -1315,8 +1315,8 @@ readable database prints as
 .BR "not installed" .
 .PP
 It also reads what that OS starts at boot, to say whether booting it \(em on
-bare metal or in the update VM \(em would run btrbk. The units it starts are
-the names in the dependency directories
+bare metal or in the update VM \(em would run btrbk. A walk starts from the
+names in the dependency directories
 .RI ( UNIT .wants ,
 .IR UNIT .requires ,
 .IR UNIT .upholds )
@@ -1329,22 +1329,105 @@ puts its links, and
 and
 .IR usr/lib/systemd/system ,
 where packages enable their own. Only the names are read: an entry is a link
-to a unit file, and no link is read or followed. For each enabled service and
-socket, and for the service each enabled timer or path unit starts (its
-.BR Unit= ,
-else the one of its own name), the unit file is looked up by name in
-systemd's precedence order \(em an instance falls back to its template \(em
-and read with its drop\-ins: those in its own, its template's, its dash
-prefixes' and its type's
+to a unit file, and no link is read or followed. Each unit is looked up by
+name in systemd's precedence order \(em an instance falls back to its
+template \(em and read with its drop\-ins: those in its own, its template's,
+its dash prefixes' and its type's
 .I .d
 directories, each file name once, applied in file name order, an empty
-assignment clearing a list. It runs btrbk if a command of its
+assignment clearing an
+.B Exec*=
+list. From each unit the walk goes on to what it starts: the unit a timer or
+a path unit names
+.RB ( Unit= ,
+else the one of its own name); the service a socket starts when something
+connects to it
+.RB ( Service= ,
+else the one of its own name; for
+.BR Accept=yes ,
+its template); and every unit its
+.B [Unit]
+section pulls in with
+.BR Wants= ,
+.BR Requires= ,
+.BR Requisite= ,
+.BR BindsTo= ,
+.BR Upholds= ,
+.B OnSuccess=
+or
+.BR OnFailure= ,
+in its file or a drop\-in \(em an empty one of these resets nothing, as
+.BR systemd.unit (5)
+says. The specifiers that come from a unit's own name
+.RB ( %i ,
+.BR %n ,
+.BR %N ,
+.BR %p ,
+.BR %j ,
+.BR %% )
+are resolved in the names it gives and in its commands, and a template left
+over is instantiated with its instance, or its prefix when it has none, as
+systemd does; a name with any other specifier is unknown. Each unit is read
+once, at most 4096 in all (more is unknown), and each way it is started is
+reported.
+.PP
+A unit runs btrbk if a command of its
 .B Exec*=
 settings names it: a word that is
 .B btrbk
 or a path ending in it, also inside a
 .B "sh \-c"
-script \(em cautiously, even as an argument. When cron is enabled
+script \(em cautiously, even as an argument. A word whose last component
+only contains
+.B btrbk
+.RB ( btrbk.sh ,
+.BR run\-btrbk ,
+.IR /etc/btrbk.conf )
+means it may: what that runs is not known. A command also runs every
+.B #!
+script it names by an absolute path: read whole when it is no larger than
+64 KiB (larger, or unreadable, is unknown) and searched the same way, one
+level deep \(em what that script runs is not read. A path through one of
+Arch's merged\-/usr links
+.RI ( /bin ,
+.IR /sbin ,
+.IR /lib ,
+.IR /lib64 ,
+.IR /usr/sbin ,
+.IR /usr/lib64 )
+is read where Arch's
+.B filesystem
+package points it, taken by name since the link is not read; nothing there
+is unknown, as another layout may point it elsewhere. A program that is not
+a
+.B #!
+script, and one named through a link
+.RI ( /usr/bin/sh ,
+a link to
+.BR bash ),
+is not looked into. Under
+.IR /run ,
+.IR /var/run ,
+.IR /var/lock ,
+.IR /dev ,
+.I /proc
+and
+.IR /sys ,
+which systemd mounts from memory, there is nothing to run. The root read is
+that OS's
+.B @
+subvolume alone: a script or a
+.B \-c
+config that is not here, under a mount point of its
+.I etc/fstab
+that is not a memory filesystem's
+.RI ( /root ,
+.IR /home ,
+.I /srv
+on CachyOS), may be there once it is up, so it is unknown \(em and so is
+anything not here when that fstab cannot be read.
+.PP
+When a cron daemon is among the units
 .RB ( cronie.service ,
 .BR crond.service ,
 .BR cron.service ,
@@ -1353,7 +1436,8 @@ script \(em cautiously, even as an argument. When cron is enabled
 .B anacron.service
 or
 .BR anacron.timer ),
-its tables and scripts are read for btrbk the same way:
+its tables and scripts are read the same way, scripts their lines name
+included:
 .IR etc/crontab ,
 .IR etc/anacrontab ,
 and every file in
@@ -1368,10 +1452,13 @@ and
 A file larger than 64 KiB is not read: unknown.
 .PP
 Each runner's config is the one it names with
-.BR \-c ,
+.B \-c
+.IR FILE ,
+.BI \-c FILE ,
 .B \-\-config
+.I FILE
 or
-.BR \-\-config= ,
+.BI \-\-config= FILE ,
 else btrbk's default: the first of
 .I /etc/btrbk.conf
 and
@@ -1389,11 +1476,15 @@ unit file linked into
 .I /etc/systemd/system
 by
 .BR "systemctl link" ,
-and one masked there by
+one masked there by
 .B systemctl mask
 (a link to
 .IR /dev/null ),
-cannot be told apart: both are unknown, and a masked unit still counts as
+and an alias
+.B systemctl enable
+made there
+.RB ( display\-manager.service )
+cannot be told apart: each is unknown, and a masked unit still counts as
 enabled. A link among the vendor units is a package's alias (Arch's
 .B dbus.service
 is a link to
@@ -1403,8 +1494,33 @@ and is not counted, unless its name contains
 A unit whose file is found nowhere (a package removed, its link left behind)
 cannot start, unless its name contains
 .BR btrbk ,
-which is unknown. Not read: the scripts a command or a cron job runs, units
-that generators create at boot, user units, and
+which is unknown.
+.PP
+A
+.B no
+holds within what can be seen without running that OS. Not seen: what a
+script that a command runs runs in turn (one level only); a script named
+through a variable
+.RB ( "sh \-c \(dq$CMD\(dq" ,
+.BR $SCRIPT ),
+by a bare name looked up in
+.BR PATH ,
+or in an option's value
+.RB ( \-\-script=/path );
+a program that is not a
+.B #!
+script \(em a binary, or a script with no
+.B #!
+line that a shell runs anyway; btrbk under another name, a renamed binary or
+a link to it, since a link is not read; units that generators create at boot
+(from
+.IR etc/systemd/system\-generators ,
+.I usr/lib/systemd/system\-generators
+or a
+.B systemd.wants=
+on the kernel command line), and units udev, D\-Bus or a mount starts; user
+units, and a user manager \(em a lingering root user's included \(em that
+starts them; and
 .IR /etc/rc.local .
 .PP
 .B "Enabled timers"
@@ -1465,11 +1581,18 @@ row just above
 .B Result
 says so, with what it rests on and when it would run, e.g.
 .RB \(dq "btrbk will run when this OS boots \(em btrbk.timer starts btrbk.service, which runs btrbk straight after boot (Persistent catch\-up), with /etc/btrbk/btrbk.conf present: check its config before booting it, on bare metal or in the update VM" \(dq.
-When: a service or socket that a boot target pulls in runs at every boot; a
-timer with
-.B OnBootSec=
+When: a unit that a boot target pulls in runs at every boot, and so does
+what it pulls in; a unit
+.B OnFailure=
 or
+.B OnSuccess=
+starts runs if, or after, the other fails or succeeds; a socket's service
+when something connects to it; a path unit's when its condition is met; a
+timer with
+.BR OnBootSec= ,
 .B OnStartupSec=
+or
+.B OnActiveSec=
 soon after boot; a
 .B Persistent=true
 calendar timer that has run before (its stamp under
@@ -1478,7 +1601,12 @@ exists) straight after boot, catching up the runs it missed \(em and every
 boot of a recovery OS has missed some; one with no stamp yet at its next
 scheduled time, which is a reading of
 .BR systemd.timer (5)
-rather than something it states; a cron job on its schedule.
+rather than something it states; a cron job marked
+.B @reboot
+at boot; a job in
+.IR etc/anacrontab ,
+or a script in a directory anacron runs (one its table names), soon after
+boot, when anacron catches up; any other cron job on its schedule.
 .B btrbk run
 then applies that OS's own configuration and retention to whatever it
 names \(em possibly the received backups on this very drive. A warning does
@@ -1543,6 +1671,10 @@ is
 each runner with
 .BR source ,
 .BR via ,
+.B script
+(the
+.B #!
+script whose line runs btrbk, or null when the command itself does),
 .BR when ,
 .B config
 (the

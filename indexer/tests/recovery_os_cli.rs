@@ -487,6 +487,7 @@ fn inspect_warns_when_btrbk_would_run_at_boot_and_exits_one() {
             "runners": [{
                 "source": "btrbk.service",
                 "via": "btrbk.timer",
+                "script": null,
                 "when": "at its next scheduled time after boot",
                 "config": null,
                 "config_present": true
