@@ -165,8 +165,10 @@ Checked before any directory is created, both roots compared **after resolution*
     something FAILED, or it aborted on a target's or a source's state; **1** = could not start
     (nothing mounted or sent); **128+N** = stopped by HUP INT USR1 PIPE ALRM or TERM (129 130
     138 141 142 143), the unit fails. Both backup units carry `SuccessExitStatus=3`, and that line is load-bearing.
-  - A 3 is not silent: the report says FAILURES DETECTED, and an abort before the report sends
-    one **ABORTED** report (what, why, targets seen, log) and records a failed history row (bd `2my`).
+  - A 3 is not silent: the report says FAILURES DETECTED (for a FAIL recorded after the report is
+    built — email delivery, the history record, a report saved nowhere — the row says it), and an
+    abort before the report sends one **ABORTED** report (what, why, targets seen, log) and records
+    a failed history row (bd `2my`).
     The one exception: an abort *after* the report went out exits 3 under a report and a row that
     already say what they saw — the journal's `status=3` and the log are its only trace.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some

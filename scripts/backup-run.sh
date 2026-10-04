@@ -2887,11 +2887,14 @@ report_unrecorded_run() {
 # The status of a run that reached the end of main(): 3 when any operation
 # FAILED, else 0 — a WARN (a stale recovery OS) is not a failure. The same
 # test run_status() makes for the history row and generate_report() for its
-# status line, on the operations recorded by then. Two FAILs can come after
-# the report is built: email delivery (the history row then says FAILURE)
-# and the history record itself (report_unrecorded_run sends the report again
-# saying so). The snapshot counters used to be a third; they are decided
-# before the report now (decide_run_counts, bd DAS-Backup-Manager-bzw).
+# status line, on the operations recorded by then. Three FAILs can come after
+# the report is built: email delivery (the history row then says FAILURE),
+# the history record itself (report_unrecorded_run sends the report again
+# saying so), and, with email off, a report that could not be saved either
+# (send_report records it; the row says FAILURE and why, while the journal's
+# only copy of the report still reads as it was built — round 4, N4). The
+# snapshot counters used to come after it too; they are decided before the
+# report now (decide_run_counts, bd DAS-Backup-Manager-bzw).
 completed_exit_status() {
     if any_op_is FAIL; then
         echo 3
