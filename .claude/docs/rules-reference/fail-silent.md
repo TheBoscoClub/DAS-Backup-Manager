@@ -143,6 +143,14 @@ make (no fd to spare) returns 0 with nothing in it (bash 5.3, measured), so
 `tests/test_early_exit_readers.sh`, RED against 2.2.1 (rc 0 for every failed,
 aborted, never-run and unreadable drive).
 
+The same gate held a third, inside smartctl itself (review F1, 2.3.1). Its
+default `-b warn` turns an invalid checksum in a structure it reads into a
+warning, sets no exit bit, and prints the rows anyway, so the gate passed a
+log smartctl had disowned. A tool's own "carry on" default is a suppression
+too, and the direction test applies to it as to any other: the gate now reads
+with `-b exit`, which stops smartctl at the warning (exit 4, no row; measured
+on the 7.5 binary with a replayed drive).
+
 ### Rust inventory, triaged 2026-09-01 (bd `8wx`)
 
 All **236** hits of the Rust grep below were classified — 223 in production
