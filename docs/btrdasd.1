@@ -1297,8 +1297,12 @@ das\-backup\-manager from
 written: files and directories are opened with
 .BR O_NOATIME ,
 which needs root or ownership of the file (without it the item is reported
-as unreadable rather than read), and no symlink inside the root is followed,
-since following one updates the link's access time. So
+as unreadable rather than read), and a symlink inside the root is never
+followed or read on a mount that would record the access, since doing so
+updates the link's own access time (the boot reading below follows links
+only where the mount is
+.B noatime
+or read\-only). So
 .I etc/os\-release
 is read from
 .IR usr/lib/os\-release ,
@@ -1315,37 +1319,14 @@ readable database prints as
 .BR "not installed" .
 .PP
 It also reads what that OS starts at boot, to say whether booting it \(em on
-bare metal or in the update VM \(em would run btrbk. A walk starts from the
-names in the dependency directories
-.RI ( UNIT .wants ,
-.IR UNIT .requires ,
-.IR UNIT .upholds )
-of its three unit trees:
-.IR etc/systemd/system ,
-where
-.B systemctl enable
-puts its links, and
-.I usr/local/lib/systemd/system
-and
-.IR usr/lib/systemd/system ,
-where packages enable their own. Only the names are read: an entry is a link
-to a unit file, and no link is read or followed. Each unit is looked up by
-name in systemd's precedence order \(em an instance falls back to its
-template \(em and read with its drop\-ins: those in its own, its template's,
-its dash prefixes' and its type's
-.I .d
-directories, each file name once, applied in file name order, an empty
-assignment clearing an
-.B Exec*=
-list. From each unit the walk goes on to what it starts: the unit a timer or
-a path unit names
-.RB ( Unit= ,
-else the one of its own name); the service a socket starts when something
-connects to it
-.RB ( Service= ,
-else the one of its own name; for
-.BR Accept=yes ,
-its template); and every unit its
+bare metal or in the update VM \(em would run btrbk. A walk starts where
+systemd starts,
+.B default.target
+.RI ( etc/systemd/system/default.target ,
+the link
+.B "systemctl set\-default"
+makes, else the vendor's), and takes all it pulls in as starting at every
+boot. From each unit the walk goes on to what it starts: the units its
 .B [Unit]
 section pulls in with
 .BR Wants= ,
@@ -1355,77 +1336,132 @@ section pulls in with
 .BR Upholds= ,
 .B OnSuccess=
 or
-.BR OnFailure= ,
-in its file or a drop\-in \(em an empty one of these resets nothing, as
+.B OnFailure=
+(in its file or a drop\-in \(em an empty one of these resets nothing, as
 .BR systemd.unit (5)
-says. The specifiers that come from a unit's own name
+says), the names in its
+.IR UNIT .wants ,
+.IR UNIT .requires
+and
+.IR UNIT .upholds
+directories, the unit a timer or a path unit names
+.RB ( Unit= ,
+else the one of its own name), and the service a socket starts when
+something connects to it
+.RB ( Service= ,
+else the one of its own name; for
+.BR Accept=yes ,
+its template). Then it does the same from every name in every such directory
+of the unit trees \(em what
+.B systemctl enable
+and packages enable \(em for what the boot did not reach. The trees are
+systemd's persistent unit path, highest first:
+.IR etc/systemd/system.control ,
+.IR etc/systemd/system ,
+.IR etc/systemd/system.attached ,
+.I usr/local/lib/systemd/system
+and
+.IR usr/lib/systemd/system .
+Each unit is read once, by name, in that order \(em an instance falls back to
+its template \(em with its drop\-ins: those in its own, its template's, its
+dash prefixes' and its type's
+.I .d
+directories, each file name once, applied in file name order, an empty
+assignment clearing an
+.B Exec*=
+list. The specifiers that come from a unit's own name
 .RB ( %i ,
 .BR %n ,
 .BR %N ,
 .BR %p ,
 .BR %j ,
 .BR %% )
-are resolved in the names it gives and in its commands, and a template left
-over is instantiated with its instance, or its prefix when it has none, as
-systemd does; a name with any other specifier is unknown. Each unit is read
-once, at most 4096 in all (more is unknown), and each way it is started is
-reported.
+are resolved in the names it gives and in its commands \(em but a template's
+own instance, a connection's, is unknown \(em and a template left over is
+instantiated as systemd does; a name with any other specifier is unknown. A
+unit reached again sooner than before passes that on to what it starts; at
+most 4096 units are read and 262144 starts followed (more is unknown), and
+each way a unit is started is reported.
 .PP
-A unit runs btrbk if a command of its
-.B Exec*=
-settings names it: a word that is
+A unit runs btrbk if a command it runs names it \(em a word that is
 .B btrbk
 or a path ending in it, also inside a
 .B "sh \-c"
-script \(em cautiously, even as an argument. A word whose last component
-only contains
+line, cautiously even as an argument \(em or runs btrbk under another name
+through a link. A word whose last component only contains
 .B btrbk
 .RB ( btrbk.sh ,
 .BR run\-btrbk ,
 .IR /etc/btrbk.conf )
-means it may: what that runs is not known. A command also runs every
+means it may: what that runs is not known. Programs are read where they run:
+the program of an
+.B Exec*=
+command, taken literally as systemd takes it (a
+.B $
+or a glob in it is part of its name; a specifier it cannot resolve here is
+unknown) and found by name where systemd looks \(em
+.I /usr/local/bin
+and
+.IR /usr/bin ,
+and their sbin counterparts on a system that keeps sbin apart, as
+.BR systemd.service (5)
+documents; the first word of each shell command, found the same way; the
+script a shell or an interpreter is given, read even with no
 .B #!
-script it names by an absolute path: read whole when it is no larger than
-64 KiB (larger, or unreadable, is unknown) and searched the same way, one
-level deep \(em what that script runs is not read. A path through one of
-Arch's merged\-/usr links
-.RI ( /bin ,
-.IR /sbin ,
-.IR /lib ,
-.IR /lib64 ,
-.IR /usr/sbin ,
-.IR /usr/lib64 )
-is read where Arch's
-.B filesystem
-package points it, taken by name since the link is not read; nothing there
-is unknown, as another layout may point it elsewhere. A program that is not
-a
+line, as the shell runs it anyway; the command a wrapper runs
+.RB ( env ,
+.BR nice ,
+.BR ionice ,
+.BR flock ,
+.BR timeout ,
+.BR sudo ,
+.BR runuser ,
+.BR su ,
+.BR setsid ,
+.BR systemd\-run ,
+and others); and a
+.B \-c
+line. A
 .B #!
-script, and one named through a link
-.RI ( /usr/bin/sh ,
-a link to
-.BR bash ),
-is not looked into. Under
+script is read whole when it is no larger than 64 KiB (larger, or
+unreadable, is unknown), as sh reads it \(em a backslash at the end of a line
+joins the next, a quoted string may run across lines, a comment and a
+here\-document are no commands, and one that ends inside a quote or after a
+joining backslash is unknown \(em and so are the scripts it runs, four
+scripts deep at most (deeper is unknown). A binary is not looked into. Any
+other absolute path on a command line is read only if it is a
+.B #!
+script there; a plain argument that is not there is no program, and is
+ignored. An argument of btrbk's with a variable or a command substitution in
+it \(em
+.B \(dq$@\(dq
+forwarded by a wrapper,
+.B $OPTS
+from the unit's environment \(em leaves its config unknown.
+.PP
+The root read is that OS's
+.B @
+subvolume alone. A program, script,
+.B \-c
+config or cron table at or under a mount point of its
+.IR etc/fstab ,
+or of a
+.B .mount
+or
+.B .automount
+unit (named after the path it mounts), is not the one it will see \(em the
+mount shadows the disk's copy at boot \(em so it is unknown; a memory
+filesystem's mount point holds nothing. So is anything not here when that
+fstab cannot be read. A program under
 .IR /run ,
 .IR /var/run ,
 .IR /var/lock ,
 .IR /dev ,
 .I /proc
-and
+or
 .IR /sys ,
-which systemd mounts from memory, there is nothing to run. The root read is
-that OS's
-.B @
-subvolume alone: a script or a
-.B \-c
-config that is not here, under a mount point of its
-.I etc/fstab
-that is not a memory filesystem's
-.RI ( /root ,
-.IR /home ,
-.I /srv
-on CachyOS), may be there once it is up, so it is unknown \(em and so is
-anything not here when that fstab cannot be read.
+which only a running system fills, is unknown \(em something at boot may put
+it there; an argument there is ignored.
 .PP
 When a cron daemon is among the units
 .RB ( cronie.service ,
@@ -1436,20 +1472,24 @@ When a cron daemon is among the units
 .B anacron.service
 or
 .BR anacron.timer ),
-its tables and scripts are read the same way, scripts their lines name
-included:
+its tables and scripts are read the same way, and what their commands run:
 .IR etc/crontab ,
 .IR etc/anacrontab ,
 and every file in
 .IR etc/cron.d ,
-.IR etc/cron.hourly ,
-.IR etc/cron.daily ,
-.IR etc/cron.weekly ,
-.IR etc/cron.monthly ,
 .I var/spool/cron
 and
-.IR var/spool/cron/crontabs .
-A file larger than 64 KiB is not read: unknown.
+.I var/spool/cron/crontabs
+as tables (past each line's schedule and, in a system table, its user; up to
+an unescaped
+.BR % ,
+cron's newline), and every file in
+.IR etc/cron.hourly ,
+.IR etc/cron.daily ,
+.I etc/cron.weekly
+and
+.I etc/cron.monthly
+as a script. A file larger than 64 KiB is not read: unknown.
 .PP
 Each runner's config is the one it names with
 .B \-c
@@ -1469,51 +1509,75 @@ with its size in bytes. A config is only checked with
 .BR lstat (2),
 never opened: its presence is the whole signal, and parsing another system's
 file would decide nothing. A config that only that OS could resolve (a
-variable, a specifier, a relative path) is unknown.
+variable, a specifier, a relative path), or that is under a mount point, is
+unknown.
 .PP
-A link is never read, since reading it would update its access time. So a
-unit file linked into
+A link is read only on a mount that records no access time:
+.BR readlinkat (2)
+updates the link's own access time, and no flag prevents it, so a link is
+read only where
+.BR fstatvfs (3)
+reports the mount
+.B noatime
+or read\-only \(em as every DAS target is mounted, with
+.BR [das].mount_opts .
+There a link resolves inside the root (an absolute target is the root's,
+.B ..
+cannot leave it, at most 8 links): a link to
+.IR /dev/null ,
+or an empty unit file, masks the unit, which then runs nothing; a link to
+another unit's file makes the unit that unit's alias (to a template's file,
+of that template's same instance, as
+.BR systemd.unit (5)
+says; an instance's link to its own template is its own file), read by that
+unit's own name (an
+.I /etc
+copy of it first) with the alias's drop\-ins too; a link to a program is that
+program. On any other mount a link is not read. A unit file linked into
 .I /etc/systemd/system
 by
 .BR "systemctl link" ,
 one masked there by
-.B systemctl mask
-(a link to
-.IR /dev/null ),
+.BR "systemctl mask" ,
 and an alias
 .B systemctl enable
 made there
 .RB ( display\-manager.service )
-cannot be told apart: each is unknown, and a masked unit still counts as
-enabled. A link among the vendor units is a package's alias (Arch's
-.B dbus.service
-is a link to
-.BR dbus\-broker.service )
-and is not counted, unless its name contains
-.BR btrbk .
-A unit whose file is found nowhere (a package removed, its link left behind)
-cannot start, unless its name contains
+then cannot be told apart, and each is unknown, as is
+.BR default.target ;
+a link among the vendor units is a package's alias, not counted unless its
+name contains
+.BR btrbk ;
+a program named through a link is not looked into; and a path through one of
+Arch's merged\-/usr links
+.RI ( /bin ,
+.IR /sbin ,
+.IR /lib ,
+.IR /lib64 ,
+.IR /usr/sbin ,
+.IR /usr/lib64 )
+is read where Arch's
+.B filesystem
+package points it, nothing there being unknown. A unit whose file is found
+nowhere (a package removed, its link left behind) cannot start, unless its
+name contains
 .BR btrbk ,
 which is unknown.
 .PP
 A
 .B no
-holds within what can be seen without running that OS. Not seen: what a
-script that a command runs runs in turn (one level only); a script named
-through a variable
+holds within what can be seen without running that OS. Not seen: a program
+named through a variable
 .RB ( "sh \-c \(dq$CMD\(dq" ,
-.BR $SCRIPT ),
-by a bare name looked up in
-.BR PATH ,
+.BR $SCRIPT )
 or in an option's value
 .RB ( \-\-script=/path );
-a program that is not a
+the command of a wrapper this does not know; a program that is not a
 .B #!
-script \(em a binary, or a script with no
-.B #!
-line that a shell runs anyway; btrbk under another name, a renamed binary or
-a link to it, since a link is not read; units that generators create at boot
-(from
+script and is not given to a shell \(em a binary, or a file run by a program
+this does not know as one; btrbk under another name as a renamed binary (a
+link to it is followed where links are read); units that generators create
+at boot (from
 .IR etc/systemd/system\-generators ,
 .I usr/lib/systemd/system\-generators
 or a

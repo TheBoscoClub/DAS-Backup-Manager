@@ -8,11 +8,11 @@
 //! to update itself (an old keyring cannot). This module reads that install
 //! **read-only** and says when it is stale, and when booting it would run
 //! btrbk (bd DAS-Backup-Manager-1yg). It never writes under the root it
-//! inspects — not even an access time: every open is `O_NOATIME`, and no
-//! symlink inside the root is followed, because following one updates the
-//! link's atime (and a link to an absolute path would report the HOST's files
-//! as the recovery OS's). Both were seen moving the `@` subvolume's generation
-//! on a real filesystem before they were closed.
+//! inspects — not even an access time: every open is `O_NOATIME`, and a link
+//! is never followed or read on a mount that would record the access, as that
+//! updates the link's atime (one read resolves inside the root, never to the
+//! HOST's files). Both were seen moving the `@` subvolume's generation on a
+//! real filesystem before they were closed.
 //!
 //! An item that cannot be read is `None` plus a `problems` entry, and an
 //! unknown upgrade date or kernel is stale — never a fabricated age.
@@ -356,6 +356,61 @@ fn open_regular(path: &Path, rel: &str) -> Result<fs::File, ReadErr> {
     }
 }
 
+/// The flags (`statvfs.f_flag`) of the mount that holds an open directory,
+/// `None` when they cannot be had: what [`records_access`] decides by. A
+/// seam, so tests choose the mount.
+type MountFlags = fn(&fs::File) -> Option<libc::c_ulong>;
+
+/// The real [`MountFlags`]: `fstatvfs`.
+fn mount_flags(dir: &fs::File) -> Option<libc::c_ulong> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: an all-zero statvfs is a valid value; fstatvfs only writes it.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is open for the call, and `st` is a valid statvfs.
+    if unsafe { libc::fstatvfs(dir.as_raw_fd(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_flag)
+}
+
+/// Whether a read on a mount with these flags would record an access time,
+/// so that reading a link there — which `readlinkat` does, and no flag
+/// prevents — is a write. False only on a mount that is `noatime` or
+/// read-only: there the kernel's atime path returns before it writes
+/// anything (fs/inode.c: `atime_needs_update` on `MNT_NOATIME` and
+/// `IS_NOATIME`, `touch_atime` on a read-only mount). `nodiratime` spares
+/// directories only, not a link. Unknown flags count as recording.
+/// Production qualifies: every DAS target is mounted with
+/// `[das].mount_opts`, which carries `noatime`.
+fn records_access(flags: Option<libc::c_ulong>) -> bool {
+    flags.is_none_or(|f| (f & libc::ST_NOATIME) == 0 && (f & libc::ST_RDONLY) == 0)
+}
+
+/// The target of the symlink `name` in the open directory `dir`. The caller
+/// asks [`records_access`] first: `readlinkat` updates the link's access
+/// time on any mount that records one.
+fn read_link_at(dir: &fs::File, name: &str) -> std::io::Result<String> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(name)?;
+    let mut buf = vec![0u8; 4097];
+    // SAFETY: `dir` is open, `name` is NUL-terminated, and `buf` has room
+    // for `buf.len()` bytes, which is all readlinkat writes.
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let n = usize::try_from(n).map_err(|_| std::io::Error::last_os_error())?;
+    if n == buf.len() {
+        return Err(std::io::Error::other("a target longer than 4096 bytes"));
+    }
+    buf.truncate(n);
+    String::from_utf8(buf).map_err(|_| std::io::Error::other("a target that is not UTF-8"))
+}
+
 /// Read a regular file under `root` ([`open_in_root`]).
 fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
     let mut bytes = Vec::new();
@@ -526,6 +581,11 @@ fn parse_desc(text: &str) -> Option<(String, String)> {
 /// An absent item is left `None`/unread; an unreadable one is also listed in
 /// `problems`.
 pub fn inspect(root: &Path) -> RecoveryOs {
+    inspect_with(root, mount_flags)
+}
+
+/// [`inspect`], reading a link only where `probe` says that records nothing.
+fn inspect_with(root: &Path, probe: MountFlags) -> RecoveryOs {
     let mut os = RecoveryOs::default();
     let unreadable = |e: ReadErr, problems: &mut Vec<String>| {
         if let ReadErr::Unreadable(why) = e {
@@ -580,7 +640,7 @@ pub fn inspect(root: &Path) -> RecoveryOs {
         }
         Err(e) => unreadable(e, &mut os.problems),
     }
-    let boot = boot::read(root);
+    let boot = boot::read_with(root, probe);
     os.enabled_units = boot.units;
     os.btrbk_config = boot.config;
     os.btrbk_at_boot = boot.at_boot;
@@ -1557,11 +1617,6 @@ mod tests {
             root.join(VENDOR).join("dbus.service"),
         )
         .unwrap();
-        std::os::unix::fs::symlink(
-            "/usr/lib/systemd/system/graphical.target",
-            root.join(ETC).join("default.target"),
-        )
-        .unwrap();
     }
 
     const ETC: &str = "etc/systemd/system";
@@ -1724,6 +1779,46 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_records_access_unless_it_is_noatime_or_read_only() {
+        use libc::{ST_NOATIME, ST_NODEV, ST_NODIRATIME, ST_NOSUID, ST_RDONLY, ST_RELATIME};
+        for (flags, records) in [
+            (None, true),
+            (Some(0), true),
+            (Some(ST_RELATIME), true),
+            (Some(ST_NOSUID | ST_NODEV | ST_RELATIME), true),
+            // nodiratime spares directories, and a link is not one.
+            (Some(ST_NODIRATIME), true),
+            (Some(ST_NOATIME), false),
+            (Some(ST_NOATIME | ST_NOSUID), false),
+            (Some(ST_RDONLY), false),
+            (Some(ST_RDONLY | ST_RELATIME), false),
+            (Some(ST_RDONLY | ST_NOATIME), false),
+        ] {
+            assert_eq!(records_access(flags), records, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn mount_flags_are_the_kernel_s_for_that_directory() {
+        // Read through the path instead, the other way the kernel answers.
+        let by_path = |dir: &Path| {
+            let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: an all-zero statvfs is valid; statvfs only writes it.
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `path` is NUL-terminated and `st` a valid statvfs.
+            assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut st) }, 0);
+            st.f_flag
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // /proc is nosuid, nodev and noexec wherever it is mounted.
+        for dir in [Path::new("/proc"), tmp.path()] {
+            let flags = mount_flags(&fs::File::open(dir).unwrap());
+            assert_eq!(flags, Some(by_path(dir)), "{}", dir.display());
+        }
+        assert_ne!(by_path(Path::new("/proc")) & libc::ST_NOSUID, 0);
+    }
+
+    #[test]
     fn inspect_never_updates_an_access_time() {
         // A read that bumps atime is a write to the recovery OS (it moved the
         // subvolume's generation on a real drive). Old atimes below mtime make
@@ -1791,6 +1886,13 @@ mod tests {
             &format!("{VENDOR}/snap.service"),
             "[Service]\nExecStart=/usr/bin/true\n",
         );
+        // What the boot starts, `systemctl set-default`'s link: on this
+        // mount, which records access times, it is not read.
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/graphical.target",
+            root.join(ETC).join("default.target"),
+        )
+        .unwrap();
         // An enabled name whose link leads to a real file outside the root:
         // a follower would read it (and believe its btrbk line) or stat it.
         let outside = dir.path().join("elsewhere.service");
@@ -1861,7 +1963,16 @@ mod tests {
             filetime::set_symlink_file_times(link, old, old).unwrap();
         }
         let os = inspect(&root);
-        assert!(os.problems.is_empty(), "{:?}", os.problems);
+        // The real probe, on a mount that records access times: no link is
+        // read, and what the boot starts is then unknown.
+        assert_eq!(
+            os.problems,
+            [
+                "etc/systemd/system/default.target: a link, not read: this mount records access \
+              times (mount it noatime)"
+            ]
+        );
+        assert_eq!(os.btrbk_at_boot.verdict, BootVerdict::Will);
         assert_eq!(
             os.last_full_upgrade_applied.as_deref(),
             Some("2026-03-14"),
