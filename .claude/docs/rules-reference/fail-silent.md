@@ -84,12 +84,17 @@ site, never the pattern.
    **The direction test, honestly:** for a run that got as far as its report
    the substituted "success" costs nothing — the FAILURES DETECTED email is
    the alert. For an abort before the report stage (no primary target, a
-   target or source failing verification, the bare-mountpoint guard) it does
-   cost something: such a run sends no report and writes no history row, so
-   before 4.11.0 the failed unit and sentinel's notice were its only alert, and
-   now the journal and the run log are its only trace — `bd 2my` (an abort
-   report) closes that. The scrub's split is `bd DAS-Backup-Manager-18p`;
-   both are in `backup.md` §Sentinel Interaction.
+   target or source failing verification, the bare-mountpoint guard, a
+   command failing under `set -e`) it cost something until the same release
+   closed it: such a run sent no report and wrote no history row, so with the
+   unit no longer failed, nothing showed it — a powered-off DAS would have
+   failed every night unseen. That half could not ship alone. `cleanup()` now
+   records the run as failed (`--counts-unknown`, `aborted: <what>: <why>` in
+   the errors) and sends one ABORTED report through `send_report` — both best
+   effort, neither able to change the status (`bd DAS-Backup-Manager-2my`).
+   Only then is the substituted "success" cautious on every path. The scrub's
+   split is `bd DAS-Backup-Manager-18p`; both are in `backup.md` §Sentinel
+   Interaction.
 
 ### Bash inventory, triaged 2026-09-01 (bd `76g`)
 

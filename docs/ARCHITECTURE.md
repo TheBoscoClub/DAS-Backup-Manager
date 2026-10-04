@@ -97,7 +97,7 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
-         ├──▶ singleton lock (/run/das-backup.lock), then maintenance lock (/run/das-maintenance.lock, blocking)
+         ├──▶ singleton lock (/run/das-backup.lock: held → skip, exit 0; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
          ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml when the plan changes it, and btrbk.conf whenever it differs from what config.toml renders to
          │                                   (then: reload config, verify_sources_before_write() again for any source sync added;
@@ -109,7 +109,8 @@ The system has six major components:
          ├──▶ update_boot_subvolumes()     → creates missing @/@home on non-mirror targets; archives + recreates them only on --full runs
          ├──▶ btrdasd walk                 → indexes new snapshots on the primary target into SQLite
          ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
-         ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted
+         ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted;
+         │                                   decide_run_counts() then settles the snapshot counts, before the run status
          ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report
          ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25); report also written to last_report
          └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown)
@@ -119,6 +120,12 @@ The report goes out before the run is recorded, because the record carries the r
 outcome (a delivery failure fails the run). If recording then fails, the run is missing from the
 history, so the record step marks the run FAIL (`run_history`) and writes and sends the report
 again: `FAILURES DETECTED`, with a `RUN HISTORY` section saying the run is not recorded and why.
+
+A run that aborts before its report (exit 3: no primary target, a target or source failing
+verification, a command failing under `set -e`) never reaches those steps. Its EXIT trap,
+`cleanup()`, records it as failed (`--counts-unknown`, the reason in the errors), sends one short
+report with the subject `ABORTED` through the same relay path, and only then unmounts — the
+unmount can hang on a drive that went away. A dry run sends and records nothing.
 
 A `--dryrun` stops after the expiry preview and the recovery OS check: it previews the archive pruner and
 unmounts, and sends, records and archives nothing. It may create a missing, empty
