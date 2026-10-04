@@ -161,6 +161,7 @@ readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
      else
        "entry\tpresent",
        "checked\t\($d.checked_epoch | clean)",
+       "checkedtype\t\($d.checked_epoch | type)",
        (if $d.error != null then "error\t\(($d.error | clean) as $e | if $e == "" then "an error without text" else $e end)"
         elif $d.os == null then "error\tno OS was inspected"
         else empty end),
@@ -739,7 +740,7 @@ last_session_time() {
     local n=0 line
     while IFS= read -r line; do
         n=$((n + 1))
-        if [[ ! "$line" =~ ^([^[:space:]]+)\ ([0-9]{1,18})$ ]]; then
+        if [[ ! "$line" =~ ^([^[:space:]]+)\ ([1-9][0-9]{0,17})$ ]]; then
             SESSIONS_FAILURE="line $n of $SESSIONS_FILE is not '<label> <seconds>': '$line'"
             return 1
         fi
@@ -751,11 +752,22 @@ last_session_time() {
     done <<<"$lines"
 }
 
+is_target_label() {
+    local l
+    for l in "${TARGET_LABELS[@]}"; do
+        [[ "$l" != "$1" ]] || return 0
+    done
+    return 1
+}
+
 # Record $1 (seconds since the epoch) as this label's session time: one line
 # per label, the file replaced whole, readable by all and written by its
-# owner (root) only. 1, with SESSIONS_FAILURE set, when it cannot be.
+# owner (root) only. Only well-formed lines go back, and none silently:
+# another target's line whose time cannot be read is written back at $1, so
+# that drive's next session waits for a new record too; any other bad line
+# is dropped. 1, with SESSIONS_FAILURE set, when it cannot be written.
 record_session_time() {
-    local lines="" label t tmp
+    local lines="" line label tmp out="" n=0
     SESSIONS_FAILURE=""
     if [[ -L "$SESSIONS_FILE" ]] || [[ -e "$SESSIONS_FILE" && ! -f "$SESSIONS_FILE" ]]; then
         SESSIONS_FAILURE="$SESSIONS_FILE is not a regular file"
@@ -765,14 +777,25 @@ record_session_time() {
         SESSIONS_FAILURE="cannot read $SESSIONS_FILE: $lines"
         return 1
     fi
-    tmp="$SESSIONS_FILE.new.$$"
-    if ! {
-        while read -r label t; do
-            [[ -n "$label" && "$label" != "$LABEL" ]] || continue
-            printf '%s %s\n' "$label" "$t"
+    if [[ -n "$lines" ]]; then
+        while IFS= read -r line; do
+            n=$((n + 1))
+            label=${line%%[[:space:]]*}
+            if [[ "$line" =~ ^([^[:space:]]+)\ ([1-9][0-9]{0,17})$ ]]; then
+                [[ "${BASH_REMATCH[1]}" == "$LABEL" ]] || out+="$line"$'\n'
+            elif [[ "$label" == "$LABEL" ]]; then
+                : # this drive's own line: replaced below
+            elif [[ -n "$label" ]] && is_target_label "$label"; then
+                out+="$label $1"$'\n'
+                warn "rewrote line $n of $SESSIONS_FILE ('$line') as '$label $1': its time could not be read, so that drive's next session waits for a new boot record"
+            else
+                warn "dropped line $n of $SESSIONS_FILE ('$line'): not '<label> <seconds>' for any target"
+            fi
         done <<<"$lines"
-        printf '%s %s\n' "$LABEL" "$1"
-    } >"$tmp"; then
+    fi
+    out+="$LABEL $1"$'\n'
+    tmp="$SESSIONS_FILE.new.$$"
+    if ! printf '%s' "$out" >"$tmp"; then
         rm -f -- "$tmp"
         SESSIONS_FAILURE="cannot write $tmp"
         return 1
@@ -813,8 +836,8 @@ resolve_os_state() {
 # run when its OS boots -- before anything is taken. The record's own facts
 # are shown whatever they say.
 check_boot_record() {
-    local file out rc=0 key value schemas=0 schema="" schematype="" entry="" checked="" error=""
-    local verdict="" units_state="" when now age p problems=() reasons=() units=() hint
+    local file out rc=0 key value schemas=0 schema="" schematype="" entry="" checked="" checkedtype="" error=""
+    local verdict="" units_state="" when now age p problems=() hints=() reasons=() units=() hint=""
     resolve_os_state
     file=$OS_STATE_FILE
     if [[ ! -e "$file" ]]; then
@@ -834,6 +857,7 @@ check_boot_record() {
             schematype) schematype=$value ;;
             entry) entry=$value ;;
             checked) checked=$value ;;
+            checkedtype) checkedtype=$value ;;
             error) error=$value ;;
             verdict) verdict=$value ;;
             reason) reasons+=("$value") ;;
@@ -853,8 +877,10 @@ check_boot_record() {
     if [[ "$entry" != present ]]; then
         refuse "the boot record $file has no entry for '$LABEL' -- the nightly backup run writes one when it checks this drive; let one run with it attached"
     fi
-    if [[ ! "$checked" =~ ^[0-9]{1,18}$ ]]; then
-        refuse "the boot record for '$LABEL' has no check time ('$checked')"
+    # A JSON number of whole seconds above 0: a string -- "015260430204" --
+    # would reach bash arithmetic as octal, and 0 is no time at all.
+    if [[ "$checkedtype" != number || ! "$checked" =~ ^[1-9][0-9]{0,17}$ ]]; then
+        refuse "the boot record for '$LABEL' has no check time ('$checked', a $checkedtype) -- a whole number of seconds above 0 is needed"
     fi
     when="$(utc "$checked" 2>&1)" ||
         refuse "the boot record for '$LABEL' has a check time this host cannot read as a date ($checked: $when) -- not a time in seconds"
@@ -885,16 +911,21 @@ check_boot_record() {
 
     if [[ "$verdict" != no ]]; then
         problems+=("btrbk $verdict run when this OS boots")
+        hints+=("fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again (without starting btrbk: boot it with systemd.unit=emergency.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1 on its kernel line, remount / read-write if needed, mask the unit the record names, then systemctl poweroff -- never exit or Ctrl-D, and never Ctrl-Alt-Del: each boots it on; to stop at any prompt, hold the power button; see the disaster recovery guide)")
     fi
     if ((checked > now + 300)); then
         problems+=("the record is dated in the future ($when): the clock of the run that wrote it, or this one, is wrong")
+        hints+=("let the next backup run, with this drive attached, record it again")
     elif ((age > MAX_RECORD_AGE_DAYS * 86400)); then
         problems+=("the record is $(age_text "$age" | sed 's/ ago$//') old, older than $MAX_RECORD_AGE_DAYS days: it no longer describes the drive")
+        hints+=("let the next backup run, with this drive attached, record it again")
     fi
     if ! last_session_time; then
         problems+=("cannot tell when this drive's last VM session ended ($SESSIONS_FAILURE)")
+        hints+=("remove the bad line, or the whole file, at $SESSIONS_FILE, then run a backup with the drive attached")
     elif [[ -n "$LAST_SESSION" ]] && ((checked <= LAST_SESSION)); then
         problems+=("the record was made before this drive's last VM session ended ($(utc "$LAST_SESSION")): the OS may have changed in it")
+        hints+=("let the next backup run, with this drive attached, record it again")
     fi
     if ((${#problems[@]} == 0)); then
         log "boot record: btrbk will not run when this OS boots"
@@ -907,11 +938,10 @@ check_boot_record() {
         done
         return 0
     fi
-    if [[ "$verdict" != no ]]; then
-        hint="fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again (without starting btrbk: boot it with systemd.unit=rescue.target SYSTEMD_SULOGIN_FORCE=1 on its kernel line, disable or mask its btrbk units, then systemctl poweroff -- never exit the rescue shell, and at a 'Press Enter to continue' prompt power off instead; see the disaster recovery guide)"
-    else
-        hint="let the next backup run, with this drive attached, record it again"
-    fi
+    # Each piece of advice once, in the order the problems were found.
+    for p in "${hints[@]}"; do
+        [[ "; $hint; " == *"; $p; "* ]] || hint+="${hint:+; }$p"
+    done
     refuse "$(IFS=';'; printf '%s' "${problems[*]}" | sed 's/;/; /g') (the record was checked $when, $(age_text "$age")) -- $hint"
 }
 
