@@ -1964,13 +1964,13 @@ mod tests {
         }
         let os = inspect(&root);
         // The real probe, on a mount that records access times: no link is
-        // read, and what the boot starts is then unknown.
+        // read, and what the boot starts, or a program link leads to, is
+        // then unknown.
         assert_eq!(
             os.problems,
-            [
-                "etc/systemd/system/default.target: a link, not read: this mount records access \
-              times (mount it noatime)"
-            ]
+            ["etc/systemd/system/default.target", "usr/local/bin/tool.sh"].map(|l| format!(
+                "{l}: a link, not read: this mount records access times (mount it noatime)"
+            ))
         );
         assert_eq!(os.btrbk_at_boot.verdict, BootVerdict::Will);
         assert_eq!(
