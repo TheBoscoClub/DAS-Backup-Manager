@@ -29,6 +29,7 @@ use std::path::Path;
 
 use crate::db::Snapshot;
 use crate::health::is_mountpoint;
+use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::scrub;
 
 /// Singleton lock for a standalone reconcile pass.
@@ -43,54 +44,66 @@ use crate::scrub;
 /// engine: an index tidy-up has nothing urgent enough to delay a real backup
 /// for, so a held lock defers the pass rather than queuing behind it.
 ///
-/// The reconcile performed inside `btrdasd walk` deliberately takes NO lock —
-/// `backup-run.sh` invokes `walk` while already holding the maintenance lock, so
-/// a non-blocking attempt there would fail every time and the in-backup
-/// reconcile would silently never run.
+/// The reconcile performed inside `btrdasd walk` takes no lock of its own: it
+/// runs under the maintenance lock `walk` already holds — taken (waiting for
+/// it) or, when `backup-run.sh` runs `walk`, handed down by the script
+/// (`maintenance::DELEGATED_FD_ENV`).
 pub const RECONCILE_LOCK_PATH: &str = "/run/das-reconcile.lock";
 
-/// Both locks a standalone reconcile holds, released on drop.
+/// Both locks a standalone reconcile holds, released on drop — maintenance
+/// first (fields drop in declaration order).
 pub struct ReconcileLocks {
-    _maintenance: scrub::FileLock,
+    maintenance: MaintenanceHeld,
     _singleton: scrub::FileLock,
+}
+
+impl HoldsMaintenance for ReconcileLocks {
+    fn maintenance(&self) -> &MaintenanceHeld {
+        &self.maintenance
+    }
 }
 
 /// Outcome of trying to acquire the standalone reconcile locks.
 pub enum LockAttempt {
     Acquired(Box<ReconcileLocks>),
     /// Another maintenance operation holds a lock — defer, do not queue.
-    Deferred(&'static str),
+    Deferred(String),
 }
 
-/// Try to take the standalone reconcile locks without blocking.
+/// Try to take the standalone reconcile locks without blocking. `job`
+/// (`btrdasd reindex`) is recorded in the maintenance lock file as its
+/// holder.
 ///
 /// Split from `try_acquire_locks()` so the acquisition ORDER and the defer
 /// behaviour can be tested against temp paths, with no root and no /run writes.
 pub fn try_acquire_locks_at(
     singleton_path: &Path,
     maintenance_path: &Path,
+    job: &str,
 ) -> Result<LockAttempt, scrub::ScrubError> {
     let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
         return Ok(LockAttempt::Deferred(
-            "another reconcile is already running",
+            "another reconcile is already running".to_string(),
         ));
     };
-    let Some(maintenance) = scrub::FileLock::try_acquire(maintenance_path)? else {
-        return Ok(LockAttempt::Deferred(
-            "DAS maintenance lock held (backup or scrub in progress)",
-        ));
+    let Some(maintenance) = MaintenanceHeld::try_acquire_at(maintenance_path, job)? else {
+        return Ok(LockAttempt::Deferred(format!(
+            "DAS maintenance lock held by {}",
+            crate::maintenance::holder_of(maintenance_path)
+        )));
     };
     Ok(LockAttempt::Acquired(Box::new(ReconcileLocks {
-        _maintenance: maintenance,
+        maintenance,
         _singleton: singleton,
     })))
 }
 
 /// Try to take the standalone reconcile locks at their production paths.
-pub fn try_acquire_locks() -> Result<LockAttempt, scrub::ScrubError> {
+pub fn try_acquire_locks(job: &str) -> Result<LockAttempt, scrub::ScrubError> {
     try_acquire_locks_at(
         Path::new(RECONCILE_LOCK_PATH),
         Path::new(scrub::MAINTENANCE_LOCK_PATH),
+        job,
     )
 }
 
@@ -340,11 +353,18 @@ mod tests {
         let singleton = dir.path().join("reconcile.lock");
         let maintenance = dir.path().join("maintenance.lock");
 
-        let held = scrub::FileLock::try_acquire(&maintenance).unwrap();
+        let held = MaintenanceHeld::try_acquire_at(&maintenance, "btrdasd scrub run").unwrap();
         assert!(held.is_some(), "fixture must actually hold the lock");
 
-        match try_acquire_locks_at(&singleton, &maintenance).unwrap() {
-            LockAttempt::Deferred(why) => assert!(why.contains("maintenance")),
+        match try_acquire_locks_at(&singleton, &maintenance, "btrdasd reconcile").unwrap() {
+            LockAttempt::Deferred(why) => assert_eq!(
+                why,
+                format!(
+                    "DAS maintenance lock held by btrdasd scrub run pid {}",
+                    std::process::id()
+                ),
+                "the holder is named, never guessed"
+            ),
             LockAttempt::Acquired(_) => panic!("acquired while maintenance lock was held"),
         }
     }
@@ -358,7 +378,7 @@ mod tests {
         let held = scrub::FileLock::try_acquire(&singleton).unwrap();
         assert!(held.is_some());
 
-        match try_acquire_locks_at(&singleton, &maintenance).unwrap() {
+        match try_acquire_locks_at(&singleton, &maintenance, "btrdasd reconcile").unwrap() {
             LockAttempt::Deferred(why) => assert!(why.contains("reconcile")),
             LockAttempt::Acquired(_) => panic!("two reconciles acquired at once"),
         }
@@ -369,8 +389,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let singleton = dir.path().join("reconcile.lock");
         let maintenance = dir.path().join("maintenance.lock");
-        match try_acquire_locks_at(&singleton, &maintenance).unwrap() {
-            LockAttempt::Acquired(_) => {}
+        match try_acquire_locks_at(&singleton, &maintenance, "btrdasd reindex").unwrap() {
+            LockAttempt::Acquired(locks) => {
+                assert_eq!(locks.maintenance().path(), maintenance);
+                assert_eq!(
+                    std::fs::read_to_string(&maintenance).unwrap(),
+                    format!("btrdasd reindex pid {}\n", std::process::id()),
+                    "the job is recorded as the maintenance lock's holder"
+                );
+            }
             LockAttempt::Deferred(why) => panic!("deferred with nothing held: {why}"),
         }
     }

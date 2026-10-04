@@ -142,7 +142,7 @@ sudo systemctl mask das-backup.service das-backup-full.service das-scrub.service
 #    A job started from the GUI runs in btrdasd-helper, not in these units, and masking
 #    does not stop it. Both checks must print nothing; WAIT means a job still holds the DAS:
 sudo flock -n /run/das-backup.lock true || echo "WAIT: a backup is running"
-sudo flock -n /run/das-maintenance.lock true || echo "WAIT: a backup, scrub, reconcile or doctor run holds the DAS"
+sudo flock -n /run/das-maintenance.lock true || echo "WAIT: a job holds the DAS; cat /run/das-maintenance.lock shows what it recorded"
 
 # 2. Unmount everything the enclosure backs. Nothing should be under /run/media
 #    (targets are hidden from udisks); a match there means the rule is not applying.

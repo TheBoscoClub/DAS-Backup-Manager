@@ -95,7 +95,7 @@ sudo cp -a /mnt/snapshot/path/to/file /where/you/want/it
 sudo umount /mnt/snapshot /mnt/backup
 ```
 
-Not there? A subvolume adopted automatically by a backup run is under `/mnt/backup/<first-source>-adopted/` (e.g. `ssd-adopted/`). A subvolume that was deleted is "retired": its last snapshots stay where they were until that target's retention window has passed (kept for 372 days after the retirement date on the primary and deleted by the first `backup-run.sh` run on or after day 373; kept 7 days on the recovery drives, deleted on or after day 8). The 2TB recovery drives hold only the last 7 daily snapshots, and their `@`/`@home` are their own OS, not yours. On the running system, check first that no backup, scrub, reconcile or doctor run holds the DAS: `sudo flock -n /run/das-maintenance.lock true || echo WAIT`.
+Not there? A subvolume adopted automatically by a backup run is under `/mnt/backup/<first-source>-adopted/` (e.g. `ssd-adopted/`). A subvolume that was deleted is "retired": its last snapshots stay where they were until that target's retention window has passed (kept for 372 days after the retirement date on the primary and deleted by the first `backup-run.sh` run on or after day 373; kept 7 days on the recovery drives, deleted on or after day 8). The 2TB recovery drives hold only the last 7 daily snapshots, and their `@`/`@home` are their own OS, not yours. On the running system, check first that no backup, scrub, restore, index, reconcile or doctor run holds the DAS: `sudo flock -n /run/das-maintenance.lock true || echo WAIT` (`cat /run/das-maintenance.lock` shows what the holder recorded).
 
 ### One of the two 22TB backup drives failed (RAID-1 degraded)
 
@@ -111,7 +111,7 @@ sudo btrfs device stats /mnt/backup-22tb
 
 **2. Mount the surviving leg (degraded)**
 
-If `/mnt/backup-22tb` is not currently mounted (or won't mount normally) — first make sure no backup, scrub, reconcile or doctor run holds the DAS (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`):
+If `/mnt/backup-22tb` is not currently mounted (or won't mount normally) — first make sure no backup, scrub, restore, index, reconcile or doctor run holds the DAS (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`; `cat /run/das-maintenance.lock` shows what the holder recorded):
 ```bash
 sudo mkdir -p /mnt/backup-22tb
 sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=120,nossd,degraded \
