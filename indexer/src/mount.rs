@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::config::{Config, TargetRole};
 use crate::health;
+use crate::maintenance::MaintenanceHeld;
 use crate::progress::ProgressCallback;
 
 /// Errors that can occur during the mount lifecycle.
@@ -325,11 +326,24 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 /// Returns `Err(MountError::NoDrivesFound)` only if **no** targets could be
 /// mounted *and* no targets were already mounted. Individual mount failures
 /// are logged as warnings but do not abort the operation.
+///
+/// `_held` is the proof that this process holds the DAS maintenance lock. It
+/// is not read, only required: no job can mount a target another job is
+/// using — a backup, a scrub, or a recovery drive a VM has mounted, which a
+/// second kernel's mount would corrupt (bd DAS-Backup-Manager-frb). Release
+/// the guard before the lock.
 pub fn ensure_targets_mounted(
     config: &Config,
     progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
-    ensure_targets_mounted_with(config, progress, &HOST_PROBES, Arc::new(SystemRunner))
+    ensure_targets_mounted_with(
+        config,
+        progress,
+        _held,
+        &HOST_PROBES,
+        Arc::new(SystemRunner),
+    )
 }
 
 /// [`ensure_targets_mounted`] against an explicit host: `probes` answers what
@@ -337,6 +351,7 @@ pub fn ensure_targets_mounted(
 fn ensure_targets_mounted_with(
     config: &Config,
     progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
     probes: &MountProbes<'_>,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<MountGuard, MountError> {
@@ -1209,7 +1224,13 @@ mod tests {
             runner: &Arc<ScriptedRunner>,
         ) -> Result<MountGuard, MountError> {
             self.with_probes(runner, |p| {
-                ensure_targets_mounted_with(config, progress, p, runner.clone())
+                ensure_targets_mounted_with(
+                    config,
+                    progress,
+                    &MaintenanceHeld::assumed(),
+                    p,
+                    runner.clone(),
+                )
             })
         }
 
@@ -3590,7 +3611,7 @@ mod tests {
 
         let config = Config::default();
         let progress = NullProgress;
-        let result = ensure_targets_mounted(&config, &progress);
+        let result = ensure_targets_mounted(&config, &progress, &MaintenanceHeld::assumed());
         assert!(result.is_ok());
         assert_eq!(result.unwrap().count(), 0);
     }

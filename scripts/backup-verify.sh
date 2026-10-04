@@ -1,7 +1,14 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.0.0
-# Date: 2026-02-21
+# Version: 3.1.0
+# Date: 2026-10-03
+#
+# 3.1.0: the maintenance lock is taken by take_maintenance_lock(), which
+# records this script as its holder, empties that record again on exit while
+# the lock is still held, and no longer empties the current holder's record
+# on open (bd DAS-Backup-Manager-frb). A btrbk/usage inspection skipped
+# because the lock is held is no longer also reported as a failed mount
+# (bd DAS-Backup-Manager-0oi).
 #
 # Checks:
 #   - SMART health on all DAS drives
@@ -304,6 +311,42 @@ check_smart_health() {
     fi
 }
 
+# Take the DAS maintenance lock without waiting, on fd 8 (held until this
+# script exits), and record this script as its holder — in the lock file, as
+# every holder does, so a job that finds the lock held can say what it waits
+# for. The EXIT trap empties the record again while fd 8 still holds the
+# lock. Returns non-zero, having said why, when the lock cannot be opened or
+# is held. Opened `<>`, not `>`: `>` would empty the current holder's record
+# (bd DAS-Backup-Manager-frb).
+take_maintenance_lock() {
+    local lock="$1"
+    if ! exec 8<>"$lock"; then
+        log_warn "Cannot open $lock — skipping btrbk/usage inspection"
+        return 1
+    fi
+    if ! flock -n 8; then
+        # Not "backup or scrub": every job that mounts the targets holds it.
+        log_warn "DAS maintenance lock held by another job — skipping btrbk/usage inspection"
+        log_warn "  Re-run when it finishes; this section mounts the array read-only."
+        return 1
+    fi
+    MAINTENANCE_RECORD="$lock"
+    trap clear_maintenance_record EXIT
+    if ! printf 'backup-verify.sh pid %s\n' "$$" >"$lock"; then
+        log_warn "Could not record backup-verify.sh as the holder of $lock"
+    fi
+}
+
+# Empty this script's holder record, as the EXIT trap, while fd 8 still holds
+# the lock — so a finished run is never named as the holder. Installed only
+# once the lock is held; before that the record is another holder's. Emptied,
+# never removed: the file is the lock. Display only: a failure is logged.
+clear_maintenance_record() {
+    if ! : >"$MAINTENANCE_RECORD"; then
+        log_warn "Could not empty the holder record in $MAINTENANCE_RECORD"
+    fi
+}
+
 check_btrbk_status() {
     log_header "btrbk Backup Status"
 
@@ -356,22 +399,25 @@ check_btrbk_status() {
     #     .claude/rules/backup.md its mount options carry `degraded` so a
     #     single-leg failure does not block inspection. A verify tool that
     #     cannot look at a degraded array is useless exactly when it matters.
+    #
+    # A held lock is a deliberate skip, which take_maintenance_lock has already
+    # explained — not a failed mount (bd DAS-Backup-Manager-0oi).
     local maint_lock="/run/das-maintenance.lock"
-    if [[ -n "$primary_dev" && -b "$primary_dev" ]] && ! exec 8>"$maint_lock"; then
-        log_warn "Cannot open $maint_lock — skipping btrbk/usage inspection"
-    elif [[ -n "$primary_dev" && -b "$primary_dev" ]] && ! flock -n 8; then
-        log_warn "DAS maintenance lock held (backup or scrub running) — skipping btrbk/usage inspection"
-        log_warn "  Re-run when the backup finishes; this section mounts the array read-only."
-    elif [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
-        mkdir -p "$primary_mount"
-        local mount_stderr
-        mount_stderr=$(mktemp)
-        if mount -o ro,nossd,noatime,degraded "$primary_dev" "$primary_mount" 2>"$mount_stderr"; then
-            mounted=true
+    local skipped=false
+    if [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
+        if take_maintenance_lock "$maint_lock"; then
+            mkdir -p "$primary_mount"
+            local mount_stderr
+            mount_stderr=$(mktemp)
+            if mount -o ro,nossd,noatime,degraded "$primary_dev" "$primary_mount" 2>"$mount_stderr"; then
+                mounted=true
+            else
+                mount_err=$(tr '\n' ' ' < "$mount_stderr")
+            fi
+            rm -f "$mount_stderr"
         else
-            mount_err=$(tr '\n' ' ' < "$mount_stderr")
+            skipped=true
         fi
-        rm -f "$mount_stderr"
     fi
 
     if $mounted; then
@@ -402,6 +448,8 @@ check_btrbk_status() {
 
         # Cleanup
         umount "$primary_mount" 2>/dev/null || log_warn "Failed to unmount $primary_mount"
+    elif $skipped; then
+        :
     elif [[ -z "$primary_dev" ]]; then
         log_warn "Primary backup drive (serial ${primary_serial:-unset}) not among the detected DAS devices"
     elif [[ ! -b "$primary_dev" ]]; then
