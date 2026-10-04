@@ -10,14 +10,21 @@ reproduction commands behind every section live under the **same heading** in
 - Config at `/etc/btrbk/btrbk.conf` (canonical, generated from `config.toml`; never hand-edit).
 
 ## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
-Both rewrite `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh` in place
-(truncate, same inode). Bash reads a running script incrementally, so a read landing in the
-truncation window sees EOF: the run fires its `EXIT` trap, unmounts, and **ends early looking
-like a clean finish** (exit 0, no prune, no report). The `2lj` staleness guard does NOT protect
-against this, and `setup` takes neither lock. Check first, every time:
+Bash reads a running script as it goes. `setup` renames a new file into place, and the three
+scripts end with `main "$@"; exit $?` (once `main` runs, bash never reads its file again), so a
+running script is never read from a rewritten file. `cmake --install` (CMake 4.4.3, measured)
+unlinks each file and creates a new one, executable once complete: a run already going keeps its
+script but calls the new sibling scripts and `btrdasd` later. A run *starting* in that instant
+mostly fails loudly (203/EXEC or 127), but bash reopens the script by path after the exec and can
+find the new file still empty: **it exits 0 having done nothing** (measured: see the reference).
+**`setup` refuses by itself**:
+every mode that writes or removes installed files takes `/run/das-backup.lock`, then
+`/run/das-maintenance.lock`, non-blocking, before its first write, holds both to the end, and exits
+75 (on stderr) having changed nothing if either is held. **`cmake --install` takes no lock** —
+check first, every time (it cannot see a run started by hand in the sub-millisecond before its flock):
 
 ```bash
-if systemctl is-active -q das-backup.service das-backup-full.service || ! flock -n /run/das-backup.lock true; then echo "WAIT — do not install"; fi
+busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
 ```
 
 Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before btrbk starts, and re-reads `config.toml`.

@@ -92,6 +92,10 @@ removed 2026-04-12 along with all ESP sync code):
 
 ## Installer Modes
 
+Every mode below that writes or removes installed files — a fresh install, `--modify`, `--upgrade`, `--uninstall`, `--uninstall-all` and `--force` — refuses while a backup or another job holding the DAS maintenance lock runs. Before its first write it takes `/run/das-backup.lock`, then `/run/das-maintenance.lock`, without waiting; if either is held it writes and removes nothing, says on stderr which lock is held (and, for the maintenance lock, by whom) and exits **75** — run it again once that job has finished. Otherwise it holds both until it is done and lets them go however it ends; a backup started meanwhile, by the timer too, finds `/run/das-backup.lock` held and skips its run. The wizard's and the uninstall's questions come first: the locks are taken once they are answered. `--force` reads `config.toml` only once it holds them; `--modify` compares the file with what it read before the wizard opened, and if something else wrote it meanwhile (the GUI, a subvol sync) it writes nothing and exits **75**, so that change is not lost under the wizard's answers — run `--modify` again. `--check` changes nothing and takes no lock.
+
+Every file setup writes is replaced whole: a new file, given its mode before it is renamed over the old one — scripts 0755, any other file the mode it had. A backup already reading a script keeps reading the old file to its end; a write that fails leaves the old file as it was and names it.
+
 ### Fresh Install (default)
 
 ```bash
@@ -114,7 +118,26 @@ Re-opens the wizard with your current configuration pre-filled from `/etc/das-ba
 sudo btrdasd setup --upgrade
 ```
 
-Regenerates all files from the existing config without re-running the wizard. Use this after updating the `btrdasd` binary to ensure generated scripts match the new version.
+Regenerates all files from the existing config without re-running the wizard, then restarts the D-Bus helper (`btrdasd-helper.service`) so it runs the binary just installed — it runs as root for as long as the system does, and nothing else restarts it. Use this after updating the binaries (`cmake --install` or a package).
+
+- **Nothing is written while a backup runs.** The upgrade takes both locks (above) before it rewrites `config.toml`, and holds them through every file it writes and the helper restart. A backup holds `/run/das-backup.lock` from its start, also while it still waits for the maintenance lock. The scripts themselves are safe to replace (setup renames a whole new file over each, and they end with `main "$@"; exit $?`), but a run that has started would call the new sibling scripts, units and `btrdasd` for its later steps — so the upgrade waits for a moment when no backup or maintenance job holds either lock. Either lock held: exit **75**, nothing written.
+- **The helper restart, under those locks.** No job in the helper is mounting a target the restart would kill — each holds the maintenance lock while it does. A backup asked of the GUI meanwhile finds `/run/das-backup.lock` held and is declined; a restore or index job waits for the maintenance lock — in the new helper, until the upgrade lets go. One that is already waiting in the **old** helper is cancelled when the restart stops it (the helper cancels every job as it stops) and ends without a `JobFinished` signal, so the GUI is never told it ended (bd `DAS-Backup-Manager-hoh`). The hold through the restart is bounded at 300 s: a `try-restart` that has not returned by then is reported as failed and the locks let go.
+- A restart that fails or does not return in time, or a unit state that cannot be read, ends the upgrade with an error, exit **1**.
+- A helper that is not running is left alone (exit 0): D-Bus starts it from the new binary when it is next needed. On an init system other than systemd the upgrade cannot restart it: restart a running `btrdasd-helper` yourself; the upgrade exits **3**.
+
+Exit status: **0** files upgraded and the helper restarted (or not running); **3** files upgraded, the helper is yours to restart (not systemd); **75** refused — a backup or a maintenance job was running, nothing written; **1** something failed. Treat 3 as "upgraded, restart the helper" and 75 as "try again later", not as failed installs. Nothing in this repository's packaging runs `setup --upgrade`; a script of your own that does should handle 3 and 75 the same way.
+
+**Keep `btrdasd`, `btrdasd-helper` and the scripts at one version.** Since schema 4 the backup history stores a snapshot count a run could not take as unknown (NULL), and the first open by a schema-4 binary migrates the database to it. A `btrdasd` or `btrdasd-helper` built before schema 4 cannot read a run with unknown counts: its history fails — `btrdasd backup report` prints `Error: InvalidColumnType(4, "snaps_created", Null)`, and the GUI's error dialog reads `IndexBackupHistory: History query failed: Invalid column type Null at index: 4, name: snaps_created` (as the code formats it; not observed) while the history stays empty. That is why the helper is restarted. Rolling back to such a binary needs the database as it was before the upgrade, or accepts that error while any such run is in the history (an old binary can still record runs).
+
+**Never run `cmake --install` while a backup runs.** Unlike `setup`, it takes no lock. It does not rewrite a script in place — CMake 4.4.3 unlinks each file and creates a new one, executable only once it is complete, so a run already going keeps its old script, though it calls the new sibling scripts and `btrdasd` for its later steps. A run that starts in that instant mostly fails at once (systemd: `203/EXEC`), but after the exec bash opens the script again by its path, so it can find the new one still empty and exit 0 having done nothing — measured with CMake 4.4.3: 17 of 7,764 starts made during 2,000 installs. (The scripts end with `main "$@"; exit $?`, so even a copy in place — a plain `cp` — cannot reach a run once it is in `main`.) Check first:
+
+```bash
+busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
+```
+
+Both units are oneshot, so a running one reads `activating` — `systemctl is-active` is false for it, which is why an earlier form of this check (`systemctl is-active -q … || …`) could never fire on its first half. The lock covers a run started by hand and a CLI or GUI backup; what no check can see is a run started by hand in the sub-millisecond before it takes the lock.
+
+Besides, the first open by a new binary migrates the database inside a write transaction that waits up to 30 s behind another writer, such as a running backup's indexer, and then fails that command with `database is locked` — leaving the database unchanged, for the next open to migrate.
 
 ### Uninstall
 

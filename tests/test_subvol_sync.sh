@@ -383,7 +383,10 @@ SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
     "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Recovery OS           N/A  (n/a)||"
-check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.9.0' <<<"$report")" "1"
+# The footer's version is the header's: one bump, both places.
+version="$(sed -n 's/^# Version: //p' "$SCRIPT")"
+check "the header names a version" "$([[ "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]] && echo yes)" "yes"
+check "report footer carries the script version" "$(grep -c -x "  backup-run.sh v$version" <<<"$report")" "1"
 
 # --- report: a failed btrbk listing is unavailable, not "none yet" -------------
 # capture_report_data under the script's own options; no target is mounted.

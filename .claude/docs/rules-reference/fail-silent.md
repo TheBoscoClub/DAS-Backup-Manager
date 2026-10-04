@@ -164,7 +164,8 @@ produced no log line at all.
 Two things deliberately left, named so they are not re-litigated:
 
 - **`serde_json::to_string(..).unwrap_or_else(\|_\| "[]")`** in four helper
-  D-Bus methods (three as of 2026-10-02). Wrong direction — "[]" tells the GUI *there is nothing there* —
+  D-Bus methods (two as of 2026-10-03: `IndexBackupHistory` now returns
+  `report::backup_history_json(..).to_string()`, which cannot fail). Wrong direction — "[]" tells the GUI *there is nothing there* —
   but `serde_json::Value` cannot hold an unserializable value (no NaN, no
   non-string keys), so it is unreachable and **no counter-test can be
   constructed**. Left rather than changed untested. If any of these ever

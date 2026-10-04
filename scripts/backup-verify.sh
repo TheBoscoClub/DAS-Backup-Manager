@@ -1,7 +1,12 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.1.0
+# Version: 3.1.1
 # Date: 2026-10-03
+#
+# 3.1.1: the last line is `main "$@"; exit $?`, so a copy over this file
+# in place while it runs (a plain `cp`) cannot have bash read the new file
+# once main returns; behaviour is otherwise unchanged
+# (bd DAS-Backup-Manager-6wt).
 #
 # 3.1.0: the maintenance lock is taken by take_maintenance_lock(), which
 # records this script as its holder, empties that record again on exit while
@@ -341,6 +346,9 @@ take_maintenance_lock() {
 # the lock — so a finished run is never named as the holder. Installed only
 # once the lock is held; before that the record is another holder's. Emptied,
 # never removed: the file is the lock. Display only: a failure is logged.
+# Run only through the EXIT trap. shellcheck 0.11 stops seeing a trap's
+# handlers as called once the last line ends in `exit` (SC2329).
+# shellcheck disable=SC2329
 clear_maintenance_record() {
     if ! : >"$MAINTENANCE_RECORD"; then
         log_warn "Could not empty the holder record in $MAINTENANCE_RECORD"
@@ -508,4 +516,4 @@ main() {
     return 0
 }
 
-main "$@"
+main "$@"; exit $?

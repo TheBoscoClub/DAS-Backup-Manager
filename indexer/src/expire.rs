@@ -563,7 +563,8 @@ pub fn expire_retired(
             .sources
             .retain(|s| !(s.subvolumes.is_empty() && touched.contains(&s.label)));
         if let Err(e) = updated.save(config_path) {
-            config_error = Some(format!("could not write {}: {e}", config_path.display()));
+            // The error names the file.
+            config_error = Some(e.to_string());
             for report in &mut entries {
                 report.removed_from_config = false;
             }
@@ -1447,8 +1448,7 @@ mod tests {
     #[test]
     fn a_config_that_cannot_be_saved_keeps_every_entry_and_fails_the_run() {
         let rig = rig();
-        // A directory where the atomic write's temp file goes makes saving fail.
-        std::fs::create_dir(rig.dir.path().join(".config.toml.tmp")).unwrap();
+        crate::fsutil::testing::unreplaceable(&rig.config_path);
         let before = std::fs::read_to_string(&rig.config_path).unwrap();
         let out = expire_retired(
             &rig.config_path,
@@ -1458,7 +1458,10 @@ mod tests {
             &mounted,
         )
         .unwrap();
-        assert!(out.config_error.is_some());
+        let why = out.config_error.as_deref().unwrap();
+        let named = rig.config_path.display().to_string();
+        assert!(why.starts_with(&format!("cannot write {named}: ")), "{why}");
+        assert_eq!(why.matches(&named).count(), 1, "the path, once: {why}");
         assert!(out.failed());
         assert!(out.entries.iter().all(|e| !e.removed_from_config));
         assert_eq!(std::fs::read_to_string(&rig.config_path).unwrap(), before);
