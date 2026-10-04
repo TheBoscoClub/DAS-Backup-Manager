@@ -558,11 +558,30 @@ locks_free() {
         echo no
     fi
 }
-# "yes" when none of the processes the stub mailx recorded is still alive.
+# pid_alive <pid>: succeeds when <pid> is a process that is still running.
+# Never `kill -0`: it succeeds on a zombie, a process that has died and waits
+# for its parent to collect it, and where PID 1 collects nothing (GitHub's job
+# container runs `tail -f /dev/null` as PID 1) every orphan stays one. The
+# bound's kill of a stalled mailx orphans its sleep child exactly so (CI run
+# 37237268866). So /proc/<pid> must exist and its state must not be Z. The
+# state is the first field after the LAST ')' of stat: comm sits inside the
+# parentheses and may itself hold spaces and parentheses.
+pid_alive() {
+    local stat state
+    # Digits only. "" would read /proc/stat, and 0 is no process: `kill -0 0`
+    # signals the caller's own group and always succeeds.
+    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+    # No /proc entry: reaped, or gone since the caller noted it. The braces
+    # silence bash's own "No such file"; on the assignment alone it leaks.
+    { stat="$(<"/proc/$1/stat")"; } 2>/dev/null || return 1
+    read -r state _ <<<"${stat##*)}"
+    [[ "$state" != Z ]]
+}
+# "yes" when none of the processes the stub mailx recorded is still running.
 mail_stubs_gone() {
     local f
     for f in "$STATE/mail_stall.pid" "$STATE/mail_stall_child.pid"; do
-        [[ -f "$f" ]] && kill -0 "$(cat "$f")" 2>/dev/null && {
+        [[ -f "$f" ]] && pid_alive "$(cat "$f")" && {
             echo no
             return
         }
@@ -1200,7 +1219,7 @@ check "clean run, mail helper escapes: exit status" "$RC" "3"
 show_tail 3
 check "clean run, mail helper escapes: over within the bound" "$((ELAPSED <= 15))" "1"
 check "clean run, mail helper escapes: the helper is still alive" \
-    "$(kill -0 "$(cat "$STATE/mail_escaped.pid" 2>/dev/null || echo 0)" 2>/dev/null && echo yes || echo no)" "yes"
+    "$(pid_alive "$(cat "$STATE/mail_escaped.pid" 2>/dev/null)" && echo yes || echo no)" "yes"
 check "clean run, mail helper escapes: both locks free all the same" "$(locks_free)" "yes"
 reap_mail_stubs
 
