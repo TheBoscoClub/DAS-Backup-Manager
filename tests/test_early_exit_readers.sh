@@ -378,6 +378,31 @@ said() { # said <serial>: what the last gate said of that drive, after its name
         echo "${line#"  $1 (label-$1): "}"
     fi
 }
+# advised <serial>: what the last gate said to do, on the line under that
+# drive ("→ …"), or "-" when it printed none.
+advised() {
+    local next
+    next="$(grep -F -A1 -- "  $1 (label-$1): " "$WORK/gate.out" | sed -n 2p)"
+    if [[ $next == "      → "* ]]; then echo "${next#"      → "}"; else echo "-"; fi
+}
+# What to do, by why a drive did not pass (round 3): each says what its state
+# means. A failure older than the newest passed extended test is ignored on
+# ATA, so one that passes now supersedes it; SCSI counts every failure among
+# its 20 entries, so no newer test does (ataprint.cpp, scsiprint.cpp).
+declare -A ADVICE=(
+    [none]="-"
+    [running]="a test is still running: wait for it to finish, then check again"
+    [never-run]="no self-test has run: run an extended test (smartctl -t long) and wait for it to PASS"
+    [unfinished]="the test stopped before it finished: run an extended test (smartctl -t long) and wait for it to PASS"
+    [failed]="the drive failed its most recent self-test: do not use it, or --force deliberately"
+    [unrecognised]="a result this script does not recognise: run an extended test (smartctl -t long) and wait for it to PASS"
+    [older-ata]="an older self-test failed and no newer extended test has passed: run an extended test (smartctl -t long), which supersedes that failure only if it PASSES"
+    [older-scsi]="an older self-test in its log failed, and on SCSI no newer test supersedes it (smartctl counts it while it is among the last 20): do not use the drive, or --force deliberately"
+    [unreadable]="smartctl could not read the drive, so nothing about it is verified: do not use it, or --force deliberately"
+    [checksum]="smartctl found an invalid checksum, so its readings cannot be trusted: do not use the drive, or --force deliberately"
+    [no-result]="smartctl gave no self-test result, so nothing is verified: do not use the drive, or --force deliberately"
+    [flagged]="smartctl reports a problem with the drive: do not use it, or --force deliberately"
+)
 # decide <fixture> <smartctl exit status> [no-fd]: the decision alone,
 # "<returned>|<status shown>"; with no-fd, with no fd to spare (ulimit -n 3).
 decide() {
@@ -398,26 +423,26 @@ decide() {
 # self-test status byte, with the exit status smartctl 7.5 gives a log whose
 # row "# 1" it is: bit 7 for the failures it counts (0x3-0x8), else 0.
 n=0
-while IFS='|' read -r status code want_rc verdict; do
+while IFS='|' read -r status code want_rc verdict advice; do
     n=$((n + 1))
     rem=9 lba=-
     [[ $status == "Completed without error" ]] && rem=0
     [[ $status == "Completed: read failure" ]] && lba=123456
     fixture "ata-$n" "$(ata_log "$(ata_row 1 'Extended offline' "$status" "$rem" "$lba")")"
-    check "ATA '$status', smartctl exit $code: $verdict" \
-        "$(gate "S1:ata-$n:$code")|$(said S1)" "$want_rc|$verdict — $status"
+    check "ATA '$status', smartctl exit $code: $verdict, advice $advice" \
+        "$(gate "S1:ata-$n:$code")|$(said S1)|$(advised S1)" "$want_rc|$verdict — $status|${ADVICE[$advice]}"
 done <<'EOF'
-Completed without error|0|0|PASSED
-Aborted by host|0|1|NOT PASSED
-Interrupted (host reset)|0|1|NOT PASSED
-Fatal or unknown error|128|1|NOT PASSED
-Completed: unknown failure|128|1|NOT PASSED
-Completed: electrical failure|128|1|NOT PASSED
-Completed: servo/seek failure|128|1|NOT PASSED
-Completed: read failure|128|1|NOT PASSED
-Completed: handling damage??|128|1|NOT PASSED
-Unknown status (0x9)|0|1|NOT PASSED
-Self-test routine in progress|0|1|STILL RUNNING
+Completed without error|0|0|PASSED|none
+Aborted by host|0|1|NOT PASSED|unfinished
+Interrupted (host reset)|0|1|NOT PASSED|unfinished
+Fatal or unknown error|128|1|NOT PASSED|failed
+Completed: unknown failure|128|1|NOT PASSED|failed
+Completed: electrical failure|128|1|NOT PASSED|failed
+Completed: servo/seek failure|128|1|NOT PASSED|failed
+Completed: read failure|128|1|NOT PASSED|failed
+Completed: handling damage??|128|1|NOT PASSED|failed
+Unknown status (0x9)|0|1|NOT PASSED|unrecognised
+Self-test routine in progress|0|1|STILL RUNNING|running
 EOF
 
 # SCSI: every result scsiprint.cpp prints, 25 wide as it pads them (result 7
@@ -425,30 +450,30 @@ EOF
 # status for it: bit 2 for result 3, bit 7 for results 4-7, else 0. Only a
 # whole "Completed" field passes; "Completed, segment failed" shares its
 # first word.
-while IFS='|' read -r result seg lba sense code want_rc verdict shown; do
+while IFS='|' read -r result seg lba sense code want_rc verdict shown advice; do
     n=$((n + 1))
     hours=1234
     [[ $result == "Self test in progress ..." ]] && hours=NOW
     fixture "scsi-$n" "$(scsi_log "$(scsi_row 1 'Background long ' "$result" "$seg" "$hours" "$lba" "$sense")")"
-    check "SCSI '$shown', smartctl exit $code: $verdict" \
-        "$(gate "S1:scsi-$n:$code")|$(said S1)" "$want_rc|$verdict — $shown"
+    check "SCSI '$shown', smartctl exit $code: $verdict, advice $advice" \
+        "$(gate "S1:scsi-$n:$code")|$(said S1)|$(advised S1)" "$want_rc|$verdict — $shown|${ADVICE[$advice]}"
 done <<'EOF'
-Completed                |-|-|-|0|0|PASSED|Completed
-Aborted (by user command)|-|-|-|0|1|NOT PASSED|Aborted (by user command)
-Aborted (device reset ?) |-|-|-|0|1|NOT PASSED|Aborted (device reset ?)
-Unknown error, incomplete|-|-|-|4|1|NOT PASSED|Unknown error, incomplete
-Completed, segment failed|-|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Completed, segment failed
-Failed in first segment  |1|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Failed in first segment
-Failed in second segment |2|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Failed in second segment
-Failed in segment -->    |3|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Failed in segment -->
-Reserved(8)              |-|-|-|0|1|NOT PASSED|Reserved(8)
-Reserved(9)              |-|-|-|0|1|NOT PASSED|Reserved(9)
-Reserved(10)             |-|-|-|0|1|NOT PASSED|Reserved(10)
-Reserved(11)             |-|-|-|0|1|NOT PASSED|Reserved(11)
-Reserved(12)             |-|-|-|0|1|NOT PASSED|Reserved(12)
-Reserved(13)             |-|-|-|0|1|NOT PASSED|Reserved(13)
-Reserved(14)             |-|-|-|0|1|NOT PASSED|Reserved(14)
-Self test in progress ...|-|-|-|0|1|STILL RUNNING|Self test in progress ...
+Completed                |-|-|-|0|0|PASSED|Completed|none
+Aborted (by user command)|-|-|-|0|1|NOT PASSED|Aborted (by user command)|unfinished
+Aborted (device reset ?) |-|-|-|0|1|NOT PASSED|Aborted (device reset ?)|unfinished
+Unknown error, incomplete|-|-|-|4|1|NOT PASSED|Unknown error, incomplete|failed
+Completed, segment failed|-|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Completed, segment failed|failed
+Failed in first segment  |1|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Failed in first segment|failed
+Failed in second segment |2|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Failed in second segment|failed
+Failed in segment -->    |3|1234567|0x3 0x11 0x0|128|1|NOT PASSED|Failed in segment -->|failed
+Reserved(8)              |-|-|-|0|1|NOT PASSED|Reserved(8)|unrecognised
+Reserved(9)              |-|-|-|0|1|NOT PASSED|Reserved(9)|unrecognised
+Reserved(10)             |-|-|-|0|1|NOT PASSED|Reserved(10)|unrecognised
+Reserved(11)             |-|-|-|0|1|NOT PASSED|Reserved(11)|unrecognised
+Reserved(12)             |-|-|-|0|1|NOT PASSED|Reserved(12)|unrecognised
+Reserved(13)             |-|-|-|0|1|NOT PASSED|Reserved(13)|unrecognised
+Reserved(14)             |-|-|-|0|1|NOT PASSED|Reserved(14)|unrecognised
+Self test in progress ...|-|-|-|0|1|STILL RUNNING|Self test in progress ...|running
 EOF
 SCSI_PASSED="$(scsi_row 1 'Background long ' 'Completed                ' - 1234 - -)"
 fixture scsi-passed "$(scsi_log "$SCSI_PASSED")"
@@ -572,6 +597,20 @@ check "SCSI: # 1 passed, an older one failed (exit 128): NOT PASSED" \
     "$(gate S1:scsi-older-failed:128)|$(said S1)" \
     "1|NOT PASSED — Completed, but the log records a failed self-test (smartctl exit 128)"
 
+# What to do, for each reason that is not a row's own status (the tables
+# above cover those), and nothing for a drive that passed.
+fixture log-not-supported "$BANNER"$'\n''=== START OF READ SMART DATA SECTION ==='$'\n''SMART Self-test Log not supported'
+for case in ata-none:0:never-run scsi-none:0:never-run \
+    open-failed:2:unreadable usb-bridge:1:unreadable ata-passed:143:unreadable \
+    cksum-SMART-Self-Test-Log-Structure:0:checksum cksum-Drive-Identity-Structure:0:checksum \
+    log-not-supported:0:no-result ata-passed:8:flagged \
+    ata-older-failed:128:older-ata ata-passed:132:older-ata scsi-older-failed:128:older-scsi \
+    ata-passed:0:none ata-older-outdated:0:none scsi-older-incomplete:4:none; do
+    IFS=: read -r fx code key <<<"$case"
+    gate "S1:$fx:$code" >/dev/null
+    check "what to do, $fx at smartctl exit $code: $key" "$(advised S1)" "${ADVICE[$key]}"
+done
+
 # Every drive must pass; one that does not blocks them all. Each is named by
 # serial, never by its device path.
 fixture ata-running "$(ata_log "$(ata_row 1 'Extended offline' 'Self-test routine in progress' 9 -)")"
@@ -688,12 +727,24 @@ check "main --run, one drive failed: exits 1 before the plan and YES-DESTROY" \
     "$(run_main --run S1:ata-passed:0 S2:ata-read-failure:128)" "1|"
 check "main --run, one drive failed: says partitioning is blocked" \
     "$(grep -c '^\[ERROR\] Partitioning blocked: every drive must have PASSED its most recent SMART self-test' "$WORK/main.out")" "1"
+# The advice follows each drive's reason, under that drive; the error line
+# points to it and gives no reason of its own (round 3).
+check "main --run, one drive failed: what to do is under that drive" \
+    "$(grep -cF "      → ${ADVICE[failed]}" "$WORK/main.out")" "1"
+check "main --run: the error line points to the advice, and to --force as deliberate" \
+    "$(grep -c '^\[ERROR\] What to do is under each drive that did not\. --force skips this check: use it only deliberately\.$' "$WORK/main.out")" "1"
+check "main --run: no advice that ignores the reason" \
+    "$(grep -c "where none passed\|replace a drive whose test failed" "$WORK/main.out")" "0"
 check "main --run, one drive never tested: exits 1 before YES-DESTROY" \
     "$(run_main --run S1:ata-passed:0 S2:ata-none:0)" "1|"
+check "main --run, one drive never tested: told to run an extended test" \
+    "$(grep -cF "      → ${ADVICE[never-run]}" "$WORK/main.out")" "1"
 check "main --check, one drive failed: the plan, never YES-DESTROY" \
     "$(run_main --check S1:ata-passed:0 S2:ata-read-failure:128)" "0|show_plan"
 check "main --check, one drive failed: names it" \
     "$(grep -cF '  S2 (label-S2): NOT PASSED — Completed: read failure' "$WORK/main.out")" "1"
+check "main --check, one drive failed: and says what to do" \
+    "$(grep -cF "      → ${ADVICE[failed]}" "$WORK/main.out")" "1"
 # --force is the one way past a failed drive, as its usage says: it skips
 # the gate, and smartctl is never asked.
 check "main --force, one drive failed: on to YES-DESTROY" \
