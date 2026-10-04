@@ -16,7 +16,7 @@
 #            cachyos-sentinel see success and never restart the run, while
 #            the journal still shows status=3.
 #   1        it could not start: config unreadable, btrdasd missing, an
-#            argument error, not root, the maintenance lock unusable.
+#            argument error, not root, the backup or maintenance lock unusable.
 #            Nothing was mounted or sent.
 #   0        a skip: another backup holds the singleton lock (unchanged).
 #   130/143  stopped by SIGINT/SIGTERM (unchanged).
