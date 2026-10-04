@@ -33,6 +33,11 @@
 # the conditions the input they would need: for check_smart_tests by letting
 # `head` pass every line through.
 #
+# The sites are matched by bash itself (`[[ ]]`), not by a here-string: a
+# here-string needs a temp file (over 64 KiB) or a pipe, and when bash
+# cannot make one — /tmp full, no fd to spare — the `if` reads "no match"
+# just the same (round 4, N3). Both are tested below.
+#
 # Writes only beneath a mktemp directory. No root, no devices.
 
 set -uo pipefail
@@ -98,7 +103,7 @@ echo "== backup-run.sh: update_boot_subvolumes, the drift check"
 extract backup-run.sh update_boot_subvolumes "Target HAS btrbk-shaped snapshots but none matched"
 extract backup-run.sh record_op 'OP_STATUS[$op]="$result"'
 
-run_boot_subvols() { # run_boot_subvols <listing file>: "<result>|<detail>"
+run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
     (
         set -euo pipefail
         # shellcheck source=/dev/null
@@ -123,6 +128,12 @@ run_boot_subvols() { # run_boot_subvols <listing file>: "<result>|<detail>"
         log_info() { echo "[INFO] $*"; }
         log_warn() { echo "[WARN] $*"; }
         log_error() { echo "[ERROR] $*"; }
+        # A full /tmp, as bash meets it: no file it writes may pass 4 KiB,
+        # and the write fails (SIGXFSZ ignored) instead of killing it.
+        if [[ "${2:-}" == tmp-full ]]; then
+            trap '' XFSZ
+            ulimit -f 4
+        fi
         update_boot_subvolumes true >"$WORK/boot.out" 2>&1
         printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
     )
@@ -138,6 +149,13 @@ check "boot subvolumes, drift on line 1 of a listing over 64 KiB: FAIL" \
     "$(run_boot_subvols "$WORK/drift-big.txt")" "FAIL|0 updated, 1 failed"
 check "boot subvolumes, drift over 64 KiB: says it drifted" \
     "$(grep -c 'HAS btrbk-shaped snapshots but none matched' "$WORK/boot.out")" "1"
+
+# The same listing with /tmp full: a here-string that large went to a temp
+# file, could not be written ("here-document: No space left on device"),
+# and the check read "no match" — the quiet branch again, 5 of 5 times
+# measured (round 4, N3). `[[ =~ ]]` writes nothing.
+check "boot subvolumes, drift over 64 KiB with /tmp full: still FAIL" \
+    "$(run_boot_subvols "$WORK/drift-big.txt" tmp-full)" "FAIL|0 updated, 1 failed"
 
 echo "$DRIFTED" >"$WORK/drift-small.txt"
 check "boot subvolumes, drift in a small listing: FAIL" \
@@ -256,6 +274,45 @@ echo "$COMPLETED" >"$WORK/selftest-completed.txt"
 check "self-test completed: completed" "$(run_selftest "$WORK/selftest-completed.txt")" "0|completed"
 echo '# 1  Short offline       Aborted by host               90%      1000         -' >"$WORK/selftest-other.txt"
 check "self-test neither: shown as it is" "$(run_selftest "$WORK/selftest-other.txt")" "0|other"
+
+# ---------------------------------------------------------------------------
+echo "== each site's condition, as its script has it, with no fd to spare"
+# ---------------------------------------------------------------------------
+# A here-string needs a file or a pipe: bash writes one over 64 KiB to a temp
+# file and sends a smaller one down a pipe. With no fd left (ulimit -n 3) it
+# can make neither, says "cannot create temp file for here-document", and
+# the `if` reads "no match" — at the self-test site, "not running", the
+# permissive answer (round 4, N3; measured for every site). `[[ ]]` needs
+# no fd. Each condition is taken from its script.
+condition() { # condition <script> <ERE matching one if/elif line>: its condition
+    local line
+    line="$(grep -E -- "$2" "$ROOT/scripts/$1")" || harness_broken "no line in $1 matches: $2"
+    [[ "$line" != *$'\n'* ]] || harness_broken "more than one line in $1 matches: $2"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line#el}"
+    line="${line#if }"
+    printf '%s\n' "${line%; then}"
+}
+with_no_fd_to_spare() { # with_no_fd_to_spare <condition> <variable> <value>
+    (
+        set -euo pipefail
+        printf -v "$2" '%s' "$3"
+        ulimit -n 3
+        if eval "$1"; then echo match; else echo "no match"; fi
+    ) 2>/dev/null
+}
+check "no fd to spare: the drift check still sees a btrbk name" \
+    "$(with_no_fd_to_spare "$(condition backup-run.sh '^[[:space:]]*if .*\$subvol_listing')" \
+        subvol_listing "$(cat "$WORK/drift-big.txt")")" "match"
+check "no fd to spare: the SMART check still sees PASSED" \
+    "$(with_no_fd_to_spare "$(condition backup-verify.sh '^[[:space:]]*if .*PASSED')" \
+        health "$PASSED_LINE")" "match"
+check "no fd to spare: a running self-test still reads as running" \
+    "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*if .*\$status')" \
+        status "$RUNNING")" "match"
+check "no fd to spare: a completed self-test still reads as completed" \
+    "$(with_no_fd_to_spare "$(condition das-partition-drives.sh '^[[:space:]]*elif .*\$status')" \
+        status "$COMPLETED")" "match"
 
 # ---------------------------------------------------------------------------
 echo "== no producer | grep -q left in scripts/"
