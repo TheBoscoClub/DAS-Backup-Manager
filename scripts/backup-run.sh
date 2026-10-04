@@ -4,15 +4,17 @@
 # Date: 2026-10-03
 #
 # Features:
-#   - A rewrite of this file cannot cut a run short (v4.9.2): the last line
-#     is `main "$@"; exit $?`. Bash reads a script as it runs, so a copy
-#     over this file in place — truncate and write the same inode, as a
-#     plain `cp` does and `btrdasd setup` did — that landed while main ran
+#   - A rewrite of this file while main runs is never read (v4.9.2): the
+#     last line is `main "$@"; exit $?`. Bash reads a script as it runs, so
+#     a copy over this file in place — truncate and write the same inode, as
+#     a plain `cp` does and `btrdasd setup` did — that landed while main ran
 #     had bash read the NEW file at the old offset once main returned: a
 #     tail, half a line (exit 127). That line is read whole before main
-#     starts, and after main there is nothing left to read. `btrdasd setup`
-#     now renames a new file over the old one. Behaviour is otherwise
-#     unchanged (bd DAS-Backup-Manager-6wt; tests/test_script_rewrite.sh).
+#     starts, and after main there is nothing left to read. A copy in place
+#     that lands during bash's parse of this file, before main is called
+#     (about 3 ms), can still end it there. `btrdasd setup` now renames a new
+#     file over the old one. Behaviour is otherwise unchanged
+#     (bd DAS-Backup-Manager-6wt; tests/test_script_rewrite.sh).
 #   - A failed run is recorded, with unknown counts as unknown (v4.9.1):
 #     record_run_args() builds the `btrdasd backup record-run` vector and
 #     says an unknown snapshot count with --counts-unknown, which the history
