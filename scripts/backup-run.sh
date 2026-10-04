@@ -23,12 +23,19 @@
 #     the rule, and it runs with errexit off: a log line it could not write
 #     used to end it with exit 1 and skip the unmount (bd
 #     DAS-Backup-Manager-d1r; tests/test_backup_exit_semantics.sh).
-#     Only a singleton lock another run holds is a skip (0): one that
-#     cannot be opened or taken is "could not start" (1) and says why, where
-#     it used to skip silently (bd DAS-Backup-Manager-ismb).
-#     The snapshot counters are decided before the run status and the
-#     report, so a counter failure reads FAILURES DETECTED in the report as
-#     in the history (bd DAS-Backup-Manager-bzw).
+#     An abort is not silent: a run that aborts with 3 before its report sent
+#     no report and wrote no history row, so with the unit no longer failed
+#     nothing at all showed it — a powered-off DAS would have failed every
+#     night unseen. cleanup() now records it as failed (--counts-unknown, the
+#     reason in --errors) and sends one ABORTED report through send_report:
+#     what aborted, why, what was backed up, which targets were seen, whether
+#     it is in the history, where the log is. Both best effort; neither
+#     changes the status (bd DAS-Backup-Manager-2my). Only a singleton lock
+#     another run holds is a skip (0): one that cannot be opened or taken is
+#     "could not start" (1) and says why, where it used to skip silently
+#     (bd DAS-Backup-Manager-ismb). The snapshot counters are decided before
+#     the run status and the report, so a counter failure reads FAILURES
+#     DETECTED in the report as in the history (bd DAS-Backup-Manager-bzw).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -313,7 +320,9 @@
 #      both units list SuccessExitStatus=3: systemd and cachyos-sentinel see
 #      success and do not restart a whole backup for it. The journal still
 #      shows status=3, the report says FAILURES DETECTED and the history row
-#      says failed — for a run that got as far as its report.
+#      says failed. A run that aborts before its report sends one ABORTED
+#      report instead and is recorded as failed all the same (cleanup(),
+#      bd DAS-Backup-Manager-2my) — a dry run sends and records nothing.
 #   1  it could not start: nothing was mounted or sent. A unit that fails
 #      this way fails in seconds, which sentinel's 3-per-600 s limiter does
 #      brake.
@@ -362,6 +371,12 @@
 #   130/143  wherever the run is           SIGINT/SIGTERM — `systemctl stop` sends TERM — kept
 #                                          as they are: a stop is not a run's outcome, and a
 #                                          stopped unit ends failed (stop it with mask, too)
+#
+# Every 3 above that ends before main()'s report — all but the end-of-main
+# row — is recorded as failed and sends one ABORTED report naming what
+# aborted (abort_reason; a set -e failure is named by its command), unless it
+# is a dry run (bd DAS-Backup-Manager-2my). A signal (130/143) is recorded,
+# but sends no report: the unit then ends failed, which shows it.
 #
 # cleanup(), the EXIT trap, exits with exactly one of these: errexit is off
 # inside it, so nothing failing there (a log line it cannot write) can end it
@@ -576,6 +591,19 @@ RUN_COUNTS=()
 # of them. CLEANUP_ARMED is what keeps that invariant true on backup's
 # abort paths, not just its happy path. bd DAS-Backup-Manager-oeo.
 CLEANUP_ARMED="false"
+# What stopped a run that aborted with 3 before its report — the step, and
+# why, one line per finding — for cleanup()'s ABORTED report and history row
+# (bd DAS-Backup-Manager-2my). Set by abort_reason, or by note_abort for a
+# command that failed under set -e.
+ABORT_WHAT=""
+ABORT_REASON=""
+# "true" once main() has sent its report: an abort after that has a report
+# already, and sends no second one.
+REPORT_SENT="false"
+# Which targets check_das_connected found ("true") or not ("false"), keyed by
+# label. Declared here, empty, so the abort report can read it under set -u
+# even when the run stopped before detection.
+declare -A TARGET_AVAILABLE=()
 
 # Colors for interactive output
 RED='\033[0;31m'
@@ -853,6 +881,7 @@ check_das_connected() {
     if [[ "$any_primary_configured" == "true" && "$any_primary_available" != "true" ]]; then
         log_error "No primary backup target is available — aborting"
         log_error "Is the DAS connected and powered on?"
+        abort_reason "DAS detection" "no primary backup target is available — is the DAS connected and powered on?"
         exit 3
     fi
 }
@@ -909,6 +938,7 @@ create_mount_points() {
             log_warn "  $label is unavailable but $mnt is currently mounted — attempting umount"
             if ! umount "$mnt" 2>/dev/null; then
                 log_error "  $label: refusing to proceed — $mnt is mounted but target is marked unavailable"
+                abort_reason "mount point preparation" "$label is unavailable, but $mnt is mounted and will not unmount"
                 exit 3
             fi
         fi
@@ -922,6 +952,8 @@ create_mount_points() {
             log_error "  wrote data to a bare directory because the DAS target wasn't mounted."
             log_error "  Inspect $mnt manually, move/delete its contents (likely on /), and re-run."
             log_error "  See bd DAS-Backup-Manager-9on."
+            abort_reason "the bare-mountpoint guard" \
+                "$label is unavailable, but $mnt is not empty: an earlier run may have written there, on the root filesystem"
             exit 3
         fi
     done
@@ -1100,6 +1132,7 @@ verify_sources_before_write() {
         record_op "verify_sources" "FAIL" "${#violations[@]} violation(s)"
         # 3: a source volume's state, met again by the next start (EXIT
         # STATUS, bd DAS-Backup-Manager-d1r).
+        abort_reason "source verification" "$(printf '%s\n' "${violations[@]}")"
         exit 3
     fi
 
@@ -1605,6 +1638,7 @@ verify_targets_before_btrbk() {
         record_op "verify_targets" "FAIL" "${#violations[@]} violation(s)"
         # 3: a target's state — one that failed to mount included — met
         # again by the next start (EXIT STATUS, bd DAS-Backup-Manager-d1r).
+        abort_reason "target verification" "$(printf '%s\n' "${violations[@]}")"
         exit 3
     fi
 
@@ -2681,14 +2715,19 @@ record_backup_run_in_db() {
     # the run before it as the latest. That is a FAIL, not a warning: the run
     # status turns FAILURE and report_unrecorded_run says so in the report,
     # and the run exits 3 (EXIT STATUS).
-    local record_err
-    if record_err=$("$BTRDASD_BIN" "${RECORD_RUN_ARGS[@]}" 2>&1); then
+    #
+    # Marked attempted as soon as the attempt returns, before anything is
+    # logged: a log line that fails ends the run under set -e, and cleanup()
+    # would then record it a second time (bd DAS-Backup-Manager-2my).
+    local record_err record_rc=0
+    record_err=$("$BTRDASD_BIN" "${RECORD_RUN_ARGS[@]}" 2>&1) || record_rc=$?
+    BACKUP_RUN_RECORDED="true"
+    if ((record_rc == 0)); then
         log_info "Backup run recorded in database"
     else
         log_error "This run is NOT in the backup history — recording it failed: $record_err"
         record_op "run_history" "FAIL" "recording it failed: $(head -n1 <<<"$record_err")"
     fi
-    BACKUP_RUN_RECORDED="true"
 }
 
 # Write and send the report again when the run could not be recorded. The
@@ -2765,6 +2804,130 @@ failed_ops() {
 }
 
 # ============================================================================
+# ABORTED RUNS — one report and one history row (bd DAS-Backup-Manager-2my)
+# ============================================================================
+#
+# A run that aborts with 3 before its report — no primary target, a target
+# or source that fails verification, the bare-mountpoint guard, a command
+# failing under set -e — exits with a status its units count as success. It
+# sent no report and wrote no history row, so with no failed unit either it
+# was silent: a powered-off DAS would have failed every night unseen.
+# cleanup() now records it as failed and sends one ABORTED report through
+# send_report's relay path, both best effort: their own failures are logged
+# and change neither the status nor what the run did.
+
+# Keep what stops the run ($1) and why ($2, one line per finding) for
+# cleanup()'s report and history row. The caller has logged the detail, and
+# exits 3 itself on the next line: a guard never relies on a helper to stop.
+abort_reason() {
+    ABORT_WHAT="$1"
+    ABORT_REASON="$2"
+}
+
+# Make what stopped an aborted run an operation that FAILED —
+# `aborted: <what>: <why>`, the reason's lines joined with "; " — so the run
+# status, the history row's errors and the report all carry it. A command
+# that failed under set -e, with no abort_reason before it, is named by its
+# status ($1) and its text ($2: $BASH_COMMAND as the EXIT trap saw it).
+# Called only by cleanup(), the EXIT trap (SC2329: see clear_maintenance_holder).
+# shellcheck disable=SC2329
+note_abort() {
+    local rc="$1" cmd="$2"
+    if [[ -z "${ABORT_WHAT:-}" ]]; then
+        ABORT_WHAT="a command that failed"
+        ABORT_REASON="exit status $rc: $cmd"
+    fi
+    local reason="${ABORT_REASON:-}"
+    record_op "aborted" "FAIL" "$ABORT_WHAT: ${reason//$'\n'/; }"
+}
+
+# The ABORTED report: what stopped the run and why, what was backed up,
+# which targets it found, whether it is in the history, and where its log
+# is. $1 is the status the run exits with. Called only by send_abort_report.
+# shellcheck disable=SC2329
+generate_abort_report() {
+    local status="$1"
+    local hostname timestamp
+    hostname=$(hostname)
+    timestamp=$(date '+%Y-%m-%d %H:%M')
+
+    # Nothing is backed up until btrbk starts (capture_usage stamps it).
+    local backed_up
+    if [[ -n "${OP_STATUS[btrbk]:-}" ]]; then
+        backed_up="btrbk had finished (${OP_STATUS[btrbk]}${OP_STATUS[btrbk_detail]:+: ${OP_STATUS[btrbk_detail]}}); the run stopped after it"
+    elif ((BTRBK_START_TIME != 0)); then
+        backed_up="not known — btrbk was running when the run stopped"
+    else
+        backed_up="nothing — the run stopped before btrbk started"
+    fi
+
+    # The targets detection found and did not, once it had run.
+    local seen="not known" unseen="not known" label
+    if ((${#TARGET_AVAILABLE[@]} > 0)); then
+        seen="" unseen=""
+        while IFS= read -r label; do
+            if [[ "${TARGET_AVAILABLE[$label]}" == "true" ]]; then
+                seen+="${seen:+, }$label"
+            else
+                unseen+="${unseen:+, }$label"
+            fi
+        done < <(printf '%s\n' "${!TARGET_AVAILABLE[@]}" | sort)
+        seen="${seen:-none}" unseen="${unseen:-none}"
+    fi
+
+    local history
+    if [[ "${OP_STATUS[run_history]:-}" == "FAIL" ]]; then
+        history="NOT recorded — ${OP_STATUS[run_history_detail]:-}"
+    elif [[ "$BACKUP_RUN_RECORDED" == "true" ]]; then
+        history="recorded as failed"
+    else
+        history="not recorded"
+    fi
+
+    # The reason's first line beside its label, any further ones below it.
+    local why="${ABORT_REASON:-}" why_more=""
+    if [[ "$why" == *$'\n'* ]]; then
+        why_more="$(printf '%s\n' "${why#*$'\n'}" | sed 's/^/                     /')"$'\n'
+        why="${why%%$'\n'*}"
+    fi
+
+    cat <<-REPORT
+===============================================================
+  DAS Backup Report — $timestamp
+  Host: $hostname
+  Status: ABORTED
+===============================================================
+
+The backup run aborted before its report and exited $status. Its units
+count that as success, so this report, the history and the journal are
+the record of it.
+
+  What aborted:      ${ABORT_WHAT:-not known}
+  Why:               $why
+${why_more}  Backed up:         $backed_up
+  Targets seen:      $seen
+  Targets not seen:  $unseen
+  History:           $history
+  Log:               $LOG_FILE
+===============================================================
+REPORT
+}
+
+# Print and send the ABORTED report — through send_report, the relay path the
+# full report takes, so $LAST_REPORT holds it before any send is tried and a
+# relay outage costs delivery only. Called only by cleanup().
+# shellcheck disable=SC2329
+send_abort_report() {
+    local report
+    report="$(generate_abort_report "$1")"
+    echo ""
+    echo "$report"
+    if ! send_report "$report" "ABORTED"; then
+        log_warn "The report saying this run aborted was not emailed — it is in $LAST_REPORT"
+    fi
+}
+
+# ============================================================================
 # CLEANUP
 # ============================================================================
 
@@ -2776,8 +2939,9 @@ cleanup() {
     # triggered this EXIT trap invocation BEFORE any other command in this
     # function can overwrite $? — main()'s own status (0 or 3) when it
     # completed, or the status of whatever `exit N`, set -e abort or signal
-    # trap fired the trap.
-    local rc=$?
+    # trap fired the trap. $BASH_COMMAND is, here, the command that was
+    # running when the trap fired: for a set -e abort, the one that failed.
+    local rc=$? cmd="$BASH_COMMAND"
 
     # Best effort from here on, and the exit below is the only status. Under
     # set -e a command failing inside an EXIT trap ends bash at once with
@@ -2836,16 +3000,29 @@ cleanup() {
 
     log_warn "Cleaning up after abnormal termination (status $rc; exiting $status)..."
 
+    # An abort (3): what stopped the run becomes an operation that FAILED, for
+    # the history row's errors and the ABORTED report (bd DAS-Backup-Manager-2my).
+    if [[ "$status" == 3 ]]; then
+        note_abort "$rc" "$cmd"
+    fi
+
     # Record the failed backup run if we were in a real backup and haven't
-    # recorded yet. Neither this nor unmount_all can cut the trap short and
-    # skip the exit below: errexit is off in here (set +e above), and each
-    # soft-fails internally as well.
+    # recorded yet — an abort before btrbk too (2my); a dry run records
+    # nothing. None of this can cut the trap short and skip the exit below:
+    # errexit is off in here (set +e above), and each step soft-fails as well.
     if [[ "$BACKUP_MODE_REAL" == "true" && "$BACKUP_RUN_RECORDED" == "false" ]]; then
-        # Ensure end time is set (may not be if failure was during btrbk)
-        if (( BTRBK_END_TIME == 0 )); then
+        # btrbk's duration so far, if it started; 0 if it never did.
+        if (( BTRBK_START_TIME != 0 && BTRBK_END_TIME == 0 )); then
             BTRBK_END_TIME=$(date +%s)
         fi
         record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL"
+    fi
+
+    # And say so: one ABORTED report, unless main() sent its report already.
+    # Before the unmount, which can hang on a drive that went away. A stop
+    # (130/143) sends none: the unit then ends failed, and that shows it.
+    if [[ "$status" == 3 && "$BACKUP_MODE_REAL" == "true" && "${REPORT_SENT:-false}" != "true" ]]; then
+        send_abort_report "$status"
     fi
 
     unmount_all
@@ -2911,6 +3088,14 @@ main() {
         esac
         shift
     done
+
+    # Known from here on, for cleanup(): a real run that aborts once it holds
+    # the maintenance lock is recorded and reported, however early; a dry run
+    # is neither (bd DAS-Backup-Manager-2my).
+    BACKUP_FORCE_FULL="$force_full"
+    if [[ "$mode" != "dryrun" ]]; then
+        BACKUP_MODE_REAL="true"
+    fi
 
     # Ensure log directory exists
     mkdir -p "$(dirname "$LOG_FILE")"
@@ -2979,8 +3164,6 @@ main() {
     create_target_dirs
 
     if [[ "$mode" != "dryrun" ]]; then
-        BACKUP_MODE_REAL="true"
-        BACKUP_FORCE_FULL="$force_full"
         capture_usage "before"
     fi
 
@@ -3044,6 +3227,9 @@ main() {
             record_op "email" "FAIL" "delivery failed; report was written to $LAST_REPORT"
             overall_status="FAILURE"
         fi
+        # From here an abort has a report already: cleanup() sends no
+        # ABORTED one (bd DAS-Backup-Manager-2my).
+        REPORT_SENT="true"
 
         # Record backup run in the database for GUI history
         record_backup_run_in_db "$overall_status" "$force_full"

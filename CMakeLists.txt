@@ -245,6 +245,13 @@ if(BUILD_TESTING)
         NAME shell-backup-exit-semantics
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backup_exit_semantics.sh
     )
+    # With the binary this build makes, the suite replays each aborted run's
+    # record-run vector through the real btrdasd (bd DAS-Backup-Manager-2my);
+    # without it the summary says those replays did not run.
+    if(BUILD_INDEXER)
+        set_tests_properties(shell-backup-exit-semantics PROPERTIES
+            ENVIRONMENT "REAL_BTRDASD=${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd")
+    endif()
     add_test(
         NAME shell-verify-sources
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_sources.sh

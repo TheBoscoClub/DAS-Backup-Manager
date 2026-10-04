@@ -96,8 +96,14 @@ blkid() {
     echo "$v"
 }
 
-# Source the function out of the live script.
+# Source the function out of the live script, with the helper a refusal
+# calls to keep its reason for the abort report (bd DAS-Backup-Manager-2my).
 eval "$(sed -n '/^verify_sources_before_write() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^abort_reason() {/,/^}/p' "$SCRIPT")"
+if ! declare -F abort_reason >/dev/null; then
+    echo "FAIL: abort_reason() not found in $SCRIPT" >&2
+    exit 1
+fi
 
 if ! declare -F verify_sources_before_write >/dev/null; then
     echo "FAIL: verify_sources_before_write() not found in $SCRIPT" >&2

@@ -28,6 +28,17 @@
 # than ten minutes — would start a whole new backup each time, one roughly
 # every ten minutes until the drive came back.
 #
+# With 3 counted as success, an abort must not be silent (bd
+# DAS-Backup-Manager-2my): every run that aborts with 3 before its report
+# sends ONE report through send_report's relay path, subject ABORTED — what
+# aborted, why, what was backed up, which targets were seen, whether the run
+# is in the history, where the log is — and records ONE failed history row
+# (--counts-unknown, no --success, the reason in --errors). Neither can change
+# the status. A run that could not start sends and records nothing; a dry run
+# neither; a signal records the run but sends nothing. With REAL_BTRDASD set
+# (ctest sets it to the binary CMake built) each abort's captured record-run
+# vector is replayed through the real binary.
+#
 # The singleton lock (bd DAS-Backup-Manager-ismb): only "held by another run"
 # is a skip (0); a lock file that cannot be opened, or a flock that fails for
 # any other reason, is "could not start" (1), and says why.
@@ -35,6 +46,8 @@
 # The snapshot counters (bd DAS-Backup-Manager-bzw) are decided before the
 # run status and the report, so a counter failure reads FAILURES DETECTED in
 # the report, the history and the exit status alike.
+#
+# Every run's mail goes to a stub mailx, which keeps each one.
 #
 # How: the REAL script runs end to end — its EXIT trap, cleanup() and its
 # `main "$@"; exit $?` line included — from a copy in which exactly three lines
@@ -173,8 +186,19 @@ case "$1 ${2:-}" in
     exit "$(knob recovery_rc 0)"
     ;;
 "backup record-run")
+    # The run's log file stops being writable right here, at the record.
+    if [[ -f "$S/knobs/break_log_at_record" ]]; then
+        log="$(cat "$S/knobs/break_log_at_record")"
+        rm -f "$log"
+        mkdir "$log"
+    fi
     printf '%s\n' "$@" >"$S/record_args"
-    exit "$(knob record_rc 0)"
+    # The exact vector, NUL-separated, for the replay through the real binary.
+    printf '%s\0' "$@" >"$S/record_vec"
+    echo x >>"$S/record_calls"
+    rc="$(knob record_rc 0)"
+    [[ "$rc" == 0 ]] || echo "error: the history could not be written (stub)" >&2
+    exit "$rc"
     ;;
 walk*)
     echo "Discovered: 0 new snapshots"
@@ -240,6 +264,16 @@ EOF
 stub umount <<'EOF'
 printf '%s\n' "$*" >>"$S/calls/umount"
 dst="${*: -1}"
+# A drive that went away can leave umount hanging: with the knob, wait (at
+# most 10 s) until the test says go.
+if [[ -f "$S/knobs/umount_waits" ]]; then
+    i=0
+    while [[ ! -e "$S/umount_release" ]] && ((i < 200)); do
+        : >"$S/umount_waiting"
+        sleep 0.05
+        i=$((i + 1))
+    done
+fi
 if listed umount_fails_once "$dst" && ! listed umount_failed "$dst"; then
     echo "$dst" >>"$S/knobs/umount_failed"
     echo "umount: $dst: target is busy (stub)." >&2
@@ -313,9 +347,15 @@ stub systemctl <<'EOF'
 echo "NextElapseUSecRealtime="
 EOF
 
+# Keeps each mail: its arguments (the subject follows -s) and its body.
 stub mailx <<'EOF'
-cat >/dev/null
-printf '%s\n' "$*" >>"$S/calls/mailx"
+n=$(($(cat "$S/mail_count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$S/mail_count"
+printf '%s\n' "$@" >"$S/mail.$n.args"
+cat >"$S/mail.$n.body"
+rc="$(knob mail_rc 0)"
+[[ "$rc" == 0 ]] || echo "smtp-server: 127.0.0.1:25: Connection refused (stub)" >&2
+exit "$rc"
 EOF
 
 # flock: fd 9 (the singleton lock) fails with the status in the flock9_rc
@@ -373,7 +413,11 @@ DAS_TARGET_1_MOUNT_UUID='recovery-a-uuid'
 DAS_TARGET_1_MOUNT='$RECOVERY_MNT'
 DAS_TARGET_1_ROLE='mirror'
 DAS_ALL_TARGET_MOUNTS='$PRIMARY_MNT $RECOVERY_MNT'
-DAS_EMAIL_ENABLED=false
+DAS_EMAIL_ENABLED=true
+DAS_EMAIL_SMTP_HOST='127.0.0.1'
+DAS_EMAIL_SMTP_PORT=25
+DAS_EMAIL_FROM='das-backup@example.test'
+DAS_EMAIL_TO='operator@example.test'
 EOF
 }
 
@@ -408,6 +452,11 @@ tripwire() {
     if grep -q 'command not found' "$STATE/out"; then
         bad "the run reached a command that is neither stubbed nor whitelisted: $(grep -m1 'command not found' "$STATE/out")"
     fi
+    # Under set -u an unset variable ends bash where it stands — in cleanup()
+    # too, which would skip the unmount and the exit status it owes.
+    if grep -q 'unbound variable' "$STATE/out"; then
+        bad "the run met an unbound variable: $(grep -m1 'unbound variable' "$STATE/out")"
+    fi
 }
 # run_backup [args...]: one run, to completion; its status in RC.
 run_backup() {
@@ -435,31 +484,108 @@ recorded_as() {
     fi
 }
 show_tail() { [[ "$RC" == "$1" ]] || sed 's/^/      | /' "$STATE/out" | tail -n 15; }
+
+# The mails the stub mailx kept, one by one.
+mails() { cat "$STATE/mail_count" 2>/dev/null || echo 0; }
+mail_subject() { sed -n '/^-s$/{n;p;q;}' "$STATE/mail.$1.args" 2>/dev/null; }
+mail_body() { cat "$STATE/mail.$1.body" 2>/dev/null; }
+# The status in a subject: "[DAS Backup] <host> — <STATUS> — <date>".
+mail_status() { mail_subject "$1" | awk -F ' — ' '{ print $2 }'; }
+# The value after "  <label>:" in mail <n>.
+body_field() { mail_body "$1" | sed -n "s/^  $2: *//p" | head -n1; }
+record_calls() { if [[ -f "$STATE/record_calls" ]]; then wc -l <"$STATE/record_calls" | tr -d ' '; else echo 0; fi; }
 vector_has() { grep -qxF -- "$1" "$STATE/record_args" 2>/dev/null && echo yes || echo no; }
+# The value after <option> in the captured record-run vector.
+vector_value() {
+    local -a v=()
+    local i
+    [[ -f "$STATE/record_vec" ]] || return 0
+    mapfile -d '' -t v <"$STATE/record_vec"
+    for ((i = 0; i < ${#v[@]} - 1; i++)); do
+        if [[ "${v[i]}" == "$1" ]]; then
+            printf '%s\n' "${v[i + 1]}"
+            return 0
+        fi
+    done
+}
+
+# The captured record-run vector through the real btrdasd, into a fresh
+# database: it must parse, and the row it writes must say failed, with the
+# counts unknown — the 6wt contract, per abort class. The row's errors are
+# not shown by any btrdasd output: expect_aborted reads them in the vector,
+# and indexer/tests/record_run_contract.rs reads the stored ones back with
+# SQL. Without REAL_BTRDASD this is not run, and the summary says so.
+NOT_RUN=0
+replay() { # replay <name>
+    if [[ -z "${REAL_BTRDASD:-}" ]]; then
+        NOT_RUN=$((NOT_RUN + 1))
+        return
+    fi
+    local db="$WORK/replay.db" out json i
+    local -a v=()
+    rm -f "$db" "$db-wal" "$db-shm"
+    mapfile -d '' -t v <"$STATE/record_vec"
+    for ((i = 0; i < ${#v[@]} - 1; i++)); do
+        [[ "${v[i]}" == --db ]] && v[i + 1]="$db"
+    done
+    if ! out="$("$REAL_BTRDASD" "${v[@]}" 2>&1)"; then
+        bad "$1: the real btrdasd refused the vector: $out"
+        return
+    fi
+    json="$("$REAL_BTRDASD" --json backup report --db "$db" 2>&1)"
+    check "$1: replayed through the real btrdasd: one run, failed, counts unknown" \
+        "$(grep -oE '"(success|snaps_created|snaps_sent)": ?[a-z]+' <<<"$json" | tr -d ' ' | sort | tr '\n' ' ')" \
+        '"snaps_created":null "snaps_sent":null "success":false '
+}
 
 # A run that reached its report: the exit status, the report's status line,
-# the history row, and nothing left mounted.
+# the history row, the one mail, and nothing left mounted.
 expect_completed() { # expect_completed <name> <status> <report status> <recorded as>
+    local subject
+    case "$3" in
+    "ALL OPERATIONS SUCCESSFUL") subject="SUCCESS" ;;
+    "COMPLETED WITH WARNINGS") subject="SUCCESS WITH WARNINGS" ;;
+    *) subject="FAILURE" ;;
+    esac
     check "$1: exit status" "$RC" "$2"
     show_tail "$2"
     check "$1: report status" "$(report_status)" "$3"
     check "$1: history row" "$(recorded_as)" "$4"
     check "$1: nothing left mounted" "$(left_mounted)" "nothing"
+    check "$1: one mail" "$(mails)" "1"
+    check "$1: its subject" "$(mail_status 1)" "$subject"
 }
 # A run that aborted once it held the maintenance lock: 3, btrbk never ran,
-# cleanup() unmounted what the run had mounted.
-expect_aborted() { # expect_aborted <name> <what the log must say>
+# cleanup() unmounted what the run had mounted — and the abort is not silent
+# (bd DAS-Backup-Manager-2my): one ABORTED report saying what and why, and
+# one failed history row with the reason in its errors.
+expect_aborted() { # expect_aborted <name> <what the log says> <what aborted> <in the reason>
     check "$1: exit status" "$RC" "3"
     show_tail "3"
     check "$1: btrbk never ran" "$(ran_btrbk)" "no"
-    check "$1: says why" "$(grep -cF -- "$2" "$STATE/out")" "1"
+    check "$1: says why" "$(grep -qF -- "$2" "$STATE/out" && echo yes || echo no)" "yes"
     check "$1: cleanup() ran its recovery body" \
         "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "1"
     check "$1: nothing left mounted" "$(left_mounted)" "nothing"
+    check "$1: one mail" "$(mails)" "1"
+    check "$1: it says ABORTED" "$(mail_status 1)" "ABORTED"
+    check "$1: what aborted" "$(body_field 1 'What aborted')" "$3"
+    check "$1: why" "$(mail_body 1 | grep -qF -- "$4" && echo yes || echo no)" "yes"
+    check "$1: nothing was backed up" "$(body_field 1 'Backed up')" \
+        "nothing — the run stopped before btrbk started"
+    check "$1: the log" "$(body_field 1 'Log')" "$WORK/log/das-backup.log"
+    check "$1: the history" "$(body_field 1 'History')" "recorded as failed"
+    check "$1: written to the last report first" "$(report_status)" "ABORTED"
+    check "$1: recorded once" "$(record_calls)" "1"
+    check "$1: recorded as failed" "$(recorded_as)" "failure"
+    check "$1: counts unknown" "$(vector_has --counts-unknown)" "yes"
+    check "$1: the abort in the errors" "$(vector_value --errors | grep -c "^aborted: $3: ")" "1"
+    replay "$1"
 }
 # A run that could not start: 1, and nothing was mounted or sent. Nor was
 # anything unmounted: without the maintenance lock cleanup() must not touch
-# the targets a scrub may hold (bd DAS-Backup-Manager-oeo).
+# the targets a scrub may hold (bd DAS-Backup-Manager-oeo). Nothing new is
+# mailed or recorded either.
 expect_not_started() { # expect_not_started <name>
     check "$1: exit status" "$RC" "1"
     show_tail "1"
@@ -468,6 +594,8 @@ expect_not_started() { # expect_not_started <name>
     check "$1: cleanup() skipped its recovery body" \
         "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "0"
     check "$1: nothing unmounted" "$(called umount)" "no"
+    check "$1: no mail" "$(mails)" "0"
+    check "$1: not recorded" "$(record_calls)" "0"
 }
 
 # ---------------------------------------------------------------------------
@@ -480,7 +608,6 @@ check "clean run: btrbk ran" "$(ran_btrbk)" "yes"
 check "clean run: the snapshot counts row" \
     "$(grep -c '^  Snapshot counts       OK  (counted)$' "$WORK/lib/last-report.txt")" "1"
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
-
 
 fresh
 run_backup --full
@@ -497,6 +624,8 @@ check "clean dry run: exit status" "$RC" "0"
 show_tail 0
 check "clean dry run: btrbk dryrun ran" "$(ran_btrbk)" "yes"
 check "clean dry run: nothing left mounted" "$(left_mounted)" "nothing"
+check "clean dry run: no mail" "$(mails)" "0"
+check "clean dry run: not recorded" "$(record_calls)" "0"
 
 # ---------------------------------------------------------------------------
 echo "== 3: the run began its work and something FAILED"
@@ -572,12 +701,15 @@ run_backup
 check "a FAIL without btrbk failing (history record): exit status" "$RC" "3"
 show_tail 3
 check "history record failed: the report sent again says so" "$(report_status)" "FAILURES DETECTED"
+check "history record failed: two mails" "$(mails)" "2"
+check "history record failed: the second says FAILURE" "$(mail_status 2)" "FAILURE"
 
 fresh
 knob btrbk_dryrun_rc 10
 run_backup --dryrun
 check "dry run, btrbk dryrun exits 10: exit status" "$RC" "3"
 show_tail 3
+check "dry run, btrbk dryrun exits 10: no mail" "$(mails)" "0"
 
 # ---------------------------------------------------------------------------
 echo "== 3: the run began its work and aborted on a target's or a source's state"
@@ -586,12 +718,14 @@ fresh
 knob wrong_fs_at "$PRIMARY_MNT"
 run_backup
 expect_aborted "verify_targets_before_btrbk (wrong filesystem on a target)" \
-    "ABORTING — refusing to invoke btrbk"
+    "ABORTING — refusing to invoke btrbk" "target verification" \
+    "primary-22tb: $PRIMARY_MNT has fs UUID 'a-different-filesystem', expected 'primary-uuid'"
 
 fresh
 knob mount_fails "$RECOVERY_MNT"
 run_backup
-expect_aborted "a target that fails to mount" "is NOT a mountpoint (mount failed silently in mount_targets)"
+expect_aborted "a target that fails to mount" "is NOT a mountpoint (mount failed silently in mount_targets)" \
+    "target verification" "system-recovery-A-2tb (mirror): expected mounted but $RECOVERY_MNT is NOT a mountpoint"
 
 fresh
 printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
@@ -599,7 +733,10 @@ mkdir -p "$RECOVERY_MNT"
 echo "written while the drive was away" >"$RECOVERY_MNT/stray-file"
 run_backup
 expect_aborted "the bare-mountpoint guard (absent target, non-empty directory)" \
-    "ABORTING: target system-recovery-A-2tb is unavailable but $RECOVERY_MNT is non-empty"
+    "ABORTING: target system-recovery-A-2tb is unavailable but $RECOVERY_MNT is non-empty" \
+    "the bare-mountpoint guard" "system-recovery-A-2tb is unavailable, but $RECOVERY_MNT is not empty"
+check "bare-mountpoint guard: the targets seen" "$(body_field 1 'Targets seen')" "primary-22tb"
+check "bare-mountpoint guard: the targets not seen" "$(body_field 1 'Targets not seen')" "system-recovery-A-2tb"
 
 fresh
 printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
@@ -608,38 +745,132 @@ printf '%s\trecovery-a-uuid\t/\n' "$RECOVERY_MNT" >>"$STATE/mounted"
 knob umount_fails_once "$RECOVERY_MNT"
 run_backup
 expect_aborted "an absent target still mounted that will not unmount" \
-    "refusing to proceed — $RECOVERY_MNT is mounted but target is marked unavailable"
+    "refusing to proceed — $RECOVERY_MNT is mounted but target is marked unavailable" \
+    "mount point preparation" "system-recovery-A-2tb is unavailable, but $RECOVERY_MNT is mounted and will not unmount"
 
+# The DAS powered off: before bd 2my this was silent every night.
 fresh
 printf '%s\n' recovery-a-uuid >"$STATE/knobs/present_uuids"
 run_backup
-expect_aborted "no primary target available" "No primary backup target is available — aborting"
+expect_aborted "no primary target available" "No primary backup target is available — aborting" \
+    "DAS detection" "no primary backup target is available"
+check "no primary target: the targets seen" "$(body_field 1 'Targets seen')" "system-recovery-A-2tb"
+check "no primary target: the targets not seen" "$(body_field 1 'Targets not seen')" "primary-22tb"
 
 fresh
 knob mount_fails "$SOURCE_MNT"
 run_backup
 # Not an explicit exit in the script: `mount` fails (32) under set -e, and
-# cleanup() turns any status of a run that held the lock into 3.
-expect_aborted "a source that fails to mount (set -e, mount exits 32)" "wrong fs type, bad option"
+# cleanup() turns any status of a run that held the lock into 3, naming the
+# command that failed.
+expect_aborted "a source that fails to mount (set -e, mount exits 32)" "wrong fs type, bad option" \
+    "a command that failed" "exit status 32: mount "
 
 fresh
 knob wrong_fs_at "$SOURCE_MNT"
 run_backup
 expect_aborted "verify_sources_before_write (wrong filesystem on a source)" \
-    "ABORTING — refusing to write to source volumes"
+    "ABORTING — refusing to write to source volumes" "source verification" \
+    "nvme: $SOURCE_MNT has fs UUID 'a-different-filesystem', expected 'source-uuid'"
 
 # The log file stops being writable mid-run (the root filesystem full, say):
 # the next log line aborts the run under set -e, and cleanup()'s own log
 # lines fail too. They must not end the trap early with their status (1) —
-# the run still exits 3 and still unmounts what it mounted.
+# the run still exits 3, still unmounts what it mounted, and still reports.
 fresh
 knob break_log "$WORK/log/das-backup.log"
 run_backup
-check "the log unwritable mid-run: exit status" "$RC" "3"
+expect_aborted "the log unwritable mid-run" "Is a directory" "a command that failed" "exit status 1: "
+
+# Two findings at once: both in the report — one beside "Why:", the other on
+# a line of its own below it — and both on the one `aborted:` line in the
+# history's errors.
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+knob mount_fails "$RECOVERY_MNT"
+run_backup
+check "two violations: exit status" "$RC" "3"
 show_tail 3
-check "the log unwritable mid-run: cleanup() ran its recovery body" \
-    "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "1"
-check "the log unwritable mid-run: nothing left mounted" "$(left_mounted)" "nothing"
+check "two violations: one beside Why" \
+    "$(mail_body 1 | grep -cE '^  Why:               (primary-22tb|system-recovery-A-2tb)')" "1"
+check "two violations: the other on its own line below" \
+    "$(mail_body 1 | grep -cE '^ {21}(primary-22tb|system-recovery-A-2tb)')" "1"
+check "two violations: one aborted line in the history, both in it" \
+    "$(vector_value --errors | grep -E '^aborted: target verification: ' | grep -c 'primary-22tb: .*; .*system-recovery-A-2tb\|system-recovery-A-2tb.*; .*primary-22tb: ')" "1"
+
+# --- the abort report and the history row are best effort: neither may change
+# --- the status or hide the abort (bd 2my).
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+knob mail_rc 1 # the relay is down
+run_backup
+check "abort, relay down: exit status" "$RC" "3"
+show_tail 3
+check "abort, relay down: the report was still written first" "$(report_status)" "ABORTED"
+check "abort, relay down: said so" "$(grep -c 'The report saying this run aborted was not emailed' "$STATE/out")" "1"
+check "abort, relay down: still recorded as failed" "$(recorded_as)" "failure"
+check "abort, relay down: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+knob record_rc 2 # the history cannot be written
+run_backup
+check "abort, history unwritable: exit status" "$RC" "3"
+show_tail 3
+check "abort, history unwritable: one mail, ABORTED" "$(mails) $(mail_status 1)" "1 ABORTED"
+check "abort, history unwritable: the report says the run is missing" \
+    "$(body_field 1 'History')" "NOT recorded — recording it failed: error: the history could not be written (stub)"
+check "abort, history unwritable: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+knob mail_rc 1
+knob record_rc 2
+run_backup
+check "abort, relay and history both down: exit status" "$RC" "3"
+show_tail 3
+check "abort, relay and history both down: the report is on disk" "$(report_status)" "ABORTED"
+check "abort, relay and history both down: nothing left mounted" "$(left_mounted)" "nothing"
+
+# An abort AFTER main() sent its report and recorded the run — the log turns
+# unwritable at the record, and the next log line ends the run under set -e:
+# it exits 3, but sends no second report and records no second row.
+fresh
+knob break_log_at_record "$WORK/log/das-backup.log"
+run_backup
+check "abort after the report: exit status" "$RC" "3"
+show_tail 3
+check "abort after the report: the one report only" "$(mails) $(mail_status 1)" "1 SUCCESS"
+check "abort after the report: recorded once" "$(record_calls)" "1"
+check "abort after the report: nothing left mounted" "$(left_mounted)" "nothing"
+
+# The report and the record come before the unmount, which can hang on a
+# drive that went away: while umount hangs, both must already be out.
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+knob umount_waits 1
+run_cmd
+"${CMD[@]}" >"$STATE/out" 2>&1 &
+run_pid=$!
+for _ in $(seq 1 200); do [[ -e "$STATE/umount_waiting" ]] && break; sleep 0.05; done
+check "unmount hanging: the run is in the unmount" "$([[ -e "$STATE/umount_waiting" ]] && echo yes || echo no)" "yes"
+check "unmount hanging: the ABORTED report is already out" "$(mails) $(mail_status 1)" "1 ABORTED"
+check "unmount hanging: the run is already recorded" "$(record_calls)" "1"
+: >"$STATE/umount_release"
+wait "$run_pid"
+RC=$?
+tripwire
+check "unmount hanging: exit status once it returns" "$RC" "3"
+show_tail 3
+
+# A dry run sends and records nothing, aborted or not.
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup --dryrun
+check "dry run aborted: exit status" "$RC" "3"
+show_tail 3
+check "dry run aborted: no mail" "$(mails)" "0"
+check "dry run aborted: not recorded" "$(record_calls)" "0"
 
 # ---------------------------------------------------------------------------
 echo "== 1: it could not start — nothing mounted, nothing sent"
@@ -718,6 +949,7 @@ check "singleton held: exit status" "$RC" "0"
 check "singleton held: says it skips" "$(grep -c 'skipping this invocation' "$STATE/out")" "1"
 check "singleton held: btrdasd never called" "$(called btrdasd)" "no"
 check "singleton held: nothing mounted" "$(called mount)" "no"
+check "singleton held: no mail" "$(mails)" "0"
 
 # ---------------------------------------------------------------------------
 echo "== 130/143: stopped by a signal, as \`systemctl stop\` does (unchanged)"
@@ -745,12 +977,16 @@ check "SIGTERM while btrbk runs: exit status" "$RC" "143"
 show_tail 143
 check "SIGTERM: the run is recorded as failed" "$(recorded_as)" "failure"
 check "SIGTERM: nothing left mounted" "$(left_mounted)" "nothing"
+# A stop is not an abort: it is recorded, and the failed unit shows it; it
+# sends no ABORTED report.
+check "SIGTERM: no mail" "$(mails)" "0"
 
 fresh
 knob btrbk_blocks 1
 run_signalled INT
 check "SIGINT while btrbk runs: exit status" "$RC" "130"
 show_tail 130
+check "SIGINT: no mail" "$(mails)" "0"
 
 # ---------------------------------------------------------------------------
 echo "== every exit path of a run that does not complete, by the rule"
@@ -786,5 +1022,10 @@ done
 
 echo
 echo "passed=$pass failed=$fail"
+if ((NOT_RUN > 0)); then
+    # Visible, never a pass: ctest sets REAL_BTRDASD to the binary CMake built.
+    echo "NOT RUN: $NOT_RUN replay(s) of an abort's record-run vector through the real btrdasd —" \
+        "set REAL_BTRDASD to a built btrdasd to run them"
+fi
 [[ $fail -eq 0 ]] || exit 1
 echo "BACKUP EXIT SEMANTICS SUITE GREEN"

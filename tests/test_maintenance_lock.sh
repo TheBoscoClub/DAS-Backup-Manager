@@ -44,7 +44,7 @@ cleanup_test() {
 trap cleanup_test EXIT
 
 extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
-for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status cleanup; do
+for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup; do
     body="$(extract "$RUN" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
