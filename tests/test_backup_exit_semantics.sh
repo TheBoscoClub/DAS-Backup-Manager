@@ -905,8 +905,53 @@ check "abort, relay down: exit status" "$RC" "3"
 show_tail 3
 check "abort, relay down: the report was still written first" "$(report_status)" "ABORTED"
 check "abort, relay down: said so" "$(grep -c 'The report saying this run aborted was not emailed' "$STATE/out")" "1"
+check "abort, relay down: says the file has it" \
+    "$(grep -c "was not emailed — it is in $WORK/lib/last-report.txt" "$STATE/out")" "1"
 check "abort, relay down: still recorded as failed" "$(recorded_as)" "failure"
 check "abort, relay down: nothing left mounted" "$(left_mounted)" "nothing"
+
+# A last report that cannot be written (a full disk, a directory where the
+# file goes) is said, never claimed: no "Report saved", and each line saying
+# the report was not emailed says where it is instead — the journal, which
+# every report is echoed to before it is saved (round 3, M3).
+fresh
+mkdir -p "$WORK/lib/last-report.txt"
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup
+check "abort, last report unwritable: exit status" "$RC" "3"
+show_tail 3
+check "abort, last report unwritable: never says it was saved" "$(grep -c 'Report saved to' "$STATE/out")" "0"
+check "abort, last report unwritable: says it could not be saved" \
+    "$(grep -c "Could not save the report to $WORK/lib/last-report.txt" "$STATE/out")" "1"
+check "abort, last report unwritable: still emailed" "$(mails) $(mail_status 1)" "1 ABORTED"
+check "abort, last report unwritable: still recorded as failed" "$(recorded_as)" "failure"
+
+fresh
+mkdir -p "$WORK/lib/last-report.txt"
+knob wrong_fs_at "$PRIMARY_MNT"
+knob mail_rc 1
+run_backup
+check "abort, last report unwritable, relay down: exit status" "$RC" "3"
+show_tail 3
+check "abort, last report unwritable, relay down: no claim the file has it" \
+    "$(grep -c "it is in $WORK/lib/last-report.txt" "$STATE/out")" "0"
+check "abort, last report unwritable, relay down: says the journal has it" \
+    "$(grep -c 'was not emailed — it could not be saved' "$STATE/out")" "1"
+check "abort, last report unwritable, relay down: and the journal has it" \
+    "$(grep -c '^  Status: ABORTED$' "$STATE/out")" "1"
+
+fresh
+mkdir -p "$WORK/lib/last-report.txt"
+knob mail_rc 1
+run_backup
+check "clean run, last report unwritable, relay down: exit status (email FAILED)" "$RC" "3"
+show_tail 3
+check "clean run, last report unwritable, relay down: never says it was saved" \
+    "$(grep -c "Report saved to\|it is in $WORK/lib/last-report.txt" "$STATE/out")" "0"
+check "clean run, last report unwritable, relay down: the history says where it is" \
+    "$(vector_value --errors | grep -c '^email: delivery failed; it could not be saved')" "1"
+check "clean run, last report unwritable, relay down: the journal has it" \
+    "$(grep -c '^  DAS Backup Report — ' "$STATE/out")" "1"
 
 fresh
 knob wrong_fs_at "$PRIMARY_MNT"

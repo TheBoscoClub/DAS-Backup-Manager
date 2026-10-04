@@ -47,7 +47,10 @@
 #     its own code and is recorded as a stop by name, where they read as
 #     "a command that failed" — exit 3, an ABORTED mail — and then killed
 #     the run anyway. cleanup() ignores PIPE, so a stdout that went away
-#     cannot end it before the unmount (round 3, M2).
+#     cannot end it before the unmount (round 3, M2). A last report that
+#     cannot be written is said, never "Report saved", and each line that
+#     says a report was not emailed names the journal when the file failed
+#     too (round 3, M3).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -621,6 +624,9 @@ ABORT_REASON=""
 # "true" once main() has sent its report: an abort after that has a report
 # already, and sends no second one.
 REPORT_SENT="false"
+# "true" when send_report() wrote the report it was last given to
+# $LAST_REPORT; "false" when that write failed (report_whereabouts).
+REPORT_SAVED="false"
 # Which targets check_das_connected found ("true") or not ("false"), keyed by
 # label. Declared here, empty, so the abort report can read it under set -u
 # even when the run stopped before detection.
@@ -2540,18 +2546,36 @@ generate_smart_section() {
 # the recovery OS check bounds its reads.
 MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10
 
+# Where the last report is, for each line saying it was not emailed: the file
+# when send_report() could write it, otherwise the journal, which every caller
+# echoes the report to before it calls send_report().
+report_whereabouts() {
+    if [[ "$REPORT_SAVED" == "true" ]]; then
+        echo "it is in $LAST_REPORT"
+    else
+        echo "it could not be saved to $LAST_REPORT either: it is in the journal only"
+    fi
+}
+
 send_report() {
     local report="$1"
     local overall_status="$2"
 
-    # Always save to file for reference. This happens BEFORE any send attempt so
-    # the report survives a relay outage — a failed send loses nothing.
-    mkdir -p "$(dirname "$LAST_REPORT")"
-    echo "$report" > "$LAST_REPORT"
-    log_info "Report saved to $LAST_REPORT"
+    # Always saved to a file first, BEFORE any send attempt, so the report
+    # survives a relay outage: a failed send loses nothing. A save that fails
+    # (a full disk, a directory where the file goes) is said, not assumed —
+    # the log used to say "Report saved" either way, and the lines below "it
+    # is in $LAST_REPORT" (bd DAS-Backup-Manager-d1r, round 3: M3).
+    REPORT_SAVED="false"
+    if mkdir -p "$(dirname "$LAST_REPORT")" && printf '%s\n' "$report" >"$LAST_REPORT"; then
+        REPORT_SAVED="true"
+        log_info "Report saved to $LAST_REPORT"
+    else
+        log_error "Could not save the report to $LAST_REPORT — it is in the journal only"
+    fi
 
     if [[ "${DAS_EMAIL_ENABLED:-false}" != "true" ]]; then
-        log_info "Email reporting disabled in config — report saved only"
+        log_info "Email reporting disabled in config — not emailed; $(report_whereabouts)"
         return 0
     fi
 
@@ -2564,7 +2588,7 @@ send_report() {
     local report_from_addr="${DAS_REPORT_FROM:-$DAS_EMAIL_FROM}"
 
     if [[ -z "$report_to" || -z "$report_from_addr" ]]; then
-        log_warn "Email enabled but from/to unset in config — report saved but not emailed"
+        log_warn "Email enabled but from/to unset in config — not emailed; $(report_whereabouts)"
         return 1
     fi
 
@@ -2586,7 +2610,8 @@ send_report() {
     #                     any smtp:// mta and aborts with exit 4 without this.
     #   nosave          — a failed send otherwise drops the body in
     #                     /root/dead.letter, which nothing ever reads or prunes.
-    #                     The report is already in $LAST_REPORT.
+    #                     The report is already in $LAST_REPORT, or in the
+    #                     journal if that write failed.
     #
     # stderr is captured rather than discarded: a successful send emits nothing
     # on stderr (measured), so anything here is the real reason for a failure.
@@ -2614,9 +2639,9 @@ send_report() {
     fi
     # timeout: 124 after the TERM, 137 if it took the KILL.
     if ((rc == 124 || rc == 137)); then
-        log_warn "The relay at $smtp_url did not answer within $MAIL_TIMEOUT_SECS s — gave up emailing the report to $report_to — saved to $LAST_REPORT"
+        log_warn "The relay at $smtp_url did not answer within $MAIL_TIMEOUT_SECS s — gave up emailing the report to $report_to — $(report_whereabouts)"
     else
-        log_warn "Failed to email report to $report_to via $smtp_url (mailx exit $rc) — saved to $LAST_REPORT"
+        log_warn "Failed to email report to $report_to via $smtp_url (mailx exit $rc) — $(report_whereabouts)"
     fi
     [[ -n "$mail_err" ]] && log_warn "mailx: $mail_err"
     return 1
@@ -2789,7 +2814,7 @@ report_unrecorded_run() {
     echo ""
     echo "$report"
     if ! send_report "$report" "$(subject_status)"; then
-        log_warn "The report saying this run is not recorded was not emailed — it is in $LAST_REPORT"
+        log_warn "The report saying this run is not recorded was not emailed — $(report_whereabouts)"
     fi
 }
 
@@ -2970,7 +2995,7 @@ send_abort_report() {
     echo ""
     echo "$report"
     if ! send_report "$report" "ABORTED"; then
-        log_warn "The report saying this run aborted was not emailed — it is in $LAST_REPORT"
+        log_warn "The report saying this run aborted was not emailed — $(report_whereabouts)"
     fi
 }
 
@@ -3307,7 +3332,7 @@ main() {
         # regardless of whether it had. bd nsp (b15).
         if ! send_report "$report" "$(subject_status)"; then
             log_warn "Email delivery failed (run status was: $overall_status)"
-            record_op "email" "FAIL" "delivery failed; report was written to $LAST_REPORT"
+            record_op "email" "FAIL" "delivery failed; $(report_whereabouts)"
             overall_status="FAILURE"
         fi
         # From here an abort has a report already: cleanup() sends no
