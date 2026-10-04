@@ -26,6 +26,9 @@
 #     Only a singleton lock another run holds is a skip (0): one that
 #     cannot be opened or taken is "could not start" (1) and says why, where
 #     it used to skip silently (bd DAS-Backup-Manager-ismb).
+#     The snapshot counters are decided before the run status and the
+#     report, so a counter failure reads FAILURES DETECTED in the report as
+#     in the history (bd DAS-Backup-Manager-bzw).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -555,6 +558,9 @@ UNAVAILABLE_TARGETS=()
 # (bd nsp c4). Empty until then: a run that ends before the read records its
 # counts as unknown, never as 0 (bd DAS-Backup-Manager-6wt).
 BTRBK_LATEST_RAW_OK=""
+# The snapshot counts this run reports, as record-run arguments — set by
+# decide_run_counts (bd DAS-Backup-Manager-bzw).
+RUN_COUNTS=()
 # Set inside main() the moment this process actually OWNS the shared DAS
 # mountpoints — immediately after acquire_maintenance_lock() returns (see
 # the arming site in main() for the exact line and full rationale). Until
@@ -2329,6 +2335,7 @@ BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
   Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
+  Snapshot counts       ${OP_STATUS[btrbk_counters]:-OK}  (${OP_STATUS[btrbk_counters_detail]:-counted})
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
   Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
   Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
@@ -2541,6 +2548,61 @@ send_report() {
 # RECORD BACKUP RUN IN DATABASE
 # ============================================================================
 
+# The snapshot counts this run reports, into RUN_COUNTS, from the
+# `btrbk --format=raw list latest` output capture_report_data() cached while
+# the targets were still mounted (after unmount_all a live listing shows every
+# target's STATUS as `-`, bd DAS-Backup-Manager-ecg) — and, when they are not
+# known, a btrbk_counters FAIL.
+#
+# main() calls this after capture_report_data and BEFORE run_status() and
+# generate_report(): a counter failure must read FAILURES DETECTED in the
+# report and be no --success in the history, as it makes the run exit 3. It
+# was decided only inside record_run_args, after both were fixed, so the email
+# said ALL OPERATIONS SUCCESSFUL (bd DAS-Backup-Manager-bzw). record_run_args
+# calls it again for the vector — the same answer, and the warning once.
+#
+# A count that is not known is said as --counts-unknown and stored as NULL,
+# never as a number: a 0 reads as "nothing was sent", and the -1 this used
+# to send (bd nsp c4/c5) was refused by record-run's parser as an unknown
+# option, so the run was not recorded at all. Unknown when the listing was
+# never read (the run ended before capture_report_data, so its state is
+# still the empty starting value), when it failed, and when its output held
+# no field this parser knows (btrbk renamed its raw fields: bd oi0, 06p).
+# A listing that succeeded with no output is a measured 0.
+decide_run_counts() {
+    RUN_COUNTS=(--counts-unknown)
+    local snaps_created snaps_sent
+    case "$BTRBK_LATEST_RAW_OK" in
+        true)
+            if [[ -z "$BTRBK_LATEST_RAW" ]]; then
+                RUN_COUNTS=(--snaps-created 0 --snaps-sent 0)
+            else
+                # One source subvolume yields one snapshot, replicated to N
+                # targets, so the two counts are genuinely different numbers.
+                snaps_created=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
+                    | grep -o "snapshot_subvolume='[^']*'" | sort -u | grep -c . || true)
+                snaps_sent=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
+                    | grep -c "target_subvolume='[^']" || true)
+                if (( snaps_created == 0 && snaps_sent == 0 )); then
+                    if [[ "${OP_STATUS[btrbk_counters]:-}" != "FAIL" ]]; then
+                        log_warn "btrbk produced output but no snapshot_subvolume/target_subvolume fields parsed —"
+                        log_warn "  the --format=raw field names have probably changed. Counts recorded as unknown."
+                    fi
+                    record_op "btrbk_counters" "FAIL" "raw output present but no fields parsed; counts unknown"
+                else
+                    RUN_COUNTS=(--snaps-created "$snaps_created" --snaps-sent "$snaps_sent")
+                fi
+            fi
+            ;;
+        false)
+            record_op "btrbk_counters" "FAIL" "btrbk list latest failed; counts unknown"
+            ;;
+        *)
+            record_op "btrbk_counters" "FAIL" "not read — the run ended before the snapshot counters were taken"
+            ;;
+    esac
+}
+
 # The `btrdasd backup record-run` argument vector for this run, into
 # RECORD_RUN_ARGS. Built apart from the call so that
 # indexer/tests/record_run_contract.rs can hand this exact vector, built by this
@@ -2572,48 +2634,10 @@ record_run_args() {
         fi
     done
 
-    # Snapshot counters, from the `btrbk --format=raw list latest` output that
-    # capture_report_data() cached while the targets were still mounted. This
-    # runs after unmount_all(), where a live listing would show every target's
-    # STATUS as `-` (bd DAS-Backup-Manager-ecg).
-    #
-    # A count that is not known is said as --counts-unknown and stored as NULL,
-    # never as a number: a 0 reads as "nothing was sent", and the -1 this used
-    # to send (bd nsp c4/c5) was refused by record-run's parser as an unknown
-    # option, so the run was not recorded at all. Unknown when the listing was
-    # never read (the run ended before capture_report_data, so its state is
-    # still the empty starting value), when it failed, and when its output held
-    # no field this parser knows (btrbk renamed its raw fields: bd oi0, 06p).
-    # A listing that succeeded with no output is a measured 0.
-    local counts=(--counts-unknown)
-    local snaps_created snaps_sent
-    case "$BTRBK_LATEST_RAW_OK" in
-        true)
-            if [[ -z "$BTRBK_LATEST_RAW" ]]; then
-                counts=(--snaps-created 0 --snaps-sent 0)
-            else
-                # One source subvolume yields one snapshot, replicated to N
-                # targets, so the two counts are genuinely different numbers.
-                snaps_created=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
-                    | grep -o "snapshot_subvolume='[^']*'" | sort -u | grep -c . || true)
-                snaps_sent=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
-                    | grep -c "target_subvolume='[^']" || true)
-                if (( snaps_created == 0 && snaps_sent == 0 )); then
-                    log_warn "btrbk produced output but no snapshot_subvolume/target_subvolume fields parsed —"
-                    log_warn "  the --format=raw field names have probably changed. Counts recorded as unknown."
-                    record_op "btrbk_counters" "FAIL" "raw output present but no fields parsed; counts unknown"
-                else
-                    counts=(--snaps-created "$snaps_created" --snaps-sent "$snaps_sent")
-                fi
-            fi
-            ;;
-        false)
-            record_op "btrbk_counters" "FAIL" "btrbk list latest failed; counts unknown"
-            ;;
-        *)
-            record_op "btrbk_counters" "FAIL" "not read — the run ended before the snapshot counters were taken"
-            ;;
-    esac
+    # Snapshot counters: decided by decide_run_counts — already in main(),
+    # before the run status and the report (bd DAS-Backup-Manager-bzw); again
+    # here, with the same answer, for a run cleanup() records.
+    decide_run_counts
 
     # Collect errors from failed operations (newline-separated for DB storage)
     local error_list=""
@@ -2632,7 +2656,7 @@ record_run_args() {
         backup record-run
         --db "$DAS_DB_PATH"
         --mode "$mode"
-        "${counts[@]}"
+        "${RUN_COUNTS[@]}"
         --bytes-sent "$total_bytes"
         --duration-secs "$elapsed"
     )
@@ -2993,6 +3017,10 @@ main() {
         # generate_growth_section() for the cache the report now reads from.
         # Tracks bd DAS-Backup-Manager-ecg.
         capture_report_data
+        # The counters are read: decide them — and their FAIL, if they are
+        # unknown — before the run status and the report are decided
+        # (bd DAS-Backup-Manager-bzw).
+        decide_run_counts
         unmount_all
 
         # Only FAIL makes the run a failure; a WARN (a recovery OS that is

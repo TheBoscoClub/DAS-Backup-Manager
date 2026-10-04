@@ -32,7 +32,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in record_run_args record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status generate_report; do
+for fn in decide_run_counts record_run_args record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status generate_report; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -161,6 +161,48 @@ record_run_args SUCCESS false
 check "unparsed: --counts-unknown" "$(counts_words)" "--counts-unknown "
 check "unparsed: counter FAIL" "${OP_STATUS[btrbk_counters]:-unset}" "FAIL"
 check "unparsed: warned" "$(grep -c '^WARN: .*no snapshot_subvolume/target_subvolume fields parsed' "$WORK/log")" "1"
+
+# --- bd DAS-Backup-Manager-bzw: the counters are decided before the status ----------------
+# main() decides them after capture_report_data and before run_status and the
+# report, so a counter failure reads FAILURES DETECTED in the report's status
+# line and is not --success in the history. It used to be recorded only inside
+# record_run_args, after both were fixed: the email said ALL OPERATIONS
+# SUCCESSFUL while the history listed the failure (and d1r exited 3).
+reset
+BTRBK_LATEST_RAW_OK=false
+decide_run_counts
+check "bzw: a failed listing is a FAIL before any status is read" "${OP_STATUS[btrbk_counters]:-unset}" "FAIL"
+check "bzw: so the run status is FAILURE" "$(run_status)" "FAILURE"
+report="$(generate_report)"
+check "bzw: the report says FAILURES DETECTED" "$(grep -c '^  Status: FAILURES DETECTED$' <<<"$report")" "1"
+check "bzw: and names the counters" \
+    "$(grep -c '^  Snapshot counts       FAIL  (btrbk list latest failed; counts unknown)$' <<<"$report")" "1"
+record_run_args "$(run_status)" false
+check "bzw: the history row is not --success" "$(vector | grep -c '^--success$' || true)" "0"
+check "bzw: the row carries the counts decided" "$(counts_words)" "--counts-unknown "
+
+reset
+BTRBK_LATEST_RAW_OK=true
+BTRBK_LATEST_RAW="$(raw_listing)"
+decide_run_counts
+check "bzw: counts known: no FAIL" "${OP_STATUS[btrbk_counters]:-unset}" "unset"
+check "bzw: counts known: SUCCESS" "$(run_status)" "SUCCESS"
+check "bzw: counts known: the row reads OK" "$(generate_report | grep -c '^  Snapshot counts       OK  (counted)$')" "1"
+
+# main() decides, then record_run_args decides again for its vector: the same
+# answer, and the unparsed-output warning only once.
+reset
+BTRBK_LATEST_RAW_OK=true
+BTRBK_LATEST_RAW="format=\"latest\" snapshot_path='/v/.s/root-.1' target_path='/t1/root-.1'"
+decide_run_counts
+record_run_args FAILURE false
+check "bzw: decided twice, the same counts" "$(counts_words)" "--counts-unknown "
+check "bzw: decided twice, warned once" "$(grep -c 'no snapshot_subvolume/target_subvolume fields parsed' "$WORK/log")" "1"
+
+# The order in main(): read the counters, decide them, then the status.
+check "bzw: main() decides the counts before the run status" \
+    "$(extract main | grep -E '^ +(capture_report_data|decide_run_counts|overall_status="\$\(run_status\)")$' | tr -s ' ' | tr '\n' '|')" \
+    ' capture_report_data| decide_run_counts| overall_status="$(run_status)"|'
 
 # --- a record that works ----------------------------------------------------------------
 reset
