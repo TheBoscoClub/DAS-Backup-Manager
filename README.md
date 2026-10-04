@@ -49,7 +49,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active (v2.1.0) |
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v2.2.0) |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
-| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to the `recovery-os-updater` VM (`packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim | Active (v1.0.0) |
+| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to the `recovery-os-updater` VM (`packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active (v1.0.0) |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |

@@ -48,6 +48,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | virt-viewer | system | That VM's console |
 | ImageMagick (`magick`) | 7 | `recovery-os-vm.sh screenshot` |
 | jq | 1.6 or later | `recovery-os-vm.sh session` reads the recovery OS's boot record with it, and refuses without it |
+| systemd **in the recovery OS** | 256 or later | The VM session guard: older ones ignore it, and the session, finding no confirmation, shuts the recovery OS down (record `will`/`may`) or warns (`no`) |
 
 ### Optional (for GUI)
 
@@ -472,7 +473,7 @@ Every `role = "mirror"` target is taken to carry its own bootable install under 
 | File | Purpose |
 |------|---------|
 | `${prefix}/lib/das-backup/recovery-os-vm.sh` | Lends one `role = "mirror"` recovery drive, whole, to the libvirt domain `recovery-os-updater`, boots the drive's own OS there to be updated, and gives the disk back when it powers off (`define`, `session`, `session-end`, `status`, `screenshot`; `--help` for usage) |
-| `${prefix}/lib/das-backup/libvirt/recovery-os-updater.xml` | That domain's definition, the one source of it: UEFI without Secure Boot, the host's CPU passed through (CachyOS's packages need x86-64-v3/v4), 4 vCPUs, 8 GiB, no disk of its own, a virtio NIC on the NAT network `default` with boot order 2 (a session attaches the disk with 1), VNC only on a libvirt-private socket (no network address), a serial console and a guest-agent channel |
+| `${prefix}/lib/das-backup/libvirt/recovery-os-updater.xml` | That domain's definition, the one source of it: UEFI without Secure Boot, the host's CPU passed through (CachyOS's packages need x86-64-v3/v4), 4 vCPUs, 8 GiB, no disk of its own, a virtio NIC with a fixed address on the NAT network `default` with boot order 2 (a session attaches the disk with 1), VNC only on a libvirt-private socket (no network address), a serial console and a guest-agent channel. It carries no session guard: each session defines the domain from it plus that session's guard, and from it alone afterwards |
 
 It needs libvirt with the QEMU/KVM driver running, the UEFI firmware at the paths the XML names — `/usr/share/edk2/x64/OVMF_CODE.4m.fd` and `OVMF_VARS.4m.fd`, Arch Linux's `edk2-ovmf`; `define` refuses when they are elsewhere; libvirt creates the VM's own variable store from the second at its first start — libvirt's network `default` active (`sudo virsh net-start default && sudo virsh net-autostart default`), and systemd's `systemd-run`, from systemd 254 or later (`--expand-environment=`): the disk holder runs in a transient scope of its own, `das-recovery-os-holder-<label>.scope`, and a session refuses without it. Run everything as root:
 
@@ -482,7 +483,7 @@ sudo /usr/lib/das-backup/recovery-os-vm.sh session A --dry-run
 sudo /usr/lib/das-backup/recovery-os-vm.sh session A
 ```
 
-A session starts only when the nightly backup run's record (`/var/lib/das-backup/recovery-os.json`) says btrbk will not run when that drive's OS boots, is at most 8 days old, and is newer than the drive's last session; each session's time is kept in `/var/lib/das-backup/recovery-os-vm-sessions` (root's, mode 644). During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder in `/run/das-recovery-os-vm/`. The console, from your desktop session: `virt-viewer --connect qemu:///system --attach recovery-os-updater`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
+A session starts only when the nightly backup run's record (`/var/lib/das-backup/recovery-os.json`) does not say btrbk will run when that drive's OS boots (`will` is refused; `may` and `no` go on), is at most 8 days old, and is newer than the drive's last session; each session's time is kept in `/var/lib/das-backup/recovery-os-vm-sessions` (root's, mode 644). It boots the OS with the session guard: SMBIOS strings that the recovery OS's systemd, 256 or later, turns into masks of btrbk's units, cron and every unit the record names, and a bind mount of `/usr/bin/false` over btrbk, confirmed by one line through the virtio port `org.dasbackup.guard`; a recovery OS that does not confirm within 5 minutes is asked to shut down when its record says `will` or `may` (exit status 6). During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder, the definition with its guard and the guard's report in `/run/das-recovery-os-vm/` (root's only). The console, from your desktop session: `virt-viewer --connect qemu:///system --attach recovery-os-updater`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
 
 `btrdasd setup --uninstall-all` removes the two files; the domain and its UEFI variable store belong to libvirt and stay — remove them with `sudo virsh undefine --nvram recovery-os-updater`.
 

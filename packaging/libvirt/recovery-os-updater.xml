@@ -8,7 +8,11 @@
   ${prefix}/lib/das-backup/libvirt/, and `recovery-os-vm.sh define` defines
   the domain from that installed copy. To change the VM, edit this file,
   reinstall, and run `define` again (the domain must be shut off, with no
-  disk attached).
+  disk attached). Every session defines the domain anew as well: from this
+  file plus that session's guard (SMBIOS strings and a virtio port, which
+  keep btrbk from running in the booted OS), and afterwards from this file
+  alone. So a change made in libvirt by hand (virsh edit) does not last, and
+  this file itself never carries the guard.
 
   The VM has NO disk of its own. `recovery-os-vm.sh session` lends it one
   whole recovery drive for one session, by its /dev/disk/by-id path, on SATA,
@@ -82,7 +86,11 @@
          device refuses the disk's per-device boot order when a session
          attaches it ("per-device boot elements cannot be used together with
          os/boot elements"). -->
+    <!-- A fixed address: each session defines the domain anew, and libvirt
+         gives an interface without one a new address every time, so the
+         recovery OS would find a new network card at every session. -->
     <interface type='network'>
+      <mac address='52:54:00:8a:60:e1'/>
       <source network='default'/>
       <model type='virtio'/>
       <boot order='2'/>
