@@ -36,6 +36,9 @@
 #     (bd DAS-Backup-Manager-ismb). The snapshot counters are decided before
 #     the run status and the report, so a counter failure reads FAILURES
 #     DETECTED in the report as in the history (bd DAS-Backup-Manager-bzw).
+#     The boot-subvolume step's drift check reads the target's listing
+#     without a pipe: under pipefail a listing over 64 KiB read as "no
+#     snapshots" when printf died of SIGPIPE (bd DAS-Backup-Manager-wkvz).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -1762,7 +1765,12 @@ update_boot_subvolumes() {
             # "@" => "root" map stopped matching an on-disk "root-" prefix.
             # That is a defect, not a skip, so it must not exit through the
             # quiet branch.
-            if printf '%s\n' "$subvol_listing" | grep -qE '[0-9]{8}T[0-9]{4}'; then
+            #
+            # No pipe: grep -q quits at its first match, and a listing longer
+            # than a pipe holds (the primary target's is near 64 KiB) left
+            # printf to die of SIGPIPE, which pipefail read as "no match" —
+            # straight into the quiet branch (bd DAS-Backup-Manager-wkvz).
+            if grep -qE '[0-9]{8}T[0-9]{4}' <<<"$subvol_listing"; then
                 log_error "  [$label] Target HAS btrbk-shaped snapshots but none matched the expected names."
                 log_error "  [$label] The name patterns in this function have drifted from /etc/btrbk/btrbk.conf."
                 (( failed += 1 ))

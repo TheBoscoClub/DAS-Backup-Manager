@@ -280,4 +280,8 @@ if(BUILD_TESTING)
         NAME shell-script-rewrite
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_script_rewrite.sh
     )
+    add_test(
+        NAME shell-early-exit-readers
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_exit_readers.sh
+    )
 endif()
