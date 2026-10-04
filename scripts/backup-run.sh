@@ -36,9 +36,11 @@
 #     (bd DAS-Backup-Manager-ismb). The snapshot counters are decided before
 #     the run status and the report, so a counter failure reads FAILURES
 #     DETECTED in the report as in the history (bd DAS-Backup-Manager-bzw).
-#     The boot-subvolume step's drift check reads the target's listing
-#     without a pipe: under pipefail a listing over 64 KiB read as "no
-#     snapshots" when printf died of SIGPIPE (bd DAS-Backup-Manager-wkvz).
+#     The boot-subvolume step's drift check is matched by bash itself,
+#     `[[ =~ ]]`: piped into grep -q, a listing over 64 KiB read as "no
+#     snapshots" when printf died of SIGPIPE (bd DAS-Backup-Manager-wkvz),
+#     and as a here-string it needed a temp file, which a full /tmp or no
+#     fd to spare turned into the same answer (round 4, N3).
 #     Every report's delivery is bounded (MAIL_TIMEOUT_SECS, 60 s, then KILL
 #     10 s later) and mailx runs without the lock fds: a relay that took the
 #     connection and never answered held the run, the DAS mounted and both
@@ -1818,11 +1820,14 @@ update_boot_subvolumes() {
             # That is a defect, not a skip, so it must not exit through the
             # quiet branch.
             #
-            # No pipe: grep -q quits at its first match, and a listing longer
-            # than a pipe holds (the primary target's is near 64 KiB) left
-            # printf to die of SIGPIPE, which pipefail read as "no match" —
-            # straight into the quiet branch (bd DAS-Backup-Manager-wkvz).
-            if grep -qE '[0-9]{8}T[0-9]{4}' <<<"$subvol_listing"; then
+            # Matched by bash itself: no pipe, no file, no fd. Piped into
+            # grep -q, a listing longer than a pipe holds (the primary
+            # target's is near 64 KiB) left printf to die of SIGPIPE, which
+            # pipefail read as "no match" (bd DAS-Backup-Manager-wkvz); fed
+            # as a here-string, it went to a temp file, and a full /tmp or no
+            # fd to spare read as "no match" too (round 4, N3). Either way,
+            # straight into the quiet branch.
+            if [[ $subvol_listing =~ [0-9]{8}T[0-9]{4} ]]; then
                 log_error "  [$label] Target HAS btrbk-shaped snapshots but none matched the expected names."
                 log_error "  [$label] The name patterns in this function have drifted from /etc/btrbk/btrbk.conf."
                 (( failed += 1 ))

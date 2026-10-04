@@ -142,12 +142,16 @@ check_smart_tests() {
         local status
         status=$(smartctl -l selftest "$dev" 2>/dev/null | grep -E "# 1" | head -1 || echo "No tests")
 
-        # No pipe into grep -q: under pipefail a producer killed by SIGPIPE
-        # when grep quits early reads as "no match" (bd DAS-Backup-Manager-wkvz).
-        if grep -qE "in progress|Self-test routine in progress" <<<"$status"; then
+        # Matched by bash itself — no pipe, no file, no fd. A pipe into
+        # grep -q read a producer killed by SIGPIPE as "no match" under
+        # pipefail (bd DAS-Backup-Manager-wkvz), and a here-string reads a
+        # pipe it cannot make as "no match" too: here, a running test read
+        # as not running. "in progress" covers "Self-test routine in
+        # progress", the other form the old pattern named.
+        if [[ $status == *"in progress"* ]]; then
             echo -e "  $dev ($label): ${YELLOW}Test still running${NC}"
             all_complete=false
-        elif grep -q "Completed without error" <<<"$status"; then
+        elif [[ $status == *"Completed without error"* ]]; then
             echo -e "  $dev ($label): ${GREEN}Test completed - PASSED${NC}"
         else
             echo -e "  $dev ($label): ${YELLOW}$status${NC}"
