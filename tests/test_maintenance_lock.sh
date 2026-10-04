@@ -44,7 +44,7 @@ cleanup_test() {
 trap cleanup_test EXIT
 
 extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
-for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op cleanup; do
+for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup; do
     body="$(extract "$RUN" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -138,33 +138,56 @@ check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown hold
     exec 8<>"$LOCK"
     flock 8
     printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
-    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="true"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="true"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     cleanup
 )
 check "on exit: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
 # An abort once the lock is ours runs cleanup()'s recovery body: the record
-# still names the run while it unmounts, is emptied after, and the abort's
-# own exit status survives.
+# still names the run while it unmounts, is emptied after, and the run exits
+# 3 — it had begun its work, whatever status ended it (bd
+# DAS-Backup-Manager-d1r; tests/test_backup_exit_semantics.sh has every path).
 rc=0
 (
     set +e
     exec 8<>"$LOCK"
     flock 8
     printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
-    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     unmount_all() { record >"$WORK/during_unmount"; }
-    (exit 3)
+    (exit 1)
     cleanup
 ) || rc=$?
 check "on abort: the record names the run while it unmounts" "$(cat "$WORK/during_unmount")" "backup-run.sh pid $$"
 check "on abort: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
-check "on abort: the abort's exit status is kept" "$rc" "3"
-printf 'btrdasd scrub run pid 77\n' >"$LOCK"
+check "on abort: the run exits 3" "$rc" "3"
+# A stop the run itself received keeps the signal's code, lock held or not
+# (bd DAS-Backup-Manager-d1r round 3, M2).
+rc=0
 (
-    CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; DRYRUN_BTRBK_CONF=""
+    set +e
+    exec 8<>"$LOCK"
+    flock 8
+    printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL="HUP"
+    unmount_all() { :; }
+    (exit 129)
     cleanup
-)
+) || rc=$?
+check "on a stop: the run exits with the signal's code" "$rc" "129"
+check "on a stop: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
+printf 'btrdasd scrub run pid 77\n' >"$LOCK"
+rm -f "$WORK/during_unmount"
+rc=0
+(
+    # Everything the recovery body reads is set, so it is the gate alone
+    # that keeps the run away from unmount_all.
+    CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
+    unmount_all() { record >"$WORK/during_unmount"; }
+    cleanup
+) || rc=$?
 check "exit before the lock is ours: another holder's record is left alone" "$(record)" "btrdasd scrub run pid 77"
+check "exit before the lock is ours: nothing is unmounted" "$([[ -e "$WORK/during_unmount" ]] && echo yes || echo no)" "no"
+check "exit before the lock is ours: it could not start, exit 1" "$rc" "1"
 
 # --- walk is handed the lock the backup holds --------------------------------
 rm -f "$LOCK"

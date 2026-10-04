@@ -63,15 +63,43 @@ site, never the pattern.
    excluded** — the failure branches must not mark it available. Two of them
    did, and that was `bd DAS-Backup-Manager-aea`.
 
-5. **`backup-run.sh` exits 0 on a per-target failure that btrbk survives.**
-   Deliberate, and NOT to be "fixed" without reading the reasoning: nonzero
-   means *the run could not execute at all* — with one exception the code
-   makes and its own comment understates: `main()` returns 1 whenever btrbk
-   exited nonzero, and btrbk exits 10 when any one target is aborted (see
-   `backup.md` §Sentinel Interaction). A multi-hour job never produces three failures inside
-   cachyos-sentinel's 600-second restart-limiter window, so a per-target
-   nonzero would produce an unbounded retry loop rather than an alert. Recorded
-   in full under `bd DAS-Backup-Manager-18p` and in `backup.md`.
+5. **`backup-run.sh` exits 3 — which `das-backup.service` and
+   `das-backup-full.service` count as success (`SuccessExitStatus=3`) — when
+   the run began its work and something failed.** Deliberate, and NOT to be
+   "fixed" without reading the reasoning (operator decision C, 2026-10-04,
+   `bd DAS-Backup-Manager-d1r`, the doctor's rule). A multi-hour job never
+   produces three failures inside cachyos-sentinel's 600-second
+   restart-limiter window, so a unit left `failed` by a failure the next start
+   meets again is an unbounded retry loop, not an alert. Until 4.11.0 the
+   script exited 1 whenever btrbk exited nonzero, and btrbk exits 10 when any
+   ONE target aborts (measured 2026-10-02 by hand, recovery drive A pulled:
+   btrbk 10, the script 1); under the timer sentinel would have started a new
+   ~25-minute backup about every ten minutes until the drive came back. Now:
+   **0** nothing failed (a WARN still 0),
+   **3** began and failed or aborted (btrbk nonzero for some or all targets,
+   any FAIL operation, an abort on a target's or a source's state), **1** could
+   not start (nothing mounted or sent — a unit failing in seconds, which the
+   limiter does brake). The failure itself travels by the report, the history
+   row and the journal's `status=3`.
+   **The direction test, honestly:** for a run that got as far as its report
+   the substituted "success" costs nothing — the FAILURES DETECTED email is
+   the alert. For an abort before the report stage (no primary target, a
+   target or source failing verification, the bare-mountpoint guard, a
+   command failing under `set -e`) it cost something until the same release
+   closed it: such a run sent no report and wrote no history row, so with the
+   unit no longer failed, nothing showed it — a powered-off DAS would have
+   failed every night unseen. That half could not ship alone. `cleanup()` now
+   records the run as failed (`--counts-unknown`, `aborted: <what>: <why>` in
+   the errors) and sends one ABORTED report through `send_report` — both best
+   effort, neither able to change the status (`bd DAS-Backup-Manager-2my`).
+   Only then is the substituted "success" cautious on the paths that matter —
+   every path but one: an abort *after* `main()`'s report went out (a log line
+   that cannot be written after the history row, say) exits 3 under a report
+   and a row that already say what they saw, SUCCESS if nothing else failed,
+   and only the journal's `status=3` and the log show it. That is a trace,
+   not an alert; it is narrow (the run's work was done and reported) and
+   stated in `backup.md` rather than claimed away. The scrub's split is
+   `bd DAS-Backup-Manager-18p`; both are in `backup.md` §Sentinel Interaction.
 
 ### Bash inventory, triaged 2026-09-01 (bd `76g`)
 
@@ -269,5 +297,5 @@ shell options, environment, or privileges is not evidence in either direction.
 ## Related
 
 - `~/.claude/rules/verification.md` — the class, and the both-directions test rule
-- `backup.md` — the `18p` exit-code split, in full
+- `backup.md` — the exit-code splits, in full: `18p` (scrub), `d1r` (backup)
 - `bd DAS-Backup-Manager-nsp` — the audit this file closes out

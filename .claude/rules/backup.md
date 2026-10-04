@@ -128,7 +128,13 @@ Checked before any directory is created, both roots compared **after resolution*
   `DAS_REPORT_FROM` override for testing.
 - **`smtp-auth=none` is REQUIRED on every mailx invocation**, or s-nail aborts with exit 4.
 - **Never redirect mailx stderr to `/dev/null`.**
-- The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only.
+- **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed: s-nail
+  gives up after ~45 s of silence by itself, but not on a relay that keeps trickling bytes, and
+  such a relay must cost the report, not the run.
+- The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only. A
+  write that fails is logged as such, and the not-emailed lines then name the journal instead.
+  With email off, an unsavable report is a FAIL (exit 3, `report:` in the row): the journal has
+  the only copy.
 - **Unattended (no-session) delivery is proven in production — do not re-test it.**
 - Diagnose with `journalctl -u das-backup`, `journalctl -u postfix`, `mailq`. `status=sent` means
   the provider accepted it, not that it reached the inbox.
@@ -152,9 +158,19 @@ Checked before any directory is created, both roots compared **after resolution*
   stop alone is undone within seconds.
 - The unit files carry no `Restart=`, `OnFailure=` or `OnUnitInactiveSec=`. Keep it that way.
 - Sentinel's limiter is 3 restarts per 600 s and **cannot brake a failure loop slower than
-  ~10 minutes**. So exit codes mean "could not run", not "found a problem":
-  - `backup-run.sh` and `btrdasd scrub run`: **0** = the run/pass executed, whatever it found;
-    **nonzero** = it could not start at all, or (backup) btrbk exited nonzero. Findings travel by email.
+  ~10 minutes**, so a failure the next start would meet again must never leave a unit `failed`:
+  - `btrdasd scrub run`: **0** = the pass executed, whatever it found; **nonzero** = it could not
+    start. Findings travel by email.
+  - `backup-run.sh` (bd `d1r`): **0** = nothing FAILED (a WARN still 0); **3** = began its work and
+    something FAILED, or it aborted on a target's or a source's state; **1** = could not start
+    (nothing mounted or sent); **128+N** = stopped by HUP INT USR1 PIPE ALRM or TERM (129 130
+    138 141 142 143), the unit fails. Both backup units carry `SuccessExitStatus=3`, and that line is load-bearing.
+  - A 3 is not silent: the report says FAILURES DETECTED (for a FAIL recorded after the report is
+    built — email delivery, the history record, a report saved nowhere — the row says it), and an
+    abort before the report sends one **ABORTED** report (what, why, targets seen, log) and records
+    a failed history row (bd `2my`).
+    The one exception: an abort *after* the report went out exits 3 under a report and a row that
+    already say what they saw — the journal's `status=3` and the log are its only trace.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.
@@ -168,13 +184,15 @@ Two layers, both unconditional and both run under `--dryrun`:
    for an unavailable one is `rmdir`'d if empty, and is a fatal ABORT if non-empty.
 2. **`verify_targets_before_btrbk`** — after mounting, before `run_btrbk`: an available target
    must be a real mountpoint whose UUID (or serial) matches `config.toml`; an unavailable
-   target's `$mnt` must not exist. Any violation aborts and is recorded in the report.
+   target's `$mnt` must not exist. Any violation aborts, exit 3, with an ABORTED report and a
+   failed history row (bd `2my`).
 
 Rust twin (CLI/GUI): `mount::verify_write_targets`.
 
 ## Maintenance Interlock — backup vs. scrub mutual exclusion
 Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesystems and must never overlap.
-1. **Singleton lock**, non-blocking: `/run/das-{backup,scrub,reconcile,doctor}.lock`. Held ⇒ skip.
+1. **Singleton lock**, non-blocking: `/run/das-{backup,scrub,reconcile,doctor}.lock`. Held ⇒ skip;
+   a backup lock that cannot be opened or taken is "could not start", exit 1 (bd `ismb`).
 2. **Maintenance lock**: `/run/das-maintenance.lock`, shared by all sides and held for the whole
    operation. Backup and scrub **wait** for it, never skipped; `reconcile` and `doctor` defer.
 - **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`); `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75; a holder that runs them hands its hold down (`DAS_MAINTENANCE_LOCK_FD`) or they fail.
