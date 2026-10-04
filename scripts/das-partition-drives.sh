@@ -1,6 +1,6 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.3.0
+# Version: 2.3.1
 # Date: 2026-10-04
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
@@ -8,8 +8,9 @@
 #     ATA "Completed without error" or SCSI "Completed", with smartctl's exit
 #     status flagging nothing beyond bit 2 or 6 (smartctl(8)). A test still
 #     running, failed, aborted, interrupted or never run, a failed test still
-#     in the log (bit 7), or a drive smartctl cannot read: refused, the drive
-#     named by serial. --check shows the same; --force skips the check.
+#     in the log (bit 7), a drive smartctl cannot read, or one where it finds
+#     an invalid SMART checksum (read with -b exit): refused, the drive named
+#     by serial. --check shows the same; --force skips the check.
 #     All configuration loaded from config.toml via btrdasd.
 #
 # Drive Layout (from config):
@@ -155,8 +156,15 @@ check_smart_tests() {
         # one. A capture bash cannot make (no fd to spare) prints nothing and
         # still returns 0 (measured, bash 5.3): no output must block by
         # itself, whatever the status says.
+        #
+        # -b exit (smartctl(8), --badsum): a structure this call reads whose
+        # checksum is invalid (the drive's IDENTIFY data, its SMART data, the
+        # self-test log) ends smartctl at its warning, exit 4, before any
+        # row. Its default, warn, prints the warning and carries on, so a log
+        # smartctl itself calls invalid printed its rows at exit 0 and could
+        # pass (measured on the smartctl 7.5 binary, a replayed drive).
         rc=0
-        out="$(smartctl -l selftest "$dev" 2>&1)" || rc=$?
+        out="$(smartctl -b exit -l selftest "$dev" 2>&1)" || rc=$?
 
         if selftest_passed "$out" "$rc"; then
             verdict="${GREEN}PASSED${NC}"
@@ -200,9 +208,14 @@ selftest_passed() {
     # newest first, and only its rows start with "#". Found by one regex
     # over the whole output: no pipe, no file (round 4, N3), and no digit
     # class to widen with the locale (N5).
-    local re="(^|$nl)(# 1  [^$nl]*)"
+    # With no row, say why when smartctl did: an invalid checksum (-b exit
+    # stops at its warning, above) is named, so the operator sees it.
+    local re="(^|$nl)(# 1  [^$nl]*)" bad="Warning! ([^$nl]*) error: invalid SMART checksum"
     if [[ $out =~ $re ]]; then
         row="${BASH_REMATCH[2]}"
+    elif [[ $out =~ $bad ]]; then
+        SELFTEST_STATUS="no self-test result: smartctl found an invalid checksum in the ${BASH_REMATCH[1]} (exit $rc)"
+        return 1
     elif [[ $out == *"No "[Ss]"elf-tests have been logged"* ]]; then
         SELFTEST_STATUS="no self-test logged"
         return 1
@@ -231,10 +244,12 @@ selftest_passed() {
 
     # A pass, unless the exit status flags more than bit 2 (some other SMART
     # command failed) or bit 6 (the error log has entries), which say
-    # nothing of this log. Bit 7: the log holds a failed self-test — on ATA
-    # one no later passed extended test outdates, on SCSI any of the last 20.
-    # Bits 3-5 (the drive reports failing) come only with -H, never with
-    # this call (smartctl 7.5's source); were one set, it blocks all the same.
+    # nothing of this log. (-b exit's checksum stop sets bit 2 as well, but
+    # before any row is printed, so it never reaches here.) Bit 7: the log
+    # holds a failed self-test — on ATA one no later passed extended test
+    # outdates, on SCSI any of the last 20. Bits 3-5 (the drive reports
+    # failing) come only with -H, never with this call (smartctl 7.5's
+    # source); were one set, it blocks all the same.
     if ((rc & 128)); then
         SELFTEST_STATUS="$status, but the log records a failed self-test (smartctl exit $rc)"
         return 1

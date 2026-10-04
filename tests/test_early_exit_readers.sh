@@ -257,11 +257,15 @@ echo "== das-partition-drives.sh: check_smart_tests, the self-test gate"
 # the log holds a failed self-test; bits 2 and 6 say nothing of this log.
 #
 # Every row is printed with smartctl 7.5's own format strings and status
-# words (ataprint.cpp, scsiprint.cpp; the words are in the installed
-# binary's strings), and exits as smartctl 7.5 exits for it. Each goes
-# through the real check_smart_tests and the helper defined after it, with
-# smartctl a stub per drive, no smartctl on PATH, and device paths that are
-# not devices.
+# words (ataprint.cpp, scsiprint.cpp), and exits as smartctl 7.5 exits for
+# it. The ATA layout, and a sample of exit statuses, were checked byte for
+# byte against the smartctl 7.5 binary itself, run on a replayed drive (its
+# "-" device reads a "-r ataioctl,2" dump from stdin and touches no drive):
+# rows, a whole log, the never-run line, the checksum warnings. The SCSI
+# rows rest on scsiprint.cpp's format strings alone. Each goes through the
+# real check_smart_tests and the helper defined after it, with smartctl a
+# stub per drive (taking -b exit as the binary does), no smartctl on PATH,
+# and device paths that are not devices.
 extract_upto das-partition-drives.sh check_smart_tests show_plan 'smartctl -l selftest'
 extract das-partition-drives.sh main 'confirm_destruction'
 
@@ -287,6 +291,20 @@ ata_log() { # ata_log <rows>: what `smartctl -l selftest` prints for an ATA driv
     printf '%s\n' "$BANNER" '=== START OF READ SMART DATA SECTION ===' \
         'SMART Self-test log structure revision number 1' \
         'Num  Test_Description    Status                  Remaining  LifeTime(hours)  LBA_of_first_error' "$1"
+}
+# What smartctl prints by default (-b warn) when a structure it reads fails
+# its checksum: its warning where it reads that structure (IDENTIFY and SMART
+# data before the section line, the self-test log after it), then the log as
+# ever, at exit 0. Under -b exit that warning is its last line, at exit 4: the
+# stub below does so.
+ata_log_bad_checksum() { # ata_log_bad_checksum <structure> <rows>
+    local log section='=== START OF READ SMART DATA SECTION ===' warning="Warning! $1 error: invalid SMART checksum."
+    log="$(ata_log "$2")"
+    if [[ $1 == "SMART Self-Test Log Structure" ]]; then
+        printf '%s\n' "${log/"$section"/"$section"$'\n'"$warning"}"
+    else
+        printf '%s\n' "${log/"$section"/"$warning"$'\n'"$section"}"
+    fi
 }
 scsi_log() { # scsi_log <rows>: what it prints for a SCSI drive
     printf '%s\n' "$BANNER" '=== START OF READ SMART DATA SECTION ===' 'SMART Self-test log' \
@@ -321,8 +339,15 @@ gate_drives() {
     : >"$WORK/smartctl.calls"
     smartctl() {
         echo "$*" >>"$WORK/smartctl.calls"
-        printf '%s\n' "${SMART_OUT[${!#}]}"
-        return "${SMART_RC[${!#}]}"
+        local out="${SMART_OUT[${!#}]}" rc="${SMART_RC[${!#}]}"
+        # -b exit: smartctl stops at its first invalid checksum's warning and
+        # exits 4 (FAILSMART: smartctl.cpp checksumwarning(), main()'s catch)
+        if [[ " $* " == *" -b exit "* && $out == *"invalid SMART checksum."* ]]; then
+            out="${out%%invalid SMART checksum.*}invalid SMART checksum."
+            rc=4
+        fi
+        printf '%s\n' "$out"
+        return "$rc"
     }
     log_header() { :; }
     log_info() { echo "[INFO] $*"; }
@@ -352,6 +377,21 @@ said() { # said <serial>: what the last gate said of that drive, after its name
     else
         echo "${line#"  $1 (label-$1): "}"
     fi
+}
+# decide <fixture> <smartctl exit status> [no-fd]: the decision alone,
+# "<returned>|<status shown>"; with no-fd, with no fd to spare (ulimit -n 3).
+decide() {
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/check_smart_tests.sh"
+        out="$(<"$WORK/st-$1.txt")"
+        SELFTEST_STATUS=""
+        if [[ ${3:-} == no-fd ]]; then ulimit -n 3; fi
+        r=0
+        selftest_passed "$out" "$2" || r=$?
+        printf '%s|%s\n' "$r" "$SELFTEST_STATUS"
+    ) 2>/dev/null
 }
 
 # ATA: every status ataprint.cpp prints, by the high nibble of the
@@ -484,6 +524,26 @@ for no_row in 'Read SMART Self-test Log failed: scsi error aborted command|4' \
         "$(gate "S1:no-row:${no_row#*|}")|$(said S1)" \
         "1|NOT PASSED — no self-test result in smartctl's output (exit ${no_row#*|})"
 done
+# An invalid SMART checksum (review F1). By default (-b warn) smartctl warns
+# and carries on: the rows print at exit 0, so a log it calls invalid would
+# pass. The gate reads with -b exit, where smartctl stops at that warning,
+# exit 4, no row. Both behaviours, and these fixtures byte for byte, were
+# measured on the smartctl 7.5 binary itself, run on a replayed drive (its
+# "-" device reads a "-r ataioctl,2" dump from stdin and touches no drive).
+for structure in "SMART Self-Test Log Structure" "Drive Identity Structure" "SMART Attribute Data Structure"; do
+    fixture "cksum-${structure// /-}" "$(ata_log_bad_checksum "$structure" "$ATA_PASSED")"
+    check "a passed row, invalid checksum in the $structure: NOT PASSED" \
+        "$(gate "S1:cksum-${structure// /-}:0")|$(said S1)" \
+        "1|NOT PASSED — no self-test result: smartctl found an invalid checksum in the $structure (exit 4)"
+done
+check "the gate asks smartctl with -b exit" "$(grep -c '^-b exit -l selftest ' "$WORK/smartctl.calls")" "1"
+# What smartctl -b exit prints for an invalid IDENTIFY checksum: the banner and
+# its warning, nothing more (exit 4).
+fixture cksum-exit-identity "$(printf '%s\n' "$BANNER" 'Warning! Drive Identity Structure error: invalid SMART checksum.')"
+# What -b exit is for: that log as smartctl prints it by default (the 2.3.0
+# call) reaches the decision with its row, and the row passes.
+check "the same log without -b exit, as 2.3.0 read it: its row passes the decision" \
+    "$(decide cksum-SMART-Self-Test-Log-Structure 0)" "0|Completed without error"
 
 # Only row "# 1", the most recent, decides; the rows below it only through
 # smartctl's bit 7. ATA counts a failure outdated by a newer passed EXTENDED
@@ -532,8 +592,8 @@ check "two drives, one unreadable: the gate blocks" \
 check "three drives, one aborted: the gate blocks" \
     "$(gate S1:ata-passed:0 S2:scsi-aborted:0 S3:ata-passed:0)|$(said S2)" "1|NOT PASSED — Aborted (by user command)"
 check "three drives: none named by device path" "$(grep -c 'not-a-device' "$WORK/gate.out")" "0"
-check "three drives: smartctl asked once each, for the self-test log" \
-    "$(grep -c '^-l selftest .*/not-a-device-S[123]$' "$WORK/smartctl.calls")" "3"
+check "three drives: smartctl asked once each, for the self-test log, with -b exit" \
+    "$(grep -c '^-b exit -l selftest .*/not-a-device-S[123]$' "$WORK/smartctl.calls")" "3"
 
 # Output over 64 KiB, its row on line 1 or after it all. The filler lines
 # start "# 1 " and one space: no row of smartctl's starts so.
@@ -562,25 +622,15 @@ done
 # With no fd to spare (ulimit -n 3). The decision alone needs none: it reads
 # the output it is handed by bash itself, no pipe and no file (round 4, N3);
 # one that needed a fd would read "no match" here, and a pass would block.
-decide_no_fd() { # decide_no_fd <fixture> <smartctl exit status>: "<returned>|<status shown>"
-    (
-        set -euo pipefail
-        # shellcheck source=/dev/null
-        source "$WORK/check_smart_tests.sh"
-        out="$(<"$WORK/st-$1.txt")"
-        SELFTEST_STATUS=""
-        ulimit -n 3
-        r=0
-        selftest_passed "$out" "$2" || r=$?
-        printf '%s|%s\n' "$r" "$SELFTEST_STATUS"
-    ) 2>/dev/null
-}
-check "no fd to spare: a passed row still passes" "$(decide_no_fd ata-passed 0)" "0|Completed without error"
-check "no fd to spare: a passed SCSI row still passes" "$(decide_no_fd scsi-passed 0)" "0|Completed"
+check "no fd to spare: a passed row still passes" "$(decide ata-passed 0 no-fd)" "0|Completed without error"
+check "no fd to spare: a passed SCSI row still passes" "$(decide scsi-passed 0 no-fd)" "0|Completed"
 check "no fd to spare: a passed row after 64 KiB still passes" \
-    "$(decide_no_fd big-last-ata-passed 0)" "0|Completed without error"
-check "no fd to spare: a failed row still fails" "$(decide_no_fd ata-read-failure 128)" "1|Completed: read failure"
-check "no fd to spare: a running SCSI row still fails" "$(decide_no_fd scsi-running 0)" "1|Self test in progress ..."
+    "$(decide big-last-ata-passed 0 no-fd)" "0|Completed without error"
+check "no fd to spare: a failed row still fails" "$(decide ata-read-failure 128 no-fd)" "1|Completed: read failure"
+check "no fd to spare: a running SCSI row still fails" "$(decide scsi-running 0 no-fd)" "1|Self test in progress ..."
+check "no fd to spare: an invalid checksum still fails, and says so" \
+    "$(decide cksum-exit-identity 4 no-fd)" \
+    "1|no self-test result: smartctl found an invalid checksum in the Drive Identity Structure (exit 4)"
 # The whole gate with no fd to spare cannot capture smartctl at all. bash
 # says "cannot make pipe for command substitution", and the capture returns
 # 0 with nothing in it (measured, bash 5.3): no reading, so no pass.
@@ -649,6 +699,13 @@ check "main --check, one drive failed: names it" \
 check "main --force, one drive failed: on to YES-DESTROY" \
     "$(run_main --force S1:ata-passed:0 S2:ata-read-failure:128)" "0|show_plan YES-DESTROY run_partitioning"
 check "main --force: smartctl never asked" "$(grep -c . "$WORK/smartctl.calls")" "0"
+# An invalid checksum blocks --run like any other drive that has not passed;
+# --force still overrides it, and still asks smartctl nothing.
+check "main --run, a self-test log with an invalid checksum: exits 1 before YES-DESTROY" \
+    "$(run_main --run S1:ata-passed:0 S2:cksum-SMART-Self-Test-Log-Structure:0)" "1|"
+check "main --force, the same drive: on to YES-DESTROY" \
+    "$(run_main --force S1:ata-passed:0 S2:cksum-SMART-Self-Test-Log-Structure:0)" "0|show_plan YES-DESTROY run_partitioning"
+check "main --force over it: smartctl never asked" "$(grep -c . "$WORK/smartctl.calls")" "0"
 
 # ---------------------------------------------------------------------------
 echo "== each site's condition, as its script has it, with no fd to spare"
