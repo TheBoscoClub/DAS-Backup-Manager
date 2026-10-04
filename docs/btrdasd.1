@@ -599,8 +599,8 @@ exits 1. A run stopped by a signal \(em HUP, INT, USR1, PIPE, ALRM or TERM,
 which
 .B systemctl stop
 sends \(em exits with that signal's own code, 128 plus its number, and sends no
-report; its unit ends failed. Every report's delivery is bounded: a relay that
-does not answer within 60 seconds costs the report, not the run.
+report; its unit ends failed. Every report's delivery is bounded: a send that
+has not finished within 60 seconds costs the report, not the run.
 .PP
 .B btrdasd backup run
 .RB [ \-\-config
