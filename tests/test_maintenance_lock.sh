@@ -228,13 +228,26 @@ release_lock
 
 # --- backup-verify.sh: a deliberate skip is not a failed mount (bd 0oi) ------
 # check_btrbk_status only tries the primary when its partition is a block
-# device; any node ending in 1 will do — `mount` is a stub, nothing is touched.
+# device; any node ending in 1 will do — `mount` is a stub, nothing is touched,
+# and the node is only ever tested with -b, never opened.
+#
+# A container's /dev holds no block devices (CI's archlinux container has none),
+# so when the host offers none of these, make one in the temp dir. 0:0 is the
+# "unnamed" major, which no block driver owns, so even an accidental open could
+# only fail. mknod needs CAP_MKNOD, which root in CI's container has; with
+# neither a host node nor the capability the suite FAILS — it never skips.
 blockdev=""
 for b in /dev/loop1 /dev/vda1 /dev/sda1 /dev/nvme0n1p1 /dev/ram1; do
     if [[ -b "$b" ]]; then blockdev="$b"; break; fi
 done
+mknod_err=""
 if [[ -z "$blockdev" ]]; then
-    echo "FAIL: no block device node ending in 1 to drive check_btrbk_status with"
+    if mknod_err="$(mknod "$WORK/blk1" b 0 0 2>&1)" && [[ -b "$WORK/blk1" ]]; then
+        blockdev="$WORK/blk1"
+    fi
+fi
+if [[ -z "$blockdev" ]]; then
+    echo "FAIL: no block device node ending in 1 to drive check_btrbk_status with (mknod: ${mknod_err:-made no node})"
     fails=$((fails + 1))
 else
     DAS_DEVICES=("${blockdev%1}")
