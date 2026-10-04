@@ -1447,10 +1447,22 @@ across lines; a comment, a here\-document, a
 .B case
 pattern and a redirection are no commands;
 .B $((\|...\|))
-is one word, unless a command substitution in it
+is one word where bash reads it as arithmetic \(em its second
+.B (
+closes right before a last
+.B )
+\(em unless a command substitution in it
 .RB ( $(\|...\|)
-or a backtick) runs a command; braces expand into each word they make (more
-than 16 is unknown); after a
+or a backtick) runs a command; otherwise, as in
+.BR "$((cmd) | wc \-l)" ,
+it is a command substitution, and its command runs; a command substitution in
+double quotes
+.RB ( \(dq$(cmd)\(dq )
+runs as an unquoted one does, and is read so (systemd's own quotes are not
+sh's: a
+.B "sh \-c \(dq...\(dq"
+line systemd passes on whole is read as that shell's line); braces expand
+into each word they make (more than 16 is unknown); after a
 .B function
 .I NAME
 header its body's commands are commands. A builtin is no program. A name the
@@ -1579,8 +1591,11 @@ or
 .IR /sys ,
 which only a running system fills \(em something at boot may put it there
 \(em and one reached through a link that lives in such a place. So is
-anything not here when that fstab cannot be read. A memory filesystem's
-mount point (a tmpfs
+anything not here when that fstab cannot be read. A unit tree under such a
+mount point may hold any unit at boot, whatever its copy here lists, and
+with no copy here at all: a unit not found in a tree above it, and any
+unit's drop\-ins, are unknown there. A
+memory filesystem's mount point (a tmpfs
 .IR /tmp )
 is not counted as one: what is under it is read as the disk holds it (see
 what is not seen, below).
@@ -1751,6 +1766,26 @@ directory only that OS knows.
 What a directory a program is given holds
 .RB ( "run\-parts /etc/backup.d" ;
 cron's own directories are read).
+.IP \- 2
+A command substitution in a
+.BR for ,
+.B select
+or
+.B case
+header
+.RB ( "for f in $(ls /etc/backup.d)" ,
+.BR "case $(uname) in" ).
+.IP \- 2
+A directory only that OS can resolve at the front of a unit's
+.B PATH
+(set by an
+.B EnvironmentFile=
+under
+.IR /run ,
+or a relative entry), once a script sets its own
+.BR PATH :
+a program found in a directory the script added hides it, though where the
+assignment does not apply that directory is searched first.
 .IP \- 2
 A program put in place at boot and then run
 .RB ( "install /root/x /usr/local/bin/job && /usr/local/bin/job" ,

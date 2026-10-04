@@ -65,10 +65,13 @@ jobs:
   # always has. Measured too: cargo-mutants 27.1.0 writes no outcomes.json
   # for an empty shard, so the gate could not score one, not even with
   # --allow-zero-total — it fails closed on the absent file, rightly.
-  # Re-measure before changing SHARDS:
+  # The matrix list is the only place the shard count lives: SHARD, SHARDS
+  # and the names come from strategy.job-index and strategy.job-total, so a
+  # longer list adds a shard and every shard still runs. Re-measure before
+  # changing it:
   #   cargo mutants --list --in-diff <diff> --shard k/N --sharding round-robin | wc -l
   incremental:
-    name: Falsifiability — this push (shard ${{ matrix.shard }}/4)
+    name: Falsifiability — this push (shard ${{ strategy.job-index }}/${{ strategy.job-total }})
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -77,8 +80,8 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3]
     env:
-      SHARD: ${{ matrix.shard }}
-      SHARDS: 4
+      SHARD: ${{ strategy.job-index }}
+      SHARDS: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -176,7 +179,7 @@ jobs:
         if: always() && steps.diff.outputs.listed != '0'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: mutants-incremental-${{ matrix.shard }}
+          name: mutants-incremental-${{ strategy.job-index }}
           path: indexer/mutants.out
           if-no-files-found: ignore
 
@@ -215,10 +218,11 @@ jobs:
   # 944 and 944, about 2.6 hours each. 7wb's recovery_os/hold_disk.rs (about
   # 26 more) joins through the glob when it is merged.
   # Re-measure before widening:
-  #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/2)
+  #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/N)
+  # As above, the matrix list alone sets the shard count.
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
   full-scope:
-    name: Falsifiability — security-critical scope (shard ${{ matrix.shard }}/2)
+    name: Falsifiability — security-critical scope (shard ${{ strategy.job-index }}/${{ strategy.job-total }})
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 300
@@ -227,7 +231,8 @@ jobs:
       matrix:
         shard: [0, 1]
     env:
-      SHARD: ${{ matrix.shard }}
+      SHARD: ${{ strategy.job-index }}
+      SHARDS: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -257,7 +262,7 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo mutants --in-place --no-shuffle \
-            --shard "$SHARD/2" --sharding round-robin \
+            --shard "$SHARD/$SHARDS" --sharding round-robin \
             --file 'src/setup/**/*.rs' \
             --file src/mount.rs \
             --file src/forget.rs \
@@ -277,12 +282,12 @@ jobs:
         working-directory: indexer
         run: |
           python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
-            --label "indexer full-scope shard $SHARD/2"
+            --label "indexer full-scope shard $SHARD/$SHARDS"
 
       - name: Archive mutants.out
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: mutants-full-scope-${{ matrix.shard }}
+          name: mutants-full-scope-${{ strategy.job-index }}
           path: indexer/mutants.out
           if-no-files-found: ignore
