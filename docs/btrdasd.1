@@ -392,11 +392,16 @@ Re-open the wizard with the current configuration pre-filled.
 Regenerate all managed files from the existing configuration
 (useful after a binary update), then restart
 .B btrdasd\-helper.service
-when it is running, so the GUI is served by the new binary. While the DAS
-maintenance lock is held \(em a job may be running in the helper \(em it is not
-restarted: the holder is named, with the command to run once the job has
-finished. A restart that fails, or a unit state or lock that cannot be read,
-is an error. A binary from before schema 4 cannot read a run whose snapshot
+when it is running, so the GUI is served by the new binary. The restart is
+done holding the DAS maintenance lock until
+.B "systemctl try\-restart"
+returns, at most 300 seconds, so no job can start mounting under it. While
+another holds the lock \(em a job may be running in the helper \(em the helper is
+not restarted: the holder is named, with the command to run once the job has
+finished, and the upgrade exits 3. A restart that fails or does not return in
+time, or a unit state or lock that cannot be read, is an error (exit 1). On an
+init system other than systemd the helper is restarted by hand (exit 3).
+A binary from before schema 4 cannot read a run whose snapshot
 counts are unknown, so keep
 .BR btrdasd ,
 .B btrdasd\-helper
@@ -1759,8 +1764,14 @@ and
 (could not run).
 .TP
 .B 3
-.B "btrdasd doctor"
-only: the check ran but some volume went unexamined; see its section.
+.BR "btrdasd doctor" :
+the check ran but some volume went unexamined; see its section.
+.BR "btrdasd setup \-\-upgrade" :
+the files were upgraded, but restarting
+.B btrdasd\-helper
+was left for later \(em a job holds the DAS maintenance lock, or the init system
+is not systemd. The output names the holder and the command to run; this is not
+a failed install.
 .TP
 .B 75
 .B walk
