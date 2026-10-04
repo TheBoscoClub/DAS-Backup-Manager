@@ -703,7 +703,7 @@ run_backup
 expect_completed "clean run" 0 "ALL OPERATIONS SUCCESSFUL" success
 check "clean run: btrbk ran" "$(ran_btrbk)" "yes"
 check "clean run: the snapshot counts row" \
-    "$(grep -c '^  Snapshot counts       OK  (counted)$' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Snapshot counts       OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
 
 fresh

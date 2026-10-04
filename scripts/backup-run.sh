@@ -54,6 +54,8 @@
 #     unexpanded command text: a source that will not mount says which,
 #     its device and mount's message; a set -e failure, the call chain it
 #     failed in (round 3, M4).
+#     The Snapshot counts row reads N/A until the counts are decided, like
+#     every other row; decide_run_counts records OK with them (round 3, M6).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -2417,7 +2419,7 @@ BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
   Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
-  Snapshot counts       ${OP_STATUS[btrbk_counters]:-OK}  (${OP_STATUS[btrbk_counters_detail]:-counted})
+  Snapshot counts       ${OP_STATUS[btrbk_counters]:-N/A}  (${OP_STATUS[btrbk_counters_detail]:-n/a})
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
   Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
   Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
@@ -2670,8 +2672,11 @@ send_report() {
 # The snapshot counts this run reports, into RUN_COUNTS, from the
 # `btrbk --format=raw list latest` output capture_report_data() cached while
 # the targets were still mounted (after unmount_all a live listing shows every
-# target's STATUS as `-`, bd DAS-Backup-Manager-ecg) — and, when they are not
-# known, a btrbk_counters FAIL.
+# target's STATUS as `-`, bd DAS-Backup-Manager-ecg) — and their report row:
+# btrbk_counters OK with the counts when they are known, FAIL when they are
+# not. The row reads N/A until this has run, like every other row: its default
+# used to be "OK (counted)", so a report built before the counts were decided
+# would have read as a success (bd DAS-Backup-Manager-d1r, round 3: M6).
 #
 # main() calls this after capture_report_data and BEFORE run_status() and
 # generate_report(): a counter failure must read FAILURES DETECTED in the
@@ -2695,6 +2700,7 @@ decide_run_counts() {
         true)
             if [[ -z "$BTRBK_LATEST_RAW" ]]; then
                 RUN_COUNTS=(--snaps-created 0 --snaps-sent 0)
+                record_op "btrbk_counters" "OK" "0 created, 0 sent"
             else
                 # One source subvolume yields one snapshot, replicated to N
                 # targets, so the two counts are genuinely different numbers.
@@ -2710,6 +2716,7 @@ decide_run_counts() {
                     record_op "btrbk_counters" "FAIL" "raw output present but no fields parsed; counts unknown"
                 else
                     RUN_COUNTS=(--snaps-created "$snaps_created" --snaps-sent "$snaps_sent")
+                    record_op "btrbk_counters" "OK" "$snaps_created created, $snaps_sent sent"
                 fi
             fi
             ;;
