@@ -247,7 +247,7 @@ impl Database {
     /// get `series = ''`, which reproduces the old `UNIQUE(path)` behaviour exactly
     /// — the migration makes the schema correct, it does not repair the data. Only
     /// re-indexing populates real series values (`btrdasd reindex --rebuild`).
-    fn migrate(conn: &Connection) -> SqlResult<()> {
+    fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version >= SCHEMA_VERSION {
             return Ok(());
@@ -297,7 +297,7 @@ impl Database {
     /// references — the DROP would cascade into or break those rows; nothing
     /// in this schema references it — or one with a column schema 3 never
     /// had, whose data the copy would lose.
-    fn migrate_backup_runs_counts(conn: &Connection) -> SqlResult<()> {
+    fn migrate_backup_runs_counts(conn: &Connection) -> Result<(), rusqlite::Error> {
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let not_null = tx
@@ -1118,7 +1118,7 @@ impl Database {
 
     /// Record a completed backup run. Returns the new row ID. A count of
     /// `None` is stored as NULL: the run could not count it.
-    pub fn insert_backup_run(&self, run: &NewBackupRun<'_>) -> SqlResult<i64> {
+    pub fn insert_backup_run(&self, run: &NewBackupRun<'_>) -> Result<i64, rusqlite::Error> {
         let errors_str = run.errors.join("\n");
         self.conn.execute(
             "INSERT INTO backup_runs (timestamp, success, mode, snaps_created, snaps_sent, bytes_sent, duration_secs, errors)
@@ -1138,7 +1138,10 @@ impl Database {
     }
 
     /// Get the most recent backup runs, ordered newest first.
-    pub fn get_backup_history(&self, limit: usize) -> SqlResult<Vec<BackupRunRecord>> {
+    pub fn get_backup_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<BackupRunRecord>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent, duration_secs, errors
              FROM backup_runs ORDER BY timestamp DESC LIMIT ?1",
@@ -1255,7 +1258,7 @@ pub struct BackupRunRecord {
 
 /// A run count as stored: NULL when it is not known. A count beyond what
 /// SQLite's 64-bit signed integer holds is refused, never wrapped negative.
-fn count_to_sql(count: Option<u64>) -> SqlResult<Option<i64>> {
+fn count_to_sql(count: Option<u64>) -> Result<Option<i64>, rusqlite::Error> {
     count
         .map(i64::try_from)
         .transpose()
@@ -1264,7 +1267,7 @@ fn count_to_sql(count: Option<u64>) -> SqlResult<Option<i64>> {
 
 /// A run count as read: NULL is "not known". A negative value cannot be
 /// stored (the column's CHECK), so one read back is an error, not a count.
-fn count_from_sql(row: &rusqlite::Row<'_>, idx: usize) -> SqlResult<Option<u64>> {
+fn count_from_sql(row: &rusqlite::Row<'_>, idx: usize) -> Result<Option<u64>, rusqlite::Error> {
     row.get::<_, Option<i64>>(idx)?
         .map(|n| u64::try_from(n).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, n)))
         .transpose()
