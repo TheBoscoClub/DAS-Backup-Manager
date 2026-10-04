@@ -38,9 +38,11 @@
 //! lock file, a duration, a user) not. A word a program is given, it may
 //! run: it is read like a program, unless the program is [`INERT`] as that
 //! OS ships it. A word that only contains btrbk (`btrbk.sh`, `run-btrbk`)
-//! means it may. sh's redirections, `case` patterns and a `$((…))` with no
-//! command substitution in it are no commands, and its brace expansion is
-//! each word it makes; builtins are not looked up — a function's name is,
+//! means it may. sh's redirections, `case` patterns and a `$((…))` bash
+//! reads as arithmetic, with no command substitution in it, are no commands;
+//! a command substitution in double quotes is read as an unquoted one; its
+//! brace expansion is each word it makes; builtins are not looked up — a
+//! function's name is,
 //! as a wrapper, `exec` or a branch where it is not defined runs the
 //! program. When a cron daemon is among the units, its tables and scripts
 //! are read the same way. Each runner's config is the `-c` it passes, else
@@ -71,8 +73,9 @@
 //! point of its `etc/fstab` or of a `.mount` unit (CachyOS mounts `/root`,
 //! `/home`, `/srv` from subvolumes of their own), or under a tree only a
 //! running system fills (`/run`…), by its path or through a link on the way,
-//! is not what it will see there, so it is unknown. A word that is not
-//! there, and nowhere boot could see another, is nothing to run.
+//! is not what it will see there, so it is unknown — a unit tree under one
+//! may hold any unit. A word that is not there, and nowhere boot could see
+//! another, is nothing to run.
 //!
 //! Not read, so a `no` holds only within it (the man page lists each in
 //! plain words): a program named through a variable or in an option's
@@ -85,8 +88,11 @@
 //! argument; a program put in place at boot and then run, or written to a
 //! memory filesystem other than `/run` (a tmpfs `/tmp`); `DefaultEnvironment=`
 //! in `system.conf` and a login shell's `/etc/profile.d`; a function named
-//! like an [`INERT`] program that a script gets from a file it sources;
-//! units generators create at boot (and `systemd.unit=` on the kernel
+//! like an [`INERT`] program that a script gets from a file it sources; a
+//! command substitution in a `for`, `select` or `case` header; a directory
+//! only that OS can resolve at the front of a unit's `PATH` once a script
+//! sets its own, where a program found in a directory the script added
+//! hides it; units generators create at boot (and `systemd.unit=` on the kernel
 //! command line), units udev, D-Bus or mounts start, user units and user
 //! managers, and `/etc/rc.local`.
 
@@ -1508,7 +1514,8 @@ fn is_unit_name(name: &str) -> bool {
 /// alias, loaded by that unit's own name ("treating as alias"); any other —
 /// out of the trees, however its links go on — is a linked unit file:
 /// `name`'s own, whose text is the file its links lead to. A link, or the
-/// file it leads to, that boot sees elsewhere ([`shadowed`]) is unknown. A
+/// file it leads to, that boot sees elsewhere ([`shadowed`]) is unknown,
+/// there or not, in a tree here or not. A
 /// link that cannot be read is a package's alias in the vendor tree,
 /// skipped, and unknown anywhere else — `systemctl link`, `mask` and an
 /// `enable` alias then cannot be told apart.
@@ -1522,11 +1529,11 @@ fn find_unit_file(
     let template = template_of(name);
     for candidate in std::iter::once(name.to_string()).chain(template.clone()) {
         for tree in trees {
-            match &tree.listing {
-                Listing::Absent => continue,
-                Listing::Unreadable(why) => return UnitFile::Unknown(why.clone()),
-                Listing::Names(names) if !names.contains(&candidate) => continue,
-                Listing::Names(_) => {}
+            // A name the listing lacks is looked for all the same, in a tree
+            // not here too: what is not here, under a mount point, may be
+            // there at boot.
+            if let Listing::Unreadable(why) = &tree.listing {
+                return UnitFile::Unknown(why.clone());
             }
             let rel = format!("{}/{candidate}", tree.rel);
             let (located, hops) = locate_via(root, &rel, probe);
@@ -1659,11 +1666,10 @@ fn read_drop_ins(
     let dirs: Vec<String> = names.iter().flat_map(|n| drop_in_dirs(n)).collect();
     for dir in dirs {
         for (rank, tree) in trees.iter().enumerate() {
-            // A name its listing lacks is absent to `locate` too.
-            match &tree.listing {
-                Listing::Absent => continue,
-                Listing::Unreadable(why) => return Err(why.clone()),
-                Listing::Names(_) => {}
+            // A name its listing lacks, or a tree not here, is absent to
+            // `locate` too, and unknown where boot sees something else.
+            if let Listing::Unreadable(why) = &tree.listing {
+                return Err(why.clone());
             }
             let rel = format!("{}/{dir}", tree.rel);
             let (located, hops) = locate_via(root, &rel, probe);
@@ -1907,19 +1913,66 @@ fn load_unit(
     }
 }
 
-/// The words of a command or a script line: split at blanks and at shell
-/// operators, each operator a word of its own; quotes group and are removed,
-/// a backslash escapes the next character. systemd's `|` prefix is split off
-/// as an operator, before the word it prefixes. A `&` in a redirection
-/// (`&>`, `2>&1`) is no operator, and `$((…))` is one word — unless a
-/// command substitution is in it ([`substitutes`]), whose command runs.
+/// The words of a command or a script line as systemd reads a command: split
+/// at blanks and at shell operators, each operator a word of its own; quotes
+/// group and are removed, a backslash escapes the next character. systemd's
+/// `|` prefix is split off as an operator, before the word it prefixes. A
+/// `&` in a redirection (`&>`, `2>&1`) is no operator, and `$((…))` is one
+/// word where bash reads arithmetic ([`arithmetic_closes`]) with no command
+/// substitution in it ([`substitutes`]); else its command runs.
 fn words(line: &str) -> Vec<String> {
+    split(line, false)
+}
+
+/// [`words`] as sh reads a line: a command substitution in double quotes
+/// (`"$(cmd)"`, `` "`cmd`" ``) runs as an unquoted one does, so its words
+/// are split out of the quotes, which go on after it. systemd's quotes are
+/// its own: a `sh -c "… $(cmd)"` line it passes on whole is that shell's.
+fn shell_words(line: &str) -> Vec<String> {
+    split(line, true)
+}
+
+/// Where a command substitution split out of double quotes ends
+/// ([`shell_words`]): the quote goes on after it.
+#[derive(Debug, PartialEq, Eq)]
+enum Resume {
+    /// At the `)` that brings the parentheses open outside quotes back to
+    /// this many.
+    Paren(usize),
+    /// At the next backtick.
+    Backtick,
+}
+
+/// [`words`], or with `shell` [`shell_words`].
+fn split(line: &str, shell: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
+    // Parentheses open outside quotes, and where each substitution split
+    // out of double quotes ends.
+    let mut depth = 0usize;
+    let mut resume: Vec<Resume> = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
+        if shell && quote == Some('"') {
+            if c == '`' {
+                quote = None;
+                if !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+                in_word = false;
+                out.push(c.to_string());
+                resume.push(Resume::Backtick);
+                continue;
+            }
+            if c == '$' && chars.peek() == Some(&'(') {
+                quote = None;
+                resume.push(Resume::Paren(depth));
+            }
+        }
+        // Whether a substitution split out of double quotes ends here.
+        let mut ended = false;
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) if c == '\\' => word.extend(chars.next()),
@@ -1945,11 +1998,13 @@ fn words(line: &str) -> Vec<String> {
                 }
                 '$' if chars.peek() == Some(&'(')
                     && chars.clone().nth(1) == Some('(')
+                    && arithmetic_closes(chars.clone())
                     && !substitutes(&arithmetic(chars.clone())) =>
                 {
                     word.push(c);
                     word.push_str(&arithmetic(chars.by_ref()));
                     in_word = true;
+                    ended = resume.last() == Some(&Resume::Paren(depth));
                 }
                 ';' | '&' | '|' | '(' | ')' | '`' => {
                     if in_word {
@@ -1957,6 +2012,15 @@ fn words(line: &str) -> Vec<String> {
                         in_word = false;
                     }
                     out.push(c.to_string());
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            ended = resume.last() == Some(&Resume::Paren(depth));
+                        }
+                        '`' => ended = resume.last() == Some(&Resume::Backtick),
+                        _ => {}
+                    }
                 }
                 c => {
                     word.push(c);
@@ -1964,11 +2028,39 @@ fn words(line: &str) -> Vec<String> {
                 }
             },
         }
+        if ended {
+            // The double quote it was in goes on, unless it closes at once.
+            resume.pop();
+            if chars.next_if_eq(&'"').is_none() {
+                quote = Some('"');
+                in_word = true;
+            }
+        }
     }
     if in_word {
         out.push(word);
     }
     out
+}
+
+/// Whether `$((` opens arithmetic as bash reads it (`chars` from its first
+/// `(`): the second `(` must close right before a last `)`. Else it is a
+/// command substitution whose command starts with a subshell,
+/// `$( (cmd) … )`.
+fn arithmetic_closes(mut chars: impl Iterator<Item = char>) -> bool {
+    chars.next();
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return chars.next() == Some(')');
+            }
+        }
+    }
+    false
 }
 
 /// An arithmetic expansion's text after its `$`: from its first `(` to the
@@ -3393,6 +3485,8 @@ impl Findings<'_> {
     ) -> Runs {
         let mut raw_words = words(raw);
         let grammar = if raw_words.first().is_some_and(|w| w == "|") {
+            // The rest is a shell's, which reads its own quotes.
+            raw_words = shell_words(raw);
             raw_words.remove(0);
             Grammar::Shell
         } else {
@@ -3525,7 +3619,7 @@ impl Findings<'_> {
                 let mut path = path.clone();
                 let mut cases = Cases::default();
                 for line in lines {
-                    let words = cases.commands(words(&line));
+                    let words = cases.commands(shell_words(&line));
                     runs.extend(self.words_run(at, &mut path, &words, Grammar::Shell));
                 }
                 runs
@@ -3879,7 +3973,7 @@ impl Findings<'_> {
                 };
                 let mut cases = Cases::default();
                 for line in lines {
-                    let words = cases.commands(words(&line));
+                    let words = cases.commands(shell_words(&line));
                     runs.extend(self.words_run(inside, &mut path, &words, Grammar::Shell));
                 }
             }
@@ -4018,7 +4112,7 @@ impl Findings<'_> {
                         let mut path = known(&CRON_PATH);
                         let mut cases = Cases::default();
                         for line in lines {
-                            let words = cases.commands(words(&line));
+                            let words = cases.commands(shell_words(&line));
                             let runs = self.words_run(at, &mut path, &words, Grammar::Shell);
                             for (script, arg) in runs {
                                 self.runner(rel, Some(daemon), script, when, arg);
@@ -4059,7 +4153,7 @@ impl Findings<'_> {
                         let mut job = path.clone();
                         let mut cases = Cases::default();
                         for command in commands {
-                            let words = cases.commands(words(&command));
+                            let words = cases.commands(shell_words(&command));
                             let runs = self.words_run(at, &mut job, &words, Grammar::Shell);
                             for (script, arg) in runs {
                                 self.runner(rel, Some(daemon), script, when, arg);
@@ -5225,9 +5319,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         configure(root);
-        // A mounted /usr/local: `.` or `source` looked up there as a program
-        // may be anything; as the shell's own there is nothing to look up.
-        write(root, "etc/fstab", "x /usr/local btrfs subvol=@local 0 0\n");
+        // A mounted /usr/local/bin: `.` or `source` looked up there as a
+        // program may be anything; as the shell's own there is nothing to look
+        // up. (All of /usr/local mounted would cover its unit tree too, unknown
+        // first: mr_s1b.)
+        write(
+            root,
+            "etc/fstab",
+            "x /usr/local/bin btrfs subvol=@localbin 0 0\n",
+        );
         unit(
             root,
             ETC,
@@ -6005,6 +6105,9 @@ mod tests {
             ("job@.service", "snap@%n.service", None),
             ("job@.service", "snap@%N.service", None),
             ("job@.service", "snap@%p.service", Some("snap@job.service")),
+            // A template pulling a template: systemd's `resolve_template`
+            // names it with the puller's prefix where it has no instance.
+            ("job@.service", "snap@.service", Some("snap@job.service")),
             ("job.service", "snap@.socket", Some("snap@job.socket")),
             (
                 "db-backup@x.service",
@@ -8725,7 +8828,10 @@ mod tests {
             "test -x /root/bin/backup.sh\n[ -x /root/bin/backup.sh ]\n",
         );
         assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
-        // ...where a shell runs them; systemd runs what it finds.
+        // ...named bare, where a shell runs them; by its path a program of
+        // that name is what runs, and systemd runs what it finds.
+        outer(root, "/usr/local/bin/test /root/bin/backup.sh\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
         nightly_runs(root, "ExecStart=test -x /root/bin/backup.sh");
         assert_eq!(verdict_of(root).0, BootVerdict::May);
     }
@@ -8753,6 +8859,228 @@ mod tests {
             nightly_runs(root, exec);
             assert_eq!(verdict_of(root).0, BootVerdict::May, "{exec}");
         }
+    }
+
+    // ---- merge readiness: the merge diff's survivors, the final review ------
+
+    #[test]
+    fn mr_s2_a_template_pulling_a_template_names_it_with_its_prefix() {
+        // An Accept=yes socket's service is a template; one it pulls in is
+        // named with its prefix, so that one's %i is the prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        unit(
+            root,
+            VENDOR,
+            "snapd.socket",
+            "[Socket]\nListenStream=7777\nAccept=yes\n",
+        );
+        enable(root, ETC, "sockets.target.wants", "snapd.socket");
+        unit(
+            root,
+            VENDOR,
+            "snapd@.service",
+            "[Unit]\nWants=job@.service\n[Service]\nExecStart=/usr/bin/true\n",
+        );
+        unit(
+            root,
+            VENDOR,
+            "job@.service",
+            "[Service]\nType=oneshot\nExecStart=/usr/bin/btrbk -c /etc/btrbk/%i.conf run\n",
+        );
+        write(root, "etc/btrbk/snapd.conf", "volume /mnt/x\n");
+        let b = at_boot(root);
+        assert_eq!(b.verdict, BootVerdict::Will, "{:?}", b.reasons);
+        assert_eq!(
+            b.runners,
+            [runner(
+                "job@snapd.service",
+                Some("snapd@.service"),
+                "when something connects to it",
+                Some("/etc/btrbk/snapd.conf"),
+                Some(true)
+            )]
+        );
+    }
+
+    #[test]
+    fn mr_s3_a_cron_script_s_function_named_cp_may_run_what_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cron_root(root);
+        write(
+            root,
+            "etc/fstab",
+            "UUID=x / btrfs subvol=/@ 0 0\nUUID=x /root btrfs subvol=/@root 0 0\n",
+        );
+        write(
+            root,
+            "etc/cron.daily/job",
+            "cp() { \"$@\"; }\ncp /root/bin/backup.sh\n",
+        );
+        assert_eq!(at_boot(root).verdict, BootVerdict::May);
+        // The converse: no function by that name, and cp found nowhere,
+        // runs nothing it is given.
+        write(root, "etc/cron.daily/job", "cp /root/bin/backup.sh\n");
+        assert_eq!(at_boot(root), nothing());
+    }
+
+    #[test]
+    fn mr_s1_a_unit_tree_under_a_mount_point_may_hold_a_unit_its_copy_here_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        fs::create_dir_all(root.join(LOCAL)).unwrap();
+        link(
+            root,
+            &format!("{ETC}/multi-user.target.wants/extra.service"),
+            &format!("/{LOCAL}/extra.service"),
+        );
+        write(
+            root,
+            "etc/fstab",
+            "UUID=x / btrfs subvol=/@ 0 0\nUUID=x /usr/local btrfs subvol=/@usrlocal 0 0\n",
+        );
+        let reasons = verdict_of(root).1;
+        assert!(
+            reasons.iter().any(|r| r
+                == "extra.service may run btrbk: usr/local/lib/systemd/system/extra.service: \
+                    under /usr/local, which that OS mounts from elsewhere (etc/fstab)"),
+            "{reasons:?}"
+        );
+        // The converse: a tree boot sees as it is here — a unit it lacks is
+        // in no tree, and runs nothing.
+        write(root, "etc/fstab", "UUID=x / btrfs subvol=/@ 0 0\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn mr_s1b_a_unit_tree_under_a_mount_point_may_hold_a_unit_though_it_is_not_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        // An empty mount point, as `@` holds one: no unit tree under it here.
+        assert!(root.join("usr/local").is_dir() && !root.join(LOCAL).exists());
+        link(
+            root,
+            &format!("{ETC}/multi-user.target.wants/extra.service"),
+            &format!("/{LOCAL}/extra.service"),
+        );
+        unit(
+            root,
+            ETC,
+            "plain.service",
+            "[Service]\nExecStart=/usr/bin/true\n",
+        );
+        enable(root, ETC, "multi-user.target.wants", "plain.service");
+        write(
+            root,
+            "etc/fstab",
+            "UUID=x / btrfs subvol=/@ 0 0\nUUID=x /usr/local btrfs subvol=/@usrlocal 0 0\n",
+        );
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::May, "{reasons:?}");
+        let why = "under /usr/local, which that OS mounts from elsewhere (etc/fstab)";
+        // A unit no tree here holds; and one a tree above it holds, whose
+        // drop-ins it may hold.
+        for expected in [
+            format!("extra.service may run btrbk: {LOCAL}/extra.service: {why}"),
+            format!("plain.service may run btrbk: {LOCAL}/plain.service.d: {why}"),
+        ] {
+            assert!(reasons.contains(&expected), "{expected}\n{reasons:?}");
+        }
+        // The converse: a tree boot sees as it is here — not there at boot
+        // either, so it holds nothing.
+        write(root, "etc/fstab", "UUID=x / btrfs subvol=/@ 0 0\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn mr_ar1_dollar_double_paren_is_arithmetic_only_where_it_closes_with_two() {
+        for body in [
+            "n=$((snap-run) )\n",
+            "n=$((snap-run) | wc -l)\n",
+            "echo $((snap-run) && true)\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            outer(root, body);
+            snap(root, "usr/local/bin", "snap-run");
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{body}");
+            // The converse: arithmetic that closes with `))` runs nothing.
+            outer(root, "n=$(( snap-run ))\nm=$(( (snap-run) * 2 ))\n");
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{body}");
+        }
+    }
+
+    #[test]
+    fn mr_q_a_command_substitution_in_double_quotes_runs() {
+        for body in [
+            // q1, q2, q4, q5, and one inside a longer quoted word.
+            "x=\"$(snap-run)\"\n",
+            "echo \"$(/usr/local/bin/snap-run)\"\n",
+            "x=\"`snap-run`\"\n",
+            "n=\"$(( $(snap-run) + 0 ))\"\n",
+            "echo \"a $(snap-run) b\" c\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            outer(root, body);
+            snap(root, "usr/local/bin", "snap-run");
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{body}");
+            // The converse: in single quotes, escaped, or arithmetic alone,
+            // nothing runs.
+            outer(
+                root,
+                "x='$(snap-run)'\ny=\"\\$(snap-run)\"\nz=\"$((1 + 2))\"\n",
+            );
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{body}");
+        }
+        // systemd's own quotes keep a sh -c line whole: sh -c runs it. A
+        // line systemd hands a shell (`|`) is that shell's to read.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        snap(root, "usr/local/bin", "snap-run");
+        for exec in [
+            "ExecStart=/bin/sh -c \"x $(snap-run)\"",
+            "ExecStart=|x=\"$(snap-run)\"",
+        ] {
+            nightly_runs(root, exec);
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{exec}");
+        }
+    }
+
+    #[test]
+    fn sh_splits_a_double_quoted_command_substitution_out_and_systemd_does_not() {
+        let s = |line: &str| shell_words(line);
+        assert_eq!(s("x=\"$(a b)\" c"), ["x=$", "(", "a", "b", ")", "c"]);
+        assert_eq!(s("x=\"p $(a) q\""), ["x=p $", "(", "a", ")", " q"]);
+        assert_eq!(s("x=\"`a`\""), ["x=", "`", "a", "`"]);
+        assert_eq!(s("x=\"a`b`c\""), ["x=a", "`", "b", "`", "c"]);
+        assert_eq!(s("\"$((1+2))\" z"), ["$((1+2))", "z"]);
+        assert_eq!(s("\"$(echo \"a b\")\""), ["$", "(", "echo", "a b", ")"]);
+        assert_eq!(
+            s("\"$(echo `a`)\" \"`echo $(b)`\""),
+            [
+                "$", "(", "echo", "`", "a", "`", ")", "`", "echo", "$", "(", "b", ")", "`"
+            ]
+        );
+        // Parentheses inside it end nothing; its own last one does.
+        assert_eq!(
+            s("\"$(a (b) c)\" d"),
+            ["$", "(", "a", "(", "b", ")", "c", ")", "d"]
+        );
+        assert_eq!(s("'$(a)' \"\\$(b)\" \"${c}\""), ["$(a)", "$(b)", "${c}"]);
+        // Only `$(` leaves the quotes: a variable, or a parenthesis alone,
+        // stays in them, blanks and all.
+        assert_eq!(s("\"$x y\" \"a(b) c\""), ["$x y", "a(b) c"]);
+        // systemd's quotes are its own: what sh -c is given stays one word.
+        assert_eq!(words("sh -c \"x $(a)\""), ["sh", "-c", "x $(a)"]);
+        assert_eq!(words("x=\"`a`\""), ["x=`a`"]);
     }
 
     // ---- fix round 4: words, redirections, cases, braces, paths ----------
@@ -8820,7 +9148,18 @@ mod tests {
             ["echo", "$(( (1+2) * 3 ))", "z"]
         );
         assert_eq!(w("v=$(date) z"), ["v=$", "(", "date", ")", "z"]);
-        assert_eq!(w("$((open"), ["$((open"]);
+        // `$((` is arithmetic only where its second `(` closes right before
+        // a last `)`, as bash reads it; else a command substitution of a
+        // subshell. Unclosed, it is a substitution too.
+        assert_eq!(
+            w("$((a) + (b))"),
+            ["$", "(", "(", "a", ")", "+", "(", "b", ")", ")"]
+        );
+        assert_eq!(
+            w("x=$((cmd) | wc -l)"),
+            ["x=$", "(", "(", "cmd", ")", "|", "wc", "-l", ")"]
+        );
+        assert_eq!(w("$((open"), ["$", "(", "(", "open"]);
         // Arithmetic in arithmetic is one word; a command substitution in
         // it runs a command, so it is split as sh splits it.
         assert_eq!(w("x=$(( $((1+2)) * 3 ))"), ["x=$(( $((1+2)) * 3 ))"]);
@@ -10025,18 +10364,24 @@ mod tests {
         );
         fs::remove_file(root.join("usr/local/bin/snap")).unwrap();
         script(root, "usr/local/sbin/snap", "btrbk -c /opt/s.conf run\n");
-        // A directory searched that that OS mounts: it may be there.
+        // A directory searched that that OS mounts: it may be there. (All of
+        // /usr/local mounted would cover its unit tree too, unknown first:
+        // mr_s1b.)
         fs::remove_dir_all(root.join("usr/sbin")).unwrap();
         fs::remove_dir_all(root.join("usr/local")).unwrap();
         fs::remove_file(root.join("usr/bin/snap")).unwrap();
-        write(root, "etc/fstab", "x /usr/local btrfs subvol=@local 0 0\n");
+        write(
+            root,
+            "etc/fstab",
+            "x /usr/local/bin btrfs subvol=@localbin 0 0\n",
+        );
         let b = at_boot(root);
         assert_eq!(b.verdict, BootVerdict::May);
         assert_eq!(
             b.reasons,
             [
                 "backup.service may run btrbk through /usr/local/bin/snap: usr/local/bin/snap: \
-              under /usr/local, which that OS mounts from elsewhere (etc/fstab)"
+              under /usr/local/bin, which that OS mounts from elsewhere (etc/fstab)"
             ]
         );
         // In a script, and in a cron line, the same.
