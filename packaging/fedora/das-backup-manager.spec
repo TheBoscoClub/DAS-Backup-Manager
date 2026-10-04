@@ -16,6 +16,8 @@ BuildRequires:  cmake(KF6Notifications) cmake(KF6StatusNotifierItem)
 BuildRequires:  cmake(Qt6Charts)
 Requires:       btrbk btrfs-progs smartmontools bash util-linux
 Recommends:     s-nail mbuffer
+# The recovery-os-updater VM (recovery-os-vm.sh): optional, and heavy.
+Suggests:       libvirt-daemon-kvm libvirt-client qemu-kvm edk2-ovmf virt-viewer ImageMagick jq
 Requires:       qt6-qtbase qt6-qtcharts kf6-kcoreaddons kf6-ki18n kf6-kxmlgui
 Requires:       kf6-kconfigwidgets kf6-kiconthemes kf6-kcrash kf6-kio
 Requires:       kf6-knotifications kf6-kstatusnotifieritem
