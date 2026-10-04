@@ -14,7 +14,7 @@ Both rewrite `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup
 (truncate, same inode). Bash reads a running script incrementally, so a read landing in the
 truncation window sees EOF: the run fires its `EXIT` trap, unmounts, and **ends early looking
 like a clean finish** (exit 0, no prune, no report). The `2lj` staleness guard does NOT protect
-against this, and `setup` takes neither lock. Check first, every time:
+against this, and `setup` holds neither lock while it writes. Check first, every time:
 
 ```bash
 if systemctl is-active -q das-backup.service das-backup-full.service || ! flock -n /run/das-backup.lock true; then echo "WAIT — do not install"; fi

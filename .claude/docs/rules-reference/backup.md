@@ -27,9 +27,9 @@ script is byte-identical to the embedded copy, so the guard is inert and
 `setup --upgrade` rewrites it. `2lj` guards against a *stale downgrade*; it is not a
 concurrency lock and there is no lock here — `setup` holds neither
 `/run/das-backup.lock` nor `/run/das-maintenance.lock` while it writes. (After the files are
-written, `setup --upgrade` takes the maintenance lock for an instant and lets go, only to decide
-whether `btrdasd-helper` can be restarted — bd `6wt`; that protects a GUI job in the helper, not
-a running `backup-run.sh`.)
+written, `setup --upgrade` holds the maintenance lock through `systemctl try-restart
+btrdasd-helper.service`, at most 300 s, and exits 3 without restarting when another holds it —
+bd `6wt`; that protects a GUI job in the helper, not a running `backup-run.sh`.)
 
 The database adds a second reason since schema 4 (bd `6wt`): the first open by a new binary
 migrates `backup_runs` inside `BEGIN IMMEDIATE`, which waits up to the 30 s busy timeout behind

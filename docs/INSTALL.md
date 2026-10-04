@@ -116,9 +116,12 @@ sudo btrdasd setup --upgrade
 
 Regenerates all files from the existing config without re-running the wizard, then restarts the D-Bus helper (`btrdasd-helper.service`) so it runs the binary just installed — it runs as root for as long as the system does, and nothing else restarts it. Use this after updating the binaries (`cmake --install` or a package), never while a backup runs (see below).
 
-- If the DAS maintenance lock is held — a backup, restore or index job may be running in the helper — the helper is **not** restarted: the upgrade names the holder and the command to run once the job has finished, `sudo systemctl try-restart btrdasd-helper.service`.
-- A restart that fails, or a unit state or lock that cannot be read, ends the upgrade with an error saying so.
-- A helper that is not running is left alone: D-Bus starts it from the new binary when it is next needed. On an init system other than systemd, restart a running `btrdasd-helper` yourself.
+- The restart is done holding the DAS maintenance lock, from before `systemctl try-restart` until it returns, so a backup or restore asked of the helper meanwhile waits instead of mounting a target the restart would kill. The hold is bounded at 300 s: a `try-restart` that has not returned by then is reported as failed and the lock let go.
+- If the lock is held by another — a backup, restore or index job may be running in the helper — the helper is **not** restarted: the upgrade names the holder and the command to run once the job has finished, `sudo systemctl try-restart btrdasd-helper.service`, and exits **3**.
+- A restart that fails or does not return in time, or a unit state or lock that cannot be read, ends the upgrade with an error, exit **1**.
+- A helper that is not running is left alone (exit 0): D-Bus starts it from the new binary when it is next needed. On an init system other than systemd the upgrade cannot restart it: restart a running `btrdasd-helper` yourself; the upgrade exits 3.
+
+Exit status: **0** files upgraded and the helper restarted (or not running); **3** files upgraded, helper restart deferred — the output says who holds the lock and what to run; **1** something failed. Treat 3 as "upgraded, restart the helper later", not as a failed install. Nothing in this repository's packaging runs `setup --upgrade`; a script of your own that does should handle 3 the same way.
 
 **Keep `btrdasd`, `btrdasd-helper` and the scripts at one version.** Since schema 4 the backup history stores a snapshot count a run could not take as unknown (NULL), and the first open by a schema-4 binary migrates the database to it. A `btrdasd` or `btrdasd-helper` built before schema 4 cannot read a run with unknown counts: its history fails — `btrdasd backup report` prints `Error: InvalidColumnType(4, "snaps_created", Null)`, and the GUI reports `History query failed: Invalid column type Null at index: 4, name: snaps_created` and shows an empty history. That is why the helper is restarted. Rolling back to such a binary needs the database as it was before the upgrade, or accepts that error while any such run is in the history (an old binary can still record runs).
 
