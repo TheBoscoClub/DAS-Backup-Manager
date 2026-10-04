@@ -31,7 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     # Same base image as the Arch release job, so CI and the shipped package are
     # built by the same toolchain rather than two that drift independently.
-    container: archlinux:latest
+    # /tmp is a noatime tmpfs, as every DAS target is mounted: the recovery-OS
+    # tests read a link there, and fail under CI where none can be found.
+    container:
+      image: archlinux:latest
+      options: --tmpfs /tmp:rw,exec,nosuid,nodev,noatime,mode=1777,size=4g
     steps:
       - uses: actions/checkout@v7.0.1
 

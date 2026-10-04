@@ -1393,22 +1393,21 @@ through a link. A word whose last component only contains
 .RB ( btrbk.sh ,
 .BR run\-btrbk ,
 .IR /etc/btrbk.conf )
-means it may: what that runs is not known. Programs are read where they run:
-the program of an
+means it may: what that runs is not known. The rule throughout: nothing that
+may run is read as nothing unless it is known not to run. Programs are read
+where they run: the program of an
 .B Exec*=
 command, taken literally as systemd takes it (a
 .B $
 or a glob in it is part of its name; a specifier it cannot resolve here is
-unknown) and found by name where systemd looks \(em
-.I /usr/local/bin
-and
-.IR /usr/bin ,
-and their sbin counterparts on a system that keeps sbin apart, as
-.BR systemd.service (5)
-documents; the first word of each shell command, found the same way; the
-script a shell or an interpreter is given, read even with no
+unknown); the first word of each shell command; the script a shell is given,
+read as sh even with no
 .B #!
-line, as the shell runs it anyway; the command a wrapper runs
+line; the script another interpreter is given
+.RB ( python3 ,
+.BR perl ,
+and others), only searched for btrbk's name, which makes it may; the command
+a wrapper runs
 .RB ( env ,
 .BR nice ,
 .BR ionice ,
@@ -1423,27 +1422,90 @@ and others); and a
 .B \-c
 line. A
 .B #!
-script is read whole when it is no larger than 64 KiB (larger, or
-unreadable, is unknown), as sh reads it \(em a backslash at the end of a line
-joins the next, a quoted string may run across lines, a comment and a
-here\-document are no commands, and one that ends inside a quote or after a
-joining backslash is unknown \(em and so are the scripts it runs, four
-scripts deep at most (deeper is unknown). A binary is not looked into. Any
-other absolute path on a command line is read only if it is a
+script whose interpreter is a shell is read whole when it is no larger than
+64 KiB (larger, or unreadable, is unknown), as sh reads it \(em a backslash at
+the end of a line joins the next, a quoted string may run across lines; a
+comment, a here\-document, a
+.B case
+pattern and a redirection are no commands;
+.B $((\|...\|))
+is one word; braces expand into each word they make (more than 16 is
+unknown); a builtin, or one of the script's own functions, is no program
+\(em and so are the scripts it runs, four scripts deep at most (deeper is
+unknown); one that ends inside a quote or after a joining backslash is
+unknown. One whose
 .B #!
-script there; a plain argument that is not there is no program, and is
-ignored. An argument of btrbk's with a variable or a command substitution in
-it \(em
+names another interpreter is that interpreter's. A binary is not looked into.
+.PP
+A word a program is given may be one it runs, so it is read like one: a
+.B #!
+script there is read, and one boot may see differently (below) is unknown \(em
+unless the program is one known not to run its operands:
+.BR install ,
+.BR mkdir ,
+.BR chown ,
+.BR chmod ,
+.BR chgrp ,
+.BR touch ,
+.BR ln ,
+.BR cp ,
+.BR mv ,
+.BR rm ,
+.BR rmdir ,
+.BR mknod ,
+.BR mkfifo ,
+.BR test ,
+.BR [ ,
+and btrbk, whose
+.B \-c
+is judged as its config. A word not there, nor anywhere boot could see
+another, is nothing to run, and so is
+.IR /dev/null .
+A redirection gives its target to the command only when the command reads it
+.RB ( < ).
+An argument of btrbk's with a variable or a command substitution in it \(em
 .B \(dq$@\(dq
 forwarded by a wrapper,
 .B $OPTS
-from the unit's environment \(em leaves its config unknown.
+from the unit's environment \(em may carry a
+.B \-c
+only that OS sees, so its config is unknown.
+.PP
+A program named without a path is found where it would be. systemd looks for
+the program of an
+.B Exec*=
+command in
+.B ExecSearchPath=
+when the unit sets one, else in its own fixed path \(em
+.I /usr/local/bin
+and
+.IR /usr/bin ,
+and their sbin counterparts on a system that keeps sbin apart, as
+.BR systemd.service (5)
+documents; one found only in the unit's
+.B PATH
+may or may not run. Anything else looks a bare name up in
+.BR $PATH :
+the unit's \(em what
+.B Environment=
+or an
+.B EnvironmentFile=
+sets, else
+.BR ExecSearchPath= ,
+else systemd's
+.I /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+.RB ( systemd.exec (5);
+systemd expands no variable there) \(em as a script then sets it, a file it
+sources included, or as a cron table sets it (a cron job starts from every
+standard directory). A directory only that OS can resolve \(em a variable, a
+relative entry, an environment file that cannot be read \(em leaves a name
+not found before it unknown.
 .PP
 The root read is that OS's
 .B @
-subvolume alone. A program, script,
+subvolume alone. A program, script, argument,
 .B \-c
-config or cron table at or under a mount point of its
+config, unit file, drop\-in or cron table at or under a mount point of its
 .IR etc/fstab ,
 or of a
 .B .mount
@@ -1451,8 +1513,7 @@ or
 .B .automount
 unit (named after the path it mounts), is not the one it will see \(em the
 mount shadows the disk's copy at boot \(em so it is unknown; a memory
-filesystem's mount point holds nothing. So is anything not here when that
-fstab cannot be read. A program under
+filesystem's mount point holds nothing. So is one under
 .IR /run ,
 .IR /var/run ,
 .IR /var/lock ,
@@ -1460,8 +1521,9 @@ fstab cannot be read. A program under
 .I /proc
 or
 .IR /sys ,
-which only a running system fills, is unknown \(em something at boot may put
-it there; an argument there is ignored.
+which only a running system fills \(em something at boot may put it there
+\(em and one reached through a link that lives in such a place. So is
+anything not here when that fstab cannot be read.
 .PP
 When a cron daemon is among the units
 .RB ( cronie.service ,
@@ -1509,8 +1571,8 @@ with its size in bytes. A config is only checked with
 .BR lstat (2),
 never opened: its presence is the whole signal, and parsing another system's
 file would decide nothing. A config that only that OS could resolve (a
-variable, a specifier, a relative path), or that is under a mount point, is
-unknown.
+variable, a specifier, a relative path), or that boot may see differently
+(above), is unknown.
 .PP
 A link is read only on a mount that records no access time:
 .BR readlinkat (2)
@@ -1523,17 +1585,22 @@ or read\-only \(em as every DAS target is mounted, with
 .BR [das].mount_opts .
 There a link resolves inside the root (an absolute target is the root's,
 .B ..
-cannot leave it, at most 8 links): a link to
-.IR /dev/null ,
-or an empty unit file, masks the unit, which then runs nothing; a link to
-another unit's file makes the unit that unit's alias (to a template's file,
-of that template's same instance, as
+cannot leave it, at most 8 links): one that names
+.I /dev/null
+(however many
+.B ..
+it climbs, as at
+.BR / ),
+or an empty unit file, masks the unit, which then runs nothing; a unit
+file's link to another unit's file in a unit tree makes the unit that unit's
+alias (to a template's file, of that template's same instance, as
 .BR systemd.unit (5)
 says; an instance's link to its own template is its own file), read by that
 unit's own name (an
 .I /etc
-copy of it first) with the alias's drop\-ins too; a link to a program is that
-program. On any other mount a link is not read. A unit file linked into
+copy of it first) with the alias's drop\-ins too, and one to a file outside
+the unit trees is the unit's own file, as systemd reads a linked unit file;
+a link to a program is that program. On any other mount a link is not read. A unit file linked into
 .I /etc/systemd/system
 by
 .BR "systemctl link" ,
@@ -1548,7 +1615,8 @@ then cannot be told apart, and each is unknown, as is
 a link among the vendor units is a package's alias, not counted unless its
 name contains
 .BR btrbk ;
-a program named through a link is not looked into; and a path through one of
+a program named through a link may be anything, so it is unknown; and a
+path through one of
 Arch's merged\-/usr links
 .RI ( /bin ,
 .IR /sbin ,
@@ -1572,19 +1640,20 @@ named through a variable
 .BR $SCRIPT )
 or in an option's value
 .RB ( \-\-script=/path );
-the command of a wrapper this does not know; a program that is not a
-.B #!
-script and is not given to a shell \(em a binary, or a file run by a program
-this does not know as one; btrbk under another name as a renamed binary (a
-link to it is followed where links are read); units that generators create
-at boot (from
+the command of a wrapper this does not know; a binary, or a file run by a
+program this does not know as one; btrbk under another name as a renamed
+binary (a link to it is followed where links are read); what a directory a
+program is given holds; units that generators create at boot (from
 .IR etc/systemd/system\-generators ,
 .I usr/lib/systemd/system\-generators
 or a
 .B systemd.wants=
-on the kernel command line), and units udev, D\-Bus or a mount starts; user
-units, and a user manager \(em a lingering root user's included \(em that
-starts them; and
+on the kernel command line, where a
+.B systemd.unit=
+also boots another target than
+.BR default.target );
+units udev, D\-Bus or a mount starts; user units, and a user manager \(em a
+lingering root user's included \(em that starts them; and
 .IR /etc/rc.local .
 .PP
 .B "Enabled timers"

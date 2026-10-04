@@ -68,6 +68,17 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
 
+      # Every mutant runs the whole suite, and the recovery-OS tests read a
+      # link on a noatime mount, as every DAS target is mounted; they fail
+      # under CI where none can be found. The runner has none: make the temp
+      # dir one, under /tmp, where the restore tests' destinations must be.
+      - name: A noatime temp dir
+        run: |
+          sudo mkdir -p /tmp/noatime
+          sudo mount -t tmpfs -o rw,exec,nosuid,nodev,noatime,mode=1777,size=4g tmpfs /tmp/noatime
+          findmnt -no OPTIONS /tmp/noatime | grep -q noatime
+          echo "TMPDIR=/tmp/noatime" >> "$GITHUB_ENV"
+
       - name: Compute crate-relative diff
         id: diff
         working-directory: indexer
@@ -164,14 +175,14 @@ jobs:
   # Widened 2026-10-03 (bd 1yg) by the recovery-OS reading, which decides
   # whether booting a recovery drive's own OS would run btrbk — the update
   # VM's driver refuses on anything but "no" — and reads that OS without
-  # writing to it. Re-measured for its fix round 3: 1681 mutants in all —
-  # recovery_os.rs 232, recovery_os/**/*.rs 424, the rest 1025 — about 73
+  # writing to it. Re-measured for its fix round 4: 1815 mutants in all —
+  # recovery_os.rs 232, recovery_os/**/*.rs 558, the rest 1025 — about 80
   # minutes locally (the recovery-OS ones 3.3 s each: build 1.8 + test 1.6;
-  # the rest 37 minutes, as above), so about 4.4 hours on the runner at the
+  # the rest 37 minutes, as above), so about 4.8 hours on the runner at the
   # 3.6 ratio above: too near the 6-hour ceiling for one job, whose Mutants
   # step is continue-on-error (a killed job would mean no gate that week).
   # Hence two shards, round-robin so each gets its share of every module:
-  # 841 and 840 mutants, about 2.2 hours each, timeout-minutes 300. 7wb's
+  # 908 and 907 mutants, about 2.4 hours each, timeout-minutes 300. 7wb's
   # recovery_os/hold_disk.rs (about 26 more) joins through the glob when it
   # is merged.
   # Re-measure before widening:
@@ -196,6 +207,17 @@ jobs:
 
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+
+      # Every mutant runs the whole suite, and the recovery-OS tests read a
+      # link on a noatime mount, as every DAS target is mounted; they fail
+      # under CI where none can be found. The runner has none: make the temp
+      # dir one, under /tmp, where the restore tests' destinations must be.
+      - name: A noatime temp dir
+        run: |
+          sudo mkdir -p /tmp/noatime
+          sudo mount -t tmpfs -o rw,exec,nosuid,nodev,noatime,mode=1777,size=4g tmpfs /tmp/noatime
+          findmnt -no OPTIONS /tmp/noatime | grep -q noatime
+          echo "TMPDIR=/tmp/noatime" >> "$GITHUB_ENV"
 
       - name: Mutants
         working-directory: indexer
