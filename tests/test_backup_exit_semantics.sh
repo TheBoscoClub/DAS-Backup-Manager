@@ -60,6 +60,12 @@
 # findmnt stubs share one mount table (a file), so what the script mounts it
 # can verify, and what cleanup() leaves mounted the test can see.
 #
+# The host's name is bash's own $HOSTNAME (bd DAS-Backup-Manager-arv1), so no
+# `hostname` program is whitelisted: CI's container has none, and a run that
+# reached for one is "command not found" here. Each run is given HOSTNAME=
+# test-host.example.org, which bash keeps; one case leaves it out, to see bash
+# set it itself (neither unit source sets Environment=).
+#
 # Writes only beneath a mktemp directory. No root, no devices, no network.
 
 set -uo pipefail
@@ -160,7 +166,7 @@ esac
 # PATH: stubs, and a whitelist of harmless tools
 # ---------------------------------------------------------------------------
 mkdir -p "$BIN" "$SYSBIN"
-for tool in awk basename cat cut date dirname flock grep head hostname mkdir mktemp mv \
+for tool in awk basename cat cut date dirname flock grep head mkdir mktemp mv \
     rm rmdir sed setsid sleep sort tail timeout touch tr wc; do
     path="$(type -P "$tool")" || harness_broken "no $tool on this system"
     ln -s "$path" "$SYSBIN/$tool"
@@ -492,18 +498,24 @@ knob() { printf '%s\n' "$2" >"$STATE/knobs/$1"; }
 
 RUN_EUID=0
 RUN_BTRDASD="$BIN/btrdasd"
+# What the run's environment says HOSTNAME is; empty leaves it out, and bash
+# then sets it itself.
+RUN_HOSTNAME=test-host.example.org
 RC=""
 # The command line of one run, into CMD: the copy, under `env -i`. SIGPIPE
 # starts at its default, as it does in a terminal: a shell cannot trap a
 # signal it inherited ignored, so a suite started with PIPE ignored would
 # otherwise test nothing about it (systemd starts units with PIPE ignored).
 run_cmd() {
+    local -a host_env=()
+    [[ -n "$RUN_HOSTNAME" ]] && host_env=(HOSTNAME="$RUN_HOSTNAME")
     CMD=(env -i --default-signal=PIPE
         PATH="$BIN:$SYSBIN" HOME="$WORK/home" LC_ALL=C TMPDIR="$WORK/tmp"
         DAS_TEST_STATE="$STATE" DAS_TEST_EUID="$RUN_EUID"
         BTRDASD_BIN="$RUN_BTRDASD" DAS_CONFIG="$WORK/etc/config.toml"
         BOOT_ARCHIVE_CLEANUP_BIN="$BIN/boot-archive-cleanup.sh"
         DAS_RECOVERY_OS_STATE="$WORK/lib/recovery-os.json"
+        "${host_env[@]}"
         "$BASH" "$COPY" "$@")
 }
 tripwire() {
@@ -593,6 +605,10 @@ mail_subject() { sed -n '/^-s$/{n;p;q;}' "$STATE/mail.$1.args" 2>/dev/null; }
 mail_body() { cat "$STATE/mail.$1.body" 2>/dev/null; }
 # The status in a subject: "[DAS Backup] <host> — <STATUS> — <date>".
 mail_status() { mail_subject "$1" | awk -F ' — ' '{ print $2 }'; }
+# ... and what comes before it: "[DAS Backup] <host>".
+mail_subject_head() { mail_subject "$1" | awk -F ' — ' '{ print $1 }'; }
+# The From of mail <n>: the argument after -r.
+mail_from() { sed -n '/^-r$/{n;p;q;}' "$STATE/mail.$1.args" 2>/dev/null; }
 # The value after "  <label>:" in mail <n>.
 body_field() { sed -n "/^  $2: */{s///p;q;}" "$STATE/mail.$1.body" 2>/dev/null; }
 record_calls() { if [[ -f "$STATE/record_calls" ]]; then wc -l <"$STATE/record_calls" | tr -d ' '; else echo 0; fi; }
@@ -744,6 +760,59 @@ check "clean dry run: btrbk dryrun ran" "$(ran_btrbk)" "yes"
 check "clean dry run: nothing left mounted" "$(left_mounted)" "nothing"
 check "clean dry run: no mail" "$(mails)" "0"
 check "clean dry run: not recorded" "$(record_calls)" "0"
+
+# ---------------------------------------------------------------------------
+echo "== the host's name is bash's own \$HOSTNAME, never the hostname program"
+# ---------------------------------------------------------------------------
+# On a host without the program — CI's container is one, and no packaging
+# declares it — a run sent these with the name left blank: an empty "Host:", a
+# subject of "[DAS Backup]  — SUCCESS", a From of "DAS Backup ()", and "command
+# not found" in the journal (bd DAS-Backup-Manager-arv1). The whitelist has no
+# `hostname` now, so a run that reaches for it fails tripwire(); these cases
+# pin the value: the report's Host line and the subject carry HOSTNAME as it
+# is, the From name its short form, everything before the first dot.
+fresh
+run_backup
+check "host name, clean run: HOSTNAME was in the run's environment" \
+    "$(printf '%s\n' "${CMD[@]}" | grep -c '^HOSTNAME=test-host.example.org$')" "1"
+check "host name, clean run: exit status" "$RC" "0"
+show_tail 0
+check "host name, clean run: the report's Host line" "$(body_field 1 Host)" "test-host.example.org"
+check "host name, clean run: the subject" "$(mail_subject_head 1)" "[DAS Backup] test-host.example.org"
+check "host name, clean run: the From name is the short name" \
+    "$(mail_from 1)" "DAS Backup (test-host) <das-backup@example.test>"
+
+# The ABORTED report is built by a function of its own, and sent the same way.
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup
+check "host name, ABORTED report: exit status" "$RC" "3"
+show_tail 3
+check "host name, ABORTED report: it is the ABORTED mail" "$(mail_status 1)" "ABORTED"
+check "host name, ABORTED report: its Host line" "$(body_field 1 Host)" "test-host.example.org"
+check "host name, ABORTED report: the subject" "$(mail_subject_head 1)" "[DAS Backup] test-host.example.org"
+check "host name, ABORTED report: the From name" \
+    "$(mail_from 1)" "DAS Backup (test-host) <das-backup@example.test>"
+
+# Left out of the environment (neither unit source sets Environment=),
+# HOSTNAME is set by bash itself from gethostname(): the name the kernel
+# reports — read here from /proc, not from a program — and set under `set -u`,
+# or tripwire() would fail the run on an unbound variable.
+kernel_host=""
+read -r kernel_host </proc/sys/kernel/hostname || harness_broken "cannot read the kernel's host name"
+[[ -n "$kernel_host" ]] || harness_broken "the kernel's host name is empty"
+RUN_HOSTNAME=""
+fresh
+run_backup
+RUN_HOSTNAME=test-host.example.org
+check "host name set by bash: HOSTNAME was left out of the run's environment" \
+    "$(printf '%s\n' "${CMD[@]}" | grep -c '^HOSTNAME=')" "0"
+check "host name set by bash: exit status" "$RC" "0"
+show_tail 0
+check "host name set by bash: the Host line is the kernel's" "$(body_field 1 Host)" "$kernel_host"
+check "host name set by bash: the subject" "$(mail_subject_head 1)" "[DAS Backup] $kernel_host"
+check "host name set by bash: the From name is the name up to its first dot" \
+    "$(mail_from 1)" "DAS Backup ($(cut -d. -f1 <<<"$kernel_host")) <das-backup@example.test>"
 
 # ---------------------------------------------------------------------------
 echo "== 3: the run began its work and something FAILED"

@@ -1,9 +1,26 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.11.0
+# Version: 4.11.1
 # Date: 2026-10-04
 #
 # Features:
+#   - No external hostname program (v4.11.1): the report's Host: line (the
+#     full report's and the ABORTED one's), the mail subject and the From
+#     display name read bash's own $HOSTNAME, and the short name is
+#     ${HOSTNAME%%.*}, everything before the first dot, as `hostname -s`
+#     printed it. bash sets HOSTNAME from gethostname() when it starts
+#     (measured under `env -i`; neither unit source sets Environment=), so
+#     under set -u it is always set and needs no default.
+#     The script ran the `hostname` program, inetutils on Arch, which no
+#     packaging declares. Without it a run did not stop: it mailed a report
+#     with no host name — "Host:" empty, a subject of "[DAS Backup]  —
+#     SUCCESS", a From of "DAS Backup ()" — and "hostname: command not found"
+#     in the journal, once for each call. main's CI container has none, and
+#     the exit-semantics suite stopped at its harness check. That suite no
+#     longer whitelists the program, so a run that reaches for it fails there,
+#     and it checks the Host line, the subject and the From name. Behaviour is
+#     otherwise unchanged (bd DAS-Backup-Manager-arv1;
+#     tests/test_backup_exit_semantics.sh).
 #   - Exit status 0 / 3 / 1 (v4.11.0), operator decision C of 2026-10-04,
 #     the doctor's rule: 0 = the run executed and nothing FAILED (a WARN
 #     still exits 0); 3 = the run began its work and something FAILED or it
@@ -2395,8 +2412,13 @@ run_indexer() {
 # ============================================================================
 
 generate_report() {
-    local hostname
-    hostname=$(hostname)
+    # The host's name, here and in the ABORTED report, the mail subject and the
+    # From name, is bash's own $HOSTNAME, never the `hostname` program: bash
+    # sets it from gethostname() when the shell starts, so under `set -u` it is
+    # always set and needs no default, and a host without inetutils (no
+    # packaging declares it; CI's container has none) still has it. The short
+    # name, for the From name, is everything before the first dot, as
+    # `hostname -s` printed it (bd DAS-Backup-Manager-arv1).
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M')
     local overall_status="ALL OPERATIONS SUCCESSFUL"
@@ -2437,7 +2459,7 @@ generate_report() {
     cat <<-REPORT
 ===============================================================
   DAS Backup Report — $timestamp
-  Host: $hostname
+  Host: $HOSTNAME
   Status: $overall_status
 ===============================================================
 
@@ -2475,7 +2497,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.11.0
+  backup-run.sh v4.11.1
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2655,11 +2677,11 @@ send_report() {
     # envelope sender is what the relay keys its upstream credential on.
     local report_from="$report_from_addr"
     if [[ "$report_from_addr" != *"<"* ]]; then
-        report_from="DAS Backup ($(hostname -s)) <${report_from_addr}>"
+        report_from="DAS Backup (${HOSTNAME%%.*}) <${report_from_addr}>"
     fi
 
     local subject
-    subject="[DAS Backup] $(hostname) — $overall_status — $(date '+%Y-%m-%d %H:%M')"
+    subject="[DAS Backup] $HOSTNAME — $overall_status — $(date '+%Y-%m-%d %H:%M')"
 
     # Submit to the local relay: no credentials, no TLS on this hop. The relay
     # owns the authenticated, certificate-verified leg to the provider.
@@ -2988,8 +3010,7 @@ note_abort() {
 # shellcheck disable=SC2329
 generate_abort_report() {
     local status="$1"
-    local hostname timestamp
-    hostname=$(hostname)
+    local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M')
 
     # Nothing is backed up until btrbk starts (capture_usage stamps it).
@@ -3035,7 +3056,7 @@ generate_abort_report() {
     cat <<-REPORT
 ===============================================================
   DAS Backup Report — $timestamp
-  Host: $hostname
+  Host: $HOSTNAME
   Status: ABORTED
 ===============================================================
 

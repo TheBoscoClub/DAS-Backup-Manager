@@ -60,9 +60,8 @@ timeout() {
 fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
 
-# generate_report's helpers and host probes are stubbed; only the status line,
+# generate_report's helpers and host probe are stubbed; only the status line,
 # the operation row and the section are under test.
-hostname() { echo testhost; }
 systemctl() { :; }
 generate_throughput_section() { echo "  tp"; }
 generate_capacity_section() { echo "  cap"; }
