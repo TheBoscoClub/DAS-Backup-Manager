@@ -388,8 +388,9 @@ n=$(($(cat "$S/mail_count" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$S/mail_count"
 printf '%s\n' "$@" >"$S/mail.$n.args"
 cat >"$S/mail.$n.body"
-# A relay that took the connection and never answers: mailx waits on it, as
-# s-nail does (it has no read timeout), with a child of its own.
+# A relay that took the connection and never finishes — one that keeps
+# trickling bytes, which s-nail does not give up on (it gives up after about
+# 45 s of silence) — with a child of mailx's own: mailx waits on it.
 if [[ -f "$S/knobs/mail_stalls" ]]; then
     echo "$$" >"$S/mail_stall.pid"
     sleep 3600 &
@@ -1085,10 +1086,12 @@ show_tail 3
 check "dry run aborted: no mail" "$(mails)" "0"
 check "dry run aborted: not recorded" "$(record_calls)" "0"
 
-# A relay that takes the connection and never answers costs the report, not
-# the run (round 3, M1). s-nail has no read timeout, so an unbounded mailx
-# kept the DAS mounted and both locks held for as long as the relay stayed
-# silent — a waiting scrub behind it, and the alert the very thing stuck.
+# A relay that takes the connection and never finishes costs the report, not
+# the run (round 3, M1). s-nail gives up after about 45 s of silence, but
+# not on a relay that keeps trickling bytes, so an unbounded mailx kept the
+# DAS mounted and both locks held for as long as such a relay trickled — a
+# waiting scrub behind it, and the alert the very thing stuck (round 4, N2,
+# corrected the "no read timeout" this said).
 # Every send is bounded: in this copy TERM after 2 s, KILL 1 s later. The
 # suite's own deadline (30 s) only ends a run that hangs regardless.
 fresh
@@ -1100,7 +1103,7 @@ show_tail 3
 check "abort, relay stalls: over within the bound" "$((ELAPSED <= 15))" "1"
 check "abort, relay stalls: the send was given its time" "$((ELAPSED >= 2))" "1"
 check "abort, relay stalls: says why it was not emailed" \
-    "$(grep -c 'did not answer within 2 s' "$STATE/out")" "1"
+    "$(grep -c 'did not finish within 2 s' "$STATE/out")" "1"
 check "abort, relay stalls: still recorded as failed" "$(recorded_as)" "failure"
 check "abort, relay stalls: nothing left mounted" "$(left_mounted)" "nothing"
 check "abort, relay stalls: both locks free" "$(locks_free)" "yes"
@@ -1113,7 +1116,7 @@ check "clean run, relay stalls: exit status (email FAILED)" "$RC" "3"
 show_tail 3
 check "clean run, relay stalls: over within the bound" "$((ELAPSED <= 15))" "1"
 check "clean run, relay stalls: says why it was not emailed" \
-    "$(grep -c 'did not answer within 2 s' "$STATE/out")" "1"
+    "$(grep -c 'did not finish within 2 s' "$STATE/out")" "1"
 check "clean run, relay stalls: recorded as failed" "$(recorded_as)" "failure"
 check "clean run, relay stalls: nothing left mounted" "$(left_mounted)" "nothing"
 check "clean run, relay stalls: both locks free" "$(locks_free)" "yes"

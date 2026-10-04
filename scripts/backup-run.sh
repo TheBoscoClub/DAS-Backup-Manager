@@ -42,9 +42,11 @@
 #     and as a here-string it needed a temp file, which a full /tmp or no
 #     fd to spare turned into the same answer (round 4, N3).
 #     Every report's delivery is bounded (MAIL_TIMEOUT_SECS, 60 s, then KILL
-#     10 s later) and mailx runs without the lock fds: a relay that took the
-#     connection and never answered held the run, the DAS mounted and both
-#     locks held, for as long as it stayed silent (d1r round 3, M1).
+#     10 s later) and mailx runs without the lock fds. s-nail gives up by
+#     itself after about 45 s of silence on a read, but not on a relay that
+#     keeps trickling bytes, and that held the run, the DAS mounted and both
+#     locks held, for as long as it trickled (d1r round 3, M1; the 45 s
+#     measured in round 4, N2).
 #     HUP, PIPE, USR1 and ALRM are trapped like INT and TERM: each keeps
 #     its own code and is recorded as a stop by name, where they read as
 #     "a command that failed" — exit 3, an ABORTED mail — and then killed
@@ -2574,13 +2576,16 @@ generate_smart_section() {
 }
 
 # Upper bound on one report's delivery. mailx talks SMTP to the local relay,
-# which takes a report in well under a second. s-nail has a connect timeout
-# but no read timeout, so a relay that accepts the connection and never
-# answers held the run for as long as it stayed silent: the DAS mounted (an
+# which takes a report in well under a second. s-nail gives up by itself
+# after about 45 s of silence on a read (measured, s-nail 14.9.25: 44 s
+# against a relay that accepts and never speaks, 44 s against one that
+# greets and stalls; exit 4), but not on a relay that keeps trickling bytes.
+# That one held the run for as long as it trickled: the DAS mounted (an
 # abort sends before it unmounts), both locks held, a scrub waiting behind
 # them, and the alert the very thing stuck (bd DAS-Backup-Manager-d1r, round
-# 3: M1). TERM after MAIL_TIMEOUT_SECS, KILL MAIL_KILL_AFTER_SECS later, as
-# the recovery OS check bounds its reads.
+# 3: M1; the 45 s measured in round 4: N2). The bound covers the trickle and
+# any helper mailx starts: TERM after MAIL_TIMEOUT_SECS, KILL
+# MAIL_KILL_AFTER_SECS later, as the recovery OS check bounds its reads.
 MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10
 
 # Where the last report is, for each line saying it was not emailed: the file
@@ -2686,7 +2691,7 @@ send_report() {
     fi
     # timeout: 124 after the TERM, 137 if it took the KILL.
     if ((rc == 124 || rc == 137)); then
-        log_warn "The relay at $smtp_url did not answer within $MAIL_TIMEOUT_SECS s — gave up emailing the report to $report_to — $(report_whereabouts)"
+        log_warn "Sending to $smtp_url did not finish within $MAIL_TIMEOUT_SECS s — gave up emailing the report to $report_to — $(report_whereabouts)"
     else
         log_warn "Failed to email report to $report_to via $smtp_url (mailx exit $rc) — $(report_whereabouts)"
     fi

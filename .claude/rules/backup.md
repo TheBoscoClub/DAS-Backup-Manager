@@ -129,9 +129,12 @@ Checked before any directory is created, both roots compared **after resolution*
 - **`smtp-auth=none` is REQUIRED on every mailx invocation**, or s-nail aborts with exit 4.
 - **Never redirect mailx stderr to `/dev/null`.**
 - **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed: s-nail
-  has no read timeout, and a relay that never answers must cost the report, not the run.
+  gives up after ~45 s of silence by itself, but not on a relay that keeps trickling bytes, and
+  such a relay must cost the report, not the run.
 - The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only. A
   write that fails is logged as such, and the not-emailed lines then name the journal instead.
+  With email off, an unsavable report is a FAIL (exit 3, `report:` in the row): the journal has
+  the only copy.
 - **Unattended (no-session) delivery is proven in production — do not re-test it.**
 - Diagnose with `journalctl -u das-backup`, `journalctl -u postfix`, `mailq`. `status=sent` means
   the provider accepted it, not that it reached the inbox.
