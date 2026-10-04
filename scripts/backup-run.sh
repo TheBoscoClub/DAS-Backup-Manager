@@ -39,6 +39,10 @@
 #     The boot-subvolume step's drift check reads the target's listing
 #     without a pipe: under pipefail a listing over 64 KiB read as "no
 #     snapshots" when printf died of SIGPIPE (bd DAS-Backup-Manager-wkvz).
+#     Every report's delivery is bounded (MAIL_TIMEOUT_SECS, 60 s, then KILL
+#     10 s later) and mailx runs without the lock fds: a relay that took the
+#     connection and never answered held the run, the DAS mounted and both
+#     locks held, for as long as it stayed silent (d1r round 3, M1).
 #   - Recovery OS boot warning (v4.10.0): `btrdasd recovery-os status` now
 #     also exits 1 for a current recovery OS whose boot may run btrbk —
 #     something enabled there (a unit, its timer, or cron) runs btrbk and its
@@ -2512,6 +2516,16 @@ generate_smart_section() {
     done
 }
 
+# Upper bound on one report's delivery. mailx talks SMTP to the local relay,
+# which takes a report in well under a second. s-nail has a connect timeout
+# but no read timeout, so a relay that accepts the connection and never
+# answers held the run for as long as it stayed silent: the DAS mounted (an
+# abort sends before it unmounts), both locks held, a scrub waiting behind
+# them, and the alert the very thing stuck (bd DAS-Backup-Manager-d1r, round
+# 3: M1). TERM after MAIL_TIMEOUT_SECS, KILL MAIL_KILL_AFTER_SECS later, as
+# the recovery OS check bounds its reads.
+MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10
+
 send_report() {
     local report="$1"
     local overall_status="$2"
@@ -2564,26 +2578,34 @@ send_report() {
     # on stderr (measured), so anything here is the real reason for a failure.
     # The previous `2>/dev/null` claimed to hide s-nail deprecation warnings
     # that do not exist, and cost every failure its diagnosis.
-    local mail_err rc
-    mail_err=$(echo "$report" | mailx \
+    #
+    # Bounded (MAIL_TIMEOUT_SECS above): timeout puts mailx in a process
+    # group of its own and signals the whole group. mailx runs with fds 8 and
+    # 9 closed, so nothing it starts can keep this run's locks once the run
+    # ends. The report goes in as a here-string, not through a pipe.
+    local mail_err rc=0
+    mail_err=$(timeout -k "$MAIL_KILL_AFTER_SECS" "$MAIL_TIMEOUT_SECS" mailx \
         -s "$subject" \
         -r "$report_from" \
         -S v15-compat \
         -S "mta=${smtp_url}" \
         -S "smtp-auth=none" \
         -S nosave \
-        "$report_to" 2>&1 >/dev/null)
-    rc=$?
+        "$report_to" 8>&- 9>&- <<<"$report" 2>&1 >/dev/null) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
         log_info "Report emailed to $report_to via $smtp_url"
         [[ -n "$mail_err" ]] && log_warn "mailx wrote to stderr despite success: $mail_err"
         return 0
+    fi
+    # timeout: 124 after the TERM, 137 if it took the KILL.
+    if ((rc == 124 || rc == 137)); then
+        log_warn "The relay at $smtp_url did not answer within $MAIL_TIMEOUT_SECS s — gave up emailing the report to $report_to — saved to $LAST_REPORT"
     else
         log_warn "Failed to email report to $report_to via $smtp_url (mailx exit $rc) — saved to $LAST_REPORT"
-        [[ -n "$mail_err" ]] && log_warn "mailx: $mail_err"
-        return 1
     fi
+    [[ -n "$mail_err" ]] && log_warn "mailx: $mail_err"
+    return 1
 }
 
 # ============================================================================
