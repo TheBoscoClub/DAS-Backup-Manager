@@ -11,23 +11,32 @@
 #     mounted first, each once, on every way out: the end of main(), and
 #     cleanup() after an abort or a stop, dry runs alike. A source volume
 #     already mounted when the run looks is used as found, and the log says
-#     so. The run used to unmount every source: since cb5937b turned the old
-#     cleanup of its own helper mounts into "unmount every source", the first
-#     run after a boot took down the fstab mounts /.btrfs-nvme, /.btrfs-ssd
-#     and /.btrfs-hdd, down until the next boot (each later run mounting and
+#     so; one fstab declares but the run finds unmounted is said too, as
+#     INFO, since only the run's helper then stands in for fstab's mount. The
+#     run used to unmount every source: since cb5937b turned the old cleanup
+#     of its own helper mounts into "unmount every source", the first run
+#     after a boot took down the fstab mounts /.btrfs-nvme, /.btrfs-ssd and
+#     /.btrfs-hdd, down until the next boot (each later run mounting and
 #     unmounting them itself), and every run tried /dasRaid0, the operator's
 #     general-use filesystem. That failed every night with a WARN that could
-#     not say why: umount's message went to /dev/null. Most likely the nested
-#     fstab mount /dasRaid0/VirtualMachines pinned it, not running VMs as the
-#     comment said: none ran and no process held it (measured 2026-10-04). A
-#     helper mount that will not unmount is still a WARN, not a FAIL and not
-#     part of the disconnect gate, now with umount's own message.
-#     Source verification is unchanged: a source found mounted must still be
-#     the expected filesystem at its top level, or the run aborts (3) — and
-#     now leaves the mount it refused as it found it. The Rust path's
-#     MountGuard already left a pre-existing source mount alone
-#     (bd DAS-Backup-Manager-8cf; tests/test_unmount_all.sh,
-#     tests/test_backup_exit_semantics.sh).
+#     not say why: umount's message went to /dev/null. The nested fstab mount
+#     /dasRaid0/VirtualMachines pinned it, not running VMs as the comment
+#     said: umount refuses a mount with another mounted beneath it (reproduced
+#     on this kernel, 2026-10-04), and that night no VM ran and no process
+#     held /dasRaid0. A helper mount that will not unmount is still a WARN,
+#     not a FAIL and not part of the disconnect gate, now with umount's own
+#     message. The probe before each unmount (probe_mount_point) tells "not
+#     mounted" from "could not tell": mountpoint's error read as "not
+#     mounted" struck the run's helper off its record and left it mounted,
+#     with nothing said; now the run says it could not tell, with the probe's
+#     message, and unmounts anyway (review F1). The record is written before
+#     mount runs, and a test now holds it there: a stop while mount runs
+#     still takes the mount down (review F2). Source verification is
+#     unchanged: a source found mounted must still be the expected
+#     filesystem at its top level, or the run aborts (3) — and now leaves the
+#     mount it refused as it found it. The Rust path's MountGuard already
+#     left a pre-existing source mount alone (bd DAS-Backup-Manager-8cf;
+#     tests/test_unmount_all.sh, tests/test_backup_exit_semantics.sh).
 #   - No external hostname program (v4.11.1): the report's Host: line (the
 #     full report's and the ABORTED one's), the mail subject and the From
 #     display name read bash's own $HOSTNAME, and the short name is
@@ -1100,6 +1109,14 @@ mount_sources() {
             fi
             continue
         fi
+        # fstab may declare this mount point (it declares the /.btrfs-* top
+        # levels). Then fstab's own mount is missing, and only this run's
+        # helper stands in for it, until the run takes it down. Said, not
+        # warned: restoring it is the operator's, not the backup's. Display
+        # only: a query that fails says nothing.
+        if findmnt --fstab -n -o TARGET --mountpoint "$mnt" >/dev/null 2>&1; then
+            log_info "  $label: fstab mounts $mnt at boot, but it was not mounted — this run mounts a helper there and takes it down at the end"
+        fi
         opts=(-o subvolid=5)
         if [[ "$dev" == UUID=* ]]; then
             # UUID-based mount (stable across device letter changes)
@@ -2062,6 +2079,33 @@ run_archive_cleanup() {
     fi
 }
 
+# Whether <path> is a mount point, as mountpoint(1) answers it, with its two
+# kinds of "no" kept apart. util-linux exits 0 for a mount point, 32 for a
+# path that is not one, and 1 for a usage, permission or system error — and
+# 1 as well for a path that does not exist (measured, util-linux 2.42.4).
+# Returns 0 mounted, 1 not mounted, 2 could not tell, and for "could not
+# tell" prints the probe's own message. A path that does not exist is not
+# mounted (nothing can be mounted where there is nothing), and an
+# unavailable target's mount point is removed on purpose (create_mount_points),
+# so it is told from an error by mountpoint's message, read in the C locale;
+# any other answer is "could not tell". Read as "not mounted", an error left
+# the run's own source mount behind with nothing said (bd
+# DAS-Backup-Manager-8cf, review F1).
+probe_mount_point() { # probe_mount_point <path>
+    local rc=0 err
+    err="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null)" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        32) return 1 ;;
+    esac
+    if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
+        return 1
+    fi
+    err="${err//$'\n'/; }"
+    printf '%s (exit %s)\n' "${err:-mountpoint printed nothing}" "$rc"
+    return 2
+}
+
 # The same budget as the Rust path (mount.rs UMOUNT_ATTEMPTS / _RETRY_PAUSE).
 UMOUNT_ATTEMPTS=5
 UMOUNT_RETRY_PAUSE=2
@@ -2117,29 +2161,39 @@ unmount_all() {
     # run reads from it and owns nothing about it (bd DAS-Backup-Manager-8cf).
     # One unmounted is struck off, so a second pass — cleanup() after an
     # abort that follows main()'s own call — neither repeats it nor touches a
-    # mount someone else has made there since. One no longer mounted is
-    # struck off as well, untouched.
+    # mount someone else has made there since. One the probe says is not
+    # mounted is struck off as well, untouched, and said. One the probe
+    # cannot tell about is said, with the probe's message, and unmounted
+    # anyway: umount's own answer decides (8cf review, F1).
     #
     # Best effort, deliberately NOT tracked via record_op and NOT part of the
     # disconnect gate above: sources are host filesystems, not the removable
     # DAS enclosure, so one left mounted has no bearing on whether the DAS is
     # safe to disconnect. A helper mount that will not unmount is a WARN with
-    # umount's own message (which used to be discarded), is left mounted, and
-    # stays the run's, for a later pass to try again.
+    # umount's own message (which used to be discarded), is left as it is,
+    # and stays the run's, for a later pass to try again.
     local -a owned=("${SOURCE_MOUNTS_OWNED[@]}")
-    local src_mnt umount_err
+    local src_mnt umount_err probe_rc probe_why left
     for (( i=${#owned[@]}-1; i>=0; i-- )); do
         src_mnt="${owned[$i]}"
-        if ! mountpoint -q "$src_mnt" 2>/dev/null; then
+        probe_rc=0
+        probe_why="$(probe_mount_point "$src_mnt")" || probe_rc=$?
+        if ((probe_rc == 1)); then
             disown_source_mount "$src_mnt"
+            log_info "  Source volume $src_mnt, recorded as this run's, is not mounted now — nothing to unmount"
             continue
+        fi
+        left="left mounted"
+        if ((probe_rc != 0)); then
+            log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $probe_why; unmounting it anyway"
+            left="left as it is"
         fi
         if umount_err="$(umount "$src_mnt" 2>&1)"; then
             disown_source_mount "$src_mnt"
             log_info "  Unmounted source volume $src_mnt (this run mounted it)"
         else
             umount_err="${umount_err//$'\n'/; }"
-            log_warn "  Could not unmount source volume $src_mnt, which this run mounted: ${umount_err:-no message} — left mounted; best effort, not a DAS disconnect concern"
+            log_warn "  Could not unmount source volume $src_mnt, which this run mounted: ${umount_err:-no message} — $left; best effort, not a DAS disconnect concern"
         fi
     done
 

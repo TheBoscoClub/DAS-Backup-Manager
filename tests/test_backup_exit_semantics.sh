@@ -48,10 +48,13 @@
 # the report, the history and the exit status alike.
 #
 # Source volumes (bd DAS-Backup-Manager-8cf): a run unmounts only the source
-# mount points it mounted itself, each once, on every way out. One already
-# mounted when it starts — as fstab mounts /dasRaid0 and the /.btrfs-* top
-# levels — is used as found and never unmounted, and verification still
-# refuses one that holds the wrong filesystem, leaving it mounted.
+# mount points it mounted itself, each once, on every way out — a stop while
+# mount runs included. One already mounted when it starts — as fstab mounts
+# /dasRaid0 and the /.btrfs-* top levels — is used as found and never
+# unmounted, and verification still refuses one that holds the wrong
+# filesystem, leaving it mounted. A probe that cannot tell is said, and the
+# helper unmounted anyway. The mountpoint stub answers as util-linux does:
+# 0 a mount point, 32 not one, 1 an error or a path that is not there.
 #
 # Every run's mail goes to a stub mailx, which keeps each one.
 #
@@ -303,9 +306,19 @@ fi
 if listed mount_warns "$dst"; then
     echo "mount: $dst: WARNING: source write-protected, mounted read-only." >&2
 fi
+# A stop that lands while mount runs: block (until the test signals the run)
+# before the mount is made, or after it is made.
+if listed mount_blocks_before "$dst"; then
+    : >"$S/mount_in"
+    sleep 30
+fi
 uuid="${src#UUID=}"
 listed wrong_fs_at "$dst" && uuid="a-different-filesystem"
 printf '%s\t%s\t/\n' "$dst" "$uuid" >>"$S/mounted"
+if listed mount_blocks_after "$dst"; then
+    : >"$S/mount_in"
+    sleep 30
+fi
 EOF
 
 stub umount <<'EOF'
@@ -331,19 +344,41 @@ awk -F'\t' -v p="$dst" '$1 != p' "$S/mounted" >"$S/mounted.new"
 mv "$S/mounted.new" "$S/mounted"
 EOF
 
+# As util-linux 2.42.4 answers (measured): 0 a mount point, 32 not one, 1 an
+# error — and 1, "No such file or directory", for a path that does not exist
+# (an absent target's mount point, which the run removes). A path listed in
+# probe_fails_after_btrbk answers an error once btrbk has run, as a probe on a
+# link that went bad mid-run might.
 stub mountpoint <<'EOF'
-is_mounted "${*: -1}"
+p="${*: -1}"
+if listed probe_fails_after_btrbk "$p" && grep -qE '(^| )(run|dryrun)$' "$S/calls/btrbk" 2>/dev/null; then
+    echo "mountpoint: $p: Input/output error (stub)" >&2
+    exit 1
+fi
+is_mounted "$p" && exit 0
+if [[ ! -e "$p" ]]; then
+    echo "mountpoint: $p: No such file or directory" >&2
+    exit 1
+fi
+exit 32
 EOF
 
 stub findmnt <<'EOF'
-cols="" target=""
+cols="" target="" fstab=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
     -o) cols="$2"; shift ;;
-    --target) target="$2"; shift ;;
+    --target | --mountpoint) target="$2"; shift ;;
+    --fstab) fstab=1 ;;
     esac
     shift
 done
+# fstab, as the knob declares it: the entry for <target>, or none (1).
+if [[ -n "$fstab" ]]; then
+    listed fstab_declares "$target" || exit 1
+    echo "$target"
+    exit 0
+fi
 # Like the real findmnt, a path that is not a mount point reports the
 # filesystem that contains it — here the root filesystem.
 uuid="root-filesystem-uuid" fsroot="/" source="/nonexistent/root-device"
@@ -1315,14 +1350,20 @@ echo "== 129/130/138/141/142/143: stopped by a signal, as \`systemctl stop\` doe
 # does, while btrbk runs. `exec` makes the background job the run itself, so
 # `wait` reports the run's status, not a subshell's death by the signal.
 run_signalled() { # run_signalled <signal> [args...]
-    local sig="$1"
-    shift
+    run_signalled_when btrbk_started "$@"
+}
+# run_signalled_when <state file> <signal> [args...]: the same, with the
+# signal sent once the stub that blocks has written <state file> —
+# btrbk_started (btrbk runs), mount_in (a source's mount runs).
+run_signalled_when() {
+    local flag="$1" sig="$2"
+    shift 2
     run_cmd "$@"
     (
         set -m # the run gets its own process group
         { exec "${CMD[@]}"; } >"$STATE/out" 2>&1 &
         pid=$!
-        for _ in $(seq 1 400); do [[ -e "$STATE/btrbk_started" ]] && break; sleep 0.05; done
+        for _ in $(seq 1 400); do [[ -e "$STATE/$flag" ]] && break; sleep 0.05; done
         kill "-$sig" -- "-$pid"
         wait "$pid"
     ) 2>/dev/null
@@ -1685,6 +1726,68 @@ check "helper will not unmount: tried once" "$(calls_for umount "$SOURCE_MNT")" 
 check "helper will not unmount: left mounted, the targets released" "$(left_mounted)" "$SOURCE_MNT "
 check "helper will not unmount: the DAS is still safe to disconnect" \
     "$(grep -c 'DAS can be safely disconnected' "$STATE/out")" "1"
+
+# --- the probe cannot tell whether the helper is still mounted (review F1) -----
+# A mountpoint error is not "not mounted": the helper used to be struck off
+# its record and left mounted, with nothing said. Now the run says it could
+# not tell, with the probe's message, and unmounts anyway.
+fresh
+knob probe_fails_after_btrbk "$SOURCE_MNT"
+run_backup
+check "probe cannot tell for the helper: exit status" "$RC" "0"
+show_tail 0
+check "probe cannot tell for the helper: unmounted anyway, once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "probe cannot tell for the helper: nothing left mounted" "$(left_mounted)" "nothing"
+check "probe cannot tell for the helper: says so, with the probe's own message" \
+    "$(grep -cF -- "Could not tell whether source volume $SOURCE_MNT, which this run mounted, is still mounted — mountpoint: $SOURCE_MNT: Input/output error (stub) (exit 1); unmounting it anyway" "$WORK/log/das-backup.log")" "1"
+check "probe cannot tell for the helper: a WARN" \
+    "$(grep -c "\[WARN\]   Could not tell whether source volume" "$WORK/log/das-backup.log")" "1"
+
+# --- a stop while a source's mount runs (review F2) -----------------------------
+# The run records the mount point as its own BEFORE mount runs, so a stop that
+# lands while mount runs still finds a mount mount made, and takes it down.
+# Recorded after mount instead, the stop leaves it mounted.
+fresh
+knob mount_blocks_after "$SOURCE_MNT"
+run_signalled_when mount_in TERM
+check "SIGTERM while mount runs, the mount made: the stop landed there" \
+    "$([[ -e "$STATE/mount_in" ]] && echo yes || echo no) $(ran_btrbk)" "yes no"
+check "SIGTERM while mount runs, the mount made: exit status" "$RC" "143"
+show_tail 143
+check "SIGTERM while mount runs, the mount made: taken down once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "SIGTERM while mount runs, the mount made: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+knob mount_blocks_before "$SOURCE_MNT"
+run_signalled_when mount_in TERM
+check "SIGTERM while mount runs, the mount not made: the stop landed there" \
+    "$([[ -e "$STATE/mount_in" ]] && echo yes || echo no) $(ran_btrbk)" "yes no"
+check "SIGTERM while mount runs, the mount not made: exit status" "$RC" "143"
+show_tail 143
+check "SIGTERM while mount runs, the mount not made: nothing to unmount" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "SIGTERM while mount runs, the mount not made: nothing left mounted" "$(left_mounted)" "nothing"
+
+# --- fstab declares a source's mount point, and it is not mounted -------------
+# fstab's own mount is missing: said once, as INFO — not a WARN, not a FAIL —
+# and the run still takes its helper down. Nothing is said for one found
+# mounted, nor for a path fstab does not declare.
+fresh
+second_source das-storage "$DAS_STORAGE_MNT" UUID=das-storage-uuid
+premount "$DAS_STORAGE_MNT" das-storage-uuid
+printf '%s\n' "$SOURCE_MNT" "$DAS_STORAGE_MNT" >"$STATE/knobs/fstab_declares"
+run_backup
+check "fstab declares it, not mounted: exit status" "$RC" "0"
+show_tail 0
+check "fstab declares it, not mounted: said, as INFO" \
+    "$(grep -cF -- "[INFO]   nvme: fstab mounts $SOURCE_MNT at boot, but it was not mounted — this run mounts a helper there and takes it down at the end" "$WORK/log/das-backup.log")" "1"
+check "fstab declares it, found mounted: nothing said" "$(grep -cF -- "fstab mounts $DAS_STORAGE_MNT" "$STATE/out")" "0"
+check "fstab declares it, not mounted: the helper still taken down; fstab's other mount left" \
+    "$(calls_for umount "$SOURCE_MNT") $(left_mounted)" "1 $DAS_STORAGE_MNT "
+check "fstab declares it, not mounted: the report is unchanged" "$(report_status)" "ALL OPERATIONS SUCCESSFUL"
+
+fresh
+run_backup
+check "fstab does not declare it: nothing said" "$(grep -c 'fstab mounts' "$STATE/out")" "0"
 
 # ---------------------------------------------------------------------------
 echo "== every exit path of a run that does not complete, by the rule"

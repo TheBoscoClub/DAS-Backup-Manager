@@ -32,8 +32,14 @@
 #     the time cleanup() looks.
 #   - A helper mount that will not unmount is a WARN carrying umount's own
 #     message, not a FAIL, and stays the run's for a later pass.
+#   - The probe's three answers (8cf review, F1): mountpoint answers as
+#     util-linux does (0, 32, 1). "Could not tell" is said, with the probe's
+#     message, and the helper is unmounted anyway; "not mounted", or a path
+#     that is not there, is struck off and said, never unmounted.
+#   - A mount point fstab declares, found unmounted, is said once, as INFO.
 # The found-mounted cases and the failed-mount case go red if unmount_all()
-# unmounts every mounted source again, as it did before 4.11.2.
+# unmounts every mounted source again, as it did before 4.11.2. A stop while
+# mount runs needs a signal, so test_backup_exit_semantics.sh holds that one.
 
 # The shell options backup-run.sh itself runs under: a function that let a
 # failing command escape would abort the backup there, and must abort here.
@@ -44,7 +50,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in umount_with_retry unmount_all record_op mount_sources owns_source_mount disown_source_mount; do
+for fn in umount_with_retry unmount_all record_op mount_sources owns_source_mount disown_source_mount probe_mount_point; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -59,7 +65,23 @@ abort_reason() { echo "ABORT: $1: $2" >>"$WORK/log"; }
 
 # Stubs. A mount point is "mounted" while $WORK/mounted/<name> exists.
 # $WORK/busy/<name> holds how many more umount calls fail with "target is busy".
-mountpoint() { [[ -e "$WORK/mounted/$(basename "${!#}")" ]]; }
+# mountpoint answers as util-linux 2.42.4 does (measured): 0 a mount point, 32
+# not one, 1 an error — and 1, "No such file or directory", for a path that
+# does not exist. Every path here exists but those in $WORK/absent; one in
+# $WORK/probe_errors answers an error.
+mountpoint() {
+    local p="${!#}" name
+    name="$(basename "$p")"
+    if [[ -e "$WORK/probe_errors/$name" ]]; then
+        echo "mountpoint: $p: Input/output error" >&2
+        return 1
+    fi
+    if [[ -e "$WORK/absent/$name" ]]; then
+        echo "mountpoint: $p: No such file or directory" >&2
+        return 1
+    fi
+    [[ -e "$WORK/mounted/$name" ]] || return 32
+}
 umount() {
     local name; name="$(basename "$1")"
     echo "$1" >>"$WORK/umount_calls"
@@ -70,7 +92,16 @@ umount() {
         echo "umount: $1: target is busy." >&2
         return 32
     fi
+    if [[ ! -e "$WORK/mounted/$name" ]]; then
+        echo "umount: $1: not mounted." >&2
+        return 32
+    fi
     rm -f "$WORK/mounted/$name"
+}
+# findmnt --fstab ... --mountpoint <path>: declared while $WORK/fstab/<name> exists.
+findmnt() {
+    [[ " $* " == *" --fstab "* ]] || return 1
+    [[ -e "$WORK/fstab/$(basename "${!#}")" ]]
 }
 # mount [options] <device> <mount point>. A mount point in MOUNT_RACES fails
 # because something else mounted it first, as util-linux says it.
@@ -91,8 +122,8 @@ fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
 
 setup() {
-    rm -rf "$WORK/mounted" "$WORK/busy"
-    mkdir -p "$WORK/mounted" "$WORK/busy"
+    rm -rf "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab"
+    mkdir -p "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab"
     : >"$WORK/umount_calls"; : >"$WORK/mount_calls"; : >"$WORK/sleeps"; : >"$WORK/log"
     declare -gA OP_STATUS=()
     declare -gA SOURCE_VOLUMES=()
@@ -274,6 +305,82 @@ check "helper busy: left mounted" "$(is_mounted /.btrfs-hdd)" "yes"
 unmount_all
 check "helper busy: still the run's, so a later pass releases it" \
     "$(calls /.btrfs-hdd) $(is_mounted /.btrfs-hdd)" "2 no"
+
+# --- the probe's three answers, for the run's own helper (8cf review, F1) ------
+# mountpoint's error is not "not mounted": the helper was struck off and left
+# mounted, with nothing said. Now an error is "could not tell": the run says
+# so, with the probe's own message, and unmounts anyway — umount's answer
+# decides.
+setup
+sources hdd-media=/.btrfs-hdd
+mount_sources
+touch "$WORK/probe_errors/.btrfs-hdd"
+unmount_all
+check "probe cannot tell, helper mounted: unmounted anyway, once" \
+    "$(calls /.btrfs-hdd) $(is_mounted /.btrfs-hdd)" "1 no"
+check "probe cannot tell, helper mounted: says so, with the probe's message" \
+    "$(logged 'WARN:   Could not tell whether source volume /.btrfs-hdd, which this run mounted, is still mounted — mountpoint: /.btrfs-hdd: Input/output error (exit 1); unmounting it anyway')" "1"
+check "probe cannot tell, helper mounted: then unmounted" \
+    "$(logged 'INFO:   Unmounted source volume /.btrfs-hdd (this run mounted it)')" "1"
+rm -f "$WORK/probe_errors/.btrfs-hdd"
+unmount_all
+check "probe cannot tell, helper mounted: struck off once unmounted" "$(calls /.btrfs-hdd)" "1"
+
+# Could not tell, and it was not mounted after all: umount says so, the run
+# says that too, and the record keeps it until a probe can tell.
+setup
+sources hdd-media=/.btrfs-hdd
+mount_sources
+rm -f "$WORK/mounted/.btrfs-hdd"
+touch "$WORK/probe_errors/.btrfs-hdd"
+unmount_all
+check "probe cannot tell, helper gone: unmount tried once" "$(calls /.btrfs-hdd)" "1"
+check "probe cannot tell, helper gone: umount's own message, and no claim it is mounted" \
+    "$(logged 'WARN:   Could not unmount source volume /.btrfs-hdd, which this run mounted: umount: /.btrfs-hdd: not mounted. — left as it is; best effort, not a DAS disconnect concern')" "1"
+rm -f "$WORK/probe_errors/.btrfs-hdd"
+unmount_all
+check "probe cannot tell, helper gone: a later pass that can tell strikes it off, no umount" \
+    "$(calls /.btrfs-hdd)" "1"
+check "probe cannot tell, helper gone: and says why" \
+    "$(logged 'INFO:   Source volume /.btrfs-hdd, recorded as this run'"'"'s, is not mounted now — nothing to unmount')" "1"
+
+# Not mounted (32), or not there at all: struck off, said, never unmounted.
+setup
+sources hdd-media=/.btrfs-hdd ssd=/.btrfs-ssd
+mount_sources
+rm -f "$WORK/mounted/.btrfs-hdd" "$WORK/mounted/.btrfs-ssd"
+touch "$WORK/absent/.btrfs-ssd"
+unmount_all
+check "probe says not mounted, or no such path: never unmounted" \
+    "$(calls /.btrfs-hdd) $(calls /.btrfs-ssd)" "0 0"
+check "probe says not mounted, or no such path: each said" \
+    "$(grep -c "INFO:   Source volume /.btrfs-\(hdd\|ssd\), recorded as this run's, is not mounted now — nothing to unmount" "$WORK/log" || true)" "2"
+check "probe says not mounted, or no such path: no warning" "$(grep -c '^WARN:' "$WORK/log" || true)" "0"
+unmount_all
+check "probe says not mounted, or no such path: struck off" "$(calls /.btrfs-hdd) $(calls /.btrfs-ssd)" "0 0"
+
+# --- fstab declares a source mount point the run finds unmounted --------------
+# Said once, as INFO: fstab's own mount is missing, and only this run's helper
+# stands in for it while the run lasts. Not for one found mounted, nor for a
+# path fstab does not declare.
+setup
+sources hdd-media=/.btrfs-hdd hdd-system=/.btrfs-hdd ssd=/.btrfs-ssd das-storage=/dasRaid0
+touch "$WORK/fstab/.btrfs-hdd" "$WORK/fstab/dasRaid0"
+premounted /dasRaid0
+mount_sources
+# Whichever of the two sources on /.btrfs-hdd bash's hash order visits first
+# mounts it, and that is the one the line names.
+mounted_by="$(sed -n 's|^INFO:   Mounted \(.*\) at /.btrfs-hdd$|\1|p' "$WORK/log")"
+check "fstab declares it, not mounted: mounted by one of its two sources" \
+    "$([[ "$mounted_by" == hdd-media || "$mounted_by" == hdd-system ]] && echo yes || echo "no ($mounted_by)")" "yes"
+check "fstab declares it, not mounted: said, as INFO, for the source that mounts it" \
+    "$(logged "INFO:   $mounted_by: fstab mounts /.btrfs-hdd at boot, but it was not mounted — this run mounts a helper there and takes it down at the end")" "1"
+check "fstab declares it, not mounted: said once" "$(grep -c 'fstab mounts' "$WORK/log" || true)" "1"
+check "fstab does not declare it, or it was found mounted: nothing said" \
+    "$(grep -c 'fstab mounts /.btrfs-ssd\|fstab mounts /dasRaid0' "$WORK/log" || true)" "0"
+unmount_all
+check "fstab declares it: still the run's helper, taken down once; fstab's other mount untouched" \
+    "$(calls /.btrfs-hdd) $(calls /dasRaid0)" "1 0"
 
 if [[ $fails -eq 0 ]]; then
     echo "UNMOUNT RETRY SUITE GREEN"
