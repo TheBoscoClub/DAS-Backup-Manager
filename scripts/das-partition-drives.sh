@@ -1,10 +1,17 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.2.1
+# Version: 2.3.2
 # Date: 2026-10-04
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
-#     Run ONLY after verifying SMART tests passed.
+#     --run refuses unless every drive's most recent SMART self-test PASSED:
+#     ATA "Completed without error" or SCSI "Completed", with smartctl's exit
+#     status flagging nothing beyond bit 2 or 6 (smartctl(8)). A test still
+#     running, failed, aborted, interrupted or never run, a failed test still
+#     in the log (bit 7), a drive smartctl cannot read, or one where it finds
+#     an invalid SMART checksum (read with -b exit): refused, the drive named
+#     by serial with what to do next. --check shows the same; --force skips
+#     the check.
 #     All configuration loaded from config.toml via btrdasd.
 #
 # Drive Layout (from config):
@@ -131,39 +138,160 @@ verify_serials() {
     log_info "All drive serials verified"
 }
 
+# The gate in front of --run: every drive's most recent SMART self-test must
+# have PASSED (bd DAS-Backup-Manager-25r7). Up to 2.2.1 it blocked only on a
+# test still running, so one that failed, was aborted or interrupted, or
+# never ran read as done, and --run went on to YES-DESTROY. A drive is named
+# by serial, never by /dev/sdX: letters move on every reconnect.
 check_smart_tests() {
-    log_header "Checking SMART Test Status"
+    log_header "Checking SMART Self-Test Results"
 
-    local all_complete=true
-
+    local all_passed=true serial dev label out rc verdict SELFTEST_STATUS SELFTEST_ADVICE
     for serial in "${!DISCOVERED_DEVICES[@]}"; do
-        local dev="${DISCOVERED_DEVICES[$serial]}"
-        local label="${TARGET_LABELS[$serial]}"
-        local status
-        status=$(smartctl -l selftest "$dev" 2>/dev/null | grep -E "# 1" | head -1 || echo "No tests")
+        dev="${DISCOVERED_DEVICES[$serial]}"
+        label="${TARGET_LABELS[$serial]}"
 
-        # Matched by bash itself — no pipe, no file, no fd. A pipe into
-        # grep -q read a producer killed by SIGPIPE as "no match" under
-        # pipefail (bd DAS-Backup-Manager-wkvz), and a here-string reads a
-        # pipe it cannot make as "no match" too: here, a running test read
-        # as not running. "in progress" covers "Self-test routine in
-        # progress", the other form the old pattern named.
-        if [[ $status == *"in progress"* ]]; then
-            echo -e "  $dev ($label): ${YELLOW}Test still running${NC}"
-            all_complete=false
-        elif [[ $status == *"Completed without error"* ]]; then
-            echo -e "  $dev ($label): ${GREEN}Test completed - PASSED${NC}"
+        # The output and the exit status, apart (bd DAS-Backup-Manager-jgzx):
+        # the status is a bitmask, nonzero for findings that leave the log
+        # readable, so `|| echo "No tests"` added a second status to a real
+        # one. A capture bash cannot make (no fd to spare) prints nothing and
+        # still returns 0 (measured, bash 5.3): no output must block by
+        # itself, whatever the status says.
+        #
+        # -b exit (smartctl(8), --badsum): a structure this call reads whose
+        # checksum is invalid (the drive's IDENTIFY data, its SMART data, the
+        # self-test log) ends smartctl at its warning, exit 4, before any
+        # row. Its default, warn, prints the warning and carries on, so a log
+        # smartctl itself calls invalid printed its rows at exit 0 and could
+        # pass (measured on the smartctl 7.5 binary, a replayed drive).
+        rc=0
+        out="$(smartctl -b exit -l selftest "$dev" 2>&1)" || rc=$?
+
+        if selftest_passed "$out" "$rc"; then
+            verdict="${GREEN}PASSED${NC}"
         else
-            echo -e "  $dev ($label): ${YELLOW}$status${NC}"
+            all_passed=false
+            # Display only: anything but a pass blocks either way. Matched
+            # by bash itself, no pipe and no file, like every match here.
+            if [[ $SELFTEST_STATUS == *"in progress"* ]]; then
+                verdict="${YELLOW}STILL RUNNING${NC}"
+            else
+                verdict="${RED}NOT PASSED${NC}"
+            fi
         fi
+        echo -e "  $serial ($label): $verdict — $SELFTEST_STATUS"
+        # What to do follows from why it did not pass (empty on a pass).
+        [[ -z $SELFTEST_ADVICE ]] || echo "      → $SELFTEST_ADVICE"
     done
 
-    if ! $all_complete; then
-        log_warn "SMART tests still running. Wait for completion before partitioning."
+    if ! $all_passed; then
+        log_warn "Not every drive has PASSED its most recent SMART self-test."
+        return 1
+    fi
+    log_info "Every drive PASSED its most recent SMART self-test"
+    return 0
+}
+
+# selftest_passed <smartctl -l selftest output> <its exit status>
+# Returns 0 only when the drive's most recent self-test PASSED. Sets, in the
+# caller's locals, SELFTEST_STATUS (what the operator is shown) and
+# SELFTEST_ADVICE (what to do next, from why it did not pass; empty on a
+# pass). Each piece of advice says what that state means, nothing more.
+selftest_passed() {
+    local out="$1" rc="$2" nl=$'\n' row status pass
+    SELFTEST_ADVICE=""
+
+    # smartctl's exit status is a bitmask (smartctl(8), EXIT STATUS). Bits
+    # 0-1: it could not parse its command line or open the drive, so nothing
+    # it printed is a reading. 127 (no smartctl) sets both. A signal (128+N)
+    # always sets bit 7, which blocks below.
+    if ((rc & 3)); then
+        SELFTEST_STATUS="smartctl could not read it (exit $rc)"
+        SELFTEST_ADVICE="smartctl could not read the drive, so nothing about it is verified: do not use it, or --force deliberately"
         return 1
     fi
 
-    log_info "All SMART tests complete"
+    # The most recent self-test is row "# 1": smartctl numbers its log
+    # newest first, and only its rows start with "#". Found by one regex
+    # over the whole output: no pipe, no file (round 4, N3), and no digit
+    # class to widen with the locale (N5).
+    # With no row, say why when smartctl did: an invalid checksum (-b exit
+    # stops at its warning, above) is named, so the operator sees it.
+    local re="(^|$nl)(# 1  [^$nl]*)" bad="Warning! ([^$nl]*) error: invalid SMART checksum"
+    if [[ $out =~ $re ]]; then
+        row="${BASH_REMATCH[2]}"
+    elif [[ $out =~ $bad ]]; then
+        SELFTEST_STATUS="no self-test result: smartctl found an invalid checksum in the ${BASH_REMATCH[1]} (exit $rc)"
+        SELFTEST_ADVICE="smartctl found an invalid checksum, so its readings cannot be trusted: do not use the drive, or --force deliberately"
+        return 1
+    elif [[ $out == *"No "[Ss]"elf-tests have been logged"* ]]; then
+        SELFTEST_STATUS="no self-test logged"
+        SELFTEST_ADVICE="no self-test has run: run an extended test (smartctl -t long) and wait for it to PASS"
+        return 1
+    else
+        SELFTEST_STATUS="no self-test result in smartctl's output (exit $rc)"
+        SELFTEST_ADVICE="smartctl gave no self-test result, so nothing is verified: do not use the drive, or --force deliberately"
+        return 1
+    fi
+
+    # Its status is one fixed-width field, in smartctl 7.5's own layouts:
+    #   ATA   "#%2u  %-19s %-29s %1d0%%  %8u         %s"   status, columns 25-53
+    #   SCSI  "#%2d  %s" (16 wide), "  %s%s" (25 wide), ... " [sense]"
+    #                                                     result, columns 23-47
+    # Only a SCSI row ends in "]", its sense field. Read whole, a failure
+    # cannot pass on a pass's first word: ATA "Completed: read failure",
+    # SCSI "Completed, segment failed".
+    if [[ $row == *"]" ]]; then
+        status="${row:23:25}" pass="Completed"
+    else
+        status="${row:25:29}" pass="Completed without error"
+    fi
+    status="${status%"${status##*[! ]}"}"
+    SELFTEST_STATUS="${status:-$row}"
+    if [[ $status != "$pass" ]]; then
+        # What the status means (ACS-3 and SPC-3, in smartctl's words): still
+        # running; stopped before it finished, by the host or a reset; a
+        # failure (ATA 0x3-0x8, SCSI 0x3-0x7); or a code no standard
+        # defines, or wording this script does not know, which only a
+        # passed test can answer.
+        case $status in
+            *"in progress"*)
+                SELFTEST_ADVICE="a test is still running: wait for it to finish, then check again" ;;
+            "Aborted by host" | "Interrupted (host reset)" | "Aborted (by user command)" | "Aborted (device reset ?)")
+                SELFTEST_ADVICE="the test stopped before it finished: run an extended test (smartctl -t long) and wait for it to PASS" ;;
+            "Fatal or unknown error" | "Completed: "* | "Unknown error, incomplete" | "Completed, segment failed" | "Failed in "*)
+                SELFTEST_ADVICE="the drive failed its most recent self-test: do not use it, or --force deliberately" ;;
+            *)
+                SELFTEST_ADVICE="a result this script does not recognise: run an extended test (smartctl -t long) and wait for it to PASS" ;;
+        esac
+        return 1
+    fi
+
+    # A pass, unless the exit status flags more than bit 2 (some other SMART
+    # command failed) or bit 6 (the error log has entries), which say
+    # nothing of this log. (-b exit's checksum stop sets bit 2 as well, but
+    # before any row is printed, so it never reaches here.) Bit 7: the log
+    # holds a failed self-test — on ATA one no later passed extended test
+    # outdates, on SCSI any of the last 20. Bits 3-5 (the drive reports
+    # failing) come only with -H, never with this call (smartctl 7.5's
+    # source); were one set, it blocks all the same.
+    if ((rc & 128)); then
+        SELFTEST_STATUS="$status, but the log records a failed self-test (smartctl exit $rc)"
+        # ATA ignores a failure older than the newest passed extended test,
+        # so one that passes now clears it; SCSI counts every failure among
+        # its 20 entries, and no newer test does.
+        if [[ $row == *"]" ]]; then
+            SELFTEST_ADVICE="an older self-test in its log failed, and on SCSI no newer test supersedes it (smartctl counts it while it is among the last 20): do not use the drive, or --force deliberately"
+        else
+            SELFTEST_ADVICE="an older self-test failed and no newer extended test has passed: run an extended test (smartctl -t long), which supersedes that failure only if it PASSES"
+        fi
+        return 1
+    fi
+    if ((rc & ~(4 | 64))); then
+        SELFTEST_STATUS="$status, but smartctl reports a problem (exit $rc)"
+        SELFTEST_ADVICE="smartctl reports a problem with the drive: do not use it, or --force deliberately"
+        return 1
+    fi
     return 0
 }
 
@@ -484,14 +612,15 @@ main() {
 
     case "$mode" in
         --check|-c)
-            check_smart_tests || true
+            check_smart_tests || log_warn "--run will refuse until every drive has."
             show_plan
             echo ""
             log_info "Run with --run to execute partitioning"
             ;;
         --run|-r)
             if ! check_smart_tests; then
-                log_error "SMART tests incomplete. Wait or use --force to override."
+                log_error "Partitioning blocked: every drive must have PASSED its most recent SMART self-test (see above)."
+                log_error "What to do is under each drive that did not. --force skips this check: use it only deliberately."
                 exit 1
             fi
             show_plan
@@ -499,7 +628,7 @@ main() {
             run_partitioning
             ;;
         --force)
-            log_warn "Forcing partitioning (SMART tests may be incomplete)"
+            log_warn "Forcing partitioning: SMART self-test results are NOT checked"
             show_plan
             confirm_destruction
             run_partitioning
@@ -507,8 +636,8 @@ main() {
         *)
             echo "Usage: $0 [--check|--run|--force]"
             echo "  --check  Verify drives and show plan (default)"
-            echo "  --run    Execute partitioning (requires SMART tests complete)"
-            echo "  --force  Execute partitioning (skip SMART check)"
+            echo "  --run    Execute partitioning (every drive's most recent SMART self-test must have PASSED)"
+            echo "  --force  Execute partitioning (skip the SMART self-test check)"
             exit 1
             ;;
     esac
