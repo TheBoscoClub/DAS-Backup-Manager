@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
 # Version: 1.0.0
-# Date: 2026-10-03
+# Date: 2026-10-04
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -42,20 +42,39 @@
 #     with the drive already in the USB enclosure may lack it, and the first
 #     boot in the VM then needs the fallback entry -- the documented path,
 #     not a defect.
-#   - Only an OS that will not run btrbk when it boots (bd 1yg): the drive
-#     holds the received backups on the same partition 2, and a btrbk run
-#     by that OS could delete or rewrite them. The nightly backup run
-#     records, per drive, what booting its OS would run (`btrdasd
-#     recovery-os status --state-file`, /var/lib/das-backup/recovery-os.json)
-#     and one verdict: will, may or no. A session goes on only when that
-#     record says no, is at most MAX_RECORD_AGE_DAYS old, and was made after
-#     this drive's last session (the OS may have changed in it; the time of
-#     each session is kept in recovery-os-vm-sessions beside the record,
-#     written before the OS boots and again when the disk is back).
-#     --accept-boot-record-risk lets a verdict, an age or a session through,
-#     loudly and into the summary -- never a record that is missing, of
-#     another schema, or says nothing about this drive. The rule that makes
-#     the verdict is btrdasd's; this only reads it (with jq).
+#   - btrbk cannot run in the booted OS (bd 1yg, 0zm): the drive holds the
+#     received backups on the same partition 2, and a btrbk run by that OS
+#     could delete or rewrite them. Two layers:
+#       1. The boot record. The nightly backup run records, per drive, what
+#          booting its OS would run (`btrdasd recovery-os status
+#          --state-file`, /var/lib/das-backup/recovery-os.json) and one
+#          verdict: will, may or no. "will" is refused; "may" and "no" go on,
+#          the guard enforcing. The record must also be at most
+#          MAX_RECORD_AGE_DAYS old and made after this drive's last session
+#          (the OS may have changed in it; the time of each session is kept
+#          in recovery-os-vm-sessions beside the record, written before the
+#          OS boots and again when the disk is back).
+#          --accept-boot-record-risk lets a "will", an age or a session
+#          through, loudly and into the summary -- never a record that is
+#          missing, of another schema, or says nothing about this drive. The
+#          rule that makes the verdict is btrdasd's; this only reads it (jq).
+#          Advisory on its own: no static reading of shell and systemd is
+#          complete, and a stock install reads "may" for ever.
+#       2. The session guard, the enforcement. For this session only, the
+#          domain is defined with SMBIOS Type 11 strings that systemd >= 256
+#          in the guest turns into units (systemd.system-credentials(7)):
+#          btrbk's own units, every cron daemon and every unit the record
+#          names as running btrbk are masked, and das-vm-guard.service binds
+#          /usr/bin/false over /usr/bin/btrbk and /usr/local/bin/btrbk before
+#          sysinit.target. das-vm-guard-report.service then checks all of it
+#          and writes one line to the virtio port org.dasbackup.guard, which
+#          lands in a root-only file here. No line, or the wrong one, within
+#          GUARD_SECS of the start: on a "will" or "may" record the recovery
+#          OS is asked to shut down (exit 6), on a "no" record it is a warning.
+#          The guard cannot be added: nothing boots. Lifted inside the guest
+#          for the update (systemctl stop das-vm-guard: pacman cannot replace
+#          a file something is mounted on). Afterwards the domain is defined
+#          from the template again; the template itself carries none of it.
 #   - This script never destroys a running recovery OS -- it could be in the
 #     middle of an update. An interrupt or an expired --timeout leaves the
 #     VM, the claim and the lock as they are and says how to finish.
@@ -84,8 +103,13 @@
 #   5  the session ended and the disk was given back, but something needs a
 #      look (see the summary): the claim was lost while the VM ran (taken
 #      again or not), the drive re-enumerated during the session, a
-#      partition was mounted afterwards, the device scan failed, or the
-#      boot-record check was overridden (a dry run with the override too)
+#      partition was mounted afterwards, the device scan failed, the
+#      boot-record check was overridden (a dry run with the override too),
+#      the session guard did not confirm on a "no" record, or it could not
+#      be taken out of the domain's definition again
+#   6  the session guard did not confirm on a "will" or "may" record: the
+#      recovery OS was asked to shut down (never destroyed) and powered off,
+#      or powered off by itself without confirming, and the disk was given back
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
@@ -106,7 +130,8 @@
 #                               hatch lends a loop file, and a hatch session must
 #                               never count as a session of the real drive.
 #   DAS_RECOVERY_VM_POLL_SECS (5), DAS_RECOVERY_VM_MINUTE_SECS (60),
-#   DAS_RECOVERY_VM_GRACE_SECS (600)   faster clocks
+#   DAS_RECOVERY_VM_GRACE_SECS (600), DAS_RECOVERY_VM_GUARD_SECS (300)
+#                               faster clocks
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
 
 set -euo pipefail
@@ -135,6 +160,9 @@ readonly TEST_LOOP="${DAS_RECOVERY_VM_TEST_LOOP:-}"
 readonly POLL_SECS="${DAS_RECOVERY_VM_POLL_SECS:-5}"
 readonly MINUTE_SECS="${DAS_RECOVERY_VM_MINUTE_SECS:-60}"
 readonly GRACE_SECS="${DAS_RECOVERY_VM_GRACE_SECS:-600}"
+# How long the recovery OS has, from its start, to confirm the session guard:
+# firmware, boot menu, an fsck or a slow initramfs, then sysinit.
+readonly GUARD_SECS="${DAS_RECOVERY_VM_GUARD_SECS:-300}"
 
 # Installed side by side by CMake: ${prefix}/lib/das-backup/{this script,libvirt/}.
 readonly DOMAIN_XML="$SCRIPT_DIR/libvirt/$DOMAIN.xml"
@@ -150,7 +178,9 @@ readonly SYS_BLOCK="$TEST_ROOT/sys/block"
 readonly OS_STATE_SCHEMA=3
 readonly MAX_RECORD_AGE_DAYS=8
 # One line per fact; every string cleaned of control characters, since unit
-# names and reasons come from the recovery OS itself.
+# names and reasons come from the recovery OS itself. A runner is said by the
+# name the guard would mask: the unit that runs btrbk, or for a cron file
+# (a source with a slash) the cron daemon that runs it.
 # shellcheck disable=SC2016 # jq's variables, not the shell's
 readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
 "schema\t\(.schema_version | clean)",
@@ -168,6 +198,9 @@ readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
        (if $d.os == null then empty else
           "verdict\t\(($d.os.btrbk_at_boot.verdict // "") | clean)",
           (($d.os.btrbk_at_boot.reasons // [])[] | "reason\t\(clean)"),
+          (($d.os.btrbk_at_boot.runners // [])[]
+           | (if ((.source // "") | tostring | contains("/")) then .via else .source end) // ""
+           | "runner\t\(clean)"),
           ($d.os.enabled_units as $u
            | if $u == null then "units\tnot recorded"
              elif $u.state == "listed" then "units\tlisted", (($u.units // [])[] | "unit\t\(.name | clean)")
@@ -175,6 +208,23 @@ readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
         end)
      end
  else empty end)'
+
+# The session guard (bd DAS-Backup-Manager-0zm): its two units, the drop-in
+# that pulls both into the boot, the virtio port its report goes through,
+# where btrbk can be (both covered when present), what is always masked, and
+# the names a mask is ever given -- the characters unit names are made of,
+# starting with a letter or digit, and only units that can run something.
+readonly GUARD_UNIT="das-vm-guard.service"
+readonly GUARD_REPORT_UNIT="das-vm-guard-report.service"
+readonly GUARD_DROPIN="sysinit.target~das-vm-guard"
+readonly GUARD_PORT="org.dasbackup.guard"
+readonly GUARD_BTRBK_PATHS=(/usr/bin/btrbk /usr/local/bin/btrbk)
+readonly GUARD_DEFAULT_MASKS=(btrbk.service btrbk.timer cronie.service crond.service)
+readonly GUARD_MAX_MASKS=64
+readonly GUARD_ISSUE="/run/issue.d/das-vm-guard.issue"
+readonly UNIT_NAME_RE='^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.(service|timer|socket|path)$'
+# A reason that begins with what runs: "unit ..." or "timer starts unit, which ...".
+readonly REASON_UNITS_RE='^([^ ]+)( starts ([^ ]+), which )?'
 
 # How long the holder has to announce its claim (a spun-down disk may take
 # seconds to open), and to exit after SIGTERM. In tenths of a second.
@@ -217,6 +267,21 @@ SESSIONS_FAILURE="" # why they could not be read or written
 LAST_SESSION=""     # this label's last session time, if one is recorded
 ACCEPT_BOOT_RISK=false
 BOOT_OVERRIDES=()   # what --accept-boot-record-risk let through
+VERDICT=""          # the boot record's btrbk-at-boot verdict: will, may or no
+REC_UNITS=()        # the record's enabled units, when it lists them
+REC_REASONS=()      # what its verdict rests on
+REC_RUNNERS=()      # the name each runner it found would be masked by
+MASKS=()            # the units the session guard masks
+GUARD_ENTRIES=()    # the SMBIOS strings that carry the guard
+GUARD_EXPECT=""     # the one line a recovery OS whose guard holds reports
+GUARD_FILE=""       # where that report lands: the port's file on this host
+GUARD_XML_FILE=""   # the domain definition with the guard, as defined
+GUARDED=false       # the guard MAY be in the domain's definition (set before defining)
+GUARD_CONFIRMED=false
+GUARD_FAILED=false  # it did not confirm (GUARD_RESULT says how)
+GUARD_SHUT_DOWN=false # ...and the recovery OS was asked to shut down for it
+GUARD_RESULT="not booted"
+GUARD_LEFT=""       # why the guard could not be taken out of the definition
 ATTACHED=false      # the disk MAY be in the domain's definition (set before attaching)
 STARTED=false       # `virsh start` was attempted, so the guest may have written
 DONE=false          # nothing left for the trap to undo
@@ -261,12 +326,13 @@ whole disk passed through, to update it without rebooting the workstation.
                          (it must be shut off, with no disk attached)
   session <A|B|label> [--dry-run] [--timeout <minutes>]
           [--accept-boot-record-risk]
-                         lend one role = "mirror" drive to the VM, boot it,
+                         lend one role = "mirror" drive to the VM, boot it
+                         with the session guard (btrbk cannot run in it),
                          wait until it powers off, give the disk back --
-                         only when the nightly run's record says its OS
-                         will not run btrbk at boot, is fresh, and is newer
+                         only when the nightly run's record does not say its
+                         OS will run btrbk at boot, is fresh, and is newer
                          than the drive's last session (the flag lets a
-                         verdict, an age or a session through, loudly)
+                         "will", an age or a session through, loudly)
   session-end <A|B|label>
                          finish a session whose driver died (VM shut off)
   status                 domain state, attached disk, holder, lock
@@ -276,7 +342,9 @@ Exit status: 0 done; 1 refused, failed or interrupted, nothing held;
 2 usage; 3 the recovery OS is still running and keeps the disk and the lock;
 4 the disk could not be returned completely and is kept (finish 3 and 4 with
 session-end); 5 done and given back, but see the summary's warnings (a dry
-run that needed --accept-boot-record-risk exits 5 too).
+run that needed --accept-boot-record-risk exits 5 too); 6 the session guard
+did not confirm on a "will" or "may" record, so the recovery OS was shut down
+(never destroyed) and the disk given back.
 EOF
 }
 
@@ -530,6 +598,8 @@ resolve_label() {
     HOLDER_OUT="$STATE_DIR/$LABEL.holder.out"
     HOLDER_ERR="$STATE_DIR/$LABEL.holder.err"
     DISK_XML_FILE="$STATE_DIR/$LABEL.disk.xml"
+    GUARD_FILE="$STATE_DIR/$LABEL.guard"
+    GUARD_XML_FILE="$STATE_DIR/$LABEL.domain.xml"
 }
 
 # The allow-list is config's, never a list in this script: the serial must
@@ -832,12 +902,13 @@ resolve_os_state() {
     SESSIONS_FILE="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-sessions"
 }
 
-# Read this drive's boot record and go on only when it says btrbk will not
-# run when its OS boots -- before anything is taken. The record's own facts
-# are shown whatever they say.
+# Read this drive's boot record and go on only when it does not say btrbk
+# will run when its OS boots -- before anything is taken. "may" goes on: the
+# session guard is what keeps btrbk from running, and what the record names
+# is masked by it. The record's own facts are shown whatever they say.
 check_boot_record() {
     local file out rc=0 key value schemas=0 schema="" schematype="" entry="" checked="" checkedtype="" error=""
-    local verdict="" units_state="" when now age p problems=() hints=() reasons=() units=() hint=""
+    local verdict="" units_state="" when now age p problems=() hints=() reasons=() units=() runners=() hint=""
     resolve_os_state
     file=$OS_STATE_FILE
     if [[ ! -e "$file" ]]; then
@@ -861,6 +932,7 @@ check_boot_record() {
             error) error=$value ;;
             verdict) verdict=$value ;;
             reason) reasons+=("$value") ;;
+            runner) runners+=("$value") ;;
             units) units_state=$value ;;
             unit) units+=("$value") ;;
         esac
@@ -908,9 +980,19 @@ check_boot_record() {
     for p in "${reasons[@]}"; do
         log "    - $p"
     done
+    VERDICT=$verdict
+    REC_REASONS=("${reasons[@]}")
+    REC_RUNNERS=("${runners[@]}")
+    REC_UNITS=()
+    if [[ "$units_state" == listed ]]; then
+        REC_UNITS=("${units[@]}")
+    fi
 
-    if [[ "$verdict" != no ]]; then
-        problems+=("btrbk $verdict run when this OS boots")
+    if [[ "$verdict" == may ]]; then
+        log "boot record: btrbk may run when this OS boots: the session guard is what keeps it from running"
+    fi
+    if [[ "$verdict" == will ]]; then
+        problems+=("btrbk will run when this OS boots")
         hints+=("fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again (without starting btrbk: boot it with systemd.unit=emergency.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1 on its kernel line, remount / read-write if needed, mask the unit the record names, then systemctl poweroff -- never exit or Ctrl-D, and never Ctrl-Alt-Del: each boots it on; to stop at any prompt, hold the power button; see the disaster recovery guide)")
     fi
     if ((checked > now + 300)); then
@@ -928,7 +1010,9 @@ check_boot_record() {
         hints+=("let the next backup run, with this drive attached, record it again")
     fi
     if ((${#problems[@]} == 0)); then
-        log "boot record: btrbk will not run when this OS boots"
+        if [[ "$verdict" == no ]]; then
+            log "boot record: btrbk will not run when this OS boots"
+        fi
         return 0
     fi
     if [[ "$ACCEPT_BOOT_RISK" == true ]]; then
@@ -943,6 +1027,313 @@ check_boot_record() {
         [[ "; $hint; " == *"; $p; "* ]] || hint+="${hint:+; }$p"
     done
     refuse "$(IFS=';'; printf '%s' "${problems[*]}" | sed 's/;/; /g') (the record was checked $when, $(age_text "$age")) -- $hint"
+}
+
+# ---------------------------------------------------------------------------
+# The session guard (bd DAS-Backup-Manager-0zm)
+# ---------------------------------------------------------------------------
+
+# A string from the recovery OS (a record, or its report) as it may be shown:
+# printable characters only, and not without end.
+printable() {
+    local s=${1//[^[:print:]]/?}
+    printf '%s' "${s:0:300}"
+}
+
+# $1 to be masked, if it is a name this script puts into a credential: the
+# characters unit names are made of, a unit that can run something, and never
+# one of the guard's own. Nor a template (name@.service): the report could not
+# ask systemd about it (`systemctl show` refuses a template's name), and an
+# instance is named in full. $2 says where it came from. Into MASKS once.
+guard_candidate() {
+    local m
+    if [[ ${#1} -gt 200 || ! "$1" =~ $UNIT_NAME_RE || "$1" == das-vm-guard* || "$1" =~ @\.[a-z]+$ ]]; then
+        warn "session guard: not masked: '$(printable "$1")' ($2): only a service, timer, socket or path unit of a plain name -- no template -- is ever masked, and never the guard's own; the binary guard still covers it"
+        return 0
+    fi
+    for m in "${MASKS[@]}"; do
+        [[ "$m" != "$1" ]] || return 0
+    done
+    MASKS+=("$1")
+}
+
+# What the guard masks: btrbk's units and the cron daemons always; every
+# cron daemon the record lists among the enabled units; every runner it found
+# (the unit, or the cron daemon running a cron file); and the unit each
+# reason begins with ("unit may run btrbk: ...", "timer starts unit, which
+# ..."). The defaults first, the rest in order, at most GUARD_MAX_MASKS. Then
+# the SMBIOS strings that carry it all, and the line its report must be.
+build_guard() {
+    local u r w extra=() sorted=() unit_b64 report_b64 dropin_b64
+    MASKS=("${GUARD_DEFAULT_MASKS[@]}")
+    for u in "${REC_UNITS[@]}"; do
+        [[ "$u" != *cron* ]] || guard_candidate "$u" "a cron daemon the boot record lists as enabled"
+    done
+    for r in "${REC_RUNNERS[@]}"; do
+        [[ -z "$r" ]] || guard_candidate "$r" "the boot record found it running btrbk"
+    done
+    for r in "${REC_REASONS[@]}"; do
+        [[ "$r" =~ $REASON_UNITS_RE ]] || continue
+        for w in "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"; do
+            w=${w%[:,]}
+            if [[ "$w" =~ \.(service|timer|socket|path)$ ]]; then
+                guard_candidate "$w" "a reason in the boot record begins with it"
+            fi
+        done
+    done
+    extra=("${MASKS[@]:${#GUARD_DEFAULT_MASKS[@]}}")
+    if ((${#extra[@]} > 0)); then
+        mapfile -t sorted < <(printf '%s\n' "${extra[@]}" | LC_ALL=C sort)
+        if ((${#GUARD_DEFAULT_MASKS[@]} + ${#sorted[@]} > GUARD_MAX_MASKS)); then
+            u=$((GUARD_MAX_MASKS - ${#GUARD_DEFAULT_MASKS[@]}))
+            warn "session guard: not masked: ${sorted[*]:$u} -- the guard masks at most $GUARD_MAX_MASKS units; the binary guard still covers them"
+            sorted=("${sorted[@]:0:$u}")
+        fi
+    fi
+    MASKS=("${GUARD_DEFAULT_MASKS[@]}" "${sorted[@]}")
+    GUARD_EXPECT="das-vm-guard engaged ${#MASKS[@]} masks $(IFS=,; printf '%s' "${MASKS[*]}")"
+    unit_b64="$(guard_unit_text | base64 -w0)" || refuse "cannot encode the session guard's unit"
+    report_b64="$(guard_report_text | base64 -w0)" || refuse "cannot encode the session guard's report unit"
+    dropin_b64="$(printf '[Unit]\nWants=%s %s\n' "$GUARD_UNIT" "$GUARD_REPORT_UNIT" | base64 -w0)" ||
+        refuse "cannot encode the session guard's drop-in"
+    GUARD_ENTRIES=(
+        "io.systemd.credential.binary:systemd.extra-unit.$GUARD_UNIT=$unit_b64"
+        "io.systemd.credential.binary:systemd.extra-unit.$GUARD_REPORT_UNIT=$report_b64"
+        "io.systemd.credential.binary:systemd.unit-dropin.$GUARD_DROPIN=$dropin_b64"
+    )
+    for u in "${MASKS[@]}"; do
+        GUARD_ENTRIES+=("io.systemd.credential:systemd.extra-unit.$u=")
+    done
+    log "session guard: /usr/bin/false bound over $(IFS=,; p="${GUARD_BTRBK_PATHS[*]}"; printf '%s' "${p//,/ and }") where present; masks $(IFS=,; p="${MASKS[*]}"; printf '%s' "${p//,/, }")"
+}
+
+# What the recovery OS reads at its console and above every login prompt
+# while the guard holds (agetty >= 2.41 reads /run/issue.d always). No $, %,
+# quotes or backslashes: it goes through systemd's command-line parsing and sh.
+guard_message_lines() {
+    printf '%s\n' \
+        "das-vm-guard: btrbk cannot run in this VM session (DAS recovery OS updater)." \
+        "  Before you update, lift it:      systemctl stop das-vm-guard" \
+        "  then update:                     pacman -Syu" \
+        "  then check it was replaced:      pacman -Qkk btrbk   (0 altered files)" \
+        "  then:                            systemctl poweroff"
+}
+
+# The guard: /usr/bin/false bound over each btrbk path present, before
+# sysinit.target -- so before anything the boot starts -- and lifted again by
+# `systemctl stop das-vm-guard`. Skipped in the initrd, which loads extra
+# units too. $$ is a literal $ to systemd; nothing in it may contain %.
+guard_unit_text() {
+    local p echoes="" line paths
+    paths="${GUARD_BTRBK_PATHS[*]}"
+    while IFS= read -r line; do
+        echoes+="echo \"$line\"; "
+    done < <(guard_message_lines)
+    cat <<EOF
+[Unit]
+Description=DAS VM session guard: btrbk cannot run in this VM session
+DefaultDependencies=no
+ConditionPathExists=!/etc/initrd-release
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=60
+ExecStart=/usr/bin/sh -c 'for p in $paths; do if [ -e "\$\$p" ]; then /usr/bin/mount --bind /usr/bin/false "\$\$p" || exit 1; fi; done'
+ExecStart=-/usr/bin/sh -c 'echo "das-vm-guard: btrbk cannot run in this VM session; before pacman: systemctl stop das-vm-guard; after it: pacman -Qkk btrbk must find 0 altered files" > /dev/kmsg'
+ExecStart=-/usr/bin/sh -c 'mkdir -p ${GUARD_ISSUE%/*} && { ${echoes}echo; } > $GUARD_ISSUE'
+ExecStart=-/usr/bin/timeout 5 /usr/bin/sh -c '{ echo; ${echoes}echo; } > /dev/console'
+EOF
+    for ((p = ${#GUARD_BTRBK_PATHS[@]} - 1; p >= 0; p--)); do
+        printf 'ExecStop=-/usr/bin/umount %s\n' "${GUARD_BTRBK_PATHS[$p]}"
+    done
+    printf 'ExecStop=-/usr/bin/rm -f %s\n' "$GUARD_ISSUE"
+    printf '%s\n' "ExecStop=-/usr/bin/sh -c 'echo \"das-vm-guard: lifted: btrbk can run again; its units and cron stay masked until the VM powers off\" > /dev/kmsg'"
+}
+
+# The report: once the guard has run, check it -- active, every mask in place,
+# every btrbk present covered by /usr/bin/false -- and write one line to the
+# virtio port. Waits for the port at most two minutes and is ordered before
+# nothing, so a missing port costs the boot nothing.
+#
+# A mask in place is a unit that cannot be started. The generator writes an
+# empty credential as a file holding one newline, in
+# /run/systemd/generator.early, ahead of /etc and /usr (systemd 262's
+# systemd-debug-generator, run offline on this host). Only a file of size 0
+# loads as "masked" (systemd.unit(5)); this one loads as "bad-setting", which
+# cannot be started either. A drop-in of the OS's own that gives the unit a
+# command again makes it whole: that load state is said, and the guard is not
+# engaged.
+guard_report_text() {
+    local script
+    script="port=/dev/virtio-ports/$GUARD_PORT; n=0; "
+    script+="while [ ! -e \"\$\$port\" ] && [ \"\$\$n\" -lt 120 ]; do sleep 1; n=\$\$((n + 1)); done; "
+    script+="if [ ! -e \"\$\$port\" ]; then echo \"das-vm-guard: no port to the host\"; exit 0; fi; "
+    script+="bad=; "
+    script+="systemctl is-active --quiet $GUARD_UNIT || bad=\"\$\$bad $GUARD_UNIT is not active;\"; "
+    script+="for u in ${MASKS[*]}; do s=\$\$(systemctl show -P LoadState \"\$\$u\"); case \"\$\$s\" in masked|bad-setting) ;; *) bad=\"\$\$bad \$\$u is not masked (\$\$s);\" ;; esac; done; "
+    script+="for p in ${GUARD_BTRBK_PATHS[*]}; do if [ -e \"\$\$p\" ] && { ! findmnt -rn --mountpoint \"\$\$p\" >/dev/null || ! [ \"\$\$p\" -ef /usr/bin/false ]; }; then bad=\"\$\$bad \$\$p is not covered;\"; fi; done; "
+    script+="if [ -z \"\$\$bad\" ]; then line=\"$GUARD_EXPECT\"; else line=\"das-vm-guard NOT engaged:\$\$bad\"; fi; "
+    script+="echo \"\$\$line\"; echo \"\$\$line\" > \"\$\$port\""
+    cat <<EOF
+[Unit]
+Description=DAS VM session guard: report to the host
+ConditionPathExists=!/etc/initrd-release
+After=$GUARD_UNIT
+
+[Service]
+Type=simple
+RuntimeMaxSec=300
+ExecStart=/usr/bin/sh -c '$script'
+EOF
+}
+
+# The template with the guard: SMBIOS strings read from sysinfo, and the
+# virtio port whose host side is a file in this script's root-only directory.
+# 1 when the template is not of the shape this expects (each anchor once, no
+# SMBIOS of its own, no such port).
+guarded_domain_xml() {
+    local line os=0 devices=0 e
+    if grep -q -e '<sysinfo' -e '<smbios' -e '<oemStrings' -e "name='$GUARD_PORT'" -- "$DOMAIN_XML"; then
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            "  </os>")
+                os=$((os + 1))
+                printf "    <smbios mode='sysinfo'/>\n%s\n" "$line"
+                printf "  <sysinfo type='smbios'>\n    <oemStrings>\n"
+                for e in "${GUARD_ENTRIES[@]}"; do
+                    printf '      <entry>%s</entry>\n' "$e"
+                done
+                printf "    </oemStrings>\n  </sysinfo>\n"
+                ;;
+            "  </devices>")
+                devices=$((devices + 1))
+                printf "    <channel type='file'>\n      <source path='%s'/>\n      <target type='virtio' name='%s'/>\n    </channel>\n%s\n" \
+                    "$GUARD_FILE" "$GUARD_PORT" "$line"
+                ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done <"$DOMAIN_XML"
+    ((os == 1 && devices == 1))
+}
+
+# What of the guard a domain definition ($1) lacks, as a list; empty when it
+# carries all of it.
+guard_missing() {
+    local e missing=""
+    for e in "${GUARD_ENTRIES[@]}"; do
+        [[ "$1" == *">$e<"* ]] || missing+="${missing:+, }${e%%=*}"
+    done
+    [[ "$1" == *"<smbios mode='sysinfo'/>"* ]] || missing+="${missing:+, }<smbios mode='sysinfo'/>"
+    if [[ "$1" != *"name='$GUARD_PORT'"* || "$1" != *"<source path='$GUARD_FILE'"* ]]; then
+        missing+="${missing:+, }the $GUARD_PORT port to $GUARD_FILE"
+    fi
+    printf '%s' "$missing"
+}
+
+# Whether a domain definition ($1) carries any of a session guard.
+guard_in() {
+    [[ "$1" == *"name='$GUARD_PORT'"* || "$1" == *io.systemd.credential* ]]
+}
+
+# Define the domain with the guard, and prove the definition carries it.
+# Fail closed: without it, nothing boots.
+define_guard() {
+    local out xml missing
+    check_path_chars "$GUARD_FILE"
+    rm -f -- "$GUARD_FILE" "$GUARD_FILE".[0-9]*
+    if [[ -e "$GUARD_FILE" ]]; then
+        refuse "cannot remove an old $GUARD_FILE: a stale report could pass for this session's -- nothing was booted"
+    fi
+    if ! (umask 077 && guarded_domain_xml >"$GUARD_XML_FILE"); then
+        rm -f -- "$GUARD_XML_FILE"
+        refuse "cannot add the session guard to $DOMAIN_XML (each of '  </os>' and '  </devices>' once, and no SMBIOS strings or $GUARD_PORT port of its own, are needed) -- nothing was booted"
+    fi
+    # Set first: if the define half-happens, the cleanup must look.
+    GUARDED=true
+    if ! out="$(virsh_ define --validate "$GUARD_XML_FILE" 2>&1)"; then
+        refuse "cannot define the session guard into $DOMAIN: $out -- nothing was booted"
+    fi
+    xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition back: $xml -- nothing was booted"
+    missing="$(guard_missing "$xml")"
+    if [[ -n "$missing" ]]; then
+        refuse "$DOMAIN's definition does not carry the session guard after defining it (missing: $missing) -- nothing was booted"
+    fi
+    log "defined $DOMAIN with the session guard (${#MASKS[@]} masks; its report goes to $GUARD_FILE)"
+}
+
+# Define the domain from the template again: no guard. 1, with GUARD_LEFT
+# set, when that cannot be proven. Never a reason to keep the disk: the guard
+# only keeps btrbk from running in that VM.
+remove_guard() {
+    local out xml
+    if ! out="$(virsh_ define --validate "$DOMAIN_XML" 2>&1)"; then
+        GUARD_LEFT="virsh define $DOMAIN_XML failed: $out"
+    elif ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
+        GUARD_LEFT="cannot read $DOMAIN's definition back: $xml"
+    elif guard_in "$xml"; then
+        GUARD_LEFT="$DOMAIN's definition still carries it after defining $DOMAIN_XML"
+    else
+        GUARDED=false
+        rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]*
+        log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_XML again)"
+        return 0
+    fi
+    warn "the session guard is still in $DOMAIN's definition: $GUARD_LEFT. It only keeps btrbk from running in that VM; once it is shut off, run: $SELF define"
+    return 1
+}
+
+# The recovery OS's report, read without waiting: what it has written up to
+# the first newline. $1 is "running" or "off". Once it is in, or once there is
+# none when there must be (GUARD_SECS after the start, or the VM is off),
+# GUARD_CONFIRMED or GUARD_FAILED is set; a failure on a "will" or "may"
+# record asks a running recovery OS to shut down.
+check_guard() {
+    local line="" whole=false why partial="" shown
+    if [[ "$GUARD_CONFIRMED" == true || "$GUARD_FAILED" == true ]]; then
+        return 0
+    fi
+    # stderr first: a file not there yet fails the < redirection.
+    if IFS= read -r line 2>/dev/null <"$GUARD_FILE"; then
+        whole=true
+    fi
+    # Compared whole; only what is shown is cleaned and cut short.
+    shown="$(printable "$line")"
+    if [[ -n "$line" ]]; then
+        partial=" (an unfinished line: '$shown')"
+    fi
+    if [[ "$whole" == true && "$line" == "$GUARD_EXPECT" ]]; then
+        GUARD_CONFIRMED=true
+        GUARD_RESULT="engaged -- $GUARD_EXPECT"
+        log "the session guard is engaged: $GUARD_EXPECT"
+        return 0
+    fi
+    if [[ "$whole" == true && "$line" == "das-vm-guard NOT engaged:"* ]]; then
+        why="the recovery OS reports it NOT engaged:${shown#das-vm-guard NOT engaged:}"
+    elif [[ "$whole" == true ]]; then
+        why="the recovery OS reported '$shown', not the line expected ('$GUARD_EXPECT')"
+    elif [[ "$1" == off ]]; then
+        why="the recovery OS powered off without reporting$partial"
+    elif ((SECONDS - VM_START >= GUARD_SECS)); then
+        why="no report from the recovery OS within $(format_duration "$GUARD_SECS") of its start$partial -- an OS whose systemd is older than 256 does not even see the guard"
+    else
+        return 0
+    fi
+    GUARD_FAILED=true
+    GUARD_RESULT="NOT confirmed: $why"
+    if [[ "$VERDICT" == no ]]; then
+        warn "the session guard did not confirm: $why. The boot record says btrbk will not run when this OS boots, so the session goes on -- see the summary"
+        return 0
+    fi
+    warn "the session guard did not confirm: $why. The boot record says btrbk $VERDICT run when this OS boots, and nothing now vouches that it cannot"
+    if [[ "$1" == running ]]; then
+        GUARD_SHUT_DOWN=true
+        request_shutdown "the session guard did not confirm"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1534,11 @@ return_disk() {
         fi
         ATTACHED=false
         log "detached $DISK from $DOMAIN"
+    fi
+    # The disk is out, so the definition can be the template's again. While
+    # the claim and the lock still hold: no other session defines meanwhile.
+    if [[ "$GUARDED" == true ]]; then
+        remove_guard || :
     fi
     if [[ -n "$HOLDER_PID" ]]; then
         # session-end: this script holds no lock of its own, but a live
@@ -1384,9 +1780,12 @@ parse_session_args() {
     fi
 }
 
-shutdown_on_timeout() {
+# Ask the recovery OS to power off (ACPI) because of $1, and wait until it
+# has. Never destroyed: it may be in the middle of an update. Not off within
+# GRACE_SECS: the session is kept (exit 3).
+request_shutdown() {
     local out deadline state
-    log "the --timeout of $TIMEOUT_MIN minute(s) has passed: asking the recovery OS to shut down"
+    log "$1: asking the recovery OS to shut down"
     if ! out="$(virsh_ shutdown "$DOMAIN" 2>&1)"; then
         warn "virsh shutdown: $out"
     fi
@@ -1400,7 +1799,7 @@ shutdown_on_timeout() {
         fi
         keep_claim || :
     done
-    KEEP_REASON="it did not power off within $(format_duration "$GRACE_SECS") of the shutdown request -- it may still be updating"
+    KEEP_REASON="it did not power off within $(format_duration "$GRACE_SECS") of the shutdown request ($1) -- it may still be updating"
     exit 3
 }
 
@@ -1409,7 +1808,7 @@ wait_for_poweroff() {
     if [[ -n "$TIMEOUT_MIN" ]]; then
         deadline=$((SECONDS + TIMEOUT_MIN * MINUTE_SECS))
     fi
-    log "waiting for the recovery OS to power off (state polled every ${POLL_SECS}s${TIMEOUT_MIN:+; shutdown requested after $TIMEOUT_MIN minute(s)})"
+    log "waiting for the recovery OS to power off (state polled every ${POLL_SECS}s; the session guard must report within $(format_duration "$GUARD_SECS")${TIMEOUT_MIN:+; shutdown requested after $TIMEOUT_MIN minute(s)})"
     while :; do
         sleep "$POLL_SECS"
         state="$(current_state)"
@@ -1421,17 +1820,25 @@ wait_for_poweroff() {
             return 0
         fi
         keep_claim || :
+        check_guard running
+        if [[ "$GUARD_SHUT_DOWN" == true ]]; then
+            return 0
+        fi
         if ((deadline > 0 && SECONDS >= deadline)); then
-            shutdown_on_timeout
+            request_shutdown "the --timeout of $TIMEOUT_MIN minute(s) has passed"
             return 0
         fi
     done
 }
 
-# 5 when a session ended, everything given back, but something needs a look;
-# else 0.
+# 6 when the session guard did not confirm on a record that does not rule
+# btrbk out; 5 when a session ended, everything given back, but something
+# needs a look; else 0.
 session_status() {
-    if [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
+    if [[ "$GUARD_FAILED" == true && "$VERDICT" != no ]]; then
+        echo 6
+    elif [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
+        [[ "$GUARD_FAILED" == true || -n "$GUARD_LEFT" ]] ||
         ((HOLDER_LOSSES > 0 || ${#BOOT_OVERRIDES[@]} > 0)); then
         echo 5
     else
@@ -1457,6 +1864,7 @@ cmd_session() {
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
     fi
     check_boot_record
+    build_guard
     resolve_disk
     log "session for $LABEL: $DISK ($DISK_DEV)$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
     check_units
@@ -1486,7 +1894,7 @@ cmd_session() {
             exit 4
         fi
         DONE=true
-        log "dry run done: lock taken and released, holder started and stopped, nothing attached"
+        log "dry run done: lock taken and released, holder started and stopped, nothing defined or attached"
         if ((${#BOOT_OVERRIDES[@]} > 0)); then
             warn "dry run: the boot-record check was overridden (--accept-boot-record-risk) -- exit 5"
             exit 5
@@ -1494,6 +1902,7 @@ cmd_session() {
         exit 0
     fi
 
+    define_guard
     attach_disk
     # A USB disk that re-enumerated since the claim is another device now.
     if [[ "$(readlink -f -- "$DISK")" != "$DISK_DEV" ]]; then
@@ -1512,8 +1921,26 @@ cmd_session() {
     log "the recovery OS is booting from $DISK"
     log "console: virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN (its VNC is a libvirt-private socket; '$SELF screenshot <file.png>' works too)"
     log "serial console: virsh --connect $LIBVIRT_URI console $DOMAIN"
+    log "inside it, before updating: systemctl stop das-vm-guard; after: pacman -Qkk btrbk must find 0 altered files"
+    # What it booted with is the running domain's own definition: the
+    # persistent one could have been defined again since it was checked.
+    if ! out="$(virsh_ dumpxml "$DOMAIN" 2>&1)"; then
+        GUARD_FAILED=true
+        GUARD_RESULT="NOT confirmed: the running domain's definition cannot be read ($out)"
+        warn "the session guard: cannot read the running domain's definition: $out"
+    elif [[ -n "$(guard_missing "$out")" ]]; then
+        GUARD_FAILED=true
+        GUARD_RESULT="NOT confirmed: the running domain does not carry the session guard (missing: $(guard_missing "$out"))"
+        warn "the running domain does not carry the session guard (missing: $(guard_missing "$out"))"
+    fi
+    if [[ "$GUARD_FAILED" == true && "$VERDICT" != no ]]; then
+        GUARD_SHUT_DOWN=true
+        request_shutdown "the session guard is not in the running domain"
+    fi
 
     wait_for_poweroff
+    # It may have reported between two looks, or never.
+    check_guard off
 
     log "the recovery OS powered off after $(format_duration $((SECONDS - VM_START))) -- giving $DISK back to the host"
     trap '' INT TERM HUP
@@ -1523,7 +1950,7 @@ cmd_session() {
         exit 4
     fi
     DONE=true
-    local claim="held throughout" warnings=() w lines="" joined=""
+    local claim="held throughout" warnings=() w lines="" joined="" asked=""
     if ((HOLDER_LOSSES > 0)) && [[ "$CLAIM_GAP" == true ]]; then
         claim="LOST $HOLDER_LOSSES time(s); NOT claimed again -- see the warnings above"
         warnings+=("the claim was lost and not taken again: until the recovery OS was off, nothing kept this host off the drive")
@@ -1536,6 +1963,18 @@ cmd_session() {
     for w in "${BOOT_OVERRIDES[@]}"; do
         warnings+=("the boot-record check was overridden (--accept-boot-record-risk): $w")
     done
+    if [[ "$GUARD_FAILED" == true && "$VERDICT" == no ]]; then
+        warnings+=("the session guard did not confirm (${GUARD_RESULT#NOT confirmed: }): only the boot record's \"no\" stood between btrbk and the backups on this drive")
+    elif [[ "$GUARD_FAILED" == true ]]; then
+        # Not inside the assignment: there a false test would be its status.
+        if [[ "$GUARD_SHUT_DOWN" == true ]]; then
+            asked=", so the recovery OS was asked to shut down"
+        fi
+        warnings+=("the session guard did not confirm on a \"$VERDICT\" record$asked: look at its journal for what ran (journalctl -b -1 inside it, at its next boot)")
+    fi
+    if [[ -n "$GUARD_LEFT" ]]; then
+        warnings+=("the session guard is still in $DOMAIN's definition ($GUARD_LEFT): once it is shut off, run $SELF define")
+    fi
     for w in "${warnings[@]}"; do
         lines+=$'\n'"  Warnings      $w"
         joined+="; $w"
@@ -1544,12 +1983,13 @@ cmd_session() {
 Session done -- $LABEL
   Disk          $DISK ($DISK_DEV)
   VM ran        $(format_duration $((SECONDS - VM_START))); whole session $(format_duration $((SECONDS - SESSION_START)))
+  Guard         $GUARD_RESULT
   Claim         $claim
   Given back    detached; $HOLDER_RESULT; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
   Lock          released$lines
   Next          the next backup run reads the updated OS (RECOVERY OS in its report)
 EOF
-    logger -t "$LOG_TAG" -- "session for $LABEL done: claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT$joined" || :
+    logger -t "$LOG_TAG" -- "session for $LABEL done: guard $GUARD_RESULT; claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT$joined" || :
     exit "$(session_status)"
 }
 
@@ -1572,8 +2012,19 @@ cmd_session_end() {
     fi
     xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $xml"
     mapfile -t attached < <(disk_sources "$xml")
+    # A session that ended before giving it back left its guard behind.
+    if guard_in "$xml"; then
+        GUARDED=true
+    fi
     if [[ -z "$DISK" ]]; then
         if ((${#attached[@]} == 0)); then
+            if [[ "$GUARDED" == true ]]; then
+                if remove_guard; then
+                    log "session-end: no disk to give back for $LABEL; the session guard was still in $DOMAIN's definition and is out of it now"
+                    exit 0
+                fi
+                exit 5
+            fi
             log "nothing to end for $LABEL: no holder record and no disk attached to $DOMAIN"
             return 0
         fi
@@ -1648,6 +2099,13 @@ cmd_status() {
     else
         printf 'Attached disk     unknown (virsh: %s)\n' "$xml"
     fi
+    if ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
+        printf 'Session guard     unknown (virsh: %s)\n' "$xml"
+    elif guard_in "$xml"; then
+        printf 'Session guard     in the definition (a session runs, or one was not ended: session-end <label>)\n'
+    else
+        printf 'Session guard     none\n'
+    fi
     shopt -s nullglob
     for f in "$STATE_DIR"/*.holder; do
         any=true
@@ -1691,8 +2149,9 @@ cmd_screenshot() {
 # main
 # ---------------------------------------------------------------------------
 check_knobs() {
-    if [[ ! "$POLL_SECS" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$POLL_SECS" =~ [1-9] || ! "$MINUTE_SECS" =~ ^[1-9][0-9]*$ || ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ ]]; then
-        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS and _GRACE_SECS take numbers above 0\n' >&2
+    if [[ ! "$POLL_SECS" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$POLL_SECS" =~ [1-9] || ! "$MINUTE_SECS" =~ ^[1-9][0-9]*$ ||
+        ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ || ! "$GUARD_SECS" =~ ^[1-9][0-9]{0,5}$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS and _GUARD_SECS take numbers above 0\n' >&2
         exit 2
     fi
     if [[ -n "$TEST_ROOT" ]]; then
