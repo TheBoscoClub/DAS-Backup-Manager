@@ -99,6 +99,7 @@ The system has six major components:
          │
          ├──▶ singleton lock (/run/das-backup.lock: held → skip, exit 0; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
+         │                                   (one already mounted, as fstab mounts /dasRaid0, is used as found)
          ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml when the plan changes it, and btrbk.conf whenever it differs from what config.toml renders to
          │                                   (then: reload config, verify_sources_before_write() again for any source sync added;
          │                                    under --dryrun nothing is written and btrbk reads a temporary rendered btrbk.conf instead)
@@ -111,7 +112,10 @@ The system has six major components:
          ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
          ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted;
          │                                   decide_run_counts() then settles the snapshot counts, before the run status
-         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report
+         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report;
+         │                                   of the sources, only the mount points this run mounted, each once (one that will not
+         │                                   unmount is a WARN with umount's message) — never one it found mounted
+         │                                   (bd DAS-Backup-Manager-8cf)
          ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25), bounded: TERM after 60 s, KILL 10 s later;
          │                                   report written to last_report first (a write that fails is logged, and the journal has it)
          └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown)
