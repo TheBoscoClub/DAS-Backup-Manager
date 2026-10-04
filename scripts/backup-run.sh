@@ -40,7 +40,9 @@
 #     `[[ =~ ]]`: piped into grep -q, a listing over 64 KiB read as "no
 #     snapshots" when printf died of SIGPIPE (bd DAS-Backup-Manager-wkvz),
 #     and as a here-string it needed a temp file, which a full /tmp or no
-#     fd to spare turned into the same answer (round 4, N3).
+#     fd to spare turned into the same answer (round 4, N3). Its digits are
+#     [[:digit:]], ASCII in every locale as grep's [0-9] was: bash's regex
+#     [0-9] also matches non-ASCII digits under en_US.UTF-8 (round 5, N5).
 #     Every report's delivery is bounded (MAIL_TIMEOUT_SECS, 60 s, then KILL
 #     10 s later) and mailx runs without the lock fds. s-nail gives up by
 #     itself after about 45 s of silence on a read, but not on a relay that
@@ -1832,8 +1834,11 @@ update_boot_subvolumes() {
             # pipefail read as "no match" (bd DAS-Backup-Manager-wkvz); fed
             # as a here-string, it went to a temp file, and a full /tmp or no
             # fd to spare read as "no match" too (round 4, N3). Either way,
-            # straight into the quiet branch.
-            if [[ $subvol_listing =~ [0-9]{8}T[0-9]{4} ]]; then
+            # straight into the quiet branch. [[:digit:]], not [0-9]: under
+            # en_US.UTF-8 bash's regex [0-9] also matches Arabic-Indic and
+            # fullwidth digits, where grep's matched ASCII only; [[:digit:]]
+            # is ASCII in every locale, the old meaning (round 5, N5).
+            if [[ $subvol_listing =~ [[:digit:]]{8}T[[:digit:]]{4} ]]; then
                 log_error "  [$label] Target HAS btrbk-shaped snapshots but none matched the expected names."
                 log_error "  [$label] The name patterns in this function have drifted from /etc/btrbk/btrbk.conf."
                 (( failed += 1 ))

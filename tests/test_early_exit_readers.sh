@@ -1,6 +1,7 @@
 #!/bin/bash
-# shellcheck disable=SC2016,SC2034,SC2329
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2329
 # SC2016: the lines extract() looks for are literal text, single-quoted so.
+# SC2030, SC2031: every LC_ALL set here is meant to stay in its subshell.
 # SC2034, SC2329: the globals and stub functions each case defines are read
 #   and called by the function it sourced, which shellcheck cannot see.
 # A reader that quits early after a pipe, under `set -o pipefail`
@@ -133,6 +134,11 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         if [[ "${2:-}" == tmp-full ]]; then
             trap '' XFSZ
             ulimit -f 4
+        fi
+        # A locale of the caller's choosing (BOOT_LOCALE), as a unit inherits
+        # the host's: under en_US.UTF-8 bash's regex [0-9] matches more.
+        if [[ -n "${BOOT_LOCALE:-}" ]]; then
+            export LC_ALL="$BOOT_LOCALE"
         fi
         update_boot_subvolumes true >"$WORK/boot.out" 2>&1
         printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
@@ -315,6 +321,36 @@ check "no fd to spare: a completed self-test still reads as completed" \
         status "$COMPLETED")" "match"
 
 # ---------------------------------------------------------------------------
+echo "== the drift check's digits are ASCII digits, whatever the locale"
+# ---------------------------------------------------------------------------
+# grep's [0-9] matched ASCII digits only. Under en_US.UTF-8 — the host's
+# locale — bash's regex [0-9] also matches Arabic-Indic and fullwidth digits,
+# so a name like root.٢٠٢٦١٠٠٤T٠٣٠٠ read as btrbk-shaped (round 5, N5;
+# measured). [[:digit:]] is ASCII only: the old meaning exactly. Such a name
+# is no btrbk snapshot, so its target takes the quiet skip, as it did.
+NONASCII_ARABIC='ID 301 gen 9 top level 5 path nvme/renamed-root.٢٠٢٦١٠٠٤T٠٣٠٠'
+NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/renamed-root.２０２６１００４T０３００'
+# Only where the locale shows the difference: bash's own [0-9] must match a
+# non-ASCII digit there, or these checks could not fail.
+not_run=""
+probe_digit='٢'
+if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then
+    for name in NONASCII_ARABIC NONASCII_FULLWIDTH; do
+        printf '%s\n' "${!name}" >"$WORK/$name.txt"
+        check "en_US.UTF-8, the only btrbk-like name has non-ASCII digits ($name): the quiet skip" \
+            "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/$name.txt")" "OK|0 updated, 1 skipped"
+    done
+    check "en_US.UTF-8, an ASCII drifted name: still FAIL" \
+        "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/drift-small.txt")" "FAIL|0 updated, 1 failed"
+    drift_cond="$(condition backup-run.sh '^[[:space:]]*if .*\$subvol_listing')"
+    check "en_US.UTF-8: the drift condition on Arabic-Indic digits: no match" \
+        "$(export LC_ALL=en_US.UTF-8; subvol_listing="$NONASCII_ARABIC"; if eval "$drift_cond"; then echo match; else echo "no match"; fi)" "no match"
+else
+    not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "NOT RUN: $not_run"
+fi
+
+# ---------------------------------------------------------------------------
 echo "== no producer | grep -q left in scripts/"
 # ---------------------------------------------------------------------------
 # Every `if`/`elif` that pipes into grep -q under these scripts' pipefail is
@@ -324,6 +360,7 @@ check "no 'producer | grep -q' in scripts/" "${left:-none}" "none"
 
 echo ""
 echo "passed=$pass failed=$fail"
+[[ -z "$not_run" ]] || echo "NOT RUN: $not_run"
 if ((fail == 0)); then
     echo "EARLY-EXIT READERS SUITE GREEN"
     exit 0
