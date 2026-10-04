@@ -47,6 +47,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 | libvirt, QEMU with KVM, edk2-ovmf | system (tested libvirt 12.8, QEMU 11.1.1) | The recovery-os-updater VM — see [Recovery OS VM](#recovery-os-vm-optional) |
 | virt-viewer | system | That VM's console |
 | ImageMagick (`magick`) | 7 | `recovery-os-vm.sh screenshot` |
+| jq | 1.6 or later | `recovery-os-vm.sh session` reads the recovery OS's boot record with it, and refuses without it |
 
 ### Optional (for GUI)
 
@@ -481,7 +482,7 @@ sudo /usr/lib/das-backup/recovery-os-vm.sh session A --dry-run
 sudo /usr/lib/das-backup/recovery-os-vm.sh session A
 ```
 
-During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder in `/run/das-recovery-os-vm/`. The console, from your desktop session: `virt-viewer --connect qemu:///system --attach recovery-os-updater`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
+A session starts only when the nightly backup run's record (`/var/lib/das-backup/recovery-os.json`) says btrbk will not run when that drive's OS boots, is at most 8 days old, and is newer than the drive's last session; each session's time is kept in `/var/lib/das-backup/recovery-os-vm-sessions` (root's, mode 644). During a session it holds `/run/das-maintenance.lock`, so a backup or scrub due meanwhile waits, and keeps a record of its disk holder in `/run/das-recovery-os-vm/`. The console, from your desktop session: `virt-viewer --connect qemu:///system --attach recovery-os-updater`. What a session guarantees and the first update's steps at the console: `docs/DISASTER-RECOVERY-GUIDE.md`, "In the recovery-os-updater VM".
 
 `btrdasd setup --uninstall-all` removes the two files; the domain and its UEFI variable store belong to libvirt and stay — remove them with `sudo virsh undefine --nvram recovery-os-updater`.
 

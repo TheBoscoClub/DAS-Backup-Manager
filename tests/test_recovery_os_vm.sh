@@ -87,6 +87,9 @@ fixture() {
     DISK_A="$BYID/$DISK_A_NAME"
     DISK_B="$BYID/$DISK_B_NAME"
     LOOP=""
+    OS_STATE=""
+    STATE_FILE="$T/var/lib/das-backup/recovery-os.json"
+    SESSIONS="$T/var/lib/das-backup/recovery-os-vm-sessions"
     mkdir -p "$S" "$T/bin" "$T/run" "$BYID" "$T/usr/lib/das-backup/libvirt" "$T/usr/share/edk2/x64"
     cp "$REPO/scripts/recovery-os-vm.sh" "$DRIVER"
     cp "$REPO/packaging/libvirt/recovery-os-updater.xml" "$T/usr/lib/das-backup/libvirt/"
@@ -113,7 +116,30 @@ fixture() {
     printf 'running\nrunning\nrunning\nshut off\n' >"$S/states.running"
     : >"$S/events"
     dump_env ZK208Q77 ZFL41DNY
+    write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
     write_stubs
+}
+
+# One drive's entry in the boot record btrdasd keeps (`recovery-os status
+# --state-file`, schema 3), in the shape bd DAS-Backup-Manager-1yg defines:
+# $1 label, $2 verdict (no, will, may -- or anything, to test), $3 seconds
+# since it was checked (an hour if not given).
+record_json() {
+    local reasons='[]'
+    case "$2" in
+        will) reasons='["btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot, with /etc/btrbk/btrbk.conf present"]' ;;
+        may) reasons='["not read"]' ;;
+    esac
+    printf '"%s":{"checked_epoch":%s,"os":{"btrbk_at_boot":{"verdict":"%s","reasons":%s,"runners":[]},"enabled_units":{"state":"listed","units":[{"name":"fstrim.timer","dirs":["etc/systemd/system/timers.target.wants"]},{"name":"sshd.service","dirs":["etc/systemd/system/multi-user.target.wants"]}]},"btrbk_config":{"state":"absent"}},"error":null}' \
+        "$1" "$(($(date +%s) - ${3:-3600}))" "$2" "$reasons"
+}
+
+# The boot record file: $1 its schema_version, then the drives' entries.
+write_state() {
+    local schema=$1 IFS=,
+    shift
+    mkdir -p "$(dirname "$STATE_FILE")"
+    printf '{"schema_version":%s,"drives":{%s}}\n' "$schema" "$*" >"$STATE_FILE"
 }
 
 # What `btrdasd config dump-env` prints for this host's three targets, in the
@@ -211,6 +237,7 @@ case "$cmd" in
     start)
         echo "virsh start" >>"$S/events"
         head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" >"$S/lock.record.at_start"
+        cat "$DAS_RECOVERY_VM_TEST_ROOT/var/lib/das-backup/recovery-os-vm-sessions" >"$S/sessions.at_start" 2>/dev/null || :
         if [[ -f "$S/start_fail" ]]; then echo "error: Failed to start domain 'recovery-os-updater'" >&2; exit 1; fi
         cp "$S/states.running" "$S/states"
         touch "$S/started"
@@ -427,7 +454,8 @@ STUB
 }
 
 driver_env() {
-    env PATH="${DRIVER_PATH:-$T/bin:$PATH}" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
+    env -u DAS_RECOVERY_OS_STATE ${OS_STATE:+DAS_RECOVERY_OS_STATE="$OS_STATE"} \
+        PATH="${DRIVER_PATH:-$T/bin:$PATH}" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
         DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS=1 \
         ${LOOP:+DAS_RECOVERY_VM_TEST_LOOP="$LOOP"} "$@"
@@ -607,6 +635,8 @@ has "unknown label: names the mirrors" "$OUT" "no target labelled 'nope'"
 has "unknown label: lists the mirror targets" "$OUT" "system-recovery-A-2tb, system-recovery-B-2tb"
 
 fixture
+# A record that would let it through: the role alone must refuse it.
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json primary-22tb no)"
 run_driver session primary-22tb --dry-run
 check "primary label: refused" "$RC" "1"
 has "primary label: says why" "$OUT" "'primary-22tb' is a role = \"primary\" target"
@@ -935,8 +965,10 @@ check "detach fails: claim kept" "$(alive "$pid")" "alive"
 check "detach fails: lock kept" "$(lock_state)" "held"
 has "detach fails: says so" "$OUT" "still in recovery-os-updater's definition"
 rm "$S/detach_fail"
+rm -f "$SESSIONS"
 run_driver session-end A
 check "detach fails: session-end finishes it" "$RC" "0"
+matches "detach fails: session-end records the session's end" "$(file "$SESSIONS")" "^system-recovery-A-2tb [0-9]+$"
 check "detach fails: lock free after" "$(lock_state)" "free"
 
 fixture
@@ -1052,6 +1084,7 @@ check "a runner that forks: no holder left running" "$(alive "$(head -n 1 "$S/ho
 # The holder's scope is named after the label.
 fixture
 dump_env ZK208Q77 ZFL41DNY "recovery B 2tb"
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json "recovery B 2tb" no)"
 run_driver session "recovery B 2tb" --dry-run
 check "a label a unit name cannot carry: refused" "$RC" "1"
 has "a label a unit name cannot carry: says so" "$OUT" "characters a systemd unit name cannot carry"
@@ -1132,6 +1165,272 @@ check "detach fails, holder gone: exit 4" "$RC" "4"
 has "detach fails, holder gone: the claim is gone" "$OUT" "the claim is gone"
 lacks "detach fails, holder gone: no dead holder named as claiming" "$OUT" "still claims"
 
+echo "--- the boot record: would btrbk run when this OS boots (bd 1yg)"
+fixture
+run_driver session A --dry-run
+check "record no: the session goes on" "$RC" "0"
+has "record no: the verdict shown" "$OUT" "btrbk at boot  no"
+has "record no: the enabled units shown" "$OUT" "enabled units  fstrim.timer, sshd.service (2)"
+matches "record no: when it was checked, and how long ago" "$OUT" "checked        [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC, 1h 00m ago"
+has "record no: which record" "$OUT" "boot record for system-recovery-A-2tb ($STATE_FILE, schema 3)"
+
+for v in will may; do
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb "$v")" "$(record_json system-recovery-B-2tb no)"
+    run_driver session A --dry-run
+    check "record $v: refused" "$RC" "1"
+    has "record $v: says so" "$OUT" "btrbk $v run when this OS boots"
+    has "record $v: says how to put it right" "$OUT" "fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again"
+    has "record $v: with its age" "$OUT" "1h 00m ago"
+    has "record $v: and how to boot it without running btrbk" "$OUT" "boot it to rescue.target"
+    check "record $v: nothing locked" "$(file "$S/flock.calls")" ""
+    check "record $v: nothing held" "$(file "$S/holder.calls")" ""
+    check "record $v: nothing attached" "$(file "$S/attach.log")" ""
+done
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb will)"
+run_driver session A --dry-run
+has "record will: the reason shown" "$OUT" "  - btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot"
+matches "record will: the refusal itself says when the record was made" "$OUT" "REFUSED: btrbk will run when this OS boots \(the record was checked [0-9-]+ [0-9:]+ UTC, 1h 00m ago\)"
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+run_driver session A --dry-run
+has "record may: the reason shown" "$OUT" "  - not read"
+
+fixture
+rm "$STATE_FILE"
+run_driver session A --dry-run
+check "no record file: refused" "$RC" "1"
+has "no record file: says so" "$OUT" "no boot record: $STATE_FILE does not exist"
+check "no record file: nothing locked" "$(file "$S/flock.calls")" ""
+
+fixture
+rm "$STATE_FILE"
+mkdir "$STATE_FILE"
+run_driver session A --dry-run
+check "record that cannot be read: refused" "$RC" "1"
+has "record that cannot be read: says so" "$OUT" "the boot record $STATE_FILE cannot be read"
+
+fixture
+printf 'not json\n' >"$STATE_FILE"
+run_driver session A --dry-run
+check "record not JSON: refused" "$RC" "1"
+has "record not JSON: says so" "$OUT" "the boot record $STATE_FILE cannot be read"
+
+fixture
+: >"$STATE_FILE"
+run_driver session A --dry-run
+check "record empty: refused" "$RC" "1"
+has "record empty: says so" "$OUT" "not one JSON document"
+
+fixture
+printf '{"schema_version":3,"drives":{}}{"schema_version":3,"drives":{}}\n' >"$STATE_FILE"
+run_driver session A --dry-run
+check "two documents in the record: refused" "$RC" "1"
+has "two documents: says so" "$OUT" "not one JSON document"
+
+fixture
+write_state 2 "$(record_json system-recovery-A-2tb no)"
+run_driver session A --dry-run
+check "schema 2: refused" "$RC" "1"
+has "schema 2: says so" "$OUT" "is schema 2, not 3"
+fixture
+write_state 4 "$(record_json system-recovery-A-2tb no)"
+run_driver session A --dry-run
+check "schema 4, newer: refused too" "$RC" "1"
+has "schema 4: says so" "$OUT" "is schema 4, not 3"
+
+fixture
+write_state 3 "$(record_json system-recovery-B-2tb no)"
+run_driver session A --dry-run
+check "no entry for the label: refused" "$RC" "1"
+has "no entry for the label: says so" "$OUT" "has no entry for 'system-recovery-A-2tb'"
+
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":null,\"error\":\"cannot read /mnt/x/@: No such file or directory\"}"
+run_driver session A --dry-run
+check "no inspected OS: refused" "$RC" "1"
+has "no inspected OS: says so, with the error" "$OUT" "has no inspected OS (cannot read /mnt/x/@: No such file or directory)"
+
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":{},\"error\":null}"
+run_driver session A --dry-run
+check "no verdict: refused" "$RC" "1"
+has "no verdict: says so" "$OUT" "has no btrbk-at-boot verdict"
+
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":{\"btrbk_at_boot\":{\"verdict\":\"sometimes\",\"reasons\":[]}},\"error\":null}"
+run_driver session A --dry-run
+check "an unknown verdict: refused" "$RC" "1"
+has "an unknown verdict: says so" "$OUT" "has no btrbk-at-boot verdict ('sometimes')"
+
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"os\":{\"btrbk_at_boot\":{\"verdict\":\"no\",\"reasons\":[]}},\"error\":null}"
+run_driver session A --dry-run
+check "no check time: refused" "$RC" "1"
+has "no check time: says so" "$OUT" "has no check time"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no $((9 * 86400)))"
+run_driver session A --dry-run
+check "record 9 days old: refused" "$RC" "1"
+has "record 9 days old: says so" "$OUT" "older than 8 days"
+has "record 9 days old: with its age" "$OUT" "9d 0h ago"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no 7200)"
+run_driver session A --dry-run
+check "record 2 hours old: the session goes on" "$RC" "0"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no -7200)"
+run_driver session A --dry-run
+check "record from the future: refused" "$RC" "1"
+has "record from the future: says so" "$OUT" "dated in the future"
+has "record from the future: no negative age" "$OUT" "UTC, in the future)"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no 7200)"
+printf 'system-recovery-B-2tb %s\nsystem-recovery-A-2tb %s\n' "$(($(date +%s) - 60))" "$(($(date +%s) - 3600))" >"$SESSIONS"
+run_driver session A --dry-run
+check "record older than the last session: refused" "$RC" "1"
+has "record older than the last session: says so" "$OUT" "before this drive's last VM session ended"
+
+fixture
+printf 'system-recovery-B-2tb %s\n' "$(($(date +%s) - 60))" >"$SESSIONS"
+run_driver session A --dry-run
+check "another drive's session does not count" "$RC" "0"
+
+fixture
+printf 'system-recovery-A-2tb %s\n' "$(($(date +%s) - 7200))" >"$SESSIONS"
+run_driver session A --dry-run
+check "a record made after the last session: the session goes on" "$RC" "0"
+
+fixture
+printf 'system-recovery-A-2tb yesterday\n' >"$SESSIONS"
+run_driver session A --dry-run
+check "a garbled session time: refused" "$RC" "1"
+has "a garbled session time: says so" "$OUT" "cannot tell when this drive's last VM session ended"
+
+fixture
+mkdir -p "$SESSIONS"
+run_driver session A --dry-run
+check "session times not in a file: refused" "$RC" "1"
+has "session times not in a file: says so" "$OUT" "is not a regular file"
+
+echo "--- the boot record: --accept-boot-record-risk"
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb will)"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override, will: the session goes on" "$RC" "0"
+has "override, will: said loudly" "$OUT" "OVERRIDDEN (--accept-boot-record-risk): btrbk will run when this OS boots"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override, may: the session goes on" "$RC" "0"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no $((9 * 86400)))"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override, 9 days old: the session goes on" "$RC" "0"
+has "override, 9 days old: said loudly" "$OUT" "OVERRIDDEN (--accept-boot-record-risk): the record is 9d 0h old"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no 7200)"
+printf 'system-recovery-A-2tb %s\n' "$(($(date +%s) - 3600))" >"$SESSIONS"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override, before the last session: the session goes on" "$RC" "0"
+has "override, before the last session: said loudly" "$OUT" "OVERRIDDEN (--accept-boot-record-risk): the record was made before this drive's last VM session ended"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+run_driver session A --accept-boot-record-risk
+check "override, a real session: ends, flagged" "$RC" "5"
+has "override, a real session: in the summary's warnings" "$OUT" "Warnings      the boot-record check was overridden (--accept-boot-record-risk): btrbk may run when this OS boots"
+
+fixture
+rm "$STATE_FILE"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers a missing record" "$RC" "1"
+fixture
+printf 'not json\n' >"$STATE_FILE"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers a record that cannot be read" "$RC" "1"
+fixture
+write_state 2 "$(record_json system-recovery-A-2tb no)"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers another schema" "$RC" "1"
+fixture
+write_state 3 "$(record_json system-recovery-B-2tb no)"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers a missing entry" "$RC" "1"
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":null,\"error\":\"x\"}"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers an OS not inspected" "$RC" "1"
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":{},\"error\":null}"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers a missing verdict" "$RC" "1"
+fixture
+write_state 3 "\"system-recovery-A-2tb\":{\"os\":{\"btrbk_at_boot\":{\"verdict\":\"no\",\"reasons\":[]}},\"error\":null}"
+run_driver session A --dry-run --accept-boot-record-risk
+check "override never covers a missing check time" "$RC" "1"
+
+echo "--- the boot record: where it is read from"
+fixture
+OS_STATE="$T/elsewhere.json"
+cp "$STATE_FILE" "$OS_STATE"
+run_driver session A --dry-run
+check "DAS_RECOVERY_OS_STATE without the test hatch: refused" "$RC" "1"
+has "DAS_RECOVERY_OS_STATE without the test hatch: says why" "$OUT" "honoured only with the test hatch"
+OS_STATE=""
+
+fixture
+rm "$T/bin/systemd-run"
+ln -s "$(command -v bash)" "$T/bin/systemd-run"
+DRIVER_PATH="$(minimal_path)" run_driver session A --dry-run
+check "no jq: refused" "$RC" "1"
+has "no jq: says so" "$OUT" "jq is not installed"
+check "no jq: no lock taken" "$(file "$S/flock.calls")" ""
+
+echo "--- the time of each session, kept for the boot-record check"
+fixture
+run_driver session A --dry-run
+check "a dry run: no session time recorded" "$(file "$SESSIONS")" ""
+fixture
+printf 'system-recovery-B-2tb 1000\n' >"$SESSIONS"
+run_driver session A
+check "session: exit 0" "$RC" "0"
+matches "session: its time recorded" "$(grep '^system-recovery-A-2tb ' "$SESSIONS")" "^system-recovery-A-2tb [0-9]+$"
+check "session: the other drives' times kept" "$(grep '^system-recovery-B-2tb ' "$SESSIONS")" "system-recovery-B-2tb 1000"
+check "session: one line per drive" "$(wc -l <"$SESSIONS")" "2"
+matches "session: recorded before the OS booted" "$(grep '^system-recovery-A-2tb ' "$S/sessions.at_start")" "^system-recovery-A-2tb [0-9]+$"
+check "session: readable by all, written by its owner only" "$(stat -c %a "$SESSIONS")" "644"
+run_driver session A --dry-run
+check "the next session: refused until a backup run checks the OS again" "$RC" "1"
+has "the next session: says why" "$OUT" "before this drive's last VM session ended"
+write_state 3 "$(record_json system-recovery-A-2tb no -1)" "$(record_json system-recovery-B-2tb no)"
+run_driver session A --dry-run
+check "the next session, after a new check: goes on" "$RC" "0"
+run_driver session B --dry-run
+check "the other drive: not affected" "$RC" "0"
+
+fixture
+mkdir -p "$SESSIONS"
+run_driver session A --accept-boot-record-risk
+check "session time cannot be recorded: refused" "$RC" "1"
+has "session time cannot be recorded: says why" "$OUT" "cannot record the start of this session"
+lacks "session time cannot be recorded: the OS never booted" "$(events)" "virsh start"
+check "session time cannot be recorded: lock free" "$(lock_state)" "free"
+
+fixture
+touch "$S/start_fail"
+run_driver session A
+check "start failed: refused" "$RC" "1"
+matches "start failed: counted as a session all the same (it may have half-started)" "$(file "$SESSIONS")" "^system-recovery-A-2tb [0-9]+$"
+
 echo "--- the test hatch (DAS_RECOVERY_VM_TEST_LOOP)"
 fixture
 : >"$T/dev/sdz"
@@ -1162,12 +1461,26 @@ echo "$T/rv.img" >"$T/sys/block/loop7/loop/backing_file"
 run_driver session A --dry-run
 check "hatch: a shorthand refused" "$RC" "1"
 has "hatch: wants the full label" "$OUT" "needs the target's full label"
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json primary-22tb no)"
 run_driver session primary-22tb --dry-run
 check "hatch: still never a primary target" "$RC" "1"
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
 echo active >"$S/unit.das-backup.service"
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: the other checks still apply" "$RC" "1"
 rm "$S/unit.das-backup.service"
+# The hatch, and only the hatch, may read the boot record from elsewhere.
+write_state 3 "$(record_json system-recovery-A-2tb will)"
+mkdir -p "$T/elsewhere"
+OS_STATE="$T/elsewhere/recovery-os.json"
+printf '{"schema_version":3,"drives":{%s}}\n' "$(record_json system-recovery-A-2tb no)" >"$OS_STATE"
+run_driver session system-recovery-A-2tb --dry-run
+check "hatch: DAS_RECOVERY_OS_STATE honoured" "$RC" "0"
+has "hatch: says which record it read" "$OUT" "boot record for system-recovery-A-2tb ($T/elsewhere/recovery-os.json, schema 3)"
+OS_STATE=""
+run_driver session system-recovery-A-2tb --dry-run
+check "hatch: without it, the usual record applies" "$RC" "1"
+write_state 3 "$(record_json system-recovery-A-2tb no)"
 run_driver session system-recovery-A-2tb
 check "hatch: a loop device lent" "$RC" "0"
 has "hatch: announced" "$OUT" "TEST HATCH"
