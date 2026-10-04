@@ -46,7 +46,6 @@ log_warn() { echo "WARN: $*" >>"$WORK/log"; }
 log_error() { echo "ERROR: $*" >>"$WORK/log"; }
 # send_report keeps what it was given: the subject status and the report.
 send_report() { printf '%s\n' "$2" >>"$WORK/sent_subjects"; printf '%s\n' "$1" >"$WORK/sent_report"; }
-hostname() { echo testhost; }
 systemctl() { :; }
 generate_throughput_section() { echo "  tp"; }
 generate_capacity_section() { echo "  cap"; }
