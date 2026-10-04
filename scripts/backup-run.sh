@@ -1,9 +1,18 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.9.1
+# Version: 4.9.2
 # Date: 2026-10-03
 #
 # Features:
+#   - A rewrite of this file cannot cut a run short (v4.9.2): the last line
+#     is `main "$@"; exit $?`. Bash reads a script as it runs, so a copy
+#     over this file in place — truncate and write the same inode, as a
+#     plain `cp` does and `btrdasd setup` did — that landed while main ran
+#     had bash read the NEW file at the old offset once main returned: a
+#     tail, half a line (exit 127). That line is read whole before main
+#     starts, and after main there is nothing left to read. `btrdasd setup`
+#     now renames a new file over the old one. Behaviour is otherwise
+#     unchanged (bd DAS-Backup-Manager-6wt; tests/test_script_rewrite.sh).
 #   - A failed run is recorded, with unknown counts as unknown (v4.9.1):
 #     record_run_args() builds the `btrdasd backup record-run` vector and
 #     says an unknown snapshot count with --counts-unknown, which the history
@@ -565,6 +574,9 @@ record_maintenance_holder() {
 # this run's (CLEANUP_ARMED); before that the record is another holder's.
 # Emptied, never removed: the file is the lock. Display only: a failure is
 # logged, and a reader then sees that the recorded pid has gone.
+# Called only by cleanup(), the EXIT trap. shellcheck 0.11 stops seeing a
+# trap's handlers as called once the last line ends in `exit` (SC2329).
+# shellcheck disable=SC2329
 clear_maintenance_holder() {
     if ! : >"$MAINTENANCE_LOCKFILE"; then
         log_warn "Could not empty the holder record in $MAINTENANCE_LOCKFILE"
@@ -2205,7 +2217,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.9.1
+  backup-run.sh v4.9.2
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -2537,6 +2549,9 @@ report_unrecorded_run() {
 # CLEANUP
 # ============================================================================
 
+# Run only through the EXIT trap. shellcheck 0.11 stops seeing a trap's
+# handlers as called once the last line ends in `exit` (SC2329).
+# shellcheck disable=SC2329
 cleanup() {
     # First statement, unconditionally: capture the exit status that
     # triggered this EXIT trap invocation BEFORE any other command in this
@@ -2855,4 +2870,4 @@ main() {
     return 0
 }
 
-main "$@"
+main "$@"; exit $?
