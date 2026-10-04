@@ -32,6 +32,10 @@
 # is a skip (0); a lock file that cannot be opened, or a flock that fails for
 # any other reason, is "could not start" (1), and says why.
 #
+# The snapshot counters (bd DAS-Backup-Manager-bzw) are decided before the
+# run status and the report, so a counter failure reads FAILURES DETECTED in
+# the report, the history and the exit status alike.
+#
 # How: the REAL script runs end to end — its EXIT trap, cleanup() and its
 # `main "$@"; exit $?` line included — from a copy in which exactly three lines
 # differ: the two lock paths point into a temp dir instead of /run, and the
@@ -186,12 +190,23 @@ EOF
 stub btrbk <<'EOF'
 printf '%s\n' "$*" >>"$S/calls/btrbk"
 case " $* " in
-*" --format=raw list latest "*)
-    echo "format=\"latest\" snapshot_subvolume='/v/.btrbk-snapshots/root-.20261004T0300' target_subvolume='/t/nvme/root-.20261004T0300'"
-    ;;
 *" list latest "*)
-    echo "SOURCE_SUBVOLUME SNAPSHOT_SUBVOLUME STATUS TARGET_SUBVOLUME"
-    echo "/v/@ /v/.btrbk-snapshots/root-.20261004T0300 - /t/nvme/root-.20261004T0300"
+    rc="$(knob list_rc 0)"
+    if [[ "$rc" != 0 ]]; then
+        echo "ERROR: Failed to fetch subvolume detail (stub)" >&2
+        exit "$rc"
+    fi
+    if [[ " $* " == *" --format=raw "* ]]; then
+        if [[ -f "$S/knobs/raw_unparsed" ]]; then
+            # Fields this script's parser does not know (bd oi0, 06p).
+            echo "format=\"latest\" snapshot_path='/v/.btrbk-snapshots/root-.20261004T0300' target_path='/t/nvme/root-.20261004T0300'"
+        else
+            echo "format=\"latest\" snapshot_subvolume='/v/.btrbk-snapshots/root-.20261004T0300' target_subvolume='/t/nvme/root-.20261004T0300'"
+        fi
+    else
+        echo "SOURCE_SUBVOLUME SNAPSHOT_SUBVOLUME STATUS TARGET_SUBVOLUME"
+        echo "/v/@ /v/.btrbk-snapshots/root-.20261004T0300 - /t/nvme/root-.20261004T0300"
+    fi
     ;;
 *" run "* | *" dryrun "*)
     mode=run
@@ -420,6 +435,7 @@ recorded_as() {
     fi
 }
 show_tail() { [[ "$RC" == "$1" ]] || sed 's/^/      | /' "$STATE/out" | tail -n 15; }
+vector_has() { grep -qxF -- "$1" "$STATE/record_args" 2>/dev/null && echo yes || echo no; }
 
 # A run that reached its report: the exit status, the report's status line,
 # the history row, and nothing left mounted.
@@ -461,6 +477,10 @@ fresh
 run_backup
 expect_completed "clean run" 0 "ALL OPERATIONS SUCCESSFUL" success
 check "clean run: btrbk ran" "$(ran_btrbk)" "yes"
+check "clean run: the snapshot counts row" \
+    "$(grep -c '^  Snapshot counts       OK  (counted)$' "$WORK/lib/last-report.txt")" "1"
+check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
+
 
 fresh
 run_backup --full
@@ -522,6 +542,27 @@ fresh
 knob recovery_rc 2 # the check itself failed: FAIL, not WARN
 run_backup
 expect_completed "a FAIL without btrbk failing (recovery OS check)" 3 "FAILURES DETECTED" failure
+
+# bd DAS-Backup-Manager-bzw: the snapshot counters are decided before the run
+# status and the report, so a counter failure reads FAILURES DETECTED in the
+# report, the history and the exit status alike — and the report says which.
+fresh
+knob list_rc 1 # btrbk ran, but `btrbk list latest` failed
+run_backup
+expect_completed "the snapshot counts unknown (btrbk list latest failed)" 3 "FAILURES DETECTED" failure
+check "counts unknown: the report names it" \
+    "$(grep -c '^  Snapshot counts       FAIL  (btrbk list latest failed; counts unknown)$' "$WORK/lib/last-report.txt")" "1"
+check "counts unknown: recorded unknown" "$(vector_has --counts-unknown)" "yes"
+check "counts unknown: btrbk itself succeeded" "$(grep -c 'btrbk completed' "$STATE/out")" "1"
+
+fresh
+knob raw_unparsed 1 # btrbk's raw listing holds no field the parser knows
+run_backup
+expect_completed "the snapshot counts unparsed" 3 "FAILURES DETECTED" failure
+check "counts unparsed: the report names it" \
+    "$(grep -c '^  Snapshot counts       FAIL  (raw output present but no fields parsed; counts unknown)$' "$WORK/lib/last-report.txt")" "1"
+check "counts unparsed: warned once" \
+    "$(grep -c 'no snapshot_subvolume/target_subvolume fields parsed' "$STATE/out")" "1"
 
 # The history row is written after the report, and a record that fails is a
 # FAIL (bd 6wt): the report is sent again, and the run exits 3.

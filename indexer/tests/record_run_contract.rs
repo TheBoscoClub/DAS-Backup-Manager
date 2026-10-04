@@ -25,7 +25,7 @@ const HARNESS: &str = r#"
 set -euo pipefail
 script="$1" setup="$2" status="$3" full="$4"
 extract() { sed -n "/^$1() {/,/^}/p" "$script"; }
-for fn in record_run_args record_op; do
+for fn in decide_run_counts record_run_args record_op; do
     body="$(extract "$fn")"
     if [[ -z "$body" ]]; then
         echo "HARNESS BROKEN: $fn() not found in $script" >&2
