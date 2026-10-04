@@ -52,11 +52,33 @@ env:
 
 jobs:
   # ── Incremental: every push, scoped to the pushed commits' own diff ────────
+  #
+  # Sharded (bd DAS-Backup-Manager-67c): one push can carry more mutants than
+  # one job finishes in its 120 minutes, and a killed job turns main red.
+  # Measured 2026-10-04 for the ros-timers merge (bd 1yg): 702 mutants
+  # (recovery_os/boot.rs 631, recovery_os.rs 71), about 3.3 s each locally,
+  # so about 12 s on the runner at the 3.6 ratio measured below: about 139
+  # minutes in one job. Four round-robin shards take 175-176 each, about 35
+  # minutes plus setup, and leave room for a push about three times larger.
+  # Each shard counts its own mutants, after the same path check; a shard
+  # with none skips both steps on that measured zero, as an empty push
+  # always has. Measured too: cargo-mutants 27.1.0 writes no outcomes.json
+  # for an empty shard, so the gate could not score one, not even with
+  # --allow-zero-total — it fails closed on the absent file, rightly.
+  # Re-measure before changing SHARDS:
+  #   cargo mutants --list --in-diff <diff> --shard k/N --sharding round-robin | wc -l
   incremental:
-    name: Falsifiability — this push
+    name: Falsifiability — this push (shard ${{ matrix.shard }}/4)
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: 4
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -76,7 +98,10 @@ jobs:
         run: |
           sudo mkdir -p /tmp/noatime
           sudo mount -t tmpfs -o rw,exec,nosuid,nodev,noatime,mode=1777,size=4g tmpfs /tmp/noatime
-          findmnt -no OPTIONS /tmp/noatime | grep -q noatime
+          findmnt -no OPTIONS /tmp/noatime | grep -qw noatime || {
+            echo "::error::/tmp/noatime is not mounted noatime ($(findmnt -no OPTIONS /tmp/noatime)): the recovery-OS tests would read no link"
+            exit 1
+          }
           echo "TMPDIR=/tmp/noatime" >> "$GITHUB_ENV"
 
       - name: Compute crate-relative diff
@@ -121,13 +146,15 @@ jobs:
           done < <(grep '^+++ ' mutants.diff | awk '{print $2}')
 
           # A non-empty diff can still intersect zero mutants (comments, tests,
-          # formatting). cargo-mutants then writes no outcomes.json and the
-          # gate would rightly refuse the absent file. The paths are proven
-          # above, so a zero here is a measured fact; a list ERROR exits
-          # non-zero and stops the job.
-          LISTED=$(cargo mutants --list --in-diff mutants.diff | wc -l)
+          # formatting), and a shard of a small push can hold none. cargo-mutants
+          # then writes no outcomes.json and the gate would rightly refuse the
+          # absent file. The paths are proven above, so a zero here is a
+          # measured fact; a list ERROR exits non-zero and stops the job.
+          ALL=$(cargo mutants --list --in-diff mutants.diff | wc -l)
+          LISTED=$(cargo mutants --list --in-diff mutants.diff \
+            --shard "$SHARD/$SHARDS" --sharding round-robin | wc -l)
           echo "listed=$LISTED" >> "$GITHUB_OUTPUT"
-          echo "mutants intersecting this push: $LISTED"
+          echo "mutants intersecting this push: $ALL; in shard $SHARD/$SHARDS: $LISTED"
 
       - name: Mutants
         if: steps.diff.outputs.listed != '0'
@@ -135,20 +162,21 @@ jobs:
         continue-on-error: true # the gate below decides, not this exit code
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          cargo mutants --in-place --no-shuffle -vV --in-diff mutants.diff
+          cargo mutants --in-place --no-shuffle -vV --in-diff mutants.diff \
+            --shard "$SHARD/$SHARDS" --sharding round-robin
 
       - name: Gate — did this run verify anything?
         if: steps.diff.outputs.listed != '0'
         working-directory: indexer
         run: |
           python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
-            --label "indexer incremental"
+            --label "indexer incremental shard $SHARD/$SHARDS"
 
       - name: Archive mutants.out
         if: always() && steps.diff.outputs.listed != '0'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: mutants-incremental
+          name: mutants-incremental-${{ matrix.shard }}
           path: indexer/mutants.out
           if-no-files-found: ignore
 
@@ -182,9 +210,10 @@ jobs:
   # 3.6 ratio above: too near the 6-hour ceiling for one job, whose Mutants
   # step is continue-on-error (a killed job would mean no gate that week).
   # Hence two shards, round-robin so each gets its share of every module:
-  # 908 and 907 mutants, about 2.4 hours each, timeout-minutes 300. 7wb's
-  # recovery_os/hold_disk.rs (about 26 more) joins through the glob when it
-  # is merged.
+  # 908 and 907 mutants, about 2.4 hours each, timeout-minutes 300.
+  # Re-measured for fix round 5: 1888 (recovery_os/**/*.rs 631), shards of
+  # 944 and 944, about 2.6 hours each. 7wb's recovery_os/hold_disk.rs (about
+  # 26 more) joins through the glob when it is merged.
   # Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/2)
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
@@ -216,7 +245,10 @@ jobs:
         run: |
           sudo mkdir -p /tmp/noatime
           sudo mount -t tmpfs -o rw,exec,nosuid,nodev,noatime,mode=1777,size=4g tmpfs /tmp/noatime
-          findmnt -no OPTIONS /tmp/noatime | grep -q noatime
+          findmnt -no OPTIONS /tmp/noatime | grep -qw noatime || {
+            echo "::error::/tmp/noatime is not mounted noatime ($(findmnt -no OPTIONS /tmp/noatime)): the recovery-OS tests would read no link"
+            exit 1
+          }
           echo "TMPDIR=/tmp/noatime" >> "$GITHUB_ENV"
 
       - name: Mutants

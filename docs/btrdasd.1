@@ -1394,8 +1394,11 @@ through a link. A word whose last component only contains
 .BR run\-btrbk ,
 .IR /etc/btrbk.conf )
 means it may: what that runs is not known. The rule throughout: nothing that
-may run is read as nothing unless it is known not to run. Programs are read
-where they run: the program of an
+may run is read as nothing unless it is known not to run \(em within what
+this reads; what it does not see is listed at the end of this description,
+and a
+.B no
+holds only within that. Programs are read where they run: the program of an
 .B Exec*=
 command, taken literally as systemd takes it (a
 .B $
@@ -1406,8 +1409,16 @@ read as sh even with no
 line; the script another interpreter is given
 .RB ( python3 ,
 .BR perl ,
-and others), only searched for btrbk's name, which makes it may; the command
-a wrapper runs
+.BR awk ,
+and others), not read as sh but searched for btrbk's name, which makes it
+may, and for the absolute paths it names
+.RB ( os.system(\(dq/usr/local/bin/x\(dq) ,
+an argument list,
+.BR awk 's
+.BR system() ):
+one that leads to a sh script is read as a script it runs, one script
+deeper, and nothing else it names is followed or flagged; the command a
+wrapper runs
 .RB ( env ,
 .BR nice ,
 .BR ionice ,
@@ -1418,22 +1429,36 @@ a wrapper runs
 .BR su ,
 .BR setsid ,
 .BR systemd\-run ,
-and others); and a
+and others), the wrapper's own operand \(em
+.BR flock 's
+lock file,
+.BR timeout 's
+duration,
+.BR su 's
+user \(em being none it runs; and a
 .B \-c
 line. A
 .B #!
 script whose interpreter is a shell is read whole when it is no larger than
-64 KiB (larger, or unreadable, is unknown), as sh reads it \(em a backslash at
-the end of a line joins the next, a quoted string may run across lines; a
-comment, a here\-document, a
+64 KiB (larger, or unreadable, is unknown), and so are the scripts it runs,
+four scripts deep at most (deeper is unknown). It is read as sh reads it: a
+backslash at the end of a line joins the next, and a quoted string may run
+across lines; a comment, a here\-document, a
 .B case
 pattern and a redirection are no commands;
 .B $((\|...\|))
-is one word; braces expand into each word they make (more than 16 is
-unknown); a builtin, or one of the script's own functions, is no program
-\(em and so are the scripts it runs, four scripts deep at most (deeper is
-unknown); one that ends inside a quote or after a joining backslash is
-unknown. One whose
+is one word, unless a command substitution in it
+.RB ( $(\|...\|)
+or a backtick) runs a command; braces expand into each word they make (more
+than 16 is unknown); after a
+.B function
+.I NAME
+header its body's commands are commands. A builtin is no program. A name the
+script defines as a function is still looked up as a program, as one of that
+name runs where a wrapper or
+.B exec
+is given the name, or where the definition is not reached. A script that
+ends inside a quote or after a joining backslash is unknown. One whose
 .B #!
 names another interpreter is that interpreter's. A binary is not looked into.
 .PP
@@ -1458,8 +1483,23 @@ unless the program is one known not to run its operands:
 .BR [ ,
 and btrbk, whose
 .B \-c
-is judged as its config. A word not there, nor anywhere boot could see
-another, is nothing to run, and so is
+is judged as its config \(em each as that OS ships it: sh's own
+.B test
+and
+.BR [ ,
+or what its name is found to be,
+.I /usr/bin/NAME
+or
+.I /bin/NAME
+(through any link), or found nowhere, so that nothing runs at all. One of
+those names anywhere else (a wrapper in
+.IR /usr/local/bin ),
+a function the script defines by one, or one only that OS could find may run
+what it is given, so its words are read. An option's value is no operand:
+one that names a program
+.RB ( "install \-\-strip\-program=" PROG )
+is a program named in an option's value, not seen (below). A word not there,
+nor anywhere boot could see another, is nothing to run, and so is
 .IR /dev/null .
 A redirection gives its target to the command only when the command reads it
 .RB ( < ).
@@ -1495,11 +1535,28 @@ sets, else
 else systemd's
 .I /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 .RB ( systemd.exec (5);
-systemd expands no variable there) \(em as a script then sets it, a file it
-sources included, or as a cron table sets it (a cron job starts from every
-standard directory). A directory only that OS can resolve \(em a variable, a
-relative entry, an environment file that cannot be read \(em leaves a name
-not found before it unknown.
+systemd expands no variable there) \(em or as a cron table sets it (a cron
+job starts from every standard directory). A
+.B PATH
+a script sets, a file it sources included, adds its directories ahead of
+those it had and drops none: the assignment may not apply where a name is
+looked up (a branch not taken, a subshell, a pipeline's element, a
+function's
+.BR local ),
+so from then on every directory either
+.B PATH
+holds is searched, and each program found there may be the one run. A
+search passes over what cannot run there, as
+.BR execvp (3),
+sh and systemd do: a directory, a link to
+.IR /dev/null ,
+a device or FIFO. It also goes on past a program's file no execute bit
+allows (a file
+.B .
+reads needs none), but reads that file too: something at boot may make it
+executable before it runs it. A directory only that OS can resolve \(em a
+variable, a relative entry, an environment file that cannot be read \(em
+leaves a name not found before it unknown.
 .PP
 The root read is that OS's
 .B @
@@ -1512,8 +1569,7 @@ or of a
 or
 .B .automount
 unit (named after the path it mounts), is not the one it will see \(em the
-mount shadows the disk's copy at boot \(em so it is unknown; a memory
-filesystem's mount point holds nothing. So is one under
+mount shadows the disk's copy at boot \(em so it is unknown. So is one under
 .IR /run ,
 .IR /var/run ,
 .IR /var/lock ,
@@ -1523,7 +1579,11 @@ or
 .IR /sys ,
 which only a running system fills \(em something at boot may put it there
 \(em and one reached through a link that lives in such a place. So is
-anything not here when that fstab cannot be read.
+anything not here when that fstab cannot be read. A memory filesystem's
+mount point (a tmpfs
+.IR /tmp )
+is not counted as one: what is under it is read as the disk holds it (see
+what is not seen, below).
 .PP
 When a cron daemon is among the units
 .RB ( cronie.service ,
@@ -1591,16 +1651,18 @@ cannot leave it, at most 8 links): one that names
 .B ..
 it climbs, as at
 .BR / ),
-or an empty unit file, masks the unit, which then runs nothing; a unit
-file's link to another unit's file in a unit tree makes the unit that unit's
-alias (to a template's file, of that template's same instance, as
+or an empty unit file, masks the unit, which then runs nothing. A unit
+file's link is judged by its first hop, as systemd judges it: one that points
+anywhere under a unit tree, a subdirectory too, to another unit's name makes
+the unit that unit's alias (to a template's file, of that template's same
+instance, as
 .BR systemd.unit (5)
 says; an instance's link to its own template is its own file), read by that
 unit's own name (an
 .I /etc
-copy of it first) with the alias's drop\-ins too, and one to a file outside
-the unit trees is the unit's own file, as systemd reads a linked unit file;
-a link to a program is that program. On any other mount a link is not read. A unit file linked into
+copy of it first) with the alias's drop\-ins too; one that points out of the
+unit trees is a linked unit file, the unit's own, whose text is the file its
+links lead to, wherever that is. A link to a program is that program. On any other mount a link is not read. A unit file linked into
 .I /etc/systemd/system
 by
 .BR "systemctl link" ,
@@ -1634,16 +1696,102 @@ which is unknown.
 .PP
 A
 .B no
-holds within what can be seen without running that OS. Not seen: a program
-named through a variable
+holds within what can be seen without running that OS. Not seen \(em each of
+these may run btrbk and still read as
+.BR no :
+.IP \- 2
+A program named through a variable
 .RB ( "sh \-c \(dq$CMD\(dq" ,
-.BR $SCRIPT )
-or in an option's value
-.RB ( \-\-script=/path );
-the command of a wrapper this does not know; a binary, or a file run by a
+.BR $SCRIPT ,
+a
+.B for
+loop over a glob), in an option's value
+.RB ( \-\-script=/path ,
+.BR "install \-\-strip\-program=" PROG ),
+or by a variable after a literal prefix
+.RB ( /root/bin/$JOB ,
+.BR \(dq$HOME/bin/x\(dq ),
+even where that prefix is under a mount point.
+.IP \- 2
+A bare name given to a program that looks it up itself:
+.BR "chronic snap\-run" ,
+.BR "command snap\-run" ,
+.BR "eval snap\-run" ,
+.BR "screen \-dmS b snap\-run" .
+.IP \- 2
+The command of a wrapper this does not know; a binary, or a file run by a
 program this does not know as one; btrbk under another name as a renamed
-binary (a link to it is followed where links are read); what a directory a
-program is given holds; units that generators create at boot (from
+binary (a link to it is followed where links are read).
+.IP \- 2
+A file with no
+.B #!
+line that is run anyway: a shell, or
+.BR execvp (3)
+on its
+.B ENOEXEC
+fallback, runs it as sh (a cron job naming it, a wrapper such as
+.B timeout
+given it, a script's line naming it); and one a program sources
+.RB ( ". \(dq$1\(dq" ).
+.IP \- 2
+What a shell reads from its input:
+.BR "sh < file" ,
+.BR "cat file | sh" ,
+a here\-document
+.RB ( "sh <<EOF" ,
+.BR "su root <<EOF" ).
+.IP \- 2
+What another interpreter's script runs besides btrbk by name and a sh script
+by absolute path: a bare name, a binary, a link to btrbk, another
+interpreter's script, anything boot sees elsewhere.
+.IP \- 2
+A relative path given as an argument, which the program resolves from a
+directory only that OS knows.
+.IP \- 2
+What a directory a program is given holds
+.RB ( "run\-parts /etc/backup.d" ;
+cron's own directories are read).
+.IP \- 2
+A program put in place at boot and then run
+.RB ( "install /root/x /usr/local/bin/job && /usr/local/bin/job" ,
+.BR "curl \-o /usr/local/bin/tool ... && /usr/local/bin/tool" );
+and a memory filesystem mounted at boot other than
+.IR /run ,
+.IR /dev ,
+.I /proc
+and
+.I /sys
+\(em a tmpfs
+.I /tmp
+by
+.I etc/fstab
+or
+.BR tmp.mount :
+what boot writes there is not seen, and what the disk holds under it is
+read though boot does not see it.
+.IP \- 2
+.B DefaultEnvironment=PATH=
+in
+.I etc/systemd/system.conf
+or
+.IR system.conf.d ,
+which sets every service's
+.BR PATH ;
+and
+.I /etc/profile
+and
+.IR /etc/profile.d ,
+which a login shell
+.RB ( "su \-" ,
+.BR "bash \-l" )
+reads.
+.IP \- 2
+A function named like one of the programs known not to run their operands
+.RB ( cp ,
+.B install
+and the others) that a script gets from a file it sources.
+.IP \- 2
+Units that generators create at boot (from
 .IR etc/systemd/system\-generators ,
 .I usr/lib/systemd/system\-generators
 or a

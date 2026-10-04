@@ -24,18 +24,27 @@
 //! another name. Programs are read where they would run: an absolute path;
 //! a bare name in systemd's own search path for an `Exec…=` program
 //! (`ExecSearchPath=`, else its fixed path), and in `$PATH` for anything
-//! else — the unit's (`Environment=`, `EnvironmentFile=`), then what a
-//! script sets, sourced files included, a cron table's `PATH`; the script a
-//! shell is given, read as sh, or another interpreter is given, only
-//! searched for btrbk's name; the command a wrapper (`env`, `nice`,
-//! `flock`, `timeout`, `sudo`…) runs. A word a program is given, it may
-//! run: it is read like a program, unless the program is [`INERT`]. A word
-//! that only contains btrbk (`btrbk.sh`, `run-btrbk`) means it may. sh's
-//! redirections, `case` patterns and `$((…))` are no commands, and its
-//! brace expansion is each word it makes; builtins and a script's own
-//! functions are not looked up. When a cron daemon is among the units, its
-//! tables and scripts are read the same way. Each runner's config is the
-//! `-c` it passes, else btrbk's default; it is only `lstat`ed.
+//! else — the unit's (`Environment=`, `EnvironmentFile=`), a cron table's
+//! `PATH`, widened by each `PATH` a script sets, sourced files included: a
+//! script's assignment may not apply where a name is looked up, so it adds
+//! its directories and drops none, and after one each program found may be
+//! the one run. A search passes over what cannot run — a directory, a link
+//! to `/dev/null`, a device — and goes on past a program's file no execute
+//! bit allows, which it reads too. The
+//! script a shell is given is read as sh; another interpreter's script is
+//! searched for btrbk's name and for the absolute paths it names that lead
+//! to a sh script, each read as one it runs; the command a wrapper (`env`,
+//! `nice`, `flock`, `timeout`, `sudo`…) runs is read, its own operand (a
+//! lock file, a duration, a user) not. A word a program is given, it may
+//! run: it is read like a program, unless the program is [`INERT`] as that
+//! OS ships it. A word that only contains btrbk (`btrbk.sh`, `run-btrbk`)
+//! means it may. sh's redirections, `case` patterns and a `$((…))` with no
+//! command substitution in it are no commands, and its brace expansion is
+//! each word it makes; builtins are not looked up — a function's name is,
+//! as a wrapper, `exec` or a branch where it is not defined runs the
+//! program. When a cron daemon is among the units, its tables and scripts
+//! are read the same way. Each runner's config is the `-c` it passes, else
+//! btrbk's default; it is only `lstat`ed.
 //!
 //! Everything is read with the parent module's rules: `O_NOATIME`, absent
 //! told from unreadable, and nothing written. A link is never read on a
@@ -45,10 +54,11 @@
 //! is mounted. There a link resolves inside the root (an absolute target is
 //! the root's, `..` cannot leave it, at most [`MAX_LINKS`] links); one
 //! naming `/dev/null` (however many `..`), or an empty unit file, masks and
-//! runs nothing; one to another unit's file in a unit tree is an alias for
-//! that unit (a template's, of the same instance); one to a file outside
-//! the unit trees is the unit's own file. Elsewhere a link is not read, and
-//! then:
+//! runs nothing; a unit file's link is judged by its first hop, as systemd
+//! judges it: into a unit tree, a subdirectory too, it is an alias for the
+//! unit it names (a template's, of the same instance); out of them it is the
+//! unit's own file, read where its links lead. Elsewhere a link is not
+//! read, and then:
 //!
 //! - a unit file linked into `/etc` cannot be told from one masked there:
 //!   either may run btrbk; a package's link among the vendor units is its
@@ -64,11 +74,21 @@
 //! is not what it will see there, so it is unknown. A word that is not
 //! there, and nowhere boot could see another, is nothing to run.
 //!
-//! Not read: a program named through a variable or in an option's value, a
-//! program behind a wrapper this does not know, a binary, units generators
-//! create at boot (and `systemd.unit=` on the kernel command line), units
-//! udev, D-Bus or mounts start, user units and user managers, and
-//! `/etc/rc.local`.
+//! Not read, so a `no` holds only within it (the man page lists each in
+//! plain words): a program named through a variable or in an option's
+//! value, or a variable after a literal prefix (`/root/bin/$JOB`); a bare
+//! name given to a program that looks it up itself (`chronic`, `command`,
+//! `eval`, `screen`); a program behind a wrapper this does not know; a
+//! binary; a file with no `#!` line that is run anyway (a shell or `execvp`
+//! runs it as sh) or sourced; what a shell reads from stdin or a
+//! here-document; another interpreter's calls beyond the above; a relative
+//! argument; a program put in place at boot and then run, or written to a
+//! memory filesystem other than `/run` (a tmpfs `/tmp`); `DefaultEnvironment=`
+//! in `system.conf` and a login shell's `/etc/profile.d`; a function named
+//! like an [`INERT`] program that a script gets from a file it sources;
+//! units generators create at boot (and `systemd.unit=` on the kernel
+//! command line), units udev, D-Bus or mounts start, user units and user
+//! managers, and `/etc/rc.local`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -203,8 +223,11 @@ const MERGED_USR: [(&str, &str); 6] = [
 /// program there is unknown: something at boot may put it there.
 const VOLATILE: [&str; 6] = ["run", "var/run", "var/lock", "dev", "proc", "sys"];
 const FSTAB: &str = "etc/fstab";
-/// Filesystems that live in memory: what the disk holds under an fstab
-/// mount point of one of these is hidden, not elsewhere.
+/// Filesystems that live in memory: a mount point of one of these is not
+/// counted as one — no other copy of what is under it is anywhere, so what
+/// the disk holds there is read as it is. Boot sees an empty filesystem
+/// there instead, and what it writes there is not seen: a declared limit (a
+/// tmpfs `/tmp`).
 const MEMORY_FS: [&str; 6] = ["tmpfs", "ramfs", "proc", "sysfs", "devtmpfs", "devpts"];
 /// A file this reads that is larger than this is unknown, not read in part.
 const MAX_READ_BYTES: u64 = 64 * 1024;
@@ -238,12 +261,16 @@ const CRON_PATH: [&str; 6] = [
     "sbin",
     "bin",
 ];
-/// Programs known not to run their operands. They create, copy, move,
-/// link or remove files (`install`, `mkdir`, `touch`, `ln`, `cp`, `mv`,
-/// `rm`, `rmdir`, `mknod`, `mkfifo`), change their owner or mode (`chown`,
-/// `chgrp`, `chmod`), or test them (`test`, `[`); btrbk's `-c` is judged as
-/// its config, and its other operands are the subvolumes it acts on. Any
-/// other program may run what it is given.
+/// Programs known not to run their operands, as the distro ships them
+/// ([`Findings::inert`]: `/usr/bin/<name>` or `/bin/<name>`, or sh's own
+/// `test` and `[`). They create, copy, move, link or remove files
+/// (`install`, `mkdir`, `touch`, `ln`, `cp`, `mv`, `rm`, `rmdir`, `mknod`,
+/// `mkfifo`), change their owner or mode (`chown`, `chgrp`, `chmod`), or
+/// test them (`test`, `[`); btrbk's `-c` is judged as its config, and its
+/// other operands are the subvolumes it acts on. An option's value is no
+/// operand: one that names a program (`install --strip-program=PROG`) is a
+/// program named in an option's value, not seen. Any other program — or one
+/// of these names anywhere else — may run what it is given.
 const INERT: [&str; 16] = [
     "install", "mkdir", "chown", "chmod", "chgrp", "touch", "ln", "cp", "mv", "rm", "rmdir",
     "mknod", "mkfifo", "test", "[", "btrbk",
@@ -313,7 +340,8 @@ const KEYWORDS: [&str; 15] = [
     "time", "coproc",
 ];
 /// Shell keywords that start what is not a command up to the next operator.
-const HEADERS: [&str; 4] = ["for", "select", "case", "function"];
+/// (`function NAME` is passed over: what follows the name is its body.)
+const HEADERS: [&str; 3] = ["for", "select", "case"];
 
 /// A program that runs a command given after its own options.
 struct Wrapper {
@@ -1045,8 +1073,9 @@ enum Program {
     /// A shell script, read whole.
     Script(String),
     /// A script for another interpreter ([`Role::Code`], or a `#!` line
-    /// naming no shell), read whole but not as sh: only btrbk's name is
-    /// looked for in it.
+    /// naming no shell), read whole but not as sh: btrbk's name is looked
+    /// for in it, and the sh scripts its absolute paths lead to
+    /// ([`Findings::read_code`]).
     Code(String),
     /// btrbk itself, named through a link.
     Btrbk,
@@ -1070,15 +1099,17 @@ enum Role {
     /// A word a program is given, which it may run: read if it is a `#!`
     /// script there, and unknown where boot may see something else.
     Argument,
-    /// A word an [`INERT`] program is given: not run, so never read.
+    /// A word given to a program that runs none ([`Findings::inert`]): not
+    /// run, so never read.
     Inert,
 }
 
 /// `path`, an absolute path a command names, run as `role` (never
 /// [`Role::Inert`]). What that OS will not see as it is here — under
-/// [`VOLATILE`] or a mount point, by its path or through a link on the way;
-/// not here where a merged-/usr link was taken by name; through a link not
-/// read — is unknown: it may run there.
+/// [`VOLATILE`] or a mount point, by its path, through a link on the way or
+/// where its links lead ([`leads_elsewhere`]), a directory there too; not
+/// here where a merged-/usr link was taken by name; through a link not read
+/// — is unknown: it may run there.
 fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role: Role) -> Program {
     let rel = path.trim_matches('/');
     // `/`, and `/etc/` written as a directory: directories, whatever is there.
@@ -1099,12 +1130,7 @@ fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role:
     }
     match located {
         Located::File(at, _) => {
-            if let Some(dir) = VOLATILE.iter().find(|v| under(&at, v)) {
-                return Program::Unknown(format!(
-                    "{path}: leads under /{dir}, which only a running system fills"
-                ));
-            }
-            if let Some(why) = mounts.covers(&at) {
+            if let Some(why) = leads_elsewhere(mounts, path, &at) {
                 return Program::Unknown(why);
             }
             if at.rsplit('/').next() == Some(BTRBK) {
@@ -1140,13 +1166,30 @@ fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role:
             }
             mounts.hides(&at).map_or(Program::Other, Program::Unknown)
         }
-        // Nothing to run: exec fails on /dev/null and on a directory.
-        Located::Masked | Located::Dir(_) => Program::Other,
+        // Nothing to run: exec fails on /dev/null and on a directory —
+        // unless what boot sees there is another thing.
+        Located::Masked => Program::Other,
+        Located::Dir(at) => {
+            leads_elsewhere(mounts, path, &at).map_or(Program::Other, Program::Unknown)
+        }
         // exec fails on a FIFO or a device; a shell reads one.
-        Located::Node(_) if role == Role::Program => Program::Other,
-        Located::Node(at) => Program::Unknown(format!("{at}: not a regular file, which it reads")),
+        Located::Node(at) => match leads_elsewhere(mounts, path, &at) {
+            Some(why) => Program::Unknown(why),
+            None if role == Role::Program => Program::Other,
+            None => Program::Unknown(format!("{at}: not a regular file, which it reads")),
+        },
         Located::Unread { why, .. } | Located::Unknown(why) => Program::Unknown(why),
     }
+}
+
+/// Why `at`, where the path `path` leads once its links are followed, is not
+/// what boot sees there: under a [`VOLATILE`] tree, or a mount point.
+fn leads_elsewhere(mounts: &Mounts, path: &str, at: &str) -> Option<String> {
+    VOLATILE
+        .iter()
+        .find(|v| under(at, v))
+        .map(|dir| format!("{path}: leads under /{dir}, which only a running system fills"))
+        .or_else(|| mounts.covers(at))
 }
 
 /// A regular file a command names, read as `role` runs it: a script if its
@@ -1207,6 +1250,33 @@ fn runs_sh(text: &str) -> bool {
             .unwrap_or_default();
     }
     SHELLS.contains(&program.rsplit('/').next().unwrap_or_default())
+}
+
+/// Whether the regular file `at`, a path with no link on it, has an execute
+/// bit: without one `execve` refuses it, root too. One whose mode cannot be
+/// read may.
+fn executable(root: &Path, at: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(root.join(at)).map_or(true, |m| m.permissions().mode() & 0o111 != 0)
+}
+
+/// The absolute paths another interpreter's code names — `os.system("/x")`,
+/// `system("/x -q")`, `["/x", "-q"]` — in order, once each: every word that
+/// starts with `/` once blanks, quotes, brackets and separators are taken
+/// away; one with a variable, a format, a glob or an escape in it is passed
+/// over.
+fn absolute_paths(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || "\"'`()[]{},;:=|&<>".contains(c)) {
+        if word.len() > 1
+            && word.starts_with('/')
+            && !word.contains(['$', '%', '*', '?', '\\'])
+            && !found.iter().any(|f| f == word)
+        {
+            found.push(word.to_string());
+        }
+    }
+    found
 }
 
 /// The units enabled in the trees ([`EnabledUnits`]): every name in every
@@ -1431,15 +1501,17 @@ fn is_unit_name(name: &str) -> bool {
 /// `name`'s unit file, by systemd's precedence: the first tree that has it;
 /// an instance with no file of its own uses its template's. A link is
 /// followed ([`locate`]): to `/dev/null` it masks the unit (so does an empty
-/// file); to another unit's file in a unit tree it makes `name` that unit's
-/// alias, loaded by that unit's own name; to a file outside the unit trees
-/// it is `name`'s own file, as systemd reads a linked unit file (an alias
-/// must point into the search path, systemd.unit(5)); to nothing, it is
-/// passed over for the next tree. A link, or the file it leads to, that
-/// boot sees elsewhere ([`shadowed`]) is unknown. A link that cannot be
-/// read is a package's alias in the vendor tree, skipped, and unknown
-/// anywhere else — `systemctl link`, `mask` and an `enable` alias then
-/// cannot be told apart.
+/// file); to nothing, it is passed over for the next tree. Else systemd
+/// judges it by its first hop alone ([`first_hop`]; systemd 262's
+/// `unit_file_build_name_map`): one that points anywhere under a unit tree,
+/// a subdirectory too, to another unit's name makes `name` that unit's
+/// alias, loaded by that unit's own name ("treating as alias"); any other —
+/// out of the trees, however its links go on — is a linked unit file:
+/// `name`'s own, whose text is the file its links lead to. A link, or the
+/// file it leads to, that boot sees elsewhere ([`shadowed`]) is unknown. A
+/// link that cannot be read is a package's alias in the vendor tree,
+/// skipped, and unknown anywhere else — `systemctl link`, `mask` and an
+/// `enable` alias then cannot be told apart.
 fn find_unit_file(
     root: &Path,
     trees: &[Tree],
@@ -1478,11 +1550,15 @@ fn find_unit_file(
             if let Some(why) = shadowed(mounts, &at.0) {
                 return UnitFile::Unknown(why);
             }
-            let target = at.0.rsplit('/').next().unwrap_or_default();
-            // Its own file: of its own name, an instance's own template, or
-            // one outside the unit trees.
-            let own =
-                target == candidate || template.as_deref() == Some(target) || !in_unit_tree(&at.0);
+            // A link into the unit trees names the alias (what is no link
+            // has no first hop); its own file is one of its own name or an
+            // instance's own template.
+            let into = first_hop(root, &rel, probe).filter(|d| in_unit_tree(d));
+            let target = into
+                .as_deref()
+                .and_then(|d| d.rsplit('/').next())
+                .unwrap_or(candidate.as_str());
+            let own = target == candidate || template.as_deref() == Some(target);
             if !own && is_unit_name(target) {
                 // A link to a template aliases the same instance of that one —
                 // a template's link every instance, an instance's link just
@@ -1518,10 +1594,32 @@ fn find_unit_file(
     UnitFile::NotFound
 }
 
-/// Whether `rel` is a file directly in one of the [`UNIT_TREES`].
+/// Whether `rel` is anywhere under one of the [`UNIT_TREES`], as systemd
+/// tests a link's target against its search path: by prefix, a
+/// subdirectory's file too.
 fn in_unit_tree(rel: &str) -> bool {
-    rel.rsplit_once('/')
-        .is_some_and(|(dir, _)| UNIT_TREES.contains(&dir))
+    UNIT_TREES.iter().any(|tree| {
+        rel.strip_prefix(tree)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Where the link `rel` points, as systemd judges an alias (`chase` with
+/// `CHASE_NOFOLLOW | CHASE_NONEXISTENT`): its text from its own directory,
+/// the links on the way to the last component followed, that component not
+/// — what may not be there yet is taken as written. `None` when `rel` is no
+/// link, or one not read ([`link_target`]), or its way cannot be told.
+fn first_hop(root: &Path, rel: &str, probe: MountFlags) -> Option<String> {
+    let text = link_target(root, rel, probe).ok()?;
+    let from: Vec<String> = rel.split('/').map(String::from).collect();
+    let target = lexical(&from[..from.len() - 1], &text);
+    let (dir, name) = target.rsplit_once('/').unwrap_or(("", &target));
+    match locate(root, dir, probe) {
+        Located::Dir(at) | Located::Absent { rel: at, .. } => {
+            Some(lexical(&[], &format!("{at}/{name}")))
+        }
+        _ => None,
+    }
 }
 
 /// The drop-in directories of `name`, most specific first (systemd.unit(5)):
@@ -1813,7 +1911,8 @@ fn load_unit(
 /// operators, each operator a word of its own; quotes group and are removed,
 /// a backslash escapes the next character. systemd's `|` prefix is split off
 /// as an operator, before the word it prefixes. A `&` in a redirection
-/// (`&>`, `2>&1`) is no operator, and `$((…))` is one word.
+/// (`&>`, `2>&1`) is no operator, and `$((…))` is one word — unless a
+/// command substitution is in it ([`substitutes`]), whose command runs.
 fn words(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut word = String::new();
@@ -1844,20 +1943,12 @@ fn words(line: &str) -> Vec<String> {
                     word.push(c);
                     in_word = true;
                 }
-                '$' if chars.peek() == Some(&'(') && chars.clone().nth(1) == Some('(') => {
+                '$' if chars.peek() == Some(&'(')
+                    && chars.clone().nth(1) == Some('(')
+                    && !substitutes(&arithmetic(chars.clone())) =>
+                {
                     word.push(c);
-                    let mut depth = 0usize;
-                    for c in chars.by_ref() {
-                        word.push(c);
-                        if c == '(' {
-                            depth += 1;
-                        } else if c == ')' {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                    }
+                    word.push_str(&arithmetic(chars.by_ref()));
                     in_word = true;
                 }
                 ';' | '&' | '|' | '(' | ')' | '`' => {
@@ -1878,6 +1969,34 @@ fn words(line: &str) -> Vec<String> {
         out.push(word);
     }
     out
+}
+
+/// An arithmetic expansion's text after its `$`: from its first `(` to the
+/// `)` that closes it, or to the end of `chars` if none does.
+fn arithmetic(chars: impl Iterator<Item = char>) -> String {
+    let mut text = String::new();
+    let mut depth = 0usize;
+    for c in chars {
+        text.push(c);
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    text
+}
+
+/// Whether an arithmetic expansion's `text` holds a command substitution —
+/// a `$(` that opens no arithmetic, or a backtick — which runs a command.
+fn substitutes(text: &str) -> bool {
+    text.contains('`')
+        || text
+            .match_indices("$(")
+            .any(|(i, _)| !text[i + 2..].starts_with('('))
 }
 
 /// `words`, with a quoted script that names btrbk — `sh -c 'btrbk run'` —
@@ -2289,6 +2408,11 @@ fn command(words: &[String], grammar: Grammar, found: &mut Vec<Launch>) {
             let mut inputs = Vec::new();
             let mut rest = words.iter().enumerate();
             while let Some((i, word)) = rest.next() {
+                // `function NAME`: the body after the name is commands.
+                if word == "function" {
+                    rest.next();
+                    continue;
+                }
                 if HEADERS.contains(&word.as_str()) {
                     return;
                 }
@@ -2331,8 +2455,9 @@ fn command(words: &[String], grammar: Grammar, found: &mut Vec<Launch>) {
 
 /// The program at `words[i]`, what it runs in turn — a wrapper's command, a
 /// shell's script or `-c` line, an interpreter's script — and its own
-/// operands, as [`Launch::Argument`]s: up to what it runs, and of a
-/// redirection only the file it reads in.
+/// operands, as [`Launch::Argument`]s: up to what it runs, of a redirection
+/// only the file it reads in, and never a wrapper's own operand
+/// ([`wrapper_operand`]).
 fn run_from(words: &[String], i: usize, run: Run, grammar: Grammar, found: &mut Vec<Launch>) {
     let word = &words[i];
     let role = run.role;
@@ -2345,27 +2470,32 @@ fn run_from(words: &[String], i: usize, run: Run, grammar: Grammar, found: &mut 
         path: run.path,
     });
     let name = word.rsplit('/').next().unwrap_or(word);
-    let inner = if role != Role::Program {
-        Inner::Neither
+    let (inner, operand) = if role != Role::Program {
+        (Inner::Neither, None)
     } else if SHELLS.contains(&name) {
-        shell_operand(words, i + 1, name, grammar, found)
+        (shell_operand(words, i + 1, name, grammar, found), None)
     } else if INTERPRETERS.contains(&name) {
-        interpreter_operand(words, i + 1, grammar, found)
+        (interpreter_operand(words, i + 1, grammar, found), None)
     } else if let Some(wrapper) = WRAPPERS.iter().find(|w| w.name == name) {
         wrapper_operand(wrapper, words, i + 1, grammar, found)
     } else {
-        Inner::Neither
+        (Inner::Neither, None)
     };
     let end = match inner {
         Inner::Program(j) => j,
         Inner::Neither => words.len(),
     };
-    let mut own = words.iter().take(end).skip(i + 1);
-    while let Some(w) = own.next() {
+    let mut own = words.iter().enumerate().take(end).skip(i + 1);
+    while let Some((k, w)) = own.next() {
+        if operand == Some(k) {
+            continue;
+        }
         if grammar == Grammar::Shell
             && let Some((kind, target)) = redirection(w)
         {
-            let target = target.map(String::from).or_else(|| own.next().cloned());
+            let target = target
+                .map(String::from)
+                .or_else(|| own.next().map(|(_, t)| t.clone()));
             if kind == Redirect::Input {
                 found.extend(target.map(|t| Launch::Argument {
                     owner: word.clone(),
@@ -2455,29 +2585,31 @@ fn interpreter_operand(
 /// The command a wrapper runs: past its options, their values, its own
 /// operands and (for `env`) assignments — a `PATH=` among them is the one
 /// it looks that command up in; or the command line one of its options
-/// passes.
+/// passes. With it, where the wrapper's own operand is: `flock`'s lock
+/// file, `timeout`'s duration, `su`'s user — none of which it runs.
 fn wrapper_operand(
     wrapper: &Wrapper,
     words: &[String],
     from: usize,
     grammar: Grammar,
     found: &mut Vec<Launch>,
-) -> Inner {
+) -> (Inner, Option<usize>) {
     let mut operands = 0..wrapper.operands;
+    let mut operand = None;
     let mut options = true;
     let mut path = None;
     let mut rest = words.iter().enumerate().skip(from);
     while let Some((j, w)) = rest.next() {
         if options && wrapper.command.contains(&w.as_str()) {
             found.extend(words.get(j + 1).map(|line| Launch::Inline(line.clone())));
-            return Inner::Neither;
+            return (Inner::Neither, operand);
         }
         if let Some((flag, line)) = w.split_once('=')
             && options
             && wrapper.command.contains(&flag)
         {
             found.push(Launch::Inline(line.to_string()));
-            return Inner::Neither;
+            return (Inner::Neither, operand);
         }
         if options && w == "--" {
             options = false;
@@ -2490,7 +2622,9 @@ fn wrapper_operand(
             if let Some(value) = w.strip_prefix("PATH=") {
                 path = Some(value.to_string());
             }
-        } else if operands.next().is_none() {
+        } else if operands.next().is_some() {
+            operand = Some(j);
+        } else {
             let run = Run {
                 role: Role::Program,
                 literal: false,
@@ -2498,10 +2632,10 @@ fn wrapper_operand(
                 path,
             };
             run_from(words, j, run, grammar, found);
-            return Inner::Program(j);
+            return (Inner::Program(j), operand);
         }
     }
-    Inner::Neither
+    (Inner::Neither, operand)
 }
 
 /// sh's brace expansion of `word` (`{/usr,}/bin/x`: `/usr/bin/x`,
@@ -2624,18 +2758,54 @@ enum Dir {
     Unknown(String),
 }
 
-type SearchPath = Vec<Dir>;
+/// Where a bare name is looked for: the directories of a `PATH`, in order.
+/// Once a script sets its `PATH` it is `widened` ([`SearchPath::widened_by`]):
+/// every directory any `PATH` it may have holds is searched, and each program
+/// found may be the one run.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SearchPath {
+    dirs: Vec<Dir>,
+    widened: bool,
+}
+
+impl SearchPath {
+    /// `dirs` as written: the first found is the one run.
+    fn exact(dirs: Vec<Dir>) -> SearchPath {
+        SearchPath {
+            dirs,
+            widened: false,
+        }
+    }
+
+    /// This path once a script sets `PATH` to `dirs`: those first, then
+    /// every one of these they leave out. A script's assignment may not
+    /// apply where a name is looked up — on a branch not taken, in a
+    /// subshell or a pipeline's element, a function's `local` — so it never
+    /// narrows what is searched.
+    fn widened_by(&self, dirs: Vec<Dir>) -> SearchPath {
+        let mut all: Vec<Dir> = Vec::new();
+        for dir in dirs.into_iter().chain(self.dirs.iter().cloned()) {
+            if !all.contains(&dir) {
+                all.push(dir);
+            }
+        }
+        SearchPath {
+            dirs: all,
+            widened: true,
+        }
+    }
+}
 
 /// `dirs`, root-relative, as a search path.
 fn known(dirs: &[&str]) -> SearchPath {
-    dirs.iter().map(|d| Dir::Known(d.to_string())).collect()
+    SearchPath::exact(dirs.iter().map(|d| Dir::Known(d.to_string())).collect())
 }
 
-/// The search path a `PATH` value `raw` sets: each absolute entry as
-/// written; `$PATH` (or `${PATH}`) the `current` one where a shell expands
+/// The directories a `PATH` value `raw` names: each absolute entry as
+/// written; `$PATH` (or `${PATH}`) the `current` ones where a shell expands
 /// it — systemd and cron expand nothing (`None`); anything else a directory
 /// only that OS knows.
-fn parse_path(raw: &str, current: Option<&[Dir]>) -> SearchPath {
+fn parse_path(raw: &str, current: Option<&[Dir]>) -> Vec<Dir> {
     let mut path = Vec::new();
     for entry in raw.split(':') {
         match current {
@@ -2654,11 +2824,34 @@ fn parse_path(raw: &str, current: Option<&[Dir]>) -> SearchPath {
     path
 }
 
-/// Where a bare name is in a search path ([`Findings::find`]).
-enum Lookup {
-    Found(String),
-    Absent,
-    Unknown(String),
+/// Where a bare name is in a search path ([`Findings::find`]): each file
+/// that may be the one run, and why it may be one only that OS knows.
+struct Lookup {
+    found: Vec<String>,
+    unknown: Option<String>,
+}
+
+/// What a path search makes of one directory's entry
+/// ([`Findings::candidate`]).
+enum Candidate {
+    /// What runs there, or may at boot: the search ends at it.
+    Runs,
+    /// A file no execute bit allows: `execve` refuses it, so the search goes
+    /// on past it; it is read all the same.
+    Unexecutable,
+    /// Nothing that can run.
+    Nothing,
+}
+
+impl Candidate {
+    /// [`Candidate::Runs`] where boot may see something else (`why`), else
+    /// [`Candidate::Nothing`].
+    fn or_nothing(why: Option<String>) -> Candidate {
+        match why {
+            Some(_) => Candidate::Runs,
+            None => Candidate::Nothing,
+        }
+    }
 }
 
 /// How a word on a command line is used ([`Findings::program`]).
@@ -2894,8 +3087,9 @@ struct At<'s> {
     script: Option<&'s str>,
     /// Where systemd looks for a bare program of its own: `ExecSearchPath=`,
     /// else its fixed path.
-    exec: &'s [Dir],
-    /// The functions the script it is in defines: run without a lookup.
+    exec: &'s SearchPath,
+    /// The functions the script it is in defines: one by the name of an
+    /// [`INERT`] program may run what it is given ([`Findings::inert`]).
     functions: &'s BTreeSet<String>,
 }
 
@@ -3055,7 +3249,7 @@ impl Findings<'_> {
             self.unknown(format!("{who} is named for btrbk"), None);
         }
         let exec = match &settings.exec_search_path {
-            Some(dirs) => parse_path(&dirs.join(":"), None),
+            Some(dirs) => SearchPath::exact(parse_path(&dirs.join(":"), None)),
             None => self.exec_default.clone(),
         };
         let env = self.unit_path(&settings);
@@ -3145,12 +3339,12 @@ impl Findings<'_> {
             }
         }
         let mut path = match (raw, &settings.exec_search_path) {
-            (Some(raw), _) => parse_path(&raw, None),
-            (None, Some(dirs)) => parse_path(&dirs.join(":"), None),
+            (Some(raw), _) => SearchPath::exact(parse_path(&raw, None)),
+            (None, Some(dirs)) => SearchPath::exact(parse_path(&dirs.join(":"), None)),
             (None, None) => known(&SERVICE_PATH),
         };
         if let Some(why) = unknown {
-            path.insert(0, Dir::Unknown(why));
+            path.dirs.insert(0, Dir::Unknown(why));
         }
         path
     }
@@ -3194,7 +3388,7 @@ impl Findings<'_> {
         who: &str,
         unit: &str,
         raw: &str,
-        exec: &[Dir],
+        exec: &SearchPath,
         env: &SearchPath,
     ) -> Runs {
         let mut raw_words = words(raw);
@@ -3237,8 +3431,9 @@ impl Findings<'_> {
 
     /// What a command line's words run that is btrbk: btrbk named in it, and
     /// each program it launches ([`launches`]), read in turn; each word a
-    /// program is given, read as one it may run — unless that program is
-    /// [`INERT`]; and each `PATH` it sets, kept in `path` for what follows.
+    /// program is given, read as one it may run — unless that program runs
+    /// none of them ([`Findings::inert`]); and each `PATH` it sets, which
+    /// widens `path` for what follows ([`SearchPath::widened_by`]).
     fn words_run(
         &mut self,
         at: At,
@@ -3248,6 +3443,9 @@ impl Findings<'_> {
     ) -> Runs {
         let mut runs = self.btrbk_named(at, words);
         let shell = grammar == Grammar::Shell;
+        // Each program given words here: whether it runs none of them. Its
+        // own launch comes before them.
+        let mut inert: BTreeMap<String, bool> = BTreeMap::new();
         for launch in launches(words, grammar) {
             let (word, how) = match launch {
                 Launch::Inline(line) => {
@@ -3255,7 +3453,7 @@ impl Findings<'_> {
                     continue;
                 }
                 Launch::Path(raw) => {
-                    *path = parse_path(&raw, Some(path));
+                    *path = path.widened_by(parse_path(&raw, Some(&path.dirs)));
                     continue;
                 }
                 Launch::Program {
@@ -3265,20 +3463,20 @@ impl Findings<'_> {
                     args,
                     sourced,
                     path: own,
-                } => (
-                    word,
-                    Use {
+                } => {
+                    let how = Use {
                         role,
                         literal,
                         sourced,
                         path: own,
                         shell,
                         args,
-                    },
-                ),
+                    };
+                    inert.insert(word.clone(), self.inert(at, path, &word, &how));
+                    (word, how)
+                }
                 Launch::Argument { owner, word } => {
-                    let name = owner.rsplit('/').next().unwrap_or(&owner);
-                    let role = if INERT.contains(&name) {
+                    let role = if inert.get(&owner) == Some(&true) {
                         Role::Inert
                     } else {
                         Role::Argument
@@ -3346,10 +3544,9 @@ impl Findings<'_> {
     }
 
     /// One word a command line names, used as `how` says: found where that
-    /// OS would find it, and read for what it runs — btrbk under another
-    /// name, a script, read [`MAX_SCRIPT_DEPTH`] deep at most; or another
-    /// interpreter's code, only searched for btrbk's name. A sourced script
-    /// leaves its `PATH` in `path`.
+    /// OS would find it — each file a lookup finds that may be the one run
+    /// ([`Findings::bare`]) — and read for what it runs ([`Findings::read`]).
+    /// A sourced script leaves its `PATH` in `path`.
     fn program(&mut self, at: At, path: &mut SearchPath, word: &str, how: &Use) -> Runs {
         // btrbk by name is btrbk_invocations'. `.` and `source` are the
         // shell's own, their script read as the script operand: looked up
@@ -3361,8 +3558,10 @@ impl Findings<'_> {
         {
             return Vec::new();
         }
-        // The shell runs its builtins, and the script's functions, itself.
-        if how.shell && (BUILTINS.contains(&word) || at.functions.contains(word)) {
+        // The shell runs its builtins itself. A function of the script's is
+        // looked up all the same: a wrapper, `exec`, or a branch where it is
+        // not defined runs the program of that name.
+        if how.shell && BUILTINS.contains(&word) {
             return Vec::new();
         }
         // A word with a blank in it was quoted, and sh expands no braces in
@@ -3392,8 +3591,8 @@ impl Findings<'_> {
         if !how.literal && word.contains(['$', '`', '*', '?', '[', '~']) {
             return Vec::new();
         }
-        let resolved = if word.starts_with('/') {
-            word.to_string()
+        let found = if word.starts_with('/') {
+            vec![word.to_string()]
         } else if how.role == Role::Argument {
             return Vec::new();
         } else if word.contains('/') {
@@ -3407,42 +3606,28 @@ impl Findings<'_> {
             );
             return Vec::new();
         } else {
-            match self.bare(at, path, word, how) {
-                Ok(found) => found,
-                Err(None) => return Vec::new(),
-                Err(Some(why)) => {
-                    self.unknown(format!("{} may run btrbk: {why}", at.who), None);
-                    return Vec::new();
-                }
+            let lookup = self.bare(at, path, word, how);
+            if let Some(why) = lookup.unknown {
+                self.unknown(format!("{} may run btrbk: {why}", at.who), None);
             }
+            lookup.found
         };
-        match program_at(self.root, self.mounts, self.probe, &resolved, how.role) {
+        let mut runs = Vec::new();
+        for resolved in found {
+            runs.extend(self.read(at, path, &resolved, how));
+        }
+        runs
+    }
+
+    /// The program at the absolute path `resolved`, run as `how` says
+    /// ([`program_at`]): btrbk under another name; a script, read as sh
+    /// ([`Findings::read_sh`]); another interpreter's code
+    /// ([`Findings::read_code`]); or what could not be told.
+    fn read(&mut self, at: At, path: &mut SearchPath, resolved: &str, how: &Use) -> Runs {
+        match program_at(self.root, self.mounts, self.probe, resolved, how.role) {
             Program::Btrbk => vec![(at.script.map(String::from), btrbk_config(&how.args))],
-            Program::Script(_) if at.depth == MAX_SCRIPT_DEPTH => {
-                let why = format!("{resolved}: a script {MAX_SCRIPT_DEPTH} scripts deep, not read");
-                self.unknown(format!("{} may run btrbk through {why}", at.who), None);
-                Vec::new()
-            }
-            Program::Script(text) => {
-                let (runs, after) = self.script(at, path, &resolved, &text);
-                if how.sourced {
-                    *path = after;
-                }
-                runs
-            }
-            Program::Code(text) => {
-                if text.contains(BTRBK) {
-                    self.unknown(
-                        format!(
-                            "{} may run btrbk through {resolved}: a script not in sh, which \
-                             names btrbk",
-                            at.who
-                        ),
-                        None,
-                    );
-                }
-                Vec::new()
-            }
+            Program::Script(text) => self.read_sh(at, path, resolved, &text, how.sourced),
+            Program::Code(text) => self.read_code(at, path, resolved, &text),
             Program::Other => Vec::new(),
             Program::Unknown(why) => {
                 self.unknown(
@@ -3454,51 +3639,214 @@ impl Findings<'_> {
         }
     }
 
+    /// The sh script `script` a line at `at` runs, read one script deeper
+    /// ([`Findings::script`]) — unless that is past [`MAX_SCRIPT_DEPTH`]:
+    /// then unknown. A sourced one leaves its `PATH` in `path`.
+    fn read_sh(
+        &mut self,
+        at: At,
+        path: &mut SearchPath,
+        script: &str,
+        text: &str,
+        sourced: bool,
+    ) -> Runs {
+        if at.depth >= MAX_SCRIPT_DEPTH {
+            let why = format!("{script}: a script {MAX_SCRIPT_DEPTH} scripts deep, not read");
+            self.unknown(format!("{} may run btrbk through {why}", at.who), None);
+            return Vec::new();
+        }
+        let (runs, after) = self.script(at, path, script, text);
+        if sourced {
+            *path = after;
+        }
+        runs
+    }
+
+    /// Another interpreter's script `script`, which is not read as sh: btrbk
+    /// named in it may run; and of the absolute paths it names
+    /// ([`absolute_paths`]: `os.system("/usr/local/bin/x")`, awk's
+    /// `system()`, an argument list) each one that leads to a sh script is
+    /// read as one this script runs, one script deeper. Nothing else in it
+    /// is followed or flagged.
+    fn read_code(&mut self, at: At, path: &mut SearchPath, script: &str, text: &str) -> Runs {
+        if text.contains(BTRBK) {
+            self.unknown(
+                format!(
+                    "{} may run btrbk through {script}: a script not in sh, which names btrbk",
+                    at.who
+                ),
+                None,
+            );
+        }
+        // It counts as one script: what it names is one deeper.
+        let inside = At {
+            depth: at.depth + 1,
+            ..at
+        };
+        let mut runs = Vec::new();
+        for named in absolute_paths(text) {
+            if let Program::Script(body) =
+                program_at(self.root, self.mounts, self.probe, &named, Role::Program)
+            {
+                runs.extend(self.read_sh(inside, path, &named, &body, false));
+            }
+        }
+        runs
+    }
+
     /// Where a bare `name` is found ([`Findings::find`]): by systemd, for its
     /// own program, in [`At::exec`] — one found only in the unit's `PATH`
     /// may or may not run, as systemd searches its own path; by anything
     /// else in `$PATH` (`path`, or a `PATH=` given to this command alone).
-    /// `Err(None)`: nowhere, so it fails; `Err(Some(why))`: maybe somewhere
-    /// only that OS knows.
-    fn bare(&self, at: At, path: &[Dir], name: &str, how: &Use) -> Result<String, Option<String>> {
+    /// A program must be executable; a script a shell is given (`.`'s file)
+    /// need not be.
+    fn bare(&self, at: At, path: &SearchPath, name: &str, how: &Use) -> Lookup {
         if how.literal {
-            return match self.find(at.exec, name) {
-                Lookup::Found(found) => Ok(found),
-                Lookup::Unknown(why) => Err(Some(why)),
-                Lookup::Absent => match self.find(path, name) {
-                    Lookup::Found(found) => Err(Some(format!(
-                        "{name} is not where systemd looks for it, but {found} is in the \
-                         unit's PATH"
-                    ))),
-                    Lookup::Absent | Lookup::Unknown(_) => Err(None),
-                },
-            };
+            let mut lookup = self.find(at.exec, name, true);
+            if lookup.found.is_empty()
+                && lookup.unknown.is_none()
+                && let Some(found) = self.find(path, name, true).found.first()
+            {
+                lookup.unknown = Some(format!(
+                    "{name} is not where systemd looks for it, but {found} is in the unit's PATH"
+                ));
+            }
+            return lookup;
         }
-        let own = how.path.as_ref().map(|raw| parse_path(raw, Some(path)));
-        match self.find(own.as_deref().unwrap_or(path), name) {
-            Lookup::Found(found) => Ok(found),
-            Lookup::Unknown(why) => Err(Some(why)),
-            Lookup::Absent => Err(None),
+        let own = how.path.as_ref().map(|raw| SearchPath {
+            dirs: parse_path(raw, Some(&path.dirs)),
+            widened: path.widened,
+        });
+        self.find(
+            own.as_ref().unwrap_or(path),
+            name,
+            how.role == Role::Program,
+        )
+    }
+
+    /// Where `name` is in `path`, as a path search finds it: each directory
+    /// in turn ([`Findings::candidate`]), what cannot run passed over, the
+    /// first found that runs the one run — a file no execute bit allows on
+    /// the way is read too, and the search goes on past it. A directory only
+    /// that OS knows, met before any that runs, leaves it unknown. In a
+    /// widened path every directory is searched, and each one found may be
+    /// the one run.
+    fn find(&self, path: &SearchPath, name: &str, exec: bool) -> Lookup {
+        let mut lookup = Lookup {
+            found: Vec::new(),
+            unknown: None,
+        };
+        // Whether one that runs was found: a search ends there.
+        let mut ran = false;
+        for dir in &path.dirs {
+            match dir {
+                Dir::Unknown(why) => {
+                    if !ran && lookup.unknown.is_none() {
+                        lookup.unknown = Some(why.clone());
+                    }
+                }
+                Dir::Known(dir) => {
+                    let rel = format!("{dir}/{name}");
+                    match self.candidate(&rel, exec) {
+                        Candidate::Runs => {
+                            lookup.found.push(format!("/{rel}"));
+                            ran = true;
+                        }
+                        Candidate::Unexecutable => lookup.found.push(format!("/{rel}")),
+                        Candidate::Nothing => {}
+                    }
+                }
+            }
+            if !path.widened && (ran || lookup.unknown.is_some()) {
+                break;
+            }
+        }
+        lookup
+    }
+
+    /// What a path search makes of `rel` ([`Candidate`]). A directory, a
+    /// link to `/dev/null`, a device or a FIFO cannot run: `execvp`, sh and
+    /// systemd pass over each. Where `exec` (a program, not a file `.`
+    /// reads), a file no execute bit allows is passed over as well, but read:
+    /// something at boot may make it executable first. What boot sees
+    /// elsewhere — `rel` under a mount point, or a link on its way or where
+    /// it leads ([`Mounts::shadows`]), or nothing here that may be there
+    /// ([`Mounts::hides`]) — may be anything, as may a link not read.
+    fn candidate(&self, rel: &str, exec: bool) -> Candidate {
+        if self.mounts.shadows(rel).is_some() {
+            return Candidate::Runs;
+        }
+        let (located, hops) = locate_via(self.root, rel, self.probe);
+        if hops.iter().any(|hop| self.mounts.shadows(hop).is_some()) {
+            return Candidate::Runs;
+        }
+        match located {
+            Located::File(at, _) => {
+                if self.mounts.shadows(&at).is_some() || !exec || executable(self.root, &at) {
+                    Candidate::Runs
+                } else {
+                    Candidate::Unexecutable
+                }
+            }
+            Located::Absent { rel: at, .. } => Candidate::or_nothing(self.mounts.hides(&at)),
+            Located::Dir(at) | Located::Node(at) => Candidate::or_nothing(self.mounts.shadows(&at)),
+            Located::Masked => Candidate::Nothing,
+            Located::Unread { .. } | Located::Unknown(_) => Candidate::Runs,
         }
     }
 
-    /// Where `name` is in `path`: in the first directory that has it or may
-    /// have it ([`Mounts::hides`]); a directory only that OS knows, met
-    /// first, leaves it unknown.
-    fn find(&self, path: &[Dir], name: &str) -> Lookup {
-        for dir in path {
-            let dir = match dir {
-                Dir::Known(dir) => dir,
-                Dir::Unknown(why) => return Lookup::Unknown(why.clone()),
-            };
-            let rel = format!("{dir}/{name}");
-            let there = !matches!(locate(self.root, &rel, self.probe), Located::Absent { .. })
-                || self.mounts.hides(&rel).is_some();
-            if there {
-                return Lookup::Found(format!("/{rel}"));
-            }
+    /// Whether `word`, a command's program, runs none of the words it is
+    /// given: one of [`INERT`] as that OS ships it — sh's own `test` or `[`,
+    /// or what is found by its name being `/usr/bin/<name>` or `/bin/<name>`
+    /// — or a program found nowhere, which runs nothing at all. One of those
+    /// names anywhere else (a wrapper in `/usr/local/bin`), one the script
+    /// defines as a function, or one only that OS could find, may run what
+    /// it is given.
+    fn inert(&self, at: At, path: &SearchPath, word: &str, how: &Use) -> bool {
+        let name = word.rsplit('/').next().unwrap_or(word);
+        if how.role != Role::Program || !INERT.contains(&name) || at.functions.contains(name) {
+            return false;
         }
-        Lookup::Absent
+        if how.shell && word == name && matches!(name, "test" | "[") {
+            return true;
+        }
+        let found = if word.starts_with('/') {
+            vec![word.to_string()]
+        } else if word != name {
+            return false;
+        } else {
+            let lookup = self.bare(at, path, word, how);
+            if lookup.unknown.is_some() {
+                return false;
+            }
+            lookup.found
+        };
+        found.iter().all(|program| self.shipped(program, name))
+    }
+
+    /// Whether the program at the absolute path `program` is `name` as that
+    /// OS ships it, `/usr/bin/<name>` or `/bin/<name>` (through any link), or
+    /// is not there to run at all; never what boot sees elsewhere.
+    fn shipped(&self, program: &str, name: &str) -> bool {
+        let rel = program.trim_matches('/');
+        if self.mounts.shadows(rel).is_some() {
+            return false;
+        }
+        let (located, hops) = locate_via(self.root, rel, self.probe);
+        if hops.iter().any(|hop| self.mounts.shadows(hop).is_some()) {
+            return false;
+        }
+        match located {
+            Located::File(at, _) => {
+                self.mounts.shadows(&at).is_none()
+                    && (at == format!("usr/bin/{name}") || at == format!("bin/{name}"))
+            }
+            Located::Absent { rel: at, .. } => self.mounts.hides(&at).is_none(),
+            // exec fails on each: nothing runs.
+            Located::Dir(at) | Located::Node(at) => self.mounts.shadows(&at).is_none(),
+            Located::Masked => true,
+            Located::Unread { .. } | Located::Unknown(_) => false,
+        }
     }
 
     /// A script's lines, read as sh reads them ([`shell_lines`]), one script
@@ -3639,6 +3987,8 @@ impl Findings<'_> {
                         .collect()
                 });
         let catch_up = "soon after boot (anacron catch-up)";
+        // No program of systemd's own: cron looks every name up in PATH.
+        let nowhere = SearchPath::exact(Vec::new());
         for (rel, text) in &texts {
             let who = format!("{rel} (cron, {daemon})");
             let none = BTreeSet::new();
@@ -3646,7 +3996,7 @@ impl Findings<'_> {
                 who: &who,
                 depth: 0,
                 script: None,
-                exec: &[],
+                exec: &nowhere,
                 functions: &none,
             };
             if let Some(dir) = CRON_SCRIPT_DIRS.iter().find(|d| under(rel, d)) {
@@ -3690,7 +4040,7 @@ impl Findings<'_> {
             let mut path = known(&CRON_PATH);
             for line in text.lines() {
                 if let Some(value) = cron_path(line) {
-                    path = parse_path(value, None);
+                    path = SearchPath::exact(parse_path(value, None));
                     continue;
                 }
                 let Some((command, reboot)) = cron_command(line, table) else {
@@ -4092,9 +4442,17 @@ mod tests {
         }
     }
 
-    /// A `#!` script at `rel`, its lines after the interpreter line.
+    /// A `#!` script at `rel`, its lines after the interpreter line, which
+    /// anyone may execute, as a program's file is.
     fn script(root: &Path, rel: &str, body: &str) {
         write(root, rel, &format!("#!/bin/sh\n{body}"));
+        fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// An executable binary at `rel`: its first bytes, never read past.
+    fn binary(root: &Path, rel: &str) {
+        write(root, rel, "\x7fELF\x02\x01\x01\0");
+        fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// A FIFO at `rel`, with a writer standing by: a read that does open it
@@ -7098,7 +7456,7 @@ mod tests {
         link(root, "bin", "usr/bin");
         link(root, "sbin", "usr/bin");
         link(root, "usr/sbin", "bin");
-        write(root, "usr/bin/bash", "\x7fELF\x02\x01\x01\0");
+        binary(root, "usr/bin/bash");
         link(root, "usr/bin/sh", "bash");
     }
 
@@ -7499,7 +7857,7 @@ mod tests {
             "xargs",
             "ls",
         ] {
-            write(root, &format!("usr/bin/{b}"), "\x7fELF\x02\x01\x01\0");
+            binary(root, &format!("usr/bin/{b}"));
         }
         for d in ["run", "root", "home", "usr/local/bin"] {
             fs::create_dir_all(root.join(d)).unwrap();
@@ -7872,6 +8230,531 @@ mod tests {
         );
     }
 
+    // ---- rr4: what fix round 4 read as nothing that may run (round 5) -------
+
+    /// rr4's `outer`: nightly.service runs /usr/local/bin/outer.sh, of `body`.
+    fn outer(root: &Path, body: &str) {
+        nightly_runs(root, "ExecStart=/usr/local/bin/outer.sh");
+        script(root, "usr/local/bin/outer.sh", body);
+    }
+
+    /// rr4's `snaprun`: a script `name` in `dir` that runs btrbk.
+    fn snap(root: &Path, dir: &str, name: &str) {
+        script(root, &format!("{dir}/{name}"), "exec btrbk run\n");
+    }
+
+    #[test]
+    fn rr4_a9_b6_a_path_a_script_sets_narrows_nothing() {
+        for body in [
+            // a9: on a branch not taken; a9b: local to a function; b6: in a
+            // subshell; b6b: in a pipeline element.
+            "if [ -d /opt/legacy ]; then PATH=/opt/legacy/bin; fi\nsnap-run\n",
+            "f() { local PATH=/opt/legacy/bin; }\nf\nsnap-run\n",
+            "( PATH=/opt/legacy/bin; true )\nsnap-run\n",
+            "echo x | PATH=/opt/legacy/bin; snap-run\n",
+            // Set outright too: what it held before is searched still.
+            "PATH=/opt/legacy/bin\nsnap-run\n",
+            "export PATH=/opt/legacy/bin\nsnap-run\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            outer(root, body);
+            snap(root, "usr/local/bin", "snap-run");
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{body}");
+            // The converse: in no directory either PATH holds, it runs nothing.
+            fs::remove_file(root.join("usr/local/bin/snap-run")).unwrap();
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{body}");
+        }
+    }
+
+    #[test]
+    fn once_a_script_sets_its_path_each_program_found_may_be_the_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        binary(root, "usr/local/sbin/snap-run");
+        snap(root, "usr/local/bin", "snap-run");
+        // The unit's PATH, as systemd gives it: the first found is run.
+        outer(root, "snap-run\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // Once the script may have set another, either may be.
+        outer(root, "if [ -d /x ]; then PATH=/opt/x:$PATH; fi\nsnap-run\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        // A directory only that OS knows: met before any found, the name may
+        // be there; met after one, that one is the first in either PATH.
+        binary(root, "opt/x/tool");
+        outer(root, "PATH=/opt/x:$X\ntool\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        outer(root, "PATH=$X:/opt/x\ntool\n");
+        assert_eq!(
+            verdict_of(root).1,
+            [
+                "multi-user.target starts nightly.service, which may run btrbk: it looks programs up \
+                 in a PATH holding \"$X\", which only that OS can resolve"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_widened_keeps_what_it_had_after_what_it_is_set_to() {
+        let k = |d: &str| Dir::Known(d.to_string());
+        let path = SearchPath::exact(vec![k("usr/local/bin"), k("usr/bin")]);
+        assert!(!path.widened);
+        let wide = path.widened_by(vec![k("opt/x"), k("usr/bin"), k("opt/x")]);
+        assert_eq!(wide.dirs, [k("opt/x"), k("usr/bin"), k("usr/local/bin")]);
+        assert!(wide.widened);
+        // Once widened, it stays so, set again or not.
+        assert!(wide.widened_by(Vec::new()).widened);
+    }
+
+    #[test]
+    fn rr4_b1_b2_a14_a_function_never_makes_a_name_nothing() {
+        for (body, name) in [
+            // b1, b1b: defined only where the program is missing.
+            (
+                "if ! command -v snap-run >/dev/null; then\n  function snap-run { echo none; }\nfi\nsnap-run\n",
+                "snap-run",
+            ),
+            (
+                "if ! command -v snaprun >/dev/null; then\n  snaprun() { echo none; }\nfi\nsnaprun\n",
+                "snaprun",
+            ),
+            // b2, b2b: a wrapper, and exec, run the program, never a function.
+            (
+                "snaprun() { logger start; command snaprun \"$@\"; }\ntimeout 1h snaprun\n",
+                "snaprun",
+            ),
+            ("snaprun() { :; }\nexec snaprun\n", "snaprun"),
+            // a14: the word "function" given to echo defines nothing.
+            ("echo function snap-run\nsnap-run\n", "snap-run"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            outer(root, body);
+            snap(root, "usr/local/bin", name);
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{body}");
+            // The converse: a name no program has runs only the function.
+            fs::remove_file(root.join(format!("usr/local/bin/{name}"))).unwrap();
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_function_s_body_after_its_name_is_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        snap(root, "usr/local/bin", "snap-run");
+        outer(root, "function f { /usr/local/bin/snap-run; }\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        // A loop's list stays words, under a mount point or not.
+        outer(root, "for d in /root/a /root/b; do :; done\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn rr4_b3_a_command_substitution_in_arithmetic_runs() {
+        for body in [
+            "n=$(( $(snap-run) + 0 ))\n",
+            "echo $(( $(/usr/local/bin/snap-run) + 0 ))\n",
+            "echo $(( `snap-run` + 1 ))\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            outer(root, body);
+            snap(root, "usr/local/bin", "snap-run");
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{body}");
+            // The converse: arithmetic alone runs nothing, whatever it names.
+            outer(
+                root,
+                "n=$(( snap-run + 1 ))\necho $((x/2)) $(( $((1+2)) ))\n",
+            );
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{body}");
+        }
+    }
+
+    #[test]
+    fn rr4_b4_another_interpreter_s_script_runs_the_sh_scripts_it_names() {
+        for (exec, rel, text) in [
+            // b4: Python's os.system; b4b: a subprocess argument list; b4c:
+            // awk's system().
+            (
+                "ExecStart=/usr/local/bin/job.py",
+                "usr/local/bin/job.py",
+                "#!/usr/bin/python3\nimport os\nos.system(\"/usr/local/bin/snap-run\")\n",
+            ),
+            (
+                "ExecStart=/usr/bin/python3 /usr/local/lib/job.py",
+                "usr/local/lib/job.py",
+                "import subprocess\nsubprocess.run([\"/usr/local/bin/snap-run\", \"-q\"])\n",
+            ),
+            (
+                "ExecStart=/usr/local/bin/job.awk",
+                "usr/local/bin/job.awk",
+                "#!/usr/bin/awk -f\nBEGIN { system(\"/usr/local/bin/snap-run\") }\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            nightly_runs(root, exec);
+            write(root, rel, text);
+            snap(root, "usr/local/bin", "snap-run");
+            let b = at_boot(root);
+            assert_eq!(b.verdict, BootVerdict::Will, "{exec}");
+            assert_eq!(
+                b.runners[0].script.as_deref(),
+                Some("/usr/local/bin/snap-run"),
+                "{exec}"
+            );
+            // The converse: a path to anything but a sh script there is
+            // neither followed nor flagged — a binary, nothing, one boot
+            // sees elsewhere, another interpreter's script.
+            script(root, "usr/local/bin/snap-run", "true\n");
+            write(
+                root,
+                "usr/local/bin/other.py",
+                "#!/usr/bin/python3\nprint(1)\n",
+            );
+            write(
+                root,
+                rel,
+                "#!/usr/bin/python3\nimport os\nos.system('/usr/bin/true /opt/none')\n\
+                 os.system(\"/root/bin/backup.sh\") # /run/x.sh, /usr/local/bin/other.py\n",
+            );
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{exec}");
+        }
+    }
+
+    #[test]
+    fn the_absolute_paths_code_names_are_its_words_that_start_with_a_slash() {
+        assert_eq!(
+            absolute_paths(
+                "#!/usr/bin/python3\nos.system(\"/a/b -q\") ; x = ['/c', \"/d\"]\n\
+                 `/e`=/f|/g&/h<>/i,{/j}:/k /a/b /\n$x/y /l/$v /m%s /n* /o? /p\\q ~/r #/s /t~#"
+            ),
+            [
+                "/a/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i", "/j", "/k", "/t~#"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_script_another_interpreter_names_counts_one_script_deeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        snap(root, "usr/local/bin", "snap-run");
+        write(
+            root,
+            "usr/local/bin/job.py",
+            "#!/usr/bin/python3\nimport os\nos.system('/usr/local/bin/snap-run')\n",
+        );
+        // outer.sh one script deep, s2 two, the Python script three: its sh
+        // script four, the deepest read.
+        outer(root, "/usr/local/bin/s2\n");
+        script(root, "usr/local/bin/s2", "/usr/local/bin/job.py\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        let past = [
+            "multi-user.target starts nightly.service, which may run btrbk through \
+             /usr/local/bin/snap-run: a script 4 scripts deep, not read",
+        ];
+        // The Python script four deep: its sh script would be five.
+        script(root, "usr/local/bin/s2", "/usr/local/bin/s3\n");
+        script(root, "usr/local/bin/s3", "/usr/local/bin/job.py\n");
+        assert_eq!(verdict_of(root).1, past);
+        // ...and five deep, six: still not read.
+        script(root, "usr/local/bin/s3", "/usr/local/bin/s4\n");
+        script(root, "usr/local/bin/s4", "/usr/local/bin/job.py\n");
+        assert_eq!(verdict_of(root).1, past);
+    }
+
+    #[test]
+    fn rr4_a11_a_unit_s_link_is_judged_by_where_its_first_hop_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        let runs = |what: &str| format!("[Service]\nType=oneshot\nExecStart={what}\n");
+        unit(root, VENDOR, "other.service", &runs("/usr/bin/btrbk run"));
+        enable(root, ETC, "multi-user.target.wants", "nightly.service");
+        // a11: into a subdirectory of a unit tree: an alias of the name it
+        // points to (systemd: "treating as alias"), read by that name.
+        write(
+            root,
+            &format!("{ETC}/sub/other.service"),
+            &runs("/usr/bin/true"),
+        );
+        link(
+            root,
+            &format!("{ETC}/nightly.service"),
+            "/etc/systemd/system/sub/other.service",
+        );
+        assert_eq!(
+            unit_file(root, "nightly.service"),
+            UnitFile::Alias("other.service".into())
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        // a11b (a11c): out of the trees first, back into them after: a
+        // linked unit file, whose text is the file its links lead to.
+        fs::remove_file(root.join(ETC).join("nightly.service")).unwrap();
+        unit(root, ETC, "other.service", &runs("/usr/bin/true"));
+        link(
+            root,
+            "opt/units/hop.service",
+            &format!("/{VENDOR}/other.service"),
+        );
+        link(
+            root,
+            &format!("{ETC}/nightly.service"),
+            "/opt/units/hop.service",
+        );
+        assert_eq!(
+            unit_file(root, "nightly.service"),
+            UnitFile::Text(runs("/usr/bin/btrbk run"))
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        // Into the trees first: the first name it points to is the alias,
+        // however its links go on (that name's own file comes first).
+        fs::remove_file(root.join(ETC).join("nightly.service")).unwrap();
+        link(root, &format!("{VENDOR}/hop.service"), "other.service");
+        unit(root, ETC, "hop.service", &runs("/usr/bin/btrbk run"));
+        link(
+            root,
+            &format!("{ETC}/nightly.service"),
+            &format!("/{VENDOR}/hop.service"),
+        );
+        assert_eq!(
+            unit_file(root, "nightly.service"),
+            UnitFile::Alias("hop.service".into())
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+    }
+
+    #[test]
+    fn a_link_s_first_hop_is_where_it_points_with_the_links_on_its_way_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("usr/lib/systemd/system")).unwrap();
+        link(root, "lib", "usr/lib");
+        let hop = |rel: &str, target: &str| {
+            link(root, rel, target);
+            first_hop(root, rel, FOLLOW)
+        };
+        // The directory on its way followed, the name itself not.
+        assert_eq!(
+            hop(
+                "etc/systemd/system/a.service",
+                "/lib/systemd/system/b.service"
+            )
+            .as_deref(),
+            Some("usr/lib/systemd/system/b.service")
+        );
+        assert_eq!(
+            hop("etc/systemd/system/c.service", "sub/../x/c.service").as_deref(),
+            Some("etc/systemd/system/x/c.service")
+        );
+        assert_eq!(
+            hop("etc/systemd/system/d.service", "../../../opt/u/d.service").as_deref(),
+            Some("opt/u/d.service")
+        );
+        // Not a link, or one not read: no hop.
+        write(root, "etc/systemd/system/e.service", "x");
+        assert_eq!(
+            first_hop(root, "etc/systemd/system/e.service", FOLLOW),
+            None
+        );
+        assert_eq!(
+            first_hop(root, "etc/systemd/system/a.service", REFUSE),
+            None
+        );
+    }
+
+    #[test]
+    fn rr4_a7_a_path_search_passes_over_what_cannot_run() {
+        /// What is put first in the search, before the script that runs.
+        type First = fn(&Path);
+        let first: [(&str, First); 3] = [
+            // a7: a link to /dev/null; a7b: a directory; a file no one may
+            // execute.
+            ("a link to /dev/null", |root| {
+                link(root, "usr/local/bin/snap-run", "/dev/null");
+            }),
+            ("a directory", |root| {
+                fs::create_dir_all(root.join("usr/local/bin/snap-run")).unwrap();
+            }),
+            ("a file no one may execute", |root| {
+                write(root, "usr/local/bin/snap-run", "#!/bin/sh\ntrue\n");
+            }),
+        ];
+        for (what, make) in first {
+            for exec in [
+                "ExecStart=/usr/local/bin/outer.sh",
+                // a7c: systemd's own search passes over it too.
+                "ExecStart=snap-run",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                cachyos_mounted(root);
+                nightly_runs(root, exec);
+                script(root, "usr/local/bin/outer.sh", "snap-run\n");
+                snap(root, "usr/bin", "snap-run");
+                make(root);
+                assert_eq!(verdict_of(root).0, BootVerdict::Will, "{what}: {exec}");
+                // The converse: one that runs there is the one run.
+                if root.join("usr/local/bin/snap-run").is_dir() {
+                    fs::remove_dir(root.join("usr/local/bin/snap-run")).unwrap();
+                } else {
+                    fs::remove_file(root.join("usr/local/bin/snap-run")).unwrap();
+                }
+                binary(root, "usr/local/bin/snap-run");
+                assert_eq!(
+                    verdict_of(root),
+                    (BootVerdict::No, vec![]),
+                    "{what}: {exec}"
+                );
+            }
+        }
+        // A file no execute bit allows is read all the same: something at
+        // boot may make it executable before it runs it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        write(root, "usr/local/bin/job", "#!/bin/sh\nbtrbk run\n");
+        outer(root, "job\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        // `.` reads its file, which need not be executable: the first found
+        // is the one, and what it sets stays.
+        write(
+            root,
+            "usr/local/bin/tools.sh",
+            "PATH=/opt/tools/bin:$PATH\n",
+        );
+        snap(root, "opt/tools/bin", "snap-run");
+        outer(root, ". tools.sh\nsnap-run\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        write(root, "usr/local/bin/tools.sh", "true\n");
+        write(root, "usr/bin/tools.sh", "btrbk run\n");
+        outer(root, ". tools.sh\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn a_path_search_stops_where_boot_may_see_another_program() {
+        // A link into a mount point, to a file here no one may execute, to
+        // a directory, or to nothing: at boot anything may be there.
+        for make in [
+            (|root: &Path| write(root, "root/bin/snap-run", "x")) as fn(&Path),
+            |root: &Path| fs::create_dir_all(root.join("root/bin/snap-run")).unwrap(),
+            |_: &Path| {},
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            make(root);
+            link(root, "usr/local/bin/snap-run", "/root/bin/snap-run");
+            snap(root, "usr/bin", "snap-run");
+            outer(root, "snap-run\n");
+            let (verdict, reasons) = verdict_of(root);
+            assert_eq!(verdict, BootVerdict::May, "{reasons:?}");
+            assert!(
+                reasons.iter().all(|r| r.contains("root/bin/snap-run")),
+                "{reasons:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rr4_a1_a_program_named_like_an_inert_one_elsewhere_may_run_its_arguments() {
+        for (exec, wrapper, body) in [
+            // a1: by path; a1b: found first where systemd looks.
+            (
+                "ExecStart=/usr/local/bin/install /root/bin/backup.sh",
+                "usr/local/bin/install",
+                "",
+            ),
+            (
+                "ExecStart=install /root/bin/backup.sh",
+                "usr/local/bin/install",
+                "",
+            ),
+            // a1c: found first in a script's PATH.
+            (
+                "ExecStart=/usr/local/bin/outer.sh",
+                "usr/local/bin/cp",
+                "cp /root/bin/backup.sh\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            binary(root, "usr/bin/cp");
+            nightly_runs(root, exec);
+            script(root, "usr/local/bin/outer.sh", body);
+            script(root, wrapper, FORWARD);
+            assert_eq!(verdict_of(root).0, BootVerdict::May, "{exec} {body}");
+            // The converse: the distro's own runs nothing it is given.
+            fs::remove_file(root.join(wrapper)).unwrap();
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{exec} {body}");
+        }
+        // By path, through /bin, found by a script, or not there at all.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        for exec in [
+            "ExecStart=/bin/install -d /root/cache",
+            "ExecStart=install -d /root/cache",
+            "ExecStart=/opt/none/install -d /root/cache",
+        ] {
+            nightly_runs(root, exec);
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{exec}");
+        }
+        outer(root, "install -d /root/cache\nmkdir /root/x\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // A function of the script's own by that name may run what it is
+        // given.
+        outer(root, "cp() { \"$@\"; }\ncp /root/bin/backup.sh\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        // sh's own test and [: a program by that name is not the one run.
+        script(root, "usr/local/bin/test", FORWARD);
+        script(root, "usr/local/bin/[", FORWARD);
+        outer(
+            root,
+            "test -x /root/bin/backup.sh\n[ -x /root/bin/backup.sh ]\n",
+        );
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // ...where a shell runs them; systemd runs what it finds.
+        nightly_runs(root, "ExecStart=test -x /root/bin/backup.sh");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+    }
+
+    #[test]
+    fn rr4_a12_a_wrapper_s_own_operand_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        for exec in [
+            "ExecStart=/usr/bin/flock /run/lock/x.lock /usr/bin/true",
+            "ExecStart=/usr/bin/flock -w 5 /run/lock/x.lock -c true",
+            "ExecStart=/usr/bin/timeout /root/x /usr/bin/true",
+            "ExecStart=/usr/bin/su /root/user -c true",
+        ] {
+            nightly_runs(root, exec);
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{exec}");
+        }
+        // The converse: what it runs is read, and its other words are.
+        for exec in [
+            "ExecStart=/usr/bin/flock /run/lock/x.lock /root/bin/backup.sh",
+            "ExecStart=/usr/bin/flock /run/lock/x.lock -c /root/bin/backup.sh",
+            "ExecStart=/usr/bin/flock -w /root/x /run/lock/x.lock /usr/bin/true",
+        ] {
+            nightly_runs(root, exec);
+            assert_eq!(verdict_of(root).0, BootVerdict::May, "{exec}");
+        }
+    }
+
     // ---- fix round 4: words, redirections, cases, braces, paths ----------
 
     #[test]
@@ -7938,6 +8821,15 @@ mod tests {
         );
         assert_eq!(w("v=$(date) z"), ["v=$", "(", "date", ")", "z"]);
         assert_eq!(w("$((open"), ["$((open"]);
+        // Arithmetic in arithmetic is one word; a command substitution in
+        // it runs a command, so it is split as sh splits it.
+        assert_eq!(w("x=$(( $((1+2)) * 3 ))"), ["x=$(( $((1+2)) * 3 ))"]);
+        assert_eq!(
+            w("n=$(( $(a) + 1 ))"),
+            ["n=$", "(", "(", "$", "(", "a", ")", "+", "1", ")", ")"]
+        );
+        assert_eq!(w("$(( `a` ))"), ["$", "(", "(", "`", "a", "`", ")", ")"]);
+        assert_eq!(w("$(( $(a"), ["$", "(", "(", "$", "(", "a"]);
     }
 
     #[test]
@@ -8144,11 +9036,14 @@ mod tests {
     }
 
     #[test]
-    fn a_file_directly_in_a_unit_tree_is_in_one() {
+    fn a_path_anywhere_under_a_unit_tree_is_in_one() {
         assert!(in_unit_tree("etc/systemd/system/x.service"));
         assert!(in_unit_tree("usr/lib/systemd/system/x.service"));
         assert!(in_unit_tree("etc/systemd/system.control/x.service"));
-        assert!(!in_unit_tree("usr/lib/systemd/system/sub/x.service"));
+        // A subdirectory too, as systemd judges a link by its prefix.
+        assert!(in_unit_tree("usr/lib/systemd/system/sub/x.service"));
+        assert!(!in_unit_tree("usr/lib/systemd/system"));
+        assert!(!in_unit_tree("usr/lib/systemd/systemx/x.service"));
         assert!(!in_unit_tree("opt/units/x.service"));
         assert!(!in_unit_tree("x.service"));
     }
@@ -8188,13 +9083,13 @@ mod tests {
     }
 
     #[test]
-    fn a_builtin_or_a_function_is_run_by_the_shell_not_looked_up() {
+    fn a_builtin_is_run_by_the_shell_and_a_function_s_name_is_looked_up() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         cachyos_mounted(root);
         nightly_runs(root, "ExecStart=/usr/local/bin/outer.sh");
         // A PATH only that OS knows: a name looked up there may be anything.
-        let mut body = String::from("PATH=$X:$PATH\nfin() { :; }\n");
+        let mut body = String::from("PATH=$X:$PATH\n");
         for builtin in [
             ":",
             "[",
@@ -8242,9 +9137,24 @@ mod tests {
         ] {
             body.push_str(&format!("{builtin} x\n"));
         }
-        body.push_str("fin\n");
         script(root, "usr/local/bin/outer.sh", &body);
         assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        let unknown = [
+            "multi-user.target starts nightly.service, which may run btrbk: it looks programs up in a PATH holding \"$X\", \
+          which only that OS can resolve",
+        ];
+        // A function's name is looked up as a program's: a wrapper, `exec`,
+        // or a branch the definition is not on runs the program.
+        script(
+            root,
+            "usr/local/bin/outer.sh",
+            "PATH=$X:$PATH\nfin() { :; }\nfin\n",
+        );
+        assert_eq!(
+            verdict_of(root).1,
+            unknown,
+            "the function's name, looked up"
+        );
         script(
             root,
             "usr/local/bin/outer.sh",
@@ -8252,10 +9162,7 @@ mod tests {
         );
         assert_eq!(
             verdict_of(root).1,
-            [
-                "multi-user.target starts nightly.service, which may run btrbk: it looks programs up in a PATH holding \"$X\", \
-              which only that OS can resolve"
-            ],
+            unknown,
             "one reason, whatever the names"
         );
     }
@@ -8484,22 +9391,23 @@ mod tests {
             BootVerdict::May,
             "cron expands nothing"
         );
-        // A cron script's functions are its own, whatever its PATH.
+        // A cron script's function is looked up like any program: found
+        // nowhere, it runs nothing; where that OS's PATH may hold it, it may.
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         cron_root(root);
+        write(root, "etc/cron.daily/job", "fin() { :; }\nfin\n");
+        assert_eq!(at_boot(root), nothing());
         write(
             root,
             "etc/cron.daily/job",
             "PATH=$X:$PATH\nfin() { :; }\nfin\n",
         );
-        assert_eq!(at_boot(root), nothing());
-        write(root, "etc/cron.daily/job", "PATH=$X:$PATH\nfin\n");
         assert_eq!(at_boot(root).verdict, BootVerdict::May);
     }
 
     #[test]
-    fn another_interpreter_s_script_is_searched_for_btrbk_s_name_only() {
+    fn another_interpreter_s_script_is_not_read_as_sh() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         cachyos_mounted(root);
