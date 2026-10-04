@@ -1346,9 +1346,17 @@ while the target is mounted, otherwise the record the last backup run kept in
 .IR /var/lib/das\-backup/recovery\-os.json ,
 with the time it was taken and the age recomputed for today. Run it as root
 while the drives are mounted, or the live read reports the files it may not
-read without updating their access times; each line ends with the number of
-paths that could not be read, when there are any. A stale, unreadable
-or never\-checked recovery OS is also a warning, so the status reads
+read without updating their access times; each line names the timers enabled
+in that OS and whether btrbk would run at its boot
+.RB ( will ,
+.B may
+or
+.BR no ),
+and ends with the number of paths that could not be read, when there are
+any. A stale, unreadable or never\-checked recovery OS, and one whose boot
+will or may run btrbk (see
+.BR "recovery\-os inspect" ),
+is also a warning, so the status reads
 .BR WARNING .
 .PP
 .B btrdasd health
@@ -1391,8 +1399,12 @@ das\-backup\-manager from
 written: files and directories are opened with
 .BR O_NOATIME ,
 which needs root or ownership of the file (without it the item is reported
-as unreadable rather than read), and no symlink inside the root is followed,
-since following one updates the link's access time. So
+as unreadable rather than read), and a symlink inside the root is never
+followed or read on a mount that would record the access, since doing so
+updates the link's own access time (the boot reading below follows links
+only where the mount is
+.B noatime
+or read\-only). So
 .I etc/os\-release
 is read from
 .IR usr/lib/os\-release ,
@@ -1407,6 +1419,547 @@ and is listed under
 whatever is not there at all is said to be absent. A package missing from a
 readable database prints as
 .BR "not installed" .
+.PP
+It also reads what that OS starts at boot, to say whether booting it \(em on
+bare metal or in the update VM \(em would run btrbk. A walk starts where
+systemd starts,
+.B default.target
+.RI ( etc/systemd/system/default.target ,
+the link
+.B "systemctl set\-default"
+makes, else the vendor's), and takes all it pulls in as starting at every
+boot. From each unit the walk goes on to what it starts: the units its
+.B [Unit]
+section pulls in with
+.BR Wants= ,
+.BR Requires= ,
+.BR Requisite= ,
+.BR BindsTo= ,
+.BR Upholds= ,
+.B OnSuccess=
+or
+.B OnFailure=
+(in its file or a drop\-in \(em an empty one of these resets nothing, as
+.BR systemd.unit (5)
+says), the names in its
+.IR UNIT .wants ,
+.IR UNIT .requires
+and
+.IR UNIT .upholds
+directories, the unit a timer or a path unit names
+.RB ( Unit= ,
+else the one of its own name), and the service a socket starts when
+something connects to it
+.RB ( Service= ,
+else the one of its own name; for
+.BR Accept=yes ,
+its template). Then it does the same from every name in every such directory
+of the unit trees \(em what
+.B systemctl enable
+and packages enable \(em for what the boot did not reach. The trees are
+systemd's persistent unit path, highest first:
+.IR etc/systemd/system.control ,
+.IR etc/systemd/system ,
+.IR etc/systemd/system.attached ,
+.I usr/local/lib/systemd/system
+and
+.IR usr/lib/systemd/system .
+Each unit is read once, by name, in that order \(em an instance falls back to
+its template \(em with its drop\-ins: those in its own, its template's, its
+dash prefixes' and its type's
+.I .d
+directories, each file name once, applied in file name order, an empty
+assignment clearing an
+.B Exec*=
+list. The specifiers that come from a unit's own name
+.RB ( %i ,
+.BR %n ,
+.BR %N ,
+.BR %p ,
+.BR %j ,
+.BR %% )
+are resolved in the names it gives and in its commands \(em but a template's
+own instance, a connection's, is unknown \(em and a template left over is
+instantiated as systemd does; a name with any other specifier is unknown. A
+unit reached again sooner than before passes that on to what it starts; at
+most 4096 units are read and 262144 starts followed (more is unknown), and
+each way a unit is started is reported.
+.PP
+A unit runs btrbk if a command it runs names it \(em a word that is
+.B btrbk
+or a path ending in it, also inside a
+.B "sh \-c"
+line, cautiously even as an argument \(em or runs btrbk under another name
+through a link. A word whose last component only contains
+.B btrbk
+.RB ( btrbk.sh ,
+.BR run\-btrbk ,
+.IR /etc/btrbk.conf )
+means it may: what that runs is not known. The rule throughout: nothing that
+may run is read as nothing unless it is known not to run \(em within what
+this reads; what it does not see is listed at the end of this description,
+and a
+.B no
+holds only within that. Programs are read where they run: the program of an
+.B Exec*=
+command, taken literally as systemd takes it (a
+.B $
+or a glob in it is part of its name; a specifier it cannot resolve here is
+unknown); the first word of each shell command; the script a shell is given,
+read as sh even with no
+.B #!
+line; the script another interpreter is given
+.RB ( python3 ,
+.BR perl ,
+.BR awk ,
+and others), not read as sh but searched for btrbk's name, which makes it
+may, and for the absolute paths it names
+.RB ( os.system(\(dq/usr/local/bin/x\(dq) ,
+an argument list,
+.BR awk 's
+.BR system() ):
+one that leads to a sh script is read as a script it runs, one script
+deeper, and nothing else it names is followed or flagged; the command a
+wrapper runs
+.RB ( env ,
+.BR nice ,
+.BR ionice ,
+.BR flock ,
+.BR timeout ,
+.BR sudo ,
+.BR runuser ,
+.BR su ,
+.BR setsid ,
+.BR systemd\-run ,
+and others), the wrapper's own operand \(em
+.BR flock 's
+lock file,
+.BR timeout 's
+duration,
+.BR su 's
+user \(em being none it runs; and a
+.B \-c
+line. A
+.B #!
+script whose interpreter is a shell is read whole when it is no larger than
+64 KiB (larger, or unreadable, is unknown), and so are the scripts it runs,
+four scripts deep at most (deeper is unknown). It is read as sh reads it: a
+backslash at the end of a line joins the next, and a quoted string may run
+across lines; a comment, a here\-document, a
+.B case
+pattern and a redirection are no commands;
+.B $((\|...\|))
+is one word where bash reads it as arithmetic \(em its second
+.B (
+closes right before a last
+.B )
+\(em unless a command substitution in it
+.RB ( $(\|...\|)
+or a backtick) runs a command; otherwise, as in
+.BR "$((cmd) | wc \-l)" ,
+it is a command substitution, and its command runs; a command substitution in
+double quotes
+.RB ( \(dq$(cmd)\(dq )
+runs as an unquoted one does, and is read so (systemd's own quotes are not
+sh's: a
+.B "sh \-c \(dq...\(dq"
+line systemd passes on whole is read as that shell's line); braces expand
+into each word they make (more than 16 is unknown); after a
+.B function
+.I NAME
+header its body's commands are commands. A builtin is no program. A name the
+script defines as a function is still looked up as a program, as one of that
+name runs where a wrapper or
+.B exec
+is given the name, or where the definition is not reached. A script that
+ends inside a quote or after a joining backslash is unknown. One whose
+.B #!
+names another interpreter is that interpreter's. A binary is not looked into.
+.PP
+A word a program is given may be one it runs, so it is read like one: a
+.B #!
+script there is read, and one boot may see differently (below) is unknown \(em
+unless the program is one known not to run its operands:
+.BR install ,
+.BR mkdir ,
+.BR chown ,
+.BR chmod ,
+.BR chgrp ,
+.BR touch ,
+.BR ln ,
+.BR cp ,
+.BR mv ,
+.BR rm ,
+.BR rmdir ,
+.BR mknod ,
+.BR mkfifo ,
+.BR test ,
+.BR [ ,
+and btrbk, whose
+.B \-c
+is judged as its config \(em each as that OS ships it: sh's own
+.B test
+and
+.BR [ ,
+or what its name is found to be,
+.I /usr/bin/NAME
+or
+.I /bin/NAME
+(through any link), or found nowhere, so that nothing runs at all. One of
+those names anywhere else (a wrapper in
+.IR /usr/local/bin ),
+a function the script defines by one, or one only that OS could find may run
+what it is given, so its words are read. An option's value is no operand:
+one that names a program
+.RB ( "install \-\-strip\-program=" PROG )
+is a program named in an option's value, not seen (below). A word not there,
+nor anywhere boot could see another, is nothing to run, and so is
+.IR /dev/null .
+A redirection gives its target to the command only when the command reads it
+.RB ( < ).
+An argument of btrbk's with a variable or a command substitution in it \(em
+.B \(dq$@\(dq
+forwarded by a wrapper,
+.B $OPTS
+from the unit's environment \(em may carry a
+.B \-c
+only that OS sees, so its config is unknown.
+.PP
+A program named without a path is found where it would be. systemd looks for
+the program of an
+.B Exec*=
+command in
+.B ExecSearchPath=
+when the unit sets one, else in its own fixed path \(em
+.I /usr/local/bin
+and
+.IR /usr/bin ,
+and their sbin counterparts on a system that keeps sbin apart, as
+.BR systemd.service (5)
+documents; one found only in the unit's
+.B PATH
+may or may not run. Anything else looks a bare name up in
+.BR $PATH :
+the unit's \(em what
+.B Environment=
+or an
+.B EnvironmentFile=
+sets, else
+.BR ExecSearchPath= ,
+else systemd's
+.I /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+.RB ( systemd.exec (5);
+systemd expands no variable there) \(em or as a cron table sets it (a cron
+job starts from every standard directory). A
+.B PATH
+a script sets, a file it sources included, adds its directories ahead of
+those it had and drops none: the assignment may not apply where a name is
+looked up (a branch not taken, a subshell, a pipeline's element, a
+function's
+.BR local ),
+so from then on every directory either
+.B PATH
+holds is searched, and each program found there may be the one run. A
+search passes over what cannot run there, as
+.BR execvp (3),
+sh and systemd do: a directory, a link to
+.IR /dev/null ,
+a device or FIFO. It also goes on past a program's file no execute bit
+allows (a file
+.B .
+reads needs none), but reads that file too: something at boot may make it
+executable before it runs it. A directory only that OS can resolve \(em a
+variable, a relative entry, an environment file that cannot be read \(em
+leaves a name not found before it unknown.
+.PP
+The root read is that OS's
+.B @
+subvolume alone. A program, script, argument,
+.B \-c
+config, unit file, drop\-in or cron table at or under a mount point of its
+.IR etc/fstab ,
+or of a
+.B .mount
+or
+.B .automount
+unit (named after the path it mounts), is not the one it will see \(em the
+mount shadows the disk's copy at boot \(em so it is unknown. So is one under
+.IR /run ,
+.IR /var/run ,
+.IR /var/lock ,
+.IR /dev ,
+.I /proc
+or
+.IR /sys ,
+which only a running system fills \(em something at boot may put it there
+\(em and one reached through a link that lives in such a place. So is
+anything not here when that fstab cannot be read. A unit tree under such a
+mount point may hold any unit at boot, whatever its copy here lists, and
+with no copy here at all: a unit not found in a tree above it, and any
+unit's drop\-ins, are unknown there. A
+memory filesystem's mount point (a tmpfs
+.IR /tmp )
+is not counted as one: what is under it is read as the disk holds it (see
+what is not seen, below).
+.PP
+When a cron daemon is among the units
+.RB ( cronie.service ,
+.BR crond.service ,
+.BR cron.service ,
+.BR dcron.service ,
+.BR fcron.service ,
+.B anacron.service
+or
+.BR anacron.timer ),
+its tables and scripts are read the same way, and what their commands run:
+.IR etc/crontab ,
+.IR etc/anacrontab ,
+and every file in
+.IR etc/cron.d ,
+.I var/spool/cron
+and
+.I var/spool/cron/crontabs
+as tables (past each line's schedule and, in a system table, its user; up to
+an unescaped
+.BR % ,
+cron's newline), and every file in
+.IR etc/cron.hourly ,
+.IR etc/cron.daily ,
+.I etc/cron.weekly
+and
+.I etc/cron.monthly
+as a script. A file larger than 64 KiB is not read: unknown.
+.PP
+Each runner's config is the one it names with
+.B \-c
+.IR FILE ,
+.BI \-c FILE ,
+.B \-\-config
+.I FILE
+or
+.BI \-\-config= FILE ,
+else btrbk's default: the first of
+.I /etc/btrbk.conf
+and
+.I /etc/btrbk/btrbk.conf
+that exists, the order btrbk 0.32 looks in, shown as
+.B "btrbk config"
+with its size in bytes. A config is only checked with
+.BR lstat (2),
+never opened: its presence is the whole signal, and parsing another system's
+file would decide nothing. A config that only that OS could resolve (a
+variable, a specifier, a relative path), or that boot may see differently
+(above), is unknown.
+.PP
+A link is read only on a mount that records no access time:
+.BR readlinkat (2)
+updates the link's own access time, and no flag prevents it, so a link is
+read only where
+.BR fstatvfs (3)
+reports the mount
+.B noatime
+or read\-only \(em as every DAS target is mounted, with
+.BR [das].mount_opts .
+There a link resolves inside the root (an absolute target is the root's,
+.B ..
+cannot leave it, at most 8 links): one that names
+.I /dev/null
+(however many
+.B ..
+it climbs, as at
+.BR / ),
+or an empty unit file, masks the unit, which then runs nothing. A unit
+file's link is judged by its first hop, as systemd judges it: one that points
+anywhere under a unit tree, a subdirectory too, to another unit's name makes
+the unit that unit's alias (to a template's file, of that template's same
+instance, as
+.BR systemd.unit (5)
+says; an instance's link to its own template is its own file), read by that
+unit's own name (an
+.I /etc
+copy of it first) with the alias's drop\-ins too; one that points out of the
+unit trees is a linked unit file, the unit's own, whose text is the file its
+links lead to, wherever that is. A link to a program is that program. On any other mount a link is not read. A unit file linked into
+.I /etc/systemd/system
+by
+.BR "systemctl link" ,
+one masked there by
+.BR "systemctl mask" ,
+and an alias
+.B systemctl enable
+made there
+.RB ( display\-manager.service )
+then cannot be told apart, and each is unknown, as is
+.BR default.target ;
+a link among the vendor units is a package's alias, not counted unless its
+name contains
+.BR btrbk ;
+a program named through a link may be anything, so it is unknown; and a
+path through one of
+Arch's merged\-/usr links
+.RI ( /bin ,
+.IR /sbin ,
+.IR /lib ,
+.IR /lib64 ,
+.IR /usr/sbin ,
+.IR /usr/lib64 )
+is read where Arch's
+.B filesystem
+package points it, nothing there being unknown. A unit whose file is found
+nowhere (a package removed, its link left behind) cannot start, unless its
+name contains
+.BR btrbk ,
+which is unknown.
+.PP
+A
+.B no
+holds within what can be seen without running that OS. Not seen \(em each of
+these may run btrbk and still read as
+.BR no :
+.IP \- 2
+A program named through a variable
+.RB ( "sh \-c \(dq$CMD\(dq" ,
+.BR $SCRIPT ,
+a
+.B for
+loop over a glob), in an option's value
+.RB ( \-\-script=/path ,
+.BR "install \-\-strip\-program=" PROG ),
+or by a variable after a literal prefix
+.RB ( /root/bin/$JOB ,
+.BR \(dq$HOME/bin/x\(dq ),
+even where that prefix is under a mount point.
+.IP \- 2
+A bare name given to a program that looks it up itself:
+.BR "chronic snap\-run" ,
+.BR "command snap\-run" ,
+.BR "eval snap\-run" ,
+.BR "screen \-dmS b snap\-run" .
+.IP \- 2
+The command of a wrapper this does not know; a binary, or a file run by a
+program this does not know as one; btrbk under another name as a renamed
+binary (a link to it is followed where links are read).
+.IP \- 2
+A file with no
+.B #!
+line that is run anyway: a shell, or
+.BR execvp (3)
+on its
+.B ENOEXEC
+fallback, runs it as sh (a cron job naming it, a wrapper such as
+.B timeout
+given it, a script's line naming it); and one a program sources
+.RB ( ". \(dq$1\(dq" ).
+.IP \- 2
+What a shell reads from its input:
+.BR "sh < file" ,
+.BR "cat file | sh" ,
+a here\-document
+.RB ( "sh <<EOF" ,
+.BR "su root <<EOF" ).
+.IP \- 2
+What another interpreter's script runs besides btrbk by name and a sh script
+by absolute path: a bare name, a binary, a link to btrbk, another
+interpreter's script, anything boot sees elsewhere.
+.IP \- 2
+A relative path given as an argument, which the program resolves from a
+directory only that OS knows.
+.IP \- 2
+What a directory a program is given holds
+.RB ( "run\-parts /etc/backup.d" ;
+cron's own directories are read).
+.IP \- 2
+A command substitution in a
+.BR for ,
+.B select
+or
+.B case
+header
+.RB ( "for f in $(ls /etc/backup.d)" ,
+.BR "case $(uname) in" ).
+.IP \- 2
+A directory only that OS can resolve at the front of a unit's
+.B PATH
+(set by an
+.B EnvironmentFile=
+under
+.IR /run ,
+or a relative entry), once a script sets its own
+.BR PATH :
+a program found in a directory the script added hides it, though where the
+assignment does not apply that directory is searched first.
+.IP \- 2
+A program put in place at boot and then run
+.RB ( "install /root/x /usr/local/bin/job && /usr/local/bin/job" ,
+.BR "curl \-o /usr/local/bin/tool ... && /usr/local/bin/tool" );
+and a memory filesystem mounted at boot other than
+.IR /run ,
+.IR /dev ,
+.I /proc
+and
+.I /sys
+\(em a tmpfs
+.I /tmp
+by
+.I etc/fstab
+or
+.BR tmp.mount :
+what boot writes there is not seen, and what the disk holds under it is
+read though boot does not see it.
+.IP \- 2
+.B DefaultEnvironment=PATH=
+in
+.I etc/systemd/system.conf
+or
+.IR system.conf.d ,
+which sets every service's
+.BR PATH ;
+and
+.I /etc/profile
+and
+.IR /etc/profile.d ,
+which a login shell
+.RB ( "su \-" ,
+.BR "bash \-l" )
+reads.
+.IP \- 2
+A function named like one of the programs known not to run their operands
+.RB ( cp ,
+.B install
+and the others) that a script gets from a file it sources.
+.IP \- 2
+Units that generators create at boot (from
+.IR etc/systemd/system\-generators ,
+.I usr/lib/systemd/system\-generators
+or a
+.B systemd.wants=
+on the kernel command line, where a
+.B systemd.unit=
+also boots another target than
+.BR default.target );
+units udev, D\-Bus or a mount starts; user units, and a user manager \(em a
+lingering root user's included \(em that starts them; and
+.IR /etc/rc.local .
+.PP
+.B "Enabled timers"
+lists the enabled timers by the tree that enables them, e.g.
+.RB \(dq "btrbk.timer, fstrim.timer (etc); shadow.timer (usr/lib)" \(dq;
+.B none
+when there is none, and
+.BI "unknown: " REASON
+\(em never
+.B none
+\(em when a tree or a dependency directory could not be listed or is a link.
+.B "btrbk at boot"
+is
+.B will
+(something enabled runs btrbk and its config is there),
+.B may
+(something could not be told) or
+.BR no ,
+with what was ruled out, such as a runner whose config is absent so that
+btrbk would stop at once. What could not be read is also listed under
+.BR "Could not read" .
 .PP
 The OS is
 .B STALE
@@ -1439,6 +1992,45 @@ numbers (pkgrel ignored); otherwise the row says
 .B not compared
 and gives no verdict. The reason says whether an unknown item was absent or
 could not be read. An unknown age is never shown as a number.
+.PP
+When it will or may, a
+.B WARNING
+row just above
+.B Result
+says so, with what it rests on and when it would run, e.g.
+.RB \(dq "btrbk will run when this OS boots \(em btrbk.timer starts btrbk.service, which runs btrbk straight after boot (Persistent catch\-up), with /etc/btrbk/btrbk.conf present: check its config before booting it, on bare metal or in the update VM" \(dq.
+When: a unit that a boot target pulls in runs at every boot, and so does
+what it pulls in; a unit
+.B OnFailure=
+or
+.B OnSuccess=
+starts runs if, or after, the other fails or succeeds; a socket's service
+when something connects to it; a path unit's when its condition is met; a
+timer with
+.BR OnBootSec= ,
+.B OnStartupSec=
+or
+.B OnActiveSec=
+soon after boot; a
+.B Persistent=true
+calendar timer that has run before (its stamp under
+.I var/lib/systemd/timers
+exists) straight after boot, catching up the runs it missed \(em and every
+boot of a recovery OS has missed some; one with no stamp yet at its next
+scheduled time, which is a reading of
+.BR systemd.timer (5)
+rather than something it states; a cron job marked
+.B @reboot
+at boot; a job in
+.IR etc/anacrontab ,
+or a script in a directory anacron runs (one its table names), soon after
+boot, when anacron catches up; any other cron job on its schedule.
+.B btrbk run
+then applies that OS's own configuration and retention to whatever it
+names \(em possibly the received backups on this very drive. A warning does
+not make the OS
+.BR STALE ,
+but it needs attention just the same: exit status 1.
 .PP
 .B btrdasd recovery\-os inspect
 .B \-\-root
@@ -1482,12 +2074,49 @@ and
 .BR last_applied_upgrade ,
 .BR install ,
 or null when there is no age).
+.B os.enabled_units
+is
+.B "{\(dqstate\(dq: \(dqlisted\(dq, \(dqunits\(dq: [{\(dqname\(dq: ..., \(dqdirs\(dq: [...]}]}"
+or
+.BR "{\(dqstate\(dq: \(dqunreadable\(dq, \(dqreason\(dq: \(dq...\(dq}" ;
+.B os.btrbk_config
+is
+.BR "{\(dqstate\(dq: \(dqpresent\(dq, \(dqpath\(dq: \(dq/etc/btrbk/btrbk.conf\(dq, \(dqsize_bytes\(dq: N}" ,
+absent or unreadable the same way;
+.B os.btrbk_at_boot
+is
+.BR "{\(dqverdict\(dq: \(dqwill\(dq|\(dqmay\(dq|\(dqno\(dq, \(dqreasons\(dq: [...], \(dqrunners\(dq: [...]}" ,
+each runner with
+.BR source ,
+.BR via ,
+.B script
+(the
+.B #!
+script whose line runs btrbk, or null when the command itself does),
+.BR when ,
+.B config
+(the
+.B \-c
+it passes, or null) and
+.B config_present
+(true, false, or null for unknown). The state file stores the three in that
+form, and a driver keys on
+.B os.btrbk_at_boot.verdict
+alone.
+.B assessment.warnings
+lists the
+.B WARNING
+rows, and a warning leaves
+.B status
+as it is.
 .PP
 Exit status:
 .B 0
-current;
+current, with no warning;
 .B 1
-stale;
+needs attention: stale, or a
+.B WARNING
+row;
 .B 2
 the root is not a directory, or the configuration could not be loaded.
 .\"
@@ -1505,8 +2134,17 @@ as the root; the others print
 .BR "not mounted" .
 .B backup\-run.sh
 runs it after btrbk, while the targets are mounted, and records the result as
-an operation: exit 0 is OK (the detail names any mirror that was not mounted),
-exit 1 is WARN (the report status reads
+an operation: exit 0 is OK (the detail reads
+.BR "nothing needs attention" ,
+naming any mirror that was not mounted),
+exit 1 is WARN, its detail saying
+.BR stale ,
+.B btrbk may run at boot
+or both, as the section's
+.B Result
+and
+.B WARNING
+rows show (the report status reads
 .BR "COMPLETED WITH WARNINGS" ,
 the run is still recorded as a success), anything else is FAIL. The script
 bounds the command with
@@ -1531,11 +2169,17 @@ Record what was read from each drive in
 .I PATH
 (JSON, replaced atomically, mode 644) for
 .BR "btrdasd health" .
-A drive that is not mounted keeps its earlier record. An existing file that
-cannot be read or parsed, or that is not record schema version 2 (version 2
-added the install date), is left as it is and the command exits 2, its error
-naming the file, the version found and the command that clears it; every
-later run fails the same way until it is removed.
+A drive that is not mounted keeps its earlier record. The record is schema
+version 3. A version\-2 record, from before the units and btrbk were read,
+is read with those readings unknown \(em
+.B btrbk at boot
+is
+.B may
+until the drive is read again \(em and written back as version 3. An
+existing file that cannot be read or parsed, or of any other version, is
+left as it is and the command exits 2, its error naming the file, the
+version found and the command that clears it; every later run fails the
+same way until it is removed.
 .B btrdasd health
 reports such a record as unreadable.
 .B backup\-run.sh
@@ -1555,9 +2199,11 @@ also
 .PP
 Exit status:
 .B 0
-every mounted recovery OS is current, or none is mounted;
+every mounted recovery OS is current with no warning, or none is mounted;
 .B 1
-at least one is stale;
+at least one needs attention: stale, or a
+.B WARNING
+row;
 .B 2
 a mounted target has no readable
 .IR @ ,
@@ -1816,7 +2462,8 @@ and
 .B "subvol expire"
 (configuration could not be loaded),
 .B recovery\-os
-(could not be checked; 1 there means a recovery OS is stale), and
+(could not be checked; 1 there means a recovery OS needs attention \(em it is
+stale, or btrbk may run when it boots), and
 .B doctor
 (could not run).
 .TP
