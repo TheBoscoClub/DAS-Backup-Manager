@@ -29,6 +29,15 @@ if (((0x$(awk '/^SigIgn:/ {print $2}' /proc/$$/status) & 0x2) != 0)); then
     RECOVERY_OS_VM_SIGINT_RESET=1 exec env --default-signal=INT bash "$0" "$@"
 fi
 
+# The driver reads the boot record with jq and refuses every session without
+# it; the one test about that ("no jq") takes jq off the driver's PATH on
+# purpose. Without jq here, every other test would pass, or fail, through that
+# refusal instead of the check it is about: stop instead of pretending.
+if ! command -v jq >/dev/null; then
+    echo "jq is not installed: the driver refuses every session without it, so this suite cannot test anything else -- install jq" >&2
+    exit 1
+fi
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REAL_FLOCK="$(command -v flock)"
 export REAL_FLOCK
@@ -572,7 +581,7 @@ run_interrupted() {
     local i dpid
     RC=0
     set -m
-    env PATH="$T/bin:$PATH" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
+    env -u DAS_RECOVERY_OS_STATE PATH="$T/bin:$PATH" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
         DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS=1 \
         bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
@@ -1213,10 +1222,11 @@ for v in will may; do
     has "record $v: says so" "$OUT" "btrbk $v run when this OS boots"
     has "record $v: says how to put it right" "$OUT" "fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again"
     has "record $v: with its age" "$OUT" "1h 00m ago"
-    has "record $v: how to boot it without running btrbk" "$OUT" "systemd.unit=rescue.target SYSTEMD_SULOGIN_FORCE=1 on its kernel line"
+    has "record $v: how to boot it without running btrbk" "$OUT" "systemd.unit=emergency.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1 on its kernel line"
     has "record $v: then power off" "$OUT" "then systemctl poweroff"
-    has "record $v: never leave the rescue shell" "$OUT" "never exit the rescue shell"
-    has "record $v: not by Enter either" "$OUT" "at a 'Press Enter to continue' prompt power off instead"
+    has "record $v: never leave the emergency shell" "$OUT" "never exit or Ctrl-D"
+    has "record $v: never Ctrl-Alt-Del" "$OUT" "never Ctrl-Alt-Del"
+    has "record $v: hold the power button at a prompt" "$OUT" "hold the power button"
     check "record $v: nothing locked" "$(file "$S/flock.calls")" ""
     check "record $v: nothing held" "$(file "$S/holder.calls")" ""
     check "record $v: nothing attached" "$(file "$S/attach.log")" ""
@@ -1359,6 +1369,26 @@ printf 'system-recovery-B-2tb yesterday\nsystem-recovery-A-2tb %s\n' "$(($(date 
 run_driver session A --dry-run
 check "another drive's garbled line: the file is not trusted" "$RC" "1"
 has "another drive's garbled line: says which line" "$OUT" "line 1 of $SESSIONS is not"
+has "another drive's garbled line: says how to put it right" "$OUT" "remove the bad line, or the whole file, at $SESSIONS, then run a backup with the drive attached"
+lacks "another drive's garbled line: no advice that cannot help" "$OUT" "let the next backup run, with this drive attached, record it again"
+
+fixture
+printf 'system-recovery-A-2tb 0123\n' >"$SESSIONS"
+run_driver session A --dry-run
+check "a session time with a leading zero: refused" "$RC" "1"
+has "a session time with a leading zero: says which line" "$OUT" "line 1 of $SESSIONS is not"
+
+# Overridden, a session rewrites the file from its well-formed lines: another
+# drive's line with no time it can read becomes that drive's line at "now"
+# (so its next session waits for a new record), a line with no label goes.
+fixture
+printf 'system-recovery-B-2tb yesterday\nnot a session line at all\n' >"$SESSIONS"
+run_driver session A --accept-boot-record-risk
+check "overridden over a damaged file: ends, flagged" "$RC" "5"
+matches "overridden over a damaged file: the other drive's line rewritten with a time" "$(grep '^system-recovery-B-2tb ' "$SESSIONS")" "^system-recovery-B-2tb [1-9][0-9]+$"
+check "overridden over a damaged file: the line with no label dropped" "$(grep -c 'not a session line' "$SESSIONS")" "0"
+has "overridden over a damaged file: says what it rewrote" "$OUT" "rewrote line 1 of $SESSIONS"
+has "overridden over a damaged file: says what it dropped" "$OUT" "dropped line 2 of $SESSIONS"
 
 fixture
 mkdir -p "$SESSIONS"
@@ -1458,6 +1488,13 @@ fixture
 write_state 3 "$(record_json system-recovery-A-2tb no -7200)"
 run_driver session A --dry-run --accept-boot-record-risk
 check "override, 2 hours ahead (a clock skew): goes on, flagged (exit 5)" "$RC" "5"
+for t in '"015260430204"' '"089"' '"1791099438"' 0; do
+    fixture
+    write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$t,\"os\":{\"btrbk_at_boot\":{\"verdict\":\"no\",\"reasons\":[]}},\"error\":null}"
+    run_driver session A --dry-run --accept-boot-record-risk
+    check "override never covers a check time of $t" "$RC" "1"
+    has "a check time of $t: said, not misread" "$OUT" "REFUSED: the boot record for 'system-recovery-A-2tb' has no check time"
+done
 
 echo "--- the boot record: where it is read from"
 fixture

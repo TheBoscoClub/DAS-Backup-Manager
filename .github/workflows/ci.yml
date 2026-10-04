@@ -75,7 +75,7 @@ jobs:
           pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
             qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
-            qt6-tools
+            qt6-tools jq
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
