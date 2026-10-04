@@ -97,10 +97,10 @@ pub fn render_systemd_service(config: &Config, full: bool) -> String {
          #       skipped because another backup was running.\n\
          #   3 = the run began its work and something failed: btrbk failed for some or\n\
          #       all targets, any operation failed, or it aborted on a target's or a\n\
-         #       source's state. The journal carries it, and the report and the history\n\
-         #       when the run got that far.\n\
+         #       source's state. Its report says what (an abort sends a short ABORTED\n\
+         #       report), the history has it as failed, and the journal has status=3.\n\
          #   1 = could not start: nothing was mounted or sent (config, btrdasd missing,\n\
-         #       arguments, not root, the maintenance lock).\n\
+         #       arguments, not root, a lock it could not open or take).\n\
          #   130/143 = stopped by SIGINT/SIGTERM.\n\
          # SuccessExitStatus=3: what made a run fail is usually still there ten minutes\n\
          # later (an absent drive). With the unit failed, cachyos-sentinel would start\n\
@@ -636,10 +636,10 @@ mod tests {
                 "#       skipped because another backup was running.\n",
                 "#   3 = the run began its work and something failed: btrbk failed for some or\n",
                 "#       all targets, any operation failed, or it aborted on a target's or a\n",
-                "#       source's state. The journal carries it, and the report and the history\n",
-                "#       when the run got that far.\n",
+                "#       source's state. Its report says what (an abort sends a short ABORTED\n",
+                "#       report), the history has it as failed, and the journal has status=3.\n",
                 "#   1 = could not start: nothing was mounted or sent (config, btrdasd missing,\n",
-                "#       arguments, not root, the maintenance lock).\n",
+                "#       arguments, not root, a lock it could not open or take).\n",
                 "#   130/143 = stopped by SIGINT/SIGTERM.\n",
                 "# SuccessExitStatus=3: what made a run fail is usually still there ten minutes\n",
                 "# later (an absent drive). With the unit failed, cachyos-sentinel would start\n",
