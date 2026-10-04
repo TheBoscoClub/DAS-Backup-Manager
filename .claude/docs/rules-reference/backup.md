@@ -25,11 +25,30 @@ the trap.** It skips an embedded script only when the on-disk copy is newer than
 binary **AND its content differs**. Right after a `cmake --install`, the installed
 script is byte-identical to the embedded copy, so the guard is inert and
 `setup --upgrade` rewrites it. `2lj` guards against a *stale downgrade*; it is not a
-concurrency lock and there is no lock here — `setup` holds neither
-`/run/das-backup.lock` nor `/run/das-maintenance.lock` while it writes. (After the files are
-written, `setup --upgrade` holds the maintenance lock through `systemctl try-restart
-btrdasd-helper.service`, at most 300 s, and exits 3 without restarting when another holds it —
-bd `6wt`; that protects a GUI job in the helper, not a running `backup-run.sh`.)
+concurrency lock.
+
+**`setup` is guarded now (bd `6wt`, fix round 3).** Every mode that writes or removes
+installed files — the wizard, `--modify`, `--force`, `--upgrade`, `--uninstall`,
+`--uninstall-all` — takes `/run/das-backup.lock`, then `/run/das-maintenance.lock`, both
+non-blocking and in the project's order, before its first write (for `--upgrade`, before it
+rewrites `config.toml`), holds both through every write and the helper restart, and lets them go
+on every path. Either held: nothing written or removed, the lock named (the maintenance one with
+its holder's record; the singleton carries no record — `backup-run.sh` opens it with `>`), exit
+75. The singleton is the one that matters for the scripts: a backup takes it first and keeps it
+while it waits for the maintenance lock, reading its script all the while, so the maintenance
+lock alone would leave that window open. The wizard's and the uninstall's questions come first,
+so no prompt is answered under the locks — held across one, the singleton would make the timer's
+backup skip its run, as it does for the seconds an upgrade takes. The host bindings take the proof
+(`SetupLocks`): a mode that skips the locks does not compile. The hold cannot deadlock: nothing
+setup reaches takes either lock (`take_setup_locks` is the only lock call in `src/setup/`, and the
+library code it uses — `config`, `btrbk_conf`, `fsutil` — calls none); the helper claims its bus
+name, which the restart waits for, before it can take a lock; and `systemctl enable --now` waits
+for the timer's own start-up, not for a service the timer then triggers (systemctl(1) `--no-block`,
+systemd.timer(5) `Persistent=` — read in the docs, not tested). A catch-up run triggered that way
+during the hold finds the singleton held and skips (a backup), or waits for setup to let go (a scrub).
+
+**`cmake --install` takes no lock** and still rewrites the scripts in place: the check below
+stays, for it.
 
 The database adds a second reason since schema 4 (bd `6wt`): the first open by a new binary
 migrates `backup_runs` inside `BEGIN IMMEDIATE`, which waits up to the 30 s busy timeout behind
@@ -398,7 +417,7 @@ Backup side: `acquire_maintenance_lock()` in `backup-run.sh` (v4.3.0+), called f
 
 This design replaced an earlier proposal (a pre-unmount scrub cancel/wait guard) that was abandoned before implementation: with a genuine mutual-hold lock, backup and scrub can never overlap in the first place, so there is nothing to cancel.
 
-**`reconcile` and `doctor` join the interlock differently.** Each has its own singleton (`/run/das-reconcile.lock`, `/run/das-doctor.lock`) and takes the maintenance lock **non-blocking**, in the same singleton-then-maintenance order: if any other job holds it they defer (exit 0 for doctor) instead of waiting, and the deferral names the holder. CLI and GUI backups take `/run/das-backup.lock` and wait on the maintenance lock exactly as `backup-run.sh` does (`backup::acquire_manual_locks`, bd `DAS-Backup-Manager-pe6`).
+**`reconcile` and `doctor` join the interlock differently.** Each has its own singleton (`/run/das-reconcile.lock`, `/run/das-doctor.lock`) and takes the maintenance lock **non-blocking**, in the same singleton-then-maintenance order: if any other job holds it they defer (exit 0 for doctor) instead of waiting, and the deferral names the holder. CLI and GUI backups take `/run/das-backup.lock` and wait on the maintenance lock exactly as `backup-run.sh` does (`backup::acquire_manual_locks`, bd `DAS-Backup-Manager-pe6`). **`btrdasd setup` joins it too** (bd `6wt`, round 3): every mode that writes or removes installed files takes `/run/das-backup.lock`, then the maintenance lock, both non-blocking, and refuses with exit 75 if either is held — the same order, so it adds no cycle; it writes `btrdasd setup --upgrade pid …` (or its mode) as the holder. See §Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running.
 
 `/run` is tmpfs, so neither lock can go stale across a reboot. Tracks `bd DAS-Backup-Manager-b6f` (backup side) and the scrub engine's own two-lock design (`bd DAS-Backup-Manager-212`).
 

@@ -392,22 +392,19 @@ Re-open the wizard with the current configuration pre-filled.
 Regenerate all managed files from the existing configuration
 (useful after a binary update), then restart
 .B btrdasd\-helper.service
-when it is running, so the GUI is served by the new binary. The restart is
-done holding the DAS maintenance lock until
-.B "systemctl try\-restart"
-returns, at most 300 seconds, so no job can start mounting under it. While
-another holds the lock \(em a job may be running in the helper \(em the helper is
-not restarted: the holder is named, with the command to run once the job has
-finished, and the upgrade exits 3. A restart that fails or does not return in
-time, or a unit state or lock that cannot be read, is an error (exit 1). On an
-init system other than systemd the helper is restarted by hand (exit 3).
+when it is running, so the GUI is served by the new binary. All of it is done
+holding setup's two locks (below); the restart may hold them for at most 300
+seconds, so no job can start mounting under it. A restart that fails or does
+not return in time, or a unit state that cannot be read, is an error (exit 1).
+On an init system other than systemd the helper is restarted by hand: the files
+are upgraded and the upgrade exits 3. Refused while a job holds a lock: exit 75,
+nothing written. Done: exit 0.
 A binary from before schema 4 cannot read a run whose snapshot
 counts are unknown, so keep
 .BR btrdasd ,
 .B btrdasd\-helper
-and the scripts at one version, and never install while a backup runs: the
-first open by a new binary migrates the database and waits up to 30 seconds
-behind another writer, then fails.
+and the scripts at one version: the first open by a new binary migrates the
+database and waits up to 30 seconds behind another writer, then fails.
 .TP
 .B \-\-uninstall
 Remove all generated files, disable timers, and optionally remove the database.
@@ -448,6 +445,33 @@ verify only that its mount path is a mount point. The setup wizard records
 for a new target whose drive is attached;
 .B \-\-upgrade
 never adds it to an existing config.
+.PP
+Every mode that writes or removes installed files \(em the wizard,
+.BR \-\-modify ,
+.BR \-\-force ,
+.BR \-\-upgrade ,
+.B \-\-uninstall
+and
+.B \-\-uninstall\-all
+\(em first takes
+.I /run/das\-backup.lock
+and then
+.IR /run/das\-maintenance.lock ,
+without waiting, holds both until it is done, and lets them go however it ends.
+A backup holds the first from its start, also while it waits for the second,
+and reads
+.I backup\-run.sh
+as it goes: a rewrite under it ends the run early, looking like a clean finish.
+Every job that mounts a backup target holds the second. If either is held,
+setup writes and removes nothing, says which lock is held and, for the second,
+by whom, and exits 75; run it again once that job has finished. The questions
+of the wizard and of an uninstall come first: the locks are taken once they are
+answered. While setup holds them, a backup started meanwhile \(em by the timer,
+too \(em finds
+.I /run/das\-backup.lock
+held and skips its run.
+.B cmake \-\-install
+takes neither lock: never run it while a backup runs.
 .\"
 .SS config dump\-env
 Print shell-sourceable KEY=VALUE pairs from the configuration.
@@ -1748,7 +1772,9 @@ and a scrub pass that ran, whatever it found.
 .TP
 .B 1
 An error occurred (backup failure, validation error, missing configuration, a
-mount point the command mounted and could not unmount again, etc.).
+mount point the command mounted and could not unmount again, a
+.B "setup \-\-upgrade"
+whose helper restart failed, etc.).
 .TP
 .B 2
 The command line could not be parsed. Also used by
@@ -1767,11 +1793,10 @@ and
 .BR "btrdasd doctor" :
 the check ran but some volume went unexamined; see its section.
 .BR "btrdasd setup \-\-upgrade" :
-the files were upgraded, but restarting
+the files were upgraded, but
 .B btrdasd\-helper
-was left for later \(em a job holds the DAS maintenance lock, or the init system
-is not systemd. The output names the holder and the command to run; this is not
-a failed install.
+is yours to restart \(em the init system is not systemd, so setup can neither
+tell whether one runs nor restart it. This is not a failed install.
 .TP
 .B 75
 .B walk
@@ -1780,7 +1805,12 @@ or a
 command run with
 .B \-\-no\-wait
 found the DAS maintenance lock held and deferred: nothing was mounted or
-changed. (EX_TEMPFAIL: try again later.)
+changed.
+.B "btrdasd setup"
+in any mode that writes or removes installed files found
+.I /run/das\-backup.lock
+or the DAS maintenance lock held \(em a backup or another job was running:
+nothing was written or removed. (EX_TEMPFAIL: try again later.)
 .SH ENVIRONMENT
 .TP
 .B EDITOR

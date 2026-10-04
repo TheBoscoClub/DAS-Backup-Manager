@@ -372,6 +372,12 @@ wizard → Config struct → config.toml (save)
                     installer::install() → write files + manifest
 ```
 
+Every mode that writes or removes these files (install, `--modify`, `--force`, `--upgrade`,
+`--uninstall`, `--uninstall-all`) does it holding `/run/das-backup.lock` and then
+`/run/das-maintenance.lock`, taken without waiting before the first write — a running backup reads
+the scripts as it goes — or refuses with exit 75, changing nothing. `install`, `uninstall` and
+`uninstall_all` take the proof of that hold (`installer::SetupLocks`) as an argument.
+
 ### Config Sections
 
 | Section | Fields | Purpose |
