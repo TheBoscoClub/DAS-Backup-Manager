@@ -101,7 +101,7 @@ pub fn render_systemd_service(config: &Config, full: bool) -> String {
          #       report), the history has it as failed, and the journal has status=3.\n\
          #   1 = could not start: nothing was mounted or sent (config, btrdasd missing,\n\
          #       arguments, not root, a lock it could not open or take).\n\
-         #   130/143 = stopped by SIGINT/SIGTERM.\n\
+         #   129 130 138 141 142 143 = stopped by a signal (HUP INT USR1 PIPE ALRM TERM).\n\
          # SuccessExitStatus=3: what made a run fail is usually still there ten minutes\n\
          # later (an absent drive). With the unit failed, cachyos-sentinel would start\n\
          # a whole new backup about every ten minutes; its 3-per-600 s limiter cannot\n\
@@ -640,7 +640,7 @@ mod tests {
                 "#       report), the history has it as failed, and the journal has status=3.\n",
                 "#   1 = could not start: nothing was mounted or sent (config, btrdasd missing,\n",
                 "#       arguments, not root, a lock it could not open or take).\n",
-                "#   130/143 = stopped by SIGINT/SIGTERM.\n",
+                "#   129 130 138 141 142 143 = stopped by a signal (HUP INT USR1 PIPE ALRM TERM).\n",
                 "# SuccessExitStatus=3: what made a run fail is usually still there ten minutes\n",
                 "# later (an absent drive). With the unit failed, cachyos-sentinel would start\n",
                 "# a whole new backup about every ten minutes; its 3-per-600 s limiter cannot\n",
