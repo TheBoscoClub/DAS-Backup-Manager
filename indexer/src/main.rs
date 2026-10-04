@@ -353,10 +353,12 @@ enum Commands {
     },
     /// The independent operating systems on the `role = "mirror"` recovery
     /// drives: read them (never write) and say when they fall behind the host
+    /// or would run btrbk when booted
     ///
-    /// EXIT CODE: 0 every inspected OS is current (or none is mounted), 1 at
-    /// least one is STALE, 2 an OS root, the config or the state file could
-    /// not be handled.
+    /// EXIT CODE: 0 every inspected OS is current with no WARNING (or none is
+    /// mounted), 1 at least one needs attention — STALE, or a WARNING that
+    /// btrbk may run when it boots — 2 an OS root, the config or the state
+    /// file could not be handled.
     RecoveryOs {
         #[command(subcommand)]
         action: RecoveryOsAction,
