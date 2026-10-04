@@ -116,7 +116,9 @@ reset
 BTRBK_LATEST_RAW_OK=true
 BTRBK_LATEST_RAW="$(raw_listing)"
 record_run_args SUCCESS false
-check "known: head of the vector" "$(vector | head -n 6 | tr '\n' ' ')" "backup record-run --db $DAS_DB_PATH --mode incremental "
+# `sed -n '1,6p'` reads to the end, where `head` would quit early: no reader in
+# these suites may leave its producer to die of SIGPIPE under pipefail.
+check "known: head of the vector" "$(vector | sed -n '1,6p' | tr '\n' ' ')" "backup record-run --db $DAS_DB_PATH --mode incremental "
 check "known: two snapshots, three sends" "$(counts_words)" "--snaps-created 2 --snaps-sent 3 "
 check "known: bytes and duration" "$(vector | grep -A1 -e '^--bytes-sent$' -e '^--duration-secs$' | tr '\n' ' ')" "--bytes-sent 250 --duration-secs 300 "
 check "known: success flag" "$(vector | grep -c '^--success$')" "1"
