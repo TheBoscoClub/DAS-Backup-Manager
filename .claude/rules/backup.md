@@ -15,8 +15,9 @@ scripts end with `main "$@"; exit $?` (once `main` runs, bash never reads its fi
 running script is never read from a rewritten file. `cmake --install` (CMake 4.4.3, measured)
 unlinks each file and creates a new one, executable once complete: a run already going keeps its
 script but calls the new sibling scripts and `btrdasd` later. A run *starting* in that instant
-mostly fails loudly (203/EXEC), but bash reopens the script by path after the exec and can find the
-new file still empty: **it exits 0 having done nothing** (17 of 7,764 starts during installs). **`setup` refuses by itself**:
+mostly fails loudly (203/EXEC or 127), but bash reopens the script by path after the exec and can
+find the new file still empty: **it exits 0 having done nothing** (measured: see the reference).
+**`setup` refuses by itself**:
 every mode that writes or removes installed files takes `/run/das-backup.lock`, then
 `/run/das-maintenance.lock`, non-blocking, before its first write, holds both to the end, and exits
 75 (on stderr) having changed nothing if either is held. **`cmake --install` takes no lock** —

@@ -10,7 +10,7 @@
 
 ## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
 
-Until bd `6wt` fix round 4 `setup` wrote `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
+Until bd `6wt` (2026-10-03/04) `setup` wrote `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
 **in place** — `std::fs::write` is `O_TRUNC` then write, same inode (this section said `cmake --install`
 did too; measured, it does not — see below). Bash does not
 load a script into memory; it reads incrementally from an open fd, fetching the next top-level
@@ -21,17 +21,17 @@ at the old offset. Truncated or shorter, that read finds end of file: the script
 `main`'s status, the run complete. Longer or different, bash runs the new file from there: its
 tail, a stranger's commands, half a line (`command not found`, 127). This section used to say a
 truncation made the run "terminate early … no boot-archive prune, no report, exit 0". Measured
-(fix round 5, the old last line `main "$@"`, `set -euo pipefail`, an `EXIT` trap; truncated,
+(2026-10-04, the old last line `main "$@"`, `set -euo pipefail`, an `EXIT` trap; truncated,
 shortened or lengthened in place while `main` waited, three times each): `main` logged its prune
 and report every time and the trap saw 0 — nothing ended early. All a truncation can cut short is
 the parse before `main` is called. The window is microseconds and the content is usually
 identical, so this will almost always appear to work. That is what makes it worth a rule instead
 of a comment.
 
-**Since round 4, two things stop it:**
+**Since bd `6wt`, two things stop it:**
 
 - **`setup` writes atomically** — every file it writes, through `fsutil::write_atomic_mode`, as
-  every other writer of these files does (fix round 5): a new file beside the old, of its own —
+  every other writer of these files does: a new file beside the old, of its own —
   `.NAME.PID.N.tmp`, created only under a name nothing holds, so concurrent writers never meet and
   whatever stands there (a crash's leftover, anything planted) is passed over, never followed,
   reused or removed — given its mode (scripts 0755, every other file the mode it had) and, written
