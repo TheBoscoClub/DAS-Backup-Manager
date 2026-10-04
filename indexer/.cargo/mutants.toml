@@ -46,24 +46,19 @@ exclude_re = [
     # `udisks_report`, `command_stdout`) is mutated and tested.
     "replace install -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace check -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
-    # `upgrade`, `uninstall` and `uninstall_all` are the other three root-only
-    # entry points behind `btrdasd setup`, and the same reasoning applies. Each
-    # is now only the binding of its core to the host — `/etc/das-backup`, `/`
-    # and the real `systemctl` — so calling one from a test would rewrite or
-    # remove the live install and stop this host's timers. Only the whole-body
-    # replacement is excluded: the cores they call (`prepare_upgrade`,
-    # `uninstall_with`, `uninstall_all_with`, `install_schedule`) take their
-    # paths and their systemctl runner as arguments and are mutated and tested.
-    "replace upgrade -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    # `uninstall` and `uninstall_all` are the other two root-only entry points
+    # behind `btrdasd setup`, and the same reasoning applies. Each is only the
+    # binding of its core to the host — `/etc/das-backup`, `/` and the real
+    # `systemctl` — so calling one from a test would remove the live install
+    # and stop this host's timers. Only the whole-body replacement is excluded:
+    # the cores they call (`uninstall_with`, `uninstall_all_with`) take their
+    # paths and their systemctl runner as arguments and are mutated and tested,
+    # and `setup::dispatch` drives them through its `SetupHost` seam. (`upgrade`
+    # returns a `SetupOutcome`, which has no default, so it yields no viable
+    # whole-body mutant to exclude; the refusal's exit status is `exit_status`,
+    # tested.)
     "replace uninstall -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace uninstall_all -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
-    # `locked` binds `under_setup_locks` to the host's lock files,
-    # `/run/das-backup.lock` and `/run/das-maintenance.lock`, for those same
-    # root-only modes. Called from a test it would take a running backup's
-    # locks, or make the next backup skip its run. Only the whole-body
-    # replacement is excluded: `under_setup_locks` and `take_setup_locks` take
-    # their lock paths as arguments and are tested on scratch files.
-    "replace locked -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     # `delete_subvolume` is the spawn of `btrfs subvolume delete` and nothing
     # else: its only effect is a subvolume removed from a mounted BTRFS
     # filesystem, which needs root and a real filesystem to observe. Only the

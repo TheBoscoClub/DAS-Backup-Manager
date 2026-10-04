@@ -10,45 +10,85 @@
 
 ## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
 
-Both write `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
-**in place** — `std::fs::write` is `O_TRUNC` then write, same inode. Bash does not
+Until bd `6wt` fix round 4 `setup` wrote `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
+**in place** — `std::fs::write` is `O_TRUNC` then write, same inode (this section said `cmake --install`
+did too; measured, it does not — see below). Bash does not
 load a script into memory; it reads incrementally from an open fd, fetching the next
-command only when it needs it. Truncating the file under a running `backup-run.sh`
-means a read landing in that window sees **EOF**, which bash treats as the end of the
-script: it runs the `EXIT` trap, unmounts the targets, and the run **terminates early
-looking like a clean finish** — no boot-archive prune, no report, exit 0. The window
-is microseconds and the content is usually identical, so this will almost always
-appear to work. That is what makes it worth a rule instead of a comment.
+command only when it needs it, at the offset where the last one ended. Truncating the file
+under a running `backup-run.sh` means a read landing in that window sees **EOF**, which bash
+treats as the end of the script: it runs the `EXIT` trap, unmounts the targets, and the run
+**terminates early looking like a clean finish** — no boot-archive prune, no report, exit 0. A
+rewrite that landed while `main` ran let `main` finish and then had bash read the **new** file
+at the old offset: its tail, a stranger's commands, half a line (`command not found`, 127). The
+window is microseconds and the content is usually identical, so this will almost always appear
+to work. That is what makes it worth a rule instead of a comment.
 
-**The `2lj` staleness guard does NOT protect against this, and assuming it does is
-the trap.** It skips an embedded script only when the on-disk copy is newer than the
-binary **AND its content differs**. Right after a `cmake --install`, the installed
-script is byte-identical to the embedded copy, so the guard is inert and
-`setup --upgrade` rewrites it. `2lj` guards against a *stale downgrade*; it is not a
+**Since round 4, two things stop it:**
+
+- **`setup` writes atomically** — every file it writes, through `fsutil::write_atomic_mode`: a
+  new file beside the old, its mode set before a byte is written (scripts 0755, every other file
+  the mode it had), flushed, then renamed over the name. A running bash holds the old inode and
+  keeps reading the old file whole; a write that fails leaves the old file byte-identical and
+  names the path; a symlink at the path is written through (the link kept); anything planted at
+  the temp name is removed, never followed.
+- **The three scripts end with `main "$@"; exit $?`** (`backup-run.sh` 4.9.2,
+  `backup-verify.sh` 3.1.1, `boot-archive-cleanup.sh` 2.1.1). Bash parses that line whole before
+  `main` runs, and once `main` returns it exits without reading again. `tests/test_script_rewrite.sh`
+  reproduces the defect and its absence: a script blocked in `main` while its file is rewritten in
+  place — the same file longer, another script, a shorter one — exits with `main`'s status and
+  runs nothing else; with the old last line `main "$@"` the same rewrite ran the new file's tail
+  (exit 99) or its lines (exit 127). Any explicit `exit` after `main` makes shellcheck 0.11 stop
+  seeing the `EXIT` trap's handlers as called (SC2329): `cleanup`, `clear_maintenance_holder` and
+  `backup-verify.sh`'s `clear_maintenance_record` carry a directive saying so.
+
+**`cmake --install` does not copy in place either** (CMake 4.4.3, measured 2026-10-03 with
+`file(INSTALL … TYPE PROGRAM)`, which `install(PROGRAMS)` becomes, watched by `inotifywait`: `DELETE`,
+`CREATE`, then the write; an fd opened before kept reading the old content, the new file had a new
+inode). So a run already going keeps its script. **What remains:** a run that *starts* in the
+instant between the unlink and the write finds the script missing (bash exits 127; the unit fails,
+loudly) or empty (bash exits 0 having done nothing — a run that reports success and did nothing);
+a run already going calls the *new* sibling scripts and `btrdasd` for its later steps, a mix of
+versions whose new binary migrates the database on its first open; a writer that does copy in place
+— a plain `cp` over the installed script — which the last line now defuses once `main` runs; and the
+check below cannot see a run started by hand (`sudo backup-run.sh`) in the sub-millisecond window
+before it takes `/run/das-backup.lock`.
+
+**The `2lj` staleness guard was never a protection against this.** It skips an embedded script
+only when the on-disk copy is newer than the binary **AND its content differs**. Right after a
+`cmake --install`, the installed script is byte-identical to the embedded copy, so the guard is
+inert and `setup --upgrade` rewrites it. `2lj` guards against a *stale downgrade*; it is not a
 concurrency lock.
 
-**`setup` is guarded now (bd `6wt`, fix round 3).** Every mode that writes or removes
+**`setup` is guarded (bd `6wt`, rounds 3–4).** Every mode that writes or removes
 installed files — the wizard, `--modify`, `--force`, `--upgrade`, `--uninstall`,
 `--uninstall-all` — takes `/run/das-backup.lock`, then `/run/das-maintenance.lock`, both
 non-blocking and in the project's order, before its first write (for `--upgrade`, before it
-rewrites `config.toml`), holds both through every write and the helper restart, and lets them go
-on every path. Either held: nothing written or removed, the lock named (the maintenance one with
-its holder's record; the singleton carries no record — `backup-run.sh` opens it with `>`), exit
-75. The singleton is the one that matters for the scripts: a backup takes it first and keeps it
-while it waits for the maintenance lock, reading its script all the while, so the maintenance
-lock alone would leave that window open. The wizard's and the uninstall's questions come first,
-so no prompt is answered under the locks — held across one, the singleton would make the timer's
-backup skip its run, as it does for the seconds an upgrade takes. The host bindings take the proof
-(`SetupLocks`): a mode that skips the locks does not compile. The hold cannot deadlock: nothing
-setup reaches takes either lock (`take_setup_locks` is the only lock call in `src/setup/`, and the
-library code it uses — `config`, `btrbk_conf`, `fsutil` — calls none); the helper claims its bus
-name, which the restart waits for, before it can take a lock; and `systemctl enable --now` waits
-for the timer's own start-up, not for a service the timer then triggers (systemctl(1) `--no-block`,
-systemd.timer(5) `Persistent=` — read in the docs, not tested). A catch-up run triggered that way
-during the hold finds the singleton held and skips (a backup), or waits for setup to let go (a scrub).
+rewrites `config.toml`; for `--force`, before it even reads it), holds both through every write
+and the helper restart, and lets them go on every path. Either held: nothing written or removed,
+the lock named on **stderr** (the maintenance one with its holder's record; the singleton carries
+no record — `backup-run.sh` opens it with `>`), exit 75. With the writes atomic, the locks still
+matter: a run must see one version of the files from start to end — the scripts it calls later,
+the `btrbk.conf` btrbk reads, the config sync reads again — an uninstall removes them, and the
+helper restart must not kill a job that is mounting. The singleton is the one that matters for
+a backup: it takes it first and keeps it while it waits for the maintenance lock. The wizard's and
+the uninstall's questions come first, so no prompt is answered under the locks — held across one,
+the singleton would make the timer's backup skip its run, as it does for the seconds an upgrade
+takes. `--modify` keeps the bytes of `config.toml` it pre-filled the wizard from and compares them
+once it holds the locks: changed — the GUI, a subvol sync — and it writes nothing and exits 75, so
+the other writer's change is not lost under the wizard's answers. The host bindings take the proof
+(`SetupLocks`): a mode that skips the locks does not compile. `setup::dispatch` reaches the host
+only through `SetupHost`, so the tests drive every mode on a scratch tree: each writing mode
+refuses with 75 and changes nothing while either lock is held, and `--check` takes neither and
+runs while both are. The hold cannot deadlock: nothing setup reaches takes either lock
+(`take_setup_locks` is the only lock call in `src/setup/`, and the library code it uses —
+`config`, `btrbk_conf`, `fsutil` — calls none); the helper claims its bus name, which the restart
+waits for, before it can take a lock; and `systemctl enable --now` waits for the timer's own
+start-up, not for a service the timer then triggers (systemctl(1) `--no-block`, systemd.timer(5)
+`Persistent=` — read in the docs, not tested). A catch-up run triggered that way during the hold
+finds the singleton held and skips (a backup), or waits for setup to let go (a scrub).
 
-**`cmake --install` takes no lock** and still rewrites the scripts in place: the check below
-stays, for it.
+**`cmake --install` takes no lock**: the check below stays, for it — every residual above is a
+run that overlaps the install.
 
 The database adds a second reason since schema 4 (bd `6wt`): the first open by a new binary
 migrates `backup_runs` inside `BEGIN IMMEDIATE`, which waits up to the 30 s busy timeout behind
@@ -57,26 +97,34 @@ an older binary's write transaction (a backup's `walk` indexing) and then fails 
 Check before deploying, every time:
 
 ```bash
-if systemctl is-active -q das-backup.service das-backup-full.service || ! flock -n /run/das-backup.lock true; then echo "WAIT — do not install"; fi
+busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
 ```
 
-`is-active -q` with several units succeeds if any one is active, which covers the daily and the
-weekly full run (both execute `backup-run.sh`); the lock covers a run started by hand with `sudo`
-and a CLI or GUI backup, all of which hold `/run/das-backup.lock`. `flock -n … true` needs no root
-(it opens the file read-only), so it reports a held lock without taking part in it. After a reboot
-the file does not exist until the first backup, `flock` cannot create it as an ordinary user and
-the check prints WAIT — a false alarm, in the safe direction. The earlier check,
-`pgrep -f 'lib/das-backup/backup-run.sh'`, matched its own command line whenever it was run through
-`sh -c` or `ssh`, so it said WAIT with no backup running and could never be trusted to say go.
-Verified 2026-10-02: idle host → no output; the same check against a scratch lock file held by
-`flock <file> sleep 3` → `WAIT`.
+Both units are `Type=oneshot`, so **while one runs its state is `activating`, never `active`**.
+The check this replaces — `systemctl is-active -q das-backup.service das-backup-full.service || …`
+— could therefore never fire on its first half: `is-active` is true only for `active`, `reloading`
+and `refreshing`. Measured 2026-10-03 against a throwaway `systemd-run --user` oneshot (the user
+manager; never a das unit, never the real lock): running → `ActiveState=activating`, `is-active`
+printed `activating` and exited 3, the old check printed nothing, the new one `WAIT`; finished →
+`inactive`, silent; failed → `failed`, silent (a failed run is not running); the scratch lock
+held by `flock <file> sleep 3` → `WAIT`. `systemctl show -P` is asked one unit at a time because
+with several it separates their values with blank lines. The lock half covers a run started by
+hand with `sudo` and a CLI or GUI backup, all of which hold `/run/das-backup.lock`. `flock -n …
+true` needs no root (it opens the file read-only); it does hold the lock for the instant `true`
+runs, so a backup starting in that instant would skip — run the check once, by hand, never in a
+loop. After a reboot the file does not exist until the first backup, `flock` cannot create it as
+an ordinary user and the check prints WAIT — a false alarm, in the safe direction. The earlier
+check, `pgrep -f 'lib/das-backup/backup-run.sh'`, matched its own command line whenever it was
+run through `sh -c` or `ssh`, so it said WAIT with no backup running and could never be trusted
+to say go.
 
 Config edits are no longer inert mid-run (before 2026-10-01 each file was read once at startup).
 `backup-run.sh` reads `config.toml` again after `subvol sync`, so an edit made before that point is
 picked up (and the sources are re-verified against it), and sync rewrites `btrbk.conf`
 before btrbk starts whenever it differs from what `config.toml` renders to (not on a dry run or a failed sync). btrbk reads its config once, so an edit after it starts changes nothing for
 that run. Edit between runs. The three **executing shell scripts** must additionally never be
-rewritten underneath themselves.
+rewritten in place underneath themselves — a plain `cp` over them would (`cmake --install` 4.4.3
+unlinks and recreates instead).
 
 Found 2026-09-01 while deploying during a live run; the deploy was deferred rather
 than risked.

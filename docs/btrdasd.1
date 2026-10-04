@@ -458,20 +458,39 @@ and
 and then
 .IR /run/das\-maintenance.lock ,
 without waiting, holds both until it is done, and lets them go however it ends.
-A backup holds the first from its start, also while it waits for the second,
-and reads
-.I backup\-run.sh
-as it goes: a rewrite under it ends the run early, looking like a clean finish.
-Every job that mounts a backup target holds the second. If either is held,
-setup writes and removes nothing, says which lock is held and, for the second,
-by whom, and exits 75; run it again once that job has finished. The questions
-of the wizard and of an uninstall come first: the locks are taken once they are
-answered. While setup holds them, a backup started meanwhile \(em by the timer,
-too \(em finds
+A backup holds the first from its start, also while it waits for the second;
+every job that mounts a backup target holds the second. If either is held,
+setup writes and removes nothing, says on standard error which lock is held
+and, for the second, by whom, and exits 75; run it again once that job has
+finished. The questions of the wizard and of an uninstall come first: the locks
+are taken once they are answered.
+.B \-\-force
+reads the configuration only once it holds them;
+.B \-\-modify
+compares the file with what it read before the wizard opened, and if anything
+else wrote it meanwhile it writes nothing and exits 75. While setup holds the
+locks, a backup started meanwhile \(em by the timer, too \(em finds
 .I /run/das\-backup.lock
 held and skips its run.
+.PP
+Every file setup writes is replaced whole: a new file, given its mode (scripts
+0755, any other file the mode it had) before it is renamed over the old one. A
+backup already reading
+.I backup\-run.sh
+keeps reading the old file to its end, and a write that fails leaves the old
+file as it was and names it. The three scripts end with
+.BR "main \(dq$@\(dq; exit $?" ,
+so once a run is in
+.B main
+bash reads its file no more.
 .B cmake \-\-install
-takes neither lock: never run it while a backup runs.
+takes neither lock: never run it while a backup runs. It replaces each file by
+removing it and creating a new one, so a run already going keeps its script,
+but a run that starts in that instant finds the script missing or empty \(em
+empty, it exits 0 having done nothing \(em and a run already going calls the
+new sibling scripts and
+.B btrdasd
+for its later steps.
 .\"
 .SS config dump\-env
 Print shell-sourceable KEY=VALUE pairs from the configuration.
@@ -1809,8 +1828,11 @@ changed.
 .B "btrdasd setup"
 in any mode that writes or removes installed files found
 .I /run/das\-backup.lock
-or the DAS maintenance lock held \(em a backup or another job was running:
-nothing was written or removed. (EX_TEMPFAIL: try again later.)
+or the DAS maintenance lock held \(em a backup or another job was running \(em
+or, with
+.BR \-\-modify ,
+found the configuration file changed while the wizard was open: nothing was
+written or removed. (EX_TEMPFAIL: try again later.)
 .SH ENVIRONMENT
 .TP
 .B EDITOR

@@ -372,11 +372,15 @@ wizard → Config struct → config.toml (save)
                     installer::install() → write files + manifest
 ```
 
-Every mode that writes or removes these files (install, `--modify`, `--force`, `--upgrade`,
-`--uninstall`, `--uninstall-all`) does it holding `/run/das-backup.lock` and then
-`/run/das-maintenance.lock`, taken without waiting before the first write — a running backup reads
-the scripts as it goes — or refuses with exit 75, changing nothing. `install`, `uninstall` and
-`uninstall_all` take the proof of that hold (`installer::SetupLocks`) as an argument.
+Every file setup writes is replaced whole — `fsutil::write_atomic_mode`: a new file, its mode set
+first (scripts 0755, any other file the mode it had), renamed over the old one — so a backup already
+reading a script keeps the old file. Every mode that writes or removes these files (install,
+`--modify`, `--force`, `--upgrade`, `--uninstall`, `--uninstall-all`) does it holding
+`/run/das-backup.lock` and then `/run/das-maintenance.lock`, taken without waiting before the first
+write, or refuses with exit 75 on stderr, changing nothing; `--modify` also refuses when
+`config.toml` changed while its wizard was open. `install`, `uninstall` and `uninstall_all` take the
+proof of that hold (`installer::SetupLocks`) as an argument, and `setup::dispatch` reaches the host
+only through `SetupHost`, so tests drive every mode on a scratch tree.
 
 ### Config Sections
 

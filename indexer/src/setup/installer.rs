@@ -30,7 +30,7 @@ type RelayProbe<'a> = &'a dyn Fn(&Config) -> bool;
 
 /// Regenerate and install every managed file for a config, under setup's
 /// locks — `install` on the host, a recorder in tests.
-type Installer<'a> = &'a dyn Fn(&Config, &SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
+pub type Installer<'a> = &'a dyn Fn(&Config, &SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
 
 /// Run a command for its exit status, returning a description of the failure
 /// instead of discarding it.
@@ -312,8 +312,8 @@ pub fn udisks_report(export_db: Result<String, String>, config: &Config) -> Vec<
 }
 
 /// Install using system defaults (/etc, /). `_held`: the caller holds
-/// setup's locks ([`SetupLocks`]) — this rewrites the scripts a running backup
-/// reads.
+/// setup's locks ([`SetupLocks`]) — this replaces the scripts and `btrbk.conf`
+/// a running backup uses.
 pub fn install(config: &Config, _held: &SetupLocks) -> Result<(), Box<dyn std::error::Error>> {
     install_to_prefix(
         config,
@@ -403,8 +403,11 @@ fn install_schedule(
     Ok(())
 }
 
-/// Install with a custom root prefix (for testing and packaging).
-pub fn install_to_prefix(
+/// Install with a custom root prefix — the core of [`install`], which runs it
+/// on `/` under setup's locks; tests run it on a scratch tree. Private, so
+/// nothing outside this module writes the installed files without the proof
+/// of the locks.
+fn install_to_prefix(
     config: &Config,
     root: &Path,
     config_path: &Path,
@@ -483,14 +486,16 @@ pub fn install_to_prefix(
             continue;
         }
 
-        std::fs::write(&full_path, content)?;
-
-        // Make scripts executable
-        if full_path.extension().and_then(|e| e.to_str()) == Some("sh") {
-            let mut perms = std::fs::metadata(&full_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&full_path, perms)?;
-        }
+        // A new file renamed into place, never a rewrite of the old one: a
+        // backup that has a script or btrbk.conf open keeps reading the old
+        // file whole. Scripts are made executable; any other file keeps the
+        // mode it had.
+        let mode = if full_path.extension().and_then(|e| e.to_str()) == Some("sh") {
+            Some(0o755)
+        } else {
+            existing_mode(&full_path)
+        };
+        buttered_dasd::fsutil::write_atomic_mode(&full_path, content.as_bytes(), mode)?;
 
         manifest_entries.push(full_path.to_string_lossy().to_string());
     }
@@ -499,7 +504,11 @@ pub fn install_to_prefix(
     if let Some(parent) = manifest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(manifest_path, manifest_entries.join("\n"))?;
+    buttered_dasd::fsutil::write_atomic_mode(
+        manifest_path,
+        manifest_entries.join("\n").as_bytes(),
+        existing_mode(manifest_path),
+    )?;
 
     // Create DB directory. Not fatal — `db_path` is absolute, so a prefixed
     // (packaging or test) install legitimately cannot create it — but never
@@ -548,6 +557,15 @@ pub fn install_to_prefix(
         manifest_entries.len()
     );
     Ok(())
+}
+
+/// The permission bits of the file at `path` — through a symlink, as a write
+/// goes — or `None` when there is no file there yet.
+fn existing_mode(path: &Path) -> Option<u32> {
+    std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.permissions().mode() & 0o7777)
 }
 
 /// Uninstall using system defaults. `_held`: the caller holds setup's locks
@@ -661,8 +679,9 @@ fn ensure_db_dir(db_path: &str) -> Result<(), String> {
 /// `remove_file` error was dropped by `.is_ok()` — so an uninstall that removed
 /// nothing, or that left half the tree behind on a read-only `/usr`, printed
 /// "Removed 0 files." and "Uninstall complete." and looked identical to one
-/// that had nothing left to do (bd DAS-Backup-Manager-8wx).
-pub fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
+/// that had nothing left to do (bd DAS-Backup-Manager-8wx). Private, like
+/// [`install_to_prefix`]: the removal happens only under setup's locks.
+fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
     let mut problems: Vec<String> = Vec::new();
     let content = match std::fs::read_to_string(manifest_path) {
         Ok(c) => c,
@@ -735,12 +754,17 @@ fn migrate_config(config: &mut Config) -> Vec<String> {
     changes
 }
 
-/// Upgrade: reload the existing config, apply migrations, regenerate every
-/// file and restart the D-Bus helper onto the binary just installed — all of
-/// it under setup's two locks ([`SetupLocks`]). While a job holds either lock
-/// nothing is written, and setup exits [`SETUP_REFUSED_EXIT`]; a helper left
-/// for the operator to restart exits [`UPGRADE_RESTART_DEFERRED_EXIT`].
-pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
+/// `--upgrade` on the host: reload the existing config, apply migrations,
+/// regenerate every file and restart the D-Bus helper onto the binary just
+/// installed — all of it under setup's two locks at `site` ([`SetupLocks`]) —
+/// the helper's unit reached through the real `systemctl`. A refusal is said
+/// on `warn`; everything else on `say`.
+pub fn upgrade(
+    site: &SetupLockSite,
+    config_path: &Path,
+    say: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(String),
+) -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     let active_state = || {
         command_stdout(
             SYSTEMCTL,
@@ -748,25 +772,22 @@ pub fn upgrade() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     let systemctl = |args: &[&str]| command_status_within(SYSTEMCTL, args, HELPER_RESTART_LIMIT);
-    let outcome = upgrade_with(
-        &SetupLockSite::production(),
-        Path::new(CONFIG_FILE),
+    upgrade_with(
+        site,
+        config_path,
         &relay_reachable,
         &install,
         &HelperHost {
             active_state: &active_state,
             systemctl: &systemctl,
         },
-        &mut |line| println!("{line}"),
-    )?;
-    match upgrade_exit_code(outcome) {
-        0 => Ok(()),
-        code => exit_with(code),
-    }
+        say,
+        warn,
+    )
 }
 
 /// Leave with `code`, once everything said has reached stdout.
-fn exit_with(code: i32) -> ! {
+pub fn exit_with(code: i32) -> ! {
     use std::io::Write;
     // Best effort: every line was already written by println!.
     let _ = std::io::stdout().flush();
@@ -781,28 +802,33 @@ fn exit_with(code: i32) -> ! {
 pub const UPGRADE_RESTART_DEFERRED_EXIT: i32 = 3;
 
 /// `btrdasd setup`'s exit status when a backup, or a job holding the DAS
-/// maintenance lock, was running: nothing was written or removed — try again
-/// later. `EX_TEMPFAIL`, as `walk` and `restore --no-wait` exit when they find
-/// that lock held.
+/// maintenance lock, was running — or, for `--modify`, when `config.toml`
+/// changed while the wizard was open: nothing was written or removed — try
+/// again later. `EX_TEMPFAIL`, as `walk` and `restore --no-wait` exit when
+/// they find that lock held.
 pub const SETUP_REFUSED_EXIT: i32 = buttered_dasd::maintenance::DEFERRED_EXIT_CODE;
 
-/// How `setup --upgrade` ended, when it did not fail.
+/// How a `btrdasd setup` mode ended, when it did not fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Upgraded {
-    /// Files regenerated, and the helper restarted or not running.
-    Complete,
-    /// Files regenerated; the helper is the operator's to restart.
+pub enum SetupOutcome {
+    /// Done: the files written or removed — for `--upgrade`, the helper
+    /// restarted or not running — or, for `--check`, the check made.
+    Done,
+    /// `--upgrade` regenerated the files; the helper is the operator's to
+    /// restart.
     RestartDeferred,
-    /// A job holds one of setup's locks: nothing was written.
+    /// Nothing written or removed: a job held one of setup's locks, or
+    /// `config.toml` changed under `--modify`.
     Refused,
 }
 
-/// The exit status for an upgrade that ended `upgraded`.
-fn upgrade_exit_code(upgraded: Upgraded) -> i32 {
-    match upgraded {
-        Upgraded::Complete => 0,
-        Upgraded::RestartDeferred => UPGRADE_RESTART_DEFERRED_EXIT,
-        Upgraded::Refused => SETUP_REFUSED_EXIT,
+/// The exit status of a setup run that ended `outcome` — the one place a
+/// refusal becomes [`SETUP_REFUSED_EXIT`], for every mode.
+pub fn exit_status(outcome: SetupOutcome) -> i32 {
+    match outcome {
+        SetupOutcome::Done => 0,
+        SetupOutcome::RestartDeferred => UPGRADE_RESTART_DEFERRED_EXIT,
+        SetupOutcome::Refused => SETUP_REFUSED_EXIT,
     }
 }
 
@@ -813,7 +839,7 @@ const UPGRADE_JOB: &str = "btrdasd setup --upgrade";
 /// and the host bound by the caller: `install` regenerates the files, `helper`
 /// reaches the D-Bus helper's unit. Everything from the config's rewrite to the
 /// helper's restart happens under the locks, which are let go before the last
-/// line. Progress goes to `say`, one line per call.
+/// line. Progress goes to `say`, one line per call; a refusal to `warn`.
 fn upgrade_with(
     site: &SetupLockSite,
     config_path: &Path,
@@ -821,8 +847,9 @@ fn upgrade_with(
     install: Installer,
     helper: &HelperHost,
     say: &mut dyn FnMut(String),
-) -> Result<Upgraded, Box<dyn std::error::Error>> {
-    let restarted = under_setup_locks(site, UPGRADE_JOB, say, |held, say| {
+    warn: &mut dyn FnMut(String),
+) -> Result<SetupOutcome, Box<dyn std::error::Error>> {
+    let ran = under_setup_locks(site, UPGRADE_JOB, |held| {
         let config = prepare_upgrade(config_path, relay_up, say)?;
         say(format!(
             "Regenerating files from {}...",
@@ -836,20 +863,24 @@ fn upgrade_with(
         installed?;
         Ok(restarted?)
     })?;
-    let Some(restarted) = restarted else {
-        return Ok(Upgraded::Refused);
+    let restarted = match ran {
+        Locked::Ran(restarted) => restarted,
+        Locked::Refused(why) => {
+            warn(why);
+            return Ok(SetupOutcome::Refused);
+        }
     };
     Ok(match restarted {
         HelperRestart::Done => {
             say("Upgrade complete.".to_string());
-            Upgraded::Complete
+            SetupOutcome::Done
         }
         HelperRestart::Deferred => {
             say(format!(
                 "Files upgraded; the {HELPER_UNIT} restart is deferred (exit \
                  {UPGRADE_RESTART_DEFERRED_EXIT})."
             ));
-            Upgraded::RestartDeferred
+            SetupOutcome::RestartDeferred
         }
     })
 }
@@ -880,13 +911,14 @@ impl SetupLockSite {
 /// needs one — `install`, `uninstall`, `uninstall_all` and the helper restart
 /// take it as an argument — so a mode that skips the locks does not compile.
 ///
-/// Why both (`.claude/rules/backup.md` §Never Run `setup --upgrade` …): setup
-/// rewrites `backup-run.sh` and its sibling scripts in place, and bash reads a
-/// running script as it goes — a read that lands in the rewrite finds the file
-/// ending there, and the run stops early looking like a clean finish. A backup
-/// holds the singleton from its start, also while it still waits for the
-/// maintenance lock, and reads its script all the while. The maintenance lock
-/// is held by every job that mounts a backup target, and none of them may be
+/// Why both (`.claude/rules/backup.md` §Never Run `setup --upgrade` …): setup's
+/// writes are atomic — a new file renamed into place, so a backup already
+/// reading `backup-run.sh` keeps reading the old one whole — but a run must
+/// still see one version of the files from its start to its end: the scripts
+/// it calls later, the `btrbk.conf` btrbk reads, the config sync reads again.
+/// And an uninstall removes them. A backup holds the singleton from its start,
+/// also while it still waits for the maintenance lock. The maintenance lock is
+/// held by every job that mounts a backup target, and none of them may be
 /// mounting while the helper restart kills the helper's jobs.
 pub struct SetupLocks {
     // Dropped in declaration order: the maintenance lock — its record emptied
@@ -951,46 +983,30 @@ fn maintenance_held_line(path: &Path, holder: &str) -> String {
     )
 }
 
+/// What became of a change setup wanted to make under its locks.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Locked<T> {
+    /// Both locks were taken, the change made — this is what it returned — and
+    /// the locks let go again.
+    Ran(T),
+    /// A job holds one of them, as this says: the change was not made.
+    Refused(String),
+}
+
 /// Run `change` — the part of a setup mode that writes or removes installed
 /// files — holding setup's two locks from before its first write until it
 /// returns, and let them go then, whether it succeeded or failed. While a job
-/// holds either lock `change` is not run: `say` is told which, and by whom,
-/// and the result is `Ok(None)`.
-fn under_setup_locks<T>(
+/// holds either lock `change` is not run, and the result says which lock, and
+/// by whom.
+pub fn under_setup_locks<T>(
     site: &SetupLockSite,
     job: &str,
-    say: &mut dyn FnMut(String),
-    change: impl FnOnce(&SetupLocks, &mut dyn FnMut(String)) -> Result<T, Box<dyn std::error::Error>>,
-) -> Result<Option<T>, Box<dyn std::error::Error>> {
+    change: impl FnOnce(&SetupLocks) -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<Locked<T>, Box<dyn std::error::Error>> {
     match take_setup_locks(site, job)? {
-        SetupLockAttempt::Busy(why) => {
-            say(why);
-            Ok(None)
-        }
+        SetupLockAttempt::Busy(why) => Ok(Locked::Refused(why)),
         // `held` is dropped as the arm ends: after `change`, on either path.
-        SetupLockAttempt::Taken(held) => change(&held, say).map(Some),
-    }
-}
-
-/// [`under_setup_locks`] at the host's lock files, for the modes of
-/// `btrdasd setup` other than `--upgrade` that write or remove installed
-/// files: the wizard, `--modify`, `--force`, `--uninstall` and
-/// `--uninstall-all`. `job` is recorded as the maintenance lock's holder.
-/// Refused, setup exits [`SETUP_REFUSED_EXIT`] having written and removed
-/// nothing.
-pub fn locked(
-    job: &str,
-    change: impl FnOnce(&SetupLocks) -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ran = under_setup_locks(
-        &SetupLockSite::production(),
-        job,
-        &mut |line| println!("{line}"),
-        |held, _| change(held),
-    )?;
-    match ran {
-        Some(()) => Ok(()),
-        None => exit_with(SETUP_REFUSED_EXIT),
+        SetupLockAttempt::Taken(held) => change(&held).map(Locked::Ran),
     }
 }
 
@@ -2809,9 +2825,9 @@ auth = "starttls""#,
 
     #[test]
     fn the_exit_status_says_done_restart_left_to_the_operator_or_refused() {
-        assert_eq!(upgrade_exit_code(Upgraded::Complete), 0);
-        assert_eq!(upgrade_exit_code(Upgraded::RestartDeferred), 3);
-        assert_eq!(upgrade_exit_code(Upgraded::Refused), 75);
+        assert_eq!(exit_status(SetupOutcome::Done), 0);
+        assert_eq!(exit_status(SetupOutcome::RestartDeferred), 3);
+        assert_eq!(exit_status(SetupOutcome::Refused), 75);
         assert_eq!(UPGRADE_RESTART_DEFERRED_EXIT, 3);
         // EX_TEMPFAIL, as `walk` and `restore --no-wait` exit on a held lock.
         assert_eq!(SETUP_REFUSED_EXIT, 75);
@@ -2821,11 +2837,28 @@ auth = "starttls""#,
         );
     }
 
-    /// The command lines of every live process, NUL-joined as `/proc` keeps them.
+    /// The command lines of this process's own live children, NUL-joined as
+    /// `/proc` keeps them. Only its own: another test run on the host — a
+    /// parallel mutation run, a second CI job — may be running the very same
+    /// command at that moment.
     fn process_command_lines() -> Vec<String> {
+        let me = std::process::id();
         std::fs::read_dir("/proc")
             .unwrap()
-            .filter_map(|e| std::fs::read(e.ok()?.path().join("cmdline")).ok())
+            .filter_map(|e| {
+                let dir = e.ok()?.path();
+                // The parent pid is the field after the state, read after the
+                // last `)`: the command name may hold spaces and parentheses.
+                let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+                let ppid: u32 = stat
+                    .rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse()
+                    .ok()?;
+                (ppid == me).then(|| std::fs::read(dir.join("cmdline")).ok())?
+            })
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .collect()
     }
@@ -3006,8 +3039,10 @@ auth = "starttls""#,
 
     /// What one `upgrade_with` run on an installed tree did.
     struct UpgradeRun {
-        outcome: Result<Upgraded, String>,
+        outcome: Result<SetupOutcome, String>,
+        /// What it said on stdout, and on stderr.
         lines: Vec<String>,
+        warnings: Vec<String>,
         /// Each step that writes or restarts, in order, with the locks as a
         /// job asking for them at that moment would have found them. The
         /// relay probe runs right after the config is written.
@@ -3080,6 +3115,7 @@ auth = "starttls""#,
             case.systemctl_fails.map_or(Ok(()), |e| Err(e.to_string()))
         };
         let mut lines = Vec::new();
+        let mut warnings = Vec::new();
         let outcome = upgrade_with(
             site,
             &config_path,
@@ -3090,12 +3126,14 @@ auth = "starttls""#,
                 systemctl: &systemctl,
             },
             &mut |line| lines.push(line),
+            &mut |line| warnings.push(line),
         )
         .map_err(|e| e.to_string());
         let maintenance_opened = locks.site.maintenance.exists();
         UpgradeRun {
             outcome,
             lines,
+            warnings,
             steps: steps.into_inner(),
             changed: changed(&before, &tree(base)),
             config: Config::load(&config_path).unwrap(),
@@ -3137,8 +3175,8 @@ auth = "starttls""#,
             ..Default::default()
         });
 
-        assert_eq!(run.outcome, Ok(Upgraded::Refused));
-        assert_eq!(upgrade_exit_code(Upgraded::Refused), 75);
+        assert_eq!(run.outcome, Ok(SetupOutcome::Refused));
+        assert_eq!(exit_status(SetupOutcome::Refused), 75);
         assert_eq!(
             run.changed,
             Vec::<PathBuf>::new(),
@@ -3158,8 +3196,9 @@ auth = "starttls""#,
             run.locks_after, "backup held, maintenance free",
             "the backup keeps its lock, and setup holds nothing"
         );
+        assert_eq!(run.lines, Vec::<String>::new(), "a refusal goes to stderr");
         assert_eq!(
-            run.lines,
+            run.warnings,
             vec![format!(
                 "Refused, nothing written or removed: {} is held, so a backup is running — \
                  backup-run.sh, or btrdasd backup from the CLI or the GUI, which hold it from \
@@ -3178,8 +3217,8 @@ auth = "starttls""#,
             ..Default::default()
         });
 
-        assert_eq!(run.outcome, Ok(Upgraded::Refused));
-        assert_eq!(upgrade_exit_code(Upgraded::Refused), 75);
+        assert_eq!(run.outcome, Ok(SetupOutcome::Refused));
+        assert_eq!(exit_status(SetupOutcome::Refused), 75);
         assert_eq!(run.changed, Vec::<PathBuf>::new());
         assert_eq!(run.config.general.version, "0.0.1");
         assert_eq!(run.steps, Vec::<String>::new());
@@ -3193,8 +3232,9 @@ auth = "starttls""#,
             format!("btrdasd scrub run pid {pid}\n"),
             "the holder's record is left as it was"
         );
+        assert_eq!(run.lines, Vec::<String>::new(), "a refusal goes to stderr");
         assert_eq!(
-            run.lines,
+            run.warnings,
             vec![format!(
                 "Refused, nothing written or removed: the DAS maintenance lock {} is held by \
                  btrdasd scrub run pid {pid}. Run setup again once that job has finished \
@@ -3208,8 +3248,9 @@ auth = "starttls""#,
     fn an_upgrade_holds_both_locks_through_every_write_and_the_restart_then_lets_go() {
         let run = upgrade_installed_tree(UpgradeCase::default());
 
-        assert_eq!(run.outcome, Ok(Upgraded::Complete));
-        assert_eq!(upgrade_exit_code(Upgraded::Complete), 0);
+        assert_eq!(run.outcome, Ok(SetupOutcome::Done));
+        assert_eq!(exit_status(SetupOutcome::Done), 0);
+        assert_eq!(run.warnings, Vec::<String>::new());
         assert_eq!(run.steps, steps_under_both_locks(true));
         assert_eq!(run.locks_after, BOTH_FREE);
         assert_eq!(
@@ -3283,8 +3324,8 @@ auth = "starttls""#,
                 ..Default::default()
             });
 
-            assert_eq!(run.outcome, Ok(Upgraded::RestartDeferred), "{init:?}");
-            assert_eq!(upgrade_exit_code(Upgraded::RestartDeferred), 3);
+            assert_eq!(run.outcome, Ok(SetupOutcome::RestartDeferred), "{init:?}");
+            assert_eq!(exit_status(SetupOutcome::RestartDeferred), 3);
             assert_eq!(run.steps, steps_under_both_locks(false), "{init:?}");
             assert_eq!(run.locks_after, BOTH_FREE, "{init:?}");
             assert_eq!(run.config.general.version, env!("CARGO_PKG_VERSION"));
@@ -3367,6 +3408,7 @@ auth = "starttls""#,
                 active_state: &active_state,
                 systemctl: &systemctl,
             },
+            &mut |_| {},
             &mut |_| {},
         );
 
@@ -3530,29 +3572,26 @@ auth = "starttls""#,
                 let _backup = (holding == Holding::Backup).then(|| locks.hold_backup());
                 let _scrub = (holding == Holding::Maintenance).then(|| locks.hold_maintenance());
                 let systemctl = FakeSystemctl::new(&[]);
-                let mut lines = Vec::new();
 
-                let ran = under_setup_locks(
-                    &locks.site,
-                    "btrdasd setup",
-                    &mut |line| lines.push(line),
-                    |_, _| run_mode(mode, dir.path(), &config, &systemctl),
-                )
+                let ran = under_setup_locks(&locks.site, "btrdasd setup", |_| {
+                    run_mode(mode, dir.path(), &config, &systemctl)
+                })
                 .unwrap();
 
                 let case = format!("{holding:?} {mode:?}");
-                assert_eq!(ran, None, "{case}");
+                let Locked::Refused(why) = ran else {
+                    panic!("{case}: ran while a lock was held");
+                };
+                assert!(
+                    why.starts_with("Refused, nothing written or removed: "),
+                    "{case}: {why}"
+                );
                 assert_eq!(
                     changed(&before, &tree(dir.path())),
                     Vec::<PathBuf>::new(),
                     "{case}"
                 );
                 assert_eq!(systemctl.calls(), Vec::<String>::new(), "{case}");
-                assert_eq!(lines.len(), 1, "{case}: {lines:?}");
-                assert!(
-                    lines[0].starts_with("Refused, nothing written or removed: "),
-                    "{case}: {lines:?}"
-                );
             }
         }
     }
@@ -3566,20 +3605,14 @@ auth = "starttls""#,
             let locks = ScratchLocks::new();
             let systemctl = FakeSystemctl::new(&[]);
             let during = std::cell::RefCell::new(String::new());
-            let mut lines = Vec::new();
 
-            let ran = under_setup_locks(
-                &locks.site,
-                "btrdasd setup --uninstall",
-                &mut |line| lines.push(line),
-                |_, _| {
-                    *during.borrow_mut() = locks.state();
-                    run_mode(mode, dir.path(), &config, &systemctl)
-                },
-            )
+            let ran = under_setup_locks(&locks.site, "btrdasd setup --uninstall", |_| {
+                *during.borrow_mut() = locks.state();
+                run_mode(mode, dir.path(), &config, &systemctl)
+            })
             .unwrap();
 
-            assert_eq!(ran, Some(()), "{mode:?}");
+            assert_eq!(ran, Locked::Ran(()), "{mode:?}");
             assert_eq!(during.into_inner(), BOTH_HELD, "{mode:?}");
             assert!(
                 !changed(&before, &tree(dir.path())).is_empty(),
@@ -3587,17 +3620,15 @@ auth = "starttls""#,
             );
             assert_eq!(locks.state(), BOTH_FREE, "{mode:?}");
             assert_eq!(locks.record(), "", "{mode:?}");
-            assert_eq!(lines, Vec::<String>::new(), "{mode:?}");
         }
     }
 
     #[test]
     fn a_setup_change_that_fails_still_lets_both_locks_go() {
         let locks = ScratchLocks::new();
-        let ran: Result<Option<()>, _> =
-            under_setup_locks(&locks.site, "btrdasd setup", &mut |_| {}, |_, _| {
-                Err("1 systemd unit operation(s) failed".into())
-            });
+        let ran: Result<Locked<()>, _> = under_setup_locks(&locks.site, "btrdasd setup", |_| {
+            Err("1 systemd unit operation(s) failed".into())
+        });
         assert_eq!(
             ran.unwrap_err().to_string(),
             "1 systemd unit operation(s) failed"
@@ -4024,5 +4055,470 @@ auth = "starttls""#,
         assert!(!libdir.exists(), "the /usr/local script directory was left");
         assert!(!unit.exists(), "the /usr/local unit was left behind");
         assert_eq!(outside(root), before, "files outside the prefix changed");
+    }
+
+    // -----------------------------------------------------------------
+    // bd DAS-Backup-Manager-6wt fix round 4 — every file setup writes is
+    // replaced whole (a new file renamed into place), keeps its mode, and a
+    // write that fails names the file and leaves the old one
+    // -----------------------------------------------------------------
+
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Where an install under `base` puts the script `name`: beneath the
+    /// configured prefix.
+    fn installed_script(base: &Path, config: &Config, name: &str) -> PathBuf {
+        under_root(
+            base,
+            &format!("{}/lib/das-backup/{name}", config.general.install_prefix),
+        )
+    }
+
+    #[test]
+    fn install_replaces_each_file_whole_and_a_reader_of_the_old_one_reads_it_to_the_end() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let script = installed_script(dir.path(), &config, "backup-run.sh");
+        // An older script — dated long ago, so the 2lj guard lets it go — and
+        // larger than any read buffer, so a reader is part-way in, as a
+        // running bash is.
+        let old: Vec<u8> = (0..20_000u32)
+            .flat_map(|i| format!("# old backup-run.sh line {i}\n").into_bytes())
+            .collect();
+        std::fs::write(&script, &old).unwrap();
+        date_back(dir.path());
+        let before = inode_of(&script);
+        let mut reader = std::fs::File::open(&script).unwrap();
+        let mut first = vec![0u8; 4096];
+        reader.read_exact(&mut first).unwrap();
+
+        install_to_prefix(&config, dir.path(), &config_path, &manifest_path).unwrap();
+
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(
+            [first, rest].concat() == old,
+            "the script a run has open must stay the old one, whole"
+        );
+        assert_ne!(inode_of(&script), before, "a new file, renamed into place");
+        assert!(
+            std::fs::read_to_string(&script)
+                .unwrap()
+                .starts_with("#!/bin/bash"),
+            "a new open reads the new script"
+        );
+    }
+
+    #[test]
+    fn install_keeps_each_files_mode_and_makes_the_scripts_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let btrbk = dir.path().join("etc/btrbk/btrbk.conf");
+        let unit = dir.path().join("etc/systemd/system/das-backup.service");
+        let script = installed_script(dir.path(), &config, "boot-archive-cleanup.sh");
+        // The operator made btrbk.conf private and the unit group-writable; a
+        // script lost its execute bits.
+        std::fs::set_permissions(&btrbk, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o664)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        date_back(dir.path());
+        let (b, u) = (inode_of(&btrbk), inode_of(&unit));
+
+        install_to_prefix(&config, dir.path(), &config_path, &manifest_path).unwrap();
+
+        assert!(
+            inode_of(&btrbk) != b && inode_of(&unit) != u,
+            "both replaced"
+        );
+        assert_eq!(mode_of(&btrbk), 0o600, "btrbk.conf keeps its mode");
+        assert_eq!(mode_of(&unit), 0o664, "the unit keeps its mode");
+        assert_eq!(mode_of(&script), 0o755, "a script is always executable");
+    }
+
+    #[test]
+    fn an_install_that_cannot_write_a_file_names_it_and_leaves_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let btrbk = dir.path().join("etc/btrbk/btrbk.conf");
+        std::fs::write(&btrbk, "# the old btrbk.conf\n").unwrap();
+        // A directory where its temp file goes makes that one write fail, for
+        // root too.
+        std::fs::create_dir(dir.path().join("etc/btrbk/.btrbk.conf.tmp")).unwrap();
+
+        let err = install_to_prefix(&config, dir.path(), &config_path, &manifest_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.starts_with(&format!("cannot write {}: ", btrbk.display())),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&btrbk).unwrap(),
+            "# the old btrbk.conf\n"
+        );
+    }
+    // -----------------------------------------------------------------
+    // bd DAS-Backup-Manager-6wt fix round 4 — `btrdasd setup` end to end
+    // through `dispatch`: every writing mode refuses with 75 and writes
+    // nothing while either lock is held, asks its questions before it takes
+    // them, says a refusal on stderr; `--check` takes no lock at all
+    // -----------------------------------------------------------------
+
+    use crate::setup::{SetupArgs, SetupHost, dispatch};
+
+    fn setup_args(flags: &[&str]) -> SetupArgs {
+        let mut a = SetupArgs {
+            modify: false,
+            upgrade: false,
+            uninstall: false,
+            uninstall_all: false,
+            check: false,
+            force: false,
+        };
+        for flag in flags {
+            match *flag {
+                "modify" => a.modify = true,
+                "upgrade" => a.upgrade = true,
+                "uninstall" => a.uninstall = true,
+                "uninstall_all" => a.uninstall_all = true,
+                "check" => a.check = true,
+                "force" => a.force = true,
+                other => panic!("unknown flag {other}"),
+            }
+        }
+        a
+    }
+
+    /// What one `dispatch` run on an installed tree did.
+    struct Dispatched {
+        outcome: Result<SetupOutcome, String>,
+        /// Each step, with the locks as a job asking for them then would find
+        /// them.
+        steps: Vec<String>,
+        /// Lines on stdout, and on stderr.
+        said: Vec<String>,
+        warned: Vec<String>,
+        /// Every file the run changed: since it started, and since the wizard
+        /// returned.
+        changed: Vec<PathBuf>,
+        changed_after_wizard: Vec<PathBuf>,
+        locks_after: String,
+        record_after: String,
+        config_path: PathBuf,
+        /// `config.toml` once it returned, if there was one.
+        config_after: Option<Config>,
+    }
+
+    /// Run `btrdasd setup <flags>` through `dispatch` on the tree an install
+    /// left — a database beside it, every file dated long ago — while
+    /// `holding` hold their locks, the wizard returning the config it was
+    /// given (or a fresh one), the operator answering "yes" to removing the
+    /// database. With `edit_during_wizard`, something else rewrites
+    /// `config.toml` while the wizard is open.
+    fn dispatch_on_installed_tree(
+        flags: &[&str],
+        holding: &[Holding],
+        edit_during_wizard: bool,
+    ) -> Dispatched {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let config = valid_config(base);
+        let (config_path, manifest_path) = install_config_into(&config, base);
+        std::fs::write(&config.general.db_path, "index").unwrap();
+        date_back(base);
+        let before = tree(base);
+        let after_wizard = std::cell::RefCell::new(None);
+
+        let locks = ScratchLocks::new();
+        let _backup = holding
+            .contains(&Holding::Backup)
+            .then(|| locks.hold_backup());
+        let _scrub = holding
+            .contains(&Holding::Maintenance)
+            .then(|| locks.hold_maintenance());
+
+        let steps = std::cell::RefCell::new(Vec::new());
+        let step = |name: &str| {
+            steps
+                .borrow_mut()
+                .push(format!("{name} ({})", locks.state()))
+        };
+        let systemctl = FakeSystemctl::new(&[]);
+        let check = || -> Result<(), Box<dyn std::error::Error>> {
+            step("check");
+            Ok(())
+        };
+        let install = |config: &Config, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
+            step("install");
+            install_to_prefix(config, base, &config_path, &manifest_path)
+        };
+        let uninstall =
+            |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
+                step(&format!("uninstall remove_db={remove_db}"));
+                uninstall_with(&config_path, &manifest_path, remove_db, &|a| {
+                    systemctl.run(a)
+                })
+            };
+        let uninstall_all =
+            |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
+                step(&format!("uninstall-all remove_db={remove_db}"));
+                uninstall_all_with(base, &config_path, &manifest_path, remove_db, &|a| {
+                    systemctl.run(a)
+                })
+            };
+        let active_state = || Ok("active".to_string());
+        let restart = |args: &[&str]| {
+            step(&format!("systemctl {}", args.join(" ")));
+            Ok(())
+        };
+        let upgrade = |site: &SetupLockSite,
+                       config_path: &Path,
+                       say: &mut dyn FnMut(String),
+                       warn: &mut dyn FnMut(String)| {
+            upgrade_with(
+                site,
+                config_path,
+                &|_| true,
+                &install,
+                &HelperHost {
+                    active_state: &active_state,
+                    systemctl: &restart,
+                },
+                say,
+                warn,
+            )
+        };
+        let wizard = |existing: Option<Config>| -> Result<Config, Box<dyn std::error::Error>> {
+            step("wizard");
+            if edit_during_wizard {
+                // Another writer — the GUI's ConfigSet, a subvol sync — while
+                // the wizard is open.
+                let mut theirs = Config::load(&config_path)?;
+                theirs.schedule.incremental = "04:15".to_string();
+                theirs.save(&config_path)?;
+            }
+            *after_wizard.borrow_mut() = Some(tree(base));
+            Ok(existing.unwrap_or_else(|| valid_config(base)))
+        };
+        let ask_remove_db = || -> Result<bool, Box<dyn std::error::Error>> {
+            step("ask: also remove the database?");
+            Ok(true)
+        };
+        let host = SetupHost {
+            site: SetupLockSite {
+                backup: locks.site.backup.clone(),
+                maintenance: locks.site.maintenance.clone(),
+            },
+            check: &check,
+            install: &install,
+            uninstall: &uninstall,
+            uninstall_all: &uninstall_all,
+            upgrade: &upgrade,
+            wizard: &wizard,
+            ask_remove_db: &ask_remove_db,
+        };
+
+        let mut said = Vec::new();
+        let mut warned = Vec::new();
+        let outcome = dispatch(
+            &setup_args(flags),
+            &config_path,
+            &host,
+            &mut |line| said.push(line),
+            &mut |line| warned.push(line),
+        )
+        .map_err(|e| e.to_string());
+
+        let now = tree(base);
+        let after_wizard = after_wizard.into_inner().unwrap_or_else(|| before.clone());
+        Dispatched {
+            outcome,
+            steps: steps.into_inner(),
+            said,
+            warned,
+            changed: changed(&before, &now),
+            changed_after_wizard: changed(&after_wizard, &now),
+            locks_after: locks.state(),
+            record_after: locks.record(),
+            config_after: Config::load(&config_path).ok(),
+            config_path,
+        }
+    }
+
+    /// Every way to ask `btrdasd setup` to write or remove installed files.
+    const WRITING_MODES: [&[&str]; 9] = [
+        &[],
+        &["modify"],
+        &["force"],
+        &["upgrade"],
+        &["upgrade", "force"],
+        &["uninstall"],
+        &["uninstall", "force"],
+        &["uninstall_all"],
+        &["uninstall_all", "force"],
+    ];
+
+    /// The questions `flags` asks before it takes any lock.
+    fn questions(flags: &[&str]) -> Vec<&'static str> {
+        let forced = flags.contains(&"force");
+        if flags.contains(&"upgrade") || flags == ["force"] {
+            vec![]
+        } else if flags.contains(&"uninstall") || flags.contains(&"uninstall_all") {
+            if forced {
+                vec![]
+            } else {
+                vec!["ask: also remove the database?"]
+            }
+        } else {
+            vec!["wizard"]
+        }
+    }
+
+    #[test]
+    fn every_writing_mode_refuses_with_75_and_writes_nothing_while_either_lock_is_held() {
+        let pid = std::process::id();
+        for (holding, state) in [
+            (Holding::Backup, "backup held, maintenance free"),
+            (Holding::Maintenance, "backup free, maintenance held"),
+        ] {
+            for flags in WRITING_MODES {
+                let case = format!("{flags:?} while {holding:?} holds its lock");
+                let run = dispatch_on_installed_tree(flags, &[holding], false);
+
+                assert_eq!(run.outcome, Ok(SetupOutcome::Refused), "{case}");
+                assert_eq!(exit_status(SetupOutcome::Refused), 75);
+                assert_eq!(run.changed, Vec::<PathBuf>::new(), "{case}");
+                // The questions came first, with setup holding nothing; then
+                // nothing else ran.
+                let asked: Vec<String> = questions(flags)
+                    .iter()
+                    .map(|q| format!("{q} ({state})"))
+                    .collect();
+                assert_eq!(run.steps, asked, "{case}");
+                assert_eq!(run.warned.len(), 1, "{case}: {:?}", run.warned);
+                assert!(
+                    run.warned[0].starts_with("Refused, nothing written or removed: "),
+                    "{case}: {:?}",
+                    run.warned
+                );
+                assert!(
+                    !run.said.iter().any(|l| l.contains("Refused")),
+                    "{case}: a refusal goes to stderr, not stdout: {:?}",
+                    run.said
+                );
+                assert_eq!(run.locks_after, state, "{case}: setup holds nothing after");
+                if holding == Holding::Maintenance {
+                    assert_eq!(
+                        run.record_after,
+                        format!("btrdasd scrub run pid {pid}\n"),
+                        "{case}: the holder's record is untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_writing_mode_asks_first_then_writes_under_both_locks_and_lets_them_go() {
+        for flags in WRITING_MODES {
+            let case = format!("{flags:?}");
+            let run = dispatch_on_installed_tree(flags, &[], false);
+
+            assert_eq!(run.outcome, Ok(SetupOutcome::Done), "{case}");
+            assert_eq!(exit_status(SetupOutcome::Done), 0);
+            let mut expected: Vec<String> = questions(flags)
+                .iter()
+                .map(|q| format!("{q} ({BOTH_FREE})"))
+                .collect();
+            let forced = flags.contains(&"force");
+            expected.extend(
+                match flags.first().copied() {
+                    Some("upgrade") => vec![
+                        "install".to_string(),
+                        "systemctl try-restart btrdasd-helper.service".to_string(),
+                    ],
+                    Some("uninstall") => vec![format!("uninstall remove_db={}", !forced)],
+                    Some("uninstall_all") => vec![format!("uninstall-all remove_db={}", !forced)],
+                    _ => vec!["install".to_string()],
+                }
+                .into_iter()
+                .map(|s| format!("{s} ({BOTH_HELD})")),
+            );
+            assert_eq!(run.steps, expected, "{case}");
+            assert!(!run.changed.is_empty(), "{case}: nothing written");
+            assert_eq!(run.warned, Vec::<String>::new(), "{case}");
+            assert_eq!(run.locks_after, BOTH_FREE, "{case}");
+            assert_eq!(run.record_after, "", "{case}");
+        }
+    }
+
+    #[test]
+    fn check_takes_no_lock_and_runs_while_both_are_held() {
+        let pid = std::process::id();
+        for flags in [&["check"][..], &["check", "upgrade", "force"]] {
+            // Free: it runs with both still free — setup took neither.
+            let run = dispatch_on_installed_tree(flags, &[], false);
+            assert_eq!(run.outcome, Ok(SetupOutcome::Done), "{flags:?}");
+            assert_eq!(run.steps, vec![format!("check ({BOTH_FREE})")], "{flags:?}");
+
+            // Both held by others: it still runs, and changes nothing.
+            let run =
+                dispatch_on_installed_tree(flags, &[Holding::Backup, Holding::Maintenance], false);
+            assert_eq!(run.outcome, Ok(SetupOutcome::Done), "{flags:?}");
+            assert_eq!(exit_status(SetupOutcome::Done), 0);
+            assert_eq!(run.steps, vec![format!("check ({BOTH_HELD})")], "{flags:?}");
+            assert_eq!(run.warned, Vec::<String>::new(), "{flags:?}");
+            assert_eq!(run.changed, Vec::<PathBuf>::new(), "{flags:?}");
+            assert_eq!(
+                run.record_after,
+                format!("btrdasd scrub run pid {pid}\n"),
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modify_writes_nothing_when_config_toml_changed_while_the_wizard_was_open() {
+        let run = dispatch_on_installed_tree(&["modify"], &[], true);
+
+        assert_eq!(run.outcome, Ok(SetupOutcome::Refused));
+        assert_eq!(exit_status(SetupOutcome::Refused), 75);
+        assert_eq!(
+            run.steps,
+            vec![format!("wizard ({BOTH_FREE})")],
+            "nothing installed over the other writer's change"
+        );
+        assert_eq!(
+            run.changed_after_wizard,
+            Vec::<PathBuf>::new(),
+            "setup wrote nothing after the wizard"
+        );
+        assert_eq!(
+            run.warned,
+            vec![format!(
+                "Refused, nothing written or removed: {} changed while the wizard was open — \
+                 something else wrote it after --modify read it. Run setup --modify again to \
+                 start from it as it is now (exit 75).",
+                run.config_path.display()
+            )]
+        );
+        assert_eq!(run.locks_after, BOTH_FREE, "taken to compare, then let go");
+        assert_eq!(
+            run.config_after.expect("config.toml").schedule.incremental,
+            "04:15",
+            "the other writer's change stands"
+        );
     }
 }
