@@ -1,7 +1,7 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.2.0
-# Date: 2026-02-21
+# Version: 2.2.1
+# Date: 2026-10-04
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
 #     Run ONLY after verifying SMART tests passed.
@@ -142,10 +142,12 @@ check_smart_tests() {
         local status
         status=$(smartctl -l selftest "$dev" 2>/dev/null | grep -E "# 1" | head -1 || echo "No tests")
 
-        if echo "$status" | grep -qE "in progress|Self-test routine in progress"; then
+        # No pipe into grep -q: under pipefail a producer killed by SIGPIPE
+        # when grep quits early reads as "no match" (bd DAS-Backup-Manager-wkvz).
+        if grep -qE "in progress|Self-test routine in progress" <<<"$status"; then
             echo -e "  $dev ($label): ${YELLOW}Test still running${NC}"
             all_complete=false
-        elif echo "$status" | grep -q "Completed without error"; then
+        elif grep -q "Completed without error" <<<"$status"; then
             echo -e "  $dev ($label): ${GREEN}Test completed - PASSED${NC}"
         else
             echo -e "  $dev ($label): ${YELLOW}$status${NC}"
