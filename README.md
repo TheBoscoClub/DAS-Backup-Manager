@@ -44,16 +44,19 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 | Component | Description | Status |
 |-----------|-------------|--------|
-| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, email reporting | Active (v4.7.1) |
-| `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active (v3.0.0) |
-| `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active (v2.1.0) |
-| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v2.2.0) |
+| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, email reporting | Active |
+| `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active |
+| `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
+| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active |
 | `scripts/install-backup-timer.sh` | systemd timer installer | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
+
+Each script's version is the `# Version:` line in its own header — the one place it is kept.
+
 ## Project Structure
 
 ```

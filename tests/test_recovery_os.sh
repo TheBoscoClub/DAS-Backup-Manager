@@ -2,8 +2,10 @@
 # check_recovery_os / the WARN status level / the RECOVERY OS report section
 # from scripts/backup-run.sh, against a stub btrdasd (bd DAS-Backup-Manager-xd3).
 # Both directions: current -> OK and ALL OPERATIONS SUCCESSFUL; stale -> WARN,
-# a warnings status line, and a run still recorded as SUCCESS; unreadable or a
-# binary without the subcommand -> FAIL with the reason, and the run goes on.
+# a warnings status line, and a run still recorded as SUCCESS; a current OS
+# whose boot would run btrbk (bd 1yg) -> WARN saying so, not "stale";
+# unreadable or a binary without the subcommand -> FAIL with the reason, and
+# the run goes on.
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
@@ -83,7 +85,7 @@ reset
 printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK/out"; echo 0 >"$WORK/rc"
 check_recovery_os run
 check "current: OK" "${OP_STATUS[recovery_os]}" "OK"
-check "current: detail" "${OP_STATUS[recovery_os_detail]}" "none stale"
+check "current: detail" "${OP_STATUS[recovery_os_detail]}" "nothing needs attention"
 check "the call is bounded by timeout -k 10 300" "$(cat "$WORK/timeout_calls")" \
     "-k 10 300 $BTRDASD_BIN recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
 check "current: section captured" "$(head -n1 <<<"$RECOVERY_OS_REPORT")" "RECOVERY OS"
@@ -133,6 +135,51 @@ check "FAIL outranks WARN: run" "$(run_status)" "FAILURE"
 check "FAIL outranks WARN: subject" "$(subject_status)" "FAILURE"
 check "FAIL outranks WARN: status line" "$(generate_report | grep -c '^  Status: FAILURES DETECTED$')" "1"
 
+# --- current, but btrbk would run when it boots (bd 1yg) -------------------------
+# Exit 1 with a current Result: the WARNING row is why, and the detail says so.
+boot_warning='btrbk will run when this OS boots — btrbk.timer starts btrbk.service, which runs btrbk straight after boot (Persistent catch-up), with /etc/btrbk/btrbk.conf present: check its config before booting it, on bare metal or in the update VM'
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Enabled timers      btrbk.timer (etc)\n    btrbk config        /etc/btrbk/btrbk.conf (412 bytes)\n    btrbk at boot       will\n    WARNING             %s\n    Result              current\n' \
+    "$boot_warning" >"$WORK/out"; echo 1 >"$WORK/rc"
+rc=0; check_recovery_os run || rc=$?
+check "boot warning: returns 0" "$rc" "0"
+check "boot warning: WARN, not FAIL" "${OP_STATUS[recovery_os]}" "WARN"
+check "boot warning: detail says btrbk, not stale" "${OP_STATUS[recovery_os_detail]}" "btrbk may run at boot — see RECOVERY OS in the report"
+check "boot warning: logged once, as a warning" "$(grep -c '^WARN: ' "$WORK/log")" "1"
+check "boot warning: the log line names btrbk" "$(grep -c '^WARN: btrbk may run when a recovery OS boots' "$WORK/log")" "1"
+report="$(generate_report)"
+check "boot warning: status says warnings" "$(grep -c '^  Status: COMPLETED WITH WARNINGS$' <<<"$report")" "1"
+check "boot warning: row shows WARN" "$(grep -c '^  Recovery OS           WARN  (btrbk may run at boot' <<<"$report")" "1"
+check "boot warning: the WARNING row reaches the report" "$(grep -c "^    WARNING             $boot_warning\$" <<<"$report")" "1"
+check "boot warning: the run is still recorded as SUCCESS" "$(run_status)" "SUCCESS"
+check "boot warning: the subject says so" "$(subject_status)" "SUCCESS WITH WARNINGS"
+check "boot warning: the drive counts as inspected, not unmounted" "$(grep -c 'not mounted' <<<"${OP_STATUS[recovery_os_detail]}" || true)" "0"
+
+# Stale and warned at once: both said, in that order, one log line each.
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    WARNING             %s\n    Result              STALE — x\n  B  not mounted\n' \
+    "$boot_warning" >"$WORK/out"; echo 1 >"$WORK/rc"
+check_recovery_os run
+check "stale and warned: both in the detail" "${OP_STATUS[recovery_os_detail]}" \
+    "stale; btrbk may run at boot — see RECOVERY OS in the report; not mounted: B"
+check "stale and warned: two warning lines logged" "$(grep -c '^WARN: ' "$WORK/log")" "2"
+
+# Exit 1 with neither row (a binary that says something else): still WARN,
+# without claiming a reason the section does not show.
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK/out"; echo 1 >"$WORK/rc"
+check_recovery_os run
+check "exit 1, no row: WARN" "${OP_STATUS[recovery_os]}" "WARN"
+check "exit 1, no row: a neutral detail" "${OP_STATUS[recovery_os_detail]}" "needs attention — see RECOVERY OS in the report"
+check "exit 1, no row: logged once" "$(grep -c '^WARN: ' "$WORK/log")" "1"
+
+# A WARNING row with exit 0 is not possible from btrdasd; were it to appear,
+# the exit status still decides (OK), as for every other row.
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    WARNING             x\n    Result              current\n' >"$WORK/out"; echo 0 >"$WORK/rc"
+check_recovery_os run
+check "exit 0 decides: OK" "${OP_STATUS[recovery_os]}" "OK"
+
 # --- unreadable root / state not recorded -------------------------------------
 reset
 printf 'RECOVERY OS\n  A  (/mnt/a/@)  UNREADABLE: /mnt/a/@ is not a directory\n' >"$WORK/out"
@@ -172,7 +219,7 @@ BTRDASD_BIN="$WORK/btrdasd"
 reset
 printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n  B  not mounted\n  C D  not mounted\n' >"$WORK/out"; echo 0 >"$WORK/rc"
 check_recovery_os run
-check "some unmounted: detail names them" "${OP_STATUS[recovery_os_detail]}" "none stale; not mounted: B, C D"
+check "some unmounted: detail names them" "${OP_STATUS[recovery_os_detail]}" "nothing needs attention; not mounted: B, C D"
 printf 'RECOVERY OS\n  B  not mounted\n' >"$WORK/out"
 check_recovery_os run
 check "none mounted: nothing inspected, and which" "${OP_STATUS[recovery_os_detail]}" "nothing inspected; not mounted: B"
