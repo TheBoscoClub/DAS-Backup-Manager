@@ -116,6 +116,7 @@ echo "== backup-run.sh: update_boot_subvolumes, the drift check"
 extract backup-run.sh update_boot_subvolumes "Target HAS btrbk-shaped snapshots but none matched"
 extract backup-run.sh record_op 'OP_STATUS[$op]="$result"'
 extract backup-run.sh probe_mount_point 'LC_ALL=C mountpoint'
+extract backup-run.sh probe_state 'probe_mount_point "$1"'
 
 # The mount points of a run, and what mountpoint says about each (BOOT_MOUNTS,
 # BOOT_PROBES: "<mount>=<answer> ..."; a mount point not named is mounted).
@@ -138,6 +139,8 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         source "$WORK/record_op.sh"
         # shellcheck source=/dev/null
         source "$WORK/probe_mount_point.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/probe_state.sh"
         LISTING="$1"
         declare -A OP_STATUS=()
         declare -A MOUNT_ROLES=()
@@ -177,6 +180,13 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         log_info() { echo "[INFO] $*"; }
         log_warn() { echo "[WARN] $*"; }
         log_error() { echo "[ERROR] $*"; }
+        # A probe that is itself broken (BOOT_PROBE_STUB): it prints nothing,
+        # as when bash could not make its capture, or something nobody
+        # recognises (bd DAS-Backup-Manager-hhow).
+        case "${BOOT_PROBE_STUB:-}" in
+        silent) probe_mount_point() { :; } ;;
+        garbage) probe_mount_point() { echo banana; } ;;
+        esac
         # A full /tmp, as bash meets it: no file it writes may pass 4 KiB,
         # and the write fails (SIGXFSZ ignored) instead of killing it.
         if [[ "${2:-}" == tmp-full ]]; then
@@ -192,6 +202,21 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             unset -f mountpoint
             # shellcheck disable=SC2123  # the point: a PATH with no mountpoint on it
             PATH="$WORK/boot-path"
+        fi
+        if [[ -n "${BOOT_LIMIT:-}" ]]; then
+            # Descriptor starvation (bd DAS-Backup-Manager-hhow): output goes
+            # to a file first, then the limit is lowered, and it is raised
+            # again only to print the result (the soft limit only: a hard
+            # limit, once lowered, cannot be raised). Nothing in between needs
+            # a descriptor the test did not give it. The result is a line of
+            # boot.out: boot_at_limit reads it.
+            limit_before="$(ulimit -S -n)"
+            exec >"$WORK/boot.out" 2>&1
+            ulimit -S -n "$BOOT_LIMIT"
+            update_boot_subvolumes true || true
+            ulimit -S -n "$limit_before"
+            printf 'RESULT %s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
+            exit 0
         fi
         update_boot_subvolumes true >"$WORK/boot.out" 2>&1
         printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
@@ -274,6 +299,48 @@ check "boot subvolumes, first target mounted, second cannot tell: FAIL, the firs
     "FAIL|0 updated, 1 failed 1 filesystem label /mnt/t;subvolume list /mnt/t;"
 check "boot subvolumes, one target cannot tell, one not mounted: FAIL, counted once" \
     "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=notmounted" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+
+# A probe that is itself broken (bd DAS-Backup-Manager-hhow). bash returns 0
+# and an empty string for a command substitution it cannot make, so a probe
+# read from its status read "mounted" exactly when it could not run. Its
+# answer is a printed line now, and one that is empty or unrecognised is
+# "could not tell": neither "mounted" nor "not mounted".
+check "boot subvolumes, a probe that prints nothing: the step FAILS, counted" \
+    "$(BOOT_PROBE_STUB=silent run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, a probe that prints nothing: said, and btrfs never asked" \
+    "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — the mount probe printed nothing (its capture failed?); its boot subvolumes were NOT updated') $(boot_btrfs_calls)" \
+    "1 none"
+check "boot subvolumes, a probe that prints something unrecognised: the step FAILS, counted" \
+    "$(BOOT_PROBE_STUB=garbage run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, a probe that prints something unrecognised: said, naming it, btrfs never asked" \
+    "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — the mount probe printed something unrecognised: banana; its boot subvolumes were NOT updated') $(boot_btrfs_calls)" \
+    "1 none"
+
+# The same under real descriptor starvation, `ulimit -n` 3 to 10, with a
+# mountpoint that needs no descriptor. At 3 nothing at all can be captured; the
+# probe was read as "mounted" there and at 4 (the step went on to a target it
+# had not looked at and recorded OK, 1 skipped), as it was read as "not
+# mounted" before 4.11.3 (OK, 0 skipped). Whatever the limit now: a probe that
+# can only say "not mounted" is never read as "mounted", so the step is either
+# a quiet skip or a FAIL, and one that errs is a FAIL.
+boot_at_limit() { # boot_at_limit <limit>: the step's "<result>|<detail>" with that many descriptors
+    BOOT_LIMIT="$1" run_boot_subvols "$WORK/none-big.txt" >/dev/null
+    sed -n 's/^RESULT //p' "$WORK/boot.out"
+}
+for limit in 3 4 5 6 7 8 9 10; do
+    got_not="$(BOOT_PROBES="/mnt/t=notmounted" boot_at_limit "$limit")"
+    got_err="$(BOOT_PROBES="/mnt/t=error" boot_at_limit "$limit")"
+    verdict=ok
+    case "$got_not" in
+    "OK|0 updated, 0 skipped" | "FAIL|0 updated, 1 failed") ;;
+    *) verdict="a probe saying not mounted gave '$got_not'" ;;
+    esac
+    [[ "$got_err" == "FAIL|0 updated, 1 failed" ]] || verdict="a probe that errs gave '$got_err'"
+    check "boot subvolumes at descriptor limit $limit: no probe is read as the opposite of what it says" "$verdict" "ok"
+done
+check "boot subvolumes at descriptor limit 3: nothing can be captured, so the step FAILS whatever the probe says" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" boot_at_limit 3) / $(BOOT_PROBES="/mnt/t=error" boot_at_limit 3)" \
+    "FAIL|0 updated, 1 failed / FAIL|0 updated, 1 failed"
 
 # ---------------------------------------------------------------------------
 echo "== backup-verify.sh: check_smart_health, the health line"

@@ -4,6 +4,19 @@
 # Date: 2026-10-05
 #
 # Features:
+#   - The mount probe cannot be misread as "mounted" (v4.11.3): bash returns 0
+#     and an empty string for a command substitution it cannot make — no
+#     descriptor free for its pipe, measured at `ulimit -n` 3 and 4 — so the
+#     probe's three answers, read from `$(probe_mount_point …) || rc=$?`, had
+#     a fourth, silent one that read as "mounted": the boot-subvolume step went
+#     on to a target it had not looked at, and the unmount gate took a drive it
+#     could not ask about for one to unmount. probe_mount_point now prints its
+#     answer — "mounted", "not-mounted" or "unknown: <why>" — with mountpoint's
+#     own status inside its capture, and probe_state, its only caller, reads
+#     it: an empty or unrecognised answer is "unknown" at every use — the
+#     boot-subvolume step, the unmount gate's targets and the sources the run
+#     mounted (bd DAS-Backup-Manager-hhow; tests/test_unmount_all.sh,
+#     tests/test_early_exit_readers.sh).
 #   - A dry run's boot-archive cleanup is not a FAIL (v4.11.3):
 #     run_archive_cleanup() requires a per-target summary of the pruner, and
 #     looked only for the real run's, "Deleted N, kept N, errors N". The
@@ -1908,7 +1921,6 @@ run_btrbk() {
 update_boot_subvolumes() {
     local force="${1:-false}"
     local updated=0 skipped=0 failed=0
-    local mount_rc mount_why
     # One timestamp per run (not per subvolume/target) — matches the Rust
     # archive_boot() format exactly so boot-archive-cleanup.sh's
     # parse_archive_timestamp() can parse either origin's archives.
@@ -1920,23 +1932,21 @@ update_boot_subvolumes() {
     # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
     # bootable systems and must never have their @ replaced with host snapshots.
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        # Mounted, not mounted, or could not tell (probe_mount_point). Only the
-        # second is a target to leave alone; the third is a failure of this
-        # step, counted and said. `mountpoint -q ... || continue` read every
-        # failure of the probe — a missing mountpoint program (exit 127), no
-        # descriptor free for its redirection — as "not mounted": the target
-        # was skipped, counted as neither skipped nor failed, and the step
-        # recorded OK, 0 updated, 0 skipped (bd DAS-Backup-Manager-jlsz). Not
-        # seen here: a descriptor shortage so complete that bash cannot make
-        # the pipe of the capture below returns 0 and nothing, which reads as
-        # "mounted" — the limit of every capture, unmount_all's probe included.
-        mount_rc=0
-        mount_why="$(probe_mount_point "$mnt")" || mount_rc=$?
-        case "$mount_rc" in
-            0) ;;
-            1) continue ;;
+        # Mounted, not mounted, or could not tell (probe_state). Only the second
+        # is a target to leave alone; the third — a probe that could not run, a
+        # capture bash could not make, an answer nobody recognises — is a
+        # failure of this step, counted and said. `mountpoint -q ... || continue`
+        # read every failure of the probe — a missing mountpoint program (exit
+        # 127), no descriptor free for its redirection — as "not mounted": the
+        # target was skipped, counted as neither skipped nor failed, and the
+        # step recorded OK, 0 updated, 0 skipped (bd DAS-Backup-Manager-jlsz,
+        # -hhow).
+        probe_state "$mnt"
+        case "$PROBE_STATE" in
+            mounted) ;;
+            not-mounted) continue ;;
             *)
-                log_error "  Could not tell whether $mnt is mounted — $mount_why; its boot subvolumes were NOT updated"
+                log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY; its boot subvolumes were NOT updated"
                 (( failed += 1 ))
                 continue
                 ;;
@@ -2165,29 +2175,87 @@ run_archive_cleanup() {
 # kinds of "no" kept apart. util-linux exits 0 for a mount point, 32 for a
 # path that is not one, and 1 for a usage, permission or system error — and
 # 1 as well for a path that does not exist (measured, util-linux 2.42.4).
-# Returns 0 mounted, 1 not mounted, 2 could not tell, and for "could not
-# tell" prints the probe's own message. A path that does not exist is not
-# mounted (nothing can be mounted where there is nothing), and an
-# unavailable target's mount point is removed on purpose (create_mount_points),
-# so it is told from an error by mountpoint's message, read in the C locale;
-# any other answer is "could not tell". Read as "not mounted", an error left
-# the run's own source mount behind with nothing said (bd
-# DAS-Backup-Manager-8cf, review F1), and passed the target unmount gate
-# while a drive was mounted, so the run said the DAS could be disconnected
-# (bd DAS-Backup-Manager-jug6).
+#
+# The answer is the ONE LINE this prints, never a status: "mounted",
+# "not-mounted", or "unknown: <why>" with the probe's own message. A path that
+# does not exist is not mounted (nothing can be mounted where there is
+# nothing), and an unavailable target's mount point is removed on purpose
+# (create_mount_points), so it is told from an error by mountpoint's message,
+# read in the C locale; any other answer is "unknown". Read as "not mounted",
+# an error left the run's own source mount behind with nothing said (bd
+# DAS-Backup-Manager-8cf, review F1), and passed the target unmount gate while
+# a drive was mounted, so the run said the DAS could be disconnected (bd
+# DAS-Backup-Manager-jug6).
+#
+# Why a printed answer: bash returns 0 and an empty string for a command
+# substitution it cannot make — no descriptor free for its pipe (measured, bash
+# 5.3, `ulimit -n` 3 and 4) — and `$(probe …) || rc=$?` read exactly the probe
+# that could not run as "mounted" (bd DAS-Backup-Manager-hhow). So mountpoint's
+# own status travels inside ITS capture, on a last line of its own, and a
+# capture without that line is no answer, said as "unknown". Callers never
+# capture this themselves: they call probe_state, below.
 probe_mount_point() { # probe_mount_point <path>
-    local rc=0 err
-    err="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null)" || rc=$?
+    local out last rc err
+    out="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    rc="${last#status=}"
+    if [[ "$last" != status=* || ! "$rc" =~ ^[[:digit:]]+$ ]]; then
+        echo "unknown: no answer — the probe's output could not be captured (no descriptor free for its pipe?)"
+        return 0
+    fi
+    err="${out%"$last"}"
+    while [[ "$err" == *$'\n' ]]; do
+        err="${err%$'\n'}"
+    done
     case "$rc" in
-        0) return 0 ;;
-        32) return 1 ;;
+        0)
+            echo mounted
+            return 0
+            ;;
+        32)
+            echo not-mounted
+            return 0
+            ;;
     esac
     if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
-        return 1
+        echo not-mounted
+        return 0
     fi
     err="${err//$'\n'/; }"
-    printf '%s (exit %s)\n' "${err:-mountpoint printed nothing}" "$rc"
-    return 2
+    echo "unknown: ${err:-mountpoint printed nothing} (exit $rc)"
+}
+
+# Ask probe_mount_point and read what it printed into PROBE_STATE — "mounted",
+# "not-mounted" or "unknown" — and, for unknown, PROBE_WHY. THE reading of a
+# probe's answer and the only caller of probe_mount_point: an answer that is
+# empty (bash could not make the capture) or that says anything this does not
+# recognise is "unknown", never "mounted" and never "not mounted" (bd
+# DAS-Backup-Manager-hhow). Called directly, not captured, so there is no
+# second capture to fail silently. Every caller says what it does for
+# "unknown" and lets nothing else reach it.
+PROBE_STATE="unknown"
+PROBE_WHY="no mount probe has run"
+probe_state() { # probe_state <path>
+    local answer
+    answer="$(probe_mount_point "$1")"
+    case "$answer" in
+        mounted | not-mounted)
+            PROBE_STATE="$answer"
+            PROBE_WHY=""
+            ;;
+        "unknown: "?*)
+            PROBE_STATE="unknown"
+            PROBE_WHY="${answer#unknown: }"
+            ;;
+        "")
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed nothing (its capture failed?)"
+            ;;
+        *)
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed something unrecognised: ${answer:0:120}"
+            ;;
+    esac
 }
 
 # The same budget as the Rust path (mount.rs UMOUNT_ATTEMPTS / _RETRY_PAUSE).
@@ -2235,25 +2303,25 @@ unmount_all() {
     # umount did. A probe error used to read as "not mounted": the target
     # was skipped, the gate passed, and the run said the DAS could be
     # disconnected while a drive was mounted (bd DAS-Backup-Manager-jug6).
-    local mnt target_rc target_why
+    local mnt why
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
         mnt="${ALL_TARGET_MOUNTS[$i]}"
-        target_rc=0
-        target_why="$(probe_mount_point "$mnt")" || target_rc=$?
-        case "$target_rc" in
-            0)
+        probe_state "$mnt"
+        why="$PROBE_WHY"
+        case "$PROBE_STATE" in
+            mounted)
                 if ! umount_with_retry "$mnt"; then
                     log_error "  Failed to unmount $mnt"
                     still_mounted+=("$mnt")
                 fi
                 ;;
-            1) ;;
+            not-mounted) ;;
             *)
-                log_error "  Could not tell whether $mnt is mounted — $target_why; unmounting it anyway"
+                log_error "  Could not tell whether $mnt is mounted — $why; unmounting it anyway"
                 if umount_with_retry "$mnt"; then
-                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount then succeeded")
+                    not_known+=("could not tell whether $mnt is mounted — $why; umount then succeeded")
                 else
-                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount failed too")
+                    not_known+=("could not tell whether $mnt is mounted — $why; umount failed too")
                 fi
                 ;;
         esac
@@ -2279,19 +2347,18 @@ unmount_all() {
     # umount's own message (which used to be discarded), is left as it is,
     # and stays the run's, for a later pass to try again.
     local -a owned=("${SOURCE_MOUNTS_OWNED[@]}")
-    local src_mnt umount_err probe_rc probe_why left
+    local src_mnt umount_err left
     for (( i=${#owned[@]}-1; i>=0; i-- )); do
         src_mnt="${owned[$i]}"
-        probe_rc=0
-        probe_why="$(probe_mount_point "$src_mnt")" || probe_rc=$?
-        if ((probe_rc == 1)); then
+        probe_state "$src_mnt"
+        if [[ "$PROBE_STATE" == not-mounted ]]; then
             disown_source_mount "$src_mnt"
             log_info "  Source volume $src_mnt, recorded as this run's, is not mounted now — nothing to unmount"
             continue
         fi
         left="left mounted"
-        if ((probe_rc != 0)); then
-            log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $probe_why; unmounting it anyway"
+        if [[ "$PROBE_STATE" != mounted ]]; then
+            log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $PROBE_WHY; unmounting it anyway"
             left="left as it is"
         fi
         if umount_err="$(umount "$src_mnt" 2>&1)"; then
