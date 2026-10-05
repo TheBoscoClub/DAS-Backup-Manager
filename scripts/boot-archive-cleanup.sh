@@ -11,6 +11,14 @@
 # at the end of every run (daily and full) while targets are still mounted —
 # it was previously installed but never called by anything (DAS-Backup-Manager-64h).
 #
+# v2.1.2: a dry run prints the same per-target summary as a real run — "Would
+# delete N, kept N, errors N" where a run says "Deleted N, kept N, errors N" —
+# and counts what it would delete. It printed "Would keep N, found expired
+# archives above", which backup-run.sh's check for a per-target summary never
+# matched, so every dry run of the backup, the install script's included,
+# recorded this step as FAILED and exited 3 (bd DAS-Backup-Manager-zwr;
+# tests/test_boot_archive_cleanup.sh).
+#
 # v2.1.2: the two guards that stand between a listing line and `btrfs
 # subvolume delete` name their characters outright. Under en_US.UTF-8 bash's
 # regex range [A-Za-z] also matches accented and fullwidth letters (about
@@ -117,7 +125,7 @@ parse_archive_timestamp() {
 
 cleanup_target() {
     local mnt="$1"
-    local deleted=0 kept=0 errors=0
+    local deleted=0 kept=0 errors=0 would_delete=0
 
     if ! mountpoint -q "$mnt" 2>/dev/null; then
         log_info "  Skipping $mnt (not mounted - nothing examined)"
@@ -206,6 +214,7 @@ cleanup_target() {
             local age_days=$(( ($(date '+%s') - archive_epoch) / 86400 ))
             if $DRYRUN; then
                 log_warn "  [DRYRUN] Would delete: $subvol_path ($age_days days old)"
+                (( would_delete += 1 ))
             else
                 local delete_err
                 # 2>&1 >/dev/null keeps stderr only: the errno text is the whole
@@ -225,8 +234,11 @@ cleanup_target() {
 
     DELETE_ERRORS=$(( DELETE_ERRORS + errors ))
 
+    # One shape for both modes: backup-run.sh reads it back, and requires this
+    # mode's own verb (bd DAS-Backup-Manager-zwr). A dry run deletes nothing, so
+    # its errors stay 0.
     if $DRYRUN; then
-        log_info "  [$label] Would keep $kept, found expired archives above"
+        log_info "  [$label] Would delete $would_delete, kept $kept, errors $errors"
     else
         log_info "  [$label] Deleted $deleted, kept $kept, errors $errors"
     fi
