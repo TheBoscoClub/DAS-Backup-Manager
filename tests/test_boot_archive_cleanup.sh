@@ -20,6 +20,20 @@
 #     letter or digit (C and C.UTF-8 show nothing) they could not fail, so
 #     they print NOT RUN instead of passing. The ASCII cases run everywhere.
 #
+#   - What it prints, and how backup-run.sh reads it back (bd
+#     DAS-Backup-Manager-zwr). run_archive_cleanup() calls the pruner and
+#     refuses to call a run OK unless the pruner printed a per-target summary
+#     of its own mode: "Deleted N, kept N, errors N" in a real run, "Would
+#     delete N, kept N, errors N" in a dry run. The pruner's dry run printed
+#     "Would keep N, found expired archives above" — which the reader never
+#     matched, so every dry run of the backup recorded this step as FAILED and
+#     exited 3 — while the exit suite's stub pruner printed the real run's
+#     line whatever it was asked, so nothing ever saw it. Here the two are run
+#     as the host runs them, the REAL reader (extracted from backup-run.sh)
+#     over the REAL pruner's own output, both ways: a dry run and a real run
+#     with a summary are OK; a run with none, a pruner that failed, and one
+#     that printed the other mode's summary are not.
+#
 # How: the REAL script runs from a copy in which exactly one line differs, the
 # root check, which reads DAS_TEST_EUID. It runs under `env -i` with a PATH of
 # stubs (btrdasd, mountpoint, btrfs) and a few harmless tools: a command the
@@ -167,6 +181,7 @@ RC=""
 run_pruner() { # run_pruner <locale> [args...]
     local loc="$1"
     shift
+    rm -f "$STATE/deleted" # what a run deletes is that run's own
     env -i PATH="$BIN:$SYSBIN" HOME="$WORK/home" LC_ALL="$loc" TMPDIR="$WORK/tmp" \
         DAS_TEST_STATE="$STATE" DAS_TEST_EUID=0 \
         BTRDASD_BIN="$BIN/btrdasd" DAS_CONFIG="$WORK/config.toml" \
@@ -247,6 +262,120 @@ else
     NOT_RUN="the en_US.UTF-8 cases: bash's [A-Za-z] and [0-9] match no non-ASCII letter or digit here (locale missing?)"
     echo "NOT RUN: $NOT_RUN"
 fi
+
+# ---------------------------------------------------------------------------
+echo "== what the pruner prints, and the reader of it: run_archive_cleanup (bd zwr)"
+# ---------------------------------------------------------------------------
+# The reader, as the script has it, and the pruner as the host calls it: by
+# path, with its own arguments. PRUNER_FORCE=dry or real makes the pruner run in
+# that mode whatever it was asked, to hand the reader the other mode's output.
+extract() { sed -n "/^$1() {/,/^}/p" "$ROOT/scripts/backup-run.sh"; }
+for fn in run_archive_cleanup record_op; do
+    body="$(extract "$fn")"
+    [[ -n "$body" ]] || harness_broken "$fn not found in backup-run.sh"
+    eval "$body"
+done
+log_info() { echo "INFO: $*" >>"$WORK/reader.log"; }
+log_warn() { echo "WARN: $*" >>"$WORK/reader.log"; }
+declare -A OP_STATUS=()
+cat >"$WORK/pruner" <<EOF
+#!/bin/bash
+case "\${PRUNER_FORCE:-}" in
+dry) set -- --dryrun ;;
+real) set -- ;;
+esac
+exec env -i PATH="$BIN:$SYSBIN" HOME="$WORK/home" LC_ALL=C TMPDIR="$WORK/tmp" \\
+    DAS_TEST_STATE="$STATE" DAS_TEST_EUID=0 \\
+    BTRDASD_BIN="$BIN/btrdasd" DAS_CONFIG="$WORK/config.toml" \\
+    "$BASH" "$COPY" "\$@"
+EOF
+chmod +x "$WORK/pruner"
+
+# read_back <dryrun|real>: the reader's verdict on the real pruner, under the
+# shell options backup-run.sh runs under: "<status>|<detail>".
+read_back() {
+    rm -f "$STATE/deleted" # what a run deletes is that run's own
+    (
+        set -euo pipefail
+        : >"$WORK/reader.log"
+        OP_STATUS=()
+        # shellcheck disable=SC2034  # read by the extracted run_archive_cleanup
+        BOOT_ARCHIVE_CLEANUP_BIN="$WORK/pruner"
+        run_archive_cleanup "$1"
+        printf '%s|%s\n' "${OP_STATUS[archive_cleanup]:-unset}" "${OP_STATUS[archive_cleanup_detail]:-}"
+    )
+}
+status_of() { echo "${1%%|*}"; }
+detail_starts() { # detail_starts <verdict> <text>: does the detail begin with <text>?
+    local detail="${1#*|}"
+    if [[ "$detail" == "$2"* ]]; then echo yes; else echo "no ($detail)"; fi
+}
+reader_said() { grep -cF -- "$1" "$WORK/reader.log"; }
+
+# Two expired archives and one in the future: a run deletes two and keeps one.
+fresh
+listing "$ASCII_OLD" "$HOME_OLD" "$FUTURE" "$OTHER"
+
+run_pruner C --dryrun
+check "pruner, dry run: exit status" "$RC" "0"
+check "pruner, dry run: the summary has the real run's shape, counting what it would delete" \
+    "$(said 'Would delete 2, kept 1, errors 0')" "1"
+check "pruner, dry run: the line that no reader matched is gone" "$(said 'Would keep')" "0"
+check "pruner, dry run: nothing is asked of btrfs to delete" "$(deleted)" ""
+run_pruner C
+check "pruner, real run: exit status" "$RC" "0"
+check "pruner, real run: the summary" "$(said 'Deleted 2, kept 1, errors 0')" "1"
+check "pruner, real run: the two expired archives were asked to be deleted" "$(deleted)" "$ASCII_OLD $HOME_OLD "
+
+verdict="$(read_back dryrun)"
+check "reader, a dry run over the real pruner: OK" "$(status_of "$verdict")" "OK"
+check "reader, a dry run: the detail is the dry run's own summary" \
+    "$(detail_starts "$verdict" 'Would delete 2, kept 1, errors 0')" "yes"
+check "reader, a dry run: the pruner deleted nothing" "$(deleted)" ""
+verdict="$(read_back real)"
+check "reader, a real run over the real pruner: OK" "$(status_of "$verdict")" "OK"
+check "reader, a real run: the detail is the run's own summary" \
+    "$(detail_starts "$verdict" 'Deleted 2, kept 1, errors 0')" "yes"
+check "reader, a real run: the pruner deleted the two" "$(deleted)" "$ASCII_OLD $HOME_OLD "
+
+# A pruner that examined nothing prints no summary and exits 0: the reader must
+# not call it OK, in either mode. The primary is not mounted; the other target
+# is a mirror, skipped by design.
+fresh
+rm -f "$STATE/mounted/primary"
+run_pruner C --dryrun
+check "pruner, nothing mounted: exit status 0 and no summary (it is the reader that must decide)" \
+    "$RC $(said 'Would delete') $(said 'Deleted')" "0 0 0"
+for mode in dryrun real; do
+    verdict="$(read_back "$mode")"
+    check "reader, $mode with no summary: FAIL" "$(status_of "$verdict")" "FAIL"
+    check "reader, $mode with no summary: the detail says so" \
+        "$(detail_starts "$verdict" 'exit 0 with no summary line')" "yes"
+done
+read_back dryrun >/dev/null
+check "reader, a dry run with no summary: the warning names the dry run's shape" \
+    "$(reader_said 'no per-target summary (Would delete N, kept N, errors N)')" "1"
+read_back real >/dev/null
+check "reader, a real run with no summary: the warning names the real run's shape" \
+    "$(reader_said 'no per-target summary (Deleted N, kept N, errors N)')" "1"
+
+# A summary of the other mode is not this mode's: a real run that ran dry, or a
+# dry run that ran for real, did not do what it was asked.
+fresh
+listing "$ASCII_OLD" "$HOME_OLD" "$FUTURE" "$OTHER"
+verdict="$(PRUNER_FORCE=dry read_back real)"
+check "reader, a real run whose pruner ran dry: FAIL" "$(status_of "$verdict")" "FAIL"
+check "reader, a real run whose pruner ran dry: nothing was deleted" "$(deleted)" ""
+verdict="$(PRUNER_FORCE=real read_back dryrun)"
+check "reader, a dry run whose pruner ran for real: FAIL" "$(status_of "$verdict")" "FAIL"
+
+# A pruner that failed is a FAIL by its exit status, as before: no listing for
+# the primary is a target not pruned, and the run says so.
+fresh
+for mode in dryrun real; do
+    verdict="$(read_back "$mode")"
+    check "reader, $mode, the pruner failed (no listing): FAIL by its exit status" "$verdict" "FAIL|exit code 1"
+done
 
 echo
 echo "passed=$pass failed=$fail"

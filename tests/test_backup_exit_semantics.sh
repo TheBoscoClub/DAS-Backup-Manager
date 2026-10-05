@@ -479,8 +479,17 @@ fi
 exec "$(cat "$S/real_flock")" "$@"
 EOF
 
+# The two summaries the real pruner prints, a real run's and a dry run's (bd
+# DAS-Backup-Manager-zwr). The stub used to print the first whatever it was
+# asked, so a dry run passed here and failed on the host. This stub is only as
+# faithful as this text: tests/test_boot_archive_cleanup.sh runs the pruner
+# itself and reads its output back through run_archive_cleanup.
 stub boot-archive-cleanup.sh <<'EOF'
-echo "[das-backup-22tb] Deleted 0, kept 0, errors 0"
+if [[ " $* " == *" --dryrun "* ]]; then
+    echo "[das-backup-22tb] Would delete 0, kept 0, errors 0"
+else
+    echo "[das-backup-22tb] Deleted 0, kept 0, errors 0"
+fi
 EOF
 
 # ---------------------------------------------------------------------------

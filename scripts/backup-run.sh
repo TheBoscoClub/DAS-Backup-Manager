@@ -4,6 +4,18 @@
 # Date: 2026-10-05
 #
 # Features:
+#   - A dry run's boot-archive cleanup is not a FAIL (v4.11.3):
+#     run_archive_cleanup() requires a per-target summary of the pruner, and
+#     looked only for the real run's, "Deleted N, kept N, errors N". The
+#     pruner's dry run printed "Would keep N, found expired archives above",
+#     so every dry run, the install script's included, logged "printed no
+#     per-target summary", recorded archive_cleanup as FAILED and exited 3,
+#     a false failure that trains the operator to ignore the line.
+#     boot-archive-cleanup.sh 2.1.2 now prints "Would delete N, kept N, errors
+#     N" in a dry run, one shape for both modes, and each mode here requires
+#     its own verb: a real run that printed the dry run's, or a dry run that
+#     printed the real run's, is still a FAIL, and so is a run with no summary
+#     at all (bd DAS-Backup-Manager-zwr; tests/test_boot_archive_cleanup.sh).
 #   - The boot-subvolume step tells "not mounted" from "could not tell"
 #     (v4.11.3): update_boot_subvolumes() asks probe_mount_point, whose three
 #     answers it used to fold into two. A target whose mountpoint check could
@@ -2118,11 +2130,25 @@ run_archive_cleanup() {
         # whose value never varies is not a status field. Require a real
         # per-target summary line to be present before calling this OK.
         # bd nsp (c10).
-        local cleanup_summary
+        #
+        # The summary has one shape and this mode's own verb: a real run says
+        # "Deleted N, kept N, errors N", a dry run "Would delete N, kept N,
+        # errors N". Only the first was ever looked for, and the pruner's dry
+        # run printed another line, so every dry run said "no per-target
+        # summary" and was a FAIL (bd DAS-Backup-Manager-zwr). Each mode still
+        # accepts only its own: a real run that printed "Would delete" ran
+        # dry, and a dry run that printed "Deleted" ran for real, and
+        # neither did what it was asked to.
+        local cleanup_summary summary_form="Deleted N, kept N, errors N"
+        local summary_re='Deleted [[:digit:]]+, kept [[:digit:]]+, errors [[:digit:]]+'
+        if [[ "$mode" == "dryrun" ]]; then
+            summary_form="Would delete N, kept N, errors N"
+            summary_re='Would delete [[:digit:]]+, kept [[:digit:]]+, errors [[:digit:]]+'
+        fi
         cleanup_summary=$(printf '%s\n' "$cleanup_output" \
-            | grep -oE 'Deleted [0-9]+, kept [0-9]+, errors [0-9]+' | tr '\n' '; ') || true
+            | grep -oE "$summary_re" | tr '\n' '; ') || true
         if [[ -z "$cleanup_summary" ]]; then
-            log_warn "Boot archive cleanup exited 0 but printed no per-target summary — treating as FAIL"
+            log_warn "Boot archive cleanup exited 0 but printed no per-target summary ($summary_form) — treating as FAIL"
             record_op "archive_cleanup" "FAIL" "exit 0 with no summary line; pruner may have examined nothing"
         else
             record_op "archive_cleanup" "OK" "${cleanup_summary%; }"
