@@ -148,6 +148,10 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         for m in "${ALL_TARGET_MOUNTS[@]}"; do
             MOUNT_ROLES[$m]=primary
         done
+        # BOOT_MIRRORS: the mount points among them that are mirrors.
+        for m in ${BOOT_MIRRORS:-}; do
+            MOUNT_ROLES[$m]=mirror
+        done
         mountpoint() {
             local p="${!#}" pair
             for pair in ${BOOT_PROBES:-}; do
@@ -281,6 +285,27 @@ check "boot subvolumes, the probe cannot tell: the step FAILS, counted" \
 check "boot subvolumes, cannot tell: said, with the target and the probe's own message" \
     "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — mountpoint: /mnt/t: Input/output error (exit 1); its boot subvolumes were NOT updated')" "1"
 check "boot subvolumes, cannot tell: btrfs never asked — nothing was touched" "$(boot_btrfs_calls)" "none"
+
+# A mirror the probe cannot tell about (independent review, M1). The step
+# never updates a mirror's boot subvolumes — it carries another OS — so the
+# wording above, "its boot subvolumes were NOT updated", misstates what
+# happened to it. It still FAILS and is counted (a probe that errs on any
+# target is worth a failed run, and the unmount gate fails on the same probe),
+# and it is said as what it is: a mirror that could not be checked.
+check "boot subvolumes, a mirror the probe cannot tell about: the step still FAILS, counted" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=error" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, a mirror cannot tell: says it is a mirror that could not be checked, with the probe's own message" \
+    "$(said_boot "[ERROR]   Could not tell whether /mnt/t, a mirror, is mounted — mountpoint: /mnt/t: Input/output error (exit 1); it could not be checked (its boot subvolumes are never updated here)")" "1"
+check "boot subvolumes, a mirror cannot tell: nothing claims boot subvolumes were left un-updated" \
+    "$(said_boot 'NOT updated')" "0"
+check "boot subvolumes, a mirror cannot tell: btrfs never asked" "$(boot_btrfs_calls)" "none"
+check "boot subvolumes, a mounted mirror: the quiet skip, as before" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=mounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 1 skipped"
+check "boot subvolumes, a mirror that is not mounted: a quiet skip, as before" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
+check "boot subvolumes, a primary and a mirror that cannot tell: each says its own, the step counts both" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_MIRRORS=/mnt/u BOOT_PROBES="/mnt/t=error /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot ' /mnt/t is mounted — mountpoint: /mnt/t: Input/output error (exit 1); its boot subvolumes were NOT updated') $(said_boot ' /mnt/u, a mirror, is mounted — mountpoint: /mnt/u: Input/output error (exit 1); it could not be checked')" \
+    "FAIL|0 updated, 2 failed 1 1"
 
 # No mountpoint program at all (exit 127), the case the tracker names: the old
 # code skipped the target and recorded OK.
