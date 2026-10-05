@@ -54,7 +54,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in umount_with_retry unmount_all record_op mount_sources owns_source_mount disown_source_mount probe_mount_point; do
+for fn in umount_with_retry unmount_all record_op mount_sources owns_source_mount disown_source_mount probe_mount_point probe_state; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -78,6 +78,21 @@ mountpoint() {
     name="$(basename "$p")"
     if [[ -e "$WORK/probe_errors/$name" ]]; then
         echo "mountpoint: $p: Input/output error" >&2
+        return 1
+    fi
+    # An exit status of its own, with nothing said ($WORK/probe_rc/<name> holds
+    # it), and an error that takes two lines ($WORK/probe_two/<name>).
+    if [[ -e "$WORK/probe_rc/$name" ]]; then
+        return "$(cat "$WORK/probe_rc/$name")"
+    fi
+    if [[ -e "$WORK/probe_two/$name" ]]; then
+        echo "mountpoint: first line" >&2
+        echo "second line" >&2
+        return 1
+    fi
+    # An error whose message ends the way the helper's own status line does.
+    if [[ -e "$WORK/probe_fake/$name" ]]; then
+        echo "status=0" >&2
         return 1
     fi
     if [[ -e "$WORK/absent/$name" ]]; then
@@ -126,8 +141,8 @@ fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
 
 setup() {
-    rm -rf "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab"
-    mkdir -p "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab"
+    rm -rf "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab" "$WORK/probe_rc" "$WORK/probe_two" "$WORK/probe_fake"
+    mkdir -p "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab" "$WORK/probe_rc" "$WORK/probe_two" "$WORK/probe_fake"
     : >"$WORK/umount_calls"; : >"$WORK/mount_calls"; : >"$WORK/sleeps"; : >"$WORK/log"
     declare -gA OP_STATUS=()
     declare -gA SOURCE_VOLUMES=()
@@ -436,6 +451,147 @@ check "fstab does not declare it, or it was found mounted: nothing said" \
 unmount_all
 check "fstab declares it: still the run's helper, taken down once; fstab's other mount untouched" \
     "$(calls /.btrfs-hdd) $(calls /dasRaid0)" "1 0"
+
+# --- the probe's answer is a line it prints; an empty or unrecognised one is "could not tell" (bd hhow) ---
+# bash returns 0 and an empty string for a command substitution it cannot make —
+# no descriptor free for its pipe — so a probe read from `$(probe …) || rc=$?`
+# had a fourth answer, silent, that read as "mounted": the unmount gate took a
+# drive it could not ask about for one to unmount, and the boot-subvolume step
+# went on to a target it had not looked at. probe_mount_point prints
+# "mounted", "not-mounted" or "unknown: <why>", mountpoint's own status inside
+# its capture, and probe_state reads the line: anything else is "unknown".
+real_probe="$(declare -f probe_mount_point)"
+state_of() { probe_state "$1"; echo "$PROBE_STATE|$PROBE_WHY"; }
+
+# What the helper prints, for each way mountpoint can answer.
+setup
+touch "$WORK/probe_errors/err" "$WORK/absent/gone" "$WORK/mounted/mnt" "$WORK/probe_two/two" "$WORK/probe_fake/fake"
+echo 2 >"$WORK/probe_rc/rc2"
+echo 143 >"$WORK/probe_rc/killed"
+check "probe prints 'mounted' for a mount point" "$(probe_mount_point /x/mnt)" "mounted"
+check "probe prints 'not-mounted' for a path that is not one" "$(probe_mount_point /x/plain)" "not-mounted"
+check "probe prints 'not-mounted' for a path that is not there" "$(probe_mount_point /x/gone)" "not-mounted"
+check "probe prints 'unknown' with mountpoint's message and status for an error" \
+    "$(probe_mount_point /x/err)" "unknown: mountpoint: /x/err: Input/output error (exit 1)"
+check "probe joins a two-line message with '; '" \
+    "$(probe_mount_point /x/two)" "unknown: mountpoint: first line; second line (exit 1)"
+check "probe says so when mountpoint exits 2 and says nothing" \
+    "$(probe_mount_point /x/rc2)" "unknown: mountpoint printed nothing (exit 2)"
+check "probe says so when mountpoint is killed by TERM (143)" \
+    "$(probe_mount_point /x/killed)" "unknown: mountpoint printed nothing (exit 143)"
+check "probe is not fooled by a message that ends in 'status=0'" \
+    "$(probe_mount_point /x/fake)" "unknown: status=0 (exit 1)"
+# A capture that lost its status line is no answer, and is never "mounted".
+# Only the capture's own failure can drop the line (printf, a builtin, cannot
+# fail), so it is simulated: a printf that prints nothing.
+lost="$( (printf() { :; }; probe_mount_point /x/mnt) )" || true
+check "probe says so when its capture lost the status line, and does not call it mounted" \
+    "$lost" "unknown: no answer — the probe's output could not be captured (no descriptor free for its pipe?)"
+mkdir -p "$WORK/no-tools"
+# shellcheck disable=SC2123  # the point: a PATH with no mountpoint on it
+no_program="$( (unset -f mountpoint; PATH="$WORK/no-tools"; probe_mount_point /x/mnt) )" || true
+check "probe says so when there is no mountpoint program (exit 127)" \
+    "$([[ "$no_program" == "unknown: "*"mountpoint: command not found (exit 127)" ]] && echo yes || echo "no: $no_program")" "yes"
+
+# How a caller reads it.
+check "probe_state: a mount point" "$(state_of /x/mnt)" "mounted|"
+check "probe_state: not one" "$(state_of /x/plain)" "not-mounted|"
+check "probe_state: an error is unknown, with the reason" \
+    "$(state_of /x/err)" "unknown|mountpoint: /x/err: Input/output error (exit 1)"
+probe_mount_point() { :; }
+check "probe_state, a probe that prints nothing: unknown, never mounted" \
+    "$(state_of /x/mnt)" "unknown|the mount probe printed nothing (its capture failed?)"
+probe_mount_point() { echo banana; }
+check "probe_state, a probe that prints something else: unknown" \
+    "$(state_of /x/mnt)" "unknown|the mount probe printed something unrecognised: banana"
+probe_mount_point() { printf 'mounted\nand something more\n'; }
+check "probe_state, an answer with more than the answer in it: unknown" \
+    "$(state_of /x/mnt | head -n 1)" "unknown|the mount probe printed something unrecognised: mounted"
+eval "$real_probe"
+
+# The unmount gate, with a probe that says nothing: the same FAIL as for an
+# error, naming both targets, the unmount tried anyway, never "safe".
+setup
+probe_mount_point() { :; }
+unmount_all
+check "gate, a probe that prints nothing: the unmount FAILS" "${OP_STATUS[unmount]:-<none>}" "FAIL"
+check "gate, a probe that prints nothing: the detail names both targets and why" \
+    "${OP_STATUS[unmount_detail]:-<none>}" \
+    "could not tell whether /mnt/backup-system-recovery-A is mounted — the mount probe printed nothing (its capture failed?); umount then succeeded; could not tell whether /mnt/backup-22tb is mounted — the mount probe printed nothing (its capture failed?); umount then succeeded"
+check "gate, a probe that prints nothing: each target is still unmounted, once" \
+    "$(calls /mnt/backup-22tb) $(calls /mnt/backup-system-recovery-A) $(is_mounted /mnt/backup-22tb) $(is_mounted /mnt/backup-system-recovery-A)" "1 1 no no"
+check "gate, a probe that prints nothing: said as an error, per target" \
+    "$(grep -c '^ERROR:   Could not tell whether /mnt/backup-.* is mounted — the mount probe printed nothing' "$WORK/log" || true)" "2"
+eval "$real_probe"
+
+setup
+probe_mount_point() { echo banana; }
+unmount_all
+check "gate, a probe that prints something unrecognised: the unmount FAILS, naming it" \
+    "${OP_STATUS[unmount]:-<none>} $(grep -c 'could not tell whether /mnt/backup-22tb is mounted — the mount probe printed something unrecognised: banana; umount then succeeded' <<<"${OP_STATUS[unmount_detail]:-}" || true)" \
+    "FAIL 1"
+eval "$real_probe"
+
+# The sources the run mounted: said, with the reason, and unmounted anyway.
+setup
+sources hdd-media=/.btrfs-hdd
+mount_sources
+probe_mount_point() { :; }
+unmount_all
+check "source, a probe that prints nothing: said, with why, and unmounted anyway" \
+    "$(logged 'WARN:   Could not tell whether source volume /.btrfs-hdd, which this run mounted, is still mounted — the mount probe printed nothing (its capture failed?); unmounting it anyway')" "1"
+check "source, a probe that prints nothing: unmounted once, and struck off" \
+    "$(calls /.btrfs-hdd) $(is_mounted /.btrfs-hdd)" "1 no"
+check "source, a probe that prints nothing: the run's own unmount is logged" \
+    "$(logged 'INFO:   Unmounted source volume /.btrfs-hdd (this run mounted it)')" "1"
+eval "$real_probe"
+
+# Descriptor starvation. The limit is lowered in a subshell whose output is on
+# a file already, and the stub mountpoint is a function that needs no
+# descriptor (the file-backed one above captures basename's output). Whatever
+# the limit, a probe is never read as the opposite of what it can say: one
+# that can only say "not mounted" is never "mounted", one that can only say
+# "mounted" is never "not mounted", and one that errs is always unknown. At 3
+# nothing at all can be captured, so every answer is unknown; with the old
+# reading each of those three was "mounted".
+at_limit() { # at_limit <limit> <mounted|notmounted|error>: probe_state's answer
+    local out="$WORK/limit.out"
+    : >"$out"
+    (
+        MODE="$2"
+        mountpoint() {
+            case "$MODE" in
+                mounted) return 0 ;;
+                notmounted) return 32 ;;
+                error)
+                    echo "mountpoint: $1: Input/output error" >&2
+                    return 1
+                    ;;
+            esac
+        }
+        ulimit -n "$1"
+        probe_state /x/m
+        printf '%s\n' "$PROBE_STATE"
+    ) >"$out" 2>/dev/null
+    cat "$out"
+}
+for limit in 3 4 5 6 7 8 9 10; do
+    got_mounted="$(at_limit "$limit" mounted)"
+    got_not="$(at_limit "$limit" notmounted)"
+    got_error="$(at_limit "$limit" error)"
+    verdict=ok
+    [[ "$got_mounted" == mounted || "$got_mounted" == unknown ]] || verdict="a probe saying mounted read as '$got_mounted'"
+    [[ "$got_not" == not-mounted || "$got_not" == unknown ]] || verdict="a probe saying not mounted read as '$got_not'"
+    [[ "$got_error" == unknown ]] || verdict="a probe that errs read as '$got_error'"
+    check "descriptor limit $limit: no probe is read as the opposite of what it says" "$verdict" "ok"
+done
+check "descriptor limit 3: nothing can be captured, so every answer is unknown" \
+    "$(at_limit 3 mounted) $(at_limit 3 notmounted) $(at_limit 3 error)" "unknown unknown unknown"
+
+# Nothing but probe_state may capture the probe: it is named in code twice
+# only, by its definition and by probe_state's one call.
+check "probe_mount_point is named in code only by its definition and by probe_state" \
+    "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'probe_mount_point')" "2"
 
 if [[ $fails -eq 0 ]]; then
     echo "UNMOUNT RETRY SUITE GREEN"
