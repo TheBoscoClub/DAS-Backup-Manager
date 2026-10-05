@@ -176,7 +176,7 @@ Checked before any directory is created, both roots compared **after resolution*
     `SuccessExitStatus=1`, and that line is load-bearing.
 - Sentinel matches unit names by exact string — no globs. Prefer single non-template units.
 
-## The CLI/GUI Backup Touches Only What Was Selected (bd `7tx`)
+## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
 - `btrdasd backup run|snapshot|send` and the GUI hand btrbk **only** the selected sources and targets,
   as filter arguments, one per (subvolume, target) pair: `<target dir>/<snapshot_name>`
   (`btrbk_conf::declared_pairs`, `backup::btrbk_filters`). Never a volume path (it cannot tell two
@@ -184,6 +184,9 @@ Checked before any directory is created, both roots compared **after resolution*
   are a union, and a matched subvolume keeps every target).
 - A label that is not in the configuration, or a selection that leaves nothing, **refuses** the step.
   An empty filter list is btrbk's "everything": it is passed only when the selection IS everything.
+- The run mounts **nothing** itself. `mount::ensure_sources_mounted` and `ensure_targets_mounted` mount,
+  and the `MountGuard` each returns records what it mounted and gives exactly that back; `run_backup`
+  only checks that each selected source's volume is a mount point and refuses if not (bd `7tx`, `8cf`).
 - An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
   is the first primary target, so a reduced config renders the other targets' retention differently.

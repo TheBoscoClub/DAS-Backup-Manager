@@ -166,54 +166,6 @@ pub struct BackupResult {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Ensure source top-level volumes are mounted (subvolid=5).
-///
-/// btrbk needs the raw BTRFS volume mounted to see subvolumes.  The backup
-/// shell script (`backup-run.sh`) does this, but the Rust CLI/GUI code path
-/// calls btrbk directly.  This function mounts any unmounted source volumes.
-fn ensure_sources_mounted(
-    config: &Config,
-    progress: &dyn ProgressCallback,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
-    for src in &config.sources {
-        if !seen.insert((&src.volume, &src.device)) {
-            continue;
-        }
-        let mount_path = std::path::Path::new(&src.volume);
-        if !mount_path.exists() {
-            std::fs::create_dir_all(mount_path)?;
-        }
-        // Check if already mounted
-        let check = Command::new("mountpoint")
-            .arg("-q")
-            .arg(&src.volume)
-            .status();
-        if check.map(|s| s.success()).unwrap_or(false) {
-            continue;
-        }
-        progress.on_log(
-            LogLevel::Info,
-            &format!("Mounting source volume {} from {}", src.volume, src.device),
-        );
-        let status = Command::new("mount")
-            .arg("-o")
-            .arg("subvolid=5")
-            .arg(&src.device)
-            .arg(&src.volume)
-            .status()?;
-        if !status.success() {
-            return Err(format!(
-                "Failed to mount source volume {} from {}",
-                src.volume, src.device
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
 /// Build a timestamp string in YYYYMMDDTHHMMSS format using SystemTime.
 /// Uses libc localtime_r to convert to local time without extra dependencies.
 fn format_timestamp() -> String {
@@ -406,6 +358,8 @@ struct StepEnv<'a> {
     /// writing to a bare mount point falls through to the root filesystem,
     /// bd DAS-Backup-Manager-9on).
     verify: &'a VerifyTargets<'a>,
+    /// Whether a path is a mount point now (`health::is_mountpoint`).
+    is_mountpoint: &'a dyn Fn(&Path) -> bool,
 }
 
 /// The check behind [`StepEnv::verify`]: the targets (all configured ones),
@@ -417,6 +371,7 @@ impl StepEnv<'static> {
     const HOST: StepEnv<'static> = StepEnv {
         runner: &SystemRunner,
         verify: &mount::verify_write_targets,
+        is_mountpoint: &health::is_mountpoint,
     };
 }
 
@@ -1454,6 +1409,27 @@ fn emails_report(options: &BackupOptions, config: &Config) -> bool {
     options.send_report && config.email.enabled
 }
 
+/// The volumes of the `sources` selected that are not mounted, as `<volume>
+/// (source '<label>')`, one per volume. Read-only: it mounts nothing.
+fn unmounted_source_volumes(
+    config: &Config,
+    sources: &[String],
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+) -> Vec<String> {
+    let mut volumes: Vec<&str> = Vec::new();
+    let mut unmounted = Vec::new();
+    for source in config.sources.iter().filter(|s| sources.contains(&s.label)) {
+        if volumes.contains(&source.volume.as_str()) {
+            continue;
+        }
+        volumes.push(&source.volume);
+        if !is_mountpoint(Path::new(&source.volume)) {
+            unmounted.push(format!("{} (source '{}')", source.volume, source.label));
+        }
+    }
+    unmounted
+}
+
 /// The source labels a run backs up: the ones named or — when none are —
 /// every source with at least one subvolume that is not manual-only.
 fn effective_sources(config: &Config, options: &BackupOptions) -> Vec<String> {
@@ -1739,8 +1715,19 @@ fn run_backup_with(
     //   The complete backup lifecycle including housekeeping.  Deletes
     //   snapshots and backups outside the configured retention windows.
 
-    // Mount source top-level volumes (subvolid=5) so btrbk can see subvolumes.
-    ensure_sources_mounted(config, progress)?;
+    // The caller mounted the source volumes (`mount::ensure_sources_mounted`
+    // owns whatever it mounted and gives it back), and a run that does not
+    // find them refuses rather than mount them itself: this function used to
+    // mount any it did not find, outside that guard, and nothing ever
+    // unmounted them (bd DAS-Backup-Manager-7tx 3, -8cf).
+    let unmounted = unmounted_source_volumes(config, &effective_sources, env.is_mountpoint);
+    if !unmounted.is_empty() {
+        return Err(format!(
+            "Source volume not mounted: {} — refusing to run btrbk on a bare directory",
+            unmounted.join("; ")
+        )
+        .into());
+    }
 
     // Measure target disk usage before btrbk runs so we can calculate
     // bytes_sent as the delta (btrbk doesn't report transfer sizes).
@@ -2683,7 +2670,12 @@ mod tests {
 
     /// `btrbk -c <conf> <args>`, as the scripted runner keys it.
     fn btrbk(args: &str) -> String {
-        format!("btrbk -c {CONF} {args}")
+        btrbk_at(CONF, args)
+    }
+
+    /// The same for a config that names its own btrbk.conf.
+    fn btrbk_at(conf: &str, args: &str) -> String {
+        format!("btrbk -c {conf} {args}")
     }
 
     fn labels(l: &[&str]) -> Vec<String> {
@@ -2746,10 +2738,7 @@ mod tests {
     /// A step environment for the tests: `runner` runs every command, and every
     /// target verifies clean — unless a test hands in its own `verify`.
     fn env(runner: &dyn CommandRunner) -> StepEnv<'_> {
-        StepEnv {
-            runner,
-            verify: &|_, _, _| Ok(()),
-        }
+        env_for(runner, &|_, _, _| Ok(()))
     }
 
     /// A runner that cannot start any program, as when btrbk is not installed.
@@ -3804,10 +3793,7 @@ mod tests {
 
     /// `runner`, with the real `mount::verify_write_targets` as the check.
     fn env_verifying(runner: &dyn CommandRunner) -> StepEnv<'_> {
-        StepEnv {
-            runner,
-            verify: &mount::verify_write_targets,
-        }
+        env_for(runner, &mount::verify_write_targets)
     }
 
     /// The steps' config, its primary target's mount point a plain directory
@@ -3910,10 +3896,7 @@ mod tests {
             (btrbk(&format!("resume {filters}")), 0, String::new()),
             (btrbk(&format!("run {filters}")), 0, String::new()),
         ]);
-        let env = StepEnv {
-            runner: &runner,
-            verify: &verify,
-        };
+        let env = env_for(&runner, &verify);
         let primary = labels(&["primary-22tb"]);
         let config = steps_config();
         send_snapshots_with(&config, &[], &primary, false, &TestProgress::new(), &env).unwrap();
@@ -3933,10 +3916,7 @@ mod tests {
             Err("recovery is on the wrong disk".to_string())
         };
         let runner = Scripted::from_owned(vec![]);
-        let env = StepEnv {
-            runner: &runner,
-            verify: &verify,
-        };
+        let env = env_for(&runner, &verify);
         let config = steps_config();
         let every = labels(&["primary-22tb", "recovery"]);
         let err = send_snapshots_with(&config, &[], &every, false, &TestProgress::new(), &env)
@@ -3994,10 +3974,7 @@ mod tests {
             &make_test_config(),
             &options,
             &progress,
-            &StepEnv {
-                runner: &runner,
-                verify: &verify,
-            },
+            &env_for(&runner, &verify),
         )
         .unwrap();
         assert_eq!(
@@ -4014,10 +3991,7 @@ mod tests {
             &make_test_config(),
             &options,
             &progress,
-            &StepEnv {
-                runner: &runner,
-                verify: &refuse,
-            },
+            &env_for(&runner, &refuse),
         )
         .unwrap_err()
         .to_string();
@@ -4111,10 +4085,7 @@ mod tests {
             &config,
             None,
             &TestProgress::new(),
-            &StepEnv {
-                runner: &runner,
-                verify: &verify,
-            },
+            &env_for(&runner, &verify),
         )
         .unwrap();
         // A mirror carries its own OS and is never written; a target whose
@@ -4146,10 +4117,7 @@ mod tests {
                 Ok(())
             };
         let runner = Scripted::from_owned(vec![]);
-        let env = StepEnv {
-            runner: &runner,
-            verify: &verify,
-        };
+        let env = env_for(&runner, &verify);
         let only_second = labels(&["second"]);
         archive_boot_with(&config, Some(&only_second), &TestProgress::new(), &env).unwrap();
         assert_eq!(*asked.lock().unwrap(), [(vec![], only_second)]);
@@ -4171,8 +4139,12 @@ mod tests {
     }
 
     /// `env` for a closure `verify` that is a variable of the test.
-    fn env_for<'a>(runner: &'a dyn CommandRunner, verify: &'a VerifyTargets) -> StepEnv<'a> {
-        StepEnv { runner, verify }
+    fn env_for<'a>(runner: &'a dyn CommandRunner, verify: &'a VerifyTargets<'a>) -> StepEnv<'a> {
+        StepEnv {
+            runner,
+            verify,
+            is_mountpoint: &|_| true,
+        }
     }
 
     /// The whole sequence, in its safe order, against a real directory: the
@@ -4391,6 +4363,163 @@ mod tests {
                 .any(|(l, msg)| *l == LogLevel::Error && msg.starts_with("Renamed nothing:"))
         );
         assert!(live.join("old").exists());
+    }
+
+    // -- a run mounts nothing itself (bd DAS-Backup-Manager-7tx 3, 8cf) ----------
+    //
+    // `run_backup` used to mount any source volume it did not find mounted, with
+    // a raw `mount` after the guard that owns the job's mounts had finished,
+    // and nothing ever unmounted it. The caller mounts (and gives back); the
+    // run only checks.
+
+    /// The run's config: `/proc` stands in for the one target that is
+    /// mounted, a second one is absent, and one of the two sources is
+    /// manual-only.
+    fn live_config() -> Config {
+        let mut config = make_test_config();
+        config.targets.push(Target {
+            label: "recovery".into(),
+            mount: "/nonexistent/das/recovery".into(),
+            ..config.targets[0].clone()
+        });
+        config
+    }
+
+    fn live_options() -> BackupOptions {
+        BackupOptions {
+            mode: Some(BackupMode::Incremental),
+            targets: labels(&["primary-22tb"]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_live_run_goes_to_the_selected_target_only_and_mounts_nothing_itself() {
+        // `manual-src` is left out (manual-only), the absent `recovery` target
+        // is not ticked: the run names `/proc/self/root` and `home` to btrbk.
+        let f = "/proc/self/root /proc/self/home";
+        let runner = Scripted::from_owned(vec![
+            (
+                btrbk_at("/nonexistent/btrbk.conf", &format!("snapshot {f}")),
+                0,
+                String::new(),
+            ),
+            (
+                btrbk_at("/nonexistent/btrbk.conf", &format!("resume {f}")),
+                0,
+                ">>> /t/a.1\n".into(),
+            ),
+            (
+                btrbk_at(
+                    "/nonexistent/btrbk.conf",
+                    &format!("--format=raw list latest {f}"),
+                ),
+                0,
+                raw_row("/s/a.1", "/t/a.1") + &raw_row("/s/b.1", "/t/b.1"),
+            ),
+        ]);
+        let progress = TestProgress::new();
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            ..env(&runner)
+        };
+        let result = run_backup_with(&live_config(), &live_options(), &progress, &host).unwrap();
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!((result.snapshots_created, result.snapshots_sent), (2, 2));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("mount ") || c.starts_with("mountpoint ")),
+            "the run mounts nothing: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("nonexistent/das/recovery")),
+            "the unticked, absent target is not named to btrbk: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_run_refuses_a_source_volume_that_is_not_mounted_and_runs_nothing() {
+        let runner = Scripted::from_owned(vec![]);
+        let nothing_mounted = |_: &Path| false;
+        let host = StepEnv {
+            is_mountpoint: &nothing_mounted,
+            ..env(&runner)
+        };
+        let err = run_backup_with(&live_config(), &live_options(), &TestProgress::new(), &host)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Source volume not mounted: /.btrfs-nvme (source 'nvme-root') — refusing to run \
+             btrbk on a bare directory"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "neither btrbk nor a mount: {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn only_the_volumes_of_the_sources_selected_have_to_be_mounted() {
+        let runner = Scripted::from_owned(vec![]);
+        // `manual-src` is selected, its volume is not mounted.
+        let options = BackupOptions {
+            sources: labels(&["manual-src"]),
+            ..live_options()
+        };
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            ..env(&runner)
+        };
+        let err = run_backup_with(&live_config(), &options, &TestProgress::new(), &host)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/.btrfs-manual (source 'manual-src')"),
+            "{err}"
+        );
+        assert!(!err.contains("/.btrfs-nvme"), "{err}");
+    }
+
+    #[test]
+    fn unmounted_volumes_are_listed_once_each_for_the_selected_sources_only() {
+        let mut config = make_test_config();
+        let mut twin = config.sources[0].clone();
+        twin.label = "nvme-twin".into();
+        config.sources.push(twin);
+        let mounted = |_: &Path| false;
+        // Two sources share /.btrfs-nvme: one entry, the first source's name.
+        assert_eq!(
+            unmounted_source_volumes(&config, &labels(&["nvme-root", "nvme-twin"]), &mounted),
+            ["/.btrfs-nvme (source 'nvme-root')"]
+        );
+        // Only the sources named are looked at.
+        assert_eq!(
+            unmounted_source_volumes(&config, &labels(&["manual-src"]), &mounted),
+            ["/.btrfs-manual (source 'manual-src')"]
+        );
+        assert!(unmounted_source_volumes(&config, &[], &mounted).is_empty());
+        // One that is mounted is not listed.
+        assert_eq!(
+            unmounted_source_volumes(&config, &labels(&["nvme-root", "manual-src"]), &|p| {
+                p == Path::new("/.btrfs-nvme")
+            }),
+            ["/.btrfs-manual (source 'manual-src')"]
+        );
+    }
+
+    #[test]
+    fn the_host_environment_asks_the_real_mount_table() {
+        // `/proc` is a mount point wherever the tests run; a fresh directory is not.
+        assert!((StepEnv::HOST.is_mountpoint)(Path::new("/proc")));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!(StepEnv::HOST.is_mountpoint)(dir.path()));
     }
 
     // -- the selection a run starts from ----------------------------------------
