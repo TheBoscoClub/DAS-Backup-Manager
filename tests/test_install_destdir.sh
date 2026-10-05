@@ -21,10 +21,17 @@
 #   2. systemctl is never called;
 #   3. the install manifest and the files under DESTDIR are the same list, so
 #      every installed file is under DESTDIR and none was written there unlisted;
-#   4. no generated install script runs a command (execute_process) — install
-#      time may check and print, never act. The one exception is CMake's own
+#   4. no install-time script runs a command (execute_process, exec_program) —
+#      install time may check and print, never act. The scripts are the
+#      generated cmake_install.cmake files and every file they include():
+#      CMake writes `install(SCRIPT <file>)` as include("<absolute file>"), so
+#      that file's own lines are in none of the generated ones. Each include is
+#      followed, and one that cannot be — not a quoted absolute path, or a file
+#      that cannot be read — fails the check, because a command it hides is the
+#      case the check exists for. The one exception is CMake's own
 #      `cmake --install --strip` support, which it writes under
-#      `if(CMAKE_INSTALL_DO_STRIP)` and which strips the copy under DESTDIR;
+#      `if(CMAKE_INSTALL_DO_STRIP)` in a generated script and which strips the
+#      copy under DESTDIR;
 #   5. --completions: the bash, zsh and fish completions are installed and are
 #      byte for byte what this build's btrdasd prints; --no-completions: none;
 #   6. no backup unit is installed: `btrdasd setup` is the only writer of the
@@ -112,13 +119,48 @@ fi
 
 mapfile -t install_scripts < <(find "$build" -name cmake_install.cmake -print | sort)
 check "4. install scripts found" "$((${#install_scripts[@]} > 0))" "1"
-acts="$(awk '
-    FNR == 1 { prev = "" }
-    /execute_process\(/ && prev !~ /^[[:space:]]*if\(CMAKE_INSTALL_DO_STRIP\)[[:space:]]*$/ {
+
+# Every file install-time code is read from: the generated scripts, then each
+# file one of them includes, and so on. A path is canonical before it is
+# queued, so a file reached twice, or by a path with `..` in it, is read once.
+include_re='^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][[:space:]]*\("(/[^"]+)"\)[[:space:]]*$'
+declare -A seen=()
+queue=("${install_scripts[@]}")
+scanned=()
+unfollowed=()
+while ((${#queue[@]} > 0)); do
+    file="$(realpath -m "${queue[0]}")"
+    queue=("${queue[@]:1}")
+    [[ -z "${seen[$file]:-}" ]] || continue
+    seen[$file]=1
+    if [[ ! -r "$file" ]]; then
+        unfollowed+=("$file (cannot be read)")
+        continue
+    fi
+    scanned+=("$file")
+    while IFS= read -r line; do
+        if [[ "${line#*:}" =~ $include_re ]]; then
+            queue+=("${BASH_REMATCH[1]}")
+        else
+            unfollowed+=("$file:${line%%:*}")
+        fi
+    done < <(grep -n -i '^[[:space:]]*include[[:space:]]*(' "$file")
+done
+check "4. every include() in an install script is followed" "${unfollowed[*]}" ""
+
+# CMake command names are case-insensitive, and a space may precede the `(`.
+# Reading stdin would end an awk given no file at once, not hang it.
+acts="$(awk -v build="$build" '
+    FNR == 1 {
+        prev = ""
+        generated = (index(FILENAME, build "/") == 1 && FILENAME ~ /\/cmake_install\.cmake$/)
+    }
+    tolower($0) ~ /(execute_process|exec_program)[[:space:]]*\(/ &&
+        !(generated && prev ~ /^[[:space:]]*if\(CMAKE_INSTALL_DO_STRIP\)[[:space:]]*$/) {
         print FILENAME ":" FNR
     }
     NF { prev = $0 }
-' "${install_scripts[@]}" | paste -sd ' ' -)"
+' "${scanned[@]}" < /dev/null | paste -sd ' ' -)"
 check "4. no install script runs a command" "$acts" ""
 
 # The manifest's entry for one shell's completion: the line that ends with
