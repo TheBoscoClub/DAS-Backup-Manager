@@ -1,6 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2030,SC2031,SC2034,SC2329
-# SC2030, SC2031: every LC_ALL set here is meant to stay in its subshell.
+# shellcheck disable=SC2034,SC2329
 # SC2034: the variables below are read by the functions extracted from the
 #   scripts, so their use is invisible here.
 # SC2329: the log/sleep/mountpoint/mount stubs are called by that code.
@@ -143,6 +142,7 @@ check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown hold
 # NOT RUN instead of passing.
 ARABIC_THREE=$'\xd9\xa3' SUPERSCRIPT_TWO=$'\xc2\xb2'
 not_run=""
+# shellcheck disable=SC2030,SC2031  # this block only: every LC_ALL set in it is meant to stay in its subshell
 if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
     for digit in "$ARABIC_THREE" "$SUPERSCRIPT_TWO" "1$ARABIC_THREE"; do
         printf 'backup-run.sh pid %s\n' "$digit" >"$LOCK"
