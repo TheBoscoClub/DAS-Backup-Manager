@@ -11,6 +11,19 @@
 # at the end of every run (daily and full) while targets are still mounted —
 # it was previously installed but never called by anything (DAS-Backup-Manager-64h).
 #
+# v2.1.2: a target whose mount state cannot be told is a failure, not a skip.
+# cleanup_target asked `mountpoint -q ... 2>/dev/null` and read every failure
+# of it — a missing mountpoint program (exit 127), no descriptor free for its
+# redirection, an I/O error — as "not mounted - nothing examined", exit 0: the
+# target was never looked at, and with any other target examined the run was
+# OK. It asks the probe backup-run.sh's unmount gate asks, util-linux's exit
+# status (0 a mount point, 32 not one, anything else could not tell) read by
+# the same two functions, which tests/test_boot_archive_cleanup.sh holds
+# byte-identical between the scripts. Not mounted, and a path that is not
+# there (an absent drive's mount point), stay a quiet skip; could not tell
+# counts the target among those not examined, says why, and exits 1, which
+# backup-run.sh records as a FAIL (bd DAS-Backup-Manager-2dmn).
+#
 # v2.1.2: a dry run prints the same per-target summary as a real run — "Would
 # delete N, kept N, errors N" where a run says "Deleted N, kept N, errors N" —
 # and counts what it would delete. It printed "Would keep N, found expired
@@ -123,14 +136,93 @@ parse_archive_timestamp() {
     date -d "$formatted" '+%s' 2>/dev/null || echo "0"
 }
 
+# Whether a target is mounted, as backup-run.sh asks it before it unmounts one:
+# probe_mount_point prints "mounted", "not-mounted" or "unknown: <why>", and
+# probe_state reads that line into PROBE_STATE and PROBE_WHY, an empty or
+# unrecognised one included, as "unknown" (bd DAS-Backup-Manager-hhow). The two
+# functions and the two variables below are the very text of backup-run.sh's:
+# a standalone script cannot source its sibling, so
+# tests/test_boot_archive_cleanup.sh fails if either copy changes alone. Why
+# they exist: bash returns 0 and an empty string for a command substitution
+# it cannot make (no descriptor free for its pipe), and a status read from one
+# calls the probe that never ran a mount point.
+probe_mount_point() { # probe_mount_point <path>
+    local out last rc err
+    out="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    rc="${last#status=}"
+    if [[ "$last" != status=* || ! "$rc" =~ ^[[:digit:]]+$ ]]; then
+        echo "unknown: no answer — the probe's output could not be captured (no descriptor free for its pipe?)"
+        return 0
+    fi
+    err="${out%"$last"}"
+    while [[ "$err" == *$'\n' ]]; do
+        err="${err%$'\n'}"
+    done
+    case "$rc" in
+        0)
+            echo mounted
+            return 0
+            ;;
+        32)
+            echo not-mounted
+            return 0
+            ;;
+    esac
+    if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
+        echo not-mounted
+        return 0
+    fi
+    err="${err//$'\n'/; }"
+    echo "unknown: ${err:-mountpoint printed nothing} (exit $rc)"
+}
+
+PROBE_STATE="unknown"
+PROBE_WHY="no mount probe has run"
+probe_state() { # probe_state <path>
+    local answer
+    answer="$(probe_mount_point "$1")"
+    case "$answer" in
+        mounted | not-mounted)
+            PROBE_STATE="$answer"
+            PROBE_WHY=""
+            ;;
+        "unknown: "?*)
+            PROBE_STATE="unknown"
+            PROBE_WHY="${answer#unknown: }"
+            ;;
+        "")
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed nothing (its capture failed?)"
+            ;;
+        *)
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed something unrecognised: ${answer:0:120}"
+            ;;
+    esac
+}
+
 cleanup_target() {
     local mnt="$1"
     local deleted=0 kept=0 errors=0 would_delete=0
 
-    if ! mountpoint -q "$mnt" 2>/dev/null; then
-        log_info "  Skipping $mnt (not mounted - nothing examined)"
-        return 0
-    fi
+    # Three answers, and only the second is a skip: a target the probe cannot
+    # tell about was NOT examined, and the run says so and fails, as for a
+    # listing it could not get below (bd DAS-Backup-Manager-2dmn).
+    probe_state "$mnt"
+    case "$PROBE_STATE" in
+        mounted) ;;
+        not-mounted)
+            log_info "  Skipping $mnt (not mounted - nothing examined)"
+            return 0
+            ;;
+        *)
+            log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY"
+            log_error "  $mnt NOT pruned - state unknown"
+            TARGET_FAILURES=$(( TARGET_FAILURES + 1 ))
+            return 0
+            ;;
+    esac
 
     local label
     label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")

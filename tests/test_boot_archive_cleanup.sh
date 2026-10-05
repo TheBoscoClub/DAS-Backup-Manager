@@ -34,6 +34,16 @@
 #     with a summary are OK; a run with none, a pruner that failed, and one
 #     that printed the other mode's summary are not.
 #
+#   - A target it cannot tell is mounted (bd DAS-Backup-Manager-2dmn). The pruner
+#     asked `mountpoint -q ... 2>/dev/null` and read every failure of it as "not
+#     mounted - nothing examined": a skip, exit 0, with nothing said. It asks
+#     the probe the unmount gate asks now (util-linux's exit status: 0 a mount
+#     point, 32 not one, anything else could not tell; a path that is not there
+#     is the absent drive's removed mount point, and not mounted): could not
+#     tell is a target NOT pruned, counted, said with the probe's own message,
+#     and the run exits 1, which run_archive_cleanup records as a FAIL. The two
+#     functions that read the probe are one text in the two scripts, held so here.
+#
 # How: the REAL script runs from a copy in which exactly one line differs, the
 # root check, which reads DAS_TEST_EUID. It runs under `env -i` with a PATH of
 # stubs (btrdasd, mountpoint, btrfs) and a few harmless tools: a command the
@@ -58,6 +68,7 @@ COPY="$WORK/boot-archive-cleanup.sh"
 BIN="$WORK/bin"
 SYSBIN="$WORK/sysbin"
 PRIMARY="$WORK/mnt/primary"
+PRIMARY2="$WORK/mnt/primary2"
 MIRROR="$WORK/mnt/mirror"
 
 pass=0
@@ -117,14 +128,33 @@ case "$1 ${2:-}" in
     ;;
 esac
 EOF
-# mountpoint -q <path>: a mount point while $S/mounted/<name> exists.
+# mountpoint <path>, as util-linux 2.42.4 answers (measured): 0 a mount point,
+# 32 not one, 1 an error — and 1, "No such file or directory", for a path that
+# is not there. A mount point while $S/mounted/<name> exists; $S/probe/<name>
+# makes it answer otherwise: "error", "absent", or "rc:<n>" (that exit status,
+# nothing said).
 stub mountpoint <<'EOF'
-[[ -e "$S/mounted/$(basename "${*: -1}")" ]] && exit 0
+path="${*: -1}"
+name="$(basename "$path")"
+mode="$(cat "$S/probe/$name" 2>/dev/null)"
+case "$mode" in
+error)
+    echo "mountpoint: $path: Input/output error" >&2
+    exit 1
+    ;;
+absent)
+    echo "mountpoint: $path: No such file or directory" >&2
+    exit 1
+    ;;
+rc:*) exit "${mode#rc:}" ;;
+esac
+[[ -e "$S/mounted/$name" ]] && exit 0
 exit 32
 EOF
 # btrfs: a label per mount point, the listing the case wrote for it, and a
 # delete that only records its argument.
 stub btrfs <<'EOF'
+echo "$*" >>"$S/btrfs.calls"
 case "$1 ${2:-}" in
 "filesystem label") echo "label-$(basename "$3")" ;;
 "subvolume list")
@@ -160,35 +190,74 @@ DAS_TARGET_1_MOUNT='$MIRROR'
 DAS_TARGET_1_ROLE='mirror'
 EOF
 }
+# The same with a second primary between them: three targets.
+write_env2() {
+    cat >"$STATE/env" <<EOF
+DAS_BOOT_ARCHIVE_RETENTION_DAYS=60
+DAS_ALL_TARGET_MOUNTS='$PRIMARY $PRIMARY2 $MIRROR'
+DAS_TARGET_COUNT=3
+DAS_TARGET_0_MOUNT='$PRIMARY'
+DAS_TARGET_0_ROLE='primary'
+DAS_TARGET_1_MOUNT='$PRIMARY2'
+DAS_TARGET_1_ROLE='primary'
+DAS_TARGET_2_MOUNT='$MIRROR'
+DAS_TARGET_2_ROLE='mirror'
+EOF
+}
 # A new sandbox: both targets mounted, no listings.
 fresh() {
     rm -rf "${STATE:?}"
-    mkdir -p "$STATE/mounted"
+    mkdir -p "$STATE/mounted" "$STATE/probe"
     touch "$STATE/mounted/primary" "$STATE/mounted/mirror"
     write_env
 }
-# The primary's listing, one `btrfs subvolume list` line per path argument.
-listing() { # listing <path>...
-    local id=256 p
-    : >"$STATE/listing.primary"
+# A new sandbox of three targets, the two primaries and the mirror mounted.
+fresh2() {
+    rm -rf "${STATE:?}"
+    mkdir -p "$STATE/mounted" "$STATE/probe"
+    touch "$STATE/mounted/primary" "$STATE/mounted/primary2" "$STATE/mounted/mirror"
+    write_env2
+}
+# What mountpoint answers for a target (see its stub): error, absent, rc:<n>.
+probe_mode() { # probe_mode <target name> <mode>
+    printf '%s\n' "$2" >"$STATE/probe/$1"
+}
+# A target's listing, one `btrfs subvolume list` line per path argument.
+listing_for() { # listing_for <target name> <path>...
+    local name="$1" id=256 p
+    shift
+    : >"$STATE/listing.$name"
     for p in "$@"; do
-        printf 'ID %d gen %d top level 5 path %s\n' "$id" "$((id + 100))" "$p" >>"$STATE/listing.primary"
+        printf 'ID %d gen %d top level 5 path %s\n' "$id" "$((id + 100))" "$p" >>"$STATE/listing.$name"
         id=$((id + 1))
     done
+}
+listing() { listing_for primary "$@"; } # the primary's
+# How often btrfs was asked to label or list a target.
+btrfs_asked() { # btrfs_asked <target name>
+    if [[ -f "$STATE/btrfs.calls" ]]; then
+        grep -cE "^(filesystem label|subvolume list) .*/$1\$" "$STATE/btrfs.calls" || true
+    else
+        echo 0
+    fi
 }
 # One run of the real script: its output in $STATE/out, its status in RC.
 RC=""
 run_pruner() { # run_pruner <locale> [args...]
     local loc="$1"
     shift
-    rm -f "$STATE/deleted" # what a run deletes is that run's own
-    env -i PATH="$BIN:$SYSBIN" HOME="$WORK/home" LC_ALL="$loc" TMPDIR="$WORK/tmp" \
+    rm -f "$STATE/deleted" "$STATE/btrfs.calls" # what a run does is that run's own
+    env -i PATH="${RUN_PATH:-$BIN:$SYSBIN}" HOME="$WORK/home" LC_ALL="$loc" TMPDIR="$WORK/tmp" \
         DAS_TEST_STATE="$STATE" DAS_TEST_EUID=0 \
         BTRDASD_BIN="$BIN/btrdasd" DAS_CONFIG="$WORK/config.toml" \
         "$BASH" "$COPY" "$@" >"$STATE/out" 2>&1
     RC=$?
-    if grep -q 'command not found' "$STATE/out"; then
-        bad "the run reached a command that is neither stubbed nor whitelisted: $(grep -m1 'command not found' "$STATE/out")"
+    # A command that is neither stubbed nor whitelisted fails the case — unless
+    # the case took it away on purpose (ALLOW_NOT_FOUND names it).
+    local unexpected
+    unexpected="$(grep 'command not found' "$STATE/out" | grep -vF -- "${ALLOW_NOT_FOUND:-no such text}" || true)"
+    if [[ -n "$unexpected" ]]; then
+        bad "the run reached a command that is neither stubbed nor whitelisted: ${unexpected%%$'\n'*}"
     fi
 }
 deleted() { # the paths it asked btrfs to delete, relative to the primary, sorted
@@ -376,6 +445,113 @@ for mode in dryrun real; do
     verdict="$(read_back "$mode")"
     check "reader, $mode, the pruner failed (no listing): FAIL by its exit status" "$verdict" "FAIL|exit code 1"
 done
+
+# ---------------------------------------------------------------------------
+echo "== a target it cannot tell is mounted is NOT pruned, and the run fails (bd 2dmn)"
+# ---------------------------------------------------------------------------
+# `mountpoint -q ... 2>/dev/null` read every failure as "not mounted - nothing
+# examined": exit 0, nothing said, and with any other target examined the run
+# was OK. Not mounted (32) and a path that is not there stay quiet skips.
+fresh
+listing "$ASCII_OLD" "$HOME_OLD" "$FUTURE" "$OTHER"
+probe_mode primary error
+run_pruner C
+check "probe error on the primary, real run: the pruner exits 1" "$RC" "1"
+check "... says why, with mountpoint's own message and status" \
+    "$(said "Could not tell whether $PRIMARY is mounted — mountpoint: $PRIMARY: Input/output error (exit 1)")" "1"
+check "... says the target was not pruned" "$(said "$PRIMARY NOT pruned - state unknown")" "1"
+check "... and the closing line counts it" \
+    "$(said 'Boot archive cleanup FAILED: 0 deletion error(s), 1 target(s) not examined.')" "1"
+check "... btrfs was never asked about it, nothing deleted, no summary printed for it" \
+    "$(btrfs_asked primary) [$(deleted)] $(said 'Deleted')$(said 'Would delete')" "0 [] 00"
+check "... the skip's own wording is not used" "$(said "Skipping $PRIMARY")" "0"
+run_pruner C --dryrun
+check "probe error on the primary, dry run: the pruner exits 1 too" "$RC" "1"
+for mode in dryrun real; do
+    check "reader, $mode, a target the pruner could not tell: FAIL by its exit status" \
+        "$(read_back "$mode")" "FAIL|exit code 1"
+done
+read_back real >/dev/null
+check "reader, the warning carries the pruner's own words" \
+    "$(reader_said "Could not tell whether $PRIMARY is mounted — mountpoint: $PRIMARY: Input/output error (exit 1)")" "1"
+
+fresh
+probe_mode primary rc:2
+run_pruner C
+check "mountpoint exits 2 and says nothing: could not tell, exit 1" \
+    "$RC $(said "Could not tell whether $PRIMARY is mounted — mountpoint printed nothing (exit 2)")" "1 1"
+probe_mode primary rc:143
+run_pruner C
+check "mountpoint killed by TERM (143): could not tell, exit 1" \
+    "$RC $(said "Could not tell whether $PRIMARY is mounted — mountpoint printed nothing (exit 143)")" "1 1"
+
+# The quiet answers, unchanged: exit 0, the skip said, no failure.
+fresh
+rm -f "$STATE/mounted/primary"
+run_pruner C
+check "not a mount point (32): the pruner exits 0" "$RC" "0"
+check "not a mount point: the skip is said, and nothing says it failed" \
+    "$(said "Skipping $PRIMARY (not mounted - nothing examined)") $(said 'NOT pruned') $(said 'FAILED')" "1 0 0"
+fresh
+probe_mode primary absent
+run_pruner C
+check "a path that is not there (an absent drive's mount point): the pruner exits 0" "$RC" "0"
+check "a path that is not there: the same quiet skip, nothing says it failed" \
+    "$(said "Skipping $PRIMARY (not mounted - nothing examined)") $(said 'NOT pruned') $(said 'FAILED')" "1 0 0"
+
+# No mountpoint program at all (exit 127): every target is one it cannot tell.
+fresh
+RUN_PATH="$SYSBIN" ALLOW_NOT_FOUND='mountpoint: command not found' run_pruner C
+check "no mountpoint program: the pruner exits 1, and both targets are counted" \
+    "$RC $(said 'Boot archive cleanup FAILED: 0 deletion error(s), 2 target(s) not examined.')" "1 1"
+check "no mountpoint program: said with the shell's own words and the exit status" \
+    "$(grep -c "Could not tell whether $PRIMARY is mounted — .*mountpoint: command not found (exit 127)" "$STATE/out")" "1"
+
+# Every target, a mirror included: the probe comes before the role could matter,
+# and one that fails for a single drive is an anomaly worth a failed run.
+fresh
+listing "$ASCII_OLD" "$HOME_OLD" "$FUTURE" "$OTHER"
+probe_mode mirror error
+run_pruner C
+check "probe error on the mirror: the primary is pruned all the same" "$(deleted)" "$ASCII_OLD $HOME_OLD "
+check "probe error on the mirror: and the run fails, naming it" \
+    "$RC $(said "Could not tell whether $MIRROR is mounted") $(said 'Boot archive cleanup FAILED: 0 deletion error(s), 1 target(s) not examined.')" "1 1 1"
+
+# One target it cannot tell about does not stop the others: the second primary
+# is pruned and its summary printed, and the run still fails.
+fresh2
+listing_for primary "$ASCII_OLD" "$FUTURE"
+listing_for primary2 "$HOME_OLD" "$FUTURE"
+probe_mode primary error
+run_pruner C
+check "two primaries, the first cannot tell: nothing is deleted under it" \
+    "$(grep -c "^$PRIMARY/" "$STATE/deleted" || true)" "0"
+check "two primaries, the first cannot tell: the second's summary is printed" \
+    "$(said 'Deleted 1, kept 1, errors 0')" "1"
+check "two primaries, the first cannot tell: the run exits 1, one target not examined" \
+    "$RC $(said 'Boot archive cleanup FAILED: 0 deletion error(s), 1 target(s) not examined.')" "1 1"
+check "two primaries, the first cannot tell: btrfs was asked about the second only" \
+    "$(btrfs_asked primary) $(btrfs_asked primary2)" "0 2"
+check "two primaries, the first cannot tell: the second's expired archive is the one deleted" \
+    "$(sed "s|^$PRIMARY2/||" "$STATE/deleted" | tr '\n' ' ')" "$HOME_OLD "
+
+# The pruner's reading of the probe is the unmount gate's: a standalone script
+# cannot source its sibling, so the two functions, and the two variables they
+# set, are one text twice, and this fails if either copy changes alone.
+for fn in probe_mount_point probe_state; do
+    theirs="$(sed -n "/^$fn() {/,/^}/p" "$ROOT/scripts/backup-run.sh")"
+    ours="$(sed -n "/^$fn() {/,/^}/p" "$SRC")"
+    verdict=identical
+    [[ -n "$theirs" && -n "$ours" ]] || verdict="missing from one of the scripts"
+    [[ "$verdict" != identical || "$theirs" == "$ours" ]] || verdict=different
+    check "$fn is the same text in backup-run.sh and boot-archive-cleanup.sh" "$verdict" "identical"
+done
+for line in 'PROBE_STATE="unknown"' 'PROBE_WHY="no mount probe has run"'; do
+    check "the initial value $line is in both scripts" \
+        "$(grep -cxF -- "$line" "$ROOT/scripts/backup-run.sh")$(grep -cxF -- "$line" "$SRC")" "11"
+done
+check "probe_mount_point is named in the pruner's code only by its definition and by probe_state" \
+    "$(grep -v '^[[:space:]]*#' "$SRC" | grep -c 'probe_mount_point')" "2"
 
 echo
 echo "passed=$pass failed=$fail"
