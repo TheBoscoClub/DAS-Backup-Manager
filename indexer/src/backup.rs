@@ -1,5 +1,5 @@
 use crate::btrbk_conf::{self, DeclaredPair};
-use crate::config::{Config, TargetRole};
+use crate::config::{Config, Target, TargetRole};
 use crate::db::Database;
 use crate::fsutil::{CommandRunner, SystemRunner};
 use crate::health;
@@ -10,7 +10,7 @@ use crate::progress::{LogLevel, ProgressCallback};
 use crate::scrub;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::time::UNIX_EPOCH;
 
 // ---------------------------------------------------------------------------
@@ -391,6 +391,35 @@ fn describe_exit(status: ExitStatus) -> String {
     }
 }
 
+/// What the steps of a backup need from the host besides their arguments.
+///
+/// Production only ever uses [`StepEnv::HOST`]. A test hands in a scripted
+/// runner and a described verdict instead, so that no test can reach a real
+/// `btrbk` or `btrfs`: a guard that is taken out leaves the scripted runner to
+/// answer, not the machine.
+struct StepEnv<'a> {
+    /// Runs every `btrbk` and `btrfs`.
+    runner: &'a dyn CommandRunner,
+    /// Refuses (`Err`, with every reason) unless each target in the second
+    /// argument is a real mount point with the filesystem it must have. Run
+    /// before anything is written to a target (`mount::verify_write_targets`:
+    /// writing to a bare mount point falls through to the root filesystem,
+    /// bd DAS-Backup-Manager-9on).
+    verify: &'a VerifyTargets<'a>,
+}
+
+/// The check behind [`StepEnv::verify`]: the targets (all configured ones),
+/// the labels about to be written, and where to say what it found.
+type VerifyTargets<'a> =
+    dyn Fn(&[Target], &[String], &dyn ProgressCallback) -> Result<(), String> + 'a;
+
+impl StepEnv<'static> {
+    const HOST: StepEnv<'static> = StepEnv {
+        runner: &SystemRunner,
+        verify: &mount::verify_write_targets,
+    };
+}
+
 /// Why a backup that was handed no target cannot run.
 const NO_TARGETS_MOUNTED: &str =
     "No backup targets are mounted. Connect the DAS enclosure and mount targets before running.";
@@ -659,21 +688,24 @@ pub fn send_snapshots(
     preserve: bool,
     progress: &dyn ProgressCallback,
 ) -> Result<(usize, u64), Box<dyn std::error::Error>> {
-    send_snapshots_with(config, sources, targets, preserve, progress, &SystemRunner)
+    send_snapshots_with(config, sources, targets, preserve, progress, &StepEnv::HOST)
 }
 
-/// [`send_snapshots`] with every `btrbk` run by `runner`.
+/// [`send_snapshots`] in `env`: the targets it will write to are verified
+/// first, and it refuses — before any btrbk runs — on one that is not a mount
+/// point or not the filesystem it must be (bd DAS-Backup-Manager-7tx).
 fn send_snapshots_with(
     config: &Config,
     sources: &[String],
     targets: &[String],
     preserve: bool,
     progress: &dyn ProgressCallback,
-    runner: &dyn CommandRunner,
+    env: &StepEnv,
 ) -> Result<(usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Sending snapshots", 1);
 
     let targets = step_targets(config, targets)?;
+    (env.verify)(&config.targets, &targets, progress)?;
     let filters = btrbk_filters(config, sources, Some(&targets), progress)?;
     log_target_scope(config, &targets, progress);
 
@@ -694,7 +726,7 @@ fn send_snapshots_with(
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
-    let status = stream_command(&mut cmd, runner, progress, |line| {
+    let status = stream_command(&mut cmd, env.runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
         // btrbk marks sends with >>> (incremental) or *** (full)
@@ -730,7 +762,7 @@ fn send_snapshots_with(
 
     // Count from the machine-readable listing, not the human output.
     let full_output = stdout_lines.join("\n");
-    snapshots_sent = match btrbk_raw_listing(config, &filters, runner) {
+    snapshots_sent = match btrbk_raw_listing(config, &filters, env.runner) {
         Some(raw) => parse_raw_send_count(&raw),
         None => {
             progress.on_log(
@@ -766,20 +798,22 @@ pub fn run_full_pipeline(
     targets: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
-    run_full_pipeline_with(config, sources, targets, progress, &SystemRunner)
+    run_full_pipeline_with(config, sources, targets, progress, &StepEnv::HOST)
 }
 
-/// [`run_full_pipeline`] with every `btrbk` run by `runner`.
+/// [`run_full_pipeline`] in `env`: like [`send_snapshots_with`], it verifies
+/// the targets before btrbk runs and refuses on one that fails.
 fn run_full_pipeline_with(
     config: &Config,
     sources: &[String],
     targets: &[String],
     progress: &dyn ProgressCallback,
-    runner: &dyn CommandRunner,
+    env: &StepEnv,
 ) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Full backup (snapshot + send + cleanup)", 1);
 
     let targets = step_targets(config, targets)?;
+    (env.verify)(&config.targets, &targets, progress)?;
     let filters = btrbk_filters(config, sources, Some(&targets), progress)?;
     for src in sources
         .iter()
@@ -801,7 +835,7 @@ fn run_full_pipeline_with(
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
-    let status = stream_command(&mut cmd, runner, progress, |line| {
+    let status = stream_command(&mut cmd, env.runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
         if trimmed.starts_with("+++") {
@@ -846,7 +880,7 @@ fn run_full_pipeline_with(
         ),
     );
 
-    match btrbk_raw_listing(config, &filters, runner) {
+    match btrbk_raw_listing(config, &filters, env.runner) {
         Some(raw) => {
             snapshots_created = parse_raw_snapshot_count(&raw);
             snapshots_sent = parse_raw_send_count(&raw);
@@ -1058,13 +1092,13 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
 /// `resolve_snapshot_names` disambiguated a bare `@` to `root-`
 /// (bd DAS-Backup-Manager-5ig).
 fn find_latest_btrbk_snapshot(
+    runner: &dyn CommandRunner,
     target_mount: &str,
     subdirs: &[String],
     snap_name: &str,
 ) -> Option<String> {
-    let output = Command::new("btrfs")
-        .args(["subvolume", "list", target_mount])
-        .output()
+    let output = runner
+        .output(Command::new("btrfs").args(["subvolume", "list", target_mount]))
         .ok()?;
     if !output.status.success() {
         return None;
@@ -1108,13 +1142,11 @@ fn subdirs_for_subvol(config: &Config, subvol: &str) -> Vec<String> {
     dirs
 }
 
-/// Run a `btrfs` subcommand, returning whether it succeeded.
-fn btrfs_ok(args: &[&str]) -> std::io::Result<bool> {
-    Ok(Command::new("btrfs")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .status()?
+/// Run a `btrfs` subcommand through `runner`, returning whether it succeeded.
+fn btrfs_ok(runner: &dyn CommandRunner, args: &[&str]) -> std::io::Result<bool> {
+    Ok(runner
+        .output(Command::new("btrfs").args(args))?
+        .status
         .success())
 }
 
@@ -1129,9 +1161,27 @@ fn btrfs_ok(args: &[&str]) -> std::io::Result<bool> {
 /// subvolume whenever the lookup failed — and for `@` the lookup could never
 /// succeed, so every Rust-path run on a primary target left the mount without a
 /// bootable `@` (bd DAS-Backup-Manager-5ig).
+///
+/// Every target it will write under is verified first, and it refuses — nothing
+/// written — on one whose mount point is a bare directory or holds another
+/// filesystem (bd DAS-Backup-Manager-7tx, 9on): [`mount::verify_write_targets`]
+/// reads each `target.mount` as the root filesystem's own directory if nothing
+/// is mounted there, and the snapshots, deletions and renames below would land
+/// on it. A target whose mount point does not exist is not written and is left
+/// alone, as `backup-run.sh` leaves an absent target.
 pub fn archive_boot(
     config: &Config,
     progress: &dyn ProgressCallback,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    archive_boot_with(config, None, progress, &StepEnv::HOST)
+}
+
+/// [`archive_boot`] in `env`, for the targets `selected` (`None`: every one).
+fn archive_boot_with(
+    config: &Config,
+    selected: Option<&[String]>,
+    progress: &dyn ProgressCallback,
+    env: &StepEnv,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if !config.boot.enabled {
         return Ok(false);
@@ -1149,6 +1199,19 @@ pub fn archive_boot(
         );
         return Ok(false);
     }
+
+    // The targets written under: selected, not a mirror (those carry their own
+    // OS and are skipped below), and with a mount point that exists. One that
+    // exists must be the filesystem it should be.
+    let is_selected = |t: &Target| selected.is_none_or(|labels| labels.contains(&t.label));
+    let writes: Vec<String> = config
+        .targets
+        .iter()
+        .filter(|t| is_selected(t) && t.role != TargetRole::Mirror)
+        .filter(|t| Path::new(&t.mount).exists())
+        .map(|t| t.label.clone())
+        .collect();
+    (env.verify)(&config.targets, &writes, progress)?;
 
     // Snapshot names come from the file btrbk itself reads. If it cannot be
     // read we do nothing at all rather than fall back to a guess: a wrong name
@@ -1200,7 +1263,7 @@ pub fn archive_boot(
             continue;
         }
 
-        for target in &config.targets {
+        for target in config.targets.iter().filter(|t| is_selected(t)) {
             // Mirror targets carry a genuinely independent OS install in their
             // own @/@home (e.g. das-recovery-bay1) — never archive-then-replace
             // it with a host snapshot. Mirrors still receive ordinary btrbk
@@ -1222,7 +1285,9 @@ pub fn archive_boot(
 
             // Step 1: locate the replacement FIRST. Nothing is destroyed if
             // this fails.
-            let Some(latest) = find_latest_btrbk_snapshot(tgt_mount, &subdirs, snap_name) else {
+            let Some(latest) =
+                find_latest_btrbk_snapshot(env.runner, tgt_mount, &subdirs, snap_name)
+            else {
                 progress.on_log(
                     LogLevel::Warning,
                     &format!(
@@ -1236,7 +1301,10 @@ pub fn archive_boot(
             // Step 2: archive the outgoing subvolume read-only, if there is one.
             if std::path::Path::new(&subvol_path).exists() {
                 let archive_path = format!("{tgt_mount}/{archive_name}");
-                if !btrfs_ok(&["subvolume", "snapshot", "-r", &subvol_path, &archive_path])? {
+                if !btrfs_ok(
+                    env.runner,
+                    &["subvolume", "snapshot", "-r", &subvol_path, &archive_path],
+                )? {
                     progress.on_log(
                         LogLevel::Warning,
                         &format!("Failed to archive {subvol_path} -> {archive_path}"),
@@ -1252,7 +1320,7 @@ pub fn archive_boot(
 
             // Step 3: clear any staging subvolume left by an interrupted run.
             if std::path::Path::new(&staging).exists()
-                && !btrfs_ok(&["subvolume", "delete", &staging])?
+                && !btrfs_ok(env.runner, &["subvolume", "delete", &staging])?
             {
                 progress.on_log(
                     LogLevel::Warning,
@@ -1262,7 +1330,10 @@ pub fn archive_boot(
             }
 
             // Step 4: build the replacement ALONGSIDE the live subvolume.
-            if !btrfs_ok(&["subvolume", "snapshot", &latest_path, &staging])? {
+            if !btrfs_ok(
+                env.runner,
+                &["subvolume", "snapshot", &latest_path, &staging],
+            )? {
                 progress.on_log(
                     LogLevel::Warning,
                     &format!(
@@ -1274,13 +1345,13 @@ pub fn archive_boot(
 
             // Step 5: only now remove the live subvolume.
             if std::path::Path::new(&subvol_path).exists()
-                && !btrfs_ok(&["subvolume", "delete", &subvol_path])?
+                && !btrfs_ok(env.runner, &["subvolume", "delete", &subvol_path])?
             {
                 progress.on_log(
                     LogLevel::Warning,
                     &format!("Failed to delete {subvol_path} — discarding {staging}"),
                 );
-                let _ = btrfs_ok(&["subvolume", "delete", &staging]);
+                let _ = btrfs_ok(env.runner, &["subvolume", "delete", &staging]);
                 continue;
             }
 
@@ -1479,7 +1550,7 @@ fn run_pipeline(
     sources: &[String],
     targets: &[String],
     progress: &dyn ProgressCallback,
-    runner: &dyn CommandRunner,
+    env: &StepEnv,
 ) -> Pipeline {
     let mut done = Pipeline::default();
     let snapshots = |done: &mut Pipeline| match create_snapshots_with(
@@ -1487,14 +1558,14 @@ fn run_pipeline(
         sources,
         Some(targets),
         progress,
-        runner,
+        env.runner,
     ) {
         Ok(n) => done.created = n,
         Err(e) => done.failed(progress, format!("Snapshot step failed: {e}")),
     };
     let send = |done: &mut Pipeline| {
         // No --preserve: btrbk enforces retention, in both modes.
-        match send_snapshots_with(config, sources, targets, false, progress, runner) {
+        match send_snapshots_with(config, sources, targets, false, progress, env) {
             Ok((sent, bytes)) => {
                 done.sent = sent;
                 done.bytes = bytes;
@@ -1505,17 +1576,15 @@ fn run_pipeline(
     match mode {
         BackupMode::Full if options.snapshot_only => snapshots(&mut done),
         BackupMode::Full if options.send_only => send(&mut done),
-        BackupMode::Full => {
-            match run_full_pipeline_with(config, sources, targets, progress, runner) {
-                Ok((created, sent, cleaned, bytes)) => {
-                    done.created = created;
-                    done.sent = sent;
-                    done.cleaned = cleaned;
-                    done.bytes = bytes;
-                }
-                Err(e) => done.failed(progress, format!("Full backup pipeline failed: {e}")),
+        BackupMode::Full => match run_full_pipeline_with(config, sources, targets, progress, env) {
+            Ok((created, sent, cleaned, bytes)) => {
+                done.created = created;
+                done.sent = sent;
+                done.cleaned = cleaned;
+                done.bytes = bytes;
             }
-        }
+            Err(e) => done.failed(progress, format!("Full backup pipeline failed: {e}")),
+        },
         BackupMode::Incremental => {
             if !options.send_only {
                 snapshots(&mut done);
@@ -1535,15 +1604,15 @@ pub fn run_backup(
     options: &BackupOptions,
     progress: &dyn ProgressCallback,
 ) -> Result<BackupResult, Box<dyn std::error::Error>> {
-    run_backup_with(config, options, progress, &SystemRunner)
+    run_backup_with(config, options, progress, &StepEnv::HOST)
 }
 
-/// [`run_backup`] with every `btrbk` run by `runner`.
+/// [`run_backup`] in `env`.
 fn run_backup_with(
     config: &Config,
     options: &BackupOptions,
     progress: &dyn ProgressCallback,
-    runner: &dyn CommandRunner,
+    env: &StepEnv,
 ) -> Result<BackupResult, Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
 
@@ -1576,7 +1645,11 @@ fn run_backup_with(
     //
     // Runs on dry-run too: a dry-run that would have written to the root
     // filesystem is exactly the thing worth being told about.
-    mount::verify_write_targets(&config.targets, &effective_targets, progress)?;
+    //
+    // Every step that writes checks again, just before it does (a step can be
+    // called on its own, and `send` and `boot-archive` are), so a run does not
+    // trust a mount to have stayed as it was through a long snapshot step.
+    (env.verify)(&config.targets, &effective_targets, progress)?;
 
     // Only now — targets mounted and verified, config reloaded after sync —
     // create the directories btrbk receives into, so a source sync just
@@ -1686,7 +1759,7 @@ fn run_backup_with(
         &effective_sources,
         &effective_targets,
         progress,
-        runner,
+        env,
     );
     errors.extend(done.errors);
     let (snapshots_created, snapshots_sent, snapshots_cleaned) =
@@ -1717,7 +1790,7 @@ fn run_backup_with(
 
     // Step (c): Boot archive (both modes)
     if options.boot_archive {
-        match archive_boot(config, progress) {
+        match archive_boot_with(config, Some(&effective_targets), progress, env) {
             Ok(archived) => boot_archived = archived,
             Err(e) => {
                 let msg = format!("Boot archive step failed: {e}");
@@ -2447,8 +2520,13 @@ mod tests {
         };
         let progress = TestProgress::new();
 
-        let result = run_backup(&config, &options, &progress)
-            .expect("dry_run should succeed even with non-existent btrbk.conf");
+        let result = run_backup_with(
+            &config,
+            &options,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        )
+        .expect("dry_run should succeed even with non-existent btrbk.conf");
 
         assert!(result.success, "dry_run result must be success");
         assert_eq!(
@@ -2490,7 +2568,12 @@ mod tests {
         };
         let progress = TestProgress::new();
 
-        let result = run_backup(&config, &options, &progress);
+        let result = run_backup_with(
+            &config,
+            &options,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        );
         assert!(result.is_err(), "must fail when no targets are mounted");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -2658,6 +2741,15 @@ mod tests {
             "source_subvolume='/.btrfs-nvme/@' snapshot_subvolume='{snapshot}' \
              target_subvolume='{target}' target_type='send-receive'\n"
         )
+    }
+
+    /// A step environment for the tests: `runner` runs every command, and every
+    /// target verifies clean — unless a test hands in its own `verify`.
+    fn env(runner: &dyn CommandRunner) -> StepEnv<'_> {
+        StepEnv {
+            runner,
+            verify: &|_, _, _| Ok(()),
+        }
     }
 
     /// A runner that cannot start any program, as when btrbk is not installed.
@@ -3099,9 +3191,12 @@ mod tests {
         let primary = labels(&["primary-22tb"]);
         assert!(create_snapshots_with(&config, &[], None, &progress, &Unspawnable).is_err());
         assert!(
-            send_snapshots_with(&config, &[], &primary, false, &progress, &Unspawnable).is_err()
+            send_snapshots_with(&config, &[], &primary, false, &progress, &env(&Unspawnable))
+                .is_err()
         );
-        assert!(run_full_pipeline_with(&config, &[], &primary, &progress, &Unspawnable).is_err());
+        assert!(
+            run_full_pipeline_with(&config, &[], &primary, &progress, &env(&Unspawnable)).is_err()
+        );
     }
 
     #[test]
@@ -3137,7 +3232,7 @@ mod tests {
                 &every,
                 preserve,
                 &TestProgress::new(),
-                &runner,
+                &env(&runner),
             )
             .unwrap();
             assert_eq!(
@@ -3166,7 +3261,7 @@ mod tests {
             &labels(&["primary-22tb"]),
             false,
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         let calls = runner.calls();
@@ -3209,7 +3304,7 @@ mod tests {
             &labels(&["primary-22tb"]),
             false,
             &TestProgress::new(),
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         assert_eq!(runner.calls()[0], btrbk(&format!("resume {filters}")));
@@ -3232,7 +3327,7 @@ mod tests {
             &labels(&["primary-22tb"]),
             false,
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap_err()
         .to_string();
@@ -3268,7 +3363,15 @@ mod tests {
             0,
             String::new(),
         )]);
-        send_snapshots_with(&config, &[], &[], false, &TestProgress::new(), &runner).unwrap();
+        send_snapshots_with(
+            &config,
+            &[],
+            &[],
+            false,
+            &TestProgress::new(),
+            &env(&runner),
+        )
+        .unwrap();
         assert_eq!(runner.calls()[0], btrbk(&format!("resume {filters}")));
     }
 
@@ -3281,7 +3384,7 @@ mod tests {
             &[],
             false,
             &TestProgress::new(),
-            &runner,
+            &env(&runner),
         )
         .unwrap_err()
         .to_string();
@@ -3298,7 +3401,7 @@ mod tests {
             &labels(&["primary-22tb", "typo"]),
             false,
             &TestProgress::new(),
-            &runner,
+            &env(&runner),
         )
         .unwrap_err()
         .to_string();
@@ -3333,7 +3436,7 @@ mod tests {
             &labels(&["primary-22tb", "recovery"]),
             false,
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         assert_eq!(sent, 2, "target rows of the listing, not marker lines");
@@ -3367,7 +3470,7 @@ mod tests {
             &labels(&["primary-22tb", "recovery"]),
             false,
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         assert_eq!(sent, 2, "the >>> and the *** line");
@@ -3399,7 +3502,7 @@ mod tests {
             &labels(&["nvme-root", "nvme-vm", "hdd"]),
             &labels(&["primary-22tb", "recovery"]),
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         // created: distinct snapshots (2); sent: target rows (2);
@@ -3435,7 +3538,7 @@ mod tests {
             &labels(&["hdd"]),
             &labels(&["recovery"]),
             &TestProgress::new(),
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         let calls = runner.calls();
@@ -3456,7 +3559,7 @@ mod tests {
             &[],
             &labels(&["primary-22tb", "recovery"]),
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap();
         assert_eq!(got, (2, 1, 1, 0));
@@ -3476,7 +3579,7 @@ mod tests {
             &[],
             &labels(&["primary-22tb", "recovery"]),
             &progress,
-            &runner,
+            &env(&runner),
         )
         .unwrap_err()
         .to_string();
@@ -3506,7 +3609,7 @@ mod tests {
             &[],
             &labels(&["primary-22tb"]),
             &progress,
-            &runner,
+            &env(&runner),
         );
         (done, runner.calls(), progress)
     }
@@ -3693,6 +3796,603 @@ mod tests {
         );
     }
 
+    // -- the guard before every write to a target (bd DAS-Backup-Manager-7tx, 9on) --
+    //
+    // `btrdasd backup send` and `backup boot-archive`, from the CLI and from the
+    // helper, wrote to a target nobody had checked: only `backup run` verified.
+    // The check is now inside the steps themselves, so every caller has it.
+
+    /// `runner`, with the real `mount::verify_write_targets` as the check.
+    fn env_verifying(runner: &dyn CommandRunner) -> StepEnv<'_> {
+        StepEnv {
+            runner,
+            verify: &mount::verify_write_targets,
+        }
+    }
+
+    /// The steps' config, its primary target's mount point a plain directory
+    /// with nothing mounted on it.
+    fn bare_dir_config(dir: &Path) -> Config {
+        let mut config = steps_config();
+        config.targets[0].mount = dir.to_string_lossy().into_owned();
+        config
+    }
+
+    fn assert_refused_for_a_bare_dir(err: &str, dir: &Path) {
+        assert!(err.contains("Refusing to run btrbk"), "{err}");
+        assert!(err.contains("primary-22tb"), "{err}");
+        assert!(err.contains("NOT a mount point"), "{err}");
+        assert!(err.contains(&dir.to_string_lossy().to_string()), "{err}");
+    }
+
+    #[test]
+    fn send_refuses_a_bare_mount_point_and_runs_no_btrbk() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Scripted::from_owned(vec![]);
+        let err = send_snapshots_with(
+            &bare_dir_config(dir.path()),
+            &[],
+            &labels(&["primary-22tb"]),
+            false,
+            &TestProgress::new(),
+            &env_verifying(&runner),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_refused_for_a_bare_dir(&err, dir.path());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn a_full_run_refuses_a_bare_mount_point_and_runs_no_btrbk() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Scripted::from_owned(vec![]);
+        let err = run_full_pipeline_with(
+            &bare_dir_config(dir.path()),
+            &[],
+            &labels(&["primary-22tb"]),
+            &TestProgress::new(),
+            &env_verifying(&runner),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_refused_for_a_bare_dir(&err, dir.path());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// A mount point is not enough: it has to hold the filesystem the config
+    /// names. `/proc` is one, and carries no UUID `findmnt` can report.
+    #[test]
+    fn send_refuses_a_mount_point_that_is_not_the_filesystem_expected() {
+        let mut config = steps_config();
+        config.targets[0].mount = "/proc".into();
+        config.targets[0].mount_uuid = Some("00000000-0000-0000-0000-000000000000".into());
+        let runner = Scripted::from_owned(vec![]);
+        let err = send_snapshots_with(
+            &config,
+            &[],
+            &labels(&["primary-22tb"]),
+            false,
+            &TestProgress::new(),
+            &env_verifying(&runner),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Refusing to run btrbk"), "{err}");
+        assert!(err.contains("/proc"), "{err}");
+        assert!(
+            err.contains("could not determine the filesystem UUID")
+                || err.contains("has filesystem UUID"),
+            "{err}"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// What `verify` was asked, as `(every target's label, the labels to be
+    /// written)`.
+    type Asked = Vec<(Vec<String>, Vec<String>)>;
+
+    #[test]
+    fn send_and_the_full_run_verify_exactly_the_targets_they_write_and_then_run_btrbk() {
+        let asked = std::sync::Mutex::new(Asked::new());
+        let verify = |targets: &[Target],
+                      write: &[String],
+                      _: &dyn ProgressCallback|
+         -> Result<(), String> {
+            asked.lock().unwrap().push((
+                targets.iter().map(|t| t.label.clone()).collect(),
+                write.to_vec(),
+            ));
+            Ok(())
+        };
+        let filters = primary_filters();
+        let runner = Scripted::from_owned(vec![
+            (btrbk(&format!("resume {filters}")), 0, String::new()),
+            (btrbk(&format!("run {filters}")), 0, String::new()),
+        ]);
+        let env = StepEnv {
+            runner: &runner,
+            verify: &verify,
+        };
+        let primary = labels(&["primary-22tb"]);
+        let config = steps_config();
+        send_snapshots_with(&config, &[], &primary, false, &TestProgress::new(), &env).unwrap();
+        run_full_pipeline_with(&config, &[], &primary, &TestProgress::new(), &env).unwrap();
+        let both = labels(&["primary-22tb", "recovery"]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [(both.clone(), primary.clone()), (both, primary)],
+            "all the targets are passed, and the labels that will be written"
+        );
+        assert_eq!(runner.calls().len(), 4, "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn a_step_whose_verification_fails_runs_nothing_and_says_why() {
+        let verify = |_: &[Target], _: &[String], _: &dyn ProgressCallback| -> Result<(), String> {
+            Err("recovery is on the wrong disk".to_string())
+        };
+        let runner = Scripted::from_owned(vec![]);
+        let env = StepEnv {
+            runner: &runner,
+            verify: &verify,
+        };
+        let config = steps_config();
+        let every = labels(&["primary-22tb", "recovery"]);
+        let err = send_snapshots_with(&config, &[], &every, false, &TestProgress::new(), &env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "recovery is on the wrong disk");
+        let err = run_full_pipeline_with(&config, &[], &every, &TestProgress::new(), &env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "recovery is on the wrong disk");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// The host's environment is the real thing: the real command runner, and
+    /// the real check — which the wiring above rests on.
+    #[test]
+    fn the_host_environment_runs_real_commands_and_verifies_for_real() {
+        let out = StepEnv::HOST
+            .runner
+            .output(Command::new("sh").args(["-c", "exit 3"]))
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        let dir = tempfile::tempdir().unwrap();
+        let config = bare_dir_config(dir.path());
+        let err = (StepEnv::HOST.verify)(
+            &config.targets,
+            &labels(&["primary-22tb"]),
+            &TestProgress::new(),
+        )
+        .unwrap_err();
+        assert_refused_for_a_bare_dir(&err, dir.path());
+    }
+
+    #[test]
+    fn a_run_verifies_its_targets_before_it_does_anything_else() {
+        let asked = std::sync::Mutex::new(Asked::new());
+        let verify = |targets: &[Target],
+                      write: &[String],
+                      _: &dyn ProgressCallback|
+         -> Result<(), String> {
+            asked.lock().unwrap().push((
+                targets.iter().map(|t| t.label.clone()).collect(),
+                write.to_vec(),
+            ));
+            Ok(())
+        };
+        let runner = Scripted::from_owned(vec![]);
+        let options = BackupOptions {
+            dry_run: true,
+            targets: labels(&["primary-22tb"]),
+            ..Default::default()
+        };
+        let progress = TestProgress::new();
+        run_backup_with(
+            &make_test_config(),
+            &options,
+            &progress,
+            &StepEnv {
+                runner: &runner,
+                verify: &verify,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [(labels(&["primary-22tb"]), labels(&["primary-22tb"]))]
+        );
+
+        // A target that fails the check ends the run before its first step.
+        let refuse = |_: &[Target], _: &[String], _: &dyn ProgressCallback| -> Result<(), String> {
+            Err("not the disk it should be".to_string())
+        };
+        let progress = TestProgress::new();
+        let err = run_backup_with(
+            &make_test_config(),
+            &options,
+            &progress,
+            &StepEnv {
+                runner: &runner,
+                verify: &refuse,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "not the disk it should be");
+        assert!(progress.stages.lock().unwrap().is_empty());
+        assert!(runner.calls().is_empty());
+    }
+
+    // -- boot archival: guarded, and its btrfs through the runner ----------------
+
+    /// A config with one live `@` under `mount`, a btrbk.conf naming `root-`,
+    /// and a source that sends to `<mount>/nvme`. The conf file lives as long
+    /// as the returned guard.
+    fn archive_fixture(mount: &Path) -> (Config, tempfile::NamedTempFile) {
+        let conf = write_btrbk_conf("@", "root-");
+        let mut config = make_test_config();
+        config.general.btrbk_conf = conf.path().to_string_lossy().into_owned();
+        config.boot.subvolumes = vec!["@".into()];
+        config.sources[0].subvolumes = vec![SubvolConfig {
+            name: "@".into(),
+            ..Default::default()
+        }];
+        config.sources[0].target_subdirs = vec!["nvme".into()];
+        config.targets[0].mount = mount.to_string_lossy().into_owned();
+        (config, conf)
+    }
+
+    fn another_target(config: &Config, label: &str, mount: &Path, role: TargetRole) -> Target {
+        Target {
+            label: label.into(),
+            mount: mount.to_string_lossy().into_owned(),
+            role,
+            ..config.targets[0].clone()
+        }
+    }
+
+    #[test]
+    fn boot_archive_refuses_a_bare_mount_point_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("@");
+        std::fs::create_dir(&live).unwrap();
+        let (config, _conf) = archive_fixture(dir.path());
+        let runner = Scripted::from_owned(vec![]);
+        let err = archive_boot_with(&config, None, &TestProgress::new(), &env_verifying(&runner))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Refusing to run btrbk"), "{err}");
+        assert!(err.contains("NOT a mount point"), "{err}");
+        assert!(
+            err.contains(&dir.path().to_string_lossy().to_string()),
+            "{err}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "no btrfs command may run against it: {:?}",
+            runner.calls()
+        );
+        assert!(live.exists());
+    }
+
+    #[test]
+    fn boot_archive_verifies_only_the_targets_it_writes_under() {
+        let primary = tempfile::tempdir().unwrap();
+        let mirror = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(primary.path());
+        config.targets.push(another_target(
+            &config,
+            "recovery-mirror",
+            mirror.path(),
+            TargetRole::Mirror,
+        ));
+        config.targets.push(another_target(
+            &config,
+            "absent",
+            Path::new("/nonexistent/das/absent"),
+            TargetRole::Primary,
+        ));
+        let asked = std::sync::Mutex::new(Asked::new());
+        let verify = |targets: &[Target],
+                      write: &[String],
+                      _: &dyn ProgressCallback|
+         -> Result<(), String> {
+            asked.lock().unwrap().push((
+                targets.iter().map(|t| t.label.clone()).collect(),
+                write.to_vec(),
+            ));
+            Ok(())
+        };
+        let runner = Scripted::from_owned(vec![]);
+        archive_boot_with(
+            &config,
+            None,
+            &TestProgress::new(),
+            &StepEnv {
+                runner: &runner,
+                verify: &verify,
+            },
+        )
+        .unwrap();
+        // A mirror carries its own OS and is never written; a target whose
+        // mount point does not exist is not written either, and is left alone.
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [(
+                labels(&["primary-22tb", "recovery-mirror", "absent"]),
+                labels(&["primary-22tb"])
+            )]
+        );
+    }
+
+    #[test]
+    fn boot_archive_writes_only_under_the_targets_selected() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(a.path());
+        config.targets.push(another_target(
+            &config,
+            "second",
+            b.path(),
+            TargetRole::Primary,
+        ));
+        let asked = std::sync::Mutex::new(Asked::new());
+        let verify =
+            |_: &[Target], write: &[String], _: &dyn ProgressCallback| -> Result<(), String> {
+                asked.lock().unwrap().push((vec![], write.to_vec()));
+                Ok(())
+            };
+        let runner = Scripted::from_owned(vec![]);
+        let env = StepEnv {
+            runner: &runner,
+            verify: &verify,
+        };
+        let only_second = labels(&["second"]);
+        archive_boot_with(&config, Some(&only_second), &TestProgress::new(), &env).unwrap();
+        assert_eq!(*asked.lock().unwrap(), [(vec![], only_second)]);
+        assert_eq!(
+            runner.calls(),
+            [format!("btrfs subvolume list {}", b.path().display())],
+            "nothing is read or written under the target left out"
+        );
+        // Selecting nothing in particular is every target.
+        let runner = Scripted::from_owned(vec![]);
+        archive_boot_with(
+            &config,
+            None,
+            &TestProgress::new(),
+            &env_for(&runner, &verify),
+        )
+        .unwrap();
+        assert_eq!(runner.calls().len(), 2, "{:?}", runner.calls());
+    }
+
+    /// `env` for a closure `verify` that is a variable of the test.
+    fn env_for<'a>(runner: &'a dyn CommandRunner, verify: &'a VerifyTargets) -> StepEnv<'a> {
+        StepEnv { runner, verify }
+    }
+
+    /// The whole sequence, in its safe order, against a real directory: the
+    /// replacement is found first, the live subvolume is archived, the
+    /// replacement is built alongside it, and only then is the live one
+    /// removed and the replacement renamed into its place.
+    #[test]
+    fn boot_archive_replaces_the_live_subvolume_in_its_safe_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        let live = dir.path().join("@");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("old"), b"outgoing").unwrap();
+        let (config, _conf) = archive_fixture(dir.path());
+        let runner = Scripted::from_owned(vec![(
+            format!("btrfs subvolume list {m}"),
+            0,
+            "ID 300 gen 3 top level 5 path nvme/root-.20261004T0100\n\
+             ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n"
+                .into(),
+        )])
+        .snapshotting()
+        .deleting_too(vec![format!("{m}/@")]);
+        let progress = TestProgress::new();
+        let archived = archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        assert!(archived);
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls[0], format!("btrfs subvolume list {m}"));
+        let archive_prefix = format!("btrfs subvolume snapshot -r {m}/@ {m}/@.archive.");
+        assert!(calls[1].starts_with(&archive_prefix), "{calls:?}");
+        assert_eq!(
+            calls[2],
+            format!("btrfs subvolume snapshot {m}/nvme/root-.20261005T0100 {m}/@.new"),
+            "the NEWEST snapshot is built alongside the live subvolume"
+        );
+        assert_eq!(calls[3], format!("btrfs subvolume delete {m}/@"));
+
+        // The live subvolume is now the replacement, not the outgoing one.
+        assert!(live.is_dir());
+        assert!(!live.join("old").exists(), "the outgoing contents are gone");
+        assert!(!dir.path().join("@.new").exists());
+        let archive = calls[1].rsplit(' ').next().unwrap();
+        assert!(
+            Path::new(archive).is_dir(),
+            "the archive was made: {archive}"
+        );
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            &format!("Created {m}/@ from nvme/root-.20261005T0100")
+        ));
+    }
+
+    /// bd 5ig: no failure path may leave the live subvolume absent. Each step
+    /// that can fail is made to, and the live one survives, with what the
+    /// run says about it.
+    #[test]
+    fn boot_archive_never_loses_the_live_subvolume_whichever_step_fails() {
+        let list = |m: &str| {
+            (
+                format!("btrfs subvolume list {m}"),
+                0,
+                "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".to_string(),
+            )
+        };
+        // (the step made to fail, what must be in the log, calls that must NOT happen)
+        type Case = (&'static str, &'static str, &'static [&'static str]);
+        let cases: [Case; 3] = [
+            // The archive cannot be made: nothing else is done.
+            (
+                "archive",
+                "Failed to archive",
+                &["snapshot {m}/nvme", "delete {m}/@"],
+            ),
+            // The replacement cannot be built: the live one is not touched.
+            ("staging", "Failed to create", &["delete {m}/@"]),
+            // The live one cannot be removed: the replacement is discarded.
+            ("delete", "Failed to delete", &[]),
+        ];
+        for (failing, said, never) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let m = dir.path().display().to_string();
+            let live = dir.path().join("@");
+            std::fs::create_dir(&live).unwrap();
+            std::fs::write(live.join("marker"), b"live").unwrap();
+            let (config, _conf) = archive_fixture(dir.path());
+            let mut script = vec![list(&m)];
+            let stage = format!("btrfs subvolume snapshot {m}/nvme/root-.20261005T0100 {m}/@.new");
+            match failing {
+                "archive" => {
+                    // The archive's name has a timestamp: every snapshot of
+                    // the live subvolume fails, the replacement's would not.
+                    script.push((stage.clone(), 0, String::new()));
+                }
+                "staging" => script.push((stage.clone(), 1, String::new())),
+                _ => script.push((format!("btrfs subvolume delete {m}/@"), 1, String::new())),
+            }
+            let mut runner = Scripted::from_owned(script).snapshotting();
+            if failing == "archive" {
+                runner = runner.failing_snapshots_of(&format!("{m}/@ "));
+            }
+            let progress = TestProgress::new();
+            archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+            assert!(
+                live.join("marker").exists(),
+                "{failing}: the live subvolume survives"
+            );
+            assert!(
+                progress
+                    .logs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, msg)| msg.contains(said)),
+                "{failing}: {:?}",
+                progress.logs.lock().unwrap()
+            );
+            for call in runner.calls() {
+                for pattern in never {
+                    assert!(
+                        !call.contains(&pattern.replace("{m}", &m)),
+                        "{failing}: {call} must not run after the failure"
+                    );
+                }
+            }
+            if failing == "delete" {
+                assert!(
+                    runner
+                        .calls()
+                        .contains(&format!("btrfs subvolume delete {m}/@.new")),
+                    "the replacement is discarded: {:?}",
+                    runner.calls()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boot_archive_removes_a_stale_staging_subvolume_first_and_stops_if_it_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        std::fs::create_dir(dir.path().join("@")).unwrap();
+        std::fs::create_dir(dir.path().join("@.new")).unwrap();
+        let (config, _conf) = archive_fixture(dir.path());
+        let list = (
+            format!("btrfs subvolume list {m}"),
+            0,
+            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".to_string(),
+        );
+        // It cannot be removed: the live subvolume is left as it is.
+        let runner = Scripted::from_owned(vec![
+            list.clone(),
+            (
+                format!("btrfs subvolume delete {m}/@.new"),
+                1,
+                String::new(),
+            ),
+        ])
+        .snapshotting();
+        let progress = TestProgress::new();
+        archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|c| c.as_str() == format!("btrfs subvolume delete {m}/@.new"))
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.contains("nvme/root-") && c.starts_with("btrfs subvolume snapshot ")),
+            "no replacement is built over a stale one: {:?}",
+            runner.calls()
+        );
+        assert!(dir.path().join("@").is_dir());
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, msg)| msg.contains("Stale") && msg.contains("could not be removed"))
+        );
+    }
+
+    #[test]
+    fn boot_archive_reports_a_replacement_that_cannot_be_moved_into_place() {
+        // The scripted delete does nothing, so `@` is still there and the
+        // rename of `@.new` onto it fails: said, and the archive holds the old.
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        let live = dir.path().join("@");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("old"), b"x").unwrap();
+        let (config, _conf) = archive_fixture(dir.path());
+        let runner = Scripted::from_owned(vec![
+            (
+                format!("btrfs subvolume list {m}"),
+                0,
+                "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".into(),
+            ),
+            (format!("btrfs subvolume delete {m}/@"), 0, String::new()),
+        ])
+        .snapshotting();
+        let progress = TestProgress::new();
+        archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, msg)| *l == LogLevel::Error && msg.starts_with("Renamed nothing:"))
+        );
+        assert!(live.join("old").exists());
+    }
+
     // -- the selection a run starts from ----------------------------------------
 
     #[test]
@@ -3839,7 +4539,13 @@ mod tests {
         config.targets[0].mount = target_dir.path().to_string_lossy().to_string();
 
         let progress = TestProgress::new();
-        let result = archive_boot(&config, &progress).expect("must not error");
+        let result = archive_boot_with(
+            &config,
+            None,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        )
+        .expect("must not error");
         assert!(
             !result,
             "nothing may be archived when names cannot be resolved"
@@ -3867,7 +4573,13 @@ mod tests {
         config.targets[0].mount = target_dir.path().to_string_lossy().to_string();
 
         let progress = TestProgress::new();
-        archive_boot(&config, &progress).expect("must not error");
+        archive_boot_with(
+            &config,
+            None,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        )
+        .expect("must not error");
         assert!(
             live.exists(),
             "live subvolume must survive a failed snapshot lookup"
@@ -3919,7 +4631,12 @@ mod tests {
         });
 
         let progress = TestProgress::new();
-        let result = archive_boot(&config, &progress);
+        let result = archive_boot_with(
+            &config,
+            None,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        );
         assert!(result.is_ok(), "archive_boot must not error: {result:?}");
 
         let logs = progress.logs.lock().unwrap();
@@ -4127,7 +4844,13 @@ mod tests {
             ..Default::default()
         };
         let progress = TestProgress::new();
-        let result = run_backup(&config, &options, &progress).unwrap();
+        let result = run_backup_with(
+            &config,
+            &options,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        )
+        .unwrap();
         assert!(!result.success, "a failed sync must fail the run");
         assert!(
             result
@@ -4165,7 +4888,13 @@ mod tests {
             ..Default::default()
         };
         let progress = TestProgress::new();
-        let result = run_backup(&config, &options, &progress).unwrap();
+        let result = run_backup_with(
+            &config,
+            &options,
+            &progress,
+            &env(&Scripted::from_owned(vec![])),
+        )
+        .unwrap();
         assert!(!result.success);
         assert!(
             result.errors[0].starts_with("Target directories missing"),
@@ -4186,7 +4915,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = run_backup(&config, &options, &TestProgress::new()).unwrap();
+        let result = run_backup_with(
+            &config,
+            &options,
+            &TestProgress::new(),
+            &env(&Scripted::from_owned(vec![])),
+        )
+        .unwrap();
         assert!(result.success, "{:?}", result.errors);
         assert!(result.errors.is_empty());
     }
