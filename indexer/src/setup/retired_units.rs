@@ -12,7 +12,8 @@
 //! hours. Setup is now the only writer, and an upgrade removes what older
 //! versions left: only at the paths CMake wrote to, and only a file whose bytes
 //! are a version this project installed. Anything else there — an edited file,
-//! a link, a directory — stays where it is, and is named.
+//! a link, a directory, a copy reached through a linked directory, a file
+//! replaced while it was being checked — stays where it is, and is named.
 //!
 //! Remove this module once no supported host can still have those files, as
 //! the legacy entries on `setup --uninstall-all`'s list will go.
@@ -20,7 +21,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What CMake's `configure_file(... @ONLY)` filled in the two service
 /// templates: `DAS_SCRIPT_DIR`, which was `${CMAKE_INSTALL_PREFIX}/lib/das-backup`
@@ -154,9 +155,10 @@ enum Candidate {
     Bytes(Vec<u8>, File),
 }
 
-/// Read the file at `path`, never through a link and never past [`MAX_LEN`].
-/// An error is any failure other than nothing being there or `path` being a
-/// link.
+/// Read the file at `path`, never opening a link at `path` itself and never
+/// reading past [`MAX_LEN`]. A link in a directory above `path` is followed
+/// here, and refused before the removal: see [`link_above`]. An error is any
+/// failure other than nothing being there or `path` being a link.
 fn read_candidate(path: &Path) -> io::Result<Candidate> {
     let file = match OpenOptions::new()
         .read(true)
@@ -187,7 +189,7 @@ enum Retired {
     Absent,
     Removed,
     /// Left where it is, and why.
-    Kept(&'static str),
+    Kept(String),
 }
 
 /// What a [`Remover`] did.
@@ -219,28 +221,63 @@ fn remove_if_unchanged(path: &Path, held: &File) -> io::Result<Removal> {
     Ok(Removal::Removed)
 }
 
-/// Look at `path`, where an older version may have installed `unit`, and
-/// remove it with `remove` if it holds a version this project installed.
-fn retire_one(path: &Path, unit: &str, remove: Remover) -> Result<Retired, String> {
-    let read = read_candidate(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+/// The first directory on the way from `root` to `dir` that is a link, if any,
+/// by `lstat` of each in turn: what lies below `root` only, whatever `root`
+/// itself is. `O_NOFOLLOW` guards a path's last component alone, so a link in
+/// any directory above a unit is followed by the open and by the unlink — what
+/// the unlink would remove is then not at the place this module looks at, and
+/// may be a unit of setup's own.
+fn link_above(root: &Path, dir: &str) -> io::Result<Option<PathBuf>> {
+    let mut at = root.to_path_buf();
+    for part in dir.split('/') {
+        at.push(part);
+        if std::fs::symlink_metadata(&at)?.file_type().is_symlink() {
+            return Ok(Some(at));
+        }
+    }
+    Ok(None)
+}
+
+/// Where an older version may have installed `unit`: below `root`, in `dir`.
+fn unit_path(root: &Path, dir: &str, unit: &str) -> PathBuf {
+    root.join(dir).join(unit)
+}
+
+/// Look where an older version may have installed `unit` — in `dir`, below
+/// `root` — and remove it with `remove` if it holds a version this project
+/// installed.
+fn retire_one(root: &Path, dir: &str, unit: &str, remove: Remover) -> Result<Retired, String> {
+    let path = unit_path(root, dir, unit);
+    let read = read_candidate(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let (bytes, held) = match read {
         Candidate::Absent => return Ok(Retired::Absent),
-        Candidate::NotAFile => return Ok(Retired::Kept("it is not a regular file")),
+        Candidate::NotAFile => return Ok(Retired::Kept("it is not a regular file".into())),
         Candidate::TooLong => {
             return Ok(Retired::Kept(
-                "it is longer than any version this project installed",
+                "it is longer than any version this project installed".into(),
             ));
         }
         Candidate::Bytes(bytes, held) => (bytes, held),
     };
     if !is_shipped(unit, &bytes) {
         return Ok(Retired::Kept(
-            "its content is no version this project installed — edited, or not this project's",
+            "its content is no version this project installed — edited, or not this project's"
+                .into(),
         ));
     }
-    match remove(path, &held).map_err(|e| format!("cannot remove {}: {e}", path.display()))? {
+    if let Some(link) =
+        link_above(root, dir).map_err(|e| format!("cannot read {}: {e}", path.display()))?
+    {
+        return Ok(Retired::Kept(format!(
+            "a directory above it is a link ({})",
+            link.display()
+        )));
+    }
+    match remove(&path, &held).map_err(|e| format!("cannot remove {}: {e}", path.display()))? {
         Removal::Removed => Ok(Retired::Removed),
-        Removal::Replaced => Ok(Retired::Kept("it was replaced while it was being checked")),
+        Removal::Replaced => Ok(Retired::Kept(
+            "it was replaced while it was being checked".into(),
+        )),
     }
 }
 
@@ -260,8 +297,8 @@ fn remove_retired_units_with(
     let mut failed = Vec::new();
     for dir in UNIT_DIRS {
         for unit in UNITS {
-            let path = root.join(dir).join(unit);
-            match retire_one(&path, unit, remove) {
+            let path = unit_path(root, dir, unit);
+            match retire_one(root, dir, unit, remove) {
                 Ok(Retired::Absent) => {}
                 Ok(Retired::Removed) => say(format!(
                     "Removed {}: a backup unit an older version installed. `btrdasd setup` is \
@@ -559,6 +596,81 @@ mod tests {
         assert!(dir.join("das-backup.service").symlink_metadata().is_ok());
         assert!(target.exists(), "a link's target is never touched");
         assert!(dir.join("das-backup.timer").is_dir());
+    }
+
+    #[test]
+    fn a_copy_reached_through_a_link_in_a_directory_above_it_is_kept_wherever_the_link_is() {
+        // `O_NOFOLLOW` guards a path's last component only, so a link in any
+        // directory above the unit was followed by the open and the unlink: the
+        // review's R2 had `usr/local/lib/systemd/system` a link into
+        // `etc/systemd/system`, and a byte-exact copy there was removed. Every
+        // position of the link, on the way to either directory.
+        for dir in UNIT_DIRS {
+            let parts: Vec<&str> = dir.split('/').collect();
+            for i in 0..parts.len() {
+                let root = tempfile::tempdir().unwrap();
+                // The real tree, away from where the units are looked for.
+                let inside = ["real"]
+                    .into_iter()
+                    .chain(parts[i + 1..].iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let real = put(
+                    root.path(),
+                    &format!("{inside}/das-backup.timer"),
+                    versions("das-backup.timer")[0].as_bytes(),
+                );
+                let link = root.path().join(parts[..=i].join("/"));
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(root.path().join("real"), &link).unwrap();
+
+                let (result, lines) = run(root.path());
+                assert_eq!(result, Ok(()), "{dir}, link at {}", parts[i]);
+                let path = root.path().join(dir).join("das-backup.timer");
+                assert_eq!(
+                    lines,
+                    [format!(
+                        "Kept {}: a directory above it is a link ({}). Remove it yourself if it \
+                         is a leftover: it takes effect whenever setup's das-backup.timer in \
+                         /etc/systemd/system is gone.",
+                        path.display(),
+                        link.display()
+                    )],
+                    "{dir}, link at {}",
+                    parts[i]
+                );
+                assert!(real.exists(), "what the link leads to is not touched");
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_above_nothing_says_nothing_and_the_root_itself_may_be_a_link() {
+        // /usr/local is a link on hosts that keep it elsewhere: with no unit
+        // behind it there is nothing to keep, and nothing to say.
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(root.path().join("usr")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.path().join("usr/local")).unwrap();
+        assert_eq!(run(root.path()), (Ok(()), vec![]));
+
+        // Only what lies below the root is looked at: a root that is itself
+        // reached through a link is an ordinary root.
+        let real = tempfile::tempdir().unwrap();
+        let path = put(
+            real.path(),
+            "usr/lib/systemd/system/das-backup.timer",
+            versions("das-backup.timer")[0].as_bytes(),
+        );
+        let outer = tempfile::tempdir().unwrap();
+        let via = outer.path().join("root");
+        std::os::unix::fs::symlink(real.path(), &via).unwrap();
+        let (result, lines) = run(&via);
+        assert_eq!(result, Ok(()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Removed "), "{lines:?}");
+        assert!(!path.exists());
     }
 
     #[test]
