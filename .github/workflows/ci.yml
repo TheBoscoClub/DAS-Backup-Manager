@@ -9,6 +9,12 @@
 #
 # Actions are referenced by the same tags used in release-packages.yml so the two
 # stay in step and Dependabot's github_actions ecosystem updates both together.
+#
+# Every package install in the Arch jobs goes through
+# .github/scripts/pacman-install.sh, which retries a bounded number of times:
+# connections reset by a mirror once failed a run before any build step
+# (bd DAS-Backup-Manager-ravr). A step that calls pacman directly bypasses that
+# retry, and tests/test_pacman_install.sh fails if one appears.
 name: CI
 
 on:
@@ -48,7 +54,7 @@ jobs:
           }
 
       - name: Install toolchain
-        run: pacman -Syu --noconfirm base-devel rust
+        run: .github/scripts/pacman-install.sh base-devel rust
 
       - name: cargo fmt --check
         working-directory: indexer
@@ -84,7 +90,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
+          .github/scripts/pacman-install.sh \
+            base-devel rust cmake extra-cmake-modules \
             qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
             qt6-tools
@@ -113,12 +120,12 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Install shellcheck
-        run: pacman -Syu --noconfirm shellcheck
+        run: .github/scripts/pacman-install.sh shellcheck
 
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files=(scripts/*.sh tests/*.sh)
+          files=(scripts/*.sh tests/*.sh .github/scripts/*.sh)
           if [ ${#files[@]} -eq 0 ]; then
             echo "no shell scripts found — failing rather than silently passing"
             exit 1

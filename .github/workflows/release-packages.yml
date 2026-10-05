@@ -26,9 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
+      # pacman-install.sh retries a failed install a bounded number of times, so
+      # a connection reset by a mirror cannot fail a release (bd
+      # DAS-Backup-Manager-ravr); a direct pacman call here would bypass it.
       - name: Install build dependencies
         run: |
-          pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
+          .github/scripts/pacman-install.sh \
+            base-devel rust cmake extra-cmake-modules \
             qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
             qt6-tools \
