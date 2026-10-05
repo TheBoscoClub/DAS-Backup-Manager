@@ -640,7 +640,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/detect` | `src/setup/detect.rs` | — | System detection (devices, init, packages) |
 | `setup/templates` | `src/setup/templates.rs` | — | Render systemd units, cron, the udisks-ignore udev rule; embed the scripts (btrbk.conf comes from `btrbk_conf`) |
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
-| `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised byte for byte against `src/setup/retired_units/` |
+| `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
 | `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 23 methods, 3 signals, polkit checks, job ownership |
 
