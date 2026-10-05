@@ -1828,6 +1828,18 @@ check "probe cannot tell for a mounted target: the report's row" \
 check "probe cannot tell for a mounted target: the report's status" "$(report_status)" "FAILURES DETECTED"
 check "probe cannot tell for a mounted target: recorded as failed, with the reason" \
     "$(recorded_as) $(vector_value --errors | grep -c "^unmount: could not tell whether $PRIMARY_MNT is mounted")" "failure 1"
+# The same probe error reaches the boot-subvolume step, which runs after btrbk
+# and before the unmount (bd DAS-Backup-Manager-jlsz): it read the error as
+# "not mounted", skipped the target uncounted and recorded OK, with nothing said.
+# Now it fails the step, names the target and the probe's message, and touches
+# nothing on it.
+boot_row() { sed -n '/^  Boot subvolumes /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+check "probe cannot tell for a mounted target: the boot-subvolume step says so, naming the target" \
+    "$(grep -cF -- "Could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); its boot subvolumes were NOT updated" "$STATE/out")" "1"
+check "probe cannot tell for a mounted target: the report's boot-subvolume row is a FAIL" \
+    "$(boot_row)" "  Boot subvolumes       FAIL  (0 updated, 1 failed)"
+check "probe cannot tell for a mounted target: the boot-subvolume failure is in the history row" \
+    "$(vector_value --errors | grep -c '^boot_subvols: 0 updated, 1 failed')" "1"
 
 # A target that will not unmount: NOT safe, and the same line says which.
 fresh

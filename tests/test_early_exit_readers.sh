@@ -115,20 +115,56 @@ echo "== backup-run.sh: update_boot_subvolumes, the drift check"
 # pattern is a drift, a FAIL; one with none is a quiet skip.
 extract backup-run.sh update_boot_subvolumes "Target HAS btrbk-shaped snapshots but none matched"
 extract backup-run.sh record_op 'OP_STATUS[$op]="$result"'
+extract backup-run.sh probe_mount_point 'LC_ALL=C mountpoint'
+
+# The mount points of a run, and what mountpoint says about each (BOOT_MOUNTS,
+# BOOT_PROBES: "<mount>=<answer> ..."; a mount point not named is mounted).
+# The stub answers as util-linux 2.42.4 does (measured): 0 a mount point, 32
+# not one, 1 an error — and 1, "No such file or directory", for a path that is
+# not there. BOOT_NO_MOUNTPOINT=1 leaves the program out of PATH altogether
+# (exit 127), with the few tools the function needs.
+mkdir -p "$WORK/boot-path"
+for tool in awk cat date grep mktemp rm sort tail tr; do
+    ln -s "$(type -P "$tool")" "$WORK/boot-path/$tool" || harness_broken "no $tool on this system"
+done
 
 run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
+    : >"$WORK/btrfs.calls"
     (
         set -euo pipefail
         # shellcheck source=/dev/null
         source "$WORK/update_boot_subvolumes.sh"
         # shellcheck source=/dev/null
         source "$WORK/record_op.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/probe_mount_point.sh"
         LISTING="$1"
         declare -A OP_STATUS=()
-        declare -A MOUNT_ROLES=([/mnt/t]=primary)
-        ALL_TARGET_MOUNTS=(/mnt/t)
-        mountpoint() { return 0; }
+        declare -A MOUNT_ROLES=()
+        read -r -a ALL_TARGET_MOUNTS <<<"${BOOT_MOUNTS:-/mnt/t}"
+        for m in "${ALL_TARGET_MOUNTS[@]}"; do
+            MOUNT_ROLES[$m]=primary
+        done
+        mountpoint() {
+            local p="${!#}" pair
+            for pair in ${BOOT_PROBES:-}; do
+                [[ "${pair%%=*}" == "$p" ]] || continue
+                case "${pair#*=}" in
+                notmounted) return 32 ;;
+                absent)
+                    echo "mountpoint: $p: No such file or directory" >&2
+                    return 1
+                    ;;
+                error)
+                    echo "mountpoint: $p: Input/output error" >&2
+                    return 1
+                    ;;
+                esac
+            done
+            return 0
+        }
         btrfs() {
+            printf '%s\n' "$*" >>"$WORK/btrfs.calls"
             case "$1 $2" in
             "filesystem label") echo das-backup-test ;;
             "subvolume list") cat "$LISTING" ;;
@@ -151,6 +187,11 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         # the host's: under en_US.UTF-8 bash's regex [0-9] matches more.
         if [[ -n "${BOOT_LOCALE:-}" ]]; then
             export LC_ALL="$BOOT_LOCALE"
+        fi
+        if [[ -n "${BOOT_NO_MOUNTPOINT:-}" ]]; then
+            unset -f mountpoint
+            # shellcheck disable=SC2123  # the point: a PATH with no mountpoint on it
+            PATH="$WORK/boot-path"
         fi
         update_boot_subvolumes true >"$WORK/boot.out" 2>&1
         printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
@@ -185,6 +226,54 @@ check "boot subvolumes, no btrbk snapshots in a listing over 64 KiB: the quiet s
     "$(run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 1 skipped"
 check "boot subvolumes, no btrbk snapshots: says it skips" \
     "$(grep -c 'No btrbk snapshots found, skipping' "$WORK/boot.out")" "1"
+
+# The probe's three answers (bd DAS-Backup-Manager-jlsz). `mountpoint -q ... ||
+# continue` read every failure of the probe as "not mounted": the target was
+# skipped, counted as neither skipped nor failed, and the step recorded OK, 0
+# updated, 0 skipped. Only "not mounted" leaves a target alone; "could not
+# tell" fails the step, counted and said, and the other targets are still done.
+boot_btrfs_calls() { # what btrfs was asked, one call per ";"
+    if [[ -s "$WORK/btrfs.calls" ]]; then tr '\n' ';' <"$WORK/btrfs.calls"; else echo none; fi
+}
+said_boot() { grep -cF -- "$1" "$WORK/boot.out"; }
+
+check "boot subvolumes, the probe says mounted: the listing is read" \
+    "$(BOOT_PROBES="/mnt/t=mounted" run_boot_subvols "$WORK/none-big.txt") $(boot_btrfs_calls)" \
+    "OK|0 updated, 1 skipped filesystem label /mnt/t;subvolume list /mnt/t;"
+
+check "boot subvolumes, the probe says not mounted: a quiet skip, as before" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
+check "boot subvolumes, not mounted: nothing said, btrfs never asked" \
+    "$(said_boot '[ERROR]') $(boot_btrfs_calls)" "0 none"
+
+check "boot subvolumes, no such path (an absent drive's mount point): a quiet skip too" \
+    "$(BOOT_PROBES="/mnt/t=absent" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
+check "boot subvolumes, no such path: nothing said, btrfs never asked" \
+    "$(said_boot '[ERROR]') $(boot_btrfs_calls)" "0 none"
+
+check "boot subvolumes, the probe cannot tell: the step FAILS, counted" \
+    "$(BOOT_PROBES="/mnt/t=error" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, cannot tell: said, with the target and the probe's own message" \
+    "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — mountpoint: /mnt/t: Input/output error (exit 1); its boot subvolumes were NOT updated')" "1"
+check "boot subvolumes, cannot tell: btrfs never asked — nothing was touched" "$(boot_btrfs_calls)" "none"
+
+# No mountpoint program at all (exit 127), the case the tracker names: the old
+# code skipped the target and recorded OK.
+check "boot subvolumes, no mountpoint program: the step FAILS, counted" \
+    "$(BOOT_NO_MOUNTPOINT=1 run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, no mountpoint program: said, with the shell's own words and the exit status" \
+    "$(grep -c '\[ERROR\]   Could not tell whether /mnt/t is mounted — .*mountpoint: command not found (exit 127); its boot subvolumes were NOT updated' "$WORK/boot.out")" "1"
+check "boot subvolumes, no mountpoint program: btrfs never asked" "$(boot_btrfs_calls)" "none"
+
+# One target the probe cannot tell about does not stop the others, in either order.
+check "boot subvolumes, first target cannot tell, second mounted: FAIL, the second is still done" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=mounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'No btrbk snapshots found, skipping') $(boot_btrfs_calls)" \
+    "FAIL|0 updated, 1 failed 1 filesystem label /mnt/u;subvolume list /mnt/u;"
+check "boot subvolumes, first target mounted, second cannot tell: FAIL, the first was done" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=mounted /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'No btrbk snapshots found, skipping') $(boot_btrfs_calls)" \
+    "FAIL|0 updated, 1 failed 1 filesystem label /mnt/t;subvolume list /mnt/t;"
+check "boot subvolumes, one target cannot tell, one not mounted: FAIL, counted once" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=notmounted" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
 
 # ---------------------------------------------------------------------------
 echo "== backup-verify.sh: check_smart_health, the health line"
