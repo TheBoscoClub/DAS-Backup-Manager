@@ -256,3 +256,6 @@ mutants.out.old/
 
 # Self-interrogation gate log (machine-local audit trail) — never commit
 .claude-si-gate-log.md
+
+# Claude workflow files — never commit (enforced by ~/.claude/scripts/lib-local-only.sh)
+SESSION_RECORD*.md.zst
