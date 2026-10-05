@@ -35,7 +35,6 @@ modules:
       - -DBUILD_GUI=ON
       - -DBUILD_INDEXER=OFF
       - -DBUILD_HELPER=OFF
-      - -DBUILD_FFI=OFF
     sources:
       # Use the local checkout so releases build from the tagged tree without
       # needing to round-trip through GitHub's archive endpoint (which would

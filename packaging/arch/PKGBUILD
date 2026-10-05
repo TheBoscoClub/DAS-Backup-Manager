@@ -26,10 +26,11 @@ build() {
     export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
     export LDFLAGS="${LDFLAGS//-flto=auto/}"
 
-    # Build Rust indexer binary
-    cargo build --release --features dbus --manifest-path indexer/Cargo.toml
+    # btrdasd: CMake below is told -DBUILD_INDEXER=OFF, so cargo builds it
+    # here. btrdasd-helper is CMake's (BUILD_HELPER stays ON).
+    cargo build --release --bin btrdasd --manifest-path indexer/Cargo.toml
 
-    # Build scripts, systemd units, and GUI via CMake
+    # The D-Bus helper, scripts, systemd units and GUI, via CMake
     cmake -B build -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_INDEXER=OFF
@@ -39,18 +40,12 @@ build() {
 package() {
     cd "DAS-Backup-Manager-$pkgver"
 
-    # Install CMake targets (scripts, systemd, GUI, icon, desktop entry)
+    # Everything CMake builds: scripts, systemd units, the GUI with its icon and
+    # desktop entry, and btrdasd-helper with its D-Bus, polkit and unit files
     DESTDIR="$pkgdir" cmake --install build
 
-    # Install Rust binaries
+    # btrdasd, from the cargo build above
     install -Dm755 "indexer/target/release/btrdasd" "$pkgdir/usr/bin/btrdasd"
-    install -Dm755 "indexer/target/release/btrdasd-helper" "$pkgdir/usr/libexec/btrdasd-helper"
-
-    # D-Bus and polkit integration
-    install -Dm644 "dbus/org.dasbackup.Helper1.conf" "$pkgdir/usr/share/dbus-1/system.d/org.dasbackup.Helper1.conf"
-    install -Dm644 "dbus/org.dasbackup.Helper1.service" "$pkgdir/usr/share/dbus-1/system-services/org.dasbackup.Helper1.service"
-    install -Dm644 "polkit/org.dasbackup.policy" "$pkgdir/usr/share/polkit-1/actions/org.dasbackup.policy"
-    install -Dm644 "systemd/btrdasd-helper.service" "$pkgdir/usr/lib/systemd/system/btrdasd-helper.service"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
