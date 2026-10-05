@@ -95,14 +95,14 @@ DAS-Backup-Manager/
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Install all components (binaries, scripts, systemd units, D-Bus, polkit, icons, man page)
+# Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, icons, man page)
 sudo cmake --install build
 
 # Run the interactive setup wizard to configure backups
 sudo btrdasd setup
 ```
 
-The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files and enables timers.
+The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files, writes the backup, scrub and drift-check units, and enables their timers. `cmake --install` installs no backup unit: setup's are the only ones.
 
 ### CLI-Only (no GUI dependencies)
 

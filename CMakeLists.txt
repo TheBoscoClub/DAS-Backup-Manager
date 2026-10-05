@@ -136,21 +136,18 @@ install(FILES
 )
 
 # =============================================================================
-# Systemd units (templated for prefix flexibility)
+# Backup units: written by `btrdasd setup`, not installed here
 # =============================================================================
-
-configure_file(systemd/das-backup.service.in
-    ${CMAKE_BINARY_DIR}/das-backup.service @ONLY)
-configure_file(systemd/das-backup-full.service.in
-    ${CMAKE_BINARY_DIR}/das-backup-full.service @ONLY)
-
-install(FILES
-    ${CMAKE_BINARY_DIR}/das-backup.service
-    ${CMAKE_BINARY_DIR}/das-backup-full.service
-    systemd/das-backup.timer
-    systemd/das-backup-full.timer
-    DESTINATION lib/systemd/system
-)
+#
+# das-backup{,-full}.{service,timer} — like das-scrub and das-backup-doctor —
+# are rendered by `btrdasd setup` from config.toml into /etc/systemd/system
+# (cron entries on sysvinit and OpenRC): their schedule, prefix and scrub
+# state are the host's, so the only copy ever right is setup's. Until
+# bd DAS-Backup-Manager-7rf CMake also installed its own copies under
+# lib/systemd/system, which systemd ran whenever setup's were gone — with a
+# USB-glob condition that skipped runs silently and a six-hour timeout that
+# setup's units never had. `btrdasd setup --upgrade` removes the copies older
+# versions left (indexer/src/setup/retired_units.rs).
 
 # =============================================================================
 # D-Bus and polkit integration files

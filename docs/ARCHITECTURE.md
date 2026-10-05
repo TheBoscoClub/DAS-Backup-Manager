@@ -425,7 +425,7 @@ Templates are rendered programmatically (no external template files):
 | Function | Output | Description |
 |----------|--------|-------------|
 | `btrbk_conf::render_btrbk_conf()` | `btrbk.conf` | Per-source volume blocks with target retention; retired entries are left out. In the library because the backup run, the `subvol` commands and the GUI helper's saves regenerate it too |
-| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support, `SuccessExitStatus=3` (a run that began and failed; the packaged `systemd/*.service.in` carry the same line); OnCalendar with RandomizedDelaySec |
+| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support, `SuccessExitStatus=3` (a run that began and failed); OnCalendar with RandomizedDelaySec |
 | `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
 | `render_systemd_doctor_service()` / `render_systemd_doctor_timer()` | `das-backup-doctor.{service,timer}` | Weekly drift check, `SuccessExitStatus=1` |
 | `render_udev_udisks_ignore()` | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | Hides every target from udisks2 by serial and `mount_uuid` |
@@ -437,7 +437,13 @@ credential: reports are submitted unauthenticated to the local relay named by
 `[email].smtp_host`/`smtp_port`. ESP sync hook generation was removed
 2026-04-10 (see `.claude/rules/esp-safety.md`).
 
-The generated units land in `/etc/systemd/system/`. Every service is ordered
+The generated units land in `/etc/systemd/system/`, and they are the only copies: CMake installs
+just `btrdasd-helper.service`. Until bd `DAS-Backup-Manager-7rf` it also installed its own
+`das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system` — a second writer of the
+same units, which systemd ran whenever setup's were gone, with a USB-glob condition and a
+six-hour timeout setup's never had. `setup --upgrade` removes the copies older versions left under
+`/usr` and `/usr/local`, only those whose bytes are a version this project installed
+(`src/setup/retired_units.rs`). Every service is ordered
 `After=local-fs.target`; the backup and scrub services are also ordered after
 `time-sync.target`, because retirement and expiry dates come from the clock.
 On this host (live config, 2026-10-02):
@@ -628,6 +634,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/detect` | `src/setup/detect.rs` | — | System detection (devices, init, packages) |
 | `setup/templates` | `src/setup/templates.rs` | — | Render systemd units, cron, the udisks-ignore udev rule; embed the scripts (btrbk.conf comes from `btrbk_conf`) |
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
+| `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised byte for byte against `src/setup/retired_units/` |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
 | `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 23 methods, 3 signals, polkit checks, job ownership |
 

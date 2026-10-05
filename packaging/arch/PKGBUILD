@@ -30,7 +30,7 @@ build() {
     # here. btrdasd-helper is CMake's (BUILD_HELPER stays ON).
     cargo build --release --bin btrdasd --manifest-path indexer/Cargo.toml
 
-    # The D-Bus helper, scripts, systemd units and GUI, via CMake
+    # The D-Bus helper, scripts and GUI, via CMake
     cmake -B build -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_INDEXER=OFF
@@ -40,8 +40,9 @@ build() {
 package() {
     cd "DAS-Backup-Manager-$pkgver"
 
-    # Everything CMake builds: scripts, systemd units, the GUI with its icon and
-    # desktop entry, and btrdasd-helper with its D-Bus, polkit and unit files
+    # Everything CMake builds: scripts, the GUI with its icon and desktop
+    # entry, and btrdasd-helper with its D-Bus, polkit and unit files. No
+    # backup unit: `btrdasd setup` writes those on the host
     DESTDIR="$pkgdir" cmake --install build
 
     # btrdasd, from the cargo build above

@@ -64,14 +64,14 @@ The recommended installation method builds all components and runs the setup wiz
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# 2. Install all components (binaries, scripts, systemd, D-Bus, polkit, man page, icons)
+# 2. Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, man page, icons)
 sudo cmake --install build
 
 # 3. Run the interactive setup wizard
 sudo btrdasd setup
 ```
 
-This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon), backup scripts, systemd units, D-Bus/polkit configs, shell completions, man page, and desktop entry.
+This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon) and its systemd unit, backup scripts, D-Bus/polkit configs, shell completions, man page, and desktop entry. It installs no backup unit: the units that run the backups, the scrub and the drift check are written by `btrdasd setup` alone (see [Generated Files](#generated-files)).
 
 The wizard auto-detects the init system, package manager, and installed dependencies
 before it starts, then walks through the following on-screen steps (numbered `[1/9]`
@@ -122,6 +122,7 @@ Regenerates all files from the existing config without re-running the wizard, th
 
 - **Nothing is written while a backup runs.** The upgrade takes both locks (above) before it rewrites `config.toml`, and holds them through every file it writes and the helper restart. A backup holds `/run/das-backup.lock` from its start, also while it still waits for the maintenance lock. The scripts themselves are safe to replace (setup renames a whole new file over each, and they end with `main "$@"; exit $?`), but a run that has started would call the new sibling scripts, units and `btrdasd` for its later steps — so the upgrade waits for a moment when no backup or maintenance job holds either lock. Either lock held: exit **75**, nothing written.
 - **The helper restart, under those locks.** No job in the helper is mounting a target the restart would kill — each holds the maintenance lock while it does. A backup asked of the GUI meanwhile finds `/run/das-backup.lock` held and is declined; a restore or index job waits for the maintenance lock — in the new helper, until the upgrade lets go. One that is already waiting in the **old** helper is cancelled when the restart stops it (the helper cancels every job as it stops) and ends without a `JobFinished` signal, so the GUI is never told it ended (bd `DAS-Backup-Manager-hoh`). The hold through the restart is bounded at 300 s: a `try-restart` that has not returned by then is reported as failed and the locks let go.
+- **The backup units older versions installed are removed.** Until bd `DAS-Backup-Manager-7rf`, `cmake --install` and the packages also installed `das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system`; systemd ran them whenever setup's own units in `/etc/systemd/system` were gone (after `setup --uninstall`, for one), and they skipped a run silently when no USB disk was attached and killed one after six hours. Before regenerating, the upgrade removes those four files from `/usr/lib/systemd/system` and `/usr/local/lib/systemd/system` — each only if its bytes are a version this project installed. Anything else at those paths (an edited file, a link) is kept and named, for you to judge. A file that cannot be removed ends the upgrade with an error, exit **1**, once everything else is done.
 - A restart that fails or does not return in time, or a unit state that cannot be read, ends the upgrade with an error, exit **1**.
 - A helper that is not running is left alone (exit 0): D-Bus starts it from the new binary when it is next needed. On an init system other than systemd the upgrade cannot restart it: restart a running `btrdasd-helper` yourself; the upgrade exits **3**.
 
@@ -161,7 +162,7 @@ Prompts whether to also remove the backup database at `/var/lib/das-backup/backu
 sudo btrdasd setup --uninstall-all
 ```
 
-Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon. Prompts whether to remove the backup database.
+Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), D-Bus configs, polkit policy, the helper's systemd unit, man page, shell completions, desktop entry, and icon — and, under the configured prefix, the backup units and FFI files older versions installed. Prompts whether to remove the backup database.
 
 ### Non-Interactive Mode (`--force`)
 
