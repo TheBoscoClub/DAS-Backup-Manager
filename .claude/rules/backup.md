@@ -176,6 +176,18 @@ Checked before any directory is created, both roots compared **after resolution*
     `SuccessExitStatus=1`, and that line is load-bearing.
 - Sentinel matches unit names by exact string — no globs. Prefer single non-template units.
 
+## The CLI/GUI Backup Touches Only What Was Selected (bd `7tx`)
+- `btrdasd backup run|snapshot|send` and the GUI hand btrbk **only** the selected sources and targets,
+  as filter arguments, one per (subvolume, target) pair: `<target dir>/<snapshot_name>`
+  (`btrbk_conf::declared_pairs`, `backup::btrbk_filters`). Never a volume path (it cannot tell two
+  sources on one volume apart) and never a source filter next to a target filter (btrbk's filters
+  are a union, and a matched subvolume keeps every target).
+- A label that is not in the configuration, or a selection that leaves nothing, **refuses** the step.
+  An empty filter list is btrbk's "everything": it is passed only when the selection IS everything.
+- An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
+  still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
+  is the first primary target, so a reduced config renders the other targets' retention differently.
+
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 **Never invoke `btrbk` against a target path that is not a real mountpoint backed by the
 expected DAS filesystem** — the write falls through to the NVMe root and fills it (`bd 9on`).
