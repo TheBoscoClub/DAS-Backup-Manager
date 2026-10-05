@@ -318,6 +318,13 @@ if(BUILD_TESTING)
                 ${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd
         )
     endif()
+    # CI's Arch container jobs install through .github/scripts/pacman-install.sh,
+    # which retries a failed install (bd DAS-Backup-Manager-ravr). This runs that
+    # script against a stub pacman in a scratch tree: nothing is installed.
+    add_test(
+        NAME shell-pacman-install
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pacman_install.sh
+    )
 endif()
 
 # =============================================================================
