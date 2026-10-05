@@ -17,9 +17,9 @@
 //! Remove this module once no supported host can still have those files, as
 //! the legacy entries on `setup --uninstall-all`'s list will go.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 /// What CMake's `configure_file(... @ONLY)` filled in the two service
@@ -140,14 +140,18 @@ fn is_shipped(unit: &str, bytes: &[u8]) -> bool {
 }
 
 /// What is at a retired unit's path, as far as reading it goes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Candidate {
     Absent,
     /// A link, a directory, a pipe: nothing CMake installed.
     NotAFile,
     /// A regular file longer than [`MAX_LEN`].
     TooLong,
-    Bytes(Vec<u8>),
+    /// What a regular file holds, and the descriptor it was read through. The
+    /// descriptor stays open until the file is removed: while it is, the inode
+    /// it names cannot be freed and handed to another file, so that inode
+    /// number tells this file from a replacement.
+    Bytes(Vec<u8>, File),
 }
 
 /// Read the file at `path`, never through a link and never past [`MAX_LEN`].
@@ -173,8 +177,8 @@ fn read_candidate(path: &Path) -> io::Result<Candidate> {
         return Ok(Candidate::TooLong);
     }
     let mut bytes = Vec::new();
-    file.take(MAX_LEN).read_to_end(&mut bytes)?;
-    Ok(Candidate::Bytes(bytes))
+    (&file).take(MAX_LEN).read_to_end(&mut bytes)?;
+    Ok(Candidate::Bytes(bytes, file))
 }
 
 /// What became of one retired unit's path.
@@ -186,14 +190,40 @@ enum Retired {
     Kept(&'static str),
 }
 
-/// Removes one file.
-type Remover<'a> = &'a dyn Fn(&Path) -> io::Result<()>;
+/// What a [`Remover`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Removal {
+    Removed,
+    /// The path no longer names the file that was read: nothing was removed.
+    Replaced,
+}
+
+/// Removes the file at a path, given the descriptor it was read through.
+type Remover<'a> = &'a dyn Fn(&Path, &File) -> io::Result<Removal>;
+
+/// The host's [`Remover`]: unlinks `path` only if it still names the file `held`
+/// was opened on, by `lstat` against the descriptor's `fstat` — the same device
+/// and inode — and otherwise leaves whatever is there. Reading and removing go
+/// by the path separately, so without this a file put at the path in between —
+/// a package manager's, an operator's — was removed as if it were the one that
+/// had been read. The window that remains is the instant between this `lstat`
+/// and the `unlink` that follows it, and a change made to the same file in
+/// place; both need root's write access to these directories at that moment.
+fn remove_if_unchanged(path: &Path, held: &File) -> io::Result<Removal> {
+    let read = held.metadata()?;
+    let now = std::fs::symlink_metadata(path)?;
+    if (now.dev(), now.ino()) != (read.dev(), read.ino()) {
+        return Ok(Removal::Replaced);
+    }
+    std::fs::remove_file(path)?;
+    Ok(Removal::Removed)
+}
 
 /// Look at `path`, where an older version may have installed `unit`, and
 /// remove it with `remove` if it holds a version this project installed.
 fn retire_one(path: &Path, unit: &str, remove: Remover) -> Result<Retired, String> {
     let read = read_candidate(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let bytes = match read {
+    let (bytes, held) = match read {
         Candidate::Absent => return Ok(Retired::Absent),
         Candidate::NotAFile => return Ok(Retired::Kept("it is not a regular file")),
         Candidate::TooLong => {
@@ -201,15 +231,17 @@ fn retire_one(path: &Path, unit: &str, remove: Remover) -> Result<Retired, Strin
                 "it is longer than any version this project installed",
             ));
         }
-        Candidate::Bytes(bytes) => bytes,
+        Candidate::Bytes(bytes, held) => (bytes, held),
     };
     if !is_shipped(unit, &bytes) {
         return Ok(Retired::Kept(
             "its content is no version this project installed — edited, or not this project's",
         ));
     }
-    remove(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
-    Ok(Retired::Removed)
+    match remove(path, &held).map_err(|e| format!("cannot remove {}: {e}", path.display()))? {
+        Removal::Removed => Ok(Retired::Removed),
+        Removal::Replaced => Ok(Retired::Kept("it was replaced while it was being checked")),
+    }
 }
 
 /// Remove, below `root`, every copy of the four backup units an older
@@ -217,7 +249,7 @@ fn retire_one(path: &Path, unit: &str, remove: Remover) -> Result<Retired, Strin
 /// is tried; each file removed or kept is said on `say`, and so is each path
 /// that could not be read or removed, which also makes this an error.
 pub fn remove_retired_units(root: &Path, say: &mut dyn FnMut(String)) -> Result<(), String> {
-    remove_retired_units_with(root, say, &|path| std::fs::remove_file(path))
+    remove_retired_units_with(root, say, &remove_if_unchanged)
 }
 
 fn remove_retired_units_with(
@@ -562,12 +594,12 @@ mod tests {
     fn a_file_past_the_limit_is_not_read_and_one_at_it_is_read_whole() {
         let root = tempfile::tempdir().unwrap();
         let at = put(root.path(), "at", &vec![b'x'; MAX_LEN as usize]);
-        assert_eq!(
-            read_candidate(&at).unwrap(),
-            Candidate::Bytes(vec![b'x'; MAX_LEN as usize])
-        );
+        let Candidate::Bytes(bytes, _) = read_candidate(&at).unwrap() else {
+            panic!("a file at the limit is read");
+        };
+        assert_eq!(bytes, vec![b'x'; MAX_LEN as usize]);
         let past = put(root.path(), "past", &vec![b'x'; MAX_LEN as usize + 1]);
-        assert_eq!(read_candidate(&past).unwrap(), Candidate::TooLong);
+        assert!(matches!(read_candidate(&past).unwrap(), Candidate::TooLong));
 
         assert_eq!(
             kept("das-backup.service", &vec![b'x'; MAX_LEN as usize + 1]),
@@ -618,11 +650,11 @@ mod tests {
             ));
         }
         let refuse = &paths[1];
-        let remove = |p: &Path| {
+        let remove = |p: &Path, held: &File| {
             if p == refuse {
                 Err(io::Error::from_raw_os_error(libc::EROFS))
             } else {
-                std::fs::remove_file(p)
+                remove_if_unchanged(p, held)
             }
         };
         let mut lines = Vec::new();
@@ -645,6 +677,103 @@ mod tests {
         for path in &paths {
             assert_eq!(path.exists(), path == refuse, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn a_file_swapped_in_after_it_was_judged_ours_is_kept_not_removed() {
+        // The file holds a version of ours when it is read, and an edited one
+        // takes its place before the removal: the review's R3, through the
+        // seam. The host's remover must see that the path no longer names the
+        // file that was read, and leave what is there.
+        let root = tempfile::tempdir().unwrap();
+        let path = put(
+            root.path(),
+            "usr/lib/systemd/system/das-backup.timer",
+            versions("das-backup.timer")[0].as_bytes(),
+        );
+        let edited = b"[Timer]\n# an operator's own schedule\n".to_vec();
+        let swap_then_remove = |p: &Path, held: &File| {
+            let new = p.with_file_name("das-backup.timer.new");
+            std::fs::write(&new, &edited)?;
+            std::fs::rename(&new, p)?;
+            remove_if_unchanged(p, held)
+        };
+        let mut lines = Vec::new();
+        let result =
+            remove_retired_units_with(root.path(), &mut |l| lines.push(l), &swap_then_remove);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            edited,
+            "the file that was put there is still there, unchanged"
+        );
+        let lines: Vec<String> = lines
+            .into_iter()
+            .map(|l| l.replace(&path.display().to_string(), "<path>"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Kept <path>: it was replaced while it was being checked. Remove it yourself \
+                 if it is a leftover: it takes effect whenever setup's das-backup.timer in \
+                 /etc/systemd/system is gone."
+            ]
+        );
+    }
+
+    /// A file holding `bytes` in a fresh directory, and a descriptor
+    /// open on it.
+    fn held_file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, File) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = put(dir.path(), "unit", bytes);
+        let held = File::open(&path).unwrap();
+        (dir, path, held)
+    }
+
+    #[test]
+    fn the_host_remover_removes_the_file_it_holds_a_descriptor_of() {
+        let (_dir, path, held) = held_file(b"ours");
+        assert_eq!(remove_if_unchanged(&path, &held).unwrap(), Removal::Removed);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_host_remover_keeps_a_different_file_at_the_path() {
+        let (dir, path, held) = held_file(b"ours");
+        let other = put(dir.path(), "other", b"someone else's");
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(
+            remove_if_unchanged(&path, &held).unwrap(),
+            Removal::Replaced
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+    }
+
+    #[test]
+    fn the_host_remover_compares_the_path_itself_not_what_a_link_there_leads_to() {
+        // A link at the path to a second name of the held file: `stat` on the
+        // path answers with the held file's inode, `lstat` with the link's.
+        // Only the second is the truth about what unlink would remove.
+        let (dir, path, held) = held_file(b"ours");
+        let twin = dir.path().join("twin");
+        std::fs::hard_link(&path, &twin).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&twin, &path).unwrap();
+        assert_eq!(
+            remove_if_unchanged(&path, &held).unwrap(),
+            Removal::Replaced
+        );
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(twin.exists());
+    }
+
+    #[test]
+    fn the_host_remover_fails_when_nothing_is_at_the_path_any_more() {
+        let (_dir, path, held) = held_file(b"ours");
+        std::fs::remove_file(&path).unwrap();
+        let err = remove_if_unchanged(&path, &held).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
