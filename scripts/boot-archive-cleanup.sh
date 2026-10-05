@@ -1,7 +1,7 @@
 #!/bin/bash
 # boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
-# Version: 2.1.1
-# Date: 2026-10-03
+# Version: 2.1.2
+# Date: 2026-10-05
 #
 # When backup-run.sh --full (or the Rust btrdasd manual path) recreates @ and
 # @home, it snapshots the old ones as @.archive.YYYYMMDDTHHMMSS before
@@ -10,6 +10,16 @@
 # via btrdasd. As of v4.2.4, backup-run.sh invokes this script automatically
 # at the end of every run (daily and full) while targets are still mounted —
 # it was previously installed but never called by anything (DAS-Backup-Manager-64h).
+#
+# v2.1.2: the two guards that stand between a listing line and `btrfs
+# subvolume delete` name their characters outright. Under en_US.UTF-8 bash's
+# regex range [A-Za-z] also matches accented and fullwidth letters (about
+# 2,200 characters beyond ASCII) and [0-9] about 1,000 more digits (Arabic-
+# Indic, superscripts, fractions), so a name like @é.archive.20200101T000000
+# passed the guards and reached `btrfs subvolume delete`. The digits are now
+# [[:digit:]], ASCII in every locale, and the letters are listed; [[:alpha:]]
+# would be every letter of the locale (bd DAS-Backup-Manager-1bsx;
+# tests/test_boot_archive_cleanup.sh).
 #
 # v2.1.1: the last line is `main "$@"; exit $?`, so a copy over this file in
 # place while it runs (a plain `cp`) cannot have bash read the new file once
@@ -148,6 +158,15 @@ cleanup_target() {
     fi
     rm -f "$listing_stderr"
 
+    # What an archive path and name may be made of, for the guard below. Each
+    # class is spelled out: a range is not ASCII under en_US.UTF-8 ([A-Za-z]
+    # also matches accented and fullwidth letters, [0-9] other scripts'
+    # digits), and [[:alpha:]] is every letter of the locale. [[:digit:]] is
+    # ASCII in every locale. bd DAS-Backup-Manager-1bsx.
+    local letters='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    local path_re="^[${letters}[:digit:]_@.+/-]+\$"
+    local name_re="^@[${letters}[:digit:]_-]*\\.archive\\.[[:digit:]]{8}T[[:digit:]]{6}\$"
+
     # Process archive subvolumes from the (successfully obtained) listing
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -170,8 +189,8 @@ cleanup_target() {
            || [[ "$subvol_path" == "$line" ]] \
            || [[ "$subvol_path" == /* ]] \
            || [[ "$subvol_path" == *".."* ]] \
-           || [[ ! "$subvol_path" =~ ^[A-Za-z0-9_@.+/-]+$ ]] \
-           || [[ ! "$subvol_name" =~ ^@[A-Za-z0-9_-]*\.archive\.[0-9]{8}T[0-9]{6}$ ]]; then
+           || [[ ! "$subvol_path" =~ $path_re ]] \
+           || [[ ! "$subvol_name" =~ $name_re ]]; then
             log_warn "  Unrecognized archive path - NOT deleted: $subvol_path"
             continue
         fi

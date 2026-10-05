@@ -284,6 +284,13 @@ if(BUILD_TESTING)
         NAME shell-early-exit-readers
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_exit_readers.sh
     )
+    # boot-archive-cleanup.sh itself, run for real in a sandbox of stub btrfs,
+    # mountpoint and btrdasd: what it may delete (bd DAS-Backup-Manager-1bsx).
+    # Nothing is listed, mounted or deleted.
+    add_test(
+        NAME shell-boot-archive-cleanup
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_boot_archive_cleanup.sh
+    )
     # CI's Arch container jobs install through .github/scripts/pacman-install.sh,
     # which retries a failed install (bd DAS-Backup-Manager-ravr). This runs that
     # script against a stub pacman in a scratch tree: nothing is installed.

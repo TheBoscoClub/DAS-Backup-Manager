@@ -1,9 +1,17 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.11.2
-# Date: 2026-10-04
+# Version: 4.11.3
+# Date: 2026-10-05
 #
 # Features:
+#   - A pid is ASCII digits (v4.11.3): maintenance_holder() matches the pid in
+#     the lock file's record with [[:digit:]]. Under en_US.UTF-8, the host's
+#     locale, bash's regex [0-9] also matches digits of other scripts and
+#     superscripts, so a record whose "pid" was written in Arabic-Indic digits
+#     read as a pid whose process had gone, "no longer running", where it is a
+#     record with no pid in it. The other [0-9] and [A-Za-z] regex matches in
+#     the scripts got the same treatment (bd DAS-Backup-Manager-1bsx;
+#     tests/test_maintenance_lock.sh).
 #   - "DAS can be safely disconnected" only on knowledge (v4.11.2, with the
 #     entry below): the target unmount gate asks probe_mount_point, which
 #     tells "not mounted" from "could not tell". A mountpoint error on a
@@ -874,7 +882,7 @@ maintenance_holder() {
         return
     fi
     pid="${line##* pid }"
-    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[0-9]+$ ]]; then
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
         echo "an unknown holder (last recorded: $line)"
     elif [[ -d "/proc/$pid" ]]; then
         echo "$line"
@@ -2697,7 +2705,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.11.2
+  backup-run.sh v4.11.3
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
