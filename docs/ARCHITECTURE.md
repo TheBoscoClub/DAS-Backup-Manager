@@ -112,7 +112,9 @@ The system has six major components:
          ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
          ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted;
          │                                   decide_run_counts() then settles the snapshot counts, before the run status
-         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report;
+         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report,
+         │                                   and so is one the mountpoint probe cannot tell about (unmounted anyway): "DAS can be safely
+         │                                   disconnected" only on the gate's OK, else NOT safe and why (bd DAS-Backup-Manager-jug6);
          │                                   of the sources, only the mount points this run mounted, each once (one that will not
          │                                   unmount is a WARN with umount's message) — never one it found mounted
          │                                   (bd DAS-Backup-Manager-8cf)

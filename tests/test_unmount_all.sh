@@ -18,6 +18,10 @@
 # Counter-check: with UMOUNT_ATTEMPTS=1 (no retry — the pre-4.6.1 behaviour)
 # the "busy twice" target is recorded FAILED, so the retry is what makes the
 # first case pass.
+# A target the probe cannot tell about (bd DAS-Backup-Manager-jug6) fails the
+# gate whether or not the unmount tried anyway succeeds, and the detail says
+# why; one whose path is not there at all (an absent drive's, removed on
+# purpose) is not a failure.
 #
 # Sources, with mount_sources() and a stub mount too: a run unmounts only the
 # source mount points it mounted itself (bd DAS-Backup-Manager-8cf).
@@ -166,7 +170,7 @@ setup
 echo 99 >"$WORK/busy/backup-22tb"
 unmount_all  # bare, as in main(): under set -e a non-zero return ends this test
 check "busy forever: unmount recorded FAIL" "${OP_STATUS[unmount]}" "FAIL"
-check "busy forever: the detail names the mount point" "${OP_STATUS[unmount_detail]}" "/mnt/backup-22tb"
+check "busy forever: the detail names the mount point" "${OP_STATUS[unmount_detail]}" "still mounted: /mnt/backup-22tb"
 check "busy forever: exactly five attempts" "$(calls /mnt/backup-22tb)" "5"
 check "busy forever: no pause after the last attempt" "$(lines "$WORK/sleeps")" "4"
 check "busy forever: the other target is still released" "$([[ -e "$WORK/mounted/backup-system-recovery-A" ]] && echo yes || echo no)" "no"
@@ -305,6 +309,57 @@ check "helper busy: left mounted" "$(is_mounted /.btrfs-hdd)" "yes"
 unmount_all
 check "helper busy: still the run's, so a later pass releases it" \
     "$(calls /.btrfs-hdd) $(is_mounted /.btrfs-hdd)" "2 no"
+
+# --- the probe's three answers, for a target (bd DAS-Backup-Manager-jug6) -----
+# A probe error used to read as "not mounted": the target was skipped, the
+# unmount recorded OK, and the run said the DAS could be disconnected while a
+# drive was mounted. "Could not tell" now fails the gate and says why — what
+# the probe said and what umount did — and the unmount is tried anyway.
+setup
+touch "$WORK/probe_errors/backup-22tb"
+unmount_all
+check "target, probe cannot tell, mounted: unmounted anyway" \
+    "$(calls /mnt/backup-22tb) $(is_mounted /mnt/backup-22tb)" "1 no"
+check "target, probe cannot tell, mounted: the gate fails all the same" "${OP_STATUS[unmount]}" "FAIL"
+check "target, probe cannot tell, mounted: the detail says why, and what umount did" \
+    "${OP_STATUS[unmount_detail]:-<none>}" \
+    "could not tell whether /mnt/backup-22tb is mounted — mountpoint: /mnt/backup-22tb: Input/output error (exit 1); umount then succeeded"
+check "target, probe cannot tell, mounted: said as an error, with the probe's message" \
+    "$(logged 'ERROR:   Could not tell whether /mnt/backup-22tb is mounted — mountpoint: /mnt/backup-22tb: Input/output error (exit 1); unmounting it anyway')" "1"
+check "target, probe cannot tell, mounted: the other target released as before" \
+    "$(calls /mnt/backup-system-recovery-A) $(is_mounted /mnt/backup-system-recovery-A)" "1 no"
+
+setup
+rm -f "$WORK/mounted/backup-22tb"
+touch "$WORK/probe_errors/backup-22tb"
+unmount_all
+check "target, probe cannot tell, not mounted: the unmount tried with its whole budget" \
+    "$(calls /mnt/backup-22tb)" "5"
+check "target, probe cannot tell, not mounted: the gate still fails" "${OP_STATUS[unmount]}" "FAIL"
+check "target, probe cannot tell, not mounted: the detail says umount failed too" \
+    "${OP_STATUS[unmount_detail]:-<none>}" \
+    "could not tell whether /mnt/backup-22tb is mounted — mountpoint: /mnt/backup-22tb: Input/output error (exit 1); umount failed too"
+
+# Both kinds at once: each is in the detail, the one still mounted first.
+setup
+echo 99 >"$WORK/busy/backup-22tb"
+touch "$WORK/probe_errors/backup-system-recovery-A"
+unmount_all
+check "a target still mounted and one the probe cannot tell about: both in the detail" \
+    "${OP_STATUS[unmount_detail]:-<none>}" \
+    "still mounted: /mnt/backup-22tb; could not tell whether /mnt/backup-system-recovery-A is mounted — mountpoint: /mnt/backup-system-recovery-A: Input/output error (exit 1); umount then succeeded"
+
+# An absent drive's mount point is removed on purpose (create_mount_points):
+# mountpoint answers it 1, "No such file or directory", like an error, and it
+# is NOT one — the gate passes, and nothing is said about it.
+setup
+rm -f "$WORK/mounted/backup-system-recovery-A"
+touch "$WORK/absent/backup-system-recovery-A"
+unmount_all
+check "target not there at all (an absent drive): never unmounted" "$(calls /mnt/backup-system-recovery-A)" "0"
+check "target not there at all (an absent drive): the gate passes" "${OP_STATUS[unmount]}" "OK"
+check "target not there at all (an absent drive): nothing said about it" \
+    "$(grep -c 'backup-system-recovery-A' "$WORK/log" || true)" "0"
 
 # --- the probe's three answers, for the run's own helper (8cf review, F1) ------
 # mountpoint's error is not "not mounted": the helper was struck off and left
