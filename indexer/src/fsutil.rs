@@ -293,6 +293,11 @@ pub(crate) mod testing {
         stderr: Vec<(String, String)>,
         /// Paths whose `btrfs subvolume delete` really removes the directory.
         deletable: Vec<String>,
+        /// Whether an unscripted `btrfs subvolume snapshot [-r] <src> <dst>`
+        /// really makes the directory `<dst>` and exits 0.
+        snapshotting: bool,
+        /// Command-line fragments of the snapshots that fail.
+        failing: Vec<String>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -311,13 +316,37 @@ pub(crate) mod testing {
                 answers,
                 stderr: Vec::new(),
                 deletable: Vec::new(),
+                snapshotting: false,
+                failing: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The same runner, where every `btrfs subvolume snapshot [-r] <src>
+        /// <dst>` that is not scripted makes the directory `<dst>` and exits 0,
+        /// so a test can follow a sequence of snapshots on a real directory.
+        pub(crate) fn snapshotting(mut self) -> Self {
+            self.snapshotting = true;
+            self
+        }
+
+        /// The same runner, where a snapshot whose command line contains
+        /// `fragment` fails (exit 1) even when snapshots are being made.
+        pub(crate) fn failing_snapshots_of(mut self, fragment: &str) -> Self {
+            self.failing.push(fragment.to_string());
+            self
         }
 
         /// The same runner, with `argv` also writing `text` to stderr.
         pub(crate) fn with_stderr(mut self, argv: &str, text: &str) -> Self {
             self.stderr.push((argv.to_string(), text.to_string()));
+            self
+        }
+
+        /// The same runner, where `btrfs subvolume delete <path>` for each
+        /// listed path really removes that directory and exits 0.
+        pub(crate) fn deleting_too(mut self, paths: Vec<String>) -> Self {
+            self.deletable.extend(paths);
             self
         }
 
@@ -356,10 +385,21 @@ pub(crate) mod testing {
                     stderr: Vec::new(),
                 });
             }
-            let (code, stdout) = self
-                .answers
-                .iter()
-                .find(|(k, _, _)| *k == argv)
+            let scripted = self.answers.iter().find(|(k, _, _)| *k == argv);
+            if scripted.is_none()
+                && self.snapshotting
+                && let Some(args) = argv.strip_prefix("btrfs subvolume snapshot ")
+                && !self.failing.iter().any(|f| argv.contains(f.as_str()))
+                && let Some(dst) = args.rsplit(' ').next()
+            {
+                std::fs::create_dir(dst)?;
+                return Ok(Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            let (code, stdout) = scripted
                 .map(|(_, c, o)| (*c, o.clone()))
                 .unwrap_or((1, String::new()));
             let stderr = self

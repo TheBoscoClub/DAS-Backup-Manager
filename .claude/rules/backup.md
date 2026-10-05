@@ -199,7 +199,11 @@ Two layers, both unconditional and both run under `--dryrun`:
    target's `$mnt` must not exist. Any violation aborts, exit 3, with an ABORTED report and a
    failed history row (bd `2my`).
 
-Rust twin (CLI/GUI): `mount::verify_write_targets`.
+Rust twin (CLI/GUI): `mount::verify_write_targets`, called inside every step that writes under a
+target — `run_backup`, `send_snapshots`, `run_full_pipeline`, `archive_boot` (bd `7tx`) — so a caller
+cannot skip it: `backup send` and `backup boot-archive` are covered from the CLI and from the helper.
+`archive_boot` verifies the non-mirror targets whose mount point exists (the script's two safe
+states: a real mountpoint, or absent); a bare directory refuses the whole step.
 
 ## Maintenance Interlock — backup vs. scrub mutual exclusion
 Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesystems and must never overlap.
