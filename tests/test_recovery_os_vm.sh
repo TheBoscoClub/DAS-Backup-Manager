@@ -65,6 +65,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Every `virsh destroy` a driver runs, in any test of this suite: one line
+# each, "after a resume" or "never resumed". The suite ends by asserting the
+# first kind never happened -- a domain that was resumed may have run, and
+# only ACPI may stop it (I-1) -- across every scenario, not only the tests
+# that look for it.
+DESTROY_LOG="$(mktemp)"
+ROOTS+=("$DESTROY_LOG")
+export DESTROY_LOG
+
 fails=0
 passes=0
 pass() {
@@ -241,8 +250,10 @@ write_stubs() {
     cat >"$T/bin/virsh" <<'STUB'
 #!/bin/bash
 S="$STUB"
+BOOT_A=aaaaaaaa-1111-4222-8333-444444444444
 if [[ "${1:-}" == --connect ]]; then shift 2; fi
 printf '%s\n' "$*" >>"$S/virsh.calls"
+printf '%s\n' "${LC_ALL-unset}" >>"$S/virsh.lc_all"
 cmd=${1:-}
 shift || :
 nodomain() { echo "error: failed to get domain 'recovery-os-updater'" >&2; exit 1; }
@@ -262,6 +273,11 @@ case "$cmd" in
             if [[ "$line" == *" pid "* && -d "/proc/$pid" ]]; then echo alive; else echo dead; fi >>"$S/lock.records.alive"
             polls=$(($(cat "$S/polls" 2>/dev/null || echo 0) + 1))
             echo "$polls" >"$S/polls"
+            if [[ -f "$S/guard_heartbeat" && "$(head -n 1 "$S/states")" == running ]]; then
+                cat "$S/guard_heartbeat" >>"$(cat "$S/guard_port")"
+            fi
+            # The report rotated or truncated under the reader.
+            if [[ -f "$S/guard_truncate_at_poll3" && "$polls" == 3 ]]; then : >"$(cat "$S/guard_port")"; fi
             # The drive re-enumerates at the second poll: its by-id link moves.
             if [[ -f "$S/reenumerate" && "$polls" == 2 ]]; then
                 read -r link target <"$S/reenumerate"
@@ -276,6 +292,10 @@ case "$cmd" in
         ;;
     dumpxml)
         [[ -f "$S/defined" ]] || nodomain
+        if [[ "${1:-}" != --inactive && -f "$S/dumpxml_live_fail" && -f "$S/started" ]]; then
+            echo "error: internal error: client socket is closed" >&2
+            exit 1
+        fi
         if [[ -f "$S/defined.xml" ]]; then
             # What was defined last, with the disk attached since in it. A
             # running domain that booted without the guard, when told so.
@@ -315,18 +335,31 @@ case "$cmd" in
         head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" >"$S/lock.record.at_start"
         cat "$DAS_RECOVERY_VM_TEST_ROOT/var/lib/das-backup/recovery-os-vm-sessions" >"$S/sessions.at_start" 2>/dev/null || :
         if [[ -f "$S/start_fail" ]]; then echo "error: Failed to start domain 'recovery-os-updater'" >&2; exit 1; fi
-        cp "$S/states.running" "$S/states"
+        [[ " $* " == *" --paused "* ]] || { echo "stub: start without --paused" >&2; echo "UNPAUSED START" >>"$S/forbidden"; exit 98; }
+        # Started paused: the guest has executed nothing yet.
+        printf 'paused\n' >"$S/states"
         touch "$S/started"
-        # What the VM booted with; and a guest whose guard reports, as a
-        # healthy one would, every mask it was given -- unless told otherwise.
         cp "$S/defined.xml" "$S/defined.at_start.xml" 2>/dev/null || :
+        # A start that says it failed although the domain did start.
+        if [[ -f "$S/start_error_but_started" ]]; then echo "error: Timed out during operation: cannot acquire state change lock" >&2; exit 1; fi
+        echo "Domain 'recovery-os-updater' started"
+        ;;
+    resume)
+        echo "virsh resume" >>"$S/events"
+        touch "$S/resumed"
+        if [[ -f "$S/resume_fail" ]]; then echo "error: Failed to resume domain 'recovery-os-updater'" >&2; exit 1; fi
+        cp "$S/states.running" "$S/states"
+        # The guest runs: a healthy one's guard reports every mask it was given,
+        # then a heartbeat at every look -- unless told otherwise.
         if grep -q "name='org.dasbackup.guard'" "$S/defined.xml" 2>/dev/null && [[ ! -f "$S/guard_silent" ]]; then
             port=$(sed -n "s|.*<source path='\([^']*\)'/>.*|\1|p" "$S/defined.xml" | head -n 1)
             if [[ -f "$S/guard_reply" ]]; then
                 cp "$S/guard_reply" "$port"
             else
                 masks=$(grep -o 'io\.systemd\.credential:systemd\.extra-unit\.[^=<]*=' "$S/defined.xml" | sed 's/^io\.systemd\.credential:systemd\.extra-unit\.//; s/=$//')
-                printf 'das-vm-guard engaged %s masks %s\n' "$(grep -c . <<<"$masks")" "$(paste -sd, - <<<"$masks")" >"$port"
+                printf 'das-vm-guard engaged %s masks %s boot %s\n' "$(grep -c . <<<"$masks")" "$(paste -sd, - <<<"$masks")" "$BOOT_A" >"$S/guard_heartbeat"
+                printf '%s\n' "$port" >"$S/guard_port"
+                cat "$S/guard_heartbeat" >"$port"
             fi
         fi
         # The holder dies (killed, out of memory) once the VM runs.
@@ -335,11 +368,30 @@ case "$cmd" in
         if [[ -f "$S/busy_after_start" ]]; then touch "$S/hold_busy"; fi
         # Something on the host mounts a partition while the session runs.
         if [[ -f "$S/lsblk.mounts.sdj.after_start" ]]; then cp "$S/lsblk.mounts.sdj.after_start" "$S/lsblk.mounts.sdj"; fi
-        echo "Domain 'recovery-os-updater' started"
+        echo "Domain 'recovery-os-updater' resumed"
+        ;;
+    destroy)
+        # Only a domain started paused and never resumed may be destroyed:
+        # it has run nothing. Anything else is a running recovery OS.
+        if [[ -f "$S/resumed" || ! -f "$S/started" ]]; then
+            echo "destroy of a domain that was resumed (or never started): $*" >>"$S/forbidden"
+            echo "destroy after a resume (or of one never started): $S" >>"${DESTROY_LOG:-/dev/null}"
+            exit 1
+        fi
+        echo "destroy, never resumed: $S" >>"${DESTROY_LOG:-/dev/null}"
+        echo "virsh destroy" >>"$S/events"
+        if [[ -f "$S/destroy_fail" ]]; then echo "error: Failed to destroy domain" >&2; exit 1; fi
+        printf 'shut off\n' >"$S/states"
+        echo "Domain 'recovery-os-updater' destroyed"
         ;;
     shutdown)
         echo "virsh shutdown" >>"$S/events"
-        if [[ -f "$S/states.after_shutdown" ]]; then cp "$S/states.after_shutdown" "$S/states"; fi
+        # A guest that drops the first N requests (firmware, boot menu, initrd).
+        if [[ -f "$S/shutdown_ignore" ]] && (($(cat "$S/shutdown_ignore") > 0)); then
+            echo $(($(cat "$S/shutdown_ignore") - 1)) >"$S/shutdown_ignore"
+        elif [[ -f "$S/states.after_shutdown" ]]; then
+            cp "$S/states.after_shutdown" "$S/states"
+        fi
         echo "Domain 'recovery-os-updater' is being shutdown"
         ;;
     define)
@@ -352,6 +404,8 @@ case "$cmd" in
             exit 1
         fi
         echo "virsh define" >>"$S/events"
+        # Who holds the maintenance lock while the definition changes.
+        { head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" 2>/dev/null || echo "(no lock file)"; } >>"$S/lock.at_define"
         touch "$S/defined"
         if [[ -f "$S/define_keeps_guard" ]] && ! grep -q 'org.dasbackup.guard' "${!#}"; then
             echo "Domain 'recovery-os-updater' defined from ${!#}"
@@ -562,11 +616,14 @@ STUB
 }
 
 driver_env() {
-    env -u DAS_RECOVERY_OS_STATE ${OS_STATE:+DAS_RECOVERY_OS_STATE="$OS_STATE"} \
+    # GUARD_SECS=default: the knob left unset, so the driver's own default runs.
+    local guard=(DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}")
+    if [[ "${GUARD_SECS:-}" == default ]]; then guard=(); fi
+    env -u DAS_RECOVERY_OS_STATE -u DAS_RECOVERY_VM_GUARD_SECS ${OS_STATE:+DAS_RECOVERY_OS_STATE="$OS_STATE"} \
         PATH="${DRIVER_PATH:-$T/bin:$PATH}" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
-        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS=1 \
-        DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}" \
+        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-1}" \
+        DAS_RECOVERY_VM_RESEND_SECS="${RESEND:-30}" "${guard[@]}" \
         ${LOOP:+DAS_RECOVERY_VM_TEST_LOOP="$LOOP"} "$@"
 }
 
@@ -652,8 +709,8 @@ run_interrupted() {
     set -m
     env -u DAS_RECOVERY_OS_STATE PATH="$T/bin:$PATH" STUB="$S" REAL_FLOCK="$REAL_FLOCK" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
-        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS=1 \
-        DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}" \
+        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-1}" \
+        DAS_RECOVERY_VM_RESEND_SECS="${RESEND:-30}" DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}" \
         bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
     dpid=$!
     set +m
@@ -662,7 +719,7 @@ run_interrupted() {
         sleep 0.05
     done
     sleep 0.2
-    kill -INT -- "-$dpid" 2>/dev/null || echo "(the driver had exited before SIGINT)" >>"$T/driver.out"
+    kill -"${SIG:-INT}" -- "-$dpid" 2>/dev/null || echo "(the driver had exited before SIG${SIG:-INT})" >>"$T/driver.out"
     for ((i = 0; i < 600; i++)); do
         kill -0 "$dpid" 2>/dev/null || break
         sleep 0.05
@@ -952,7 +1009,7 @@ has "session: SATA" "$attached" "<target dev='sda' bus='sata'/>"
 has "session: first in the boot order" "$attached" "<boot order='1'/>"
 has "session: attached to the persistent definition" "$(file "$S/virsh.calls")" "attach-device recovery-os-updater"
 check "session: events in order" "$(events)" \
-    "holder in its own session|holder started (lock held)|virsh define|virsh attach|virsh start|virsh detach|virsh define|holder released|btrfs scan (lock held)|"
+    "holder in its own session|holder started (lock held)|virsh define|virsh attach|virsh start|virsh resume|virsh detach|virsh define|holder released|btrfs scan (lock held)|"
 matches "session: the lock's record names the session while it holds" "$(file "$S/lock.record.at_hold")" "$RECORD_A"
 check "session: the record emptied before the lock was let go" "$(file "$LOCK")" ""
 check "session: the holder runs in /" "$(file "$S/holder.cwd")" "/"
@@ -1005,6 +1062,8 @@ check "SIGINT: the original holder survived (no claim taken again)" "$(grep -c '
 check "SIGINT: the lock outlives the driver (inherited)" "$(lock_state)" "held"
 has "SIGINT: the disk is still the VM's" "$(file "$S/attached.xml")" "$DISK_A"
 has "SIGINT: says how to finish" "$OUT" "session-end system-recovery-A-2tb"
+has "SIGINT: the guard engaged, and when it last reported" "$OUT" "the session guard is engaged (das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service; its last report 0h 00m 0"
+has "SIGINT: ...and that status judges it from here" "$OUT" "From here nothing watches it: $T/usr/lib/das-backup/recovery-os-vm.sh status judges its report again"
 matches "SIGINT: the record stays while the session holds the lock" "$(head -n 1 "$LOCK")" "$RECORD_A"
 has "SIGINT: never stop the holder's scope" "$OUT" "Never 'systemctl stop' das-recovery-os-holder-system-recovery-A-2tb.scope"
 check "SIGINT: the record names the holder, which outlives the driver" "$(head -n 1 "$LOCK")" \
@@ -1121,7 +1180,7 @@ check "holder lost: the session ends, flagged" "$RC" "5"
 has "holder lost: said so" "$OUT" "is gone while the recovery OS may use"
 check "holder lost: claimed again" "$(grep -c '^hold-disk' "$S/holder.calls")" "2"
 has "holder lost: the new holder holds the lock too" "$(events)" \
-    "virsh start|holder in its own session|holder started (lock held)|"
+    "virsh start|virsh resume|holder in its own session|holder started (lock held)|"
 has "holder lost: then given back as usual" "$(events)" "virsh detach|virsh define|holder released|btrfs scan (lock held)|"
 has "holder lost: the summary says so" "$OUT" "LOST 1 time(s) and claimed again"
 check "holder lost: the record names the new holder" "$(tail -n 1 "$S/lock.records")" \
@@ -1649,6 +1708,20 @@ check "start failed: refused" "$RC" "1"
 matches "start failed: counted as a session all the same (it may have half-started)" "$(file "$SESSIONS")" "^system-recovery-A-2tb [0-9]+$"
 
 echo "--- the session guard: btrbk cannot run in the booted recovery OS (bd 0zm)"
+# A report line, as a recovery OS whose guard holds writes it: $1 the body,
+# $2 its boot (BOOT_A by default).
+# The stub's guest reports this boot, as the test's own lines do.
+BOOT_A=aaaaaaaa-1111-4222-8333-444444444444
+ENG4="das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
+LIFT4="das-vm-guard lifted 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
+BOOT_B=bbbbbbbb-1111-4222-8333-444444444444
+line() { printf '%s boot %s\n' "$1" "${2:-$BOOT_A}"; }
+# A guest that keeps running until asked to stop, and stops when asked.
+keeps_running() {
+    for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
+    printf 'shut off\n' >"$S/states.after_shutdown"
+}
+
 fixture
 run_driver session A
 check "guard: a session ends" "$RC" "0"
@@ -1658,10 +1731,15 @@ has "guard: ...read from its sysinfo" "$(file "$x")" "<smbios mode='sysinfo'/>"
 has "guard: the guard unit, a credential" "$(file "$x")" "<entry>io.systemd.credential.binary:systemd.extra-unit.das-vm-guard.service="
 has "guard: the reporter unit, a credential" "$(file "$x")" "<entry>io.systemd.credential.binary:systemd.extra-unit.das-vm-guard-report.service="
 has "guard: pulled in by sysinit.target" "$(file "$x")" "<entry>io.systemd.credential.binary:systemd.unit-dropin.sysinit.target~das-vm-guard="
+has "guard: the refusing btrbk, a credential" "$(file "$x")" "<entry>io.systemd.credential.binary:das-vm-guard.btrbk="
 for u in btrbk.service btrbk.timer cronie.service crond.service; do
     has "guard: $u masked" "$(file "$x")" "<entry>io.systemd.credential:systemd.extra-unit.$u=</entry>"
+    check "guard: $u also held by a never-true condition, sorting last" \
+        "$(credential "$x" "systemd.unit-dropin.$u~zzzzzzzz-das-vm-guard")" $'[Unit]\nConditionPathExists=/dev/null/das-vm-guard'
 done
 check "guard: those four masks, no more" "$(grep -c '<entry>io.systemd.credential:systemd.extra-unit\.' "$x")" "4"
+check "guard: and four conditions" "$(grep -c '<entry>io.systemd.credential.binary:systemd.unit-dropin\.[^<]*~zzzzzzzz-das-vm-guard=' "$x")" "4"
+check "guard: 4 units and drop-ins of its own, 2 strings per mask" "$(grep -c '<entry>' "$x")" "12"
 has "guard: a confirmation channel" "$(file "$x")" "<target type='virtio' name='org.dasbackup.guard'/>"
 has "guard: ...into a file" "$(file "$x")" "<channel type='file'>"
 has "guard: ...in the session's own root-only directory" "$(file "$x")" "<source path='$STATE/system-recovery-A-2tb.guard'/>"
@@ -1669,19 +1747,33 @@ if command -v virt-xml-validate >/dev/null; then
     check "guard: the definition it boots is valid libvirt XML" "$(virt-xml-validate "$x" domain 2>&1 | tail -n 1)" "$x validates"
 fi
 g="$(credential "$x" systemd.extra-unit.das-vm-guard.service)"
-for want in "DefaultDependencies=no" "ConditionPathExists=!/etc/initrd-release" "After=local-fs.target" "Before=sysinit.target" \
-    "Type=oneshot" "RemainAfterExit=yes" "TimeoutStartSec=60" "for p in /usr/bin/btrbk /usr/local/bin/btrbk;" \
-    "/usr/bin/mount --bind /usr/bin/false" "> /dev/console" "> /run/issue.d/das-vm-guard.issue"; do
+for want in "DefaultDependencies=no" "ConditionPathExists=!/etc/initrd-release" "After=systemd-remount-fs.service" \
+    "Before=systemd-udev-trigger.service local-fs-pre.target sysinit.target" "Type=oneshot" "RemainAfterExit=yes" \
+    "TimeoutStartSec=60" "ImportCredential=das-vm-guard.btrbk" \
+    "install -D -m 0755 \"\$\$CREDENTIALS_DIRECTORY/das-vm-guard.btrbk\" /run/das-vm-guard/btrbk" \
+    "for p in /usr/bin/btrbk /usr/local/bin/btrbk /usr/local/sbin/btrbk /usr/sbin/btrbk /bin/btrbk /sbin/btrbk;" \
+    "/usr/bin/mount --bind /run/das-vm-guard/btrbk" "> /dev/console" "> /run/issue.d/das-vm-guard.issue"; do
     has "guard unit: $want" "$g" "$want"
 done
+lacks "guard unit: not ordered after local-fs.target (udev coldplug runs before that)" "$g" "After=local-fs.target"
 has "guard unit: announces itself on /dev/kmsg" "$g" "ExecStart=-/usr/bin/sh -c 'echo \"das-vm-guard: btrbk cannot run in this VM session; before pacman: systemctl stop das-vm-guard; after it: pacman -Qkk btrbk must find 0 altered files\" > /dev/kmsg'"
 for want in "das-vm-guard: btrbk cannot run in this VM session (DAS recovery OS updater)." \
-    "  Before you update, lift it:      systemctl stop das-vm-guard" "  then update:                     pacman -Syu" \
-    "  then check it was replaced:      pacman -Qkk btrbk   (0 altered files)" "  then:                            systemctl poweroff"; do
-    check "guard unit: at the console and the login prompt: ${want# }" "$(grep -c "echo \"$want\";" <<<"$g")" "2"
+    "  To update, follow the first update in the disaster recovery guide. In short:" \
+    "  1. lift it:    systemctl stop das-vm-guard   (if it failed: findmnt -rn -o TARGET | grep /btrbk | xargs -r -n1 umount)" \
+    "  2. keyrings:   pacman -Sy archlinux-keyring cachyos-keyring" \
+    "  3. drivers:    pin both worlds into the initramfs first (the guide, step 2)" \
+    "  4. upgrade:    pacman -Su" \
+    "  5. check:      pacman -Qkk btrbk   must find 0 altered files" \
+    "  6. re-engage:  systemctl start das-vm-guard   (lifted, pacman hooks and units not masked can run btrbk)" \
+    "  7. reboot, check uname -r, then systemctl poweroff"; do
+    check "guard unit: at the console and the login prompt: ${want# }" "$(grep -c -F "echo \"$want\";" <<<"$g")" "2"
 done
 check "guard unit: stopping it lifts it, in reverse" "$(grep '^ExecStop=' <<<"$g")" \
-    "ExecStop=-/usr/bin/umount /usr/local/bin/btrbk
+    "ExecStop=-/usr/bin/umount /sbin/btrbk
+ExecStop=-/usr/bin/umount /bin/btrbk
+ExecStop=-/usr/bin/umount /usr/sbin/btrbk
+ExecStop=-/usr/bin/umount /usr/local/sbin/btrbk
+ExecStop=-/usr/bin/umount /usr/local/bin/btrbk
 ExecStop=-/usr/bin/umount /usr/bin/btrbk
 ExecStop=-/usr/bin/rm -f /run/issue.d/das-vm-guard.issue
 ExecStop=-/usr/bin/sh -c 'echo \"das-vm-guard: lifted: btrbk can run again; its units and cron stay masked until the VM powers off\" > /dev/kmsg'"
@@ -1689,30 +1781,44 @@ has "guard unit: the console write cannot hold up the boot" "$g" "ExecStart=-/us
 check "guard: the drop-in, exactly" "$(credential "$x" 'systemd.unit-dropin.sysinit.target~das-vm-guard')" $'[Unit]\nWants=das-vm-guard.service das-vm-guard-report.service'
 r="$(credential "$x" systemd.extra-unit.das-vm-guard-report.service)"
 for want in "After=das-vm-guard.service" "ConditionPathExists=!/etc/initrd-release" "/dev/virtio-ports/org.dasbackup.guard" \
-    "for u in btrbk.service btrbk.timer cronie.service crond.service;" "LoadState" "masked|bad-setting)" "findmnt" "Type=simple" "RuntimeMaxSec=300"; do
+    "for u in btrbk.service btrbk.timer cronie.service crond.service;" "LoadState" "FragmentPath" "DropInPaths" \
+    "masked) ;;" "/proc/sys/kernel/random/boot_id" "sleep 60; done" "findmnt" "Type=simple"; do
     has "reporter unit: $want" "$r" "$want"
 done
 lacks "reporter unit: ordered before nothing" "$r" "Before="
-has "guard: confirmed, and said" "$OUT" "the session guard is engaged: das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
-has "guard: in the summary" "$OUT" "Guard         engaged -- das-vm-guard engaged 4 masks"
-has "guard: the operator told what to do inside" "$OUT" "inside it, before updating: systemctl stop das-vm-guard; after: pacman -Qkk btrbk must find 0 altered files"
+lacks "reporter unit: runs as long as the VM does" "$r" "RuntimeMaxSec="
+stub="$(credential "$x" das-vm-guard.btrbk)"
+check "guard: the refusing btrbk is shell" "$(sh -n -c "$stub" 2>&1 && echo ok)" "ok"
+has "guard: the refusing btrbk says so on /dev/kmsg" "$stub" "> /dev/kmsg"
+has "guard: ...and exits nonzero" "$stub" "exit 1"
+has "guard: confirmed, and said" "$OUT" "the session guard is engaged: $ENG4"
+has "guard: in the summary" "$OUT" "Guard         engaged -- $ENG4 (1 boot; lifted 0 times)"
+has "guard: the operator told what to do inside" "$OUT" "inside it, before updating: systemctl stop das-vm-guard; after: pacman -Qkk btrbk must find 0 altered files, then systemctl start das-vm-guard"
 check "guard: defined before the attach and the start, the template again after the detach" \
-    "$(calls_in_order "define --validate $STATE/system-recovery-A-2tb.domain.xml" "attach-device" "start recovery-os-updater" "detach-disk" "define --validate $T/usr/lib/das-backup/libvirt/recovery-os-updater.xml")" "yes"
-check "guard: the running domain read once it started" "$(calls_in_order "start recovery-os-updater" "dumpxml recovery-os-updater")" "yes"
+    "$(calls_in_order "define --validate $STATE/system-recovery-A-2tb.domain.xml" "attach-device" "start --paused recovery-os-updater" "detach-disk" "define --validate $T/usr/lib/das-backup/libvirt/recovery-os-updater.xml")" "yes"
+check "guard: started paused, read back while paused, then resumed" \
+    "$(calls_in_order "start --paused recovery-os-updater" "dumpxml recovery-os-updater" "resume recovery-os-updater")" "yes"
 lacks "guard: out of the definition afterwards (strings)" "$(file "$S/defined.xml")" "oemStrings"
 lacks "guard: ...(channel)" "$(file "$S/defined.xml")" "org.dasbackup.guard"
 lacks "guard: ...(smbios)" "$(file "$S/defined.xml")" "smbios"
 check "guard: nothing of it left in the session's directory" "$(ls -A "$STATE")" ""
+check "guard: never destroyed" "$(file "$S/forbidden")" ""
+
+fixture
+GUARD_SECS=default run_driver session A --dry-run
+has "guard: the deadline without the knob is 15 minutes" "$OUT" "the session guard must report within 0h 15m 00s"
 
 # What the record names is masked too -- by name, and only names that are
-# unit names; nothing else from the record reaches a credential.
+# unit names; nothing else from the record reaches a credential. A "no"
+# record, so the names it will not mask cost a warning, not the session.
 fixture
-write_state 3 "$(record_with_runners system-recovery-A-2tb may \
+write_state 3 "$(record_with_runners system-recovery-A-2tb no \
     '["btrbk-hourly.timer starts btrbk-hourly.service, which runs btrbk at its next scheduled time after boot, its config unknown: a test","mkinitcpio-generate-shutdown-ramfs.service may run btrbk: a script not read","x=y.service may run btrbk: a test","more than 4096 units start at boot: the rest were not read"]' \
-    '[{"source":"spike-btrbk-at-boot.service","via":"multi-user.target"},{"source":"etc/cron.d/backup","via":"cronie.service"},{"source":"a=b.service","via":"x y.timer"},{"source":"das-vm-guard.service","via":null},{"source":"sysinit.target","via":null},{"source":"../evil.service","via":"das-vm-guard-report.service"},{"source":"evil.service\n<entry>io.systemd.credential:systemd.extra-unit.sshd.service=</entry>","via":"multi-user.target"},{"source":"evil\u001b[31m.service","via":null},{"source":"etc/cron.d/other","via":"fcron.service"},{"source":"backup@.service","via":null},{"source":"backup@daily.service","via":"backup.timer"},{"source":"etc/cron.d/third","via":"bcron.service"},{"source":"tail.service=x","via":null}]' \
+    '[{"source":"spike-btrbk-at-boot.service","via":"multi-user.target"},{"source":"etc/cron.d/backup","via":"cronie.service"},{"source":"a=b.service","via":"x y.timer"},{"source":"das-vm-guard.service","via":null},{"source":"sysinit.target","via":null},{"source":"../evil.service","via":"das-vm-guard-report.service"},{"source":"evil.service\n<entry>io.systemd.credential:systemd.extra-unit.sshd.service=</entry>","via":"multi-user.target"},{"source":"evil\u001b[31m.service","via":null},{"source":"etc/cron.d/other","via":"fcron.service"},{"source":"backup@.service","via":null},{"source":"backup@daily.service","via":"backup.timer"},{"source":"etc/cron.d/third","via":"bcron.service"},{"source":"tail.service=x","via":null},{"source":"systemd-backlight@backlight:acpi_video0.service","via":null},{"source":"é.service","via":null}]' \
     fcron.service anacron.timer)"
-run_driver session A
-check "guard, what the record names: a session ends" "$RC" "0"
+LC_ALL=en_US.UTF-8 run_driver session A
+check "guard, what the record names: a session ends, flagged" "$RC" "5"
+check "guard, what the record names: virsh runs in the C locale (its answers in English)" "$(sort -u "$S/virsh.lc_all")" "C"
 x="$S/defined.at_start.xml"
 masks="btrbk.service btrbk.timer cronie.service crond.service anacron.timer backup@daily.service bcron.service btrbk-hourly.service btrbk-hourly.timer fcron.service mkinitcpio-generate-shutdown-ramfs.service spike-btrbk-at-boot.service"
 for u in $masks; do
@@ -1720,38 +1826,175 @@ for u in $masks; do
 done
 check "guard, what the record names: twelve masks, no more" "$(grep -c '<entry>io.systemd.credential:systemd.extra-unit\.' "$x")" "12"
 for bad in "a=b.service" "x y.timer" "x=y.service" "evil." "evil?" "sshd.service" "multi-user.target=" "sysinit.target=" \
-    "systemd.extra-unit.das-vm-guard.service=</entry>" "systemd.extra-unit.das-vm-guard-report.service=</entry>" "cron.d" "backup@.service" "tail.service"; do
+    "systemd.extra-unit.das-vm-guard.service=</entry>" "systemd.extra-unit.das-vm-guard-report.service=</entry>" "cron.d" \
+    "backup@.service" "tail.service" "acpi_video0" $'\xc3\xa9'; do
     lacks "guard, a name that is no plain unit never reaches a credential: $bad" "$(file "$x")" "$bad"
 done
-for said in "a=b.service" "x=y.service" "das-vm-guard.service" "das-vm-guard-report.service" "sysinit.target" "multi-user.target" "evil?[31m.service" "backup@.service" "tail.service=x"; do
+for said in "a=b.service" "x=y.service" "das-vm-guard.service" "das-vm-guard-report.service" "sysinit.target" "multi-user.target" "evil?[31m.service" "backup@.service" "tail.service=x" "systemd-backlight@backlight:acpi_video0.service" "??.service"; do
     has "guard, a name it will not mask, said: $said" "$OUT" "not masked: '$said'"
 done
 lacks "guard, a name it will not mask: no control character reaches the terminal" "$OUT" $'\e'
 has "guard, what the record names: the reporter checks every mask" "$(credential "$x" systemd.extra-unit.das-vm-guard-report.service)" "for u in ${masks};"
 has "guard, what the record names: confirmed with all twelve" "$OUT" "das-vm-guard engaged 12 masks ${masks// /,}"
+has "guard, what the record names: what it would not mask, in the summary" "$OUT" "Warnings      the boot record names units the guard cannot mask:"
 
-# At most 64 masks; the rest said, never silently dropped.
+# M-2: on a "may" record, a named runner the guard cannot mask refuses the
+# session before anything is taken -- whatever the reason it cannot.
+fixture
+write_state 3 "$(record_with_runners system-recovery-A-2tb may '["a test"]' '[{"source":"a=b.service","via":null}]')"
+run_driver session A --dry-run
+check "guard, may, a runner it cannot mask: refused" "$RC" "1"
+has "guard, may, a runner it cannot mask: says which" "$OUT" "REFUSED: the boot record says btrbk may run when this OS boots, and names units the session guard cannot mask: 'a=b.service'"
+check "guard, may, a runner it cannot mask: nothing locked" "$(file "$S/flock.calls")" ""
+
 fixture
 runners='['
 for ((i = 1; i <= 70; i++)); do runners+="$(printf '{"source":"r%02d.service","via":null},' "$i")"; done
+write_state 3 "$(record_with_runners system-recovery-A-2tb may '["a test"]' "${runners%,}]")"
+run_driver session A
+check "guard, may, 70 runners: refused" "$RC" "1"
+has "guard, may, 70 runners: names the ones past the limit" "$OUT" "names units the session guard cannot mask: r61.service r62.service r63.service r64.service r65.service r66.service r67.service r68.service r69.service r70.service (it masks at most 64)"
+lacks "guard, may, 70 runners: never booted" "$(events)" "virsh start"
+
+fixture
 write_state 3 "$(record_with_runners system-recovery-A-2tb no '["a test"]' "${runners%,}]")"
 run_driver session A
-check "guard, 70 runners: a session ends" "$RC" "0"
-check "guard, 70 runners: 64 masks in all" "$(grep -c '<entry>io.systemd.credential:systemd.extra-unit\.' "$S/defined.at_start.xml")" "64"
-has "guard, 70 runners: the first 60 of them, in order" "$(file "$S/defined.at_start.xml")" "systemd.extra-unit.r60.service="
-has "guard, 70 runners: the rest said" "$OUT" "not masked: r61.service r62.service r63.service r64.service r65.service r66.service r67.service r68.service r69.service r70.service -- the guard masks at most 64 units"
+check "guard, no, 70 runners: a session ends, flagged" "$RC" "5"
+check "guard, no, 70 runners: 64 masks in all" "$(grep -c '<entry>io.systemd.credential:systemd.extra-unit\.' "$S/defined.at_start.xml")" "64"
+has "guard, no, 70 runners: the first 60 of them, in order" "$(file "$S/defined.at_start.xml")" "systemd.extra-unit.r60.service="
+has "guard, no, 70 runners: the rest in the summary" "$OUT" "Warnings      the boot record names units the guard cannot mask: r61.service r62.service"
+# The SMBIOS budget at the limit: OEM strings are counted in one byte.
+entries=$(grep -c '<entry>' "$S/defined.at_start.xml" 2>/dev/null) || entries=0
+check "guard, 64 masks: strings within SMBIOS's 255" "$((entries <= 255))" "1"
+bytes=$(sed -n 's|.*<entry>\(.*\)</entry>.*|\1|p' "$S/defined.at_start.xml" 2>/dev/null | wc -c) || bytes=0
+check "guard, 64 masks: under 64 KiB of strings ($entries strings, $bytes bytes)" "$((bytes < 65536))" "1"
+
+# I-1: the guard is checked in the started domain while it is paused, before
+# it runs. Without it there, the domain is destroyed -- it never ran a single
+# instruction -- and nothing boots.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/live_drops_guard"
+keeps_running
+run_driver session A
+check "guard not in the started domain, may: refused" "$RC" "1"
+has "guard not in the started domain, may: said" "$OUT" "the started domain does not carry the session guard (missing: io.systemd.credential.binary:systemd.extra-unit.das-vm-guard.service"
+has "guard not in the started domain, may: destroyed while paused" "$(events)" "virsh start|virsh destroy|virsh detach|virsh define|holder released|"
+lacks "guard not in the started domain, may: never resumed" "$(events)" "virsh resume"
+has "guard not in the started domain, may: says it never ran" "$OUT" "it was destroyed while still paused, before it ran a single instruction"
+check "guard not in the started domain, may: no forbidden destroy" "$(file "$S/forbidden")" ""
+check "guard not in the started domain, may: lock free" "$(lock_state)" "free"
+
+fixture
+touch "$S/live_drops_guard"
+run_driver session A
+check "guard not in the started domain, no record: refused too" "$RC" "1"
+lacks "guard not in the started domain, no record: never resumed" "$(events)" "virsh resume"
+
+# 1518 (3): the started domain's definition cannot be read.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/dumpxml_live_fail"
+run_driver session A
+check "the started domain cannot be read: refused" "$RC" "1"
+has "the started domain cannot be read: said" "$OUT" "cannot read the started domain's definition"
+has "the started domain cannot be read: destroyed while paused" "$(events)" "virsh start|virsh destroy|"
+lacks "the started domain cannot be read: never resumed" "$(events)" "virsh resume"
+
+# virsh start says it failed, though the domain started (paused): it never
+# ran, so it is destroyed, and the session ends.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/start_error_but_started"
+run_driver session A
+check "start fails though the domain started: exit 1" "$RC" "1"
+has "start fails though the domain started: destroyed while paused" "$(events)" "virsh start|virsh destroy|virsh detach|"
+lacks "start fails though the domain started: never resumed" "$(events)" "virsh resume"
+check "start fails though the domain started: no forbidden destroy" "$(file "$S/forbidden")" ""
+check "start fails though the domain started: lock free" "$(lock_state)" "free"
+
+# Interrupted just as the recovery OS powered off: its report is judged before
+# the disk -- and the report with the guard -- is given back.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+printf 'shut off\n' >"$S/states.running"
+POLL=2 GUARD_SECS=300 run_interrupted session A
+check "interrupted as it powers off, no report, may: exit 6" "$RC" "6"
+has "interrupted as it powers off, no report, may: said" "$OUT" "but the session guard did not confirm on a \"may\" record (the recovery OS powered off without reporting)"
+check "interrupted as it powers off, no report, may: the disk given back" "$(file "$S/attached.xml")" ""
+check "interrupted as it powers off, no report, may: lock free" "$(lock_state)" "free"
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+printf 'shut off\n' >"$S/states.running"
+POLL=2 GUARD_SECS=300 run_interrupted session A
+check "interrupted as it powers off, engaged: exit 1" "$RC" "1"
+has "interrupted as it powers off, engaged: said" "$OUT" "session guard: engaged -- $ENG4 (1 boot; lifted 0 times)"
+
+# The destroy of the paused domain fails: kept, never said to be destroyed,
+# told it never ran and how to end it; session-end then finds nothing to judge.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/live_drops_guard" "$S/destroy_fail"
+run_driver session A
+check "guard missing, the destroy fails: kept (exit 3)" "$RC" "3"
+lacks "guard missing, the destroy fails: never said to be destroyed" "$OUT" "it was destroyed while still paused"
+has "guard missing, the destroy fails: said" "$OUT" "and it could not be destroyed: it is still paused, and has run nothing"
+has "guard missing, the destroy fails: says it never ran" "$OUT" "was started paused and never resumed: it has not run a single instruction"
+has "guard missing, the destroy fails: how to end it" "$OUT" "1. Tear it down -- it never ran, so nothing is cut short"
+lacks "guard missing, the destroy fails: never resumed" "$(events)" "virsh resume"
+check "guard missing, the destroy fails: no forbidden destroy" "$(file "$S/forbidden")" ""
+rm -f "$S/destroy_fail"
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, started but never resumed: exit 0" "$RC" "0"
+has "session-end, started but never resumed: nothing to judge" "$OUT" "session guard: never ran (started paused, never resumed): nothing to judge"
+
+# A resume that fails: it may have run, so it is never destroyed.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/resume_fail"
+run_driver session A
+check "resume fails: the session is kept" "$RC" "3"
+lacks "resume fails: never destroyed" "$(file "$S/virsh.calls")" "destroy"
+check "resume fails: no forbidden destroy" "$(file "$S/forbidden")" ""
+has "resume fails: the guard not judged, said" "$OUT" "THE SESSION GUARD HAS NOT BEEN JUDGED"
+
+# I-1: a stop for the guard is ACPI, re-sent until the recovery OS is off.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+keeps_running
+echo 2 >"$S/shutdown_ignore"
+DRIVER_TIMEOUT=30 GRACE=10 RESEND=1 GUARD_SECS=1 run_driver session A
+check "guard silent, may, the first requests dropped: exit 6" "$RC" "6"
+check "guard silent, may, the first requests dropped: asked three times" "$(grep -c '^shutdown' "$S/virsh.calls")" "3"
+check "guard silent, may, the first requests dropped: never destroyed" "$(file "$S/forbidden")" ""
+
+# ...and when it never goes: kept, and told plainly what to do -- not to let
+# an update finish.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
+DRIVER_TIMEOUT=30 GRACE=3 RESEND=1 GUARD_SECS=1 run_driver session A
+check "guard silent, may, the guest ignores every request: kept (exit 3)" "$RC" "3"
+matches "guard silent, may, the guest ignores every request: asked again and again" "$(grep -c '^shutdown' "$S/virsh.calls")" "^[2-9]$"
+check "guard silent, may, the guest ignores every request: never destroyed" "$(file "$S/forbidden")" ""
+has "guard silent, may, the guest ignores every request: says it is unguarded" "$OUT" "THE RECOVERY OS IS RUNNING WITHOUT A CONFIRMED SESSION GUARD"
+has "guard silent, may, the guest ignores every request: says to power it off now" "$OUT" "Power it off now"
+lacks "guard silent, may, the guest ignores every request: never says to let the update finish" "$OUT" "Let the update finish"
 
 # The recovery OS stays silent. On a "may" record: shut down (never
 # destroyed), the disk given back, exit 6.
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
 touch "$S/guard_silent"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
+keeps_running
 DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
 check "guard silent, may: exit 6" "$RC" "6"
 has "guard silent, may: said" "$OUT" "the session guard did not confirm: no report from the recovery OS within 0h 00m 01s of its start"
-has "guard silent, may: asked to shut down" "$(events)" "virsh start|virsh shutdown|virsh detach|virsh define|holder released|"
+has "guard silent, may: asked to shut down" "$(events)" "virsh start|virsh resume|virsh shutdown|virsh detach|virsh define|holder released|"
 check "guard silent, may: asked once" "$(grep -c '^shutdown' "$S/virsh.calls")" "1"
 check "guard silent, may: never destroyed" "$(file "$S/forbidden")" ""
 has "guard silent, may: in the summary" "$OUT" "Guard         NOT confirmed: no report from the recovery OS"
@@ -1760,13 +2003,10 @@ check "guard silent, may: the disk given back" "$(file "$S/attached.xml")" ""
 check "guard silent, may: lock free" "$(lock_state)" "free"
 lacks "guard silent, may: out of the definition" "$(file "$S/defined.xml")" "oemStrings"
 
-# ...and it does not wait for the deadline to say so once it is past it,
-# nor give up before it.
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
 touch "$S/guard_silent"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
+keeps_running
 DRIVER_TIMEOUT=20 GUARD_SECS=3 run_driver session A
 check "guard silent, may, 3s: exit 6" "$RC" "6"
 matches "guard silent, may, 3s: not before the deadline" "$OUT" "VM ran        0h 00m 0[3-9]s"
@@ -1785,8 +2025,7 @@ has "guard silent, no record: a warning in the summary" "$OUT" "Warnings      th
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb will)"
 touch "$S/guard_silent"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
+keeps_running
 DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A --accept-boot-record-risk
 check "guard silent, will (overridden): exit 6" "$RC" "6"
 has "guard silent, will (overridden): shut down" "$(events)" "virsh shutdown"
@@ -1805,64 +2044,66 @@ touch "$S/guard_silent"
 GUARD_SECS=300 run_driver session A
 check "guard, off before it reported, no record: exit 5" "$RC" "5"
 
-# The recovery OS says the guard is not engaged: on "may", shut down at once.
-fixture
-write_state 3 "$(record_json system-recovery-A-2tb may)"
-printf 'das-vm-guard NOT engaged: btrbk.timer is not masked;\n' >"$S/guard_reply"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
-DRIVER_TIMEOUT=20 GUARD_SECS=300 run_driver session A
-check "guard not engaged, may: exit 6" "$RC" "6"
-has "guard not engaged, may: its reason" "$OUT" "the recovery OS reports it NOT engaged: btrbk.timer is not masked;"
-has "guard not engaged, may: shut down without waiting for the deadline" "$(events)" "virsh shutdown"
-
-# A line that is not the one expected is no confirmation...
-fixture
-write_state 3 "$(record_json system-recovery-A-2tb may)"
-printf 'das-vm-guard engaged 3 masks btrbk.service,btrbk.timer,cronie.service\n' >"$S/guard_reply"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
-DRIVER_TIMEOUT=20 GUARD_SECS=300 run_driver session A
-check "guard, another line: exit 6" "$RC" "6"
-has "guard, another line: said" "$OUT" "the recovery OS reported 'das-vm-guard engaged 3 masks btrbk.service,btrbk.timer,cronie.service', not the line expected ('das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service')"
-
-# ...nor is the right one unfinished, and what it wrote is shown cleaned.
-fixture
-write_state 3 "$(record_json system-recovery-A-2tb may)"
-printf 'das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service\e[2J' >"$S/guard_reply"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
-DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
-check "guard, an unfinished line: exit 6" "$RC" "6"
-has "guard, an unfinished line: said, cleaned" "$OUT" "(an unfinished line: 'das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service?[2J')"
+# Every line is judged (1518 1), not only the first.
+REPLY="$(mktemp)"
+ROOTS+=("$REPLY")
+judged() { # $1 the case, $2 the expected exit, $3 the expected words, $4 GUARD_SECS; the reply in $REPLY
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb may)"
+    cp "$REPLY" "$S/guard_reply"
+    keeps_running
+    DRIVER_TIMEOUT=20 GUARD_SECS="${4:-300}" run_driver session A
+    check "guard, $1: exit $2" "$RC" "$2"
+    has "guard, $1: said" "$OUT" "$3"
+}
+line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);" >"$REPLY"
+judged "not engaged" 6 "the recovery OS reports it NOT engaged: btrbk.timer is not masked (loaded);"
+{ line "$ENG4"; line "das-vm-guard NOT engaged: das-vm-guard.service is failed;"; } >"$REPLY"
+judged "engaged, then not" 6 "the recovery OS reports it NOT engaged: das-vm-guard.service is failed;"
+{ line "$ENG4"; line "$ENG4" "$BOOT_B"; line "das-vm-guard NOT engaged: btrbk.service is not masked (loaded);" "$BOOT_B"; } >"$REPLY"
+judged "a second boot not engaged" 6 "the recovery OS reports it NOT engaged: btrbk.service is not masked (loaded);"
+{ line "$ENG4"; line "$LIFT4" "$BOOT_B"; } >"$REPLY"
+judged "a second boot that begins lifted" 6 "boot $BOOT_B began without the guard engaged"
+{ line "$ENG4"; line "das-vm-guard engaged 3 masks btrbk.service,btrbk.timer,cronie.service"; } >"$REPLY"
+judged "a later line of another kind" 6 "a report line that is no report: 'das-vm-guard engaged 3 masks btrbk.service,btrbk.timer,cronie.service boot $BOOT_A'"
+line "das-vm-guard engaged 3 masks btrbk.service,btrbk.timer,cronie.service" >"$REPLY"
+judged "another line" 6 "boot $BOOT_A began without the guard engaged: 'das-vm-guard engaged 3 masks btrbk.service,btrbk.timer,cronie.service'"
+printf '%s\n' "$ENG4" >"$REPLY"
+judged "a line without its boot" 6 "a report line that is no report: '$ENG4'"
+printf 'das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service\e[2J' >"$REPLY"
+judged "an unfinished line" 6 "(an unfinished line: 'das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service?[2J')" 1
 lacks "guard, an unfinished line: no control character reaches the terminal" "$OUT" $'\e'
-
+printf '%s boot %s' "$ENG4" "$BOOT_A" >"$REPLY"
+judged "the right line unfinished" 6 "no report from the recovery OS within" 1
+# One line, then silence: the boot it came from was followed by one with no
+# guard, or the reporter was stopped.
+line "$ENG4" >"$REPLY"
+judged "a report, then silence" 6 "the recovery OS stopped reporting" 2
+# Lifted for the update, re-engaged, rebooted engaged: all as it should be.
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
-printf 'das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service' >"$S/guard_reply"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
-DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
-check "guard, the right line unfinished: exit 6" "$RC" "6"
-
-# The running domain is what booted: without the guard there, on "may" it
-# is shut down at once; on "no" it is a warning.
-fixture
-write_state 3 "$(record_json system-recovery-A-2tb may)"
-touch "$S/live_drops_guard"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
-DRIVER_TIMEOUT=20 GUARD_SECS=300 run_driver session A
-check "guard not in the running domain, may: exit 6" "$RC" "6"
-has "guard not in the running domain, may: said" "$OUT" "the running domain does not carry the session guard (missing: io.systemd.credential.binary:systemd.extra-unit.das-vm-guard.service"
-has "guard not in the running domain, may: shut down at once" "$(events)" "virsh start|virsh shutdown|"
-
-fixture
-touch "$S/live_drops_guard"
+{ line "$ENG4"; line "$LIFT4"; line "$ENG4"; line "$ENG4" "$BOOT_B"; } >"$S/guard_reply"
 run_driver session A
-check "guard not in the running domain, no record: exit 5" "$RC" "5"
-lacks "guard not in the running domain, no record: no shutdown" "$(events)" "virsh shutdown"
-has "guard not in the running domain, no record: a warning in the summary" "$OUT" "Warnings      the session guard did not confirm (the running domain does not carry the session guard"
+check "guard, lifted and rebooted: exit 0" "$RC" "0"
+has "guard, lifted and rebooted: the summary counts both" "$OUT" "Guard         engaged -- $ENG4 (2 boots; lifted 1 time)"
+
+# Reports for longer than the deadline, one at every look: each one counts.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+for ((i = 0; i < 80; i++)); do echo running; done >"$S/states.running"
+echo "shut off" >>"$S/states.running"
+GUARD_SECS=2 run_driver session A
+check "guard, reporting for longer than the deadline: exit 0" "$RC" "0"
+matches "guard, reporting for longer than the deadline: it ran past it" "$OUT" "VM ran        0h (00m 0[3-9]|00m [1-5][0-9]|0[1-9]m [0-5][0-9])s"
+
+# The report shrinking (rotated, truncated): it cannot be judged.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+keeps_running
+touch "$S/guard_truncate_at_poll3"
+DRIVER_TIMEOUT=20 GUARD_SECS=300 run_driver session A
+check "guard, the report shrinks: exit 6" "$RC" "6"
+has "guard, the report shrinks: said" "$OUT" "the report shrank"
 
 # Fail closed: no guard, no boot; and it never outlives a failed session.
 fixture
@@ -1898,13 +2139,13 @@ check "guard, a template with SMBIOS strings of its own: refused" "$RC" "1"
 
 fixture
 mkdir -p "$STATE"
-printf 'das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service\n' >"$STATE/system-recovery-A-2tb.guard"
+line "$ENG4" >"$STATE/system-recovery-A-2tb.guard"
 write_state 3 "$(record_json system-recovery-A-2tb may)"
 touch "$S/guard_silent"
-for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
-printf 'shut off\n' >"$S/states.after_shutdown"
-DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
+GUARD_SECS=300 run_driver session A
 check "guard, an old report left behind: never taken for this session's" "$RC" "6"
+has "guard, an old report left behind: this session's has none" "$OUT" "the recovery OS powered off without reporting"
+lacks "guard, an old report left behind: never said to be engaged" "$OUT" "the session guard is engaged"
 
 fixture
 touch "$S/attach_fail"
@@ -1936,25 +2177,113 @@ fixture
 run_driver session A --dry-run
 check "guard, dry run: exit 0" "$RC" "0"
 lacks "guard, dry run: nothing defined" "$(file "$S/virsh.calls")" "define"
-has "guard, dry run: the guard it would carry, shown" "$OUT" "session guard: /usr/bin/false bound over /usr/bin/btrbk and /usr/local/bin/btrbk where present; masks btrbk.service, btrbk.timer, cronie.service, crond.service"
+has "guard, dry run: the guard it would carry, shown" "$OUT" "session guard: a refusing btrbk bound over /usr/bin/btrbk, /usr/local/bin/btrbk, /usr/local/sbin/btrbk, /usr/sbin/btrbk, /bin/btrbk and /sbin/btrbk where present; masks btrbk.service, btrbk.timer, cronie.service, crond.service"
 
-GUARD_SECS=0 run_driver status
-check "guard knob 0: a usage error" "$RC" "2"
-has "guard knob 0: says which" "$OUT" "_GRACE_SECS and _GUARD_SECS take numbers above 0"
-GUARD_SECS=12x run_driver status
-check "guard knob not a number: a usage error" "$RC" "2"
+for knob in 0 12x; do
+    GUARD_SECS=$knob run_driver status
+    check "guard knob $knob: a usage error" "$RC" "2"
+    has "guard knob $knob: says which" "$OUT" "_GUARD_SECS and _RESEND_SECS take numbers above 0"
+done
+RESEND=0 run_driver status
+check "resend knob 0: a usage error" "$RC" "2"
 
-echo "--- a session's guard left behind: session-end takes it out"
+echo "--- I-2: a guard the driver never judged is judged by status and session-end"
+# Interrupted before the recovery OS reported: the message says so.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+check "interrupted, not judged: kept (exit 3)" "$RC" "3"
+has "interrupted, not judged: said" "$OUT" "THE SESSION GUARD HAS NOT BEEN JUDGED"
+has "interrupted, not judged: where its report lands" "$OUT" "its report lands in $STATE/system-recovery-A-2tb.guard"
+lacks "interrupted, not judged: never says to let the update finish" "$OUT" "Let the update finish"
+check "interrupted, not judged: its session state root's only" "$(stat -c %a "$STATE/system-recovery-A-2tb.guard.state")" "600"
+GUARD_SECS=300 run_driver status
+check "status, a report not yet in: exit 0 within the deadline" "$RC" "0"
+has "status, a report not yet in: said" "$OUT" "Session guard     in the definition; no report yet"
+echo "resumed=$(($(date +%s) - 1000))" >>"$STATE/system-recovery-A-2tb.guard.state" 2>/dev/null || :
+GUARD_SECS=300 run_driver status
+check "status, no report past the deadline: exit 6" "$RC" "6"
+has "status, no report past the deadline: said" "$OUT" "Session guard     in the definition; NOT engaged: no report from a recovery OS that ran"
+line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);" >"$STATE/system-recovery-A-2tb.guard" 2>/dev/null || :
+run_driver status
+check "status, a report NOT engaged: exit 6" "$RC" "6"
+has "status, a report NOT engaged: said" "$OUT" "Session guard     in the definition; NOT engaged: the recovery OS reports it NOT engaged: btrbk.timer is not masked (loaded);"
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, a report NOT engaged: exit 6" "$RC" "6"
+has "session-end, a report NOT engaged: said, before anything is removed" "$OUT" "session guard: NOT engaged: the recovery OS reports it NOT engaged: btrbk.timer is not masked (loaded);"
+check "session-end, a report NOT engaged: the disk given back all the same" "$(file "$S/attached.xml")" ""
+check "session-end, a report NOT engaged: lock free" "$(lock_state)" "free"
+
+for sig in TERM HUP; do
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb may)"
+    touch "$S/guard_silent"
+    for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+    SIG=$sig GUARD_SECS=300 run_interrupted session A
+    check "SIG$sig, not judged: kept (exit 3)" "$RC" "3"
+    has "SIG$sig, not judged: said" "$OUT" "THE SESSION GUARD HAS NOT BEEN JUDGED"
+done
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, no report from a domain that ran: exit 6" "$RC" "6"
+has "session-end, no report from a domain that ran: said" "$OUT" "session guard: NOT engaged: no report from a recovery OS that ran"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+{ line "$ENG4"; line "$LIFT4"; } >"$STATE/system-recovery-A-2tb.guard" 2>/dev/null || :
+run_driver status
+check "status, engaged: exit 0" "$RC" "0"
+has "status, engaged: said" "$OUT" "Session guard     in the definition; engaged (1 boot; lifted 1 time)"
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, engaged: exit 0" "$RC" "0"
+has "session-end, engaged: said" "$OUT" "session guard: engaged (1 boot; lifted 1 time)"
+check "session-end, engaged: then removed" "$(ls -A "$STATE")" ""
+
+fixture
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);" >"$STATE/system-recovery-A-2tb.guard" 2>/dev/null || :
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, NOT engaged on a no record: exit 5" "$RC" "5"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+rm -f "$STATE/system-recovery-A-2tb.guard"
+mkdir "$STATE/system-recovery-A-2tb.guard" 2>/dev/null || :
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, a report it cannot read: exit 6" "$RC" "6"
+has "session-end, a report it cannot read: said" "$OUT" "cannot be read"
+
+echo "--- a session's guard left behind: session-end takes it out, under the lock"
 fixture
 run_driver session A
 cp "$S/defined.at_start.xml" "$S/defined.xml" 2>/dev/null || :
 run_driver status
 has "status: a guard left in the definition" "$OUT" "Session guard     in the definition"
+check "status, a guard left without its session state: exit 6" "$RC" "6"
+has "status, a guard left without its session state: cannot be judged" "$OUT" "Session guard     in the definition; cannot be judged: no session state for it"
+rm -f "$S/lock.at_define"
 run_driver session-end A
-check "session-end, guard left: exit 0" "$RC" "0"
+check "session-end, guard left, its session state gone: exit 6" "$RC" "6"
+has "session-end, guard left, its session state gone: says it cannot be judged" "$OUT" "session guard: cannot be judged"
 has "session-end, guard left: says so" "$OUT" "the session guard was still in recovery-os-updater's definition and is out of it now"
 lacks "session-end, guard left: out of the definition" "$(file "$S/defined.xml")" "io.systemd.credential"
 check "session-end, guard left: from the template" "$(tail -n 2 "$S/virsh.calls" | head -n 1)" "define --validate $T/usr/lib/das-backup/libvirt/recovery-os-updater.xml"
+matches "session-end, guard left: under the maintenance lock, its own" "$(tail -n 1 "$S/lock.at_define")" "^recovery-os VM session system-recovery-A-2tb pid [0-9]+$"
+check "session-end, guard left: the lock free again" "$(lock_state)" "free"
 run_driver status
 has "status: then no guard" "$OUT" "Session guard     none"
 grep -v "org.dasbackup.guard" "$S/defined.at_start.xml" >"$S/defined.xml" || :
@@ -1963,74 +2292,112 @@ has "status: strings left without the port, seen" "$OUT" "Session guard     in t
 grep -v "<entry>" "$S/defined.at_start.xml" >"$S/defined.xml" || :
 run_driver status
 has "status: the port left without the strings, seen" "$OUT" "Session guard     in the definition"
-cp "$T/usr/lib/das-backup/libvirt/recovery-os-updater.xml" "$S/defined.xml"
+cp "$S/defined.at_start.xml" "$S/defined.xml" 2>/dev/null || :
+start_blocker
+run_driver session-end A
+check "session-end, guard left, the lock held: refused" "$RC" "1"
+has "session-end, guard left, the lock held: says by whom" "$OUT" "is held by"
+has "session-end, guard left, the lock held: the guard stays" "$(file "$S/defined.xml")" "org.dasbackup.guard"
+stop_blocker
 cp "$S/defined.at_start.xml" "$S/defined.xml" 2>/dev/null || :
 touch "$S/define_fail_plain"
 run_driver session-end A
-check "session-end, guard left, cannot take it out: exit 5" "$RC" "5"
+check "session-end, guard left, cannot take it out: nonzero" "$((RC != 0))" "1"
 has "session-end, guard left, cannot take it out: says so" "$OUT" "the session guard is still in recovery-os-updater's definition"
 
-echo "--- the guard's scripts, run as the recovery OS runs them (stand-ins for mount, systemctl, findmnt)"
+echo "--- the guard's scripts, run as the recovery OS runs them (stand-ins for mount, systemctl, findmnt, sleep)"
 fixture
 run_driver session A
 G="$T/guest"
-mkdir -p "$G/bin" "$G/usr/bin" "$G/usr/local/bin"
+mkdir -p "$G/bin" "$G/usr/bin" "$G/usr/local/bin" "$G/usr/local/sbin" "$G/creds" "$G/run/das-vm-guard" \
+    "$G/dev/virtio-ports" "$G/proc/sys/kernel/random"
+# Where the recovery OS's paths land here: each under $G, as guestify puts them.
+PORT="$G/dev/virtio-ports/org.dasbackup.guard"
+KMSG="$G/dev/kmsg"
 # The recovery OS's paths, here.
 guestify() {
     local s=${1//\$\$/\$}
-    s=${s//\/dev\/virtio-ports\/org.dasbackup.guard/$G\/port}
-    s=${s//\/usr\/local\/bin\/btrbk/$G\/usr\/local\/bin\/btrbk}
-    s=${s//\/usr\/bin\/btrbk/$G\/usr\/bin\/btrbk}
-    s=${s//\/usr\/bin\/mount/$G\/bin\/mount}
-    printf '%s' "$s"
+    printf '%s' "$s" | sed -E "s#(^|[ \"'=])(/dev/virtio-ports/org\.dasbackup\.guard|/proc/sys/kernel/random/boot_id|/run/das-vm-guard/btrbk|/dev/kmsg|/usr/local/sbin/btrbk|/usr/local/bin/btrbk|/usr/sbin/btrbk|/usr/bin/btrbk|/usr/bin/mount|/sbin/btrbk|/bin/btrbk)#\1$G\2#g"
 }
 g="$(credential "$S/defined.at_start.xml" systemd.extra-unit.das-vm-guard.service)"
 r="$(credential "$S/defined.at_start.xml" systemd.extra-unit.das-vm-guard-report.service)"
+credential "$S/defined.at_start.xml" das-vm-guard.btrbk >"$G/creds/das-vm-guard.btrbk"
 # One check for all of them: the suite's count must not depend on the driver.
 n=0
 notshell=""
-while IFS= read -r line; do
-    gs=$(sed -n "s|^ExecSt[a-z]*=-\{0,1\}\(/usr/bin/timeout [0-9]* \)\{0,1\}/usr/bin/sh -c '\(.*\)'$|\2|p" <<<"$line")
+while IFS= read -r l; do
+    gs=$(sed -n "s|^ExecSt[a-z]*=-\{0,1\}\(/usr/bin/timeout [0-9]* \)\{0,1\}/usr/bin/sh -c '\(.*\)'$|\2|p" <<<"$l")
     [[ -n "$gs" ]] || continue
     n=$((n + 1))
     sh -n -c "${gs//\$\$/\$}" 2>/dev/null || notshell+="line $n: ${gs:0:60}; "
 done <<<"$g"
 check "guard unit: every line of shell is shell" "${notshell:-none}" "none"
-check "guard unit: five lines of shell" "$n" "5"
+check "guard unit: six lines of shell" "$n" "6"
 
+install_line="$(guestify "$(sed -n "s|^ExecStart=/usr/bin/sh -c '\(install .*\)'$|\1|p" <<<"$g")")"
 bind="$(guestify "$(sed -n "s|^ExecStart=/usr/bin/sh -c '\(for p in .*\)'$|\1|p" <<<"$g")")"
-cat >"$G/bin/mount" <<'STUB'
+cat >"$G/usr/bin/mount" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >>"$GUEST/mount.calls"
-exit "$(cat "$GUEST/mount.rc" 2>/dev/null || echo 0)"
+rc=$(cat "$GUEST/mount.rc" 2>/dev/null || echo 0)
+# A bind that works makes the path the source's own file, as a real one does:
+# a hard link here -- the same inode, and the path still the path.
+if ((rc == 0)); then ln -f "$2" "${!#}.bound" && mv -f "${!#}.bound" "${!#}"; fi
+exit "$rc"
 STUB
-chmod +x "$G/bin/mount"
+chmod +x "$G/usr/bin/mount"
 # Never the real mount: the script runs only once it names none but the stand-in.
 guest_bind() {
-    if [[ -z "$bind" || "$bind" == *"/usr/bin/mount"* ]]; then
+    if [[ -z "$bind" || "$bind" != *"$G/usr/bin/mount"* || "$bind" == *" /usr/bin/mount"* ]]; then
         echo "NOT RUN: the script names the real mount"
         return
     fi
     rm -f "$G/mount.calls"
+    env GUEST="$G" CREDENTIALS_DIRECTORY="$G/creds" sh -c "$install_line" >/dev/null 2>&1
     env GUEST="$G" sh -c "$bind" >/dev/null 2>&1
     echo "rc=$? $(tr '\n' '|' 2>/dev/null <"$G/mount.calls")"
 }
 : >"$G/usr/bin/btrbk"
-check "guard unit, here: binds false over the btrbk present" "$(guest_bind)" "rc=0 --bind /usr/bin/false $G/usr/bin/btrbk|"
-: >"$G/usr/local/bin/btrbk"
-check "guard unit, here: ...over each one present" "$(guest_bind)" "rc=0 --bind /usr/bin/false $G/usr/bin/btrbk|--bind /usr/bin/false $G/usr/local/bin/btrbk|"
+check "guard unit, here: binds the refusing btrbk over the btrbk present" "$(guest_bind)" "rc=0 --bind $G/run/das-vm-guard/btrbk $G/usr/bin/btrbk|"
+check "guard unit, here: the refusing btrbk installed, executable" "$(stat -c %a "$G/run/das-vm-guard/btrbk")" "755"
+rm -f "$G/usr/bin/btrbk"
+: >"$G/usr/bin/btrbk"
+: >"$G/usr/local/sbin/btrbk"
+ln -sfn "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk"
+check "guard unit, here: ...over each one present, once" "$(guest_bind)" "rc=0 --bind $G/run/das-vm-guard/btrbk $G/usr/bin/btrbk|--bind $G/run/das-vm-guard/btrbk $G/usr/local/sbin/btrbk|"
+rm -f "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk" "$G/usr/local/sbin/btrbk"
+: >"$G/usr/bin/btrbk"
 echo 32 >"$G/mount.rc"
-check "guard unit, here: a bind that fails fails the guard" "$(guest_bind)" "rc=1 --bind /usr/bin/false $G/usr/bin/btrbk|"
-rm -f "$G/mount.rc" "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk"
+check "guard unit, here: a bind that fails fails the guard" "$(guest_bind)" "rc=1 --bind $G/run/das-vm-guard/btrbk $G/usr/bin/btrbk|"
+rm -f "$G/mount.rc" "$G/usr/bin/btrbk"
 check "guard unit, here: no btrbk, nothing bound" "$(guest_bind)" "rc=0 "
+rm -f "$G/creds/das-vm-guard.btrbk"
+: >"$G/usr/bin/btrbk"
+check "guard unit, here: no refusing btrbk to bind, the guard fails" "$(rm -f "$G/run/das-vm-guard/btrbk"; env GUEST="$G" CREDENTIALS_DIRECTORY="$G/creds" sh -c "$install_line" >/dev/null 2>&1; echo "rc=$?")" "rc=1"
+rm -f "$G/usr/bin/btrbk"
+credential "$S/defined.at_start.xml" das-vm-guard.btrbk >"$G/creds/das-vm-guard.btrbk"
+
+# The refusing btrbk itself: says so on the kernel log, exits nonzero.
+refuser="$(guestify "$(credential "$S/defined.at_start.xml" das-vm-guard.btrbk)")"
+: >"$KMSG"
+check "the refusing btrbk: exits nonzero" "$(sh -c "$refuser" btrbk run --progress >/dev/null 2>&1; echo $?)" "1"
+has "the refusing btrbk: logs the attempt on the kernel log" "$(file "$KMSG")" "das-vm-guard: refused: btrbk run --progress"
+has "the refusing btrbk: tells whoever ran it" "$(sh -c "$refuser" btrbk run 2>&1 >/dev/null || :)" "das-vm-guard: btrbk cannot run in this VM session"
 
 script="$(guestify "$(sed -n "s|^ExecStart=/usr/bin/sh -c '\(.*\)'$|\1|p" <<<"$r")")"
 check "reporter: its script is shell" "$(sh -n -c "$script" 2>&1 && echo ok)" "ok"
+# Properties from files where one is given, else a guard that holds.
 cat >"$G/bin/systemctl" <<'STUB'
 #!/bin/bash
-case "$1" in
-    is-active) [[ ! -f "$GUEST/guard.inactive" ]] ;;
-    show) cat "$GUEST/loadstate.${!#}" 2>/dev/null || echo masked ;;
+[[ ! -f "$GUEST/systemctl.fail" ]] || exit 1
+prop=$3 unit=${!#}
+[[ ! -f "$GUEST/systemctl.fail.$prop" ]] || exit 1
+if [[ -f "$GUEST/$prop.$unit" ]]; then cat "$GUEST/$prop.$unit"; exit 0; fi
+case "$prop" in
+    ActiveState) echo active ;;
+    LoadState) echo bad-setting ;;
+    FragmentPath) echo "/run/systemd/generator.early/$unit" ;;
+    DropInPaths) echo "/etc/systemd/system/$unit.d/override.conf /run/systemd/generator.early/$unit.d/zzzzzzzz-das-vm-guard.conf" ;;
 esac
 STUB
 # Mounted where a file names the mount point (its slashes as _); else exit 1.
@@ -2040,52 +2407,105 @@ p=${!#}
 p=${p#"$GUEST"}
 cat "$GUEST/findmnt${p//\//_}" 2>/dev/null
 STUB
-printf '#!/bin/sh\n' >"$G/bin/sleep"
-chmod +x "$G/bin/systemctl" "$G/bin/findmnt" "$G/bin/sleep"
-guest_report() {
-    rm -f "$G/port"
-    : >"$G/port"
-    env GUEST="$G" PATH="$G/bin:$PATH" sh -c "$script" >"$G/stdout" 2>&1
-    cat "$G/port"
-}
-# /usr/bin/false bound over btrbk: the path is false's own file, and mounted.
-ln -s /usr/bin/false "$G/usr/bin/btrbk"
-echo '/dev/vda2[/@/usr/bin/false]' >"$G/findmnt_usr_bin_btrbk"
-check "reporter: engaged, with every mask" "$(guest_report)" "das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
-check "reporter: ...and into its journal" "$(file "$G/stdout")" "das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
-echo loaded >"$G/loadstate.btrbk.timer"
-check "reporter: a unit not masked is said" "$(guest_report)" "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);"
-rm "$G/loadstate.btrbk.timer"
-echo loaded >"$G/loadstate.btrbk.service"
-check "reporter: ...the first one too" "$(guest_report)" "das-vm-guard NOT engaged: btrbk.service is not masked (loaded);"
-rm "$G/loadstate.btrbk.service"
-# How systemd 262 loads an empty credential: a bad setting, which cannot start.
-for u in btrbk.service btrbk.timer cronie.service crond.service; do echo bad-setting >"$G/loadstate.$u"; done
-check "reporter: a unit systemd loads as a bad setting counts as masked" "$(guest_report)" "das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
-echo not-found >"$G/loadstate.crond.service"
-check "reporter: a unit not found is not masked (the credential never applied)" "$(guest_report)" "das-vm-guard NOT engaged: crond.service is not masked (not-found);"
-rm -f "$G"/loadstate.*
-touch "$G/guard.inactive"
-check "reporter: a guard that is not active is said" "$(guest_report)" "das-vm-guard NOT engaged: das-vm-guard.service is not active;"
-rm "$G/guard.inactive"
-: >"$G/usr/local/bin/btrbk"
-check "reporter: a btrbk nothing is bound over is said" "$(guest_report)" "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;"
-echo '/dev/vda2[/@/usr/local/bin/btrbk]' >"$G/findmnt_usr_local_bin_btrbk"
-check "reporter: a btrbk something else is bound over is said" "$(guest_report)" "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;"
-rm -f "$G/usr/local/bin/btrbk" "$G/findmnt_usr_local_bin_btrbk"
-ln -s /usr/bin/false "$G/usr/local/bin/btrbk"
-check "reporter: false there without a mount is said" "$(guest_report)" "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;"
-echo '/dev/vda2[/@/usr/bin/false]' >"$G/findmnt_usr_local_bin_btrbk"
-check "reporter: both covered, engaged" "$(guest_report)" "das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service"
-rm -f "$G/usr/local/bin/btrbk" "$G/findmnt_usr_local_bin_btrbk"
-check "reporter: no port, nothing written, and no hang" "$(rm -f "$G/port"; env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >/dev/null 2>&1; echo "rc=$? $(ls "$G/port" 2>/dev/null)")" "rc=0 "
+# 1 s (the wait for the port): nothing. Longer (a heartbeat, a retry):
+# end the reporter after this one round, as the test has seen it.
 cat >"$G/bin/sleep" <<'STUB'
 #!/bin/sh
-echo x >>"$GUEST/sleeps"
+echo "$1" >>"$GUEST/sleeps"
+[ "$1" = 1 ] || kill -TERM "$PPID"
 STUB
-rm -f "$G/port" "$G/sleeps"
-env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >/dev/null 2>&1 || :
-check "reporter: waits for the port two minutes, a second at a time" "$(grep -c x "$G/sleeps")" "120"
+chmod +x "$G/bin/systemctl" "$G/bin/findmnt" "$G/bin/sleep"
+echo "$BOOT_A" >"$G/proc/sys/kernel/random/boot_id"
+# The refusing btrbk as the guard installs it, and a bind of it over $1.
+install -D -m 0755 "$G/creds/das-vm-guard.btrbk" "$G/run/das-vm-guard/btrbk"
+bindit() {
+    local key=${1#"$G"}
+    rm -f "$1"
+    ln "$G/run/das-vm-guard/btrbk" "$1"
+    echo '/dev/vda2[/@/run/das-vm-guard/btrbk]' >"$G/findmnt${key//\//_}"
+}
+guest_report() {
+    rm -f "$PORT" "$G/sleeps"
+    : >"$PORT"
+    env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >"$G/stdout" 2>&1
+    cat "$PORT"
+}
+# The refusing btrbk bound over btrbk: the path is its file, and mounted.
+rm -f "$G/usr/local/bin/btrbk" "$G/usr/local/sbin/btrbk"
+bindit "$G/usr/bin/btrbk"
+check "reporter: the btrbk it covers is there (no vacuous engaged)" "$( [ -e "$G/usr/bin/btrbk" ] && [ "$G/usr/bin/btrbk" -ef "$G/run/das-vm-guard/btrbk" ] && echo bound)" "bound"
+check "reporter: engaged, with every mask" "$(guest_report)" "$(line "$ENG4")"
+check "reporter: ...and into its journal" "$(file "$G/stdout")" "$(line "$ENG4")"
+check "reporter: then a heartbeat a minute later" "$(file "$G/sleeps")" "60"
+echo inactive >"$G/ActiveState.das-vm-guard.service"
+check "reporter: inactive at the start of a boot is not lifted" "$(guest_report)" "$(line "das-vm-guard NOT engaged: das-vm-guard.service is inactive;")"
+for st in failed deactivating; do
+    echo "$st" >"$G/ActiveState.das-vm-guard.service"
+    case $st in
+        failed) check "reporter: a guard that failed is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: das-vm-guard.service is failed;")" ;;
+        *) check "reporter: a guard in between says nothing, and looks again" "$(guest_report)$(file "$G/sleeps")" "5" ;;
+    esac
+done
+rm -f "$G/ActiveState.das-vm-guard.service"
+echo masked >"$G/LoadState.btrbk.timer"
+check "reporter: a unit masked outright counts" "$(guest_report)" "$(line "$ENG4")"
+echo loaded >"$G/LoadState.btrbk.timer"
+check "reporter: a unit made whole by a drop-in, the condition still last, counts" "$(guest_report)" "$(line "$ENG4")"
+echo "/run/systemd/generator.early/btrbk.timer.d/zzzzzzzz-das-vm-guard.conf /etc/systemd/system/btrbk.timer.d/zzzzzzzzz-later.conf" >"$G/DropInPaths.btrbk.timer"
+check "reporter: ...but not with a drop-in after the condition" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);")"
+echo "/etc/systemd/system/btrbk.timer.d/override.conf" >"$G/DropInPaths.btrbk.timer"
+check "reporter: ...nor without the condition" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);")"
+rm -f "$G/DropInPaths.btrbk.timer"
+echo /usr/lib/systemd/system/btrbk.timer >"$G/FragmentPath.btrbk.timer"
+check "reporter: ...nor when the empty unit did not apply" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);")"
+rm -f "$G/FragmentPath.btrbk.timer"
+echo not-found >"$G/LoadState.crond.service"
+check "reporter: a unit not found is not masked (the credential never applied)" "$(guest_report)" "$(line "das-vm-guard NOT engaged: crond.service is not masked (not-found);")"
+rm -f "$G"/LoadState.*
+echo not-found >"$G/LoadState.btrbk.service"
+check "reporter: ...the first one too" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.service is not masked (not-found);")"
+rm -f "$G"/LoadState.*
+touch "$G/systemctl.fail"
+check "reporter: systemd cannot be asked (a re-exec), says nothing, looks again" "$(guest_report)$(file "$G/sleeps")" "5"
+rm -f "$G/systemctl.fail"
+for prop in ActiveState LoadState FragmentPath DropInPaths; do
+    touch "$G/systemctl.fail.$prop"
+    check "reporter: $prop cannot be asked for, says nothing, looks again" "$(guest_report)$(file "$G/sleeps")" "5"
+    rm -f "$G/systemctl.fail.$prop"
+done
+: >"$G/usr/local/bin/btrbk"
+check "reporter: a btrbk nothing is bound over is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;")"
+echo '/dev/vda2[/@/usr/local/bin/btrbk]' >"$G/findmnt_usr_local_bin_btrbk"
+check "reporter: a btrbk something else is bound over is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;")"
+rm -f "$G/usr/local/bin/btrbk" "$G/findmnt_usr_local_bin_btrbk"
+ln "$G/run/das-vm-guard/btrbk" "$G/usr/local/bin/btrbk"
+check "reporter: the refusing btrbk there without a mount is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;")"
+bindit "$G/usr/local/bin/btrbk"
+check "reporter: both covered, engaged" "$(guest_report)" "$(line "$ENG4")"
+rm -f "$G/usr/local/bin/btrbk" "$G/findmnt_usr_local_bin_btrbk"
+ln -sfn "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk"
+check "reporter: a btrbk that leads to a covered one is covered" "$(guest_report)" "$(line "$ENG4")"
+rm -f "$G/usr/local/bin/btrbk"
+check "reporter: no port, nothing written, and no hang" "$(rm -f "$PORT" "$G/sleeps"; env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >/dev/null 2>&1; echo "rc=$? $(ls "$PORT" 2>/dev/null)")" "rc=0 "
+check "reporter: waits for the port two minutes, a second at a time" "$(grep -c '^1$' "$G/sleeps")" "120"
+# Lifted (stopped after the boot's first report): masks still checked, the
+# binds not, and said as such. The second round of one run.
+cat >"$G/bin/sleep" <<'STUB'
+#!/bin/sh
+echo "$1" >>"$GUEST/sleeps"
+[ "$1" = 1 ] && exit 0
+if [ -f "$GUEST/lift_next" ]; then
+    rm -f "$GUEST/lift_next" "$GUEST/usr/bin/btrbk" "$GUEST/findmnt_usr_bin_btrbk"
+    : >"$GUEST/usr/bin/btrbk"
+    echo inactive >"$GUEST/ActiveState.das-vm-guard.service"
+    exit 0
+fi
+kill -TERM "$PPID"
+STUB
+touch "$G/lift_next"
+check "reporter: engaged, then lifted and unbound: both lines, the binds not looked at once lifted" "$(guest_report)" "$(line "$ENG4")
+$(line "$LIFT4")"
+rm -f "$G/ActiveState.das-vm-guard.service"
 
 echo "--- the test hatch (DAS_RECOVERY_VM_TEST_LOOP)"
 fixture
@@ -2201,6 +2621,10 @@ run_driver screenshot "$T/shot.png"
 check "screenshot while running: exit 0" "$RC" "0"
 has "screenshot: converted to PNG" "$(file "$S/magick.calls")" "png:$T/shot.png"
 check "screenshot: written" "$(file "$T/shot.png")" "PNG"
+
+echo "--- across every test above: destroy is unreachable after a resume (I-1)"
+check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"
+matches "...and the log does see destroys: of domains never resumed, in the tests that need one" "$(grep -c '^destroy, never resumed' "$DESTROY_LOG")" "^[1-9][0-9]*$"
 
 echo
 echo "$passes passed, $fails failed"
