@@ -1,12 +1,12 @@
 use crate::config::{Config, TargetRole};
 use crate::db::Database;
+use crate::fsutil::{CommandRunner, SystemRunner};
 use crate::health;
 use crate::indexer;
 use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback};
 use crate::scrub;
-use std::io::BufRead;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
@@ -248,16 +248,15 @@ fn format_timestamp() -> String {
 /// stdout is consumed line-by-line for progress reporting, and switching that
 /// stream to raw would break the progress callback. This mirrors what
 /// `backup-run.sh` does, so the two implementations agree by construction.
-fn btrbk_raw_listing(config: &Config) -> Option<String> {
-    let output = Command::new("btrbk")
-        .args([
+fn btrbk_raw_listing(config: &Config, runner: &dyn CommandRunner) -> Option<String> {
+    let output = runner
+        .output(Command::new("btrbk").args([
             "-c",
             &config.general.btrbk_conf,
             "--format=raw",
             "list",
             "latest",
-        ])
-        .output()
+        ]))
         .ok()?;
     output
         .status
@@ -314,30 +313,36 @@ fn parse_btrbk_send_count(output: &str) -> usize {
         .count()
 }
 
-/// Run a command and return (stdout, stderr, success).
-/// Logs stderr lines at Warning level via progress.
-fn run_command(
-    cmd: &mut Command,
-    progress: &dyn ProgressCallback,
-) -> Result<(String, bool), Box<dyn std::error::Error>> {
-    let output = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    for line in stderr.lines() {
+/// Every non-blank line of a btrbk command's stderr, as a warning.
+fn log_btrbk_stderr(stderr: &[u8], progress: &dyn ProgressCallback) {
+    for line in String::from_utf8_lossy(stderr).lines() {
         if !line.trim().is_empty() {
             progress.on_log(LogLevel::Warning, &format!("btrbk stderr: {line}"));
         }
     }
-
-    Ok((stdout, output.status.success()))
 }
 
-/// Stream a command line by line, applying a callback to each stdout line.
-/// Stderr is collected and logged at Warning level. Returns success status.
+/// Run a command through `runner` and return (stdout, success).
+/// Logs stderr lines at Warning level via progress.
+fn run_command(
+    cmd: &mut Command,
+    runner: &dyn CommandRunner,
+    progress: &dyn ProgressCallback,
+) -> Result<(String, bool), Box<dyn std::error::Error>> {
+    let output = runner.output(cmd)?;
+    log_btrbk_stderr(&output.stderr, progress);
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output.status.success(),
+    ))
+}
+
+/// Stream a command through `runner`, applying a callback to each stdout
+/// line as it is written. Stderr is collected and logged at Warning level.
+/// Returns success status.
 fn stream_command<F>(
     cmd: &mut Command,
+    runner: &dyn CommandRunner,
     progress: &dyn ProgressCallback,
     mut line_cb: F,
 ) -> Result<bool, Box<dyn std::error::Error>>
@@ -347,52 +352,21 @@ where
     // Log the command being executed for diagnostics.
     progress.on_log(LogLevel::Info, &format!("stream_command: {:?}", cmd));
 
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-
-    // stderr MUST be drained concurrently with stdout, not after the child
-    // exits. A pipe buffer is ~64 KiB on Linux; once it fills, the child blocks
-    // in write(2), therefore stops producing stdout, therefore the stdout loop
-    // below blocks forever on a line that never comes and `wait()` is never
-    // reached. `run_command` avoids this by using `Command::output()`, which
-    // drains both streams on separate threads internally; this is the same
-    // thing, done by hand because we stream stdout line by line
-    // (bd DAS-Backup-Manager-az3).
-    let stderr = child.stderr.take().expect("stderr must be piped");
-    let stderr_thread = std::thread::spawn(move || {
-        std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-            .collect::<Vec<String>>()
-    });
-
-    // Read stdout line by line while the process runs.
-    let stdout = child.stdout.take().expect("stdout must be piped");
-    let reader = std::io::BufReader::new(stdout);
     let mut line_count = 0usize;
-    for line in reader.lines() {
-        let line = line?;
+    let output = runner.stream(cmd, &mut |line| {
         line_count += 1;
-        line_cb(&line);
-    }
-
-    let status = child.wait()?;
+        line_cb(line);
+    })?;
     progress.on_log(
         LogLevel::Info,
         &format!(
             "stream_command: exit={}, stdout_lines={}",
-            status.code().unwrap_or(-1),
+            output.status.code().unwrap_or(-1),
             line_count
         ),
     );
-
-    // The reader thread ends at stderr EOF, which the exit above guarantees.
-    for line in stderr_thread.join().unwrap_or_default() {
-        if !line.trim().is_empty() {
-            progress.on_log(LogLevel::Warning, &format!("btrbk stderr: {line}"));
-        }
-    }
-
-    Ok(status.success())
+    log_btrbk_stderr(&output.stderr, progress);
+    Ok(output.status.success())
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +378,16 @@ pub fn create_snapshots(
     config: &Config,
     sources: &[String],
     progress: &dyn ProgressCallback,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    create_snapshots_with(config, sources, progress, &SystemRunner)
+}
+
+/// [`create_snapshots`] with every `btrbk` run by `runner`.
+fn create_snapshots_with(
+    config: &Config,
+    sources: &[String],
+    progress: &dyn ProgressCallback,
+    runner: &dyn CommandRunner,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     progress.on_stage("Creating snapshots", sources.len() as u64);
 
@@ -445,7 +429,7 @@ pub fn create_snapshots(
         }
     }
 
-    let (stdout, success) = run_command(&mut cmd, progress)?;
+    let (stdout, success) = run_command(&mut cmd, runner, progress)?;
 
     if !success {
         // Must be an Err, not a Warning. Every caller turns Err into an entry
@@ -462,7 +446,7 @@ pub fn create_snapshots(
 
     // Prefer the machine-readable listing; fall back to the marker parse only
     // if btrbk cannot be queried (bd DAS-Backup-Manager-06p).
-    let count = match btrbk_raw_listing(config) {
+    let count = match btrbk_raw_listing(config, runner) {
         Some(raw) => parse_raw_snapshot_count(&raw),
         None => {
             progress.on_log(
@@ -494,6 +478,18 @@ pub fn send_snapshots(
     targets: &[String],
     preserve: bool,
     progress: &dyn ProgressCallback,
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
+    send_snapshots_with(config, sources, targets, preserve, progress, &SystemRunner)
+}
+
+/// [`send_snapshots`] with every `btrbk` run by `runner`.
+fn send_snapshots_with(
+    config: &Config,
+    sources: &[String],
+    targets: &[String],
+    preserve: bool,
+    progress: &dyn ProgressCallback,
+    runner: &dyn CommandRunner,
 ) -> Result<(usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Sending snapshots", 1);
 
@@ -548,7 +544,7 @@ pub fn send_snapshots(
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
-    let success = stream_command(&mut cmd, progress, |line| {
+    let success = stream_command(&mut cmd, runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
         // btrbk marks sends with >>> (incremental) or *** (full)
@@ -581,7 +577,7 @@ pub fn send_snapshots(
 
     // Count from the machine-readable listing, not the human output.
     let full_output = stdout_lines.join("\n");
-    snapshots_sent = match btrbk_raw_listing(config) {
+    snapshots_sent = match btrbk_raw_listing(config, runner) {
         Some(raw) => parse_raw_send_count(&raw),
         None => {
             progress.on_log(
@@ -615,6 +611,17 @@ pub fn run_full_pipeline(
     sources: &[String],
     targets: &[String],
     progress: &dyn ProgressCallback,
+) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
+    run_full_pipeline_with(config, sources, targets, progress, &SystemRunner)
+}
+
+/// [`run_full_pipeline`] with every `btrbk` run by `runner`.
+fn run_full_pipeline_with(
+    config: &Config,
+    sources: &[String],
+    targets: &[String],
+    progress: &dyn ProgressCallback,
+    runner: &dyn CommandRunner,
 ) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Full backup (snapshot + send + cleanup)", 1);
 
@@ -663,7 +670,7 @@ pub fn run_full_pipeline(
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
-    let success = stream_command(&mut cmd, progress, |line| {
+    let success = stream_command(&mut cmd, runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
         if trimmed.starts_with("+++") {
@@ -705,7 +712,7 @@ pub fn run_full_pipeline(
         ),
     );
 
-    match btrbk_raw_listing(config) {
+    match btrbk_raw_listing(config, runner) {
         Some(raw) => {
             snapshots_created = parse_raw_snapshot_count(&raw);
             snapshots_sent = parse_raw_send_count(&raw);
@@ -2462,12 +2469,431 @@ mod tests {
             // little stdout so the reader has something to consume first.
             cmd.arg("-c")
                 .arg("echo start; head -c 204800 /dev/zero | tr '\\0' 'x' >&2; echo done");
-            let _ = tx.send(stream_command(&mut cmd, &progress, |_| {}).is_ok());
+            let _ = tx.send(stream_command(&mut cmd, &SystemRunner, &progress, |_| {}).is_ok());
         });
         match rx.recv_timeout(std::time::Duration::from_secs(20)) {
             Ok(ok) => assert!(ok, "stream_command reported failure"),
             Err(_) => panic!("stream_command deadlocked on a large stderr write"),
         }
+    }
+
+    // --- the btrbk steps through a scripted runner (bd DAS-Backup-Manager-thi) ---
+    //
+    // `create_snapshots`, `send_snapshots` and `run_full_pipeline` spawned btrbk
+    // themselves, so nothing they decide could be tested without running it —
+    // which is how 152 of the 243 mutants in this file survived. Each now runs
+    // btrbk through a `CommandRunner`, and these tests hand it a scripted one:
+    // it answers by the exact argument vector and exits 1 for any command it was
+    // not told to expect, so a changed argument vector fails a test.
+
+    use crate::fsutil::testing::Scripted;
+
+    const CONF: &str = "/test/btrbk.conf";
+
+    /// `btrbk -c <conf> <args>`, as the scripted runner keys it.
+    fn btrbk(args: &str) -> String {
+        format!("btrbk -c {CONF} {args}")
+    }
+
+    /// Three sources on two volumes: `nvme-root` and `nvme-vm` share
+    /// `/.btrfs-nvme`, `hdd` is on `/.btrfs-hdd`. One target.
+    fn steps_config() -> Config {
+        let mut config = make_test_config();
+        config.general.btrbk_conf = CONF.into();
+        let source = |label: &str, volume: &str, subvolume: &str| Source {
+            label: label.into(),
+            volume: volume.into(),
+            subvolumes: vec![SubvolConfig {
+                name: subvolume.into(),
+                ..Default::default()
+            }],
+            device: "/dev/test".into(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![label.into()],
+            target_labels: vec![],
+        };
+        config.sources = vec![
+            source("nvme-root", "/.btrfs-nvme", "@"),
+            source("nvme-vm", "/.btrfs-nvme", "@vm"),
+            source("hdd", "/.btrfs-hdd", "@data"),
+        ];
+        config
+    }
+
+    fn labels(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// One row of `btrbk --format=raw list latest`; an empty `target` is a
+    /// snapshot that has not been sent anywhere.
+    fn raw_row(snapshot: &str, target: &str) -> String {
+        format!(
+            "source_subvolume='/.btrfs-nvme/@' snapshot_subvolume='{snapshot}' \
+             target_subvolume='{target}' target_type='send-receive'\n"
+        )
+    }
+
+    /// A runner that cannot start any program, as when btrbk is not installed.
+    struct Unspawnable;
+
+    impl CommandRunner for Unspawnable {
+        fn output(&self, _: &mut Command) -> std::io::Result<std::process::Output> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        fn stream(
+            &self,
+            _: &mut Command,
+            _: &mut dyn FnMut(&str),
+        ) -> std::io::Result<std::process::Output> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+    }
+
+    fn logged(progress: &TestProgress, level: LogLevel, text: &str) -> bool {
+        progress
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(l, m)| *l == level && m == text)
+    }
+
+    #[test]
+    fn snapshots_run_btrbk_snapshot_on_each_selected_volume_once() {
+        let runner = Scripted::from_owned(vec![
+            (btrbk("snapshot /.btrfs-nvme /.btrfs-hdd"), 0, String::new()),
+            (
+                btrbk("--format=raw list latest"),
+                0,
+                // Two series, one listed twice: the count is of snapshots.
+                raw_row("/s/a.1", "") + &raw_row("/s/b.1", "") + &raw_row("/s/a.1", ""),
+            ),
+        ]);
+        let progress = TestProgress::new();
+        let count = create_snapshots_with(
+            &steps_config(),
+            &labels(&["nvme-root", "nvme-vm", "hdd"]),
+            &progress,
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            runner.calls(),
+            [
+                btrbk("snapshot /.btrfs-nvme /.btrfs-hdd"),
+                btrbk("--format=raw list latest")
+            ]
+        );
+        assert_eq!(
+            *progress.stages.lock().unwrap(),
+            [("Creating snapshots".to_string(), 3)]
+        );
+        assert_eq!(
+            *progress.steps.lock().unwrap(),
+            [
+                (1, 3, "nvme-root".to_string()),
+                (2, 3, "nvme-vm".to_string()),
+                (3, 3, "hdd".to_string())
+            ]
+        );
+        assert!(logged(&progress, LogLevel::Info, "Snapshots created: 2"));
+    }
+
+    #[test]
+    fn snapshots_of_no_selection_name_no_volume() {
+        let runner = Scripted::from_owned(vec![
+            (btrbk("snapshot"), 0, String::new()),
+            (btrbk("--format=raw list latest"), 0, raw_row("/s/a.1", "")),
+        ]);
+        let count =
+            create_snapshots_with(&steps_config(), &[], &TestProgress::new(), &runner).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            runner.calls(),
+            [btrbk("snapshot"), btrbk("--format=raw list latest")]
+        );
+    }
+
+    #[test]
+    fn a_failed_snapshot_run_is_an_error_and_is_not_counted() {
+        let runner = Scripted::from_owned(vec![(btrbk("snapshot"), 10, String::new())])
+            .with_stderr(&btrbk("snapshot"), "ERROR: x\n\n  \nWARNING: y\n");
+        let progress = TestProgress::new();
+        let err = create_snapshots_with(&steps_config(), &[], &progress, &runner)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("btrbk snapshot command exited with non-zero status"),
+            "{err}"
+        );
+        assert_eq!(
+            runner.calls(),
+            [btrbk("snapshot")],
+            "a failed run is not followed by a listing"
+        );
+        assert!(logged(&progress, LogLevel::Error, &err));
+        // Each non-blank stderr line is a warning; blank ones are not logged.
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk stderr: ERROR: x"
+        ));
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk stderr: WARNING: y"
+        ));
+        let warnings = progress
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, m)| *l == LogLevel::Warning && m.starts_with("btrbk stderr:"))
+            .count();
+        assert_eq!(warnings, 2);
+    }
+
+    #[test]
+    fn snapshot_counts_fall_back_to_the_markers_when_the_listing_cannot_be_read() {
+        // The listing is not scripted, so it exits 1.
+        let runner = Scripted::from_owned(vec![(
+            btrbk("snapshot"),
+            0,
+            "+++ /s/a.1\n  +++ /s/b.1\n>>> /t/a.1\n".into(),
+        )]);
+        let progress = TestProgress::new();
+        let count = create_snapshots_with(&steps_config(), &[], &progress, &runner).unwrap();
+        assert_eq!(count, 2, "the two +++ lines");
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk --format=raw list latest failed — counts fall back to output markers"
+        ));
+    }
+
+    #[test]
+    fn a_btrbk_that_cannot_be_started_is_an_error_in_every_step() {
+        let config = steps_config();
+        let progress = TestProgress::new();
+        assert!(create_snapshots_with(&config, &[], &progress, &Unspawnable).is_err());
+        assert!(send_snapshots_with(&config, &[], &[], false, &progress, &Unspawnable).is_err());
+        assert!(run_full_pipeline_with(&config, &[], &[], &progress, &Unspawnable).is_err());
+    }
+
+    #[test]
+    fn send_runs_btrbk_resume_and_passes_preserve_only_when_asked() {
+        for (preserve, argv) in [
+            (true, format!("btrbk --preserve -c {CONF} resume")),
+            (false, btrbk("resume")),
+        ] {
+            let runner = Scripted::from_owned(vec![(argv.clone(), 0, String::new())]);
+            send_snapshots_with(
+                &steps_config(),
+                &[],
+                &[],
+                preserve,
+                &TestProgress::new(),
+                &runner,
+            )
+            .unwrap();
+            assert_eq!(
+                runner.calls(),
+                [argv, btrbk("--format=raw list latest")],
+                "preserve={preserve}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_limits_btrbk_to_the_volumes_of_the_selected_sources_once_each() {
+        let runner = Scripted::from_owned(vec![(
+            btrbk("resume /.btrfs-hdd /.btrfs-nvme"),
+            0,
+            String::new(),
+        )]);
+        send_snapshots_with(
+            &steps_config(),
+            &labels(&["hdd", "nvme-vm", "nvme-root"]),
+            &[],
+            false,
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(
+            runner.calls()[0],
+            btrbk("resume /.btrfs-hdd /.btrfs-nvme"),
+            "volumes in the order selected, a shared volume once"
+        );
+    }
+
+    #[test]
+    fn send_counts_target_rows_and_adds_up_the_sizes_btrbk_printed() {
+        let stdout = ">>> /mnt/backup-22tb/nvme/root.1 (incremental, 45.3 MiB)\n\
+                      \x20   22.3 MiB/s\n\
+                      *** /mnt/b/nvme/root.1 (1.5 GiB)\n\
+                      === /.btrfs-nvme/.btrbk-snapshots/up-to-date\n";
+        let runner = Scripted::from_owned(vec![
+            (btrbk("resume"), 0, stdout.into()),
+            (
+                btrbk("--format=raw list latest"),
+                0,
+                // One snapshot on two targets, one sent nowhere: 2 rows.
+                raw_row("/s/a.1", "/t1/a.1")
+                    + &raw_row("/s/a.1", "/t2/a.1")
+                    + &raw_row("/s/b.1", ""),
+            ),
+        ]);
+        let progress = TestProgress::new();
+        let (sent, bytes) =
+            send_snapshots_with(&steps_config(), &[], &[], false, &progress, &runner).unwrap();
+        assert_eq!(sent, 2, "target rows of the listing, not marker lines");
+        // 45.3 MiB + 1.5 GiB, from the two sends' parentheses.
+        assert_eq!(bytes, 47_500_492 + 1_610_612_736);
+        // 22.3 MiB/s, once.
+        assert_eq!(*progress.throughput.lock().unwrap(), [23_383_244]);
+        assert!(logged(&progress, LogLevel::Info, "Snapshots sent: 2"));
+        assert_eq!(
+            *progress.stages.lock().unwrap(),
+            [("Sending snapshots".to_string(), 1)]
+        );
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "stream_command: exit=0, stdout_lines=4"
+        ));
+    }
+
+    #[test]
+    fn send_counts_fall_back_to_the_markers_when_the_listing_cannot_be_read() {
+        let runner = Scripted::from_owned(vec![(
+            btrbk("resume"),
+            0,
+            ">>> /t/a.1\n  *** /t/b.1\n+++ /s/c.1\n".into(),
+        )]);
+        let progress = TestProgress::new();
+        let (sent, _) =
+            send_snapshots_with(&steps_config(), &[], &[], false, &progress, &runner).unwrap();
+        assert_eq!(sent, 2, "the >>> and the *** line");
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk --format=raw list latest failed — counts fall back to output markers"
+        ));
+    }
+
+    #[test]
+    fn a_failed_send_is_an_error_and_is_not_counted() {
+        let runner = Scripted::from_owned(vec![(btrbk("resume"), 10, ">>> /t/a.1\n".into())])
+            .with_stderr(&btrbk("resume"), "ERROR: target gone\n");
+        let progress = TestProgress::new();
+        let err = send_snapshots_with(&steps_config(), &[], &[], false, &progress, &runner)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("btrbk resume command exited with non-zero status"),
+            "{err}"
+        );
+        assert_eq!(
+            runner.calls(),
+            [btrbk("resume")],
+            "no listing after a failure"
+        );
+        assert!(logged(&progress, LogLevel::Error, &err));
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk stderr: ERROR: target gone"
+        ));
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "stream_command: exit=10, stdout_lines=1"
+        ));
+    }
+
+    #[test]
+    fn the_full_pipeline_runs_btrbk_run_and_counts_the_listing_and_the_deletions() {
+        let stdout = "+++ /s/a.1\n>>> /t/a.1\n--- /t/old1\n  --- /t/old2\n=== /t/kept\n";
+        let runner = Scripted::from_owned(vec![
+            (btrbk("run"), 0, stdout.into()),
+            (
+                btrbk("--format=raw list latest"),
+                0,
+                raw_row("/s/a.1", "/t1/a.1")
+                    + &raw_row("/s/a.1", "/t2/a.1")
+                    + &raw_row("/s/b.1", ""),
+            ),
+        ]);
+        let progress = TestProgress::new();
+        let got = run_full_pipeline_with(&steps_config(), &[], &[], &progress, &runner).unwrap();
+        // created: distinct snapshots (2); sent: target rows (2);
+        // cleaned: the two `---` lines; bytes: no size was printed.
+        assert_eq!(got, (2, 2, 2, 0));
+        assert_eq!(
+            runner.calls(),
+            [btrbk("run"), btrbk("--format=raw list latest")]
+        );
+        assert_eq!(
+            *progress.stages.lock().unwrap(),
+            [("Full backup (snapshot + send + cleanup)".to_string(), 1)]
+        );
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "Full backup: 2 created, 2 sent, 2 cleaned up"
+        ));
+    }
+
+    #[test]
+    fn the_full_pipeline_limits_btrbk_to_the_volumes_of_the_selected_sources() {
+        let runner = Scripted::from_owned(vec![(
+            btrbk("run /.btrfs-hdd /.btrfs-nvme"),
+            0,
+            String::new(),
+        )]);
+        run_full_pipeline_with(
+            &steps_config(),
+            &labels(&["hdd", "nvme-root", "nvme-vm"]),
+            &[],
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(runner.calls()[0], btrbk("run /.btrfs-hdd /.btrfs-nvme"));
+    }
+
+    #[test]
+    fn the_full_pipeline_falls_back_to_the_markers_when_the_listing_cannot_be_read() {
+        let runner = Scripted::from_owned(vec![(
+            btrbk("run"),
+            0,
+            "+++ /s/a.1\n+++ /s/b.1\n>>> /t/a.1\n--- /t/old\n".into(),
+        )]);
+        let progress = TestProgress::new();
+        let got = run_full_pipeline_with(&steps_config(), &[], &[], &progress, &runner).unwrap();
+        assert_eq!(got, (2, 1, 1, 0));
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk --format=raw list latest failed — counts fall back to output markers"
+        ));
+    }
+
+    #[test]
+    fn a_failed_full_run_is_an_error_and_is_not_counted() {
+        let runner = Scripted::from_owned(vec![(btrbk("run"), 10, "+++ /s/a.1\n".into())]);
+        let progress = TestProgress::new();
+        let err = run_full_pipeline_with(&steps_config(), &[], &[], &progress, &runner)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("btrbk run command exited with non-zero status"),
+            "{err}"
+        );
+        assert_eq!(runner.calls(), [btrbk("run")]);
+        assert!(logged(&progress, LogLevel::Error, &err));
     }
 
     /// A minimal btrbk.conf declaring one subvolume and its snapshot_name.

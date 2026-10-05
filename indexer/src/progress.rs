@@ -258,6 +258,10 @@ impl Drop for OrderedProgress {
 #[cfg(test)]
 pub struct TestProgress {
     pub stages: std::sync::Mutex<Vec<(String, u64)>>,
+    /// Every `on_progress`, as `(current, total, message)`.
+    pub steps: std::sync::Mutex<Vec<(u64, u64, String)>>,
+    /// Every `on_throughput`, in bytes per second.
+    pub throughput: std::sync::Mutex<Vec<u64>>,
     pub logs: std::sync::Mutex<Vec<(LogLevel, String)>>,
     pub completed: std::sync::Mutex<Option<(bool, String)>>,
 }
@@ -267,6 +271,8 @@ impl Default for TestProgress {
     fn default() -> Self {
         Self {
             stages: std::sync::Mutex::new(Vec::new()),
+            steps: std::sync::Mutex::new(Vec::new()),
+            throughput: std::sync::Mutex::new(Vec::new()),
             logs: std::sync::Mutex::new(Vec::new()),
             completed: std::sync::Mutex::new(None),
         }
@@ -289,8 +295,16 @@ impl ProgressCallback for TestProgress {
             .push((stage.to_string(), total_steps));
     }
 
-    fn on_progress(&self, _: u64, _: u64, _: &str) {}
-    fn on_throughput(&self, _: u64) {}
+    fn on_progress(&self, current: u64, total: u64, message: &str) {
+        self.steps
+            .lock()
+            .unwrap()
+            .push((current, total, message.to_string()));
+    }
+
+    fn on_throughput(&self, bytes_per_sec: u64) {
+        self.throughput.lock().unwrap().push(bytes_per_sec);
+    }
 
     fn on_log(&self, level: LogLevel, message: &str) {
         self.logs.lock().unwrap().push((level, message.to_string()));
