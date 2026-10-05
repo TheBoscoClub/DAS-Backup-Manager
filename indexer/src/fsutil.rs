@@ -3,10 +3,10 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Replace `path` with `contents` in one step — [`write_atomic_mode`] with
@@ -185,10 +185,17 @@ fn write_through(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// Every external command `adopt` and `expire` run goes through this, so
-/// tests can script what `btrfs`, `findmnt` and `blkid` answer.
+/// Every external command `adopt`, `expire` and the backup steps run goes
+/// through this, so tests can script what `btrfs`, `findmnt`, `blkid` and
+/// `btrbk` answer.
 pub trait CommandRunner {
+    /// Run to completion, capturing stdout and stderr.
     fn output(&self, cmd: &mut Command) -> io::Result<Output>;
+    /// Run to completion, handing each line of stdout to `on_line` while the
+    /// command is still writing — a backup step reports progress from btrbk's
+    /// output as it goes. The `Output` carries the exit status and all of
+    /// stderr; its `stdout` is empty, the lines having gone to `on_line`.
+    fn stream(&self, cmd: &mut Command, on_line: &mut dyn FnMut(&str)) -> io::Result<Output>;
 }
 
 /// The real thing.
@@ -197,6 +204,61 @@ pub struct SystemRunner;
 impl CommandRunner for SystemRunner {
     fn output(&self, cmd: &mut Command) -> io::Result<Output> {
         cmd.output()
+    }
+
+    fn stream(&self, cmd: &mut Command, on_line: &mut dyn FnMut(&str)) -> io::Result<Output> {
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        // stderr MUST be drained concurrently with stdout, not after the child
+        // exits. A pipe buffer is ~64 KiB on Linux; once it fills, the child
+        // blocks in write(2), therefore stops producing stdout, therefore the
+        // stdout loop below blocks forever on a line that never comes and
+        // `wait()` is never reached. `output()` avoids this by draining both
+        // streams on separate threads internally; this is the same thing, done
+        // by hand because stdout is read line by line (bd DAS-Backup-Manager-az3).
+        let mut stderr = child.stderr.take().expect("stderr is piped above");
+        let drain = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stdout = child.stdout.take().expect("stdout is piped above");
+        // A read that fails ends the loop, not the function: the child is
+        // still reaped, so it never outlives the step as an orphan still
+        // writing to a target. Dropping the reader closes the pipe, so a child
+        // that writes again dies of SIGPIPE instead of blocking.
+        let pumped = pump_lines(io::BufReader::new(stdout), on_line);
+        let status = child.wait()?;
+        // The drain ends at stderr's EOF, which the exit above guarantees.
+        let stderr = drain
+            .join()
+            .map_err(|_| io::Error::other("the stderr reader panicked"))??;
+        pumped?;
+        Ok(Output {
+            status,
+            stdout: Vec::new(),
+            stderr,
+        })
+    }
+}
+
+/// Hand each line of `reader` to `on_line`, without its `\n` or `\r\n`, as it
+/// arrives. A line that is not UTF-8 is delivered with U+FFFD in place of the
+/// bad bytes: `BufRead::lines` ends the stream with an error there instead,
+/// and a step that stopped reading btrbk's output while btrbk went on writing
+/// to a target was reported as failed with the transfer still running.
+fn pump_lines(mut reader: impl BufRead, on_line: &mut dyn FnMut(&str)) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if line.ends_with(b"\n") {
+            line.pop();
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+        }
+        on_line(&String::from_utf8_lossy(&line));
     }
 }
 
@@ -223,9 +285,12 @@ pub(crate) mod testing {
 
     /// Answers by the command's full argv, joined with single spaces. An
     /// unscripted command exits 1 with no output, so a test cannot pass by
-    /// accident on a call it never expected.
+    /// accident on a call it never expected. `stream` answers the same way,
+    /// handing the scripted stdout to its callback line by line.
     pub(crate) struct Scripted {
         answers: Vec<(String, i32, String)>,
+        /// What a command writes to stderr, by argv; none when unlisted.
+        stderr: Vec<(String, String)>,
         /// Paths whose `btrfs subvolume delete` really removes the directory.
         deletable: Vec<String>,
         calls: Mutex<Vec<String>>,
@@ -244,9 +309,16 @@ pub(crate) mod testing {
         pub(crate) fn from_owned(answers: Vec<(String, i32, String)>) -> Self {
             Self {
                 answers,
+                stderr: Vec::new(),
                 deletable: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The same runner, with `argv` also writing `text` to stderr.
+        pub(crate) fn with_stderr(mut self, argv: &str, text: &str) -> Self {
+            self.stderr.push((argv.to_string(), text.to_string()));
+            self
         }
 
         /// A runner where `btrfs subvolume delete <path>` for each listed path
@@ -290,10 +362,27 @@ pub(crate) mod testing {
                 .find(|(k, _, _)| *k == argv)
                 .map(|(_, c, o)| (*c, o.clone()))
                 .unwrap_or((1, String::new()));
+            let stderr = self
+                .stderr
+                .iter()
+                .find(|(k, _)| *k == argv)
+                .map(|(_, e)| e.clone().into_bytes())
+                .unwrap_or_default();
             Ok(Output {
                 status: ExitStatus::from_raw(code << 8),
                 stdout: stdout.into_bytes(),
-                stderr: Vec::new(),
+                stderr,
+            })
+        }
+
+        fn stream(&self, cmd: &mut Command, on_line: &mut dyn FnMut(&str)) -> io::Result<Output> {
+            let out = self.output(cmd)?;
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                on_line(line);
+            }
+            Ok(Output {
+                stdout: Vec::new(),
+                ..out
             })
         }
     }
@@ -317,6 +406,169 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn system_runner_streams_stdout_lines_and_keeps_the_status_and_stderr() {
+        let mut lines = Vec::new();
+        let out = SystemRunner
+            .stream(
+                Command::new("sh").args(["-c", "echo one; echo two >&2; echo three; exit 4"]),
+                &mut |line| lines.push(line.to_string()),
+            )
+            .unwrap();
+        assert_eq!(lines, ["one", "three"]);
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(out.stderr, b"two\n");
+        assert!(out.stdout.is_empty(), "stdout went to the callback");
+        // A program that cannot be started is an error, never an empty success.
+        assert!(
+            SystemRunner
+                .stream(
+                    &mut Command::new("/nonexistent/das-no-such-binary"),
+                    &mut |_| {}
+                )
+                .is_err()
+        );
+    }
+
+    /// Each line reaches the callback while the command still runs: the
+    /// child writes `ready`, then waits (up to 5 s) for a file only the
+    /// callback creates. Read after the exit, the child would time out.
+    #[test]
+    fn system_runner_hands_over_each_line_while_the_command_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = dir.path().join("seen");
+        let script = format!(
+            "echo ready; for i in $(seq 50); do [ -e '{}' ] && {{ echo done; exit 0; }}; \
+             sleep 0.1; done; echo timeout",
+            flag.display()
+        );
+        let mut lines = Vec::new();
+        let out = SystemRunner
+            .stream(Command::new("sh").args(["-c", &script]), &mut |line| {
+                if line == "ready" {
+                    fs::write(&flag, b"").unwrap();
+                }
+                lines.push(line.to_string());
+            })
+            .unwrap();
+        assert_eq!(lines, ["ready", "done"]);
+        assert!(out.status.success());
+    }
+
+    /// More stderr than a pipe holds (~64 KiB) used to deadlock the reader:
+    /// the child blocked writing stderr and stopped writing stdout (bd
+    /// DAS-Backup-Manager-az3). Bounded so a regression fails, not hangs.
+    #[test]
+    fn system_runner_streams_past_more_stderr_than_a_pipe_buffer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            let out = SystemRunner.stream(
+                Command::new("sh").args([
+                    "-c",
+                    "echo start; head -c 204800 /dev/zero | tr '\\0' 'x' >&2; echo done",
+                ]),
+                &mut |line| lines.push(line.to_string()),
+            );
+            let _ = tx.send(out.map(|o| (lines, o.stderr.len())));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok((lines, stderr_len))) => {
+                assert_eq!(lines, ["start", "done"]);
+                assert_eq!(stderr_len, 204_800, "all of stderr is kept");
+            }
+            Ok(Err(e)) => panic!("stream failed: {e}"),
+            Err(_) => panic!("stream deadlocked on a large stderr write"),
+        }
+    }
+
+    /// btrbk prints subvolume paths, and a path is not always UTF-8. The
+    /// line is delivered with U+FFFD for the bad byte and the stream goes on
+    /// to the next line and to the exit status.
+    #[test]
+    fn system_runner_streams_a_line_that_is_not_utf8_and_goes_on() {
+        let mut lines = Vec::new();
+        let out = SystemRunner
+            .stream(
+                Command::new("sh").args(["-c", "printf 'a\\377b\\nnext\\n'; exit 2"]),
+                &mut |line| lines.push(line.to_string()),
+            )
+            .unwrap();
+        assert_eq!(lines, ["a\u{fffd}b", "next"]);
+        assert_eq!(out.status.code(), Some(2));
+    }
+
+    #[test]
+    fn pump_lines_strips_line_endings_and_keeps_a_last_line_without_one() {
+        let mut lines = Vec::new();
+        pump_lines(
+            io::Cursor::new(&b"one\r\ntwo\n\nthree\rfour\r\nlast"[..]),
+            &mut |l| lines.push(l.to_string()),
+        )
+        .unwrap();
+        // A lone \r is part of a line; only \r\n and \n end one. A final line
+        // needs no ending. An empty line is still a line.
+        assert_eq!(lines, ["one", "two", "", "three\rfour", "last"]);
+        // A final \r with no \n after it is kept: only the pair is an ending.
+        let mut lines = Vec::new();
+        pump_lines(io::Cursor::new(&b"a\r"[..]), &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        assert_eq!(lines, ["a\r"]);
+        // No input is no line.
+        let mut lines = Vec::new();
+        pump_lines(io::Cursor::new(&b""[..]), &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        assert!(lines.is_empty());
+    }
+
+    /// A read that fails after some lines are delivered: those lines were
+    /// handed over, the half line was not, and the failure is returned, not
+    /// swallowed into an empty success.
+    #[test]
+    fn pump_lines_returns_a_read_error_after_the_lines_before_it() {
+        struct FailsAfter(Option<&'static [u8]>);
+        impl Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.0.take() {
+                    Some(data) => {
+                        buf[..data.len()].copy_from_slice(data);
+                        Ok(data.len())
+                    }
+                    None => Err(io::Error::other("disk on fire")),
+                }
+            }
+        }
+        let mut lines = Vec::new();
+        let err = pump_lines(
+            io::BufReader::new(FailsAfter(Some(b"one\ntwo"))),
+            &mut |l| lines.push(l.to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(lines, ["one"]);
+        assert!(err.to_string().contains("disk on fire"), "{err}");
+    }
+
+    #[test]
+    fn scripted_streams_its_stdout_and_answers_with_status_and_stderr() {
+        let runner = testing::Scripted::new(&[("btrbk run", 10, "a\nb\n")])
+            .with_stderr("btrbk run", "ERROR: x\n");
+        let mut lines = Vec::new();
+        let out = runner
+            .stream(Command::new("btrbk").arg("run"), &mut |l| {
+                lines.push(l.to_string())
+            })
+            .unwrap();
+        assert_eq!(lines, ["a", "b"]);
+        assert_eq!(out.status.code(), Some(10));
+        assert_eq!(out.stderr, b"ERROR: x\n");
+        assert!(out.stdout.is_empty());
+        assert_eq!(runner.calls(), ["btrbk run"]);
     }
 
     // bd DAS-Backup-Manager-6wt fix rounds 4 and 5 — every write replaces
