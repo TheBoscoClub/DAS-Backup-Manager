@@ -636,10 +636,17 @@ Both apply the retention policy.
 .TP
 .BI \-\-sources " LABELS"
 Comma-separated source labels to back up.
+btrbk is told to snapshot and send exactly those sources' subvolumes, by
+subvolume, so a source that shares a volume with another is not pulled in by it.
+A label that is not in the configuration refuses the btrbk steps.
 Default: every source with at least one subvolume that is not manual-only.
 .TP
 .BI \-\-targets " LABELS"
 Comma-separated target labels to send to.
+btrbk is told to write to exactly those targets and is not told about the others:
+a target left out can be absent without failing the run, and a target named
+that btrbk cannot read fails it. A source whose only targets are left out is
+skipped, with a warning.
 Default: all mounted targets.
 .\"
 .SS backup snapshot

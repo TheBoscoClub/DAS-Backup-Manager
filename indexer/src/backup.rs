@@ -1,3 +1,4 @@
+use crate::btrbk_conf::{self, DeclaredPair};
 use crate::config::{Config, TargetRole};
 use crate::db::Database;
 use crate::fsutil::{CommandRunner, SystemRunner};
@@ -7,8 +8,9 @@ use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback};
 use crate::scrub;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::UNIX_EPOCH;
 
 // ---------------------------------------------------------------------------
@@ -120,9 +122,11 @@ impl std::fmt::Display for BackupMode {
 pub struct BackupOptions {
     /// Incremental or full. None = use schedule default.
     pub mode: Option<BackupMode>,
-    /// Source labels to back up. Empty = all configured sources.
+    /// Source labels to back up. Empty = all configured sources. btrbk is
+    /// told to touch exactly these sources' subvolumes and no others.
     pub sources: Vec<String>,
-    /// Target labels to send to. Empty = all available targets.
+    /// Target labels to send to. Empty = all available targets. btrbk is told
+    /// to write to exactly these and is not told about the rest.
     pub targets: Vec<String>,
     /// Preview only — don't actually run btrbk.
     pub dry_run: bool,
@@ -248,15 +252,23 @@ fn format_timestamp() -> String {
 /// stdout is consumed line-by-line for progress reporting, and switching that
 /// stream to raw would break the progress callback. This mirrors what
 /// `backup-run.sh` does, so the two implementations agree by construction.
-fn btrbk_raw_listing(config: &Config, runner: &dyn CommandRunner) -> Option<String> {
+fn btrbk_raw_listing(
+    config: &Config,
+    filters: &[String],
+    runner: &dyn CommandRunner,
+) -> Option<String> {
     let output = runner
-        .output(Command::new("btrbk").args([
-            "-c",
-            &config.general.btrbk_conf,
-            "--format=raw",
-            "list",
-            "latest",
-        ]))
+        .output(
+            Command::new("btrbk")
+                .args([
+                    "-c",
+                    &config.general.btrbk_conf,
+                    "--format=raw",
+                    "list",
+                    "latest",
+                ])
+                .args(filters),
+        )
         .ok()?;
     output
         .status
@@ -322,30 +334,30 @@ fn log_btrbk_stderr(stderr: &[u8], progress: &dyn ProgressCallback) {
     }
 }
 
-/// Run a command through `runner` and return (stdout, success).
+/// Run a command through `runner` and return (stdout, exit status).
 /// Logs stderr lines at Warning level via progress.
 fn run_command(
     cmd: &mut Command,
     runner: &dyn CommandRunner,
     progress: &dyn ProgressCallback,
-) -> Result<(String, bool), Box<dyn std::error::Error>> {
+) -> Result<(String, ExitStatus), Box<dyn std::error::Error>> {
     let output = runner.output(cmd)?;
     log_btrbk_stderr(&output.stderr, progress);
     Ok((
         String::from_utf8_lossy(&output.stdout).into_owned(),
-        output.status.success(),
+        output.status,
     ))
 }
 
 /// Stream a command through `runner`, applying a callback to each stdout
 /// line as it is written. Stderr is collected and logged at Warning level.
-/// Returns success status.
+/// Returns the exit status.
 fn stream_command<F>(
     cmd: &mut Command,
     runner: &dyn CommandRunner,
     progress: &dyn ProgressCallback,
     mut line_cb: F,
-) -> Result<bool, Box<dyn std::error::Error>>
+) -> Result<ExitStatus, Box<dyn std::error::Error>>
 where
     F: FnMut(&str),
 {
@@ -366,7 +378,179 @@ where
         ),
     );
     log_btrbk_stderr(&output.stderr, progress);
-    Ok(output.status.success())
+    Ok(output.status)
+}
+
+/// How a command ended, for a message: its exit status, or the signal that
+/// killed it.
+fn describe_exit(status: ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit status {code}"),
+        (None, Some(signal)) => format!("killed by signal {signal}"),
+        (None, None) => "no exit status".to_string(),
+    }
+}
+
+/// Why a backup that was handed no target cannot run.
+const NO_TARGETS_MOUNTED: &str =
+    "No backup targets are mounted. Connect the DAS enclosure and mount targets before running.";
+
+/// The labels of the configured targets that are mounted now.
+fn mounted_target_labels(config: &Config) -> Vec<String> {
+    config
+        .targets
+        .iter()
+        .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
+        .map(|tgt| tgt.label.clone())
+        .collect()
+}
+
+/// The targets a step writes to: `requested`, or — when none are named, as
+/// `btrdasd backup send` without `--targets` — every configured target that
+/// is mounted. Never "every configured target": an absent one is not part of
+/// a run that was not told to use it.
+fn step_targets(config: &Config, requested: &[String]) -> Result<Vec<String>, String> {
+    if !requested.is_empty() {
+        return Ok(requested.to_vec());
+    }
+    let mounted = mounted_target_labels(config);
+    if mounted.is_empty() {
+        return Err(NO_TARGETS_MOUNTED.to_string());
+    }
+    Ok(mounted)
+}
+
+/// Say which configured targets a step sends to and which it leaves alone.
+fn log_target_scope(config: &Config, targets: &[String], progress: &dyn ProgressCallback) {
+    for target in &config.targets {
+        let line = if targets.contains(&target.label) {
+            format!(
+                "Target '{}' at {}: will receive",
+                target.label, target.mount
+            )
+        } else {
+            format!(
+                "Target '{}' at {}: not part of this run — btrbk is told to leave it alone",
+                target.label, target.mount
+            )
+        };
+        progress.on_log(LogLevel::Info, &line);
+    }
+}
+
+/// btrbk's command-line filter arguments for one step: the sources and targets
+/// it may touch, and nothing else.
+///
+/// `sources` are source labels (empty: every source). `targets` are target
+/// labels, or `None` for a step that involves none (`btrdasd backup
+/// snapshot`). An empty result means "no filter": the selection is everything
+/// `btrbk.conf` declares, so btrbk runs as it always did. A label that is not
+/// in the configuration, or a selection that leaves nothing to do, is an `Err`
+/// — never an empty filter list, which btrbk reads as everything.
+///
+/// Why these filters (btrbk 0.32.7, `/usr/bin/btrbk`; the line numbers are its
+/// own):
+///
+/// * Filters are a UNION, applied once to the declarations (6245-6293). One
+///   that matches a volume keeps all of it (6249-6251); one that matches a
+///   subvolume, or its snapshot path, keeps it with EVERY target (6256-6261,
+///   the `next` skips the target loop). So a source filter next to a target
+///   filter would re-admit the unticked targets, and a volume path, the old
+///   filter, cannot tell two sources on one volume apart.
+/// * The one filter that selects a subvolume AND a target is
+///   `<target directory>/<snapshot_name>` (6263-6268): the target is kept
+///   when a filter matches it or that child, the other targets are aborted
+///   `skip_cmdline_filter` (6270), and a subvolume left with no target is
+///   aborted too (6274-6277). So there is one filter per (subvolume, target)
+///   pair ([`btrbk_conf::declared_pairs`]). An absolute filter must equal the
+///   whole path; `*` is its only wildcard (3304-3339, 3342-3387), so one with
+///   a `*` is refused rather than widened.
+/// * An aborted section is skipped, not failed: only keys starting `abort_`
+///   count towards exit 10 (5257-5266), and the 3-argument `ABORTED` the
+///   filter uses sets `skip_cmdline_filter` (520-541). The target tree is
+///   read through `vinfo_subsection` without its include-aborted flag
+///   (3277-3298, 6557-6585), so a filtered-out target is never probed: an
+///   unticked ABSENT target cannot abort, where an absent target that is
+///   not filtered out aborts there (6564-6566) and ends btrbk with 10.
+/// * The snapshot and send loops walk the same non-aborted sections (6871-6872,
+///   6966-6967): a subvolume the filter leaves without a target gets NO
+///   snapshot either, in `run` and in `snapshot`.
+/// * A filter that matches nothing is exit 2 before anything runs (6285-6291),
+///   so a filter naming something `btrbk.conf` lacks fails loudly.
+///
+/// A per-run `btrbk.conf` was the alternative. `render_btrbk_conf` takes its
+/// retention baseline from the first primary target and writes the other
+/// targets' differences from it (btrbk_conf.rs `primary`), so a config without
+/// the primary target renders every other target's retention differently — and
+/// `btrbk run` enforces retention. The filters leave the one generated file
+/// as it is.
+fn btrbk_filters(
+    config: &Config,
+    sources: &[String],
+    targets: Option<&[String]>,
+    progress: &dyn ProgressCallback,
+) -> Result<Vec<String>, String> {
+    if let Some(label) = sources
+        .iter()
+        .find(|l| !config.sources.iter().any(|s| &s.label == *l))
+    {
+        return Err(format!("source '{label}' is not in the configuration"));
+    }
+    if let Some(label) = targets
+        .unwrap_or_default()
+        .iter()
+        .find(|l| !config.targets.iter().any(|t| &t.label == *l))
+    {
+        return Err(format!("target '{label}' is not in the configuration"));
+    }
+    let wants_source = |label: &String| sources.is_empty() || sources.contains(label);
+    let declared = btrbk_conf::declared_pairs(config);
+    let selected: Vec<&DeclaredPair<'_>> = declared
+        .iter()
+        .filter(|p| {
+            wants_source(&p.source.label) && targets.is_none_or(|t| t.contains(&p.target.label))
+        })
+        .collect();
+    for source in config.sources.iter().filter(|s| wants_source(&s.label)) {
+        let declared_here = declared.iter().any(|p| p.source.label == source.label);
+        if declared_here && !selected.iter().any(|p| p.source.label == source.label) {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Source '{}' sends to none of the selected targets — nothing is done for it",
+                    source.label
+                ),
+            );
+        }
+    }
+    if selected.len() == declared.len() {
+        return Ok(Vec::new());
+    }
+    if selected.is_empty() {
+        return Err(if targets.is_some() {
+            "none of the selected sources sends to a selected target — there is nothing to run"
+        } else {
+            "none of the selected sources has a subvolume to snapshot"
+        }
+        .to_string());
+    }
+    let mut filters: Vec<String> = Vec::new();
+    for pair in selected {
+        let filter = match targets {
+            Some(_) => format!("{}/{}", pair.target_dir(), pair.snapshot_name),
+            None => format!("{}/{}", pair.source.volume, pair.subvolume.name),
+        };
+        if !filter.starts_with('/') || filter.contains(['*', '\n']) {
+            return Err(format!(
+                "'{filter}' cannot be given to btrbk as a filter: it must be an absolute path \
+                 without '*'"
+            ));
+        }
+        if !filters.contains(&filter) {
+            filters.push(filter);
+        }
+    }
+    Ok(filters)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,64 +558,52 @@ where
 // ---------------------------------------------------------------------------
 
 /// Create btrbk snapshots for specified sources.
+///
+/// Only the subvolumes of the sources named are snapshotted (empty: every
+/// source) — by subvolume, so two sources on one volume are told apart. No
+/// target is selected here, so btrbk still reads every one the file declares.
 pub fn create_snapshots(
     config: &Config,
     sources: &[String],
     progress: &dyn ProgressCallback,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    create_snapshots_with(config, sources, progress, &SystemRunner)
+    create_snapshots_with(config, sources, None, progress, &SystemRunner)
 }
 
-/// [`create_snapshots`] with every `btrbk` run by `runner`.
+/// [`create_snapshots`] with every `btrbk` run by `runner`, and — when the run
+/// has chosen its targets (`targets`) — confined to the subvolumes that go to
+/// them, so an unselected target is not read, let alone written.
 fn create_snapshots_with(
     config: &Config,
     sources: &[String],
+    targets: Option<&[String]>,
     progress: &dyn ProgressCallback,
     runner: &dyn CommandRunner,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     progress.on_stage("Creating snapshots", sources.len() as u64);
 
+    let filters = btrbk_filters(config, sources, targets, progress)?;
+    for src in sources
+        .iter()
+        .filter_map(|label| config.sources.iter().find(|s| &s.label == label))
+    {
+        progress.on_log(
+            LogLevel::Info,
+            &format!("Snapshotting source '{}' at {}", src.label, src.volume),
+        );
+    }
+
     let mut cmd = Command::new("btrbk");
     cmd.arg("-c").arg(&config.general.btrbk_conf);
 
-    // btrbk syntax: `btrbk -c <conf> snapshot [<volume-path>...]`
-    // The "snapshot" subcommand must appear exactly once, followed by volume
-    // paths as optional filter arguments.
-    cmd.arg("snapshot");
+    // btrbk syntax: `btrbk -c <conf> snapshot [<filter>...]`
+    // The "snapshot" subcommand must appear exactly once, followed by the
+    // filters (see `btrbk_filters`) that limit it to the selection.
+    cmd.arg("snapshot").args(&filters);
 
-    if !sources.is_empty() {
-        // Collect unique volume paths — multiple sources can share a volume
-        // (e.g. hdd-projects and hdd-audiobooks both use /.btrfs-hdd).
-        let mut seen_volumes = std::collections::HashSet::new();
-        for label in sources {
-            if let Some(src) = config.sources.iter().find(|s| &s.label == label) {
-                if seen_volumes.insert(src.volume.clone()) {
-                    progress.on_log(
-                        LogLevel::Info,
-                        &format!("Snapshotting source '{}' at {}", label, src.volume),
-                    );
-                    cmd.arg(&src.volume);
-                } else {
-                    progress.on_log(
-                        LogLevel::Info,
-                        &format!(
-                            "Source '{}' shares volume {} (already included)",
-                            label, src.volume
-                        ),
-                    );
-                }
-            } else {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!("Source label '{label}' not found in config — skipping"),
-                );
-            }
-        }
-    }
+    let (stdout, status) = run_command(&mut cmd, runner, progress)?;
 
-    let (stdout, success) = run_command(&mut cmd, runner, progress)?;
-
-    if !success {
+    if !status.success() {
         // Must be an Err, not a Warning. Every caller turns Err into an entry
         // in `errors`, and run_backup derives `success = errors.is_empty()`,
         // so a Warning here left the run reporting SUCCESS to the CLI exit
@@ -439,14 +611,17 @@ fn create_snapshots_with(
         // subject alike. bd DAS-Backup-Manager-nsp (finding #1/#2) — the same
         // shape as bd oi0, where the outcome was decided by whether anything
         // pushed an error and nothing ever did.
-        let msg = "btrbk snapshot command exited with non-zero status. No snapshots can be assumed created.";
-        progress.on_log(LogLevel::Error, msg);
+        let msg = format!(
+            "btrbk snapshot command failed ({}). No snapshots can be assumed created.",
+            describe_exit(status)
+        );
+        progress.on_log(LogLevel::Error, &msg);
         return Err(msg.into());
     }
 
     // Prefer the machine-readable listing; fall back to the marker parse only
     // if btrbk cannot be queried (bd DAS-Backup-Manager-06p).
-    let count = match btrbk_raw_listing(config, runner) {
+    let count = match btrbk_raw_listing(config, &filters, runner) {
         Some(raw) => parse_raw_snapshot_count(&raw),
         None => {
             progress.on_log(
@@ -466,6 +641,11 @@ fn create_snapshots_with(
 }
 
 /// Send snapshots to specified targets via btrbk.
+///
+/// btrbk is told to send exactly the subvolumes of the sources named (empty:
+/// every source) to exactly the targets named (empty: every one that is
+/// mounted) — a target that is not named is not read, so one that is absent
+/// does not fail the step; one that IS named and cannot be read still does.
 ///
 /// When `preserve` is true, passes `--preserve` to btrbk so retention cleanup
 /// is skipped (incremental mode).  When false, btrbk enforces retention policy
@@ -493,58 +673,28 @@ fn send_snapshots_with(
 ) -> Result<(usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Sending snapshots", 1);
 
+    let targets = step_targets(config, targets)?;
+    let filters = btrbk_filters(config, sources, Some(&targets), progress)?;
+    log_target_scope(config, &targets, progress);
+
     let mut cmd = Command::new("btrbk");
     if preserve {
         cmd.arg("--preserve");
     }
     cmd.arg("-c").arg(&config.general.btrbk_conf);
 
-    // Use `resume` to handle interrupted transfers gracefully.
-    cmd.arg("resume");
-
-    // Add source volume path filters if requested (deduplicate shared volumes).
-    if !sources.is_empty() {
-        let mut seen_volumes = std::collections::HashSet::new();
-        for label in sources {
-            if let Some(src) = config.sources.iter().find(|s| &s.label == label)
-                && seen_volumes.insert(src.volume.clone())
-            {
-                cmd.arg(&src.volume);
-            }
-        }
-    }
-
-    // Note: target mount paths (e.g. /mnt/backup-22tb) are NOT passed as
-    // btrbk filter arguments.  btrbk expects exact matches to the configured
-    // target *directories* (e.g. /mnt/backup-22tb/nvme), not the top-level
-    // mount point.  Source volume paths already limit which data is processed,
-    // and btrbk automatically skips targets whose paths don't exist.
-    //
-    // Log which targets are expected so the user knows the scope.
-    for label in targets {
-        if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
-            if let Some(actual) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("Target '{label}' mounted at {actual} — will receive"),
-                );
-            } else {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "Target '{label}' at {} is not mounted — btrbk will skip",
-                        tgt.mount
-                    ),
-                );
-            }
-        }
-    }
+    // Use `resume` to handle interrupted transfers gracefully, limited by the
+    // filters to the sources and targets selected. btrbk does NOT skip a
+    // target it cannot read: it aborts it and exits 10 (btrbk 0.32.7,
+    // `exit_status` 5257-5266, target abort 6564-6566), which is why a target
+    // that was not selected must not be handed to it at all.
+    cmd.arg("resume").args(&filters);
 
     let mut snapshots_sent: usize = 0;
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
-    let success = stream_command(&mut cmd, runner, progress, |line| {
+    let status = stream_command(&mut cmd, runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
         // btrbk marks sends with >>> (incremental) or *** (full)
@@ -562,7 +712,7 @@ fn send_snapshots_with(
         }
     })?;
 
-    if !success {
+    if !status.success() {
         // Must be an Err, not a Warning. Every caller turns Err into an entry
         // in `errors`, and run_backup derives `success = errors.is_empty()`,
         // so a Warning here left the run reporting SUCCESS to the CLI exit
@@ -570,14 +720,17 @@ fn send_snapshots_with(
         // subject alike. bd DAS-Backup-Manager-nsp (finding #1/#2) — the same
         // shape as bd oi0, where the outcome was decided by whether anything
         // pushed an error and nothing ever did.
-        let msg = "btrbk resume command exited with non-zero status. The send may be incomplete.";
-        progress.on_log(LogLevel::Error, msg);
+        let msg = format!(
+            "btrbk resume command failed ({}). The send may be incomplete.",
+            describe_exit(status)
+        );
+        progress.on_log(LogLevel::Error, &msg);
         return Err(msg.into());
     }
 
     // Count from the machine-readable listing, not the human output.
     let full_output = stdout_lines.join("\n");
-    snapshots_sent = match btrbk_raw_listing(config, runner) {
+    snapshots_sent = match btrbk_raw_listing(config, &filters, runner) {
         Some(raw) => parse_raw_send_count(&raw),
         None => {
             progress.on_log(
@@ -603,7 +756,8 @@ fn parse_btrbk_clean_count(output: &str) -> usize {
 /// Run the full btrbk lifecycle: snapshot + send + retention cleanup.
 ///
 /// Uses `btrbk run` which atomically handles all three steps.  This is the
-/// Full backup mode — equivalent to what the nightly bash script does.
+/// Full backup mode — equivalent to what the nightly bash script does. Like
+/// [`send_snapshots`], it is limited to the sources and targets named.
 ///
 /// Returns (snapshots_created, snapshots_sent, snapshots_cleaned, bytes_sent).
 pub fn run_full_pipeline(
@@ -625,52 +779,29 @@ fn run_full_pipeline_with(
 ) -> Result<(usize, usize, usize, u64), Box<dyn std::error::Error>> {
     progress.on_stage("Full backup (snapshot + send + cleanup)", 1);
 
+    let targets = step_targets(config, targets)?;
+    let filters = btrbk_filters(config, sources, Some(&targets), progress)?;
+    for src in sources
+        .iter()
+        .filter_map(|label| config.sources.iter().find(|s| &s.label == label))
+    {
+        progress.on_log(
+            LogLevel::Info,
+            &format!("Source '{}' at {}", src.label, src.volume),
+        );
+    }
+    log_target_scope(config, &targets, progress);
+
     let mut cmd = Command::new("btrbk");
     cmd.arg("-c").arg(&config.general.btrbk_conf);
-    cmd.arg("run");
-
-    // Add source volume path filters (deduplicate shared volumes).
-    if !sources.is_empty() {
-        let mut seen_volumes = std::collections::HashSet::new();
-        for label in sources {
-            if let Some(src) = config.sources.iter().find(|s| &s.label == label)
-                && seen_volumes.insert(src.volume.clone())
-            {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("Source '{}' at {}", label, src.volume),
-                );
-                cmd.arg(&src.volume);
-            }
-        }
-    }
-
-    // Log target mount status.
-    for label in targets {
-        if let Some(tgt) = config.targets.iter().find(|t| &t.label == label) {
-            if let Some(actual) = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role) {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("Target '{label}' mounted at {actual} — will receive"),
-                );
-            } else {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "Target '{label}' at {} is not mounted — btrbk will skip",
-                        tgt.mount
-                    ),
-                );
-            }
-        }
-    }
+    cmd.arg("run").args(&filters);
 
     let mut snapshots_created: usize = 0;
     let mut snapshots_sent: usize = 0;
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
-    let success = stream_command(&mut cmd, runner, progress, |line| {
+    let status = stream_command(&mut cmd, runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
         if trimmed.starts_with("+++") {
@@ -688,7 +819,7 @@ fn run_full_pipeline_with(
         }
     })?;
 
-    if !success {
+    if !status.success() {
         // Must be an Err, not a Warning. Every caller turns Err into an entry
         // in `errors`, and run_backup derives `success = errors.is_empty()`,
         // so a Warning here left the run reporting SUCCESS to the CLI exit
@@ -696,8 +827,11 @@ fn run_full_pipeline_with(
         // subject alike. bd DAS-Backup-Manager-nsp (finding #1/#2) — the same
         // shape as bd oi0, where the outcome was decided by whether anything
         // pushed an error and nothing ever did.
-        let msg = "btrbk run command exited with non-zero status. The backup may be incomplete.";
-        progress.on_log(LogLevel::Error, msg);
+        let msg = format!(
+            "btrbk run command failed ({}). The backup may be incomplete.",
+            describe_exit(status)
+        );
+        progress.on_log(LogLevel::Error, &msg);
         return Err(msg.into());
     }
 
@@ -712,7 +846,7 @@ fn run_full_pipeline_with(
         ),
     );
 
-    match btrbk_raw_listing(config, runner) {
+    match btrbk_raw_listing(config, &filters, runner) {
         Some(raw) => {
             snapshots_created = parse_raw_snapshot_count(&raw);
             snapshots_sent = parse_raw_send_count(&raw);
@@ -1249,29 +1383,10 @@ fn emails_report(options: &BackupOptions, config: &Config) -> bool {
     options.send_report && config.email.enabled
 }
 
-/// Run a backup with the given options. Calls btrbk under the hood.
-/// The caller must ensure this runs with appropriate privileges (root).
-pub fn run_backup(
-    config: &Config,
-    options: &BackupOptions,
-    progress: &dyn ProgressCallback,
-) -> Result<BackupResult, Box<dyn std::error::Error>> {
-    let start = std::time::Instant::now();
-
-    let mut errors: Vec<String> = Vec::new();
-    if options.subvolume_sync.as_ref().is_some_and(|s| s.failed) {
-        errors.push("Subvolume sync failed — see SUBVOLUME SYNC in the report".into());
-    }
-    let mut snapshots_created: usize = 0;
-    let mut snapshots_sent: usize = 0;
-    let mut bytes_sent: u64 = 0;
-    let mut boot_archived = false;
-    let mut indexed = false;
-
-    // ---------- Resolve effective sources ----------
-
-    // Exclude manual_only subvolumes unless explicitly requested.
-    let effective_sources: Vec<String> = if options.sources.is_empty() {
+/// The source labels a run backs up: the ones named or — when none are —
+/// every source with at least one subvolume that is not manual-only.
+fn effective_sources(config: &Config, options: &BackupOptions) -> Vec<String> {
+    if options.sources.is_empty() {
         config
             .sources
             .iter()
@@ -1283,62 +1398,170 @@ pub fn run_backup(
             .collect()
     } else {
         options.sources.clone()
-    };
+    }
+}
 
-    // ---------- Resolve effective targets ----------
-    //
-    // When targets are explicitly specified (D-Bus helper pre-mounts them),
-    // trust the caller — don't re-check mount status.  Only auto-detect
-    // mounted targets when the caller leaves the list empty (standalone CLI).
-
-    let effective_targets: Vec<String> = if options.targets.is_empty() {
-        config
-            .targets
-            .iter()
-            .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
-            .map(|tgt| tgt.label.clone())
-            .collect()
-    } else {
-        // Caller specified targets — validate they exist in config but don't
-        // re-check mount status (caller already ensured mount via MountGuard).
-        let matched: Vec<String> = options
-            .targets
-            .iter()
-            .filter(|label| {
-                config
-                    .targets
-                    .iter()
-                    .any(|t| t.label.as_str() == label.as_str())
-            })
-            .cloned()
-            .collect();
-
-        // If no requested targets matched config (e.g. stale label list),
-        // fall back to auto-detecting mounted targets so the backup can
-        // still proceed.
-        if matched.is_empty() {
-            progress.on_log(
-                LogLevel::Warning,
-                &format!(
-                    "Requested targets {:?} did not match config {:?} — auto-detecting mounted targets",
-                    options.targets,
-                    config.targets.iter().map(|t| &t.label).collect::<Vec<_>>()
-                ),
-            );
+/// The target labels a run writes to.
+///
+/// When targets are explicitly specified (D-Bus helper pre-mounts them),
+/// trust the caller — don't re-check mount status.  Only auto-detect
+/// mounted targets when the caller leaves the list empty (standalone CLI).
+fn effective_targets(
+    config: &Config,
+    options: &BackupOptions,
+    progress: &dyn ProgressCallback,
+) -> Vec<String> {
+    if options.targets.is_empty() {
+        return mounted_target_labels(config);
+    }
+    // Caller specified targets — validate they exist in config but don't
+    // re-check mount status (caller already ensured mount via MountGuard).
+    let matched: Vec<String> = options
+        .targets
+        .iter()
+        .filter(|label| {
             config
                 .targets
                 .iter()
-                .filter(|tgt| health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role).is_some())
-                .map(|tgt| tgt.label.clone())
-                .collect()
-        } else {
-            matched
+                .any(|t| t.label.as_str() == label.as_str())
+        })
+        .cloned()
+        .collect();
+
+    // If no requested targets matched config (e.g. stale label list),
+    // fall back to auto-detecting mounted targets so the backup can
+    // still proceed.
+    if matched.is_empty() {
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "Requested targets {:?} did not match config {:?} — auto-detecting mounted targets",
+                options.targets,
+                config.targets.iter().map(|t| &t.label).collect::<Vec<_>>()
+            ),
+        );
+        mounted_target_labels(config)
+    } else {
+        matched
+    }
+}
+
+/// What the btrbk steps counted, and which of them failed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Pipeline {
+    created: usize,
+    sent: usize,
+    cleaned: usize,
+    bytes: u64,
+    /// One per failed step. A failed step does not stop the next one.
+    errors: Vec<String>,
+}
+
+impl Pipeline {
+    /// A step failed: log it and keep it.
+    fn failed(&mut self, progress: &dyn ProgressCallback, msg: String) {
+        progress.on_log(LogLevel::Error, &msg);
+        self.errors.push(msg);
+    }
+}
+
+/// Run the btrbk steps `mode` and `options` call for, over exactly `sources`
+/// and `targets`: every step is handed that selection, so btrbk is never told
+/// about a source or a target the run was not asked to touch.
+///
+/// Incremental: `btrbk snapshot` + `btrbk resume` — creates snapshots and
+/// sends deltas. Full: `btrbk run` (atomic snapshot + send + retention
+/// cleanup). Both enforce the retention policy, so targets cannot fill up.
+fn run_pipeline(
+    config: &Config,
+    options: &BackupOptions,
+    mode: BackupMode,
+    sources: &[String],
+    targets: &[String],
+    progress: &dyn ProgressCallback,
+    runner: &dyn CommandRunner,
+) -> Pipeline {
+    let mut done = Pipeline::default();
+    let snapshots = |done: &mut Pipeline| match create_snapshots_with(
+        config,
+        sources,
+        Some(targets),
+        progress,
+        runner,
+    ) {
+        Ok(n) => done.created = n,
+        Err(e) => done.failed(progress, format!("Snapshot step failed: {e}")),
+    };
+    let send = |done: &mut Pipeline| {
+        // No --preserve: btrbk enforces retention, in both modes.
+        match send_snapshots_with(config, sources, targets, false, progress, runner) {
+            Ok((sent, bytes)) => {
+                done.sent = sent;
+                done.bytes = bytes;
+            }
+            Err(e) => done.failed(progress, format!("Send step failed: {e}")),
         }
     };
+    match mode {
+        BackupMode::Full if options.snapshot_only => snapshots(&mut done),
+        BackupMode::Full if options.send_only => send(&mut done),
+        BackupMode::Full => {
+            match run_full_pipeline_with(config, sources, targets, progress, runner) {
+                Ok((created, sent, cleaned, bytes)) => {
+                    done.created = created;
+                    done.sent = sent;
+                    done.cleaned = cleaned;
+                    done.bytes = bytes;
+                }
+                Err(e) => done.failed(progress, format!("Full backup pipeline failed: {e}")),
+            }
+        }
+        BackupMode::Incremental => {
+            if !options.send_only {
+                snapshots(&mut done);
+            }
+            if !options.snapshot_only {
+                send(&mut done);
+            }
+        }
+    }
+    done
+}
+
+/// Run a backup with the given options. Calls btrbk under the hood.
+/// The caller must ensure this runs with appropriate privileges (root).
+pub fn run_backup(
+    config: &Config,
+    options: &BackupOptions,
+    progress: &dyn ProgressCallback,
+) -> Result<BackupResult, Box<dyn std::error::Error>> {
+    run_backup_with(config, options, progress, &SystemRunner)
+}
+
+/// [`run_backup`] with every `btrbk` run by `runner`.
+fn run_backup_with(
+    config: &Config,
+    options: &BackupOptions,
+    progress: &dyn ProgressCallback,
+    runner: &dyn CommandRunner,
+) -> Result<BackupResult, Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+
+    let mut errors: Vec<String> = Vec::new();
+    if options.subvolume_sync.as_ref().is_some_and(|s| s.failed) {
+        errors.push("Subvolume sync failed — see SUBVOLUME SYNC in the report".into());
+    }
+    let mut boot_archived = false;
+    let mut indexed = false;
+
+    // ---------- Resolve effective sources and targets ----------
+
+    let effective_sources = effective_sources(config, options);
+    let effective_targets = effective_targets(config, options, progress);
 
     // Require at least one target (unless dry-run).
     if effective_targets.is_empty() && !options.dry_run {
-        return Err("No backup targets are mounted. Connect the DAS enclosure and mount targets before running.".into());
+        return Err(NO_TARGETS_MOUNTED.into());
     }
 
     // Verify every target btrbk will write to is backed by the filesystem we
@@ -1456,92 +1679,19 @@ pub fn run_backup(
         &format!("Target usage before: {} bytes", usage_before),
     );
 
-    let mut snapshots_cleaned: usize = 0;
-
-    match mode {
-        BackupMode::Full => {
-            if options.snapshot_only {
-                // Full + snapshot-only: just create snapshots (same as incremental).
-                match create_snapshots(config, &effective_sources, progress) {
-                    Ok(n) => snapshots_created = n,
-                    Err(e) => {
-                        let msg = format!("Snapshot step failed: {e}");
-                        progress.on_log(LogLevel::Error, &msg);
-                        errors.push(msg);
-                    }
-                }
-            } else if options.send_only {
-                // Full + send-only: send with retention cleanup (no --preserve).
-                match send_snapshots(
-                    config,
-                    &effective_sources,
-                    &effective_targets,
-                    false, // no preserve → btrbk enforces retention
-                    progress,
-                ) {
-                    Ok((sent, bytes)) => {
-                        snapshots_sent = sent;
-                        bytes_sent = bytes;
-                    }
-                    Err(e) => {
-                        let msg = format!("Send step failed: {e}");
-                        progress.on_log(LogLevel::Error, &msg);
-                        errors.push(msg);
-                    }
-                }
-            } else {
-                // Full: btrbk run does snapshot + send + cleanup atomically.
-                match run_full_pipeline(config, &effective_sources, &effective_targets, progress) {
-                    Ok((snaps, sent, cleaned, bytes)) => {
-                        snapshots_created = snaps;
-                        snapshots_sent = sent;
-                        snapshots_cleaned = cleaned;
-                        bytes_sent = bytes;
-                    }
-                    Err(e) => {
-                        let msg = format!("Full backup pipeline failed: {e}");
-                        progress.on_log(LogLevel::Error, &msg);
-                        errors.push(msg);
-                    }
-                }
-            }
-        }
-        BackupMode::Incremental => {
-            // Step (a): Snapshots
-            if !options.send_only {
-                match create_snapshots(config, &effective_sources, progress) {
-                    Ok(n) => snapshots_created = n,
-                    Err(e) => {
-                        let msg = format!("Snapshot step failed: {e}");
-                        progress.on_log(LogLevel::Error, &msg);
-                        errors.push(msg);
-                    }
-                }
-            }
-            // Step (b): Send with retention cleanup (same as full mode).
-            // Both incremental and full modes enforce retention policy to
-            // prevent targets from filling up.
-            if !options.snapshot_only {
-                match send_snapshots(
-                    config,
-                    &effective_sources,
-                    &effective_targets,
-                    false, // enforce retention cleanup on every backup
-                    progress,
-                ) {
-                    Ok((sent, bytes)) => {
-                        snapshots_sent = sent;
-                        bytes_sent = bytes;
-                    }
-                    Err(e) => {
-                        let msg = format!("Send step failed: {e}");
-                        progress.on_log(LogLevel::Error, &msg);
-                        errors.push(msg);
-                    }
-                }
-            }
-        }
-    }
+    let done = run_pipeline(
+        config,
+        options,
+        mode,
+        &effective_sources,
+        &effective_targets,
+        progress,
+        runner,
+    );
+    errors.extend(done.errors);
+    let (snapshots_created, snapshots_sent, snapshots_cleaned) =
+        (done.created, done.sent, done.cleaned);
+    let mut bytes_sent = done.bytes;
 
     // Calculate bytes_sent from target disk usage delta. btrbk doesn't report
     // transfer sizes in its output, so we measure before/after. For incremental
@@ -2350,50 +2500,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Source filtering: manual_only excluded by default
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn test_source_filtering_excludes_manual_only() {
-        let config = make_test_config();
-
-        // When sources is empty, effective_sources should exclude "manual-src"
-        // because all its subvolumes are manual_only = true.
-        let effective: Vec<String> = if config.sources.is_empty() {
-            vec![]
-        } else {
-            config
-                .sources
-                .iter()
-                .filter(|src| src.subvolumes.iter().any(|sv| !sv.manual_only))
-                .map(|src| src.label.clone())
-                .collect()
-        };
-
-        assert!(
-            effective.contains(&"nvme-root".to_string()),
-            "nvme-root (has non-manual subvols) must be included"
-        );
-        assert!(
-            !effective.contains(&"manual-src".to_string()),
-            "manual-src (all subvols are manual_only) must be excluded"
-        );
-    }
-
-    #[test]
-    fn test_source_filtering_explicit_override() {
-        // When sources is explicitly set, manual_only restriction is bypassed.
-        let explicit_sources = vec!["manual-src".to_string()];
-        // Simulate what run_backup does when options.sources is non-empty.
-        let effective = explicit_sources.clone();
-
-        assert!(
-            effective.contains(&"manual-src".to_string()),
-            "explicitly requested manual-src must be included"
-        );
-    }
-
-    // -----------------------------------------------------------------
     // Existing tests (unchanged)
     // -----------------------------------------------------------------
 
@@ -2489,39 +2595,60 @@ mod tests {
     use crate::fsutil::testing::Scripted;
 
     const CONF: &str = "/test/btrbk.conf";
+    const PRIMARY: &str = "/mnt/test-primary";
+    const RECOVERY: &str = "/mnt/test-recovery";
 
     /// `btrbk -c <conf> <args>`, as the scripted runner keys it.
     fn btrbk(args: &str) -> String {
         format!("btrbk -c {CONF} {args}")
     }
 
-    /// Three sources on two volumes: `nvme-root` and `nvme-vm` share
-    /// `/.btrfs-nvme`, `hdd` is on `/.btrfs-hdd`. One target.
+    fn labels(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Four subvolumes in three sources, two targets. `nvme-root` and `nvme-vm`
+    /// share a volume, so a volume path cannot tell them apart, and `nvme-vm`
+    /// sends to the primary target only.
     fn steps_config() -> Config {
         let mut config = make_test_config();
         config.general.btrbk_conf = CONF.into();
-        let source = |label: &str, volume: &str, subvolume: &str| Source {
+        let source = |label: &str, volume: &str, subvolumes: &[&str]| Source {
             label: label.into(),
             volume: volume.into(),
-            subvolumes: vec![SubvolConfig {
-                name: subvolume.into(),
-                ..Default::default()
-            }],
+            subvolumes: subvolumes
+                .iter()
+                .map(|name| SubvolConfig {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
             device: "/dev/test".into(),
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![label.into()],
             target_labels: vec![],
         };
+        let mut vm = source("nvme-vm", "/.btrfs-nvme", &["@vm"]);
+        vm.target_labels = labels(&["primary-22tb"]);
         config.sources = vec![
-            source("nvme-root", "/.btrfs-nvme", "@"),
-            source("nvme-vm", "/.btrfs-nvme", "@vm"),
-            source("hdd", "/.btrfs-hdd", "@data"),
+            source("nvme-root", "/.btrfs-nvme", &["@", "@home"]),
+            vm,
+            source("hdd", "/.btrfs-hdd", &["@data"]),
         ];
+        config.targets[0].mount = PRIMARY.into();
+        let mut recovery = config.targets[0].clone();
+        recovery.label = "recovery".into();
+        recovery.mount = RECOVERY.into();
+        config.targets.push(recovery);
         config
     }
 
-    fn labels(l: &[&str]) -> Vec<String> {
-        l.iter().map(|s| s.to_string()).collect()
+    /// Every filter naming the primary target, in the order the file declares
+    /// them: all four subvolumes (`@` is snapshotted as `root`).
+    fn primary_filters() -> String {
+        ["nvme-root/root", "nvme-root/home", "nvme-vm/vm", "hdd/data"]
+            .map(|p| format!("{PRIMARY}/{p}"))
+            .join(" ")
     }
 
     /// One row of `btrbk --format=raw list latest`; an empty `target` is a
@@ -2558,10 +2685,237 @@ mod tests {
             .any(|(l, m)| *l == level && m == text)
     }
 
+    // -- btrbk_filters: the sources and targets a step may touch --------------
+
+    fn filters_for(
+        config: &Config,
+        sources: &[&str],
+        targets: Option<&[&str]>,
+    ) -> Result<Vec<String>, String> {
+        let targets = targets.map(labels);
+        btrbk_filters(
+            config,
+            &labels(sources),
+            targets.as_deref(),
+            &TestProgress::new(),
+        )
+    }
+
     #[test]
-    fn snapshots_run_btrbk_snapshot_on_each_selected_volume_once() {
+    fn a_selection_of_everything_is_no_filter_at_all() {
+        let config = steps_config();
+        let every = ["primary-22tb", "recovery"];
+        for sources in [&[][..], &["nvme-root", "nvme-vm", "hdd"][..]] {
+            assert_eq!(filters_for(&config, sources, Some(&every)), Ok(vec![]));
+            assert_eq!(filters_for(&config, sources, None), Ok(vec![]));
+        }
+    }
+
+    #[test]
+    fn an_unticked_target_is_in_no_filter() {
+        let config = steps_config();
+        let filters = filters_for(&config, &[], Some(&["primary-22tb"])).unwrap();
+        assert_eq!(filters.join(" "), primary_filters());
+        assert!(!filters.iter().any(|f| f.contains(RECOVERY)), "{filters:?}");
+        // And the other way round: only the recovery target's directories.
+        let filters = filters_for(&config, &[], Some(&["recovery"])).unwrap();
+        assert!(
+            filters.iter().all(|f| f.starts_with(RECOVERY)),
+            "{filters:?}"
+        );
+        // nvme-vm sends to the primary only, so it has no recovery filter.
+        assert_eq!(
+            filters,
+            [
+                format!("{RECOVERY}/nvme-root/root"),
+                format!("{RECOVERY}/nvme-root/home"),
+                format!("{RECOVERY}/hdd/data")
+            ]
+        );
+    }
+
+    /// bd 7tx 1a: the old filter was the volume path, and `nvme-root` and
+    /// `nvme-vm` share `/.btrfs-nvme`, so unticking one excluded neither.
+    #[test]
+    fn a_source_is_selected_by_its_subvolumes_not_by_its_volume() {
+        let config = steps_config();
+        let both = ["primary-22tb", "recovery"];
+        let filters = filters_for(&config, &["nvme-root"], Some(&both)).unwrap();
+        assert_eq!(
+            filters,
+            [
+                format!("{PRIMARY}/nvme-root/root"),
+                format!("{RECOVERY}/nvme-root/root"),
+                format!("{PRIMARY}/nvme-root/home"),
+                format!("{RECOVERY}/nvme-root/home"),
+            ]
+        );
+        assert!(
+            !filters.iter().any(|f| f.contains("nvme-vm")),
+            "the source on the same volume is not selected: {filters:?}"
+        );
+        // A step with no target is filtered by subvolume path, never by volume.
+        assert_eq!(
+            filters_for(&config, &["nvme-root"], None),
+            Ok(labels(&["/.btrfs-nvme/@", "/.btrfs-nvme/@home"]))
+        );
+        assert_eq!(
+            filters_for(&config, &["nvme-vm", "hdd"], None),
+            Ok(labels(&["/.btrfs-nvme/@vm", "/.btrfs-hdd/@data"]))
+        );
+    }
+
+    #[test]
+    fn a_filter_names_the_snapshot_name_btrbk_gives_not_the_subvolume_name() {
+        let mut config = steps_config();
+        config.sources[0].subvolumes[1].snapshot_name = Some("home-data".into());
+        let filters = filters_for(&config, &["nvme-root"], Some(&["primary-22tb"])).unwrap();
+        assert_eq!(
+            filters,
+            [
+                format!("{PRIMARY}/nvme-root/root"),
+                format!("{PRIMARY}/nvme-root/home-data")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retired_subvolume_is_not_named() {
+        let mut config = steps_config();
+        config.sources[0].subvolumes[1].retired = Some("2026-10-01".into());
+        let filters = filters_for(&config, &["nvme-root"], Some(&["primary-22tb"])).unwrap();
+        assert_eq!(filters, [format!("{PRIMARY}/nvme-root/root")]);
+    }
+
+    #[test]
+    fn a_source_that_sends_to_no_selected_target_is_said_and_left_out() {
+        let config = steps_config();
+        let progress = TestProgress::new();
+        // nvme-vm sends to the primary target only; the recovery one is selected.
+        let filters = btrbk_filters(
+            &config,
+            &labels(&["nvme-vm", "hdd"]),
+            Some(&labels(&["recovery"])),
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(filters, [format!("{RECOVERY}/hdd/data")]);
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "Source 'nvme-vm' sends to none of the selected targets — nothing is done for it"
+        ));
+        // A source that does send there is not warned about.
+        assert!(
+            !progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, m)| m.contains("'hdd'"))
+        );
+    }
+
+    #[test]
+    fn nothing_selected_is_an_error_and_never_an_empty_filter_list() {
+        let config = steps_config();
+        // btrbk reads an empty filter list as everything.
+        for result in [
+            filters_for(&config, &["nvme-vm"], Some(&["recovery"])),
+            filters_for(&config, &[], Some(&[])),
+        ] {
+            let err = result.unwrap_err();
+            assert!(err.contains("there is nothing to run"), "{err}");
+        }
+        let mut config = steps_config();
+        for sv in &mut config.sources[1].subvolumes {
+            sv.retired = Some("2026-10-01".into());
+        }
+        let err = filters_for(&config, &["nvme-vm"], None).unwrap_err();
+        assert!(
+            err.contains("none of the selected sources has a subvolume to snapshot"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_label_that_is_not_in_the_configuration_is_refused_not_ignored() {
+        let config = steps_config();
+        assert_eq!(
+            filters_for(&config, &["hdd", "typo"], Some(&["primary-22tb"])),
+            Err("source 'typo' is not in the configuration".to_string())
+        );
+        assert_eq!(
+            filters_for(&config, &["hdd"], Some(&["primary-22tb", "typo"])),
+            Err("target 'typo' is not in the configuration".to_string())
+        );
+        assert_eq!(
+            filters_for(&config, &["typo"], None),
+            Err("source 'typo' is not in the configuration".to_string())
+        );
+    }
+
+    #[test]
+    fn a_path_btrbk_would_read_as_a_wildcard_or_a_relative_path_is_refused() {
+        for mount in ["/mnt/back*up", "relative/mount", "/mnt/with\nnewline"] {
+            let mut config = steps_config();
+            config.targets[0].mount = mount.into();
+            let err = filters_for(&config, &["hdd"], Some(&["primary-22tb"])).unwrap_err();
+            assert!(
+                err.contains("cannot be given to btrbk as a filter"),
+                "{err}"
+            );
+        }
+        let mut config = steps_config();
+        config.sources[2].volume = "/.btrfs-h*".into();
+        let err = filters_for(&config, &["hdd"], None).unwrap_err();
+        assert!(
+            err.contains("cannot be given to btrbk as a filter"),
+            "{err}"
+        );
+    }
+
+    /// The filters name exactly what the file declares: each one is a
+    /// `<target dir>/<snapshot name>` the rendered `btrbk.conf` has, and
+    /// selecting one source and one target at a time reaches every pair.
+    /// btrbk answers a filter that matches nothing with exit 2.
+    #[test]
+    fn every_filter_is_a_declaration_of_the_rendered_btrbk_conf() {
+        let config = steps_config();
+        let declared =
+            crate::btrbk_conf::pairs_declared_in(&crate::btrbk_conf::render_btrbk_conf(&config));
+        let mut reached = std::collections::BTreeSet::new();
+        for source in &config.sources {
+            for target in &config.targets {
+                let got = btrbk_filters(
+                    &config,
+                    std::slice::from_ref(&source.label),
+                    Some(std::slice::from_ref(&target.label)),
+                    &TestProgress::new(),
+                );
+                let Ok(filters) = got else {
+                    // nvme-vm has no recovery pair.
+                    assert_eq!(
+                        (source.label.as_str(), target.label.as_str()),
+                        ("nvme-vm", "recovery")
+                    );
+                    continue;
+                };
+                for f in filters {
+                    assert!(declared.contains(&f), "{f} is not declared in {declared:?}");
+                    reached.insert(f);
+                }
+            }
+        }
+        assert_eq!(reached, declared);
+    }
+
+    // -- create_snapshots ------------------------------------------------------
+
+    #[test]
+    fn snapshots_of_everything_are_run_with_no_filter() {
         let runner = Scripted::from_owned(vec![
-            (btrbk("snapshot /.btrfs-nvme /.btrfs-hdd"), 0, String::new()),
+            (btrbk("snapshot"), 0, String::new()),
             (
                 btrbk("--format=raw list latest"),
                 0,
@@ -2573,6 +2927,7 @@ mod tests {
         let count = create_snapshots_with(
             &steps_config(),
             &labels(&["nvme-root", "nvme-vm", "hdd"]),
+            None,
             &progress,
             &runner,
         )
@@ -2580,10 +2935,7 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(
             runner.calls(),
-            [
-                btrbk("snapshot /.btrfs-nvme /.btrfs-hdd"),
-                btrbk("--format=raw list latest")
-            ]
+            [btrbk("snapshot"), btrbk("--format=raw list latest")]
         );
         assert_eq!(
             *progress.stages.lock().unwrap(),
@@ -2598,21 +2950,89 @@ mod tests {
             ]
         );
         assert!(logged(&progress, LogLevel::Info, "Snapshots created: 2"));
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "Snapshotting source 'nvme-vm' at /.btrfs-nvme"
+        ));
     }
 
     #[test]
-    fn snapshots_of_no_selection_name_no_volume() {
+    fn snapshots_of_one_source_name_its_subvolumes_and_not_the_other_on_its_volume() {
+        let filters = "/.btrfs-nvme/@ /.btrfs-nvme/@home";
         let runner = Scripted::from_owned(vec![
-            (btrbk("snapshot"), 0, String::new()),
-            (btrbk("--format=raw list latest"), 0, raw_row("/s/a.1", "")),
+            (btrbk(&format!("snapshot {filters}")), 0, String::new()),
+            (
+                btrbk(&format!("--format=raw list latest {filters}")),
+                0,
+                raw_row("/s/a.1", ""),
+            ),
         ]);
-        let count =
-            create_snapshots_with(&steps_config(), &[], &TestProgress::new(), &runner).unwrap();
+        let count = create_snapshots_with(
+            &steps_config(),
+            &labels(&["nvme-root"]),
+            None,
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             runner.calls(),
-            [btrbk("snapshot"), btrbk("--format=raw list latest")]
+            [
+                btrbk(&format!("snapshot {filters}")),
+                btrbk(&format!("--format=raw list latest {filters}"))
+            ],
+            "the listing that counts is limited to the same subvolumes"
         );
+    }
+
+    #[test]
+    fn snapshots_in_a_run_are_confined_to_the_subvolumes_that_go_to_its_targets() {
+        let filters = primary_filters();
+        let runner = Scripted::from_owned(vec![
+            (btrbk(&format!("snapshot {filters}")), 0, String::new()),
+            (
+                btrbk(&format!("--format=raw list latest {filters}")),
+                0,
+                raw_row("/s/a.1", ""),
+            ),
+        ]);
+        let primary = labels(&["primary-22tb"]);
+        create_snapshots_with(
+            &steps_config(),
+            &[],
+            Some(primary.as_slice()),
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls[0], btrbk(&format!("snapshot {filters}")));
+        assert!(
+            !calls.iter().any(|c| c.contains(RECOVERY)),
+            "an unticked target is not named to btrbk: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_source_that_is_not_in_the_configuration_is_refused_before_btrbk_runs() {
+        let runner = Scripted::from_owned(vec![]);
+        let err = create_snapshots_with(
+            &steps_config(),
+            &labels(&["typo"]),
+            None,
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("source 'typo' is not in the configuration"),
+            "{err}"
+        );
+        // Not "no volume filter, so every volume": nothing ran at all.
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
@@ -2620,12 +3040,12 @@ mod tests {
         let runner = Scripted::from_owned(vec![(btrbk("snapshot"), 10, String::new())])
             .with_stderr(&btrbk("snapshot"), "ERROR: x\n\n  \nWARNING: y\n");
         let progress = TestProgress::new();
-        let err = create_snapshots_with(&steps_config(), &[], &progress, &runner)
+        let err = create_snapshots_with(&steps_config(), &[], None, &progress, &runner)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("btrbk snapshot command exited with non-zero status"),
-            "{err}"
+        assert_eq!(
+            err,
+            "btrbk snapshot command failed (exit status 10). No snapshots can be assumed created."
         );
         assert_eq!(
             runner.calls(),
@@ -2663,7 +3083,7 @@ mod tests {
             "+++ /s/a.1\n  +++ /s/b.1\n>>> /t/a.1\n".into(),
         )]);
         let progress = TestProgress::new();
-        let count = create_snapshots_with(&steps_config(), &[], &progress, &runner).unwrap();
+        let count = create_snapshots_with(&steps_config(), &[], None, &progress, &runner).unwrap();
         assert_eq!(count, 2, "the two +++ lines");
         assert!(logged(
             &progress,
@@ -2676,13 +3096,36 @@ mod tests {
     fn a_btrbk_that_cannot_be_started_is_an_error_in_every_step() {
         let config = steps_config();
         let progress = TestProgress::new();
-        assert!(create_snapshots_with(&config, &[], &progress, &Unspawnable).is_err());
-        assert!(send_snapshots_with(&config, &[], &[], false, &progress, &Unspawnable).is_err());
-        assert!(run_full_pipeline_with(&config, &[], &[], &progress, &Unspawnable).is_err());
+        let primary = labels(&["primary-22tb"]);
+        assert!(create_snapshots_with(&config, &[], None, &progress, &Unspawnable).is_err());
+        assert!(
+            send_snapshots_with(&config, &[], &primary, false, &progress, &Unspawnable).is_err()
+        );
+        assert!(run_full_pipeline_with(&config, &[], &primary, &progress, &Unspawnable).is_err());
     }
 
     #[test]
-    fn send_runs_btrbk_resume_and_passes_preserve_only_when_asked() {
+    fn describe_exit_says_the_status_or_the_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            describe_exit(ExitStatus::from_raw(10 << 8)),
+            "exit status 10"
+        );
+        assert_eq!(describe_exit(ExitStatus::from_raw(0)), "exit status 0");
+        // Killed by SIGKILL: no exit status, a signal.
+        assert_eq!(describe_exit(ExitStatus::from_raw(9)), "killed by signal 9");
+        // Stopped, not ended: neither.
+        assert_eq!(
+            describe_exit(ExitStatus::from_raw(0x137f)),
+            "no exit status"
+        );
+    }
+
+    // -- send_snapshots --------------------------------------------------------
+
+    #[test]
+    fn send_to_every_target_of_every_source_names_no_filter_and_preserve_only_when_asked() {
+        let every = labels(&["primary-22tb", "recovery"]);
         for (preserve, argv) in [
             (true, format!("btrbk --preserve -c {CONF} resume")),
             (false, btrbk("resume")),
@@ -2691,7 +3134,7 @@ mod tests {
             send_snapshots_with(
                 &steps_config(),
                 &[],
-                &[],
+                &every,
                 preserve,
                 &TestProgress::new(),
                 &runner,
@@ -2705,27 +3148,165 @@ mod tests {
         }
     }
 
+    /// The unticked target (`recovery`) never reaches btrbk. The scripted
+    /// runner knows only the filtered command, so sending without the filter
+    /// is a failure of this test, not a quiet write.
     #[test]
-    fn send_limits_btrbk_to_the_volumes_of_the_selected_sources_once_each() {
+    fn send_limits_btrbk_to_the_targets_selected() {
+        let filters = primary_filters();
         let runner = Scripted::from_owned(vec![(
-            btrbk("resume /.btrfs-hdd /.btrfs-nvme"),
+            btrbk(&format!("resume {filters}")),
+            0,
+            String::new(),
+        )]);
+        let progress = TestProgress::new();
+        send_snapshots_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb"]),
+            false,
+            &progress,
+            &runner,
+        )
+        .unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls[0], btrbk(&format!("resume {filters}")));
+        assert_eq!(
+            calls[1],
+            btrbk(&format!("--format=raw list latest {filters}"))
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(RECOVERY)),
+            "an unticked target is not named to btrbk: {calls:?}"
+        );
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            &format!("Target 'primary-22tb' at {PRIMARY}: will receive")
+        ));
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            &format!(
+                "Target 'recovery' at {RECOVERY}: not part of this run — btrbk is told to \
+                 leave it alone"
+            )
+        ));
+    }
+
+    #[test]
+    fn send_limits_btrbk_to_the_sources_selected_by_subvolume() {
+        let filters =
+            format!("{PRIMARY}/nvme-root/root {PRIMARY}/nvme-root/home {PRIMARY}/hdd/data");
+        let runner = Scripted::from_owned(vec![(
+            btrbk(&format!("resume {filters}")),
             0,
             String::new(),
         )]);
         send_snapshots_with(
             &steps_config(),
-            &labels(&["hdd", "nvme-vm", "nvme-root"]),
-            &[],
+            &labels(&["hdd", "nvme-root"]),
+            &labels(&["primary-22tb"]),
             false,
             &TestProgress::new(),
             &runner,
         )
         .unwrap();
-        assert_eq!(
-            runner.calls()[0],
-            btrbk("resume /.btrfs-hdd /.btrfs-nvme"),
-            "volumes in the order selected, a shared volume once"
+        assert_eq!(runner.calls()[0], btrbk(&format!("resume {filters}")));
+    }
+
+    /// A target that IS selected and cannot be read still fails the step: btrbk
+    /// aborts it and exits 10, and the error says so and carries its message.
+    #[test]
+    fn a_selected_target_btrbk_cannot_read_still_fails_the_step_and_says_how() {
+        let filters = primary_filters();
+        let argv = btrbk(&format!("resume {filters}"));
+        let runner = Scripted::from_owned(vec![(argv.clone(), 10, String::new())]).with_stderr(
+            &argv,
+            "WARNING: Skipping target \"/mnt/test-primary/hdd\": Failed to fetch subvolume detail\n",
         );
+        let progress = TestProgress::new();
+        let err = send_snapshots_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb"]),
+            false,
+            &progress,
+            &runner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "btrbk resume command failed (exit status 10). The send may be incomplete."
+        );
+        assert_eq!(runner.calls(), [argv], "no listing after a failure");
+        assert!(logged(&progress, LogLevel::Error, &err));
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "btrbk stderr: WARNING: Skipping target \"/mnt/test-primary/hdd\": Failed to fetch subvolume detail"
+        ));
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "stream_command: exit=10, stdout_lines=0"
+        ));
+    }
+
+    #[test]
+    fn send_without_targets_goes_to_those_mounted_and_not_to_an_absent_one() {
+        // `/proc` is mounted wherever the tests run; the other target's mount
+        // point is not.
+        let mut config = steps_config();
+        config.targets[0].mount = "/proc".into();
+        let filters = ["nvme-root/root", "nvme-root/home", "nvme-vm/vm", "hdd/data"]
+            .map(|p| format!("/proc/{p}"))
+            .join(" ");
+        let runner = Scripted::from_owned(vec![(
+            btrbk(&format!("resume {filters}")),
+            0,
+            String::new(),
+        )]);
+        send_snapshots_with(&config, &[], &[], false, &TestProgress::new(), &runner).unwrap();
+        assert_eq!(runner.calls()[0], btrbk(&format!("resume {filters}")));
+    }
+
+    #[test]
+    fn send_with_no_target_mounted_and_none_named_runs_nothing() {
+        let runner = Scripted::from_owned(vec![]);
+        let err = send_snapshots_with(
+            &steps_config(),
+            &[],
+            &[],
+            false,
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, NO_TARGETS_MOUNTED);
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn a_target_that_is_not_in_the_configuration_is_refused_before_btrbk_runs() {
+        let runner = Scripted::from_owned(vec![]);
+        let err = send_snapshots_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb", "typo"]),
+            false,
+            &TestProgress::new(),
+            &runner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("target 'typo' is not in the configuration"),
+            "{err}"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
     #[test]
@@ -2746,8 +3327,15 @@ mod tests {
             ),
         ]);
         let progress = TestProgress::new();
-        let (sent, bytes) =
-            send_snapshots_with(&steps_config(), &[], &[], false, &progress, &runner).unwrap();
+        let (sent, bytes) = send_snapshots_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb", "recovery"]),
+            false,
+            &progress,
+            &runner,
+        )
+        .unwrap();
         assert_eq!(sent, 2, "target rows of the listing, not marker lines");
         // 45.3 MiB + 1.5 GiB, from the two sends' parentheses.
         assert_eq!(bytes, 47_500_492 + 1_610_612_736);
@@ -2773,8 +3361,15 @@ mod tests {
             ">>> /t/a.1\n  *** /t/b.1\n+++ /s/c.1\n".into(),
         )]);
         let progress = TestProgress::new();
-        let (sent, _) =
-            send_snapshots_with(&steps_config(), &[], &[], false, &progress, &runner).unwrap();
+        let (sent, _) = send_snapshots_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb", "recovery"]),
+            false,
+            &progress,
+            &runner,
+        )
+        .unwrap();
         assert_eq!(sent, 2, "the >>> and the *** line");
         assert!(logged(
             &progress,
@@ -2783,35 +3378,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_failed_send_is_an_error_and_is_not_counted() {
-        let runner = Scripted::from_owned(vec![(btrbk("resume"), 10, ">>> /t/a.1\n".into())])
-            .with_stderr(&btrbk("resume"), "ERROR: target gone\n");
-        let progress = TestProgress::new();
-        let err = send_snapshots_with(&steps_config(), &[], &[], false, &progress, &runner)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("btrbk resume command exited with non-zero status"),
-            "{err}"
-        );
-        assert_eq!(
-            runner.calls(),
-            [btrbk("resume")],
-            "no listing after a failure"
-        );
-        assert!(logged(&progress, LogLevel::Error, &err));
-        assert!(logged(
-            &progress,
-            LogLevel::Warning,
-            "btrbk stderr: ERROR: target gone"
-        ));
-        assert!(logged(
-            &progress,
-            LogLevel::Info,
-            "stream_command: exit=10, stdout_lines=1"
-        ));
-    }
+    // -- run_full_pipeline -----------------------------------------------------
 
     #[test]
     fn the_full_pipeline_runs_btrbk_run_and_counts_the_listing_and_the_deletions() {
@@ -2827,7 +3394,14 @@ mod tests {
             ),
         ]);
         let progress = TestProgress::new();
-        let got = run_full_pipeline_with(&steps_config(), &[], &[], &progress, &runner).unwrap();
+        let got = run_full_pipeline_with(
+            &steps_config(),
+            &labels(&["nvme-root", "nvme-vm", "hdd"]),
+            &labels(&["primary-22tb", "recovery"]),
+            &progress,
+            &runner,
+        )
+        .unwrap();
         // created: distinct snapshots (2); sent: target rows (2);
         // cleaned: the two `---` lines; bytes: no size was printed.
         assert_eq!(got, (2, 2, 2, 0));
@@ -2844,24 +3418,29 @@ mod tests {
             LogLevel::Info,
             "Full backup: 2 created, 2 sent, 2 cleaned up"
         ));
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "Source 'hdd' at /.btrfs-hdd"
+        ));
     }
 
     #[test]
-    fn the_full_pipeline_limits_btrbk_to_the_volumes_of_the_selected_sources() {
-        let runner = Scripted::from_owned(vec![(
-            btrbk("run /.btrfs-hdd /.btrfs-nvme"),
-            0,
-            String::new(),
-        )]);
+    fn the_full_pipeline_limits_btrbk_to_the_sources_and_targets_selected() {
+        let filters = format!("{RECOVERY}/hdd/data");
+        let runner =
+            Scripted::from_owned(vec![(btrbk(&format!("run {filters}")), 0, String::new())]);
         run_full_pipeline_with(
             &steps_config(),
-            &labels(&["hdd", "nvme-root", "nvme-vm"]),
-            &[],
+            &labels(&["hdd"]),
+            &labels(&["recovery"]),
             &TestProgress::new(),
             &runner,
         )
         .unwrap();
-        assert_eq!(runner.calls()[0], btrbk("run /.btrfs-hdd /.btrfs-nvme"));
+        let calls = runner.calls();
+        assert_eq!(calls[0], btrbk(&format!("run {filters}")));
+        assert!(!calls.iter().any(|c| c.contains(PRIMARY)), "{calls:?}");
     }
 
     #[test]
@@ -2872,7 +3451,14 @@ mod tests {
             "+++ /s/a.1\n+++ /s/b.1\n>>> /t/a.1\n--- /t/old\n".into(),
         )]);
         let progress = TestProgress::new();
-        let got = run_full_pipeline_with(&steps_config(), &[], &[], &progress, &runner).unwrap();
+        let got = run_full_pipeline_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb", "recovery"]),
+            &progress,
+            &runner,
+        )
+        .unwrap();
         assert_eq!(got, (2, 1, 1, 0));
         assert!(logged(
             &progress,
@@ -2885,15 +3471,307 @@ mod tests {
     fn a_failed_full_run_is_an_error_and_is_not_counted() {
         let runner = Scripted::from_owned(vec![(btrbk("run"), 10, "+++ /s/a.1\n".into())]);
         let progress = TestProgress::new();
-        let err = run_full_pipeline_with(&steps_config(), &[], &[], &progress, &runner)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("btrbk run command exited with non-zero status"),
-            "{err}"
+        let err = run_full_pipeline_with(
+            &steps_config(),
+            &[],
+            &labels(&["primary-22tb", "recovery"]),
+            &progress,
+            &runner,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "btrbk run command failed (exit status 10). The backup may be incomplete."
         );
         assert_eq!(runner.calls(), [btrbk("run")]);
         assert!(logged(&progress, LogLevel::Error, &err));
+    }
+
+    // -- run_pipeline: which steps a run takes, over what -----------------------
+
+    /// What a scripted pipeline did: its calls (filters in `argv` as the
+    /// primary-only selection) and what it counted.
+    fn pipeline(
+        options: BackupOptions,
+        mode: BackupMode,
+        script: Vec<(String, i32, String)>,
+    ) -> (Pipeline, Vec<String>, TestProgress) {
+        let runner = Scripted::from_owned(script);
+        let progress = TestProgress::new();
+        let done = run_pipeline(
+            &steps_config(),
+            &options,
+            mode,
+            &[],
+            &labels(&["primary-22tb"]),
+            &progress,
+            &runner,
+        );
+        (done, runner.calls(), progress)
+    }
+
+    fn listing_of(rows: String) -> (String, i32, String) {
+        (
+            btrbk(&format!("--format=raw list latest {}", primary_filters())),
+            0,
+            rows,
+        )
+    }
+
+    #[test]
+    fn an_incremental_run_snapshots_and_then_sends_to_the_selected_targets_only() {
+        let f = primary_filters();
+        let (done, calls, _) = pipeline(
+            BackupOptions::default(),
+            BackupMode::Incremental,
+            vec![
+                (btrbk(&format!("snapshot {f}")), 0, String::new()),
+                (
+                    btrbk(&format!("resume {f}")),
+                    0,
+                    ">>> /t/a.1 (1.0 KiB)\n".into(),
+                ),
+                listing_of(raw_row("/s/a.1", "/t1/a.1") + &raw_row("/s/b.1", "/t1/b.1")),
+            ],
+        );
+        assert_eq!(
+            calls,
+            [
+                btrbk(&format!("snapshot {f}")),
+                btrbk(&format!("--format=raw list latest {f}")),
+                btrbk(&format!("resume {f}")),
+                btrbk(&format!("--format=raw list latest {f}")),
+            ]
+        );
+        // The listing serves both steps: 2 snapshots, 2 target rows.
+        assert_eq!(
+            done,
+            Pipeline {
+                created: 2,
+                sent: 2,
+                cleaned: 0,
+                bytes: 1024,
+                errors: vec![]
+            }
+        );
+        assert!(!calls.iter().any(|c| c.contains(RECOVERY)), "{calls:?}");
+    }
+
+    #[test]
+    fn an_incremental_run_with_send_only_or_snapshot_only_takes_one_step() {
+        let f = primary_filters();
+        let script = || {
+            vec![
+                (btrbk(&format!("snapshot {f}")), 0, String::new()),
+                (btrbk(&format!("resume {f}")), 0, String::new()),
+                listing_of(raw_row("/s/a.1", "/t1/a.1")),
+            ]
+        };
+        let (done, calls, _) = pipeline(
+            BackupOptions {
+                send_only: true,
+                ..Default::default()
+            },
+            BackupMode::Incremental,
+            script(),
+        );
+        assert_eq!(calls[0], btrbk(&format!("resume {f}")));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!((done.created, done.sent), (0, 1));
+
+        let (done, calls, _) = pipeline(
+            BackupOptions {
+                snapshot_only: true,
+                ..Default::default()
+            },
+            BackupMode::Incremental,
+            script(),
+        );
+        assert_eq!(calls[0], btrbk(&format!("snapshot {f}")));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!((done.created, done.sent), (1, 0));
+    }
+
+    #[test]
+    fn a_full_run_is_one_btrbk_run_and_its_snapshot_only_and_send_only_forms_are_not() {
+        let f = primary_filters();
+        let script = || {
+            vec![
+                (btrbk(&format!("run {f}")), 0, "--- /t/old\n".into()),
+                (btrbk(&format!("snapshot {f}")), 0, String::new()),
+                (btrbk(&format!("resume {f}")), 0, String::new()),
+                listing_of(raw_row("/s/a.1", "/t1/a.1")),
+            ]
+        };
+        let (done, calls, _) = pipeline(BackupOptions::default(), BackupMode::Full, script());
+        assert_eq!(calls[0], btrbk(&format!("run {f}")));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(
+            done,
+            Pipeline {
+                created: 1,
+                sent: 1,
+                cleaned: 1,
+                bytes: 0,
+                errors: vec![]
+            }
+        );
+        let (done, calls, _) = pipeline(
+            BackupOptions {
+                snapshot_only: true,
+                ..Default::default()
+            },
+            BackupMode::Full,
+            script(),
+        );
+        assert_eq!(calls[0], btrbk(&format!("snapshot {f}")));
+        assert_eq!((done.created, done.sent, done.cleaned), (1, 0, 0));
+        let (done, calls, _) = pipeline(
+            BackupOptions {
+                send_only: true,
+                ..Default::default()
+            },
+            BackupMode::Full,
+            script(),
+        );
+        assert_eq!(calls[0], btrbk(&format!("resume {f}")));
+        assert_eq!((done.created, done.sent, done.cleaned), (0, 1, 0));
+    }
+
+    #[test]
+    fn a_failed_step_is_recorded_and_the_next_one_still_runs() {
+        let f = primary_filters();
+        let (done, calls, progress) = pipeline(
+            BackupOptions::default(),
+            BackupMode::Incremental,
+            vec![
+                (btrbk(&format!("snapshot {f}")), 10, String::new()),
+                (btrbk(&format!("resume {f}")), 0, String::new()),
+                listing_of(raw_row("/s/a.1", "/t1/a.1")),
+            ],
+        );
+        assert_eq!(
+            done.errors,
+            [
+                "Snapshot step failed: btrbk snapshot command failed (exit status 10). \
+              No snapshots can be assumed created."
+            ]
+        );
+        assert_eq!(
+            calls.len(),
+            3,
+            "snapshot, then resume and its listing: {calls:?}"
+        );
+        assert_eq!((done.created, done.sent), (0, 1));
+        assert!(logged(&progress, LogLevel::Error, &done.errors[0]));
+
+        let (done, _, _) = pipeline(
+            BackupOptions::default(),
+            BackupMode::Incremental,
+            vec![(btrbk(&format!("snapshot {f}")), 0, String::new())],
+        );
+        assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
+        assert!(
+            done.errors[0]
+                .starts_with("Send step failed: btrbk resume command failed (exit status 1)"),
+            "{:?}",
+            done.errors
+        );
+
+        let (done, _, _) = pipeline(
+            BackupOptions::default(),
+            BackupMode::Full,
+            vec![(btrbk(&format!("run {f}")), 2, String::new())],
+        );
+        assert_eq!(
+            done.errors,
+            [
+                "Full backup pipeline failed: btrbk run command failed (exit status 2). \
+              The backup may be incomplete."
+            ]
+        );
+    }
+
+    // -- the selection a run starts from ----------------------------------------
+
+    #[test]
+    fn a_run_with_no_sources_named_backs_up_those_with_a_subvolume_that_is_not_manual_only() {
+        let config = make_test_config();
+        let options = BackupOptions::default();
+        // `manual-src` has only a manual-only subvolume.
+        assert_eq!(effective_sources(&config, &options), ["nvme-root"]);
+    }
+
+    #[test]
+    fn a_source_named_explicitly_is_backed_up_even_if_manual_only() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            sources: labels(&["manual-src", "nvme-root"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_sources(&config, &options),
+            ["manual-src", "nvme-root"]
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_targets_named_writes_to_those_mounted() {
+        let mut config = make_test_config();
+        let mut absent = config.targets[0].clone();
+        absent.label = "absent".into();
+        absent.mount = "/nonexistent/das/absent".into();
+        config.targets.push(absent);
+        let progress = TestProgress::new();
+        assert_eq!(
+            effective_targets(&config, &BackupOptions::default(), &progress),
+            ["primary-22tb"],
+            "/proc is mounted, the other mount point does not exist"
+        );
+    }
+
+    #[test]
+    fn targets_named_are_trusted_without_a_mount_check_and_unknown_labels_are_dropped() {
+        let mut config = make_test_config();
+        let mut absent = config.targets[0].clone();
+        absent.label = "absent".into();
+        absent.mount = "/nonexistent/das/absent".into();
+        config.targets.push(absent);
+        let options = BackupOptions {
+            targets: labels(&["absent", "no-such-target"]),
+            ..Default::default()
+        };
+        // Named, so a ticked target is passed on whether or not it is
+        // mounted: the verification before btrbk is what refuses it.
+        assert_eq!(
+            effective_targets(&config, &options, &TestProgress::new()),
+            ["absent"]
+        );
+    }
+
+    #[test]
+    fn targets_named_that_match_nothing_fall_back_to_those_mounted_with_a_warning() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            targets: labels(&["stale-label"]),
+            ..Default::default()
+        };
+        let progress = TestProgress::new();
+        assert_eq!(
+            effective_targets(&config, &options, &progress),
+            ["primary-22tb"]
+        );
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Warning
+                    && m.contains("did not match config")
+                    && m.contains("stale-label"))
+        );
     }
 
     /// A minimal btrbk.conf declaring one subvolume and its snapshot_name.
