@@ -46,10 +46,6 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_libexecdir}/btrdasd-helper
 %{_bindir}/btrdasd-gui
 %{_prefix}/lib/das-backup/
-%{_unitdir}/das-backup.service
-%{_unitdir}/das-backup-full.service
-%{_unitdir}/das-backup.timer
-%{_unitdir}/das-backup-full.timer
 %{_datadir}/applications/org.theboscoclub.btrdasd-gui.desktop
 %{_datadir}/kxmlgui5/btrdasd-gui/
 %{_datadir}/dbus-1/system.d/org.dasbackup.Helper1.conf

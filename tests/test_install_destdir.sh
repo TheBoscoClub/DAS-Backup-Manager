@@ -26,7 +26,11 @@
 #      `cmake --install --strip` support, which it writes under
 #      `if(CMAKE_INSTALL_DO_STRIP)` and which strips the copy under DESTDIR;
 #   5. --completions: the bash, zsh and fish completions are installed and are
-#      byte for byte what this build's btrdasd prints; --no-completions: none.
+#      byte for byte what this build's btrdasd prints; --no-completions: none;
+#   6. no backup unit is installed: `btrdasd setup` is the only writer of the
+#      das-* units (bd DAS-Backup-Manager-7rf). Until then CMake installed its
+#      own das-backup{,-full}.{service,timer}, which systemd ran whenever
+#      setup's were gone.
 # Out of its sight: install-time code that writes outside DESTDIR without
 # running a command (a file(WRITE) to an absolute path) — neither under DESTDIR
 # nor in the manifest. Configuring with a scratch prefix exposes that too:
@@ -152,6 +156,9 @@ for shell in bash zsh fish; do
         check "5. this build's btrdasd exists, to compare against" "missing: $btrdasd" "present"
     fi
 done
+
+check "6. no backup unit is installed" \
+    "$(grep -E '/systemd/system/das-[^/]*$' "$manifest" 2>/dev/null | paste -sd ' ' -)" ""
 
 if ((fails > 0)); then
     echo "INSTALL DESTDIR SUITE RED ($fails failed)"

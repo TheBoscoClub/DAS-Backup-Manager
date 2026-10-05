@@ -11,10 +11,10 @@
 #   0        the run executed and nothing FAILED (a WARN still exits 0)
 #   3        the run began its work and something FAILED or it aborted: btrbk
 #            nonzero for some or all targets, any FAIL operation, an abort on
-#            a target's or a source's state. Both unit sources and the units
-#            `btrdasd setup` writes list SuccessExitStatus=3, so systemd and
-#            cachyos-sentinel see success and never restart the run, while
-#            the journal still shows status=3.
+#            a target's or a source's state. The units `btrdasd setup` writes
+#            — the only backup units since bd DAS-Backup-Manager-7rf — list
+#            SuccessExitStatus=3, so systemd and cachyos-sentinel see success
+#            and never restart the run, while the journal still shows status=3.
 #   1        it could not start: config unreadable, btrdasd missing, an
 #            argument error, not root, the backup or maintenance lock unusable.
 #            Nothing was mounted or sent.
@@ -1451,17 +1451,11 @@ else
     done
 fi
 
-# ---------------------------------------------------------------------------
-echo "== both packaged unit sources treat 3 as success, and only 3"
-# ---------------------------------------------------------------------------
-# The units `btrdasd setup` writes are pinned by the Rust tests in
-# indexer/src/setup/templates.rs.
-for unit in das-backup.service.in das-backup-full.service.in; do
-    file="$REPO_ROOT/systemd/$unit"
-    # Every SuccessExitStatus= line, with the section it sits in.
-    got="$(awk '/^\[/ { section = $0 } /^SuccessExitStatus=/ { print section " " $0 }' "$file")"
-    check "$unit: SuccessExitStatus" "$got" "[Service] SuccessExitStatus=3"
-done
+# The units that treat 3 as success, and only 3, are the ones `btrdasd setup`
+# writes, pinned by the Rust tests in indexer/src/setup/templates.rs. This
+# suite also compared the packaged systemd/das-backup*.service.in until
+# bd DAS-Backup-Manager-7rf, which stopped CMake installing backup units; that
+# none is installed is checked by tests/test_install_destdir.sh.
 
 echo
 echo "passed=$pass failed=$fail"

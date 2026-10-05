@@ -1,0 +1,20 @@
+[Unit]
+Description=DAS Backup - BTRFS incremental backup to DAS enclosure
+Documentation=https://github.com/TheBoscoClub/DAS-Backup-Manager
+After=local-fs.target
+# Only run if DAS is likely connected (btrdasd setup configures the actual glob)
+ConditionPathExistsGlob=/dev/disk/by-id/usb-*
+
+[Service]
+Type=oneshot
+ExecStart=@DAS_SCRIPT_DIR@/backup-run.sh
+StandardOutput=journal
+StandardError=journal
+# Nice and ionice for background operation
+Nice=19
+IOSchedulingClass=idle
+# Timeout after 6 hours (initial backup can take 3+ hours)
+TimeoutStartSec=21600
+
+[Install]
+WantedBy=multi-user.target

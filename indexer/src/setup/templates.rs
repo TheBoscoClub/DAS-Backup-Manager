@@ -70,9 +70,11 @@ pub fn is_embedded_script(path: &str) -> bool {
 /// ten minutes later, and with the unit `failed` cachyos-sentinel would start
 /// a whole new backup about every ten minutes — one absent drive was enough
 /// (measured 2026-10-02 by hand: btrbk exited 10, the script 1). Exit 1,
-/// could not start, still fails the unit. The same comment and
-/// directive are in `systemd/das-backup*.service.in`, the units `cmake
-/// --install` ships.
+/// could not start, still fails the unit.
+///
+/// Setup is the only writer of this unit and its timer. `cmake --install`
+/// shipped its own copies until bd DAS-Backup-Manager-7rf; `setup --upgrade`
+/// removes the ones older versions left (`super::retired_units`).
 pub fn render_systemd_service(config: &Config, full: bool) -> String {
     let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
     let desc = if full {
@@ -738,50 +740,6 @@ mod tests {
             // The unit says why, so `systemctl cat` explains a status=3.
             assert!(unit.contains("# Exit semantics"), "full={full}");
             assert!(unit.contains("bd DAS-Backup-Manager-d1r"), "full={full}");
-        }
-    }
-
-    /// From the `# Exit semantics` line through the `SuccessExitStatus=` line.
-    fn exit_semantics_block(unit: &str) -> Vec<&str> {
-        unit.lines()
-            .skip_while(|l| !l.starts_with("# Exit semantics"))
-            .scan(false, |done, l| {
-                if *done {
-                    return None;
-                }
-                *done = l.starts_with("SuccessExitStatus=");
-                Some(l)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn packaged_backup_units_say_what_setups_units_say_test() {
-        // Two sources write these units: `btrdasd setup` (this file) and
-        // `cmake --install` (systemd/*.service.in). Both must count exit 3 as
-        // success, in the same words, or which install a host had decides
-        // whether one absent drive restarts its backup every ten minutes.
-        let config = test_config();
-        let packaged = [
-            (
-                false,
-                include_str!("../../../systemd/das-backup.service.in"),
-            ),
-            (
-                true,
-                include_str!("../../../systemd/das-backup-full.service.in"),
-            ),
-        ];
-        for (full, source) in packaged {
-            let rendered = render_systemd_service(&config, full);
-            let block = exit_semantics_block(&rendered);
-            assert_eq!(block.last(), Some(&"SuccessExitStatus=3"), "full={full}");
-            assert_eq!(exit_semantics_block(source), block, "full={full}");
-            assert_eq!(
-                success_exit_status_lines(source),
-                ["[Service] SuccessExitStatus=3"],
-                "full={full}"
-            );
         }
     }
 

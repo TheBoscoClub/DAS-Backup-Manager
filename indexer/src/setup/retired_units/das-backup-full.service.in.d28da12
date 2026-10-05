@@ -1,0 +1,20 @@
+[Unit]
+Description=DAS Full Backup - Recreate boot subvolumes from latest snapshots
+Documentation=https://github.com/TheBoscoClub/DAS-Backup-Manager
+After=local-fs.target
+# Retirement and expiry are dated by the clock (see caldate::untrusted_clock).
+Wants=time-sync.target
+After=time-sync.target
+ConditionPathExistsGlob=/dev/disk/by-id/usb-*
+
+[Service]
+Type=oneshot
+ExecStart=@DAS_SCRIPT_DIR@/backup-run.sh --full
+StandardOutput=journal
+StandardError=journal
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=21600
+
+[Install]
+WantedBy=multi-user.target
