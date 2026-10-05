@@ -16,6 +16,14 @@ use crate::setup::templates::GeneratedFiles;
 const CONFIG_FILE: &str = "/etc/das-backup/config.toml";
 const MANIFEST_FILE: &str = "/etc/das-backup/.manifest";
 
+/// The root `upgrade` looks below for the backup units older versions installed
+/// ([`super::retired_units`]): the host's own. A constant so that a test can pin
+/// it, which `upgrade` itself, running the host's `systemctl` under the host's
+/// locks, does not allow: a root that named no real directory would turn the
+/// cleanup into a silent no-op — every path absent, nothing said — and no test
+/// on a scratch root could tell.
+const RETIRE_ROOT: &str = "/";
+
 const SYSTEMCTL: &str = "systemctl";
 
 /// How the installer reaches the host's service manager: one `systemctl`
@@ -761,7 +769,7 @@ pub fn upgrade(
     };
     let systemctl = |args: &[&str]| command_status_within(SYSTEMCTL, args, HELPER_RESTART_LIMIT);
     let retire = |say: &mut dyn FnMut(String)| {
-        super::retired_units::remove_retired_units(Path::new("/"), say)
+        super::retired_units::remove_retired_units(Path::new(RETIRE_ROOT), say)
     };
     upgrade_with(
         site,
@@ -858,7 +866,12 @@ fn upgrade_with(
         // The backup units an older `cmake --install` wrote under /usr
         // (bd DAS-Backup-Manager-7rf) go first, so the reload regenerating
         // ends with sees them gone. One that could not be removed fails the
-        // upgrade, but only once everything else has been done.
+        // upgrade, but only once everything else has been done. When
+        // regenerating fails, or `[init].system` is not systemd, no reload
+        // follows, and that is harmless: the copies removed here were shadowed
+        // by setup's units of the same names in /etc/systemd/system, so nothing
+        // systemd has loaded changes, and one it had loaded from a copy goes at
+        // its next reload.
         let retired = (host.retire)(say);
         say(format!(
             "Regenerating files from {}...",
@@ -3395,6 +3408,15 @@ auth = "starttls""#,
             Err("1 systemd unit operation(s) failed".to_string())
         );
         assert!(run.lines.contains(&"retire said this".to_string()));
+    }
+
+    #[test]
+    fn the_host_upgrade_looks_for_the_retired_units_below_the_hosts_own_root() {
+        // `upgrade` binds the cleanup to the host and cannot run in a test, and
+        // every other test hands the cleanup a scratch root. A production root
+        // that named no real directory would pass them all and remove nothing,
+        // without a word (bd DAS-Backup-Manager-7rf, the review's N-2).
+        assert_eq!(RETIRE_ROOT, "/");
     }
 
     #[test]
