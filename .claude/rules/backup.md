@@ -207,6 +207,8 @@ target — `run_backup`, `send_snapshots`, `run_full_pipeline`, `archive_boot` (
 cannot skip it: `backup send` and `backup boot-archive` are covered from the CLI and from the helper.
 `archive_boot` verifies the non-mirror targets whose mount point exists (the script's two safe
 states: a real mountpoint, or absent); a bare directory refuses the whole step.
+A target with no `mount_uuid` is identified by its drive's serial, as the script does (`findmnt` →
+`lsblk` → `smartctl -i`); a serial that cannot be read is a refusal, never a pass (bd `7tx` 4).
 
 ## Maintenance Interlock — backup vs. scrub mutual exclusion
 Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesystems and must never overlap.

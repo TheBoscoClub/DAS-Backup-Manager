@@ -5804,7 +5804,9 @@ mod tests {
             dry_run: true,
             ..Default::default()
         };
-        let result = host.run(&make_test_config(), &options, &progress).unwrap();
+        // With no target there is nothing to verify (a legacy target would be
+        // checked by its drive's serial, which no test host can supply).
+        let result = host.run(&config, &options, &progress).unwrap();
         assert!(result.success);
         let mut nothing = make_test_config();
         nothing.targets[0].mount = "/nonexistent/das/mount".into();
