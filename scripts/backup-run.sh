@@ -41,7 +41,9 @@
 #     neither skipped nor failed, and the step recorded OK, 0 updated, 0
 #     skipped, a green result for work that was not looked at. "Could not
 #     tell" now fails the step: counted, said with the probe's message and the
-#     target's name, and the targets after it are still done. "Not mounted",
+#     target's name, and the targets after it are still done. A mirror counts
+#     the same and says it could not be checked, not that its boot subvolumes
+#     were not updated, which this step never does for one. "Not mounted",
 #     and a path that is not there, stay a quiet skip (bd
 #     DAS-Backup-Manager-jlsz; tests/test_early_exit_readers.sh).
 #   - A pid is ASCII digits (v4.11.3): maintenance_holder() matches the pid in
@@ -1944,20 +1946,26 @@ update_boot_subvolumes() {
         # 127), no descriptor free for its redirection — as "not mounted": the
         # target was skipped, counted as neither skipped nor failed, and the
         # step recorded OK, 0 updated, 0 skipped (bd DAS-Backup-Manager-jlsz,
-        # -hhow).
+        # -hhow). A mirror counts the same way, and says what happened to it:
+        # this step never updates a mirror's boot subvolumes, so "NOT updated"
+        # would misstate the consequence — it could not be checked.
+        local mount_role="${MOUNT_ROLES[$mnt]:-}"
         probe_state "$mnt"
         case "$PROBE_STATE" in
             mounted) ;;
             not-mounted) continue ;;
             *)
-                log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY; its boot subvolumes were NOT updated"
+                if [[ "$mount_role" == "mirror" ]]; then
+                    log_error "  Could not tell whether $mnt, a mirror, is mounted — $PROBE_WHY; it could not be checked (its boot subvolumes are never updated here)"
+                else
+                    log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY; its boot subvolumes were NOT updated"
+                fi
                 (( failed += 1 ))
                 continue
                 ;;
         esac
 
         # Skip mirror targets — they have their own OS installations
-        local mount_role="${MOUNT_ROLES[$mnt]:-}"
         if [[ "$mount_role" == "mirror" ]]; then
             log_info "  [$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")] Skipping mirror target (independent OS)"
             (( skipped += 1 ))
