@@ -946,7 +946,7 @@ NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/renamed-root.２０２６
 # non-ASCII digit there, or these checks could not fail.
 not_run=""
 probe_digit='٢'
-if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then
+if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
     for name in NONASCII_ARABIC NONASCII_FULLWIDTH; do
         printf '%s\n' "${!name}" >"$WORK/$name.txt"
         check "en_US.UTF-8, the only btrbk-like name has non-ASCII digits ($name): the quiet skip" \
@@ -961,6 +961,99 @@ else
     not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
     echo "NOT RUN: $not_run"
 fi
+
+# ---------------------------------------------------------------------------
+echo "== backup-verify.sh: report_sector_attr, a count is ASCII digits (bd 1bsx)"
+# ---------------------------------------------------------------------------
+# The same locale effect as above, at the SMART check: under en_US.UTF-8 bash's
+# regex [0-9] also matches digits of other scripts and superscripts, so a
+# reallocated or pending sector "count" written with one was printed in yellow
+# as a number and returned success. It is a reading no one can use: UNKNOWN,
+# and a nonzero return, like any other value that is not a number.
+extract backup-verify.sh report_sector_attr 'unparsable value'
+
+run_sector_attr() { # run_sector_attr <value> [locale]: "<status>|<what it printed>"
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/report_sector_attr.sh"
+        RED='<red>' GREEN='<green>' YELLOW='<yellow>' NC='<end>'
+        if [[ -n "${2:-}" ]]; then
+            export LC_ALL="$2"
+        fi
+        rc=0
+        out="$(report_sector_attr "Pending Sectors" "$1")" || rc=$?
+        printf '%s|%s\n' "$rc" "$out"
+    )
+}
+check "sector attribute 0: green" "$(run_sector_attr 0)" "0|  Pending Sectors: <green>0<end>"
+check "sector attribute 7: a count, in yellow" "$(run_sector_attr 7)" "0|  Pending Sectors: <yellow>7<end>"
+check "sector attribute, smartctl failed: UNKNOWN, nonzero" "$(run_sector_attr SMARTCTL_FAILED)" \
+    "1|  Pending Sectors: <red>UNKNOWN (smartctl could not read this device)<end>"
+check "sector attribute, not reported: UNKNOWN, nonzero" "$(run_sector_attr NOT_PRESENT)" \
+    "1|  Pending Sectors: <red>UNKNOWN (attribute not reported by this device)<end>"
+check "sector attribute 12x: unparsable, nonzero" "$(run_sector_attr 12x)" \
+    "1|  Pending Sectors: <red>UNKNOWN (unparsable value: 12x)<end>"
+
+ARABIC_THREE=$'\xd9\xa3'
+SUPERSCRIPT_TWO=$'\xc2\xb2'
+if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
+    for digit in "$ARABIC_THREE" "$SUPERSCRIPT_TWO" "1$ARABIC_THREE"; do
+        check "en_US.UTF-8, sector attribute '$digit': unparsable, not a count" \
+            "$(run_sector_attr "$digit" en_US.UTF-8)" \
+            "1|  Pending Sectors: <red>UNKNOWN (unparsable value: $digit)<end>"
+    done
+    check "en_US.UTF-8, sector attribute 7: still a count" \
+        "$(run_sector_attr 7 en_US.UTF-8)" "0|  Pending Sectors: <yellow>7<end>"
+else
+    not_run+="${not_run:+; }the en_US.UTF-8 sector-attribute cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "NOT RUN: the en_US.UTF-8 sector-attribute cases"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== no bracket range in a regex match anywhere in the shell sources (bd 1bsx)"
+# ---------------------------------------------------------------------------
+# bash's regex follows the locale's collation. Under en_US.UTF-8 a range such
+# as [0-9] or [1-9] matches about 1,000 characters beyond ASCII digits and
+# [A-Za-z] about 2,200 beyond ASCII letters (all 1.1 million non-ASCII code
+# points were tried), where [[:digit:]] matches none. [[:alpha:]] is no
+# substitute for letters — it is every letter the locale has — so they are
+# listed. Five matches that read a guard, a pid, a bay number, a SMART value
+# and an archive name were found with the range in them; none may return.
+# A regex match here is the text after =~ on a line, or after the = of a *_RE
+# or re variable's assignment; comment lines are skipped. A deliberate use
+# carries "locale-range-ok" on its line: the probes that decide whether a
+# locale shows the effect at all.
+range_lint() { # range_lint <files>: file:line: text, for each offender
+    LC_ALL=C awk '
+        /^[ \t]*#/ { next }
+        /locale-range-ok/ { next }
+        match($0, /=~|_RE=|[ \t]re=/) {
+            if (substr($0, RSTART) ~ /\[[^]]*[0-9A-Za-z]-[0-9A-Za-z][^]]*\]/) {
+                print FILENAME ":" FNR ": " $0
+            }
+        }' "$@"
+}
+# The lint must be able to say no. A planted range in a regex match is found;
+# the forms that look alike and are not — [[:digit:]], an array subscript
+# before the =~, a comment line, a marked probe — are not.
+{
+    printf '%s\n' '[[ $x =~ ^[0-9]+$ ]]'    # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $x =~ ^[A-Za-z]+$ ]]' # locale-range-ok: lint fixture
+    printf '%s\n' 'local re="^[a-f0-9]+$"'  # locale-range-ok: lint fixture
+} >"$WORK/lint-bad.sh"
+{
+    printf '%s\n' '[[ $x =~ ^[[:digit:]]+$ ]]'
+    printf '%s\n' 'declare -A m=([hdd-media]=1); [[ $y =~ $m ]]'
+    printf '%s\n' '# [[ $x =~ ^[0-9]+$ ]] in a comment' # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $x =~ [0-9] ]] # locale-range-ok: a probe'
+} >"$WORK/lint-ok.sh"
+check "the range lint finds a planted digit range, letter range and hex range in a variable" "$(range_lint "$WORK/lint-bad.sh" | wc -l)" "3"
+check "the range lint passes [[:digit:]], a subscript, a comment and a marked probe" "$(range_lint "$WORK/lint-ok.sh" | wc -l)" "0"
+shell_sources=("$ROOT"/scripts/*.sh "$ROOT"/.github/scripts/*.sh "$ROOT"/packaging/appimage/*.sh "$ROOT"/tests/*.sh)
+[[ -e "${shell_sources[0]}" && -e "${shell_sources[${#shell_sources[@]} - 1]}" ]] || harness_broken "a source glob matched nothing"
+left="$(range_lint "${shell_sources[@]}" | sed "s|^$ROOT/||")"
+check "no bracket range in a regex match under scripts/, .github/scripts/, packaging/, tests/" "${left:-none}" "none"
 
 # ---------------------------------------------------------------------------
 echo "== no producer | grep -q left in scripts/"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.3.3
-# Date: 2026-10-04
+# Version: 2.3.4
+# Date: 2026-10-05
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
 #     --run refuses unless every drive's most recent SMART self-test PASSED:
@@ -454,7 +454,10 @@ derive_esp_label() {
 
     # Bay number lives in the target's display_name, e.g.
     #   "2TB Recovery A (Bay 1, ZK208Q77)"
-    if [[ "$display" =~ [Bb]ay[[:space:]]+([0-9]+) ]]; then
+    # [[:digit:]], not [0-9]: under en_US.UTF-8 bash's regex [0-9] also matches
+    # digits of other scripts and superscripts, and the number becomes part of
+    # a FAT label, written to a disk (bd DAS-Backup-Manager-1bsx).
+    if [[ "$display" =~ [Bb]ay[[:space:]]+([[:digit:]]+) ]]; then
         bay="${BASH_REMATCH[1]}"
     fi
 

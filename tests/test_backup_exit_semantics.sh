@@ -618,9 +618,11 @@ locks_free() {
 # parentheses and may itself hold spaces and parentheses.
 pid_alive() {
     local stat state
-    # Digits only. "" would read /proc/stat, and 0 is no process: `kill -0 0`
-    # signals the caller's own group and always succeeds.
-    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+    # ASCII digits only, none leading. "" would read /proc/stat, and 0 is no
+    # process: `kill -0 0` signals the caller's own group and always succeeds.
+    # [[:digit:]], not [0-9] or [1-9]: under en_US.UTF-8 bash's regex ranges
+    # also match digits of other scripts (bd DAS-Backup-Manager-1bsx).
+    [[ "${1:-}" =~ ^[[:digit:]]+$ && "$1" != 0* ]] || return 1
     # No /proc entry: reaped, or gone since the caller noted it. The braces
     # silence bash's own "No such file"; on the assignment alone it leaks.
     { stat="$(<"/proc/$1/stat")"; } 2>/dev/null || return 1

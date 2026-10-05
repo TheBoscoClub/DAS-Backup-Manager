@@ -69,6 +69,24 @@ expect_contains() {
     fi
 }
 
+# Characters of other scripts, as bytes (bd DAS-Backup-Manager-1bsx): under
+# en_US.UTF-8 bash's regex ranges [0-9] and [A-Za-z] match them. A case about
+# that needs a locale where bash's own range does, or it could not fail: where
+# it does not (C and C.UTF-8 show nothing; this host's CI container has no
+# en_US) the case is NOT RUN, said at the end, never passed.
+ARABIC_THREE=$'\xd9\xa3'
+SUPERSCRIPT_TWO=$'\xc2\xb2'
+E_ACUTE=$'\xc3\xa9'
+NOT_RUN=""
+# shellcheck disable=SC2030,SC2031  # the LC_ALL set in a probe stays in its subshell
+locale_widens_digits() {
+    (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null # locale-range-ok: the probe
+}
+# shellcheck disable=SC2030,SC2031  # the LC_ALL set in a probe stays in its subshell
+locale_widens_letters() {
+    (export LC_ALL=en_US.UTF-8; [[ $E_ACUTE =~ [A-Za-z] ]]) 2>/dev/null # locale-range-ok: the probe
+}
+
 # ---------------------------------------------------------------------------
 # The stubs. Quoted heredocs: nothing here is expanded by this shell.
 # ---------------------------------------------------------------------------
@@ -402,6 +420,20 @@ for bad in "0" "a b" "1 2 3" "-1 0" "1.5 2" ""; do
     expect "PACMAN_RETRY_WAITS='$bad': exit status" 2 "$RC"
     expect "PACMAN_RETRY_WAITS='$bad': pacman never called" "" "$(kinds)"
 done
+# A whole number of seconds is ASCII digits: [0-9] in bash's regex also matches
+# digits of other scripts and superscripts under en_US.UTF-8, which passed the
+# guard and let the install run on a wait nobody can sleep.
+if locale_widens_digits; then
+    for bad in "$ARABIC_THREE $ARABIC_THREE" "$SUPERSCRIPT_TWO 0" "1 1$ARABIC_THREE"; do
+        run_std "PACMAN_RETRY_WAITS=$bad" LC_ALL=en_US.UTF-8 -- "${PKGS[@]}"
+        expect "en_US.UTF-8, PACMAN_RETRY_WAITS='$bad': exit status" 2 "$RC"
+        expect "en_US.UTF-8, PACMAN_RETRY_WAITS='$bad': pacman never called" "" "$(kinds)"
+    done
+    run_std "PACMAN_RETRY_WAITS=0 0" LC_ALL=en_US.UTF-8 -- "${PKGS[@]}"
+    expect "en_US.UTF-8, ASCII waits '0 0': exit status" 0 "$RC"
+else
+    NOT_RUN+="${NOT_RUN:+; }wait guard: bash's [0-9] matches no non-ASCII digit here (en_US.UTF-8 missing?)"
+fi
 end_case
 
 new_case "usage: no packages is an error; pacman missing from PATH is an error"
@@ -500,6 +532,33 @@ run_std -- "${PKGS[@]}"
 expect "a second HOST was added" "$FASTLY $FASTLY $GEO" "$(enabled_hosts)"
 end_case
 
+new_case "mirror guard: a URL scheme is ASCII — letters, digits, + - . — and nothing else"
+# The scheme of a Server line starts with a letter and goes on with letters,
+# digits, "+", "-" and ".". The control line uses every one of those, so a
+# class that lost one would read it as no host and add a mirror. The other line
+# has an accented letter for a scheme: under en_US.UTF-8 bash's regex [A-Za-z]
+# also matches it, so it counted as a second host and no mirror was added.
+# shellcheck disable=SC2016  # pacman variables, literal here
+printf '%s\n' \
+    'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' \
+    'Server = a1+b-c.d://control.example.net/$repo/os/$arch' \
+    >"$ROOT/etc/pacman.d/mirrorlist"
+run_std LC_ALL=C -- "${PKGS[@]}"
+expect "ASCII scheme with + - . and a digit: a host, so nothing is added" "$FASTLY control.example.net" "$(enabled_hosts)"
+if locale_widens_letters; then
+    # shellcheck disable=SC2016  # pacman variables, literal here
+    printf '%s\n' \
+        'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' \
+        "Server = ${E_ACUTE}s://accented.example.net"'/$repo/os/$arch' \
+        >"$ROOT/etc/pacman.d/mirrorlist"
+    run_std LC_ALL=en_US.UTF-8 -- "${PKGS[@]}"
+    expect "en_US.UTF-8, an accented scheme is no host: the second mirror is added" \
+        "$FASTLY accented.example.net $GEO" "$(enabled_hosts)"
+else
+    NOT_RUN+="${NOT_RUN:+; }scheme class: bash's [A-Za-z] matches no non-ASCII letter here (en_US.UTF-8 missing?)"
+fi
+end_case
+
 new_case "mirror guard: a list with no final newline gets its addition on its own line"
 # shellcheck disable=SC2016  # pacman variables, literal here
 printf '%s' 'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' >"$ROOT/etc/pacman.d/mirrorlist"
@@ -596,6 +655,9 @@ expect "Arch container jobs == calls to the script" "$arch_jobs" "$wrapper_calls
 end_case
 
 printf '\n'
+if [[ -n "$NOT_RUN" ]]; then
+    echo "NOT RUN: $NOT_RUN"
+fi
 if ((FAILS == 0)); then
     echo "OK — $PASSES checks passed: pacman-install.sh retries boundedly, rotates a bad first mirror, and never passes on exhausted attempts."
     exit 0
