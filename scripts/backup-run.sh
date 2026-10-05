@@ -1,9 +1,60 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.11.1
+# Version: 4.11.2
 # Date: 2026-10-04
 #
 # Features:
+#   - "DAS can be safely disconnected" only on knowledge (v4.11.2, with the
+#     entry below): the target unmount gate asks probe_mount_point, which
+#     tells "not mounted" from "could not tell". A mountpoint error on a
+#     target used to read as "not mounted": the target was skipped, the report
+#     said "Unmount targets OK", the run exited 0 and said the DAS could be
+#     safely disconnected while a drive was still mounted — on a link going
+#     bad, the operator might pull it on that word. "Could not tell" now
+#     FAILS the gate whatever happens next (exit 3, FAILURES DETECTED), the
+#     unmount is tried anyway, and the run says the DAS is NOT safe to
+#     disconnect and why: the detail names each target not known to be
+#     released — "still mounted: …", or "could not tell whether … is
+#     mounted — <the probe's message>; umount then succeeded" (or "failed
+#     too") — in the report row, the history row and the last line. An
+#     absent drive's mount point, removed on purpose, answers mountpoint 1
+#     "No such file or directory" like an error, and is not one: the gate
+#     passes. The last line claims safe only on the gate's own OK, never by
+#     default (bd DAS-Backup-Manager-jug6; tests/test_unmount_all.sh,
+#     tests/test_backup_exit_semantics.sh).
+#   - A run unmounts only the source volumes it mounted (v4.11.2): a run never
+#     owns a mount it found in place. mount_sources() records each mount point
+#     it mounts, once however many sources share it (nvme and nvme-vm share
+#     /.btrfs-nvme), and unmount_all() unmounts those and nothing else, last
+#     mounted first, each once, on every way out: the end of main(), and
+#     cleanup() after an abort or a stop, dry runs alike. A source volume
+#     already mounted when the run looks is used as found, and the log says
+#     so; one fstab declares but the run finds unmounted is said too, as
+#     INFO, since only the run's helper then stands in for fstab's mount. The
+#     run used to unmount every source: since cb5937b turned the old cleanup
+#     of its own helper mounts into "unmount every source", the first run
+#     after a boot took down the fstab mounts /.btrfs-nvme, /.btrfs-ssd and
+#     /.btrfs-hdd, down until the next boot (each later run mounting and
+#     unmounting them itself), and every run tried /dasRaid0, the operator's
+#     general-use filesystem. That failed every night with a WARN that could
+#     not say why: umount's message went to /dev/null. The nested fstab mount
+#     /dasRaid0/VirtualMachines pinned it, not running VMs as the comment
+#     said: umount refuses a mount with another mounted beneath it (reproduced
+#     on this kernel, 2026-10-04), and that night no VM ran and no process
+#     held /dasRaid0. A helper mount that will not unmount is still a WARN,
+#     not a FAIL and not part of the disconnect gate, now with umount's own
+#     message. The probe before each unmount (probe_mount_point) tells "not
+#     mounted" from "could not tell": mountpoint's error read as "not
+#     mounted" struck the run's helper off its record and left it mounted,
+#     with nothing said; now the run says it could not tell, with the probe's
+#     message, and unmounts anyway (review F1). The record is written before
+#     mount runs, and a test now holds it there: a stop while mount runs
+#     still takes the mount down (review F2). Source verification is
+#     unchanged: a source found mounted must still be the expected
+#     filesystem at its top level, or the run aborts (3) — and now leaves the
+#     mount it refused as it found it. The Rust path's MountGuard already
+#     left a pre-existing source mount alone (bd DAS-Backup-Manager-8cf;
+#     tests/test_unmount_all.sh, tests/test_backup_exit_semantics.sh).
 #   - No external hostname program (v4.11.1): the report's Host: line (the
 #     full report's and the ABORTED one's), the mail subject and the From
 #     display name read bash's own $HOSTNAME, and the short name is
@@ -666,6 +717,15 @@ REPORT_SAVED="false"
 # label. Declared here, empty, so the abort report can read it under set -u
 # even when the run stopped before detection.
 declare -A TARGET_AVAILABLE=()
+# The source mount points THIS run mounted and has not unmounted yet, in the
+# order it mounted them: one entry per mount point, however many sources
+# share it (nvme and nvme-vm share /.btrfs-nvme). unmount_all() unmounts
+# these and nothing else. A source volume already mounted when
+# mount_sources() looked — an fstab mount such as /dasRaid0 or the /.btrfs-*
+# top levels, or one made by hand — is used as found and is never this run's
+# to unmount (bd DAS-Backup-Manager-8cf). Kept apart from SOURCE_VOLUMES,
+# which the reload after subvolume sync declares anew.
+SOURCE_MOUNTS_OWNED=()
 
 # Colors for interactive output
 RED='\033[0;31m'
@@ -1021,6 +1081,33 @@ create_mount_points() {
     done
 }
 
+# Whether this run mounted <mount point> and still holds it.
+owns_source_mount() { # owns_source_mount <mount point>
+    local m
+    for m in "${SOURCE_MOUNTS_OWNED[@]}"; do
+        if [[ "$m" == "$1" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Strike <mount point> from what this run holds: it is unmounted, or the
+# mount that was to make it the run's failed.
+disown_source_mount() { # disown_source_mount <mount point>
+    local m
+    local -a kept=()
+    for m in "${SOURCE_MOUNTS_OWNED[@]}"; do
+        if [[ "$m" != "$1" ]]; then
+            kept+=("$m")
+        fi
+    done
+    SOURCE_MOUNTS_OWNED=("${kept[@]}")
+}
+
+# Mount each source volume that is not mounted, at its top level, and record
+# each mount point this run mounts in SOURCE_MOUNTS_OWNED — the only source
+# mounts unmount_all() ever takes down (bd DAS-Backup-Manager-8cf).
 mount_sources() {
     log_info "Mounting source top-level volumes..."
 
@@ -1029,33 +1116,57 @@ mount_sources() {
     for label in "${!SOURCE_VOLUMES[@]}"; do
         mnt="${SOURCE_VOLUMES[$label]}"
         dev="${SOURCE_DEVICES[$label]}"
-        if ! mountpoint -q "$mnt"; then
-            opts=(-o subvolid=5)
-            if [[ "$dev" == UUID=* ]]; then
-                # UUID-based mount (stable across device letter changes)
-                opts=(-t btrfs -o subvolid=5)
+        if mountpoint -q "$mnt"; then
+            # Mounted already: by this run, for another source on the same
+            # mount point, or before the run, by fstab or by hand. One found
+            # mounted is used as found and never unmounted by this run;
+            # verify_sources_before_write() still requires it to be the
+            # expected filesystem at its top level, or the run aborts.
+            if ! owns_source_mount "$mnt"; then
+                log_info "  $label: $mnt was already mounted — used as found; this run will not unmount it"
             fi
-            # A source that will not mount ends the run (3: a source's state
-            # the next start meets again), named: which source, its device
-            # and mount's own message. Left to set -e, the report and the
-            # history said only `mount -t btrfs -o subvolid=5 "$dev" "$mnt"`,
-            # unexpanded (bd DAS-Backup-Manager-d1r, round 3: M4).
-            mount_rc=0
-            mount_err="$(mount "${opts[@]}" "$dev" "$mnt" 2>&1)" || mount_rc=$?
-            if ((mount_rc != 0)); then
-                log_error "Cannot mount source $label ($dev) at $mnt — mount exited $mount_rc: ${mount_err:-no message}"
-                abort_reason "source mount" "$label: $dev at $mnt: mount exited $mount_rc: ${mount_err:-no message}"
-                exit 3
-            fi
-            # A mount that succeeds can still have something to say —
-            # util-linux's "source write-protected, mounted read-only" — and
-            # it used to reach the journal on its own. Captured above, it is
-            # passed on (bd DAS-Backup-Manager-d1r, round 4: N1).
-            if [[ -n "$mount_err" ]]; then
-                log_warn "  mount said, mounting $label ($dev) at $mnt: ${mount_err//$'\n'/; }"
-            fi
-            log_info "  Mounted $label at $mnt"
+            continue
         fi
+        # fstab may declare this mount point (it declares the /.btrfs-* top
+        # levels). Then fstab's own mount is missing, and only this run's
+        # helper stands in for it, until the run takes it down. Said, not
+        # warned: restoring it is the operator's, not the backup's. Display
+        # only: a query that fails says nothing.
+        if findmnt --fstab -n -o TARGET --mountpoint "$mnt" >/dev/null 2>&1; then
+            log_info "  $label: fstab mounts $mnt at boot, but it was not mounted — this run mounts a helper there and takes it down at the end"
+        fi
+        opts=(-o subvolid=5)
+        if [[ "$dev" == UUID=* ]]; then
+            # UUID-based mount (stable across device letter changes)
+            opts=(-t btrfs -o subvolid=5)
+        fi
+        # The run's from here, recorded BEFORE mount runs: a stop that lands
+        # while it runs (`systemctl stop` signals every process of the unit)
+        # still finds it, and unmount_all() takes down a recorded mount point
+        # only while it is one. A mount that fails is struck off again before
+        # the abort, so cleanup() leaves alone whatever is mounted there.
+        SOURCE_MOUNTS_OWNED+=("$mnt")
+        # A source that will not mount ends the run (3: a source's state
+        # the next start meets again), named: which source, its device
+        # and mount's own message. Left to set -e, the report and the
+        # history said only `mount -t btrfs -o subvolid=5 "$dev" "$mnt"`,
+        # unexpanded (bd DAS-Backup-Manager-d1r, round 3: M4).
+        mount_rc=0
+        mount_err="$(mount "${opts[@]}" "$dev" "$mnt" 2>&1)" || mount_rc=$?
+        if ((mount_rc != 0)); then
+            disown_source_mount "$mnt"
+            log_error "Cannot mount source $label ($dev) at $mnt — mount exited $mount_rc: ${mount_err:-no message}"
+            abort_reason "source mount" "$label: $dev at $mnt: mount exited $mount_rc: ${mount_err:-no message}"
+            exit 3
+        fi
+        # A mount that succeeds can still have something to say —
+        # util-linux's "source write-protected, mounted read-only" — and
+        # it used to reach the journal on its own. Captured above, it is
+        # passed on (bd DAS-Backup-Manager-d1r, round 4: N1).
+        if [[ -n "$mount_err" ]]; then
+            log_warn "  mount said, mounting $label ($dev) at $mnt: ${mount_err//$'\n'/; }"
+        fi
+        log_info "  Mounted $label at $mnt"
     done
 }
 
@@ -1073,10 +1184,12 @@ mount_sources() {
 # create_snapshot_dirs() had run at least once while /.btrfs-hdd was unmounted,
 # writing to the bare mountpoint. It stayed bounded to an empty directory only
 # because btrbk then finds no source subvolumes and exits nonzero rather than
-# filling /. This script UNMOUNTS the source volumes at the end of every run,
-# so between runs these paths ARE bare and anything writing to them lands on
-# the root filesystem. Tracks bd DAS-Backup-Manager-zlv (source-side sibling of
-# bd DAS-Backup-Manager-9on).
+# filling /. This script unmounts at the end of every run the source volumes
+# it mounted itself (bd DAS-Backup-Manager-8cf), so between runs a source path
+# that nothing else mounts IS bare, and anything writing to it lands on the
+# root filesystem. And a source found mounted is used as found, so whatever
+# it holds must be checked as well. Tracks bd DAS-Backup-Manager-zlv
+# (source-side sibling of bd DAS-Backup-Manager-9on).
 #
 # Two checks, and the ORDER matters:
 #
@@ -1984,6 +2097,35 @@ run_archive_cleanup() {
     fi
 }
 
+# Whether <path> is a mount point, as mountpoint(1) answers it, with its two
+# kinds of "no" kept apart. util-linux exits 0 for a mount point, 32 for a
+# path that is not one, and 1 for a usage, permission or system error — and
+# 1 as well for a path that does not exist (measured, util-linux 2.42.4).
+# Returns 0 mounted, 1 not mounted, 2 could not tell, and for "could not
+# tell" prints the probe's own message. A path that does not exist is not
+# mounted (nothing can be mounted where there is nothing), and an
+# unavailable target's mount point is removed on purpose (create_mount_points),
+# so it is told from an error by mountpoint's message, read in the C locale;
+# any other answer is "could not tell". Read as "not mounted", an error left
+# the run's own source mount behind with nothing said (bd
+# DAS-Backup-Manager-8cf, review F1), and passed the target unmount gate
+# while a drive was mounted, so the run said the DAS could be disconnected
+# (bd DAS-Backup-Manager-jug6).
+probe_mount_point() { # probe_mount_point <path>
+    local rc=0 err
+    err="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null)" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        32) return 1 ;;
+    esac
+    if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
+        return 1
+    fi
+    err="${err//$'\n'/; }"
+    printf '%s (exit %s)\n' "${err:-mountpoint printed nothing}" "$rc"
+    return 2
+}
+
 # The same budget as the Rust path (mount.rs UMOUNT_ATTEMPTS / _RETRY_PAUSE).
 UMOUNT_ATTEMPTS=5
 UMOUNT_RETRY_PAUSE=2
@@ -2010,55 +2152,113 @@ umount_with_retry() {
 unmount_all() {
     log_info "Unmounting volumes..."
 
-    local -a failed_mounts=()
+    local -a still_mounted=() not_known=()
 
     # Unmount DAS backup targets in reverse order (0-based indexing). Every
     # configured mountpoint is attempted regardless of an earlier failure (a
-    # stuck unmount must not mask the rest). A path that mountpoint(1) does
-    # not consider mounted is skipped, not counted as a failure — the same
+    # stuck unmount must not mask the rest). A path the probe says is not a
+    # mount point, or that is not there at all (an absent target's, removed
+    # by create_mount_points), is skipped, not counted as a failure — the same
     # filesystem may legitimately be mounted elsewhere too (e.g. udisks under
     # /run/media), only this script's own mountpoints matter here. These
     # target mountpoints are the only thing that gates the "safe to
-    # disconnect" claim below — they are the physical DAS enclosure.
+    # disconnect" claim in main() — they are the physical DAS enclosure.
+    #
+    # So the gate passes only on knowledge: a target the probe cannot tell
+    # about FAILS it, whatever happens next — the run then says it is NOT
+    # safe to disconnect, and why. The unmount is tried anyway, so whatever
+    # was mounted there is taken down if it can be, and the detail says what
+    # umount did. A probe error used to read as "not mounted": the target
+    # was skipped, the gate passed, and the run said the DAS could be
+    # disconnected while a drive was mounted (bd DAS-Backup-Manager-jug6).
+    local mnt target_rc target_why
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
-        local mnt="${ALL_TARGET_MOUNTS[$i]}"
-        if ! mountpoint -q "$mnt" 2>/dev/null; then
+        mnt="${ALL_TARGET_MOUNTS[$i]}"
+        target_rc=0
+        target_why="$(probe_mount_point "$mnt")" || target_rc=$?
+        case "$target_rc" in
+            0)
+                if ! umount_with_retry "$mnt"; then
+                    log_error "  Failed to unmount $mnt"
+                    still_mounted+=("$mnt")
+                fi
+                ;;
+            1) ;;
+            *)
+                log_error "  Could not tell whether $mnt is mounted — $target_why; unmounting it anyway"
+                if umount_with_retry "$mnt"; then
+                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount then succeeded")
+                else
+                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount failed too")
+                fi
+                ;;
+        esac
+    done
+
+    # Sources: only the mount points this run mounted itself
+    # (SOURCE_MOUNTS_OWNED, recorded by mount_sources), last mounted first,
+    # each once — however many sources share one. A source volume that was
+    # already mounted when the run looked (fstab mounts /dasRaid0 and the
+    # /.btrfs-* top levels) was used as found and is never unmounted here: the
+    # run reads from it and owns nothing about it (bd DAS-Backup-Manager-8cf).
+    # One unmounted is struck off, so a second pass — cleanup() after an
+    # abort that follows main()'s own call — neither repeats it nor touches a
+    # mount someone else has made there since. One the probe says is not
+    # mounted is struck off as well, untouched, and said. One the probe
+    # cannot tell about is said, with the probe's message, and unmounted
+    # anyway: umount's own answer decides (8cf review, F1).
+    #
+    # Best effort, deliberately NOT tracked via record_op and NOT part of the
+    # disconnect gate above: sources are host filesystems, not the removable
+    # DAS enclosure, so one left mounted has no bearing on whether the DAS is
+    # safe to disconnect. A helper mount that will not unmount is a WARN with
+    # umount's own message (which used to be discarded), is left as it is,
+    # and stays the run's, for a later pass to try again.
+    local -a owned=("${SOURCE_MOUNTS_OWNED[@]}")
+    local src_mnt umount_err probe_rc probe_why left
+    for (( i=${#owned[@]}-1; i>=0; i-- )); do
+        src_mnt="${owned[$i]}"
+        probe_rc=0
+        probe_why="$(probe_mount_point "$src_mnt")" || probe_rc=$?
+        if ((probe_rc == 1)); then
+            disown_source_mount "$src_mnt"
+            log_info "  Source volume $src_mnt, recorded as this run's, is not mounted now — nothing to unmount"
             continue
         fi
-        if ! umount_with_retry "$mnt"; then
-            log_error "  Failed to unmount $mnt"
-            failed_mounts+=("$mnt")
+        left="left mounted"
+        if ((probe_rc != 0)); then
+            log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $probe_why; unmounting it anyway"
+            left="left as it is"
+        fi
+        if umount_err="$(umount "$src_mnt" 2>&1)"; then
+            disown_source_mount "$src_mnt"
+            log_info "  Unmounted source volume $src_mnt (this run mounted it)"
+        else
+            umount_err="${umount_err//$'\n'/; }"
+            log_warn "  Could not unmount source volume $src_mnt, which this run mounted: ${umount_err:-no message} — $left; best effort, not a DAS disconnect concern"
         fi
     done
 
-    # Unmount sources — best-effort only, deliberately NOT tracked via
-    # record_op and NOT part of the disconnect gate above. Sources are host
-    # filesystems (NVMe/SSD/HDD/das-storage), not part of the removable DAS
-    # enclosure, so a stuck source unmount has no bearing on whether the DAS
-    # is safe to disconnect. Some sources are host-managed mounts this
-    # script did not create and can legitimately stay busy for reasons
-    # unrelated to backup — das-storage on /dasRaid0 is a real example: it
-    # hosts running libvirt VMs and can never unmount while any are up,
-    # which would otherwise fire a FAIL on every single nightly run. Still
-    # logged (not silently swallowed) so a genuinely stuck source is visible
-    # in the journal rather than invisible.
-    for label in "${!SOURCE_VOLUMES[@]}"; do
-        local src_mnt="${SOURCE_VOLUMES[$label]}"
-        if ! mountpoint -q "$src_mnt" 2>/dev/null; then
-            continue
+    # The detail says why, for each target not known to be released: still
+    # mounted, or the probe could not tell. The report shows it beside
+    # "Unmount targets", the history row in its errors, and main() after
+    # "NOT safe to disconnect".
+    if (( ${#still_mounted[@]} + ${#not_known[@]} > 0 )); then
+        local detail="" item
+        if (( ${#still_mounted[@]} > 0 )); then
+            detail="still mounted: ${still_mounted[0]}"
+            for item in "${still_mounted[@]:1}"; do
+                detail+=", $item"
+            done
         fi
-        if ! umount "$src_mnt" 2>/dev/null; then
-            log_warn "  Could not unmount source $label ($src_mnt) — untracked, not a DAS disconnect concern"
-        fi
-    done
-
-    if (( ${#failed_mounts[@]} > 0 )); then
-        local detail="${failed_mounts[*]}"
+        for item in "${not_known[@]}"; do
+            detail+="${detail:+; }$item"
+        done
         record_op "unmount" "FAIL" "$detail"
-        log_error "Unmount FAILED for: $detail"
+        log_error "Unmount FAILED — $detail"
     else
         record_op "unmount" "OK"
-        log_info "All volumes unmounted"
+        log_info "All backup targets unmounted"
     fi
 }
 
@@ -2497,7 +2697,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.11.1
+  backup-run.sh v4.11.2
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
@@ -3454,10 +3654,13 @@ main() {
 
     log_info "=== DAS Backup Completed ==="
     echo ""
-    if [[ "${OP_STATUS[unmount]:-OK}" == "FAIL" ]]; then
-        log_warn "Backup complete, but NOT all volumes unmounted cleanly — DAS is NOT safe to disconnect (still mounted: ${OP_STATUS[unmount_detail]:-unknown})."
-    else
+    # Safe only on the unmount gate's own OK: a FAIL — a target still
+    # mounted, or one the probe could not tell about — or no answer at all is
+    # NOT safe, and the line says why (bd DAS-Backup-Manager-jug6).
+    if [[ "${OP_STATUS[unmount]:-}" == "OK" ]]; then
         log_info "Backup complete. DAS can be safely disconnected."
+    else
+        log_warn "Backup complete, but NOT every backup target is known to be unmounted — DAS is NOT safe to disconnect: ${OP_STATUS[unmount_detail]:-the unmount step recorded no result}"
     fi
 
     # ---- Process exit status: 0 or 3 (EXIT STATUS in the header) ----------

@@ -47,6 +47,20 @@
 # run status and the report, so a counter failure reads FAILURES DETECTED in
 # the report, the history and the exit status alike.
 #
+# Source volumes (bd DAS-Backup-Manager-8cf): a run unmounts only the source
+# mount points it mounted itself, each once, on every way out — a stop while
+# mount runs included. One already mounted when it starts — as fstab mounts
+# /dasRaid0 and the /.btrfs-* top levels — is used as found and never
+# unmounted, and verification still refuses one that holds the wrong
+# filesystem, leaving it mounted. A probe that cannot tell is said, and the
+# helper unmounted anyway. The mountpoint stub answers as util-linux does:
+# 0 a mount point, 32 not one, 1 an error or a path that is not there.
+#
+# The disconnect claim (bd DAS-Backup-Manager-jug6): "DAS can be safely
+# disconnected" only when every target is known released. A target the
+# probe cannot tell about fails the gate — exit 3, NOT safe, and why — and a
+# clean probe or an absent drive's removed mount point changes nothing.
+#
 # Every run's mail goes to a stub mailx, which keeps each one.
 #
 # How: the REAL script runs end to end — its EXIT trap, cleanup() and its
@@ -297,9 +311,19 @@ fi
 if listed mount_warns "$dst"; then
     echo "mount: $dst: WARNING: source write-protected, mounted read-only." >&2
 fi
+# A stop that lands while mount runs: block (until the test signals the run)
+# before the mount is made, or after it is made.
+if listed mount_blocks_before "$dst"; then
+    : >"$S/mount_in"
+    sleep 30
+fi
 uuid="${src#UUID=}"
 listed wrong_fs_at "$dst" && uuid="a-different-filesystem"
 printf '%s\t%s\t/\n' "$dst" "$uuid" >>"$S/mounted"
+if listed mount_blocks_after "$dst"; then
+    : >"$S/mount_in"
+    sleep 30
+fi
 EOF
 
 stub umount <<'EOF'
@@ -320,24 +344,50 @@ if listed umount_fails_once "$dst" && ! listed umount_failed "$dst"; then
     echo "umount: $dst: target is busy (stub)." >&2
     exit 32
 fi
+if listed umount_fails_always "$dst"; then
+    echo "umount: $dst: target is busy (stub)." >&2
+    exit 32
+fi
 is_mounted "$dst" || { echo "umount: $dst: not mounted (stub)." >&2; exit 32; }
 awk -F'\t' -v p="$dst" '$1 != p' "$S/mounted" >"$S/mounted.new"
 mv "$S/mounted.new" "$S/mounted"
 EOF
 
+# As util-linux 2.42.4 answers (measured): 0 a mount point, 32 not one, 1 an
+# error — and 1, "No such file or directory", for a path that does not exist
+# (an absent target's mount point, which the run removes). A path listed in
+# probe_fails_after_btrbk answers an error once btrbk has run, as a probe on a
+# link that went bad mid-run might.
 stub mountpoint <<'EOF'
-is_mounted "${*: -1}"
+p="${*: -1}"
+if listed probe_fails_after_btrbk "$p" && grep -qE '(^| )(run|dryrun)$' "$S/calls/btrbk" 2>/dev/null; then
+    echo "mountpoint: $p: Input/output error (stub)" >&2
+    exit 1
+fi
+is_mounted "$p" && exit 0
+if [[ ! -e "$p" ]]; then
+    echo "mountpoint: $p: No such file or directory" >&2
+    exit 1
+fi
+exit 32
 EOF
 
 stub findmnt <<'EOF'
-cols="" target=""
+cols="" target="" fstab=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
     -o) cols="$2"; shift ;;
-    --target) target="$2"; shift ;;
+    --target | --mountpoint) target="$2"; shift ;;
+    --fstab) fstab=1 ;;
     esac
     shift
 done
+# fstab, as the knob declares it: the entry for <target>, or none (1).
+if [[ -n "$fstab" ]]; then
+    listed fstab_declares "$target" || exit 1
+    echo "$target"
+    exit 0
+fi
 # Like the real findmnt, a path that is not a mount point reports the
 # filesystem that contains it — here the root filesystem.
 uuid="root-filesystem-uuid" fsroot="/" source="/nonexistent/root-device"
@@ -1309,14 +1359,20 @@ echo "== 129/130/138/141/142/143: stopped by a signal, as \`systemctl stop\` doe
 # does, while btrbk runs. `exec` makes the background job the run itself, so
 # `wait` reports the run's status, not a subshell's death by the signal.
 run_signalled() { # run_signalled <signal> [args...]
-    local sig="$1"
-    shift
+    run_signalled_when btrbk_started "$@"
+}
+# run_signalled_when <state file> <signal> [args...]: the same, with the
+# signal sent once the stub that blocks has written <state file> —
+# btrbk_started (btrbk runs), mount_in (a source's mount runs).
+run_signalled_when() {
+    local flag="$1" sig="$2"
+    shift 2
     run_cmd "$@"
     (
         set -m # the run gets its own process group
         { exec "${CMD[@]}"; } >"$STATE/out" 2>&1 &
         pid=$!
-        for _ in $(seq 1 400); do [[ -e "$STATE/btrbk_started" ]] && break; sleep 0.05; done
+        for _ in $(seq 1 400); do [[ -e "$STATE/$flag" ]] && break; sleep 0.05; done
         kill "-$sig" -- "-$pid"
         wait "$pid"
     ) 2>/dev/null
@@ -1424,6 +1480,380 @@ check "SIGTERM while waiting: cleanup() skipped its recovery body" \
 check "SIGTERM while waiting: not recorded" "$(record_calls)" "0"
 check "SIGTERM while waiting: no mail" "$(mails)" "0"
 check "SIGTERM while waiting: nothing mounted" "$(called mount)" "no"
+
+# ---------------------------------------------------------------------------
+echo "== source volumes: a run unmounts only what it mounted (bd DAS-Backup-Manager-8cf)"
+# ---------------------------------------------------------------------------
+# A run never owns a mount it found in place. A source volume already mounted
+# when the run looks — fstab mounts the operator's general-use /dasRaid0, and
+# the /.btrfs-* top levels — is used as found and never unmounted: not at the
+# end, not by cleanup() after an abort or a stop, not in a dry run. One the
+# run mounted itself is unmounted exactly once, however many sources share
+# it. The run used to unmount every source: each night it took down the
+# /.btrfs-* fstab mounts and tried /dasRaid0. Verification is unchanged: a
+# source found mounted must still be the expected filesystem at its top
+# level, or the run aborts — leaving the mount it refused as it found it.
+DAS_STORAGE_MNT="$WORK/mnt/dasRaid0"
+
+# premount <path> <uuid> [fsroot]: mounted before the run starts, as fstab
+# mounts it at boot.
+premount() {
+    mkdir -p "$1"
+    printf '%s\t%s\t%s\n' "$1" "$2" "${3:-/}" >>"$STATE/mounted"
+}
+# calls_for <mount|umount> <path>: how many times the run called it for <path>.
+calls_for() {
+    if [[ -f "$STATE/calls/$1" ]]; then
+        awk -v p="$2" '$NF == p { n++ } END { print n + 0 }' "$STATE/calls/$1"
+    else
+        echo 0
+    fi
+}
+# second_source <label> <volume> <device>: a second source in the config.
+second_source() {
+    sed -i 's/^DAS_SOURCE_COUNT=1$/DAS_SOURCE_COUNT=2/' "$STATE/env"
+    grep -qx 'DAS_SOURCE_COUNT=2' "$STATE/env" || harness_broken "could not add a second source to $STATE/env"
+    cat >>"$STATE/env" <<EOF
+DAS_SOURCE_1_LABEL='$1'
+DAS_SOURCE_1_VOLUME='$2'
+DAS_SOURCE_1_DEVICE='$3'
+DAS_SOURCE_1_SUBVOLUMES='@data'
+DAS_SOURCE_1_SNAPSHOT_DIR='.btrbk-snapshots'
+DAS_SOURCE_1_TARGET_SUBDIRS='$1'
+EOF
+}
+# The lines that say a source was used as found / unmounted by the run.
+found_line() { grep -cF -- "$1: $2 was already mounted — used as found; this run will not unmount it" "$STATE/out"; }
+unmounted_line() { grep -cF -- "Unmounted source volume $1 (this run mounted it)" "$STATE/out"; }
+
+# --- found mounted: never the run's, on any way out ---------------------------
+fresh
+premount "$SOURCE_MNT" source-uuid
+run_backup
+check "found mounted, clean run: exit status" "$RC" "0"
+show_tail 0
+check "found mounted, clean run: report status" "$(report_status)" "ALL OPERATIONS SUCCESSFUL"
+check "found mounted, clean run: says it is used as found" "$(found_line nvme "$SOURCE_MNT")" "1"
+check "found mounted, clean run: not mounted again" "$(calls_for mount "$SOURCE_MNT")" "0"
+check "found mounted, clean run: never unmounted" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "found mounted, clean run: left as found, the targets released" "$(left_mounted)" "$SOURCE_MNT "
+check "found mounted, clean run: the DAS is safe to disconnect" \
+    "$(grep -c 'DAS can be safely disconnected' "$STATE/out")" "1"
+
+fresh
+premount "$SOURCE_MNT" source-uuid
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup
+check "found mounted, an abort: exit status" "$RC" "3"
+show_tail 3
+check "found mounted, an abort: cleanup() ran its recovery body" \
+    "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "1"
+check "found mounted, an abort: the ABORTED report" "$(mails) $(mail_status 1)" "1 ABORTED"
+check "found mounted, an abort: never unmounted" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "found mounted, an abort: left as found, the targets released" "$(left_mounted)" "$SOURCE_MNT "
+
+fresh
+premount "$SOURCE_MNT" source-uuid
+knob btrbk_blocks 1
+run_signalled TERM
+check "found mounted, SIGTERM while btrbk runs: exit status" "$RC" "143"
+show_tail 143
+check "found mounted, SIGTERM: cleanup() ran its recovery body" \
+    "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "1"
+check "found mounted, SIGTERM: never unmounted" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "found mounted, SIGTERM: left as found, the targets released" "$(left_mounted)" "$SOURCE_MNT "
+
+fresh
+premount "$SOURCE_MNT" source-uuid
+run_backup --dryrun
+check "found mounted, dry run: exit status" "$RC" "0"
+show_tail 0
+check "found mounted, dry run: btrbk dryrun ran" "$(ran_btrbk)" "yes"
+check "found mounted, dry run: says it is used as found" "$(found_line nvme "$SOURCE_MNT")" "1"
+check "found mounted, dry run: never unmounted" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "found mounted, dry run: left as found, the targets released" "$(left_mounted)" "$SOURCE_MNT "
+
+fresh
+premount "$SOURCE_MNT" source-uuid
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup --dryrun
+check "found mounted, dry run aborted: exit status" "$RC" "3"
+show_tail 3
+check "found mounted, dry run aborted: never unmounted" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "found mounted, dry run aborted: left as found, the targets released" "$(left_mounted)" "$SOURCE_MNT "
+
+# --- mounted by the run: unmounted exactly once, on every way out ---------------
+fresh
+run_backup
+check "mounted by the run, clean run: exit status" "$RC" "0"
+show_tail 0
+check "mounted by the run, clean run: mounted once" "$(calls_for mount "$SOURCE_MNT")" "1"
+check "mounted by the run, clean run: unmounted exactly once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "mounted by the run, clean run: says so" "$(unmounted_line "$SOURCE_MNT")" "1"
+check "mounted by the run, clean run: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup
+check "mounted by the run, an abort: exit status" "$RC" "3"
+show_tail 3
+check "mounted by the run, an abort: unmounted exactly once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "mounted by the run, an abort: nothing left mounted" "$(left_mounted)" "nothing"
+
+# An abort after main()'s own unmount_all: cleanup() runs it a second time,
+# which must not unmount the source again.
+fresh
+knob break_log_at_record "$WORK/log/das-backup.log"
+run_backup
+check "mounted by the run, an abort after main()'s unmount: exit status" "$RC" "3"
+show_tail 3
+check "mounted by the run, an abort after main()'s unmount: cleanup() ran its recovery body" \
+    "$(grep -c 'Cleaning up after abnormal termination' "$STATE/out")" "1"
+check "mounted by the run, an abort after main()'s unmount: still unmounted exactly once" \
+    "$(calls_for umount "$SOURCE_MNT")" "1"
+
+fresh
+knob btrbk_blocks 1
+run_signalled TERM
+check "mounted by the run, SIGTERM while btrbk runs: exit status" "$RC" "143"
+show_tail 143
+check "mounted by the run, SIGTERM: unmounted exactly once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "mounted by the run, SIGTERM: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+run_backup --dryrun
+check "mounted by the run, dry run: exit status" "$RC" "0"
+show_tail 0
+check "mounted by the run, dry run: unmounted exactly once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "mounted by the run, dry run: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup --dryrun
+check "mounted by the run, dry run aborted: exit status" "$RC" "3"
+show_tail 3
+check "mounted by the run, dry run aborted: unmounted exactly once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "mounted by the run, dry run aborted: nothing left mounted" "$(left_mounted)" "nothing"
+
+# --- two sources sharing one mount point (nvme and nvme-vm: /.btrfs-nvme) -------
+fresh
+second_source nvme-vm "$SOURCE_MNT" UUID=source-uuid
+run_backup
+check "two sources, one mount point the run mounted: exit status" "$RC" "0"
+show_tail 0
+check "two sources, one mount point the run mounted: one mount, one umount" \
+    "$(calls_for mount "$SOURCE_MNT") $(calls_for umount "$SOURCE_MNT")" "1 1"
+check "two sources, one mount point the run mounted: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+second_source nvme-vm "$SOURCE_MNT" UUID=source-uuid
+knob wrong_fs_at "$PRIMARY_MNT"
+run_backup
+check "two sources, one mount point the run mounted, an abort: exit status" "$RC" "3"
+show_tail 3
+check "two sources, one mount point the run mounted, an abort: one mount, one umount" \
+    "$(calls_for mount "$SOURCE_MNT") $(calls_for umount "$SOURCE_MNT")" "1 1"
+
+fresh
+second_source nvme-vm "$SOURCE_MNT" UUID=source-uuid
+premount "$SOURCE_MNT" source-uuid
+run_backup
+check "two sources, one mount point found mounted: exit status" "$RC" "0"
+show_tail 0
+check "two sources, one mount point found mounted: neither mounted nor unmounted" \
+    "$(calls_for mount "$SOURCE_MNT") $(calls_for umount "$SOURCE_MNT")" "0 0"
+check "two sources, one mount point found mounted: left as found" "$(left_mounted)" "$SOURCE_MNT "
+
+# --- the live layout: /dasRaid0 is fstab's, a top level the run mounts ----------
+fresh
+second_source das-storage "$DAS_STORAGE_MNT" UUID=das-storage-uuid
+premount "$DAS_STORAGE_MNT" das-storage-uuid
+run_backup
+check "live layout: exit status" "$RC" "0"
+show_tail 0
+check "live layout: /dasRaid0 neither mounted nor unmounted" \
+    "$(calls_for mount "$DAS_STORAGE_MNT") $(calls_for umount "$DAS_STORAGE_MNT")" "0 0"
+check "live layout: the helper mount made, and taken down once" \
+    "$(calls_for mount "$SOURCE_MNT") $(calls_for umount "$SOURCE_MNT")" "1 1"
+check "live layout: only /dasRaid0 left mounted" "$(left_mounted)" "$DAS_STORAGE_MNT "
+check "live layout: no unmount warning" "$(grep -c 'Could not unmount' "$STATE/out")" "0"
+
+# A source that will not mount stops the run; the one found mounted stays.
+fresh
+second_source das-storage "$DAS_STORAGE_MNT" UUID=das-storage-uuid
+premount "$DAS_STORAGE_MNT" das-storage-uuid
+knob mount_fails "$SOURCE_MNT"
+run_backup
+check "live layout, a source will not mount: exit status" "$RC" "3"
+show_tail 3
+check "live layout, a source will not mount: what aborted" "$(body_field 1 'What aborted')" "source mount"
+check "live layout, a source will not mount: /dasRaid0 never unmounted" \
+    "$(calls_for umount "$DAS_STORAGE_MNT")" "0"
+check "live layout, a source will not mount: only /dasRaid0 left mounted" "$(left_mounted)" "$DAS_STORAGE_MNT "
+
+# --- verification is unchanged: a wrong mount found in place is refused --------
+fresh
+premount "$SOURCE_MNT" a-different-filesystem
+run_backup
+check "found mounted, the wrong filesystem: exit status" "$RC" "3"
+show_tail 3
+check "found mounted, the wrong filesystem: refused" \
+    "$(grep -c 'ABORTING — refusing to write to source volumes' "$STATE/out")" "1"
+check "found mounted, the wrong filesystem: btrbk never ran" "$(ran_btrbk)" "no"
+check "found mounted, the wrong filesystem: what aborted" "$(body_field 1 'What aborted')" "source verification"
+check "found mounted, the wrong filesystem: why" \
+    "$(grep -cF -- "nvme: $SOURCE_MNT has fs UUID 'a-different-filesystem', expected 'source-uuid'" "$STATE/mail.1.body")" "1"
+check "found mounted, the wrong filesystem: not mounted over" "$(calls_for mount "$SOURCE_MNT")" "0"
+check "found mounted, the wrong filesystem: left as found" \
+    "$(calls_for umount "$SOURCE_MNT") $(left_mounted)" "0 $SOURCE_MNT "
+
+fresh
+premount "$SOURCE_MNT" source-uuid /@
+run_backup
+check "found mounted at a subvolume: exit status" "$RC" "3"
+show_tail 3
+check "found mounted at a subvolume: what aborted" "$(body_field 1 'What aborted')" "source verification"
+check "found mounted at a subvolume: why" \
+    "$(grep -cF -- "nvme: $SOURCE_MNT is mounted at subvolume '/@', expected the top-level volume '/'" "$STATE/mail.1.body")" "1"
+check "found mounted at a subvolume: left as found" \
+    "$(calls_for umount "$SOURCE_MNT") $(left_mounted)" "0 $SOURCE_MNT "
+
+# --- a helper mount that will not unmount: a WARN with umount's own words -------
+fresh
+knob umount_fails_once "$SOURCE_MNT"
+run_backup
+check "helper will not unmount: exit status (a WARN, not a FAIL)" "$RC" "0"
+show_tail 0
+check "helper will not unmount: report status" "$(report_status)" "ALL OPERATIONS SUCCESSFUL"
+check "helper will not unmount: recorded as a success" "$(recorded_as)" "success"
+# The journal's copy has colour codes around its level; the log file's has not.
+check "helper will not unmount: in the journal, with umount's own message" \
+    "$(grep -cF -- "Could not unmount source volume $SOURCE_MNT, which this run mounted: umount: $SOURCE_MNT: target is busy (stub). — left mounted; best effort, not a DAS disconnect concern" "$STATE/out")" "1"
+check "helper will not unmount: a WARN in the log file, with umount's own message" \
+    "$(grep -cF -- "[WARN]   Could not unmount source volume $SOURCE_MNT, which this run mounted: umount: $SOURCE_MNT: target is busy (stub). — left mounted" "$WORK/log/das-backup.log")" "1"
+check "helper will not unmount: tried once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "helper will not unmount: left mounted, the targets released" "$(left_mounted)" "$SOURCE_MNT "
+check "helper will not unmount: the DAS is still safe to disconnect" \
+    "$(grep -c 'DAS can be safely disconnected' "$STATE/out")" "1"
+
+# --- the probe cannot tell whether the helper is still mounted (review F1) -----
+# A mountpoint error is not "not mounted": the helper used to be struck off
+# its record and left mounted, with nothing said. Now the run says it could
+# not tell, with the probe's message, and unmounts anyway.
+fresh
+knob probe_fails_after_btrbk "$SOURCE_MNT"
+run_backup
+check "probe cannot tell for the helper: exit status" "$RC" "0"
+show_tail 0
+check "probe cannot tell for the helper: unmounted anyway, once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "probe cannot tell for the helper: nothing left mounted" "$(left_mounted)" "nothing"
+check "probe cannot tell for the helper: says so, with the probe's own message" \
+    "$(grep -cF -- "Could not tell whether source volume $SOURCE_MNT, which this run mounted, is still mounted — mountpoint: $SOURCE_MNT: Input/output error (stub) (exit 1); unmounting it anyway" "$WORK/log/das-backup.log")" "1"
+check "probe cannot tell for the helper: a WARN" \
+    "$(grep -c "\[WARN\]   Could not tell whether source volume" "$WORK/log/das-backup.log")" "1"
+
+# --- a stop while a source's mount runs (review F2) -----------------------------
+# The run records the mount point as its own BEFORE mount runs, so a stop that
+# lands while mount runs still finds a mount mount made, and takes it down.
+# Recorded after mount instead, the stop leaves it mounted.
+fresh
+knob mount_blocks_after "$SOURCE_MNT"
+run_signalled_when mount_in TERM
+check "SIGTERM while mount runs, the mount made: the stop landed there" \
+    "$([[ -e "$STATE/mount_in" ]] && echo yes || echo no) $(ran_btrbk)" "yes no"
+check "SIGTERM while mount runs, the mount made: exit status" "$RC" "143"
+show_tail 143
+check "SIGTERM while mount runs, the mount made: taken down once" "$(calls_for umount "$SOURCE_MNT")" "1"
+check "SIGTERM while mount runs, the mount made: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+knob mount_blocks_before "$SOURCE_MNT"
+run_signalled_when mount_in TERM
+check "SIGTERM while mount runs, the mount not made: the stop landed there" \
+    "$([[ -e "$STATE/mount_in" ]] && echo yes || echo no) $(ran_btrbk)" "yes no"
+check "SIGTERM while mount runs, the mount not made: exit status" "$RC" "143"
+show_tail 143
+check "SIGTERM while mount runs, the mount not made: nothing to unmount" "$(calls_for umount "$SOURCE_MNT")" "0"
+check "SIGTERM while mount runs, the mount not made: nothing left mounted" "$(left_mounted)" "nothing"
+
+# --- fstab declares a source's mount point, and it is not mounted -------------
+# fstab's own mount is missing: said once, as INFO — not a WARN, not a FAIL —
+# and the run still takes its helper down. Nothing is said for one found
+# mounted, nor for a path fstab does not declare.
+fresh
+second_source das-storage "$DAS_STORAGE_MNT" UUID=das-storage-uuid
+premount "$DAS_STORAGE_MNT" das-storage-uuid
+printf '%s\n' "$SOURCE_MNT" "$DAS_STORAGE_MNT" >"$STATE/knobs/fstab_declares"
+run_backup
+check "fstab declares it, not mounted: exit status" "$RC" "0"
+show_tail 0
+check "fstab declares it, not mounted: said, as INFO" \
+    "$(grep -cF -- "[INFO]   nvme: fstab mounts $SOURCE_MNT at boot, but it was not mounted — this run mounts a helper there and takes it down at the end" "$WORK/log/das-backup.log")" "1"
+check "fstab declares it, found mounted: nothing said" "$(grep -cF -- "fstab mounts $DAS_STORAGE_MNT" "$STATE/out")" "0"
+check "fstab declares it, not mounted: the helper still taken down; fstab's other mount left" \
+    "$(calls_for umount "$SOURCE_MNT") $(left_mounted)" "1 $DAS_STORAGE_MNT "
+check "fstab declares it, not mounted: the report is unchanged" "$(report_status)" "ALL OPERATIONS SUCCESSFUL"
+
+fresh
+run_backup
+check "fstab does not declare it: nothing said" "$(grep -c 'fstab mounts' "$STATE/out")" "0"
+
+# ---------------------------------------------------------------------------
+echo "== \"DAS can be safely disconnected\" only when every target is known released (bd DAS-Backup-Manager-jug6)"
+# ---------------------------------------------------------------------------
+# The disconnect claim stands on the target unmount gate. A mountpoint error
+# on a target used to read as "not mounted": the target was skipped, the
+# report said "Unmount targets OK" and the run said the DAS could be
+# disconnected while a drive was mounted — the operator might pull it on that
+# word. "Could not tell" now fails the gate: the run says it is NOT safe to
+# disconnect and why, and tries the unmount anyway.
+unmount_row() { sed -n '/^  Unmount targets /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+
+fresh
+knob probe_fails_after_btrbk "$PRIMARY_MNT"
+run_backup
+check "probe cannot tell for a mounted target: exit status (a FAIL)" "$RC" "3"
+show_tail 3
+check "probe cannot tell for a mounted target: unmounted anyway" \
+    "$(calls_for umount "$PRIMARY_MNT") $(left_mounted)" "1 nothing"
+check "probe cannot tell for a mounted target: never says the DAS is safe to disconnect" \
+    "$(grep -c 'DAS can be safely disconnected' "$STATE/out")" "0"
+check "probe cannot tell for a mounted target: says it is NOT safe, and why" \
+    "$(grep -cF -- "DAS is NOT safe to disconnect: could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded" "$STATE/out")" "1"
+check "probe cannot tell for a mounted target: the report's row" \
+    "$(unmount_row)" \
+    "  Unmount targets       FAIL  (could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded)"
+check "probe cannot tell for a mounted target: the report's status" "$(report_status)" "FAILURES DETECTED"
+check "probe cannot tell for a mounted target: recorded as failed, with the reason" \
+    "$(recorded_as) $(vector_value --errors | grep -c "^unmount: could not tell whether $PRIMARY_MNT is mounted")" "failure 1"
+
+# A target that will not unmount: NOT safe, and the same line says which.
+fresh
+knob umount_fails_always "$PRIMARY_MNT"
+run_backup
+check "a target that will not unmount: exit status" "$RC" "3"
+show_tail 3
+check "a target that will not unmount: says it is NOT safe, and which is still mounted" \
+    "$(grep -cF -- "DAS is NOT safe to disconnect: still mounted: $PRIMARY_MNT" "$STATE/out")" "1"
+check "a target that will not unmount: the report's row" \
+    "$(unmount_row)" "  Unmount targets       FAIL  (still mounted: $PRIMARY_MNT)"
+
+# A clean probe: unchanged.
+fresh
+run_backup
+check "a clean probe: the report's row" "$(unmount_row)" "  Unmount targets       OK  (all clean)"
+check "a clean probe: safe to disconnect, and nothing says otherwise" \
+    "$(grep -c 'DAS can be safely disconnected' "$STATE/out") $(grep -c 'NOT safe to disconnect\|Could not tell' "$STATE/out")" "1 0"
+
+# An absent drive's mount point is removed on purpose: mountpoint answers it
+# 1 ("No such file or directory"), as it answers an error, and it is not one.
+fresh
+printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
+run_backup
+check "an absent target: its mount point is not there" "$([[ -e "$RECOVERY_MNT" ]] && echo yes || echo no)" "no"
+check "an absent target: the unmount gate passes" "$(unmount_row)" "  Unmount targets       OK  (all clean)"
+check "an absent target: no 'could not tell', and safe to disconnect" \
+    "$(grep -c 'Could not tell' "$STATE/out") $(grep -c 'DAS can be safely disconnected' "$STATE/out")" "0 1"
 
 # ---------------------------------------------------------------------------
 echo "== every exit path of a run that does not complete, by the rule"
