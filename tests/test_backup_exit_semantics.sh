@@ -94,7 +94,9 @@ WORK="$(mktemp -d)" && [[ -d "$WORK" ]] || {
 }
 HOLDER_PID=""
 # The processes the liveness helper's own cases start (bd DAS-Backup-Manager-7q8o),
-# so a case that stopped half way leaves none behind.
+# so a case that stopped half way leaves none behind. A case that stops one with
+# stop_proc takes it off this list: finish() signals what is left, and a pid
+# already collected may be another process's by then.
 TEST_PROCS=()
 finish() {
     local p
@@ -843,6 +845,29 @@ live() {
     LIVE_PID=$!
     TEST_PROCS+=("$LIVE_PID")
 }
+# stop_proc <pid>: kill and collect a process started above, and take it off
+# TEST_PROCS. finish() signals whatever is still on that list when the suite
+# ends, and a pid already collected may by then be another process's: one run
+# of this suite uses about 56,000 pids, so on a host at the kernel's default
+# pid_max of 32768 the counter wraps within it (independent review, M2).
+stop_proc() {
+    local pid="$1" p
+    local -a rest=()
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    for p in "${TEST_PROCS[@]:-}"; do
+        [[ -n "$p" && "$p" != "$pid" ]] && rest+=("$p")
+    done
+    TEST_PROCS=("${rest[@]:-}")
+}
+# How often a pid is on that list.
+procs_listed() { # procs_listed <pid>
+    local p n=0
+    for p in "${TEST_PROCS[@]:-}"; do
+        [[ "$p" == "$1" ]] && n=$((n + 1))
+    done
+    echo "$n"
+}
 # wait_comm <pid> <name>: until the kernel names the process so — comm is set
 # when it execs, a moment after the fork.
 wait_comm() {
@@ -881,8 +906,7 @@ make_zombie() { # make_zombie <child program> [args]
 }
 # End the case: the parent is killed and collected; its orphan is then init's.
 end_zombie() {
-    kill "$ZOMBIE_PARENT" 2>/dev/null
-    wait "$ZOMBIE_PARENT" 2>/dev/null
+    stop_proc "$ZOMBIE_PARENT"
 }
 
 REAL_SLEEP="$(type -P sleep)" || harness_broken "no sleep on this system"
@@ -898,9 +922,11 @@ ln -s "$REAL_SLEEP" "$ODDCOMM/$ZOMBIE_ODD"
 # A live process is alive; killed and collected, it is gone.
 live sleep 60
 check "pid_alive, a live process: alive" "$(liveness "$LIVE_PID")" "alive"
-kill "$LIVE_PID"
-wait "$LIVE_PID" 2>/dev/null
+check "cleanup list, a process still running: finish() would signal it" "$(procs_listed "$LIVE_PID")" "1"
+stop_proc "$LIVE_PID"
 check "pid_alive, the same process killed and collected: gone" "$(liveness "$LIVE_PID")" "gone"
+check "cleanup list, the same process, collected: no longer on it, so finish() cannot signal a reused pid" \
+    "$(procs_listed "$LIVE_PID")" "0"
 DEAD_PID="$LIVE_PID"
 
 # A zombie is gone, though kill -0 says otherwise; its parent, which has not
@@ -923,8 +949,7 @@ check "odd comm control: the kernel's name for the live process holds ') Z ('" \
     "$(cat "/proc/$ODD_PID/comm")" "$LIVE_ODD"
 check "odd comm control: and it is running" "$(proc_state "$ODD_PID")" "S"
 check "pid_alive, a live process named '$LIVE_ODD': alive" "$(liveness "$ODD_PID")" "alive"
-kill "$ODD_PID"
-wait "$ODD_PID" 2>/dev/null
+stop_proc "$ODD_PID"
 check "pid_alive, the same process killed and collected: gone" "$(liveness "$ODD_PID")" "gone"
 
 make_zombie "$ODDCOMM/$ZOMBIE_ODD" 0
@@ -956,8 +981,19 @@ check "mail_stubs_gone, only the first pid recorded: never ran" "$(mail_state "$
 check "mail_stubs_gone, both recorded, both gone: yes" "$(mail_state "$DEAD_PID" "$DEAD_PID")" "yes"
 check "mail_stubs_gone, both recorded, the first alive: no" "$(mail_state "$LIVE_FOR_MAIL" "$DEAD_PID")" "no"
 check "mail_stubs_gone, both recorded, the second alive: no" "$(mail_state "$DEAD_PID" "$LIVE_FOR_MAIL")" "no"
-kill "$LIVE_FOR_MAIL"
-wait "$LIVE_FOR_MAIL" 2>/dev/null
+stop_proc "$LIVE_FOR_MAIL"
+# Forgetting must be exact: with two running, stopping one leaves the other
+# listed, so a case that stops half way still leaves nothing behind.
+live sleep 60
+FIRST_LISTED="$LIVE_PID"
+live sleep 60
+SECOND_LISTED="$LIVE_PID"
+stop_proc "$FIRST_LISTED"
+check "cleanup list, stopping one of two running processes: it goes, the other stays" \
+    "$(procs_listed "$FIRST_LISTED") $(procs_listed "$SECOND_LISTED")" "0 1"
+stop_proc "$SECOND_LISTED"
+check "cleanup list, every process this section started has been collected: nothing is left for finish() to signal" \
+    "$(printf '%s' "${TEST_PROCS[*]:-}" | tr -d ' ')" ""
 
 # ---------------------------------------------------------------------------
 echo "== 0: the run executed and nothing failed"
