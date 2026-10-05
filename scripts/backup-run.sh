@@ -28,7 +28,11 @@
 #     N" in a dry run, one shape for both modes, and each mode here requires
 #     its own verb: a real run that printed the dry run's, or a dry run that
 #     printed the real run's, is still a FAIL, and so is a run with no summary
-#     at all (bd DAS-Backup-Manager-zwr; tests/test_boot_archive_cleanup.sh).
+#     at all. The detail it records for an OK joins the targets' summaries
+#     with "; " between them: it was joined with `tr '\n' '; '`, which writes
+#     ";" alone, so it read "a;b;" and even one summary ended in a stray ";"
+#     in the report line (bd DAS-Backup-Manager-zwr;
+#     tests/test_boot_archive_cleanup.sh).
 #   - The boot-subvolume step tells "not mounted" from "could not tell"
 #     (v4.11.3): update_boot_subvolumes() asks probe_mount_point, whose three
 #     answers it used to fold into two. A target whose mountpoint check could
@@ -2149,19 +2153,28 @@ run_archive_cleanup() {
         # accepts only its own: a real run that printed "Would delete" ran
         # dry, and a dry run that printed "Deleted" ran for real, and
         # neither did what it was asked to.
-        local cleanup_summary summary_form="Deleted N, kept N, errors N"
+        local summary_form="Deleted N, kept N, errors N"
         local summary_re='Deleted [[:digit:]]+, kept [[:digit:]]+, errors [[:digit:]]+'
         if [[ "$mode" == "dryrun" ]]; then
             summary_form="Would delete N, kept N, errors N"
             summary_re='Would delete [[:digit:]]+, kept [[:digit:]]+, errors [[:digit:]]+'
         fi
-        cleanup_summary=$(printf '%s\n' "$cleanup_output" \
-            | grep -oE "$summary_re" | tr '\n' '; ') || true
+        # The detail is each target's summary, "; " between them and nothing
+        # after the last. It was joined with `tr '\n' '; '`, which writes ";"
+        # alone (tr drops the surplus of a longer second set), so the detail
+        # read "a;b;" and the trim of "; " that followed never matched: even a
+        # single summary ended in a stray ";" in the report. The separator is
+        # now put between the elements, so there is nothing to trim.
+        local cleanup_lines cleanup_summary="" summary_line
+        cleanup_lines=$(printf '%s\n' "$cleanup_output" | grep -oE "$summary_re") || true
+        while IFS= read -r summary_line; do
+            [[ -z "$summary_line" ]] || cleanup_summary+="${cleanup_summary:+; }$summary_line"
+        done <<<"$cleanup_lines"
         if [[ -z "$cleanup_summary" ]]; then
             log_warn "Boot archive cleanup exited 0 but printed no per-target summary ($summary_form) — treating as FAIL"
             record_op "archive_cleanup" "FAIL" "exit 0 with no summary line; pruner may have examined nothing"
         else
-            record_op "archive_cleanup" "OK" "${cleanup_summary%; }"
+            record_op "archive_cleanup" "OK" "$cleanup_summary"
             log_info "Boot archive cleanup completed"
         fi
     else

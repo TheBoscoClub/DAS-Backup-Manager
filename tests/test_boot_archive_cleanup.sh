@@ -375,10 +375,6 @@ read_back() {
     )
 }
 status_of() { echo "${1%%|*}"; }
-detail_starts() { # detail_starts <verdict> <text>: does the detail begin with <text>?
-    local detail="${1#*|}"
-    if [[ "$detail" == "$2"* ]]; then echo yes; else echo "no ($detail)"; fi
-}
 reader_said() { grep -cF -- "$1" "$WORK/reader.log"; }
 
 # Two expired archives and one in the future: a run deletes two and keeps one.
@@ -398,14 +394,25 @@ check "pruner, real run: the two expired archives were asked to be deleted" "$(d
 
 verdict="$(read_back dryrun)"
 check "reader, a dry run over the real pruner: OK" "$(status_of "$verdict")" "OK"
-check "reader, a dry run: the detail is the dry run's own summary" \
-    "$(detail_starts "$verdict" 'Would delete 2, kept 1, errors 0')" "yes"
+check "reader, a dry run: the detail is exactly the dry run's own summary, nothing after it" \
+    "$verdict" "OK|Would delete 2, kept 1, errors 0"
 check "reader, a dry run: the pruner deleted nothing" "$(deleted)" ""
 verdict="$(read_back real)"
 check "reader, a real run over the real pruner: OK" "$(status_of "$verdict")" "OK"
-check "reader, a real run: the detail is the run's own summary" \
-    "$(detail_starts "$verdict" 'Deleted 2, kept 1, errors 0')" "yes"
+check "reader, a real run: the detail is exactly the run's own summary, nothing after it" \
+    "$verdict" "OK|Deleted 2, kept 1, errors 0"
 check "reader, a real run: the pruner deleted the two" "$(deleted)" "$ASCII_OLD $HOME_OLD "
+
+# Two targets: both summaries, in the pruner's order, "; " between them and
+# nothing after the last. The detail was joined with `tr '\n' '; '`, which
+# writes ";" alone and left the trim after it nothing to match: "a;b;".
+fresh2
+listing_for primary "$ASCII_OLD" "$HOME_OLD" "$FUTURE" "$OTHER"
+listing_for primary2 "$DIR_OLD" "$FUTURE"
+check "reader, two targets, a real run: both summaries, '; ' between them, nothing after the last" \
+    "$(read_back real)" "OK|Deleted 2, kept 1, errors 0; Deleted 1, kept 1, errors 0"
+check "reader, two targets, a dry run: both summaries, '; ' between them, nothing after the last" \
+    "$(read_back dryrun)" "OK|Would delete 2, kept 1, errors 0; Would delete 1, kept 1, errors 0"
 
 # A pruner that examined nothing prints no summary and exits 0: the reader must
 # not call it OK, in either mode. The primary is not mounted; the other target
@@ -418,8 +425,8 @@ check "pruner, nothing mounted: exit status 0 and no summary (it is the reader t
 for mode in dryrun real; do
     verdict="$(read_back "$mode")"
     check "reader, $mode with no summary: FAIL" "$(status_of "$verdict")" "FAIL"
-    check "reader, $mode with no summary: the detail says so" \
-        "$(detail_starts "$verdict" 'exit 0 with no summary line')" "yes"
+    check "reader, $mode with no summary: the detail says so, in full" \
+        "$verdict" "FAIL|exit 0 with no summary line; pruner may have examined nothing"
 done
 read_back dryrun >/dev/null
 check "reader, a dry run with no summary: the warning names the dry run's shape" \
