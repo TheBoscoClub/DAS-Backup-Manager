@@ -287,8 +287,9 @@ if(BUILD_TESTING)
     # boot-archive-cleanup.sh itself, run for real in a sandbox of stub btrfs,
     # mountpoint and btrdasd: what it may delete (bd DAS-Backup-Manager-1bsx),
     # and what it prints, read back by backup-run.sh's run_archive_cleanup in
-    # a dry run and a real one (bd DAS-Backup-Manager-zwr). Nothing is listed,
-    # mounted or deleted.
+    # a dry run and a real one (bd DAS-Backup-Manager-zwr), and a target whose
+    # mount state it cannot tell (bd DAS-Backup-Manager-2dmn). Nothing is
+    # listed, mounted or deleted.
     add_test(
         NAME shell-boot-archive-cleanup
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_boot_archive_cleanup.sh
