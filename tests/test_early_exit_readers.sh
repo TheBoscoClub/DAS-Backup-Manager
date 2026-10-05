@@ -1176,36 +1176,87 @@ echo "== no bracket range in a regex match anywhere in the shell sources (bd 1bs
 # substitute for letters — it is every letter the locale has — so they are
 # listed. Five matches that read a guard, a pid, a bay number, a SMART value
 # and an archive name were found with the range in them; none may return.
-# A regex match here is the text after =~ on a line, or after the = of a *_RE
-# or re variable's assignment; comment lines are skipped. A deliberate use
-# carries "locale-range-ok" on its line: the probes that decide whether a
-# locale shows the effect at all.
+#
+# What the lint reads, per file, in two passes. The first collects every name
+# a regex match reads its pattern from, UNQUOTED: `=~ $x` and `=~ ${x}` (a
+# quoted one is matched literally and cannot widen). The second flags a line
+# when it holds a range in (1) the text after a =~, (2) the text after the = of
+# an assignment to a *_RE or re variable, whatever the file does with it, or
+# (3) the text after the = of an assignment (plain, local, readonly, declare,
+# export, or +=) to any name the first pass collected, wherever the use is in
+# the file. (3) is what keeps the deletion guard's own patterns in view: they
+# moved off the =~ line into lower-case locals (path_re, name_re), where a
+# line-at-a-time reading of =~ and upper-case names saw neither the use nor the
+# assignment. An array literal (name=( ... )) holds subscripts, not a pattern.
+# Comment lines are skipped. A deliberate use carries "locale-range-ok" on its
+# line: the probes that decide whether a locale shows the effect at all.
+# Not followed: a pattern built in one file and matched in another, and the
+# patterns of grep and sed, which are not bash's regex.
 range_lint() { # range_lint <files>: file:line: text, for each offender
-    LC_ALL=C awk '
-        /^[ \t]*#/ { next }
-        /locale-range-ok/ { next }
-        match($0, /=~|_RE=|[ \t]re=/) {
-            if (substr($0, RSTART) ~ /\[[^]]*[0-9A-Za-z]-[0-9A-Za-z][^]]*\]/) {
-                print FILENAME ":" FNR ": " $0
+    local f
+    for f in "$@"; do
+        LC_ALL=C awk '
+            function ranged(s) { return s ~ /\[[^]]*[0-9A-Za-z]-[0-9A-Za-z][^]]*\]/ }
+            FNR == NR {
+                if ($0 ~ /^[ \t]*#/) next
+                s = $0
+                while (match(s, /=~[ \t]*\$\{?[A-Za-z_][A-Za-z0-9_]*/)) { # locale-range-ok: awk, not a bash match
+                    name = substr(s, RSTART, RLENGTH)
+                    sub(/^=~[ \t]*\$\{?/, "", name)
+                    used[name] = 1
+                    s = substr(s, RSTART + RLENGTH)
+                }
+                next
             }
-        }' "$@"
+            /^[ \t]*#/ { next }
+            /locale-range-ok/ { next }
+            {
+                bad = 0
+                if (match($0, /=~|_RE=|[ \t]re=/) && ranged(substr($0, RSTART))) bad = 1
+                for (n in used) {
+                    if (!bad && match($0, "(^|[ \t;])" n "\\+?=")) {
+                        rest = substr($0, RSTART + RLENGTH)
+                        if (rest !~ /^\(/ && ranged(rest)) bad = 1
+                    }
+                }
+                if (bad) print FILENAME ":" FNR ": " $0
+            }' "$f" "$f"
+    done
 }
-# The lint must be able to say no. A planted range in a regex match is found;
-# the forms that look alike and are not — [[:digit:]], an array subscript
-# before the =~, a comment line, a marked probe — are not.
+# The lint must be able to say no. A planted range in a regex match is found,
+# and so is one in a variable the file matches against, in the shapes the
+# tree uses (a lower-case local, a ${braced} use, one of two assignments on a
+# line, an append, an assignment AFTER its use); the forms that look alike and
+# are not — [[:digit:]], an array subscript before the =~, a comment line, a
+# marked probe, an array literal, a range in a variable no =~ reads, and one
+# read only quoted — are not.
 {
     printf '%s\n' '[[ $x =~ ^[0-9]+$ ]]'    # locale-range-ok: lint fixture
     printf '%s\n' '[[ $x =~ ^[A-Za-z]+$ ]]' # locale-range-ok: lint fixture
     printf '%s\n' 'local re="^[a-f0-9]+$"'  # locale-range-ok: lint fixture
+    printf '%s\n' 'local path_re="^[A-Z]+$"' # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $p =~ $path_re ]]'
+    printf '%s\n' 'local keep="^[a-z]+$" lim="^[0-9]+$"' # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $y =~ ${lim} ]]'
+    printf '%s\n' "pat+='[0-9]'" # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $z =~ $pat ]]'
+    printf '%s\n' '[[ $q =~ $late ]]'
+    printf '%s\n' "late='^[0-9]+\$'" # locale-range-ok: lint fixture
 } >"$WORK/lint-bad.sh"
 {
     printf '%s\n' '[[ $x =~ ^[[:digit:]]+$ ]]'
     printf '%s\n' 'declare -A m=([hdd-media]=1); [[ $y =~ $m ]]'
     printf '%s\n' '# [[ $x =~ ^[0-9]+$ ]] in a comment' # locale-range-ok: lint fixture
     printf '%s\n' '[[ $x =~ [0-9] ]] # locale-range-ok: a probe'
+    printf '%s\n' 'local path_re="^[${letters}[:digit:]_@.+/-]+\$"'
+    printf '%s\n' '[[ $p =~ $path_re ]]'
+    printf '%s\n' 'local globby="[a-z]*"' # a glob, and no =~ reads it
+    printf '%s\n' '[[ $g == $globby ]]'
+    printf '%s\n' 'local lit="[a-z]"' # read quoted below: matched literally
+    printf '%s\n' '[[ $l =~ "$lit" ]]'
 } >"$WORK/lint-ok.sh"
-check "the range lint finds a planted digit range, letter range and hex range in a variable" "$(range_lint "$WORK/lint-bad.sh" | wc -l)" "3"
-check "the range lint passes [[:digit:]], a subscript, a comment and a marked probe" "$(range_lint "$WORK/lint-ok.sh" | wc -l)" "0"
+check "the range lint finds a planted digit range, letter range and hex range in a variable, and four more in variables a =~ reads" "$(range_lint "$WORK/lint-bad.sh" | wc -l)" "7"
+check "the range lint passes [[:digit:]], a subscript, a comment, a marked probe, an array literal, a glob and a literal match" "$(range_lint "$WORK/lint-ok.sh" | wc -l)" "0"
 shell_sources=("$ROOT"/scripts/*.sh "$ROOT"/.github/scripts/*.sh "$ROOT"/packaging/appimage/*.sh "$ROOT"/tests/*.sh)
 [[ -e "${shell_sources[0]}" && -e "${shell_sources[${#shell_sources[@]} - 1]}" ]] || harness_broken "a source glob matched nothing"
 left="$(range_lint "${shell_sources[@]}" | sed "s|^$ROOT/||")"
