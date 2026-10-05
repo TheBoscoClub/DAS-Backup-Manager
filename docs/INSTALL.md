@@ -192,9 +192,23 @@ Validates the current installation without changing anything:
 - Verifies all manifest files exist on disk
 - Reports any issues found
 
-## Manual Installation (without wizard)
+## Manual Installation (without the wizard)
 
-For users who prefer manual configuration without the setup wizard:
+`cmake --install`, or a package, only puts files in place. What makes backups run is
+`/etc/das-backup/config.toml`, and only `btrdasd setup` turns it into a configured host:
+
+- `backup-run.sh` reads its whole configuration from that file and exits **1** without it —
+  "could not start", which leaves the unit failed — so a timer enabled before the file
+  exists starts a backup that stops at once, every time.
+- Every backup run brings `/etc/btrbk/btrbk.conf` into line with it, so a hand-written
+  `btrbk.conf` does not survive the next run.
+- `btrdasd setup` writes from it the units that run the backups, the scrub and the drift
+  check (cron entries on sysvinit and OpenRC), `btrbk.conf` and the udev rule that hides
+  the targets from udisks2 (see [Generated Files](#generated-files)), creates the database
+  directory, and enables the timers.
+
+So `btrdasd setup` is required; what you can skip is its wizard. Write the config yourself
+and let `setup --force` install from it without asking anything:
 
 ```bash
 # Build and install all components
@@ -202,22 +216,62 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 sudo cmake --install build
 
-# Create database directory
-sudo mkdir -p /var/lib/das-backup
-
-# Configure btrbk manually. Note: once a config.toml exists, btrbk.conf is
-# generated from it and a hand edit is lost the next time sync or
-# `btrdasd setup --upgrade` runs (see [subvolumes] below).
-sudo cp config/btrbk.conf /etc/btrbk/btrbk.conf
-sudo vim /etc/btrbk/btrbk.conf  # edit for your drives
+# Write the config (the smallest valid one is below) and check it; checking needs no root
+sudoedit /etc/das-backup/config.toml
+btrdasd config validate --config /etc/das-backup/config.toml
 
 # Email needs no credentials — reports are submitted unauthenticated to a
 # local mail relay ([email].smtp_host/smtp_port, default 127.0.0.1:25).
 # Verify one is listening:  ss -ltn | grep ':25 '
 
-# Enable systemd timers
-sudo systemctl enable --now das-backup.timer das-backup-full.timer
+# Generate every file from the config and enable the timers, with no questions
+sudo btrdasd setup --force
 ```
+
+The smallest config `btrdasd config validate` accepts. Edit the source and the target to
+match your volumes and drives; every other key is in the
+[Configuration Reference](#configuration-reference) below:
+
+<!-- tests/test_install_doc_config.sh validates the block below with the btrdasd the build makes -->
+```toml
+[general]
+version = "0.7.22"                   # what `btrdasd --version` prints
+install_prefix = "/usr"              # the prefix btrdasd is installed under
+db_path = "/var/lib/das-backup/backup-index.db"
+
+[init]
+system = "systemd"                   # or "sysvinit", "openrc"
+
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+
+[email]                              # reports stay off until `enabled = true`
+
+[gui]
+
+[[source]]                           # one per BTRFS volume to back up
+label = "nvme-root"
+volume = "/.btrfs-nvme"              # the volume's top level, mounted
+device = "/dev/nvme0n1p2"
+subvolumes = ["@", "@home"]
+
+[[target]]                           # one per backup drive, or RAID-1 pair
+label = "primary"
+serials = ["YOUR-DRIVE-SERIAL"]      # smartctl -i /dev/sdX
+mount = "/mnt/backup-primary"
+role = "primary"
+retention = { daily = 7, weekly = 4 }
+```
+
+The reference's Default column is what the wizard writes. Every key the block leaves out may
+be left out; these may not: `version`, `install_prefix` and `db_path` in `[general]`, `system`
+in `[init]` and all three `[schedule]` keys — and `[general]`, `[init]`, `[schedule]`,
+`[email]` and `[gui]` must all be present, even empty. `setup --force` installs only from an
+existing config — without one it refuses — and writes the file back in its own form, so
+comments are not kept. After a later edit, `sudo btrdasd setup --upgrade` regenerates
+everything from it.
 
 ## CLI-Only Build (no GUI dependencies)
 
@@ -227,9 +281,10 @@ If you don't have Qt6/KF6 installed or don't need the GUI:
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
 cmake --build build
 sudo cmake --install build
+sudo btrdasd setup
 ```
 
-This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit policy, and man page — everything except the GUI.
+This installs everything except the GUI; `btrdasd setup` then configures the host, as in the Quick Start.
 
 ## CMake Build Options
 
@@ -279,6 +334,8 @@ Native packaging recipes are included under `packaging/` and build-tested on the
 cd packaging/arch
 makepkg -si
 ```
+
+A package puts the files in place and writes no `config.toml`: run `sudo btrdasd setup` after installing it, as after `cmake --install`, and `sudo btrdasd setup --upgrade` after each package upgrade.
 
 **Minimum Rust version**: 1.88 (needs let-chains in edition 2024; not compile-tested below 1.98.1, and `Cargo.toml` declares no `rust-version`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
 

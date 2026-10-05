@@ -312,6 +312,15 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_destdir.sh
             ${CMAKE_COMMAND} ${CMAKE_BINARY_DIR} ${DAS_EXPECT_COMPLETIONS}
     )
+    # The config docs/INSTALL.md shows for an installation without the wizard
+    # is one the btrdasd this build makes accepts (bd DAS-Backup-Manager-x0m1).
+    if(BUILD_INDEXER)
+        add_test(
+            NAME shell-install-doc-config
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_doc_config.sh
+                ${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd
+        )
+    endif()
 endif()
 
 # =============================================================================

@@ -118,6 +118,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
 cmake --build build
 # Output: build/cargo-target/release/btrdasd (and btrdasd-helper)
 sudo cmake --install build   # installs to ${CMAKE_INSTALL_PREFIX}/bin (default /usr/local/bin)
+sudo btrdasd setup           # required: writes /etc/das-backup/config.toml and the units (INSTALL.md)
 ```
 
 CMake runs cargo with `--target-dir build/cargo-target`; the install step reads the binaries from there, so avoid a bare `cargo build` in this tree. The helper is built with `--features dbus` (pulls in `zbus` and `tokio`); the `btrdasd` CLI alone has no D-Bus or async dependency.
