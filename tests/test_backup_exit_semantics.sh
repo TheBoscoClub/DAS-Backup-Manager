@@ -56,6 +56,11 @@
 # helper unmounted anyway. The mountpoint stub answers as util-linux does:
 # 0 a mount point, 32 not one, 1 an error or a path that is not there.
 #
+# The disconnect claim (bd DAS-Backup-Manager-jug6): "DAS can be safely
+# disconnected" only when every target is known released. A target the
+# probe cannot tell about fails the gate — exit 3, NOT safe, and why — and a
+# clean probe or an absent drive's removed mount point changes nothing.
+#
 # Every run's mail goes to a stub mailx, which keeps each one.
 #
 # How: the REAL script runs end to end — its EXIT trap, cleanup() and its
@@ -336,6 +341,10 @@ if [[ -f "$S/knobs/umount_waits" ]]; then
 fi
 if listed umount_fails_once "$dst" && ! listed umount_failed "$dst"; then
     echo "$dst" >>"$S/knobs/umount_failed"
+    echo "umount: $dst: target is busy (stub)." >&2
+    exit 32
+fi
+if listed umount_fails_always "$dst"; then
     echo "umount: $dst: target is busy (stub)." >&2
     exit 32
 fi
@@ -1788,6 +1797,63 @@ check "fstab declares it, not mounted: the report is unchanged" "$(report_status
 fresh
 run_backup
 check "fstab does not declare it: nothing said" "$(grep -c 'fstab mounts' "$STATE/out")" "0"
+
+# ---------------------------------------------------------------------------
+echo "== \"DAS can be safely disconnected\" only when every target is known released (bd DAS-Backup-Manager-jug6)"
+# ---------------------------------------------------------------------------
+# The disconnect claim stands on the target unmount gate. A mountpoint error
+# on a target used to read as "not mounted": the target was skipped, the
+# report said "Unmount targets OK" and the run said the DAS could be
+# disconnected while a drive was mounted — the operator might pull it on that
+# word. "Could not tell" now fails the gate: the run says it is NOT safe to
+# disconnect and why, and tries the unmount anyway.
+unmount_row() { sed -n '/^  Unmount targets /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+
+fresh
+knob probe_fails_after_btrbk "$PRIMARY_MNT"
+run_backup
+check "probe cannot tell for a mounted target: exit status (a FAIL)" "$RC" "3"
+show_tail 3
+check "probe cannot tell for a mounted target: unmounted anyway" \
+    "$(calls_for umount "$PRIMARY_MNT") $(left_mounted)" "1 nothing"
+check "probe cannot tell for a mounted target: never says the DAS is safe to disconnect" \
+    "$(grep -c 'DAS can be safely disconnected' "$STATE/out")" "0"
+check "probe cannot tell for a mounted target: says it is NOT safe, and why" \
+    "$(grep -cF -- "DAS is NOT safe to disconnect: could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded" "$STATE/out")" "1"
+check "probe cannot tell for a mounted target: the report's row" \
+    "$(unmount_row)" \
+    "  Unmount targets       FAIL  (could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded)"
+check "probe cannot tell for a mounted target: the report's status" "$(report_status)" "FAILURES DETECTED"
+check "probe cannot tell for a mounted target: recorded as failed, with the reason" \
+    "$(recorded_as) $(vector_value --errors | grep -c "^unmount: could not tell whether $PRIMARY_MNT is mounted")" "failure 1"
+
+# A target that will not unmount: NOT safe, and the same line says which.
+fresh
+knob umount_fails_always "$PRIMARY_MNT"
+run_backup
+check "a target that will not unmount: exit status" "$RC" "3"
+show_tail 3
+check "a target that will not unmount: says it is NOT safe, and which is still mounted" \
+    "$(grep -cF -- "DAS is NOT safe to disconnect: still mounted: $PRIMARY_MNT" "$STATE/out")" "1"
+check "a target that will not unmount: the report's row" \
+    "$(unmount_row)" "  Unmount targets       FAIL  (still mounted: $PRIMARY_MNT)"
+
+# A clean probe: unchanged.
+fresh
+run_backup
+check "a clean probe: the report's row" "$(unmount_row)" "  Unmount targets       OK  (all clean)"
+check "a clean probe: safe to disconnect, and nothing says otherwise" \
+    "$(grep -c 'DAS can be safely disconnected' "$STATE/out") $(grep -c 'NOT safe to disconnect\|Could not tell' "$STATE/out")" "1 0"
+
+# An absent drive's mount point is removed on purpose: mountpoint answers it
+# 1 ("No such file or directory"), as it answers an error, and it is not one.
+fresh
+printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
+run_backup
+check "an absent target: its mount point is not there" "$([[ -e "$RECOVERY_MNT" ]] && echo yes || echo no)" "no"
+check "an absent target: the unmount gate passes" "$(unmount_row)" "  Unmount targets       OK  (all clean)"
+check "an absent target: no 'could not tell', and safe to disconnect" \
+    "$(grep -c 'Could not tell' "$STATE/out") $(grep -c 'DAS can be safely disconnected' "$STATE/out")" "0 1"
 
 # ---------------------------------------------------------------------------
 echo "== every exit path of a run that does not complete, by the rule"

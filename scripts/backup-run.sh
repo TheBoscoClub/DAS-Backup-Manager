@@ -4,6 +4,24 @@
 # Date: 2026-10-04
 #
 # Features:
+#   - "DAS can be safely disconnected" only on knowledge (v4.11.2, with the
+#     entry below): the target unmount gate asks probe_mount_point, which
+#     tells "not mounted" from "could not tell". A mountpoint error on a
+#     target used to read as "not mounted": the target was skipped, the report
+#     said "Unmount targets OK", the run exited 0 and said the DAS could be
+#     safely disconnected while a drive was still mounted — on a link going
+#     bad, the operator might pull it on that word. "Could not tell" now
+#     FAILS the gate whatever happens next (exit 3, FAILURES DETECTED), the
+#     unmount is tried anyway, and the run says the DAS is NOT safe to
+#     disconnect and why: the detail names each target not known to be
+#     released — "still mounted: …", or "could not tell whether … is
+#     mounted — <the probe's message>; umount then succeeded" (or "failed
+#     too") — in the report row, the history row and the last line. An
+#     absent drive's mount point, removed on purpose, answers mountpoint 1
+#     "No such file or directory" like an error, and is not one: the gate
+#     passes. The last line claims safe only on the gate's own OK, never by
+#     default (bd DAS-Backup-Manager-jug6; tests/test_unmount_all.sh,
+#     tests/test_backup_exit_semantics.sh).
 #   - A run unmounts only the source volumes it mounted (v4.11.2): a run never
 #     owns a mount it found in place. mount_sources() records each mount point
 #     it mounts, once however many sources share it (nvme and nvme-vm share
@@ -2090,7 +2108,9 @@ run_archive_cleanup() {
 # so it is told from an error by mountpoint's message, read in the C locale;
 # any other answer is "could not tell". Read as "not mounted", an error left
 # the run's own source mount behind with nothing said (bd
-# DAS-Backup-Manager-8cf, review F1).
+# DAS-Backup-Manager-8cf, review F1), and passed the target unmount gate
+# while a drive was mounted, so the run said the DAS could be disconnected
+# (bd DAS-Backup-Manager-jug6).
 probe_mount_point() { # probe_mount_point <path>
     local rc=0 err
     err="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null)" || rc=$?
@@ -2132,25 +2152,47 @@ umount_with_retry() {
 unmount_all() {
     log_info "Unmounting volumes..."
 
-    local -a failed_mounts=()
+    local -a still_mounted=() not_known=()
 
     # Unmount DAS backup targets in reverse order (0-based indexing). Every
     # configured mountpoint is attempted regardless of an earlier failure (a
-    # stuck unmount must not mask the rest). A path that mountpoint(1) does
-    # not consider mounted is skipped, not counted as a failure — the same
+    # stuck unmount must not mask the rest). A path the probe says is not a
+    # mount point, or that is not there at all (an absent target's, removed
+    # by create_mount_points), is skipped, not counted as a failure — the same
     # filesystem may legitimately be mounted elsewhere too (e.g. udisks under
     # /run/media), only this script's own mountpoints matter here. These
     # target mountpoints are the only thing that gates the "safe to
-    # disconnect" claim below — they are the physical DAS enclosure.
+    # disconnect" claim in main() — they are the physical DAS enclosure.
+    #
+    # So the gate passes only on knowledge: a target the probe cannot tell
+    # about FAILS it, whatever happens next — the run then says it is NOT
+    # safe to disconnect, and why. The unmount is tried anyway, so whatever
+    # was mounted there is taken down if it can be, and the detail says what
+    # umount did. A probe error used to read as "not mounted": the target
+    # was skipped, the gate passed, and the run said the DAS could be
+    # disconnected while a drive was mounted (bd DAS-Backup-Manager-jug6).
+    local mnt target_rc target_why
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
-        local mnt="${ALL_TARGET_MOUNTS[$i]}"
-        if ! mountpoint -q "$mnt" 2>/dev/null; then
-            continue
-        fi
-        if ! umount_with_retry "$mnt"; then
-            log_error "  Failed to unmount $mnt"
-            failed_mounts+=("$mnt")
-        fi
+        mnt="${ALL_TARGET_MOUNTS[$i]}"
+        target_rc=0
+        target_why="$(probe_mount_point "$mnt")" || target_rc=$?
+        case "$target_rc" in
+            0)
+                if ! umount_with_retry "$mnt"; then
+                    log_error "  Failed to unmount $mnt"
+                    still_mounted+=("$mnt")
+                fi
+                ;;
+            1) ;;
+            *)
+                log_error "  Could not tell whether $mnt is mounted — $target_why; unmounting it anyway"
+                if umount_with_retry "$mnt"; then
+                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount then succeeded")
+                else
+                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount failed too")
+                fi
+                ;;
+        esac
     done
 
     # Sources: only the mount points this run mounted itself
@@ -2197,10 +2239,23 @@ unmount_all() {
         fi
     done
 
-    if (( ${#failed_mounts[@]} > 0 )); then
-        local detail="${failed_mounts[*]}"
+    # The detail says why, for each target not known to be released: still
+    # mounted, or the probe could not tell. The report shows it beside
+    # "Unmount targets", the history row in its errors, and main() after
+    # "NOT safe to disconnect".
+    if (( ${#still_mounted[@]} + ${#not_known[@]} > 0 )); then
+        local detail="" item
+        if (( ${#still_mounted[@]} > 0 )); then
+            detail="still mounted: ${still_mounted[0]}"
+            for item in "${still_mounted[@]:1}"; do
+                detail+=", $item"
+            done
+        fi
+        for item in "${not_known[@]}"; do
+            detail+="${detail:+; }$item"
+        done
         record_op "unmount" "FAIL" "$detail"
-        log_error "Unmount FAILED for: $detail"
+        log_error "Unmount FAILED — $detail"
     else
         record_op "unmount" "OK"
         log_info "All backup targets unmounted"
@@ -3599,10 +3654,13 @@ main() {
 
     log_info "=== DAS Backup Completed ==="
     echo ""
-    if [[ "${OP_STATUS[unmount]:-OK}" == "FAIL" ]]; then
-        log_warn "Backup complete, but NOT all volumes unmounted cleanly — DAS is NOT safe to disconnect (still mounted: ${OP_STATUS[unmount_detail]:-unknown})."
-    else
+    # Safe only on the unmount gate's own OK: a FAIL — a target still
+    # mounted, or one the probe could not tell about — or no answer at all is
+    # NOT safe, and the line says why (bd DAS-Backup-Manager-jug6).
+    if [[ "${OP_STATUS[unmount]:-}" == "OK" ]]; then
         log_info "Backup complete. DAS can be safely disconnected."
+    else
+        log_warn "Backup complete, but NOT every backup target is known to be unmounted — DAS is NOT safe to disconnect: ${OP_STATUS[unmount_detail]:-the unmount step recorded no result}"
     fi
 
     # ---- Process exit status: 0 or 3 (EXIT STATUS in the header) ----------
