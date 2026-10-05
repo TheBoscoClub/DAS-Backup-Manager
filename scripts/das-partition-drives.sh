@@ -1,12 +1,14 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.3.2
+# Version: 2.3.3
 # Date: 2026-10-04
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
 #     --run refuses unless every drive's most recent SMART self-test PASSED:
-#     ATA "Completed without error" or SCSI "Completed", with smartctl's exit
-#     status flagging nothing beyond bit 2 or 6 (smartctl(8)). A test still
+#     ATA "Completed without error" or SCSI "Completed" as the log's newest
+#     entry, with smartctl's exit status flagging nothing beyond bit 2 or 6
+#     (smartctl(8)), and the drive's current execution status (-c) agreeing:
+#     no test running now, and none stopped or failed since. A test still
 #     running, failed, aborted, interrupted or never run, a failed test still
 #     in the log (bit 7), a drive smartctl cannot read, or one where it finds
 #     an invalid SMART checksum (read with -b exit): refused, the drive named
@@ -164,8 +166,13 @@ check_smart_tests() {
         # row. Its default, warn, prints the warning and carries on, so a log
         # smartctl itself calls invalid printed its rows at exit 0 and could
         # pass (measured on the smartctl 7.5 binary, a replayed drive).
+        #
+        # -c adds the drive's current self-test execution status, which the
+        # log can lag (bd zet1). It reads nothing new: it prints the SMART
+        # data this call reads anyway, so -b exit covers the same three
+        # structures (measured: the same three commands, replayed).
         rc=0
-        out="$(smartctl -b exit -l selftest "$dev" 2>&1)" || rc=$?
+        out="$(smartctl -b exit -c -l selftest "$dev" 2>&1)" || rc=$?
 
         if selftest_passed "$out" "$rc"; then
             verdict="${GREEN}PASSED${NC}"
@@ -192,13 +199,19 @@ check_smart_tests() {
     return 0
 }
 
-# selftest_passed <smartctl -l selftest output> <its exit status>
-# Returns 0 only when the drive's most recent self-test PASSED. Sets, in the
+# selftest_passed <smartctl -c -l selftest output> <its exit status>
+# Returns 0 only when the drive's most recent self-test PASSED: the log's
+# newest entry, and the drive's current execution status. Sets, in the
 # caller's locals, SELFTEST_STATUS (what the operator is shown) and
 # SELFTEST_ADVICE (what to do next, from why it did not pass; empty on a
 # pass). Each piece of advice says what that state means, nothing more.
 selftest_passed() {
-    local out="$1" rc="$2" nl=$'\n' row status pass
+    local out="$1" rc="$2" nl=$'\n' row status pass live=-1 left=""
+    local wait="a test is still running: wait for it to finish, then check again"
+    local rerun="the test stopped before it finished: run an extended test (smartctl -t long) and wait for it to PASS"
+    local failed="the drive failed its most recent self-test: do not use it, or --force deliberately"
+    local unknown="a result this script does not recognise: run an extended test (smartctl -t long) and wait for it to PASS"
+    local nothing="smartctl gave no self-test result, so nothing is verified: do not use the drive, or --force deliberately"
     SELFTEST_ADVICE=""
 
     # smartctl's exit status is a bitmask (smartctl(8), EXIT STATUS). Bits
@@ -230,7 +243,7 @@ selftest_passed() {
         return 1
     else
         SELFTEST_STATUS="no self-test result in smartctl's output (exit $rc)"
-        SELFTEST_ADVICE="smartctl gave no self-test result, so nothing is verified: do not use the drive, or --force deliberately"
+        SELFTEST_ADVICE="$nothing"
         return 1
     fi
 
@@ -248,6 +261,45 @@ selftest_passed() {
     fi
     status="${status%"${status##*[! ]}"}"
     SELFTEST_STATUS="${status:-$row}"
+
+    # The drive's CURRENT self-test execution status (bd DAS-Backup-Manager-
+    # zet1). A drive that writes its log entry only when a test ends still
+    # shows the previous test as row "# 1" while a new one runs.
+    #   ATA: -c prints the status byte from the SMART data,
+    #     "Self-test execution status:      (%4d)", read here as the number:
+    #     high nibble 0 done or never run, 1-2 stopped, 3-8 failed, 15
+    #     running with the low nibble tens of percent left. No such line
+    #     (SMART data unreadable) is no reading, and no pass.
+    #   SCSI: no -c section; -l selftest adds "Self-test execution status:
+    #     <TAB><TAB>%d%% of test remaining" while a test runs, nothing otherwise.
+    # (ataprint.cpp, scsiprint.cpp, 7.5.) Matched by bash, ASCII digits only.
+    if [[ $row == *"]" ]]; then
+        local scsi_live="(^|$nl)Self-test execution status:[[:space:]]+([[:digit:]]+)% of test remaining"
+        if [[ $out =~ $scsi_live ]]; then
+            left="${BASH_REMATCH[2]}%"
+        fi
+    else
+        local ata_live="(^|$nl)Self-test execution status:[[:space:]]+\([[:space:]]*([[:digit:]]+)\)"
+        if ! [[ $out =~ $ata_live ]]; then
+            SELFTEST_STATUS="no self-test result: smartctl printed no current execution status (exit $rc)"
+            SELFTEST_ADVICE="$nothing"
+            return 1
+        fi
+        live=$((10#${BASH_REMATCH[2]}))
+        if ((live >> 4 == 15)); then
+            left="$(( (live & 15) * 10 ))%"
+        fi
+    fi
+    # A test running now outranks whatever the log's newest entry says.
+    if [[ -n $left ]]; then
+        SELFTEST_STATUS="self-test in progress, $left remaining"
+        if [[ $status != *"in progress"* ]]; then
+            SELFTEST_STATUS+="; the log's newest entry is an earlier test: $status"
+        fi
+        SELFTEST_ADVICE="$wait"
+        return 1
+    fi
+
     if [[ $status != "$pass" ]]; then
         # What the status means (ACS-3 and SPC-3, in smartctl's words): still
         # running; stopped before it finished, by the host or a reset; a
@@ -255,14 +307,39 @@ selftest_passed() {
         # defines, or wording this script does not know, which only a
         # passed test can answer.
         case $status in
-            *"in progress"*)
-                SELFTEST_ADVICE="a test is still running: wait for it to finish, then check again" ;;
+            *"in progress"*) SELFTEST_ADVICE="$wait" ;;
             "Aborted by host" | "Interrupted (host reset)" | "Aborted (by user command)" | "Aborted (device reset ?)")
-                SELFTEST_ADVICE="the test stopped before it finished: run an extended test (smartctl -t long) and wait for it to PASS" ;;
+                SELFTEST_ADVICE="$rerun" ;;
             "Fatal or unknown error" | "Completed: "* | "Unknown error, incomplete" | "Completed, segment failed" | "Failed in "*)
-                SELFTEST_ADVICE="the drive failed its most recent self-test: do not use it, or --force deliberately" ;;
-            *)
-                SELFTEST_ADVICE="a result this script does not recognise: run an extended test (smartctl -t long) and wait for it to PASS" ;;
+                SELFTEST_ADVICE="$failed" ;;
+            *) SELFTEST_ADVICE="$unknown" ;;
+        esac
+        return 1
+    fi
+
+    # The log's newest entry passed. On ATA the current status must agree: one
+    # that says the last test was stopped, failed, or is something no
+    # standard defines means the newest test is not the one logged (bd zet1).
+    # A current status of 0 (done, or never run) adds nothing: the log keeps
+    # every block it makes.
+    if ((live >= 16)); then
+        local what
+        case $((live >> 4)) in
+            1) what="was aborted by the host" ;;
+            2) what="was interrupted by the host with a reset" ;;
+            3) what="could not complete due to a fatal or unknown error" ;;
+            4) what="completed with error (unknown test element)" ;;
+            5) what="completed with error (electrical test element)" ;;
+            6) what="completed with error (servo/seek test element)" ;;
+            7) what="completed with error (read test element)" ;;
+            8) what="completed with error (handling damage?)" ;;
+            *) what="has a status no standard defines" ;;
+        esac
+        SELFTEST_STATUS="the last self-test $what (smartctl -c, status $live); the log's newest entry is an earlier test: $status"
+        case $((live >> 4)) in
+            1 | 2) SELFTEST_ADVICE="$rerun" ;;
+            3 | 4 | 5 | 6 | 7 | 8) SELFTEST_ADVICE="$failed" ;;
+            *) SELFTEST_ADVICE="$unknown" ;;
         esac
         return 1
     fi
