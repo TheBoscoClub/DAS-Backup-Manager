@@ -211,13 +211,17 @@ Validates the current installation without changing anything:
 So `btrdasd setup` is required; what you can skip is its wizard. Write the config yourself
 and let `setup --force` install from it without asking anything:
 
+<!-- tests/test_install_doc_config.sh checks that the steps below create what they edit in -->
 ```bash
 # Build and install all components
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 sudo cmake --install build
 
-# Write the config (the smallest valid one is below) and check it; checking needs no root
+# Installing writes nothing under /etc, and sudoedit will not create a missing directory
+sudo install -d -m 0755 /etc/das-backup
+
+# Write the config (a minimal valid one is below) and check it; checking needs no root
 sudoedit /etc/das-backup/config.toml
 btrdasd config validate --config /etc/das-backup/config.toml
 
@@ -229,7 +233,7 @@ btrdasd config validate --config /etc/das-backup/config.toml
 sudo btrdasd setup --force
 ```
 
-The smallest config `btrdasd config validate` accepts. Edit the source and the target to
+A minimal config `btrdasd config validate` accepts. Edit the source and the target to
 match your volumes and drives; every other key is in the
 [Configuration Reference](#configuration-reference) below:
 
@@ -252,6 +256,9 @@ randomized_delay_min = 30
 
 [gui]
 
+[scrub]                              # the monthly scrub, on unless `enabled = false`
+targets = ["primary"]                # [[target]] labels to scrub (default: the author's three)
+
 [[source]]                           # one per BTRFS volume to back up
 label = "nvme-root"
 volume = "/.btrfs-nvme"              # the volume's top level, mounted
@@ -266,13 +273,17 @@ role = "primary"
 retention = { daily = 7, weekly = 4 }
 ```
 
-The reference's Default column is what the wizard writes. Every key the block leaves out may
-be left out; these may not: `version`, `install_prefix` and `db_path` in `[general]`, `system`
-in `[init]` and all three `[schedule]` keys — and `[general]`, `[init]`, `[schedule]`,
-`[email]` and `[gui]` must all be present, even empty. `setup --force` installs only from an
-existing config — without one it refuses — and writes the file back in its own form, so
-comments are not kept. After a later edit, `sudo btrdasd setup --upgrade` regenerates
-everything from it.
+The reference's Default column is what the wizard writes. A key the block leaves out takes
+that default and the config still loads — but one default is wrong for anyone whose drives are
+not the author's: `[scrub].targets` names three of the author's target labels, so a config that
+leaves it out, with the scrub on, schedules a monthly scrub of labels it does not define and
+scrubs none of its own drives. The block sets it to its own label; do the same for each
+`[[target]]` you add. These keys have no default and may not be left out: `version`,
+`install_prefix` and `db_path` in `[general]`, `system` in `[init]` and all three `[schedule]`
+keys — and `[general]`, `[init]`, `[schedule]`, `[email]` and `[gui]` must all be present, even
+empty. `setup --force` installs only from an existing config — without one it refuses — and
+writes the file back in its own form, so comments are not kept. After a later edit,
+`sudo btrdasd setup --upgrade` regenerates everything from it.
 
 ## CLI-Only Build (no GUI dependencies)
 
