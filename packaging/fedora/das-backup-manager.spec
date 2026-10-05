@@ -30,18 +30,15 @@ restoring files from backup snapshots.
 %autosetup -n DAS-Backup-Manager-%{version}
 
 %build
-cargo build --release --features dbus --manifest-path indexer/Cargo.toml
+# btrdasd: CMake is told -DBUILD_INDEXER=OFF, so cargo builds it here.
+# btrdasd-helper and its D-Bus, polkit and unit files are CMake's.
+cargo build --release --bin btrdasd --manifest-path indexer/Cargo.toml
 %cmake -DBUILD_INDEXER=OFF
 %cmake_build
 
 %install
 %cmake_install
 install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
-install -Dm755 indexer/target/release/btrdasd-helper %{buildroot}%{_libexecdir}/btrdasd-helper
-install -Dm644 dbus/org.dasbackup.Helper1.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.dasbackup.Helper1.conf
-install -Dm644 dbus/org.dasbackup.Helper1.service %{buildroot}%{_datadir}/dbus-1/system-services/org.dasbackup.Helper1.service
-install -Dm644 polkit/org.dasbackup.policy %{buildroot}%{_datadir}/polkit-1/actions/org.dasbackup.policy
-install -Dm644 systemd/btrdasd-helper.service %{buildroot}%{_unitdir}/btrdasd-helper.service
 
 %files
 %license LICENSE
