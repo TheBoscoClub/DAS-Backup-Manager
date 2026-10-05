@@ -48,7 +48,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active |
-| `scripts/install-backup-timer.sh` | systemd timer installer | Active |
+| `scripts/install-backup-timer.sh` | Former timer installer: now prints a pointer to `btrdasd setup`, which writes and enables the timers, and exits 1 | Deprecated |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
