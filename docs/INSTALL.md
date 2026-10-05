@@ -238,6 +238,7 @@ This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit
 | `BUILD_GUI` | `ON` | Build the KDE Plasma GUI (requires Qt6/KF6) |
 | `BUILD_INDEXER` | `ON` | Build the `btrdasd` Rust binary via cargo |
 | `BUILD_HELPER` | `ON` | Build the `btrdasd-helper` D-Bus daemon and install polkit/D-Bus config |
+| `REQUIRE_ALL_SHELL_CASES` | `OFF` | `ctest` fails a shell suite that prints `NOT RUN`, a case its host could not run (no `en_US.UTF-8` locale, no built `btrdasd`); CI sets it |
 | `CMAKE_INSTALL_PREFIX` | `/usr/local` | Installation prefix for binaries and scripts |
 | `CMAKE_BUILD_TYPE` | (unset) | `Release`, `RelWithDebInfo`, or `Debug` |
 

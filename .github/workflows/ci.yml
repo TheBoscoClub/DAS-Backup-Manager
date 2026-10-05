@@ -96,8 +96,43 @@ jobs:
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
             qt6-tools
 
+      # Five shell suites carry cases that need en_US.UTF-8, and under C or
+      # C.UTF-8 they cannot fail: bash's regex ranges [A-Za-z] and [0-9] match
+      # thousands of non-ASCII letters and digits only under a locale like it
+      # (bd DAS-Backup-Manager-1bsx). The Arch container carries that locale's
+      # source but never compiles it, so every suite printed "NOT RUN" and
+      # passed, and CI never exercised the fix it exists to guard. This compiles
+      # the locale and then measures its effect on bash, in the log: the job
+      # fails here, not quietly later, if the effect the suites test is absent.
+      - name: Generate the en_US.UTF-8 locale
+        run: |
+          set -euo pipefail
+          sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+          locale-gen
+          if ! LC_ALL=en_US.UTF-8 bash -c '
+              letter=$(printf "\303\251")
+              digit=$(printf "\331\243")
+              widened=no
+              if [[ $letter =~ [A-Za-z] && $digit =~ [0-9] ]]; then
+                widened=yes
+              fi
+              echo "en_US.UTF-8 probe: charmap $(locale charmap)," \
+                "[A-Za-z] and [0-9] match non-ASCII: $widened"
+              [[ $widened == yes ]]
+            '; then
+            echo "::error::en_US.UTF-8 is not usable:" \
+              "the suites' locale cases would be skipped"
+            exit 1
+          fi
+
+      # REQUIRE_ALL_SHELL_CASES: a shell suite that prints NOT RUN fails (see
+      # CMakeLists.txt), so the ctest step below passes only if the locale
+      # cases, and the exit suite's replays through the btrdasd this build
+      # makes, ran.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+        run: >-
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DREQUIRE_ALL_SHELL_CASES=ON
 
       # Always via cmake — a bare `cargo build` writes to a different target dir
       # and the install step then picks up a stale binary.
@@ -106,7 +141,7 @@ jobs:
 
       # Offscreen QPA so the GUI smoke suite needs no display or session bus.
       # --output-on-failure, because a bare pass/fail count is not a diagnosis.
-      - name: ctest (GUI smoke suite)
+      - name: ctest (shell suites and GUI smoke suite)
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
