@@ -4,6 +4,17 @@
 # Date: 2026-10-05
 #
 # Features:
+#   - The boot-subvolume step tells "not mounted" from "could not tell"
+#     (v4.11.3): update_boot_subvolumes() asks probe_mount_point, whose three
+#     answers it used to fold into two. A target whose mountpoint check could
+#     not run — a missing mountpoint program (exit 127), or no descriptor free
+#     for its redirection — read as "not mounted": it was skipped, counted as
+#     neither skipped nor failed, and the step recorded OK, 0 updated, 0
+#     skipped, a green result for work that was not looked at. "Could not
+#     tell" now fails the step: counted, said with the probe's message and the
+#     target's name, and the targets after it are still done. "Not mounted",
+#     and a path that is not there, stay a quiet skip (bd
+#     DAS-Backup-Manager-jlsz; tests/test_early_exit_readers.sh).
 #   - A pid is ASCII digits (v4.11.3): maintenance_holder() matches the pid in
 #     the lock file's record with [[:digit:]]. Under en_US.UTF-8, the host's
 #     locale, bash's regex [0-9] also matches digits of other scripts and
@@ -1885,6 +1896,7 @@ run_btrbk() {
 update_boot_subvolumes() {
     local force="${1:-false}"
     local updated=0 skipped=0 failed=0
+    local mount_rc mount_why
     # One timestamp per run (not per subvolume/target) — matches the Rust
     # archive_boot() format exactly so boot-archive-cleanup.sh's
     # parse_archive_timestamp() can parse either origin's archives.
@@ -1896,9 +1908,27 @@ update_boot_subvolumes() {
     # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
     # bootable systems and must never have their @ replaced with host snapshots.
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        if ! mountpoint -q "$mnt" 2>/dev/null; then
-            continue
-        fi
+        # Mounted, not mounted, or could not tell (probe_mount_point). Only the
+        # second is a target to leave alone; the third is a failure of this
+        # step, counted and said. `mountpoint -q ... || continue` read every
+        # failure of the probe — a missing mountpoint program (exit 127), no
+        # descriptor free for its redirection — as "not mounted": the target
+        # was skipped, counted as neither skipped nor failed, and the step
+        # recorded OK, 0 updated, 0 skipped (bd DAS-Backup-Manager-jlsz). Not
+        # seen here: a descriptor shortage so complete that bash cannot make
+        # the pipe of the capture below returns 0 and nothing, which reads as
+        # "mounted" — the limit of every capture, unmount_all's probe included.
+        mount_rc=0
+        mount_why="$(probe_mount_point "$mnt")" || mount_rc=$?
+        case "$mount_rc" in
+            0) ;;
+            1) continue ;;
+            *)
+                log_error "  Could not tell whether $mnt is mounted — $mount_why; its boot subvolumes were NOT updated"
+                (( failed += 1 ))
+                continue
+                ;;
+        esac
 
         # Skip mirror targets — they have their own OS installations
         local mount_role="${MOUNT_ROLES[$mnt]:-}"
