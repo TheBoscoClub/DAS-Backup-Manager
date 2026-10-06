@@ -252,30 +252,56 @@ fn sync_dry_run_renders_the_planned_btrbk_conf_into_an_existing_file() {
     assert_eq!(std::fs::read_to_string(&render).unwrap(), "");
 }
 
-#[test]
-fn backup_boot_plan_prints_the_plan_and_refuses_an_unreadable_btrbk_conf() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = write_config(dir.path());
-    let config_s = config.to_str().unwrap();
-    // The config's [boot] section names no subvolume by default: add one and
-    // give btrbk.conf the name it writes for it.
-    let text = std::fs::read_to_string(&config).unwrap();
+/// Config with `[boot]` naming `@` and source `s` carrying `target_subdirs`
+/// (`None` = the key absent), plus the btrbk.conf that names `@`'s snapshot.
+fn boot_plan_config(dir: &Path, subdirs: Option<&str>) -> std::path::PathBuf {
+    let config = write_config(dir);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    if let Some(list) = subdirs {
+        let anchor = "device = \"UUID=abc\"\n";
+        assert!(text.contains(anchor), "{text}");
+        text = text.replacen(anchor, &format!("{anchor}target_subdirs = {list}\n"), 1);
+    }
     std::fs::write(&config, format!("{text}[boot]\nsubvolumes = [\"@\"]\n")).unwrap();
     std::fs::write(
-        dir.path().join("btrbk.conf"),
+        dir.join("btrbk.conf"),
         "volume /vol\n  subvolume  @\n    snapshot_name  root-\n",
     )
     .unwrap();
-    let out = btrdasd(&["backup", "boot-plan", "--config", config_s]);
+    config
+}
+
+fn boot_plan_stdout(config: &Path) -> String {
+    let out = btrdasd(&["backup", "boot-plan", "--config", config.to_str().unwrap()]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "@\troot-\t-\n");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
 
+#[test]
+fn backup_boot_plan_prints_the_subdirs_comma_joined_and_dash_when_there_are_none() {
+    let one = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(one.path(), Some("[\"nvme\"]"));
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme\n");
+
+    let two = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(two.path(), Some("[\"nvme\", \"ssd\"]"));
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme,ssd\n");
+
+    let none = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(none.path(), None);
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\t-\n");
+}
+
+#[test]
+fn backup_boot_plan_refuses_an_unreadable_btrbk_conf() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(dir.path(), Some("[\"nvme\"]"));
     std::fs::remove_file(dir.path().join("btrbk.conf")).unwrap();
-    let out = btrdasd(&["backup", "boot-plan", "--config", config_s]);
+    let out = btrdasd(&["backup", "boot-plan", "--config", config.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("btrbk.conf"), "{err}");
