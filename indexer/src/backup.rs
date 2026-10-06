@@ -6241,13 +6241,14 @@ mod tests {
     }
 
     /// A stat that fails is a FAIL and nothing is mutated — never "absent".
-    /// Live: a target directory nobody can search (tests do not run as root).
+    /// Live: `@` is a symlink to itself, so its stat fails with ELOOP — an
+    /// error root cannot bypass (a mode-000 directory would pass as root, as
+    /// CI's container runs).
     #[test]
     fn a_live_subvolume_that_cannot_be_statted_fails_and_nothing_runs_after_it() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let m = dir.path().display().to_string();
-        std::fs::create_dir(dir.path().join("@")).unwrap();
+        std::os::unix::fs::symlink("@", dir.path().join("@")).unwrap();
         let (config, _conf) = archive_fixture(dir.path());
         let runner = Scripted::from_owned(vec![(
             format!("btrfs subvolume list {m}"),
@@ -6255,9 +6256,7 @@ mod tests {
             "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".into(),
         )])
         .snapshotting();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
         let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             matches!(&step, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0
                 && o.failures[0].contains("Cannot tell whether") && o.failures[0].contains(&format!("{m}/@"))),
@@ -7419,15 +7418,15 @@ mod tests {
     #[test]
     fn a_mount_point_that_cannot_be_statted_fails_the_whole_step() {
         // bd 4za8: `exists()` read a failed stat as "not mounted", so the step
-        // reported OK with nothing done. Not root: mode 000 makes the stat fail.
-        use std::os::unix::fs::PermissionsExt;
+        // reported OK with nothing done. The mount path lies under a regular
+        // file (ENOTDIR), which root cannot bypass, unlike a mode-000 directory.
         let primary_dir = tempfile::tempdir().unwrap();
-        let locked = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
-        let unreadable = locked.path().join("mnt");
+        let file = primary_dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let unreadable = file.join("mnt");
         assert!(
             Path::new(&unreadable).try_exists().is_err(),
-            "fixture: the stat must fail (are the tests running as root?)"
+            "fixture: the stat must fail"
         );
         let (config, _conf) = primary_and_mirror(
             &primary_dir.path().to_string_lossy(),
@@ -7436,7 +7435,6 @@ mod tests {
         let progress = TestProgress::new();
         let runner = Scripted::from_owned(vec![]);
         let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
-        std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             matches!(&step, BootStep::Ran(o) if o.status() == "FAIL"
                 && o.failures.iter().any(|f| f.contains("cannot tell whether")
