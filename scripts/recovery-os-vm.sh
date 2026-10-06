@@ -1382,12 +1382,15 @@ guard_message_lines() {
 
 # What runs in place of btrbk while the guard holds: it refuses, and says so
 # on the kernel log -- the evidence that something tried. A credential of its
-# own, so no line of it passes through systemd's parsing.
+# own, so no line of it passes through systemd's parsing. 2>/dev/null comes
+# before > /dev/kmsg: redirections apply left to right, and a caller who
+# cannot write the kernel log (not root) would otherwise see that failure
+# instead of only the refusal (bd DAS-Backup-Manager-uo39).
 guard_stub_text() {
     cat <<'EOF'
 #!/bin/sh
 # das-vm-guard (DAS recovery OS updater): btrbk cannot run in this VM session.
-echo "das-vm-guard: refused: btrbk $* (pid $$, parent $PPID $(cat /proc/$PPID/comm 2>/dev/null))" > /dev/kmsg 2>/dev/null
+echo "das-vm-guard: refused: btrbk $* (pid $$, parent $PPID $(cat /proc/$PPID/comm 2>/dev/null))" 2>/dev/null > /dev/kmsg
 echo "das-vm-guard: btrbk cannot run in this VM session -- lift the guard first: systemctl stop das-vm-guard" >&2
 exit 1
 EOF

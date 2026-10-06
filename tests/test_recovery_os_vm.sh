@@ -3515,6 +3515,13 @@ refuser="$(guestify "$(credential "$S/defined.at_start.xml" das-vm-guard.btrbk)"
 check "the refusing btrbk: exits nonzero" "$(sh -c "$refuser" btrbk run --progress >/dev/null 2>&1; echo $?)" "1"
 has "the refusing btrbk: logs the attempt on the kernel log" "$(file "$KMSG")" "das-vm-guard: refused: btrbk run --progress"
 has "the refusing btrbk: tells whoever ran it" "$(sh -c "$refuser" btrbk run 2>&1 >/dev/null || :)" "das-vm-guard: btrbk cannot run in this VM session"
+# A caller who cannot write the kernel log (any non-root user, in the real VM)
+# is told the refusal and nothing else -- not the failed redirect's own error
+# (bd DAS-Backup-Manager-uo39). A path in a missing directory fails for root
+# too, so this holds however the suite is run.
+unwritable="${refuser//"$KMSG"/"$G/no-such-dir/kmsg"}"
+check "the refusing btrbk: an unwritable kernel log is not the caller's error" "$(sh -c "$unwritable" btrbk run 2>&1 >/dev/null || :)" "das-vm-guard: btrbk cannot run in this VM session -- lift the guard first: systemctl stop das-vm-guard"
+check "the refusing btrbk: ...and still refuses" "$(sh -c "$unwritable" btrbk run >/dev/null 2>&1; echo $?)" "1"
 
 script="$(guestify "$(sed -n "s|^ExecStart=/usr/bin/sh -c '\(.*\)'$|\1|p" <<<"$r")")"
 check "reporter: its script is shell" "$(sh -n -c "$script" 2>&1 && echo ok)" "ok"
