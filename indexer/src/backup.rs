@@ -122,12 +122,17 @@ impl std::fmt::Display for BackupMode {
 pub struct BackupOptions {
     /// Incremental or full. None = use schedule default.
     pub mode: Option<BackupMode>,
-    /// Source labels to back up. Empty = all configured sources. btrbk is
-    /// told to touch exactly these sources' subvolumes and no others.
-    pub sources: Vec<String>,
-    /// Target labels to send to. Empty = all available targets. btrbk is told
-    /// to write to exactly these and is not told about the rest.
-    pub targets: Vec<String>,
+    /// Source labels to back up. `None` = not specified: every configured
+    /// source. `Some(labels)` = exactly these, and btrbk is told to touch
+    /// exactly their subvolumes and no others. **`Some` of an empty list is a
+    /// selection of nothing, and the run is refused** ([`empty_selection`]) —
+    /// never read as "all": a GUI with every box unticked asks for nothing.
+    pub sources: Option<Vec<String>>,
+    /// Target labels to send to. `None` = not specified: every target that is
+    /// mounted. `Some(labels)` = exactly these, and btrbk is told to write to
+    /// exactly these and is not told about the rest. `Some` of an empty list
+    /// is refused, as for `sources`.
+    pub targets: Option<Vec<String>>,
     /// Preview only — don't actually run btrbk.
     pub dry_run: bool,
     /// Create snapshots but skip send/receive.
@@ -1430,11 +1435,53 @@ fn unmounted_source_volumes(
     unmounted
 }
 
-/// The source labels a run backs up: the ones named or — when none are —
-/// every source with at least one subvolume that is not manual-only.
-fn effective_sources(config: &Config, options: &BackupOptions) -> Vec<String> {
-    if options.sources.is_empty() {
-        config
+/// Why a selection that was made and is empty cannot be run, or `None` when
+/// nothing is wrong with it. `None` for a list that was never given
+/// (`BackupOptions` with no `sources`): that one means "all", an empty one
+/// that was given means "nothing" — an operator who unticked every box asked
+/// for no backup, not for every backup. Callers whose input cannot say "not
+/// specified" (the D-Bus helper's `as` arguments) hand over `Some(list)`, so
+/// an empty list is refused there.
+pub fn empty_selection(options: &BackupOptions) -> Option<String> {
+    options
+        .sources
+        .as_deref()
+        .and_then(refuse_empty_sources)
+        .or_else(|| options.targets.as_deref().and_then(refuse_empty_targets))
+}
+
+/// [`empty_selection`] for one list of source labels that was given: the
+/// refusal if it is empty. For the D-Bus `BackupSnapshot`, which takes no
+/// options.
+pub fn refuse_empty_sources(sources: &[String]) -> Option<String> {
+    sources
+        .is_empty()
+        .then(|| nothing_selected("source", "target"))
+}
+
+/// [`refuse_empty_sources`] for target labels (the D-Bus `BackupSend`).
+pub fn refuse_empty_targets(targets: &[String]) -> Option<String> {
+    targets
+        .is_empty()
+        .then(|| nothing_selected("target", "source"))
+}
+
+fn nothing_selected(what: &str, other: &str) -> String {
+    format!(
+        "No {what} selected — nothing was started. An empty selection is not \"every {what}\"; \
+         tick at least one {what} (and one {other}) and run again."
+    )
+}
+
+/// The source labels a run backs up: the ones named or — when none were
+/// specified — every source with at least one subvolume that is not
+/// manual-only. A selection made and empty is refused, never widened.
+fn effective_sources(config: &Config, options: &BackupOptions) -> Result<Vec<String>, String> {
+    if let Some(why) = empty_selection(options) {
+        return Err(why);
+    }
+    Ok(match &options.sources {
+        None => config
             .sources
             .iter()
             .filter(|src| {
@@ -1442,29 +1489,28 @@ fn effective_sources(config: &Config, options: &BackupOptions) -> Vec<String> {
                 src.subvolumes.iter().any(|sv| !sv.manual_only)
             })
             .map(|src| src.label.clone())
-            .collect()
-    } else {
-        options.sources.clone()
-    }
+            .collect(),
+        Some(named) => named.clone(),
+    })
 }
 
 /// The target labels a run writes to.
 ///
 /// When targets are explicitly specified (D-Bus helper pre-mounts them),
 /// trust the caller — don't re-check mount status.  Only auto-detect
-/// mounted targets when the caller leaves the list empty (standalone CLI).
-fn effective_targets(
-    config: &Config,
-    options: &BackupOptions,
-    progress: &dyn ProgressCallback,
-) -> Vec<String> {
-    if options.targets.is_empty() {
-        return mounted_target_labels(config);
+/// mounted targets when the caller never specified any (standalone CLI).
+/// A selection made and empty, or one naming no configured target, is
+/// refused: neither is "every mounted target".
+fn effective_targets(config: &Config, options: &BackupOptions) -> Result<Vec<String>, String> {
+    if let Some(why) = empty_selection(options) {
+        return Err(why);
     }
+    let Some(named) = &options.targets else {
+        return Ok(mounted_target_labels(config));
+    };
     // Caller specified targets — validate they exist in config but don't
     // re-check mount status (caller already ensured mount via MountGuard).
-    let matched: Vec<String> = options
-        .targets
+    let matched: Vec<String> = named
         .iter()
         .filter(|label| {
             config
@@ -1474,23 +1520,22 @@ fn effective_targets(
         })
         .cloned()
         .collect();
-
-    // If no requested targets matched config (e.g. stale label list),
-    // fall back to auto-detecting mounted targets so the backup can
-    // still proceed.
     if matched.is_empty() {
-        progress.on_log(
-            LogLevel::Warning,
-            &format!(
-                "Requested targets {:?} did not match config {:?} — auto-detecting mounted targets",
-                options.targets,
-                config.targets.iter().map(|t| &t.label).collect::<Vec<_>>()
-            ),
-        );
-        mounted_target_labels(config)
-    } else {
-        matched
+        // A stale label list used to fall back to every mounted target: the
+        // same widening as an empty list, and for the same reason refused.
+        return Err(format!(
+            "None of the targets selected ({}) is in the configuration ({}) — nothing was \
+             started",
+            named.join(", "),
+            config
+                .targets
+                .iter()
+                .map(|t| t.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
+    Ok(matched)
 }
 
 /// What the btrbk steps counted, and which of them failed.
@@ -1601,8 +1646,8 @@ fn run_backup_with(
 
     // ---------- Resolve effective sources and targets ----------
 
-    let effective_sources = effective_sources(config, options);
-    let effective_targets = effective_targets(config, options, progress);
+    let effective_sources = effective_sources(config, options)?;
+    let effective_targets = effective_targets(config, options)?;
 
     // Require at least one target (unless dry-run).
     if effective_targets.is_empty() && !options.dry_run {
@@ -2068,6 +2113,11 @@ pub fn run_backup_job(
     mut options: BackupOptions,
     progress: &dyn ProgressCallback,
 ) -> BackupJobOutcome {
+    // Before the first lock and the first mount: a selection of nothing is
+    // refused with nothing touched (bd DAS-Backup-Manager-7tx).
+    if let Some(why) = empty_selection(&options) {
+        return BackupJobOutcome::NotRun(why);
+    }
     let locks = match host.acquire_locks(progress) {
         Ok(Some(locks)) => locks,
         Ok(None) => return BackupJobOutcome::Declined,
@@ -2577,8 +2627,11 @@ mod tests {
     fn backup_options_defaults() {
         let opts = BackupOptions::default();
         assert!(opts.mode.is_none());
-        assert!(opts.sources.is_empty());
-        assert!(opts.targets.is_empty());
+        assert!(
+            opts.sources.is_none(),
+            "not specified is not an empty selection"
+        );
+        assert!(opts.targets.is_none());
         assert!(!opts.dry_run);
         assert!(!opts.snapshot_only);
         assert!(!opts.send_only);
@@ -3966,7 +4019,7 @@ mod tests {
         let runner = Scripted::from_owned(vec![]);
         let options = BackupOptions {
             dry_run: true,
-            targets: labels(&["primary-22tb"]),
+            targets: Some(labels(&["primary-22tb"])),
             ..Default::default()
         };
         let progress = TestProgress::new();
@@ -4388,7 +4441,7 @@ mod tests {
     fn live_options() -> BackupOptions {
         BackupOptions {
             mode: Some(BackupMode::Incremental),
-            targets: labels(&["primary-22tb"]),
+            targets: Some(labels(&["primary-22tb"])),
             ..Default::default()
         }
     }
@@ -4469,7 +4522,7 @@ mod tests {
         let runner = Scripted::from_owned(vec![]);
         // `manual-src` is selected, its volume is not mounted.
         let options = BackupOptions {
-            sources: labels(&["manual-src"]),
+            sources: Some(labels(&["manual-src"])),
             ..live_options()
         };
         let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
@@ -4529,18 +4582,18 @@ mod tests {
         let config = make_test_config();
         let options = BackupOptions::default();
         // `manual-src` has only a manual-only subvolume.
-        assert_eq!(effective_sources(&config, &options), ["nvme-root"]);
+        assert_eq!(effective_sources(&config, &options).unwrap(), ["nvme-root"]);
     }
 
     #[test]
     fn a_source_named_explicitly_is_backed_up_even_if_manual_only() {
         let config = make_test_config();
         let options = BackupOptions {
-            sources: labels(&["manual-src", "nvme-root"]),
+            sources: Some(labels(&["manual-src", "nvme-root"])),
             ..Default::default()
         };
         assert_eq!(
-            effective_sources(&config, &options),
+            effective_sources(&config, &options).unwrap(),
             ["manual-src", "nvme-root"]
         );
     }
@@ -4552,9 +4605,8 @@ mod tests {
         absent.label = "absent".into();
         absent.mount = "/nonexistent/das/absent".into();
         config.targets.push(absent);
-        let progress = TestProgress::new();
         assert_eq!(
-            effective_targets(&config, &BackupOptions::default(), &progress),
+            effective_targets(&config, &BackupOptions::default()).unwrap(),
             ["primary-22tb"],
             "/proc is mounted, the other mount point does not exist"
         );
@@ -4568,38 +4620,135 @@ mod tests {
         absent.mount = "/nonexistent/das/absent".into();
         config.targets.push(absent);
         let options = BackupOptions {
-            targets: labels(&["absent", "no-such-target"]),
+            targets: Some(labels(&["absent", "no-such-target"])),
             ..Default::default()
         };
         // Named, so a ticked target is passed on whether or not it is
         // mounted: the verification before btrbk is what refuses it.
-        assert_eq!(
-            effective_targets(&config, &options, &TestProgress::new()),
-            ["absent"]
+        assert_eq!(effective_targets(&config, &options).unwrap(), ["absent"]);
+    }
+
+    // -- an empty selection is a refusal, never "all" (bd DAS-Backup-Manager-7tx) --
+
+    #[test]
+    fn targets_named_that_match_nothing_are_refused_not_widened_to_those_mounted() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            targets: Some(labels(&["stale-label"])),
+            ..Default::default()
+        };
+        let why = effective_targets(&config, &options).unwrap_err();
+        assert!(
+            why.contains("stale-label") && why.contains("primary-22tb"),
+            "{why}"
         );
     }
 
     #[test]
-    fn targets_named_that_match_nothing_fall_back_to_those_mounted_with_a_warning() {
+    fn every_target_unticked_is_a_refusal_not_every_mounted_target() {
         let config = make_test_config();
         let options = BackupOptions {
-            targets: labels(&["stale-label"]),
+            targets: Some(Vec::new()),
             ..Default::default()
         };
-        let progress = TestProgress::new();
+        let why = effective_targets(&config, &options).unwrap_err();
+        assert!(why.contains("No target selected"), "{why}");
+        // The control: left unspecified, the same config selects what is mounted.
         assert_eq!(
-            effective_targets(&config, &options, &progress),
+            effective_targets(&config, &BackupOptions::default()).unwrap(),
             ["primary-22tb"]
         );
+    }
+
+    #[test]
+    fn every_source_unticked_is_a_refusal_not_every_source() {
+        let config = make_test_config();
+        let options = BackupOptions {
+            sources: Some(Vec::new()),
+            ..Default::default()
+        };
+        let why = effective_sources(&config, &options).unwrap_err();
+        assert!(why.contains("No source selected"), "{why}");
+        assert_eq!(
+            effective_sources(&config, &BackupOptions::default()).unwrap(),
+            ["nvme-root"]
+        );
+    }
+
+    #[test]
+    fn the_empty_selection_check_names_the_list_that_is_empty_and_passes_the_rest() {
+        let empty_sources = BackupOptions {
+            sources: Some(Vec::new()),
+            targets: Some(labels(&["primary-22tb"])),
+            ..Default::default()
+        };
         assert!(
-            progress
-                .logs
-                .lock()
+            empty_selection(&empty_sources)
                 .unwrap()
-                .iter()
-                .any(|(l, m)| *l == LogLevel::Warning
-                    && m.contains("did not match config")
-                    && m.contains("stale-label"))
+                .starts_with("No source selected")
+        );
+        let empty_targets = BackupOptions {
+            sources: Some(labels(&["nvme-root"])),
+            targets: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(
+            empty_selection(&empty_targets)
+                .unwrap()
+                .starts_with("No target selected")
+        );
+        let both = BackupOptions {
+            sources: Some(labels(&["nvme-root"])),
+            targets: Some(labels(&["primary-22tb"])),
+            ..Default::default()
+        };
+        assert_eq!(empty_selection(&both), None);
+        assert_eq!(empty_selection(&BackupOptions::default()), None);
+    }
+
+    #[test]
+    fn the_d_bus_lists_are_checked_one_by_one() {
+        assert!(refuse_empty_sources(&[]).unwrap().contains("No source"));
+        assert!(refuse_empty_targets(&[]).unwrap().contains("No target"));
+        assert_eq!(refuse_empty_sources(&labels(&["nvme-root"])), None);
+        assert_eq!(refuse_empty_targets(&labels(&["primary-22tb"])), None);
+    }
+
+    #[test]
+    fn a_live_run_with_every_target_unticked_is_refused_and_btrbk_is_never_run() {
+        let config = live_config();
+        let runner = Scripted::from_owned(vec![]);
+        let options = BackupOptions {
+            targets: Some(Vec::new()),
+            ..live_options()
+        };
+        let err = run_backup_with(&config, &options, &TestProgress::new(), &env(&runner))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No target selected"), "{err}");
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may run: {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn a_live_run_with_every_source_unticked_is_refused_and_btrbk_is_never_run() {
+        let config = live_config();
+        let runner = Scripted::from_owned(vec![]);
+        let options = BackupOptions {
+            sources: Some(Vec::new()),
+            ..live_options()
+        };
+        let err = run_backup_with(&config, &options, &TestProgress::new(), &env(&runner))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No source selected"), "{err}");
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may run: {:?}",
+            runner.calls()
         );
     }
 
@@ -5465,6 +5614,45 @@ mod tests {
             outcome.finish_line(false),
             (false, "A backup is already running — declined".to_string())
         );
+    }
+
+    #[test]
+    fn a_job_with_nothing_selected_is_refused_before_any_lock_mount_or_record() {
+        for (sources, targets, says) in [
+            (None, Some(Vec::new()), "No target selected"),
+            (Some(Vec::new()), None, "No source selected"),
+            (Some(Vec::new()), Some(Vec::new()), "No source selected"),
+        ] {
+            let host = FakeHost::default();
+            let options = BackupOptions {
+                sources,
+                targets,
+                ..Default::default()
+            };
+            let outcome = run_backup_job(&host, make_test_config(), options, &TestProgress::new());
+            let (ok, line) = outcome.finish_line(false);
+            assert!(!ok, "{outcome:?}");
+            assert!(line.contains(says), "{line}");
+            assert!(
+                host.steps().is_empty(),
+                "the host was touched: {:?}",
+                host.steps()
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_with_a_selection_made_proceeds_exactly_as_one_without() {
+        let host = FakeHost::default();
+        let options = BackupOptions {
+            sources: Some(labels(&["nvme-root"])),
+            targets: Some(labels(&["primary-22tb"])),
+            ..Default::default()
+        };
+        let outcome = run_backup_job(&host, make_test_config(), options, &TestProgress::new());
+        assert!(outcome.success(), "{outcome:?}");
+        assert!(host.steps().contains(&"locks".to_string()));
+        assert!(host.steps().contains(&"record".to_string()));
     }
 
     #[test]

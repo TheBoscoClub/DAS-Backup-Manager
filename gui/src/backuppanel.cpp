@@ -14,6 +14,8 @@
 #include <QStringList>
 #include <QVBoxLayout>
 
+#include <algorithm>
+
 namespace {
 // Property key used to store the original (accelerator-free) label on each
 // dynamically created source/target checkbox.  KAcceleratorManager inserts
@@ -172,6 +174,7 @@ void BackupPanel::loadConfig()
         auto *errLabel2 = new QLabel(i18n("Could not load configuration"), m_targetsGroup);
         errLabel2->setEnabled(false);
         qobject_cast<QVBoxLayout *>(m_targetsGroup->layout())->addWidget(errLabel2);
+        updateRunEnabled();
         return;
     }
 
@@ -260,6 +263,7 @@ void BackupPanel::loadConfig()
             cb->setToolTip(i18n("Include this source in the backup"));
             srcLayout->addWidget(cb);
             m_sourceChecks.append(cb);
+            connect(cb, &QCheckBox::toggled, this, &BackupPanel::updateRunEnabled);
         }
     }
 
@@ -276,8 +280,26 @@ void BackupPanel::loadConfig()
             cb->setToolTip(i18n("Include this target in the backup"));
             tgtLayout->addWidget(cb);
             m_targetChecks.append(cb);
+            connect(cb, &QCheckBox::toggled, this, &BackupPanel::updateRunEnabled);
         }
     }
+    updateRunEnabled();
+}
+
+void BackupPanel::updateRunEnabled()
+{
+    const auto anyChecked = [](const QList<QCheckBox *> &boxes) {
+        return std::any_of(boxes.cbegin(), boxes.cend(),
+                           [](const QCheckBox *cb) { return cb->isChecked(); });
+    };
+    const bool selected = anyChecked(m_sourceChecks) && anyChecked(m_targetChecks);
+    const bool enabled = selected && !m_jobRunning;
+    m_dryRunButton->setEnabled(enabled);
+    m_runButton->setEnabled(enabled);
+    const QString why = selected ? QString()
+                                 : i18n("Tick at least one source and one target");
+    m_dryRunButton->setStatusTip(why);
+    m_runButton->setStatusTip(why);
 }
 
 void BackupPanel::runBackup(bool dryRun)
@@ -300,22 +322,27 @@ void BackupPanel::runBackup(bool dryRun)
         }
     }
 
-    m_dryRunButton->setEnabled(false);
-    m_runButton->setEnabled(false);
+    // Nothing ticked is nothing to back up — never "everything". The buttons
+    // are disabled in that state; this keeps a stray call from sending it.
+    if (sources.isEmpty() || targets.isEmpty())
+        return;
+
+    m_jobRunning = true;
+    updateRunEnabled();
 
     // Re-enable the buttons once the job completes (success or failure)
     connect(m_client, &DBusClient::jobFinished, this,
             [this](const QString & /*jobId*/, bool /*success*/, const QString & /*summary*/) {
-                m_dryRunButton->setEnabled(true);
-                m_runButton->setEnabled(true);
+                m_jobRunning = false;
+                updateRunEnabled();
             },
             Qt::SingleShotConnection);
 
     // Re-enable buttons if the D-Bus call itself fails (e.g. polkit denied)
     connect(m_client, &DBusClient::errorOccurred, this,
             [this](const QString & /*operation*/, const QString & /*error*/) {
-                m_dryRunButton->setEnabled(true);
-                m_runButton->setEnabled(true);
+                m_jobRunning = false;
+                updateRunEnabled();
             },
             Qt::SingleShotConnection);
 

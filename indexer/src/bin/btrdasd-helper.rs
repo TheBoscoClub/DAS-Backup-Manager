@@ -330,8 +330,11 @@ impl HelperInterface {
         };
         let options = BackupOptions {
             mode: backup_mode,
-            sources,
-            targets,
+            // An `as` argument cannot say "not specified", and the GUI always
+            // lists its ticks: an empty list is a selection of nothing and
+            // the job refuses it (backup::empty_selection) — never "all".
+            sources: Some(sources),
+            targets: Some(targets),
             dry_run,
             boot_archive: config.boot.enabled,
             index_after: true,
@@ -388,6 +391,12 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
+        // A D-Bus list cannot say "not specified": empty is a selection of
+        // nothing, refused before any lock, mount or btrbk — never "all".
+        if let Some(why) = backup::refuse_empty_sources(&sources) {
+            return Err(fdo::Error::InvalidArgs(why));
+        }
 
         let config = load_config()?;
         let job_id = new_job_id();
@@ -454,6 +463,12 @@ impl HelperInterface {
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+
+        // A D-Bus list cannot say "not specified": empty is a selection of
+        // nothing, refused before any lock, mount or btrbk — never "all".
+        if let Some(why) = backup::refuse_empty_targets(&targets) {
+            return Err(fdo::Error::InvalidArgs(why));
+        }
 
         let config = load_config()?;
         let job_id = new_job_id();
