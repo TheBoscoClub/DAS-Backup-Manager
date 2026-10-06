@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  recovery-os-updater: the libvirt domain that boots ONE recovery drive's own
+  operating system at a time, so it can be updated without rebooting the
+  workstation (DAS-Backup-Manager, bd DAS-Backup-Manager-7wb).
+
+  This file is the single source of the definition. CMake installs it to
+  ${prefix}/lib/das-backup/libvirt/, and `recovery-os-vm.sh define` defines
+  the domain from that installed copy. To change the VM, edit this file,
+  reinstall, and run `define` again (the domain must be shut off, with no
+  disk attached). Every session defines the domain anew as well: from this
+  file plus that session's guard (SMBIOS strings and a virtio port, which
+  keep btrbk from running in the booted OS), and afterwards from this file
+  alone. So a change made in libvirt by hand (virsh edit) does not last, and
+  this file itself never carries the guard.
+
+  The VM has NO disk of its own. `recovery-os-vm.sh session` lends it one
+  whole recovery drive for one session, by its /dev/disk/by-id path, on SATA,
+  with boot order 1, and takes it back afterwards. Never attach a disk by
+  hand: the session is what keeps the host from mounting the drive while the
+  VM has it.
+
+  The firmware paths are those of Arch Linux's edk2-ovmf package.
+-->
+<domain type='kvm'>
+  <name>recovery-os-updater</name>
+  <!-- Fixed, so that `define` updates this domain in place: libvirt refuses
+       to redefine a domain under a name it already knows with a different
+       UUID, and generates a new one when none is given. -->
+  <uuid>8a60e198-02b3-4db9-ad4e-2962b1b6e542</uuid>
+  <title>DAS recovery OS updater</title>
+  <description>Boots one DAS recovery drive's own OS, whole disk passed through, to update it. Managed by recovery-os-vm.sh (DAS-Backup-Manager); never attach a disk by hand.</description>
+  <memory unit='GiB'>8</memory>
+  <currentMemory unit='GiB'>8</currentMemory>
+  <vcpu placement='static'>4</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <!-- UEFI without Secure Boot: the recovery OSes boot unsigned loaders.
+         The firmware code is mapped read-only; the variable store is this
+         VM's own, which libvirt creates from the template at the first start
+         and keeps afterwards. -->
+    <loader readonly='yes' secure='no' type='pflash'>/usr/share/edk2/x64/OVMF_CODE.4m.fd</loader>
+    <nvram template='/usr/share/edk2/x64/OVMF_VARS.4m.fd'>/var/lib/libvirt/qemu/nvram/recovery-os-updater_VARS.fd</nvram>
+    <!-- Three seconds at the firmware splash to press Esc for its menus
+         (Boot Manager; Boot Maintenance Manager, then Boot From File), which
+         is the way in when the firmware finds no bootloader on the disk.
+         Never a boot-device line here: the boot order is per device, the
+         disk's 1 (set when a session attaches it) and the NIC's 2 below. -->
+    <bootmenu enable='yes' timeout='3000'/>
+  </os>
+  <features>
+    <!-- ACPI is also how `virsh shutdown` asks the guest to power off. -->
+    <acpi/>
+    <apic/>
+  </features>
+  <!-- REQUIRED, not a tuning choice: CachyOS builds its packages for
+       x86-64-v3 and x86-64-v4. An emulated CPU model without those
+       instructions would crash the recovery OS's own binaries with an
+       illegal instruction, its init among them. -->
+  <cpu mode='host-passthrough'>
+    <topology sockets='1' dies='1' cores='4' threads='1'/>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <!-- No suspend. A guest that suspended itself (a desktop's idle timer)
+       would sit in pmsuspended, neither running nor shut off, and the
+       session would wait for it forever. -->
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <controller type='usb' model='qemu-xhci'/>
+    <!-- virtio NIC on the NAT network `default`, for the pacman mirrors. The
+         guest loads virtio_net from its own module tree once its root is
+         mounted; nothing earlier needs the network. -->
+    <!-- Boot order 2: the network only after the disk. It is here even more
+         for what it prevents: libvirt gives a domain defined with no boot
+         element at all an os-level boot device (hd), and an os-level boot
+         device refuses the disk's per-device boot order when a session
+         attaches it ("per-device boot elements cannot be used together with
+         os/boot elements"). -->
+    <!-- A fixed address: each session defines the domain anew, and libvirt
+         gives an interface without one a new address every time, so the
+         recovery OS would find a new network card at every session. -->
+    <interface type='network'>
+      <mac address='52:54:00:8a:60:e1'/>
+      <source network='default'/>
+      <model type='virtio'/>
+      <boot order='2'/>
+    </interface>
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <!-- For automation once the recovery OS runs qemu-guest-agent. -->
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <!-- An absolute pointer, so the VNC mouse follows the cursor. Keyboard
+         input reaches the guest through the PS/2 keyboard every q35 machine
+         has, which the firmware and the kernel drive without modules. -->
+    <input type='tablet' bus='usb'/>
+    <!-- VNC only on a UNIX socket libvirt creates for this VM, which other
+         users cannot reach — never on a network address, where any local
+         user could attach to the console: a root shell, while the operator
+         is logged in, on a drive that holds the host's backups. virt-viewer
+         attaches through libvirt and its access control (the command is in
+         docs/DISASTER-RECOVERY-GUIDE.md); `virsh screenshot` reads the screen
+         through QEMU's monitor and works the same. -->
+    <graphics type='vnc'>
+      <listen type='socket'/>
+    </graphics>
+    <!-- Standard VGA, chosen for the stretch between the firmware and the
+         guest's own root filesystem. The firmware drives it and hands a
+         plain linear framebuffer to the kernel, whose built-in
+         firmware-framebuffer console (simpledrm, efifb) keeps drawing on it
+         through the initramfs, and the stock kernel's bochs DRM module takes
+         over later. So the boot menu, the kernel's messages and an initramfs
+         rescue shell ("cannot find root") are all visible without any guest
+         driver. virtio-gpu would need the virtio_gpu module, which the
+         recovery OS's initramfs very probably lacks for the same reason it
+         lacks virtio_blk; QXL is a legacy SPICE device. -->
+    <video>
+      <model type='vga' heads='1' primary='yes'/>
+    </video>
+    <memballoon model='none'/>
+  </devices>
+</domain>

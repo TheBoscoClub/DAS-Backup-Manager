@@ -44,11 +44,12 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 | Component | Description | Status |
 |-----------|-------------|--------|
-| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, email reporting | Active |
+| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, recovery OS check, email reporting | Active |
 | `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active |
 | `scripts/install-backup-timer.sh` | Former timer installer: now prints a pointer to `btrdasd setup`, which writes and enables the timers, and exits 1 | Deprecated |
+| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to the `recovery-os-updater` VM (`packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
@@ -61,10 +62,10 @@ Each script's version is the `# Version:` line in its own header — the one pla
 
 ```
 DAS-Backup-Manager/
-├── scripts/           # Shell scripts (backup, verify, cleanup, partition)
+├── scripts/           # Shell scripts (backup, verify, cleanup, partition, recovery OS VM)
 ├── config/            # btrbk.conf reference template
 ├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper
-│   ├── src/           # Library modules (21): adopt, backup, btrbk_conf, caldate, config, db, doctor, expire, forget, fsutil, health, indexer, mount, progress, reconcile, report, restore, scanner, schedule, scrub, subvol
+│   ├── src/           # Library modules (22): adopt, backup, btrbk_conf, caldate, config, db, doctor, expire, forget, fsutil, health, indexer, mount, progress, reconcile, recovery_os, report, restore, scanner, schedule, scrub, subvol
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 │   ├── src/bin/       # btrdasd-helper D-Bus daemon
 │   └── completions/   # Shell completion installation instructions
@@ -72,7 +73,7 @@ DAS-Backup-Manager/
 │   └── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
 ├── dbus/              # D-Bus bus config and service activation
 ├── polkit/            # Polkit privilege escalation policy
-├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap)
+├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap); libvirt/ the recovery OS VM
 ├── docs/              # Architecture, installation, dependencies, recovery, man page
 └── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER)
 ```

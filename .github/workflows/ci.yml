@@ -94,7 +94,7 @@ jobs:
             base-devel rust cmake extra-cmake-modules \
             qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
-            qt6-tools
+            qt6-tools jq
 
       # Five shell suites carry cases that need en_US.UTF-8, and under C or
       # C.UTF-8 they cannot fail: bash's regex ranges [A-Za-z] and [0-9] match

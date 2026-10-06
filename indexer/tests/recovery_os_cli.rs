@@ -637,3 +637,41 @@ fn health_shows_the_stored_recovery_os_record_with_its_time() {
         "{j}"
     );
 }
+
+/// `recovery-os hold-disk`, the real binary: what is not a block device is
+/// refused with 2 and nothing on stdout — no `held` line, so a driver can
+/// never read a refusal as a hold — and so is `--json`, before anything is
+/// opened. The hold itself needs a block device and root; the loop-device
+/// run on the host covers it (bd DAS-Backup-Manager-7wb).
+#[test]
+fn hold_disk_refuses_what_is_not_a_disk_with_nothing_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    std::fs::write(&img, b"x").unwrap();
+    let img = img.to_str().unwrap();
+
+    let out = btrdasd(&["recovery-os", "hold-disk", "--device", img], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("Error: cannot hold {img}: {img} is a regular file, not a block device\n")
+    );
+
+    let out = btrdasd(
+        &["--json", "recovery-os", "hold-disk", "--device", img],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out), "");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hold-disk has no JSON output"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // No device: a usage error, not a hold of nothing.
+    let out = btrdasd(&["recovery-os", "hold-disk"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(text(&out), "");
+}
