@@ -1275,11 +1275,75 @@ fn prune_deleted_from_index(
     Ok(ids.len())
 }
 
-/// The exit status `backup run` ends with, if not 0: 1 when the run failed —
-/// including when only the subvolume sync before it did, which `run_backup`
-/// folds into the result.
-fn backup_run_exit_code(run_succeeded: bool) -> Option<i32> {
-    (!run_succeeded).then_some(1)
+/// What `backup run` asks of the job: incremental unless `--full`, the
+/// selection its flags name (none given: not specified), everything after the
+/// btrbk steps on, and a report.
+fn backup_run_options(
+    dry_run: bool,
+    full: bool,
+    sources: Vec<String>,
+    targets: Vec<String>,
+) -> BackupOptions {
+    BackupOptions {
+        mode: if full {
+            Some(BackupMode::Full)
+        } else {
+            Some(BackupMode::Incremental)
+        },
+        sources: flag_selection(sources),
+        targets: flag_selection(targets),
+        dry_run,
+        boot_archive: true,
+        index_after: true,
+        send_report: true,
+        ..Default::default()
+    }
+}
+
+/// The status `backup run` exits with, if it is not 0 (see
+/// `BackupJobOutcome::exit_code`).
+fn backup_run_exit(code: i32) -> Option<i32> {
+    (code != 0).then_some(code)
+}
+
+/// A `--sources` / `--targets` flag as the selection the run is given: no flag
+/// is "not specified" (all); a flag that names something is exactly that. A
+/// flag that names nothing real (`--targets ''`) arrives as a list holding an
+/// empty label and is refused as an unknown one — it never reads as "all".
+fn flag_selection(list: Vec<String>) -> Option<Vec<String>> {
+    (!list.is_empty()).then_some(list)
+}
+
+/// `backup run --json`: the counts are `null` when the run could not take
+/// them, never 0 (bd DAS-Backup-Manager-no4).
+fn backup_run_json(result: &backup::BackupResult) -> String {
+    let count = |n: Option<usize>| serde_json::Value::from(n).to_string();
+    format!(
+        "{{\"success\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{},\"duration_secs\":{}}}",
+        result.success,
+        count(result.snapshots_created),
+        count(result.snapshots_sent),
+        result.bytes_sent,
+        result.duration_secs
+    )
+}
+
+/// `backup run`'s one-line outcome. A count the run could not take reads
+/// `unknown`, never 0.
+fn backup_run_line(result: &backup::BackupResult) -> String {
+    let count = |n: Option<usize>| report::format_count(n.map(|n| n as u64));
+    format!(
+        "Backup {}: snapshots created: {}, sent: {}, {} in {}s",
+        if result.success {
+            "succeeded"
+        } else {
+            "FAILED"
+        },
+        count(result.snapshots_created),
+        count(result.snapshots_sent),
+        report::format_bytes(result.bytes_sent),
+        result.duration_secs
+    )
 }
 
 /// Whether `subvol expire` failed overall: the expiry itself did, or snapshots
@@ -2046,20 +2110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 targets,
             } => {
                 let cfg = Config::load(&config)?;
-                let options = BackupOptions {
-                    mode: if full {
-                        Some(BackupMode::Full)
-                    } else {
-                        Some(BackupMode::Incremental)
-                    },
-                    sources,
-                    targets,
-                    dry_run,
-                    boot_archive: true,
-                    index_after: true,
-                    send_report: true,
-                    ..Default::default()
-                };
+                let options = backup_run_options(dry_run, full, sources, targets);
                 let progress = CliProgress;
                 // The same job the GUI runs (`backup::run_backup_job`): the
                 // interlock (bd DAS-Backup-Manager-pe6), subvolume sync, mounts,
@@ -2071,46 +2122,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     options,
                     &progress,
                 );
+                // 0 ran clean (or declined), 3 began and something failed or
+                // aborted, 1 could not start: the doctor's rule (bd `vzsu`).
+                let exit_code = outcome.exit_code();
                 let result = match outcome {
                     backup::BackupJobOutcome::Declined => {
                         println!("A backup is already running — declining.");
                         return Ok(());
                     }
-                    backup::BackupJobOutcome::NotRun(e) => return Err(e.into()),
+                    // Could not start (1) or began and stopped on a target's or
+                    // a source's state (3, recorded as a failed run): the
+                    // reason on stderr, the doctor's exit rule.
+                    stopped @ (backup::BackupJobOutcome::CouldNotStart(_)
+                    | backup::BackupJobOutcome::Aborted(_)) => {
+                        let (_, why) = stopped.finish_line(dry_run);
+                        eprintln!("Error: {why}");
+                        std::process::exit(exit_code);
+                    }
                     backup::BackupJobOutcome::Ran(result) => result,
                 };
                 progress.on_complete(result.success, &backup::backup_summary(&result, dry_run));
 
                 if json {
-                    println!(
-                        "{{\"success\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{},\"duration_secs\":{}}}",
-                        result.success,
-                        result.snapshots_created,
-                        result.snapshots_sent,
-                        result.bytes_sent,
-                        result.duration_secs
-                    );
+                    println!("{}", backup_run_json(&result));
                 } else {
-                    println!(
-                        "Backup {}: {} snapshots created, {} sent, {} in {}s",
-                        if result.success {
-                            "succeeded"
-                        } else {
-                            "FAILED"
-                        },
-                        result.snapshots_created,
-                        result.snapshots_sent,
-                        report::format_bytes(result.bytes_sent),
-                        result.duration_secs
-                    );
+                    println!("{}", backup_run_line(&result));
                     for e in &result.errors {
                         eprintln!("  ERROR: {e}");
                     }
                 }
                 // A failed sync or a target left mounted did not stop the run;
-                // it is in the result, so the command fails once the run has
-                // finished and been recorded.
-                if let Some(code) = backup_run_exit_code(result.success) {
+                // it is in the result, so the command fails (3) once the run
+                // has finished and been recorded.
+                if let Some(code) = backup_run_exit(exit_code) {
                     std::process::exit(code);
                 }
             }
@@ -2128,8 +2172,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                let count = buttered_dasd::backup::create_snapshots(&cfg, &sources, &progress)?;
+                // As `backup run` does, with the sources mounted: btrbk.conf is
+                // brought into line first (a failed sync stops the step).
+                let counted = backup::sync_for_manual_step(&config, &cfg, &progress)
+                    .map_err(Box::<dyn std::error::Error>::from)
+                    .and_then(|cfg| {
+                        buttered_dasd::backup::create_snapshots(
+                            &cfg,
+                            flag_selection(sources).as_deref(),
+                            &progress,
+                        )
+                    });
                 let sources_still_mounted = source_guard.unmount(&progress);
+                let count = counted?;
                 println!("Created {count} snapshots");
                 mount::require_released(&sources_still_mounted)?;
             }
@@ -2146,10 +2201,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
+                // As `backup run` does, with the sources mounted and before the
+                // targets are: btrbk.conf is brought into line first, because
+                // a send of everything passes btrbk no filter. A failed sync
+                // stops the step, with the sources given back.
+                let cfg = match backup::sync_for_manual_step(&config, &cfg, &progress) {
+                    Ok(cfg) => cfg,
+                    Err(why) => {
+                        let still = source_guard.unmount(&progress);
+                        mount::require_released(&still)?;
+                        return Err(why.into());
+                    }
+                };
                 let mut guard =
                     mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
                 let result =
-                    buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, false, &progress);
+                    buttered_dasd::backup::send_snapshots(&cfg, None, &targets, false, &progress);
                 let mut still_mounted = guard.unmount(&progress);
                 still_mounted.extend(source_guard.unmount(&progress));
                 let (sent, bytes) = result?;
@@ -2846,6 +2913,98 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn backup_run_asks_the_job_for_what_its_flags_say() {
+        let full = backup_run_options(true, true, vec!["a".into()], vec!["t1".into(), "t2".into()]);
+        assert_eq!(full.mode, Some(BackupMode::Full));
+        assert_eq!(full.sources, Some(vec!["a".to_string()]));
+        assert_eq!(full.targets, Some(vec!["t1".to_string(), "t2".to_string()]));
+        assert!(full.dry_run && full.boot_archive && full.index_after && full.send_report);
+        // No flags: incremental, nothing specified, not a dry run.
+        let plain = backup_run_options(false, false, vec![], vec![]);
+        assert_eq!(plain.mode, Some(BackupMode::Incremental));
+        assert_eq!((plain.sources, plain.targets), (None, None));
+        assert!(!plain.dry_run);
+        assert!(plain.boot_archive && plain.index_after && plain.send_report);
+    }
+
+    #[test]
+    fn backup_run_exits_with_the_jobs_status_unless_it_is_0() {
+        assert_eq!(backup_run_exit(0), None);
+        assert_eq!(backup_run_exit(3), Some(3));
+        assert_eq!(backup_run_exit(1), Some(1));
+    }
+
+    #[test]
+    fn backup_run_prints_unknown_counts_as_null_and_unknown_never_as_zero() {
+        let result = |created, sent| backup::BackupResult {
+            success: false,
+            mode: BackupMode::Incremental,
+            snapshots_created: created,
+            snapshots_sent: sent,
+            snapshots_cleaned: 0,
+            bytes_sent: 0,
+            boot_archived: false,
+            indexed: false,
+            report_sent: false,
+            errors: Vec::new(),
+            duration_secs: 7,
+        };
+        assert_eq!(
+            backup_run_json(&result(None, Some(0))),
+            "{\"success\":false,\"snapshots_created\":null,\"snapshots_sent\":0,\"bytes_sent\":0,\"duration_secs\":7}"
+        );
+        assert_eq!(
+            backup_run_line(&result(None, Some(0))),
+            "Backup FAILED: snapshots created: unknown, sent: 0, 0 B in 7s"
+        );
+        // The counter-case: measured counts print as numbers.
+        let ok = backup::BackupResult {
+            success: true,
+            ..result(Some(2), Some(3))
+        };
+        assert_eq!(
+            backup_run_json(&ok),
+            "{\"success\":true,\"snapshots_created\":2,\"snapshots_sent\":3,\"bytes_sent\":0,\"duration_secs\":7}"
+        );
+        assert_eq!(
+            backup_run_line(&ok),
+            "Backup succeeded: snapshots created: 2, sent: 3, 0 B in 7s"
+        );
+    }
+
+    /// `backup run --sources/--targets` and what the run is handed (bd
+    /// DAS-Backup-Manager-7tx): no flag is "all"; a flag is exactly what it
+    /// names; a flag naming nothing real is a label nobody has, never "all".
+    #[test]
+    fn backup_run_flags_become_a_selection_and_never_widen_to_all() {
+        let selection = |extra: &[&str]| {
+            let mut argv = vec!["btrdasd", "backup", "run"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Commands::Backup {
+                    action:
+                        BackupAction::Run {
+                            sources, targets, ..
+                        },
+                } => (flag_selection(sources), flag_selection(targets)),
+                _ => panic!("not backup run"),
+            }
+        };
+        assert_eq!(selection(&[]), (None, None), "no flag: not specified");
+        assert_eq!(
+            selection(&["--sources", "a,b", "--targets", "t"]),
+            (
+                Some(vec!["a".to_string(), "b".to_string()]),
+                Some(vec!["t".to_string()])
+            )
+        );
+        // An empty value is not "no flag": it is a label that matches nothing.
+        let (sources, targets) = selection(&["--sources", "", "--targets", ""]);
+        assert_eq!(sources, Some(vec![String::new()]));
+        assert_eq!(targets, Some(vec![String::new()]));
     }
 
     /// `backup record-run` takes both counts, or `--counts-unknown` — never
@@ -3571,12 +3730,6 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let left = Database::open(&db_path).unwrap().list_snapshots().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].path, "/mnt/t/kept.20260101");
-    }
-
-    #[test]
-    fn backup_run_exits_non_zero_exactly_when_the_run_failed() {
-        assert_eq!(backup_run_exit_code(true), None);
-        assert_eq!(backup_run_exit_code(false), Some(1));
     }
 
     // --- walk and restore wait for the maintenance lock (bd DAS-Backup-Manager-frb)

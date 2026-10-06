@@ -844,6 +844,94 @@ fn filesystem_uuid_with(runner: &dyn CommandRunner, path: &str) -> Option<String
     if uuid.is_empty() { None } else { Some(uuid) }
 }
 
+/// The device the filesystem mounted at `mount` is on: `findmnt`'s `SOURCE`
+/// without the `[/subvolume]` it appends for btrfs. `None` when `findmnt`
+/// cannot say, or says something that is not a device (`proc`, `tmpfs`).
+fn mount_source(runner: &dyn CommandRunner, mount: &str) -> Option<String> {
+    let out = runner
+        .output(Command::new("findmnt").args(["-n", "-o", "SOURCE", "--target", mount]))
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let source = text.lines().next()?.split('[').next()?.trim();
+    source.starts_with("/dev/").then(|| source.to_string())
+}
+
+/// The disk a partition is on (`lsblk -dno PKNAME`); a device with no parent
+/// is a whole disk and is its own. `None` when `lsblk` cannot answer.
+fn disk_of(runner: &dyn CommandRunner, device: &str) -> Option<String> {
+    let out = runner
+        .output(Command::new("lsblk").args(["-dno", "PKNAME", device]))
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parent = text.lines().next().unwrap_or_default().trim();
+    Some(if parent.is_empty() {
+        device.to_string()
+    } else {
+        format!("/dev/{parent}")
+    })
+}
+
+/// The serial number `smartctl -i` reports for `disk`. Its exit status is a
+/// bitmask of what it found, not of whether it could read the drive, so only
+/// its text says: no `Serial Number:` line is `None`.
+fn disk_serial(runner: &dyn CommandRunner, disk: &str) -> Option<String> {
+    let out = runner
+        .output(Command::new("smartctl").args(["-i", disk]))
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Serial Number:"))
+        .map(|serial| serial.trim().to_string())
+        .filter(|serial| !serial.is_empty())
+}
+
+/// Whether the drive under `target`'s mount point is one of the drives its
+/// config names — `verify_targets_before_btrbk`'s legacy check in
+/// `scripts/backup-run.sh`, for a target with no `mount_uuid`: the device under
+/// the mount, its disk, that disk's serial, compared with the target's serials
+/// (a RAID-1 pair has two; either is enough). `Ok` says what was found;
+/// `Err` is the violation. A serial that cannot be read is a refusal, never a
+/// pass: nothing was shown to be the drive, so nothing is let through (bd
+/// DAS-Backup-Manager-7tx 4).
+fn verify_legacy_serial(
+    runner: &dyn CommandRunner,
+    target: &crate::config::Target,
+) -> Result<String, String> {
+    let expected = target.effective_serials();
+    if expected.is_empty() {
+        return Err(format!(
+            "{}: '{}' has no mount_uuid and no serial in the config, so nothing says which \
+             filesystem belongs there",
+            target.label, target.mount
+        ));
+    }
+    let Some(source) = mount_source(runner, &target.mount) else {
+        return Err(format!(
+            "{}: '{}' is a mount point but findmnt could not resolve its source device",
+            target.label, target.mount
+        ));
+    };
+    let serial = disk_of(runner, &source).and_then(|disk| disk_serial(runner, &disk));
+    match serial {
+        Some(got) if expected.contains(&got) => {
+            Ok(format!("{} → {source}, serial={got}", target.mount))
+        }
+        other => Err(format!(
+            "{}: '{}' mounted from {source} (serial='{}'), expected one of: {}",
+            target.label,
+            target.mount,
+            other.as_deref().unwrap_or("?"),
+            expected.join(" ")
+        )),
+    }
+}
+
 /// Refuse to hand btrbk a target that is not backed by the filesystem we expect.
 ///
 /// This is the Rust counterpart of `verify_targets_before_btrbk()` in
@@ -857,6 +945,10 @@ fn filesystem_uuid_with(runner: &dyn CommandRunner, path: &str) -> Option<String
 /// stayed reachable from every caller that pre-mounts and then names its
 /// targets explicitly — which the Plasma GUI always does
 /// (bd DAS-Backup-Manager-aea).
+///
+/// A write target is identified by its `mount_uuid` when it has one, else by its
+/// drive's serial number (`verify_legacy_serial`), as the script does: both
+/// refuse when the identity cannot be read.
 ///
 /// Scope is deliberate: only targets btrbk will actually be told to write to
 /// are fatal. A configured target that is not part of this run cannot be
@@ -957,16 +1049,15 @@ fn verify_write_targets_with(
                 )),
             }
         } else {
-            // No UUID configured (legacy target). The mount-point check above
-            // is all the assurance available; say so rather than implying more.
-            progress.on_log(
-                crate::progress::LogLevel::Warning,
-                &format!(
-                    "Target '{}' has no mount_uuid configured — verified only that '{}' \
-                     is a mount point, not which filesystem it is",
-                    target.label, target.mount
+            // No UUID configured (legacy target): the drive's serial number is
+            // the identity, as `verify_targets_before_btrbk` has it.
+            match verify_legacy_serial(runner, target) {
+                Ok(found) => progress.on_log(
+                    crate::progress::LogLevel::Info,
+                    &format!("  {}: OK ({found})", target.label),
                 ),
-            );
+                Err(violation) => violations.push(violation),
+            }
         }
     }
 
@@ -1259,8 +1350,9 @@ mod tests {
         }
     }
 
-    /// `TestProgress` drops `on_progress`; the step numbers and messages are
-    /// part of what these functions report, so record them too.
+    /// Stages, steps and log lines kept in one place, with `assert_only_log`.
+    /// (`TestProgress` records them too, but did not record steps when this was
+    /// written, and these tests read steps and logs together.)
     #[derive(Default)]
     struct Recorder {
         stages: Mutex<Vec<(String, u64)>>,
@@ -3328,25 +3420,314 @@ mod tests {
         }
     }
 
-    /// No (or an empty) `mount_uuid` is a legacy target: accepted on the
-    /// mount-point check alone, with a warning that says that is all it was.
+    // --- a target with no mount_uuid is checked by its drive's serial ----------
+    //
+    // bd DAS-Backup-Manager-7tx 4: the Rust path checked a legacy target only
+    // as "is a mount point"; backup-run.sh's verify_targets_before_btrbk also
+    // finds the serial of the drive under it. The three questions are
+    // findmnt (which device), lsblk (which disk) and smartctl (which serial);
+    // each is keyed here by an argument only it has.
+
+    const SMART_INFO: &str = "smartctl 7.5 2025-04-30 r5714 [x86_64-linux-7.2.8] (local build)\n\
+        === START OF INFORMATION SECTION ===\n\
+        Device Model:     ST22000NM000C-3WC103\n\
+        Serial Number:    ZXA1R71M\n\
+        Firmware Version: SN03\n";
+
+    fn serial_target(scratch: &Scratch, serials: &[&str]) -> (Vec<Target>, Host, String) {
+        let (mut targets, host, mnt) = mounted_write_target(scratch, None);
+        targets[0].serials = serials.iter().map(|s| s.to_string()).collect();
+        targets[0].serial = serials.first().map_or_else(String::new, |s| s.to_string());
+        (targets, host, mnt)
+    }
+
+    fn drive_reply(stdout: &'static str) -> Reply {
+        Reply::Exit {
+            code: 0,
+            stdout,
+            stderr: "",
+        }
+    }
+
+    /// A runner answering the three questions: where the mount is from, what
+    /// disk that is on, and what that disk's serial is.
+    fn drive_runner(mnt: &str, source: Reply, disk: Reply, smart: Reply) -> Arc<ScriptedRunner> {
+        ScriptedRunner::with_rules(&[(mnt, source), ("PKNAME", disk), ("-i", smart)])
+    }
+
     #[test]
-    fn verify_warns_when_a_write_target_has_no_uuid_to_check() {
+    fn a_legacy_target_is_accepted_when_the_drive_under_it_has_a_configured_serial() {
         for uuid in [None, Some("")] {
             let scratch = Scratch::new();
-            let (targets, host, mnt) = mounted_write_target(&scratch, uuid);
-            let runner = ScriptedRunner::succeeding();
+            let (mut targets, host, mnt) = serial_target(&scratch, &["ZXA1R71M"]);
+            targets[0].mount_uuid = uuid.map(str::to_string);
+            // findmnt appends the btrfs subvolume to the device.
+            let runner = drive_runner(
+                &mnt,
+                drive_reply("/dev/sdj1[/@backups]\n"),
+                drive_reply("sdj\n"),
+                drive_reply(SMART_INFO),
+            );
             let progress = Recorder::default();
 
             let result = host.verify(&targets, &["primary-22tb"], &progress, &runner);
 
-            assert_eq!(result, Ok(()));
-            assert!(runner.calls().is_empty(), "{:?}", runner.calls());
-            progress.assert_only_log(
-                LogLevel::Warning,
-                &["Target 'primary-22tb' has no mount_uuid configured", &mnt],
+            assert_eq!(result, Ok(()), "{uuid:?}");
+            assert_eq!(
+                runner.calls(),
+                vec![
+                    output_call(&["findmnt", "-n", "-o", "SOURCE", "--target", &mnt]),
+                    output_call(&["lsblk", "-dno", "PKNAME", "/dev/sdj1"]),
+                    output_call(&["smartctl", "-i", "/dev/sdj"]),
+                ]
+            );
+            assert_eq!(
+                progress.logs(),
+                vec![(
+                    LogLevel::Info,
+                    format!("  primary-22tb: OK ({mnt} → /dev/sdj1, serial=ZXA1R71M)")
+                )]
             );
         }
+    }
+
+    /// A RAID-1 target names two drives, and either is the one mounted.
+    #[test]
+    fn either_serial_of_a_raid_pair_is_enough_and_the_other_is_not_needed() {
+        let scratch = Scratch::new();
+        let (targets, host, mnt) = serial_target(&scratch, &["ZXA1NYGZ", "ZXA1R71M"]);
+        let runner = drive_runner(
+            &mnt,
+            drive_reply("/dev/sdj1\n"),
+            drive_reply("sdj\n"),
+            drive_reply(SMART_INFO),
+        );
+        assert_eq!(
+            host.verify(&targets, &["primary-22tb"], &Recorder::default(), &runner),
+            Ok(())
+        );
+    }
+
+    /// A whole disk has no parent: it is its own disk.
+    #[test]
+    fn a_device_with_no_parent_disk_is_its_own_disk() {
+        let scratch = Scratch::new();
+        let (targets, host, mnt) = serial_target(&scratch, &["ZXA1R71M"]);
+        let runner = drive_runner(
+            &mnt,
+            drive_reply("/dev/sdj\n"),
+            drive_reply("\n"),
+            drive_reply(SMART_INFO),
+        );
+        assert_eq!(
+            host.verify(&targets, &["primary-22tb"], &Recorder::default(), &runner),
+            Ok(())
+        );
+        assert_eq!(
+            runner.calls()[2],
+            output_call(&["smartctl", "-i", "/dev/sdj"])
+        );
+    }
+
+    /// The counter-test: another drive is under the mount point.
+    #[test]
+    fn a_legacy_target_whose_drive_has_another_serial_is_refused_and_says_which() {
+        let scratch = Scratch::new();
+        let (targets, host, mnt) = serial_target(&scratch, &["ZXA1NYGZ", "ZK208Q77"]);
+        let runner = drive_runner(
+            &mnt,
+            drive_reply("/dev/sdj1\n"),
+            drive_reply("sdj\n"),
+            drive_reply(SMART_INFO),
+        );
+        let progress = Recorder::default();
+
+        let err = host
+            .verify(&targets, &["primary-22tb"], &progress, &runner)
+            .unwrap_err();
+
+        assert!(err.starts_with("Refusing to run btrbk"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "primary-22tb: '{mnt}' mounted from /dev/sdj1 (serial='ZXA1R71M'), expected one \
+                 of: ZXA1NYGZ ZK208Q77"
+            )),
+            "{err}"
+        );
+        assert!(progress.logs().is_empty(), "{:?}", progress.logs());
+    }
+
+    /// Nothing that cannot be read is a pass: each question can fail, and each
+    /// failure is a refusal.
+    #[test]
+    fn a_serial_that_cannot_be_read_is_a_refusal_never_a_pass() {
+        let good_source = || drive_reply("/dev/sdj1\n");
+        let good_disk = || drive_reply("sdj\n");
+        let good_smart = || drive_reply(SMART_INFO);
+        // (what findmnt, lsblk and smartctl answer, what the refusal must say)
+        let cases: Vec<(&str, Reply, Reply, Reply, &str)> = vec![
+            (
+                "findmnt cannot run",
+                Reply::CannotRun,
+                good_disk(),
+                good_smart(),
+                "could not resolve its source device",
+            ),
+            (
+                "findmnt fails",
+                Reply::exit(1),
+                good_disk(),
+                good_smart(),
+                "could not resolve its source device",
+            ),
+            (
+                "findmnt says nothing",
+                drive_reply(""),
+                good_disk(),
+                good_smart(),
+                "could not resolve its source device",
+            ),
+            (
+                "findmnt names no device",
+                drive_reply("proc\n"),
+                good_disk(),
+                good_smart(),
+                "could not resolve its source device",
+            ),
+            (
+                "lsblk cannot run",
+                good_source(),
+                Reply::CannotRun,
+                good_smart(),
+                "serial='?'",
+            ),
+            (
+                "lsblk fails",
+                good_source(),
+                Reply::exit(32),
+                good_smart(),
+                "serial='?'",
+            ),
+            (
+                "smartctl cannot run",
+                good_source(),
+                good_disk(),
+                Reply::CannotRun,
+                "serial='?'",
+            ),
+            (
+                "smartctl prints no serial",
+                good_source(),
+                good_disk(),
+                drive_reply("Device Model: X\n"),
+                "serial='?'",
+            ),
+            (
+                "smartctl prints an empty serial",
+                good_source(),
+                good_disk(),
+                drive_reply("Serial Number:   \n"),
+                "serial='?'",
+            ),
+            (
+                "smartctl fails without a serial",
+                good_source(),
+                good_disk(),
+                Reply::exit(2),
+                "serial='?'",
+            ),
+        ];
+        for (what, source, disk, smart, says) in cases {
+            let scratch = Scratch::new();
+            let (targets, host, mnt) = serial_target(&scratch, &["ZXA1R71M"]);
+            let runner = drive_runner(&mnt, source, disk, smart);
+
+            let err = host
+                .verify(&targets, &["primary-22tb"], &Recorder::default(), &runner)
+                .unwrap_err();
+
+            assert!(err.starts_with("Refusing to run btrbk"), "{what}: {err}");
+            assert!(err.contains(says), "{what}: {err}");
+            assert!(err.contains(&mnt), "{what}: {err}");
+        }
+    }
+
+    /// smartctl's exit status is a bitmask of what it found (a failing disk, a
+    /// logged error), not of whether it could read the drive: a serial that was
+    /// printed is a serial.
+    #[test]
+    fn a_serial_smartctl_printed_counts_whatever_its_exit_status() {
+        let scratch = Scratch::new();
+        let (targets, host, mnt) = serial_target(&scratch, &["ZXA1R71M"]);
+        let runner = drive_runner(
+            &mnt,
+            drive_reply("/dev/sdj1\n"),
+            drive_reply("sdj\n"),
+            Reply::Exit {
+                code: 4,
+                stdout: SMART_INFO,
+                stderr: "",
+            },
+        );
+        assert_eq!(
+            host.verify(&targets, &["primary-22tb"], &Recorder::default(), &runner),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_legacy_target_with_no_serial_at_all_is_refused_without_asking_anything() {
+        let scratch = Scratch::new();
+        let (targets, host, mnt) = serial_target(&scratch, &[]);
+        let runner = ScriptedRunner::succeeding();
+
+        let err = host
+            .verify(&targets, &["primary-22tb"], &Recorder::default(), &runner)
+            .unwrap_err();
+
+        assert!(
+            err.contains("has no mount_uuid and no serial in the config") && err.contains(&mnt),
+            "{err}"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// A target with a `mount_uuid` is checked by it alone: the serial
+    /// commands are never run.
+    #[test]
+    fn a_target_with_a_uuid_is_not_asked_for_its_serial() {
+        let scratch = Scratch::new();
+        let (targets, host, mnt) = mounted_write_target(&scratch, Some(EXPECTED_UUID));
+        let runner = ScriptedRunner::with_rules(&[(&mnt, drive_reply(EXPECTED_UUID_LINE))]);
+        assert_eq!(
+            host.verify(&targets, &["primary-22tb"], &Recorder::default(), &runner),
+            Ok(())
+        );
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .all(|c| c.argv[0] == "findmnt" && c.argv.contains(&"UUID".to_string())),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// The real commands, against a real mount point that is no configured
+    /// drive: `/proc` is `proc`, not a device, so it is refused (and a
+    /// machine with no `findmnt` refuses it the same way).
+    #[test]
+    fn a_real_mount_point_that_is_no_configured_drive_is_refused() {
+        let targets = vec![target_at("primary-22tb", "/proc", None)];
+        let progress = TestProgress::new();
+
+        let err =
+            verify_write_targets(&targets, &["primary-22tb".to_string()], &progress).unwrap_err();
+
+        assert!(
+            err.contains("primary-22tb: '/proc' is a mount point but findmnt could not resolve its source device"),
+            "{err}"
+        );
     }
 
     /// Every failing write target is named in the one refusal.
@@ -3467,17 +3848,6 @@ mod tests {
 
         assert!(err.contains("NOT a mount point"), "{err}");
         assert!(err.contains("primary-22tb"), "{err}");
-    }
-
-    /// Positive control: a real mount point passes. Without this, the refusal
-    /// test above would still pass if the function refused everything.
-    #[test]
-    fn verify_accepts_a_real_mountpoint_write_target() {
-        // /proc is a mount point in every Linux test environment.
-        let targets = vec![target_at("primary-22tb", "/proc", None)];
-        let progress = TestProgress::new();
-
-        assert!(verify_write_targets(&targets, &["primary-22tb".to_string()], &progress).is_ok());
     }
 
     /// A mount point carrying the WRONG filesystem must abort: the point of the

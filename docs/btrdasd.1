@@ -592,11 +592,19 @@ replaces an existing one only on a full run.
 .PP
 If another backup already holds the singleton lock, the command prints that it
 declines and exits 0; it waits for a running scrub. A run that could not start
-(locks, mounting, target verification, btrbk) exits 1 and is not recorded. A run
-that started and failed is recorded and reported, then exits 1.
+(nothing selected, a label the configuration lacks, or the locks cannot be taken) exits 1, having mounted and run
+nothing. A run that began \(em it took the locks \(em and then stopped on a
+target's or a source's state (no target would mount, a target or a source
+volume is not what it must be, an absent ticked target, btrbk could not be
+started) is recorded as a failed run, its counts unknown, and exits 3, as is a
+run that ran with any failure: btrbk failing, the subvolume sync, a target left
+mounted, a report that could be neither saved nor mailed, or a history row that
+could not be written. Everything else exits 0; a warning is still 0. The GUI
+has no exit status: it shows the same outcome as a success flag and the
+summary line.
 .PP
 .BR backup\-run.sh ,
-which the scheduled units run, follows a different rule: 0 when nothing
+which the scheduled units run, follows the same rule: 0 when nothing
 failed, 3 when the run began its work and something failed or it aborted on a
 target's or a source's state (target verification and btrbk included), 1 only
 when it could not start. Its units count 3 as success
@@ -649,11 +657,24 @@ Both apply the retention policy.
 .TP
 .BI \-\-sources " LABELS"
 Comma-separated source labels to back up.
-Default: every source with at least one subvolume that is not manual-only.
+btrbk is told to snapshot and send exactly those sources' subvolumes, by
+subvolume, so a source that shares a volume with another is not pulled in by it.
+A label that is not in the configuration refuses the run before anything is
+locked or mounted (exit 1), even beside valid ones.
+A value that names nothing real (an empty one) is such a label: the run is
+refused, never widened to every source.
+Default (flag not given): every source with at least one subvolume that is not manual-only.
 .TP
 .BI \-\-targets " LABELS"
 Comma-separated target labels to send to.
-Default: all mounted targets.
+btrbk is told to write to exactly those targets and is not told about the others:
+a target left out can be absent without failing the run, and a target named
+that btrbk cannot read fails it. A source whose only targets are left out is
+skipped, with a warning.
+A label that is not a configured target refuses the run before anything is
+locked or mounted (exit 1), even beside valid ones; it is never dropped, and
+the selection is never widened to every mounted target.
+Default (flag not given): all mounted targets.
 .\"
 .SS backup snapshot
 Create snapshots without sending them to targets
@@ -662,6 +683,11 @@ Like the other manual
 .B backup
 commands below, it declines (exit 0) while another backup holds the singleton
 lock, and waits for a running scrub.
+Like
+.BR "backup run" ,
+it first syncs
+.I btrbk.conf
+with the subvolumes on the mounted sources, and stops if the sync fails.
 .PP
 .B btrdasd backup snapshot
 .RB [ \-\-config
@@ -682,6 +708,15 @@ Default: all.
 Send existing snapshots to targets
 .RB ( "btrbk resume" ,
 which also applies the retention policy).
+Like
+.BR "backup run" ,
+it first syncs
+.I btrbk.conf
+with the subvolumes on the mounted sources, and stops if the sync fails:
+a send of every source and target passes btrbk no filter, so it would
+otherwise trust a
+.I btrbk.conf
+that may be out of date.
 .PP
 .B btrdasd backup send
 .RB [ \-\-config

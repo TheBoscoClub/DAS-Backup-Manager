@@ -171,10 +171,53 @@ Checked before any directory is created, both roots compared **after resolution*
     a failed history row (bd `2my`).
     The one exception: an abort *after* the report went out exits 3 under a report and a row that
     already say what they saw — the journal's `status=3` and the log are its only trace.
+  - `btrdasd backup run` (CLI, GUI; not run by the units; bd `vzsu`): the same 0 / 3 / 1 — see
+    "The CLI/GUI Run Records Truthfully" below.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.
 - Sentinel matches unit names by exact string — no globs. Prefer single non-template units.
+
+## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
+- `btrdasd backup run|snapshot|send` and the GUI hand btrbk **only** the selected sources and targets,
+  as filter arguments, one per (subvolume, target) pair: `<target dir>/<snapshot_name>`
+  (`btrbk_conf::declared_pairs`, `backup::btrbk_filters`). Never a volume path (it cannot tell two
+  sources on one volume apart) and never a source filter next to a target filter (btrbk's filters
+  are a union, and a matched subvolume keeps every target).
+- A label that is not in the configuration, or a selection that leaves nothing, **refuses** the step.
+  An empty filter list is btrbk's "everything": it is passed only when the selection IS everything.
+- **`backup snapshot` and `backup send` (CLI and helper) sync first, as `run` does**
+  (`backup::sync_for_manual_step`, sources mounted, before the targets are). A selection of everything
+  passes btrbk no filter, so it trusts `btrbk.conf`; sync brings that file into line with `config.toml`.
+  Unlike `run`, a failed sync stops the step: `run` goes on because configured subvolumes must still be
+  backed up, a step that cannot tell whether `btrbk.conf` is current has no such obligation.
+- The run mounts **nothing** itself. `mount::ensure_sources_mounted` and `ensure_targets_mounted` mount,
+  and the `MountGuard` each returns records what it mounted and gives exactly that back; `run_backup`
+  only checks that each selected source's volume is a mount point and refuses if not (bd `7tx`, `8cf`).
+- **An empty selection is a refusal, never "all"** (bd `7tx`). `BackupOptions.sources`/`.targets` are
+  `Option`s: `None` = not specified (CLI with no flag: all), `Some(vec![])` = nothing ticked, refused by
+  `backup::empty_selection` before the first lock or mount. The D-Bus `as` arguments cannot say "not
+  specified", so the helper always passes `Some(list)` and refuses an empty `BackupSnapshot`/`BackupSend`
+  list itself. A label (source or target) the configuration lacks is refused too, before the first lock
+  (`backup::unknown_label`, exit 1), even beside known ones — never dropped, never widened to "all mounted".
+- An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
+  still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
+  is the first primary target, so a reduced config renders the other targets' retention differently.
+
+## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
+- `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`: **`None` = unknown** — the step
+  that counts them was asked for and failed. Never `Some(0)` (a measurement: "nothing to do"). Stored as
+  NULL (schema 4), printed `unknown` (summary, `backup run`), `null` (`--json`); GUI history shows "unknown".
+- **`btrdasd backup run` exits 0 / 3 / 1 — the script's and the doctor's rule** (bd `vzsu`;
+  `BackupJobOutcome::exit_code`): **0** clean (a warning too) or declined; **3** began and something
+  failed, or aborted on a target's/source's state (`Aborted`: no target mounts, verification refuses,
+  an absent ticked target — recorded as a failed row, counts NULL, unless a dry run); **1** could not
+  start (`CouldNotStart`: empty selection, unknown label, locks). A report neither saved nor mailed fails the run
+  BEFORE the row is written, so the row says `report: …`; a failed email beside a saved report stays a
+  warning. The GUI has no exit codes: it shows `JobFinished(success, summary)` — exit 0 = success, 3 and
+  1 = failure with the summary or reason.
+- A failed `host.record` fails the job (`history not recorded: …` in `errors`), never only a warning: a run
+  missing from the history that reports success is the fail-silent defect.
 
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 **Never invoke `btrbk` against a target path that is not a real mountpoint backed by the
@@ -187,7 +230,13 @@ Two layers, both unconditional and both run under `--dryrun`:
    target's `$mnt` must not exist. Any violation aborts, exit 3, with an ABORTED report and a
    failed history row (bd `2my`).
 
-Rust twin (CLI/GUI): `mount::verify_write_targets`.
+Rust twin (CLI/GUI): `mount::verify_write_targets`, called inside every step that writes under a
+target — `run_backup`, `send_snapshots`, `run_full_pipeline`, `archive_boot` (bd `7tx`) — so a caller
+cannot skip it: `backup send` and `backup boot-archive` are covered from the CLI and from the helper.
+`archive_boot` verifies the non-mirror targets whose mount point exists (the script's two safe
+states: a real mountpoint, or absent); a bare directory refuses the whole step.
+A target with no `mount_uuid` is identified by its drive's serial, as the script does (`findmnt` →
+`lsblk` → `smartctl -i`); a serial that cannot be read is a refusal, never a pass (bd `7tx` 4).
 
 ## Maintenance Interlock — backup vs. scrub mutual exclusion
 Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesystems and must never overlap.

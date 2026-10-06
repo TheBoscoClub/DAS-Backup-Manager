@@ -31,6 +31,7 @@ struct BackupRunInfo {
     bool success = false;
     qint64 durationSecs = 0;
     std::optional<qint64> snapsCreated; // no value: the run could not count
+    std::optional<qint64> snapsSent;    // no value: the run could not count
     qint64 bytesSent = 0;
     QStringList errors;
 };
@@ -87,6 +88,8 @@ public:
                     .durationSecs = obj.value(QLatin1String("duration_secs")).toInteger(),
                     .snapsCreated = BackupHistoryView::countFromJson(
                         obj.value(QLatin1String("snaps_created"))),
+                    .snapsSent = BackupHistoryView::countFromJson(
+                        obj.value(QLatin1String("snaps_sent"))),
                     .bytesSent = obj.value(QLatin1String("bytes_sent")).toInteger(),
                     .errors = errors,
                 });
@@ -168,6 +171,10 @@ public:
         case Sent:
             if (run.bytesSent > 0)
                 return i18n("Yes");
+            // A run that could not count what it sent did not send "no"
+            // snapshots: it does not know.
+            if (!run.snapsSent)
+                return i18n("unknown");
             if (!run.success)
                 return i18n("No");
             return QStringLiteral("—");

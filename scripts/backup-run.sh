@@ -541,8 +541,10 @@
 # cleanup(), the EXIT trap, exits with exactly one of these: errexit is off
 # inside it, so nothing failing there (a log line it cannot write) can end it
 # early with a status of its own. A dry run follows the same rule.
-# `btrdasd backup run` (CLI, GUI) is not run by the units and keeps its own
-# codes: 0, or 1 for any failure.
+# `btrdasd backup run` (CLI, GUI) is not run by the units, and follows the
+# same rule: 0 ran clean (or declined), 3 began and something failed or
+# aborted on a target's or a source's state (recorded as a failed run), 1 could
+# not start (bd DAS-Backup-Manager-vzsu).
 
 set -euo pipefail
 
