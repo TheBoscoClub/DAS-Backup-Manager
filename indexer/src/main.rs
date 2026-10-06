@@ -1283,6 +1283,38 @@ fn flag_selection(list: Vec<String>) -> Option<Vec<String>> {
     (!list.is_empty()).then_some(list)
 }
 
+/// `backup run --json`: the counts are `null` when the run could not take
+/// them, never 0 (bd DAS-Backup-Manager-no4).
+fn backup_run_json(result: &backup::BackupResult) -> String {
+    let count = |n: Option<usize>| serde_json::Value::from(n).to_string();
+    format!(
+        "{{\"success\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{},\"duration_secs\":{}}}",
+        result.success,
+        count(result.snapshots_created),
+        count(result.snapshots_sent),
+        result.bytes_sent,
+        result.duration_secs
+    )
+}
+
+/// `backup run`'s one-line outcome. A count the run could not take reads
+/// `unknown`, never 0.
+fn backup_run_line(result: &backup::BackupResult) -> String {
+    let count = |n: Option<usize>| report::format_count(n.map(|n| n as u64));
+    format!(
+        "Backup {}: snapshots created: {}, sent: {}, {} in {}s",
+        if result.success {
+            "succeeded"
+        } else {
+            "FAILED"
+        },
+        count(result.snapshots_created),
+        count(result.snapshots_sent),
+        report::format_bytes(result.bytes_sent),
+        result.duration_secs
+    )
+}
+
 /// The exit status `backup run` ends with, if not 0: 1 when the run failed —
 /// including when only the subvolume sync before it did, which `run_backup`
 /// folds into the result.
@@ -2090,27 +2122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress.on_complete(result.success, &backup::backup_summary(&result, dry_run));
 
                 if json {
-                    println!(
-                        "{{\"success\":{},\"snapshots_created\":{},\"snapshots_sent\":{},\"bytes_sent\":{},\"duration_secs\":{}}}",
-                        result.success,
-                        result.snapshots_created,
-                        result.snapshots_sent,
-                        result.bytes_sent,
-                        result.duration_secs
-                    );
+                    println!("{}", backup_run_json(&result));
                 } else {
-                    println!(
-                        "Backup {}: {} snapshots created, {} sent, {} in {}s",
-                        if result.success {
-                            "succeeded"
-                        } else {
-                            "FAILED"
-                        },
-                        result.snapshots_created,
-                        result.snapshots_sent,
-                        report::format_bytes(result.bytes_sent),
-                        result.duration_secs
-                    );
+                    println!("{}", backup_run_line(&result));
                     for e in &result.errors {
                         eprintln!("  ERROR: {e}");
                     }
@@ -2854,6 +2868,44 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn backup_run_prints_unknown_counts_as_null_and_unknown_never_as_zero() {
+        let result = |created, sent| backup::BackupResult {
+            success: false,
+            mode: BackupMode::Incremental,
+            snapshots_created: created,
+            snapshots_sent: sent,
+            snapshots_cleaned: 0,
+            bytes_sent: 0,
+            boot_archived: false,
+            indexed: false,
+            report_sent: false,
+            errors: Vec::new(),
+            duration_secs: 7,
+        };
+        assert_eq!(
+            backup_run_json(&result(None, Some(0))),
+            "{\"success\":false,\"snapshots_created\":null,\"snapshots_sent\":0,\"bytes_sent\":0,\"duration_secs\":7}"
+        );
+        assert_eq!(
+            backup_run_line(&result(None, Some(0))),
+            "Backup FAILED: snapshots created: unknown, sent: 0, 0 B in 7s"
+        );
+        // The counter-case: measured counts print as numbers.
+        let ok = backup::BackupResult {
+            success: true,
+            ..result(Some(2), Some(3))
+        };
+        assert_eq!(
+            backup_run_json(&ok),
+            "{\"success\":true,\"snapshots_created\":2,\"snapshots_sent\":3,\"bytes_sent\":0,\"duration_secs\":7}"
+        );
+        assert_eq!(
+            backup_run_line(&ok),
+            "Backup succeeded: snapshots created: 2, sent: 3, 0 B in 7s"
+        );
     }
 
     /// `backup run --sources/--targets` and what the run is handed (bd
