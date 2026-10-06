@@ -2205,19 +2205,41 @@ update_boot_subvolumes() {
 
         local label
         label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
-        # The subvolume listing is captured ONCE, with its status checked,
-        # before anything is matched against it: a failed listing must not
-        # read as "this target has no snapshots" (bd DAS-Backup-Manager-nsp).
-        local subvol_listing subvol_err
-        subvol_err="$(mktemp)"
-        if ! subvol_listing=$(btrfs subvolume list "$mnt" 2>"$subvol_err"); then
-            log_error "  [$label] Could not list subvolumes: $(tr '\n' ' ' <"$subvol_err")"
+        # The subvolume listing is captured ONCE, before anything is matched
+        # against it, and btrfs's own status travels INSIDE the capture, on a
+        # last line of its own (as probe_mount_point's does): bash returns 0
+        # and an empty string for a command substitution it cannot make (no
+        # descriptor free for its pipe), and that empty listing would read as
+        # "this target has no snapshots" — now a WARN per subvolume, where the
+        # truth is a failure to look. A capture without the status line, or a
+        # status other than 0, is a FAIL for this target, counted once, and
+        # nothing on it is touched (bd DAS-Backup-Manager-nsp, dtm).
+        local subvol_listing subvol_out subvol_last subvol_rc subvol_err
+        if ! subvol_err="$(mktemp)"; then
+            log_error "  [$label] Could not make a temp file to list its subvolumes — boot subvolumes NOT updated"
+            (( failed += 1 ))
+            continue
+        fi
+        subvol_out="$(btrfs subvolume list "$mnt" 2>"$subvol_err" && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+        subvol_last="${subvol_out##*$'\n'}"
+        subvol_rc="${subvol_last#status=}"
+        if [[ "$subvol_last" != status=* || ! "$subvol_rc" =~ ^[[:digit:]]+$ ]]; then
+            log_error "  [$label] Could not list subvolumes: no answer (its output could not be captured)"
+            log_error "  [$label] Refusing to treat an unreadable target as 'no snapshots'"
+            rm -f "$subvol_err"
+            (( failed += 1 ))
+            continue
+        fi
+        if (( subvol_rc != 0 )); then
+            log_error "  [$label] Could not list subvolumes: $(tr '\n' ' ' <"$subvol_err")(exit $subvol_rc)"
             log_error "  [$label] Refusing to treat an unreadable target as 'no snapshots'"
             rm -f "$subvol_err"
             (( failed += 1 ))
             continue
         fi
         rm -f "$subvol_err"
+        subvol_listing="${subvol_out%"$subvol_last"}"
+        subvol_listing="${subvol_listing%$'\n'}"
 
         # Walk the plan, one line per subvolume: "<subvol>\t<name or ->\t<subdirs or ->".
         # Parameter expansion, not a pipe or a here-string (see latest_boot_snapshot).

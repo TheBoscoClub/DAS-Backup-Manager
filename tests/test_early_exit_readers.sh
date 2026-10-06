@@ -221,7 +221,18 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             printf '%s\n' "$*" >>"$WORK/btrfs.calls"
             case "$1 $2" in
             "filesystem label") echo das-backup-test ;;
-            "subvolume list") cat "$LISTING" ;;
+            "subvolume list")
+                # BOOT_LIST_RC: the listing fails, with its reason on stderr.
+                if [[ -n "${BOOT_LIST_RC:-}" ]]; then
+                    echo "ERROR: can't access '$3': Input/output error (stub)" >&2
+                    return "$BOOT_LIST_RC"
+                fi
+                # BOOT_LIST_VANISH: the capture itself dies before btrfs's
+                # status can be printed (as when bash cannot make it): the
+                # stub's subshell exits, so the capture holds no status line.
+                [[ -z "${BOOT_LIST_VANISH:-}" ]] || exit 0
+                cat "$LISTING"
+                ;;
             "subvolume snapshot")
                 # BOOT_FAIL_ON: a substring of the call that fails.
                 if [[ -n "${BOOT_FAIL_ON:-}" && "$*" == *"$BOOT_FAIL_ON"* ]]; then
@@ -416,6 +427,20 @@ check "boot full, a stale @.new: deleted AFTER the archive, before the build" \
 check "boot full, the stale @.new cannot be removed: FAIL, live untouched" \
     "$(BOOT_FAIL_ON="delete /mnt/t/@.new" BOOT_PRESENT="/mnt/t/@ /mnt/t/@.new" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(calls_of 'subvolume delete /mnt/t/@$') $(calls_of '^mv')" \
     "FAIL|0 updated, 1 failed 0 0"
+# 7. the listing cannot be read: FAIL for the target, nothing touched.
+check "boot, the listing fails: the step FAILS, counted once" \
+    "$(BOOT_LIST_RC=1 BOOT_PRESENT="/mnt/t/@" run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot, the listing fails: says why, with the exit status" \
+    "$(said_boot "[ERROR]   [das-backup-test] Could not list subvolumes: ERROR: can't access '/mnt/t': Input/output error (stub) (exit 1)")" "1"
+check "boot, the listing fails: no snapshot, delete or mv" \
+    "$(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" "0 0 0"
+# R7: a listing whose capture bash could not make is no answer, not an empty one.
+check "boot, the listing capture yields no status line: FAIL, not a WARN for 'no snapshot'" \
+    "$(BOOT_LIST_VANISH=1 BOOT_PRESENT="/mnt/t/@" run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot, the listing capture yields no status line: said, and nothing touched" \
+    "$(said_boot 'Could not list subvolumes: no answer') $(said_boot 'No btrbk snapshot named') $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" "1 0 0 0 0"
+check "boot, an empty listing with status 0: the WARN, as before" \
+    "$(: >"$WORK/empty-list.txt"; BOOT_FORCE=false run_boot_subvols "$WORK/empty-list.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
 # R5: an existence test that cannot say yes or no is a FAIL, nothing mutated.
 check "boot, @ existence cannot be told: FAIL for it, no snapshot, no delete, no mv" \
     "$(BOOT_STAT_ERR="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
