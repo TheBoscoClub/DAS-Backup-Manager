@@ -94,8 +94,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   replace the live subvolume from the latest btrbk snapshot. If the archive fails, the
   replacement is skipped — the only copy of the outgoing subvolume is never destroyed.
 - Two code paths, which must stay symmetric: bash `update_boot_subvolumes()` in
-  `scripts/backup-run.sh` (`--full` runs) and Rust `archive_boot()` in `indexer/src/backup.rs`.
-  **Both locate the replacement BEFORE deleting anything**, and skip if none is found.
+  `scripts/backup-run.sh` (every run) and Rust `archive_boot_with` in
+  `indexer/src/backup.rs`. **Both locate the replacement BEFORE deleting anything**; none found is a WARN.
 - **One classification, both paths** (bd woq, dtm, 2026-10-06). Per target, per configured boot
   subvolume; the Rust path is `archive_boot_with` (`BootOutcome`, `BootStep`), the script's rows
   and words are the same:
@@ -129,7 +129,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   `<subdir>/<snapshot_name>.<TS>`, `TS` = 8 ASCII digits, `T`, 4 ASCII digits, optionally `_` and
   digits, `subdir` trimmed of leading and trailing `/`; the newest is the bytewise-greatest match.
 - **Snapshot names are read from `/etc/btrbk/btrbk.conf`, never re-derived**
-  (`forget::live_subvol_snapshot_names()`). If it cannot be read, decline the whole step.
+  (`forget::live_subvol_snapshot_names()`). If it cannot be read, the whole step FAILs.
 - **Both paths, and the pruner, skip `role=mirror` targets entirely** — the recovery drives carry
   their own independent OS under `@`/`@home`. Ordinary btrbk send/receive to them is unaffected.
 - The pruner deletes only `@.archive.*` / `@home.archive.*` past retention on non-mirror
@@ -229,8 +229,8 @@ Checked before any directory is created, both roots compared **after resolution*
 - **An empty selection is a refusal, never "all"** (bd `7tx`). `BackupOptions.sources`/`.targets` are
   `Option`s: `None` = not specified (CLI with no flag: all), `Some(vec![])` = nothing ticked, refused by
   `backup::empty_selection` before the first lock or mount. The D-Bus `as` arguments cannot say "not
-  specified", so the helper always passes `Some(list)` and refuses an empty `BackupSnapshot`/`BackupSend`
-  list itself. A label (source or target) the configuration lacks is refused too, before the first lock
+  specified", so the helper always passes `Some(list)` and refuses an empty `sources` or `targets`
+  list of `BackupRun` itself. A label (source or target) the configuration lacks is refused too, before the first lock
   (`backup::unknown_label`, exit 1), even beside known ones — never dropped, never widened to "all mounted".
 - An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline

@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.22.3
+**Version**: 0.7.23.0
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -25,7 +25,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 - **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure
 - **Multi-Target Architecture** — Configurable primary and mirror roles across any number of DAS drives
-- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
+- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention). Every run, incremental or full, creates a missing boot subvolume from the latest snapshot; only a full run (or `btrdasd backup boot-archive`) archives and replaces an existing one. The GUI and `backup-run.sh` apply the same rule
 - **Scheduled BTRFS Scrub** (`btrdasd scrub`) — Monthly integrity scrub of all DAS backup filesystems, with health-check integration and email reports
 - **Automatic Subvolume Adoption** (`btrdasd subvol sync`) — Every backup run adds an entry for each new subvolume on a source volume (unless excluded by `[subvolumes].exclude`), retires entries whose subvolume is gone, and later expires the retired subvolume's backups once the retention window has passed
 - **Subvolume Drift Detector** (`btrdasd doctor --check-drift`) — Weekly check comparing every source filesystem's actual subvolumes against config.toml, catching silent backup gaps (missing) and stale entries (removed), with email alerts. New subvolumes are adopted by the backup run itself, so a finding means that step failed

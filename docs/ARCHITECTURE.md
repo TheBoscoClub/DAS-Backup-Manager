@@ -140,7 +140,9 @@ A `--dryrun` stops after the expiry preview and the recovery OS check: it previe
 unmounts, and sends, records and archives nothing. It may create a missing, empty
 target directory (for example for a pending adoption), as the real run would.
 
-`btrdasd backup run` and the GUI (through `btrdasd-helper`'s `BackupRun`) run the same
+`btrdasd backup run` and the GUI (through `btrdasd-helper`'s `BackupRun`, which takes the
+ticked sources, targets, a mode (`full` or `incremental`) and a steps dictionary of exactly
+five booleans: `snapshot`, `send`, `boot_archive`, `index`, `email`) run the same
 job through one library entry point, `backup::run_backup_job`: locks (decline if a
 backup holds the singleton, wait for the maintenance lock), mount sources, subvolume
 sync, mount targets (`mount::verify_write_targets()` before btrbk), `run_backup`, capture

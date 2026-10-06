@@ -163,11 +163,6 @@ async fn finish_job(progress: Arc<OrderedProgress>, success: bool, summary: Stri
 // Polkit authorization
 // ---------------------------------------------------------------------------
 
-/// Check Polkit authorization for the caller of a D-Bus method.
-///
-/// Calls `org.freedesktop.PolicyKit1.Authority.CheckAuthorization` with the
-/// caller's bus name as the subject.  Returns `Ok(())` if authorized, or an
-/// `fdo::Error::AccessDenied` otherwise.
 /// The steps dictionary as (key, value) pairs; a value that is not a
 /// boolean becomes `None`, which `RunSteps::from_entries` refuses.
 fn step_entries(map: HashMap<String, zbus::zvariant::OwnedValue>) -> Vec<(String, Option<bool>)> {
@@ -188,6 +183,11 @@ fn parse_mode(mode: &str) -> Result<BackupMode, String> {
     }
 }
 
+/// Check Polkit authorization for the caller of a D-Bus method.
+///
+/// Calls `org.freedesktop.PolicyKit1.Authority.CheckAuthorization` with the
+/// caller's bus name as the subject.  Returns `Ok(())` if authorized, or an
+/// `fdo::Error::AccessDenied` otherwise.
 async fn check_polkit(conn: &Connection, sender: &str, action_id: &str) -> Result<(), fdo::Error> {
     // Subject: ("system-bus-name", { "name" => sender })
     let subject_kind = "system-bus-name";
