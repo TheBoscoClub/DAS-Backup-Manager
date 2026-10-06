@@ -97,7 +97,7 @@ pub fn acquire_manual_locks(
 /// Whether to run an incremental or full backup.
 ///
 /// **Incremental**: `btrbk snapshot` then `btrbk resume` — two steps, so a run
-/// can take one of them alone (`snapshot_only`, `send_only`). Neither is given
+/// can take one of them alone ([`BtrbkSteps`]). Neither is given
 /// `--preserve`: btrbk applies the retention policy after the send.
 ///
 /// **Full**: `btrbk run` — snapshot, send and retention cleanup as one btrbk
@@ -115,6 +115,91 @@ impl std::fmt::Display for BackupMode {
             BackupMode::Incremental => write!(f, "incremental"),
             BackupMode::Full => write!(f, "full"),
         }
+    }
+}
+
+/// Which btrbk steps a run performs. Snapshot and Send are the GUI's two
+/// ticks; neither is not a choice — it is refused (bd c4x, as 7tx refuses
+/// an empty selection), so it has no variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BtrbkSteps {
+    /// Full: one `btrbk run`. Incremental: `btrbk snapshot`, then `btrbk resume`.
+    #[default]
+    SnapshotAndSend,
+    /// `btrbk snapshot` only, in either mode.
+    SnapshotOnly,
+    /// `btrbk resume` only, in either mode: send what exists.
+    SendOnly,
+}
+
+impl BtrbkSteps {
+    pub fn from_ticks(snapshot: bool, send: bool) -> Result<Self, String> {
+        match (snapshot, send) {
+            (true, true) => Ok(Self::SnapshotAndSend),
+            (true, false) => Ok(Self::SnapshotOnly),
+            (false, true) => Ok(Self::SendOnly),
+            (false, false) => Err("Nothing to do: neither Snapshot nor Send is selected — \
+                                   refused, never read as both"
+                .to_string()),
+        }
+    }
+    pub fn snapshots(self) -> bool {
+        !matches!(self, Self::SendOnly)
+    }
+    pub fn sends(self) -> bool {
+        !matches!(self, Self::SnapshotOnly)
+    }
+}
+
+/// The keys of the steps dictionary the GUI sends with `BackupRun`. Every
+/// one must be present: a missing key is refused, never defaulted, so a GUI
+/// and a helper from different builds fail loudly.
+pub const RUN_STEP_KEYS: [&str; 5] = ["snapshot", "send", "boot_archive", "index", "email"];
+
+/// What a GUI run was asked to do, read from the steps dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSteps {
+    pub btrbk: BtrbkSteps,
+    pub boot_archive: bool,
+    pub index: bool,
+    pub email: bool,
+}
+
+impl RunSteps {
+    /// `entries` are the dictionary's (key, value) pairs; a value that is not
+    /// a boolean arrives as `None`.
+    pub fn from_entries<I: IntoIterator<Item = (String, Option<bool>)>>(
+        entries: I,
+    ) -> Result<Self, String> {
+        let mut seen = std::collections::HashMap::new();
+        for (key, value) in entries {
+            if !RUN_STEP_KEYS.contains(&key.as_str()) {
+                return Err(format!("unknown step '{key}' — refused"));
+            }
+            let Some(value) = value else {
+                return Err(format!("step '{key}' is not a boolean — refused"));
+            };
+            seen.insert(key, value);
+        }
+        let get = |key: &str| {
+            seen.get(key)
+                .copied()
+                .ok_or_else(|| format!("step '{key}' not given — refused, never defaulted"))
+        };
+        Ok(Self {
+            btrbk: BtrbkSteps::from_ticks(get("snapshot")?, get("send")?)?,
+            boot_archive: get("boot_archive")?,
+            index: get("index")?,
+            email: get("email")?,
+        })
+    }
+
+    /// Put these steps into `options`.
+    pub fn apply(self, options: &mut BackupOptions) {
+        options.steps = self.btrbk;
+        options.boot_archive = self.boot_archive;
+        options.index_after = self.index;
+        options.send_report = self.email; // `email_report` after Task 2
     }
 }
 
@@ -136,10 +221,8 @@ pub struct BackupOptions {
     pub targets: Option<Vec<String>>,
     /// Preview only — don't actually run btrbk.
     pub dry_run: bool,
-    /// Create snapshots but skip send/receive.
-    pub snapshot_only: bool,
-    /// Send existing snapshots without creating new ones.
-    pub send_only: bool,
+    /// Which btrbk steps run (Snapshot, Send or both). Default: both.
+    pub steps: BtrbkSteps,
     /// Archive boot subvolumes after backup.
     pub boot_archive: bool,
     /// Run the content indexer after backup completes.
@@ -1773,29 +1856,27 @@ fn run_pipeline(
             }
         }
     };
-    match mode {
-        BackupMode::Full if options.snapshot_only => snapshots(&mut done),
-        BackupMode::Full if options.send_only => send(&mut done),
-        BackupMode::Full => match run_full_pipeline_with(config, sources, targets, progress, env) {
-            Ok((created, sent, cleaned, bytes)) => {
-                done.created = Some(created);
-                done.sent = Some(sent);
-                done.cleaned = cleaned;
-                done.bytes = bytes;
+    match (mode, options.steps) {
+        (_, BtrbkSteps::SnapshotOnly) => snapshots(&mut done),
+        (_, BtrbkSteps::SendOnly) => send(&mut done),
+        (BackupMode::Full, BtrbkSteps::SnapshotAndSend) => {
+            match run_full_pipeline_with(config, sources, targets, progress, env) {
+                Ok((created, sent, cleaned, bytes)) => {
+                    done.created = Some(created);
+                    done.sent = Some(sent);
+                    done.cleaned = cleaned;
+                    done.bytes = bytes;
+                }
+                Err(e) => {
+                    // One btrbk run did all of it: what it created and sent is not known.
+                    (done.created, done.sent) = (None, None);
+                    done.failed(progress, format!("{}: {e}", BTRBK_STEP_FAILURES[2]));
+                }
             }
-            Err(e) => {
-                // One btrbk run did all of it: what it created and sent is not known.
-                (done.created, done.sent) = (None, None);
-                done.failed(progress, format!("{}: {e}", BTRBK_STEP_FAILURES[2]));
-            }
-        },
-        BackupMode::Incremental => {
-            if !options.send_only {
-                snapshots(&mut done);
-            }
-            if !options.snapshot_only {
-                send(&mut done);
-            }
+        }
+        (BackupMode::Incremental, BtrbkSteps::SnapshotAndSend) => {
+            snapshots(&mut done);
+            send(&mut done);
         }
     }
     done
@@ -1937,25 +2018,11 @@ fn run_backup_with(
     }
 
     // Count enabled pipeline steps for the top-level stage announcement.
-    let total_steps = {
-        let mut n = 0u64;
-        if !options.send_only {
-            n += 1;
-        } // snapshots
-        if !options.snapshot_only {
-            n += 1;
-        } // send
-        if options.boot_archive {
-            n += 1;
-        }
-        if options.index_after {
-            n += 1;
-        }
-        if options.send_report {
-            n += 1;
-        }
-        n.max(1)
-    };
+    let total_steps = options.steps.snapshots() as u64
+        + options.steps.sends() as u64
+        + options.boot_archive as u64
+        + options.index_after as u64
+        + 1; // the report is always written
     progress.on_stage("Backup", total_steps);
 
     let mode = options.mode.unwrap_or(BackupMode::Incremental);
@@ -1963,20 +2030,24 @@ fn run_backup_with(
     // ---------- Dry-run path ----------
 
     if options.dry_run {
-        progress.on_log(
-            LogLevel::Info,
-            &format!(
-                "DRY RUN ({mode}): would create snapshots for {:?}",
-                effective_sources
-            ),
-        );
-        progress.on_log(
-            LogLevel::Info,
-            &format!(
-                "DRY RUN ({mode}): would send to targets {:?}",
-                effective_targets
-            ),
-        );
+        if options.steps.snapshots() {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "DRY RUN ({mode}): would create snapshots for {:?}",
+                    effective_sources
+                ),
+            );
+        }
+        if options.steps.sends() {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "DRY RUN ({mode}): would send to targets {:?}",
+                    effective_targets
+                ),
+            );
+        }
         if options.boot_archive {
             progress.on_log(
                 LogLevel::Info,
@@ -1986,6 +2057,23 @@ fn run_backup_with(
                 ),
             );
         }
+        if options.index_after {
+            progress.on_log(
+                LogLevel::Info,
+                &format!("DRY RUN ({mode}): would index the targets afterwards"),
+            );
+        }
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "DRY RUN ({mode}): {}",
+                if options.send_report {
+                    "would email the report"
+                } else {
+                    "would save the report without emailing it"
+                }
+            ),
+        );
 
         let success = errors.is_empty();
         let result = BackupResult {
@@ -2967,8 +3055,7 @@ mod tests {
         );
         assert!(opts.targets.is_none());
         assert!(!opts.dry_run);
-        assert!(!opts.snapshot_only);
-        assert!(!opts.send_only);
+        assert_eq!(opts.steps, BtrbkSteps::SnapshotAndSend);
         assert!(!opts.boot_archive);
         assert!(!opts.index_after);
         assert!(!opts.send_report);
@@ -3306,7 +3393,7 @@ mod tests {
     fn the_sizes_btrbk_prints_on_its_send_lines_are_added_up_by_a_send_and_a_full_run() {
         let f = primary_filters();
         let send_only = BackupOptions {
-            send_only: true,
+            steps: BtrbkSteps::SendOnly,
             ..Default::default()
         };
         let (done, _, _) = pipeline(
@@ -3343,7 +3430,7 @@ mod tests {
         let f = primary_filters();
         let want = [10 * 1_024, 10 * 1_048_576, 1_073_741_824];
         let send_only = BackupOptions {
-            send_only: true,
+            steps: BtrbkSteps::SendOnly,
             ..Default::default()
         };
         let (_, _, progress) = pipeline(
@@ -3435,12 +3522,16 @@ mod tests {
             f(&mut options);
             options
         };
-        assert_eq!(announced(with(&|_| {})), 2, "snapshot + send");
-        assert_eq!(announced(with(&|o| o.send_only = true)), 1);
-        assert_eq!(announced(with(&|o| o.snapshot_only = true)), 1);
-        assert_eq!(announced(with(&|o| o.boot_archive = true)), 3);
-        assert_eq!(announced(with(&|o| o.index_after = true)), 3);
-        assert_eq!(announced(with(&|o| o.send_report = true)), 3);
+        assert_eq!(announced(with(&|_| {})), 3, "snapshot + send + report");
+        assert_eq!(announced(with(&|o| o.steps = BtrbkSteps::SendOnly)), 2);
+        assert_eq!(announced(with(&|o| o.steps = BtrbkSteps::SnapshotOnly)), 2);
+        assert_eq!(announced(with(&|o| o.boot_archive = true)), 4);
+        assert_eq!(announced(with(&|o| o.index_after = true)), 4);
+        assert_eq!(
+            announced(with(&|o| o.send_report = true)),
+            3,
+            "the report is written whether or not it is emailed"
+        );
         assert_eq!(
             announced(with(&|o| {
                 o.boot_archive = true;
@@ -3449,13 +3540,195 @@ mod tests {
             })),
             5
         );
-        // Nothing asked for at all still announces one.
+    }
+
+    #[test]
+    fn btrbk_steps_from_the_two_ticks_and_nothing_ticked_is_refused() {
         assert_eq!(
-            announced(with(&|o| {
-                o.send_only = true;
-                o.snapshot_only = true;
-            })),
-            1
+            BtrbkSteps::from_ticks(true, true),
+            Ok(BtrbkSteps::SnapshotAndSend)
+        );
+        assert_eq!(
+            BtrbkSteps::from_ticks(true, false),
+            Ok(BtrbkSteps::SnapshotOnly)
+        );
+        assert_eq!(
+            BtrbkSteps::from_ticks(false, true),
+            Ok(BtrbkSteps::SendOnly)
+        );
+        let why = BtrbkSteps::from_ticks(false, false).unwrap_err();
+        assert!(why.contains("neither Snapshot nor Send"), "{why}");
+        assert!(BtrbkSteps::SnapshotOnly.snapshots() && !BtrbkSteps::SnapshotOnly.sends());
+        assert!(!BtrbkSteps::SendOnly.snapshots() && BtrbkSteps::SendOnly.sends());
+        assert!(BtrbkSteps::SnapshotAndSend.snapshots() && BtrbkSteps::SnapshotAndSend.sends());
+    }
+
+    fn entries(pairs: &[(&str, Option<bool>)]) -> Vec<(String, Option<bool>)> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn run_steps_reads_every_key_and_each_one_reaches_its_own_field() {
+        let all = [
+            ("snapshot", true),
+            ("send", true),
+            ("boot_archive", true),
+            ("index", true),
+            ("email", true),
+        ];
+        // Flip one key at a time: a swapped key (index <-> email) fails here.
+        for flipped in ["boot_archive", "index", "email"] {
+            let pairs: Vec<_> = all
+                .iter()
+                .map(|(k, v)| (*k, Some(if *k == flipped { !v } else { *v })))
+                .collect();
+            let s = RunSteps::from_entries(entries(&pairs)).unwrap();
+            assert_eq!(s.boot_archive, flipped != "boot_archive", "{flipped}");
+            assert_eq!(s.index, flipped != "index", "{flipped}");
+            assert_eq!(s.email, flipped != "email", "{flipped}");
+            assert_eq!(s.btrbk, BtrbkSteps::SnapshotAndSend);
+        }
+    }
+
+    #[test]
+    fn run_steps_refuses_a_missing_unknown_or_non_boolean_key_and_never_defaults() {
+        let full = [
+            ("snapshot", Some(true)),
+            ("send", Some(true)),
+            ("boot_archive", Some(true)),
+            ("index", Some(true)),
+            ("email", Some(true)),
+        ];
+        for missing in RUN_STEP_KEYS {
+            let pairs: Vec<_> = full
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != missing)
+                .collect();
+            let why = RunSteps::from_entries(entries(&pairs)).unwrap_err();
+            assert!(why.contains(missing) && why.contains("not given"), "{why}");
+        }
+        let mut extra = full.to_vec();
+        extra.push(("preserve", Some(true)));
+        assert!(
+            RunSteps::from_entries(entries(&extra))
+                .unwrap_err()
+                .contains("unknown step 'preserve'")
+        );
+        let mut not_bool = full.to_vec();
+        not_bool[3] = ("index", None);
+        assert!(
+            RunSteps::from_entries(entries(&not_bool))
+                .unwrap_err()
+                .contains("'index' is not a boolean")
+        );
+        assert!(
+            RunSteps::from_entries(Vec::new()).is_err(),
+            "an empty dictionary is refused"
+        );
+        let mut neither = full.to_vec();
+        neither[0] = ("snapshot", Some(false));
+        neither[1] = ("send", Some(false));
+        assert!(
+            RunSteps::from_entries(entries(&neither))
+                .unwrap_err()
+                .contains("neither Snapshot nor Send")
+        );
+    }
+
+    #[test]
+    fn run_steps_apply_puts_each_step_into_its_own_option() {
+        let mut options = BackupOptions::default();
+        RunSteps {
+            btrbk: BtrbkSteps::SendOnly,
+            boot_archive: true,
+            index: false,
+            email: true,
+        }
+        .apply(&mut options);
+        assert_eq!(options.steps, BtrbkSteps::SendOnly);
+        assert!(options.boot_archive && !options.index_after && options.send_report);
+    }
+
+    #[test]
+    fn every_mode_and_step_choice_makes_exactly_its_btrbk_calls() {
+        use BackupMode::{Full, Incremental};
+        use BtrbkSteps::{SendOnly, SnapshotAndSend, SnapshotOnly};
+        let f = primary_filters();
+        let run = btrbk(&format!("run {f}"));
+        let snap = btrbk(&format!("snapshot {f}"));
+        let resume = btrbk(&format!("resume {f}"));
+        let cases = [
+            (Full, SnapshotAndSend, vec![run.clone()], (1, 1)),
+            (Full, SnapshotOnly, vec![snap.clone()], (1, 0)),
+            (Full, SendOnly, vec![resume.clone()], (0, 1)),
+            (
+                Incremental,
+                SnapshotAndSend,
+                vec![snap.clone(), resume.clone()],
+                (1, 1),
+            ),
+            (Incremental, SnapshotOnly, vec![snap.clone()], (1, 0)),
+            (Incremental, SendOnly, vec![resume.clone()], (0, 1)),
+        ];
+        for (mode, steps, want, (created, sent)) in cases {
+            let (done, calls, _) = pipeline(
+                BackupOptions {
+                    steps,
+                    ..Default::default()
+                },
+                mode,
+                vec![
+                    (run.clone(), 0, String::new()),
+                    (snap.clone(), 0, String::new()),
+                    (resume.clone(), 0, String::new()),
+                    listing_of(raw_row("/s/a.1", "/t1/a.1")),
+                ],
+            );
+            // The listings btrbk is asked for between steps are not steps.
+            let btrbk_calls: Vec<_> = calls
+                .iter()
+                .filter(|c| !c.contains(" list "))
+                .cloned()
+                .collect();
+            assert_eq!(btrbk_calls, want, "{mode} {steps:?}: {calls:?}");
+            assert_eq!(
+                (done.created, done.sent),
+                (Some(created), Some(sent)),
+                "{mode} {steps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_run_names_only_the_btrbk_steps_it_would_take() {
+        let log_of = |steps: BtrbkSteps| {
+            let runner = Scripted::from_owned(vec![]);
+            let progress = TestProgress::new();
+            let options = BackupOptions {
+                dry_run: true,
+                steps,
+                targets: Some(labels(&["primary-22tb"])),
+                ..Default::default()
+            };
+            run_backup_with(&live_config(), &options, &progress, &env(&runner)).unwrap();
+            let logs = progress.logs.lock().unwrap();
+            logs.iter()
+                .map(|(_, m)| m.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let send = log_of(BtrbkSteps::SendOnly);
+        assert!(send.contains("would send to targets"), "{send}");
+        assert!(!send.contains("would create snapshots"), "{send}");
+        let snap = log_of(BtrbkSteps::SnapshotOnly);
+        assert!(snap.contains("would create snapshots"), "{snap}");
+        assert!(!snap.contains("would send to targets"), "{snap}");
+        let both = log_of(BtrbkSteps::SnapshotAndSend);
+        assert!(both.contains("would create snapshots") && both.contains("would send to targets"));
+        assert!(
+            both.contains("would save the report without emailing it"),
+            "{both}"
         );
     }
 
@@ -4469,7 +4742,7 @@ mod tests {
         };
         let (done, calls, _) = pipeline(
             BackupOptions {
-                send_only: true,
+                steps: BtrbkSteps::SendOnly,
                 ..Default::default()
             },
             BackupMode::Incremental,
@@ -4481,7 +4754,7 @@ mod tests {
 
         let (done, calls, _) = pipeline(
             BackupOptions {
-                snapshot_only: true,
+                steps: BtrbkSteps::SnapshotOnly,
                 ..Default::default()
             },
             BackupMode::Incremental,
@@ -4518,7 +4791,7 @@ mod tests {
         );
         let (done, calls, _) = pipeline(
             BackupOptions {
-                snapshot_only: true,
+                steps: BtrbkSteps::SnapshotOnly,
                 ..Default::default()
             },
             BackupMode::Full,
@@ -4531,7 +4804,7 @@ mod tests {
         );
         let (done, calls, _) = pipeline(
             BackupOptions {
-                send_only: true,
+                steps: BtrbkSteps::SendOnly,
                 ..Default::default()
             },
             BackupMode::Full,
@@ -5467,7 +5740,7 @@ mod tests {
     fn bytes_sent_is_measured_for_a_send_alone_and_for_a_snapshot_alone() {
         let row = raw_row("/s/a.1", "/t/a.1");
         let send_only = BackupOptions {
-            send_only: true,
+            steps: BtrbkSteps::SendOnly,
             ..Default::default()
         };
         let (result, taken) = live_run_measuring(
@@ -5482,7 +5755,7 @@ mod tests {
         assert_eq!((result.bytes_sent, taken), (4000, 2));
 
         let snapshot_only = BackupOptions {
-            snapshot_only: true,
+            steps: BtrbkSteps::SnapshotOnly,
             ..Default::default()
         };
         let (result, taken) =
@@ -5516,7 +5789,7 @@ mod tests {
     fn nothing_created_or_sent_reads_the_targets_once_and_sends_zero_bytes() {
         let (result, taken) = live_run_measuring(
             BackupOptions {
-                send_only: true,
+                steps: BtrbkSteps::SendOnly,
                 ..Default::default()
             },
             btrbk_script(0, "", ""),
@@ -5535,7 +5808,7 @@ mod tests {
         let row = raw_row("/s/a.1", "/t/a.1");
         let (result, taken) = live_run_measuring(
             BackupOptions {
-                send_only: true,
+                steps: BtrbkSteps::SendOnly,
                 ..Default::default()
             },
             btrbk_script(0, ">>> /t/a.1 (incremental, 2.0 MiB)\n", &row),
