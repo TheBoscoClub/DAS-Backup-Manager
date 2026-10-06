@@ -96,6 +96,38 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 - Two code paths, which must stay symmetric: bash `update_boot_subvolumes()` in
   `scripts/backup-run.sh` (`--full` runs) and Rust `archive_boot()` in `indexer/src/backup.rs`.
   **Both locate the replacement BEFORE deleting anything**, and skip if none is found.
+- **One classification, both paths** (bd woq, dtm, 2026-10-06). Per target, per configured boot
+  subvolume; the Rust path is `archive_boot_with` (`BootOutcome`, `BootStep`), the script's rows
+  and words are the same:
+
+  | Situation | Outcome |
+  | --- | --- |
+  | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
+  | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
+  | Target not selected / not mounted (absent mount point) | not counted, Info |
+  | Mirror target | skipped (counted once per target), Info |
+  | Mount state cannot be told / write verification refuses | **FAIL** (whole step) |
+  | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
+  | Target's subvolume listing cannot be read | **FAIL** (once per target) |
+  | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
+  | No source declares `target_subdirs` for it | **WARN** |
+  | No snapshot of that series on the target | **WARN** |
+  | Incremental, the subvolume exists on the target | skipped, Info |
+  | The subvolume is absent (either mode) | create from the newest snapshot; failure **FAIL** |
+  | Full, it exists: archive `-r` fails | **FAIL**, live untouched |
+  | Full: stale `<subvol>.new` cannot be removed | **FAIL**, live untouched |
+  | Full: building `<subvol>.new` fails | **FAIL**, live untouched |
+  | Full: deleting the live one fails | **FAIL**, staging discarded |
+  | Full: the rename fails | **FAIL** (archive holds the old) |
+  | `btrfs` cannot be run at all | **FAIL** |
+
+  Status: any FAIL gives `FAIL (<u> updated, <f> failed)`; else any WARN gives
+  `WARN (<u> updated, <s> skipped, <w> warnings)`; else `OK (<u> updated, <s> skipped)`. FAIL fails
+  the run (exit 3); WARN does not (exit 0, report `COMPLETED WITH WARNINGS`). An incremental run
+  creates a missing boot subvolume and never replaces one; only a full run (or `backup
+  boot-archive`) archives and replaces. Snapshot match: a listing line's last field equals
+  `<subdir>/<snapshot_name>.<TS>`, `TS` = 8 ASCII digits, `T`, 4 ASCII digits, optionally `_` and
+  digits, `subdir` trimmed of leading and trailing `/`; the newest is the bytewise-greatest match.
 - **Snapshot names are read from `/etc/btrbk/btrbk.conf`, never re-derived**
   (`forget::live_subvol_snapshot_names()`). If it cannot be read, decline the whole step.
 - **Both paths, and the pruner, skip `role=mirror` targets entirely** — the recovery drives carry

@@ -237,6 +237,88 @@ pub struct BackupOptions {
     pub subvolume_sync: Option<SyncSection>,
 }
 
+/// What a boot-step failure is prefixed with in a run's `errors`.
+pub const BOOT_ERROR_PREFIX: &str = "Boot subvolumes: ";
+
+/// What the boot step did, counted the way `backup-run.sh` counts it: one
+/// `updated` per boot subvolume created or replaced, one `skipped` per
+/// subvolume left alone because it exists (incremental run) and per mirror
+/// target. A warning is an absence (nothing to act on); a failure is something
+/// that was meant to work and did not — it fails the run (bd woq, dtm).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BootOutcome {
+    pub updated: usize,
+    pub skipped: usize,
+    pub warnings: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl BootOutcome {
+    /// `FAIL` beats `WARN` beats `OK`.
+    pub fn status(&self) -> &'static str {
+        if !self.failures.is_empty() {
+            "FAIL"
+        } else if !self.warnings.is_empty() {
+            "WARN"
+        } else {
+            "OK"
+        }
+    }
+
+    /// `backup-run.sh` records `boot_subvols` with these words.
+    pub fn detail(&self) -> String {
+        match self.status() {
+            "FAIL" => format!("{} updated, {} failed", self.updated, self.failures.len()),
+            "WARN" => format!(
+                "{} updated, {} skipped, {} warnings",
+                self.updated,
+                self.skipped,
+                self.warnings.len()
+            ),
+            _ => format!("{} updated, {} skipped", self.updated, self.skipped),
+        }
+    }
+
+    fn warn(&mut self, progress: &dyn ProgressCallback, msg: String) {
+        progress.on_log(LogLevel::Warning, &msg);
+        self.warnings.push(msg);
+    }
+
+    fn fail(&mut self, progress: &dyn ProgressCallback, msg: String) {
+        progress.on_log(LogLevel::Error, &msg);
+        self.failures.push(msg);
+    }
+}
+
+/// The boot step of a run: not asked for, switched off in `config.toml`, or
+/// run with this outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootStep {
+    NotSelected,
+    DisabledInConfig,
+    Ran(BootOutcome),
+}
+
+impl BootStep {
+    /// Whether any boot subvolume was created or replaced.
+    pub fn archived(&self) -> bool {
+        matches!(self, Self::Ran(o) if o.updated > 0)
+    }
+
+    pub fn has_warnings(&self) -> bool {
+        matches!(self, Self::Ran(o) if !o.warnings.is_empty())
+    }
+
+    /// The report's `Boot subvolumes` cell.
+    pub fn row(&self) -> String {
+        match self {
+            Self::NotSelected => "N/A  (not selected)".into(),
+            Self::DisabledInConfig => "OK  (disabled in config)".into(),
+            Self::Ran(o) => format!("{}  ({})", o.status(), o.detail()),
+        }
+    }
+}
+
 /// Result of a completed backup run.
 #[derive(Debug)]
 pub struct BackupResult {
@@ -251,7 +333,7 @@ pub struct BackupResult {
     pub snapshots_sent: Option<usize>,
     pub snapshots_cleaned: usize,
     pub bytes_sent: u64,
-    pub boot_archived: bool,
+    pub boot: BootStep,
     pub indexed: bool,
     pub report_sent: bool,
     pub errors: Vec<String>,
@@ -1196,23 +1278,6 @@ fn is_btrbk_timestamp(ts: &str) -> bool {
         && collision.is_none_or(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
 }
 
-/// Latest btrbk snapshot named `snap_name` under any of `subdirs` on `target_mount`.
-///
-/// Both inputs are supplied by the caller from a source of truth: `snap_name`
-/// from the live `btrbk.conf`, `subdirs` from the owning [`Source`]. Neither is
-/// derived here (bd DAS-Backup-Manager-5ig). An unreadable listing is `None`
-/// here until the boot step is rebuilt on [`subvolume_listing`], which reports
-/// it as an error.
-fn find_latest_btrbk_snapshot(
-    runner: &dyn CommandRunner,
-    target_mount: &str,
-    subdirs: &[String],
-    snap_name: &str,
-) -> Option<String> {
-    let listing = subvolume_listing(runner, target_mount).ok()?;
-    Some(latest_matching_snapshot(&listing, subdirs, snap_name)?.to_string())
-}
-
 /// `btrfs subvolume list <mount>`. Could not run, or a nonzero exit, is an
 /// error carrying stderr: an unreadable target is never an empty listing
 /// (fail-silent rule 6).
@@ -1306,17 +1371,36 @@ fn btrfs_ok(runner: &dyn CommandRunner, args: &[&str]) -> std::io::Result<bool> 
         .success())
 }
 
-/// Archive boot subvolumes as read-only snapshots on backup targets, then
-/// refresh the live subvolume from the newest received snapshot.
+/// [`btrfs_ok`] for the boot step: a `btrfs` that cannot be run at all is a
+/// recorded failure (`None`), never a quiet "no".
+fn btrfs_step(
+    runner: &dyn CommandRunner,
+    args: &[&str],
+    out: &mut BootOutcome,
+    progress: &dyn ProgressCallback,
+) -> Option<bool> {
+    match btrfs_ok(runner, args) {
+        Ok(ok) => Some(ok),
+        Err(e) => {
+            out.fail(progress, format!("btrfs could not be run: {e}"));
+            None
+        }
+    }
+}
+
+/// Create or replace the boot subvolumes on backup targets from the newest
+/// received snapshot, as `update_boot_subvolumes()` in `scripts/backup-run.sh`
+/// does, and with the same classification (`.claude/rules/backup.md`
+/// §Boot Subvolume Archival). This entry point (`backup boot-archive`, the
+/// GUI's Boot Archive) replaces: archive the live one, then swap in the new.
 ///
-/// **The ordering is the safety property**, and it mirrors
-/// `update_boot_subvolumes()` in `scripts/backup-run.sh`: locate the
-/// replacement and build it alongside the live subvolume BEFORE removing the
-/// live one, so no failure path can leave `@` absent. Until 0.7.20.0 the order
-/// was archive -> delete -> look up -> recreate, which destroyed the live
-/// subvolume whenever the lookup failed — and for `@` the lookup could never
-/// succeed, so every Rust-path run on a primary target left the mount without a
-/// bootable `@` (bd DAS-Backup-Manager-5ig).
+/// **The ordering is the safety property**: locate the replacement and build
+/// it alongside the live subvolume BEFORE removing the live one, so no failure
+/// path can leave `@` absent. Until 0.7.20.0 the order was archive -> delete ->
+/// look up -> recreate, which destroyed the live subvolume whenever the lookup
+/// failed — and for `@` the lookup could never succeed, so every Rust-path run
+/// on a primary target left the mount without a bootable `@` (bd
+/// DAS-Backup-Manager-5ig).
 ///
 /// Every target it will write under is verified first, and it refuses — nothing
 /// written — on one whose mount point is a bare directory or holds another
@@ -1325,35 +1409,35 @@ fn btrfs_ok(runner: &dyn CommandRunner, args: &[&str]) -> std::io::Result<bool> 
 /// is mounted there, and the snapshots, deletions and renames below would land
 /// on it. A target whose mount point does not exist is not written and is left
 /// alone, as `backup-run.sh` leaves an absent target.
-pub fn archive_boot(
-    config: &Config,
-    progress: &dyn ProgressCallback,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    archive_boot_with(config, None, progress, &StepEnv::HOST)
+pub fn archive_boot(config: &Config, progress: &dyn ProgressCallback) -> BootStep {
+    archive_boot_with(config, None, true, progress, &StepEnv::HOST)
 }
 
 /// [`archive_boot`] in `env`, for the targets `selected` (`None`: every one).
+/// `replace` is a full run: an existing boot subvolume is archived and
+/// replaced; without it an existing one is skipped and only a missing one is
+/// created. Never returns [`BootStep::NotSelected`].
 fn archive_boot_with(
     config: &Config,
     selected: Option<&[String]>,
+    replace: bool,
     progress: &dyn ProgressCallback,
     env: &StepEnv,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> BootStep {
     if !config.boot.enabled {
-        return Ok(false);
-    }
-
-    progress.on_stage(
-        "Archiving boot subvolumes",
-        config.boot.subvolumes.len() as u64,
-    );
-
-    if config.targets.is_empty() {
         progress.on_log(
-            LogLevel::Warning,
-            "No backup targets configured — skipping boot archive",
+            LogLevel::Info,
+            "Boot subvolumes: disabled in config ([boot] enabled = false)",
         );
-        return Ok(false);
+        return BootStep::DisabledInConfig;
+    }
+    let mut out = BootOutcome::default();
+    if config.targets.is_empty() {
+        out.warn(
+            progress,
+            "No backup targets configured — no boot subvolume updated".into(),
+        );
+        return BootStep::Ran(out);
     }
 
     // The targets written under: selected, not a mirror (those carry their own
@@ -1367,189 +1451,265 @@ fn archive_boot_with(
         .filter(|t| Path::new(&t.mount).exists())
         .map(|t| t.label.clone())
         .collect();
-    (env.verify)(&config.targets, &writes, progress)?;
+    if let Err(e) = (env.verify)(&config.targets, &writes, progress) {
+        out.fail(progress, format!("Boot subvolumes not updated: {e}"));
+        return BootStep::Ran(out);
+    }
 
     // Snapshot names come from the file btrbk itself reads. If it cannot be
     // read we do nothing at all rather than fall back to a guess: a wrong name
     // here is what used to cost the live subvolume.
-    let btrbk_conf = std::path::Path::new(&config.general.btrbk_conf);
-    let snap_names = match crate::forget::live_subvol_snapshot_names(btrbk_conf) {
-        Ok(map) => map,
+    let plan = match boot_plan(config) {
+        Ok(plan) => plan,
         Err(e) => {
-            progress.on_log(
-                LogLevel::Error,
-                &format!(
-                    "Cannot read {} ({e}) — skipping boot archive rather than guessing snapshot names",
-                    btrbk_conf.display()
-                ),
-            );
-            return Ok(false);
+            out.fail(progress, e);
+            return BootStep::Ran(out);
         }
     };
 
     let ts = format_timestamp();
-    let mut any_archived = false;
-
-    for (step, subvol) in config.boot.subvolumes.iter().enumerate() {
+    let targets: Vec<&Target> = config.targets.iter().filter(|t| is_selected(t)).collect();
+    progress.on_stage("Boot subvolumes", targets.len() as u64);
+    for (i, target) in targets.iter().enumerate() {
         progress.on_progress(
-            step as u64,
-            config.boot.subvolumes.len() as u64,
-            &format!("Archiving {subvol}"),
+            i as u64,
+            targets.len() as u64,
+            &format!("Boot subvolumes on {}", target.label),
         );
-
-        let archive_name = format!("{subvol}.archive.{ts}");
-
-        let Some(snap_name) = snap_names.get(subvol.as_str()) else {
+        // Mirror targets carry a genuinely independent OS install in their own
+        // @/@home — never archive-then-replace it with a host snapshot. Mirrors
+        // still receive ordinary btrbk send/receive; only this step skips
+        // them. Wording matches update_boot_subvolumes() in
+        // scripts/backup-run.sh (bd DAS-Backup-Manager-am1).
+        if target.role == TargetRole::Mirror {
             progress.on_log(
-                LogLevel::Warning,
+                LogLevel::Info,
+                &format!("[{}] Skipping mirror target (independent OS)", target.mount),
+            );
+            out.skipped += 1;
+            continue;
+        }
+        // Only a target verified above is written: one that is selected but
+        // has no mount point was not verified, and is left alone rather than
+        // trusted to fail later on a `btrfs` call (review M6).
+        if !writes.contains(&target.label) {
+            progress.on_log(
+                LogLevel::Info,
                 &format!(
-                    "{subvol} has no snapshot_name in {} — leaving it untouched",
-                    btrbk_conf.display()
+                    "[{}] Not mounted — boot subvolumes not updated on '{}'",
+                    target.mount, target.label
                 ),
             );
             continue;
+        }
+        // An unreadable target is never "no snapshots" (fail-silent rule 6).
+        let listing = match subvolume_listing(env.runner, &target.mount) {
+            Ok(listing) => listing,
+            Err(e) => {
+                out.fail(
+                    progress,
+                    format!(
+                        "[{}] Could not list subvolumes ({e}) — refusing to read an unreadable \
+                         target as 'no snapshots'",
+                        target.label
+                    ),
+                );
+                continue;
+            }
         };
-
-        let subdirs = subdirs_for_subvol(config, subvol);
-        if subdirs.is_empty() {
-            progress.on_log(
-                LogLevel::Warning,
-                &format!("No source declares target_subdirs for {subvol} — leaving it untouched"),
-            );
-            continue;
-        }
-
-        for target in config.targets.iter().filter(|t| is_selected(t)) {
-            // Mirror targets carry a genuinely independent OS install in their
-            // own @/@home (e.g. das-recovery-bay1) — never archive-then-replace
-            // it with a host snapshot. Mirrors still receive ordinary btrbk
-            // send/receive via run_backup(); only this boot-subvol step skips
-            // them. Wording matches update_boot_subvolumes() in
-            // scripts/backup-run.sh so both origins log identically
-            // (bd DAS-Backup-Manager-am1).
-            if target.role == TargetRole::Mirror {
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("[{}] Skipping mirror target (independent OS)", target.mount),
-                );
-                continue;
-            }
-
-            // Only a target verified above is written: one that is selected but
-            // has no mount point was not verified, and is left alone rather
-            // than trusted to fail later on a `btrfs` call (review M6).
-            if !writes.contains(&target.label) {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "[{}] Mount point does not exist — not archiving on target '{}'",
-                        target.mount, target.label
-                    ),
-                );
-                continue;
-            }
-
-            let tgt_mount = &target.mount;
-            let subvol_path = format!("{tgt_mount}/{subvol}");
-            let staging = format!("{subvol_path}.new");
-
-            // Step 1: locate the replacement FIRST. Nothing is destroyed if
-            // this fails.
-            let Some(latest) =
-                find_latest_btrbk_snapshot(env.runner, tgt_mount, &subdirs, snap_name)
-            else {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "[{tgt_mount}] No btrbk snapshot named '{snap_name}' — leaving {subvol} untouched"
-                    ),
-                );
-                continue;
+        for item in &plan {
+            let run = BootRun {
+                runner: env.runner,
+                btrbk_conf: &config.general.btrbk_conf,
+                replace,
+                ts: &ts,
             };
-            let latest_path = format!("{tgt_mount}/{latest}");
-
-            // Step 2: archive the outgoing subvolume read-only, if there is one.
-            if std::path::Path::new(&subvol_path).exists() {
-                let archive_path = format!("{tgt_mount}/{archive_name}");
-                if !btrfs_ok(
-                    env.runner,
-                    &["subvolume", "snapshot", "-r", &subvol_path, &archive_path],
-                )? {
-                    progress.on_log(
-                        LogLevel::Warning,
-                        &format!("Failed to archive {subvol_path} -> {archive_path}"),
-                    );
-                    continue;
-                }
-                progress.on_log(
-                    LogLevel::Info,
-                    &format!("Archived {subvol_path} -> {archive_path}"),
-                );
-                any_archived = true;
-            }
-
-            // Step 3: clear any staging subvolume left by an interrupted run.
-            if std::path::Path::new(&staging).exists()
-                && !btrfs_ok(env.runner, &["subvolume", "delete", &staging])?
-            {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!("Stale {staging} could not be removed — leaving {subvol} untouched"),
-                );
-                continue;
-            }
-
-            // Step 4: build the replacement ALONGSIDE the live subvolume.
-            if !btrfs_ok(
-                env.runner,
-                &["subvolume", "snapshot", &latest_path, &staging],
-            )? {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!(
-                        "Failed to create {staging} from {latest} — leaving {subvol} untouched"
-                    ),
-                );
-                continue;
-            }
-
-            // Step 5: only now remove the live subvolume.
-            if std::path::Path::new(&subvol_path).exists()
-                && !btrfs_ok(env.runner, &["subvolume", "delete", &subvol_path])?
-            {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!("Failed to delete {subvol_path} — discarding {staging}"),
-                );
-                let _ = btrfs_ok(env.runner, &["subvolume", "delete", &staging]);
-                continue;
-            }
-
-            // Step 6: swap the replacement into place.
-            if let Err(e) = std::fs::rename(&staging, &subvol_path) {
-                progress.on_log(
-                    LogLevel::Error,
-                    &format!(
-                        "Renamed nothing: {staging} -> {subvol_path} failed ({e}). \
-                         The archive {archive_name} on {tgt_mount} holds the previous contents."
-                    ),
-                );
-                continue;
-            }
-            progress.on_log(
-                LogLevel::Info,
-                &format!("Created {subvol_path} from {latest}"),
-            );
+            update_boot_subvol(&run, target, item, &listing, &mut out, progress);
         }
+    }
+    progress.on_progress(
+        targets.len() as u64,
+        targets.len() as u64,
+        "Boot subvolumes done",
+    );
+    BootStep::Ran(out)
+}
 
-        progress.on_progress(
-            step as u64 + 1,
-            config.boot.subvolumes.len() as u64,
-            &format!("Archived {subvol}"),
+/// What one boot-step pass shares across its targets and subvolumes.
+struct BootRun<'a> {
+    runner: &'a dyn CommandRunner,
+    btrbk_conf: &'a str,
+    /// A full run: archive and replace an existing boot subvolume.
+    replace: bool,
+    ts: &'a str,
+}
+
+/// One boot subvolume on one (mounted, verified, listed) target. Classifies
+/// as `.claude/rules/backup.md` §Boot Subvolume Archival says; every failure
+/// stops this subvolume and leaves the live one as it was (until the delete,
+/// which is only reached once its replacement exists beside it).
+fn update_boot_subvol(
+    run: &BootRun,
+    target: &Target,
+    item: &BootPlanItem,
+    listing: &str,
+    out: &mut BootOutcome,
+    progress: &dyn ProgressCallback,
+) {
+    let (label, tgt_mount, subvol) = (&target.label, &target.mount, &item.subvol);
+    let Some(snap_name) = &item.snapshot_name else {
+        out.warn(
+            progress,
+            format!(
+                "[{label}] {subvol} has no snapshot_name in {} — leaving it untouched",
+                run.btrbk_conf
+            ),
         );
+        return;
+    };
+    if item.subdirs.is_empty() {
+        out.warn(
+            progress,
+            format!(
+                "[{label}] No source declares target_subdirs for {subvol} — leaving it untouched"
+            ),
+        );
+        return;
+    }
+    let Some(latest) = latest_matching_snapshot(listing, &item.subdirs, snap_name) else {
+        out.warn(
+            progress,
+            format!("[{label}] No btrbk snapshot named '{snap_name}' — leaving {subvol} untouched"),
+        );
+        return;
+    };
+    let latest_path = format!("{tgt_mount}/{latest}");
+    let live = format!("{tgt_mount}/{subvol}");
+    let live_exists = Path::new(&live).exists();
+
+    if live_exists && !run.replace {
+        progress.on_log(
+            LogLevel::Info,
+            &format!("[{label}] {subvol} exists, skipping (a full run replaces it)"),
+        );
+        out.skipped += 1;
+        return;
     }
 
-    Ok(any_archived)
+    // Absent, in either mode: create it from the newest snapshot. Nothing is
+    // there to lose.
+    if !live_exists {
+        match btrfs_step(
+            run.runner,
+            &["subvolume", "snapshot", &latest_path, &live],
+            out,
+            progress,
+        ) {
+            None => {}
+            Some(true) => {
+                progress.on_log(LogLevel::Info, &format!("Created {live} from {latest}"));
+                out.updated += 1;
+            }
+            Some(false) => out.fail(progress, format!("Failed to create {live} from {latest}")),
+        }
+        return;
+    }
+
+    // Full run, live subvolume present: archive -> clear stale staging ->
+    // build staging -> delete live -> rename.
+    let staging = format!("{live}.new");
+    let archive_name = format!("{subvol}.archive.{}", run.ts);
+    let archive_path = format!("{tgt_mount}/{archive_name}");
+
+    // Step 1: archive the outgoing subvolume read-only.
+    match btrfs_step(
+        run.runner,
+        &["subvolume", "snapshot", "-r", &live, &archive_path],
+        out,
+        progress,
+    ) {
+        None => return,
+        Some(false) => {
+            out.fail(
+                progress,
+                format!("Failed to archive {live} -> {archive_path}"),
+            );
+            return;
+        }
+        Some(true) => progress.on_log(
+            LogLevel::Info,
+            &format!("Archived {live} -> {archive_path}"),
+        ),
+    }
+
+    // Step 2: clear any staging subvolume left by an interrupted run.
+    if Path::new(&staging).exists() {
+        match btrfs_step(
+            run.runner,
+            &["subvolume", "delete", &staging],
+            out,
+            progress,
+        ) {
+            None => return,
+            Some(false) => {
+                out.fail(
+                    progress,
+                    format!("Stale {staging} could not be removed — leaving {subvol} untouched"),
+                );
+                return;
+            }
+            Some(true) => {}
+        }
+    }
+
+    // Step 3: build the replacement ALONGSIDE the live subvolume.
+    match btrfs_step(
+        run.runner,
+        &["subvolume", "snapshot", &latest_path, &staging],
+        out,
+        progress,
+    ) {
+        None => return,
+        Some(false) => {
+            out.fail(
+                progress,
+                format!("Failed to create {staging} from {latest} — leaving {subvol} untouched"),
+            );
+            return;
+        }
+        Some(true) => {}
+    }
+
+    // Step 4: only now remove the live subvolume.
+    match btrfs_step(run.runner, &["subvolume", "delete", &live], out, progress) {
+        None => return,
+        Some(false) => {
+            out.fail(
+                progress,
+                format!("Failed to delete {live} — discarding {staging}"),
+            );
+            let _ = btrfs_ok(run.runner, &["subvolume", "delete", &staging]);
+            return;
+        }
+        Some(true) => {}
+    }
+
+    // Step 5: swap the replacement into place.
+    if let Err(e) = std::fs::rename(&staging, &live) {
+        out.fail(
+            progress,
+            format!(
+                "Renamed nothing: {staging} -> {live} failed ({e}). \
+                 The archive {archive_name} on {tgt_mount} holds the previous contents."
+            ),
+        );
+        return;
+    }
+    progress.on_log(
+        LogLevel::Info,
+        &format!("Recreated {live} from {latest} (archived old {subvol} -> {archive_name})"),
+    );
+    out.updated += 1;
 }
 
 /// What the subvolume sync at the start of a backup run found, as the run
@@ -2041,7 +2201,6 @@ fn run_backup_with(
     if options.subvolume_sync.as_ref().is_some_and(|s| s.failed) {
         errors.push("Subvolume sync failed — see SUBVOLUME SYNC in the report".into());
     }
-    let mut boot_archived = false;
     let mut indexed = false;
 
     // ---------- Resolve effective sources and targets ----------
@@ -2114,13 +2273,14 @@ fn run_backup_with(
             );
         }
         if options.boot_archive {
-            progress.on_log(
-                LogLevel::Info,
-                &format!(
-                    "DRY RUN ({mode}): would archive boot subvolumes: {:?}",
-                    config.boot.subvolumes
-                ),
-            );
+            let what = if !config.boot.enabled {
+                "boot subvolumes: disabled in config"
+            } else if mode == BackupMode::Full {
+                "would archive and replace boot subvolumes"
+            } else {
+                "would create any missing boot subvolume (never replace one)"
+            };
+            progress.on_log(LogLevel::Info, &format!("DRY RUN ({mode}): {what}"));
         }
         if options.index_after {
             progress.on_log(
@@ -2148,7 +2308,7 @@ fn run_backup_with(
             snapshots_sent: Some(0),
             snapshots_cleaned: 0,
             bytes_sent: 0,
-            boot_archived: false,
+            boot: BootStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors,
@@ -2226,17 +2386,24 @@ fn run_backup_with(
         bytes_sent = usage_after.saturating_sub(usage_before);
     }
 
-    // Step (c): Boot archive (both modes)
-    if options.boot_archive {
-        match archive_boot_with(config, Some(&effective_targets), progress, env) {
-            Ok(archived) => boot_archived = archived,
-            Err(e) => {
-                let msg = format!("Boot archive step failed: {e}");
-                progress.on_log(LogLevel::Error, &msg);
-                errors.push(msg);
-            }
+    // Step (c): boot subvolumes — create a missing one on every run, archive
+    // and replace on a full run, as backup-run.sh's update_boot_subvolumes does
+    // (bd woq, dtm). A failure fails the run; an absence only warns.
+    let boot = if options.boot_archive {
+        let step = archive_boot_with(
+            config,
+            Some(&effective_targets),
+            mode == BackupMode::Full,
+            progress,
+            env,
+        );
+        if let BootStep::Ran(o) = &step {
+            errors.extend(o.failures.iter().map(|f| format!("{BOOT_ERROR_PREFIX}{f}")));
         }
-    }
+        step
+    } else {
+        BootStep::NotSelected
+    };
 
     // Step (d): Index — walk each target's mount path to pick up new snapshots.
     if options.index_after {
@@ -2254,7 +2421,7 @@ fn run_backup_with(
         snapshots_sent,
         snapshots_cleaned,
         bytes_sent,
-        boot_archived,
+        boot,
         indexed,
         report_sent: false,
         errors,
@@ -2304,8 +2471,8 @@ pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
         .snapshots_sent
         .map_or_else(|| "sent: unknown".to_string(), |n| format!("{n} sent"));
     let mut summary = format!(
-        "Backup {status} ({mode}): {created}, {sent}{cleaned}, boot archived: {}",
-        result.boot_archived,
+        "Backup {status} ({mode}): {created}, {sent}{cleaned}, boot subvolumes: {}",
+        result.boot.row(),
     );
     if !result.success {
         summary.push_str(&format!(" — {}", result.errors.join("; ")));
@@ -2534,7 +2701,7 @@ fn abort_job(
         snapshots_sent: None,
         snapshots_cleaned: 0,
         bytes_sent: 0,
-        boot_archived: false,
+        boot: BootStep::NotSelected,
         indexed: false,
         report_sent: false,
         errors: vec![why.clone()],
@@ -3053,7 +3220,7 @@ mod tests {
             "dry_run must send 0 snapshots"
         );
         assert_eq!(result.bytes_sent, 0);
-        assert!(!result.boot_archived);
+        assert_eq!(result.boot, BootStep::NotSelected);
 
         // Verify at least one DRY RUN log message was emitted.
         let logs = progress.logs.lock().unwrap();
@@ -5261,9 +5428,18 @@ mod tests {
         std::fs::create_dir(&live).unwrap();
         let (config, _conf) = archive_fixture(dir.path());
         let runner = Scripted::from_owned(vec![]);
-        let err = archive_boot_with(&config, None, &TestProgress::new(), &env_verifying(&runner))
-            .unwrap_err()
-            .to_string();
+        let step = archive_boot_with(
+            &config,
+            None,
+            true,
+            &TestProgress::new(),
+            &env_verifying(&runner),
+        );
+        let BootStep::Ran(o) = &step else {
+            panic!("{step:?}")
+        };
+        assert_eq!(o.status(), "FAIL", "{step:?}");
+        let err = o.failures.join("\n");
         assert!(err.contains("Refusing to run btrbk"), "{err}");
         assert!(err.contains("NOT a mount point"), "{err}");
         assert!(
@@ -5310,10 +5486,10 @@ mod tests {
         archive_boot_with(
             &config,
             None,
+            true,
             &TestProgress::new(),
             &env_for(&runner, &verify),
-        )
-        .unwrap();
+        );
         // A mirror carries its own OS and is never written; a target whose
         // mount point does not exist is not written either, and is left alone.
         assert_eq!(
@@ -5340,7 +5516,7 @@ mod tests {
         ));
         let runner = Scripted::from_owned(vec![]);
         let progress = TestProgress::new();
-        archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        archive_boot_with(&config, None, true, &progress, &env(&runner));
         let calls = runner.calls();
         let on = |mount: &str| calls.iter().filter(|c| c.contains(mount)).count();
         assert!(
@@ -5350,9 +5526,9 @@ mod tests {
         assert_eq!(on("/nonexistent/das/absent"), 0, "{calls:?}");
         let logs = progress.logs.lock().unwrap();
         assert!(
-            logs.iter().any(|(level, msg)| *level == LogLevel::Warning
+            logs.iter().any(|(level, msg)| *level == LogLevel::Info
                 && msg.contains("/nonexistent/das/absent")
-                && msg.contains("not archiving")),
+                && msg.contains("Not mounted")),
             "{logs:?}"
         );
     }
@@ -5377,7 +5553,13 @@ mod tests {
         let runner = Scripted::from_owned(vec![]);
         let env = env_for(&runner, &verify);
         let only_second = labels(&["second"]);
-        archive_boot_with(&config, Some(&only_second), &TestProgress::new(), &env).unwrap();
+        archive_boot_with(
+            &config,
+            Some(&only_second),
+            true,
+            &TestProgress::new(),
+            &env,
+        );
         assert_eq!(*asked.lock().unwrap(), [(vec![], only_second)]);
         assert_eq!(
             runner.calls(),
@@ -5389,10 +5571,10 @@ mod tests {
         archive_boot_with(
             &config,
             None,
+            true,
             &TestProgress::new(),
             &env_for(&runner, &verify),
-        )
-        .unwrap();
+        );
         assert_eq!(runner.calls().len(), 2, "{:?}", runner.calls());
     }
 
@@ -5429,8 +5611,12 @@ mod tests {
         .snapshotting()
         .deleting_too(vec![format!("{m}/@")]);
         let progress = TestProgress::new();
-        let archived = archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
-        assert!(archived);
+        let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.updated == 1 && o.status() == "OK"),
+            "{step:?}"
+        );
+        assert!(step.archived());
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 4, "{calls:?}");
@@ -5453,18 +5639,20 @@ mod tests {
             Path::new(archive).is_dir(),
             "the archive was made: {archive}"
         );
+        let archive_name = Path::new(archive).file_name().unwrap().to_string_lossy();
         assert!(logged(
             &progress,
             LogLevel::Info,
-            &format!("Created {m}/@ from nvme/root-.20261005T0100")
+            &format!(
+                "Recreated {m}/@ from nvme/root-.20261005T0100 (archived old @ -> {archive_name})"
+            )
         ));
-        // One subvolume: started at 0 of the 1 the config names, done at 1.
-        assert_eq!(config.boot.subvolumes.len(), 1);
+        // One target: started at 0 of the 1 it names, done at 1.
         assert_eq!(
             *progress.steps.lock().unwrap(),
             [
-                (0, 1, "Archiving @".to_string()),
-                (1, 1, "Archived @".to_string())
+                (0, 1, "Boot subvolumes on primary-22tb".to_string()),
+                (1, 1, "Boot subvolumes done".to_string())
             ]
         );
     }
@@ -5518,7 +5706,11 @@ mod tests {
                 runner = runner.failing_snapshots_of(&format!("{m}/@ "));
             }
             let progress = TestProgress::new();
-            archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+            let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+            assert!(
+                matches!(&step, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0),
+                "{failing}: {step:?}"
+            );
             assert!(
                 live.join("marker").exists(),
                 "{failing}: the live subvolume survives"
@@ -5576,7 +5768,11 @@ mod tests {
         ])
         .snapshotting();
         let progress = TestProgress::new();
-        archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "FAIL"),
+            "{step:?}"
+        );
         assert!(
             runner
                 .calls()
@@ -5622,7 +5818,11 @@ mod tests {
         ])
         .snapshotting();
         let progress = TestProgress::new();
-        archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0),
+            "{step:?}"
+        );
         assert!(
             progress
                 .logs
@@ -5632,6 +5832,293 @@ mod tests {
                 .any(|(l, msg)| *l == LogLevel::Error && msg.starts_with("Renamed nothing:"))
         );
         assert!(live.join("old").exists());
+    }
+
+    #[test]
+    fn boot_outcome_status_and_detail_are_the_scripts_words() {
+        let mut o = BootOutcome {
+            updated: 1,
+            skipped: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            (o.status(), o.detail()),
+            ("OK", "1 updated, 2 skipped".to_string())
+        );
+        o.warnings.push("w".into());
+        assert_eq!(
+            (o.status(), o.detail()),
+            ("WARN", "1 updated, 2 skipped, 1 warnings".to_string())
+        );
+        o.failures.push("f".into());
+        assert_eq!(
+            (o.status(), o.detail()),
+            ("FAIL", "1 updated, 1 failed".to_string())
+        );
+    }
+
+    #[test]
+    fn an_incremental_run_creates_a_missing_boot_subvolume_and_never_replaces_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        let (config, _conf) = archive_fixture(dir.path());
+        let list = (
+            format!("btrfs subvolume list {m}"),
+            0,
+            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".to_string(),
+        );
+        // Absent: created from the newest snapshot.
+        let runner = Scripted::from_owned(vec![list.clone()]).snapshotting();
+        let step = archive_boot_with(&config, None, false, &TestProgress::new(), &env(&runner));
+        assert_eq!(
+            runner.calls(),
+            [
+                format!("btrfs subvolume list {m}"),
+                format!("btrfs subvolume snapshot {m}/nvme/root-.20261005T0100 {m}/@")
+            ]
+        );
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.updated == 1 && o.failures.is_empty()),
+            "{step:?}"
+        );
+        // Present: skipped, nothing archived, nothing deleted.
+        std::fs::create_dir_all(dir.path().join("@")).unwrap();
+        let runner = Scripted::from_owned(vec![list]).snapshotting();
+        let step = archive_boot_with(&config, None, false, &TestProgress::new(), &env(&runner));
+        assert_eq!(runner.calls(), [format!("btrfs subvolume list {m}")]);
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.skipped == 1 && o.updated == 0),
+            "{step:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_boot_step_runs_nothing_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(dir.path());
+        config.boot.enabled = false;
+        let runner = Scripted::from_owned(vec![]);
+        assert_eq!(
+            archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner)),
+            BootStep::DisabledInConfig
+        );
+        assert!(runner.calls().is_empty());
+        assert_eq!(BootStep::DisabledInConfig.row(), "OK  (disabled in config)");
+        assert_eq!(BootStep::NotSelected.row(), "N/A  (not selected)");
+    }
+
+    /// btrbk always succeeds with no output (the boot step is under test, not
+    /// the snapshot step); every other command goes to the script.
+    struct QuietBtrbk<'a>(&'a Scripted);
+
+    impl CommandRunner for QuietBtrbk<'_> {
+        fn output(&self, cmd: &mut Command) -> std::io::Result<std::process::Output> {
+            if cmd.get_program() == "btrbk" {
+                return Command::new("true").output();
+            }
+            self.0.output(cmd)
+        }
+        fn stream(
+            &self,
+            cmd: &mut Command,
+            _: &mut dyn FnMut(&str),
+        ) -> std::io::Result<std::process::Output> {
+            self.output(cmd)
+        }
+    }
+
+    /// The classification table of `.claude/rules/backup.md` §Boot Subvolume
+    /// Archival, driven through `run_backup_with`: for every FAIL the run
+    /// fails, for every WARN (an absence) it does not, and the counts are the
+    /// script's. One row per situation; do not shorten.
+    #[test]
+    fn every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns() {
+        const SNAP: &str = "nvme/root-.20261005T0100";
+        // (case, mode, status, updated, skipped)
+        let cases: [(&str, BackupMode, &str, usize, usize); 12] = [
+            ("conf-unreadable", BackupMode::Full, "FAIL", 0, 0),
+            ("listing-unreadable", BackupMode::Full, "FAIL", 0, 0),
+            ("archive-fails", BackupMode::Full, "FAIL", 0, 0),
+            ("stale-staging-stuck", BackupMode::Full, "FAIL", 0, 0),
+            ("staging-fails", BackupMode::Full, "FAIL", 0, 0),
+            ("delete-fails", BackupMode::Full, "FAIL", 0, 0),
+            ("rename-fails", BackupMode::Full, "FAIL", 0, 0),
+            ("no-snapshot-name", BackupMode::Full, "WARN", 0, 0),
+            ("no-target-subdirs", BackupMode::Full, "WARN", 0, 0),
+            ("no-snapshot-of-series", BackupMode::Full, "WARN", 0, 0),
+            // An incremental run leaves an existing boot subvolume alone.
+            ("incremental-exists", BackupMode::Incremental, "OK", 0, 1),
+            // The control: nothing wrong, so nothing is flagged.
+            ("replaced-cleanly", BackupMode::Full, "OK", 1, 0),
+        ];
+        for (case, mode, status, updated, skipped) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let m = dir.path().display().to_string();
+            let live = dir.path().join("@");
+            std::fs::create_dir(&live).unwrap();
+            std::fs::write(live.join("marker"), b"live").unwrap();
+            let (mut config, mut conf) = archive_fixture(dir.path());
+            let mut script = vec![(
+                format!("btrfs subvolume list {m}"),
+                0,
+                format!("ID 257 gen 9 top level 5 path {SNAP}\n"),
+            )];
+            let stage = format!("btrfs subvolume snapshot {m}/{SNAP} {m}/@.new");
+            let mut failing = None;
+            match case {
+                "conf-unreadable" => {
+                    config.general.btrbk_conf = "/nonexistent/btrbk.conf".into();
+                }
+                "listing-unreadable" => script[0].1 = 1,
+                "archive-fails" => failing = Some(format!("{m}/@ ")),
+                "stale-staging-stuck" => {
+                    std::fs::create_dir(dir.path().join("@.new")).unwrap();
+                    script.push((
+                        format!("btrfs subvolume delete {m}/@.new"),
+                        1,
+                        String::new(),
+                    ));
+                }
+                "staging-fails" => script.push((stage, 1, String::new())),
+                "delete-fails" => {
+                    script.push((format!("btrfs subvolume delete {m}/@"), 1, String::new()));
+                }
+                // The scripted delete removes nothing, so the live one is
+                // still there and the rename onto it fails.
+                "rename-fails" => {
+                    script.push((format!("btrfs subvolume delete {m}/@"), 0, String::new()));
+                }
+                "no-snapshot-name" => conf = write_btrbk_conf("@home", "home"),
+                "no-target-subdirs" => config.sources[0].target_subdirs.clear(),
+                "no-snapshot-of-series" => {
+                    script[0].2 = "ID 9 gen 1 top level 5 path other/x\n".into()
+                }
+                "replaced-cleanly" | "incremental-exists" => {}
+                other => panic!("{other}"),
+            }
+            if case == "no-snapshot-name" {
+                config.general.btrbk_conf = conf.path().to_string_lossy().into_owned();
+            }
+            let mut scripted = Scripted::from_owned(script).snapshotting();
+            if let Some(f) = &failing {
+                scripted = scripted.failing_snapshots_of(f);
+            }
+            if case == "replaced-cleanly" {
+                scripted = scripted.deleting_too(vec![format!("{m}/@")]);
+            }
+            let runner = QuietBtrbk(&scripted);
+            let host = env(&runner);
+            let options = BackupOptions {
+                mode: Some(mode),
+                steps: BtrbkSteps::SnapshotOnly,
+                boot_archive: true,
+                targets: Some(labels(&["primary-22tb"])),
+                ..Default::default()
+            };
+            let mut result =
+                run_backup_with(&config, &options, &TestProgress::new(), &host).unwrap();
+            // The target-directory step asks the host whether the target is a
+            // mount point, and a tempdir is not one: that complaint is about the
+            // fixture, not the boot step, so it is set aside.
+            result
+                .errors
+                .retain(|e| !e.starts_with("Target directories missing"));
+            result.success = result.errors.is_empty();
+            let BootStep::Ran(o) = &result.boot else {
+                panic!("{case}: {:?}", result.boot)
+            };
+            assert_eq!(
+                (o.status(), o.updated, o.skipped),
+                (status, updated, skipped),
+                "{case}: {o:?}"
+            );
+            let boot_errors = result
+                .errors
+                .iter()
+                .filter(|e| e.starts_with(BOOT_ERROR_PREFIX))
+                .count();
+            assert_eq!(boot_errors, o.failures.len(), "{case}: {:?}", result.errors);
+            // The run fails exactly for a FAIL, and for nothing else here.
+            assert_eq!(
+                result.success,
+                status != "FAIL",
+                "{case}: {:?}",
+                result.errors
+            );
+            if status != "FAIL" {
+                assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
+            }
+            // Whatever failed, the live subvolume (or its replacement, on a
+            // clean run) is still there: nothing leaves `@` absent.
+            assert!(live.is_dir(), "{case}: the live subvolume survives");
+            if case != "replaced-cleanly" {
+                assert!(live.join("marker").exists(), "{case}: and it is untouched");
+            }
+            if case == "incremental-exists" {
+                assert!(
+                    !scripted
+                        .calls()
+                        .iter()
+                        .any(|c| c.contains("archive") || c.starts_with("btrfs subvolume delete")),
+                    "nothing archived or deleted: {:?}",
+                    scripted.calls()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_dry_run_says_what_the_boot_step_would_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(dir.path());
+        let say = |config: &Config, mode| {
+            let runner = Scripted::from_owned(vec![]);
+            let host = env(&runner);
+            let options = BackupOptions {
+                mode: Some(mode),
+                dry_run: true,
+                boot_archive: true,
+                targets: Some(labels(&["primary-22tb"])),
+                ..Default::default()
+            };
+            let progress = TestProgress::new();
+            let result = run_backup_with(config, &options, &progress, &host).unwrap();
+            assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+            // (Only the fixture's "not a mount point" complaint, as above.)
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .all(|e| e.starts_with("Target directories missing")),
+                "{:?}",
+                result.errors
+            );
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect::<Vec<_>>()
+        };
+        let has = |logs: &[String], text: &str| logs.iter().any(|l| l.contains(text));
+        let full = say(&config, BackupMode::Full);
+        assert!(
+            has(&full, "would archive and replace boot subvolumes"),
+            "{full:?}"
+        );
+        let inc = say(&config, BackupMode::Incremental);
+        assert!(
+            has(
+                &inc,
+                "would create any missing boot subvolume (never replace one)"
+            ),
+            "{inc:?}"
+        );
+        assert!(!has(&inc, "would archive and replace"), "{inc:?}");
+        config.boot.enabled = false;
+        let off = say(&config, BackupMode::Full);
+        assert!(has(&off, "boot subvolumes: disabled in config"), "{off:?}");
     }
 
     // -- a run mounts nothing itself (bd DAS-Backup-Manager-7tx 3, 8cf) ----------
@@ -6498,21 +6985,17 @@ mod tests {
         config.targets[0].mount = target_dir.path().to_string_lossy().to_string();
 
         let progress = TestProgress::new();
-        let result = archive_boot_with(
-            &config,
-            None,
-            &progress,
-            &env(&Scripted::from_owned(vec![])),
-        )
-        .expect("must not error");
+        let runner = Scripted::from_owned(vec![]);
+        let result = archive_boot_with(&config, None, true, &progress, &env(&runner));
         assert!(
-            !result,
-            "nothing may be archived when names cannot be resolved"
+            matches!(&result, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0),
+            "nothing may be archived when names cannot be resolved: {result:?}"
         );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         let logs = progress.logs.lock().unwrap();
         assert!(
-            logs.iter()
-                .any(|(_, m)| m.contains("skipping boot archive rather than guessing")),
+            logs.iter().any(|(_, m)| m
+                .contains("no boot subvolume is touched rather than a snapshot name guessed")),
             "must say why it declined, got: {logs:?}"
         );
     }
@@ -6532,13 +7015,16 @@ mod tests {
         config.targets[0].mount = target_dir.path().to_string_lossy().to_string();
 
         let progress = TestProgress::new();
-        archive_boot_with(
-            &config,
-            None,
-            &progress,
-            &env(&Scripted::from_owned(vec![])),
-        )
-        .expect("must not error");
+        let runner = Scripted::from_owned(vec![(
+            format!("btrfs subvolume list {}", target_dir.path().display()),
+            0,
+            String::new(),
+        )]);
+        let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "WARN" && o.updated == 0),
+            "{step:?}"
+        );
         assert!(
             live.exists(),
             "live subvolume must survive a failed snapshot lookup"
@@ -6593,10 +7079,14 @@ mod tests {
         let result = archive_boot_with(
             &config,
             None,
+            true,
             &progress,
             &env(&Scripted::from_owned(vec![])),
         );
-        assert!(result.is_ok(), "archive_boot must not error: {result:?}");
+        assert!(
+            matches!(&result, BootStep::Ran(o) if o.skipped == 1),
+            "the mirror is skipped, once: {result:?}"
+        );
 
         let logs = progress.logs.lock().unwrap();
 
@@ -7039,7 +7529,7 @@ mod tests {
             snapshots_sent: r.snapshots_sent,
             snapshots_cleaned: r.snapshots_cleaned,
             bytes_sent: r.bytes_sent,
-            boot_archived: r.boot_archived,
+            boot: r.boot.clone(),
             indexed: r.indexed,
             report_sent: r.report_sent,
             errors: r.errors.clone(),
@@ -7123,7 +7613,7 @@ mod tests {
                 snapshots_sent: Some(2),
                 snapshots_cleaned: 0,
                 bytes_sent: 10,
-                boot_archived: false,
+                boot: BootStep::NotSelected,
                 indexed: true,
                 report_sent: false,
                 errors,
@@ -7729,7 +8219,10 @@ mod tests {
             snapshots_sent: Some(sent),
             snapshots_cleaned: cleaned,
             bytes_sent: 0,
-            boot_archived: true,
+            boot: BootStep::Ran(BootOutcome {
+                updated: 1,
+                ..Default::default()
+            }),
             indexed: false,
             report_sent: false,
             errors: if success {
@@ -7749,7 +8242,7 @@ mod tests {
         assert_eq!(
             backup_summary(&result, false),
             "Backup completed with errors (full): snapshots created: unknown, sent: unknown, \
-             boot archived: true — a; b"
+             boot subvolumes: OK  (1 updated, 0 skipped) — a; b"
         );
         // A run whose counts are unknown is never "nothing to do", even clean
         // and even when the other count is a measured zero.
@@ -7782,19 +8275,19 @@ mod tests {
         );
         assert_eq!(
             backup_summary(&result_with(true, 2, 0, 0), false),
-            "Backup succeeded (full): 2 snapshots created, 0 sent, boot archived: true"
+            "Backup succeeded (full): 2 snapshots created, 0 sent, boot subvolumes: OK  (1 updated, 0 skipped)"
         );
         assert_eq!(
             backup_summary(&result_with(true, 0, 3, 0), false),
-            "Backup succeeded (full): 0 snapshots created, 3 sent, boot archived: true"
+            "Backup succeeded (full): 0 snapshots created, 3 sent, boot subvolumes: OK  (1 updated, 0 skipped)"
         );
         assert_eq!(
             backup_summary(&result_with(true, 0, 0, 4), false),
-            "Backup succeeded (full): 0 snapshots created, 0 sent, 4 cleaned up, boot archived: true"
+            "Backup succeeded (full): 0 snapshots created, 0 sent, 4 cleaned up, boot subvolumes: OK  (1 updated, 0 skipped)"
         );
         assert_eq!(
             backup_summary(&result_with(false, 0, 0, 0), false),
-            "Backup completed with errors (full): 0 snapshots created, 0 sent, boot archived: true — a; b"
+            "Backup completed with errors (full): 0 snapshots created, 0 sent, boot subvolumes: OK  (1 updated, 0 skipped) — a; b"
         );
     }
 
