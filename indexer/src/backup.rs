@@ -314,12 +314,12 @@ impl BootStep {
         matches!(self, Self::Ran(o) if !o.failures.is_empty())
     }
 
-    /// The exit status of `backup boot-archive`, the doctor's rule: 0 clean, 3
+    /// The exit status of `backup boot-archive`, the doctor's rule: `None` clean, 3
     /// when it began and something failed — the step, or the unmount after it
     /// (`released` false) — and never 1, which is "could not start" and decided
     /// before the step runs.
-    pub fn exit_code(&self, released: bool) -> i32 {
-        if self.failed() || !released { 3 } else { 0 }
+    pub fn exit_code(&self, released: bool) -> Option<i32> {
+        (self.failed() || !released).then_some(3)
     }
 
     /// The report's `Boot subvolumes` cell.
@@ -7492,11 +7492,15 @@ mod tests {
         let mut failed_outcome = BootOutcome::default();
         failed_outcome.fail(&TestProgress::new(), "x".into());
         let failed = BootStep::Ran(failed_outcome);
-        assert_eq!(ok.exit_code(true), 0);
-        assert_eq!(failed.exit_code(true), 3, "step failed, mounts released");
-        assert_eq!(ok.exit_code(false), 3, "step fine, unmount failed");
-        assert_eq!(failed.exit_code(false), 3, "both");
-        assert_eq!(BootStep::DisabledInConfig.exit_code(true), 0);
+        assert_eq!(ok.exit_code(true), None);
+        assert_eq!(
+            failed.exit_code(true),
+            Some(3),
+            "step failed, mounts released"
+        );
+        assert_eq!(ok.exit_code(false), Some(3), "step fine, unmount failed");
+        assert_eq!(failed.exit_code(false), Some(3), "both");
+        assert_eq!(BootStep::DisabledInConfig.exit_code(true), None);
     }
 
     // --- the sync that starts every backup, from the CLI and the GUI alike ---

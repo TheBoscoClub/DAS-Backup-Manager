@@ -2292,8 +2292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(why) = &released {
                     eprintln!("Error: {why}");
                 }
-                let code = step.exit_code(released.is_ok());
-                if code != 0 {
+                if let Some(code) = step.exit_code(released.is_ok()) {
                     std::process::exit(code);
                 }
             }
