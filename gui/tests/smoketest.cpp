@@ -29,6 +29,7 @@
 #include "../src/filemodel.h"
 #include "../src/healthdashboard.h"
 #include "../src/backuphistory.h"
+#include "../src/backupsteps.h"
 #include "../src/progresspanel.h"
 
 class GuiSmokeTest : public QObject
@@ -225,6 +226,44 @@ private Q_SLOTS:
             cells << model->index(r, column).data().toString();
         QCOMPARE(cells, (QStringList{QStringLiteral("unknown"), QStringLiteral("No"),
                                      QStringLiteral("Yes"), QStringLiteral("\u2014")}));
+    }
+
+    void backupStepsMapToTheHelpersKeys()
+    {
+        const BackupSteps all;
+        const QVariantMap map = all.toDBus();
+        QCOMPARE(map.keys(), (QStringList{QStringLiteral("boot_archive"), QStringLiteral("email"),
+                                          QStringLiteral("index"), QStringLiteral("send"),
+                                          QStringLiteral("snapshot")}));
+        // One box at a time: each reaches its own key and no other.
+        const QList<std::pair<bool BackupSteps::*, QString>> boxes{
+            {&BackupSteps::snapshot, QStringLiteral("snapshot")},
+            {&BackupSteps::send, QStringLiteral("send")},
+            {&BackupSteps::bootArchive, QStringLiteral("boot_archive")},
+            {&BackupSteps::index, QStringLiteral("index")},
+            {&BackupSteps::email, QStringLiteral("email")},
+        };
+        for (const auto &[member, key] : boxes) {
+            BackupSteps s;
+            s.*member = false;
+            const QVariantMap m = s.toDBus();
+            for (auto it = m.cbegin(); it != m.cend(); ++it) {
+                QCOMPARE(it.value().metaType().id(), QMetaType::Bool);
+                QCOMPARE(it.value().toBool(), it.key() != key);
+            }
+        }
+    }
+
+    void nothingToRunWithoutSnapshotOrSend()
+    {
+        BackupSteps s;
+        QVERIFY(s.runsBtrbk());
+        s.snapshot = false;
+        QVERIFY(s.runsBtrbk());
+        s.send = false;
+        QVERIFY(!s.runsBtrbk());
+        s.snapshot = true;
+        QVERIFY(s.runsBtrbk());
     }
 
     void fileModelIsEmptyWithoutAReachableHelper()

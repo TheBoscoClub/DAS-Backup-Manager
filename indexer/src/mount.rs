@@ -327,23 +327,18 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 /// mounted *and* no targets were already mounted. Individual mount failures
 /// are logged as warnings but do not abort the operation.
 ///
-/// `_held` is the proof that this process holds the DAS maintenance lock. It
-/// is not read, only required: no job can mount a target another job is
-/// using — a backup, a scrub, or a recovery drive a VM has mounted, which a
-/// second kernel's mount would corrupt (bd DAS-Backup-Manager-frb). Release
-/// the guard before the lock.
+/// `held` is the proof that this process holds the DAS maintenance lock, and
+/// says whether the hold was handed down by a parent job that mounted the
+/// targets for this run (`is_delegated`). Requiring it means no job can mount
+/// a target another job is using — a backup, a scrub, or a recovery drive a
+/// VM has mounted, which a second kernel's mount would corrupt
+/// (bd DAS-Backup-Manager-frb). Release the guard before the lock.
 pub fn ensure_targets_mounted(
     config: &Config,
     progress: &dyn ProgressCallback,
-    _held: &MaintenanceHeld,
+    held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
-    ensure_targets_mounted_with(
-        config,
-        progress,
-        _held,
-        &HOST_PROBES,
-        Arc::new(SystemRunner),
-    )
+    ensure_targets_mounted_with(config, progress, held, &HOST_PROBES, Arc::new(SystemRunner))
 }
 
 /// [`ensure_targets_mounted`] against an explicit host: `probes` answers what
@@ -351,7 +346,7 @@ pub fn ensure_targets_mounted(
 fn ensure_targets_mounted_with(
     config: &Config,
     progress: &dyn ProgressCallback,
-    _held: &MaintenanceHeld,
+    held: &MaintenanceHeld,
     probes: &MountProbes<'_>,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<MountGuard, MountError> {
@@ -378,14 +373,28 @@ fn ensure_targets_mounted_with(
             );
             // Not this run's to unmount — say so, so a target an earlier run
             // failed to unmount is visible rather than quietly reused.
-            progress.on_log(
-                crate::progress::LogLevel::Warning,
-                &format!(
-                    "Target '{}': {} was already mounted before this run and will be \
-                     left mounted",
-                    target.label, target.mount
-                ),
-            );
+            // Under a handed-down lock the parent mounted it for this run (and
+            // its own pre-existing-mount check reports a leftover), so it is
+            // not a finding here; an owned hold keeps the warning.
+            if held.is_delegated() {
+                progress.on_log(
+                    crate::progress::LogLevel::Info,
+                    &format!(
+                        "Target '{}': {} is mounted by the job that handed down the \
+                         maintenance lock; left mounted for it",
+                        target.label, target.mount
+                    ),
+                );
+            } else {
+                progress.on_log(
+                    crate::progress::LogLevel::Warning,
+                    &format!(
+                        "Target '{}': {} was already mounted before this run and will be \
+                         left mounted",
+                        target.label, target.mount
+                    ),
+                );
+            }
             continue;
         }
 
@@ -1314,14 +1323,18 @@ mod tests {
             progress: &Recorder,
             runner: &Arc<ScriptedRunner>,
         ) -> Result<MountGuard, MountError> {
+            self.mount_targets_held(config, progress, runner, &MaintenanceHeld::assumed())
+        }
+
+        fn mount_targets_held(
+            &self,
+            config: &Config,
+            progress: &Recorder,
+            runner: &Arc<ScriptedRunner>,
+            held: &MaintenanceHeld,
+        ) -> Result<MountGuard, MountError> {
             self.with_probes(runner, |p| {
-                ensure_targets_mounted_with(
-                    config,
-                    progress,
-                    &MaintenanceHeld::assumed(),
-                    p,
-                    runner.clone(),
-                )
+                ensure_targets_mounted_with(config, progress, held, p, runner.clone())
             })
         }
 
@@ -1830,6 +1843,46 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Under a handed-down lock the parent (`backup-run.sh`) mounted the
+    /// target for this run: an Info line, never the "left mounted" Warning
+    /// (bd 8veh). The owned hold keeps its Warning (previous test).
+    #[test]
+    fn target_mounted_by_the_delegating_parent_is_info_not_warning() {
+        let scratch = Scratch::new();
+        let a = scratch.mkdir("mnt/a");
+        let config = config_with(
+            vec![target("alpha", "SER-A", &a, TargetRole::Primary)],
+            Vec::new(),
+        );
+        let host = Host {
+            mountpoints: vec![PathBuf::from(&a)],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let guard = host
+            .mount_targets_held(
+                &config,
+                &progress,
+                &runner,
+                &MaintenanceHeld::delegated_for_test(),
+            )
+            .unwrap();
+
+        assert_eq!(guard.count(), 0);
+        assert_eq!(
+            progress.logs(),
+            vec![(
+                LogLevel::Info,
+                format!(
+                    "Target 'alpha': {a} is mounted by the job that handed down the \
+                     maintenance lock; left mounted for it"
+                )
+            )]
+        );
     }
 
     /// A directory that merely EXISTS at the mount path is not a mounted
