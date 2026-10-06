@@ -128,12 +128,20 @@ install(PROGRAMS
     scripts/boot-archive-cleanup.sh
     scripts/das-partition-drives.sh
     scripts/install-backup-timer.sh
+    scripts/recovery-os-vm.sh
     DESTINATION "${DAS_SCRIPT_DIR}"
 )
 
 install(FILES
     config/btrbk.conf
     DESTINATION "${DAS_SCRIPT_DIR}/config"
+)
+
+# The recovery-os-updater VM (bd DAS-Backup-Manager-7wb). recovery-os-vm.sh
+# defines the domain from this installed copy, found beside itself.
+install(FILES
+    packaging/libvirt/recovery-os-updater.xml
+    DESTINATION "${DAS_SCRIPT_DIR}/libvirt"
 )
 
 # =============================================================================
@@ -281,6 +289,17 @@ if(BUILD_TESTING)
         NAME shell-recovery-os
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os.sh
     )
+    add_test(
+        NAME shell-recovery-os-vm
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os_vm.sh
+    )
+    # With the binary this build makes, the suite also reads boot records the
+    # real btrdasd wrote (the contract, bd DAS-Backup-Manager-1yg and -df0);
+    # without it the summary says they did not run.
+    if(BUILD_INDEXER)
+        set_tests_properties(shell-recovery-os-vm PROPERTIES
+            ENVIRONMENT "REAL_BTRDASD=${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd")
+    endif()
     add_test(
         NAME shell-maintenance-lock
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance_lock.sh
