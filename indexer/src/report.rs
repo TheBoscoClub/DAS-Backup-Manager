@@ -248,7 +248,11 @@ pub fn format_report_from(
     ));
 
     // Backup Operations
-    let btrbk_status = if result.errors.iter().any(|e| e.contains("btrbk")) {
+    let btrbk_status = if result
+        .errors
+        .iter()
+        .any(|e| e.contains("btrbk") || crate::backup::is_btrbk_step_failure(e))
+    {
         "FAIL"
     } else {
         "OK"
@@ -278,6 +282,10 @@ pub fn format_report_from(
             format_bytes(result.bytes_sent),
             format_bytes(rate as u64),
         ));
+    } else if result.snapshots_created.is_none() || result.snapshots_sent.is_none() {
+        // A step failed before its counts were taken (bd DAS-Backup-Manager-no4):
+        // nothing is known about what was sent, so none of it is said.
+        r.push_str("  (not measured — a step failed, so what was sent is unknown)\n");
     } else {
         r.push_str("  (no data transferred)\n");
     }
@@ -571,6 +579,77 @@ mod tests {
         assert!(report.contains("DISK CAPACITY"));
         assert!(report.contains("SMART STATUS"));
         assert!(!report.contains("ERRORS"));
+    }
+
+    fn result_with(
+        created: Option<usize>,
+        sent: Option<usize>,
+        bytes: u64,
+        errors: &[&str],
+    ) -> BackupResult {
+        BackupResult {
+            success: errors.is_empty(),
+            mode: BackupMode::Incremental,
+            snapshots_created: created,
+            snapshots_sent: sent,
+            snapshots_cleaned: 0,
+            bytes_sent: bytes,
+            boot_archived: false,
+            indexed: false,
+            report_sent: false,
+            errors: errors.iter().map(|e| e.to_string()).collect(),
+            duration_secs: 60,
+        }
+    }
+
+    /// Review M7: a failed step's count is unknown, and the report must not
+    /// turn that into "no data transferred".
+    #[test]
+    fn the_throughput_section_says_not_measured_when_a_count_is_unknown_never_no_data() {
+        let cfg = Config::default();
+        let unknown = [
+            result_with(None, Some(0), 0, &["Snapshot step failed: x"]),
+            result_with(Some(0), None, 0, &["Send step failed: x"]),
+            result_with(None, None, 0, &["Full backup pipeline failed: x"]),
+        ];
+        for result in &unknown {
+            let report = format_report(result, &cfg);
+            assert!(report.contains("(not measured"), "{report}");
+            assert!(!report.contains("no data transferred"), "{report}");
+        }
+        // The controls: counts that are real zeros do say it, and a real
+        // measurement says neither.
+        let report = format_report(&result_with(Some(0), Some(0), 0, &[]), &cfg);
+        assert!(report.contains("(no data transferred)"), "{report}");
+        assert!(!report.contains("not measured"), "{report}");
+        let report = format_report(&result_with(Some(1), Some(1), 1_073_741_824, &[]), &cfg);
+        assert!(report.contains("1.00 GiB"), "{report}");
+        assert!(!report.contains("not measured"), "{report}");
+    }
+
+    /// Review M7: the btrbk line follows the step errors, whatever their text.
+    #[test]
+    fn the_btrbk_line_is_fail_for_every_failed_step_even_one_that_never_names_btrbk() {
+        let cfg = Config::default();
+        for error in [
+            "Send step failed: none of the selected sources sends to a selected target",
+            "Snapshot step failed: No source selected",
+            "Full backup pipeline failed: Refusing to run on /mnt/x",
+        ] {
+            let report = format_report(&result_with(None, None, 0, &[error]), &cfg);
+            assert!(
+                report.contains("btrbk send/receive    FAIL"),
+                "{error}: {report}"
+            );
+        }
+        // The controls: no error, and an error of another step, are OK.
+        let report = format_report(&result_with(Some(1), Some(1), 1, &[]), &cfg);
+        assert!(report.contains("btrbk send/receive    OK"), "{report}");
+        let report = format_report(
+            &result_with(Some(1), Some(1), 1, &["Boot archive step failed: x"]),
+            &cfg,
+        );
+        assert!(report.contains("btrbk send/receive    OK"), "{report}");
     }
 
     #[test]
