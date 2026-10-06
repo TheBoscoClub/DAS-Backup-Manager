@@ -481,6 +481,12 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Print the boot subvolumes a full run refreshes, with their btrbk snapshot names and target subdirectories (tab-separated; read by backup-run.sh)
+    BootPlan {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Show the last backup report
     Report {
         /// Path to SQLite database
@@ -2279,6 +2285,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 mount::require_released(&still_mounted)?;
+            }
+            BackupAction::BootPlan { config } => {
+                let cfg = Config::load(&config).unwrap_or_else(|e| {
+                    eprintln!("Error: cannot read {}: {e}", config.display());
+                    std::process::exit(2);
+                });
+                let plan = match backup::boot_plan(&cfg) {
+                    Ok(plan) => plan,
+                    Err(why) => {
+                        eprintln!("{why}");
+                        std::process::exit(2);
+                    }
+                };
+                let mut lines = Vec::new();
+                for item in &plan {
+                    let name = item.snapshot_name.as_deref().unwrap_or("-");
+                    let dirs = if item.subdirs.is_empty() {
+                        "-".to_string()
+                    } else {
+                        item.subdirs.join(",")
+                    };
+                    let unsafe_field = [item.subvol.as_str(), name, dirs.as_str()]
+                        .iter()
+                        .any(|f| f.contains(['\t', '\n']))
+                        || item.subdirs.iter().any(|d| d.contains(','));
+                    if unsafe_field {
+                        eprintln!(
+                            "boot subvolume {:?}: a tab, newline or comma in a field cannot be passed to backup-run.sh",
+                            item.subvol
+                        );
+                        std::process::exit(2);
+                    }
+                    lines.push(format!("{}\t{name}\t{dirs}", item.subvol));
+                }
+                for line in lines {
+                    println!("{line}");
+                }
             }
             BackupAction::Report { db, limit } => {
                 let database = Database::open(&db)?;

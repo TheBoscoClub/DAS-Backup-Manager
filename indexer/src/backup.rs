@@ -1171,37 +1171,70 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
         .sum()
 }
 
-/// Find the latest btrbk snapshot matching a given name on a target.
-///
-/// Looks for subvolumes in the `nvme/` subdirectory matching the pattern
-/// `nvme/{name}.YYYYMMDDTHHMM`.  Returns the most recent one (by
-/// lexicographic sort of the timestamp suffix).
+/// One boot subvolume of the boot step: what `[boot].subvolumes` names, the
+/// snapshot name `btrbk.conf` gives it (`None` = absent there, never guessed)
+/// and the target subdirectories its snapshots land in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootPlanItem {
+    pub subvol: String,
+    pub snapshot_name: Option<String>,
+    pub subdirs: Vec<String>,
+}
+
+/// Whether `ts` is btrbk's `timestamp_format long` suffix: 8 digits, `T`,
+/// 4 digits, optionally `_` and a collision number. ASCII only.
+fn is_btrbk_timestamp(ts: &str) -> bool {
+    let (stamp, collision) = match ts.split_once('_') {
+        Some((s, n)) => (s, Some(n)),
+        None => (ts, None),
+    };
+    let b = stamp.as_bytes();
+    b.len() == 13
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..].iter().all(u8::is_ascii_digit)
+        && collision.is_none_or(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
 /// Latest btrbk snapshot named `snap_name` under any of `subdirs` on `target_mount`.
 ///
 /// Both inputs are supplied by the caller from a source of truth: `snap_name`
 /// from the live `btrbk.conf`, `subdirs` from the owning [`Source`]. Neither is
-/// derived here. The previous version hardcoded `nvme/` and an algorithmic
-/// name, and the pair silently stopped matching the moment
-/// `resolve_snapshot_names` disambiguated a bare `@` to `root-`
-/// (bd DAS-Backup-Manager-5ig).
+/// derived here (bd DAS-Backup-Manager-5ig). An unreadable listing is `None`
+/// here until the boot step is rebuilt on [`subvolume_listing`], which reports
+/// it as an error.
 fn find_latest_btrbk_snapshot(
     runner: &dyn CommandRunner,
     target_mount: &str,
     subdirs: &[String],
     snap_name: &str,
 ) -> Option<String> {
-    let output = runner
-        .output(Command::new("btrfs").args(["subvolume", "list", target_mount]))
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Some(latest_matching_snapshot(&stdout, subdirs, snap_name)?.to_string())
+    let listing = subvolume_listing(runner, target_mount).ok()?;
+    Some(latest_matching_snapshot(&listing, subdirs, snap_name)?.to_string())
 }
 
-/// Pure half of [`find_latest_btrbk_snapshot`], so the matching rule is testable
-/// without a btrfs filesystem.
+/// `btrfs subvolume list <mount>`. Could not run, or a nonzero exit, is an
+/// error carrying stderr: an unreadable target is never an empty listing
+/// (fail-silent rule 6).
+fn subvolume_listing(runner: &dyn CommandRunner, mount: &str) -> Result<String, String> {
+    let output = runner
+        .output(Command::new("btrfs").args(["subvolume", "list", mount]))
+        .map_err(|e| format!("btrfs could not be run: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "btrfs subvolume list {mount}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The snapshot-match rule, pinned by `tests/fixtures/boot-subvol-listing.txt`
+/// (which the bash suite reads too). A path matches when it is
+/// `<subdir>/<snap_name>.<TS>` with `TS` a btrbk timestamp, so `root-root.*`,
+/// `root-.latest`, `root-.<TS>.new` and `nvmeX/…` do not. The newest match has
+/// the greatest `TS` (bytewise), ties broken by the greater full path: the
+/// path alone would pick by subdirectory name.
 fn latest_matching_snapshot<'a>(
     listing: &'a str,
     subdirs: &[String],
@@ -1211,15 +1244,45 @@ fn latest_matching_snapshot<'a>(
         .iter()
         .map(|d| format!("{}/{snap_name}.", d.trim_matches('/')))
         .collect();
-    let mut matches: Vec<&str> = listing
+    listing
         .lines()
-        .filter_map(|line| {
-            let path = line.split_whitespace().last()?;
-            prefixes.iter().any(|p| path.starts_with(p)).then_some(path)
+        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|path| {
+            prefixes
+                .iter()
+                .find_map(|p| path.strip_prefix(p.as_str()))
+                .filter(|ts| is_btrbk_timestamp(ts))
+                .map(|ts| (ts, path))
         })
-        .collect();
-    matches.sort();
-    matches.last().copied()
+        .max()
+        .map(|(_, path)| path)
+}
+
+/// The boot subvolumes `[boot].subvolumes` names, each with the snapshot name
+/// `btrbk.conf` gives it and the target subdirectories its snapshots land in.
+/// What both `archive_boot` and `backup-run.sh` (through `backup boot-plan`)
+/// act on, so the names are derived in one place (bd dtm).
+pub fn boot_plan(config: &Config) -> Result<Vec<BootPlanItem>, String> {
+    let conf = Path::new(&config.general.btrbk_conf);
+    let names = crate::forget::live_subvol_snapshot_names(conf).map_err(|e| {
+        format!(
+            "Cannot read {} ({e}) — no boot subvolume is touched rather than a snapshot name guessed",
+            conf.display()
+        )
+    })?;
+    Ok(config
+        .boot
+        .subvolumes
+        .iter()
+        .map(|subvol| BootPlanItem {
+            subvol: subvol.clone(),
+            snapshot_name: names.get(subvol.as_str()).cloned(),
+            subdirs: subdirs_for_subvol(config, subvol)
+                .into_iter()
+                .map(|d| d.trim_matches('/').to_string())
+                .collect(),
+        })
+        .collect())
 }
 
 /// Which `target_subdirs` a given boot subvolume's snapshots live under.
@@ -6315,6 +6378,71 @@ mod tests {
         )
         .unwrap();
         f
+    }
+
+    const SHARED_LISTING: &str = include_str!("../../tests/fixtures/boot-subvol-listing.txt");
+
+    #[test]
+    fn the_snapshot_match_rule_is_the_one_the_script_uses() {
+        let cases: [(&[&str], &str, Option<&str>); 7] = [
+            (&["nvme"], "root-", Some("nvme/root-.20261005T0100_1")),
+            (&["/nvme/"], "root-", Some("nvme/root-.20261005T0100_1")),
+            (&["nvme"], "home", Some("nvme/home.20261005T0100")),
+            (&["nvme", "ssd"], "home", Some("ssd/home.20261007T0100")),
+            (&["nvme", "ssd"], "var", Some("nvme/var.20261009T0100")),
+            (&["nvme"], "a.b", Some("nvme/a.b.20261003T0100")),
+            (&["nvme"], "log", None),
+        ];
+        for (subdirs, name, want) in cases {
+            let subdirs: Vec<String> = subdirs.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                latest_matching_snapshot(SHARED_LISTING, &subdirs, name),
+                want,
+                "{subdirs:?} {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listing_that_cannot_be_read_is_an_error_not_an_empty_listing() {
+        let failed =
+            Scripted::from_owned(vec![("btrfs subvolume list /m".into(), 1, String::new())])
+                .with_stderr("btrfs subvolume list /m", "ERROR: can't access '/m'\n");
+        let why = subvolume_listing(&failed, "/m").unwrap_err();
+        assert!(why.contains("can't access"), "{why}");
+        let ok = Scripted::from_owned(vec![(
+            "btrfs subvolume list /m".into(),
+            0,
+            "ID 1 path x\n".into(),
+        )]);
+        assert_eq!(subvolume_listing(&ok, "/m").unwrap(), "ID 1 path x\n");
+    }
+
+    #[test]
+    fn the_boot_plan_names_come_from_btrbk_conf_and_an_unreadable_one_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(dir.path());
+        config.boot.subvolumes = vec!["@".into(), "@home".into()];
+        let plan = boot_plan(&config).unwrap();
+        assert_eq!(
+            plan[0],
+            BootPlanItem {
+                subvol: "@".into(),
+                snapshot_name: Some("root-".into()),
+                subdirs: vec!["nvme".into()]
+            }
+        );
+        assert_eq!(plan[1].subvol, "@home");
+        assert_eq!(
+            plan[1].snapshot_name, None,
+            "absent from btrbk.conf: never guessed"
+        );
+        config.general.btrbk_conf = "/nonexistent-c4x/btrbk.conf".into();
+        assert!(
+            boot_plan(&config)
+                .unwrap_err()
+                .contains("/nonexistent-c4x/btrbk.conf")
+        );
     }
 
     // --- bd DAS-Backup-Manager-5ig ---------------------------------------

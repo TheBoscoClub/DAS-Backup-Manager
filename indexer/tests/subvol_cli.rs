@@ -251,3 +251,33 @@ fn sync_dry_run_renders_the_planned_btrbk_conf_into_an_existing_file() {
     );
     assert_eq!(std::fs::read_to_string(&render).unwrap(), "");
 }
+
+#[test]
+fn backup_boot_plan_prints_the_plan_and_refuses_an_unreadable_btrbk_conf() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let config_s = config.to_str().unwrap();
+    // The config's [boot] section names no subvolume by default: add one and
+    // give btrbk.conf the name it writes for it.
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}[boot]\nsubvolumes = [\"@\"]\n")).unwrap();
+    std::fs::write(
+        dir.path().join("btrbk.conf"),
+        "volume /vol\n  subvolume  @\n    snapshot_name  root-\n",
+    )
+    .unwrap();
+    let out = btrdasd(&["backup", "boot-plan", "--config", config_s]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "@\troot-\t-\n");
+
+    std::fs::remove_file(dir.path().join("btrbk.conf")).unwrap();
+    let out = btrdasd(&["backup", "boot-plan", "--config", config_s]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("btrbk.conf"), "{err}");
+    assert!(out.stdout.is_empty());
+}
