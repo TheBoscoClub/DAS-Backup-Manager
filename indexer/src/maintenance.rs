@@ -235,6 +235,21 @@ impl MaintenanceHeld {
         }
     }
 
+    /// A hold handed down by the process that started this one.
+    #[cfg(test)]
+    pub(crate) fn delegated_for_test() -> Self {
+        Self {
+            path: PathBuf::from(MAINTENANCE_LOCK_PATH),
+            how: How::Delegated,
+        }
+    }
+
+    /// Whether the process that started this one holds the lock and handed
+    /// it down (`DAS_MAINTENANCE_LOCK_FD`), as `backup-run.sh` does.
+    pub fn is_delegated(&self) -> bool {
+        matches!(self.how, How::Delegated)
+    }
+
     /// The lock file.
     pub fn path(&self) -> &Path {
         &self.path

@@ -378,14 +378,28 @@ fn ensure_targets_mounted_with(
             );
             // Not this run's to unmount — say so, so a target an earlier run
             // failed to unmount is visible rather than quietly reused.
-            progress.on_log(
-                crate::progress::LogLevel::Warning,
-                &format!(
-                    "Target '{}': {} was already mounted before this run and will be \
-                     left mounted",
-                    target.label, target.mount
-                ),
-            );
+            // Under a handed-down lock the parent mounted it for this run (and
+            // its own pre-existing-mount check reports a leftover), so it is
+            // not a finding here; an owned hold keeps the warning.
+            if _held.is_delegated() {
+                progress.on_log(
+                    crate::progress::LogLevel::Info,
+                    &format!(
+                        "Target '{}': {} is mounted by the job that handed down the \
+                         maintenance lock; left mounted for it",
+                        target.label, target.mount
+                    ),
+                );
+            } else {
+                progress.on_log(
+                    crate::progress::LogLevel::Warning,
+                    &format!(
+                        "Target '{}': {} was already mounted before this run and will be \
+                         left mounted",
+                        target.label, target.mount
+                    ),
+                );
+            }
             continue;
         }
 
@@ -1314,14 +1328,18 @@ mod tests {
             progress: &Recorder,
             runner: &Arc<ScriptedRunner>,
         ) -> Result<MountGuard, MountError> {
+            self.mount_targets_held(config, progress, runner, &MaintenanceHeld::assumed())
+        }
+
+        fn mount_targets_held(
+            &self,
+            config: &Config,
+            progress: &Recorder,
+            runner: &Arc<ScriptedRunner>,
+            held: &MaintenanceHeld,
+        ) -> Result<MountGuard, MountError> {
             self.with_probes(runner, |p| {
-                ensure_targets_mounted_with(
-                    config,
-                    progress,
-                    &MaintenanceHeld::assumed(),
-                    p,
-                    runner.clone(),
-                )
+                ensure_targets_mounted_with(config, progress, held, p, runner.clone())
             })
         }
 
@@ -1830,6 +1848,46 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Under a handed-down lock the parent (`backup-run.sh`) mounted the
+    /// target for this run: an Info line, never the "left mounted" Warning
+    /// (bd 8veh). The owned hold keeps its Warning (previous test).
+    #[test]
+    fn target_mounted_by_the_delegating_parent_is_info_not_warning() {
+        let scratch = Scratch::new();
+        let a = scratch.mkdir("mnt/a");
+        let config = config_with(
+            vec![target("alpha", "SER-A", &a, TargetRole::Primary)],
+            Vec::new(),
+        );
+        let host = Host {
+            mountpoints: vec![PathBuf::from(&a)],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let guard = host
+            .mount_targets_held(
+                &config,
+                &progress,
+                &runner,
+                &MaintenanceHeld::delegated_for_test(),
+            )
+            .unwrap();
+
+        assert_eq!(guard.count(), 0);
+        assert_eq!(
+            progress.logs(),
+            vec![(
+                LogLevel::Info,
+                format!(
+                    "Target 'alpha': {a} is mounted by the job that handed down the \
+                     maintenance lock; left mounted for it"
+                )
+            )]
+        );
     }
 
     /// A directory that merely EXISTS at the mount path is not a mounted
