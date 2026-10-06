@@ -236,6 +236,10 @@ case "$1 ${2:-}" in
     printf 'RETIRED SUBVOLUMES\n  None.\n'
     exit "$(knob expire_rc 0)"
     ;;
+"backup boot-plan")
+    # The plan btrbk.conf gives: @ and @home on the nvme volume.
+    printf '@\troot-\tnvme\n@home\thome\tnvme\n'
+    ;;
 "recovery-os status")
     printf 'RECOVERY OS\n  stub reading\n'
     exit "$(knob recovery_rc 0)"
@@ -443,8 +447,12 @@ case " $* " in
 esac
 EOF
 
+# `systemctl show --value` of a timer: empty (exit 0) while the timer's own
+# service runs (measured, bd hyvh); knob timer_next gives the value, knob
+# timer_fails makes it exit 1.
 stub systemctl <<'EOF'
-echo "NextElapseUSecRealtime="
+if [[ -f "$S/knobs/timer_fails" ]]; then exit 1; fi
+printf '%s\n' "$(knob timer_next '')"
 EOF
 
 # Keeps each mail: its arguments (the subject follows -s) and its body.
@@ -518,6 +526,7 @@ DAS_GROWTH_LOG='$WORK/lib/growth.log'
 DAS_LAST_REPORT='$WORK/lib/last-report.txt'
 DAS_BTRBK_CONF='$WORK/etc/btrbk.conf'
 DAS_IO_SCHEDULER='mq-deadline'
+DAS_BOOT_ENABLED='$(cat "$STATE/knobs/boot_enabled" 2>/dev/null || echo false)'
 DAS_MOUNT_OPTS='noatime,degraded'
 DAS_SOURCE_COUNT=1
 DAS_SOURCE_0_LABEL='nvme'
@@ -1007,6 +1016,25 @@ check "clean run: the snapshot counts row" \
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
 check "clean run: a silent mount logs no mount warning" \
     "$(grep -c 'WARN.*mount said' "$STATE/out")" "0"
+
+# The report's "Next scheduled:" line is never blank (bd hyvh): systemd prints
+# an empty value, exit 0, while the timer's own service runs.
+next_line() { sed -n 's/^  Next scheduled: //p' "$WORK/lib/last-report.txt"; }
+fresh
+run_backup
+check "next scheduled, empty value (the timer's own run is going): unknown" "$(next_line)" "unknown"
+fresh
+knob timer_next "Wed 2026-10-07 03:05:47 CDT"
+run_backup
+check "next scheduled, a date: the zone is dropped" "$(next_line)" "Wed 2026-10-07 03:05:47"
+fresh
+knob timer_next "n/a"
+run_backup
+check "next scheduled, n/a: unknown" "$(next_line)" "unknown"
+fresh
+knob timer_fails 1
+run_backup
+check "next scheduled, systemctl fails: unknown" "$(next_line)" "unknown"
 
 # A source that mounts with something to say — util-linux's "source
 # write-protected, mounted read-only" — still says it: mount_sources()
@@ -2021,6 +2049,9 @@ unmount_row() { sed -n '/^  Unmount targets /{p;q;}' "$WORK/lib/last-report.txt"
 
 fresh
 knob probe_fails_after_btrbk "$PRIMARY_MNT"
+# The boot step does nothing unless [boot] is enabled (dtm): enable it here.
+knob boot_enabled true
+write_env
 run_backup
 check "probe cannot tell for a mounted target: exit status (a FAIL)" "$RC" "3"
 show_tail 3

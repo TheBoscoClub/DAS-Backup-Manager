@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.22.3
+**Version**: 0.7.23.0
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -25,7 +25,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 - **btrbk Backup Orchestration** — Nightly incremental BTRFS snapshot backups to DAS enclosure
 - **Multi-Target Architecture** — Configurable primary and mirror roles across any number of DAS drives
-- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention)
+- **Boot Subvolume Archival** — Archives old boot subvolumes with timestamps (configurable retention). Every run, incremental or full, creates a missing boot subvolume from the latest snapshot; only a full run (or `btrdasd backup boot-archive`) archives and replaces an existing one. The GUI and `backup-run.sh` apply the same rule
 - **Scheduled BTRFS Scrub** (`btrdasd scrub`) — Monthly integrity scrub of all DAS backup filesystems, with health-check integration and email reports
 - **Automatic Subvolume Adoption** (`btrdasd subvol sync`) — Every backup run adds an entry for each new subvolume on a source volume (unless excluded by `[subvolumes].exclude`), retires entries whose subvolume is gone, and later expires the retired subvolume's backups once the retention window has passed
 - **Subvolume Drift Detector** (`btrdasd doctor --check-drift`) — Weekly check comparing every source filesystem's actual subvolumes against config.toml, catching silent backup gaps (missing) and stale entries (removed), with email alerts. New subvolumes are adopted by the backup run itself, so a finding means that step failed
@@ -33,7 +33,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
 - **Auto-Mount/Unmount** — RAII `MountGuard` finds each target by its `mount_uuid` or drive serial (the same rule as `backup-run.sh`), auto-mounts BTRFS partitions before operations, and unmounts on completion, retrying a busy target; one it cannot release fails the operation with `still mounted: <path>` (all D-Bus methods and CLI commands)
 - **Targets Hidden From Desktop Automount** — a generated udev rule marks every backup target as ignored by udisks2, so nothing mounts it under `/run/media`; only the backup run and `btrdasd` mount targets (`btrdasd setup --check` reads back whether each attached target carries the flag)
-- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 23 methods for backup, restore, config, schedule, health, and index read operations
+- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 20 methods for backup, restore, config, schedule, health, and index read operations
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 full backup management application with sidebar navigation, Dolphin-style file browser, backup operations, health dashboard, config editor, first-run wizard, desktop notifications, and system tray
 - **USB SMART Passthrough** — Health queries use `-d sat` for USB-attached DAS drives to read SMART data through USB-SATA bridges
 - **Interactive Installer** (`btrdasd setup`) — 9-step wizard with 5 modes: install, modify, upgrade, uninstall, check

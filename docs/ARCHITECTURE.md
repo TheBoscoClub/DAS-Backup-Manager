@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.22.3
+**Version**: 0.7.23.0
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -47,7 +47,7 @@ at that path. `ClaudeCodeProjects/powershell-scripts` had been in the same state
 for three weeks. See `.claude/rules/backup.md` for the reproduction and the
 per-filesystem command that finds coverage gaps.
 
-## Component Overview (v0.7.22.3)
+## Component Overview (v0.7.23.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -83,7 +83,7 @@ The system has six major components:
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
 | Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 22 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
-| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (23 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
+| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (20 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 9-step setup wizard with template generation |
 
@@ -140,7 +140,9 @@ A `--dryrun` stops after the expiry preview and the recovery OS check: it previe
 unmounts, and sends, records and archives nothing. It may create a missing, empty
 target directory (for example for a pending adoption), as the real run would.
 
-`btrdasd backup run` and the GUI (through `btrdasd-helper`'s `BackupRun`) run the same
+`btrdasd backup run` and the GUI (through `btrdasd-helper`'s `BackupRun`, which takes the
+ticked sources, targets, a mode (`full` or `incremental`) and a steps dictionary of exactly
+five booleans: `snapshot`, `send`, `boot_archive`, `index`, `email`) run the same
 job through one library entry point, `backup::run_backup_job`: locks (decline if a
 backup holds the singleton, wait for the maintenance lock), mount sources, subvolume
 sync, mount targets (`mount::verify_write_targets()` before btrbk), `run_backup`, capture
@@ -644,7 +646,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
 | `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
-| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 23 methods, 3 signals, polkit checks, job ownership |
+| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 20 methods, 3 signals, polkit checks, job ownership |
 
 ### KDE Plasma GUI (`gui/src/`)
 
@@ -675,15 +677,15 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 
 ### Tests
 
-Counts from `cargo test --features dbus -- --list` and `gui/tests/smoketest.cpp` at 0.7.22.3
-(2026-10-02); re-run that command rather than trusting these numbers.
+Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case at 0.7.23.0
+(2026-10-06); re-run that command rather than trusting these numbers.
 
 | Suite | Count | Framework |
 |-------|-------|-----------|
-| Rust unit tests | 661 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 21 `pub mod`s) |
-| Rust CLI + setup tests | 178 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
-| D-Bus helper tests | 1 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
-| Rust integration tests | 16 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (6), `setup_requires_root.rs` (1) |
+| Rust unit tests | 1114 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 23 `pub mod`s) |
+| Rust CLI + setup tests | 263 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
+| D-Bus helper tests | 13 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
+| Rust integration tests | 32 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (9), `recovery_os_cli.rs` (7), `record_run_contract.rs` (6), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 8 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (3), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
-| C++ GUI smoke tests | 6 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **856 Rust (864 incl. manual) + 6 Qt** | |
+| C++ GUI smoke tests | 18 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper. The click-simulation suites were removed 2026-03-01 |
+| **Total** | **1422 Rust (1430 incl. manual) + 18 Qt** | |

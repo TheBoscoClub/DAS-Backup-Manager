@@ -20,6 +20,9 @@ private Q_SLOTS:
     // ticked and no job is running. An empty selection is not "everything":
     // the helper refuses it (bd DAS-Backup-Manager-7tx).
     void updateRunEnabled();
+    // Boot Archive says what it does in the selected mode, and is unticked and
+    // disabled, with the reason, when [boot] enabled = false in config.toml.
+    void updateBootArchive();
 
 private:
     DBusClient *m_client;
@@ -43,4 +46,5 @@ private:
     QPushButton *m_dryRunButton = nullptr;
     QPushButton *m_runButton = nullptr;
     bool m_jobRunning = false;
+    bool m_bootEnabledInConfig = true;
 };

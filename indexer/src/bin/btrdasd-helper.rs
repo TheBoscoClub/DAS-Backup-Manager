@@ -21,13 +21,13 @@ use zbus::fdo;
 use zbus::object_server::SignalEmitter;
 use zbus::{Connection, interface};
 
-use buttered_dasd::backup::{self, BackupLockAttempt, BackupMode, BackupOptions};
+use buttered_dasd::backup::{self, BackupMode, BackupOptions};
 use buttered_dasd::btrbk_conf;
 use buttered_dasd::config::Config;
 use buttered_dasd::db::Database;
 use buttered_dasd::health;
 use buttered_dasd::indexer;
-use buttered_dasd::maintenance::{self, HoldsMaintenance, LockSite};
+use buttered_dasd::maintenance::{self, LockSite};
 use buttered_dasd::mount;
 use buttered_dasd::progress::{
     LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
@@ -162,6 +162,26 @@ async fn finish_job(progress: Arc<OrderedProgress>, success: bool, summary: Stri
 // ---------------------------------------------------------------------------
 // Polkit authorization
 // ---------------------------------------------------------------------------
+
+/// The steps dictionary as (key, value) pairs; a value that is not a
+/// boolean becomes `None`, which `RunSteps::from_entries` refuses.
+fn step_entries(map: HashMap<String, zbus::zvariant::OwnedValue>) -> Vec<(String, Option<bool>)> {
+    map.into_iter()
+        .map(|(key, value)| (key, bool::try_from(&value).ok()))
+        .collect()
+}
+
+/// `mode` as the GUI sends it. Anything else is refused: an unknown mode
+/// read as incremental would be a setting accepted and ignored.
+fn parse_mode(mode: &str) -> Result<BackupMode, String> {
+    match mode.to_lowercase().as_str() {
+        "full" => Ok(BackupMode::Full),
+        "incremental" => Ok(BackupMode::Incremental),
+        other => Err(format!(
+            "unknown backup mode {other:?} — refused (full or incremental)"
+        )),
+    }
+}
 
 /// Check Polkit authorization for the caller of a D-Bus method.
 ///
@@ -310,7 +330,7 @@ impl HelperInterface {
 
     // ---- Async (job-returning) methods ----
 
-    /// Run a full backup pipeline.
+    /// Run a backup job with the operations the GUI ticked (bd c4x).
     async fn backup_run(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -318,31 +338,27 @@ impl HelperInterface {
         sources: Vec<String>,
         targets: Vec<String>,
         dry_run: bool,
+        steps: HashMap<String, zbus::zvariant::OwnedValue>,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
+        let mode = parse_mode(mode).map_err(fdo::Error::InvalidArgs)?;
+        let steps =
+            backup::RunSteps::from_entries(step_entries(steps)).map_err(fdo::Error::InvalidArgs)?;
         let config = load_config()?;
-        let backup_mode = match mode.to_lowercase().as_str() {
-            "full" => Some(BackupMode::Full),
-            "incremental" => Some(BackupMode::Incremental),
-            _ => None,
-        };
-        let options = BackupOptions {
-            mode: backup_mode,
+        let mut options = BackupOptions {
+            mode: Some(mode),
             // An `as` argument cannot say "not specified", and the GUI always
             // lists its ticks: an empty list is a selection of nothing and
             // the job refuses it (backup::empty_selection) — never "all".
             sources: Some(sources),
             targets: Some(targets),
             dry_run,
-            boot_archive: config.boot.enabled,
-            index_after: true,
-            // Written to [general].last_report every run, mailed only when
-            // [email] is enabled (backup::deliver_report).
-            send_report: true,
             ..Default::default()
         };
+        // Snapshot, send, boot archive, index and email: exactly the ticks.
+        steps.apply(&mut options);
 
         let job_id = new_job_id();
         let progress = job_progress(&self.conn, &job_id);
@@ -371,258 +387,6 @@ impl HelperInterface {
             })
             .await
             .unwrap_or_else(|e| (false, format!("Backup task panicked: {e}")));
-
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
-        Ok(job_id)
-    }
-
-    /// Create snapshots only.
-    async fn backup_snapshot(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        sources: Vec<String>,
-    ) -> fdo::Result<String> {
-        let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
-
-        // A D-Bus list cannot say "not specified": empty is a selection of
-        // nothing, refused before any lock, mount or btrbk — never "all".
-        if let Some(why) = backup::refuse_empty_sources(&sources) {
-            return Err(fdo::Error::InvalidArgs(why));
-        }
-
-        let config = load_config()?;
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                // Join the same two-lock interlock as the scheduled path and the
-                // CLI: singleton (non-blocking — a second backup is redundant,
-                // not late) then the shared maintenance lock (blocking — a scrub
-                // is a peer operation and this should wait for it). Without it
-                // a GUI backup could run concurrently with the 03:00 timer or a
-                // live scrub, and MountGuard::Drop could unmount a target out
-                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
-                // fixed this for main.rs in 0.7.15.0 and never reached the
-                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let _locks = match backup::acquire_manual_locks(
-                    "btrdasd-helper BackupSnapshot job",
-                    progress,
-                ) {
-                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
-                    Ok(BackupLockAttempt::AlreadyRunning) => {
-                        return Err("A backup is already running — declined".to_string());
-                    }
-                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
-                };
-                let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                // As `backup run` does, with the sources mounted: btrbk.conf is
-                // brought into line first (a failed sync stops the step).
-                let res = match backup::sync_for_manual_step(
-                    Path::new(CANONICAL_CONFIG),
-                    &config,
-                    progress,
-                ) {
-                    Err(e) => Err(format!("Snapshot failed: {e}")),
-                    Ok(config) => match backup::create_snapshots(&config, Some(&sources), progress)
-                    {
-                        Ok(n) => Ok(format!("{n} snapshots created")),
-                        Err(e) => Err(format!("Snapshot failed: {e}")),
-                    },
-                };
-                let still_mounted = source_guard.unmount(progress);
-                mount::fail_if_still_mounted(res, &still_mounted)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("Snapshot task panicked: {e}")));
-
-            let (success, summary) = match result {
-                Ok(msg) => (true, msg),
-                Err(msg) => (false, msg),
-            };
-
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
-        Ok(job_id)
-    }
-
-    /// Send existing snapshots to targets.
-    async fn backup_send(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        targets: Vec<String>,
-    ) -> fdo::Result<String> {
-        let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
-
-        // A D-Bus list cannot say "not specified": empty is a selection of
-        // nothing, refused before any lock, mount or btrbk — never "all".
-        if let Some(why) = backup::refuse_empty_targets(&targets) {
-            return Err(fdo::Error::InvalidArgs(why));
-        }
-
-        let config = load_config()?;
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
-        // Send from all sources (`None`: not an empty list) to the specified targets.
-
-        let handle = tokio::spawn(async move {
-            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                // Join the same two-lock interlock as the scheduled path and the
-                // CLI: singleton (non-blocking — a second backup is redundant,
-                // not late) then the shared maintenance lock (blocking — a scrub
-                // is a peer operation and this should wait for it). Without it
-                // a GUI backup could run concurrently with the 03:00 timer or a
-                // live scrub, and MountGuard::Drop could unmount a target out
-                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
-                // fixed this for main.rs in 0.7.15.0 and never reached the
-                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let locks =
-                    match backup::acquire_manual_locks("btrdasd-helper BackupSend job", progress) {
-                        Ok(BackupLockAttempt::Acquired(locks)) => locks,
-                        Ok(BackupLockAttempt::AlreadyRunning) => {
-                            return Err("A backup is already running — declined".to_string());
-                        }
-                        Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
-                    };
-                let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                // As `backup run` does, with the sources mounted and before the
-                // targets are: btrbk.conf is brought into line first, because
-                // a send of everything passes btrbk no filter.
-                let config = match backup::sync_for_manual_step(
-                    Path::new(CANONICAL_CONFIG),
-                    &config,
-                    progress,
-                ) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        let still = source_guard.unmount(progress);
-                        return mount::fail_if_still_mounted(
-                            Err(format!("Send failed: {e}")),
-                            &still,
-                        );
-                    }
-                };
-                let mut guard =
-                    mount::ensure_targets_mounted(&config, progress, locks.maintenance())
-                        .map_err(|e| format!("Mount failed: {e}"))?;
-
-                let res = match backup::send_snapshots(&config, None, &targets, false, progress) {
-                    Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
-                    Err(e) => Err(format!("Send failed: {e}")),
-                };
-
-                let mut still_mounted = guard.unmount(progress);
-                still_mounted.extend(source_guard.unmount(progress));
-                mount::fail_if_still_mounted(res, &still_mounted)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("Send task panicked: {e}")));
-
-            let (success, summary) = match result {
-                Ok(msg) => (true, msg),
-                Err(msg) => (false, msg),
-            };
-
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
-        Ok(job_id)
-    }
-
-    /// Archive boot subvolumes.
-    async fn backup_boot_archive(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> fdo::Result<String> {
-        let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
-
-        let config = load_config()?;
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-                let progress = &*progress;
-                // Join the same two-lock interlock as the scheduled path and the
-                // CLI: singleton (non-blocking — a second backup is redundant,
-                // not late) then the shared maintenance lock (blocking — a scrub
-                // is a peer operation and this should wait for it). Without it
-                // a GUI backup could run concurrently with the 03:00 timer or a
-                // live scrub, and MountGuard::Drop could unmount a target out
-                // from under a running `btrfs receive`. bd DAS-Backup-Manager-pe6
-                // fixed this for main.rs in 0.7.15.0 and never reached the
-                // daemon the GUI actually calls (bd DAS-Backup-Manager-dca).
-                let locks = match backup::acquire_manual_locks(
-                    "btrdasd-helper BackupBootArchive job",
-                    progress,
-                ) {
-                    Ok(BackupLockAttempt::Acquired(locks)) => locks,
-                    Ok(BackupLockAttempt::AlreadyRunning) => {
-                        return Err("A backup is already running — declined".to_string());
-                    }
-                    Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
-                };
-                let mut guard =
-                    mount::ensure_targets_mounted(&config, progress, locks.maintenance())
-                        .map_err(|e| format!("Mount failed: {e}"))?;
-
-                let res = match backup::archive_boot(&config, progress) {
-                    Ok(archived) => {
-                        let msg = if archived {
-                            "Boot subvolumes archived"
-                        } else {
-                            "No boot subvolumes to archive"
-                        };
-                        Ok(msg.to_string())
-                    }
-                    Err(e) => Err(format!("Boot archive failed: {e}")),
-                };
-
-                let still_mounted = guard.unmount(progress);
-                mount::fail_if_still_mounted(res, &still_mounted)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("Boot archive task panicked: {e}")));
-
-            let (success, summary) = match result {
-                Ok(msg) => (true, msg),
-                Err(msg) => (false, msg),
-            };
 
             finish_job(finisher, success, summary).await;
             jobs.lock().await.remove(&jid);
@@ -1805,6 +1569,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_value_that_is_not_a_boolean_reaches_the_library_as_none() {
+        use zbus::zvariant::{OwnedValue, Value};
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "index".to_string(),
+            OwnedValue::try_from(Value::from(true)).unwrap(),
+        );
+        map.insert(
+            "email".to_string(),
+            OwnedValue::try_from(Value::from("yes")).unwrap(),
+        );
+        let mut got = step_entries(map);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("email".to_string(), None),
+                ("index".to_string(), Some(true))
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_empty_mode_is_refused_never_read_as_incremental() {
+        assert_eq!(parse_mode("full"), Ok(BackupMode::Full));
+        assert_eq!(parse_mode("Incremental"), Ok(BackupMode::Incremental));
+        for bad in ["", "weekly", "snapshot"] {
+            assert!(parse_mode(bad).unwrap_err().contains("mode"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_half_selection_methods_are_gone_from_the_interface() {
+        let src = include_str!("btrdasd-helper.rs");
+        for name in ["backup_snapshot", "backup_send", "backup_boot_archive"] {
+            let needle = format!("async fn {name}(");
+            // The needle is built at run time so this test does not match itself.
+            assert!(
+                !src.contains(&needle),
+                "{name} is still an interface method"
+            );
+        }
+    }
 
     /// The refresh must produce a NAMED failure, not nothing. Its result used
     /// to be dropped by `let _ = ..`, which is why a DB the helper could no

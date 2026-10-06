@@ -481,6 +481,12 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Print the boot subvolumes a full run refreshes, with their btrbk snapshot names and target subdirectories (tab-separated; read by backup-run.sh)
+    BootPlan {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Show the last backup report
     Report {
         /// Path to SQLite database
@@ -1308,7 +1314,7 @@ fn backup_run_options(
         dry_run,
         boot_archive: true,
         index_after: true,
-        send_report: true,
+        email_report: true,
         ..Default::default()
     }
 }
@@ -2268,17 +2274,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 let mut guard =
                     mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
-                let result = buttered_dasd::backup::archive_boot(&cfg, &progress);
+                let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
-                let archived = result?;
-                if archived {
-                    println!("Boot subvolumes archived successfully");
-                } else {
-                    println!(
-                        "No boot subvolumes to archive (boot archival disabled or no targets mounted)"
-                    );
+                println!("Boot subvolumes: {}", step.row());
+                if let backup::BootStep::Ran(o) = &step {
+                    for f in &o.failures {
+                        println!("  FAIL  {f}");
+                    }
+                    for w in &o.warnings {
+                        println!("  WARN  {w}");
+                    }
                 }
-                mount::require_released(&still_mounted)?;
+                // The script's and the doctor's rule: 3 = it began and
+                // something failed (the step, or giving the mounts back);
+                // 1 stays "could not start".
+                let released = mount::require_released(&still_mounted);
+                if let Err(why) = &released {
+                    eprintln!("Error: {why}");
+                }
+                if let Some(code) = step.exit_code(released.is_ok()) {
+                    std::process::exit(code);
+                }
+            }
+            BackupAction::BootPlan { config } => {
+                let cfg = Config::load(&config).unwrap_or_else(|e| {
+                    eprintln!("Error: cannot read {}: {e}", config.display());
+                    std::process::exit(2);
+                });
+                let plan = match backup::boot_plan(&cfg) {
+                    Ok(plan) => plan,
+                    Err(why) => {
+                        eprintln!("{why}");
+                        std::process::exit(2);
+                    }
+                };
+                let mut lines = Vec::new();
+                for item in &plan {
+                    let name = item.snapshot_name.as_deref().unwrap_or("-");
+                    let dirs = if item.subdirs.is_empty() {
+                        "-".to_string()
+                    } else {
+                        item.subdirs.join(",")
+                    };
+                    let unsafe_field = [item.subvol.as_str(), name, dirs.as_str()]
+                        .iter()
+                        .any(|f| f.contains(['\t', '\n']))
+                        || item.subdirs.iter().any(|d| d.contains(','));
+                    if unsafe_field {
+                        eprintln!(
+                            "boot subvolume {:?}: a tab, newline or comma in a field cannot be passed to backup-run.sh",
+                            item.subvol
+                        );
+                        std::process::exit(2);
+                    }
+                    lines.push(format!("{}\t{name}\t{dirs}", item.subvol));
+                }
+                for line in lines {
+                    println!("{line}");
+                }
             }
             BackupAction::Report { db, limit } => {
                 let database = Database::open(&db)?;
@@ -2951,13 +3004,13 @@ mod tests {
         assert_eq!(full.mode, Some(BackupMode::Full));
         assert_eq!(full.sources, Some(vec!["a".to_string()]));
         assert_eq!(full.targets, Some(vec!["t1".to_string(), "t2".to_string()]));
-        assert!(full.dry_run && full.boot_archive && full.index_after && full.send_report);
+        assert!(full.dry_run && full.boot_archive && full.index_after && full.email_report);
         // No flags: incremental, nothing specified, not a dry run.
         let plain = backup_run_options(false, false, vec![], vec![]);
         assert_eq!(plain.mode, Some(BackupMode::Incremental));
         assert_eq!((plain.sources, plain.targets), (None, None));
         assert!(!plain.dry_run);
-        assert!(plain.boot_archive && plain.index_after && plain.send_report);
+        assert!(plain.boot_archive && plain.index_after && plain.email_report);
     }
 
     #[test]
@@ -2976,7 +3029,7 @@ mod tests {
             snapshots_sent: sent,
             snapshots_cleaned: 0,
             bytes_sent: 0,
-            boot_archived: false,
+            boot: backup::BootStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: Vec::new(),
