@@ -579,7 +579,7 @@ replaces an existing one only on a full run.
 .PP
 If another backup already holds the singleton lock, the command prints that it
 declines and exits 0; it waits for a running scrub. A run that could not start
-(nothing selected, or the locks cannot be taken) exits 1, having mounted and run
+(nothing selected, a label the configuration lacks, or the locks cannot be taken) exits 1, having mounted and run
 nothing. A run that began \(em it took the locks \(em and then stopped on a
 target's or a source's state (no target would mount, a target or a source
 volume is not what it must be, an absent ticked target, btrbk could not be
@@ -646,7 +646,8 @@ Both apply the retention policy.
 Comma-separated source labels to back up.
 btrbk is told to snapshot and send exactly those sources' subvolumes, by
 subvolume, so a source that shares a volume with another is not pulled in by it.
-A label that is not in the configuration refuses the btrbk steps.
+A label that is not in the configuration refuses the run before anything is
+locked or mounted (exit 1), even beside valid ones.
 A value that names nothing real (an empty one) is such a label: the run is
 refused, never widened to every source.
 Default (flag not given): every source with at least one subvolume that is not manual-only.
@@ -657,8 +658,9 @@ btrbk is told to write to exactly those targets and is not told about the others
 a target left out can be absent without failing the run, and a target named
 that btrbk cannot read fails it. A source whose only targets are left out is
 skipped, with a warning.
-Labels that match no configured target refuse the run; they are never widened
-to every mounted target.
+A label that is not a configured target refuses the run before anything is
+locked or mounted (exit 1), even beside valid ones; it is never dropped, and
+the selection is never widened to every mounted target.
 Default (flag not given): all mounted targets.
 .\"
 .SS backup snapshot
