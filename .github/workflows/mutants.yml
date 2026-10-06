@@ -198,11 +198,15 @@ jobs:
   # 40 on the GitHub runner, about 3.6 times slower; that scope took 35 minutes
   # locally, so about 2 hours on the runner, hence timeout-minutes 300.
   # Re-measured 2026-10-02: 1018 mutants (999 + progress.rs 19), about 37
-  # minutes locally, about 2.3 hours on the runner. backup.rs (243 mutants,
-  # 13 minutes locally with progress.rs) would still fit the time, but is NOT
-  # in scope: 152 of its mutants survive — its btrbk-spawning steps
-  # (create_snapshots, send_snapshots, run_full_pipeline, run_backup's live
-  # path) have no test seam yet — so adding it would only turn this job red.
+  # minutes locally, about 2.3 hours on the runner. backup.rs was left out
+  # then: 152 of its 243 mutants survived, its btrbk-spawning steps having no
+  # test seam. Since bd DAS-Backup-Manager-thi (its btrbk runs through
+  # fsutil::CommandRunner, its target usage and index step through StepEnv) it
+  # is IN scope: measured 2026-10-05, 293 mutants, 275 caught, 0 missed, 0
+  # timed out, 18 unviable, 18 minutes locally (3.7 s each). The four one-line
+  # public wrappers that bind a core to the real btrbk and mount table, and
+  # the two host bindings behind StepEnv, are excluded in
+  # indexer/.cargo/mutants.toml with their reasons.
   # Widened 2026-10-03 (bd 1yg) by the recovery-OS reading, which decides
   # whether booting a recovery drive's own OS would run btrbk — the update
   # VM's driver refuses on anything but "no" — and reads that OS without
@@ -217,6 +221,10 @@ jobs:
   # Re-measured for fix round 5: 1888 (recovery_os/**/*.rs 631), shards of
   # 944 and 944, about 2.6 hours each. 7wb's recovery_os/hold_disk.rs (about
   # 26 more) joins through the glob when it is merged.
+  # Re-measured 2026-10-05 for bd DAS-Backup-Manager-thi: 1992 without
+  # backup.rs (fsutil.rs and mount.rs grew), 2285 with it; shards of 1143 and
+  # 1142, about 3.1 hours each at 9.9 s a mutant on the runner (2.6 hours for
+  # 944), under timeout-minutes 300.
   # Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/N)
   # As above, the matrix list alone sets the shard count.
@@ -274,6 +282,7 @@ jobs:
             --file src/caldate.rs \
             --file src/fsutil.rs \
             --file src/progress.rs \
+            --file src/backup.rs \
             --file src/recovery_os.rs \
             --file 'src/recovery_os/**/*.rs'
 
