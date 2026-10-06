@@ -297,6 +297,16 @@ fn backup_boot_plan_prints_the_subdirs_comma_joined_and_dash_when_there_are_none
 }
 
 #[test]
+fn backup_boot_plan_refuses_a_subdirectory_the_script_could_not_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(dir.path(), Some("[\"a,b\"]"));
+    let out = btrdasd(&["backup", "boot-plan", "--config", config.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("comma"));
+}
+
+#[test]
 fn backup_boot_plan_refuses_an_unreadable_btrbk_conf() {
     let dir = tempfile::tempdir().unwrap();
     let config = boot_plan_config(dir.path(), Some("[\"nvme\"]"));
