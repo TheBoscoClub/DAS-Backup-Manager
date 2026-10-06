@@ -64,14 +64,14 @@ The recommended installation method builds all components and runs the setup wiz
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# 2. Install all components (binaries, scripts, systemd, D-Bus, polkit, man page, icons)
+# 2. Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, man page, icons)
 sudo cmake --install build
 
 # 3. Run the interactive setup wizard
 sudo btrdasd setup
 ```
 
-This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon), backup scripts, systemd units, D-Bus/polkit configs, shell completions, man page, and desktop entry.
+This installs: `btrdasd` (CLI), `btrdasd-gui` (KDE GUI), `btrdasd-helper` (D-Bus daemon) and its systemd unit, backup scripts, D-Bus/polkit configs, shell completions, man page, and desktop entry. It installs no backup unit: the units that run the backups, the scrub and the drift check are written by `btrdasd setup` alone (see [Generated Files](#generated-files)).
 
 The wizard auto-detects the init system, package manager, and installed dependencies
 before it starts, then walks through the following on-screen steps (numbered `[1/9]`
@@ -122,6 +122,7 @@ Regenerates all files from the existing config without re-running the wizard, th
 
 - **Nothing is written while a backup runs.** The upgrade takes both locks (above) before it rewrites `config.toml`, and holds them through every file it writes and the helper restart. A backup holds `/run/das-backup.lock` from its start, also while it still waits for the maintenance lock. The scripts themselves are safe to replace (setup renames a whole new file over each, and they end with `main "$@"; exit $?`), but a run that has started would call the new sibling scripts, units and `btrdasd` for its later steps — so the upgrade waits for a moment when no backup or maintenance job holds either lock. Either lock held: exit **75**, nothing written.
 - **The helper restart, under those locks.** No job in the helper is mounting a target the restart would kill — each holds the maintenance lock while it does. A backup asked of the GUI meanwhile finds `/run/das-backup.lock` held and is declined; a restore or index job waits for the maintenance lock — in the new helper, until the upgrade lets go. One that is already waiting in the **old** helper is cancelled when the restart stops it (the helper cancels every job as it stops) and ends without a `JobFinished` signal, so the GUI is never told it ended (bd `DAS-Backup-Manager-hoh`). The hold through the restart is bounded at 300 s: a `try-restart` that has not returned by then is reported as failed and the locks let go.
+- **The backup units older versions installed are removed.** Until bd `DAS-Backup-Manager-7rf`, `cmake --install` and the packages also installed `das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system`; systemd ran them whenever setup's own units in `/etc/systemd/system` were gone (after `setup --uninstall`, for one), and they skipped a run silently when no USB disk was attached and killed one after six hours. Before regenerating, the upgrade removes those four files from `/usr/lib/systemd/system` and `/usr/local/lib/systemd/system` — each only if its bytes are a version this project installed: a service's `ExecStart=` may name any install prefix, and nothing else may differ. Anything else at those paths is kept and named, for you to judge: an edited file, a link, a directory, a copy reached through a linked directory, a file replaced while it was being checked. A path it cannot read, or a file it cannot remove, ends the upgrade with an error, exit **1**, once everything else is done.
 - A restart that fails or does not return in time, or a unit state that cannot be read, ends the upgrade with an error, exit **1**.
 - A helper that is not running is left alone (exit 0): D-Bus starts it from the new binary when it is next needed. On an init system other than systemd the upgrade cannot restart it: restart a running `btrdasd-helper` yourself; the upgrade exits **3**.
 
@@ -161,7 +162,7 @@ Prompts whether to also remove the backup database at `/var/lib/das-backup/backu
 sudo btrdasd setup --uninstall-all
 ```
 
-Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon. Prompts whether to remove the backup database.
+Removes all generated files (same as `--uninstall`), then also removes cmake-installed components: binaries (`btrdasd`, `btrdasd-gui`, `btrdasd-helper`), D-Bus configs, polkit policy, the helper's systemd unit, man page, shell completions, desktop entry, and icon — and, under the configured prefix, the backup units and FFI files older versions installed. Prompts whether to remove the backup database.
 
 ### Non-Interactive Mode (`--force`)
 
@@ -192,32 +193,97 @@ Validates the current installation without changing anything:
 - Verifies all manifest files exist on disk
 - Reports any issues found
 
-## Manual Installation (without wizard)
+## Manual Installation (without the wizard)
 
-For users who prefer manual configuration without the setup wizard:
+`cmake --install`, or a package, only puts files in place. What makes backups run is
+`/etc/das-backup/config.toml`, and only `btrdasd setup` turns it into a configured host:
 
+- `backup-run.sh` reads its whole configuration from that file and exits **1** without it —
+  "could not start", which leaves the unit failed — so a timer enabled before the file
+  exists starts a backup that stops at once, every time.
+- Every backup run brings `/etc/btrbk/btrbk.conf` into line with it, so a hand-written
+  `btrbk.conf` does not survive the next run.
+- `btrdasd setup` writes from it the units that run the backups, the scrub and the drift
+  check (cron entries on sysvinit and OpenRC), `btrbk.conf` and the udev rule that hides
+  the targets from udisks2 (see [Generated Files](#generated-files)), creates the database
+  directory, and enables the timers.
+
+So `btrdasd setup` is required; what you can skip is its wizard. Write the config yourself
+and let `setup --force` install from it without asking anything:
+
+<!-- tests/test_install_doc_config.sh checks that the steps below create what they edit in -->
 ```bash
 # Build and install all components
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 sudo cmake --install build
 
-# Create database directory
-sudo mkdir -p /var/lib/das-backup
+# Installing writes nothing under /etc, and sudoedit will not create a missing directory
+sudo install -d -m 0755 /etc/das-backup
 
-# Configure btrbk manually. Note: once a config.toml exists, btrbk.conf is
-# generated from it and a hand edit is lost the next time sync or
-# `btrdasd setup --upgrade` runs (see [subvolumes] below).
-sudo cp config/btrbk.conf /etc/btrbk/btrbk.conf
-sudo vim /etc/btrbk/btrbk.conf  # edit for your drives
+# Write the config (a minimal valid one is below) and check it; checking needs no root
+sudoedit /etc/das-backup/config.toml
+btrdasd config validate --config /etc/das-backup/config.toml
 
 # Email needs no credentials — reports are submitted unauthenticated to a
 # local mail relay ([email].smtp_host/smtp_port, default 127.0.0.1:25).
 # Verify one is listening:  ss -ltn | grep ':25 '
 
-# Enable systemd timers
-sudo systemctl enable --now das-backup.timer das-backup-full.timer
+# Generate every file from the config and enable the timers, with no questions
+sudo btrdasd setup --force
 ```
+
+A minimal config `btrdasd config validate` accepts. Edit the source and the target to
+match your volumes and drives; every other key is in the
+[Configuration Reference](#configuration-reference) below:
+
+<!-- tests/test_install_doc_config.sh validates the block below with the btrdasd the build makes -->
+```toml
+[general]
+version = "0.7.22"                   # what `btrdasd --version` prints
+install_prefix = "/usr"              # the prefix btrdasd is installed under
+db_path = "/var/lib/das-backup/backup-index.db"
+
+[init]
+system = "systemd"                   # or "sysvinit", "openrc"
+
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+
+[email]                              # reports stay off until `enabled = true`
+
+[gui]
+
+[scrub]                              # the monthly scrub, on unless `enabled = false`
+targets = ["primary"]                # [[target]] labels to scrub (default: the author's three)
+
+[[source]]                           # one per BTRFS volume to back up
+label = "nvme-root"
+volume = "/.btrfs-nvme"              # the volume's top level, mounted
+device = "/dev/nvme0n1p2"
+subvolumes = ["@", "@home"]
+
+[[target]]                           # one per backup drive, or RAID-1 pair
+label = "primary"
+serials = ["YOUR-DRIVE-SERIAL"]      # smartctl -i /dev/sdX
+mount = "/mnt/backup-primary"
+role = "primary"
+retention = { daily = 7, weekly = 4 }
+```
+
+The reference's Default column is what the wizard writes. A key the block leaves out takes
+that default and the config still loads — but one default is wrong for anyone whose drives are
+not the author's: `[scrub].targets` names three of the author's target labels, so a config that
+leaves it out, with the scrub on, schedules a monthly scrub of labels it does not define and
+scrubs none of its own drives. The block sets it to its own label; do the same for each
+`[[target]]` you add. These keys have no default and may not be left out: `version`,
+`install_prefix` and `db_path` in `[general]`, `system` in `[init]` and all three `[schedule]`
+keys — and `[general]`, `[init]`, `[schedule]`, `[email]` and `[gui]` must all be present, even
+empty. `setup --force` installs only from an existing config — without one it refuses — and
+writes the file back in its own form, so comments are not kept. After a later edit,
+`sudo btrdasd setup --upgrade` regenerates everything from it.
 
 ## CLI-Only Build (no GUI dependencies)
 
@@ -227,9 +293,10 @@ If you don't have Qt6/KF6 installed or don't need the GUI:
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
 cmake --build build
 sudo cmake --install build
+sudo btrdasd setup
 ```
 
-This still installs the CLI, D-Bus helper, backup scripts, systemd units, polkit policy, and man page — everything except the GUI.
+This installs everything except the GUI; `btrdasd setup` then configures the host, as in the Quick Start.
 
 ## CMake Build Options
 
@@ -280,6 +347,8 @@ Native packaging recipes are included under `packaging/` and build-tested on the
 cd packaging/arch
 makepkg -si
 ```
+
+A package puts the files in place and writes no `config.toml`: run `sudo btrdasd setup` after installing it, as after `cmake --install`, and `sudo btrdasd setup --upgrade` after each package upgrade.
 
 **Minimum Rust version**: 1.88 (needs let-chains in edition 2024; not compile-tested below 1.98.1, and `Cargo.toml` declares no `rust-version`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
 

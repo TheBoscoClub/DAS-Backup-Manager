@@ -1,8 +1,6 @@
 // Installer module — install, uninstall, upgrade, and check modes.
 // Orchestrates config saving, template generation, file writing, and manifest tracking.
 
-#![allow(dead_code)]
-
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +13,14 @@ use crate::setup::templates::GeneratedFiles;
 
 const CONFIG_FILE: &str = "/etc/das-backup/config.toml";
 const MANIFEST_FILE: &str = "/etc/das-backup/.manifest";
+
+/// The root `upgrade` looks below for the backup units older versions installed
+/// ([`super::retired_units`]): the host's own. A constant so that a test can pin
+/// it, which `upgrade` itself, running the host's `systemctl` under the host's
+/// locks, does not allow: a root that named no real directory would turn the
+/// cleanup into a silent no-op — every path absent, nothing said — and no test
+/// on a scratch root could tell.
+const RETIRE_ROOT: &str = "/";
 
 const SYSTEMCTL: &str = "systemctl";
 
@@ -30,6 +36,11 @@ type RelayProbe<'a> = &'a dyn Fn(&Config) -> bool;
 /// Regenerate and install every managed file for a config, under setup's
 /// locks — `install` on the host, a recorder in tests.
 pub type Installer<'a> = &'a dyn Fn(&Config, &SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
+
+/// Remove what older versions installed and this one no longer does, saying
+/// what it removed and kept — [`super::retired_units`] under `/` on the host,
+/// a recorder in tests.
+type Retirer<'a> = &'a dyn Fn(&mut dyn FnMut(String)) -> Result<(), String>;
 
 /// Run a command for its exit status, returning a description of the failure
 /// instead of discarding it.
@@ -737,10 +748,11 @@ fn migrate_config(config: &mut Config) -> Vec<String> {
 }
 
 /// `--upgrade` on the host: reload the existing config, apply migrations,
-/// regenerate every file and restart the D-Bus helper onto the binary just
-/// installed — all of it under setup's two locks at `site` ([`SetupLocks`]) —
-/// the helper's unit reached through the real `systemctl`. A refusal is said
-/// on `warn`; everything else on `say`.
+/// remove the backup units older versions installed under `/usr`, regenerate
+/// every file and restart the D-Bus helper onto the binary just installed —
+/// all of it under setup's two locks at `site` ([`SetupLocks`]) — the helper's
+/// unit reached through the real `systemctl`. A refusal is said on `warn`;
+/// everything else on `say`.
 pub fn upgrade(
     site: &SetupLockSite,
     config_path: &Path,
@@ -754,14 +766,20 @@ pub fn upgrade(
         )
     };
     let systemctl = |args: &[&str]| command_status_within(SYSTEMCTL, args, HELPER_RESTART_LIMIT);
+    let retire = |say: &mut dyn FnMut(String)| {
+        super::retired_units::remove_retired_units(Path::new(RETIRE_ROOT), say)
+    };
     upgrade_with(
         site,
         config_path,
-        &relay_reachable,
-        &install,
-        &HelperHost {
-            active_state: &active_state,
-            systemctl: &systemctl,
+        &UpgradeHost {
+            relay_up: &relay_reachable,
+            retire: &retire,
+            install: &install,
+            helper: HelperHost {
+                active_state: &active_state,
+                systemctl: &systemctl,
+            },
         },
         say,
         warn,
@@ -817,22 +835,42 @@ pub fn exit_status(outcome: SetupOutcome) -> i32 {
 /// What `setup --upgrade` records as the maintenance lock's holder.
 const UPGRADE_JOB: &str = "btrdasd setup --upgrade";
 
+/// What `--upgrade` asks of the host, one seam per step: the host's own in
+/// [`upgrade`], recorders and scratch trees in tests.
+struct UpgradeHost<'a> {
+    /// Whether the configured mail relay answers.
+    relay_up: RelayProbe<'a>,
+    /// Removes what older versions installed and this one no longer does.
+    retire: Retirer<'a>,
+    /// Regenerates every file.
+    install: Installer<'a>,
+    /// Reaches the D-Bus helper's unit.
+    helper: HelperHost<'a>,
+}
+
 /// `upgrade` with setup's lock files at `site`, the config at `config_path`,
-/// and the host bound by the caller: `install` regenerates the files, `helper`
-/// reaches the D-Bus helper's unit. Everything from the config's rewrite to the
+/// and the host as `host` binds it. Everything from the config's rewrite to the
 /// helper's restart happens under the locks, which are let go before the last
 /// line. Progress goes to `say`, one line per call; a refusal to `warn`.
 fn upgrade_with(
     site: &SetupLockSite,
     config_path: &Path,
-    relay_up: RelayProbe,
-    install: Installer,
-    helper: &HelperHost,
+    host: &UpgradeHost,
     say: &mut dyn FnMut(String),
     warn: &mut dyn FnMut(String),
 ) -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     let ran = under_setup_locks(site, UPGRADE_JOB, |held| {
-        let config = prepare_upgrade(config_path, relay_up, say)?;
+        let config = prepare_upgrade(config_path, host.relay_up, say)?;
+        // The backup units an older `cmake --install` wrote under /usr
+        // (bd DAS-Backup-Manager-7rf) go first, so the reload regenerating
+        // ends with sees them gone. One that could not be removed fails the
+        // upgrade, but only once everything else has been done. When
+        // regenerating fails, or `[init].system` is not systemd, no reload
+        // follows, and that is harmless: the copies removed here were shadowed
+        // by setup's units of the same names in /etc/systemd/system, so nothing
+        // systemd has loaded changes, and one it had loaded from a copy goes at
+        // its next reload.
+        let retired = (host.retire)(say);
         say(format!(
             "Regenerating files from {}...",
             config_path.display()
@@ -840,9 +878,10 @@ fn upgrade_with(
         // The helper is restarted even when regenerating failed: what it runs
         // is the binary `cmake --install` or the package already put in place,
         // not anything written here, and left alone it keeps the old one.
-        let installed = install(&config, held);
-        let restarted = restart_helper(&config, helper, held, say);
+        let installed = (host.install)(&config, held);
+        let restarted = restart_helper(&config, &host.helper, held, say);
         installed?;
+        retired?;
         Ok(restarted?)
     })?;
     let restarted = match ran {
@@ -1330,17 +1369,24 @@ fn cmake_installed_paths(prefix: &str) -> Vec<String> {
         p("lib/das-backup/das-partition-drives.sh"),
         p("lib/das-backup/install-backup-timer.sh"),
         p("lib/das-backup/config/btrbk.conf"),
-        // Systemd units (cmake-installed templates). Under the prefix like
-        // everything else: CMakeLists.txt gives them the relative destination
-        // `lib/systemd/system`. They were listed at a fixed
+        // The helper's unit. Under the prefix like everything else:
+        // CMakeLists.txt gives it the relative destination
+        // `lib/systemd/system`. Units were listed at a fixed
         // `/lib/systemd/system`, which is the same place only for `/usr` on a
         // merged-/usr host; for any other prefix it missed the installed units
         // and named files this install never wrote.
+        p("lib/systemd/system/btrdasd-helper.service"),
+        // LEGACY backup units. CMake stopped installing them in bd
+        // DAS-Backup-Manager-7rf — `btrdasd setup` writes its own to
+        // /etc/systemd/system — but hosts installed before still carry them,
+        // and `setup --upgrade` removes only the copies under /usr and
+        // /usr/local whose bytes it recognises (`super::retired_units`). They
+        // stay on this list, like the FFI artifacts, until no supported host
+        // can still have them.
         p("lib/systemd/system/das-backup.service"),
         p("lib/systemd/system/das-backup-full.service"),
         p("lib/systemd/system/das-backup.timer"),
         p("lib/systemd/system/das-backup-full.timer"),
-        p("lib/systemd/system/btrdasd-helper.service"),
     ]
 }
 
@@ -3014,6 +3060,8 @@ auth = "starttls""#,
         init: Option<InitSystem>,
         /// Regenerating fails, after writing, as a failed timer enable does.
         install_fails: bool,
+        /// Removing what older versions installed fails with this.
+        retire_fails: Option<&'a str>,
         /// Every `systemctl` call fails with this.
         systemctl_fails: Option<&'a str>,
         /// Lock paths to use instead of the scratch ones.
@@ -3084,6 +3132,11 @@ auth = "starttls""#,
             step("relay probe");
             true
         };
+        let retire = |say: &mut dyn FnMut(String)| {
+            step("retire");
+            say("retire said this".to_string());
+            case.retire_fails.map_or(Ok(()), |e| Err(e.to_string()))
+        };
         let install = |config: &Config, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
             step("install");
             install_to_prefix(config, base, &config_path, &manifest_path)?;
@@ -3102,11 +3155,14 @@ auth = "starttls""#,
         let outcome = upgrade_with(
             site,
             &config_path,
-            &relay_up,
-            &install,
-            &HelperHost {
-                active_state: &active_state,
-                systemctl: &systemctl,
+            &UpgradeHost {
+                relay_up: &relay_up,
+                retire: &retire,
+                install: &install,
+                helper: HelperHost {
+                    active_state: &active_state,
+                    systemctl: &systemctl,
+                },
             },
             &mut |line| lines.push(line),
             &mut |line| warnings.push(line),
@@ -3140,7 +3196,8 @@ auth = "starttls""#,
                 "relay probe ({BOTH_HELD}; record: btrdasd setup --upgrade pid {})",
                 std::process::id()
             ),
-            format!("install ({BOTH_HELD}; record: mark of relay probe)"),
+            format!("retire ({BOTH_HELD}; record: mark of relay probe)"),
+            format!("install ({BOTH_HELD}; record: mark of retire)"),
         ];
         if restart {
             steps.push(format!(
@@ -3299,6 +3356,68 @@ auth = "starttls""#,
     }
 
     #[test]
+    fn a_retired_unit_that_cannot_be_removed_fails_the_upgrade_only_after_everything_else() {
+        // bd DAS-Backup-Manager-7rf: a backup unit an older version installed
+        // that cannot be removed must not cost the regenerated files or the
+        // helper's restart — and must not be passed over either.
+        let error = "1 backup unit(s) an older version installed could not be checked or \
+                     removed: cannot remove /usr/lib/systemd/system/das-backup.timer";
+        let run = upgrade_installed_tree(UpgradeCase {
+            retire_fails: Some(error),
+            ..Default::default()
+        });
+
+        assert_eq!(run.outcome, Err(error.to_string()));
+        assert_eq!(
+            run.steps,
+            steps_under_both_locks(true),
+            "removed first, then the rest"
+        );
+        assert!(
+            run.changed
+                .iter()
+                .any(|p| p.ends_with("lib/das-backup/backup-run.sh")),
+            "regenerated all the same: {:?}",
+            run.changed
+        );
+        assert!(
+            run.lines.contains(&RESTARTED.to_string()),
+            "{:?}",
+            run.lines
+        );
+        assert!(
+            run.lines.contains(&"retire said this".to_string()),
+            "what the removal says reaches stdout: {:?}",
+            run.lines
+        );
+        assert!(!run.lines.contains(&"Upgrade complete.".to_string()));
+        assert_eq!(run.locks_after, BOTH_FREE);
+        assert_eq!(run.record_after, "");
+
+        // Regenerating failing too: its error is the one returned, and the
+        // removal's was said all the same.
+        let run = upgrade_installed_tree(UpgradeCase {
+            retire_fails: Some(error),
+            install_fails: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            run.outcome,
+            Err("1 systemd unit operation(s) failed".to_string())
+        );
+        assert!(run.lines.contains(&"retire said this".to_string()));
+    }
+
+    #[test]
+    fn the_host_upgrade_looks_for_the_retired_units_below_the_hosts_own_root() {
+        // `upgrade` binds the cleanup to the host and cannot run in a test, and
+        // every other test hands the cleanup a scratch root. A production root
+        // that named no real directory would pass them all and remove nothing,
+        // without a word (bd DAS-Backup-Manager-7rf, the review's N-2).
+        assert_eq!(RETIRE_ROOT, "/");
+    }
+
+    #[test]
     fn without_systemd_the_files_are_upgraded_under_both_locks_and_the_restart_is_left_to_the_operator()
      {
         for init in [InitSystem::Sysvinit, InitSystem::Openrc] {
@@ -3382,21 +3501,29 @@ auth = "starttls""#,
             Ok(())
         };
 
+        let retire = |_: &mut dyn FnMut(String)| -> Result<(), String> {
+            reached.set(true);
+            Ok(())
+        };
+
         let outcome = upgrade_with(
             &locks.site,
             &config_path,
-            &|_| true,
-            &install,
-            &HelperHost {
-                active_state: &active_state,
-                systemctl: &systemctl,
+            &UpgradeHost {
+                relay_up: &|_| true,
+                retire: &retire,
+                install: &install,
+                helper: HelperHost {
+                    active_state: &active_state,
+                    systemctl: &systemctl,
+                },
             },
             &mut |_| {},
             &mut |_| {},
         );
 
         assert!(outcome.is_err());
-        assert!(!reached.get(), "nothing regenerated or restarted");
+        assert!(!reached.get(), "nothing removed, regenerated or restarted");
         assert_eq!(changed(&before, &tree(dir.path())), Vec::<PathBuf>::new());
         assert_eq!(locks.state(), BOTH_FREE);
         assert_eq!(locks.record(), "");
@@ -3924,8 +4051,9 @@ auth = "starttls""#,
     }
 
     /// Every file `cmake --install` writes for prefix `/usr`, read off the
-    /// `install()` rules in CMakeLists.txt and gui/CMakeLists.txt, plus the
-    /// two FFI artifacts older releases installed.
+    /// `install()` rules in CMakeLists.txt and gui/CMakeLists.txt, plus what
+    /// older releases installed and this one does not: the two FFI artifacts
+    /// and the four backup units (bd DAS-Backup-Manager-7rf).
     const CMAKE_PATHS_USR: [&str; 26] = [
         "/usr/bin/btrdasd",
         "/usr/bin/btrdasd-gui",
@@ -3948,11 +4076,11 @@ auth = "starttls""#,
         "/usr/lib/das-backup/das-partition-drives.sh",
         "/usr/lib/das-backup/install-backup-timer.sh",
         "/usr/lib/das-backup/config/btrbk.conf",
+        "/usr/lib/systemd/system/btrdasd-helper.service",
         "/usr/lib/systemd/system/das-backup.service",
         "/usr/lib/systemd/system/das-backup-full.service",
         "/usr/lib/systemd/system/das-backup.timer",
         "/usr/lib/systemd/system/das-backup-full.timer",
-        "/usr/lib/systemd/system/btrdasd-helper.service",
     ];
 
     #[test]
@@ -4304,6 +4432,10 @@ auth = "starttls""#,
             step(&format!("systemctl {}", args.join(" ")));
             Ok(())
         };
+        let retire = |_: &mut dyn FnMut(String)| -> Result<(), String> {
+            step("retire");
+            Ok(())
+        };
         let upgrade = |site: &SetupLockSite,
                        config_path: &Path,
                        say: &mut dyn FnMut(String),
@@ -4311,11 +4443,14 @@ auth = "starttls""#,
             upgrade_with(
                 site,
                 config_path,
-                &|_| true,
-                &install,
-                &HelperHost {
-                    active_state: &active_state,
-                    systemctl: &restart,
+                &UpgradeHost {
+                    relay_up: &|_| true,
+                    retire: &retire,
+                    install: &install,
+                    helper: HelperHost {
+                        active_state: &active_state,
+                        systemctl: &restart,
+                    },
                 },
                 say,
                 warn,
@@ -4467,6 +4602,7 @@ auth = "starttls""#,
             expected.extend(
                 match flags.first().copied() {
                     Some("upgrade") => vec![
+                        "retire".to_string(),
                         "install".to_string(),
                         "systemctl try-restart btrdasd-helper.service".to_string(),
                     ],

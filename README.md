@@ -48,7 +48,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active |
-| `scripts/install-backup-timer.sh` | systemd timer installer | Active |
+| `scripts/install-backup-timer.sh` | Former timer installer: now prints a pointer to `btrdasd setup`, which writes and enables the timers, and exits 1 | Deprecated |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
@@ -95,14 +95,14 @@ DAS-Backup-Manager/
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Install all components (binaries, scripts, systemd units, D-Bus, polkit, icons, man page)
+# Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, icons, man page)
 sudo cmake --install build
 
 # Run the interactive setup wizard to configure backups
 sudo btrdasd setup
 ```
 
-The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files and enables timers.
+The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files, writes the backup, scrub and drift-check units, and enables their timers. `cmake --install` installs no backup unit: setup's are the only ones.
 
 ### CLI-Only (no GUI dependencies)
 

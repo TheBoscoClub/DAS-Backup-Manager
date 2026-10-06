@@ -137,21 +137,18 @@ install(FILES
 )
 
 # =============================================================================
-# Systemd units (templated for prefix flexibility)
+# Backup units: written by `btrdasd setup`, not installed here
 # =============================================================================
-
-configure_file(systemd/das-backup.service.in
-    ${CMAKE_BINARY_DIR}/das-backup.service @ONLY)
-configure_file(systemd/das-backup-full.service.in
-    ${CMAKE_BINARY_DIR}/das-backup-full.service @ONLY)
-
-install(FILES
-    ${CMAKE_BINARY_DIR}/das-backup.service
-    ${CMAKE_BINARY_DIR}/das-backup-full.service
-    systemd/das-backup.timer
-    systemd/das-backup-full.timer
-    DESTINATION lib/systemd/system
-)
+#
+# das-backup{,-full}.{service,timer} — like das-scrub and das-backup-doctor —
+# are rendered by `btrdasd setup` from config.toml into /etc/systemd/system
+# (cron entries on sysvinit and OpenRC): their schedule, prefix and scrub
+# state are the host's, so the only copy ever right is setup's. Until
+# bd DAS-Backup-Manager-7rf CMake also installed its own copies under
+# lib/systemd/system, which systemd ran whenever setup's were gone — with a
+# USB-glob condition that skipped runs silently and a six-hour timeout that
+# setup's units never had. `btrdasd setup --upgrade` removes the copies older
+# versions left (indexer/src/setup/retired_units.rs).
 
 # =============================================================================
 # D-Bus and polkit integration files
@@ -170,16 +167,14 @@ if(BUILD_HELPER)
     install(FILES systemd/btrdasd-helper.service
         DESTINATION lib/systemd/system)
 
-    install(CODE "
-        execute_process(
-            COMMAND systemctl daemon-reload
-            ERROR_QUIET
-        )
-        execute_process(
-            COMMAND systemctl enable btrdasd-helper.service
-            ERROR_QUIET
-        )
-    ")
+    # Installing enables and reloads nothing. The helper needs no enabling:
+    # D-Bus starts it on first use (SystemdService= in
+    # dbus/org.dasbackup.Helper1.service), and `btrdasd setup --upgrade`
+    # reloads systemd and restarts it after an update. This block used to run
+    # `systemctl daemon-reload` and `systemctl enable btrdasd-helper.service`
+    # from install(CODE): on the INSTALLING machine — under DESTDIR, the
+    # package build host — with ERROR_QUIET discarding every failure
+    # (bd DAS-Backup-Manager-cway).
 endif()
 
 # =============================================================================
@@ -189,27 +184,44 @@ endif()
 install(FILES docs/btrdasd.1 DESTINATION "${CMAKE_INSTALL_PREFIX}/share/man/man1")
 
 # =============================================================================
-# Shell completions (generated at install time)
+# Shell completions (generated at build time, installed as files)
 # =============================================================================
+#
+# The btrdasd this build makes prints them into the build tree, and they are
+# installed like any other file, so a DESTDIR install carries them. They used
+# to be generated at INSTALL time, by running ${CMAKE_INSTALL_PREFIX}/bin/btrdasd
+# and writing under ${CMAKE_INSTALL_PREFIX}/share: outside DESTDIR, with
+# whatever btrdasd the installing machine had (an old one, or none), and with
+# ERROR_QUIET discarding every failure (bd DAS-Backup-Manager-cway).
+#
+# Relative destinations, resolved against the prefix at install time — where
+# the old block wrote them. The three paths are on `btrdasd setup
+# --uninstall-all`'s list (cmake_installed_paths in indexer/src/setup/installer.rs).
 
 if(BUILD_INDEXER)
-    install(CODE "
-        execute_process(
-            COMMAND \${CMAKE_INSTALL_PREFIX}/bin/btrdasd completions bash
-            OUTPUT_FILE \${CMAKE_INSTALL_PREFIX}/share/bash-completion/completions/btrdasd
-            ERROR_QUIET
-        )
-        execute_process(
-            COMMAND \${CMAKE_INSTALL_PREFIX}/bin/btrdasd completions zsh
-            OUTPUT_FILE \${CMAKE_INSTALL_PREFIX}/share/zsh/site-functions/_btrdasd
-            ERROR_QUIET
-        )
-        execute_process(
-            COMMAND \${CMAKE_INSTALL_PREFIX}/bin/btrdasd completions fish
-            OUTPUT_FILE \${CMAKE_INSTALL_PREFIX}/share/fish/vendor_completions.d/btrdasd.fish
-            ERROR_QUIET
-        )
-    ")
+    set(DAS_COMPLETIONS_DIR "${CMAKE_BINARY_DIR}/completions")
+    add_custom_target(btrdasd_completions ALL
+        COMMAND "${CMAKE_COMMAND}"
+            "-DBTRDASD=${CARGO_TARGET_DIR}/release/btrdasd"
+            "-DOUT_DIR=${DAS_COMPLETIONS_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/GenerateCompletions.cmake"
+        BYPRODUCTS
+            "${DAS_COMPLETIONS_DIR}/btrdasd.bash"
+            "${DAS_COMPLETIONS_DIR}/_btrdasd"
+            "${DAS_COMPLETIONS_DIR}/btrdasd.fish"
+        COMMENT "Generating bash, zsh and fish completions from the btrdasd just built"
+        VERBATIM
+    )
+    # Only once cargo has built the binary.
+    add_dependencies(btrdasd_completions btrdasd_rust)
+
+    install(FILES "${DAS_COMPLETIONS_DIR}/btrdasd.bash"
+        DESTINATION share/bash-completion/completions
+        RENAME btrdasd)
+    install(FILES "${DAS_COMPLETIONS_DIR}/_btrdasd"
+        DESTINATION share/zsh/site-functions)
+    install(FILES "${DAS_COMPLETIONS_DIR}/btrdasd.fish"
+        DESTINATION share/fish/vendor_completions.d)
 endif()
 
 # =============================================================================
@@ -295,6 +307,28 @@ if(BUILD_TESTING)
         NAME shell-boot-archive-cleanup
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_boot_archive_cleanup.sh
     )
+    # Installs this very build into a scratch DESTDIR: every file lands there,
+    # the completions among them, and installing runs nothing on this machine
+    # (bd DAS-Backup-Manager-cway). Needs the finished build, as ctest does.
+    if(BUILD_INDEXER)
+        set(DAS_EXPECT_COMPLETIONS --completions)
+    else()
+        set(DAS_EXPECT_COMPLETIONS --no-completions)
+    endif()
+    add_test(
+        NAME shell-install-destdir
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_destdir.sh
+            ${CMAKE_COMMAND} ${CMAKE_BINARY_DIR} ${DAS_EXPECT_COMPLETIONS}
+    )
+    # The config docs/INSTALL.md shows for an installation without the wizard
+    # is one the btrdasd this build makes accepts (bd DAS-Backup-Manager-x0m1).
+    if(BUILD_INDEXER)
+        add_test(
+            NAME shell-install-doc-config
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_doc_config.sh
+                ${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd
+        )
+    endif()
     # CI's Arch container jobs install through .github/scripts/pacman-install.sh,
     # which retries a failed install (bd DAS-Backup-Manager-ravr). This runs that
     # script against a stub pacman in a scratch tree: nothing is installed.
@@ -319,3 +353,18 @@ if(BUILD_TESTING)
         set_tests_properties(${shell_suites} PROPERTIES FAIL_REGULAR_EXPRESSION "NOT RUN")
     endif()
 endif()
+
+# =============================================================================
+# What installing leaves to setup
+# =============================================================================
+#
+# Last, so it prints after every file. Installing writes files and nothing
+# else; the host is configured by `btrdasd setup`, which writes config.toml
+# and the units and enables the timers (bd DAS-Backup-Manager-cway).
+
+install(CODE [[
+    message(STATUS "Installed files only: nothing was enabled, started or reloaded.")
+    message(STATUS "Next, on the machine that runs the backups: `sudo btrdasd setup` "
+                   "for a first install, `sudo btrdasd setup --upgrade` after an update "
+                   "(docs/INSTALL.md).")
+]])
