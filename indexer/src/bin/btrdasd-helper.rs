@@ -429,9 +429,19 @@ impl HelperInterface {
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                let res = match backup::create_snapshots(&config, Some(&sources), progress) {
-                    Ok(n) => Ok(format!("{n} snapshots created")),
+                // As `backup run` does, with the sources mounted: btrbk.conf is
+                // brought into line first (a failed sync stops the step).
+                let res = match backup::sync_for_manual_step(
+                    Path::new(CANONICAL_CONFIG),
+                    &config,
+                    progress,
+                ) {
                     Err(e) => Err(format!("Snapshot failed: {e}")),
+                    Ok(config) => match backup::create_snapshots(&config, Some(&sources), progress)
+                    {
+                        Ok(n) => Ok(format!("{n} snapshots created")),
+                        Err(e) => Err(format!("Snapshot failed: {e}")),
+                    },
                 };
                 let still_mounted = source_guard.unmount(progress);
                 mount::fail_if_still_mounted(res, &still_mounted)
@@ -500,6 +510,23 @@ impl HelperInterface {
                         Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                     };
                 let mut source_guard = mount::ensure_sources_mounted(&config, progress);
+                // As `backup run` does, with the sources mounted and before the
+                // targets are: btrbk.conf is brought into line first, because
+                // a send of everything passes btrbk no filter.
+                let config = match backup::sync_for_manual_step(
+                    Path::new(CANONICAL_CONFIG),
+                    &config,
+                    progress,
+                ) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        let still = source_guard.unmount(progress);
+                        return mount::fail_if_still_mounted(
+                            Err(format!("Send failed: {e}")),
+                            &still,
+                        );
+                    }
+                };
                 let mut guard =
                     mount::ensure_targets_mounted(&config, progress, locks.maintenance())
                         .map_err(|e| format!("Mount failed: {e}"))?;

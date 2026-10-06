@@ -186,6 +186,11 @@ Checked before any directory is created, both roots compared **after resolution*
   are a union, and a matched subvolume keeps every target).
 - A label that is not in the configuration, or a selection that leaves nothing, **refuses** the step.
   An empty filter list is btrbk's "everything": it is passed only when the selection IS everything.
+- **`backup snapshot` and `backup send` (CLI and helper) sync first, as `run` does**
+  (`backup::sync_for_manual_step`, sources mounted, before the targets are). A selection of everything
+  passes btrbk no filter, so it trusts `btrbk.conf`; sync brings that file into line with `config.toml`.
+  Unlike `run`, a failed sync stops the step: `run` goes on because configured subvolumes must still be
+  backed up, a step that cannot tell whether `btrbk.conf` is current has no such obligation.
 - The run mounts **nothing** itself. `mount::ensure_sources_mounted` and `ensure_targets_mounted` mount,
   and the `MountGuard` each returns records what it mounted and gives exactly that back; `run_backup`
   only checks that each selected source's volume is a mount point and refuses if not (bd `7tx`, `8cf`).

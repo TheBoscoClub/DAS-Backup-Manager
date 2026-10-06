@@ -1470,6 +1470,59 @@ pub fn sync_before_backup(
     (config, section)
 }
 
+/// The first step of `btrdasd backup snapshot` and `send` (CLI and helper), as
+/// [`sync_before_backup`] is of `run`: `btrbk.conf` is brought into line with
+/// `config.toml` and the sources, and the config sync wrote is returned. A step
+/// that selects everything passes btrbk no filter at all, so it trusts
+/// `btrbk.conf` — a target removed from `config.toml` but still in a stale
+/// `btrbk.conf` would otherwise be written without ever being verified (review
+/// M5). Unlike `run`, a failed sync stops the step: a `run` goes on because the
+/// subvolumes already configured must still be backed up, but a step that
+/// cannot tell whether `btrbk.conf` is current has no such obligation.
+pub fn sync_for_manual_step(
+    config_path: &Path,
+    before: &Config,
+    progress: &dyn ProgressCallback,
+) -> Result<Config, String> {
+    sync_for_manual_step_with(
+        config_path,
+        before,
+        &crate::caldate::today(),
+        &SystemRunner,
+        &health::is_mountpoint,
+        progress,
+    )
+}
+
+/// [`sync_for_manual_step`] with the runner, the mount-point test and the date
+/// given.
+fn sync_for_manual_step_with(
+    config_path: &Path,
+    before: &Config,
+    today: &str,
+    runner: &dyn CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+    progress: &dyn ProgressCallback,
+) -> Result<Config, String> {
+    let (config, section) = sync_before_backup(
+        config_path,
+        before,
+        false,
+        today,
+        runner,
+        is_mountpoint,
+        progress,
+    );
+    if section.failed {
+        return Err(
+            "The subvolume sync failed (its report is in the log above), so btrbk.conf may not \
+             match config.toml — nothing was run"
+                .to_string(),
+        );
+    }
+    Ok(config)
+}
+
 /// Whether the run writes and emails its report: the caller asked for it and
 /// `[email]` is enabled.
 fn emails_report(options: &BackupOptions, config: &Config) -> bool {
@@ -6260,6 +6313,57 @@ mod tests {
         );
         assert!(sync.failed, "{}", sync.report);
         assert!(sync.report.contains("VOLUMES NOT READ"), "{}", sync.report);
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(level, msg)| *level == LogLevel::Error && msg.contains("VOLUMES NOT READ")),
+            "{logs:?}"
+        );
+    }
+
+    /// Review M5: `backup snapshot` / `send` sync first, as `run` does, and
+    /// work from the config sync wrote — not the one they loaded.
+    #[test]
+    fn a_manual_step_syncs_first_and_runs_on_the_config_sync_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let progress = TestProgress::new();
+        let config = sync_for_manual_step_with(
+            &path,
+            &make_test_config(),
+            "2026-10-02",
+            &listing(&["@srv", "@new"]),
+            &|_| true,
+            &progress,
+        )
+        .unwrap();
+        assert!(
+            config
+                .sources
+                .iter()
+                .flat_map(|s| &s.subvolumes)
+                .any(|e| e.name == "@new"),
+            "the step must use the config sync wrote"
+        );
+    }
+
+    #[test]
+    fn a_manual_step_whose_sync_failed_is_refused_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let progress = TestProgress::new();
+        // The volume is not mounted: sync reads nothing and fails.
+        let err = sync_for_manual_step_with(
+            &path,
+            &make_test_config(),
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| false,
+            &progress,
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was run"), "{err}");
+        // The reason is in the log, at error level, for the operator.
         let logs = progress.logs.lock().unwrap();
         assert!(
             logs.iter()
