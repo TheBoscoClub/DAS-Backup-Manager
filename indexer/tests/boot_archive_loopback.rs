@@ -173,10 +173,10 @@ fn archive_boot_replaces_the_live_subvolume_when_a_snapshot_exists() {
 
     let (cfg, _conf) = config_for(&fs, "root-");
     let progress = Collector::new();
-    let archived = archive_boot(&cfg, &progress).expect("archive_boot must not error");
+    let step = archive_boot(&cfg, &progress);
 
     assert!(
-        archived,
+        step.archived(),
         "should report having archived: {}",
         progress.dump()
     );
@@ -217,9 +217,13 @@ fn archive_boot_never_deletes_the_live_subvolume_without_a_replacement() {
 
     let (cfg, _conf) = config_for(&fs, "root-");
     let progress = Collector::new();
-    let archived = archive_boot(&cfg, &progress).expect("archive_boot must not error");
+    let step = archive_boot(&cfg, &progress);
 
-    assert!(!archived, "nothing should be archived: {}", progress.dump());
+    assert!(
+        !step.archived() && step.has_warnings(),
+        "nothing should be archived, and it is a warning: {step:?} {}",
+        progress.dump()
+    );
     assert!(
         live.exists(),
         "live @ MUST survive when no replacement exists: {}",

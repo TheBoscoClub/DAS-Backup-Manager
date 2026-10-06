@@ -602,15 +602,13 @@ impl HelperInterface {
                         .map_err(|e| format!("Mount failed: {e}"))?;
 
                 let res = match backup::archive_boot(&config, progress) {
-                    Ok(archived) => {
-                        let msg = if archived {
-                            "Boot subvolumes archived"
-                        } else {
-                            "No boot subvolumes to archive"
-                        };
-                        Ok(msg.to_string())
-                    }
-                    Err(e) => Err(format!("Boot archive failed: {e}")),
+                    backup::BootStep::Ran(o) if !o.failures.is_empty() => Err(format!(
+                        "Boot subvolumes: {}  ({}) — {}",
+                        o.status(),
+                        o.detail(),
+                        o.failures.join("; ")
+                    )),
+                    step => Ok(format!("Boot subvolumes: {}", step.row())),
                 };
 
                 let still_mounted = guard.unmount(progress);

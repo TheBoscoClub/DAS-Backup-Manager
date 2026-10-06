@@ -2274,17 +2274,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 let mut guard =
                     mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
-                let result = buttered_dasd::backup::archive_boot(&cfg, &progress);
+                let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
-                let archived = result?;
-                if archived {
-                    println!("Boot subvolumes archived successfully");
-                } else {
-                    println!(
-                        "No boot subvolumes to archive (boot archival disabled or no targets mounted)"
-                    );
+                println!("Boot subvolumes: {}", step.row());
+                let mut failed = false;
+                if let backup::BootStep::Ran(o) = &step {
+                    for f in &o.failures {
+                        println!("  FAIL  {f}");
+                    }
+                    for w in &o.warnings {
+                        println!("  WARN  {w}");
+                    }
+                    failed = !o.failures.is_empty();
                 }
                 mount::require_released(&still_mounted)?;
+                // The script's and the doctor's rule: 3 = it began and
+                // something failed; 1 stays "could not start".
+                if failed {
+                    std::process::exit(3);
+                }
             }
             BackupAction::BootPlan { config } => {
                 let cfg = Config::load(&config).unwrap_or_else(|e| {
@@ -3019,7 +3027,7 @@ mod tests {
             snapshots_sent: sent,
             snapshots_cleaned: 0,
             bytes_sent: 0,
-            boot_archived: false,
+            boot: backup::BootStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: Vec::new(),

@@ -231,10 +231,12 @@ pub fn format_report_from(
         (ts, hn)
     };
 
-    let overall = if result.success {
-        "ALL OPERATIONS SUCCESSFUL"
-    } else {
+    let overall = if !result.success {
         "FAILURES DETECTED"
+    } else if result.boot.has_warnings() {
+        "COMPLETED WITH WARNINGS"
+    } else {
+        "ALL OPERATIONS SUCCESSFUL"
     };
 
     let elapsed_min = result.duration_secs / 60;
@@ -248,29 +250,42 @@ pub fn format_report_from(
     ));
 
     // Backup Operations
+    // A boot-step failure is the boot row's, even when its text names btrbk
+    // (an unreadable btrbk.conf): it is not a send/receive failure.
     let btrbk_status = if result
         .errors
         .iter()
+        .filter(|e| !e.starts_with(crate::backup::BOOT_ERROR_PREFIX))
         .any(|e| e.contains("btrbk") || crate::backup::is_btrbk_step_failure(e))
     {
         "FAIL"
     } else {
         "OK"
     };
-    let boot_status = if result.boot_archived { "OK" } else { "N/A" };
     let index_status = if result.indexed { "OK" } else { "N/A" };
 
     r.push_str(&format!("BACKUP OPERATIONS\n{thin}\n"));
     r.push_str(&format!(
         "  btrbk send/receive    {btrbk_status}  ({elapsed_min}m {elapsed_sec}s)\n"
     ));
-    r.push_str(&format!("  Boot subvolumes       {boot_status}\n"));
+    r.push_str(&format!("  Boot subvolumes       {}\n", result.boot.row()));
     r.push_str(&format!("  Content indexer       {index_status}\n"));
     if let Some(sync) = sync {
         let status = if sync.failed { "FAIL" } else { "OK" };
         r.push_str(&format!("  Subvolume sync        {status}\n"));
         r.push('\n');
         r.push_str(&sync.report);
+    }
+    if let crate::backup::BootStep::Ran(o) = &result.boot
+        && (!o.warnings.is_empty() || !o.failures.is_empty())
+    {
+        r.push_str(&format!("\nBOOT SUBVOLUMES\n{thin}\n"));
+        for f in &o.failures {
+            r.push_str(&format!("  FAIL  {f}\n"));
+        }
+        for w in &o.warnings {
+            r.push_str(&format!("  WARN  {w}\n"));
+        }
     }
 
     // Throughput — simple summary from result data.
@@ -563,7 +578,7 @@ mod tests {
             snapshots_sent: Some(5),
             snapshots_cleaned: 2,
             bytes_sent: 1_073_741_824,
-            boot_archived: true,
+            boot: crate::backup::BootStep::NotSelected,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -581,6 +596,80 @@ mod tests {
         assert!(!report.contains("ERRORS"));
     }
 
+    /// A boot-step outcome in a finished run's report.
+    fn boot_report(outcome: crate::backup::BootOutcome, success: bool) -> String {
+        let mut result = result_with(Some(0), Some(0), 0, &[]);
+        result.success = success;
+        result.boot = crate::backup::BootStep::Ran(outcome);
+        format_report(&result, &Config::default())
+    }
+
+    #[test]
+    fn a_boot_warning_completes_with_warnings_and_a_boot_failure_fails_the_report() {
+        let warned = boot_report(
+            crate::backup::BootOutcome {
+                warnings: vec!["[t] no snapshot".into()],
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            warned.contains("Status: COMPLETED WITH WARNINGS"),
+            "{warned}"
+        );
+        assert!(
+            warned.contains("Boot subvolumes       WARN  (0 updated, 0 skipped, 1 warnings)"),
+            "{warned}"
+        );
+        assert!(warned.contains("BOOT SUBVOLUMES"), "{warned}");
+        assert!(warned.contains("WARN  [t] no snapshot"), "{warned}");
+
+        let failed = boot_report(
+            crate::backup::BootOutcome {
+                failures: vec!["[t] could not list".into()],
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(failed.contains("Status: FAILURES DETECTED"), "{failed}");
+        assert!(
+            failed.contains("Boot subvolumes       FAIL  (0 updated, 1 failed)"),
+            "{failed}"
+        );
+        assert!(failed.contains("FAIL  [t] could not list"), "{failed}");
+
+        // The counter-case: a clean boot step flags nothing.
+        let clean = boot_report(
+            crate::backup::BootOutcome {
+                updated: 2,
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            clean.contains("Status: ALL OPERATIONS SUCCESSFUL"),
+            "{clean}"
+        );
+        assert!(!clean.contains("BOOT SUBVOLUMES"), "{clean}");
+        assert!(clean.contains("Boot subvolumes       OK  (2 updated, 0 skipped)"));
+    }
+
+    #[test]
+    fn a_boot_failure_that_names_btrbk_is_not_a_btrbk_send_receive_failure() {
+        let mut result = result_with(Some(0), Some(0), 0, &[]);
+        result.success = false;
+        result.errors = vec![format!(
+            "{}Cannot read /etc/btrbk/btrbk.conf (denied)",
+            crate::backup::BOOT_ERROR_PREFIX
+        )];
+        result.boot = crate::backup::BootStep::Ran(crate::backup::BootOutcome {
+            failures: vec!["Cannot read /etc/btrbk/btrbk.conf (denied)".into()],
+            ..Default::default()
+        });
+        let report = format_report(&result, &Config::default());
+        assert!(report.contains("btrbk send/receive    OK"), "{report}");
+    }
+
     fn result_with(
         created: Option<usize>,
         sent: Option<usize>,
@@ -594,7 +683,7 @@ mod tests {
             snapshots_sent: sent,
             snapshots_cleaned: 0,
             bytes_sent: bytes,
-            boot_archived: false,
+            boot: crate::backup::BootStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: errors.iter().map(|e| e.to_string()).collect(),
@@ -661,7 +750,7 @@ mod tests {
             snapshots_sent: Some(1),
             snapshots_cleaned: 0,
             bytes_sent: 0,
-            boot_archived: false,
+            boot: crate::backup::BootStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: vec!["Subvolume sync failed — see SUBVOLUME SYNC in the report".into()],
@@ -712,7 +801,7 @@ mod tests {
             snapshots_sent: Some(3),
             snapshots_cleaned: 0,
             bytes_sent: 500_000,
-            boot_archived: false,
+            boot: crate::backup::BootStep::NotSelected,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -800,7 +889,7 @@ mod tests {
             snapshots_sent: Some(0),
             snapshots_cleaned: 0,
             bytes_sent: 0,
-            boot_archived: false,
+            boot: crate::backup::BootStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: vec!["btrbk failed".into(), "target not mounted".into()],
