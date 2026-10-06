@@ -1287,6 +1287,20 @@ fn archive_boot_with(
                 continue;
             }
 
+            // Only a target verified above is written: one that is selected but
+            // has no mount point was not verified, and is left alone rather
+            // than trusted to fail later on a `btrfs` call (review M6).
+            if !writes.contains(&target.label) {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "[{}] Mount point does not exist — not archiving on target '{}'",
+                        target.mount, target.label
+                    ),
+                );
+                continue;
+            }
+
             let tgt_mount = &target.mount;
             let subvol_path = format!("{tgt_mount}/{subvol}");
             let staging = format!("{subvol_path}.new");
@@ -4908,6 +4922,38 @@ mod tests {
                 labels(&["primary-22tb", "recovery-mirror", "absent"]),
                 labels(&["primary-22tb"])
             )]
+        );
+    }
+
+    /// Review M6: the loop walks the targets that were verified, not every
+    /// selected one. A selected target whose mount point does not exist was
+    /// never verified, so btrfs must not be asked anything about it.
+    #[test]
+    fn boot_archive_walks_only_the_verified_targets_not_every_selected_one() {
+        let primary = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(primary.path());
+        config.targets.push(another_target(
+            &config,
+            "absent",
+            Path::new("/nonexistent/das/absent"),
+            TargetRole::Primary,
+        ));
+        let runner = Scripted::from_owned(vec![]);
+        let progress = TestProgress::new();
+        archive_boot_with(&config, None, &progress, &env(&runner)).unwrap();
+        let calls = runner.calls();
+        let on = |mount: &str| calls.iter().filter(|c| c.contains(mount)).count();
+        assert!(
+            on(&primary.path().to_string_lossy()) > 0,
+            "the verified target is the one walked: {calls:?}"
+        );
+        assert_eq!(on("/nonexistent/das/absent"), 0, "{calls:?}");
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(level, msg)| *level == LogLevel::Warning
+                && msg.contains("/nonexistent/das/absent")
+                && msg.contains("not archiving")),
+            "{logs:?}"
         );
     }
 
