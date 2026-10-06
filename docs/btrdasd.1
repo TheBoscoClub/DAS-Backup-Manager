@@ -670,6 +670,11 @@ Like the other manual
 .B backup
 commands below, it declines (exit 0) while another backup holds the singleton
 lock, and waits for a running scrub.
+Like
+.BR "backup run" ,
+it first syncs
+.I btrbk.conf
+with the subvolumes on the mounted sources, and stops if the sync fails.
 .PP
 .B btrdasd backup snapshot
 .RB [ \-\-config
@@ -690,6 +695,15 @@ Default: all.
 Send existing snapshots to targets
 .RB ( "btrbk resume" ,
 which also applies the retention policy).
+Like
+.BR "backup run" ,
+it first syncs
+.I btrbk.conf
+with the subvolumes on the mounted sources, and stops if the sync fails:
+a send of every source and target passes btrbk no filter, so it would
+otherwise trust a
+.I btrbk.conf
+that may be out of date.
 .PP
 .B btrdasd backup send
 .RB [ \-\-config

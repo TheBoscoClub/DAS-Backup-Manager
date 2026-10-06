@@ -2172,12 +2172,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                let count = buttered_dasd::backup::create_snapshots(
-                    &cfg,
-                    flag_selection(sources).as_deref(),
-                    &progress,
-                )?;
+                // As `backup run` does, with the sources mounted: btrbk.conf is
+                // brought into line first (a failed sync stops the step).
+                let counted = backup::sync_for_manual_step(&config, &cfg, &progress)
+                    .map_err(Box::<dyn std::error::Error>::from)
+                    .and_then(|cfg| {
+                        buttered_dasd::backup::create_snapshots(
+                            &cfg,
+                            flag_selection(sources).as_deref(),
+                            &progress,
+                        )
+                    });
                 let sources_still_mounted = source_guard.unmount(&progress);
+                let count = counted?;
                 println!("Created {count} snapshots");
                 mount::require_released(&sources_still_mounted)?;
             }
@@ -2194,6 +2201,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
+                // As `backup run` does, with the sources mounted and before the
+                // targets are: btrbk.conf is brought into line first, because
+                // a send of everything passes btrbk no filter. A failed sync
+                // stops the step, with the sources given back.
+                let cfg = match backup::sync_for_manual_step(&config, &cfg, &progress) {
+                    Ok(cfg) => cfg,
+                    Err(why) => {
+                        let still = source_guard.unmount(&progress);
+                        mount::require_released(&still)?;
+                        return Err(why.into());
+                    }
+                };
                 let mut guard =
                     mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
                 let result =
