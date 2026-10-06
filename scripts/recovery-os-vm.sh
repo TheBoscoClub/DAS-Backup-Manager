@@ -72,27 +72,41 @@
 #          the guard cannot mask is refused on "will" or "may".
 #          das-vm-guard-report.service checks all of it and writes a line to
 #          the virtio port org.dasbackup.guard -- at the start of every boot
-#          and every minute after -- which lands in a root-only file here.
-#          Every line is judged: each boot must begin engaged, none may be
-#          NOT engaged, and no silence longer than GUARD_SECS (a boot that
-#          came without the guard says nothing). A failure on a "will" or
-#          "may" record asks the recovery OS to shut down (exit 6); on "no"
-#          it is a warning. The domain is started paused and resumed only if
-#          its live definition carries the guard; otherwise it is destroyed
-#          before it ran an instruction, and nothing boots. Lifted inside the
-#          guest for the update (systemctl stop das-vm-guard: pacman cannot
-#          replace a file something is mounted on), engaged again after.
-#          Afterwards the domain is defined from the template again; the
-#          template itself carries none of it. status and session-end judge
-#          the report too, before session-end removes anything.
+#          and every minute after, each with the boot's id and a sequence
+#          number -- which lands in a root-only file here (followed across
+#          virtlogd's rotation). Every line is judged: each boot must begin
+#          engaged and none may be NOT engaged. The guard's enforcement does
+#          not depend on its reporter, so silence after a boot confirmed is
+#          a warning, repeated, never a stop -- the reporter died or the OS
+#          hung, which this script cannot tell apart -- except after a reset:
+#          libvirt's reboot event is watched, and after one the next boot
+#          must report engaged within GUARD_SECS, as the first boot must
+#          from the start. A failure on a "will" or "may" record asks the
+#          recovery OS to shut down (exit 6); on "no" it is a warning. Not
+#          seen: a new boot without a reset that says nothing (kexec) -- it
+#          is only silence, a warning. A host suspend, or a paused domain,
+#          is not silence. The domain is started paused, afresh (never from
+#          a managed-save image: one refuses the session), and resumed only
+#          if its live definition carries the guard; otherwise it is
+#          destroyed before it ran an instruction, and nothing boots.
+#          Lifted inside the guest for the update (systemctl stop
+#          das-vm-guard: pacman cannot replace a file something is mounted
+#          on), engaged again after. Afterwards the domain is defined from
+#          the template again; the template itself carries none of it.
+#          status and session-end judge the report too, before session-end
+#          removes anything -- status counts silence too, since it cannot
+#          see resets.
 #   - This script never destroys a running recovery OS -- it could be in the
 #     middle of an update. Every stop is an ACPI request (virsh shutdown),
 #     sent again until it is off, and bounded (exit 3 at the bound). The one
 #     exception, approved by the operator on 2026-10-05 (bd
 #     DAS-Backup-Manager-0zm): `virsh destroy` of a domain started --paused
 #     and never resumed, whose guest has not executed a single instruction --
-#     no firmware, no OS, no write to the disk. destroy_never_resumed is the
-#     only call, and it refuses once `virsh resume` has been tried. An
+#     no firmware, no OS, no write to the disk (started with --force-boot,
+#     so never a restored image). destroy_never_resumed is the only call: it
+#     refuses once `virsh resume` has been tried, and unless the domain
+#     reads paused immediately before. A stop that does not land within the
+#     bound is left to the operator, with the facts and the trade-off. An
 #     interrupt or an expired --timeout leaves the VM, the claim and the lock
 #     as they are and says how to finish -- and what the guard was, or that
 #     it was not judged.
@@ -112,8 +126,11 @@
 #
 # Exit status:
 #   0  done
-#   1  refused, failed or interrupted before the VM ran -- nothing is held
-#      (a started domain without the guard is destroyed while still paused)
+#   1  refused, failed or interrupted -- nothing is held (a started domain
+#      without the guard is destroyed while still paused: nothing ran, a
+#      retry is safe, and a repeat means a cause to fix; a session
+#      interrupted as its recovery OS powered off gives everything back and
+#      says what the guard was -- 5 if it did not confirm on a "no" record)
 #   2  usage
 #   3  the recovery OS is still running (an interrupt, --timeout without a
 #      shutdown, or a shutdown asked for the guard and not done within
@@ -127,15 +144,17 @@
 #      again or not), the drive re-enumerated during the session, a
 #      partition was mounted afterwards, the device scan failed, the
 #      boot-record check was overridden (a dry run with the override too),
-#      the session guard did not confirm on a "no" record, or it could not
-#      be taken out of the domain's definition again
+#      the session guard did not confirm on a "no" record, its reporter went
+#      silent or lost lines, the reset watch stopped, or it could not be
+#      taken out of the domain's definition again
 #   6  the session guard did not confirm on a "will" or "may" record: the
 #      recovery OS was asked to shut down (ACPI, again until it went; never
 #      destroyed) and powered off, or powered off by itself without
 #      confirming -- a session interrupted as it did, too -- and the disk was
 #      given back. status and session-end exit 6 (5 on a "no" record) when
 #      the guard's report says NOT engaged, is missing for a recovery OS that
-#      ran, or cannot be read
+#      ran, cannot be read, or -- status, for one not shut off -- has been
+#      silent for GUARD_SECS
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
@@ -157,7 +176,7 @@
 #                               never count as a session of the real drive.
 #   DAS_RECOVERY_VM_POLL_SECS (5), DAS_RECOVERY_VM_MINUTE_SECS (60),
 #   DAS_RECOVERY_VM_GRACE_SECS (600), DAS_RECOVERY_VM_GUARD_SECS (900),
-#   DAS_RECOVERY_VM_RESEND_SECS (20)
+#   DAS_RECOVERY_VM_RESEND_SECS (20), DAS_RECOVERY_VM_CLOCK_GAP_SECS (120)
 #                               faster clocks
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
 
@@ -200,6 +219,11 @@ readonly GUARD_SECS="${DAS_RECOVERY_VM_GUARD_SECS:-900}"
 # off: one sent while it is in its firmware, boot menu or initramfs is
 # dropped (QEMU drops a power-button press the guest has not enabled).
 readonly RESEND_SECS="${DAS_RECOVERY_VM_RESEND_SECS:-20}"
+# Two looks this far apart mean this script did not run in between -- a host
+# suspend (the recovery OS did not run either), or this script stopped: the
+# guard's clock does not count that time. A look takes at most about 45 s
+# (a holder claimed again), so this is well above any look's own length.
+readonly CLOCK_GAP_SECS="${DAS_RECOVERY_VM_CLOCK_GAP_SECS:-120}"
 
 # Installed side by side by CMake: ${prefix}/lib/das-backup/{this script,libvirt/}.
 readonly DOMAIN_XML="$SCRIPT_DIR/libvirt/$DOMAIN.xml"
@@ -279,8 +303,15 @@ readonly GUARD_HEARTBEAT_SECS=60
 # Unit names, ASCII spelled out: a range ([A-Z]) follows the locale's
 # collation, and systemd refuses ":" in a credential's name.
 readonly UNIT_NAME_RE='^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.@-]*\.(service|timer|socket|path)$'
-# One line of the guard's report: what, then " boot " and the boot's id.
-readonly REPORT_LINE_RE='^(.*) boot ([0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12})$'
+# One line of the guard's report: what, then " seq " and its number in this
+# boot (from 1), then " boot " and the boot's id.
+readonly REPORT_LINE_RE='^(.*) seq ([123456789][0123456789]{0,8}) boot ([0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12})$'
+# What libvirt's event stream says when the domain is reset -- a reboot
+# inside it, or virsh reset (virsh-domain-event.c, the generic print).
+readonly RESET_EVENT="event 'reboot' for domain '$DOMAIN'"
+# How many rotated files of the report virtlogd keeps (.0 the newest) are
+# looked for at most; its max_backups is 3 by default.
+readonly REPORT_BACKUPS_MAX=10
 # A reason that begins with what runs: "unit ..." or "timer starts unit, which ...".
 readonly REASON_UNITS_RE='^([^ ]+)( starts ([^ ]+), which )?'
 
@@ -332,7 +363,16 @@ REC_RUNNERS=()      # the name each runner it found would be masked by
 MASKS=()            # the units the session guard masks
 GUARD_ENTRIES=()    # the SMBIOS strings that carry the guard
 GUARD_EXPECT=""     # the one line a recovery OS whose guard holds reports
+GUARD_EXPECT_C=""   # ...in short: the mask list as its digest
+GUARD_EXPECT_LIFTED_C=""
 GUARD_FILE=""       # where that report lands: the port's file on this host
+RESET_FILE=""       # the resets the reset watch saw, with where the report stood
+RESET_WATCH_PID=""  # the reset watch: a reader of libvirt's event stream
+RESET_LINES_READ=0  # lines of RESET_FILE already taken
+RESET_WATCH_DOWN="" # why the reset watch is not running, once it stopped
+RESETS=0            # resets of the VM seen this session
+DESTROYED=false     # destroy_never_resumed destroyed the domain
+DESTROY_STATE=""    # what destroy_never_resumed read the domain's state as
 GUARD_XML_FILE=""   # the domain definition with the guard, as defined
 GUARDED=false       # the guard MAY be in the domain's definition (set before defining)
 GUARD_CONFIRMED=false
@@ -343,10 +383,27 @@ GUARD_LEFT=""       # why the guard could not be taken out of the definition
 GUARD_EXPECT_LIFTED="" # the line of a recovery OS whose guard is lifted for the update
 GUARD_STATE_FILE="" # the session's guard state, for status and session-end
 UNMASKABLE=()       # what the record names that the guard cannot mask
-GUARD_LINES_SEEN=0  # report lines judged so far
-GUARD_BOOTS_SEEN=0
-GUARD_LIFTS_SEEN=0
-GUARD_LAST_AT=0     # when the last of them arrived (SECONDS)
+# The guard's clock: seconds the recovery OS could run, counted from its
+# resume -- not while it is paused, not across a gap between two looks.
+GCLOCK=0
+G_TICK_AT=0         # SECONDS at the last look
+G_LAST_LINE=0       # GCLOCK when the last report line arrived
+G_GAPS=0            # gaps between two looks (a host suspend, or this script stopped)
+# What must still prove itself: "start" (the first boot) or "reset" (the boot
+# after one), from a boot whose first line comes at or after PROOF_POS in
+# the report, before GCLOCK reaches PROOF_DEADLINE. Empty: nothing.
+PROOF_WHY=""
+PROOF_POS=0
+PROOF_DEADLINE=0
+SILENT=false        # silent past GUARD_SECS now, with no reset since (a warning)
+SILENT_NEXT=0       # GCLOCK at which that is said again
+SILENCES=0          # how many times it went silent
+SILENCE_LONGEST=0
+G_WATCH_DOWN_AT=0   # GCLOCK when the reset watch was found stopped
+G_LIFTS_SAID=0      # lifts already said
+REPORT_LOSSES=()    # what of the report was lost (cut, or gone before it was read)
+SHUTDOWN_ASKED=0    # how often the recovery OS was asked to shut down
+SHUTDOWN_SECS=0     # ...over how long
 RESUME_ATTEMPTED=false # `virsh resume` was tried: never destroy from here on
 ATTACHED=false      # the disk MAY be in the domain's definition (set before attaching)
 STARTED=false       # `virsh start` was attempted, so the guest may have written
@@ -413,8 +470,8 @@ session-end); 5 done and given back, but see the summary's warnings (a dry
 run that needed --accept-boot-record-risk exits 5 too); 6 the session guard
 did not confirm on a "will" or "may" record, so the recovery OS was shut down
 (never destroyed) and the disk given back. status and session-end exit 6 (5
-on a "no" record) when the guard's report says it is not engaged, or cannot
-be judged.
+on a "no" record) when the guard's report says it is not engaged, cannot be
+judged, or -- for a recovery OS not shut off -- has been silent too long.
 EOF
 }
 
@@ -671,6 +728,7 @@ resolve_label() {
     GUARD_FILE="$STATE_DIR/$LABEL.guard"
     GUARD_XML_FILE="$STATE_DIR/$LABEL.domain.xml"
     GUARD_STATE_FILE="$STATE_DIR/$LABEL.guard.state"
+    RESET_FILE="$STATE_DIR/$LABEL.resets"
 }
 
 # The allow-list is config's, never a list in this script: the serial must
@@ -808,12 +866,35 @@ check_not_mounted() {
     fi
 }
 
+# A managed-save image is the memory of a recovery OS that was RUNNING when
+# it was saved (virsh managedsave, virt-manager's Save, libvirt-guests at a
+# host shutdown); the domain then reads "shut off", and a start resumes that
+# OS where it stopped instead of booting it -- and a domain started paused
+# would then not be one that never ran. Refused, with what it is; this
+# script never discards it: that is the operator's decision. So is a domain
+# whose image cannot be told (dominfo says "unknown", or nothing).
+check_no_managed_save() {
+    local out line saved=""
+    out="$(virsh_ dominfo "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's information (whether it has a managed-save image): $out"
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Managed\ save:[[:space:]]+([^[:space:]].*)$ ]]; then
+            saved=${BASH_REMATCH[1]}
+        fi
+    done <<<"$out"
+    case "$saved" in
+        no) return 0 ;;
+        yes) refuse "$DOMAIN has a managed-save image: the saved memory of a recovery OS that was RUNNING when it was saved (virsh managedsave, virt-manager's Save, or libvirt-guests at a host shutdown). A start would resume that OS where it stopped -- its disk included, against a partition 2 this host may have written since -- instead of booting it afresh. This script never discards it: the decision is yours. To throw that state away (whatever that OS had not written to its disk is lost): virsh --connect $LIBVIRT_URI managedsave-remove $DOMAIN -- then run the session again" ;;
+        *) refuse "cannot tell whether $DOMAIN has a managed-save image (virsh dominfo says '$(printable "${saved:-nothing of it}")') -- a session never starts a domain that may resume a saved OS" ;;
+    esac
+}
+
 check_domain_idle() {
     local state xml sources
     state="$(virsh_ domstate "$DOMAIN" 2>&1)" || refuse "cannot read the state of $DOMAIN: $state -- is it defined? $SELF define"
     if [[ "$state" != "shut off" ]]; then
         refuse "$DOMAIN is $state -- it must be shut off"
     fi
+    check_no_managed_save
     xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $xml"
     sources="$(disk_sources "$xml")"
     if [[ -n "$sources" ]]; then
@@ -1171,7 +1252,7 @@ guard_candidate() {
 # but not undo a condition applied after it). Then the strings that carry it
 # all, and the lines its report must be.
 build_guard() {
-    local u r w extra=() sorted=() over=() unit_b64 report_b64 dropin_b64 stub_b64 never_b64
+    local u r w extra=() sorted=() over=() unit_b64 report_b64 dropin_b64 stub_b64 never_b64 list digest
     MASKS=("${GUARD_DEFAULT_MASKS[@]}")
     UNMASKABLE=()
     for u in "${REC_UNITS[@]}"; do
@@ -1201,8 +1282,17 @@ build_guard() {
         fi
     fi
     MASKS=("${GUARD_DEFAULT_MASKS[@]}" "${sorted[@]}")
-    GUARD_EXPECT="das-vm-guard engaged ${#MASKS[@]} masks $(IFS=,; printf '%s' "${MASKS[*]}")"
-    GUARD_EXPECT_LIFTED="das-vm-guard lifted ${#MASKS[@]} masks $(IFS=,; printf '%s' "${MASKS[*]}")"
+    list="$(IFS=,; printf '%s' "${MASKS[*]}")"
+    # A heartbeat names the masks by a digest of their list: the first 16
+    # hex digits of its SHA-256. Computed here and given to the reporter, so
+    # the recovery OS needs no tool for it.
+    digest="$(printf '%s' "$list" | sha256sum)" || refuse "cannot compute the digest of the session guard's masks"
+    digest=${digest:0:16}
+    [[ "$digest" =~ ^[0123456789abcdef]{16}$ ]] || refuse "cannot compute the digest of the session guard's masks"
+    GUARD_EXPECT="das-vm-guard engaged ${#MASKS[@]} masks $list"
+    GUARD_EXPECT_LIFTED="das-vm-guard lifted ${#MASKS[@]} masks $list"
+    GUARD_EXPECT_C="das-vm-guard engaged ${#MASKS[@]} masks sha256:$digest"
+    GUARD_EXPECT_LIFTED_C="das-vm-guard lifted ${#MASKS[@]} masks sha256:$digest"
     unit_b64="$(guard_unit_text | base64 -w0)" || refuse "cannot encode the session guard's unit"
     report_b64="$(guard_report_text | base64 -w0)" || refuse "cannot encode the session guard's report unit"
     dropin_b64="$(printf '[Unit]\nWants=%s %s\n' "$GUARD_UNIT" "$GUARD_REPORT_UNIT" | base64 -w0)" ||
@@ -1226,12 +1316,14 @@ build_guard() {
 # What the recovery OS reads at its console and above every login prompt
 # while the guard holds (agetty >= 2.41 reads /run/issue.d always): the
 # guide's order, condensed. No $, %, quotes or backslashes: it goes through
-# systemd's command-line parsing and sh.
+# systemd's command-line parsing and sh. A guard that failed halfway has no
+# stop to run, so step 1 names each place it binds, exactly (an umount of
+# one not mounted only says so).
 guard_message_lines() {
     printf '%s\n' \
         "das-vm-guard: btrbk cannot run in this VM session (DAS recovery OS updater)." \
         "  To update, follow the first update in the disaster recovery guide. In short:" \
-        "  1. lift it:    systemctl stop das-vm-guard   (if it failed: findmnt -rn -o TARGET | grep /btrbk | xargs -r -n1 umount)" \
+        "  1. lift it:    systemctl stop das-vm-guard   (if it failed: umount ${GUARD_BTRBK_PATHS[*]})" \
         "  2. keyrings:   pacman -Sy archlinux-keyring cachyos-keyring" \
         "  3. drivers:    pin both worlds into the initramfs first (the guide, step 2)" \
         "  4. upgrade:    pacman -Su" \
@@ -1294,42 +1386,62 @@ EOF
 }
 
 # The report: at the start of every boot and then every minute for as long as
-# the VM runs, one line through the virtio port with this boot's id -- the
-# host notices silence, so a boot that comes without the guard is noticed too.
-# The first line of a boot needs the guard active ("engaged"); later, an
-# inactive one was stopped for the update ("lifted"), its masks still checked.
-# A unit masked is one that cannot be started: masked outright, or this
-# guard's empty unit (which systemd 262 loads as "bad-setting": the generator
-# writes an empty credential as one newline) or that unit made whole by a
-# drop-in of the OS's own ("loaded") -- in both cases only with the guard's
-# never-true condition as the LAST drop-in. A state systemd cannot be asked
-# about (a re-exec during an upgrade) or a unit between states sends nothing
-# and looks again in 5 s. Waits for the port at most two minutes; ordered
-# before nothing.
+# the VM runs, one line through the virtio port with this boot's id and the
+# line's number in this boot (from 1) -- the host notices a boot that came
+# without the guard by its silence after a reset. A boot's first line needs
+# the guard active ("engaged"); once one was sent, an inactive guard was
+# stopped for the update ("lifted"), its masks still checked. That "once"
+# lives in /run (with the boot's id and the count), so a reporter restarted
+# while the guard is lifted (Restart=, a few times an hour) goes on with
+# "lifted", never a first-line NOT engaged. A unit masked is one that cannot
+# be started: masked outright, or this guard's empty unit (which systemd 262
+# loads as "bad-setting": the generator writes an empty credential as one
+# newline) or that unit made whole by a drop-in of the OS's own ("loaded")
+# -- in both cases only with the guard's never-true condition as the LAST
+# drop-in. What cannot be checked this round -- systemd not answering (a
+# re-exec during an upgrade), a unit between states, findmnt or readlink
+# failing -- sends nothing and looks again in 5 s: never "not covered". A
+# line names its masks in full when the reporter starts or its state
+# changes, by their digest otherwise. Waits for the port at most two
+# minutes; ordered before nothing.
 guard_report_text() {
-    local script
-    script="port=/dev/virtio-ports/$GUARD_PORT; boot=\$\$(cat /proc/sys/kernel/random/boot_id); n=0; "
+    local script n=${#MASKS[@]} list digest
+    list="$(IFS=,; printf '%s' "${MASKS[*]}")"
+    digest=${GUARD_EXPECT_C##*sha256:}
+    script="port=/dev/virtio-ports/$GUARD_PORT; st=/run/das-vm-guard/report.state; "
+    script+="boot=\$\$(cat /proc/sys/kernel/random/boot_id) || exit 1; n=0; "
     script+="while [ ! -e \"\$\$port\" ] && [ \"\$\$n\" -lt 120 ]; do sleep 1; n=\$\$((n + 1)); done; "
     script+="if [ ! -e \"\$\$port\" ]; then echo \"das-vm-guard: no port to the host\"; exit 0; fi; "
-    script+="first=1; while :; do bad=; mode=; "
-    script+="st=\$\$(systemctl show -P ActiveState $GUARD_UNIT) || { sleep 5; continue; }; "
-    script+="case \"\$\$st\" in active) mode=engaged ;; inactive) if [ \"\$\$first\" = 1 ]; then bad=\"\$\$bad $GUARD_UNIT is inactive;\"; else mode=lifted; fi ;; activating|deactivating|reloading|refreshing) sleep 5; continue ;; *) bad=\"\$\$bad $GUARD_UNIT is \$\$st;\" ;; esac; "
+    script+="mkdir -p /run/das-vm-guard; seq=0; eng=0; last=; "
+    script+="if { read -r b s e < \"\$\$st\"; } 2>/dev/null && [ \"\$\$b\" = \"\$\$boot\" ]; then case \"\$\$s\" in *[!0-9]*) ;; [0-9]*) seq=\$\$s ;; esac; if [ \"\$\$e\" = 1 ]; then eng=1; fi; fi; "
+    script+="while :; do bad=; mode=; "
+    script+="a=\$\$(systemctl show -P ActiveState $GUARD_UNIT) || { sleep 5; continue; }; "
+    script+="case \"\$\$a\" in active) mode=engaged ;; inactive) if [ \"\$\$eng\" = 1 ]; then mode=lifted; else bad=\"\$\$bad $GUARD_UNIT is inactive;\"; fi ;; activating|deactivating|reloading|refreshing) sleep 5; continue ;; *) bad=\"\$\$bad $GUARD_UNIT is \$\$a;\" ;; esac; "
     script+="ok=1; for u in ${MASKS[*]}; do s=\$\$(systemctl show -P LoadState \"\$\$u\") || { ok=0; break; }; "
-    script+="case \"\$\$s\" in masked) ;; bad-setting|loaded) f=\$\$(systemctl show -P FragmentPath \"\$\$u\") || { ok=0; break; }; d=\$\$(systemctl show -P DropInPaths \"\$\$u\") || { ok=0; break; }; last=; for x in \$\$d; do last=\$\$x; done; "
-    script+="if [ \"\$\$f\" != \"$GUARD_EARLY/\$\$u\" ] || [ \"\$\$last\" != \"$GUARD_EARLY/\$\$u.d/$GUARD_MASK_DROPIN.conf\" ]; then bad=\"\$\$bad \$\$u is not masked (\$\$s);\"; fi ;; "
+    script+="case \"\$\$s\" in masked) ;; bad-setting|loaded) f=\$\$(systemctl show -P FragmentPath \"\$\$u\") || { ok=0; break; }; d=\$\$(systemctl show -P DropInPaths \"\$\$u\") || { ok=0; break; }; z=; for x in \$\$d; do z=\$\$x; done; "
+    script+="if [ \"\$\$f\" != \"$GUARD_EARLY/\$\$u\" ] || [ \"\$\$z\" != \"$GUARD_EARLY/\$\$u.d/$GUARD_MASK_DROPIN.conf\" ]; then bad=\"\$\$bad \$\$u is not masked (\$\$s);\"; fi ;; "
     script+="*) bad=\"\$\$bad \$\$u is not masked (\$\$s);\" ;; esac; done; "
+    script+="if [ \"\$\$ok\" = 1 ] && [ \"\$\$mode\" = engaged ]; then m=\$\$(findmnt -rn -o TARGET) || ok=0; set -f; "
+    script+="for p in ${GUARD_BTRBK_PATHS[*]}; do if [ \"\$\$ok\" = 1 ] && [ -e \"\$\$p\" ]; then t=\$\$(readlink -f \"\$\$p\") || { ok=0; break; }; c=; for x in \$\$m; do if [ \"\$\$x\" = \"\$\$t\" ]; then c=1; fi; done; "
+    script+="if ! [ \"\$\$p\" -ef $GUARD_STUB ] || [ -z \"\$\$c\" ]; then bad=\"\$\$bad \$\$p is not covered;\"; fi; fi; done; set +f; fi; "
     script+="if [ \"\$\$ok\" = 0 ]; then sleep 5; continue; fi; "
-    script+="if [ \"\$\$mode\" = engaged ]; then for p in ${GUARD_BTRBK_PATHS[*]}; do if [ -e \"\$\$p\" ] && { ! [ \"\$\$p\" -ef $GUARD_STUB ] || ! findmnt -rn --mountpoint \"\$\$(readlink -f \"\$\$p\")\" >/dev/null; }; then bad=\"\$\$bad \$\$p is not covered;\"; fi; done; fi; "
-    script+="if [ -z \"\$\$bad\" ]; then line=\"das-vm-guard \$\$mode ${#MASKS[@]} masks $(IFS=,; printf '%s' "${MASKS[*]}") boot \$\$boot\"; else line=\"das-vm-guard NOT engaged:\$\$bad boot \$\$boot\"; fi; "
-    script+="echo \"\$\$line\"; echo \"\$\$line\" >> \"\$\$port\"; first=0; sleep $GUARD_HEARTBEAT_SECS; done"
+    script+="if [ -n \"\$\$bad\" ]; then body=\"das-vm-guard NOT engaged:\$\$bad\"; elif [ \"\$\$mode\" = \"\$\$last\" ]; then body=\"das-vm-guard \$\$mode $n masks sha256:$digest\"; else body=\"das-vm-guard \$\$mode $n masks $list\"; fi; "
+    script+="line=\"\$\$body seq \$\$((seq + 1)) boot \$\$boot\"; echo \"\$\$line\"; "
+    script+="if echo \"\$\$line\" >> \"\$\$port\"; then seq=\$\$((seq + 1)); last=; if [ -z \"\$\$bad\" ]; then last=\$\$mode; if [ \"\$\$mode\" = engaged ]; then eng=1; fi; fi; "
+    script+="echo \"\$\$boot \$\$seq \$\$eng\" > \"\$\$st.new\" && mv -f \"\$\$st.new\" \"\$\$st\"; fi; "
+    script+="sleep $GUARD_HEARTBEAT_SECS; done"
     cat <<EOF
 [Unit]
 Description=DAS VM session guard: report to the host
 ConditionPathExists=!/etc/initrd-release
 After=$GUARD_UNIT
+StartLimitIntervalSec=1h
+StartLimitBurst=4
 
 [Service]
 Type=simple
+Restart=on-failure
+RestartSec=5
 TimeoutStopSec=5
 ExecStart=/usr/bin/sh -c '$script'
 EOF
@@ -1395,22 +1507,26 @@ write_guard_state() {
     fi
 }
 
-# Read a guard state file ($1) into GS_VERDICT, GS_ENGAGED, GS_LIFTED,
-# GS_STARTED, GS_RESUMED. 1 when it is missing, unreadable, or incomplete.
+# Read a guard state file ($1) into GS_VERDICT, GS_ENGAGED, GS_LIFTED (and
+# their short forms GS_ENGAGED_C, GS_LIFTED_C), GS_STARTED, GS_RESUMED. 1
+# when it is missing, unreadable, or incomplete.
 read_guard_state() {
     local k v
-    GS_VERDICT="" GS_ENGAGED="" GS_LIFTED="" GS_STARTED="" GS_RESUMED=""
+    GS_VERDICT="" GS_ENGAGED="" GS_LIFTED="" GS_ENGAGED_C="" GS_LIFTED_C="" GS_STARTED="" GS_RESUMED=""
     [[ -f "$1" && ! -L "$1" ]] || return 1
     while IFS='=' read -r k v; do
         case "$k" in
             verdict) GS_VERDICT=$v ;;
             engaged) GS_ENGAGED=$v ;;
             lifted) GS_LIFTED=$v ;;
+            engaged_short) GS_ENGAGED_C=$v ;;
+            lifted_short) GS_LIFTED_C=$v ;;
             started) GS_STARTED=$v ;;
             resumed) GS_RESUMED=$v ;;
         esac
     done 2>/dev/null <"$1" || return 1
-    [[ "$GS_VERDICT" =~ ^(will|may|no)$ && "$GS_ENGAGED" == "das-vm-guard engaged "* && "$GS_LIFTED" == "das-vm-guard lifted "* ]]
+    [[ "$GS_VERDICT" =~ ^(will|may|no)$ && "$GS_ENGAGED" == "das-vm-guard engaged "* && "$GS_LIFTED" == "das-vm-guard lifted "* &&
+        "$GS_ENGAGED_C" == "das-vm-guard engaged "* && "$GS_LIFTED_C" == "das-vm-guard lifted "* ]]
 }
 
 # Define the domain with the guard, and prove the definition carries it.
@@ -1418,15 +1534,16 @@ read_guard_state() {
 define_guard() {
     local out xml missing
     check_path_chars "$GUARD_FILE"
-    rm -f -- "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE"
-    if [[ -e "$GUARD_FILE" || -e "$GUARD_STATE_FILE" ]]; then
-        refuse "cannot remove an old $GUARD_FILE or its state: a stale report could pass for this session's -- nothing was booted"
+    rm -f -- "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
+    if [[ -e "$GUARD_FILE" || -e "$GUARD_FILE.0" || -e "$GUARD_STATE_FILE" || -e "$RESET_FILE" ]]; then
+        refuse "cannot remove an old $GUARD_FILE, its state or its resets: a stale report could pass for this session's -- nothing was booted"
     fi
     if ! (umask 077 && guarded_domain_xml >"$GUARD_XML_FILE"); then
         rm -f -- "$GUARD_XML_FILE"
         refuse "cannot add the session guard to $DOMAIN_XML (each of '  </os>' and '  </devices>' once, and no SMBIOS strings or $GUARD_PORT port of its own, are needed) -- nothing was booted"
     fi
-    write_guard_state "verdict=$VERDICT" "engaged=$GUARD_EXPECT" "lifted=$GUARD_EXPECT_LIFTED"
+    write_guard_state "verdict=$VERDICT" "engaged=$GUARD_EXPECT" "lifted=$GUARD_EXPECT_LIFTED" \
+        "engaged_short=$GUARD_EXPECT_C" "lifted_short=$GUARD_EXPECT_LIFTED_C"
     # Set first: if the define half-happens, the cleanup must look.
     GUARDED=true
     if ! out="$(virsh_ define --validate "$GUARD_XML_FILE" 2>&1)"; then
@@ -1453,7 +1570,7 @@ remove_guard() {
         GUARD_LEFT="$DOMAIN's definition still carries it after defining $DOMAIN_XML"
     else
         GUARDED=false
-        rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE"
+        rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
         log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_XML again)"
         return 0
     fi
@@ -1461,50 +1578,215 @@ remove_guard() {
     return 1
 }
 
-# Judge every line of a guard report ($1) against the engaged ($2) and
-# lifted ($3) lines. A line is "<what> boot <id>"; each boot's first line must
-# be the engaged one; later lines of a boot, the engaged or the lifted one;
-# a NOT engaged line, or any other, fails. Sets J_RESULT (none: no complete
-# line; ok; failed, with J_WHY), J_LINES, J_BOOTS, J_LIFTS, and J_PARTIAL (an
-# unfinished last line, cleaned for showing).
-judge_report() {
-    local file=$1 engaged=$2 lifted=$3 line="" body boot seen=" "
-    J_RESULT=none J_WHY="" J_LINES=0 J_BOOTS=0 J_LIFTS=0 J_PARTIAL=""
-    if [[ ! -e "$file" && ! -L "$file" ]]; then
-        return 0
+# The reader's place in a report (report_read): R_INO the file being read,
+# R_OFF how much of it was read, R_STREAM how much of the whole report,
+# R_BASES[inode] where each file read begins in it, R_PART an unfinished
+# last line, R_POLL_START where this round's reading began.
+R_INO="" R_OFF=0 R_STREAM=0 R_PART="" R_POLL_START=0
+declare -A R_BASES=()
+
+report_reader_start() {
+    R_INO="" R_OFF=0 R_STREAM=0 R_PART="" R_POLL_START=0
+    R_BASES=()
+}
+
+# Whether a report's path ($1) is one that cannot be read: a symlink, not a
+# regular file, or a file that will not open. Absent is not that.
+report_unreadable() {
+    [[ -L "$1" ]] || { [[ -e "$1" ]] && { [[ ! -f "$1" ]] || ! head -c 0 -- "$1" 2>/dev/null; }; }
+}
+
+# Read what is new in the report $1: each complete line into NEW_LINES, and
+# where it begins in the whole report into NEW_POS. The report is followed
+# across virtlogd's rotation -- once the file reaches max_size, virtlogd
+# renames it to .0 (.0 to .1, and so on: virrotatingfile.c) and starts a new
+# one, cutting a line in two when none ends near the limit -- by inode: what
+# is left of the file being read is read where it is now, then each newer
+# file. Rotation loses nothing. A file cut in place (not virtlogd's way) is
+# read again from its start. What cannot be read -- the file being read gone,
+# or cut -- is said in R_LOST. A file renamed while it is read is read at the
+# next look.
+report_read() {
+    local base=$1 k i f st data off cut start=-1 files=() inos=() sizes=() parts=() pos
+    NEW_LINES=() NEW_POS=() R_LOST=""
+    R_POLL_START=$R_STREAM
+    for ((k = 0; k < REPORT_BACKUPS_MAX; k++)); do
+        [[ -e "$base.$k" ]] || break
+    done
+    # Oldest first: .N ... .0, then the file itself.
+    for ((i = k - 1; i >= 0; i--)); do
+        files+=("$base.$i")
+    done
+    files+=("$base")
+    for f in "${files[@]}"; do
+        st="$(stat -c '%i %s' -- "$f" 2>/dev/null)" || st=" "
+        inos+=("${st% *}")
+        sizes+=("${st#* }")
+    done
+    if [[ -n "$R_INO" ]]; then
+        for i in "${!inos[@]}"; do
+            [[ "${inos[$i]}" != "$R_INO" ]] || start=$i
+        done
     fi
-    if [[ -L "$file" || ! -f "$file" ]] || ! head -c 0 -- "$file" 2>/dev/null; then
-        J_RESULT=failed J_WHY="the report $file cannot be read"
-        return 0
-    fi
-    while IFS= read -r line; do
-        J_LINES=$((J_LINES + 1))
-        if [[ ! "$line" =~ $REPORT_LINE_RE ]]; then
-            J_RESULT=failed J_WHY="a report line that is no report: '$(printable "$line")'"
-            return 0
-        fi
-        body=${BASH_REMATCH[1]} boot=${BASH_REMATCH[2]}
-        if [[ "$body" == "das-vm-guard NOT engaged:"* ]]; then
-            J_RESULT=failed J_WHY="the recovery OS reports it NOT engaged:$(printable "${body#das-vm-guard NOT engaged:}")"
-            return 0
-        elif [[ "$seen" != *" $boot "* ]]; then
-            seen+="$boot "
-            J_BOOTS=$((J_BOOTS + 1))
-            if [[ "$body" != "$engaged" ]]; then
-                J_RESULT=failed J_WHY="boot $boot began without the guard engaged: '$(printable "$body")'"
-                return 0
+    if ((start < 0)); then
+        # Nothing read yet, or the file being read is gone: the oldest file
+        # not read yet.
+        for i in "${!inos[@]}"; do
+            if [[ -n "${inos[$i]}" && -z "${R_BASES[${inos[$i]}]:-}" ]]; then
+                start=$i
+                break
             fi
-        elif [[ "$body" == "$lifted" ]]; then
-            J_LIFTS=$((J_LIFTS + 1))
-        elif [[ "$body" != "$engaged" ]]; then
+        done
+        ((start >= 0)) || return 0
+        if [[ -n "$R_INO" ]]; then
+            R_LOST="the rest of the file being read (inode $R_INO) was gone before it could be read; lines in it would never be seen"
+            R_INO="" R_OFF=0 R_PART=""
+        fi
+    fi
+    for ((i = start; i < ${#files[@]}; i++)); do
+        f=${files[$i]} off=0 cut=false
+        [[ -n "${inos[$i]}" ]] || continue
+        if [[ "${inos[$i]}" == "$R_INO" ]]; then
+            off=$R_OFF
+            if ((${sizes[$i]} < R_OFF)); then
+                cut=true off=0
+            fi
+        elif [[ -n "${R_BASES[${inos[$i]}]:-}" ]]; then
+            continue
+        fi
+        # Kept whole even when it ends in newlines; and still the same file.
+        data="$(tail -c "+$((off + 1))" -- "$f" 2>/dev/null && printf x)" || data=""
+        if [[ "$data" != *x || "$(stat -c %i -- "$f" 2>/dev/null)" != "${inos[$i]}" ]]; then
+            break
+        fi
+        data=${data%x}
+        if [[ "${inos[$i]}" != "$R_INO" ]]; then
+            R_INO=${inos[$i]}
+            R_BASES[$R_INO]=$R_STREAM
+        elif [[ "$cut" == true ]]; then
+            R_LOST="the report was cut in place, from $R_OFF bytes to ${sizes[$i]}: whatever it held past that, unread, would never be seen"
+            R_BASES[$R_INO]=$R_STREAM
+            R_PART=""
+        fi
+        R_OFF=$((off + ${#data}))
+        R_STREAM=$((R_BASES[$R_INO] + R_OFF))
+        data=$R_PART$data
+        pos=$((R_STREAM - ${#data}))
+        # The last of the parts is what follows the last newline.
+        mapfile -t parts <<<"$data"
+        for ((k = 0; k < ${#parts[@]} - 1; k++)); do
+            NEW_LINES+=("${parts[$k]}")
+            NEW_POS+=("$pos")
+            pos=$((pos + ${#parts[$k]} + 1))
+        done
+        R_PART=${parts[${#parts[@]} - 1]}
+    done
+}
+
+# Begin judging a report: $1..$4 the lines a guarded recovery OS writes --
+# engaged, engaged in short, lifted, lifted in short. The judgement so far:
+# J_RESULT none (no line yet), ok, or failed (final; J_WHY says why); J_LINES,
+# J_BOOTS, J_LIFTS (times lifted); the boot the last line came from (J_BOOT),
+# its last number (J_SEQ) and state (J_MODE); J_LOST (lines of a boot that
+# never arrived), J_RESTARTS (its reporter started again), J_ODD (lines out of
+# order).
+judge_start() {
+    J_E=$1 J_EC=$2 J_L=$3 J_LC=$4
+    J_RESULT=none J_WHY="" J_LINES=0 J_BOOTS=0 J_LIFTS=0 J_SEEN=" " J_BOOT="" J_SEQ=0 J_MODE=""
+    J_LOST=0 J_RESTARTS=0 J_ODD=0 J_PARTIAL="" J_NEW_BOOT=false J_NOTE=""
+}
+
+# Judge one line of the report ($1). A line is "<what> seq <n> boot <id>".
+# Each boot must begin with its line 1, engaged; its later lines, engaged or
+# lifted. A NOT engaged line, or a line of any other shape, fails -- final.
+# So does a boot first seen past its line 1: that line was lost, and whether
+# the boot began guarded cannot be known. Within a boot, lines that never
+# arrived, came twice or out of order are noted in J_NOTE, never a failure:
+# the boot was seen to begin engaged. J_NEW_BOOT: this line began a boot.
+judge_line() {
+    local line=$1 body seq boot mode full
+    J_NEW_BOOT=false J_NOTE=""
+    [[ "$J_RESULT" != failed ]] || return 0
+    J_LINES=$((J_LINES + 1))
+    if [[ ! "$line" =~ $REPORT_LINE_RE ]]; then
+        J_RESULT=failed J_WHY="a report line that is no report: '$(printable "$line")'"
+        return 0
+    fi
+    body=${BASH_REMATCH[1]} seq=${BASH_REMATCH[2]} boot=${BASH_REMATCH[3]}
+    case "$body" in
+        "das-vm-guard NOT engaged:"*)
+            J_RESULT=failed J_WHY="the recovery OS reports it NOT engaged:$(printable "${body#das-vm-guard NOT engaged:}") (boot $boot)"
+            return 0
+            ;;
+        "$J_E") mode=engaged full=true ;;
+        "$J_EC") mode=engaged full=false ;;
+        "$J_L") mode=lifted full=true ;;
+        "$J_LC") mode=lifted full=false ;;
+        *)
             J_RESULT=failed J_WHY="a report line that is no report: '$(printable "$line")'"
             return 0
+            ;;
+    esac
+    if [[ "$boot" != "$J_BOOT" && "$J_SEEN" == *" $boot "* ]]; then
+        J_ODD=$((J_ODD + 1))
+        J_NOTE="a line of boot $boot came after boot $J_BOOT began"
+    elif [[ "$boot" != "$J_BOOT" ]]; then
+        if ((seq != 1)); then
+            J_RESULT=failed J_WHY="boot $boot: its first report was not seen (this is its line $seq) -- lines of the report were lost, so whether that boot began with the guard engaged cannot be known"
+            return 0
         fi
-    done <"$file"
-    J_PARTIAL="$(printable "$line")"
-    if ((J_LINES > 0)); then
-        J_RESULT=ok
+        if [[ "$mode" != engaged ]]; then
+            J_RESULT=failed J_WHY="boot $boot began without the guard engaged: '$(printable "$body")'"
+            return 0
+        fi
+        J_SEEN+="$boot "
+        J_BOOT=$boot J_SEQ=1 J_MODE=engaged J_NEW_BOOT=true
+        J_BOOTS=$((J_BOOTS + 1))
+    else
+        if ((seq > J_SEQ + 1)); then
+            J_LOST=$((J_LOST + seq - J_SEQ - 1))
+            J_NOTE="$(count_of $((seq - J_SEQ - 1)) line) of boot $boot never arrived (its $((J_SEQ + 1)) to $((seq - 1))): a NOT engaged one among them would not have been seen"
+        elif ((seq < J_SEQ)); then
+            J_ODD=$((J_ODD + 1))
+            J_NOTE="a line of boot $boot came out of order (its $seq after its $J_SEQ)"
+        elif [[ "$full" == true && "$mode" == "$J_MODE" ]]; then
+            # A reporter names the masks in full when it starts.
+            J_RESTARTS=$((J_RESTARTS + 1))
+            J_NOTE=restarted
+        fi
+        if [[ "$mode" == lifted && "$J_MODE" != lifted ]]; then
+            J_LIFTS=$((J_LIFTS + 1))
+        fi
+        ((seq <= J_SEQ)) || J_SEQ=$seq
+        J_MODE=$mode
     fi
+    J_RESULT=ok
+}
+
+# Judge a saved report ($1) from its beginning -- every file of it, oldest
+# first; $2..$5 as judge_start's. J_LAST_AT: when its newest file was last
+# written (seconds since the epoch), empty when none is there.
+judge_report_files() {
+    local i f
+    J_LAST_AT=""
+    judge_start "$2" "$3" "$4" "$5"
+    report_reader_start
+    if report_unreadable "$1"; then
+        J_RESULT=failed J_WHY="the report $1 cannot be read"
+        return 0
+    fi
+    report_read "$1"
+    for ((i = 0; i < ${#NEW_LINES[@]}; i++)); do
+        judge_line "${NEW_LINES[$i]}"
+        [[ "$J_RESULT" != failed ]] || return 0
+    done
+    J_PARTIAL="$(printable "$R_PART")"
+    for f in "$1" "$1.0"; do
+        if [[ -f "$f" ]]; then
+            J_LAST_AT="$(stat -c %Y -- "$f" 2>/dev/null)" || J_LAST_AT=""
+            break
+        fi
+    done
 }
 
 # "engaged (2 boots; lifted 1 time)", from the last judgement.
@@ -1524,73 +1806,213 @@ guard_failed() {
     warn "the session guard did not confirm: $1. The boot record says btrbk $VERDICT run when this OS boots, and nothing now vouches that it cannot"
     if [[ "$2" == running ]]; then
         GUARD_SHUT_DOWN=true
-        request_shutdown "the session guard did not confirm"
+        request_shutdown "the session guard did not confirm" guard
     fi
 }
 
-# Judge the recovery OS's report again, every line of it. $1 is "running" or
-# "off". A failure is final; so is a report that shrank (rotated, or cut).
-# Silence counts too: no line within GUARD_SECS of the start, or none for
-# GUARD_SECS after the last one (a boot that came without the guard, or its
-# reporter stopped) -- while it runs; and no line at all once it is off.
+# What is wrong with the report, said once each: lines lost or out of order.
+# Never a failure -- every boot was seen to begin engaged -- but the summary
+# carries it.
+report_trouble() {
+    REPORT_LOSSES+=("$1")
+    warn "the session guard's report: $1"
+}
+
+# "THE SESSION GUARD'S REPORTER IS SILENT ...", $1 seconds of it.
+silence_text() {
+    printf '%s' "THE SESSION GUARD'S REPORTER IS SILENT: nothing from the recovery OS for $(format_duration "$1") (its last report from boot ${J_BOOT:-unknown}), and the VM has not been reset since. Either its reporter stopped -- the guard itself, the bind mount and the masks, does not depend on it -- or the recovery OS has hung: this script cannot tell which, and does not stop it for that. Look: virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN (inside it: systemctl status das-vm-guard-report das-vm-guard)"
+}
+
+# Advance the guard's clock to now ($1: the domain's state now) -- by none
+# of the time it is paused, and none of a gap between two looks far longer
+# than a look takes: a host suspend (the recovery OS did not run either), or
+# this script stopped. A gap is said.
+guard_clock_tick() {
+    local now=$SECONDS d
+    d=$((now - G_TICK_AT))
+    G_TICK_AT=$now
+    ((d > 0)) || return 0
+    if ((d > CLOCK_GAP_SECS)); then
+        G_GAPS=$((G_GAPS + 1))
+        log "$(format_duration "$d") passed between two looks at the recovery OS (a host suspend, or this script was stopped): the guard's deadlines and its silence do not count that time"
+        return 0
+    fi
+    [[ "$1" == paused ]] || GCLOCK=$((GCLOCK + d))
+}
+
+# Begin watching the guard: just before the domain is resumed. The first
+# boot must report within GUARD_SECS.
+guard_watch_begin() {
+    judge_start "$GUARD_EXPECT" "$GUARD_EXPECT_C" "$GUARD_EXPECT_LIFTED" "$GUARD_EXPECT_LIFTED_C"
+    report_reader_start
+    GCLOCK=0 G_TICK_AT=$SECONDS G_LAST_LINE=0 G_LIFTS_SAID=0
+    PROOF_WHY=start PROOF_POS=0 PROOF_DEADLINE=$GUARD_SECS
+}
+
+# A line ($1: where it begins in the report) that judge_line found good.
+guard_line_seen() {
+    local silent=$((GCLOCK - G_LAST_LINE))
+    G_LAST_LINE=$GCLOCK
+    if [[ "$SILENT" == true ]]; then
+        SILENT=false
+        log "the recovery OS reports again, after $(format_duration "$silent") of silence"
+    fi
+    if [[ "$J_NEW_BOOT" == true && -n "$PROOF_WHY" ]] && (($1 >= PROOF_POS)); then
+        if [[ "$PROOF_WHY" == reset ]]; then
+            log "the boot after the reset reports its guard engaged (boot $J_BOOT)"
+        fi
+        PROOF_WHY=""
+    fi
+    if [[ "$GUARD_CONFIRMED" != true ]]; then
+        GUARD_CONFIRMED=true
+        log "the session guard is engaged: $GUARD_EXPECT"
+    elif [[ "$J_NEW_BOOT" == true ]]; then
+        log "the recovery OS booted again (boot $J_BOOT), and its guard is engaged ($(count_of "$J_BOOTS" boot) so far)"
+    fi
+    if ((J_LIFTS > G_LIFTS_SAID)); then
+        G_LIFTS_SAID=$J_LIFTS
+        log "the session guard is lifted for the update (its masks hold); btrbk can run there by hand until it is engaged again"
+    fi
+    case "$J_NOTE" in
+        "") ;;
+        restarted) log "the guard's reporter in the recovery OS started again (boot $J_BOOT); the guard does not depend on it" ;;
+        *) report_trouble "$J_NOTE" ;;
+    esac
+}
+
+# A reset of the VM, recorded where the report stood ($1): a boot whose first
+# line begins there or later must report the guard engaged, within GUARD_SECS
+# of the first reset not yet answered -- a boot loop of resets does not push
+# that deadline out.
+guard_reset_seen() {
+    RESETS=$((RESETS + 1))
+    SILENT=false
+    if [[ -z "$PROOF_WHY" ]]; then
+        PROOF_WHY=reset PROOF_DEADLINE=$((GCLOCK + GUARD_SECS))
+    fi
+    PROOF_POS=$1
+    log "the recovery OS was reset (a reboot inside it, or virsh reset): a boot after that must report its guard engaged within $(format_duration $((PROOF_DEADLINE - GCLOCK)))"
+}
+
+# Judge what is new: the report's lines and the resets the reset watch saw,
+# in the order they happened -- a reset recorded where the report stood comes
+# before every line that begins there or later. $1: "running" (the domain
+# runs, and may be asked to shut down), "off" (it is off: the last look), or
+# "final" (this script is leaving: judge, never act). $2: its state now.
+#   - A line that fails is final (guard_failed).
+#   - The first boot must report within GUARD_SECS of the start, and after a
+#     reset, a boot that begins after it within GUARD_SECS of the reset --
+#     by the guard's clock. Otherwise guard_failed: a boot that came without
+#     the guard says nothing.
+#   - Silence past GUARD_SECS with no reset since: the guard's enforcement
+#     does not depend on its reporter, so a warning, said again every
+#     GUARD_SECS -- never a stop. Unless the reset watch is down: a reset
+#     cannot be ruled out then, and silence past GUARD_SECS from the later of
+#     the last line and the watch's end fails as above.
+#   - Off: no line at all, or a reset no boot answered, fails.
 check_guard() {
-    local partial=""
+    local mode=$1 state=${2:-} i=0 j=0 partial="" silent resets
     if [[ "$GUARD_FAILED" == true ]]; then
         return 0
     fi
-    judge_report "$GUARD_FILE" "$GUARD_EXPECT" "$GUARD_EXPECT_LIFTED"
+    guard_clock_tick "$state"
+    if report_unreadable "$GUARD_FILE"; then
+        guard_failed "the report $GUARD_FILE cannot be read" "$mode"
+        return 0
+    fi
+    report_read "$GUARD_FILE"
+    if [[ -n "$R_LOST" ]]; then
+        report_trouble "$R_LOST"
+    fi
+    if [[ "$mode" == running ]]; then
+        reset_watch_check
+    fi
+    read_resets
+    while ((i < ${#NEW_LINES[@]} || j < ${#NEW_RESETS[@]})); do
+        if ((j < ${#NEW_RESETS[@]})) && { ((i >= ${#NEW_LINES[@]})) || ((NEW_RESETS[j] <= NEW_POS[i])); }; then
+            guard_reset_seen "${NEW_RESETS[$j]}"
+            j=$((j + 1))
+            continue
+        fi
+        judge_line "${NEW_LINES[$i]}"
+        if [[ "$J_RESULT" == failed ]]; then
+            guard_failed "$J_WHY" "$mode"
+            return 0
+        fi
+        guard_line_seen "${NEW_POS[$i]}"
+        i=$((i + 1))
+    done
+    J_PARTIAL="$(printable "$R_PART")"
     if [[ -n "$J_PARTIAL" ]]; then
         partial=" (an unfinished line: '$J_PARTIAL')"
     fi
-    if [[ "$J_RESULT" == failed ]]; then
-        guard_failed "$J_WHY" "$1"
-        return 0
-    fi
-    if ((J_LINES < GUARD_LINES_SEEN)); then
-        guard_failed "the report shrank from $GUARD_LINES_SEEN lines to $J_LINES (rotated, or cut): it cannot be judged" "$1"
-        return 0
-    fi
-    if ((J_LINES > GUARD_LINES_SEEN)); then
-        GUARD_LAST_AT=$SECONDS
-        if [[ "$GUARD_CONFIRMED" != true ]]; then
-            GUARD_CONFIRMED=true
-            log "the session guard is engaged: $GUARD_EXPECT"
-        fi
-        if ((J_BOOTS > GUARD_BOOTS_SEEN && GUARD_BOOTS_SEEN > 0)); then
-            log "the recovery OS booted again, and its guard is engaged ($(count_of "$J_BOOTS" boot) so far)"
-        fi
-        if ((J_LIFTS > GUARD_LIFTS_SEEN)); then
-            log "the session guard is lifted for the update (its masks hold); btrbk can run there by hand until it is engaged again"
-        fi
-        GUARD_LINES_SEEN=$J_LINES GUARD_BOOTS_SEEN=$J_BOOTS GUARD_LIFTS_SEEN=$J_LIFTS
-    fi
     if ((J_LINES > 0)); then
-        GUARD_RESULT="engaged -- $GUARD_EXPECT ($(count_of "$J_BOOTS" boot); lifted $(count_of "$J_LIFTS" time))"
-    fi
-    if [[ "$1" == off ]]; then
-        if ((J_LINES == 0)); then
-            guard_failed "the recovery OS powered off without reporting$partial" off
+        resets=""
+        # Not inside the assignment: there a false test would be its status.
+        if ((RESETS > 0)); then
+            resets="; $(count_of "$RESETS" reset)"
         fi
-    elif ((J_LINES == 0 && SECONDS - VM_START >= GUARD_SECS)); then
-        guard_failed "no report from the recovery OS within $(format_duration "$GUARD_SECS") of its start$partial -- an OS whose systemd is older than 256 does not even see the guard" running
-    elif ((J_LINES > 0 && SECONDS - GUARD_LAST_AT >= GUARD_SECS)); then
-        guard_failed "the recovery OS stopped reporting: nothing for $(format_duration "$GUARD_SECS") after its last report -- a boot that came without the guard, or its reporter stopped" running
+        GUARD_RESULT="engaged -- $GUARD_EXPECT ($(count_of "$J_BOOTS" boot); lifted $(count_of "$J_LIFTS" time)$resets)"
+    fi
+    case "$mode" in
+        off)
+            if ((J_LINES == 0)); then
+                guard_failed "the recovery OS powered off without reporting$partial" off
+            elif [[ "$PROOF_WHY" == reset ]]; then
+                guard_failed "the recovery OS was reset, and powered off before a boot after that reported its guard engaged$partial -- a boot that came without the guard says nothing (or it never got as far as its OS)" off
+            fi
+            return 0
+            ;;
+        final) return 0 ;;
+    esac
+    if [[ -n "$PROOF_WHY" ]] && ((GCLOCK >= PROOF_DEADLINE)); then
+        if [[ "$PROOF_WHY" == start ]]; then
+            guard_failed "no report from the recovery OS within $(format_duration "$GUARD_SECS") of its start$partial -- an OS whose systemd is older than 256 does not even see the guard" running
+        else
+            guard_failed "the recovery OS was reset, and no boot after that reported its guard engaged within $(format_duration "$GUARD_SECS")$partial -- a boot that came without the guard says nothing" running
+        fi
+        return 0
+    fi
+    if [[ -n "$PROOF_WHY" ]]; then
+        return 0
+    fi
+    if [[ -n "$RESET_WATCH_DOWN" ]]; then
+        silent=$((GCLOCK - (G_LAST_LINE > G_WATCH_DOWN_AT ? G_LAST_LINE : G_WATCH_DOWN_AT)))
+        if ((silent >= GUARD_SECS)); then
+            guard_failed "the recovery OS stopped reporting: nothing for $(format_duration "$silent"), and with the reset watch down ($RESET_WATCH_DOWN) a boot that came without the guard cannot be told from a reporter that stopped" running
+        fi
+        return 0
+    fi
+    silent=$((GCLOCK - G_LAST_LINE))
+    if ((silent < GUARD_SECS)); then
+        return 0
+    fi
+    if [[ "$SILENT" != true ]]; then
+        SILENT=true SILENCES=$((SILENCES + 1)) SILENT_NEXT=$GCLOCK
+    fi
+    ((silent <= SILENCE_LONGEST)) || SILENCE_LONGEST=$silent
+    if ((GCLOCK >= SILENT_NEXT)); then
+        warn "$(silence_text "$silent")"
+        SILENT_NEXT=$((GCLOCK + GUARD_SECS))
     fi
 }
 
 # The judgement of a session's guard for status and session-end, from its
 # state ($1, the state file) and report ($2): GJ_TEXT, and GJ_STATUS -- 0, or
 # 6 (5 on a "no" record) when it is not engaged or cannot be judged. $3 is
-# the domain's state.
+# the domain's state. With no driver left to watch for resets, silence counts
+# here as it cannot in a session: a recovery OS not shut off (nor paused)
+# whose report was last written GUARD_SECS ago or more is NOT confirmed.
+# Information only: nothing here stops anything.
 judge_saved_guard() {
-    local partial=""
+    local partial="" age
     GJ_STATUS=0
     if ! read_guard_state "$1"; then
         GJ_TEXT="cannot be judged: its session state ($1) is gone or unreadable -- a host restart clears /run"
         GJ_STATUS=6
         return 0
     fi
-    judge_report "$2" "$GS_ENGAGED" "$GS_LIFTED"
+    judge_report_files "$2" "$GS_ENGAGED" "$GS_ENGAGED_C" "$GS_LIFTED" "$GS_LIFTED_C"
     if [[ -n "$J_PARTIAL" ]]; then
         partial=" (an unfinished line: '$J_PARTIAL')"
     fi
@@ -1598,7 +2020,18 @@ judge_saved_guard() {
         GJ_TEXT="NOT engaged: $J_WHY"
     elif [[ "$J_RESULT" == ok ]]; then
         GJ_TEXT="$(judged_engaged)"
-        return 0
+        if ((J_LOST > 0)); then
+            GJ_TEXT+="; $(count_of "$J_LOST" line) of its report never arrived"
+        fi
+        if [[ "$3" == "shut off" || "$3" == paused || ! "$J_LAST_AT" =~ ^[0-9]+$ ]]; then
+            return 0
+        fi
+        age=$(($(date +%s) - J_LAST_AT))
+        if ((age < GUARD_SECS)); then
+            GJ_TEXT+="; its last report $(format_duration "$age") ago"
+            return 0
+        fi
+        GJ_TEXT="NOT confirmed: silent for $(format_duration "$age") -- the reporter stopped, or a boot came without the guard (status cannot see resets; before the silence: $GJ_TEXT). Look: virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN"
     elif [[ -z "$GS_RESUMED" ]]; then
         if [[ -n "$GS_STARTED" ]]; then
             GJ_TEXT="never ran (started paused, never resumed): nothing to judge"
@@ -1620,34 +2053,168 @@ judge_saved_guard() {
 
 # PERMITTED ONLY HERE -- the operator-approved exception in the header -- and
 # the only `virsh destroy` this script ever runs: a domain started with
-# --paused and never resumed has not executed a single guest instruction -- no
-# firmware, no boot loader, no OS, no write to the disk. It is not a running
-# recovery OS, and tearing it down interrupts nothing. Once `virsh resume` has
-# been tried, never: a resumed recovery OS may be in the middle of anything,
-# and only ACPI may ask it to stop.
+# --paused --force-boot and never resumed has not executed a single guest
+# instruction -- no firmware, no boot loader, no OS, no write to the disk. It
+# is not a running recovery OS, and tearing it down interrupts nothing. Once
+# `virsh resume` has been tried, never: a resumed recovery OS may be in the
+# middle of anything, and only ACPI may ask it to stop. And only when its
+# state, read right here, is still paused: this script never resumed it, so
+# anything else means something else did (or it stopped). What is left
+# (bd DAS-Backup-Manager-ir5c): a resume by someone else between that read
+# and the destroy -- two virsh calls, milliseconds.
+#   0 destroyed; 1 a resume was tried; 2 not paused (DESTROY_STATE says what
+#   it is); 3 virsh destroy failed.
 destroy_never_resumed() {
-    local out
+    local out state
     if [[ "$RESUME_ATTEMPTED" != false ]]; then
         warn "not destroying $DOMAIN: it was resumed, so it may have run"
         return 1
     fi
+    state="$(current_state)"
+    DESTROY_STATE=$state
+    if [[ "$state" != paused ]]; then
+        warn "not destroying $DOMAIN: it is $state, not paused -- this script never resumed it, so something else did (or it stopped), and it may have run"
+        return 2
+    fi
     if ! out="$(virsh_ destroy "$DOMAIN" 2>&1)"; then
         warn "virsh destroy (of the paused, never resumed domain): $out"
-        return 1
+        return 3
     fi
+    DESTROYED=true
     log "destroyed $DOMAIN while still paused, before it ran a single instruction"
 }
 
-# The domain was started paused: read its live definition and resume it only
+# What the operator is told when destroy_never_resumed has destroyed the
+# domain: that nothing ran, that a retry is safe, and what a repeat means.
+never_ran_text() {
+    printf '%s' "Nothing ran in $DOMAIN: it was destroyed while still paused, before it ran a single instruction -- no firmware, no OS, no write to the disk. A retry is safe: run the session again. If it fails the same way again, the cause is persistent -- libvirt not applying the session guard's SMBIOS strings to the started domain, for one -- and needs a fix before any session can boot"
+}
+
+# Whether process $1 (a child of this script) has ended: gone, or a zombie.
+child_gone() {
+    local s
+    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    s=${s##*) }
+    [[ "${s%% *}" == Z ]]
+}
+
+# The reset watch: libvirt's event stream of this domain's resets (a reboot
+# inside it, or virsh reset), read by a process of this script's own. At each
+# reset it records where the report stood -- its file's inode and size -- so
+# the boot after it is told by where its first line begins, not by when this
+# script looked. Started before the domain; ended on every way out
+# (stop_reset_watch). It ends by itself when the stream does (a libvirt
+# restart; the reason is in RESET_FILE) or this script is gone.
+reset_watch() {
+    local line vpid st wfd
+    set +e
+    # The maintenance lock is held by this script and the disk holder, never
+    # by the watch or its virsh: inherited, its descriptor would keep the lock
+    # held after this script let it go, for as long as the watch lived.
+    if [[ -n "$LOCK_FD" ]]; then
+        exec {LOCK_FD}>&-
+    fi
+    exec {wfd}< <(exec virsh --connect "$LIBVIRT_URI" event --domain "$DOMAIN" --event reboot --loop 2>&1)
+    vpid=$!
+    printf 'virsh %s\n' "$vpid" >>"$RESET_FILE"
+    trap 'kill "$vpid" 2>/dev/null; exit 0' TERM INT HUP
+    while :; do
+        if IFS= read -r -t "$POLL_SECS" -u "$wfd" line; then
+            if [[ "$line" == *"$RESET_EVENT"* ]]; then
+                st="$(stat -c '%i %s' -- "$GUARD_FILE" 2>/dev/null)" || st="- 0"
+                printf 'reset %s\n' "$st" >>"$RESET_FILE"
+            elif [[ -n "$line" ]]; then
+                printf 'said %s\n' "$(printable "$line")" >>"$RESET_FILE"
+            fi
+        elif (($? <= 128)); then
+            break
+        fi
+        kill -0 "$$" 2>/dev/null || break
+    done
+    kill "$vpid" 2>/dev/null
+    exit 0
+}
+
+start_reset_watch() {
+    reset_watch &
+    RESET_WATCH_PID=$!
+    log "watching $DOMAIN for resets (libvirt's reboot event): a boot after one must report its guard engaged within $(format_duration "$GUARD_SECS")"
+}
+
+# End the reset watch, and the virsh it reads, and wait until they have --
+# five seconds at most, then killed.
+stop_reset_watch() {
+    local i vpid=""
+    [[ -n "$RESET_WATCH_PID" ]] || return 0
+    if [[ -f "$RESET_FILE" ]]; then
+        vpid="$(sed -n 's/^virsh \([0-9]*\)$/\1/p' -- "$RESET_FILE" 2>/dev/null | tail -n 1)" || vpid=""
+    fi
+    kill "$RESET_WATCH_PID" 2>/dev/null
+    for ((i = 0; i < 50; i++)); do
+        child_gone "$RESET_WATCH_PID" && break
+        sleep 0.1
+    done
+    if ! child_gone "$RESET_WATCH_PID"; then
+        kill -KILL "$RESET_WATCH_PID" 2>/dev/null
+    fi
+    wait "$RESET_WATCH_PID" 2>/dev/null
+    if [[ -n "$vpid" && "$(tr '\0' ' ' 2>/dev/null <"/proc/$vpid/cmdline")" == *virsh*" event "* ]]; then
+        kill -KILL "$vpid" 2>/dev/null
+    fi
+    RESET_WATCH_PID=""
+}
+
+# Has the reset watch stopped? Then a reset can no longer be seen: said once,
+# loudly, with what virsh last said; from here silence counts as it did
+# before the watch existed (check_guard).
+reset_watch_check() {
+    local said
+    if [[ -z "$RESET_WATCH_PID" || -n "$RESET_WATCH_DOWN" ]] || ! child_gone "$RESET_WATCH_PID"; then
+        return 0
+    fi
+    wait "$RESET_WATCH_PID" 2>/dev/null
+    RESET_WATCH_PID=""
+    said="$(sed -n 's/^said //p' -- "$RESET_FILE" 2>/dev/null | tail -n 1)" || said=""
+    RESET_WATCH_DOWN="libvirt's event stream ended${said:+: $said}"
+    G_WATCH_DOWN_AT=$GCLOCK
+    warn "THE RESET WATCH HAS STOPPED ($RESET_WATCH_DOWN): a reset of the VM can no longer be seen, so from here $(format_duration "$GUARD_SECS") without a report is taken as a boot that came without the guard"
+}
+
+# The resets the reset watch recorded since the last look: NEW_RESETS, each
+# as the place in the report it stood at -- or, where that place is not one
+# read (the report's file was being rotated, or not there yet), where this
+# look's reading began.
+read_resets() {
+    local rlines=() i ino size
+    NEW_RESETS=()
+    [[ -f "$RESET_FILE" ]] || return 0
+    mapfile -t rlines <"$RESET_FILE" 2>/dev/null || return 0
+    for ((i = RESET_LINES_READ; i < ${#rlines[@]}; i++)); do
+        [[ "${rlines[$i]}" =~ ^reset\ ([0123456789]+|-)\ ([0123456789]+)$ ]] || continue
+        ino=${BASH_REMATCH[1]} size=${BASH_REMATCH[2]}
+        if [[ "$ino" != - && -n "${R_BASES[$ino]:-}" ]]; then
+            NEW_RESETS+=("$((R_BASES[$ino] + size))")
+        else
+            NEW_RESETS+=("$R_POLL_START")
+        fi
+    done
+    RESET_LINES_READ=${#rlines[@]}
+}
+
+# The domain was started paused (afresh: --force-boot, and only once no
+# managed-save image is there): read its live definition and resume it only
 # if it carries the guard. Without the guard there (another define or
 # session-end ran between this session's check and its start), or with no
 # definition to read, it is destroyed paused -- it never ran -- and nothing
-# boots.
+# boots. Found running instead (something else resumed it), it is never
+# destroyed: an OS without its guard, it fails closed like any other.
 start_guarded() {
-    local out xml missing
+    local out xml missing rc=0
+    check_no_managed_save
+    start_reset_watch
     write_guard_state "started=$(date +%s)"
     STARTED=true
-    if ! out="$(virsh_ start --paused "$DOMAIN" 2>&1)"; then
+    if ! out="$(virsh_ start --paused --force-boot "$DOMAIN" 2>&1)"; then
         refuse "virsh start failed: $out"
     fi
     if ! xml="$(virsh_ dumpxml "$DOMAIN" 2>&1)"; then
@@ -1657,14 +2224,20 @@ start_guarded() {
         [[ -z "$missing" ]] || missing="the started domain does not carry the session guard (missing: $missing)"
     fi
     if [[ -n "$missing" ]]; then
-        if destroy_never_resumed; then
-            refuse "$missing -- it was destroyed while still paused, before it ran a single instruction; nothing was booted"
-        fi
-        refuse "$missing -- and it could not be destroyed: it is still paused, and has run nothing (it is never resumed)"
+        destroy_never_resumed || rc=$?
+        case "$rc" in
+            0) refuse "$missing -- it was destroyed while still paused, before it ran a single instruction; nothing was booted" ;;
+            2)
+                guard_failed "$missing, and it is $DESTROY_STATE: something other than this script resumed it" "$DESTROY_STATE"
+                refuse "$missing -- it is $DESTROY_STATE: something other than this script resumed it, so it was not destroyed"
+                ;;
+            *) refuse "$missing -- and it could not be destroyed: it is still paused, and has run nothing (it is never resumed)" ;;
+        esac
     fi
     write_guard_state "resumed=$(date +%s)"
     RESUME_ATTEMPTED=true
     VM_START=$SECONDS
+    guard_watch_begin
     if ! out="$(virsh_ resume "$DOMAIN" 2>&1)"; then
         refuse "virsh resume failed: $out"
     fi
@@ -1996,17 +2569,38 @@ check_left_unmounted() {
     fi
 }
 
+# The one place a recovery OS that may have run is offered a `virsh destroy`
+# (bd DAS-Backup-Manager-0zm, the operator's ruling): the facts, the
+# trade-off, and the command as the operator's own choice -- never on a clock,
+# never by this script. $1: what running on means here.
+force_off_choice() {
+    local asked=""
+    if ((SHUTDOWN_ASKED > 0)); then
+        asked="It was asked to shut down $(count_of "$SHUTDOWN_ASKED" time) over $(format_duration "$SHUTDOWN_SECS") (ACPI), and has not gone. "
+    fi
+    cat >&2 <<EOF
+     ${asked}Forcing it off is your choice to make, and this script never
+     makes it: on one side, $1; on the other, an update in it cut short
+     (whatever it was writing, half written). If you choose to:
+       virsh --connect $LIBVIRT_URI destroy $DOMAIN
+EOF
+}
+
+# The session is left running ($1 why, $2 the domain's state): what the
+# guard is, first, then what keeps the disk, then how to finish.
 keep_session() {
-    local never_ran=false
+    local never_ran=false paused_tried=false last=""
     # Paused, and never resumed by this script: it has run nothing.
     if [[ "$RESUME_ATTEMPTED" == false && "$2" == paused ]]; then
         never_ran=true
+    elif [[ "$2" == paused ]]; then
+        paused_tried=true
     fi
     warn "leaving the session in place: $1"
     # What is left must be a live holder: it is what keeps both the claim and
     # the lock once this script has exited.
     if ! keep_claim; then
-        warn "ONCE THIS SCRIPT EXITS NOTHING KEEPS THE HOST OFF $DISK: power the recovery OS off from inside it now, then run $SELF session-end $LABEL"
+        warn "ONCE THIS SCRIPT EXITS NOTHING KEEPS THE HOST OFF $DISK: end the recovery OS now (see below), then run $SELF session-end $LABEL"
     fi
     # What the guard is, first: whether this OS may run btrbk decides what
     # the operator does next.
@@ -2015,9 +2609,15 @@ keep_session() {
     elif [[ "$GUARD_FAILED" == true ]]; then
         warn "THE RECOVERY OS IS RUNNING WITHOUT A CONFIRMED SESSION GUARD (${GUARD_RESULT#NOT confirmed: }): btrbk may run in it, against the backups on $DISK"
     elif [[ "$GUARD_CONFIRMED" == true ]]; then
-        log "the session guard is engaged ($GUARD_EXPECT; its last report $(format_duration $((SECONDS - GUARD_LAST_AT))) ago, it reports every minute): btrbk cannot run in the recovery OS. From here nothing watches it: $SELF status judges its report again -- NOT engaged means a boot came without it"
+        if ((G_LAST_LINE <= GCLOCK)); then
+            last="; its last report $(format_duration $((GCLOCK - G_LAST_LINE))) ago, it reports every minute"
+        fi
+        log "the session guard is engaged ($GUARD_EXPECT$last): btrbk cannot run in the recovery OS. From here nothing watches it but $SELF status, which judges its report again -- NOT engaged means a boot came without it -- and which also counts $(format_duration "$GUARD_SECS") of silence as NOT confirmed, since it cannot see resets: it cannot tell a reporter that stopped from a boot that came without the guard"
+        if [[ "$SILENT" == true ]]; then
+            warn "$(silence_text $((GCLOCK - G_LAST_LINE)))"
+        fi
     else
-        warn "THE SESSION GUARD HAS NOT BEEN JUDGED: its report lands in $GUARD_FILE. Judge it now: $SELF status -- until it says engaged, treat the recovery OS as unguarded and power it off"
+        warn "THE SESSION GUARD HAS NOT BEEN JUDGED: its report lands in $GUARD_FILE. Judge it first: $SELF status -- until it says engaged, treat the recovery OS as unguarded"
     fi
     cat >&2 <<EOF
 The recovery OS keeps $DISK:
@@ -2031,24 +2631,51 @@ Nothing was detached and nothing was destroyed. To finish:
 EOF
     if [[ "$never_ran" == true ]]; then
         cat >&2 <<EOF
-  1. Tear it down -- it never ran, so nothing is cut short:
-     virsh --connect $LIBVIRT_URI destroy $DOMAIN
+  1. Check it is still paused -- only then has it run nothing:
+       virsh --connect $LIBVIRT_URI domstate $DOMAIN      (must say: paused)
+     Paused: tear it down, nothing is cut short:
+       virsh --connect $LIBVIRT_URI destroy $DOMAIN
+     Anything else: something other than this script resumed it, and it may
+     be running without the guard -- judge it: $SELF status
   2. Then run:          $SELF session-end $LABEL
+EOF
+    elif [[ "$paused_tried" == true ]]; then
+        cat >&2 <<EOF
+  It is paused, after a resume was tried: it may have run, and a paused guest
+  runs nothing -- not even a power-off asked from its console. Either:
+  1. Resume it, judge the guard, and power it off from inside it:
+       virsh --connect $LIBVIRT_URI resume $DOMAIN
+       $SELF status
+       virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN
+  2. Or end it where it stands:
+EOF
+        force_off_choice "a paused recovery OS that may have run, holding $DISK and the lock"
+        cat >&2 <<EOF
+  3. Then run:          $SELF session-end $LABEL
 EOF
     elif [[ "$GUARD_CONFIRMED" == true && "$GUARD_FAILED" != true ]]; then
         cat >&2 <<EOF
   1. Open the console:  virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN
      Let the update finish, then power the recovery OS off from inside it.
   2. Then run:          $SELF session-end $LABEL
-Only if it has hung, and accepting that an update in progress is cut short:
-     virsh --connect $LIBVIRT_URI destroy $DOMAIN   -- then step 2.
+  Only if it has hung:
 EOF
+        force_off_choice "a hung recovery OS that keeps $DISK and the lock"
     else
+        if [[ "$GUARD_FAILED" != true ]]; then
+            cat >&2 <<EOF
+  0. Judge the guard first:  $SELF status
+     engaged: let the update finish, power it off from inside, then step 3.
+     Anything else: steps 1 to 3.
+EOF
+        fi
         cat >&2 <<EOF
   1. Power it off now: open the console (virt-viewer --connect $LIBVIRT_URI
      --attach $DOMAIN) and run systemctl poweroff there.
-  2. If it has not gone within a minute, force it off -- a recovery OS whose
-     guard is not confirmed must not run on: virsh --connect $LIBVIRT_URI destroy $DOMAIN
+  2. If it does not go:
+EOF
+        force_off_choice "a recovery OS without a confirmed session guard, running beside the backups on $DISK"
+        cat >&2 <<EOF
   3. Then run:          $SELF session-end $LABEL
      It reads the guard's report before anything is removed, and says what it found.
 EOF
@@ -2087,6 +2714,8 @@ on_exit() {
     local rc=$? state
     set +e
     trap '' INT TERM HUP
+    # The reset watch ends with this script, on every way out.
+    stop_reset_watch
     if [[ "$DONE" == true ]]; then
         exit "$rc"
     fi
@@ -2104,14 +2733,19 @@ on_exit() {
     if [[ "$STARTED" == true ]]; then
         state="$(current_state)"
         # Started paused and never resumed (an interrupt, or a start that said
-        # it failed but did start): it ran nothing, so it may be torn down.
-        # Paused after a resume was tried, it may have run: destroy_never_resumed
-        # refuses it, and says so.
-        if [[ "$state" == paused ]]; then
+        # it failed but did start): it ran nothing, so it may be torn down --
+        # destroy_never_resumed reads the state again and refuses anything not
+        # paused. Paused after a resume was tried, it may have run: never.
+        if [[ "$state" == paused && "$RESUME_ATTEMPTED" == false ]]; then
             destroy_never_resumed || :
             state="$(current_state)"
         fi
         if [[ "$state" != "shut off" ]]; then
+            # What reached the report since the last look is judged too: a
+            # NOT engaged line in the last poll's interval is said.
+            if [[ "$RESUME_ATTEMPTED" == true ]]; then
+                check_guard final "$state"
+            fi
             keep_session "${KEEP_REASON:-the driver stopped while the recovery OS is $state}" "$state"
             exit 3
         fi
@@ -2125,6 +2759,13 @@ on_exit() {
         keep_after_failure
         exit 4
     fi
+    # Both ways to a destroy end here (a start that did not carry the guard,
+    # and a session stopped while paused): the one place that says what it
+    # means.
+    if [[ "$DESTROYED" == true ]]; then
+        warn "session for $LABEL ended; the disk is the host's again and nothing is held. $(never_ran_text)"
+        exit 1
+    fi
     if [[ "$GUARD_FAILED" == true && "$VERDICT" != no ]]; then
         warn "session for $LABEL ended early; the disk is the host's again and nothing is held -- but the session guard did not confirm on a \"$VERDICT\" record (${GUARD_RESULT#NOT confirmed: }): look at the recovery OS's journal for what ran (journalctl -b -1 inside it, at its next boot)"
         exit 6
@@ -2133,6 +2774,10 @@ on_exit() {
         log "session guard: $GUARD_RESULT"
     fi
     log "session for $LABEL ended early; the disk is the host's again and nothing is held"
+    # A guard that did not confirm on a "no" record: as a finished session.
+    if [[ "$GUARD_FAILED" == true ]]; then
+        exit 5
+    fi
     exit 1
 }
 
@@ -2173,20 +2818,22 @@ parse_session_args() {
 # RESEND_SECS -- one asked while it is in its firmware, boot menu or
 # initramfs is dropped -- and wait until it has. Never destroyed: it may be in
 # the middle of an update. Not off within GRACE_SECS: the session is kept
-# (exit 3).
+# (exit 3). $2: why -- "timeout" (the operator's --timeout: an update may
+# still be running, which is said) or "guard" (it did not confirm).
 request_shutdown() {
-    local out deadline state next=0 sent=0
+    local out deadline state next=0 start=$SECONDS
     deadline=$((SECONDS + GRACE_SECS))
     while :; do
         if ((SECONDS >= next)); then
-            sent=$((sent + 1))
-            log "$1: asking the recovery OS to shut down$( ((sent > 1)) && printf ' (request %s)' "$sent")"
+            SHUTDOWN_ASKED=$((SHUTDOWN_ASKED + 1))
+            log "$1: asking the recovery OS to shut down$( ((SHUTDOWN_ASKED > 1)) && printf ' (request %s)' "$SHUTDOWN_ASKED")"
             if ! out="$(virsh_ shutdown "$DOMAIN" 2>&1)"; then
                 warn "virsh shutdown: $out"
             fi
             next=$((SECONDS + RESEND_SECS))
         fi
         sleep "$POLL_SECS"
+        SHUTDOWN_SECS=$((SECONDS - start))
         state="$(current_state)"
         if [[ "$state" == "shut off" ]]; then
             log "the recovery OS shut down on request"
@@ -2195,7 +2842,10 @@ request_shutdown() {
         keep_claim || :
         ((SECONDS < deadline)) || break
     done
-    KEEP_REASON="it did not power off within $(format_duration "$GRACE_SECS") of the shutdown request ($1) -- it may still be updating"
+    KEEP_REASON="it did not power off within $(format_duration "$GRACE_SECS") of the shutdown request ($1)"
+    if [[ "$2" == timeout ]]; then
+        KEEP_REASON+=" -- it may still be updating"
+    fi
     exit 3
 }
 
@@ -2216,12 +2866,12 @@ wait_for_poweroff() {
             return 0
         fi
         keep_claim || :
-        check_guard running
+        check_guard running "$state"
         if [[ "$GUARD_SHUT_DOWN" == true ]]; then
             return 0
         fi
         if ((deadline > 0 && SECONDS >= deadline)); then
-            request_shutdown "the --timeout of $TIMEOUT_MIN minute(s) has passed"
+            request_shutdown "the --timeout of $TIMEOUT_MIN minute(s) has passed" timeout
             return 0
         fi
     done
@@ -2234,8 +2884,8 @@ session_status() {
     if [[ "$GUARD_FAILED" == true && "$VERDICT" != no ]]; then
         echo 6
     elif [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
-        [[ "$GUARD_FAILED" == true || -n "$GUARD_LEFT" ]] || ((${#UNMASKABLE[@]} > 0)) ||
-        ((HOLDER_LOSSES > 0 || ${#BOOT_OVERRIDES[@]} > 0)); then
+        [[ "$GUARD_FAILED" == true || -n "$GUARD_LEFT" || -n "$RESET_WATCH_DOWN" ]] || ((${#UNMASKABLE[@]} > 0)) ||
+        ((HOLDER_LOSSES > 0 || ${#BOOT_OVERRIDES[@]} > 0 || SILENCES > 0 || ${#REPORT_LOSSES[@]} > 0)); then
         echo 5
     else
         echo 0
@@ -2296,7 +2946,7 @@ cmd_session() {
             exit 4
         fi
         DONE=true
-        log "dry run: the session guard must report within $(format_duration "$GUARD_SECS") of the start, and again within that after each report"
+        log "dry run: the session guard must report within $(format_duration "$GUARD_SECS") of the start, and of every reset; silence after that is a warning"
         log "dry run done: lock taken and released, holder started and stopped, nothing defined or attached"
         if ((${#BOOT_OVERRIDES[@]} > 0)); then
             warn "dry run: the boot-record check was overridden (--accept-boot-record-risk) -- exit 5"
@@ -2362,6 +3012,15 @@ cmd_session() {
     if ((${#UNMASKABLE[@]} > 0)); then
         warnings+=("the boot record names units the guard cannot mask: ${UNMASKABLE[*]} -- it says nothing runs btrbk at boot, but put them right before the next session")
     fi
+    if ((SILENCES > 0)); then
+        warnings+=("the session guard's reporter went silent $(count_of "$SILENCES" time) (the longest $(format_duration "$SILENCE_LONGEST")) with no reset of the VM: its reporter stopped, or the recovery OS hung -- the guard does not depend on it, and nothing was stopped for it")
+    fi
+    if [[ -n "$RESET_WATCH_DOWN" ]]; then
+        warnings+=("the reset watch stopped ($RESET_WATCH_DOWN): from then, silence counted as a boot without the guard")
+    fi
+    for w in "${REPORT_LOSSES[@]}"; do
+        warnings+=("the session guard's report: $w")
+    done
     for w in "${warnings[@]}"; do
         lines+=$'\n'"  Warnings      $w"
         joined+="; $w"
@@ -2505,7 +3164,7 @@ cmd_define() {
 }
 
 cmd_status() {
-    local state xml sources f any=false rc=0 saved=()
+    local state xml sources f any=false rc=0 saved=() names
     require_root
     state="$(current_state)"
     printf 'Domain            %s: %s\n' "$DOMAIN" "$state"
@@ -2516,8 +3175,13 @@ cmd_status() {
         printf 'Attached disk     unknown (virsh: %s)\n' "$xml"
     fi
     if ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
-        printf 'Session guard     unknown (virsh: %s)\n' "$xml"
-        rc=6
+        # Not defined at all is no guard; anything else cannot be told.
+        if names="$(virsh_ list --all --name 2>&1)" && ! grep -qxF -- "$DOMAIN" <<<"$names"; then
+            printf 'Session guard     none (%s is not defined)\n' "$DOMAIN"
+        else
+            printf 'Session guard     unknown (virsh: %s)\n' "$xml"
+            rc=6
+        fi
     elif guard_in "$xml"; then
         # Judged as session-end would, without removing anything.
         shopt -s nullglob
@@ -2584,8 +3248,9 @@ cmd_screenshot() {
 # ---------------------------------------------------------------------------
 check_knobs() {
     if [[ ! "$POLL_SECS" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$POLL_SECS" =~ [1-9] || ! "$MINUTE_SECS" =~ ^[1-9][0-9]*$ ||
-        ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ || ! "$GUARD_SECS" =~ ^[1-9][0-9]{0,5}$ || ! "$RESEND_SECS" =~ ^[1-9][0-9]{0,4}$ ]]; then
-        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS and _RESEND_SECS take numbers above 0\n' >&2
+        ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ || ! "$GUARD_SECS" =~ ^[1-9][0-9]{0,5}$ || ! "$RESEND_SECS" =~ ^[1-9][0-9]{0,4}$ ||
+        ! "$CLOCK_GAP_SECS" =~ ^[1-9][0-9]{0,5}$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS and _CLOCK_GAP_SECS take numbers above 0\n' >&2
         exit 2
     fi
     if [[ -n "$TEST_ROOT" ]]; then
