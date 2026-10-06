@@ -171,6 +171,8 @@ Checked before any directory is created, both roots compared **after resolution*
     a failed history row (bd `2my`).
     The one exception: an abort *after* the report went out exits 3 under a report and a row that
     already say what they saw — the journal's `status=3` and the log are its only trace.
+  - `btrdasd backup run` (CLI, GUI; not run by the units; bd `vzsu`): the same 0 / 3 / 1 — see
+    "The CLI/GUI Run Records Truthfully" below.
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.
@@ -196,10 +198,18 @@ Checked before any directory is created, both roots compared **after resolution*
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
   is the first primary target, so a reduced config renders the other targets' retention differently.
 
-## The CLI/GUI Run Records Truthfully (bd `no4`, `vzsu`)
+## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
 - `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`: **`None` = unknown** — the step
   that counts them was asked for and failed. Never `Some(0)` (a measurement: "nothing to do"). Stored as
   NULL (schema 4), printed `unknown` (summary, `backup run`), `null` (`--json`); GUI history shows "unknown".
+- **`btrdasd backup run` exits 0 / 3 / 1 — the script's and the doctor's rule** (bd `vzsu`;
+  `BackupJobOutcome::exit_code`): **0** clean (a warning too) or declined; **3** began and something
+  failed, or aborted on a target's/source's state (`Aborted`: no target mounts, verification refuses,
+  an absent ticked target — recorded as a failed row, counts NULL, unless a dry run); **1** could not
+  start (`CouldNotStart`: empty selection, locks). A report neither saved nor mailed fails the run
+  BEFORE the row is written, so the row says `report: …`; a failed email beside a saved report stays a
+  warning. The GUI has no exit codes: it shows `JobFinished(success, summary)` — exit 0 = success, 3 and
+  1 = failure with the summary or reason.
 - A failed `host.record` fails the job (`history not recorded: …` in `errors`), never only a warning: a run
   missing from the history that reports success is the fail-silent defect.
 

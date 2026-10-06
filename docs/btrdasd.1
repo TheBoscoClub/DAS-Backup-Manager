@@ -579,11 +579,19 @@ replaces an existing one only on a full run.
 .PP
 If another backup already holds the singleton lock, the command prints that it
 declines and exits 0; it waits for a running scrub. A run that could not start
-(locks, mounting, target verification, btrbk) exits 1 and is not recorded. A run
-that started and failed is recorded and reported, then exits 1.
+(nothing selected, or the locks cannot be taken) exits 1, having mounted and run
+nothing. A run that began \(em it took the locks \(em and then stopped on a
+target's or a source's state (no target would mount, a target or a source
+volume is not what it must be, an absent ticked target, btrbk could not be
+started) is recorded as a failed run, its counts unknown, and exits 3, as is a
+run that ran with any failure: btrbk failing, the subvolume sync, a target left
+mounted, a report that could be neither saved nor mailed, or a history row that
+could not be written. Everything else exits 0; a warning is still 0. The GUI
+has no exit status: it shows the same outcome as a success flag and the
+summary line.
 .PP
 .BR backup\-run.sh ,
-which the scheduled units run, follows a different rule: 0 when nothing
+which the scheduled units run, follows the same rule: 0 when nothing
 failed, 3 when the run began its work and something failed or it aborted on a
 target's or a source's state (target verification and btrbk included), 1 only
 when it could not start. Its units count 3 as success
