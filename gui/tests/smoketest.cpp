@@ -189,6 +189,44 @@ private Q_SLOTS:
                                        QStringLiteral("unknown")}));
     }
 
+    void historyShowsASentCountItCouldNotTakeAsUnknownNotAsNo()
+    {
+        DBusClient client;
+        BackupHistoryView view(&client);
+        // Newest first: a failed run that could not count (NULL), a failed run
+        // that counted nothing sent (a measured 0), a clean run that sent
+        // bytes, and a clean run with nothing to send.
+        view.showHistory(QStringLiteral(R"([
+            {"id": 4, "timestamp": 1791000000, "mode": "full", "success": false,
+             "duration_secs": 5, "snaps_created": null, "snaps_sent": null,
+             "bytes_sent": 0, "errors": ["btrbk: exit code 10"]},
+            {"id": 3, "timestamp": 1790900000, "mode": "full", "success": false,
+             "duration_secs": 5, "snaps_created": 2, "snaps_sent": 0,
+             "bytes_sent": 0, "errors": ["target not mounted"]},
+            {"id": 2, "timestamp": 1790800000, "mode": "incremental", "success": true,
+             "duration_secs": 5, "snaps_created": 3, "snaps_sent": 3,
+             "bytes_sent": 4096, "errors": []},
+            {"id": 1, "timestamp": 1790700000, "mode": "incremental", "success": true,
+             "duration_secs": 5, "snaps_created": 0, "snaps_sent": 0,
+             "bytes_sent": 0, "errors": []}
+        ])"));
+        const auto *table = view.findChild<QTableView *>();
+        QVERIFY(table != nullptr);
+        QAbstractItemModel *model = table->model();
+        QCOMPARE(model->rowCount(), 4);
+        int column = -1;
+        for (int c = 0; c < model->columnCount(); ++c) {
+            if (model->headerData(c, Qt::Horizontal).toString() == QStringLiteral("Sent"))
+                column = c;
+        }
+        QVERIFY(column >= 0);
+        QStringList cells;
+        for (int r = 0; r < model->rowCount(); ++r)
+            cells << model->index(r, column).data().toString();
+        QCOMPARE(cells, (QStringList{QStringLiteral("unknown"), QStringLiteral("No"),
+                                     QStringLiteral("Yes"), QStringLiteral("\u2014")}));
+    }
+
     void fileModelIsEmptyWithoutAReachableHelper()
     {
         // An unreachable helper must leave an empty model, not throw or abort —

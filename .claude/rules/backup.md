@@ -196,6 +196,13 @@ Checked before any directory is created, both roots compared **after resolution*
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
   is the first primary target, so a reduced config renders the other targets' retention differently.
 
+## The CLI/GUI Run Records Truthfully (bd `no4`, `vzsu`)
+- `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`: **`None` = unknown** — the step
+  that counts them was asked for and failed. Never `Some(0)` (a measurement: "nothing to do"). Stored as
+  NULL (schema 4), printed `unknown` (summary, `backup run`), `null` (`--json`); GUI history shows "unknown".
+- A failed `host.record` fails the job (`history not recorded: …` in `errors`), never only a warning: a run
+  missing from the history that reports success is the fail-silent defect.
+
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 **Never invoke `btrbk` against a target path that is not a real mountpoint backed by the
 expected DAS filesystem** — the write falls through to the NVMe root and fills it (`bd 9on`).

@@ -156,8 +156,13 @@ pub struct BackupOptions {
 pub struct BackupResult {
     pub success: bool,
     pub mode: BackupMode,
-    pub snapshots_created: usize,
-    pub snapshots_sent: usize,
+    /// Snapshots btrbk created. `None` = unknown: the step that counts them
+    /// was asked for and failed, so nothing was measured — never `Some(0)`,
+    /// which is a measurement ("there was nothing to do"). Recorded as NULL
+    /// in `backup_runs` (schema 4) and shown as "unknown".
+    pub snapshots_created: Option<usize>,
+    /// Snapshots sent to a target. `None` = unknown, as `snapshots_created`.
+    pub snapshots_sent: Option<usize>,
     pub snapshots_cleaned: usize,
     pub bytes_sent: u64,
     pub boot_archived: bool,
@@ -1539,14 +1544,29 @@ fn effective_targets(config: &Config, options: &BackupOptions) -> Result<Vec<Str
 }
 
 /// What the btrbk steps counted, and which of them failed.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Pipeline {
-    created: usize,
-    sent: usize,
+    /// `None` once a step that counts them was run and failed; a step that was
+    /// not asked for leaves `Some(0)`.
+    created: Option<usize>,
+    sent: Option<usize>,
     cleaned: usize,
     bytes: u64,
     /// One per failed step. A failed step does not stop the next one.
     errors: Vec<String>,
+}
+
+impl Default for Pipeline {
+    /// Nothing run yet: no step has failed, so nothing is unknown.
+    fn default() -> Self {
+        Self {
+            created: Some(0),
+            sent: Some(0),
+            cleaned: 0,
+            bytes: 0,
+            errors: Vec::new(),
+        }
+    }
 }
 
 impl Pipeline {
@@ -1581,17 +1601,23 @@ fn run_pipeline(
         progress,
         env.runner,
     ) {
-        Ok(n) => done.created = n,
-        Err(e) => done.failed(progress, format!("Snapshot step failed: {e}")),
+        Ok(n) => done.created = Some(n),
+        Err(e) => {
+            done.created = None;
+            done.failed(progress, format!("Snapshot step failed: {e}"));
+        }
     };
     let send = |done: &mut Pipeline| {
         // No --preserve: btrbk enforces retention, in both modes.
         match send_snapshots_with(config, sources, targets, false, progress, env) {
             Ok((sent, bytes)) => {
-                done.sent = sent;
+                done.sent = Some(sent);
                 done.bytes = bytes;
             }
-            Err(e) => done.failed(progress, format!("Send step failed: {e}")),
+            Err(e) => {
+                done.sent = None;
+                done.failed(progress, format!("Send step failed: {e}"));
+            }
         }
     };
     match mode {
@@ -1599,12 +1625,16 @@ fn run_pipeline(
         BackupMode::Full if options.send_only => send(&mut done),
         BackupMode::Full => match run_full_pipeline_with(config, sources, targets, progress, env) {
             Ok((created, sent, cleaned, bytes)) => {
-                done.created = created;
-                done.sent = sent;
+                done.created = Some(created);
+                done.sent = Some(sent);
                 done.cleaned = cleaned;
                 done.bytes = bytes;
             }
-            Err(e) => done.failed(progress, format!("Full backup pipeline failed: {e}")),
+            Err(e) => {
+                // One btrbk run did all of it: what it created and sent is not known.
+                (done.created, done.sent) = (None, None);
+                done.failed(progress, format!("Full backup pipeline failed: {e}"));
+            }
         },
         BackupMode::Incremental => {
             if !options.send_only {
@@ -1737,8 +1767,8 @@ fn run_backup_with(
         let result = BackupResult {
             success,
             mode,
-            snapshots_created: 0,
-            snapshots_sent: 0,
+            snapshots_created: Some(0),
+            snapshots_sent: Some(0),
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot_archived: false,
@@ -1803,7 +1833,7 @@ fn run_backup_with(
     // mode (no cleanup) this is the actual bytes sent. For full mode (with
     // cleanup) it's the net change, which may underestimate if old data was
     // purged. Still better than reporting 0.
-    if bytes_sent == 0 && (snapshots_sent > 0 || snapshots_created > 0) {
+    if bytes_sent == 0 && (snapshots_sent.unwrap_or(0) > 0 || snapshots_created.unwrap_or(0) > 0) {
         // Force BTRFS to commit pending transactions so statvfs reflects the
         // data that was just received. Without this, BTRFS defers metadata
         // updates and statvfs returns stale values, making the delta zero.
@@ -1918,8 +1948,8 @@ pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
         };
     }
     if result.success
-        && result.snapshots_created == 0
-        && result.snapshots_sent == 0
+        && result.snapshots_created == Some(0)
+        && result.snapshots_sent == Some(0)
         && result.snapshots_cleaned == 0
     {
         return format!("Backup ({mode}): nothing to do — all snapshots up to date");
@@ -1934,9 +1964,17 @@ pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
     } else {
         "completed with errors"
     };
+    // A count that could not be measured says so; it is never printed as 0.
+    let created = result.snapshots_created.map_or_else(
+        || "snapshots created: unknown".to_string(),
+        |n| format!("{n} snapshots created"),
+    );
+    let sent = result
+        .snapshots_sent
+        .map_or_else(|| "sent: unknown".to_string(), |n| format!("{n} sent"));
     let mut summary = format!(
-        "Backup {status} ({mode}): {} snapshots created, {} sent{cleaned}, boot archived: {}",
-        result.snapshots_created, result.snapshots_sent, result.boot_archived,
+        "Backup {status} ({mode}): {created}, {sent}{cleaned}, boot archived: {}",
+        result.boot_archived,
     );
     if !result.success {
         summary.push_str(&format!(" — {}", result.errors.join("; ")));
@@ -2164,11 +2202,14 @@ pub fn run_backup_job(
     }
     if let Some(captured) = &captured {
         result.report_sent = host.report(&config, &options, &result, captured, progress);
+        // A run that cannot be recorded vanishes from the history while the
+        // job reports success: it fails the job, in its errors and its status
+        // (bd DAS-Backup-Manager-no4).
         if let Err(e) = host.record(&config, &result) {
-            progress.on_log(
-                LogLevel::Warning,
-                &format!("Failed to record backup history: {e}"),
-            );
+            let msg = format!("history not recorded: {e}");
+            progress.on_log(LogLevel::Error, &msg);
+            result.errors.push(msg);
+            result.success = false;
         }
     }
     BackupJobOutcome::Ran(result)
@@ -2567,10 +2608,15 @@ mod tests {
 
         assert!(result.success, "dry_run result must be success");
         assert_eq!(
-            result.snapshots_created, 0,
+            result.snapshots_created,
+            Some(0),
             "dry_run must create 0 snapshots"
         );
-        assert_eq!(result.snapshots_sent, 0, "dry_run must send 0 snapshots");
+        assert_eq!(
+            result.snapshots_sent,
+            Some(0),
+            "dry_run must send 0 snapshots"
+        );
         assert_eq!(result.bytes_sent, 0);
         assert!(!result.boot_archived);
 
@@ -3693,8 +3739,8 @@ mod tests {
         assert_eq!(
             done,
             Pipeline {
-                created: 2,
-                sent: 2,
+                created: Some(2),
+                sent: Some(2),
                 cleaned: 0,
                 bytes: 1024,
                 errors: vec![]
@@ -3723,7 +3769,7 @@ mod tests {
         );
         assert_eq!(calls[0], btrbk(&format!("resume {f}")));
         assert_eq!(calls.len(), 2, "{calls:?}");
-        assert_eq!((done.created, done.sent), (0, 1));
+        assert_eq!((done.created, done.sent), (Some(0), Some(1)));
 
         let (done, calls, _) = pipeline(
             BackupOptions {
@@ -3735,7 +3781,7 @@ mod tests {
         );
         assert_eq!(calls[0], btrbk(&format!("snapshot {f}")));
         assert_eq!(calls.len(), 2, "{calls:?}");
-        assert_eq!((done.created, done.sent), (1, 0));
+        assert_eq!((done.created, done.sent), (Some(1), Some(0)));
     }
 
     #[test]
@@ -3755,8 +3801,8 @@ mod tests {
         assert_eq!(
             done,
             Pipeline {
-                created: 1,
-                sent: 1,
+                created: Some(1),
+                sent: Some(1),
                 cleaned: 1,
                 bytes: 0,
                 errors: vec![]
@@ -3771,7 +3817,10 @@ mod tests {
             script(),
         );
         assert_eq!(calls[0], btrbk(&format!("snapshot {f}")));
-        assert_eq!((done.created, done.sent, done.cleaned), (1, 0, 0));
+        assert_eq!(
+            (done.created, done.sent, done.cleaned),
+            (Some(1), Some(0), 0)
+        );
         let (done, calls, _) = pipeline(
             BackupOptions {
                 send_only: true,
@@ -3781,7 +3830,10 @@ mod tests {
             script(),
         );
         assert_eq!(calls[0], btrbk(&format!("resume {f}")));
-        assert_eq!((done.created, done.sent, done.cleaned), (0, 1, 0));
+        assert_eq!(
+            (done.created, done.sent, done.cleaned),
+            (Some(0), Some(1), 0)
+        );
     }
 
     #[test]
@@ -3808,13 +3860,23 @@ mod tests {
             3,
             "snapshot, then resume and its listing: {calls:?}"
         );
-        assert_eq!((done.created, done.sent), (0, 1));
+        assert_eq!(
+            (done.created, done.sent),
+            (None, Some(1)),
+            "the snapshot step failed, so its count is unknown, not 0; the send's is real"
+        );
         assert!(logged(&progress, LogLevel::Error, &done.errors[0]));
 
         let (done, _, _) = pipeline(
             BackupOptions::default(),
             BackupMode::Incremental,
             vec![(btrbk(&format!("snapshot {f}")), 0, String::new())],
+        );
+        assert_eq!(
+            (done.created, done.sent),
+            (Some(0), None),
+            "the send step failed: its count is unknown, not 0 ({:?})",
+            done.errors
         );
         assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
         assert!(
@@ -3835,6 +3897,11 @@ mod tests {
                 "Full backup pipeline failed: btrbk run command failed (exit status 2). \
               The backup may be incomplete."
             ]
+        );
+        assert_eq!(
+            (done.created, done.sent),
+            (None, None),
+            "one btrbk run did both; nothing it did is known"
         );
     }
 
@@ -4479,7 +4546,10 @@ mod tests {
         };
         let result = run_backup_with(&live_config(), &live_options(), &progress, &host).unwrap();
         assert!(result.success, "{:?}", result.errors);
-        assert_eq!((result.snapshots_created, result.snapshots_sent), (2, 2));
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(2), Some(2))
+        );
         let calls = runner.calls();
         assert_eq!(calls.len(), 4, "{calls:?}");
         assert!(
@@ -4491,6 +4561,107 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("nonexistent/das/recovery")),
             "the unticked, absent target is not named to btrbk: {calls:?}"
+        );
+    }
+
+    /// A live run's result, recorded and read back from the history the way
+    /// the GUI reads it.
+    fn recorded(result: &BackupResult) -> crate::report::BackupRun {
+        let db = Database::open(":memory:").unwrap();
+        crate::report::record_backup_run(&db, result).unwrap();
+        crate::report::get_backup_history(&db, 1).unwrap().remove(0)
+    }
+
+    #[test]
+    fn a_failed_btrbk_step_leaves_its_count_unknown_and_the_history_says_null_not_zero() {
+        // The snapshot step fails (exit 10); the send, which does not depend
+        // on it, runs and counts one.
+        let f = "/proc/self/root /proc/self/home";
+        let runner = Scripted::from_owned(vec![
+            (
+                btrbk_at("/nonexistent/btrbk.conf", &format!("snapshot {f}")),
+                10,
+                String::new(),
+            ),
+            (
+                btrbk_at("/nonexistent/btrbk.conf", &format!("resume {f}")),
+                0,
+                ">>> /t/a.1\n".into(),
+            ),
+            (
+                btrbk_at(
+                    "/nonexistent/btrbk.conf",
+                    &format!("--format=raw list latest {f}"),
+                ),
+                0,
+                raw_row("/s/a.1", "/t/a.1"),
+            ),
+        ]);
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            ..env(&runner)
+        };
+        let result =
+            run_backup_with(&live_config(), &live_options(), &TestProgress::new(), &host).unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (None, Some(1))
+        );
+        let row = recorded(&result);
+        assert_eq!((row.snapshots_created, row.snapshots_sent), (None, Some(1)));
+        let summary = backup_summary(&result, false);
+        assert!(
+            summary.contains("snapshots created: unknown, 1 sent"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_counted_zero_records_zero_not_unknown() {
+        // The counter-case: a measured zero is a count, and stays one.
+        let f = "/proc/self/root /proc/self/home";
+        let runner = Scripted::from_owned(vec![
+            (
+                btrbk_at("/nonexistent/btrbk.conf", &format!("snapshot {f}")),
+                0,
+                String::new(),
+            ),
+            (
+                btrbk_at("/nonexistent/btrbk.conf", &format!("resume {f}")),
+                0,
+                String::new(),
+            ),
+            (
+                btrbk_at(
+                    "/nonexistent/btrbk.conf",
+                    &format!("--format=raw list latest {f}"),
+                ),
+                0,
+                String::new(),
+            ),
+        ]);
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            ..env(&runner)
+        };
+        let result =
+            run_backup_with(&live_config(), &live_options(), &TestProgress::new(), &host).unwrap();
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(0), Some(0))
+        );
+        let row = recorded(&result);
+        assert_eq!(
+            (row.snapshots_created, row.snapshots_sent),
+            (Some(0), Some(0))
+        );
+        assert_eq!(
+            backup_summary(&result, false),
+            "Backup (incremental): nothing to do — all snapshots up to date"
         );
     }
 
@@ -5369,8 +5540,8 @@ mod tests {
             Ok(BackupResult {
                 success: errors.is_empty(),
                 mode: BackupMode::Incremental,
-                snapshots_created: 2,
-                snapshots_sent: 2,
+                snapshots_created: Some(2),
+                snapshots_sent: Some(2),
                 snapshots_cleaned: 0,
                 bytes_sent: 10,
                 boot_archived: false,
@@ -5707,30 +5878,52 @@ mod tests {
     }
 
     #[test]
-    fn a_record_that_fails_is_a_warning_not_a_failed_run() {
+    fn a_record_that_fails_fails_the_run_and_says_so() {
         let host = FakeHost {
             record_fails: true,
             ..Default::default()
         };
         let (outcome, progress) = job(&host, false);
-        assert!(outcome.success());
+        assert!(
+            !outcome.success(),
+            "a run missing from the history is not a success: {outcome:?}"
+        );
+        let (ok, line) = outcome.finish_line(false);
+        assert!(!ok);
+        assert!(line.contains("history not recorded: disk full"), "{line}");
+        let BackupJobOutcome::Ran(result) = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(result.errors, ["history not recorded: disk full"]);
         assert!(
             progress
                 .logs
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(l, m)| *l == LogLevel::Warning
-                    && m == "Failed to record backup history: disk full")
+                .any(|(l, m)| *l == LogLevel::Error && m == "history not recorded: disk full")
         );
+    }
+
+    #[test]
+    fn a_record_that_works_leaves_the_run_a_success() {
+        // The counter-case to the one above.
+        let host = FakeHost::default();
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success(), "{outcome:?}");
+        let BackupJobOutcome::Ran(result) = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(host.recorded.lock().unwrap().len(), 1);
     }
 
     fn result_with(success: bool, created: usize, sent: usize, cleaned: usize) -> BackupResult {
         BackupResult {
             success,
             mode: BackupMode::Full,
-            snapshots_created: created,
-            snapshots_sent: sent,
+            snapshots_created: Some(created),
+            snapshots_sent: Some(sent),
             snapshots_cleaned: cleaned,
             bytes_sent: 0,
             boot_archived: true,
@@ -5742,6 +5935,31 @@ mod tests {
                 vec!["a".into(), "b".into()]
             },
             duration_secs: 0,
+        }
+    }
+
+    #[test]
+    fn a_summary_never_prints_an_unknown_count_as_a_number() {
+        let mut result = result_with(false, 0, 0, 0);
+        result.snapshots_created = None;
+        result.snapshots_sent = None;
+        assert_eq!(
+            backup_summary(&result, false),
+            "Backup completed with errors (full): snapshots created: unknown, sent: unknown, \
+             boot archived: true — a; b"
+        );
+        // A run whose counts are unknown is never "nothing to do", even clean
+        // and even when the other count is a measured zero.
+        result.success = true;
+        result.errors.clear();
+        for (created, sent) in [(None, None), (None, Some(0)), (Some(0), None)] {
+            result.snapshots_created = created;
+            result.snapshots_sent = sent;
+            let line = backup_summary(&result, false);
+            assert!(
+                line.contains("unknown") && !line.contains("nothing to do"),
+                "{created:?} {sent:?}: {line}"
+            );
         }
     }
 
