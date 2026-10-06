@@ -1,8 +1,6 @@
 // Installer module — install, uninstall, upgrade, and check modes.
 // Orchestrates config saving, template generation, file writing, and manifest tracking.
 
-#![allow(dead_code)]
-
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
