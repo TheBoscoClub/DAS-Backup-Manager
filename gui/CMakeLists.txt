@@ -48,6 +48,7 @@ target_sources(btrdasd-gui PRIVATE
     src/progresspanel.cpp
     src/backuphistory.cpp
     src/backuppanel.cpp
+    src/backupsteps.cpp
     src/healthdashboard.cpp
     src/configdialog.cpp
     src/snapshotbrowser.cpp
@@ -102,6 +103,7 @@ if(BUILD_TESTING)
         src/filemodel.cpp
         src/healthdashboard.cpp
         src/backuphistory.cpp
+        src/backupsteps.cpp
         src/progresspanel.cpp
         src/indexrunner.cpp
     )

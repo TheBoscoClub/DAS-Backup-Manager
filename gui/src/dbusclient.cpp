@@ -1,4 +1,5 @@
 #include "dbusclient.h"
+#include "backupsteps.h"
 
 #include <QDBusConnection>
 #include <QDBusInterface>
@@ -84,33 +85,13 @@ QString DBusClient::unavailableReason() const
 
 void DBusClient::backupRun(const QString &mode,
                            const QStringList &sources, const QStringList &targets,
-                           bool dryRun)
+                           bool dryRun, const BackupSteps &steps)
 {
     callAsync(QStringLiteral("BackupRun"),
               {mode, QVariant::fromValue(sources),
-               QVariant::fromValue(targets), dryRun},
+               QVariant::fromValue(targets), dryRun,
+               QVariant::fromValue(steps.toDBus())},
               QStringLiteral("BackupRun"));
-}
-
-void DBusClient::backupSnapshot(const QStringList &sources)
-{
-    callAsync(QStringLiteral("BackupSnapshot"),
-              {QVariant::fromValue(sources)},
-              QStringLiteral("BackupSnapshot"));
-}
-
-void DBusClient::backupSend(const QStringList &targets)
-{
-    callAsync(QStringLiteral("BackupSend"),
-              {QVariant::fromValue(targets)},
-              QStringLiteral("BackupSend"));
-}
-
-void DBusClient::backupBootArchive()
-{
-    callAsync(QStringLiteral("BackupBootArchive"),
-              {},
-              QStringLiteral("BackupBootArchive"));
 }
 
 void DBusClient::indexWalk(const QString &targetPath)

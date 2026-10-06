@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 
+struct BackupSteps;
 class QDBusInterface;
 class QDBusPendingCallWatcher;
 
@@ -21,10 +22,7 @@ public:
     // Async job-returning methods (return job_id via signal)
     void backupRun(const QString &mode,
                    const QStringList &sources, const QStringList &targets,
-                   bool dryRun);
-    void backupSnapshot(const QStringList &sources);
-    void backupSend(const QStringList &targets);
-    void backupBootArchive();
+                   bool dryRun, const BackupSteps &steps);
     void indexWalk(const QString &targetPath);
     void restoreFiles(const QString &snapshot,
                       const QString &dest, const QStringList &files);

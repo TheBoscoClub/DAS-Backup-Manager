@@ -1,4 +1,5 @@
 #include "backuppanel.h"
+#include "backupsteps.h"
 #include "dbusclient.h"
 
 #include <KLocalizedString>
@@ -90,7 +91,6 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     m_sendCheck->setChecked(true);
 
     m_bootArchiveCheck = new QCheckBox(i18n("Boot Archive"), m_operationsGroup);
-    m_bootArchiveCheck->setToolTip(i18n("Archive the @boot subvolume as a read-only snapshot before recreation"));
     m_bootArchiveCheck->setChecked(true);
 
     m_indexCheck = new QCheckBox(i18n("Index"), m_operationsGroup);
@@ -98,8 +98,14 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     m_indexCheck->setChecked(true);
 
     m_emailCheck = new QCheckBox(i18n("Email Report"), m_operationsGroup);
-    m_emailCheck->setToolTip(i18n("Send a summary email report after the backup completes"));
+    m_emailCheck->setToolTip(i18n("Email the report after the run (when [email] is enabled in config). The report is always saved."));
     m_emailCheck->setChecked(true);
+
+    m_snapshotCheck->setObjectName(QStringLiteral("snapshotCheck"));
+    m_sendCheck->setObjectName(QStringLiteral("sendCheck"));
+    m_bootArchiveCheck->setObjectName(QStringLiteral("bootArchiveCheck"));
+    m_indexCheck->setObjectName(QStringLiteral("indexCheck"));
+    m_emailCheck->setObjectName(QStringLiteral("emailCheck"));
 
     opsLayout->addWidget(m_snapshotCheck);
     opsLayout->addWidget(m_sendCheck);
@@ -139,7 +145,14 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     buttonRow->addWidget(m_runButton);
     outerLayout->addLayout(buttonRow);
 
+    m_dryRunButton->setObjectName(QStringLiteral("dryRunButton"));
+    m_runButton->setObjectName(QStringLiteral("runButton"));
+
     // --- Connections ---
+    connect(m_fullRadio, &QRadioButton::toggled, this, &BackupPanel::updateBootArchive);
+    connect(m_incrementalRadio, &QRadioButton::toggled, this, &BackupPanel::updateBootArchive);
+    connect(m_snapshotCheck, &QCheckBox::toggled, this, &BackupPanel::updateRunEnabled);
+    connect(m_sendCheck, &QCheckBox::toggled, this, &BackupPanel::updateRunEnabled);
     connect(m_dryRunButton, &QPushButton::clicked, this, [this]() {
         runBackup(true);
     });
@@ -153,6 +166,8 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
 
 void BackupPanel::loadConfig()
 {
+    m_bootEnabledInConfig = true;
+
     // Clear any previously created dynamic checkboxes
     for (QCheckBox *cb : std::as_const(m_sourceChecks)) {
         cb->deleteLater();
@@ -174,6 +189,7 @@ void BackupPanel::loadConfig()
         auto *errLabel2 = new QLabel(i18n("Could not load configuration"), m_targetsGroup);
         errLabel2->setEnabled(false);
         qobject_cast<QVBoxLayout *>(m_targetsGroup->layout())->addWidget(errLabel2);
+        updateBootArchive();
         updateRunEnabled();
         return;
     }
@@ -196,7 +212,7 @@ void BackupPanel::loadConfig()
     QStringList sources;
     QStringList targets;
 
-    enum class Section { None, Source, Target };
+    enum class Section { None, Source, Target, Boot };
     Section currentSection = Section::None;
 
     const QStringList lines = toml.split(QLatin1Char('\n'));
@@ -210,6 +226,10 @@ void BackupPanel::loadConfig()
         }
         if (line == QLatin1String("[[target]]")) {
             currentSection = Section::Target;
+            continue;
+        }
+        if (line == QLatin1String("[boot]")) {
+            currentSection = Section::Boot;
             continue;
         }
         // Any other section header resets context
@@ -244,6 +264,10 @@ void BackupPanel::loadConfig()
         case Section::Target:
             if (key == QLatin1String("label"))
                 targets.append(value);
+            break;
+        case Section::Boot:
+            if (key == QLatin1String("enabled") && value == QLatin1String("false"))
+                m_bootEnabledInConfig = false;
             break;
         case Section::None:
             break;
@@ -283,7 +307,22 @@ void BackupPanel::loadConfig()
             connect(cb, &QCheckBox::toggled, this, &BackupPanel::updateRunEnabled);
         }
     }
+    updateBootArchive();
     updateRunEnabled();
+}
+
+void BackupPanel::updateBootArchive()
+{
+    if (!m_bootEnabledInConfig) {
+        m_bootArchiveCheck->setChecked(false);
+        m_bootArchiveCheck->setEnabled(false);
+        m_bootArchiveCheck->setToolTip(i18n("Disabled in config.toml ([boot] enabled = false)"));
+        return;
+    }
+    m_bootArchiveCheck->setEnabled(true);
+    m_bootArchiveCheck->setToolTip(m_fullRadio->isChecked()
+        ? i18n("Archive each [boot] subvolume (@, @home) on primary targets read-only, then replace it from the newest snapshot. Mirror targets are never touched.")
+        : i18n("Create a [boot] subvolume (@, @home) that is missing on a primary target from the newest snapshot. An existing one is never replaced. Mirror targets are never touched."));
 }
 
 void BackupPanel::updateRunEnabled()
@@ -292,12 +331,17 @@ void BackupPanel::updateRunEnabled()
         return std::any_of(boxes.cbegin(), boxes.cend(),
                            [](const QCheckBox *cb) { return cb->isChecked(); });
     };
-    const bool selected = anyChecked(m_sourceChecks) && anyChecked(m_targetChecks);
+    const bool anySelected = anyChecked(m_sourceChecks) && anyChecked(m_targetChecks);
+    const bool opChosen = m_snapshotCheck->isChecked() || m_sendCheck->isChecked();
+    const bool selected = anySelected && opChosen;
     const bool enabled = selected && !m_jobRunning;
     m_dryRunButton->setEnabled(enabled);
     m_runButton->setEnabled(enabled);
-    const QString why = selected ? QString()
-                                 : i18n("Tick at least one source and one target");
+    QString why;
+    if (!anySelected)
+        why = i18n("Tick at least one source and one target");
+    else if (!opChosen)
+        why = i18n("Tick Snapshot or Send");
     m_dryRunButton->setStatusTip(why);
     m_runButton->setStatusTip(why);
 }
@@ -322,9 +366,16 @@ void BackupPanel::runBackup(bool dryRun)
         }
     }
 
+    BackupSteps steps;
+    steps.snapshot = m_snapshotCheck->isChecked();
+    steps.send = m_sendCheck->isChecked();
+    steps.bootArchive = m_bootArchiveCheck->isChecked();
+    steps.index = m_indexCheck->isChecked();
+    steps.email = m_emailCheck->isChecked();
+
     // Nothing ticked is nothing to back up — never "everything". The buttons
     // are disabled in that state; this keeps a stray call from sending it.
-    if (sources.isEmpty() || targets.isEmpty())
+    if (sources.isEmpty() || targets.isEmpty() || !steps.runsBtrbk())
         return;
 
     m_jobRunning = true;
@@ -346,5 +397,5 @@ void BackupPanel::runBackup(bool dryRun)
             },
             Qt::SingleShotConnection);
 
-    m_client->backupRun(mode, sources, targets, dryRun);
+    m_client->backupRun(mode, sources, targets, dryRun, steps);
 }
