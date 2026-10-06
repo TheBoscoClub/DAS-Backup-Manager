@@ -44,7 +44,7 @@ cleanup_test() {
 trap cleanup_test EXIT
 
 extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
-for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op cleanup; do
+for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup; do
     body="$(extract "$RUN" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -133,38 +133,87 @@ check "holder: a record whose process runs names it" "$(maintenance_holder)" "bt
 rm -f "$LOCK"
 check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown holder"
 
+# --- a pid is ASCII digits, whatever the locale (bd DAS-Backup-Manager-1bsx) --
+# Under en_US.UTF-8 bash's regex [0-9] also matches digits of other scripts and
+# superscripts, so a record whose "pid" was one of those read as a holder whose
+# process had gone, "no longer running"; it is a record with no pid in it.
+# These cases need a locale where bash's own [0-9] matches such a digit (C and
+# C.UTF-8 show nothing); where none does they could not fail, so they print
+# NOT RUN instead of passing.
+ARABIC_THREE=$'\xd9\xa3' SUPERSCRIPT_TWO=$'\xc2\xb2'
+not_run=""
+# shellcheck disable=SC2030,SC2031  # this block only: every LC_ALL set in it is meant to stay in its subshell
+if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
+    for digit in "$ARABIC_THREE" "$SUPERSCRIPT_TWO" "1$ARABIC_THREE"; do
+        printf 'backup-run.sh pid %s\n' "$digit" >"$LOCK"
+        check "holder, en_US.UTF-8: a pid written '$digit' is no pid" \
+            "$(export LC_ALL=en_US.UTF-8; maintenance_holder)" \
+            "an unknown holder (last recorded: backup-run.sh pid $digit)"
+    done
+    printf 'btrdasd restore browse pid %s\n' "$$" >"$LOCK"
+    check "holder, en_US.UTF-8: an ASCII pid still names its live holder" \
+        "$(export LC_ALL=en_US.UTF-8; maintenance_holder)" "btrdasd restore browse pid $$"
+    rm -f "$LOCK"
+else
+    not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "NOT RUN: $not_run"
+fi
+
 # --- the backup empties its record on the way out, while it holds the lock ---
 (
     exec 8<>"$LOCK"
     flock 8
     printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
-    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="true"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="true"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     cleanup
 )
 check "on exit: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
 # An abort once the lock is ours runs cleanup()'s recovery body: the record
-# still names the run while it unmounts, is emptied after, and the abort's
-# own exit status survives.
+# still names the run while it unmounts, is emptied after, and the run exits
+# 3 — it had begun its work, whatever status ended it (bd
+# DAS-Backup-Manager-d1r; tests/test_backup_exit_semantics.sh has every path).
 rc=0
 (
     set +e
     exec 8<>"$LOCK"
     flock 8
     printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
-    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
     unmount_all() { record >"$WORK/during_unmount"; }
-    (exit 3)
+    (exit 1)
     cleanup
 ) || rc=$?
 check "on abort: the record names the run while it unmounts" "$(cat "$WORK/during_unmount")" "backup-run.sh pid $$"
 check "on abort: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
-check "on abort: the abort's exit status is kept" "$rc" "3"
-printf 'btrdasd scrub run pid 77\n' >"$LOCK"
+check "on abort: the run exits 3" "$rc" "3"
+# A stop the run itself received keeps the signal's code, lock held or not
+# (bd DAS-Backup-Manager-d1r round 3, M2).
+rc=0
 (
-    CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; DRYRUN_BTRBK_CONF=""
+    set +e
+    exec 8<>"$LOCK"
+    flock 8
+    printf 'backup-run.sh pid %s\n' "$$" >"$LOCK"
+    CLEANUP_ARMED="true"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL="HUP"
+    unmount_all() { :; }
+    (exit 129)
     cleanup
-)
+) || rc=$?
+check "on a stop: the run exits with the signal's code" "$rc" "129"
+check "on a stop: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
+printf 'btrdasd scrub run pid 77\n' >"$LOCK"
+rm -f "$WORK/during_unmount"
+rc=0
+(
+    # Everything the recovery body reads is set, so it is the gate alone
+    # that keeps the run away from unmount_all.
+    CLEANUP_ARMED="false"; SCRIPT_COMPLETED="false"; BACKUP_MODE_REAL="false"; DRYRUN_BTRBK_CONF=""; STOP_SIGNAL=""
+    unmount_all() { record >"$WORK/during_unmount"; }
+    cleanup
+) || rc=$?
 check "exit before the lock is ours: another holder's record is left alone" "$(record)" "btrdasd scrub run pid 77"
+check "exit before the lock is ours: nothing is unmounted" "$([[ -e "$WORK/during_unmount" ]] && echo yes || echo no)" "no"
+check "exit before the lock is ours: it could not start, exit 1" "$rc" "1"
 
 # --- walk is handed the lock the backup holds --------------------------------
 rm -f "$LOCK"
@@ -228,13 +277,26 @@ release_lock
 
 # --- backup-verify.sh: a deliberate skip is not a failed mount (bd 0oi) ------
 # check_btrbk_status only tries the primary when its partition is a block
-# device; any node ending in 1 will do — `mount` is a stub, nothing is touched.
+# device; any node ending in 1 will do — `mount` is a stub, nothing is touched,
+# and the node is only ever tested with -b, never opened.
+#
+# A container's /dev holds no block devices (CI's archlinux container has none),
+# so when the host offers none of these, make one in the temp dir. 0:0 is the
+# "unnamed" major, which no block driver owns, so even an accidental open could
+# only fail. mknod needs CAP_MKNOD, which root in CI's container has; with
+# neither a host node nor the capability the suite FAILS — it never skips.
 blockdev=""
 for b in /dev/loop1 /dev/vda1 /dev/sda1 /dev/nvme0n1p1 /dev/ram1; do
     if [[ -b "$b" ]]; then blockdev="$b"; break; fi
 done
+mknod_err=""
 if [[ -z "$blockdev" ]]; then
-    echo "FAIL: no block device node ending in 1 to drive check_btrbk_status with"
+    if mknod_err="$(mknod "$WORK/blk1" b 0 0 2>&1)" && [[ -b "$WORK/blk1" ]]; then
+        blockdev="$WORK/blk1"
+    fi
+fi
+if [[ -z "$blockdev" ]]; then
+    echo "FAIL: no block device node ending in 1 to drive check_btrbk_status with (mknod: ${mknod_err:-made no node})"
     fails=$((fails + 1))
 else
     DAS_DEVICES=("${blockdev%1}")
@@ -267,6 +329,7 @@ else
 fi
 
 if [[ $fails -eq 0 ]]; then
+    [[ -z "$not_run" ]] || echo "NOT RUN: $not_run"
     echo "MAINTENANCE LOCK SUITE GREEN"
 else
     echo "$fails FAILED"

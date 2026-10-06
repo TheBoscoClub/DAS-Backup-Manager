@@ -34,8 +34,12 @@ never the pattern.**
    `None`/`unknown`, never to a fabricated measurement.
 4. **Per-target mount failure is logged and the run continues** — legitimate *only because the
    target is then excluded*. A failure branch must never mark it available (`bd aea`).
-5. **`backup-run.sh` exits 0 on a failure btrbk survives** — deliberate; see `backup.md`
-   §Sentinel Interaction (`bd 18p`). A btrbk failure exits 1.
+5. **`backup-run.sh` exits 3 — which its units count as success — when it began its work and
+   something failed** — deliberate, the doctor's rule; see `backup.md` §Sentinel Interaction
+   (`bd d1r`). The failure travels by the report, the history row and the journal's `status=3`,
+   never by a restart; only a run that could not start exits 1 and fails the unit. An abort
+   before the report stage sends one ABORTED report and records a failed row (`bd 2my`); one
+   after the report went out has only the journal's `status=3` and the log as its trace.
 6. Display-only fallbacks, documented config defaults, fire-and-forget D-Bus signals, and
    errors discarded in `Drop` or on a path already returning `Err`.
 
@@ -51,7 +55,8 @@ never the pattern.**
 5. **`local x=$(cmd)` masking `cmd`'s exit status**, and any pipeline whose producer dies of
    SIGPIPE under `set -o pipefail`.
 6. **Empty output read as a negative answer** — "blkid printed nothing" is not "unlabelled".
-   Split on exit status and fail closed.
+   Split on exit status and fail closed: a `flock` that failed is not one that found the lock
+   held (`bd ismb`).
 
 ## Auditing this as a diff
 
@@ -80,4 +85,4 @@ in opposite directions; each was caught only by checking against the running sys
 ## Related
 
 - `~/.claude/rules/verification.md` — the class, and the both-directions test rule
-- `backup.md` — the `18p` exit-code split
+- `backup.md` — the exit-code splits: `18p` (scrub), `d1r` (backup)

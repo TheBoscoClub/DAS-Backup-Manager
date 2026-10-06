@@ -225,6 +225,7 @@ sudo /usr/lib/das-backup/backup-run.sh --full         # also archive + recreate 
 After each backup, the report includes:
 
 - **Backup Operations** -- maintenance-lock wait, btrbk success/fail + duration, boot subvolume archive/cleanup status, unmount status, content indexer, subvolume sync, retired-subvolume expiry
+- **Run History** -- only when the run could not be recorded: it is missing from the backup history, and the report is sent again with this section and `FAILURES DETECTED`
 - **Subvolume Sync / Retired Subvolumes** -- what was adopted, retired, skipped or expired (when there is anything to say)
 - **Throughput** -- per-target data written and transfer rate
 - **Disk Capacity** -- used/available/percentage for all backup targets

@@ -330,8 +330,11 @@ impl HelperInterface {
         };
         let options = BackupOptions {
             mode: backup_mode,
-            sources,
-            targets,
+            // An `as` argument cannot say "not specified", and the GUI always
+            // lists its ticks: an empty list is a selection of nothing and
+            // the job refuses it (backup::empty_selection) — never "all".
+            sources: Some(sources),
+            targets: Some(targets),
             dry_run,
             boot_archive: config.boot.enabled,
             index_after: true,
@@ -389,6 +392,12 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
+        // A D-Bus list cannot say "not specified": empty is a selection of
+        // nothing, refused before any lock, mount or btrbk — never "all".
+        if let Some(why) = backup::refuse_empty_sources(&sources) {
+            return Err(fdo::Error::InvalidArgs(why));
+        }
+
         let config = load_config()?;
         let job_id = new_job_id();
         let progress = job_progress(&self.conn, &job_id);
@@ -420,9 +429,19 @@ impl HelperInterface {
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                let res = match backup::create_snapshots(&config, &sources, progress) {
-                    Ok(n) => Ok(format!("{n} snapshots created")),
+                // As `backup run` does, with the sources mounted: btrbk.conf is
+                // brought into line first (a failed sync stops the step).
+                let res = match backup::sync_for_manual_step(
+                    Path::new(CANONICAL_CONFIG),
+                    &config,
+                    progress,
+                ) {
                     Err(e) => Err(format!("Snapshot failed: {e}")),
+                    Ok(config) => match backup::create_snapshots(&config, Some(&sources), progress)
+                    {
+                        Ok(n) => Ok(format!("{n} snapshots created")),
+                        Err(e) => Err(format!("Snapshot failed: {e}")),
+                    },
                 };
                 let still_mounted = source_guard.unmount(progress);
                 mount::fail_if_still_mounted(res, &still_mounted)
@@ -455,6 +474,12 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
 
+        // A D-Bus list cannot say "not specified": empty is a selection of
+        // nothing, refused before any lock, mount or btrbk — never "all".
+        if let Some(why) = backup::refuse_empty_targets(&targets) {
+            return Err(fdo::Error::InvalidArgs(why));
+        }
+
         let config = load_config()?;
         let job_id = new_job_id();
         let progress = job_progress(&self.conn, &job_id);
@@ -462,8 +487,7 @@ impl HelperInterface {
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        // Send from all sources to the specified targets.
-        let sources: Vec<String> = Vec::new();
+        // Send from all sources (`None`: not an empty list) to the specified targets.
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
@@ -486,12 +510,28 @@ impl HelperInterface {
                         Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                     };
                 let mut source_guard = mount::ensure_sources_mounted(&config, progress);
+                // As `backup run` does, with the sources mounted and before the
+                // targets are: btrbk.conf is brought into line first, because
+                // a send of everything passes btrbk no filter.
+                let config = match backup::sync_for_manual_step(
+                    Path::new(CANONICAL_CONFIG),
+                    &config,
+                    progress,
+                ) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        let still = source_guard.unmount(progress);
+                        return mount::fail_if_still_mounted(
+                            Err(format!("Send failed: {e}")),
+                            &still,
+                        );
+                    }
+                };
                 let mut guard =
                     mount::ensure_targets_mounted(&config, progress, locks.maintenance())
                         .map_err(|e| format!("Mount failed: {e}"))?;
 
-                let res = match backup::send_snapshots(&config, &sources, &targets, false, progress)
-                {
+                let res = match backup::send_snapshots(&config, None, &targets, false, progress) {
                     Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
                     Err(e) => Err(format!("Send failed: {e}")),
                 };
@@ -903,23 +943,7 @@ impl HelperInterface {
             let runs = db
                 .get_backup_history(limit as usize)
                 .map_err(|e| fdo::Error::Failed(format!("History query failed: {e}")))?;
-            let arr: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "id": r.id,
-                        "timestamp": r.timestamp,
-                        "mode": r.mode,
-                        "success": r.success,
-                        "duration_secs": r.duration_secs,
-                        "snaps_created": r.snaps_created,
-                        "snaps_sent": r.snaps_sent,
-                        "bytes_sent": r.bytes_sent,
-                        "errors": &r.errors,
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string()))
+            Ok(buttered_dasd::report::backup_history_json(&runs).to_string())
         })
         .await
         .map_err(|e| fdo::Error::Failed(format!("History task join failed: {e}")))?

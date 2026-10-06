@@ -97,23 +97,44 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
-         ├──▶ singleton lock (/run/das-backup.lock), then maintenance lock (/run/das-maintenance.lock, blocking)
+         ├──▶ singleton lock (/run/das-backup.lock: held → skip, exit 0; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
+         │                                   (one already mounted, as fstab mounts /dasRaid0, is used as found)
          ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml when the plan changes it, and btrbk.conf whenever it differs from what config.toml renders to
          │                                   (then: reload config, verify_sources_before_write() again for any source sync added;
          │                                    under --dryrun nothing is written and btrbk reads a temporary rendered btrbk.conf instead)
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
-         ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it); STALE is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun)
+         ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it), including what it starts at boot and whether that runs btrbk; STALE, or a WARNING that its boot will or may run btrbk, is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun)
          ├──▶ update_boot_subvolumes()     → creates missing @/@home on non-mirror targets; archives + recreates them only on --full runs
          ├──▶ btrdasd walk                 → indexes new snapshots on the primary target into SQLite
          ├──▶ growth log, boot-archive-cleanup.sh → prunes expired @.archive.*/@home.archive.* snapshots
-         ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted
-         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report
-         ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25); report also written to last_report
-         └──▶ btrdasd backup record-run    → adds the run to backup_runs
+         ├──▶ capture_report_data()        → capacity, growth and latest-snapshot data read while the targets are still mounted;
+         │                                   decide_run_counts() then settles the snapshot counts, before the run status
+         ├──▶ unmount_all()                → each target unmount retried 5 times, 2 s apart; a target left mounted is a FAIL in the report,
+         │                                   and so is one the mountpoint probe cannot tell about (unmounted anyway): "DAS can be safely
+         │                                   disconnected" only on the gate's OK, else NOT safe and why (bd DAS-Backup-Manager-jug6);
+         │                                   of the sources, only the mount points this run mounted, each once (one that will not
+         │                                   unmount is a WARN with umount's message) — never one it found mounted
+         │                                   (bd DAS-Backup-Manager-8cf)
+         ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25), bounded: TERM after 60 s, KILL 10 s later;
+         │                                   report written to last_report first (a write that fails is logged, and the journal has it)
+         └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown)
 ```
+
+The report goes out before the run is recorded, because the record carries the report's own
+outcome (a delivery failure fails the run). If recording then fails, the run is missing from the
+history, so the record step marks the run FAIL (`run_history`) and writes and sends the report
+again: `FAILURES DETECTED`, with a `RUN HISTORY` section saying the run is not recorded and why.
+
+A run that aborts before its report (exit 3: no primary target, a target or source failing
+verification, a command failing under `set -e`) never reaches those steps. Its EXIT trap,
+`cleanup()`, records it as failed (`--counts-unknown`, the reason in the errors), sends one short
+report with the subject `ABORTED` through the same relay path, and only then unmounts — the
+unmount can hang on a drive that went away. A dry run sends and records nothing. A stop by a
+signal (HUP, INT, USR1, PIPE, ALRM, TERM) keeps its own code (128 + its number), is recorded as
+a stop once the run holds the maintenance lock, and sends no report.
 
 A `--dryrun` stops after the expiry preview and the recovery OS check: it previews the archive pruner and
 unmounts, and sends, records and archives nothing. It may create a missing, empty
@@ -288,7 +309,7 @@ btrdasd-gui
 
 ### Schema
 
-The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 3, kept in
+The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 4, kept in
 `PRAGMA user_version`) uses four index tables, two history tables and an FTS5 virtual table:
 
 ```sql
@@ -299,7 +320,8 @@ snapshot_targets (snapshot_id FK ON DELETE CASCADE, target_root, path,
                   PK(snapshot_id, target_root))   -- schema v3, which targets hold a snapshot
 files_fts (FTS5 virtual: name, path — synced via triggers)
 backup_runs  (id PK, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent,
-              duration_secs, errors)              -- run history, read by the GUI
+              duration_secs, errors)              -- run history, read by the GUI; schema v4: a
+                                                  -- count the run could not take is NULL
 target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_count)
 ```
 
@@ -366,6 +388,18 @@ wizard → Config struct → config.toml (save)
                     installer::install() → write files + manifest
 ```
 
+Every file setup writes is replaced whole — `fsutil::write_atomic_mode`, which every writer of
+`config.toml` and `btrbk.conf` uses too: a temp file of the write's own (`.NAME.PID.N.tmp`, made only
+under a free name), given its mode (scripts 0755, any other file the mode it had) and, written by
+root, the old file's owner and group, flushed, renamed over the old one, the directory flushed — so
+a backup already reading a script keeps the old file, and two writers never meet. Every mode that writes or removes these files (install,
+`--modify`, `--force`, `--upgrade`, `--uninstall`, `--uninstall-all`) does it holding
+`/run/das-backup.lock` and then `/run/das-maintenance.lock`, taken without waiting before the first
+write, or refuses with exit 75 on stderr, changing nothing; `--modify` also refuses when
+`config.toml` changed while its wizard was open. `install`, `uninstall` and `uninstall_all` take the
+proof of that hold (`installer::SetupLocks`) as an argument, and `setup::dispatch` reaches the host
+only through `SetupHost`, so tests drive every mode on a scratch tree.
+
 ### Config Sections
 
 | Section | Fields | Purpose |
@@ -397,7 +431,7 @@ Templates are rendered programmatically (no external template files):
 | Function | Output | Description |
 |----------|--------|-------------|
 | `btrbk_conf::render_btrbk_conf()` | `btrbk.conf` | Per-source volume blocks with target retention; retired entries are left out. In the library because the backup run, the `subvol` commands and the GUI helper's saves regenerate it too |
-| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support; OnCalendar with RandomizedDelaySec |
+| `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support, `SuccessExitStatus=3` (a run that began and failed); OnCalendar with RandomizedDelaySec |
 | `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
 | `render_systemd_doctor_service()` / `render_systemd_doctor_timer()` | `das-backup-doctor.{service,timer}` | Weekly drift check, `SuccessExitStatus=1` |
 | `render_udev_udisks_ignore()` | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | Hides every target from udisks2 by serial and `mount_uuid` |
@@ -409,7 +443,13 @@ credential: reports are submitted unauthenticated to the local relay named by
 `[email].smtp_host`/`smtp_port`. ESP sync hook generation was removed
 2026-04-10 (see `.claude/rules/esp-safety.md`).
 
-The generated units land in `/etc/systemd/system/`. Every service is ordered
+The generated units land in `/etc/systemd/system/`, and they are the only copies: CMake installs
+just `btrdasd-helper.service`. Until bd `DAS-Backup-Manager-7rf` it also installed its own
+`das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system` — a second writer of the
+same units, which systemd ran whenever setup's were gone, with a USB-glob condition and a
+six-hour timeout setup's never had. `setup --upgrade` removes the copies older versions left under
+`/usr` and `/usr/local`, only those whose bytes are a version this project installed
+(`src/setup/retired_units.rs`). Every service is ordered
 `After=local-fs.target`; the backup and scrub services are also ordered after
 `time-sync.target`, because retirement and expiry dates come from the clock.
 On this host (live config, 2026-10-02):
@@ -601,6 +641,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/detect` | `src/setup/detect.rs` | — | System detection (devices, init, packages) |
 | `setup/templates` | `src/setup/templates.rs` | — | Render systemd units, cron, the udisks-ignore udev rule; embed the scripts (btrbk.conf comes from `btrbk_conf`) |
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
+| `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
 | `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 23 methods, 3 signals, polkit checks, job ownership |
 

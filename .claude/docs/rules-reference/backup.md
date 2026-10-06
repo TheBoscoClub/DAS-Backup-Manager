@@ -10,47 +10,145 @@
 
 ## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
 
-Both write `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
-**in place** — `std::fs::write` is `O_TRUNC` then write, same inode. Bash does not
-load a script into memory; it reads incrementally from an open fd, fetching the next
-command only when it needs it. Truncating the file under a running `backup-run.sh`
-means a read landing in that window sees **EOF**, which bash treats as the end of the
-script: it runs the `EXIT` trap, unmounts the targets, and the run **terminates early
-looking like a clean finish** — no boot-archive prune, no report, exit 0. The window
-is microseconds and the content is usually identical, so this will almost always
-appear to work. That is what makes it worth a rule instead of a comment.
+Until bd `6wt` (2026-10-03/04) `setup` wrote `/usr/lib/das-backup/{backup-run,backup-verify,boot-archive-cleanup}.sh`
+**in place** — `std::fs::write` is `O_TRUNC` then write, same inode (this section said `cmake --install`
+did too; measured, it does not — see below). Bash does not
+load a script into memory; it reads incrementally from an open fd, fetching the next top-level
+command only when it needs it, at the offset where the last one ended. **While `main` runs it
+reads nothing** — `main` was parsed whole before it was called — so a rewrite in place under a
+running `backup-run.sh` reaches it only when `main` returns, and bash then reads the **new** file
+at the old offset. Truncated or shorter, that read finds end of file: the script ends with
+`main`'s status, the run complete. Longer or different, bash runs the new file from there: its
+tail, a stranger's commands, half a line (`command not found`, 127). This section used to say a
+truncation made the run "terminate early … no boot-archive prune, no report, exit 0". Measured
+(2026-10-04, the old last line `main "$@"`, `set -euo pipefail`, an `EXIT` trap; truncated,
+shortened or lengthened in place while `main` waited, three times each): `main` logged its prune
+and report every time and the trap saw 0 — nothing ended early. All a truncation can cut short is
+the parse before `main` is called. The window is microseconds and the content is usually
+identical, so this will almost always appear to work. That is what makes it worth a rule instead
+of a comment.
 
-**The `2lj` staleness guard does NOT protect against this, and assuming it does is
-the trap.** It skips an embedded script only when the on-disk copy is newer than the
-binary **AND its content differs**. Right after a `cmake --install`, the installed
-script is byte-identical to the embedded copy, so the guard is inert and
-`setup --upgrade` rewrites it. `2lj` guards against a *stale downgrade*; it is not a
-concurrency lock and there is no lock here — `setup` takes neither
-`/run/das-backup.lock` nor `/run/das-maintenance.lock`.
+**Since bd `6wt`, two things stop it:**
+
+- **`setup` writes atomically** — every file it writes, through `fsutil::write_atomic_mode`, as
+  every other writer of these files does: a new file beside the old, of its own —
+  `.NAME.PID.N.tmp`, created only under a name nothing holds, so concurrent writers never meet and
+  whatever stands there (a crash's leftover, anything planted) is passed over, never followed,
+  reused or removed — given its mode (scripts 0755, every other file the mode it had) and, written
+  by root, the old file's owner and group, flushed, renamed over the name, and the directory
+  flushed. A running bash holds the old inode and keeps reading the old file whole; a write that
+  fails leaves the old file byte-identical and names the path; a symlink at the path is written
+  through (the link kept), and one that names nothing fails the write. Not carried over: ACLs
+  and other extended attributes (the new file gets its directory's defaults). A crash between the
+  create and the rename leaves its `.NAME.PID.N.tmp` behind, and nothing removes it: a dot-name
+  ending `.tmp`, which systemd (no unit suffix), udev (`*.rules`) and cron (no dot-names, by its
+  source, not tested here) do not read.
+- **The three scripts end with `main "$@"; exit $?`** (`backup-run.sh` 4.9.2,
+  `backup-verify.sh` 3.1.1, `boot-archive-cleanup.sh` 2.1.1). Bash parses that line whole before
+  `main` runs, and once `main` returns it exits without reading again. `tests/test_script_rewrite.sh`
+  reproduces the defect and its absence: a script blocked in `main` while its file is rewritten in
+  place — the same file longer, or another script — exits with `main`'s status and runs nothing
+  else; with the old last line `main "$@"` the same rewrite ran the new file's tail (exit 99) or
+  its lines (exit 127). Rewrites that end the same under either last line — `main` returning
+  nonzero, which `set -e` ends at once, or a file rewritten shorter — run under both and are
+  labelled controls: they cannot fail for want of the new line. Any explicit `exit` after `main` makes shellcheck 0.11 stop
+  seeing the `EXIT` trap's handlers as called (SC2329): `cleanup`, `clear_maintenance_holder` and
+  `backup-verify.sh`'s `clear_maintenance_record` carry a directive saying so.
+
+**`cmake --install` does not copy in place either** (CMake 4.4.3, measured 2026-10-03 with
+`file(INSTALL … TYPE PROGRAM)`, which `install(PROGRAMS)` becomes, watched by `inotifywait`: `DELETE`,
+`CREATE`, then the write; an fd opened before kept reading the old content, the new file had a new
+inode; the new file gets its execute bit only once its content is complete). So a run already
+going keeps its script. **What remains:**
+a run that *starts* while a script is being replaced. Every start here is a direct exec (systemd's
+`ExecStart=`, cron, `backup-run.sh` calling its siblings), and an exec in that instant mostly
+fails loudly: the file is missing (127) or not yet executable (126) — `203/EXEC` in systemd
+(measured for the second against a throwaway user oneshot). But after the kernel execs a script, bash opens it
+again **by its path** — measured: a file swapped during bash's own startup is the one that runs —
+so a start whose exec found the old file can open the new one while it is still empty, and **exit
+0 having done nothing**: a run that reports success. Measured on CMake 4.4.3 (2,000 installs of a
+565 KB script, four loops exec'ing it, 7,764 starts): 7,475 ran a whole script, 265 failed at the
+exec, 7 failed in bash's own open (127), 17 exited 0 having run nothing; no partly read script was
+seen. Polls of 1,588 and 1,437 starts (the review's, and its round-4 repeat) saw none of the 17 —
+too few starts landed between an exec and its open. Also remaining: a run already going calls the *new* sibling
+scripts and `btrdasd` for its later steps, a mix of versions whose new binary migrates the
+database on its first open; a writer that does copy in place — a plain `cp` over the installed
+script — which the last line now defuses once `main` runs; and the check below cannot see a run
+started by hand (`sudo backup-run.sh`) in the sub-millisecond window before it takes
+`/run/das-backup.lock`.
+
+**The `2lj` staleness guard was never a protection against this.** It skips an embedded script
+only when the on-disk copy is newer than the binary **AND its content differs**. Right after a
+`cmake --install`, the installed script is byte-identical to the embedded copy, so the guard is
+inert and `setup --upgrade` rewrites it. `2lj` guards against a *stale downgrade*; it is not a
+concurrency lock.
+
+**`setup` is guarded (bd `6wt`, rounds 3–4).** Every mode that writes or removes
+installed files — the wizard, `--modify`, `--force`, `--upgrade`, `--uninstall`,
+`--uninstall-all` — takes `/run/das-backup.lock`, then `/run/das-maintenance.lock`, both
+non-blocking and in the project's order, before its first write (for `--upgrade`, before it
+rewrites `config.toml`; for `--force`, before it even reads it), holds both through every write
+and the helper restart, and lets them go on every path. Either held: nothing written or removed,
+the lock named on **stderr** (the maintenance one with its holder's record; the singleton carries
+no record — `backup-run.sh` opens it with `>`), exit 75. With the writes atomic, the locks still
+matter: a run must see one version of the files from start to end — the scripts it calls later,
+the `btrbk.conf` btrbk reads, the config sync reads again — an uninstall removes them, and the
+helper restart must not kill a job that is mounting. The singleton is the one that matters for
+a backup: it takes it first and keeps it while it waits for the maintenance lock. The wizard's and
+the uninstall's questions come first, so no prompt is answered under the locks — held across one,
+the singleton would make the timer's backup skip its run, as it does for the seconds an upgrade
+takes. `--modify` keeps the bytes of `config.toml` it pre-filled the wizard from and compares them
+once it holds the locks: changed — the GUI, a subvol sync — and it writes nothing and exits 75, so
+the other writer's change is not lost under the wizard's answers. The host bindings take the proof
+(`SetupLocks`): a mode that skips the locks does not compile. `setup::dispatch` reaches the host
+only through `SetupHost`, so the tests drive every mode on a scratch tree: each writing mode
+refuses with 75 and changes nothing while either lock is held, and `--check` takes neither and
+runs while both are. The hold cannot deadlock: nothing setup reaches takes either lock
+(`take_setup_locks` is the only lock call in `src/setup/`, and the library code it uses —
+`config`, `btrbk_conf`, `fsutil` — calls none); the helper claims its bus name, which the restart
+waits for, before it can take a lock; and `systemctl enable --now` waits for the timer's own
+start-up, not for a service the timer then triggers (systemctl(1) `--no-block`, systemd.timer(5)
+`Persistent=` — read in the docs, not tested). A catch-up run triggered that way during the hold
+finds the singleton held and skips (a backup), or waits for setup to let go (a scrub).
+
+**`cmake --install` takes no lock**: the check below stays, for it — every residual above is a
+run that overlaps the install.
+
+The database adds a second reason since schema 4 (bd `6wt`): the first open by a new binary
+migrates `backup_runs` inside `BEGIN IMMEDIATE`, which waits up to the 30 s busy timeout behind
+an older binary's write transaction (a backup's `walk` indexing) and then fails that command.
 
 Check before deploying, every time:
 
 ```bash
-if systemctl is-active -q das-backup.service das-backup-full.service || ! flock -n /run/das-backup.lock true; then echo "WAIT — do not install"; fi
+busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
 ```
 
-`is-active -q` with several units succeeds if any one is active, which covers the daily and the
-weekly full run (both execute `backup-run.sh`); the lock covers a run started by hand with `sudo`
-and a CLI or GUI backup, all of which hold `/run/das-backup.lock`. `flock -n … true` needs no root
-(it opens the file read-only), so it reports a held lock without taking part in it. After a reboot
-the file does not exist until the first backup, `flock` cannot create it as an ordinary user and
-the check prints WAIT — a false alarm, in the safe direction. The earlier check,
-`pgrep -f 'lib/das-backup/backup-run.sh'`, matched its own command line whenever it was run through
-`sh -c` or `ssh`, so it said WAIT with no backup running and could never be trusted to say go.
-Verified 2026-10-02: idle host → no output; the same check against a scratch lock file held by
-`flock <file> sleep 3` → `WAIT`.
+Both units are `Type=oneshot`, so **while one runs its state is `activating`, never `active`**.
+The check this replaces — `systemctl is-active -q das-backup.service das-backup-full.service || …`
+— could therefore never fire on its first half: `is-active` is true only for `active`, `reloading`
+and `refreshing`. Measured 2026-10-03 against a throwaway `systemd-run --user` oneshot (the user
+manager; never a das unit, never the real lock): running → `ActiveState=activating`, `is-active`
+printed `activating` and exited 3, the old check printed nothing, the new one `WAIT`; finished →
+`inactive`, silent; failed → `failed`, silent (a failed run is not running); the scratch lock
+held by `flock <file> sleep 3` → `WAIT`. `systemctl show -P` is asked one unit at a time because
+with several it separates their values with blank lines. The lock half covers a run started by
+hand with `sudo` and a CLI or GUI backup, all of which hold `/run/das-backup.lock`. `flock -n …
+true` needs no root (it opens the file read-only); it does hold the lock for the instant `true`
+runs, so a backup starting in that instant would skip — run the check once, by hand, never in a
+loop. After a reboot the file does not exist until the first backup, `flock` cannot create it as
+an ordinary user and the check prints WAIT — a false alarm, in the safe direction. The earlier
+check, `pgrep -f 'lib/das-backup/backup-run.sh'`, matched its own command line whenever it was
+run through `sh -c` or `ssh`, so it said WAIT with no backup running and could never be trusted
+to say go.
 
 Config edits are no longer inert mid-run (before 2026-10-01 each file was read once at startup).
 `backup-run.sh` reads `config.toml` again after `subvol sync`, so an edit made before that point is
 picked up (and the sources are re-verified against it), and sync rewrites `btrbk.conf`
 before btrbk starts whenever it differs from what `config.toml` renders to (not on a dry run or a failed sync). btrbk reads its config once, so an edit after it starts changes nothing for
 that run. Edit between runs. The three **executing shell scripts** must additionally never be
-rewritten underneath themselves.
+rewritten in place underneath themselves — a plain `cp` over them would (`cmake --install` 4.4.3
+unlinks and recreates instead).
 
 Found 2026-09-01 while deploying during a live run; the deploy was deferred rather
 than risked.
@@ -151,10 +249,15 @@ Measured 2026-09-01 against an isolated config whose only defect was a missing
 subvolume: `btrbk dryrun` → 10, `btrbk list snapshots` → 10. `run_btrbk()` turns
 that into `record_op btrbk FAIL`, so **the report's `Status:` becomes `FAILURES
 DETECTED` and `backup_runs.success` is written 0**, even though every other
-subvolume was backed up correctly. The run itself then exits 1: since 0.7.21.0 `backup-run.sh`
-returns nonzero whenever btrbk did (`OP_STATUS[btrbk]` FAIL), so the unit is marked failed. (An
-earlier version of this paragraph said the run still exited 0 per the `18p` split; that was not
-true of any release after 2026-08-31 — see the Sentinel section.)
+subvolume was backed up correctly. (Reliably only since bd `6wt`: whenever `btrbk list
+latest` failed as well — measured in the live absent-target run of 2026-10-02; not measured
+for this missing-subvolume shape — the "unknown" snapshot counts went to `record-run` as
+`-1`, the parser refused them, and the run left no `backup_runs` row at all. Unknown counts
+are now `--counts-unknown`, stored as NULL.) The run itself exits 3, which both backup units count
+as success (`SuccessExitStatus=3`, `backup-run.sh` 4.11.0, bd `d1r`). From 0.7.21.0 until then it
+exited 1 whenever btrbk exited nonzero (`OP_STATUS[btrbk]` FAIL), so the unit was marked failed,
+for Sentinel to restart. (An earlier version of this paragraph said the run still exited 0 per
+the `18p` split; that was not true of any release after 2026-08-31 — see the Sentinel section.)
 
 **Measured both shapes, because the first measurement did not settle it.** A
 config whose *only* subvolume is missing exits 10 — but so does one with a
@@ -301,7 +404,9 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 - **TLS**: none on the submission hop, by design — it is loopback-only plaintext. The certificate-verified TLS leg is the relay's (`smtp_tls_security_level = secure` to `[smtp.resend.com]:587`). The old `ssl-verify=ignore` existed solely for Bridge's self-signed loopback cert and is gone
 - **`smtp-auth=none` is REQUIRED on every mailx invocation.** s-nail defaults to demanding a password for any `smtp://` mta and aborts with `A password is necessary for smtp authentication` (exit 4) without it — removing the auth flags wholesale breaks every report
 - **Never redirect mailx stderr to `/dev/null`.** A successful submission emits nothing on stderr (measured 2026-08-06); the `2>/dev/null` removed in this migration claimed to hide "s-nail v14 deprecation warnings" that do not exist, and cost every failure its diagnosis — the log read `Failed to email report` with no cause for two years
-- **Reports include**: btrbk status, subvolume sync (adopted, retired, skipped) and retired-subvolume expiry, throughput, archive/cleanup counts, indexing status, disk capacity, SMART summary, latest snapshots, growth trend
+- **Every send is bounded: `timeout -k 10 60 mailx …`, with fds 8 and 9 closed** (bd `DAS-Backup-Manager-d1r`, round 3: M1). s-nail 14.9 documents only a `socket-connect-timeout`, and the round-2 review read that as "no read timeout". Measured with s-nail 14.9.25 (round 4, N2): it gives up by itself after about 45 s of silence on a read — 42–45 s in the reviewer's runs, 44 s in mine, against a relay that accepts and never speaks and one that greets and stalls (exit 4, "SMTP: Resource temporarily unavailable") — but not on a relay that keeps trickling bytes, which held `send_report` for as long as it trickled. An abort sends its ABORTED report before it unmounts, so that meant the DAS mounted and both locks held, a scrub waiting behind them, with the alert itself the thing stuck (a silent relay cost about 45 s of that); under the packaged units' 6-hour `TimeoutStartSec` the SIGTERM then ended the run inside `cleanup()`, before its unmount. Reproduced in the suite with a mailx stub that stalls: the run hung until the suite's deadline and the abort left three volumes mounted. Now TERM after 60 s, KILL 10 s later — the idiom the recovery OS check uses — and a timed-out send (a trickling relay: 60 s, measured) is a failed delivery like any other. `timeout` signals mailx's whole process group; closing fds 8 and 9 means even a helper that leaves the group cannot keep the run's locks once the run ends. The local relay takes a report in well under a second, so 60 s only ever ends a stall
+- **A last report that cannot be written is said, not claimed** (round 3, M3). `send_report` used to log "Report saved" whatever the write did — it runs with errexit off, inside `if !` or `cleanup()` — and every later line said the report "is in `$LAST_REPORT`". The write is checked now: a failure is logged as one, and `report_whereabouts` gives each line that says a report was not emailed (and the history row's email error) the journal instead, which every caller echoes the report to before it sends. With email off as well, the journal has the only copy, and that is a failure under the operator's rule (round 4, N4; pre-existing): `send_report` records `report: not saved to <path>, and email is disabled: the journal has the only copy`, the run is FAILURE and exits 3, and the next run would meet the same full disk anyway. With email on, a failed save stays a logged error when the mail goes out — the operator has the report, and nothing reads the file (`report.rs`) — and is part of the delivery failure when it does not
+- **Reports include**: btrbk status, the snapshot counts, subvolume sync (adopted, retired, skipped) and retired-subvolume expiry, throughput, archive/cleanup counts, indexing status, disk capacity, SMART summary, latest snapshots, growth trend. A run that aborts before its report sends a short one instead, subject `ABORTED`: what aborted and why, what was backed up, the targets seen, whether it is in the history, the log path (bd `DAS-Backup-Manager-2my`, §Sentinel Interaction)
 - **Transport**: plain SMTP to the local relay at `127.0.0.1:25`, no auth, no TLS. Store-and-forward: if the uplink or the provider is down, mail queues on the host and retries for days rather than being lost. The report is written to `$LAST_REPORT` **before** any send is attempted, so a relay outage costs delivery, never the report itself
 - **Unattended (no-session) delivery is PROVEN in production — do not re-test it.** `hvf` was closed 2026-08-25 on journal evidence, not on a staged test. Two boots delivered the report hours before that boot's first graphical login (sessions do not survive a reboot, so none had existed since power-on): boot 08-16 09:26:37 sent `2026-08-17 03:53:48` against first login `07:06:38`; boot 08-17 22:41:23 sent `2026-08-18 03:49:09` against first login `06:45:19`. `backup-run.sh` logged `Report emailed to gjbr@pm.me via smtp://127.0.0.1:25`, Postfix carried queue `8E80214919D2` to `status=sent (250 fa9dd9ed-…)`, and Protonmail Bridge was not merely idle but unable to start (`start-limit-hit` — the KWallet guard refusing a locked wallet), so no `:1025` listener existed at send time. To re-derive: correlate `New session '<n>' of user 'bosco' with class 'user'` against `journalctl -u postfix | grep 'from=<das-backup'`. **Trap**: logind *quotes* the session id, so a `New session [0-9]+` pattern silently matches nothing and reports "no login" for every boot; and `graphical-session.target` is reached spuriously via the `foot-server.socket` ordering cycle, so it is not evidence of a login — `class 'user'` is
 - **Failure diagnosis**: `journalctl -u das-backup` for the consumer side; `journalctl -u postfix` and `mailq` for the relay. A `status=sent` in the Postfix log means the provider accepted it — **not** that it reached the inbox. Spam filing is invisible from this host at every observable point (API 200, `status=sent`, queue drains), so inbox placement is verified by looking, once, per recipient
@@ -337,7 +442,7 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 
 ## Sentinel Interaction — `cachyos-sentinel` Auto-Restarts Failed Services
 - `sentinel-core` (project at `/hddRaid1/ClaudeCodeProjects/cachyos-sentinel/`) monitors all systemd services and auto-remediates ones it sees in `failed` state by re-issuing `systemctl start`. **This includes `das-backup.service`** — confirmed 2026-05-11 by journal evidence (`sentinel-core` WARN log immediately followed by `systemd Starting DAS Backup` within the same second of a manual kill).
-- **For normal daily runs this is mostly desirable**: transient backup failures (USB hiccup, brief DAS disconnect) get retried automatically. The timer fires once a day at 03:00 plus a randomised delay of up to 30 minutes (`RandomizedDelaySec=1800`); the service either succeeds (Sentinel doesn't act) or fails (Sentinel retries once or more).
+- **Which backup failures it retries (since `backup-run.sh` 4.11.0, bd `DAS-Backup-Manager-d1r`)**: only a run that could not start — exit 1, the unit `failed` — is restarted, and those fail in seconds, so the limiter brakes them. A run that began its work and failed exits 3, which both backup units count as success (`SuccessExitStatus=3`): it is **not** retried, and the next attempt is the next timer fire (daily 03:00 plus up to 30 minutes, `RandomizedDelaySec=1800`). That is the price of decision C, and it is deliberate: a transient hiccup (a USB reset) loses its same-day retry, but a persistent cause (an absent drive) no longer restarts a ~25-minute backup every ten minutes. The failure is in the report, the history row and the journal (`status=3`).
 - **For intentional manual stops** of an in-progress backup (e.g. wrong targeting, debugging) — `systemctl stop das-backup.service` alone is insufficient: Sentinel will restart it within seconds. The correct sequence for a manual stop is `systemctl stop das-backup.service && systemctl mask das-backup.service`. Mask makes Sentinel's start attempt fail at the systemd layer (`unit is masked`), and Sentinel will log the failure rather than thrash on it. Unmask + re-enable timer to resume normal operation.
 - **If Sentinel's retries become unwanted** (e.g. persistent hardware fault causing thrashing), add an exclusion in Sentinel's runtime config at `/etc/sentinel/` — service-monitoring exclusion list. The das-backup unit files themselves are clean (no `Restart=`, no `OnFailure=`, no `OnUnitInactiveSec=`); Sentinel is the layer above.
 - **`das-backup-doctor.service` carries `SuccessExitStatus=1`, and that line is load-bearing.** `btrdasd doctor` exits 1 when it FINDS DRIFT — a successful check with a result, deliberately kept as a CLI contract (bd `DAS-Backup-Manager-01u`: "exit 1 is the whole point of the weekly timer"). systemd cannot tell a finding from a malfunction, so before this line it marked the unit `failed`, Sentinel restarted it, the restart failed identically, and Sentinel notified `"backup service das-backup-doctor.service last run failed: Result=exit-code"` — the operator was told the checker broke at the moment it worked, and that alert competed with the drift email carrying the real signal (observed 2026-08-31: run 13:47:34 → drift found → emailed → sentinel restart 13:47:57 → notification 13:48:08; same double-start on Aug 23). Bounded at 2 starts, because Sentinel gives up when the restart command itself fails — this was never the unbounded loop `18p` guards against, which is why the fix is a unit directive and not another exit-code narrowing.
@@ -348,8 +453,58 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
   - **Exit nonzero — "the pass could not even start."** Config load failure, lock-file IO error, or *every* target failing before any scrub was attempted (e.g. all targets unresolvable/unmountable) — the `ScrubError::NoTargets` case and friends. These fail in seconds, which is exactly the failure-loop shape Sentinel's 3/600s limiter *can* brake.
   - Sentinel's unit matching (`assert_unit_safe`, `never_touch.units`) is **exact string equality — no globs**. Template instances like `btrfs-scrub@*.service` are not expressible, and any future per-filesystem or lifecycle-tied scrub units would each need hand-listing, with new ones silently unprotected until added. Prefer single non-template units (like today's `das-scrub.service`) where Sentinel interaction matters.
   - Do not rely on Sentinel's rate limiter to brake failure loops whose period exceeds ~10 minutes — it structurally cannot. That is precisely why this fix could not be "let Sentinel handle it": no rate-limiter tuning fixes a limiter that never sees three failures inside its window in the first place.
-  - **`backup-run.sh` does not follow the same split for btrbk.** Its `main()` returns 1 whenever `OP_STATUS[btrbk]` is FAIL, i.e. whenever btrbk exited nonzero (`54c46ac`, 0.7.21.0), while the comment above that line says nonzero is reserved for "btrbk failing on every target". btrbk's own `exit_status()` returns 10 when **any** subsection is aborted, so — by reading btrbk's source, not by a host run — one target btrbk cannot reach probably fails the whole unit, and Sentinel would then restart a ~30-minute job. Not reproduced on the host; recorded here so nobody reads the comment as the behaviour
+  - **`backup-run.sh` exits 0 / 3 / 1 — the doctor's rule, operator decision C of 2026-10-04 (bd `DAS-Backup-Manager-d1r`, script 4.11.0).** Until then its `main()` returned 1 whenever `OP_STATUS[btrbk]` was FAIL (`54c46ac`, 0.7.21.0), while the comment above that line reserved nonzero for "btrbk failing on every target". btrbk's `exit_status()` returns 10 when **any** subsection is aborted (btrbk 0.32.7, `/usr/bin/btrbk:5257`; target abort at `:6565`), and an absent target always aborts: `btrbk.conf` names every configured target and `create_mount_points` has just removed the absent one's mount directory. Measured 2026-10-02, a run by hand with recovery drive A pulled: the dry run said `btrbk dryrun failed`, exit 1; the real run received 53 snapshots on `primary-22tb` and 41 on recovery B, none on A, and exited 1 after 8 min 36 s of btrbk. Under the timer that is a `failed` unit on every run, and Sentinel would restart the ~25-minute job about every ten minutes until the drive came back. Now:
+    - **0** — the run executed and nothing FAILED; a WARN (a stale recovery OS) still exits 0, and so does the singleton skip
+    - **3** — the run began its work (it holds the maintenance lock) and something FAILED or it aborted: btrbk nonzero for some or all targets, any FAIL operation (sync, expiry, the recovery OS check, boot subvolumes, archive cleanup, unmount, indexer, USB link speed, email delivery, the history record, the snapshot counters), or an abort on a target's or a source's state — no primary target, the bare-mountpoint guard, `verify_targets_before_btrbk` (which catches a target that failed to mount), `verify_sources_before_write`, a source that will not mount (`mount_sources` aborts and names it: the source, its device, mount's message — round 3, M4)
+    - **1** — it could not start: config unreadable, `btrdasd` missing, an argument error, not root, the log or the maintenance lock file unusable, the singleton lock unopenable or untakeable (below). Nothing mounted or sent; such a unit fails in seconds, the regime the limiter brakes
+    - **129 130 138 141 142 143** — stopped by SIGHUP, SIGINT, SIGUSR1, SIGPIPE, SIGALRM or SIGTERM: the signal's own code, kept (bd `oeo` for INT/TERM; round 3, M2 for the other four, which used to read as "a command that failed" — exit 3 and an ABORTED mail — before bash died by the signal anyway). A `systemctl stop` still leaves the unit `failed` with status 143 even with `SuccessExitStatus=3` (measured on a transient user unit, 2026-10-04), so the stop-and-mask procedure above stands. A stop is recorded as failed (`stopped: by SIG…`) only once the run holds the maintenance lock and is not a dry run — a run stopped while it waits for the lock had not begun (oeo) — and sends no report. systemd starts units with SIGPIPE ignored (`IgnoreSIGPIPE=yes`), so under the units PIPE never arrives; `cleanup()` ignores it too, so a stdout that went away cannot end it before the unmount
+    - **One owner for the abort side**: `cleanup()` exits with `abort_exit_status` — 3 once `CLEANUP_ARMED` (the run holds the maintenance lock), 1 before, and the code of a signal the run itself received (`STOP_SIGNAL`, set by its trap) kept — so no `set -e` abort can fall outside the rule, and a status that only looks like a signal's (a pipeline's SIGPIPE 141 under pipefail, a child killed by TERM 143) is a command that failed, not a stop (in 800 runs with the whole group signalled, bash ran the trap before `set -e` saw the child's status every time); the explicit `exit 3` at each target- and source-state abort only says the same at the site. `cleanup()` runs with errexit off: measured on bash 5.3, a command failing inside an EXIT trap under `set -e` ends bash at once with that command's status — a log line it could not write made a run that should exit 3 exit 1 and skip the unmount
+    - **`SuccessExitStatus=3` is load-bearing**, like the doctor's `=1`, and sits in the one unit source: `render_systemd_service`, what `btrdasd setup` writes to `/etc/systemd/system`, with the exit-semantics comment — pinned by `render_systemd_service_counts_exit_3_as_success_test` in `indexer/src/setup/templates.rs`. Until bd `DAS-Backup-Manager-7rf` `cmake --install` also shipped `systemd/das-backup*.service.in`, a second source a drift test compared on these two lines only, which stayed GREEN with the copy's USB-glob condition and six-hour timeout made worse; CMake now installs no backup unit, and `setup --upgrade` removes the copies older versions left. Measured with throwaway `systemd-run --user` units: `Type=oneshot` + `SuccessExitStatus=3` + `exit 3` → `Finished with result: success`, the unit inactive; the same without the property → `failed`, `Result=exit-code`; `exit 1` with it → still `failed`
+    - **A run that reached its report**: report and email unchanged (`FAILURES DETECTED`, `COMPLETED WITH WARNINGS`), and exit 3 goes with `FAILURES DETECTED` and a FAILURE row — except three FAILs recorded after the report is built: email delivery (the row says FAILURE), the history record (the report is sent again), and, with email off, a report that could not be saved either (the row says FAILURE with `report:`, while the journal's only copy of the report still reads as it was built — round 4, N4). The snapshot counters used to come after it too, and the report then said ALL OPERATIONS SUCCESSFUL while the run exited 3; `decide_run_counts` now runs after `capture_report_data` and before `run_status`, and the report has a `Snapshot counts` row (bd `DAS-Backup-Manager-bzw`), which reads `N/A` until the counts are decided, like every other row (round 3, M6)
+    - **A run that aborts before its report is never silent** (bd `DAS-Backup-Manager-2my`, shipped with d1r because exit 3 alone made it so: no report, no history row, no failed unit — a powered-off DAS would have failed every night unseen). `cleanup()`, for a real run that held the maintenance lock and exits 3 before `main()` sent its report (`REPORT_SENT`), in this order: `note_abort` makes what stopped it an operation, `aborted: <what>: <why>` (`abort_reason` at each guard; a `set -e` failure by its status and the call chain it failed in, "exit status 1 in log < log_info < sync_subvolumes < main" — never `$BASH_COMMAND`, the unexpanded command text, which named neither source nor device: round 3, M4); the run is recorded as failed (`--counts-unknown`, no `--success`, btrbk's duration 0 when it never started); one ABORTED report goes out through `send_report` — subject `[DAS Backup] <host> — ABORTED — <date>`, body: what aborted, why (one line per finding), what was backed up, the targets seen and not seen, whether the run is in the history, the log path — written to `$LAST_REPORT` before any send; then the unmount, which can hang on a drive that went away. Recording and mailing are best effort: a relay outage costs delivery, a history that cannot be written is named in the report, and neither changes the status. Every send is bounded — `timeout -k 10 60` around mailx, which runs with fds 8 and 9 closed — because s-nail, which gives up by itself after about 45 s of silence, does not give up on a relay that keeps trickling bytes: such a relay held the run, the DAS mounted and both locks held, with the alert the thing stuck (round 3, M1; the 45 s measured in round 4, N2). A last report that cannot be written is logged as such, and the lines saying a report was not emailed then name the journal, which every report is echoed to first (round 3, M3). A dry run sends and records nothing; a stop by a signal sends nothing (see the 128+N bullet). The one 3 this cannot cover: an abort *after* `main()`'s report went out exits 3 under a report and a history row that already say what they saw (SUCCESS, if nothing else failed) — the journal's `status=3` and the log are its trace
+    - **The singleton lock** (bd `DAS-Backup-Manager-ismb`): only a lock another run holds is a skip (0). `flock -n -E 75 9` gives "held" a status no failure returns — util-linux flock exits 64, 65 or 71 for its own errors, but a flock that answers 1 to anything must not read as held — and a lock file that cannot be opened (`exec 9>` fails) or taken is "could not start", exit 1, with the reason on stderr. Before, any failure read as "held": a broken lock file disabled every backup with exit 0
+    - **`btrdasd backup run` (CLI, GUI) is not run by the units and follows the same rule since `vzsu`**: 0 when the run succeeded or another backup holds the lock (declined), 3 when it began and something failed or it aborted on a target's or a source's state — btrbk's exit 10 included (btrbk is handed only the selected sources and targets, so an absent target that was not selected is not read; a selected one it cannot read aborts there with 10), an absent ticked target, a target that will not mount — and 1 only when it could not start (nothing selected, a label the configuration lacks, the locks). Before `vzsu` every one of these exited 1, so a CLI run could not tell "never began" from "ran and a target failed", and the abort left no history row
+    - `tests/test_backup_exit_semantics.sh` runs the real script end to end (lock paths redirected to a temp dir, root check read from `DAS_TEST_EUID`, `env -i` with stubs for every system command) and pins every class above to its exact status
   - `das-scrub.service`'s generated unit file (`render_systemd_scrub_service` in `indexer/src/setup/templates.rs`) carries a one-line `# Exit semantics: ...` comment above `ExecStart=` so `systemctl cat das-scrub.service` documents this on its own, without sending a reader to the Rust source.
+
+## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
+
+**What was wrong.** `send_snapshots` and `run_full_pipeline` handed btrbk the volume path of each selected source and no target at all, while `ensure_targets_mounted` mounts every configured target. Unticking a target in the GUI therefore stopped nothing: btrbk wrote to it. Two sources on one volume (`hdd-projects`, `hdd-audiobooks` on `/.btrfs-hdd`) were told apart by nothing, so unticking one excluded neither. And the comment above the call said btrbk "automatically skips targets whose paths don't exist"; it aborts them and exits 10.
+
+**What btrbk 0.32.7 does with a filter** (`/usr/bin/btrbk`, the perl source; line numbers are its own — re-read them after a btrbk update):
+
+| Lines | What it does |
+|---|---|
+| 6245-6293 | The one pass that applies command-line filters to the declarations, before anything is read. |
+| 6249-6251 | A filter that matches a **volume** keeps all of it, every subvolume and target. |
+| 6256-6261 | A filter that matches a **subvolume** (its path, or its snapshot path) keeps it with **every** target: the `next` skips the target loop. Filters are a union, so a source filter beside a target filter re-admits the unticked targets. |
+| 6263-6270 | Otherwise a target is kept when a filter matches it **or `<target>/<snapshot_name>`**; the others are `ABORTED(…, "skip_cmdline_filter", …)`. |
+| 6274-6277 | A subvolume left with no kept target is aborted the same way. |
+| 6285-6291 | A filter that matched nothing at all is an error and **exit 2**, before anything runs. |
+| 520-541, 5257-5266 | `ABORTED` with three arguments sets the key `skip_cmdline_filter`; `exit_status` returns 10 only for keys starting `abort_`. A filtered-out section is skipped, not failed. |
+| 3277-3298, 6557-6585 | The target tree is read through `vinfo_subsection` **without** its include-aborted flag, so a filtered-out target is never probed. An absent target that is NOT filtered out aborts at 6564-6566, and btrbk ends with 10. |
+| 6871-6872, 6966-6967 | The snapshot and send loops walk the same non-aborted sections. **A subvolume the filter leaves without a target gets no snapshot** — in `run` and in `snapshot`. |
+| 3304-3339, 3342-3387 | An absolute filter must equal the whole path; `*` is the only wildcard. |
+
+**So** the one filter that selects a subvolume *and* a target is `<target directory>/<snapshot_name>` (6263-6268), one per (subvolume, target) pair, and the pairs come from `btrbk_conf::declared_pairs`, which `declared_pairs_are_exactly_what_the_rendered_file_declares` holds equal to what `render_btrbk_conf` writes. A step with no target (`btrdasd backup snapshot`) uses `<volume>/<subvolume>` instead. When the selection is every declared pair no filter is passed at all, so the common case is argv-identical to what ran before. A filter that btrbk would widen (`*`) or read as relative is refused.
+
+**Why not a per-run `btrbk.conf`** (the other option in the tracker): `render_btrbk_conf` takes its retention baseline from the first primary target and writes the other targets' differences from it, so a config reduced to the selected targets renders every other target's retention differently — and `btrbk run` enforces retention. The filters leave the one generated file as it is.
+
+**The run mounts nothing itself (7tx item 3).** `run_backup` had a private `ensure_sources_mounted` that, after the job's `MountGuard` had mounted the sources, mounted again any volume it did not find with a raw `mount` — and created the directory first. That mount was in no guard's list, so nothing unmounted it: a job that ended with its sources "released" could leave one behind, the mirror image of the script's 8cf. The function is gone. The caller mounts (the job host, `backup snapshot`, `backup send`, the helper), the guard records what it mounted — and only that — and gives it back, and `run_backup` merely checks that each *selected* source's volume is a mount point, refusing with the volume and source named if not (the old function refused too, but for every configured source). The tests drive a live `run_backup` against a scripted runner and show that no `mount` or `mountpoint` command is ever issued by it; `MountGuard`'s own tests (`mount.rs`) hold that it unmounts what it mounted and leaves a volume it found mounted alone.
+
+**An empty selection is a refusal (7tx, found by this branch's implementer).** The GUI sends `sources` and `targets` as its ticked boxes; with every box unticked that is `[]`, and `effective_targets` read an empty list as "not specified": every mounted target was written (and `effective_sources` every source). Worse, a target list naming no configured target (a stale label list) fell back to "every mounted target" with a warning. Both are the same widening of an explicit selection and are now refused. `BackupOptions.sources` and `.targets` are `Option<Vec<String>>`: `None` is "not specified" (`btrdasd backup run` with no flag: all), `Some(vec![])` is "nothing", refused by `backup::empty_selection` — in `run_backup_job` before the first lock and mount, and again in `effective_sources`/`effective_targets` for a caller of `run_backup` itself. A D-Bus `as` argument cannot say "not specified", so the helper passes `Some(list)` for `BackupRun`, and refuses an empty `BackupSnapshot`/`BackupSend` list with `InvalidArgs` (`refuse_empty_sources`/`refuse_empty_targets`); the signature is unchanged. The panel also disables Run and Dry Run while no source or no target is ticked (`BackupPanel::updateRunEnabled`). `--sources ''` on the CLI arrives as one empty label and is refused as an unknown one. **A label the configuration lacks is refused the same way** (review M2, M3): `backup::unknown_label` is checked in `run_backup_job` before the first lock, sync and mount, so a stale or mistyped list is `CouldNotStart` — exit 1, no history row, like the empty list (the 0/3/1 rule: 1 is a run that could not start, nothing mounted or sent; 3 is one that took the locks and then met the state of a target or source). A partial list used to drop the unknown *target* labels without a word and go on to the known ones; it is refused now. Nothing is mounted or locked on this path, so a refusal costs nothing but the message. Not covered by a unit test: the helper's own `Some(sources)` lines (a zbus method needs a bus) — the contract they rely on is the library's, tested both ways.
+
+**Standalone `snapshot` and `send` sync first (review M5).** A selection of everything is "no filter", so btrbk reads `btrbk.conf` as it stands; `run` syncs it first (`sync_before_backup`) but `backup snapshot` and `backup send` (CLI and helper) did not, so a target removed from `config.toml` and still in a stale `btrbk.conf` would be written without ever being verified. They now call `backup::sync_for_manual_step` with the sources mounted and before the targets are, which is `run`'s order. The alternative (always passing filters, so a stale entry matches nothing and btrbk exits 2) was not taken: it would change what an unfiltered, everything-selected run does, and with a filtered-out target btrbk skips source-snapshot cleanup (see below). A failed sync stops the step where it does not stop `run`: a run must still back up what is configured, a step that cannot tell whether `btrbk.conf` is current has no such duty. The helper's two methods have no GUI caller (M9, tracked with the c4x stream) and the three wiring sites are not unit tested; the library function is, both ways.
+
+**Consequences worth knowing.** An unticked target that is absent no longer fails the step; a target that is named and cannot be read still does, with btrbk's status in the message and its own words (stderr) in the log. A source whose only targets are unticked is skipped, with a warning, and is not snapshotted either. Read from the source, not observed (btrbk is not run from the tests or from this work): for every subvolume that has a target filtered out, btrbk 0.32.7 sets `$target_aborted = -1` (`/usr/bin/btrbk` 7075-7081) and **skips the cleanup of that subvolume's source snapshots** (7131-7133, "as at least one target is skipped by command line argument"). So while a target stays unticked, CLI/GUI runs never prune those subvolumes' source snapshots: they pile up on the source volume until an unfiltered run prunes them — on this host the nightly `backup-run.sh` passes no filter, so they stay bounded. This is the opposite of a forced full send: the older claim here (a target left unticked past `snapshot_preserve` gets a full send when next included) was wrong, because the snapshots that serve as the incremental parent are the ones that are kept (an inference from the same lines; not observed). The standalone `backup snapshot` still reads every declared target, because it has no selection of them: btrbk probes them unless both `--preserve-snapshots` and `--preserve-backups` are given (6551), and an aborted target does not stop the snapshot loop (6919-6925), so an absent one should make that command exit 10 after creating the snapshots. Not changed here; reported with the branch.
+
+## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
+
+**no4, what was wrong.** Two fail-silent defects on the Rust path, both found by 6wt after it fixed the script. (1) `run_backup_job` logged a failed `host.record` as a warning, so a run whose `backup_runs` row was never written was missing from the history while the GUI said "Complete". (2) The snapshot and send steps stored `usize` counts; a step that failed left its count at `0` and the row said `snaps_created = 0` — a sentinel indistinguishable from "nothing to do" (fail-silent.md, always-a-defect 1). The same `0` also fed the "nothing to do — all snapshots up to date" summary of a run that had failed.
+
+**What it is now.** `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`. `run_pipeline` starts every count at `Some(0)` — a step that is not asked for (`snapshot_only` has no send) measured nothing and found nothing, which is a real zero — and sets `None` when a requested step fails; the full pipeline is one btrbk run, so its failure makes both `None`. `report::record_backup_run` maps `None` to NULL (schema 4 from 6wt), `backup_summary` prints `snapshots created: unknown` (and is never "nothing to do" unless both counts are `Some(0)`), `backup run --json` prints `null`, the text line prints `unknown`. The GUI history already showed NULL `snaps_created` as "unknown" (6wt); its **Sent** column is driven by `bytes_sent`, so a failed run with NULL counts read "No" — it now parses `snaps_sent` and shows "unknown" (`gui/tests/smoketest.cpp`, `historyShowsASentCountItCouldNotTakeAsUnknownNotAsNo`). A failed `host.record` pushes `history not recorded: <why>` into the result's errors and makes `success` false; the finish line the GUI shows carries it. The report that was already mailed cannot say so (it is built before the row is written, as in the script).
+
+**vzsu, what it is now.** `run_backup_job` ends in a `BackupJobOutcome`: `Declined` (the singleton lock is held: exit 0), `CouldNotStart` (the selection was refused or the locks could not be taken: exit 1, nothing mounted, nothing recorded), `Aborted` (it took the locks and then stopped on a target's or a source's state — `mount_targets` or `run` returned an error, which includes the verification refusal, an unmounted source and "no target mounted": exit 3) and `Ran` (exit 0 if `success`, else 3). `NotRun` is gone: it put "never began" and "began and stopped" in one bucket that exited 1 and was not recorded, the vanishing the script's abort path (`2my`) was built to prevent. An `Aborted` job that is not a dry run records a failed row (mode of the run, counts NULL, the reason as its only error) through `host.record`; a record that fails is appended to the reason (`…; history not recorded: <why>`), and no ABORTED email is sent from this path (not requested; the report, mailed or not, is built from a result that exists). Report delivery returns `ReportDelivery { saved, emailed }`: with email off a report that cannot be written is **lost**, as is one neither written nor mailed, and the run fails with `report: <why>` before `host.record`, so the row says why (the script's `d1r` N4); a failed email beside a written report stays a warning. The CLI prints the reason on stderr and exits with `exit_code()`; the GUI has no exit codes — the helper hands `finish_line` to `JobFinished(job_id, success, summary)`, and the panel shows exit 0 as "Complete" with the summary, and a 3 or a 1 as the red "Failed" bar with the abort reason (`Backup failed: …`, `Mount failed: …`) or `backup_summary` ("Backup completed with errors … — <errors>"), its log expanded, a `backupFailed` notification carrying the same text, and the History view refreshed (the abort's row is in it; a "could not start" has none). The `backup-run.sh` header comment that said the CLI "keeps its own codes: 0, or 1 for any failure" was rewritten; the script's version is not bumped for a comment (the only version check is `tests/test_subvol_sync.sh:386-388`, which asserts that the header's version equals the report footer's; a comment-only edit does not move either).
 
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 
@@ -365,9 +520,9 @@ Two layers of defense, both implemented in `scripts/backup-run.sh` v4.2.2+:
    - If `available=false`: `$mnt` must NOT exist on disk
    - Any violation aborts the run with a clear error listing each affected target
 
-Both layers run unconditionally — `--dryrun` includes them. The verify function records `OP_STATUS[verify_targets]` so failures appear in the email report. Since v4.7.0 `create_target_dirs` runs only after `verify_targets_before_btrbk`, so no target directory is made under an unproven path; the source-side twin is `verify_sources_before_write` (v4.5.0, bd `DAS-Backup-Manager-zlv`).
+Both layers run unconditionally — `--dryrun` includes them. Either abort exits 3 (bd `d1r`: a target's state, which the next start would meet again). The full report is built only when `main()` completes, so an abort never reaches it; instead `cleanup()` records the run as failed and sends one ABORTED report naming the guard and each violation (bd `DAS-Backup-Manager-2my`, see §Sentinel Interaction). Since v4.7.0 `create_target_dirs` runs only after `verify_targets_before_btrbk`, so no target directory is made under an unproven path; the source-side twin is `verify_sources_before_write` (v4.5.0, bd `DAS-Backup-Manager-zlv`).
 
-**The Rust path (`btrdasd backup run`, GUI backups) has the same guard**: `backup::run_backup` calls `mount::verify_write_targets` before btrbk — every target it will write to must be a mountpoint carrying the expected UUID or serial, and a stale directory at an unavailable target's mount point is refused (bd `DAS-Backup-Manager-aea`).
+**The Rust path (`btrdasd backup run`, GUI backups) has the same guard**: `backup::run_backup` calls `mount::verify_write_targets` before btrbk — every target it will write to must be a mountpoint carrying the expected UUID or serial, and a stale directory at an unavailable target's mount point is refused (bd `DAS-Backup-Manager-aea`). Until bd `7tx` only `run_backup` did: `backup send` ran btrbk, and `backup boot-archive` snapshotted, deleted and renamed under `target.mount`, with nothing checked, from the CLI and from the helper alike. The check now lives inside the steps (`send_snapshots`, `run_full_pipeline`, `archive_boot`), through `backup::StepEnv`, so a caller cannot leave it out. `archive_boot` checks the targets it will write under — selected, not a mirror, mount point present — and refuses the whole step, writing nothing, if one is a bare directory or holds another filesystem; a target whose mount point does not exist is left alone, which is the script's second safe state. A target with no `mount_uuid` used to be checked only as "is a mount point" on this path (with a warning saying so), while the script also checks the serial (bd `7tx` 4): `mount::verify_legacy_serial` now asks `findmnt -n -o SOURCE --target <mount>` for the device (the btrfs `[/subvolume]` suffix stripped), `lsblk -dno PKNAME` for its disk (none: it is a whole disk) and `smartctl -i` for its `Serial Number:`, and accepts only a serial the target names (a RAID-1 pair names two). Every question that cannot be answered is a refusal. smartctl's exit status is not consulted — it is a bitmask of findings, and only its text says whether it read the drive. Not mirrored from the script: it strips the device name at its first digit, which is wrong for NVMe names; `lsblk` is asked instead. No `-d sat` retry for USB bridges either, as in the script. The steps' `btrbk` and `btrfs` go through `fsutil::CommandRunner` for the tests' sake: a test of the guard that is taken out must meet a scripted runner, never a real `btrfs`.
 
 **Cross-references:**
 - `bd DAS-Backup-Manager-9on` — failure-mode writeup and incident notes
@@ -378,7 +533,7 @@ Both layers run unconditionally — `--dryrun` includes them. The verify functio
 
 Backups (`scripts/backup-run.sh`) and the scheduled BTRFS scrub engine (`indexer/src/scrub.rs`) both mount and unmount the same DAS filesystems, so they must never run concurrently. Two-lock design, identical on both sides, acquired in the same order (singleton → maintenance) so the pair is deadlock-free by construction:
 
-1. **Singleton lock** — non-blocking, prevents two instances of the *same* kind of job. Backup: `flock -n` fd 9 on `/run/das-backup.lock` (held ⇒ skip, exit 0). Scrub: `flock -n` on `/run/das-scrub.lock` (held ⇒ skip, no state written).
+1. **Singleton lock** — non-blocking, prevents two instances of the *same* kind of job. Backup: `flock -n -E 75` fd 9 on `/run/das-backup.lock` (held ⇒ skip, exit 0; a lock that cannot be opened or taken ⇒ "could not start", exit 1, bd `ismb`). Scrub: `flock -n` on `/run/das-scrub.lock` (held ⇒ skip, no state written).
 2. **Maintenance lock** — `/run/das-maintenance.lock`, path shared verbatim between both sides. Blocking on both sides: whichever job arrives second **waits**, it is never skipped or canceled. Held for the entire operation, including that job's own mounts/unmounts.
 
 Deadlock-freedom depends only on both sides **acquiring** in the same order (singleton, then maintenance) — never the reverse. Release order does not need to match on both sides for that guarantee to hold. The two implementations release differently: the scrub engine's `ScrubLocks` (Rust) has an explicit field-drop order (`maintenance` before `singleton`) that deliberately releases maintenance first; `backup-run.sh` (bash) has no equivalent — both fd 9 (singleton) and fd 8 (maintenance) simply stay open until the process exits, and the kernel's fd-teardown order at exit is unspecified and irrelevant here, since nothing in this design depends on it.
@@ -387,7 +542,7 @@ Backup side: `acquire_maintenance_lock()` in `backup-run.sh` (v4.3.0+), called f
 
 This design replaced an earlier proposal (a pre-unmount scrub cancel/wait guard) that was abandoned before implementation: with a genuine mutual-hold lock, backup and scrub can never overlap in the first place, so there is nothing to cancel.
 
-**`reconcile` and `doctor` join the interlock differently.** Each has its own singleton (`/run/das-reconcile.lock`, `/run/das-doctor.lock`) and takes the maintenance lock **non-blocking**, in the same singleton-then-maintenance order: if any other job holds it they defer (exit 0 for doctor) instead of waiting, and the deferral names the holder. CLI and GUI backups take `/run/das-backup.lock` and wait on the maintenance lock exactly as `backup-run.sh` does (`backup::acquire_manual_locks`, bd `DAS-Backup-Manager-pe6`).
+**`reconcile` and `doctor` join the interlock differently.** Each has its own singleton (`/run/das-reconcile.lock`, `/run/das-doctor.lock`) and takes the maintenance lock **non-blocking**, in the same singleton-then-maintenance order: if any other job holds it they defer (exit 0 for doctor) instead of waiting, and the deferral names the holder. CLI and GUI backups take `/run/das-backup.lock` and wait on the maintenance lock exactly as `backup-run.sh` does (`backup::acquire_manual_locks`, bd `DAS-Backup-Manager-pe6`). **`btrdasd setup` joins it too** (bd `6wt`, round 3): every mode that writes or removes installed files takes `/run/das-backup.lock`, then the maintenance lock, both non-blocking, and refuses with exit 75 if either is held — the same order, so it adds no cycle; it writes `btrdasd setup --upgrade pid …` (or its mode) as the holder. See §Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running.
 
 `/run` is tmpfs, so neither lock can go stale across a reboot. Tracks `bd DAS-Backup-Manager-b6f` (backup side) and the scrub engine's own two-lock design (`bd DAS-Backup-Manager-212`).
 

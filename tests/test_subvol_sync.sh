@@ -345,9 +345,8 @@ check "sync OK: expire is real" "$(grep -c -- '--dry-run' "$WORK/calls" || true)
 check "sync OK: recorded OK" "${OP_STATUS[subvol_expire]}" "OK"
 
 # --- report layout ----------------------------------------------------------
-# generate_report's helpers and host probes are stubbed; only the layout of the
+# generate_report's helpers and host probe are stubbed; only the layout of the
 # new lines and optional sections is under test.
-hostname() { echo testhost; }
 systemctl() { :; }
 generate_throughput_section() { echo "  tp"; }
 generate_capacity_section() { echo "  cap"; }
@@ -383,7 +382,10 @@ SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
     "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Recovery OS           N/A  (n/a)||"
-check "report footer carries the script version" "$(grep -c 'backup-run.sh v4.9.0' <<<"$report")" "1"
+# The footer's version is the header's: one bump, both places.
+version="$(sed -n 's/^# Version: //p' "$SCRIPT")"
+check "the header names a version" "$([[ "$version" =~ ^[[:digit:]]+(\.[[:digit:]]+)+$ ]] && echo yes)" "yes"
+check "report footer carries the script version" "$(grep -c -x "  backup-run.sh v$version" <<<"$report")" "1"
 
 # --- report: a failed btrbk listing is unavailable, not "none yet" -------------
 # capture_report_data under the script's own options; no target is mounted.

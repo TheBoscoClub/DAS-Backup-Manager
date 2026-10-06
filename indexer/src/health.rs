@@ -275,8 +275,10 @@ pub struct HealthReport {
     pub last_backup: Option<String>,
     pub growth_points: Vec<GrowthPoint>,
     pub warnings: Vec<String>,
-    /// One line per `role = "mirror"` target's OS (bd DAS-Backup-Manager-xd3).
-    /// A stale, unreadable or never-checked one is also in `warnings`.
+    /// One line per `role = "mirror"` target's OS (bd DAS-Backup-Manager-xd3),
+    /// with its enabled timers. A stale, unreadable or never-checked one, and
+    /// one whose boot may run btrbk (bd DAS-Backup-Manager-1yg), is also in
+    /// `warnings`.
     pub recovery_os: Vec<String>,
 }
 

@@ -9,6 +9,12 @@
 #
 # Actions are referenced by the same tags used in release-packages.yml so the two
 # stay in step and Dependabot's github_actions ecosystem updates both together.
+#
+# Every package install in the Arch jobs goes through
+# .github/scripts/pacman-install.sh, which retries a bounded number of times:
+# connections reset by a mirror once failed a run before any build step
+# (bd DAS-Backup-Manager-ravr). A step that calls pacman directly bypasses that
+# retry, and tests/test_pacman_install.sh fails if one appears.
 name: CI
 
 on:
@@ -31,12 +37,24 @@ jobs:
     runs-on: ubuntu-latest
     # Same base image as the Arch release job, so CI and the shipped package are
     # built by the same toolchain rather than two that drift independently.
-    container: archlinux:latest
+    # /tmp is a noatime tmpfs, as every DAS target is mounted: the recovery-OS
+    # tests read a link there, and fail under CI where none can be found.
+    container:
+      image: archlinux:latest
+      options: --tmpfs /tmp:rw,exec,nosuid,nodev,noatime,mode=1777,size=4g
     steps:
       - uses: actions/checkout@v7.0.1
 
+      # The container option above is the mount; this says so, or names why not.
+      - name: /tmp is noatime
+        run: |
+          findmnt -no OPTIONS /tmp | grep -qw noatime || {
+            echo "::error::/tmp is not mounted noatime ($(findmnt -no OPTIONS /tmp)): the recovery-OS tests would read no link"
+            exit 1
+          }
+
       - name: Install toolchain
-        run: pacman -Syu --noconfirm base-devel rust
+        run: .github/scripts/pacman-install.sh base-devel rust
 
       - name: cargo fmt --check
         working-directory: indexer
@@ -72,13 +90,49 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          pacman -Syu --noconfirm base-devel rust cmake extra-cmake-modules \
+          .github/scripts/pacman-install.sh \
+            base-devel rust cmake extra-cmake-modules \
             qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
             qt6-tools jq
 
+      # Five shell suites carry cases that need en_US.UTF-8, and under C or
+      # C.UTF-8 they cannot fail: bash's regex ranges [A-Za-z] and [0-9] match
+      # thousands of non-ASCII letters and digits only under a locale like it
+      # (bd DAS-Backup-Manager-1bsx). The Arch container carries that locale's
+      # source but never compiles it, so every suite printed "NOT RUN" and
+      # passed, and CI never exercised the fix it exists to guard. This compiles
+      # the locale and then measures its effect on bash, in the log: the job
+      # fails here, not quietly later, if the effect the suites test is absent.
+      - name: Generate the en_US.UTF-8 locale
+        run: |
+          set -euo pipefail
+          sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+          locale-gen
+          if ! LC_ALL=en_US.UTF-8 bash -c '
+              letter=$(printf "\303\251")
+              digit=$(printf "\331\243")
+              widened=no
+              if [[ $letter =~ [A-Za-z] && $digit =~ [0-9] ]]; then
+                widened=yes
+              fi
+              echo "en_US.UTF-8 probe: charmap $(locale charmap)," \
+                "[A-Za-z] and [0-9] match non-ASCII: $widened"
+              [[ $widened == yes ]]
+            '; then
+            echo "::error::en_US.UTF-8 is not usable:" \
+              "the suites' locale cases would be skipped"
+            exit 1
+          fi
+
+      # REQUIRE_ALL_SHELL_CASES: a shell suite that prints NOT RUN fails (see
+      # CMakeLists.txt), so the ctest step below passes only if the locale
+      # cases, and the exit suite's replays through the btrdasd this build
+      # makes, ran.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+        run: >-
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DREQUIRE_ALL_SHELL_CASES=ON
 
       # Always via cmake — a bare `cargo build` writes to a different target dir
       # and the install step then picks up a stale binary.
@@ -87,7 +141,7 @@ jobs:
 
       # Offscreen QPA so the GUI smoke suite needs no display or session bus.
       # --output-on-failure, because a bare pass/fail count is not a diagnosis.
-      - name: ctest (GUI smoke suite)
+      - name: ctest (shell suites and GUI smoke suite)
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
@@ -101,12 +155,12 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Install shellcheck
-        run: pacman -Syu --noconfirm shellcheck
+        run: .github/scripts/pacman-install.sh shellcheck
 
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files=(scripts/*.sh tests/*.sh)
+          files=(scripts/*.sh tests/*.sh .github/scripts/*.sh)
           if [ ${#files[@]} -eq 0 ]; then
             echo "no shell scripts found — failing rather than silently passing"
             exit 1
