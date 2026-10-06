@@ -199,7 +199,7 @@ impl RunSteps {
         options.steps = self.btrbk;
         options.boot_archive = self.boot_archive;
         options.index_after = self.index;
-        options.send_report = self.email; // `email_report` after Task 2
+        options.email_report = self.email;
     }
 }
 
@@ -227,8 +227,10 @@ pub struct BackupOptions {
     pub boot_archive: bool,
     /// Run the content indexer after backup completes.
     pub index_after: bool,
-    /// Send an email report after backup.
-    pub send_report: bool,
+    /// Mail the report as well, when [email] is enabled. The report itself is
+    /// always written to [general].last_report (backup-run.sh writes
+    /// $LAST_REPORT before any send).
+    pub email_report: bool,
     /// The subvolume sync that started this run (`sync_before_backup`). A
     /// failed one fails the run — in its result, its `backup_runs` row and
     /// its report — and its section is carried into the report.
@@ -1606,10 +1608,10 @@ fn sync_for_manual_step_with(
     Ok(config)
 }
 
-/// Whether the run writes and emails its report: the caller asked for it and
-/// `[email]` is enabled.
+/// Whether the run emails its report: the caller ticked Email and `[email]`
+/// is enabled. The report is written either way.
 fn emails_report(options: &BackupOptions, config: &Config) -> bool {
-    options.send_report && config.email.enabled
+    options.email_report && config.email.enabled
 }
 
 /// The volumes of the `sources` selected that are not mounted, as `<volume>
@@ -2067,7 +2069,7 @@ fn run_backup_with(
             LogLevel::Info,
             &format!(
                 "DRY RUN ({mode}): {}",
-                if options.send_report {
+                if options.email_report {
                     "would email the report"
                 } else {
                     "would save the report without emailing it"
@@ -2271,8 +2273,8 @@ impl ReportDelivery {
     }
 }
 
-/// Write the run report to `[general].last_report` when the caller asked
-/// for a report, and email it when `[email]` is enabled too — the report is
+/// Write the run report to `[general].last_report` — always — and email it
+/// when the caller ticked Email and `[email]` is enabled — the report is
 /// written whether or not it is mailed, as `backup-run.sh` writes
 /// `$LAST_REPORT` before any send. `data` is what was captured while the
 /// targets were mounted. Email failure alone is non-fatal — the backup data
@@ -2285,12 +2287,6 @@ pub fn deliver_report(
     data: &crate::report::ReportData,
     progress: &dyn ProgressCallback,
 ) -> ReportDelivery {
-    if !options.send_report {
-        return ReportDelivery {
-            saved: Ok(()),
-            emailed: false,
-        };
-    }
     let report_text =
         crate::report::format_report_from(result, options.subvolume_sync.as_ref(), data);
     // The directory may not exist yet (backup-run.sh: `mkdir -p`). A plain
@@ -3058,7 +3054,7 @@ mod tests {
         assert_eq!(opts.steps, BtrbkSteps::SnapshotAndSend);
         assert!(!opts.boot_archive);
         assert!(!opts.index_after);
-        assert!(!opts.send_report);
+        assert!(!opts.email_report);
     }
 
     #[test]
@@ -3528,7 +3524,7 @@ mod tests {
         assert_eq!(announced(with(&|o| o.boot_archive = true)), 4);
         assert_eq!(announced(with(&|o| o.index_after = true)), 4);
         assert_eq!(
-            announced(with(&|o| o.send_report = true)),
+            announced(with(&|o| o.email_report = true)),
             3,
             "the report is written whether or not it is emailed"
         );
@@ -3536,7 +3532,7 @@ mod tests {
             announced(with(&|o| {
                 o.boot_archive = true;
                 o.index_after = true;
-                o.send_report = true;
+                o.email_report = true;
             })),
             5
         );
@@ -3647,7 +3643,7 @@ mod tests {
         }
         .apply(&mut options);
         assert_eq!(options.steps, BtrbkSteps::SendOnly);
-        assert!(options.boot_archive && !options.index_after && options.send_report);
+        assert!(options.boot_archive && !options.index_after && options.email_report);
     }
 
     #[test]
@@ -6836,7 +6832,7 @@ mod tests {
         ] {
             config.email.enabled = enabled;
             let options = BackupOptions {
-                send_report: send,
+                email_report: send,
                 ..Default::default()
             };
             assert_eq!(emails_report(&options, &config), want, "{send} {enabled}");
@@ -7766,7 +7762,7 @@ mod tests {
             capacity_and_smart: "\nDISK CAPACITY\n  t  CAPTURED\n".into(),
             latest_snapshots: "\nLATEST SNAPSHOTS\n  CAPTURED-SNAP\n".into(),
         };
-        // Not asked for: nothing written.
+        // Email not ticked: written, not mailed, even with [email] enabled.
         config.email.enabled = true;
         let not_asked = BackupOptions::default();
         assert!(
@@ -7774,12 +7770,13 @@ mod tests {
                 .report(&config, &not_asked, &result, &data, &progress)
                 .emailed
         );
-        assert!(!report.exists(), "no report asked for: none written");
+        assert!(report.exists(), "email not ticked: still written");
+        std::fs::remove_file(&report).unwrap();
 
         // Asked for, email disabled: written (as backup-run.sh does), not mailed.
         config.email.enabled = false;
         let ask = BackupOptions {
-            send_report: true,
+            email_report: true,
             ..Default::default()
         };
         assert!(
@@ -7823,6 +7820,53 @@ mod tests {
     }
 
     #[test]
+    fn the_report_is_written_whether_or_not_it_is_emailed() {
+        for email_report in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = make_test_config();
+            config.general.last_report = dir.path().join("last-report.txt").display().to_string();
+            config.email.enabled = false; // nothing is mailed in a test
+            let options = BackupOptions {
+                email_report,
+                ..Default::default()
+            };
+            let data = crate::report::ReportData {
+                capacity_and_smart: String::new(),
+                latest_snapshots: String::new(),
+            };
+            let delivery = deliver_report(
+                &config,
+                &options,
+                &result_with(true, 1, 1, 0),
+                &data,
+                &TestProgress::new(),
+            );
+            assert_eq!(delivery.saved, Ok(()), "email_report={email_report}");
+            assert!(
+                Path::new(&config.general.last_report).is_file(),
+                "email_report={email_report}: written"
+            );
+            assert!(!delivery.emailed);
+        }
+    }
+
+    #[test]
+    fn an_unticked_email_is_not_mailed_even_with_email_enabled() {
+        let mut config = make_test_config();
+        config.email.enabled = true;
+        let options = BackupOptions {
+            email_report: false,
+            ..Default::default()
+        };
+        assert!(!emails_report(&options, &config));
+        let options = BackupOptions {
+            email_report: true,
+            ..Default::default()
+        };
+        assert!(emails_report(&options, &config));
+    }
+
+    #[test]
     fn a_report_that_cannot_be_written_is_lost_when_nothing_mails_it_and_says_where() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = make_test_config();
@@ -7832,7 +7876,7 @@ mod tests {
         config.general.last_report = path.to_string_lossy().into_owned();
         config.email.enabled = false;
         let options = BackupOptions {
-            send_report: true,
+            email_report: true,
             ..Default::default()
         };
         let data = crate::report::ReportData {
@@ -7872,7 +7916,7 @@ mod tests {
         config.general.last_report = path.to_string_lossy().into_owned();
         config.email.enabled = false;
         let options = BackupOptions {
-            send_report: true,
+            email_report: true,
             ..Default::default()
         };
         let data = crate::report::ReportData {

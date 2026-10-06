@@ -340,7 +340,7 @@ impl HelperInterface {
             index_after: true,
             // Written to [general].last_report every run, mailed only when
             // [email] is enabled (backup::deliver_report).
-            send_report: true,
+            email_report: true,
             ..Default::default()
         };
 
