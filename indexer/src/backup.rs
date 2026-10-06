@@ -1388,6 +1388,27 @@ fn btrfs_step(
     }
 }
 
+/// Whether `path` exists, for a decision to create, archive, delete or build.
+/// A stat that fails is not "absent": that reading sends a delete path down
+/// the wrong branch (a snapshot nested in a stale `.new`, then live replaced
+/// by it). It is a recorded failure (`None`) and the caller stops.
+fn exists_or_fail(
+    path: &str,
+    out: &mut BootOutcome,
+    progress: &dyn ProgressCallback,
+) -> Option<bool> {
+    match Path::new(path).try_exists() {
+        Ok(exists) => Some(exists),
+        Err(e) => {
+            out.fail(
+                progress,
+                format!("Cannot tell whether {path} exists ({e}) — leaving it untouched"),
+            );
+            None
+        }
+    }
+}
+
 /// Create or replace the boot subvolumes on backup targets from the newest
 /// received snapshot, as `update_boot_subvolumes()` in `scripts/backup-run.sh`
 /// does, and with the same classification (`.claude/rules/backup.md`
@@ -1585,7 +1606,9 @@ fn update_boot_subvol(
     };
     let latest_path = format!("{tgt_mount}/{latest}");
     let live = format!("{tgt_mount}/{subvol}");
-    let live_exists = Path::new(&live).exists();
+    let Some(live_exists) = exists_or_fail(&live, out, progress) else {
+        return;
+    };
 
     if live_exists && !run.replace {
         progress.on_log(
@@ -1621,6 +1644,11 @@ fn update_boot_subvol(
     let archive_name = format!("{subvol}.archive.{}", run.ts);
     let archive_path = format!("{tgt_mount}/{archive_name}");
 
+    // Every existence check comes before the first mutation.
+    let Some(staging_exists) = exists_or_fail(&staging, out, progress) else {
+        return;
+    };
+
     // Step 1: archive the outgoing subvolume read-only.
     match btrfs_step(
         run.runner,
@@ -1643,7 +1671,7 @@ fn update_boot_subvol(
     }
 
     // Step 2: clear any staging subvolume left by an interrupted run.
-    if Path::new(&staging).exists() {
+    if staging_exists {
         match btrfs_step(
             run.runner,
             &["subvolume", "delete", &staging],
@@ -1688,7 +1716,15 @@ fn update_boot_subvol(
                 progress,
                 format!("Failed to delete {live} — discarding {staging}"),
             );
-            let _ = btrfs_ok(run.runner, &["subvolume", "delete", &staging]);
+            if !matches!(
+                btrfs_ok(run.runner, &["subvolume", "delete", &staging]),
+                Ok(true)
+            ) {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("[{label}] {staging} could not be discarded — remove it by hand"),
+                );
+            }
             return;
         }
         Some(true) => {}
@@ -5909,12 +5945,21 @@ mod tests {
 
     /// btrbk always succeeds with no output (the boot step is under test, not
     /// the snapshot step); every other command goes to the script.
-    struct QuietBtrbk<'a>(&'a Scripted);
+    /// With `.1` set, every `btrfs` other than the listing cannot be spawned.
+    struct QuietBtrbk<'a>(&'a Scripted, bool);
 
     impl CommandRunner for QuietBtrbk<'_> {
         fn output(&self, cmd: &mut Command) -> std::io::Result<std::process::Output> {
             if cmd.get_program() == "btrbk" {
                 return Command::new("true").output();
+            }
+            if self.1
+                && cmd.get_program() == "btrfs"
+                && cmd.get_args().next().is_some_and(|a| {
+                    a != "subvolume" || cmd.get_args().nth(1).is_some_and(|b| b != "list")
+                })
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
             }
             self.0.output(cmd)
         }
@@ -5935,7 +5980,7 @@ mod tests {
     fn every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns() {
         const SNAP: &str = "nvme/root-.20261005T0100";
         // (case, mode, status, updated, skipped)
-        let cases: [(&str, BackupMode, &str, usize, usize); 12] = [
+        let cases: [(&str, BackupMode, &str, usize, usize); 15] = [
             ("conf-unreadable", BackupMode::Full, "FAIL", 0, 0),
             ("listing-unreadable", BackupMode::Full, "FAIL", 0, 0),
             ("archive-fails", BackupMode::Full, "FAIL", 0, 0),
@@ -5946,6 +5991,17 @@ mod tests {
             ("no-snapshot-name", BackupMode::Full, "WARN", 0, 0),
             ("no-target-subdirs", BackupMode::Full, "WARN", 0, 0),
             ("no-snapshot-of-series", BackupMode::Full, "WARN", 0, 0),
+            // Creating an absent one fails, in either mode.
+            ("absent-create-fails-full", BackupMode::Full, "FAIL", 0, 0),
+            (
+                "absent-create-fails-incremental",
+                BackupMode::Incremental,
+                "FAIL",
+                0,
+                0,
+            ),
+            // `btrfs` cannot be run at all (after the listing was read).
+            ("btrfs-unspawnable", BackupMode::Full, "FAIL", 0, 0),
             // An incremental run leaves an existing boot subvolume alone.
             ("incremental-exists", BackupMode::Incremental, "OK", 0, 1),
             // The control: nothing wrong, so nothing is flagged.
@@ -5993,7 +6049,15 @@ mod tests {
                 "no-snapshot-of-series" => {
                     script[0].2 = "ID 9 gen 1 top level 5 path other/x\n".into()
                 }
-                "replaced-cleanly" | "incremental-exists" => {}
+                "absent-create-fails-full" | "absent-create-fails-incremental" => {
+                    std::fs::remove_dir_all(&live).unwrap();
+                    script.push((
+                        format!("btrfs subvolume snapshot {m}/{SNAP} {m}/@"),
+                        1,
+                        String::new(),
+                    ));
+                }
+                "replaced-cleanly" | "incremental-exists" | "btrfs-unspawnable" => {}
                 other => panic!("{other}"),
             }
             if case == "no-snapshot-name" {
@@ -6006,7 +6070,7 @@ mod tests {
             if case == "replaced-cleanly" {
                 scripted = scripted.deleting_too(vec![format!("{m}/@")]);
             }
-            let runner = QuietBtrbk(&scripted);
+            let runner = QuietBtrbk(&scripted, case == "btrfs-unspawnable");
             let host = env(&runner);
             let options = BackupOptions {
                 mode: Some(mode),
@@ -6048,10 +6112,16 @@ mod tests {
             if status != "FAIL" {
                 assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
             }
+            let absent = case.starts_with("absent-");
             // Whatever failed, the live subvolume (or its replacement, on a
-            // clean run) is still there: nothing leaves `@` absent.
-            assert!(live.is_dir(), "{case}: the live subvolume survives");
-            if case != "replaced-cleanly" {
+            // clean run) is still there: nothing leaves `@` absent. (Where it
+            // was absent to begin with, a failed create leaves it absent.)
+            assert_eq!(
+                live.is_dir(),
+                !absent,
+                "{case}: the live subvolume survives"
+            );
+            if case != "replaced-cleanly" && !absent {
                 assert!(live.join("marker").exists(), "{case}: and it is untouched");
             }
             if case == "incremental-exists" {
@@ -6065,6 +6135,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stat that fails is a FAIL and nothing is mutated — never "absent".
+    /// Live: a target directory nobody can search (tests do not run as root).
+    #[test]
+    fn a_live_subvolume_that_cannot_be_statted_fails_and_nothing_runs_after_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        std::fs::create_dir(dir.path().join("@")).unwrap();
+        let (config, _conf) = archive_fixture(dir.path());
+        let runner = Scripted::from_owned(vec![(
+            format!("btrfs subvolume list {m}"),
+            0,
+            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".into(),
+        )])
+        .snapshotting();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0
+                && o.failures[0].contains("Cannot tell whether") && o.failures[0].contains(&format!("{m}/@"))),
+            "{step:?}"
+        );
+        assert_eq!(runner.calls(), [format!("btrfs subvolume list {m}")]);
+    }
+
+    /// Staging: a subvolume name whose `.new` is one byte too long for a file
+    /// name, so only the staging stat fails. Nothing is archived, built or
+    /// deleted.
+    #[test]
+    fn a_staging_path_that_cannot_be_statted_fails_before_building_or_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        let name = "v".repeat(252);
+        std::fs::create_dir(dir.path().join(&name)).unwrap();
+        let conf = write_btrbk_conf(&name, "root-");
+        let (mut config, _unused) = archive_fixture(dir.path());
+        config.general.btrbk_conf = conf.path().to_string_lossy().into_owned();
+        config.boot.subvolumes = vec![name.clone()];
+        config.sources[0].subvolumes = vec![SubvolConfig {
+            name: name.clone(),
+            ..Default::default()
+        }];
+        let runner = Scripted::from_owned(vec![(
+            format!("btrfs subvolume list {m}"),
+            0,
+            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".into(),
+        )])
+        .snapshotting();
+        let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0
+                && o.failures[0].contains("Cannot tell whether")),
+            "{step:?}"
+        );
+        let calls = runner.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains(".new") || c.contains("delete")),
+            "nothing built or deleted: {calls:?}"
+        );
+        assert_eq!(calls.len(), 1, "only the listing ran: {calls:?}");
+        assert!(dir.path().join(&name).is_dir());
     }
 
     #[test]
