@@ -1,7 +1,24 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.1.0
-# Date: 2026-10-03
+# Version: 3.1.3
+# Date: 2026-10-05
+#
+# 3.1.3: a sector-count attribute is a number only if it is ASCII digits:
+# report_sector_attr() matches [[:digit:]], not [0-9], which under en_US.UTF-8
+# also matches digits of other scripts and superscripts, and printed such a
+# value as a count in yellow, returning success, where it is a reading no
+# one can use (bd DAS-Backup-Manager-1bsx; tests/test_early_exit_readers.sh).
+#
+# 3.1.2: the SMART health line is matched by bash itself, `[[ ]]`. Under
+# pipefail, `echo "$health" | grep -q PASSED` read a PASSED followed by
+# more than 64 KiB of output as no match: grep quit at the match and echo
+# died of SIGPIPE (bd DAS-Backup-Manager-wkvz). A here-string would need a
+# pipe or a temp file, and with no fd to spare it reads "no match" as well.
+#
+# 3.1.1: the last line is `main "$@"; exit $?`, so a copy over this file
+# in place while it runs (a plain `cp`) cannot have bash read the new file
+# once main returns; behaviour is otherwise unchanged
+# (bd DAS-Backup-Manager-6wt).
 #
 # 3.1.0: the maintenance lock is taken by take_maintenance_lock(), which
 # records this script as its holder, empties that record again on exit while
@@ -161,7 +178,7 @@ report_sector_attr() {
             return 0
             ;;
         *)
-            if [[ "$value" =~ ^[0-9]+$ ]]; then
+            if [[ "$value" =~ ^[[:digit:]]+$ ]]; then
                 echo -e "  $label: ${YELLOW}$value${NC}"
                 return 0
             fi
@@ -268,7 +285,11 @@ check_smart_health() {
         local health
         health=$(smartctl -H "$dev" 2>/dev/null | grep -E "SMART overall-health" || echo "UNKNOWN")
 
-        if echo "$health" | grep -q "PASSED"; then
+        # Matched by bash itself — no pipe, no file, no fd. A pipe into
+        # grep -q read a producer killed by SIGPIPE as "no match" under
+        # pipefail (bd DAS-Backup-Manager-wkvz), and a here-string reads a
+        # pipe or temp file it cannot make as "no match" too.
+        if [[ $health == *PASSED* ]]; then
             echo -e "  Health: ${GREEN}PASSED${NC}"
         else
             echo -e "  Health: ${RED}$health${NC}"
@@ -341,6 +362,9 @@ take_maintenance_lock() {
 # the lock — so a finished run is never named as the holder. Installed only
 # once the lock is held; before that the record is another holder's. Emptied,
 # never removed: the file is the lock. Display only: a failure is logged.
+# Run only through the EXIT trap. shellcheck 0.11 stops seeing a trap's
+# handlers as called once the last line ends in `exit` (SC2329).
+# shellcheck disable=SC2329
 clear_maintenance_record() {
     if ! : >"$MAINTENANCE_RECORD"; then
         log_warn "Could not empty the holder record in $MAINTENANCE_RECORD"
@@ -508,4 +532,4 @@ main() {
     return 0
 }
 
-main "$@"
+main "$@"; exit $?

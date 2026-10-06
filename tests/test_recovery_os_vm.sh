@@ -864,7 +864,7 @@ frb_reader() {
         return
     fi
     pid="${line##* pid }"
-    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[0-9]+$ ]]; then
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
         echo "an unknown holder (last recorded: $line)"
     elif [[ -d "/proc/$pid" ]]; then
         echo "$line"

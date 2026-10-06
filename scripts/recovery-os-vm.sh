@@ -193,6 +193,10 @@ set -euo pipefail
 # One locale: bracket ranges then mean ASCII (bd 1bsx's class), and virsh
 # says "shut off" -- what this script waits for -- in English.
 export LC_ALL=C
+# And no bracket range anyway (the tree's rule, bd 1bsx): digits are
+# [[:digit:]], letters are spelt out.
+readonly ASCII_LOWER=abcdefghijklmnopqrstuvwxyz
+readonly ASCII_LETTERS=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
 # No job control: the holder must start in this process group, so that
 # `setsid` gives it a session of its own without forking a second time.
 set +m
@@ -334,7 +338,7 @@ readonly NAME_RE="<name>([^<]+)</name>"
 readonly LOADER_RE="<loader [^>]*>([^<]+)</loader>"
 readonly TEMPLATE_RE="<nvram template='([^']+)'"
 readonly SOURCE_RE="<source (dev|file)='([^']*)'"
-readonly HELD_RE="^held (.+) pid ([0-9]+)$"
+readonly HELD_RE="^held (.+) pid ([[:digit:]]+)$"
 
 # ---------------------------------------------------------------------------
 # Session state, read by the EXIT trap
@@ -516,7 +520,7 @@ require_root() {
 # A path that goes into a libvirt definition and onto command lines: only the
 # characters udev itself uses in /dev/disk/by-id names.
 check_path_chars() {
-    if [[ ! "$1" =~ ^/[A-Za-z0-9/#+.:=@_-]+$ ]]; then
+    if [[ ! "$1" =~ ^/[${ASCII_LETTERS}[:digit:]/#+.:=@_-]+$ ]]; then
         refuse "the path '$1' has characters this script will not put in a libvirt definition"
     fi
 }
@@ -595,7 +599,7 @@ mounted_partitions() {
 partition_path() {
     if [[ "$1" == */disk/by-id/* ]]; then
         printf '%s-part%s\n' "$1" "$2"
-    elif [[ "$1" =~ [0-9]$ ]]; then
+    elif [[ "$1" =~ [[:digit:]]$ ]]; then
         printf '%sp%s\n' "$1" "$2"
     else
         printf '%s%s\n' "$1" "$2"
@@ -610,7 +614,7 @@ read_record() {
     REC_UNIT=""
     { IFS= read -r REC_PID && IFS= read -r REC_DEV; } <"$1" 2>/dev/null || return 1
     { IFS= read -r _ && IFS= read -r _ && IFS= read -r REC_UNIT; } <"$1" 2>/dev/null || REC_UNIT=""
-    [[ "$REC_PID" =~ ^[0-9]+$ && -n "$REC_DEV" ]]
+    [[ "$REC_PID" =~ ^[[:digit:]]+$ && -n "$REC_DEV" ]]
 }
 
 write_record() {
@@ -624,7 +628,7 @@ write_record() {
 # recycled pid running something else.
 holder_alive() {
     local cmd
-    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    [[ "$1" =~ ^[[:digit:]]+$ ]] || return 1
     # stderr first: a gone pid fails the < redirection, which would print.
     cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline")" || return 1
     [[ "$cmd" == *" recovery-os hold-disk --device $2 "* ]]
@@ -718,7 +722,7 @@ resolve_label() {
     if [[ -n "${T_ROLE[$arg]+set}" ]]; then
         LABEL=$arg
         LABEL_EXPLICIT=true
-    elif [[ "$arg" =~ ^[A-Za-z]$ ]]; then
+    elif [[ "$arg" =~ ^[${ASCII_LETTERS}]$ ]]; then
         arg=${arg^^}
         for label in "${TARGET_LABELS[@]}"; do
             if [[ "${T_ROLE[$label]}" == mirror && "-$label-" == *"-$arg-"* ]]; then
@@ -809,7 +813,7 @@ resolve_disk() {
         refuse "'$LABEL' lists ${#serials[@]} drive serials (${serials[*]:-none}) in $DAS_CONFIG -- a recovery drive is one disk"
     fi
     SERIAL=${serials[0]}
-    if [[ ! "$SERIAL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    if [[ ! "$SERIAL" =~ ^[${ASCII_LETTERS}[:digit:]._-]+$ ]]; then
         refuse "the serial '$SERIAL' of '$LABEL' has characters a drive serial does not"
     fi
     require_attachable_serial "$SERIAL"
@@ -977,7 +981,7 @@ last_session_time() {
     local n=0 line
     while IFS= read -r line; do
         n=$((n + 1))
-        if [[ ! "$line" =~ ^([^[:space:]]+)\ ([1-9][0-9]{0,17})$ ]]; then
+        if [[ ! "$line" =~ ^([^[:space:]]+)\ ([123456789][[:digit:]]{0,17})$ ]]; then
             SESSIONS_FAILURE="line $n of $SESSIONS_FILE is not '<label> <seconds>': '$line'"
             return 1
         fi
@@ -1018,7 +1022,7 @@ record_session_time() {
         while IFS= read -r line; do
             n=$((n + 1))
             label=${line%%[[:space:]]*}
-            if [[ "$line" =~ ^([^[:space:]]+)\ ([1-9][0-9]{0,17})$ ]]; then
+            if [[ "$line" =~ ^([^[:space:]]+)\ ([123456789][[:digit:]]{0,17})$ ]]; then
                 [[ "${BASH_REMATCH[1]}" == "$LABEL" ]] || out+="$line"$'\n'
             elif [[ "$label" == "$LABEL" ]]; then
                 : # this drive's own line: replaced below
@@ -1118,7 +1122,7 @@ check_boot_record() {
     fi
     # A JSON number of whole seconds above 0: a string -- "015260430204" --
     # would reach bash arithmetic as octal, and 0 is no time at all.
-    if [[ "$checkedtype" != number || ! "$checked" =~ ^[1-9][0-9]{0,17}$ ]]; then
+    if [[ "$checkedtype" != number || ! "$checked" =~ ^[123456789][[:digit:]]{0,17}$ ]]; then
         refuse "the boot record for '$LABEL' has no check time ('$checked', a $checkedtype) -- a whole number of seconds above 0 is needed"
     fi
     when="$(utc "$checked" 2>&1)" ||
@@ -1234,7 +1238,7 @@ count_of() {
 # template's name, so the report could never vouch for one; an instance is
 # named in full.
 guard_maskable() {
-    [[ ${#1} -le 200 && "$1" =~ $UNIT_NAME_RE && "$1" != das-vm-guard* && ! "$1" =~ @\.[a-z]+$ ]]
+    [[ ${#1} -le 200 && "$1" =~ $UNIT_NAME_RE && "$1" != das-vm-guard* && ! "$1" =~ @\.[${ASCII_LOWER}]+$ ]]
 }
 
 # $1 a name the boot record gives ($2 says where): into MASKS once, or, when
@@ -2108,7 +2112,7 @@ judge_saved_guard() {
             GJ_STATUS=5
             return 0
         fi
-        if [[ "$3" == "shut off" || "$3" == paused || ! "$J_LAST_AT" =~ ^[0-9]+$ ]]; then
+        if [[ "$3" == "shut off" || "$3" == paused || ! "$J_LAST_AT" =~ ^[[:digit:]]+$ ]]; then
             return 0
         fi
         age=$(($(date +%s) - J_LAST_AT))
@@ -2124,7 +2128,7 @@ judge_saved_guard() {
             GJ_TEXT="never ran (never started): nothing to judge"
         fi
         return 0
-    elif [[ "$3" != "shut off" && "$GS_RESUMED" =~ ^[0-9]+$ ]] && (($(date +%s) - GS_RESUMED < GUARD_SECS)); then
+    elif [[ "$3" != "shut off" && "$GS_RESUMED" =~ ^[[:digit:]]+$ ]] && (($(date +%s) - GS_RESUMED < GUARD_SECS)); then
         GJ_TEXT="no report yet ($(format_duration $(($(date +%s) - GS_RESUMED))) since it started; it has $(format_duration "$GUARD_SECS"))"
         return 0
     else
@@ -2982,7 +2986,7 @@ parse_session_args() {
         shift
     done
     [[ -n "$TARGET_ARG" ]] || usage
-    if [[ -n "$TIMEOUT_MIN" && ! "$TIMEOUT_MIN" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ -n "$TIMEOUT_MIN" && ! "$TIMEOUT_MIN" =~ ^[123456789][[:digit:]]*$ ]]; then
         printf 'recovery-os-vm.sh: --timeout takes a whole number of minutes, at least 1\n' >&2
         exit 2
     fi
@@ -3083,7 +3087,7 @@ cmd_session() {
     fi
     load_targets
     resolve_label "$TARGET_ARG"
-    if [[ ! "$LABEL" =~ ^[A-Za-z0-9:_.-]+$ ]]; then
+    if [[ ! "$LABEL" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
     fi
     check_boot_record
@@ -3428,9 +3432,9 @@ cmd_screenshot() {
 # main
 # ---------------------------------------------------------------------------
 check_knobs() {
-    if [[ ! "$POLL_SECS" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$POLL_SECS" =~ [1-9] || ! "$MINUTE_SECS" =~ ^[1-9][0-9]*$ ||
-        ! "$GRACE_SECS" =~ ^[1-9][0-9]*$ || ! "$GUARD_SECS" =~ ^[1-9][0-9]{0,5}$ || ! "$RESEND_SECS" =~ ^[1-9][0-9]{0,4}$ ||
-        ! "$CLOCK_GAP_SECS" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    if [[ ! "$POLL_SECS" =~ ^[[:digit:]]+(\.[[:digit:]]+)?$ || ! "$POLL_SECS" =~ [123456789] || ! "$MINUTE_SECS" =~ ^[123456789][[:digit:]]*$ ||
+        ! "$GRACE_SECS" =~ ^[123456789][[:digit:]]*$ || ! "$GUARD_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$RESEND_SECS" =~ ^[123456789][[:digit:]]{0,4}$ ||
+        ! "$CLOCK_GAP_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
         printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS and _CLOCK_GAP_SECS take numbers above 0\n' >&2
         exit 2
     fi

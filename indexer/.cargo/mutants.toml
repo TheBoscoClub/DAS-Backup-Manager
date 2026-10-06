@@ -46,15 +46,17 @@ exclude_re = [
     # `udisks_report`, `command_stdout`) is mutated and tested.
     "replace install -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace check -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
-    # `upgrade`, `uninstall` and `uninstall_all` are the other three root-only
-    # entry points behind `btrdasd setup`, and the same reasoning applies. Each
-    # is now only the binding of its core to the host — `/etc/das-backup`, `/`
-    # and the real `systemctl` — so calling one from a test would rewrite or
-    # remove the live install and stop this host's timers. Only the whole-body
-    # replacement is excluded: the cores they call (`prepare_upgrade`,
-    # `uninstall_with`, `uninstall_all_with`, `install_schedule`) take their
-    # paths and their systemctl runner as arguments and are mutated and tested.
-    "replace upgrade -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
+    # `uninstall` and `uninstall_all` are the other two root-only entry points
+    # behind `btrdasd setup`, and the same reasoning applies. Each is only the
+    # binding of its core to the host — `/etc/das-backup`, `/` and the real
+    # `systemctl` — so calling one from a test would remove the live install
+    # and stop this host's timers. Only the whole-body replacement is excluded:
+    # the cores they call (`uninstall_with`, `uninstall_all_with`) take their
+    # paths and their systemctl runner as arguments and are mutated and tested,
+    # and `setup::dispatch` drives them through its `SetupHost` seam. (`upgrade`
+    # returns a `SetupOutcome`, which has no default, so it yields no viable
+    # whole-body mutant to exclude; the refusal's exit status is `exit_status`,
+    # tested.)
     "replace uninstall -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     "replace uninstall_all -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)",
     # `delete_subvolume` is the spawn of `btrfs subvolume delete` and nothing
@@ -92,6 +94,32 @@ exclude_re = [
     # status, blank or non-device answer), mutated and tested with scripted
     # answers. All three whole-body replacements are excluded.
     "replace device_for_fs_uuid -> Option<String> with ",
+    # `create_snapshots`, `send_snapshots`, `run_full_pipeline` and `archive_boot`
+    # (src/backup.rs) are each one line: the `_with` core handed `SystemRunner`
+    # and `StepEnv::HOST` — the real btrbk, the real mount table and the real
+    # target check. Calling one from a test would run btrbk or btrfs on this
+    # host, which no test may do, so nothing can tell the real body from
+    # `Ok(0)`. Only the whole-body replacements are excluded: the cores
+    # (`create_snapshots_with`, `send_snapshots_with`, `run_full_pipeline_with`,
+    # `archive_boot_with`) are mutated and tested against a scripted runner,
+    # and `the_host_environment_runs_real_commands_and_verifies_for_real`
+    # pins what `HOST` is made of. bd DAS-Backup-Manager-thi.
+    "replace create_snapshots -> Result<usize, Box<dyn std::error::Error>> with Ok\\(",
+    "replace send_snapshots -> Result<\\(usize, u64\\), Box<dyn std::error::Error>> with Ok\\(",
+    "replace run_full_pipeline -> Result<\\(usize, usize, usize, u64\\), Box<dyn std::error::Error>> with Ok\\(",
+    "replace archive_boot -> Result<bool, Box<dyn std::error::Error>> with Ok\\(",
+    # `sync_targets` is `syncfs(2)` on each target's filesystem, so that the
+    # `statvfs` reading behind `bytes_sent` is not stale. Its only effect is the
+    # kernel committing a transaction early; nothing a test can read changes
+    # (the reading itself is `used_bytes`, mutated and tested, and the order of
+    # sync and reading is `synced_target_usage`'s, which the host test calls).
+    "replace sync_targets with \\(\\)",
+    # `index_mounted_targets` binds `index_targets_with` to the real mount
+    # lookup and the real `indexer::walk`, which would walk this host's mounted
+    # targets: no test may. The core is mutated and tested with a scripted
+    # mount lookup and walk, and `run_backup_with` is tested against a scripted
+    # `StepEnv::index`. Only the whole-body replacement is excluded.
+    "replace index_mounted_targets -> bool with ",
 ]
 
 # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with

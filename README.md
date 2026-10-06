@@ -44,17 +44,20 @@ That said, suggestions, recommendations, and requests that fall within this narr
 
 | Component | Description | Status |
 |-----------|-------------|--------|
-| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, recovery OS check, email reporting | Active (v4.8.0) |
-| `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active (v3.0.0) |
-| `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active (v2.1.0) |
-| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active (v2.2.0) |
-| `scripts/install-backup-timer.sh` | systemd timer installer | Active |
-| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to the `recovery-os-updater` VM (`packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active (v1.0.0) |
+| `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, recovery OS check, email reporting | Active |
+| `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active |
+| `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
+| `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active |
+| `scripts/install-backup-timer.sh` | Former timer installer: now prints a pointer to `btrdasd setup`, which writes and enables the timers, and exits 1 | Deprecated |
+| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to the `recovery-os-updater` VM (`packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (7 actions: backup, restore, config, config.read, index, index.read, health) | Active (v0.7.0+) |
+
+Each script's version is the `# Version:` line in its own header — the one place it is kept.
+
 ## Project Structure
 
 ```
@@ -93,14 +96,14 @@ DAS-Backup-Manager/
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Install all components (binaries, scripts, systemd units, D-Bus, polkit, icons, man page)
+# Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, icons, man page)
 sudo cmake --install build
 
 # Run the interactive setup wizard to configure backups
 sudo btrdasd setup
 ```
 
-The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files and enables timers.
+The wizard configures backup sources, targets, retention, scheduling, and email — then generates all configuration files, writes the backup, scrub and drift-check units, and enables their timers. `cmake --install` installs no backup unit: setup's are the only ones.
 
 ### CLI-Only (no GUI dependencies)
 

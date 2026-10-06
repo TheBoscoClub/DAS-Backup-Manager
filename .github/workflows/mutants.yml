@@ -52,11 +52,36 @@ env:
 
 jobs:
   # ── Incremental: every push, scoped to the pushed commits' own diff ────────
+  #
+  # Sharded (bd DAS-Backup-Manager-67c): one push can carry more mutants than
+  # one job finishes in its 120 minutes, and a killed job turns main red.
+  # Measured 2026-10-04 for the ros-timers merge (bd 1yg): 702 mutants
+  # (recovery_os/boot.rs 631, recovery_os.rs 71), about 3.3 s each locally,
+  # so about 12 s on the runner at the 3.6 ratio measured below: about 139
+  # minutes in one job. Four round-robin shards take 175-176 each, about 35
+  # minutes plus setup, and leave room for a push about three times larger.
+  # Each shard counts its own mutants, after the same path check; a shard
+  # with none skips both steps on that measured zero, as an empty push
+  # always has. Measured too: cargo-mutants 27.1.0 writes no outcomes.json
+  # for an empty shard, so the gate could not score one, not even with
+  # --allow-zero-total — it fails closed on the absent file, rightly.
+  # The matrix list is the only place the shard count lives: SHARD, SHARDS
+  # and the names come from strategy.job-index and strategy.job-total, so a
+  # longer list adds a shard and every shard still runs. Re-measure before
+  # changing it:
+  #   cargo mutants --list --in-diff <diff> --shard k/N --sharding round-robin | wc -l
   incremental:
-    name: Falsifiability — this push
+    name: Falsifiability — this push (shard ${{ strategy.job-index }}/${{ strategy.job-total }})
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SHARD: ${{ strategy.job-index }}
+      SHARDS: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -67,6 +92,20 @@ jobs:
 
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+
+      # Every mutant runs the whole suite, and the recovery-OS tests read a
+      # link on a noatime mount, as every DAS target is mounted; they fail
+      # under CI where none can be found. The runner has none: make the temp
+      # dir one, under /tmp, where the restore tests' destinations must be.
+      - name: A noatime temp dir
+        run: |
+          sudo mkdir -p /tmp/noatime
+          sudo mount -t tmpfs -o rw,exec,nosuid,nodev,noatime,mode=1777,size=4g tmpfs /tmp/noatime
+          findmnt -no OPTIONS /tmp/noatime | grep -qw noatime || {
+            echo "::error::/tmp/noatime is not mounted noatime ($(findmnt -no OPTIONS /tmp/noatime)): the recovery-OS tests would read no link"
+            exit 1
+          }
+          echo "TMPDIR=/tmp/noatime" >> "$GITHUB_ENV"
 
       - name: Compute crate-relative diff
         id: diff
@@ -110,13 +149,15 @@ jobs:
           done < <(grep '^+++ ' mutants.diff | awk '{print $2}')
 
           # A non-empty diff can still intersect zero mutants (comments, tests,
-          # formatting). cargo-mutants then writes no outcomes.json and the
-          # gate would rightly refuse the absent file. The paths are proven
-          # above, so a zero here is a measured fact; a list ERROR exits
-          # non-zero and stops the job.
-          LISTED=$(cargo mutants --list --in-diff mutants.diff | wc -l)
+          # formatting), and a shard of a small push can hold none. cargo-mutants
+          # then writes no outcomes.json and the gate would rightly refuse the
+          # absent file. The paths are proven above, so a zero here is a
+          # measured fact; a list ERROR exits non-zero and stops the job.
+          ALL=$(cargo mutants --list --in-diff mutants.diff | wc -l)
+          LISTED=$(cargo mutants --list --in-diff mutants.diff \
+            --shard "$SHARD/$SHARDS" --sharding round-robin | wc -l)
           echo "listed=$LISTED" >> "$GITHUB_OUTPUT"
-          echo "mutants intersecting this push: $LISTED"
+          echo "mutants intersecting this push: $ALL; in shard $SHARD/$SHARDS: $LISTED"
 
       - name: Mutants
         if: steps.diff.outputs.listed != '0'
@@ -124,20 +165,21 @@ jobs:
         continue-on-error: true # the gate below decides, not this exit code
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          cargo mutants --in-place --no-shuffle -vV --in-diff mutants.diff
+          cargo mutants --in-place --no-shuffle -vV --in-diff mutants.diff \
+            --shard "$SHARD/$SHARDS" --sharding round-robin
 
       - name: Gate — did this run verify anything?
         if: steps.diff.outputs.listed != '0'
         working-directory: indexer
         run: |
           python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
-            --label "indexer incremental"
+            --label "indexer incremental shard $SHARD/$SHARDS"
 
       - name: Archive mutants.out
         if: always() && steps.diff.outputs.listed != '0'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: mutants-incremental
+          name: mutants-incremental-${{ strategy.job-index }}
           path: indexer/mutants.out
           if-no-files-found: ignore
 
@@ -156,19 +198,49 @@ jobs:
   # 40 on the GitHub runner, about 3.6 times slower; that scope took 35 minutes
   # locally, so about 2 hours on the runner, hence timeout-minutes 300.
   # Re-measured 2026-10-02: 1018 mutants (999 + progress.rs 19), about 37
-  # minutes locally, about 2.3 hours on the runner. backup.rs (243 mutants,
-  # 13 minutes locally with progress.rs) would still fit the time, but is NOT
-  # in scope: 152 of its mutants survive — its btrbk-spawning steps
-  # (create_snapshots, send_snapshots, run_full_pipeline, run_backup's live
-  # path) have no test seam yet — so adding it would only turn this job red.
+  # minutes locally, about 2.3 hours on the runner. backup.rs was left out
+  # then: 152 of its 243 mutants survived, its btrbk-spawning steps having no
+  # test seam. Since bd DAS-Backup-Manager-thi (its btrbk runs through
+  # fsutil::CommandRunner, its target usage and index step through StepEnv) it
+  # is IN scope: measured 2026-10-05, 293 mutants, 275 caught, 0 missed, 0
+  # timed out, 18 unviable, 18 minutes locally (3.7 s each). The four one-line
+  # public wrappers that bind a core to the real btrbk and mount table, and
+  # the two host bindings behind StepEnv, are excluded in
+  # indexer/.cargo/mutants.toml with their reasons.
+  # Widened 2026-10-03 (bd 1yg) by the recovery-OS reading, which decides
+  # whether booting a recovery drive's own OS would run btrbk — the update
+  # VM's driver refuses on anything but "no" — and reads that OS without
+  # writing to it. Re-measured for its fix round 4: 1815 mutants in all —
+  # recovery_os.rs 232, recovery_os/**/*.rs 558, the rest 1025 — about 80
+  # minutes locally (the recovery-OS ones 3.3 s each: build 1.8 + test 1.6;
+  # the rest 37 minutes, as above), so about 4.8 hours on the runner at the
+  # 3.6 ratio above: too near the 6-hour ceiling for one job, whose Mutants
+  # step is continue-on-error (a killed job would mean no gate that week).
+  # Hence two shards, round-robin so each gets its share of every module:
+  # 908 and 907 mutants, about 2.4 hours each, timeout-minutes 300.
+  # Re-measured for fix round 5: 1888 (recovery_os/**/*.rs 631), shards of
+  # 944 and 944, about 2.6 hours each. 7wb's recovery_os/hold_disk.rs (about
+  # 26 more) joins through the glob when it is merged.
+  # Re-measured 2026-10-05 for bd DAS-Backup-Manager-thi: 1992 without
+  # backup.rs (fsutil.rs and mount.rs grew), 2285 with it; shards of 1143 and
+  # 1142, about 3.1 hours each at 9.9 s a mutant on the runner (2.6 hours for
+  # 944), under timeout-minutes 300.
   # Re-measure before widening:
-  #   cargo mutants --list --file '<glob>' | wc -l
+  #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/N)
+  # As above, the matrix list alone sets the shard count.
   # --file takes a GLOB, not a directory: 'src/setup/' lists 0, silently.
   full-scope:
-    name: Falsifiability — security-critical scope
+    name: Falsifiability — security-critical scope (shard ${{ strategy.job-index }}/${{ strategy.job-total }})
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      SHARD: ${{ strategy.job-index }}
+      SHARDS: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -178,12 +250,27 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
 
+      # Every mutant runs the whole suite, and the recovery-OS tests read a
+      # link on a noatime mount, as every DAS target is mounted; they fail
+      # under CI where none can be found. The runner has none: make the temp
+      # dir one, under /tmp, where the restore tests' destinations must be.
+      - name: A noatime temp dir
+        run: |
+          sudo mkdir -p /tmp/noatime
+          sudo mount -t tmpfs -o rw,exec,nosuid,nodev,noatime,mode=1777,size=4g tmpfs /tmp/noatime
+          findmnt -no OPTIONS /tmp/noatime | grep -qw noatime || {
+            echo "::error::/tmp/noatime is not mounted noatime ($(findmnt -no OPTIONS /tmp/noatime)): the recovery-OS tests would read no link"
+            exit 1
+          }
+          echo "TMPDIR=/tmp/noatime" >> "$GITHUB_ENV"
+
       - name: Mutants
         working-directory: indexer
         continue-on-error: true
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo mutants --in-place --no-shuffle \
+            --shard "$SHARD/$SHARDS" --sharding round-robin \
             --file 'src/setup/**/*.rs' \
             --file src/mount.rs \
             --file src/forget.rs \
@@ -194,19 +281,22 @@ jobs:
             --file src/btrbk_conf.rs \
             --file src/caldate.rs \
             --file src/fsutil.rs \
-            --file src/progress.rs
+            --file src/progress.rs \
+            --file src/backup.rs \
+            --file src/recovery_os.rs \
+            --file 'src/recovery_os/**/*.rs'
 
       # No --allow-zero-total: an empty result here means the globs are wrong.
       - name: Gate — did this run verify anything?
         working-directory: indexer
         run: |
           python3 "$GITHUB_WORKSPACE/.github/scripts/mutants-gate.py" \
-            --label "indexer full-scope"
+            --label "indexer full-scope shard $SHARD/$SHARDS"
 
       - name: Archive mutants.out
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: mutants-full-scope
+          name: mutants-full-scope-${{ strategy.job-index }}
           path: indexer/mutants.out
           if-no-files-found: ignore

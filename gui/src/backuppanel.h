@@ -16,6 +16,10 @@ public:
 private Q_SLOTS:
     void runBackup(bool dryRun);
     void loadConfig();
+    // Run and Dry Run are available only while a source and a target are
+    // ticked and no job is running. An empty selection is not "everything":
+    // the helper refuses it (bd DAS-Backup-Manager-7tx).
+    void updateRunEnabled();
 
 private:
     DBusClient *m_client;
@@ -38,4 +42,5 @@ private:
 
     QPushButton *m_dryRunButton = nullptr;
     QPushButton *m_runButton = nullptr;
+    bool m_jobRunning = false;
 };

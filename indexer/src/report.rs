@@ -1,6 +1,6 @@
 use crate::backup::{BackupResult, SyncSection};
 use crate::config::Config;
-use crate::db::{Database, NewBackupRun};
+use crate::db::{BackupRunRecord, Database, NewBackupRun};
 
 use std::process::{Command, Stdio};
 
@@ -11,11 +11,41 @@ pub struct BackupRun {
     pub timestamp: i64,
     pub success: bool,
     pub mode: String,
-    pub snapshots_created: usize,
-    pub snapshots_sent: usize,
+    /// `None`: the run could not count them.
+    pub snapshots_created: Option<u64>,
+    /// `None`: the run could not count them.
+    pub snapshots_sent: Option<u64>,
     pub bytes_sent: u64,
     pub duration_secs: u64,
     pub errors: Vec<String>,
+}
+
+/// A run count as the history shows it: the number, or `unknown` when the run
+/// could not count — never 0, which would read as nothing done
+/// (bd DAS-Backup-Manager-6wt).
+pub fn format_count(count: Option<u64>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |n| n.to_string())
+}
+
+/// The run history as the GUI reads it from the D-Bus helper
+/// (`IndexBackupHistory`): one object per run, in the order given. A count the
+/// run could not take is `null`, never 0 or -1; the GUI shows it as "unknown".
+pub fn backup_history_json(runs: &[BackupRunRecord]) -> serde_json::Value {
+    runs.iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "timestamp": r.timestamp,
+                "mode": r.mode,
+                "success": r.success,
+                "duration_secs": r.duration_secs,
+                "snaps_created": r.snaps_created,
+                "snaps_sent": r.snaps_sent,
+                "bytes_sent": r.bytes_sent,
+                "errors": r.errors,
+            })
+        })
+        .collect()
 }
 
 /// Generate a backup report for the Rust (manual `btrdasd backup run`) path.
@@ -218,7 +248,11 @@ pub fn format_report_from(
     ));
 
     // Backup Operations
-    let btrbk_status = if result.errors.iter().any(|e| e.contains("btrbk")) {
+    let btrbk_status = if result
+        .errors
+        .iter()
+        .any(|e| e.contains("btrbk") || crate::backup::is_btrbk_step_failure(e))
+    {
         "FAIL"
     } else {
         "OK"
@@ -248,6 +282,10 @@ pub fn format_report_from(
             format_bytes(result.bytes_sent),
             format_bytes(rate as u64),
         ));
+    } else if result.snapshots_created.is_none() || result.snapshots_sent.is_none() {
+        // A step failed before its counts were taken (bd DAS-Backup-Manager-no4):
+        // nothing is known about what was sent, so none of it is said.
+        r.push_str("  (not measured — a step failed, so what was sent is unknown)\n");
     } else {
         r.push_str("  (no data transferred)\n");
     }
@@ -320,8 +358,8 @@ pub fn record_backup_run(
         timestamp,
         success: result.success,
         mode: &mode_str,
-        snaps_created: result.snapshots_created,
-        snaps_sent: result.snapshots_sent,
+        snaps_created: result.snapshots_created.map(|n| n as u64),
+        snaps_sent: result.snapshots_sent.map(|n| n as u64),
         bytes_sent: result.bytes_sent,
         duration_secs: result.duration_secs,
         errors: &result.errors,
@@ -521,8 +559,8 @@ mod tests {
         let result = BackupResult {
             success: true,
             mode: BackupMode::Full,
-            snapshots_created: 5,
-            snapshots_sent: 5,
+            snapshots_created: Some(5),
+            snapshots_sent: Some(5),
             snapshots_cleaned: 2,
             bytes_sent: 1_073_741_824,
             boot_archived: true,
@@ -543,13 +581,84 @@ mod tests {
         assert!(!report.contains("ERRORS"));
     }
 
+    fn result_with(
+        created: Option<usize>,
+        sent: Option<usize>,
+        bytes: u64,
+        errors: &[&str],
+    ) -> BackupResult {
+        BackupResult {
+            success: errors.is_empty(),
+            mode: BackupMode::Incremental,
+            snapshots_created: created,
+            snapshots_sent: sent,
+            snapshots_cleaned: 0,
+            bytes_sent: bytes,
+            boot_archived: false,
+            indexed: false,
+            report_sent: false,
+            errors: errors.iter().map(|e| e.to_string()).collect(),
+            duration_secs: 60,
+        }
+    }
+
+    /// Review M7: a failed step's count is unknown, and the report must not
+    /// turn that into "no data transferred".
+    #[test]
+    fn the_throughput_section_says_not_measured_when_a_count_is_unknown_never_no_data() {
+        let cfg = Config::default();
+        let unknown = [
+            result_with(None, Some(0), 0, &["Snapshot step failed: x"]),
+            result_with(Some(0), None, 0, &["Send step failed: x"]),
+            result_with(None, None, 0, &["Full backup pipeline failed: x"]),
+        ];
+        for result in &unknown {
+            let report = format_report(result, &cfg);
+            assert!(report.contains("(not measured"), "{report}");
+            assert!(!report.contains("no data transferred"), "{report}");
+        }
+        // The controls: counts that are real zeros do say it, and a real
+        // measurement says neither.
+        let report = format_report(&result_with(Some(0), Some(0), 0, &[]), &cfg);
+        assert!(report.contains("(no data transferred)"), "{report}");
+        assert!(!report.contains("not measured"), "{report}");
+        let report = format_report(&result_with(Some(1), Some(1), 1_073_741_824, &[]), &cfg);
+        assert!(report.contains("1.00 GiB"), "{report}");
+        assert!(!report.contains("not measured"), "{report}");
+    }
+
+    /// Review M7: the btrbk line follows the step errors, whatever their text.
+    #[test]
+    fn the_btrbk_line_is_fail_for_every_failed_step_even_one_that_never_names_btrbk() {
+        let cfg = Config::default();
+        for error in [
+            "Send step failed: none of the selected sources sends to a selected target",
+            "Snapshot step failed: No source selected",
+            "Full backup pipeline failed: Refusing to run on /mnt/x",
+        ] {
+            let report = format_report(&result_with(None, None, 0, &[error]), &cfg);
+            assert!(
+                report.contains("btrbk send/receive    FAIL"),
+                "{error}: {report}"
+            );
+        }
+        // The controls: no error, and an error of another step, are OK.
+        let report = format_report(&result_with(Some(1), Some(1), 1, &[]), &cfg);
+        assert!(report.contains("btrbk send/receive    OK"), "{report}");
+        let report = format_report(
+            &result_with(Some(1), Some(1), 1, &["Boot archive step failed: x"]),
+            &cfg,
+        );
+        assert!(report.contains("btrbk send/receive    OK"), "{report}");
+    }
+
     #[test]
     fn the_report_carries_the_subvolume_sync_section_and_its_status() {
         let result = BackupResult {
             success: false,
             mode: BackupMode::Incremental,
-            snapshots_created: 1,
-            snapshots_sent: 1,
+            snapshots_created: Some(1),
+            snapshots_sent: Some(1),
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot_archived: false,
@@ -599,8 +708,8 @@ mod tests {
         let result = BackupResult {
             success: true,
             mode: BackupMode::Incremental,
-            snapshots_created: 3,
-            snapshots_sent: 3,
+            snapshots_created: Some(3),
+            snapshots_sent: Some(3),
             snapshots_cleaned: 0,
             bytes_sent: 500_000,
             boot_archived: false,
@@ -617,11 +726,69 @@ mod tests {
         assert_eq!(history[0].id, id);
         assert!(history[0].success);
         assert_eq!(history[0].mode, "incremental");
-        assert_eq!(history[0].snapshots_created, 3);
-        assert_eq!(history[0].snapshots_sent, 3);
+        assert_eq!(history[0].snapshots_created, Some(3));
+        assert_eq!(history[0].snapshots_sent, Some(3));
         assert_eq!(history[0].bytes_sent, 500_000);
         assert_eq!(history[0].duration_secs, 120);
         assert!(history[0].errors.is_empty());
+    }
+
+    #[test]
+    fn a_count_shows_as_its_number_or_unknown_never_as_zero() {
+        assert_eq!(format_count(Some(0)), "0");
+        assert_eq!(format_count(Some(53)), "53");
+        assert_eq!(format_count(None), "unknown");
+    }
+
+    #[test]
+    fn history_json_has_null_for_an_unknown_count_and_the_number_otherwise() {
+        let runs = [
+            BackupRunRecord {
+                id: 290,
+                timestamp: 1_791_000_000,
+                success: false,
+                mode: "full".into(),
+                snaps_created: None,
+                snaps_sent: None,
+                bytes_sent: 0,
+                duration_secs: 516,
+                errors: vec![
+                    "btrbk: exit code 10".into(),
+                    "btrbk_counters: btrbk list latest failed; counts unknown".into(),
+                ],
+            },
+            BackupRunRecord {
+                id: 289,
+                timestamp: 1_790_900_000,
+                success: true,
+                mode: "incremental".into(),
+                snaps_created: Some(0),
+                snaps_sent: Some(41),
+                bytes_sent: 4096,
+                duration_secs: 300,
+                errors: vec![],
+            },
+        ];
+        assert_eq!(
+            backup_history_json(&runs),
+            serde_json::json!([
+                {
+                    "id": 290, "timestamp": 1_791_000_000_i64, "mode": "full",
+                    "success": false, "duration_secs": 516, "snaps_created": null,
+                    "snaps_sent": null, "bytes_sent": 0,
+                    "errors": [
+                        "btrbk: exit code 10",
+                        "btrbk_counters: btrbk list latest failed; counts unknown"
+                    ]
+                },
+                {
+                    "id": 289, "timestamp": 1_790_900_000_i64, "mode": "incremental",
+                    "success": true, "duration_secs": 300, "snaps_created": 0,
+                    "snaps_sent": 41, "bytes_sent": 4096, "errors": []
+                }
+            ])
+        );
+        assert_eq!(backup_history_json(&[]), serde_json::json!([]));
     }
 
     #[test]
@@ -629,8 +796,8 @@ mod tests {
         let result = BackupResult {
             success: false,
             mode: BackupMode::Full,
-            snapshots_created: 2,
-            snapshots_sent: 0,
+            snapshots_created: Some(2),
+            snapshots_sent: Some(0),
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot_archived: false,

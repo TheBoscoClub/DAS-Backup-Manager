@@ -97,6 +97,30 @@ refuse "two bootable targets deriving the same label" \
      verify_esp_labels_unique' \
     "ESP label collision"
 
+echo "== LOCALE: a bay number is ASCII digits, whatever the locale (bd 1bsx) =="
+# The bay number becomes part of a FAT label that is written to a disk. Under
+# en_US.UTF-8 bash's regex [0-9] also matches digits of other scripts and
+# superscripts, so "Bay <Arabic-Indic 3>" derived RECOV-ESP-<that digit>. These
+# need a locale where bash's own [0-9] matches such a digit (C and C.UTF-8 show
+# nothing); where none does they could not fail, so they print NOT RUN.
+ARABIC_THREE=$'\xd9\xa3'
+SUPERSCRIPT_TWO=$'\xc2\xb2'
+NOT_RUN=""
+if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
+    refuse "en_US.UTF-8: a bay number in Arabic-Indic digits is no bay number" \
+        'export LC_ALL=en_US.UTF-8; TARGET_NAMES[X]="Recovery (Bay $ARABIC_THREE)"; derive_esp_label X' \
+        "no bay number in display_name"
+    refuse "en_US.UTF-8: a superscript is no bay number" \
+        'export LC_ALL=en_US.UTF-8; TARGET_NAMES[X]="Recovery (Bay $SUPERSCRIPT_TWO)"; derive_esp_label X' \
+        "no bay number in display_name"
+    accept "en_US.UTF-8: an ASCII bay number still derives its label" \
+        'export LC_ALL=en_US.UTF-8; TARGET_NAMES[X]="Recovery (Bay 4)"; derive_esp_label X' \
+        "RECOV-ESP-4"
+else
+    NOT_RUN="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "  NOT RUN: $NOT_RUN"
+fi
+
 echo "== SUBSHELL PROPAGATION: a refusal must escape the command substitution =="
 # derive_esp_label is always reached through command substitution, and an
 # "exit 1" inside one only terminates the subshell. If the refusal does not
@@ -183,4 +207,5 @@ accept "non-bootable primary skipped even with no bay in its name" \
 echo
 echo "passed=$pass failed=$fail"
 [[ $fail -eq 0 ]] || exit 1
+[[ -z "$NOT_RUN" ]] || echo "NOT RUN: $NOT_RUN"
 echo "ESP LABEL SUITE GREEN"

@@ -6,12 +6,13 @@
 //! when the host cannot, so it must be able to mount and `btrfs receive` what
 //! the host's current kernel and btrfs-progs wrote — and it must still be able
 //! to update itself (an old keyring cannot). This module reads that install
-//! **read-only** and says when it is stale. It never writes under the root it
-//! inspects — not even an access time: every open is `O_NOATIME`, and no
-//! symlink inside the root is followed, because following one updates the
-//! link's atime (and a link to an absolute path would report the HOST's files
-//! as the recovery OS's). Both were seen moving the `@` subvolume's generation
-//! on a real filesystem before they were closed.
+//! **read-only** and says when it is stale, and when booting it would run
+//! btrbk (bd DAS-Backup-Manager-1yg). It never writes under the root it
+//! inspects — not even an access time: every open is `O_NOATIME`, and a link
+//! is never followed or read on a mount that would record the access, as that
+//! updates the link's atime (one read resolves inside the root, never to the
+//! HOST's files). Both were seen moving the `@` subvolume's generation on a
+//! real filesystem before they were closed.
 //!
 //! An item that cannot be read is `None` plus a `problems` entry, and an
 //! unknown upgrade date or kernel is stale — never a fabricated age.
@@ -25,7 +26,7 @@ pub mod hold_disk;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -56,6 +57,12 @@ const OS_RELEASE_FALLBACK: &str = "usr/lib/os-release";
 const MODULES: &str = "usr/lib/modules";
 const PACMAN_LOG: &str = "var/log/pacman.log";
 const PACMAN_LOCAL: &str = "var/lib/pacman/local";
+/// Where btrbk looks for its configuration, in its own order (btrbk 0.32's
+/// `@config_src`), relative to the root: `btrbk run` uses the first that
+/// exists, and with neither it stops with an error before doing anything.
+const BTRBK_CONFIGS: [&str; 2] = ["etc/btrbk.conf", "etc/btrbk/btrbk.conf"];
+/// What a reading holds before it is taken: unknown, never "none".
+const NOT_READ: &str = "not read";
 
 /// What was read from one recovery OS root.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -92,10 +99,155 @@ pub struct RecoveryOs {
     /// Whether pacman's database could be listed. When false, a package
     /// missing from `packages` is unknown, not "not installed".
     pub packages_read: bool,
+    /// The units systemd starts in this OS, by name. A record of schema
+    /// version 2 has none of the three readings below; it loads with each
+    /// one "not read", which is unknown, never "none".
+    #[serde(default)]
+    pub enabled_units: EnabledUnits,
+    /// The configuration btrbk would read by default if it ran in this OS.
+    #[serde(default)]
+    pub btrbk_config: BtrbkConfig,
+    /// Whether booting this OS would run btrbk, as read from it. Stored with
+    /// the facts, unlike the staleness verdict: it depends on nothing but
+    /// this OS, so it cannot go stale between readings.
+    #[serde(default)]
+    pub btrbk_at_boot: BtrbkAtBoot,
     /// Every item that is there but could not be read, as
     /// `<path relative to root>: <why>`. An absent item is not a problem: it
-    /// is recorded by the `*_read` flags and the `None`s alone.
+    /// is recorded by the `*_read` flags, the `None`s and the `Absent`s alone.
     pub problems: Vec<String>,
+}
+
+/// The units systemd starts in a recovery OS: every name in the dependency
+/// directories (`<unit>.wants/`, `.requires/`, `.upholds/`) of its three
+/// persistent unit trees — `etc/systemd/system`, where `systemctl enable`
+/// puts its links, and `usr/local/lib/systemd/system` and
+/// `usr/lib/systemd/system`, where packages enable their own. Each entry is a
+/// symlink to a unit file; only the names are read — never a link, never its
+/// target, which may not exist and, being absolute, would name the host's.
+///
+/// Stored as `{"state": "listed", "units": [{"name": ..., "dirs": [...]}]}`
+/// or `{"state": "unreadable", "reason": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EnabledUnits {
+    /// Every dependency directory of every tree there was listed (a tree that
+    /// is not there enables nothing): the units by name, sorted, each once.
+    Listed { units: Vec<EnabledUnit> },
+    /// A tree or a dependency directory is there and could not be listed
+    /// (permissions, I/O, a symlink): which units are enabled is unknown,
+    /// never "none".
+    Unreadable { reason: String },
+}
+
+/// Not read is unknown: the cautious default, never "none".
+impl Default for EnabledUnits {
+    fn default() -> Self {
+        Self::Unreadable {
+            reason: NOT_READ.to_string(),
+        }
+    }
+}
+
+/// One enabled unit, and where it is enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnabledUnit {
+    pub name: String,
+    /// The dependency directories that name it, relative to the root
+    /// (`etc/systemd/system/timers.target.wants`), highest tree first.
+    pub dirs: Vec<String>,
+}
+
+/// Whether booting a recovery OS — on bare metal or in the update VM — would
+/// run btrbk, and why.
+///
+/// Stored as `{"verdict": "will"|"may"|"no", "reasons": [...], "runners":
+/// [...]}`. A driver keys on `verdict` alone and prints `reasons`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrbkAtBoot {
+    pub verdict: BootVerdict,
+    /// What the verdict rests on: for `will` each run whose config is
+    /// present, for `may` each thing that could not be told, for `no` each
+    /// run that would stop for want of a config (none when nothing runs
+    /// btrbk).
+    pub reasons: Vec<String>,
+    /// Every enabled unit or cron file found running btrbk, whatever its
+    /// config.
+    pub runners: Vec<BtrbkRunner>,
+}
+
+/// Not read is "may": a record with no reading must never read as safe to
+/// boot. This default is what makes a version-2 record load cautiously.
+impl Default for BtrbkAtBoot {
+    fn default() -> Self {
+        Self {
+            verdict: BootVerdict::May,
+            reasons: vec![NOT_READ.to_string()],
+            runners: Vec::new(),
+        }
+    }
+}
+
+/// `will`: something enabled runs btrbk and its config is there. `may`:
+/// something could not be told. `no`: ruled out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootVerdict {
+    Will,
+    May,
+    No,
+}
+
+/// Something enabled whose command runs btrbk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrbkRunner {
+    /// The unit, or the cron file (`etc/cron.d/backup`), whose command runs
+    /// btrbk.
+    pub source: String,
+    /// What starts it: the unit that pulls it in, or the timer, path or
+    /// socket unit that starts it, or the cron daemon's unit; `None` for a
+    /// unit enabled itself.
+    pub via: Option<String>,
+    /// The script, named by an absolute path in its command and read one
+    /// level deep, whose line runs btrbk; `None` when the command itself
+    /// does. Missing from records written before scripts were read.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// When it runs once that OS is up.
+    pub when: String,
+    /// The `-c`/`--config` it passes, as written; `None` when it leaves btrbk
+    /// to find its default config.
+    pub config: Option<String>,
+    /// Whether the config it would use exists; `None` when that could not be
+    /// told.
+    pub config_present: Option<bool>,
+}
+
+/// The configuration btrbk would read if it ran in a recovery OS: the first
+/// of `/etc/btrbk.conf` and `/etc/btrbk/btrbk.conf` that exists.
+///
+/// Stored in the state file as
+/// `{"state": "present", "path": "/etc/btrbk/btrbk.conf", "size_bytes": N}`,
+/// `{"state": "absent"}` or `{"state": "unreadable", "reason": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BtrbkConfig {
+    /// It exists: its path as that OS sees it, and its size in bytes.
+    Present { path: String, size_bytes: u64 },
+    /// Neither exists, so `btrbk run` would stop before doing anything.
+    Absent,
+    /// The one btrbk would look at first is there and could not be checked
+    /// (a symlink, not a regular file, a permission): unknown.
+    Unreadable { reason: String },
+}
+
+/// Not read is unknown: the cautious default, never "absent".
+impl Default for BtrbkConfig {
+    fn default() -> Self {
+        Self::Unreadable {
+            reason: NOT_READ.to_string(),
+        }
+    }
 }
 
 /// Why an item could not be read: it is not there, or it is there and
@@ -151,20 +303,24 @@ fn open_error(rel: &str, e: &std::io::Error) -> String {
     }
 }
 
-/// Open flags for a file: no access-time update, and never through a symlink
+/// Open flags for a file: no access-time update, never through a symlink
 /// (defence in depth behind `resolve_in_root`, against a link swapped in
-/// after its check).
+/// after its check), and never blocking — a FIFO swapped in after the `lstat`
+/// that would have refused it opens at once instead of waiting for a writer,
+/// and its `fstat` then refuses it ([`open_regular`]).
 ///
 /// The flags are single, distinct bits, so `+` is `|` here (asserted below).
 /// It is written `+` because a mutation test cannot tell `|` from `^` on
 /// disjoint bits — the same number — while every mutation of `+` changes it.
-const FILE_FLAGS: i32 = libc::O_NOATIME + libc::O_NOFOLLOW;
-/// The same for a directory, which must be one.
+const FILE_FLAGS: i32 = libc::O_NOATIME + libc::O_NOFOLLOW + libc::O_NONBLOCK;
+/// The same for a directory, which must be one: `O_DIRECTORY` refuses
+/// anything else before it is opened, so it cannot block either.
 const DIR_FLAGS: i32 = libc::O_NOATIME + libc::O_NOFOLLOW + libc::O_DIRECTORY;
 const _: () = assert!(
     libc::O_NOATIME & libc::O_NOFOLLOW == 0
         && libc::O_NOATIME & libc::O_DIRECTORY == 0
         && libc::O_NOFOLLOW & libc::O_DIRECTORY == 0
+        && libc::O_NONBLOCK & (libc::O_NOATIME | libc::O_NOFOLLOW) == 0
 );
 
 /// Open read-only with `flags` ([`FILE_FLAGS`] or [`DIR_FLAGS`]). Every read
@@ -177,17 +333,94 @@ fn open_noatime(path: &Path, flags: i32) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// Read a regular file under `root`. A FIFO or device in its place is refused
-/// before it is opened, so a read can never block.
-fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
+fn not_a_file(rel: &str) -> ReadErr {
+    ReadErr::Unreadable(format!("{rel}: not a regular file"))
+}
+
+/// Open a regular file under `root` for reading. A FIFO or a device in its
+/// place is refused twice: by its `lstat` before the open, so it is never
+/// opened, and by [`open_regular`] after it, for one swapped in between.
+fn open_in_root(root: &Path, rel: &str) -> Result<fs::File, ReadErr> {
     let path = resolve_in_root(root, rel)?;
-    let meta = fs::metadata(&path).map_err(|e| io_error(rel, &e))?;
-    if !meta.is_file() {
-        return Err(ReadErr::Unreadable(format!("{rel}: not a regular file")));
-    }
-    let mut bytes = Vec::new();
-    open_noatime(&path, FILE_FLAGS)
+    if !fs::symlink_metadata(&path)
         .map_err(|e| io_error(rel, &e))?
+        .is_file()
+    {
+        return Err(not_a_file(rel));
+    }
+    open_regular(&path, rel)
+}
+
+/// Open `path` with [`FILE_FLAGS`], which cannot block, and keep it only if
+/// the descriptor's own `fstat` says it is a regular file.
+fn open_regular(path: &Path, rel: &str) -> Result<fs::File, ReadErr> {
+    let file = open_noatime(path, FILE_FLAGS).map_err(|e| io_error(rel, &e))?;
+    if file.metadata().map_err(|e| io_error(rel, &e))?.is_file() {
+        Ok(file)
+    } else {
+        Err(not_a_file(rel))
+    }
+}
+
+/// The flags (`statvfs.f_flag`) of the mount that holds an open directory,
+/// `None` when they cannot be had: what [`records_access`] decides by. A
+/// seam, so tests choose the mount.
+type MountFlags = fn(&fs::File) -> Option<libc::c_ulong>;
+
+/// The real [`MountFlags`]: `fstatvfs`.
+fn mount_flags(dir: &fs::File) -> Option<libc::c_ulong> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: an all-zero statvfs is a valid value; fstatvfs only writes it.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is open for the call, and `st` is a valid statvfs.
+    if unsafe { libc::fstatvfs(dir.as_raw_fd(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_flag)
+}
+
+/// Whether a read on a mount with these flags would record an access time,
+/// so that reading a link there — which `readlinkat` does, and no flag
+/// prevents — is a write. False only on a mount that is `noatime` or
+/// read-only: there the kernel's atime path returns before it writes
+/// anything (fs/inode.c: `atime_needs_update` on `MNT_NOATIME` and
+/// `IS_NOATIME`, `touch_atime` on a read-only mount). `nodiratime` spares
+/// directories only, not a link. Unknown flags count as recording.
+/// Production qualifies: every DAS target is mounted with
+/// `[das].mount_opts`, which carries `noatime`.
+fn records_access(flags: Option<libc::c_ulong>) -> bool {
+    flags.is_none_or(|f| (f & libc::ST_NOATIME) == 0 && (f & libc::ST_RDONLY) == 0)
+}
+
+/// The target of the symlink `name` in the open directory `dir`. The caller
+/// asks [`records_access`] first: `readlinkat` updates the link's access
+/// time on any mount that records one.
+fn read_link_at(dir: &fs::File, name: &str) -> std::io::Result<String> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(name)?;
+    let mut buf = vec![0u8; 4097];
+    // SAFETY: `dir` is open, `name` is NUL-terminated, and `buf` has room
+    // for `buf.len()` bytes, which is all readlinkat writes.
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let n = usize::try_from(n).map_err(|_| std::io::Error::last_os_error())?;
+    if n == buf.len() {
+        return Err(std::io::Error::other("a target longer than 4096 bytes"));
+    }
+    buf.truncate(n);
+    String::from_utf8(buf).map_err(|_| std::io::Error::other("a target that is not UTF-8"))
+}
+
+/// Read a regular file under `root` ([`open_in_root`]).
+fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
+    let mut bytes = Vec::new();
+    open_in_root(root, rel)?
         .read_to_end(&mut bytes)
         .map_err(|e| ReadErr::Unreadable(format!("{rel}: {e}")))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -247,6 +480,26 @@ fn list_in_root(root: &Path, rel: &str) -> Result<Vec<String>, ReadErr> {
         .collect();
     names.sort();
     Ok(names)
+}
+
+mod boot;
+
+/// The `WARNING` line for an OS whose boot would, or may, run btrbk —
+/// [`RecoveryOs::btrbk_at_boot`], read by [`inspect`] — or `None` when that
+/// is ruled out. A warning is not a staleness reason; see
+/// [`Assessment::warnings`].
+pub fn boot_warning(os: &RecoveryOs) -> Option<String> {
+    let at_boot = &os.btrbk_at_boot;
+    let (verb, check) = match at_boot.verdict {
+        BootVerdict::No => return None,
+        BootVerdict::Will => ("will", "its config"),
+        BootVerdict::May => ("may", "what it starts at boot and its btrbk config"),
+    };
+    Some(format!(
+        "btrbk {verb} run when this OS boots — {}: check {check} before booting it, on bare \
+         metal or in the update VM",
+        at_boot.reasons.join("; ")
+    ))
 }
 
 fn unquote(v: &str) -> &str {
@@ -334,6 +587,11 @@ fn parse_desc(text: &str) -> Option<(String, String)> {
 /// An absent item is left `None`/unread; an unreadable one is also listed in
 /// `problems`.
 pub fn inspect(root: &Path) -> RecoveryOs {
+    inspect_with(root, mount_flags)
+}
+
+/// [`inspect`], reading a link only where `probe` says that records nothing.
+fn inspect_with(root: &Path, probe: MountFlags) -> RecoveryOs {
     let mut os = RecoveryOs::default();
     let unreadable = |e: ReadErr, problems: &mut Vec<String>| {
         if let ReadErr::Unreadable(why) = e {
@@ -388,6 +646,11 @@ pub fn inspect(root: &Path) -> RecoveryOs {
         }
         Err(e) => unreadable(e, &mut os.problems),
     }
+    let boot = boot::read_with(root, probe);
+    os.enabled_units = boot.units;
+    os.btrbk_config = boot.config;
+    os.btrbk_at_boot = boot.at_boot;
+    os.problems.extend(boot.problems);
     os
 }
 
@@ -493,6 +756,17 @@ pub struct Assessment {
     pub stale: bool,
     /// Why it is stale; empty exactly when it is current.
     pub reasons: Vec<String>,
+    /// What to look at before booting it, whatever its age: [`boot_warning`].
+    /// A warning does not make it stale.
+    pub warnings: Vec<String>,
+}
+
+impl Assessment {
+    /// Stale, or carrying a warning: what `recovery-os` exits 1 for, and
+    /// what the backup run marks WARN.
+    pub fn needs_attention(&self) -> bool {
+        self.stale || !self.warnings.is_empty()
+    }
 }
 
 /// The problem recorded for `rel`, if it was unreadable.
@@ -623,6 +897,7 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
         age_basis: age.map(|(_, basis)| basis),
         stale: !reasons.is_empty(),
         reasons,
+        warnings: boot_warning(os).into_iter().collect(),
     }
 }
 
@@ -633,8 +908,9 @@ pub enum DriveReport {
     NotMounted,
     /// The target is mounted but its OS root could not be read at all.
     Unreadable(String),
+    /// What was read, boxed so the other variants stay small.
     Inspected {
-        os: RecoveryOs,
+        os: Box<RecoveryOs>,
         assessment: Assessment,
     },
 }
@@ -668,7 +944,7 @@ fn read_drive(
     Ok((os, assessment))
 }
 
-/// [`read_drive`] as a report entry; an unreadable root is
+/// `read_drive` as a report entry; an unreadable root is
 /// [`DriveReport::Unreadable`].
 pub fn inspect_drive(
     label: &str,
@@ -678,7 +954,10 @@ pub fn inspect_drive(
     max_age_days: u32,
 ) -> DriveEntry {
     let report = match read_drive(root, host, today, max_age_days) {
-        Ok((os, assessment)) => DriveReport::Inspected { os, assessment },
+        Ok((os, assessment)) => DriveReport::Inspected {
+            os: Box::new(os),
+            assessment,
+        },
         Err(why) => DriveReport::Unreadable(why),
     };
     DriveEntry {
@@ -720,13 +999,14 @@ pub fn status_with(
         .collect()
 }
 
-/// 2 if any mounted drive's root was unreadable, else 1 if any is stale, else 0.
+/// 2 if any mounted drive's root was unreadable, else 1 if any needs
+/// attention — stale, or carrying a warning — else 0.
 pub fn exit_code(entries: &[DriveEntry]) -> i32 {
     entries
         .iter()
         .map(|e| match &e.report {
             DriveReport::Unreadable(_) => 2,
-            DriveReport::Inspected { assessment, .. } if assessment.stale => 1,
+            DriveReport::Inspected { assessment, .. } if assessment.needs_attention() => 1,
             _ => 0,
         })
         .max()
@@ -742,6 +1022,92 @@ fn days(n: i64) -> String {
         "1 day".to_string()
     } else {
         format!("{n} days")
+    }
+}
+
+/// The enabled timers' names, each once.
+fn timer_names(units: &[EnabledUnit]) -> impl Iterator<Item = &EnabledUnit> {
+    units.iter().filter(|u| u.name.ends_with(".timer"))
+}
+
+/// The `Enabled timers` row: the timers grouped by the tree that enables
+/// them, highest first — `btrbk.timer (etc); shadow.timer (usr/lib)` —
+/// `none`, or `unknown: <why>`, never `none` for what could not be read.
+fn timers_text(units: &EnabledUnits) -> String {
+    let units = match units {
+        EnabledUnits::Listed { units } => units,
+        EnabledUnits::Unreadable { reason } => return format!("unknown: {reason}"),
+    };
+    let groups: Vec<String> = boot::UNIT_TREES
+        .iter()
+        .filter_map(|tree| {
+            let prefix = format!("{tree}/");
+            let names: Vec<&str> = timer_names(units)
+                .filter(|u| u.dirs.first().is_some_and(|d| d.starts_with(&prefix)))
+                .map(|u| u.name.as_str())
+                .collect();
+            (!names.is_empty()).then(|| {
+                let short = tree.strip_suffix("/systemd/system").unwrap_or(tree);
+                format!("{} ({short})", names.join(", "))
+            })
+        })
+        .collect();
+    if groups.is_empty() {
+        "none".to_string()
+    } else {
+        groups.join("; ")
+    }
+}
+
+/// The timers in a `health` line: names only; the reason, when unknown, is
+/// counted with the unreadable paths instead.
+fn timers_short(units: &EnabledUnits) -> String {
+    match units {
+        EnabledUnits::Unreadable { .. } => "unknown".to_string(),
+        EnabledUnits::Listed { units } => {
+            let names: Vec<&str> = timer_names(units).map(|u| u.name.as_str()).collect();
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        }
+    }
+}
+
+/// The `btrbk at boot` row: the verdict word, and for `no` what was ruled
+/// out (a `will` or `may` has its reasons in the `WARNING` row below it).
+fn at_boot_text(at_boot: &BtrbkAtBoot) -> String {
+    let word = verdict_word(at_boot.verdict);
+    if at_boot.verdict == BootVerdict::No && !at_boot.reasons.is_empty() {
+        format!("{word} — {}", at_boot.reasons.join("; "))
+    } else {
+        word.to_string()
+    }
+}
+
+/// The verdict word: `will`, `may` or `no`.
+fn verdict_word(verdict: BootVerdict) -> &'static str {
+    match verdict {
+        BootVerdict::Will => "will",
+        BootVerdict::May => "may",
+        BootVerdict::No => "no",
+    }
+}
+
+/// The `btrbk config` row: the path btrbk would read and its size, `none`
+/// with both paths it looks at, or `unknown: <why>`.
+fn btrbk_config_text(config: &BtrbkConfig) -> String {
+    match config {
+        BtrbkConfig::Present { path, size_bytes } => {
+            let unit = if *size_bytes == 1 { "byte" } else { "bytes" };
+            format!("{path} ({size_bytes} {unit})")
+        }
+        BtrbkConfig::Absent => format!(
+            "none: /{} and /{} are absent",
+            BTRBK_CONFIGS[0], BTRBK_CONFIGS[1]
+        ),
+        BtrbkConfig::Unreadable { reason } => format!("unknown: {reason}"),
     }
 }
 
@@ -839,8 +1205,14 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                     "das-backup-manager",
                     &package_text(os, "das-backup-manager"),
                 ));
+                out.push_str(&row("Enabled timers", &timers_text(&os.enabled_units)));
+                out.push_str(&row("btrbk config", &btrbk_config_text(&os.btrbk_config)));
+                out.push_str(&row("btrbk at boot", &at_boot_text(&os.btrbk_at_boot)));
                 for p in &os.problems {
                     out.push_str(&row("Could not read", p));
+                }
+                for w in &assessment.warnings {
+                    out.push_str(&row("WARNING", w));
                 }
                 out.push_str(&row("Result", &verdict(assessment)));
             }
@@ -865,8 +1237,13 @@ pub struct StoredDrive {
     pub error: Option<String>,
 }
 
-/// 2 since `installed` was added; a record of any other version is refused.
-const STATE_SCHEMA_VERSION: u32 = 2;
+/// The version written: 3 since `enabled_units`, `btrbk_config` and
+/// `btrbk_at_boot` were added (2 added `installed`).
+const STATE_SCHEMA_VERSION: u32 = 3;
+/// The versions read. A version-2 record has none of the readings 3 added;
+/// they load as "not read" — unknown, so its boot verdict is "may" — and the
+/// next write records it as version 3. Anything else is refused.
+const STATE_SCHEMA_READ: [u64; 2] = [2, 3];
 
 /// The state file, overridable for tests and the VM rig via
 /// `DAS_RECOVERY_OS_STATE`.
@@ -877,9 +1254,11 @@ pub fn state_path() -> PathBuf {
     )
 }
 
-/// `Ok(None)` when there is no file yet; an unreadable or corrupt file, or a
-/// record of another schema version, is an error — never an empty record —
-/// that names the file and the command that clears it.
+/// `Ok(None)` when there is no file yet. A version-2 record loads with its
+/// missing readings "not read" (`STATE_SCHEMA_READ`). An unreadable or
+/// corrupt file, or a record of any other version (older, newer, none), is an
+/// error — never an empty record — that names the file and the command that
+/// clears it.
 pub fn load_state(path: &Path) -> Result<Option<StoredState>, String> {
     if !path.exists() {
         return Ok(None);
@@ -893,9 +1272,9 @@ pub fn load_state(path: &Path) -> Result<Option<StoredState>, String> {
     let version = value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64);
-    if version != Some(u64::from(STATE_SCHEMA_VERSION)) {
+    if !version.is_some_and(|v| STATE_SCHEMA_READ.contains(&v)) {
         return Err(fail(format!(
-            "record schema version {}, this btrdasd reads {STATE_SCHEMA_VERSION}",
+            "record schema version {}, this btrdasd reads 2 and 3",
             version.map_or_else(|| "none".to_string(), |v| v.to_string())
         )));
     }
@@ -921,16 +1300,17 @@ pub fn write_state(path: &Path, entries: &[DriveEntry], now_epoch: i64) -> Resul
             },
             DriveReport::Inspected { os, .. } => StoredDrive {
                 checked_epoch: now_epoch,
-                os: Some(os.clone()),
+                os: Some(RecoveryOs::clone(os)),
                 error: None,
             },
         };
         state.drives.insert(e.label.clone(), record);
     }
     let text = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-    crate::fsutil::write_atomic(path, &format!("{text}\n"))
-        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(0o644)))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    // 0644 whatever the file had (`health` runs unprivileged), set before the
+    // new file is renamed into place. The error names the file.
+    crate::fsutil::write_atomic_mode(path, format!("{text}\n").as_bytes(), Some(0o644))
+        .map_err(|e| e.to_string())
 }
 
 /// `YYYY-MM-DD HH:MM UTC`.
@@ -949,12 +1329,31 @@ pub fn format_epoch_utc(epoch: i64) -> String {
 pub struct RecoveryHealth {
     /// One summary line per mirror target.
     pub lines: Vec<String>,
-    /// Stale, unreadable or never-checked drives; these make health WARNING.
+    /// Stale, unreadable or never-checked drives, and every [`boot_warning`];
+    /// these make health WARNING.
     pub warnings: Vec<String>,
 }
 
-/// `<label> (<when>): installed …, last full upgrade …, age …, kernel … —
-/// current|STALE: …`.
+/// One line per stale reason and boot warning of `label`'s reading.
+fn assessment_warnings(label: &str, a: &Assessment) -> Vec<String> {
+    let stale = a.stale.then(|| {
+        format!(
+            "Recovery OS on '{label}' is STALE: {}",
+            a.reasons.join("; ")
+        )
+    });
+    stale
+        .into_iter()
+        .chain(
+            a.warnings
+                .iter()
+                .map(|w| format!("Recovery OS on '{label}': {w}")),
+        )
+        .collect()
+}
+
+/// `<label> (<when>): installed …, last full upgrade …, age …, kernel …,
+/// enabled timers …, btrbk at boot will|may|no — current|STALE: …`.
 fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
     let upgrade = upgrade_text(os);
     let kernel = or_unknown(newest_kernel(&os.kernels).map(String::as_str));
@@ -969,10 +1368,12 @@ fn summary(label: &str, when: &str, os: &RecoveryOs, a: &Assessment) -> String {
         n => format!("; {n} paths unreadable"),
     };
     format!(
-        "{label} ({when}): installed {}, last full upgrade {upgrade}, age {}, kernel {kernel} \
-         — {state}{unreadable}",
+        "{label} ({when}): installed {}, last full upgrade {upgrade}, age {}, kernel {kernel}, \
+         enabled timers {}, btrbk at boot {} — {state}{unreadable}",
         or_unknown(os.installed.as_deref()),
-        age_text(a)
+        age_text(a),
+        timers_short(&os.enabled_units),
+        verdict_word(os.btrbk_at_boot.verdict)
     )
 }
 
@@ -998,12 +1399,7 @@ pub fn health_with(
             match read_drive(&os_root(&t.mount), host(), today, max) {
                 Ok((os, assessment)) => {
                     h.lines.push(summary(label, "live", &os, &assessment));
-                    if assessment.stale {
-                        h.warnings.push(format!(
-                            "Recovery OS on '{label}' is STALE: {}",
-                            assessment.reasons.join("; ")
-                        ));
-                    }
+                    h.warnings.extend(assessment_warnings(label, &assessment));
                 }
                 Err(why) => {
                     h.lines
@@ -1044,12 +1440,7 @@ pub fn health_with(
                 let when = format_epoch_utc(*checked_epoch);
                 h.lines
                     .push(summary(label, &format!("as of {when}"), os, &a));
-                if a.stale {
-                    h.warnings.push(format!(
-                        "Recovery OS on '{label}' is STALE: {}",
-                        a.reasons.join("; ")
-                    ));
-                }
+                h.warnings.extend(assessment_warnings(label, &a));
             }
             Some(StoredDrive {
                 checked_epoch,
@@ -1074,7 +1465,8 @@ pub struct StatusRun {
     pub entries: Vec<DriveEntry>,
     /// Why the state file could not be written, when it could not.
     pub state_error: Option<String>,
-    /// 0 current, 1 stale, 2 a root or the state file could not be handled.
+    /// 0 nothing needs attention, 1 a drive is stale or carries a warning,
+    /// 2 a root or the state file could not be handled.
     pub code: i32,
 }
 
@@ -1102,7 +1494,8 @@ pub fn status_run_with(
 }
 
 /// One drive as JSON: `status` is `current`, `stale`, `unreadable` or
-/// `not_mounted`; `os` and `assessment` are null unless it was inspected.
+/// `not_mounted`; `os` and `assessment` are null unless it was inspected. A
+/// boot warning is in `assessment.warnings` and leaves `status` as it is.
 pub fn entry_json(entry: &DriveEntry) -> serde_json::Value {
     let (status, os, assessment, error) = match &entry.report {
         DriveReport::NotMounted => ("not_mounted", None, None, None),
@@ -1191,6 +1584,124 @@ mod tests {
         add_pkg(root, "vim-9.1-1", "vim", "9.1-1");
         // The ALPM_DB_VERSION file pacman keeps next to the entries.
         write(root, "var/lib/pacman/local/ALPM_DB_VERSION", "9\n");
+        // What a CachyOS install enables, the way `systemctl enable` and its
+        // packages leave it: fstrim.timer and sshd.service under /etc, the
+        // vendor-enabled shadow.timer, an alias that is not a dependency
+        // directory, and a package's alias (dbus.service → dbus-broker). None
+        // runs btrbk, and there is no btrbk config.
+        enable(root, ETC, "timers.target.wants", "fstrim.timer");
+        enable(root, ETC, "multi-user.target.wants", "sshd.service");
+        enable(root, VENDOR, "timers.target.wants", "shadow.timer");
+        enable(root, VENDOR, "multi-user.target.wants", "dbus.service");
+        for (name, text) in [
+            (
+                "fstrim.timer",
+                "[Timer]\nOnCalendar=weekly\nPersistent=true\n",
+            ),
+            (
+                "fstrim.service",
+                "[Service]\nType=oneshot\nExecStart=/usr/bin/fstrim --listed-in \
+                 /etc/fstab:/proc/self/mountinfo --verbose --quiet-unsupported\n",
+            ),
+            ("sshd.service", "[Service]\nExecStart=/usr/bin/sshd -D\n"),
+            (
+                "shadow.timer",
+                "[Timer]\nOnCalendar=daily\nPersistent=true\n",
+            ),
+            (
+                "shadow.service",
+                "[Service]\nType=oneshot\nExecStart=/usr/bin/pwck -r\nExecStart=/usr/bin/grpck -r\n",
+            ),
+            (
+                "dbus-broker.service",
+                "[Service]\nExecStart=/usr/bin/dbus-broker-launch --scope system --audit\n",
+            ),
+        ] {
+            write(root, &format!("{VENDOR}/{name}"), text);
+        }
+        std::os::unix::fs::symlink(
+            "dbus-broker.service",
+            root.join(VENDOR).join("dbus.service"),
+        )
+        .unwrap();
+    }
+
+    const ETC: &str = "etc/systemd/system";
+    const VENDOR: &str = "usr/lib/systemd/system";
+
+    /// Enable `unit` the way `systemctl enable` does: a symlink named after
+    /// it in the dependency directory `dir` of the unit tree `tree` — here to
+    /// a path that exists nowhere, so anything that follows it fails.
+    fn enable(root: &Path, tree: &str, dir: &str, unit: &str) {
+        let deps = root.join(tree).join(dir);
+        fs::create_dir_all(&deps).unwrap();
+        std::os::unix::fs::symlink(
+            format!("/nonexistent/das-test/usr/lib/systemd/system/{unit}"),
+            deps.join(unit),
+        )
+        .unwrap();
+    }
+
+    const BTRBK_CONF_TEXT: &str =
+        "volume /mnt/btr_pool\n  target /mnt/backup-system-recovery-A\n  subvolume @\n";
+
+    /// btrbk's package units, its timer enabled, and /etc/btrbk/btrbk.conf:
+    /// btrbk will run when this OS boots.
+    fn arm_btrbk(root: &Path) {
+        write(
+            root,
+            &format!("{VENDOR}/btrbk.service"),
+            "[Service]\nType=oneshot\nExecStart=/usr/bin/btrbk run\n",
+        );
+        write(
+            root,
+            &format!("{VENDOR}/btrbk.timer"),
+            "[Timer]\nOnCalendar=daily\nAccuracySec=10min\nPersistent=true\n",
+        );
+        enable(root, ETC, "timers.target.wants", "btrbk.timer");
+        write(root, "etc/btrbk/btrbk.conf", BTRBK_CONF_TEXT);
+    }
+
+    /// [`full_root`], upgraded yesterday: current against [`current_host`].
+    fn current_root(root: &Path) {
+        full_root(root);
+        write(
+            root,
+            "var/log/pacman.log",
+            &format!(
+                "[{d}T01:00:00+0000] [PACMAN] starting full system upgrade\n\
+                 [{d}T01:05:00+0000] [ALPM] transaction completed\n",
+                d = days_before(TODAY, 1)
+            ),
+        );
+        add_pkg(root, "btrfs-progs-6.10-1", "btrfs-progs", "6.17-1");
+    }
+
+    /// The host [`current_root`] is current against.
+    fn current_host() -> HostVersions {
+        host("6.12.3-1-cachyos")
+    }
+
+    const WILL_RUN: &str = "btrbk will run when this OS boots — btrbk.timer starts \
+         btrbk.service, which runs btrbk at its next scheduled time after boot, with \
+         /etc/btrbk/btrbk.conf present: check its config before booting it, on bare metal or \
+         in the update VM";
+
+    /// The enabled timers' names.
+    fn timers(os: &RecoveryOs) -> Vec<&str> {
+        match &os.enabled_units {
+            EnabledUnits::Listed { units } => timer_names(units).map(|u| u.name.as_str()).collect(),
+            EnabledUnits::Unreadable { reason } => panic!("units unreadable: {reason}"),
+        }
+    }
+
+    /// Nothing runs btrbk.
+    fn quiet() -> BtrbkAtBoot {
+        BtrbkAtBoot {
+            verdict: BootVerdict::No,
+            reasons: Vec::new(),
+            runners: Vec::new(),
+        }
     }
 
     fn host(kernel: &str) -> HostVersions {
@@ -1210,6 +1721,9 @@ mod tests {
             kernels: kernels.iter().map(|k| k.to_string()).collect(),
             modules_read: true,
             packages_read: true,
+            enabled_units: EnabledUnits::Listed { units: Vec::new() },
+            btrbk_config: BtrbkConfig::Absent,
+            btrbk_at_boot: quiet(),
             ..Default::default()
         }
     }
@@ -1249,18 +1763,17 @@ mod tests {
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .collect();
         assert_eq!(os.packages, want, "only watched names, matched exactly");
+        assert_eq!(timers(&os), ["fstrim.timer", "shadow.timer"], "all trees");
+        assert_eq!(os.btrbk_config, BtrbkConfig::Absent);
+        assert_eq!(os.btrbk_at_boot, quiet());
         assert!(os.problems.is_empty(), "{:?}", os.problems);
     }
 
-    #[test]
-    fn inspect_never_updates_an_access_time() {
-        // A read that bumps atime is a write to the recovery OS (it moved the
-        // subvolume's generation on a real drive). Old atimes below mtime make
-        // relatime update on the first read, so this fails without O_NOATIME.
-        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-        // Positive control: only a filesystem where a plain read DOES move the
-        // atime can show this. /tmp is often noatime; /dev/shm usually is not.
-        let dir = ["/dev/shm", &std::env::temp_dir().to_string_lossy()]
+    /// A directory on a filesystem where a plain read DOES move the atime —
+    /// only there can a test show that a read did not. /tmp is often noatime;
+    /// /dev/shm usually is not. `None` when there is none.
+    fn atime_dir(old: filetime::FileTime) -> Option<tempfile::TempDir> {
+        ["/dev/shm", &std::env::temp_dir().to_string_lossy()]
             .iter()
             .filter_map(|base| tempfile::tempdir_in(base).ok())
             .find(|d| {
@@ -1269,31 +1782,204 @@ mod tests {
                 filetime::set_file_atime(&probe, old).unwrap();
                 fs::read(&probe).unwrap();
                 filetime::FileTime::from_last_access_time(&fs::metadata(&probe).unwrap()) != old
-            });
-        let Some(dir) = dir else {
-            eprintln!("SKIPPED: no writable filesystem here updates atime on read");
+            })
+    }
+
+    #[test]
+    fn a_mount_records_access_unless_it_is_noatime_or_read_only() {
+        use libc::{ST_NOATIME, ST_NODEV, ST_NODIRATIME, ST_NOSUID, ST_RDONLY, ST_RELATIME};
+        for (flags, records) in [
+            (None, true),
+            (Some(0), true),
+            (Some(ST_RELATIME), true),
+            (Some(ST_NOSUID | ST_NODEV | ST_RELATIME), true),
+            // nodiratime spares directories, and a link is not one.
+            (Some(ST_NODIRATIME), true),
+            (Some(ST_NOATIME), false),
+            (Some(ST_NOATIME | ST_NOSUID), false),
+            (Some(ST_RDONLY), false),
+            (Some(ST_RDONLY | ST_RELATIME), false),
+            (Some(ST_RDONLY | ST_NOATIME), false),
+        ] {
+            assert_eq!(records_access(flags), records, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn mount_flags_are_the_kernel_s_for_that_directory() {
+        // Read through the path instead, the other way the kernel answers.
+        let by_path = |dir: &Path| {
+            let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: an all-zero statvfs is valid; statvfs only writes it.
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `path` is NUL-terminated and `st` a valid statvfs.
+            assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut st) }, 0);
+            st.f_flag
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // /proc is nosuid, nodev and noexec wherever it is mounted.
+        for dir in [Path::new("/proc"), tmp.path()] {
+            let flags = mount_flags(&fs::File::open(dir).unwrap());
+            assert_eq!(flags, Some(by_path(dir)), "{}", dir.display());
+        }
+        assert_ne!(by_path(Path::new("/proc")) & libc::ST_NOSUID, 0);
+    }
+
+    #[test]
+    fn inspect_never_updates_an_access_time() {
+        // A read that bumps atime is a write to the recovery OS (it moved the
+        // subvolume's generation on a real drive). Old atimes below mtime make
+        // relatime update on the first read, so this fails without O_NOATIME.
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        let Some(dir) = atime_dir(old) else {
+            testutil::skip("no writable filesystem here updates atime on read");
             return;
         };
-        full_root(dir.path());
-        let paths: Vec<PathBuf> = [
+        let root = dir.path().join("os");
+        full_root(&root);
+        arm_btrbk(&root);
+        // A drop-in, a timer's stamp, and cron with a table that runs btrbk.
+        write(
+            &root,
+            "etc/systemd/system/sshd.service.d/override.conf",
+            "[Service]\nExecStartPre=/usr/bin/sshd -t\n",
+        );
+        write(&root, "var/lib/systemd/timers/stamp-btrbk.timer", "");
+        enable(&root, ETC, "multi-user.target.wants", "cronie.service");
+        write(
+            &root,
+            &format!("{VENDOR}/cronie.service"),
+            "[Service]\nExecStart=/usr/bin/crond -n\n",
+        );
+        write(
+            &root,
+            "etc/cron.d/backup",
+            "0 3 * * * root /usr/bin/btrbk run\n",
+        );
+        write(&root, "etc/crontab", "SHELL=/bin/sh\n");
+        // What the walk reads past the enabled names: a target's pull, a
+        // socket's service, a script a command names (read whole), a binary
+        // it names (its first two bytes), a program link (never followed),
+        // and a path through Arch's /bin link (taken by name, never read).
+        enable(&root, ETC, "multi-user.target.wants", "backup.target");
+        write(
+            &root,
+            &format!("{ETC}/backup.target"),
+            "[Unit]\nWants=backup.service\n",
+        );
+        write(
+            &root,
+            &format!("{ETC}/backup.service"),
+            "[Service]\nExecStart=/usr/local/bin/backup.sh /usr/local/bin/tool \
+             /usr/local/bin/tool.sh /bin/wrap.sh\n",
+        );
+        write(
+            &root,
+            "usr/local/bin/backup.sh",
+            "#!/bin/sh\nexec btrbk -q run\n",
+        );
+        write(&root, "usr/local/bin/tool", "\x7fELF\x02\x01\x01\0");
+        std::os::unix::fs::symlink("backup.sh", root.join("usr/local/bin/tool.sh")).unwrap();
+        write(&root, "usr/bin/wrap.sh", "#!/bin/sh\ntrue\n");
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        enable(&root, VENDOR, "sockets.target.wants", "snap.socket");
+        write(
+            &root,
+            &format!("{VENDOR}/snap.socket"),
+            "[Socket]\nListenStream=/run/snap.sock\n",
+        );
+        write(
+            &root,
+            &format!("{VENDOR}/snap.service"),
+            "[Service]\nExecStart=/usr/bin/true\n",
+        );
+        // What the boot starts, `systemctl set-default`'s link: on this
+        // mount, which records access times, it is not read.
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/graphical.target",
+            root.join(ETC).join("default.target"),
+        )
+        .unwrap();
+        // An enabled name whose link leads to a real file outside the root:
+        // a follower would read it (and believe its btrbk line) or stat it.
+        let outside = dir.path().join("elsewhere.service");
+        fs::write(&outside, "[Service]\nExecStart=/usr/bin/btrbk run\n").unwrap();
+        let outside_link =
+            root.join("etc/systemd/system/multi-user.target.wants/elsewhere.service");
+        std::os::unix::fs::symlink(&outside, &outside_link).unwrap();
+        let mut paths: Vec<PathBuf> = [
             "usr/lib/os-release",
             "var/log/pacman.log",
             "usr/lib/modules",
             "var/lib/pacman/local",
             "var/lib/pacman/local/btrbk-0.32.6-1/desc",
+            "etc/systemd/system",
+            "etc/systemd/system/timers.target.wants",
+            "etc/systemd/system/multi-user.target.wants",
+            "etc/systemd/system/sshd.service.d",
+            "etc/systemd/system/sshd.service.d/override.conf",
+            "usr/lib/systemd/system",
+            "usr/lib/systemd/system/timers.target.wants",
+            "usr/lib/systemd/system/btrbk.service",
+            "usr/lib/systemd/system/btrbk.timer",
+            "usr/lib/systemd/system/fstrim.timer",
+            "usr/lib/systemd/system/cronie.service",
+            "var/lib/systemd/timers/stamp-btrbk.timer",
+            "etc/cron.d",
+            "etc/cron.d/backup",
+            "etc/crontab",
+            "etc/btrbk",
+            "etc/btrbk/btrbk.conf",
+            "etc/systemd/system/backup.target",
+            "etc/systemd/system/backup.service",
+            "usr/local/bin/backup.sh",
+            "usr/local/bin/tool",
+            "usr/bin/wrap.sh",
+            "usr/lib/systemd/system/sockets.target.wants",
+            "usr/lib/systemd/system/snap.socket",
+            "usr/lib/systemd/system/snap.service",
         ]
         .iter()
-        .map(|r| dir.path().join(r))
+        .map(|r| root.join(r))
         .collect();
+        paths.push(outside.clone());
         for p in &paths {
             filetime::set_file_atime(p, old).unwrap();
         }
         // Following a symlink updates the link's own atime; no open flag stops
-        // that, so the etc/os-release link must not be followed at all.
-        let link = dir.path().join("etc/os-release");
-        filetime::set_symlink_file_times(&link, old, old).unwrap();
-        let os = inspect(dir.path());
-        assert!(os.problems.is_empty(), "{:?}", os.problems);
+        // that, so no link may be followed at all: not etc/os-release, not an
+        // enabled unit, not an alias, not a package's alias.
+        let mut links: Vec<PathBuf> = [
+            "etc/os-release",
+            "etc/systemd/system/timers.target.wants/btrbk.timer",
+            "etc/systemd/system/timers.target.wants/fstrim.timer",
+            "etc/systemd/system/multi-user.target.wants/sshd.service",
+            "etc/systemd/system/default.target",
+            "usr/lib/systemd/system/timers.target.wants/shadow.timer",
+            "usr/lib/systemd/system/dbus.service",
+            "etc/systemd/system/multi-user.target.wants/backup.target",
+            "usr/lib/systemd/system/sockets.target.wants/snap.socket",
+            "usr/local/bin/tool.sh",
+            "bin",
+        ]
+        .iter()
+        .map(|r| root.join(r))
+        .collect();
+        links.push(outside_link);
+        for link in &links {
+            filetime::set_symlink_file_times(link, old, old).unwrap();
+        }
+        let os = inspect(&root);
+        // The real probe, on a mount that records access times: no link is
+        // read, and what the boot starts, or a program link leads to, is
+        // then unknown.
+        assert_eq!(
+            os.problems,
+            ["etc/systemd/system/default.target", "usr/local/bin/tool.sh"].map(|l| format!(
+                "{l}: a link, not read: this mount records access times (mount it noatime)"
+            ))
+        );
+        assert_eq!(os.btrbk_at_boot.verdict, BootVerdict::Will);
         assert_eq!(
             os.last_full_upgrade_applied.as_deref(),
             Some("2026-03-14"),
@@ -1304,34 +1990,100 @@ mod tests {
             Some("CachyOS"),
             "via usr/lib/os-release"
         );
+        assert_eq!(
+            timers(&os),
+            ["btrbk.timer", "fstrim.timer", "shadow.timer"],
+            "it did list"
+        );
+        let EnabledUnits::Listed { units } = &os.enabled_units else {
+            panic!("{:?}", os.enabled_units)
+        };
+        assert!(
+            units.iter().any(|u| u.name == "elsewhere.service"),
+            "recorded by name: {units:?}"
+        );
+        let runners = &os.btrbk_at_boot.runners;
+        let sources: Vec<(&str, Option<&str>)> = runners
+            .iter()
+            .map(|r| (r.source.as_str(), r.script.as_deref()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                ("backup.service", Some("/usr/local/bin/backup.sh")),
+                ("btrbk.service", None),
+                ("etc/cron.d/backup", None)
+            ],
+            "it did read the units, the script and cron, and not the file outside: {runners:?}"
+        );
+        assert_eq!(
+            runners[1].when, "straight after boot (Persistent catch-up)",
+            "it did see the stamp: {runners:?}"
+        );
+        // Every change at once, with what a reader needs to tell a read by
+        // inspect from one by anything else on that filesystem (bd 1yg: one
+        // unexplained failure in 22 runs; 600 runs since did not reproduce it).
+        let now = filetime::FileTime::now();
+        let atime = |m: fs::Metadata| filetime::FileTime::from_last_access_time(&m);
+        let mut changed: Vec<String> = Vec::new();
         for p in &paths {
-            let atime = filetime::FileTime::from_last_access_time(&fs::metadata(p).unwrap());
-            assert_eq!(atime, old, "atime of {} changed", p.display());
+            let after = atime(fs::metadata(p).unwrap());
+            if after != old {
+                changed.push(format!("{}: {old:?} -> {after:?}", p.display()));
+            }
         }
-        let atime =
-            filetime::FileTime::from_last_access_time(&fs::symlink_metadata(&link).unwrap());
-        assert_eq!(atime, old, "atime of the etc/os-release symlink changed");
+        for link in &links {
+            let after = atime(fs::symlink_metadata(link).unwrap());
+            if after != old {
+                changed.push(format!("the link {}: {old:?} -> {after:?}", link.display()));
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "{} access time(s) changed; now {now:?}; filesystem: {}\n{}",
+            changed.len(),
+            mount_of(dir.path()),
+            changed.join("\n")
+        );
+    }
+
+    /// The `/proc/self/mountinfo` line of the filesystem `path` is on — its
+    /// options decide when an access time moves — for a failure message.
+    fn mount_of(path: &Path) -> String {
+        fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| Some((line.split(' ').nth(4)?, line)))
+            .filter(|(point, _)| path.starts_with(point))
+            .max_by_key(|(point, _)| point.len())
+            .map_or_else(
+                || "not in /proc/self/mountinfo".into(),
+                |(_, line)| line.into(),
+            )
     }
 
     #[test]
     fn a_file_that_needs_an_atime_update_to_read_is_refused() {
-        // Unprivileged, a file someone else owns cannot be opened O_NOATIME.
-        // /usr/lib/os-release is a regular, root-owned file on every
-        // distribution this runs on (/etc/os-release is usually a link to it).
-        // As root, or as its owner, there is nothing to refuse.
+        // A file someone else owns cannot be opened O_NOATIME: the open would
+        // have to update its access time. /usr/lib/os-release is a regular,
+        // root-owned file on every distribution this runs on (/etc/os-release
+        // is usually a link to it). Run by root — CI's container — the read
+        // runs with this thread's filesystem uid made nobody's.
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = fs::symlink_metadata("/usr/lib/os-release") else {
-            eprintln!("SKIPPED: no /usr/lib/os-release on this system");
+            testutil::skip("no /usr/lib/os-release on this system");
             return;
         };
         // SAFETY: geteuid() is always safe.
         let euid = unsafe { libc::geteuid() };
-        if !meta.is_file() || euid == 0 || meta.uid() == euid {
-            eprintln!("SKIPPED: not a regular file, or running as root or its owner");
+        if !meta.is_file() || (euid != 0 && meta.uid() == euid) {
+            testutil::skip("/usr/lib/os-release is not a regular file, or is this user's own");
             return;
         }
+        let read =
+            testutil::as_unprivileged(None, || read_in_root(Path::new("/"), "usr/lib/os-release"));
         assert_eq!(
-            read_in_root(Path::new("/"), "usr/lib/os-release"),
+            read,
             Err(ReadErr::Unreadable(
                 "usr/lib/os-release: cannot be read without updating its access time (run as root)"
                     .into()
@@ -1358,6 +2110,9 @@ mod tests {
             !os.packages_read,
             "an unread database is not 'nothing installed'"
         );
+        assert_eq!(os.enabled_units, EnabledUnits::Listed { units: Vec::new() });
+        assert_eq!(os.btrbk_config, BtrbkConfig::Absent);
+        assert_eq!(os.btrbk_at_boot, quiet());
         assert!(
             os.problems.is_empty(),
             "absent is not unreadable: {:?}",
@@ -1370,6 +2125,242 @@ mod tests {
                 "last upgrade unknown: var/log/pacman.log is absent",
                 "no kernel found: usr/lib/modules is absent"
             ]
+        );
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+    }
+
+    // ---- would booting it run btrbk (bd 1yg) ------------------------------
+
+    #[test]
+    fn inspect_reads_whether_booting_it_would_run_btrbk() {
+        let dir = tempfile::tempdir().unwrap();
+        current_root(dir.path());
+        let h = current_host();
+        let clean = assess(&inspect(dir.path()), &h, TODAY, 60);
+        assert!(
+            !clean.stale && clean.warnings.is_empty(),
+            "the fixture is current and quiet: {clean:?}"
+        );
+        assert!(!clean.needs_attention());
+
+        arm_btrbk(dir.path());
+        let os = inspect(dir.path());
+        assert_eq!(os.btrbk_at_boot.verdict, BootVerdict::Will);
+        assert_eq!(
+            os.btrbk_at_boot.runners,
+            [BtrbkRunner {
+                source: "btrbk.service".into(),
+                via: Some("btrbk.timer".into()),
+                script: None,
+                when: "at its next scheduled time after boot".into(),
+                config: None,
+                config_present: Some(true),
+            }]
+        );
+        let a = assess(&os, &h, TODAY, 60);
+        assert_eq!(a.warnings, [WILL_RUN]);
+        assert!(!a.stale, "a warning is not staleness: {:?}", a.reasons);
+        assert!(a.needs_attention());
+        // A stale OS keeps both: its reasons and the warning.
+        let a = assess(&os, &host("7.2.8"), TODAY, 60);
+        assert!(a.stale);
+        assert_eq!(a.warnings, [WILL_RUN]);
+
+        // No config: btrbk would stop at once. Said, but nothing to attend to.
+        fs::remove_file(dir.path().join("etc/btrbk/btrbk.conf")).unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(os.btrbk_at_boot.verdict, BootVerdict::No);
+        assert_eq!(
+            os.btrbk_at_boot.reasons,
+            [
+                "btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time \
+                 after boot, but /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent, so it \
+                 stops at once"
+            ]
+        );
+        let a = assess(&os, &h, TODAY, 60);
+        assert!(a.warnings.is_empty() && !a.needs_attention(), "{a:?}");
+    }
+
+    #[test]
+    fn boot_warning_says_will_or_may_and_nothing_for_no() {
+        let os = |verdict, reasons: &[&str]| RecoveryOs {
+            btrbk_at_boot: BtrbkAtBoot {
+                verdict,
+                reasons: reasons.iter().map(|r| r.to_string()).collect(),
+                runners: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            boot_warning(&os(BootVerdict::Will, &["a", "b"])).as_deref(),
+            Some(
+                "btrbk will run when this OS boots — a; b: check its config before booting it, \
+                 on bare metal or in the update VM"
+            )
+        );
+        assert_eq!(
+            boot_warning(&os(BootVerdict::May, &["c"])).as_deref(),
+            Some(
+                "btrbk may run when this OS boots — c: check what it starts at boot and its btrbk \
+                 config before booting it, on bare metal or in the update VM"
+            )
+        );
+        assert_eq!(boot_warning(&os(BootVerdict::No, &["d"])), None);
+        // Not read is "may", never safe: what a version-2 record loads as.
+        let unread = RecoveryOs::default();
+        assert_eq!(
+            unread.enabled_units,
+            EnabledUnits::Unreadable {
+                reason: "not read".into()
+            }
+        );
+        assert_eq!(
+            unread.btrbk_config,
+            BtrbkConfig::Unreadable {
+                reason: "not read".into()
+            }
+        );
+        assert_eq!(
+            boot_warning(&unread).as_deref(),
+            Some(
+                "btrbk may run when this OS boots — not read: check what it starts at boot and \
+                 its btrbk config before booting it, on bare metal or in the update VM"
+            )
+        );
+    }
+
+    #[test]
+    fn a_unit_listing_that_cannot_be_read_is_unknown_in_the_section_and_may_run() {
+        let dir = tempfile::tempdir().unwrap();
+        current_root(dir.path());
+        arm_btrbk(dir.path());
+        let wants = dir.path().join("etc/systemd/system/timers.target.wants");
+        fs::set_permissions(&wants, fs::Permissions::from_mode(0o000)).unwrap();
+        let h = current_host();
+        let e = testutil::as_unprivileged(Some(dir.path()), || {
+            inspect_drive("A", dir.path(), &h, TODAY, 60)
+        });
+        fs::set_permissions(&wants, fs::Permissions::from_mode(0o755)).unwrap();
+        let reason = "etc/systemd/system/timers.target.wants: Permission denied (os error 13)";
+        let DriveReport::Inspected { os, assessment } = &e.report else {
+            panic!("{e:?}")
+        };
+        assert_eq!(
+            os.enabled_units,
+            EnabledUnits::Unreadable {
+                reason: reason.into()
+            }
+        );
+        assert_eq!(os.problems, [reason]);
+        assert_eq!(
+            assessment.warnings,
+            [format!(
+                "btrbk may run when this OS boots — enabled units unknown: {reason}: check what \
+                 it starts at boot and its btrbk config before booting it, on bare metal or in \
+                 the update VM"
+            )]
+        );
+        let text = format_section(std::slice::from_ref(&e), &h);
+        for line in [
+            format!("    Enabled timers      unknown: {reason}\n"),
+            "    btrbk at boot       may\n".to_string(),
+            format!("    Could not read      {reason}\n"),
+        ] {
+            assert!(text.contains(&line), "missing {line:?} in\n{text}");
+        }
+        assert!(!text.contains("Enabled timers      none"), "{text}");
+        assert_eq!(exit_code(std::slice::from_ref(&e)), 1);
+    }
+
+    #[test]
+    fn the_stored_shapes_of_the_new_readings_are_the_documented_ones() {
+        // recovery-os-vm.sh reads these from the state file (bd 1yg).
+        use serde_json::{json, to_value};
+        assert_eq!(
+            to_value(EnabledUnits::Listed {
+                units: vec![EnabledUnit {
+                    name: "btrbk.timer".into(),
+                    dirs: vec!["etc/systemd/system/timers.target.wants".into()],
+                }]
+            })
+            .unwrap(),
+            json!({"state": "listed", "units": [
+                {"name": "btrbk.timer", "dirs": ["etc/systemd/system/timers.target.wants"]}
+            ]})
+        );
+        assert_eq!(
+            to_value(EnabledUnits::Unreadable { reason: "r".into() }).unwrap(),
+            json!({"state": "unreadable", "reason": "r"})
+        );
+        assert_eq!(
+            to_value(BtrbkConfig::Present {
+                path: "/etc/btrbk/btrbk.conf".into(),
+                size_bytes: 412,
+            })
+            .unwrap(),
+            json!({"state": "present", "path": "/etc/btrbk/btrbk.conf", "size_bytes": 412})
+        );
+        assert_eq!(
+            to_value(BtrbkConfig::Absent).unwrap(),
+            json!({"state": "absent"})
+        );
+        assert_eq!(
+            to_value(BtrbkConfig::Unreadable { reason: "r".into() }).unwrap(),
+            json!({"state": "unreadable", "reason": "r"})
+        );
+        assert_eq!(
+            to_value(BtrbkAtBoot {
+                verdict: BootVerdict::Will,
+                reasons: vec!["why".into()],
+                runners: vec![BtrbkRunner {
+                    source: "btrbk.service".into(),
+                    via: Some("btrbk.timer".into()),
+                    script: Some("/usr/local/bin/backup.sh".into()),
+                    when: "at every boot".into(),
+                    config: Some("/opt/x.conf".into()),
+                    config_present: Some(true),
+                }],
+            })
+            .unwrap(),
+            json!({"verdict": "will", "reasons": ["why"], "runners": [{
+                "source": "btrbk.service", "via": "btrbk.timer",
+                "script": "/usr/local/bin/backup.sh", "when": "at every boot",
+                "config": "/opt/x.conf", "config_present": true
+            }]})
+        );
+        // A runner recorded before scripts were read has no `script`: none.
+        let old: BtrbkRunner = serde_json::from_value(json!({
+            "source": "btrbk.service", "via": null, "when": "at every boot",
+            "config": null, "config_present": true
+        }))
+        .unwrap();
+        assert_eq!(old.script, None);
+        for (verdict, word) in [
+            (BootVerdict::Will, "will"),
+            (BootVerdict::May, "may"),
+            (BootVerdict::No, "no"),
+        ] {
+            assert_eq!(to_value(verdict).unwrap(), json!(word));
+            assert_eq!(verdict_word(verdict), word);
+        }
+        assert_eq!(
+            serde_json::from_value::<BtrbkAtBoot>(
+                json!({"verdict": "may", "reasons": ["x"], "runners": []})
+            )
+            .unwrap(),
+            BtrbkAtBoot {
+                verdict: BootVerdict::May,
+                reasons: vec!["x".into()],
+                runners: Vec::new(),
+            }
+        );
+        assert!(serde_json::from_value::<BtrbkConfig>(json!({"state": "maybe"})).is_err());
+        assert!(
+            serde_json::from_value::<BtrbkAtBoot>(
+                json!({"verdict": "perhaps", "reasons": [], "runners": []})
+            )
+            .is_err()
         );
     }
 
@@ -1812,6 +2803,48 @@ mod tests {
     }
 
     #[test]
+    fn a_file_is_opened_without_blocking_and_kept_only_if_its_fstat_is_regular() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f", "x");
+        // The descriptor really carries the flags: never blocking, no atime.
+        let file = open_noatime(&dir.path().join("f"), FILE_FLAGS).unwrap();
+        // SAFETY: F_GETFL only reads the status flags of an open descriptor.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK, "{flags:#o}");
+        assert_eq!(flags & libc::O_NOATIME, libc::O_NOATIME, "{flags:#o}");
+        assert!(open_regular(&dir.path().join("f"), "f").is_ok());
+        // A FIFO swapped in after the lstat that would have refused it: the
+        // open returns at once and its fstat refuses it. A writer stands by
+        // so that a regression blocks nothing; it is released either way.
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap())
+        });
+        let got = open_regular(&fifo, "fifo");
+        let _release = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            got.err(),
+            Some(ReadErr::Unreadable("fifo: not a regular file".into()))
+        );
+        // The whole read refuses it before opening it, by its lstat.
+        assert_eq!(
+            read_in_root(dir.path(), "fifo"),
+            Err(ReadErr::Unreadable("fifo: not a regular file".into()))
+        );
+    }
+
+    #[test]
     fn a_regular_etc_os_release_wins_over_the_fallback() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "etc/os-release", "PRETTY_NAME=\"From etc\"\n");
@@ -2180,11 +3213,11 @@ mod tests {
             report,
         };
         let current = entry(DriveReport::Inspected {
-            os: RecoveryOs::default(),
+            os: Box::default(),
             assessment: Assessment::default(),
         });
         let stale = entry(DriveReport::Inspected {
-            os: RecoveryOs::default(),
+            os: Box::default(),
             assessment: Assessment {
                 stale: true,
                 ..Default::default()
@@ -2192,9 +3225,20 @@ mod tests {
         });
         let bad = entry(DriveReport::Unreadable("x".into()));
         let off = entry(DriveReport::NotMounted);
+        // Current, with a warning: it needs attention all the same.
+        let warned = entry(DriveReport::Inspected {
+            os: Box::default(),
+            assessment: Assessment {
+                warnings: vec![WILL_RUN.into()],
+                ..Default::default()
+            },
+        });
         assert_eq!(exit_code(&[]), 0);
         assert_eq!(exit_code(&[current.clone(), off.clone()]), 0);
         assert_eq!(exit_code(&[current.clone(), stale.clone()]), 1);
+        assert_eq!(exit_code(&[current.clone(), warned.clone()]), 1);
+        assert_eq!(exit_code(&[warned.clone(), off]), 1);
+        assert_eq!(exit_code(&[warned, bad.clone()]), 2);
         assert_eq!(exit_code(&[stale.clone(), bad.clone()]), 2);
         assert_eq!(exit_code(&[bad, stale]), 2);
     }
@@ -2220,6 +3264,9 @@ mod tests {
              \x20   btrfs-progs         6.10-1 (host 6.17-1)\n\
              \x20   btrbk               0.32.6-1\n\
              \x20   das-backup-manager  not installed\n\
+             \x20   Enabled timers      fstrim.timer (etc); shadow.timer (usr/lib)\n\
+             \x20   btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n\
+             \x20   btrbk at boot       no\n\
              \x20   Result              STALE — last full upgrade 202 days ago (limit 60); \
              kernel series 6.12 (6.12.1-1-cachyos) is behind the host's 7.2; \
              btrfs-progs 6.10-1 is older than the host's 6.17-1\n"
@@ -2242,12 +3289,16 @@ mod tests {
             "    btrfs-progs         unknown (host unknown)\n",
             "    btrbk               unknown\n",
             "    das-backup-manager  unknown\n",
+            "    Enabled timers      none\n",
+            "    btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n",
+            "    btrbk at boot       no\n",
             "    Result              STALE — last upgrade unknown: var/log/pacman.log is absent; \
              no kernel found: usr/lib/modules is absent\n",
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
         assert!(!text.contains("Could not read"), "{text}");
+        assert!(!text.contains("WARNING"), "{text}");
         assert!(!text.contains(" 0 days"), "{text}");
 
         // Unreadable: there, but it could not be read — said as such.
@@ -2381,6 +3432,141 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_section_shows_the_timers_the_config_and_the_warning_before_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        current_root(dir.path());
+        arm_btrbk(dir.path());
+        let h = current_host();
+        let e = inspect_drive("A", dir.path(), &h, TODAY, 60);
+        let text = format_section(std::slice::from_ref(&e), &h);
+        let tail = format!(
+            "    das-backup-manager  not installed\n\
+             \x20   Enabled timers      btrbk.timer, fstrim.timer (etc); shadow.timer (usr/lib)\n\
+             \x20   btrbk config        /etc/btrbk/btrbk.conf ({} bytes)\n\
+             \x20   btrbk at boot       will\n\
+             \x20   WARNING             {WILL_RUN}\n\
+             \x20   Result              current\n",
+            BTRBK_CONF_TEXT.len()
+        );
+        assert!(text.ends_with(&tail), "{text}");
+        assert_eq!(
+            exit_code(std::slice::from_ref(&e)),
+            1,
+            "current, and still it needs attention"
+        );
+        let j = entry_json(&e);
+        assert_eq!(j["status"], "current", "a warning is not staleness");
+        assert_eq!(j["assessment"]["warnings"], serde_json::json!([WILL_RUN]));
+        assert_eq!(j["os"]["btrbk_at_boot"]["verdict"], "will");
+        assert_eq!(
+            j["os"]["btrbk_at_boot"]["reasons"],
+            serde_json::json!([
+                "btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time \
+                 after boot, with /etc/btrbk/btrbk.conf present"
+            ])
+        );
+        assert_eq!(
+            j["os"]["enabled_units"]["units"][0],
+            serde_json::json!({
+                "name": "btrbk.timer",
+                "dirs": ["etc/systemd/system/timers.target.wants"]
+            })
+        );
+        assert_eq!(
+            j["os"]["btrbk_config"],
+            serde_json::json!({
+                "state": "present",
+                "path": "/etc/btrbk/btrbk.conf",
+                "size_bytes": BTRBK_CONF_TEXT.len()
+            })
+        );
+
+        // Without the config: no WARNING row, nothing to attend to, and the
+        // row says what was ruled out.
+        fs::remove_file(dir.path().join("etc/btrbk/btrbk.conf")).unwrap();
+        let e = inspect_drive("A", dir.path(), &h, TODAY, 60);
+        let text = format_section(std::slice::from_ref(&e), &h);
+        assert!(!text.contains("WARNING"), "{text}");
+        for line in [
+            "    btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n",
+            "    btrbk at boot       no — btrbk.timer starts btrbk.service, which runs btrbk at \
+             its next scheduled time after boot, but /etc/btrbk.conf and /etc/btrbk/btrbk.conf \
+             are absent, so it stops at once\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+        assert_eq!(exit_code(std::slice::from_ref(&e)), 0);
+        assert_eq!(
+            entry_json(&e)["assessment"]["warnings"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn the_timers_config_and_boot_rows_say_none_or_unknown_and_never_blank() {
+        let unit = |name: &str, dir: &str| EnabledUnit {
+            name: name.into(),
+            dirs: vec![dir.into()],
+        };
+        let listed = |units: Vec<EnabledUnit>| EnabledUnits::Listed { units };
+        assert_eq!(timers_text(&listed(Vec::new())), "none");
+        let units = listed(vec![
+            unit("a.timer", "etc/systemd/system/timers.target.wants"),
+            unit("b.service", "etc/systemd/system/multi-user.target.wants"),
+            unit(
+                "c.timer",
+                "usr/local/lib/systemd/system/timers.target.wants",
+            ),
+            unit("d.timer", "usr/lib/systemd/system/timers.target.wants"),
+            unit("e.timer", "etc/systemd/system/timers.target.wants"),
+        ]);
+        assert_eq!(
+            timers_text(&units),
+            "a.timer, e.timer (etc); c.timer (usr/local/lib); d.timer (usr/lib)"
+        );
+        assert_eq!(timers_short(&units), "a.timer, c.timer, d.timer, e.timer");
+        assert_eq!(
+            timers_text(&listed(vec![unit(
+                "b.service",
+                "etc/systemd/system/x.target.wants"
+            )])),
+            "none",
+            "services are units, not timers"
+        );
+        assert_eq!(timers_short(&listed(Vec::new())), "none");
+        let unknown = EnabledUnits::Unreadable { reason: "r".into() };
+        assert_eq!(timers_text(&unknown), "unknown: r");
+        assert_eq!(timers_short(&unknown), "unknown");
+        let present = |size_bytes| BtrbkConfig::Present {
+            path: "/etc/btrbk.conf".into(),
+            size_bytes,
+        };
+        assert_eq!(btrbk_config_text(&present(1)), "/etc/btrbk.conf (1 byte)");
+        assert_eq!(btrbk_config_text(&present(0)), "/etc/btrbk.conf (0 bytes)");
+        assert_eq!(
+            btrbk_config_text(&present(2048)),
+            "/etc/btrbk.conf (2048 bytes)"
+        );
+        assert_eq!(
+            btrbk_config_text(&BtrbkConfig::Absent),
+            "none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent"
+        );
+        assert_eq!(
+            btrbk_config_text(&BtrbkConfig::Unreadable { reason: "r".into() }),
+            "unknown: r"
+        );
+        let at = |verdict, reasons: &[&str]| BtrbkAtBoot {
+            verdict,
+            reasons: reasons.iter().map(|r| r.to_string()).collect(),
+            runners: Vec::new(),
+        };
+        assert_eq!(at_boot_text(&at(BootVerdict::No, &[])), "no");
+        assert_eq!(at_boot_text(&at(BootVerdict::No, &["x", "y"])), "no — x; y");
+        assert_eq!(at_boot_text(&at(BootVerdict::Will, &["x"])), "will");
+        assert_eq!(at_boot_text(&at(BootVerdict::May, &["x"])), "may");
+    }
+
     // ---- state and health -----------------------------------------------
 
     fn inspected(label: &str, root: &Path) -> DriveEntry {
@@ -2420,15 +3606,16 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         let st = load_state(&path).unwrap().unwrap();
-        assert_eq!(st.schema_version, 2);
+        assert_eq!(st.schema_version, 3);
         let DriveReport::Inspected { os, .. } = &a.report else {
             panic!()
         };
+        assert_eq!(timers(os), ["fstrim.timer", "shadow.timer"], "kept as read");
         assert_eq!(
             st.drives["A"],
             StoredDrive {
                 checked_epoch: 1000,
-                os: Some(os.clone()),
+                os: Some(RecoveryOs::clone(os)),
                 error: None
             }
         );
@@ -2453,7 +3640,38 @@ mod tests {
         assert_eq!(st.drives["A"].checked_epoch, 1000);
         assert_eq!(st.drives["B"].checked_epoch, 2000);
         assert_eq!(st.drives["B"].error, None);
-        assert!(!dir.path().join(".recovery-os.json.tmp").exists());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["recovery-os.json"], "no temp file left behind");
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_written_is_an_error_that_names_its_file_once() {
+        let roots = tempfile::tempdir().unwrap();
+        full_root(&roots.path().join("a"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-os.json");
+        let a = inspected("A", &roots.path().join("a"));
+        write_state(&path, std::slice::from_ref(&a), 1000).unwrap();
+        crate::fsutil::testing::unreplaceable(&path);
+
+        let err = write_state(&path, &[a], 2000).unwrap_err();
+
+        assert!(
+            err.starts_with(&format!("cannot write {}: ", path.display())),
+            "{err}"
+        );
+        assert_eq!(
+            err.matches(&path.display().to_string()).count(),
+            1,
+            "the path, once: {err}"
+        );
+        assert_eq!(
+            load_state(&path).unwrap().unwrap().drives["A"].checked_epoch,
+            1000
+        );
     }
 
     #[test]
@@ -2522,11 +3740,14 @@ mod tests {
             h.lines,
             [
                 "A (live): installed 2026-01-02, last full upgrade 2026-03-14, age 202 days \
-                 since last applied upgrade, kernel 6.12.1-1-cachyos — STALE: last full upgrade 202 days ago (limit 60); kernel series 6.12 \
+                 since last applied upgrade, kernel 6.12.1-1-cachyos, enabled timers fstrim.timer, \
+                 shadow.timer, btrbk at boot no — STALE: last full upgrade 202 days ago (limit 60); \
+                 kernel series 6.12 \
                  (6.12.1-1-cachyos) is behind the host's 7.2; btrfs-progs 6.10-1 is older \
                  than the host's 6.17-1",
                 "B (as of 2026-10-01 03:20 UTC): installed unknown, last full upgrade 2026-09-30, \
-                 age 2 days since last applied upgrade, kernel 7.2.1 — current",
+                 age 2 days since last applied upgrade, kernel 7.2.1, enabled timers none, btrbk at \
+                 boot no — current",
                 "C (as of 2026-10-01 03:20 UTC): OS root unreadable: not a directory",
                 "D: not mounted and never checked",
             ]
@@ -2611,7 +3832,8 @@ mod tests {
             h.lines,
             [
                 "B (as of 1970-01-01 00:00 UTC): installed unknown, last full upgrade 2026-10-02, \
-                 age 0 days since last applied upgrade, kernel 7.2.1 — current; 2 paths unreadable"
+                 age 0 days since last applied upgrade, kernel 7.2.1, enabled timers none, btrbk at \
+                 boot no — current; 2 paths unreadable"
             ]
         );
         os.problems.truncate(1);
@@ -2621,6 +3843,95 @@ mod tests {
         );
         os.problems.clear();
         assert!(summary("B", "live", &os, &Assessment::default()).ends_with("— current"));
+    }
+
+    #[test]
+    fn health_shows_the_enabled_timers_and_warns_when_btrbk_would_run_at_boot() {
+        let a = tempfile::tempdir().unwrap();
+        current_root(&a.path().join("@"));
+        arm_btrbk(&a.path().join("@"));
+        let cfg = mirror_config(&[
+            ("A", a.path().to_str().unwrap()),
+            ("B", "/nonexistent/b"),
+            ("C", "/nonexistent/c"),
+        ]);
+        let timer = |name: &str| EnabledUnit {
+            name: name.into(),
+            dirs: vec!["etc/systemd/system/timers.target.wants".into()],
+        };
+        // A stored reading whose boot will run btrbk...
+        let mut armed = os_with(Some(TODAY), &["7.2.1"]);
+        armed.enabled_units = EnabledUnits::Listed {
+            units: vec![timer("btrbk.timer"), timer("fstrim.timer")],
+        };
+        armed.btrbk_at_boot = BtrbkAtBoot {
+            verdict: BootVerdict::Will,
+            reasons: vec!["stored reason".into()],
+            runners: Vec::new(),
+        };
+        // ...and one whose units could not be listed: it may.
+        let mut unknown = os_with(Some(TODAY), &["7.2.1"]);
+        unknown.enabled_units = EnabledUnits::Unreadable {
+            reason: "etc/systemd/system: denied".into(),
+        };
+        unknown.btrbk_at_boot = BtrbkAtBoot {
+            verdict: BootVerdict::May,
+            reasons: vec!["enabled units unknown: etc/systemd/system: denied".into()],
+            runners: Vec::new(),
+        };
+        unknown.problems = vec!["etc/systemd/system: denied".into()];
+        let mut drives = BTreeMap::new();
+        for (label, os) in [("B", armed), ("C", unknown)] {
+            drives.insert(
+                label.to_string(),
+                StoredDrive {
+                    checked_epoch: 0,
+                    os: Some(os),
+                    error: None,
+                },
+            );
+        }
+        let state = Ok(Some(StoredState {
+            schema_version: STATE_SCHEMA_VERSION,
+            drives,
+        }));
+        let is_mounted = |p: &Path| p == a.path();
+        let h = health_with(&cfg, &state, &current_host, TODAY, &is_mounted);
+        let when = "as of 1970-01-01 00:00 UTC";
+        assert_eq!(
+            h.lines,
+            [
+                format!(
+                    "A (live): installed {d}, last full upgrade {d}, age 1 day since last \
+                     applied upgrade, kernel 6.12.1-1-cachyos, enabled timers btrbk.timer, \
+                     fstrim.timer, shadow.timer, btrbk at boot will — current",
+                    d = days_before(TODAY, 1)
+                ),
+                format!(
+                    "B ({when}): installed unknown, last full upgrade 2026-10-02, age 0 days \
+                     since last applied upgrade, kernel 7.2.1, enabled timers btrbk.timer, \
+                     fstrim.timer, btrbk at boot will — current"
+                ),
+                format!(
+                    "C ({when}): installed unknown, last full upgrade 2026-10-02, age 0 days \
+                     since last applied upgrade, kernel 7.2.1, enabled timers unknown, btrbk at \
+                     boot may — current; 1 path unreadable"
+                ),
+            ]
+        );
+        assert_eq!(
+            h.warnings,
+            [
+                format!("Recovery OS on 'A': {WILL_RUN}"),
+                "Recovery OS on 'B': btrbk will run when this OS boots — stored reason: check its \
+                 config before booting it, on bare metal or in the update VM"
+                    .to_string(),
+                "Recovery OS on 'C': btrbk may run when this OS boots — enabled units unknown: \
+                 etc/systemd/system: denied: check what it starts at boot and its btrbk config \
+                 before booting it, on bare metal or in the update VM"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2789,8 +4100,9 @@ mod tests {
         assert_eq!(
             summary("A", "live", os, assessment),
             "A (live): installed 2026-04-12, last full upgrade none recorded, \
-             age 174 days since install, kernel 6.12.1-1-cachyos — STALE: never upgraded \
-             since install on 2026-04-12 (174 days)"
+             age 174 days since install, kernel 6.12.1-1-cachyos, enabled timers fstrim.timer, \
+             shadow.timer, btrbk at boot no — STALE: never upgraded since install on 2026-04-12 \
+             (174 days)"
         );
         // No age: said as unknown, never as a number, and JSON carries null.
         let unknown = upgrades("garbage\n");
@@ -2825,50 +4137,192 @@ mod tests {
     }
 
     #[test]
-    fn a_state_of_another_schema_version_is_refused_with_the_way_out() {
+    fn a_version_2_record_loads_as_not_read_and_any_other_version_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recovery-os.json");
         let hint = format!("remove it to start over: rm -- '{}'", path.display());
-        let v1 = r#"{"schema_version":1,"drives":{}}"#;
-        fs::write(&path, v1).unwrap();
-        let err = load_state(&path).unwrap_err();
+        // Version 2, before the units and btrbk were read, as the nightly run
+        // of 2026-10-03 wrote it.
+        let v2 = r#"{"schema_version":2,"drives":{"B":{"checked_epoch":1,"os":{"os_name":"Arch Linux","last_full_upgrade_applied":null,"last_full_upgrade_attempted":null,"last_attempt_completed":false,"installed":"2026-04-12","log_read":true,"modules_read":true,"kernels":["6.19.12-1-cachyos"],"packages":{"btrbk":"0.32.6-2"},"packages_read":true,"problems":[]},"error":null}}}"#;
+        fs::write(&path, v2).unwrap();
+        let state = load_state(&path).unwrap().unwrap();
+        assert_eq!(state.schema_version, 2);
+        let os = state.drives["B"].os.clone().unwrap();
         assert_eq!(
-            err,
-            format!(
-                "{}: record schema version 1, this btrdasd reads 2 — left as it is; {hint}",
-                path.display()
-            )
+            os.installed.as_deref(),
+            Some("2026-04-12"),
+            "its facts load"
         );
-        // The writer refuses it the same way and leaves it alone.
+        assert_eq!(os.enabled_units, EnabledUnits::default());
+        assert_eq!(os.btrbk_config, BtrbkConfig::default());
+        assert_eq!(os.btrbk_at_boot, BtrbkAtBoot::default());
+        assert_eq!(os.btrbk_at_boot.verdict, BootVerdict::May, "never safe");
+        // health says it may run, until the next run reads the drive.
+        let cfg = mirror_config(&[("B", "/nonexistent/b")]);
+        let h = health_with(&cfg, &Ok(Some(state)), &|| host("6.19.12"), TODAY, &|_| {
+            false
+        });
+        assert!(
+            h.lines[0].contains(", enabled timers unknown, btrbk at boot may — "),
+            "{:?}",
+            h.lines
+        );
+        assert!(
+            h.warnings.contains(
+                &"Recovery OS on 'B': btrbk may run when this OS boots — not read: check what it \
+                  starts at boot and its btrbk config before booting it, on bare metal or in the \
+                  update VM"
+                    .to_string()
+            ),
+            "{:?}",
+            h.warnings
+        );
+        // The next write records version 3, the unmounted drive's reading
+        // carried over as it was read.
+        let roots = tempfile::tempdir().unwrap();
+        full_root(&roots.path().join("a"));
+        let a = inspected("A", &roots.path().join("a"));
         let off = DriveEntry {
-            label: "A".into(),
+            label: "B".into(),
             root: PathBuf::new(),
             report: DriveReport::NotMounted,
         };
-        assert_eq!(write_state(&path, &[off], 5).unwrap_err(), err);
-        assert_eq!(fs::read_to_string(&path).unwrap(), v1);
-        // No version at all, or a newer one, is refused too.
-        fs::write(&path, r#"{"drives":{}}"#).unwrap();
-        assert!(
-            load_state(&path)
-                .unwrap_err()
-                .contains(": record schema version none, this btrdasd reads 2 — "),
-            "{:?}",
-            load_state(&path)
+        write_state(&path, &[a, off], 5).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["schema_version"], 3);
+        assert_eq!(written["drives"]["B"]["checked_epoch"], 1);
+        assert_eq!(
+            written["drives"]["B"]["os"]["btrbk_at_boot"]["verdict"],
+            "may"
         );
+        assert_eq!(
+            written["drives"]["A"]["os"]["btrbk_at_boot"]["verdict"],
+            "no"
+        );
+        assert_eq!(load_state(&path).unwrap().unwrap().schema_version, 3);
+
+        // Version 1, no version, and a newer one are refused, and left alone.
+        for (record, found) in [
+            (r#"{"schema_version":1,"drives":{}}"#, "1"),
+            (r#"{"drives":{}}"#, "none"),
+            (r#"{"schema_version":4,"drives":{}}"#, "4"),
+        ] {
+            fs::write(&path, record).unwrap();
+            let err = load_state(&path).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "{}: record schema version {found}, this btrdasd reads 2 and 3 — left as it \
+                     is; {hint}",
+                    path.display()
+                )
+            );
+            let off = DriveEntry {
+                label: "A".into(),
+                root: PathBuf::new(),
+                report: DriveReport::NotMounted,
+            };
+            assert_eq!(write_state(&path, &[off], 5).unwrap_err(), err);
+            assert_eq!(fs::read_to_string(&path).unwrap(), record);
+        }
+        // Version 3 loads; so does a version-3 record missing the new
+        // readings, as "not read".
         fs::write(&path, r#"{"schema_version":3,"drives":{}}"#).unwrap();
-        assert!(load_state(&path).unwrap_err().ends_with(&hint));
-        // The current version loads.
-        fs::write(&path, r#"{"schema_version":2,"drives":{}}"#).unwrap();
         assert_eq!(
             load_state(&path),
             Ok(Some(StoredState {
-                schema_version: 2,
+                schema_version: 3,
                 drives: BTreeMap::new()
             }))
         );
-        // A corrupt file says the same way out from the loader itself.
+        fs::write(
+            &path,
+            v2.replace(r#""schema_version":2"#, r#""schema_version":3"#),
+        )
+        .unwrap();
+        let os = load_state(&path).unwrap().unwrap().drives["B"]
+            .os
+            .clone()
+            .unwrap();
+        assert_eq!(os.btrbk_at_boot, BtrbkAtBoot::default());
+        // A corrupt file says the way out from the loader itself.
         fs::write(&path, "{not json").unwrap();
         assert!(load_state(&path).unwrap_err().ends_with(&hint));
+        let bad_verdict = v2
+            .replace(r#""schema_version":2"#, r#""schema_version":3"#)
+            .replace(
+                r#""problems":[]"#,
+                r#""btrbk_at_boot":{"verdict":"perhaps","reasons":[],"runners":[]},"problems":[]"#,
+            );
+        fs::write(&path, bad_verdict).unwrap();
+        assert!(load_state(&path).unwrap_err().ends_with(&hint));
+    }
+}
+
+/// What the tests here and in [`boot`] share.
+#[cfg(test)]
+mod testutil {
+    use std::path::Path;
+
+    /// A test that cannot run here says so, and under CI (`CI` set, as
+    /// GitHub Actions sets it) it fails instead: a skipped check there would
+    /// report a success it has not earned.
+    pub fn skip(why: &str) {
+        let ci = std::env::var("CI").is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false"));
+        assert!(!ci, "cannot run here, and CI is set: {why}");
+        eprintln!("SKIPPED: {why}");
+    }
+
+    const NOBODY: libc::uid_t = 65534;
+
+    /// This thread's filesystem uid, for the life of the guard.
+    struct FsUid(libc::uid_t);
+
+    impl FsUid {
+        fn set(uid: libc::uid_t) -> Self {
+            // SAFETY: setfsuid(2) changes only this thread's credentials;
+            // given an invalid uid (-1) it changes nothing and returns the
+            // current one, which checks that the change took.
+            let before = unsafe { libc::setfsuid(uid) } as libc::uid_t;
+            let now = unsafe { libc::setfsuid(libc::uid_t::MAX) } as libc::uid_t;
+            assert_eq!(now, uid, "setfsuid({uid}) did not take");
+            Self(before)
+        }
+    }
+
+    impl Drop for FsUid {
+        fn drop(&mut self) {
+            // SAFETY: as above; restores this thread's filesystem uid.
+            unsafe { libc::setfsuid(self.0) };
+        }
+    }
+
+    fn chown_tree(path: &Path) {
+        std::os::unix::fs::lchown(path, Some(NOBODY), Some(NOBODY)).unwrap();
+        if std::fs::symlink_metadata(path).unwrap().is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                chown_tree(&entry.unwrap().path());
+            }
+        }
+    }
+
+    /// Run `f` with permissions checked as for an ordinary user. Run by root
+    /// — CI's container — this thread's filesystem uid is `nobody`'s for the
+    /// call: setfsuid(2) is per thread, and leaving uid 0 drops
+    /// CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH and CAP_FOWNER from the thread's
+    /// effective set, so mode 000 and `O_NOATIME`'s owner rule apply; they
+    /// return with uid 0. `fixture`, when given, is given to `nobody` first
+    /// so it stays reachable. Unprivileged, `f` just runs.
+    pub fn as_unprivileged<T>(fixture: Option<&Path>, f: impl FnOnce() -> T) -> T {
+        // SAFETY: geteuid() is always safe.
+        if unsafe { libc::geteuid() } != 0 {
+            return f();
+        }
+        if let Some(dir) = fixture {
+            chown_tree(dir);
+        }
+        let _fsuid = FsUid::set(NOBODY);
+        f()
     }
 }
