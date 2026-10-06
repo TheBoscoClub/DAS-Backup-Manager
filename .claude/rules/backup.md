@@ -105,8 +105,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
   | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
   | Target not selected / not mounted (absent mount point) | not counted, Info |
-  | Mirror target | skipped (counted once per target), Info |
-  | Mount state cannot be told / write verification refuses | **FAIL** (whole step) |
+  | Mirror target (mounted; an unmounted one is the row above) | skipped (counted once per target), Info |
+  | Mount state cannot be told (stat error) / write verification refuses | **FAIL** (whole step) |
   | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
   | Target's subvolume listing cannot be read | **FAIL** (once per target) |
   | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
@@ -218,7 +218,7 @@ Checked before any directory is created, both roots compared **after resolution*
   are a union, and a matched subvolume keeps every target).
 - A label that is not in the configuration, or a selection that leaves nothing, **refuses** the step.
   An empty filter list is btrbk's "everything": it is passed only when the selection IS everything.
-- **`backup snapshot` and `backup send` (CLI and helper) sync first, as `run` does**
+- **`backup snapshot` and `backup send` (CLI only) sync first, as `run` does**
   (`backup::sync_for_manual_step`, sources mounted, before the targets are). A selection of everything
   passes btrbk no filter, so it trusts `btrbk.conf`; sync brings that file into line with `config.toml`.
   Unlike `run`, a failed sync stops the step: `run` goes on because configured subvolumes must still be
@@ -229,8 +229,8 @@ Checked before any directory is created, both roots compared **after resolution*
 - **An empty selection is a refusal, never "all"** (bd `7tx`). `BackupOptions.sources`/`.targets` are
   `Option`s: `None` = not specified (CLI with no flag: all), `Some(vec![])` = nothing ticked, refused by
   `backup::empty_selection` before the first lock or mount. The D-Bus `as` arguments cannot say "not
-  specified", so the helper always passes `Some(list)` and refuses an empty `sources` or `targets`
-  list of `BackupRun` itself. A label (source or target) the configuration lacks is refused too, before the first lock
+  specified", so the helper's `BackupRun` always passes `Some(list)` and the job refuses an empty one
+  (`CouldNotStart`; the GUI gets `JobFinished(false, …)`, not a D-Bus error). A label (source or target) the configuration lacks is refused too, before the first lock
   (`backup::unknown_label`, exit 1), even beside known ones — never dropped, never widened to "all mounted".
 - An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
@@ -264,7 +264,7 @@ Two layers, both unconditional and both run under `--dryrun`:
 
 Rust twin (CLI/GUI): `mount::verify_write_targets`, called inside every step that writes under a
 target — `run_backup`, `send_snapshots`, `run_full_pipeline`, `archive_boot` (bd `7tx`) — so a caller
-cannot skip it: `backup send` and `backup boot-archive` are covered from the CLI and from the helper.
+cannot skip it: `backup send` and `backup boot-archive` are covered from the CLI (the helper has only `BackupRun`).
 `archive_boot` verifies the non-mirror targets whose mount point exists (the script's two safe
 states: a real mountpoint, or absent); a bare directory refuses the whole step.
 A target with no `mount_uuid` is identified by its drive's serial, as the script does (`findmnt` →

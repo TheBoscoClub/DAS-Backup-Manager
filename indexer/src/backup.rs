@@ -314,6 +314,14 @@ impl BootStep {
         matches!(self, Self::Ran(o) if !o.failures.is_empty())
     }
 
+    /// The exit status of `backup boot-archive`, the doctor's rule: 0 clean, 3
+    /// when it began and something failed — the step, or the unmount after it
+    /// (`released` false) — and never 1, which is "could not start" and decided
+    /// before the step runs.
+    pub fn exit_code(&self, released: bool) -> i32 {
+        if self.failed() || !released { 3 } else { 0 }
+    }
+
     /// The report's `Boot subvolumes` cell.
     pub fn row(&self) -> String {
         match self {
@@ -1466,15 +1474,38 @@ fn archive_boot_with(
         return BootStep::Ran(out);
     }
 
+    // Whether each selected target's mount point exists, mirrors included. A
+    // stat that fails is not "absent" (`.claude/rules/backup.md` §Boot Subvolume
+    // Archival: mount state that cannot be told fails the whole step): it is a
+    // recorded failure and no btrfs call is made.
+    let is_selected = |t: &Target| selected.is_none_or(|labels| labels.contains(&t.label));
+    let mut mount_exists: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    for t in config.targets.iter().filter(|t| is_selected(t)) {
+        match Path::new(&t.mount).try_exists() {
+            Ok(present) => {
+                mount_exists.insert(t.label.as_str(), present);
+            }
+            Err(e) => {
+                out.fail(
+                    progress,
+                    format!(
+                        "Boot subvolumes not updated: cannot tell whether {} is mounted ({e})",
+                        t.mount
+                    ),
+                );
+                return BootStep::Ran(out);
+            }
+        }
+    }
     // The targets written under: selected, not a mirror (those carry their own
     // OS and are skipped below), and with a mount point that exists. One that
     // exists must be the filesystem it should be.
-    let is_selected = |t: &Target| selected.is_none_or(|labels| labels.contains(&t.label));
     let writes: Vec<String> = config
         .targets
         .iter()
-        .filter(|t| is_selected(t) && t.role != TargetRole::Mirror)
-        .filter(|t| Path::new(&t.mount).exists())
+        .filter(|t| {
+            t.role != TargetRole::Mirror && mount_exists.get(t.label.as_str()) == Some(&true)
+        })
         .map(|t| t.label.clone())
         .collect();
     if let Err(e) = (env.verify)(&config.targets, &writes, progress) {
@@ -1508,11 +1539,22 @@ fn archive_boot_with(
         // them. Wording matches update_boot_subvolumes() in
         // scripts/backup-run.sh (bd DAS-Backup-Manager-am1).
         if target.role == TargetRole::Mirror {
-            progress.on_log(
-                LogLevel::Info,
-                &format!("[{}] Skipping mirror target (independent OS)", target.mount),
-            );
-            out.skipped += 1;
+            // Counted as skipped only when mounted, as the script counts it.
+            if mount_exists.get(target.label.as_str()) == Some(&true) {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("[{}] Skipping mirror target (independent OS)", target.mount),
+                );
+                out.skipped += 1;
+            } else {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "[{}] Not mounted — mirror target left alone (independent OS)",
+                        target.mount
+                    ),
+                );
+            }
             continue;
         }
         // Only a target verified above is written: one that is selected but
@@ -1955,16 +1997,16 @@ pub fn unknown_label(config: &Config, options: &BackupOptions) -> Option<String>
 }
 
 /// [`empty_selection`] for one list of source labels that was given: the
-/// refusal if it is empty. The helper's `BackupRun` passes the list the GUI
-/// sent, which cannot say "not specified".
-pub fn refuse_empty_sources(sources: &[String]) -> Option<String> {
+/// refusal if it is empty. [`empty_selection`] calls it for the lists the
+/// helper's `BackupRun` passes (`Some(list)`: the GUI cannot say "not specified").
+fn refuse_empty_sources(sources: &[String]) -> Option<String> {
     sources
         .is_empty()
         .then(|| nothing_selected("source", "target"))
 }
 
 /// [`refuse_empty_sources`] for target labels (the D-Bus `BackupRun` `targets` argument).
-pub fn refuse_empty_targets(targets: &[String]) -> Option<String> {
+fn refuse_empty_targets(targets: &[String]) -> Option<String> {
     targets
         .is_empty()
         .then(|| nothing_selected("target", "source"))
@@ -7338,6 +7380,123 @@ mod tests {
             }),
             "no archive/create/delete operation may reference the mirror mount, got: {logs:?}"
         );
+    }
+
+    /// A primary and a mirror target on the given mount paths, with a
+    /// readable btrbk.conf (kept alive by the returned handle).
+    fn primary_and_mirror(primary: &str, mirror: &str) -> (Config, tempfile::NamedTempFile) {
+        let mut config = make_test_config();
+        let conf = write_btrbk_conf("@", "root-");
+        config.general.btrbk_conf = conf.path().to_string_lossy().to_string();
+        config.boot.subvolumes = vec!["@".to_string()];
+        config.sources[0].subvolumes = vec![SubvolConfig {
+            name: "@".into(),
+            manual_only: false,
+            snapshot_name: None,
+            ..Default::default()
+        }];
+        config.sources[0].target_subdirs = vec!["nvme".into()];
+        config.targets[0].mount = primary.to_string();
+        config.targets[0].label = "primary-22tb".into();
+        config.targets.push(Target {
+            label: "system-recovery-A-2tb".into(),
+            serial: "MIRRORSERIAL".into(),
+            serials: vec!["MIRRORSERIAL".into()],
+            mount_uuid: None,
+            mount: mirror.to_string(),
+            role: TargetRole::Mirror,
+            retention: Retention {
+                weekly: 4,
+                monthly: 2,
+                daily: 7,
+                yearly: 0,
+            },
+            display_name: "Recovery A (independent OS)".into(),
+        });
+        (config, conf)
+    }
+
+    #[test]
+    fn a_mount_point_that_cannot_be_statted_fails_the_whole_step() {
+        // bd 4za8: `exists()` read a failed stat as "not mounted", so the step
+        // reported OK with nothing done. Not root: mode 000 makes the stat fail.
+        use std::os::unix::fs::PermissionsExt;
+        let primary_dir = tempfile::tempdir().unwrap();
+        let locked = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = locked.path().join("mnt");
+        assert!(
+            Path::new(&unreadable).try_exists().is_err(),
+            "fixture: the stat must fail (are the tests running as root?)"
+        );
+        let (config, _conf) = primary_and_mirror(
+            &primary_dir.path().to_string_lossy(),
+            &unreadable.to_string_lossy(),
+        );
+        let progress = TestProgress::new();
+        let runner = Scripted::from_owned(vec![]);
+        let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+        std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "FAIL"
+                && o.failures.iter().any(|f| f.contains("cannot tell whether")
+                    && f.contains(&*unreadable.to_string_lossy()))),
+            "{step:?}"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(step.failed());
+    }
+
+    #[test]
+    fn an_unmounted_mirror_is_not_counted_as_skipped_and_a_mounted_one_is() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let absent = mirror_dir.path().join("absent");
+
+        let (config, _conf) = primary_and_mirror(
+            &primary_dir.path().to_string_lossy(),
+            &absent.to_string_lossy(),
+        );
+        let step = archive_boot_with(
+            &config,
+            None,
+            true,
+            &TestProgress::new(),
+            &env(&Scripted::from_owned(vec![])),
+        );
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.skipped == 0),
+            "an unmounted mirror is not a skip: {step:?}"
+        );
+
+        let (config, _conf) = primary_and_mirror(
+            &primary_dir.path().to_string_lossy(),
+            &mirror_dir.path().to_string_lossy(),
+        );
+        let step = archive_boot_with(
+            &config,
+            None,
+            true,
+            &TestProgress::new(),
+            &env(&Scripted::from_owned(vec![])),
+        );
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.skipped == 1),
+            "a mounted mirror is skipped, once: {step:?}"
+        );
+    }
+
+    #[test]
+    fn boot_archive_exits_3_when_the_step_or_the_release_failed() {
+        let ok = BootStep::Ran(BootOutcome::default());
+        let mut failed_outcome = BootOutcome::default();
+        failed_outcome.fail(&TestProgress::new(), "x".into());
+        let failed = BootStep::Ran(failed_outcome);
+        assert_eq!(ok.exit_code(true), 0);
+        assert_eq!(failed.exit_code(true), 3, "step failed, mounts released");
+        assert_eq!(ok.exit_code(false), 3, "step fine, unmount failed");
+        assert_eq!(failed.exit_code(false), 3, "both");
+        assert_eq!(BootStep::DisabledInConfig.exit_code(true), 0);
     }
 
     // --- the sync that starts every backup, from the CLI and the GUI alike ---
