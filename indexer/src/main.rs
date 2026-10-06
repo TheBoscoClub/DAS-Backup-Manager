@@ -2277,7 +2277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
                 println!("Boot subvolumes: {}", step.row());
-                let mut failed = false;
+                let failed = step.failed();
                 if let backup::BootStep::Ran(o) = &step {
                     for f in &o.failures {
                         println!("  FAIL  {f}");
@@ -2285,7 +2285,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for w in &o.warnings {
                         println!("  WARN  {w}");
                     }
-                    failed = !o.failures.is_empty();
                 }
                 mount::require_released(&still_mounted)?;
                 // The script's and the doctor's rule: 3 = it began and

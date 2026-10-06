@@ -309,6 +309,11 @@ impl BootStep {
         matches!(self, Self::Ran(o) if !o.warnings.is_empty())
     }
 
+    /// Whether the step ran and anything that was meant to work did not.
+    pub fn failed(&self) -> bool {
+        matches!(self, Self::Ran(o) if !o.failures.is_empty())
+    }
+
     /// The report's `Boot subvolumes` cell.
     pub fn row(&self) -> String {
         match self {
@@ -5735,7 +5740,15 @@ mod tests {
                     script.push((stage.clone(), 0, String::new()));
                 }
                 "staging" => script.push((stage.clone(), 1, String::new())),
-                _ => script.push((format!("btrfs subvolume delete {m}/@"), 1, String::new())),
+                _ => {
+                    script.push((format!("btrfs subvolume delete {m}/@"), 1, String::new()));
+                    // The replacement's discard works.
+                    script.push((
+                        format!("btrfs subvolume delete {m}/@.new"),
+                        0,
+                        String::new(),
+                    ));
+                }
             }
             let mut runner = Scripted::from_owned(script).snapshotting();
             if failing == "archive" {
@@ -5777,8 +5790,56 @@ mod tests {
                     "the replacement is discarded: {:?}",
                     runner.calls()
                 );
+                assert!(
+                    !progress
+                        .logs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, msg)| msg.contains("could not be discarded")),
+                    "a discard that worked is not reported as failed: {:?}",
+                    progress.logs.lock().unwrap()
+                );
             }
         }
+    }
+
+    #[test]
+    fn a_replacement_that_cannot_be_discarded_after_a_failed_delete_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        std::fs::create_dir(dir.path().join("@")).unwrap();
+        let (config, _conf) = archive_fixture(dir.path());
+        let runner = Scripted::from_owned(vec![
+            (
+                format!("btrfs subvolume list {m}"),
+                0,
+                "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".to_string(),
+            ),
+            (format!("btrfs subvolume delete {m}/@"), 1, String::new()),
+            (
+                format!("btrfs subvolume delete {m}/@.new"),
+                1,
+                String::new(),
+            ),
+        ])
+        .snapshotting();
+        let progress = TestProgress::new();
+        let step = archive_boot_with(&config, None, true, &progress, &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "FAIL"),
+            "{step:?}"
+        );
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, msg)| msg.contains("could not be discarded")),
+            "{:?}",
+            progress.logs.lock().unwrap()
+        );
     }
 
     #[test]
@@ -7024,6 +7085,38 @@ mod tests {
                 "{subdirs:?} {name}"
             );
         }
+    }
+
+    #[test]
+    fn a_btrbk_timestamp_is_digits_t_digits_and_an_optional_numeric_collision() {
+        for good in ["20261005T0100", "20261005T0100_1", "20261005T0100_12"] {
+            assert!(is_btrbk_timestamp(good), "{good}");
+        }
+        for bad in [
+            "",
+            "20261005T010",
+            "20261005X0100",
+            "2026100aT0100",
+            "20261005T01a0",
+            "20261005T0100_",
+            "20261005T0100_x",
+            "20261005T0100_1x",
+            "20261005T0100_1_2",
+        ] {
+            assert!(!is_btrbk_timestamp(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_boot_step_reports_archived_and_failed_only_when_it_ran_and_did() {
+        let mut ran = BootOutcome::default();
+        assert!(!BootStep::NotSelected.archived() && !BootStep::NotSelected.failed());
+        assert!(!BootStep::DisabledInConfig.archived() && !BootStep::DisabledInConfig.failed());
+        assert!(!BootStep::Ran(ran.clone()).archived() && !BootStep::Ran(ran.clone()).failed());
+        ran.updated = 1;
+        assert!(BootStep::Ran(ran.clone()).archived() && !BootStep::Ran(ran.clone()).failed());
+        ran.failures.push("x".into());
+        assert!(BootStep::Ran(ran).failed());
     }
 
     #[test]
