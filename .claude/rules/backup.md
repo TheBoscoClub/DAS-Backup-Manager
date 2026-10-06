@@ -193,7 +193,8 @@ Checked before any directory is created, both roots compared **after resolution*
   `Option`s: `None` = not specified (CLI with no flag: all), `Some(vec![])` = nothing ticked, refused by
   `backup::empty_selection` before the first lock or mount. The D-Bus `as` arguments cannot say "not
   specified", so the helper always passes `Some(list)` and refuses an empty `BackupSnapshot`/`BackupSend`
-  list itself. A target list naming no configured target is refused too, never widened to "all mounted".
+  list itself. A label (source or target) the configuration lacks is refused too, before the first lock
+  (`backup::unknown_label`, exit 1), even beside known ones — never dropped, never widened to "all mounted".
 - An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
   is the first primary target, so a reduced config renders the other targets' retention differently.
@@ -206,7 +207,7 @@ Checked before any directory is created, both roots compared **after resolution*
   `BackupJobOutcome::exit_code`): **0** clean (a warning too) or declined; **3** began and something
   failed, or aborted on a target's/source's state (`Aborted`: no target mounts, verification refuses,
   an absent ticked target — recorded as a failed row, counts NULL, unless a dry run); **1** could not
-  start (`CouldNotStart`: empty selection, locks). A report neither saved nor mailed fails the run
+  start (`CouldNotStart`: empty selection, unknown label, locks). A report neither saved nor mailed fails the run
   BEFORE the row is written, so the row says `report: …`; a failed email beside a saved report stays a
   warning. The GUI has no exit codes: it shows `JobFinished(success, summary)` — exit 0 = success, 3 and
   1 = failure with the summary or reason.

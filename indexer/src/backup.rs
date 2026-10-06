@@ -1496,6 +1496,46 @@ pub fn empty_selection(options: &BackupOptions) -> Option<String> {
         .or_else(|| options.targets.as_deref().and_then(refuse_empty_targets))
 }
 
+/// Why a selection naming a label the configuration does not have cannot be
+/// run, or `None` when every label named is configured. Checked against the
+/// configuration the job was handed, before the first lock and mount, so a
+/// stale label list (a GUI that has not reloaded, a typo) is refused with
+/// nothing started — the same class as [`empty_selection`], and the same
+/// outcome (`CouldNotStart`: exit 1, nothing recorded). An unknown *source*
+/// was already refused by `btrbk_filters`, but only after the locks, the
+/// sync and the mounts; an unknown *target* in a list with some known ones
+/// was dropped without a word.
+pub fn unknown_label(config: &Config, options: &BackupOptions) -> Option<String> {
+    let refuse = |what: &str, label: &str, known: Vec<&str>| {
+        format!(
+            "The {what} '{label}' is not in the configuration ({}) — nothing was started",
+            known.join(", ")
+        )
+    };
+    if let Some(label) = options
+        .sources
+        .iter()
+        .flatten()
+        .find(|l| !config.sources.iter().any(|s| &s.label == *l))
+    {
+        return Some(refuse(
+            "source",
+            label,
+            config.sources.iter().map(|s| s.label.as_str()).collect(),
+        ));
+    }
+    let label = options
+        .targets
+        .iter()
+        .flatten()
+        .find(|l| !config.targets.iter().any(|t| &t.label == *l))?;
+    Some(refuse(
+        "target",
+        label,
+        config.targets.iter().map(|t| t.label.as_str()).collect(),
+    ))
+}
+
 /// [`empty_selection`] for one list of source labels that was given: the
 /// refusal if it is empty. For the D-Bus `BackupSnapshot`, which takes no
 /// options.
@@ -1523,7 +1563,7 @@ fn nothing_selected(what: &str, other: &str) -> String {
 /// specified — every source with at least one subvolume that is not
 /// manual-only. A selection made and empty is refused, never widened.
 fn effective_sources(config: &Config, options: &BackupOptions) -> Result<Vec<String>, String> {
-    if let Some(why) = empty_selection(options) {
+    if let Some(why) = empty_selection(options).or_else(|| unknown_label(config, options)) {
         return Err(why);
     }
     match &options.sources {
@@ -1555,43 +1595,20 @@ fn effective_sources(config: &Config, options: &BackupOptions) -> Result<Vec<Str
 /// When targets are explicitly specified (D-Bus helper pre-mounts them),
 /// trust the caller — don't re-check mount status.  Only auto-detect
 /// mounted targets when the caller never specified any (standalone CLI).
-/// A selection made and empty, or one naming no configured target, is
-/// refused: neither is "every mounted target".
+/// A selection made and empty, or one naming a target the configuration does
+/// not have (even beside known ones), is refused: neither is "every mounted
+/// target", and no label is dropped silently.
 fn effective_targets(config: &Config, options: &BackupOptions) -> Result<Vec<String>, String> {
-    if let Some(why) = empty_selection(options) {
+    if let Some(why) = empty_selection(options).or_else(|| unknown_label(config, options)) {
         return Err(why);
     }
-    let Some(named) = &options.targets else {
-        return Ok(mounted_target_labels(config));
-    };
-    // Caller specified targets — validate they exist in config but don't
-    // re-check mount status (caller already ensured mount via MountGuard).
-    let matched: Vec<String> = named
-        .iter()
-        .filter(|label| {
-            config
-                .targets
-                .iter()
-                .any(|t| t.label.as_str() == label.as_str())
-        })
-        .cloned()
-        .collect();
-    if matched.is_empty() {
-        // A stale label list used to fall back to every mounted target: the
-        // same widening as an empty list, and for the same reason refused.
-        return Err(format!(
-            "None of the targets selected ({}) is in the configuration ({}) — nothing was \
-             started",
-            named.join(", "),
-            config
-                .targets
-                .iter()
-                .map(|t| t.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    Ok(matched)
+    // Caller specified targets — every one is in the configuration (checked
+    // above, so none is dropped) but its mount status is not re-checked: the
+    // caller already ensured mount via MountGuard.
+    Ok(match &options.targets {
+        Some(named) => named.clone(),
+        None => mounted_target_labels(config),
+    })
 }
 
 /// What the btrbk steps counted, and which of them failed.
@@ -2320,7 +2337,7 @@ pub fn run_backup_job(
 ) -> BackupJobOutcome {
     // Before the first lock and the first mount: a selection of nothing is
     // refused with nothing touched (bd DAS-Backup-Manager-7tx).
-    if let Some(why) = empty_selection(&options) {
+    if let Some(why) = empty_selection(&options).or_else(|| unknown_label(&config, &options)) {
         return BackupJobOutcome::CouldNotStart(why);
     }
     let started = std::time::Instant::now();
@@ -5635,19 +5652,64 @@ mod tests {
     }
 
     #[test]
-    fn targets_named_are_trusted_without_a_mount_check_and_unknown_labels_are_dropped() {
+    fn targets_named_are_trusted_without_a_mount_check_and_an_unknown_label_is_refused() {
         let mut config = make_test_config();
         let mut absent = config.targets[0].clone();
         absent.label = "absent".into();
         absent.mount = "/nonexistent/das/absent".into();
         config.targets.push(absent);
         let options = BackupOptions {
-            targets: Some(labels(&["absent", "no-such-target"])),
+            targets: Some(labels(&["absent"])),
             ..Default::default()
         };
         // Named, so a ticked target is passed on whether or not it is
         // mounted: the verification before btrbk is what refuses it.
         assert_eq!(effective_targets(&config, &options).unwrap(), ["absent"]);
+        // An unknown label beside it is refused, not dropped (review M2):
+        // the run would otherwise go on to the known one without a word.
+        let options = BackupOptions {
+            targets: Some(labels(&["absent", "no-such-target"])),
+            ..Default::default()
+        };
+        let why = effective_targets(&config, &options).unwrap_err();
+        assert!(why.contains("target 'no-such-target'"), "{why}");
+        assert!(
+            why.contains("absent") && why.contains("primary-22tb"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_label_in_a_partial_list_is_found_in_either_list() {
+        let config = make_test_config();
+        let known = BackupOptions {
+            sources: Some(labels(&["nvme-root"])),
+            targets: Some(labels(&["primary-22tb"])),
+            ..Default::default()
+        };
+        assert_eq!(unknown_label(&config, &known), None);
+        assert_eq!(unknown_label(&config, &BackupOptions::default()), None);
+        let bad_target = BackupOptions {
+            sources: Some(labels(&["nvme-root"])),
+            targets: Some(labels(&["primary-22tb", "bogus"])),
+            ..Default::default()
+        };
+        let why = unknown_label(&config, &bad_target).unwrap();
+        assert!(
+            why.starts_with("The target 'bogus' is not in the configuration"),
+            "{why}"
+        );
+        let bad_source = BackupOptions {
+            sources: Some(labels(&["nvme-root", "bogus"])),
+            targets: Some(labels(&["primary-22tb"])),
+            ..Default::default()
+        };
+        let why = unknown_label(&config, &bad_source).unwrap();
+        assert!(
+            why.starts_with("The source 'bogus' is not in the configuration"),
+            "{why}"
+        );
+        assert!(effective_sources(&config, &bad_source).is_err());
     }
 
     // -- an empty selection is a refusal, never "all" (bd DAS-Backup-Manager-7tx) --
@@ -6736,6 +6798,44 @@ mod tests {
             (None, Some(Vec::new()), "No target selected"),
             (Some(Vec::new()), None, "No source selected"),
             (Some(Vec::new()), Some(Vec::new()), "No source selected"),
+        ] {
+            let host = FakeHost::default();
+            let options = BackupOptions {
+                sources,
+                targets,
+                ..Default::default()
+            };
+            let outcome = run_backup_job(&host, make_test_config(), options, &TestProgress::new());
+            let (ok, line) = outcome.finish_line(false);
+            assert!(!ok, "{outcome:?}");
+            assert!(line.contains(says), "{line}");
+            assert_eq!(outcome.exit_code(), 1, "it never began: {outcome:?}");
+            assert!(
+                host.steps().is_empty(),
+                "the host was touched: {:?}",
+                host.steps()
+            );
+        }
+    }
+
+    /// Review M3: a label list the configuration does not know is refused
+    /// before the first lock, sync or mount, as an empty one is: it never
+    /// began, so exit 1 and nothing recorded (the script's rule for a run that
+    /// "could not start"), not an abort with a failed history row.
+    #[test]
+    fn a_job_naming_a_label_the_configuration_lacks_is_refused_before_any_lock_mount_or_record() {
+        for (sources, targets, says) in [
+            (
+                None,
+                Some(labels(&["primary-22tb", "bogus"])),
+                "target 'bogus'",
+            ),
+            (
+                Some(labels(&["nvme-root", "bogus"])),
+                None,
+                "source 'bogus'",
+            ),
+            (None, Some(labels(&["bogus"])), "target 'bogus'"),
         ] {
             let host = FakeHost::default();
             let options = BackupOptions {
