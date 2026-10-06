@@ -327,23 +327,18 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 /// mounted *and* no targets were already mounted. Individual mount failures
 /// are logged as warnings but do not abort the operation.
 ///
-/// `_held` is the proof that this process holds the DAS maintenance lock. It
-/// is not read, only required: no job can mount a target another job is
-/// using — a backup, a scrub, or a recovery drive a VM has mounted, which a
-/// second kernel's mount would corrupt (bd DAS-Backup-Manager-frb). Release
-/// the guard before the lock.
+/// `held` is the proof that this process holds the DAS maintenance lock, and
+/// says whether the hold was handed down by a parent job that mounted the
+/// targets for this run (`is_delegated`). Requiring it means no job can mount
+/// a target another job is using — a backup, a scrub, or a recovery drive a
+/// VM has mounted, which a second kernel's mount would corrupt
+/// (bd DAS-Backup-Manager-frb). Release the guard before the lock.
 pub fn ensure_targets_mounted(
     config: &Config,
     progress: &dyn ProgressCallback,
-    _held: &MaintenanceHeld,
+    held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
-    ensure_targets_mounted_with(
-        config,
-        progress,
-        _held,
-        &HOST_PROBES,
-        Arc::new(SystemRunner),
-    )
+    ensure_targets_mounted_with(config, progress, held, &HOST_PROBES, Arc::new(SystemRunner))
 }
 
 /// [`ensure_targets_mounted`] against an explicit host: `probes` answers what
@@ -351,7 +346,7 @@ pub fn ensure_targets_mounted(
 fn ensure_targets_mounted_with(
     config: &Config,
     progress: &dyn ProgressCallback,
-    _held: &MaintenanceHeld,
+    held: &MaintenanceHeld,
     probes: &MountProbes<'_>,
     runner: Arc<dyn CommandRunner>,
 ) -> Result<MountGuard, MountError> {
@@ -381,7 +376,7 @@ fn ensure_targets_mounted_with(
             // Under a handed-down lock the parent mounted it for this run (and
             // its own pre-existing-mount check reports a leftover), so it is
             // not a finding here; an owned hold keeps the warning.
-            if _held.is_delegated() {
+            if held.is_delegated() {
                 progress.on_log(
                     crate::progress::LogLevel::Info,
                     &format!(

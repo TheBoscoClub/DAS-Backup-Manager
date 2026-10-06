@@ -584,11 +584,24 @@ does, with
 .BR "subvol expire" ).
 When
 .B [boot].enabled
-is set, every run of this command, incremental or full, archives the boot
-subvolumes on each non-mirror target and replaces them from the latest
-snapshot;
-.B backup\-run.sh
-replaces an existing one only on a full run.
+is set, the boot subvolumes on each non-mirror target are handled by one rule
+here and in
+.BR backup\-run.sh :
+an incremental run
+.I creates
+a boot subvolume that is missing, from its latest btrbk snapshot, and never
+touches one that exists; a full run (or
+.BR "backup boot\-archive" )
+archives an existing one to
+.IB name .archive. timestamp
+and replaces it from the latest snapshot. A subvolume with no snapshot name in
+btrbk.conf, no declared target directory or no snapshot to build from is a
+warning (the run still exits 0, its report reading COMPLETED WITH WARNINGS);
+anything that was meant to work and did not \(em a listing that cannot be
+read, a failed create, archive or replace, a path whose state cannot be
+determined \(em fails the run. The report is always written to
+.BR [general].last_report ;
+the GUI's Email box decides only whether it is mailed as well.
 .PP
 If another backup already holds the singleton lock, the command prints that it
 declines and exits 0; it waits for a running scrub. A run that could not start
@@ -742,9 +755,38 @@ is snapshotted read-only to
 and then replaced from its latest btrbk snapshot. Mirror targets, which carry
 their own operating system, are skipped. Snapshot names are read from
 .IR /etc/btrbk/btrbk.conf ;
-if it cannot be read, nothing is done.
+if it cannot be read, nothing is done and the step fails. It always archives
+and replaces, as a full run does, and creates a subvolume that is missing. Each
+failure is printed as
+.B FAIL
+and each warning as
+.BR WARN .
+Exit status: 0 when nothing failed (a warning is still 0), 3 when it began and
+something failed, 1 when it could not start; another backup holding the
+singleton lock is a decline, exit 0.
 .PP
 .B btrdasd backup boot\-archive
+.RB [ \-\-config
+.IR PATH ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.\"
+.SS backup boot\-plan
+Print the boot subvolumes a full run refreshes, one per line, tab-separated:
+the subvolume name, the snapshot name btrbk.conf gives it, and its target
+subdirectories, comma-joined
+.RB ( \-
+for no snapshot name or no subdirectory). It mounts nothing.
+.B backup\-run.sh
+reads it so that the script and the library derive the same names. Exit status
+2, with the reason on standard error, when a configuration file cannot be read
+or a field holds a tab, a newline or (in a subdirectory) a comma, which the
+script could not pass on.
+.PP
+.B btrdasd backup boot\-plan
 .RB [ \-\-config
 .IR PATH ]
 .TP

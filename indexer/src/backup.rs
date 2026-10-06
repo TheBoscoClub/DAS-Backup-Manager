@@ -1950,15 +1950,15 @@ pub fn unknown_label(config: &Config, options: &BackupOptions) -> Option<String>
 }
 
 /// [`empty_selection`] for one list of source labels that was given: the
-/// refusal if it is empty. For the D-Bus `BackupSnapshot`, which takes no
-/// options.
+/// refusal if it is empty. The helper's `BackupRun` passes the list the GUI
+/// sent, which cannot say "not specified".
 pub fn refuse_empty_sources(sources: &[String]) -> Option<String> {
     sources
         .is_empty()
         .then(|| nothing_selected("source", "target"))
 }
 
-/// [`refuse_empty_sources`] for target labels (the D-Bus `BackupSend`).
+/// [`refuse_empty_sources`] for target labels (the D-Bus `BackupRun` `targets` argument).
 pub fn refuse_empty_targets(targets: &[String]) -> Option<String> {
     targets
         .is_empty()
