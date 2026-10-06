@@ -115,20 +115,63 @@ echo "== backup-run.sh: update_boot_subvolumes, the drift check"
 # pattern is a drift, a FAIL; one with none is a quiet skip.
 extract backup-run.sh update_boot_subvolumes "Target HAS btrbk-shaped snapshots but none matched"
 extract backup-run.sh record_op 'OP_STATUS[$op]="$result"'
+extract backup-run.sh probe_mount_point 'LC_ALL=C mountpoint'
+extract backup-run.sh probe_state 'probe_mount_point "$1"'
+
+# The mount points of a run, and what mountpoint says about each (BOOT_MOUNTS,
+# BOOT_PROBES: "<mount>=<answer> ..."; a mount point not named is mounted).
+# The stub answers as util-linux 2.42.4 does (measured): 0 a mount point, 32
+# not one, 1 an error — and 1, "No such file or directory", for a path that is
+# not there. BOOT_NO_MOUNTPOINT=1 leaves the program out of PATH altogether
+# (exit 127), with the few tools the function needs.
+mkdir -p "$WORK/boot-path"
+for tool in awk cat date grep mktemp rm sort tail tr; do
+    ln -s "$(type -P "$tool")" "$WORK/boot-path/$tool" || harness_broken "no $tool on this system"
+done
 
 run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
+    : >"$WORK/btrfs.calls"
     (
         set -euo pipefail
         # shellcheck source=/dev/null
         source "$WORK/update_boot_subvolumes.sh"
         # shellcheck source=/dev/null
         source "$WORK/record_op.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/probe_mount_point.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/probe_state.sh"
         LISTING="$1"
         declare -A OP_STATUS=()
-        declare -A MOUNT_ROLES=([/mnt/t]=primary)
-        ALL_TARGET_MOUNTS=(/mnt/t)
-        mountpoint() { return 0; }
+        declare -A MOUNT_ROLES=()
+        read -r -a ALL_TARGET_MOUNTS <<<"${BOOT_MOUNTS:-/mnt/t}"
+        for m in "${ALL_TARGET_MOUNTS[@]}"; do
+            MOUNT_ROLES[$m]=primary
+        done
+        # BOOT_MIRRORS: the mount points among them that are mirrors.
+        for m in ${BOOT_MIRRORS:-}; do
+            MOUNT_ROLES[$m]=mirror
+        done
+        mountpoint() {
+            local p="${!#}" pair
+            for pair in ${BOOT_PROBES:-}; do
+                [[ "${pair%%=*}" == "$p" ]] || continue
+                case "${pair#*=}" in
+                notmounted) return 32 ;;
+                absent)
+                    echo "mountpoint: $p: No such file or directory" >&2
+                    return 1
+                    ;;
+                error)
+                    echo "mountpoint: $p: Input/output error" >&2
+                    return 1
+                    ;;
+                esac
+            done
+            return 0
+        }
         btrfs() {
+            printf '%s\n' "$*" >>"$WORK/btrfs.calls"
             case "$1 $2" in
             "filesystem label") echo das-backup-test ;;
             "subvolume list") cat "$LISTING" ;;
@@ -141,6 +184,13 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         log_info() { echo "[INFO] $*"; }
         log_warn() { echo "[WARN] $*"; }
         log_error() { echo "[ERROR] $*"; }
+        # A probe that is itself broken (BOOT_PROBE_STUB): it prints nothing,
+        # as when bash could not make its capture, or something nobody
+        # recognises (bd DAS-Backup-Manager-hhow).
+        case "${BOOT_PROBE_STUB:-}" in
+        silent) probe_mount_point() { :; } ;;
+        garbage) probe_mount_point() { echo banana; } ;;
+        esac
         # A full /tmp, as bash meets it: no file it writes may pass 4 KiB,
         # and the write fails (SIGXFSZ ignored) instead of killing it.
         if [[ "${2:-}" == tmp-full ]]; then
@@ -151,6 +201,26 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         # the host's: under en_US.UTF-8 bash's regex [0-9] matches more.
         if [[ -n "${BOOT_LOCALE:-}" ]]; then
             export LC_ALL="$BOOT_LOCALE"
+        fi
+        if [[ -n "${BOOT_NO_MOUNTPOINT:-}" ]]; then
+            unset -f mountpoint
+            # shellcheck disable=SC2123  # the point: a PATH with no mountpoint on it
+            PATH="$WORK/boot-path"
+        fi
+        if [[ -n "${BOOT_LIMIT:-}" ]]; then
+            # Descriptor starvation (bd DAS-Backup-Manager-hhow): output goes
+            # to a file first, then the limit is lowered, and it is raised
+            # again only to print the result (the soft limit only: a hard
+            # limit, once lowered, cannot be raised). Nothing in between needs
+            # a descriptor the test did not give it. The result is a line of
+            # boot.out: boot_at_limit reads it.
+            limit_before="$(ulimit -S -n)"
+            exec >"$WORK/boot.out" 2>&1
+            ulimit -S -n "$BOOT_LIMIT"
+            update_boot_subvolumes true || true
+            ulimit -S -n "$limit_before"
+            printf 'RESULT %s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
+            exit 0
         fi
         update_boot_subvolumes true >"$WORK/boot.out" 2>&1
         printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
@@ -185,6 +255,117 @@ check "boot subvolumes, no btrbk snapshots in a listing over 64 KiB: the quiet s
     "$(run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 1 skipped"
 check "boot subvolumes, no btrbk snapshots: says it skips" \
     "$(grep -c 'No btrbk snapshots found, skipping' "$WORK/boot.out")" "1"
+
+# The probe's three answers (bd DAS-Backup-Manager-jlsz). `mountpoint -q ... ||
+# continue` read every failure of the probe as "not mounted": the target was
+# skipped, counted as neither skipped nor failed, and the step recorded OK, 0
+# updated, 0 skipped. Only "not mounted" leaves a target alone; "could not
+# tell" fails the step, counted and said, and the other targets are still done.
+boot_btrfs_calls() { # what btrfs was asked, one call per ";"
+    if [[ -s "$WORK/btrfs.calls" ]]; then tr '\n' ';' <"$WORK/btrfs.calls"; else echo none; fi
+}
+said_boot() { grep -cF -- "$1" "$WORK/boot.out"; }
+
+check "boot subvolumes, the probe says mounted: the listing is read" \
+    "$(BOOT_PROBES="/mnt/t=mounted" run_boot_subvols "$WORK/none-big.txt") $(boot_btrfs_calls)" \
+    "OK|0 updated, 1 skipped filesystem label /mnt/t;subvolume list /mnt/t;"
+
+check "boot subvolumes, the probe says not mounted: a quiet skip, as before" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
+check "boot subvolumes, not mounted: nothing said, btrfs never asked" \
+    "$(said_boot '[ERROR]') $(boot_btrfs_calls)" "0 none"
+
+check "boot subvolumes, no such path (an absent drive's mount point): a quiet skip too" \
+    "$(BOOT_PROBES="/mnt/t=absent" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
+check "boot subvolumes, no such path: nothing said, btrfs never asked" \
+    "$(said_boot '[ERROR]') $(boot_btrfs_calls)" "0 none"
+
+check "boot subvolumes, the probe cannot tell: the step FAILS, counted" \
+    "$(BOOT_PROBES="/mnt/t=error" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, cannot tell: said, with the target and the probe's own message" \
+    "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — mountpoint: /mnt/t: Input/output error (exit 1); its boot subvolumes were NOT updated')" "1"
+check "boot subvolumes, cannot tell: btrfs never asked — nothing was touched" "$(boot_btrfs_calls)" "none"
+
+# A mirror the probe cannot tell about (independent review, M1). The step
+# never updates a mirror's boot subvolumes — it carries another OS — so the
+# wording above, "its boot subvolumes were NOT updated", misstates what
+# happened to it. It still FAILS and is counted (a probe that errs on any
+# target is worth a failed run, and the unmount gate fails on the same probe),
+# and it is said as what it is: a mirror that could not be checked.
+check "boot subvolumes, a mirror the probe cannot tell about: the step still FAILS, counted" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=error" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, a mirror cannot tell: says it is a mirror that could not be checked, with the probe's own message" \
+    "$(said_boot "[ERROR]   Could not tell whether /mnt/t, a mirror, is mounted — mountpoint: /mnt/t: Input/output error (exit 1); it could not be checked (its boot subvolumes are never updated here)")" "1"
+check "boot subvolumes, a mirror cannot tell: nothing claims boot subvolumes were left un-updated" \
+    "$(said_boot 'NOT updated')" "0"
+check "boot subvolumes, a mirror cannot tell: btrfs never asked" "$(boot_btrfs_calls)" "none"
+check "boot subvolumes, a mounted mirror: the quiet skip, as before" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=mounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 1 skipped"
+check "boot subvolumes, a mirror that is not mounted: a quiet skip, as before" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
+check "boot subvolumes, a primary and a mirror that cannot tell: each says its own, the step counts both" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_MIRRORS=/mnt/u BOOT_PROBES="/mnt/t=error /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot ' /mnt/t is mounted — mountpoint: /mnt/t: Input/output error (exit 1); its boot subvolumes were NOT updated') $(said_boot ' /mnt/u, a mirror, is mounted — mountpoint: /mnt/u: Input/output error (exit 1); it could not be checked')" \
+    "FAIL|0 updated, 2 failed 1 1"
+
+# No mountpoint program at all (exit 127), the case the tracker names: the old
+# code skipped the target and recorded OK.
+check "boot subvolumes, no mountpoint program: the step FAILS, counted" \
+    "$(BOOT_NO_MOUNTPOINT=1 run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, no mountpoint program: said, with the shell's own words and the exit status" \
+    "$(grep -c '\[ERROR\]   Could not tell whether /mnt/t is mounted — .*mountpoint: command not found (exit 127); its boot subvolumes were NOT updated' "$WORK/boot.out")" "1"
+check "boot subvolumes, no mountpoint program: btrfs never asked" "$(boot_btrfs_calls)" "none"
+
+# One target the probe cannot tell about does not stop the others, in either order.
+check "boot subvolumes, first target cannot tell, second mounted: FAIL, the second is still done" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=mounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'No btrbk snapshots found, skipping') $(boot_btrfs_calls)" \
+    "FAIL|0 updated, 1 failed 1 filesystem label /mnt/u;subvolume list /mnt/u;"
+check "boot subvolumes, first target mounted, second cannot tell: FAIL, the first was done" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=mounted /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'No btrbk snapshots found, skipping') $(boot_btrfs_calls)" \
+    "FAIL|0 updated, 1 failed 1 filesystem label /mnt/t;subvolume list /mnt/t;"
+check "boot subvolumes, one target cannot tell, one not mounted: FAIL, counted once" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=notmounted" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+
+# A probe that is itself broken (bd DAS-Backup-Manager-hhow). bash returns 0
+# and an empty string for a command substitution it cannot make, so a probe
+# read from its status read "mounted" exactly when it could not run. Its
+# answer is a printed line now, and one that is empty or unrecognised is
+# "could not tell": neither "mounted" nor "not mounted".
+check "boot subvolumes, a probe that prints nothing: the step FAILS, counted" \
+    "$(BOOT_PROBE_STUB=silent run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, a probe that prints nothing: said, and btrfs never asked" \
+    "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — the mount probe printed nothing (its capture failed?); its boot subvolumes were NOT updated') $(boot_btrfs_calls)" \
+    "1 none"
+check "boot subvolumes, a probe that prints something unrecognised: the step FAILS, counted" \
+    "$(BOOT_PROBE_STUB=garbage run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, a probe that prints something unrecognised: said, naming it, btrfs never asked" \
+    "$(said_boot '[ERROR]   Could not tell whether /mnt/t is mounted — the mount probe printed something unrecognised: banana; its boot subvolumes were NOT updated') $(boot_btrfs_calls)" \
+    "1 none"
+
+# The same under real descriptor starvation, `ulimit -n` 3 to 10, with a
+# mountpoint that needs no descriptor. At 3 nothing at all can be captured; the
+# probe was read as "mounted" there and at 4 (the step went on to a target it
+# had not looked at and recorded OK, 1 skipped), as it was read as "not
+# mounted" before 4.11.3 (OK, 0 skipped). Whatever the limit now: a probe that
+# can only say "not mounted" is never read as "mounted", so the step is either
+# a quiet skip or a FAIL, and one that errs is a FAIL.
+boot_at_limit() { # boot_at_limit <limit>: the step's "<result>|<detail>" with that many descriptors
+    BOOT_LIMIT="$1" run_boot_subvols "$WORK/none-big.txt" >/dev/null
+    sed -n 's/^RESULT //p' "$WORK/boot.out"
+}
+for limit in 3 4 5 6 7 8 9 10; do
+    got_not="$(BOOT_PROBES="/mnt/t=notmounted" boot_at_limit "$limit")"
+    got_err="$(BOOT_PROBES="/mnt/t=error" boot_at_limit "$limit")"
+    verdict=ok
+    case "$got_not" in
+    "OK|0 updated, 0 skipped" | "FAIL|0 updated, 1 failed") ;;
+    *) verdict="a probe saying not mounted gave '$got_not'" ;;
+    esac
+    [[ "$got_err" == "FAIL|0 updated, 1 failed" ]] || verdict="a probe that errs gave '$got_err'"
+    check "boot subvolumes at descriptor limit $limit: no probe is read as the opposite of what it says" "$verdict" "ok"
+done
+check "boot subvolumes at descriptor limit 3: nothing can be captured, so the step FAILS whatever the probe says" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" boot_at_limit 3) / $(BOOT_PROBES="/mnt/t=error" boot_at_limit 3)" \
+    "FAIL|0 updated, 1 failed / FAIL|0 updated, 1 failed"
 
 # ---------------------------------------------------------------------------
 echo "== backup-verify.sh: check_smart_health, the health line"
@@ -946,7 +1127,7 @@ NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/renamed-root.２０２６
 # non-ASCII digit there, or these checks could not fail.
 not_run=""
 probe_digit='٢'
-if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then
+if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
     for name in NONASCII_ARABIC NONASCII_FULLWIDTH; do
         printf '%s\n' "${!name}" >"$WORK/$name.txt"
         check "en_US.UTF-8, the only btrbk-like name has non-ASCII digits ($name): the quiet skip" \
@@ -961,6 +1142,150 @@ else
     not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
     echo "NOT RUN: $not_run"
 fi
+
+# ---------------------------------------------------------------------------
+echo "== backup-verify.sh: report_sector_attr, a count is ASCII digits (bd 1bsx)"
+# ---------------------------------------------------------------------------
+# The same locale effect as above, at the SMART check: under en_US.UTF-8 bash's
+# regex [0-9] also matches digits of other scripts and superscripts, so a
+# reallocated or pending sector "count" written with one was printed in yellow
+# as a number and returned success. It is a reading no one can use: UNKNOWN,
+# and a nonzero return, like any other value that is not a number.
+extract backup-verify.sh report_sector_attr 'unparsable value'
+
+run_sector_attr() { # run_sector_attr <value> [locale]: "<status>|<what it printed>"
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/report_sector_attr.sh"
+        RED='<red>' GREEN='<green>' YELLOW='<yellow>' NC='<end>'
+        if [[ -n "${2:-}" ]]; then
+            export LC_ALL="$2"
+        fi
+        rc=0
+        out="$(report_sector_attr "Pending Sectors" "$1")" || rc=$?
+        printf '%s|%s\n' "$rc" "$out"
+    )
+}
+check "sector attribute 0: green" "$(run_sector_attr 0)" "0|  Pending Sectors: <green>0<end>"
+check "sector attribute 7: a count, in yellow" "$(run_sector_attr 7)" "0|  Pending Sectors: <yellow>7<end>"
+check "sector attribute, smartctl failed: UNKNOWN, nonzero" "$(run_sector_attr SMARTCTL_FAILED)" \
+    "1|  Pending Sectors: <red>UNKNOWN (smartctl could not read this device)<end>"
+check "sector attribute, not reported: UNKNOWN, nonzero" "$(run_sector_attr NOT_PRESENT)" \
+    "1|  Pending Sectors: <red>UNKNOWN (attribute not reported by this device)<end>"
+check "sector attribute 12x: unparsable, nonzero" "$(run_sector_attr 12x)" \
+    "1|  Pending Sectors: <red>UNKNOWN (unparsable value: 12x)<end>"
+
+ARABIC_THREE=$'\xd9\xa3'
+SUPERSCRIPT_TWO=$'\xc2\xb2'
+if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
+    for digit in "$ARABIC_THREE" "$SUPERSCRIPT_TWO" "1$ARABIC_THREE"; do
+        check "en_US.UTF-8, sector attribute '$digit': unparsable, not a count" \
+            "$(run_sector_attr "$digit" en_US.UTF-8)" \
+            "1|  Pending Sectors: <red>UNKNOWN (unparsable value: $digit)<end>"
+    done
+    check "en_US.UTF-8, sector attribute 7: still a count" \
+        "$(run_sector_attr 7 en_US.UTF-8)" "0|  Pending Sectors: <yellow>7<end>"
+else
+    not_run+="${not_run:+; }the en_US.UTF-8 sector-attribute cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "NOT RUN: the en_US.UTF-8 sector-attribute cases"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== no bracket range in a regex match anywhere in the shell sources (bd 1bsx)"
+# ---------------------------------------------------------------------------
+# bash's regex follows the locale's collation. Under en_US.UTF-8 a range such
+# as [0-9] or [1-9] matches about 1,000 characters beyond ASCII digits and
+# [A-Za-z] about 2,200 beyond ASCII letters (all 1.1 million non-ASCII code
+# points were tried), where [[:digit:]] matches none. [[:alpha:]] is no
+# substitute for letters — it is every letter the locale has — so they are
+# listed. Five matches that read a guard, a pid, a bay number, a SMART value
+# and an archive name were found with the range in them; none may return.
+#
+# What the lint reads, per file, in two passes. The first collects every name
+# a regex match reads its pattern from, UNQUOTED: `=~ $x` and `=~ ${x}` (a
+# quoted one is matched literally and cannot widen). The second flags a line
+# when it holds a range in (1) the text after a =~, (2) the text after the = of
+# an assignment to a *_RE or re variable, whatever the file does with it, or
+# (3) the text after the = of an assignment (plain, local, readonly, declare,
+# export, or +=) to any name the first pass collected, wherever the use is in
+# the file. (3) is what keeps the deletion guard's own patterns in view: they
+# moved off the =~ line into lower-case locals (path_re, name_re), where a
+# line-at-a-time reading of =~ and upper-case names saw neither the use nor the
+# assignment. An array literal (name=( ... )) holds subscripts, not a pattern.
+# Comment lines are skipped. A deliberate use carries "locale-range-ok" on its
+# line: the probes that decide whether a locale shows the effect at all.
+# Not followed: a pattern built in one file and matched in another, and the
+# patterns of grep and sed, which are not bash's regex.
+range_lint() { # range_lint <files>: file:line: text, for each offender
+    local f
+    for f in "$@"; do
+        LC_ALL=C awk '
+            function ranged(s) { return s ~ /\[[^]]*[0-9A-Za-z]-[0-9A-Za-z][^]]*\]/ }
+            FNR == NR {
+                if ($0 ~ /^[ \t]*#/) next
+                s = $0
+                while (match(s, /=~[ \t]*\$\{?[A-Za-z_][A-Za-z0-9_]*/)) { # locale-range-ok: awk, not a bash match
+                    name = substr(s, RSTART, RLENGTH)
+                    sub(/^=~[ \t]*\$\{?/, "", name)
+                    used[name] = 1
+                    s = substr(s, RSTART + RLENGTH)
+                }
+                next
+            }
+            /^[ \t]*#/ { next }
+            /locale-range-ok/ { next }
+            {
+                bad = 0
+                if (match($0, /=~|_RE=|[ \t]re=/) && ranged(substr($0, RSTART))) bad = 1
+                for (n in used) {
+                    if (!bad && match($0, "(^|[ \t;])" n "\\+?=")) {
+                        rest = substr($0, RSTART + RLENGTH)
+                        if (rest !~ /^\(/ && ranged(rest)) bad = 1
+                    }
+                }
+                if (bad) print FILENAME ":" FNR ": " $0
+            }' "$f" "$f"
+    done
+}
+# The lint must be able to say no. A planted range in a regex match is found,
+# and so is one in a variable the file matches against, in the shapes the
+# tree uses (a lower-case local, a ${braced} use, one of two assignments on a
+# line, an append, an assignment AFTER its use); the forms that look alike and
+# are not — [[:digit:]], an array subscript before the =~, a comment line, a
+# marked probe, an array literal, a range in a variable no =~ reads, and one
+# read only quoted — are not.
+{
+    printf '%s\n' '[[ $x =~ ^[0-9]+$ ]]'    # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $x =~ ^[A-Za-z]+$ ]]' # locale-range-ok: lint fixture
+    printf '%s\n' 'local re="^[a-f0-9]+$"'  # locale-range-ok: lint fixture
+    printf '%s\n' 'local path_re="^[A-Z]+$"' # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $p =~ $path_re ]]'
+    printf '%s\n' 'local keep="^[a-z]+$" lim="^[0-9]+$"' # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $y =~ ${lim} ]]'
+    printf '%s\n' "pat+='[0-9]'" # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $z =~ $pat ]]'
+    printf '%s\n' '[[ $q =~ $late ]]'
+    printf '%s\n' "late='^[0-9]+\$'" # locale-range-ok: lint fixture
+} >"$WORK/lint-bad.sh"
+{
+    printf '%s\n' '[[ $x =~ ^[[:digit:]]+$ ]]'
+    printf '%s\n' 'declare -A m=([hdd-media]=1); [[ $y =~ $m ]]'
+    printf '%s\n' '# [[ $x =~ ^[0-9]+$ ]] in a comment' # locale-range-ok: lint fixture
+    printf '%s\n' '[[ $x =~ [0-9] ]] # locale-range-ok: a probe'
+    printf '%s\n' 'local path_re="^[${letters}[:digit:]_@.+/-]+\$"'
+    printf '%s\n' '[[ $p =~ $path_re ]]'
+    printf '%s\n' 'local globby="[a-z]*"' # a glob, and no =~ reads it
+    printf '%s\n' '[[ $g == $globby ]]'
+    printf '%s\n' 'local lit="[a-z]"' # read quoted below: matched literally
+    printf '%s\n' '[[ $l =~ "$lit" ]]'
+} >"$WORK/lint-ok.sh"
+check "the range lint finds a planted digit range, letter range and hex range in a variable, and four more in variables a =~ reads" "$(range_lint "$WORK/lint-bad.sh" | wc -l)" "7"
+check "the range lint passes [[:digit:]], a subscript, a comment, a marked probe, an array literal, a glob and a literal match" "$(range_lint "$WORK/lint-ok.sh" | wc -l)" "0"
+shell_sources=("$ROOT"/scripts/*.sh "$ROOT"/.github/scripts/*.sh "$ROOT"/packaging/appimage/*.sh "$ROOT"/tests/*.sh)
+[[ -e "${shell_sources[0]}" && -e "${shell_sources[${#shell_sources[@]} - 1]}" ]] || harness_broken "a source glob matched nothing"
+left="$(range_lint "${shell_sources[@]}" | sed "s|^$ROOT/||")"
+check "no bracket range in a regex match under scripts/, .github/scripts/, packaging/, tests/" "${left:-none}" "none"
 
 # ---------------------------------------------------------------------------
 echo "== no producer | grep -q left in scripts/"

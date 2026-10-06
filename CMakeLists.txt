@@ -16,6 +16,7 @@ include(CTest)
 option(BUILD_GUI "Build KDE Plasma GUI (requires Qt6/KF6)" ON)
 option(BUILD_INDEXER "Build btrdasd Rust binary via cargo" ON)
 option(BUILD_HELPER "Build btrdasd-helper D-Bus daemon (requires zbus)" ON)
+option(REQUIRE_ALL_SHELL_CASES "Fail a shell suite that prints NOT RUN, a case its host could not run (CI sets this)" OFF)
 
 # =============================================================================
 # Defense-in-depth: refuse to install zero-byte Rust binaries
@@ -284,6 +285,16 @@ if(BUILD_TESTING)
         NAME shell-early-exit-readers
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_exit_readers.sh
     )
+    # boot-archive-cleanup.sh itself, run for real in a sandbox of stub btrfs,
+    # mountpoint and btrdasd: what it may delete (bd DAS-Backup-Manager-1bsx),
+    # and what it prints, read back by backup-run.sh's run_archive_cleanup in
+    # a dry run and a real one (bd DAS-Backup-Manager-zwr), and a target whose
+    # mount state it cannot tell (bd DAS-Backup-Manager-2dmn). Nothing is
+    # listed, mounted or deleted.
+    add_test(
+        NAME shell-boot-archive-cleanup
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_boot_archive_cleanup.sh
+    )
     # CI's Arch container jobs install through .github/scripts/pacman-install.sh,
     # which retries a failed install (bd DAS-Backup-Manager-ravr). This runs that
     # script against a stub pacman in a scratch tree: nothing is installed.
@@ -291,4 +302,20 @@ if(BUILD_TESTING)
         NAME shell-pacman-install
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pacman_install.sh
     )
+
+    # A suite whose host cannot run a case prints "NOT RUN" and exits 0: right
+    # on a developer's machine, and a silent hole in CI. Five suites skipped
+    # their en_US.UTF-8 cases on every CI run for as long as the Arch container
+    # had no such locale, and passed (bd DAS-Backup-Manager-1bsx). CI generates
+    # the locale and sets REQUIRE_ALL_SHELL_CASES; then a "NOT RUN" anywhere in a
+    # suite's output fails that suite, so a pass means every case ran. The
+    # exit suite's replays through the real btrdasd are such a case too: ctest
+    # sets REAL_BTRDASD for them whenever the indexer is built.
+    if(REQUIRE_ALL_SHELL_CASES)
+        get_property(shell_suites DIRECTORY PROPERTY TESTS)
+        if(NOT shell_suites)
+            message(FATAL_ERROR "REQUIRE_ALL_SHELL_CASES is on and no shell suite was found to apply it to")
+        endif()
+        set_tests_properties(${shell_suites} PROPERTIES FAIL_REGULAR_EXPRESSION "NOT RUN")
+    endif()
 endif()

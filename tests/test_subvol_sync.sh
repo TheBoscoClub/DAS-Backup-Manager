@@ -384,7 +384,7 @@ check "no sections: one blank line before THROUGHPUT" \
     "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Recovery OS           N/A  (n/a)||"
 # The footer's version is the header's: one bump, both places.
 version="$(sed -n 's/^# Version: //p' "$SCRIPT")"
-check "the header names a version" "$([[ "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]] && echo yes)" "yes"
+check "the header names a version" "$([[ "$version" =~ ^[[:digit:]]+(\.[[:digit:]]+)+$ ]] && echo yes)" "yes"
 check "report footer carries the script version" "$(grep -c -x "  backup-run.sh v$version" <<<"$report")" "1"
 
 # --- report: a failed btrbk listing is unavailable, not "none yet" -------------

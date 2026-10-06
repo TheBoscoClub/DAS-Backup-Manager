@@ -133,6 +133,32 @@ check "holder: a record whose process runs names it" "$(maintenance_holder)" "bt
 rm -f "$LOCK"
 check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown holder"
 
+# --- a pid is ASCII digits, whatever the locale (bd DAS-Backup-Manager-1bsx) --
+# Under en_US.UTF-8 bash's regex [0-9] also matches digits of other scripts and
+# superscripts, so a record whose "pid" was one of those read as a holder whose
+# process had gone, "no longer running"; it is a record with no pid in it.
+# These cases need a locale where bash's own [0-9] matches such a digit (C and
+# C.UTF-8 show nothing); where none does they could not fail, so they print
+# NOT RUN instead of passing.
+ARABIC_THREE=$'\xd9\xa3' SUPERSCRIPT_TWO=$'\xc2\xb2'
+not_run=""
+# shellcheck disable=SC2030,SC2031  # this block only: every LC_ALL set in it is meant to stay in its subshell
+if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
+    for digit in "$ARABIC_THREE" "$SUPERSCRIPT_TWO" "1$ARABIC_THREE"; do
+        printf 'backup-run.sh pid %s\n' "$digit" >"$LOCK"
+        check "holder, en_US.UTF-8: a pid written '$digit' is no pid" \
+            "$(export LC_ALL=en_US.UTF-8; maintenance_holder)" \
+            "an unknown holder (last recorded: backup-run.sh pid $digit)"
+    done
+    printf 'btrdasd restore browse pid %s\n' "$$" >"$LOCK"
+    check "holder, en_US.UTF-8: an ASCII pid still names its live holder" \
+        "$(export LC_ALL=en_US.UTF-8; maintenance_holder)" "btrdasd restore browse pid $$"
+    rm -f "$LOCK"
+else
+    not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
+    echo "NOT RUN: $not_run"
+fi
+
 # --- the backup empties its record on the way out, while it holds the lock ---
 (
     exec 8<>"$LOCK"
@@ -303,6 +329,7 @@ else
 fi
 
 if [[ $fails -eq 0 ]]; then
+    [[ -z "$not_run" ]] || echo "NOT RUN: $not_run"
     echo "MAINTENANCE LOCK SUITE GREEN"
 else
     echo "$fails FAILED"
