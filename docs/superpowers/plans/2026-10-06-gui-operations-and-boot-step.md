@@ -878,7 +878,7 @@ fn a_step_value_that_is_not_a_boolean_reaches_the_library_as_none() {
 fn an_unknown_or_empty_mode_is_refused_never_read_as_incremental() {
     assert_eq!(parse_mode("full"), Ok(BackupMode::Full));
     assert_eq!(parse_mode("Incremental"), Ok(BackupMode::Incremental));
-    for bad in ["", "fulll", "snapshot"] {
+    for bad in ["", "weekly", "snapshot"] {
         assert!(parse_mode(bad).unwrap_err().contains("mode"), "{bad:?}");
     }
 }
