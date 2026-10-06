@@ -4,6 +4,10 @@
 # Date: 2026-10-06
 #
 # Features:
+#   - "Next scheduled:" is never blank (v4.12.0): systemd reports the timer's
+#     next run EMPTY, exit 0, while the timer's own service runs, and the old
+#     one-liner put that blank in the report; next_scheduled() prints
+#     "unknown" for an empty, n/a or failed reading (bd DAS-Backup-Manager-hyvh).
 #   - The boot step honours [boot] and reads its names from btrbk.conf (v4.12.0):
 #     [boot] enabled = false makes it a no-op; the subvolumes, snapshot_names and
 #     target_subdirs come from `btrdasd backup boot-plan` (the Rust step's own
@@ -2906,6 +2910,22 @@ run_indexer() {
 # EMAIL REPORT
 # ============================================================================
 
+# next_scheduled: the timer's next run for the report, or "unknown". Empty
+# while the timer's own run is going (measured: see bd hyvh) — the old
+# `… | sed … || echo unknown` could never print unknown: sed exits 0 on
+# empty input, so the blank went into the report.
+next_scheduled() {
+    local next
+    if ! next=$(systemctl show das-backup.timer --property=NextElapseUSecRealtime --value 2>/dev/null); then
+        next=""
+    fi
+    next=${next% [[:upper:]]*}
+    if [[ -z $next || $next == "n/a" ]]; then
+        next="unknown"
+    fi
+    printf '%s' "$next"
+}
+
 generate_report() {
     # The host's name, here and in the ABORTED report, the mail subject and the
     # From name, is bash's own $HOSTNAME, never the `hostname` program: bash
@@ -2993,7 +3013,7 @@ ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
   backup-run.sh v4.12.0
-  Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
+  Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
 }
