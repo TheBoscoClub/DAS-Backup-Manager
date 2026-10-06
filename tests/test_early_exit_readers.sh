@@ -22,9 +22,10 @@
 # matching branch. Every branch also runs on small input, so the fix is shown
 # to change nothing else.
 #
-#   backup-run.sh          update_boot_subvolumes  the drift check on a
+#   backup-run.sh          update_boot_subvolumes  the match against a
 #                          target's subvolume listing (exposed: the primary
-#                          target's listing is near 64 KiB and grows)
+#                          target's listing is near 64 KiB and grows), now
+#                          latest_boot_snapshot's walk by parameter expansion
 #   backup-verify.sh       check_smart_health      the SMART health line
 #   das-partition-drives.sh check_smart_tests      the self-test gate
 #
@@ -109,11 +110,16 @@ big_size_ok() { # big_size_ok <file>: over 64 KiB, or the case proves nothing
 }
 
 # ---------------------------------------------------------------------------
-echo "== backup-run.sh: update_boot_subvolumes, the drift check"
+echo "== backup-run.sh: update_boot_subvolumes, the listing walk and the boot plan"
 # ---------------------------------------------------------------------------
-# A target whose listing HAS btrbk-shaped snapshots that match neither name
-# pattern is a drift, a FAIL; one with none is a quiet skip.
-extract backup-run.sh update_boot_subvolumes "Target HAS btrbk-shaped snapshots but none matched"
+# The names come from `btrdasd backup boot-plan` (btrbk.conf), not from
+# patterns in the script, so a target whose listing holds only OTHER series
+# is a WARN for the subvolume that has none — there is no "drift" to detect
+# any more (dtm). The listing is walked by bash itself, never piped.
+extract backup-run.sh update_boot_subvolumes 'backup boot-plan'
+extract backup-run.sh update_boot_subvol 'mv -T --'
+extract backup-run.sh latest_boot_snapshot 'LATEST_BOOT_SNAPSHOT'
+extract backup-run.sh boot_path_state 'stat'
 extract backup-run.sh record_op 'OP_STATUS[$op]="$result"'
 extract backup-run.sh probe_mount_point 'LC_ALL=C mountpoint'
 extract backup-run.sh probe_state 'probe_mount_point "$1"'
@@ -131,6 +137,7 @@ done
 
 run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
     : >"$WORK/btrfs.calls"
+    : >"$WORK/btrdasd.calls"
     (
         set -euo pipefail
         # shellcheck source=/dev/null
@@ -141,7 +148,47 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         source "$WORK/probe_mount_point.sh"
         # shellcheck source=/dev/null
         source "$WORK/probe_state.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/boot_path_state.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/update_boot_subvol.sh"
         LISTING="$1"
+        BTRDASD_BIN=btrdasd
+        DAS_CONFIG=/etc/das-backup/config.toml
+        DAS_BOOT_ENABLED="${BOOT_ENABLED:-true}"
+        # The plan `btrdasd backup boot-plan` prints (BOOT_PLAN, tab-separated
+        # lines), or its failure (BOOT_PLAN_RC) with the reason on stderr.
+        btrdasd() {
+            printf '%s\n' "$*" >>"$WORK/btrdasd.calls"
+            if [[ "${BOOT_PLAN_RC:-0}" != 0 ]]; then
+                echo "error: cannot read /nonexistent/btrbk.conf (stub)" >&2
+                return "$BOOT_PLAN_RC"
+            fi
+            printf '%b' "${BOOT_PLAN-@\troot-\tnvme\n@home\thome\tnvme\n}"
+        }
+        # stat as the helper asks it: a path in BOOT_PRESENT exists, one in
+        # BOOT_STAT_ERR cannot be told, anything else is not there.
+        stat() {
+            local p="${!#}" q
+            for q in ${BOOT_PRESENT:-}; do
+                [[ "$q" == "$p" ]] && return 0
+            done
+            for q in ${BOOT_STAT_ERR:-}; do
+                if [[ "$q" == "$p" ]]; then
+                    echo "stat: cannot statx '$p': Input/output error" >&2
+                    return 1
+                fi
+            done
+            echo "stat: cannot statx '$p': No such file or directory" >&2
+            return 1
+        }
+        # mv is only ever the swap of a staging subvolume into place.
+        mv() {
+            printf 'mv %s\n' "$*" >>"$WORK/btrfs.calls"
+            [[ "${BOOT_MV_FAILS:-}" != 1 ]]
+        }
         declare -A OP_STATUS=()
         declare -A MOUNT_ROLES=()
         read -r -a ALL_TARGET_MOUNTS <<<"${BOOT_MOUNTS:-/mnt/t}"
@@ -175,6 +222,19 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             case "$1 $2" in
             "filesystem label") echo das-backup-test ;;
             "subvolume list") cat "$LISTING" ;;
+            "subvolume snapshot")
+                # BOOT_FAIL_ON: a substring of the call that fails.
+                if [[ -n "${BOOT_FAIL_ON:-}" && "$*" == *"$BOOT_FAIL_ON"* ]]; then
+                    echo "ERROR: stub refuses: $*" >&2
+                    return 1
+                fi
+                ;;
+            "subvolume delete")
+                if [[ -n "${BOOT_FAIL_ON:-}" && "$*" == *"$BOOT_FAIL_ON"* ]]; then
+                    echo "ERROR: stub refuses: $*" >&2
+                    return 1
+                fi
+                ;;
             *)
                 echo "btrfs stub: unexpected: $*" >&2
                 return 99
@@ -217,12 +277,12 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             limit_before="$(ulimit -S -n)"
             exec >"$WORK/boot.out" 2>&1
             ulimit -S -n "$BOOT_LIMIT"
-            update_boot_subvolumes true || true
+            update_boot_subvolumes "${BOOT_FORCE:-true}" || true
             ulimit -S -n "$limit_before"
             printf 'RESULT %s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
             exit 0
         fi
-        update_boot_subvolumes true >"$WORK/boot.out" 2>&1
+        update_boot_subvolumes "${BOOT_FORCE:-true}" >"$WORK/boot.out" 2>&1
         printf '%s|%s\n' "${OP_STATUS[boot_subvols]:-unset}" "${OP_STATUS[boot_subvols_detail]:-}"
     )
 }
@@ -233,42 +293,147 @@ DRIFTED='ID 300 gen 9 top level 5 path nvme/renamed-root.20261004T0300'
     filler 1500
 } >"$WORK/drift-big.txt"
 big_size_ok "$WORK/drift-big.txt"
-check "boot subvolumes, drift on line 1 of a listing over 64 KiB: FAIL" \
-    "$(run_boot_subvols "$WORK/drift-big.txt")" "FAIL|0 updated, 1 failed"
-check "boot subvolumes, drift over 64 KiB: says it drifted" \
-    "$(grep -c 'HAS btrbk-shaped snapshots but none matched' "$WORK/boot.out")" "1"
+check "boot subvolumes, another series on line 1 of a listing over 64 KiB: WARN, nothing touched" \
+    "$(run_boot_subvols "$WORK/drift-big.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
+check "boot subvolumes, another series over 64 KiB: says there is none of the planned name" \
+    "$(grep -c "No btrbk snapshot named 'root-'" "$WORK/boot.out")" "1"
 
 # The same listing with /tmp full: a here-string that large went to a temp
 # file, could not be written ("here-document: No space left on device"),
 # and the check read "no match" — the quiet branch again, 5 of 5 times
 # measured (round 4, N3). `[[ =~ ]]` writes nothing.
-check "boot subvolumes, drift over 64 KiB with /tmp full: still FAIL" \
-    "$(run_boot_subvols "$WORK/drift-big.txt" tmp-full)" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, another series over 64 KiB with /tmp full: still the same WARN" \
+    "$(run_boot_subvols "$WORK/drift-big.txt" tmp-full)" "WARN|0 updated, 0 skipped, 2 warnings"
 
 echo "$DRIFTED" >"$WORK/drift-small.txt"
-check "boot subvolumes, drift in a small listing: FAIL" \
-    "$(run_boot_subvols "$WORK/drift-small.txt")" "FAIL|0 updated, 1 failed"
+check "boot subvolumes, another series in a small listing: WARN" \
+    "$(run_boot_subvols "$WORK/drift-small.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
 
 filler 1500 >"$WORK/none-big.txt"
 big_size_ok "$WORK/none-big.txt"
-check "boot subvolumes, no btrbk snapshots in a listing over 64 KiB: the quiet skip" \
-    "$(run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 1 skipped"
-check "boot subvolumes, no btrbk snapshots: says it skips" \
-    "$(grep -c 'No btrbk snapshots found, skipping' "$WORK/boot.out")" "1"
+check "boot subvolumes, no btrbk snapshots in a listing over 64 KiB: WARN, nothing touched" \
+    "$(run_boot_subvols "$WORK/none-big.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
+check "boot subvolumes, no btrbk snapshots: says it leaves each subvolume untouched" \
+    "$(grep -c "No btrbk snapshot named '.*' — leaving @.* untouched" "$WORK/boot.out")" "2"
+
+# ---------------------------------------------------------------------------
+echo "== backup-run.sh: boot plan and the shared listing (bd DAS-Backup-Manager-dtm)"
+# ---------------------------------------------------------------------------
+boot_btrfs_calls() { # what btrfs was asked, one call per ";"
+    if [[ -s "$WORK/btrfs.calls" ]]; then tr '\n' ';' <"$WORK/btrfs.calls"; else echo none; fi
+}
+said_boot() { grep -cF -- "$1" "$WORK/boot.out"; }
+SHARED="$ROOT/tests/fixtures/boot-subvol-listing.txt"
+[[ -s "$SHARED" ]] || harness_broken "no $SHARED"
+
+# latest_boot_snapshot against the fixture the Rust library's test also reads:
+# the same seven answers, one rule in two languages (R2: newest = greatest
+# timestamp, ties to the greater path).
+latest_of() { # latest_of <subdirs> <snapshot_name>: the answer ("" = none)
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        latest_boot_snapshot "$(cat "$SHARED")" "$2" "$1"
+        printf '%s' "$LATEST_BOOT_SNAPSHOT"
+    )
+}
+check "shared listing: nvme root- -> the _1 collision suffix wins" "$(latest_of nvme root-)" "nvme/root-.20261005T0100_1"
+check "shared listing: /nvme/ root- -> slashes trimmed" "$(latest_of /nvme/ root-)" "nvme/root-.20261005T0100_1"
+check "shared listing: nvme home" "$(latest_of nvme home)" "nvme/home.20261005T0100"
+check "shared listing: nvme,ssd home -> ssd, the later timestamp" "$(latest_of nvme,ssd home)" "ssd/home.20261007T0100"
+check "shared listing: nvme,ssd var -> the greater TIMESTAMP, not the greater path (R2)" "$(latest_of nvme,ssd var)" "nvme/var.20261009T0100"
+check "shared listing: nvme a.b -> a literal prefix, aXb never matches" "$(latest_of nvme a.b)" "nvme/a.b.20261003T0100"
+check "shared listing: nvme log -> none" "$(latest_of nvme log)" ""
+
+# A big listing with the matching series appended at its END: a pipe into an
+# early-exit reader dies of SIGPIPE here (bd wkvz); the walk reads it all.
+{
+    filler 1500
+    echo 'ID 900 gen 9 top level 5 path nvme/root-.20261010T0100'
+    echo 'ID 901 gen 9 top level 5 path nvme/home.20261010T0100'
+} >"$WORK/series-at-end.txt"
+big_size_ok "$WORK/series-at-end.txt"
+MNT=/mnt/t
+snap_calls() { grep -c '^subvolume snapshot' "$WORK/btrfs.calls" || true; }
+boot_seq() { boot_btrfs_calls | sed 's/^[^;]*;[^;]*;//; s/archive\.[0-9T]*/archive.TS/'; } # the writes, the stamp masked
+calls_of() { grep -c -- "$1" "$WORK/btrfs.calls" || true; }
+
+check "boot, the series at the end of a listing over 64 KiB (pipefail): both are created from it" \
+    "$(BOOT_FORCE=false run_boot_subvols "$WORK/series-at-end.txt") $(boot_btrfs_calls)" \
+    "OK|2 updated, 0 skipped filesystem label /mnt/t;subvolume list /mnt/t;subvolume snapshot /mnt/t/nvme/root-.20261010T0100 /mnt/t/@;subvolume snapshot /mnt/t/nvme/home.20261010T0100 /mnt/t/@home;"
+
+# 1. [boot] enabled = false: nothing is asked, nothing is touched.
+check "boot disabled in config: OK, and says so" \
+    "$(BOOT_ENABLED=false run_boot_subvols "$SHARED")" "OK|disabled in config"
+check "boot disabled in config: btrfs and the plan never asked" \
+    "$(boot_btrfs_calls) $(wc -c <"$WORK/btrdasd.calls")" "none 0"
+# 2. the plan cannot be read: FAIL, nothing touched.
+check "boot plan unreadable: the step FAILS, counted" \
+    "$(BOOT_PLAN_RC=2 run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot plan unreadable: the reason is said, btrfs never asked" \
+    "$(said_boot 'Could not read the boot plan: error: cannot read /nonexistent/btrbk.conf (stub)') $(boot_btrfs_calls)" "1 none"
+# 3. a plan with a name and a gap; @ absent, an incremental run.
+PLAN_GAP='@\troot-\tnvme\n@home\t-\tnvme\n'
+check "boot plan with one name missing, @ absent: @ created, @home a WARN" \
+    "$(BOOT_PLAN=$PLAN_GAP BOOT_FORCE=false run_boot_subvols "$SHARED")" "WARN|1 updated, 0 skipped, 1 warnings"
+check "boot plan, @ absent: created from the newest root- snapshot" \
+    "$(calls_of 'subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@$')" "1"
+check "boot plan, a name that is '-': @home never touched" "$(calls_of '@home')" "0"
+check "boot plan, a name that is '-': said" "$(said_boot '@home has no snapshot_name')" "1"
+# 4. the same with @ present, incremental: skipped, no snapshot call.
+check "boot plan, @ present, incremental: skipped beside the WARN" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$PLAN_GAP BOOT_FORCE=false run_boot_subvols "$SHARED")" "WARN|0 updated, 1 skipped, 1 warnings"
+check "boot plan, @ present, incremental: no snapshot call" "$(snap_calls)" "0"
+# R5: the absence checks come before "exists, skip": no snapshot => WARN, not a skip.
+check "boot, @ present, incremental, NO snapshot of its series: a WARN, not a skip (R5)" \
+    "$(BOOT_PRESENT="/mnt/t/@ /mnt/t/@home" BOOT_FORCE=false run_boot_subvols "$WORK/none-big.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
+check "boot plan with no subdirs: WARN, said" \
+    "$(BOOT_PLAN='@\troot-\t-\n' BOOT_FORCE=false run_boot_subvols "$SHARED")" "WARN|0 updated, 0 skipped, 1 warnings"
+check "boot plan with no subdirs: the reason" "$(said_boot 'No source declares target_subdirs for @')" "1"
+# 5. full, @ present: archive -> build staging -> delete live -> rename, in that order.
+ONE='@\troot-\tnvme\n'
+check "boot full, @ present: replaced" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED")" "OK|1 updated, 0 skipped"
+check "boot full, @ present: the exact sequence" \
+    "$(boot_seq)" \
+    "subvolume snapshot -r /mnt/t/@ /mnt/t/@.archive.TS;subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@.new;subvolume delete /mnt/t/@;mv -T -- /mnt/t/@.new /mnt/t/@;"
+check "boot full, archive fails: the step FAILS" \
+    "$(BOOT_FAIL_ON="snapshot -r" BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot full, archive fails: live never deleted, never renamed" "$(calls_of 'subvolume delete') $(calls_of '^mv')" "0 0"
+check "boot full, staging build fails: FAIL, live never deleted" \
+    "$(BOOT_FAIL_ON="@.new" BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "FAIL|0 updated, 1 failed 0 0"
+check "boot full, deleting live fails: FAIL, staging discarded, no rename" \
+    "$(BOOT_FAIL_ON="delete /mnt/t/@" BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(calls_of 'subvolume delete /mnt/t/@.new') $(calls_of '^mv')" \
+    "FAIL|0 updated, 1 failed 1 0"
+check "boot full, the swap fails: FAIL, the archive is named" \
+    "$(BOOT_MV_FAILS=1 BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(said_boot 'holds the previous contents')" \
+    "FAIL|0 updated, 1 failed 1"
+check "boot full, a stale @.new: deleted AFTER the archive, before the build" \
+    "$(BOOT_PRESENT="/mnt/t/@ /mnt/t/@.new" BOOT_PLAN=$ONE run_boot_subvols "$SHARED" >/dev/null; boot_seq)" \
+    "subvolume snapshot -r /mnt/t/@ /mnt/t/@.archive.TS;subvolume delete /mnt/t/@.new;subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@.new;subvolume delete /mnt/t/@;mv -T -- /mnt/t/@.new /mnt/t/@;"
+check "boot full, the stale @.new cannot be removed: FAIL, live untouched" \
+    "$(BOOT_FAIL_ON="delete /mnt/t/@.new" BOOT_PRESENT="/mnt/t/@ /mnt/t/@.new" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(calls_of 'subvolume delete /mnt/t/@$') $(calls_of '^mv')" \
+    "FAIL|0 updated, 1 failed 0 0"
+# R5: an existence test that cannot say yes or no is a FAIL, nothing mutated.
+check "boot, @ existence cannot be told: FAIL for it, no snapshot, no delete, no mv" \
+    "$(BOOT_STAT_ERR="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot, @ existence cannot be told: said" "$(said_boot 'Cannot tell whether /mnt/t/@ exists')" "1"
+check "boot full, @.new existence cannot be told: FAIL BEFORE the archive (nothing mutated)" \
+    "$(BOOT_STAT_ERR="/mnt/t/@.new" BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(snap_calls)" \
+    "FAIL|0 updated, 1 failed 0"
 
 # The probe's three answers (bd DAS-Backup-Manager-jlsz). `mountpoint -q ... ||
 # continue` read every failure of the probe as "not mounted": the target was
 # skipped, counted as neither skipped nor failed, and the step recorded OK, 0
 # updated, 0 skipped. Only "not mounted" leaves a target alone; "could not
 # tell" fails the step, counted and said, and the other targets are still done.
-boot_btrfs_calls() { # what btrfs was asked, one call per ";"
-    if [[ -s "$WORK/btrfs.calls" ]]; then tr '\n' ';' <"$WORK/btrfs.calls"; else echo none; fi
-}
-said_boot() { grep -cF -- "$1" "$WORK/boot.out"; }
 
 check "boot subvolumes, the probe says mounted: the listing is read" \
     "$(BOOT_PROBES="/mnt/t=mounted" run_boot_subvols "$WORK/none-big.txt") $(boot_btrfs_calls)" \
-    "OK|0 updated, 1 skipped filesystem label /mnt/t;subvolume list /mnt/t;"
+    "WARN|0 updated, 0 skipped, 2 warnings filesystem label /mnt/t;subvolume list /mnt/t;"
 
 check "boot subvolumes, the probe says not mounted: a quiet skip, as before" \
     "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt")" "OK|0 updated, 0 skipped"
@@ -317,10 +482,10 @@ check "boot subvolumes, no mountpoint program: btrfs never asked" "$(boot_btrfs_
 
 # One target the probe cannot tell about does not stop the others, in either order.
 check "boot subvolumes, first target cannot tell, second mounted: FAIL, the second is still done" \
-    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=mounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'No btrbk snapshots found, skipping') $(boot_btrfs_calls)" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=mounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot "No btrbk snapshot named 'root-'") $(boot_btrfs_calls)" \
     "FAIL|0 updated, 1 failed 1 filesystem label /mnt/u;subvolume list /mnt/u;"
 check "boot subvolumes, first target mounted, second cannot tell: FAIL, the first was done" \
-    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=mounted /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'No btrbk snapshots found, skipping') $(boot_btrfs_calls)" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=mounted /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot "No btrbk snapshot named 'root-'") $(boot_btrfs_calls)" \
     "FAIL|0 updated, 1 failed 1 filesystem label /mnt/t;subvolume list /mnt/t;"
 check "boot subvolumes, one target cannot tell, one not mounted: FAIL, counted once" \
     "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=notmounted" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
@@ -1106,23 +1271,36 @@ with_no_fd_to_spare() { # with_no_fd_to_spare <condition> <variable> <value>
         if eval "$1"; then echo match; else echo "no match"; fi
     ) 2>/dev/null
 }
-check "no fd to spare: the drift check still sees a btrbk name" \
-    "$(with_no_fd_to_spare "$(condition backup-run.sh '^[[:space:]]*if .*\$subvol_listing')" \
-        subvol_listing "$(cat "$WORK/drift-big.txt")")" "match"
+# The boot step's matcher is latest_boot_snapshot now: a walk by parameter
+# expansion and `[[ =~ ]]`, which need no descriptor either.
+no_fd_boot_walk() {
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        listing="$(cat "$WORK/series-at-end.txt")"
+        ulimit -n 3
+        latest_boot_snapshot "$listing" root- nvme
+        printf '%s' "$LATEST_BOOT_SNAPSHOT"
+    ) 2>/dev/null
+}
+check "no fd to spare: the boot snapshot walk still finds a series at the end of 64 KiB" \
+    "$(no_fd_boot_walk)" "nvme/root-.20261010T0100"
 check "no fd to spare: the SMART check still sees PASSED" \
     "$(with_no_fd_to_spare "$(condition backup-verify.sh '^[[:space:]]*if .*PASSED')" \
         health "$PASSED_LINE")" "match"
 
 # ---------------------------------------------------------------------------
-echo "== the drift check's digits are ASCII digits, whatever the locale"
+echo "== the boot snapshot match's digits are ASCII digits, whatever the locale"
 # ---------------------------------------------------------------------------
 # grep's [0-9] matched ASCII digits only. Under en_US.UTF-8 — the host's
 # locale — bash's regex [0-9] also matches Arabic-Indic and fullwidth digits,
 # so a name like root.٢٠٢٦١٠٠٤T٠٣٠٠ read as btrbk-shaped (round 5, N5;
 # measured). [[:digit:]] is ASCII only: the old meaning exactly. Such a name
-# is no btrbk snapshot, so its target takes the quiet skip, as it did.
-NONASCII_ARABIC='ID 301 gen 9 top level 5 path nvme/renamed-root.٢٠٢٦١٠٠٤T٠٣٠٠'
-NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/renamed-root.２０２６１００４T０３００'
+# is no btrbk snapshot, so no series matches it: a WARN for each subvolume of
+# the plan (latest_boot_snapshot compares under its own LC_ALL=C).
+NONASCII_ARABIC='ID 301 gen 9 top level 5 path nvme/root-.٢٠٢٦١٠٠٤T٠٣٠٠'
+NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/root-.２０２６１００４T０３００'
 # Only where the locale shows the difference: bash's own [0-9] must match a
 # non-ASCII digit there, or these checks could not fail.
 not_run=""
@@ -1130,14 +1308,13 @@ probe_digit='٢'
 if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
     for name in NONASCII_ARABIC NONASCII_FULLWIDTH; do
         printf '%s\n' "${!name}" >"$WORK/$name.txt"
-        check "en_US.UTF-8, the only btrbk-like name has non-ASCII digits ($name): the quiet skip" \
-            "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/$name.txt")" "OK|0 updated, 1 skipped"
+        check "en_US.UTF-8, the only planned-name snapshot has non-ASCII digits ($name): no match, a WARN" \
+            "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/$name.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
     done
-    check "en_US.UTF-8, an ASCII drifted name: still FAIL" \
-        "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/drift-small.txt")" "FAIL|0 updated, 1 failed"
-    drift_cond="$(condition backup-run.sh '^[[:space:]]*if .*\$subvol_listing')"
-    check "en_US.UTF-8: the drift condition on Arabic-Indic digits: no match" \
-        "$(export LC_ALL=en_US.UTF-8; subvol_listing="$NONASCII_ARABIC"; if eval "$drift_cond"; then echo match; else echo "no match"; fi)" "no match"
+    check "en_US.UTF-8, an ASCII series of another name: still the WARN" \
+        "$(BOOT_LOCALE=en_US.UTF-8 run_boot_subvols "$WORK/drift-small.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
+    check "en_US.UTF-8, an ASCII timestamp is still matched" \
+        "$(BOOT_LOCALE=en_US.UTF-8 BOOT_FORCE=false run_boot_subvols "$WORK/series-at-end.txt")" "OK|2 updated, 0 skipped"
 else
     not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
     echo "NOT RUN: $not_run"
