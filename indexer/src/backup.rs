@@ -1982,22 +1982,48 @@ pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
     summary
 }
 
+/// What became of a run's report: whether it was written, and whether it was
+/// mailed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportDelivery {
+    /// `Err(why)` when a report was asked for and could not be written;
+    /// `Ok` when it was written, or none was asked for.
+    pub saved: Result<(), String>,
+    /// Whether the email went out.
+    pub emailed: bool,
+}
+
+impl ReportDelivery {
+    /// Why the report is lost, if it is: not written and not mailed either —
+    /// the one case in which nothing of it exists. A report that was written
+    /// but not mailed (or mailed but not written) is not lost.
+    pub fn lost(&self) -> Option<&str> {
+        match &self.saved {
+            Err(why) if !self.emailed => Some(why),
+            _ => None,
+        }
+    }
+}
+
 /// Write the run report to `[general].last_report` when the caller asked
 /// for a report, and email it when `[email]` is enabled too — the report is
 /// written whether or not it is mailed, as `backup-run.sh` writes
 /// `$LAST_REPORT` before any send. `data` is what was captured while the
-/// targets were mounted. Returns whether the email was sent. Email failure
-/// is non-fatal — the backup data is safe — and is logged, not added to the
-/// run's errors.
+/// targets were mounted. Email failure alone is non-fatal — the backup data
+/// is safe and the report is on disk — and is logged, not added to the run's
+/// errors; a report that exists nowhere is not (see [`ReportDelivery::lost`]).
 pub fn deliver_report(
     config: &Config,
     options: &BackupOptions,
     result: &BackupResult,
     data: &crate::report::ReportData,
     progress: &dyn ProgressCallback,
-) -> bool {
+) -> ReportDelivery {
     if !options.send_report {
-        return false;
+        return ReportDelivery {
+            saved: Ok(()),
+            emailed: false,
+        };
     }
     let report_text =
         crate::report::format_report_from(result, options.subvolume_sync.as_ref(), data);
@@ -2005,24 +2031,26 @@ pub fn deliver_report(
     // write, not `fsutil::write_atomic`: that makes a new file, which does
     // not keep an existing report's mode and owner.
     let report_path = Path::new(&config.general.last_report);
-    if let Err(e) = report_path
+    let saved = report_path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::write(report_path, &report_text))
-    {
-        progress.on_log(
-            LogLevel::Warning,
-            &format!(
+        .map_err(|e| {
+            let why = format!(
                 "Failed to save report to {}: {e}",
                 config.general.last_report
-            ),
-        );
-    }
+            );
+            progress.on_log(LogLevel::Warning, &why);
+            why
+        });
     if !emails_report(options, config) {
-        return false;
+        return ReportDelivery {
+            saved,
+            emailed: false,
+        };
     }
-    match crate::report::send_email_report(&report_text, config) {
+    let emailed = match crate::report::send_email_report(&report_text, config) {
         Ok(()) => {
             progress.on_log(LogLevel::Info, "Email report sent successfully");
             true
@@ -2034,7 +2062,8 @@ pub fn deliver_report(
             );
             false
         }
-    }
+    };
+    ReportDelivery { saved, emailed }
 }
 
 /// Something a backup job mounted and must give back: [`mount::MountGuard`]
@@ -2084,7 +2113,7 @@ pub trait BackupJobHost {
     /// The report sections that read the mounted targets. Called while they
     /// are still mounted.
     fn capture_report(&self, config: &Config) -> crate::report::ReportData;
-    /// Write and email the report; whether the email went out.
+    /// Write and email the report; what became of it.
     fn report(
         &self,
         config: &Config,
@@ -2092,7 +2121,7 @@ pub trait BackupJobHost {
         result: &BackupResult,
         data: &crate::report::ReportData,
         progress: &dyn ProgressCallback,
-    ) -> bool;
+    ) -> ReportDelivery;
     /// Add the run to `backup_runs`.
     fn record(&self, config: &Config, result: &BackupResult) -> Result<(), String>;
 }
@@ -2102,10 +2131,17 @@ pub trait BackupJobHost {
 pub enum BackupJobOutcome {
     /// Another backup holds the singleton lock — declined, not queued.
     Declined,
-    /// The job could not run: locks, mounts, target verification, or btrbk
-    /// could not be started. Nothing is recorded — the same cases in which
-    /// `backup-run.sh` exits before it records a run.
-    NotRun(String),
+    /// The job never began: the selection was refused, or the locks could not
+    /// be taken. Nothing was mounted, run or recorded — the cases in which
+    /// `backup-run.sh` exits 1.
+    CouldNotStart(String),
+    /// The job began and stopped on the state of a target or a source — no
+    /// target would mount, a target or a source volume was not what it must
+    /// be, btrbk could not be started — and ran nothing, or nothing that
+    /// counts. Recorded as a failed run unless it was a dry run, as the
+    /// script's abort path does (bd `2my`), so it does not vanish from the
+    /// history. Exits 3.
+    Aborted(String),
     /// The job ran. Recorded in `backup_runs` (unless a dry run); its
     /// `success` says whether everything worked.
     Ran(BackupResult),
@@ -2116,12 +2152,28 @@ impl BackupJobOutcome {
         matches!(self, Self::Ran(r) if r.success)
     }
 
+    /// The exit status of `btrdasd backup run`, which is the rule of
+    /// `btrdasd doctor` and of `backup-run.sh` (bd `d1r`, `vzsu`): **0** it
+    /// ran and nothing failed (a warning is still 0) or another backup was
+    /// running and this one declined; **3** it began and something failed or
+    /// it aborted on a target's or a source's state — whatever caused it will
+    /// usually still be there on the next start; **1** it could not start.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Declined => 0,
+            Self::CouldNotStart(_) => 1,
+            Self::Aborted(_) => 3,
+            Self::Ran(result) if result.success => 0,
+            Self::Ran(_) => 3,
+        }
+    }
+
     /// Whether the job succeeded, and the line that says how it ended — what
     /// the GUI shows when the job finishes.
     pub fn finish_line(&self, dry_run: bool) -> (bool, String) {
         match self {
             Self::Declined => (false, "A backup is already running — declined".to_string()),
-            Self::NotRun(why) => (false, why.clone()),
+            Self::CouldNotStart(why) | Self::Aborted(why) => (false, why.clone()),
             Self::Ran(result) => (result.success, backup_summary(result, dry_run)),
         }
     }
@@ -2132,6 +2184,44 @@ fn with_still_mounted(msg: String, still_mounted: &[String]) -> String {
     match mount::still_mounted_error(still_mounted) {
         Some(e) => format!("{msg}; {e}"),
         None => msg,
+    }
+}
+
+/// The job began and stopped on the state of a target or a source: the
+/// outcome, after recording it as a failed run — counts unknown, the reason as
+/// its error — unless it was a dry run, as `backup-run.sh` records an abort
+/// (bd `2my`). A record that cannot be written is added to the reason.
+fn abort_job(
+    host: &dyn BackupJobHost,
+    config: &Config,
+    options: &BackupOptions,
+    started: std::time::Instant,
+    why: String,
+    progress: &dyn ProgressCallback,
+) -> BackupJobOutcome {
+    if options.dry_run {
+        return BackupJobOutcome::Aborted(why);
+    }
+    let result = BackupResult {
+        success: false,
+        mode: options.mode.unwrap_or(BackupMode::Incremental),
+        snapshots_created: None,
+        snapshots_sent: None,
+        snapshots_cleaned: 0,
+        bytes_sent: 0,
+        boot_archived: false,
+        indexed: false,
+        report_sent: false,
+        errors: vec![why.clone()],
+        duration_secs: started.elapsed().as_secs(),
+    };
+    match host.record(config, &result) {
+        Ok(()) => BackupJobOutcome::Aborted(why),
+        Err(e) => {
+            let msg = format!("{why}; history not recorded: {e}");
+            progress.on_log(LogLevel::Error, &format!("history not recorded: {e}"));
+            BackupJobOutcome::Aborted(msg)
+        }
     }
 }
 
@@ -2154,13 +2244,14 @@ pub fn run_backup_job(
     // Before the first lock and the first mount: a selection of nothing is
     // refused with nothing touched (bd DAS-Backup-Manager-7tx).
     if let Some(why) = empty_selection(&options) {
-        return BackupJobOutcome::NotRun(why);
+        return BackupJobOutcome::CouldNotStart(why);
     }
+    let started = std::time::Instant::now();
     let locks = match host.acquire_locks(progress) {
         Ok(Some(locks)) => locks,
         Ok(None) => return BackupJobOutcome::Declined,
         Err(e) => {
-            return BackupJobOutcome::NotRun(format!("Could not acquire backup locks: {e}"));
+            return BackupJobOutcome::CouldNotStart(format!("Could not acquire backup locks: {e}"));
         }
     };
     let mut sources = host.mount_sources(&config, progress);
@@ -2172,10 +2263,14 @@ pub fn run_backup_job(
         Ok(targets) => targets,
         Err(e) => {
             let still = sources.release(progress);
-            return BackupJobOutcome::NotRun(with_still_mounted(
-                format!("Mount failed: {e}"),
-                &still,
-            ));
+            return abort_job(
+                host,
+                &config,
+                &options,
+                started,
+                with_still_mounted(format!("Mount failed: {e}"), &still),
+                progress,
+            );
         }
     };
     let ran = host.run(&config, &options, progress);
@@ -2189,10 +2284,14 @@ pub fn run_backup_job(
     let mut result = match ran {
         Ok(result) => result,
         Err(e) => {
-            return BackupJobOutcome::NotRun(with_still_mounted(
-                format!("Backup failed: {e}"),
-                &still_mounted,
-            ));
+            return abort_job(
+                host,
+                &config,
+                &options,
+                started,
+                with_still_mounted(format!("Backup failed: {e}"), &still_mounted),
+                progress,
+            );
         }
     };
     if let Some(e) = mount::still_mounted_error(&still_mounted) {
@@ -2201,7 +2300,18 @@ pub fn run_backup_job(
         result.success = false;
     }
     if let Some(captured) = &captured {
-        result.report_sent = host.report(&config, &options, &result, captured, progress);
+        let delivery = host.report(&config, &options, &result, captured, progress);
+        result.report_sent = delivery.emailed;
+        // With email off — or failing — a report that was not written exists
+        // nowhere: the run fails, and the row below says why, as in
+        // `backup-run.sh` (bd `d1r` N4). An email that fails beside a report
+        // that was written stays a warning: the report is on disk.
+        if let Some(why) = delivery.lost() {
+            let msg = format!("report: {why}");
+            progress.on_log(LogLevel::Error, &msg);
+            result.errors.push(msg);
+            result.success = false;
+        }
         // A run that cannot be recorded vanishes from the history while the
         // job reports success: it fails the job, in its errors and its status
         // (bd DAS-Backup-Manager-no4).
@@ -2307,7 +2417,7 @@ impl BackupJobHost for SystemBackupHost {
         result: &BackupResult,
         data: &crate::report::ReportData,
         progress: &dyn ProgressCallback,
-    ) -> bool {
+    ) -> ReportDelivery {
         deliver_report(config, options, result, data, progress)
     }
 
@@ -5407,6 +5517,9 @@ mod tests {
         reported: std::sync::Mutex<Vec<BackupResult>>,
         report_texts: std::sync::Mutex<Vec<String>>,
         record_fails: bool,
+        /// What `report` says became of the report.
+        report_saved: Result<(), String>,
+        report_emailed: bool,
     }
 
     impl Default for FakeHost {
@@ -5422,6 +5535,8 @@ mod tests {
                 reported: std::sync::Mutex::new(Vec::new()),
                 report_texts: std::sync::Mutex::new(Vec::new()),
                 record_fails: false,
+                report_saved: Ok(()),
+                report_emailed: true,
             }
         }
     }
@@ -5565,7 +5680,7 @@ mod tests {
             result: &BackupResult,
             data: &crate::report::ReportData,
             _: &dyn ProgressCallback,
-        ) -> bool {
+        ) -> ReportDelivery {
             self.step("report");
             self.reported.lock().unwrap().push(copy_result(result));
             self.report_texts
@@ -5576,7 +5691,10 @@ mod tests {
                     options.subvolume_sync.as_ref(),
                     data,
                 ));
-            true
+            ReportDelivery {
+                saved: self.report_saved.clone(),
+                emailed: self.report_emailed,
+            }
         }
         fn record(&self, _: &Config, result: &BackupResult) -> Result<(), String> {
             self.step("record");
@@ -5804,6 +5922,7 @@ mod tests {
             let (ok, line) = outcome.finish_line(false);
             assert!(!ok, "{outcome:?}");
             assert!(line.contains(says), "{line}");
+            assert_eq!(outcome.exit_code(), 1, "it never began: {outcome:?}");
             assert!(
                 host.steps().is_empty(),
                 "the host was touched: {:?}",
@@ -5826,6 +5945,178 @@ mod tests {
         assert!(host.steps().contains(&"record".to_string()));
     }
 
+    // -- the exit rule of `backup run`: 0 / 3 / 1 (bd DAS-Backup-Manager-vzsu) --
+
+    #[test]
+    fn the_exit_status_follows_the_doctors_rule_for_every_way_a_job_ends() {
+        let ran = |success| BackupJobOutcome::Ran(result_with(success, 1, 1, 0));
+        // 0: ran clean, or another backup was running and this one declined.
+        assert_eq!(ran(true).exit_code(), 0);
+        assert_eq!(BackupJobOutcome::Declined.exit_code(), 0);
+        // 3: began and something failed, or aborted on a target's or a source's state.
+        assert_eq!(ran(false).exit_code(), 3);
+        assert_eq!(BackupJobOutcome::Aborted("x".into()).exit_code(), 3);
+        // 1: could not start.
+        assert_eq!(BackupJobOutcome::CouldNotStart("x".into()).exit_code(), 1);
+    }
+
+    #[test]
+    fn an_absent_ticked_target_that_stops_the_run_exits_3_not_1() {
+        // The refusal run_backup gives for a ticked target that is not what it
+        // must be ("Refusing to run btrbk ...") used to exit 1 here.
+        let host = FakeHost {
+            run: Err("Refusing to run btrbk on a bare directory".into()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert_eq!(outcome.exit_code(), 3, "{outcome:?}");
+        assert!(host.steps().contains(&"locks".to_string()));
+    }
+
+    #[test]
+    fn an_abort_is_recorded_as_a_failed_run_with_unknown_counts() {
+        let host = FakeHost {
+            run: Err("Refusing to run btrbk".into()),
+            ..Default::default()
+        };
+        let options = BackupOptions {
+            mode: Some(BackupMode::Full),
+            ..Default::default()
+        };
+        let outcome = run_backup_job(&host, make_test_config(), options, &TestProgress::new());
+        assert_eq!(outcome.exit_code(), 3);
+        let recorded = host.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let row = &recorded[0];
+        assert!(!row.success);
+        assert_eq!(row.mode, BackupMode::Full);
+        assert_eq!((row.snapshots_created, row.snapshots_sent), (None, None));
+        assert_eq!(row.errors, ["Backup failed: Refusing to run btrbk"]);
+    }
+
+    #[test]
+    fn an_aborted_dry_run_records_nothing() {
+        let host = FakeHost {
+            run: Err("Refusing to run btrbk".into()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, true);
+        assert_eq!(outcome.exit_code(), 3);
+        assert!(host.recorded.lock().unwrap().is_empty());
+        assert!(!host.steps().contains(&"record".to_string()));
+    }
+
+    #[test]
+    fn an_abort_whose_row_cannot_be_written_says_so_and_still_exits_3() {
+        let host = FakeHost {
+            run: Err("Refusing to run btrbk".into()),
+            record_fails: true,
+            ..Default::default()
+        };
+        let (outcome, progress) = job(&host, false);
+        assert_eq!(outcome.exit_code(), 3);
+        let (ok, line) = outcome.finish_line(false);
+        assert!(!ok);
+        assert_eq!(
+            line,
+            "Backup failed: Refusing to run btrbk; history not recorded: disk full"
+        );
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Error && m == "history not recorded: disk full")
+        );
+    }
+
+    #[test]
+    fn a_job_that_could_not_start_records_nothing_and_exits_1() {
+        let host = FakeHost {
+            locks: Err("permission denied".into()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert_eq!(outcome.exit_code(), 1);
+        assert_eq!(host.steps(), vec!["locks"]);
+        assert!(host.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_run_that_did_begin_exits_3_and_a_clean_one_0() {
+        let host = FakeHost::default();
+        let (clean, _) = job(&host, false);
+        assert_eq!(clean.exit_code(), 0, "{clean:?}");
+        let host = FakeHost {
+            sync_failed: true,
+            ..Default::default()
+        };
+        let (failed, _) = job(&host, false);
+        assert_eq!(failed.exit_code(), 3, "{failed:?}");
+    }
+
+    // -- a report that exists nowhere fails the run, and the row says why --
+
+    #[test]
+    fn a_report_that_is_neither_saved_nor_mailed_fails_the_run_before_it_is_recorded() {
+        let host = FakeHost {
+            report_saved: Err(
+                "Failed to save report to /x/last-report.txt: Not a directory".into(),
+            ),
+            report_emailed: false,
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(!outcome.success(), "{outcome:?}");
+        assert_eq!(outcome.exit_code(), 3);
+        let recorded = host.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].success, "the row is written after the report");
+        assert_eq!(
+            recorded[0].errors,
+            ["report: Failed to save report to /x/last-report.txt: Not a directory"]
+        );
+        let steps = host.steps();
+        let at = |s: &str| steps.iter().position(|x| x == s).unwrap();
+        assert!(at("report") < at("record"), "{steps:?}");
+    }
+
+    #[test]
+    fn a_report_that_exists_somewhere_does_not_fail_the_run() {
+        // Mailed but not saved: the report exists.
+        let host = FakeHost {
+            report_saved: Err("disk full".into()),
+            report_emailed: true,
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success(), "{outcome:?}");
+        // Saved but not mailed: the report exists, the email is non-fatal.
+        let host = FakeHost {
+            report_saved: Ok(()),
+            report_emailed: false,
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success(), "{outcome:?}");
+        let BackupJobOutcome::Ran(result) = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(!result.report_sent);
+    }
+
+    #[test]
+    fn a_report_is_lost_only_when_it_was_neither_written_nor_mailed() {
+        let lost = |saved: Result<(), String>, emailed| {
+            ReportDelivery { saved, emailed }.lost().map(str::to_string)
+        };
+        assert_eq!(lost(Err("e".into()), false), Some("e".to_string()));
+        assert_eq!(lost(Err("e".into()), true), None);
+        assert_eq!(lost(Ok(()), false), None);
+        assert_eq!(lost(Ok(()), true), None);
+    }
+
     #[test]
     fn a_lock_error_does_not_run() {
         let host = FakeHost {
@@ -5833,10 +6124,12 @@ mod tests {
             ..Default::default()
         };
         let (outcome, _) = job(&host, false);
-        let BackupJobOutcome::NotRun(why) = outcome else {
-            panic!()
+        let BackupJobOutcome::CouldNotStart(why) = &outcome else {
+            panic!("{outcome:?}")
         };
         assert_eq!(why, "Could not acquire backup locks: permission denied");
+        assert_eq!(outcome.exit_code(), 1);
+        assert!(!host.steps().contains(&"record".to_string()));
         assert_eq!(host.steps(), vec!["locks"]);
     }
 
@@ -5848,16 +6141,21 @@ mod tests {
             ..Default::default()
         };
         let (outcome, _) = job(&host, false);
-        let BackupJobOutcome::NotRun(why) = &outcome else {
-            panic!()
+        let BackupJobOutcome::Aborted(why) = &outcome else {
+            panic!("{outcome:?}")
         };
         assert_eq!(
             why,
             "Mount failed: No DAS drives found; still mounted: /.btrfs-nvme"
         );
         assert_eq!(outcome.finish_line(false), (false, why.clone()));
+        assert_eq!(outcome.exit_code(), 3);
         assert!(host.steps().contains(&"release sources".to_string()));
-        assert!(!host.steps().contains(&"record".to_string()));
+        // Began, and stopped on a target's state: recorded as a failed run.
+        let recorded = host.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].success);
+        assert_eq!(recorded[0].errors, std::slice::from_ref(why));
     }
 
     #[test]
@@ -5867,14 +6165,17 @@ mod tests {
             ..Default::default()
         };
         let (outcome, _) = job(&host, false);
-        let BackupJobOutcome::NotRun(why) = outcome else {
-            panic!()
+        let BackupJobOutcome::Aborted(why) = &outcome else {
+            panic!("{outcome:?}")
         };
         assert_eq!(why, "Backup failed: Refusing to run btrbk");
+        assert_eq!(outcome.exit_code(), 3);
         let steps = host.steps();
         assert!(steps.contains(&"release targets".to_string()), "{steps:?}");
         assert!(steps.contains(&"release sources".to_string()), "{steps:?}");
-        assert!(!steps.contains(&"record".to_string()), "{steps:?}");
+        let recorded = host.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "an abort is a failed row: {steps:?}");
+        assert!(!recorded[0].success);
     }
 
     #[test]
@@ -6090,7 +6391,11 @@ mod tests {
         // Not asked for: nothing written.
         config.email.enabled = true;
         let not_asked = BackupOptions::default();
-        assert!(!host.report(&config, &not_asked, &result, &data, &progress));
+        assert!(
+            !host
+                .report(&config, &not_asked, &result, &data, &progress)
+                .emailed
+        );
         assert!(!report.exists(), "no report asked for: none written");
 
         // Asked for, email disabled: written (as backup-run.sh does), not mailed.
@@ -6099,7 +6404,11 @@ mod tests {
             send_report: true,
             ..Default::default()
         };
-        assert!(!host.report(&config, &ask, &result, &data, &progress));
+        assert!(
+            !host
+                .report(&config, &ask, &result, &data, &progress)
+                .emailed
+        );
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(
             text.contains("CAPTURED-SNAP") && text.contains("t  CAPTURED"),
@@ -6125,14 +6434,18 @@ mod tests {
         config.email.to = String::new();
         config.email.smtp_port = 1;
         config.email.smtp_host = "127.0.0.1".into();
-        assert!(!host.report(&config, &ask, &result, &data, &progress));
+        assert!(
+            !host
+                .report(&config, &ask, &result, &data, &progress)
+                .emailed
+        );
         assert!(tried_to_mail(&progress), "email enabled: the send is tried");
         let text = std::fs::read_to_string(&report).unwrap();
         assert!(text.contains("a"), "{text}");
     }
 
     #[test]
-    fn a_report_that_cannot_be_written_is_a_warning_naming_the_path() {
+    fn a_report_that_cannot_be_written_is_lost_when_nothing_mails_it_and_says_where() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = make_test_config();
         // A file where the report's directory should be.
@@ -6149,13 +6462,19 @@ mod tests {
             latest_snapshots: String::new(),
         };
         let progress = TestProgress::new();
-        assert!(!deliver_report(
+        let delivery = deliver_report(
             &config,
             &options,
             &result_with(true, 1, 1, 0),
             &data,
-            &progress
-        ));
+            &progress,
+        );
+        assert!(!delivery.emailed);
+        let why = delivery.lost().expect("email off and unwritable: lost");
+        assert!(
+            why.starts_with(&format!("Failed to save report to {}", path.display())),
+            "{why}"
+        );
         let logs = progress.logs.lock().unwrap();
         assert!(
             logs.iter().any(|(l, m)| *l == LogLevel::Warning

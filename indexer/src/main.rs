@@ -1315,13 +1315,6 @@ fn backup_run_line(result: &backup::BackupResult) -> String {
     )
 }
 
-/// The exit status `backup run` ends with, if not 0: 1 when the run failed —
-/// including when only the subvolume sync before it did, which `run_backup`
-/// folds into the result.
-fn backup_run_exit_code(run_succeeded: bool) -> Option<i32> {
-    (!run_succeeded).then_some(1)
-}
-
 /// Whether `subvol expire` failed overall: the expiry itself did, or snapshots
 /// are gone and the index still lists them. The database is not opened at all
 /// when nothing was deleted (it may not exist yet).
@@ -2111,12 +2104,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     options,
                     &progress,
                 );
+                // 0 ran clean (or declined), 3 began and something failed or
+                // aborted, 1 could not start: the doctor's rule (bd `vzsu`).
+                let exit_code = outcome.exit_code();
                 let result = match outcome {
                     backup::BackupJobOutcome::Declined => {
                         println!("A backup is already running — declining.");
                         return Ok(());
                     }
-                    backup::BackupJobOutcome::NotRun(e) => return Err(e.into()),
+                    // Could not start (1) or began and stopped on a target's or
+                    // a source's state (3, recorded as a failed run): the
+                    // reason on stderr, the doctor's exit rule.
+                    stopped @ (backup::BackupJobOutcome::CouldNotStart(_)
+                    | backup::BackupJobOutcome::Aborted(_)) => {
+                        let (_, why) = stopped.finish_line(dry_run);
+                        eprintln!("Error: {why}");
+                        std::process::exit(exit_code);
+                    }
                     backup::BackupJobOutcome::Ran(result) => result,
                 };
                 progress.on_complete(result.success, &backup::backup_summary(&result, dry_run));
@@ -2130,10 +2134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 // A failed sync or a target left mounted did not stop the run;
-                // it is in the result, so the command fails once the run has
-                // finished and been recorded.
-                if let Some(code) = backup_run_exit_code(result.success) {
-                    std::process::exit(code);
+                // it is in the result, so the command fails (3) once the run
+                // has finished and been recorded.
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
                 }
             }
             BackupAction::Snapshot { config, sources } => {
@@ -3663,12 +3667,6 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let left = Database::open(&db_path).unwrap().list_snapshots().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].path, "/mnt/t/kept.20260101");
-    }
-
-    #[test]
-    fn backup_run_exits_non_zero_exactly_when_the_run_failed() {
-        assert_eq!(backup_run_exit_code(true), None);
-        assert_eq!(backup_run_exit_code(false), Some(1));
     }
 
     // --- walk and restore wait for the maintenance lock (bd DAS-Backup-Manager-frb)
