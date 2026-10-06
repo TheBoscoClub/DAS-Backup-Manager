@@ -101,7 +101,9 @@ const UNIT_DIRS: [&str; 2] = ["usr/lib/systemd/system", "usr/local/lib/systemd/s
 /// Longer than any version: a file past this is not one, and is not read.
 const MAX_LEN: u64 = 64 * 1024;
 
-/// Open flags: never through a link, and never blocking — a pipe at the path
+/// Open flags: never through a link in the last path component (`O_NOFOLLOW`
+/// covers only that one; a link above it is `link_above`'s job), and never
+/// blocking — a pipe at the path
 /// opens at once instead of waiting for a writer, and its `fstat` then refuses
 /// it. Single, distinct bits, so `+` is `|` here (asserted below), written `+`
 /// for the reason `recovery_os`'s `FILE_FLAGS` gives: a mutation test cannot
