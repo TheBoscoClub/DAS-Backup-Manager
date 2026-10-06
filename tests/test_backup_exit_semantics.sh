@@ -447,8 +447,12 @@ case " $* " in
 esac
 EOF
 
+# `systemctl show --value` of a timer: empty (exit 0) while the timer's own
+# service runs (measured, bd hyvh); knob timer_next gives the value, knob
+# timer_fails makes it exit 1.
 stub systemctl <<'EOF'
-echo "NextElapseUSecRealtime="
+if [[ -f "$S/knobs/timer_fails" ]]; then exit 1; fi
+printf '%s\n' "$(knob timer_next '')"
 EOF
 
 # Keeps each mail: its arguments (the subject follows -s) and its body.
@@ -1012,6 +1016,25 @@ check "clean run: the snapshot counts row" \
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
 check "clean run: a silent mount logs no mount warning" \
     "$(grep -c 'WARN.*mount said' "$STATE/out")" "0"
+
+# The report's "Next scheduled:" line is never blank (bd hyvh): systemd prints
+# an empty value, exit 0, while the timer's own service runs.
+next_line() { sed -n 's/^  Next scheduled: //p' "$WORK/lib/last-report.txt"; }
+fresh
+run_backup
+check "next scheduled, empty value (the timer's own run is going): unknown" "$(next_line)" "unknown"
+fresh
+knob timer_next "Wed 2026-10-07 03:05:47 CDT"
+run_backup
+check "next scheduled, a date: the zone is dropped" "$(next_line)" "Wed 2026-10-07 03:05:47"
+fresh
+knob timer_next "n/a"
+run_backup
+check "next scheduled, n/a: unknown" "$(next_line)" "unknown"
+fresh
+knob timer_fails 1
+run_backup
+check "next scheduled, systemctl fails: unknown" "$(next_line)" "unknown"
 
 # A source that mounts with something to say — util-linux's "source
 # write-protected, mounted read-only" — still says it: mount_sources()
