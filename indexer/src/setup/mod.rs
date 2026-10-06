@@ -2,6 +2,7 @@ pub mod config;
 pub mod detect;
 pub mod env_export;
 pub mod installer;
+mod retired_units;
 pub mod templates;
 pub mod wizard;
 

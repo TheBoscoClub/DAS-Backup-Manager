@@ -396,6 +396,18 @@ when it is running, so the GUI is served by the new binary. All of it is done
 holding setup's two locks (below); the restart may hold them for at most 300
 seconds, so no job can start mounting under it. A restart that fails or does
 not return in time, or a unit state that cannot be read, is an error (exit 1).
+Before regenerating, it removes the backup units an older version's
+.B "cmake \-\-install"
+left in
+.I /usr/lib/systemd/system
+and
+.I /usr/local/lib/systemd/system
+(das\-backup.service, das\-backup\-full.service and their timers), each only
+if its bytes are a version this project installed, whatever install prefix its
+ExecStart= line names; anything else at those paths (an edited file, a link, a
+directory, a copy reached through a linked directory, a file replaced while it
+was being checked) is kept and named. A file it cannot remove, or a path it
+cannot read, is an error (exit 1), once the rest is done.
 On an init system other than systemd the helper is restarted by hand: the files
 are upgraded and the upgrade exits 3. Refused while a job holds a lock: exit 75,
 nothing written. Done: exit 0.
@@ -414,9 +426,10 @@ Remove ALL installed files: generated configs (same as \-\-uninstall), plus
 cmake-installed binaries (btrdasd, btrdasd\-gui, btrdasd\-helper), the backup
 scripts under
 .IR /usr/lib/das\-backup ,
-D\-Bus configs, polkit policy, systemd units, man page, shell completions,
-desktop entry, icon, and the FFI library and header that releases up to
-0.7.22.1 installed. Prompts whether to remove the backup database.
+D\-Bus configs, polkit policy, the helper's systemd unit, man page, shell
+completions, desktop entry, icon, the FFI library and header that releases up
+to 0.7.22.1 installed, and the backup units that releases up to 0.7.22.3
+installed under the prefix. Prompts whether to remove the backup database.
 .TP
 .B \-\-force
 Non-interactive mode: skip all prompts and never remove or overwrite the
