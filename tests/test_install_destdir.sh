@@ -21,7 +21,8 @@
 #   2. systemctl is never called;
 #   3. the install manifest and the files under DESTDIR are the same list, so
 #      every installed file is under DESTDIR and none was written there unlisted;
-#   4. no install-time script runs a command (execute_process, exec_program) —
+#   4. no install-time script runs a command (execute_process, exec_program, or
+#      cmake_language, whose CALL and EVAL reach both) —
 #      install time may check and print, never act. The scripts are the
 #      generated cmake_install.cmake files and every file they include():
 #      CMake writes `install(SCRIPT <file>)` as include("<absolute file>"), so
@@ -155,7 +156,7 @@ acts="$(awk -v build="$build" '
         prev = ""
         generated = (index(FILENAME, build "/") == 1 && FILENAME ~ /\/cmake_install\.cmake$/)
     }
-    tolower($0) ~ /(execute_process|exec_program)[[:space:]]*\(/ &&
+    tolower($0) ~ /(execute_process|exec_program|cmake_language)[[:space:]]*\(/ &&
         !(generated && prev ~ /^[[:space:]]*if\(CMAKE_INSTALL_DO_STRIP\)[[:space:]]*$/) {
         print FILENAME ":" FNR
     }
