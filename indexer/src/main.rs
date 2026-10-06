@@ -1308,7 +1308,7 @@ fn backup_run_options(
         dry_run,
         boot_archive: true,
         index_after: true,
-        send_report: true,
+        email_report: true,
         ..Default::default()
     }
 }
@@ -2951,13 +2951,13 @@ mod tests {
         assert_eq!(full.mode, Some(BackupMode::Full));
         assert_eq!(full.sources, Some(vec!["a".to_string()]));
         assert_eq!(full.targets, Some(vec!["t1".to_string(), "t2".to_string()]));
-        assert!(full.dry_run && full.boot_archive && full.index_after && full.send_report);
+        assert!(full.dry_run && full.boot_archive && full.index_after && full.email_report);
         // No flags: incremental, nothing specified, not a dry run.
         let plain = backup_run_options(false, false, vec![], vec![]);
         assert_eq!(plain.mode, Some(BackupMode::Incremental));
         assert_eq!((plain.sources, plain.targets), (None, None));
         assert!(!plain.dry_run);
-        assert!(plain.boot_archive && plain.index_after && plain.send_report);
+        assert!(plain.boot_archive && plain.index_after && plain.email_report);
     }
 
     #[test]
