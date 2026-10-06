@@ -187,6 +187,11 @@ Checked before any directory is created, both roots compared **after resolution*
 - The run mounts **nothing** itself. `mount::ensure_sources_mounted` and `ensure_targets_mounted` mount,
   and the `MountGuard` each returns records what it mounted and gives exactly that back; `run_backup`
   only checks that each selected source's volume is a mount point and refuses if not (bd `7tx`, `8cf`).
+- **An empty selection is a refusal, never "all"** (bd `7tx`). `BackupOptions.sources`/`.targets` are
+  `Option`s: `None` = not specified (CLI with no flag: all), `Some(vec![])` = nothing ticked, refused by
+  `backup::empty_selection` before the first lock or mount. The D-Bus `as` arguments cannot say "not
+  specified", so the helper always passes `Some(list)` and refuses an empty `BackupSnapshot`/`BackupSend`
+  list itself. A target list naming no configured target is refused too, never widened to "all mounted".
 - An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
   still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline
   is the first primary target, so a reduced config renders the other targets' retention differently.

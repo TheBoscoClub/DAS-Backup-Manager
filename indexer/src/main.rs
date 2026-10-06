@@ -1275,6 +1275,14 @@ fn prune_deleted_from_index(
     Ok(ids.len())
 }
 
+/// A `--sources` / `--targets` flag as the selection the run is given: no flag
+/// is "not specified" (all); a flag that names something is exactly that. A
+/// flag that names nothing real (`--targets ''`) arrives as a list holding an
+/// empty label and is refused as an unknown one — it never reads as "all".
+fn flag_selection(list: Vec<String>) -> Option<Vec<String>> {
+    (!list.is_empty()).then_some(list)
+}
+
 /// The exit status `backup run` ends with, if not 0: 1 when the run failed —
 /// including when only the subvolume sync before it did, which `run_backup`
 /// folds into the result.
@@ -2052,8 +2060,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Some(BackupMode::Incremental)
                     },
-                    sources,
-                    targets,
+                    sources: flag_selection(sources),
+                    targets: flag_selection(targets),
                     dry_run,
                     boot_archive: true,
                     index_after: true,
@@ -2846,6 +2854,38 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `backup run --sources/--targets` and what the run is handed (bd
+    /// DAS-Backup-Manager-7tx): no flag is "all"; a flag is exactly what it
+    /// names; a flag naming nothing real is a label nobody has, never "all".
+    #[test]
+    fn backup_run_flags_become_a_selection_and_never_widen_to_all() {
+        let selection = |extra: &[&str]| {
+            let mut argv = vec!["btrdasd", "backup", "run"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Commands::Backup {
+                    action:
+                        BackupAction::Run {
+                            sources, targets, ..
+                        },
+                } => (flag_selection(sources), flag_selection(targets)),
+                _ => panic!("not backup run"),
+            }
+        };
+        assert_eq!(selection(&[]), (None, None), "no flag: not specified");
+        assert_eq!(
+            selection(&["--sources", "a,b", "--targets", "t"]),
+            (
+                Some(vec!["a".to_string(), "b".to_string()]),
+                Some(vec!["t".to_string()])
+            )
+        );
+        // An empty value is not "no flag": it is a label that matches nothing.
+        let (sources, targets) = selection(&["--sources", "", "--targets", ""]);
+        assert_eq!(sources, Some(vec![String::new()]));
+        assert_eq!(targets, Some(vec![String::new()]));
     }
 
     /// `backup record-run` takes both counts, or `--counts-unknown` — never
