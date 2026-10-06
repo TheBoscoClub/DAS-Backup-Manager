@@ -920,6 +920,12 @@ pub struct DriveEntry {
     pub label: String,
     /// The OS root that was (or would have been) read.
     pub root: PathBuf,
+    /// The UUID of the filesystem the reading was made of: what `findmnt`
+    /// said was mounted at the target's mount point, asked before the reading
+    /// and again after it, and kept only when both answers name the same
+    /// filesystem. `None` when that cannot be told, for a drive that was not
+    /// read, and for `inspect`, whose root is no target's.
+    pub mount_uuid: Option<String>,
     pub report: DriveReport,
 }
 
@@ -963,8 +969,16 @@ pub fn inspect_drive(
     DriveEntry {
         label: label.to_string(),
         root: root.to_path_buf(),
+        mount_uuid: None,
         report,
     }
+}
+
+/// The UUID of the filesystem mounted at `mount`, read as the write guard
+/// reads it ([`crate::mount::filesystem_uuid_at`]); `None` when it cannot be
+/// told.
+pub fn mounted_uuid(mount: &Path) -> Option<String> {
+    crate::mount::filesystem_uuid_at(mount.to_str()?)
 }
 
 /// The OS root of a recovery drive mounted at `mount`.
@@ -973,12 +987,15 @@ pub fn os_root(mount: &str) -> PathBuf {
 }
 
 /// Every `role = "mirror"` target, in config order: inspected when it is a
-/// mountpoint, [`DriveReport::NotMounted`] otherwise.
+/// mountpoint, [`DriveReport::NotMounted`] otherwise. `fs_uuid` names the
+/// filesystem mounted at a mount point ([`mounted_uuid`]); it is asked before
+/// and after each reading ([`DriveEntry::mount_uuid`]).
 pub fn status_with(
     cfg: &Config,
     host: &HostVersions,
     today: &str,
     is_mounted: &dyn Fn(&Path) -> bool,
+    fs_uuid: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<DriveEntry> {
     let max = cfg.recovery_os.max_age_days;
     cfg.targets
@@ -986,12 +1003,18 @@ pub fn status_with(
         .filter(|t| t.role == TargetRole::Mirror)
         .map(|t| {
             let root = os_root(&t.mount);
-            if is_mounted(Path::new(&t.mount)) {
-                inspect_drive(&t.label, &root, host, today, max)
+            let mount = Path::new(&t.mount);
+            if is_mounted(mount) {
+                let before = fs_uuid(mount);
+                let mut entry = inspect_drive(&t.label, &root, host, today, max);
+                let after = fs_uuid(mount);
+                entry.mount_uuid = before.filter(|b| after.as_ref() == Some(b));
+                entry
             } else {
                 DriveEntry {
                     label: t.label.clone(),
                     root,
+                    mount_uuid: None,
                     report: DriveReport::NotMounted,
                 }
             }
@@ -1233,6 +1256,14 @@ pub struct StoredState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredDrive {
     pub checked_epoch: i64,
+    /// The filesystem the reading was made of ([`DriveEntry::mount_uuid`]),
+    /// null when it could not be told. A record written before it was kept
+    /// loads with none. `scripts/recovery-os-vm.sh` lends a drive only when
+    /// its record names the filesystem config mounts that drive by, so a
+    /// label pointed at another drive, or a filesystem made again, never
+    /// inherits the old reading (bd DAS-Backup-Manager-df0).
+    #[serde(default)]
+    pub mount_uuid: Option<String>,
     pub os: Option<RecoveryOs>,
     pub error: Option<String>,
 }
@@ -1295,11 +1326,13 @@ pub fn write_state(path: &Path, entries: &[DriveEntry], now_epoch: i64) -> Resul
             DriveReport::NotMounted => continue,
             DriveReport::Unreadable(why) => StoredDrive {
                 checked_epoch: now_epoch,
+                mount_uuid: e.mount_uuid.clone(),
                 os: None,
                 error: Some(why.clone()),
             },
             DriveReport::Inspected { os, .. } => StoredDrive {
                 checked_epoch: now_epoch,
+                mount_uuid: e.mount_uuid.clone(),
                 os: Some(RecoveryOs::clone(os)),
                 error: None,
             },
@@ -1478,8 +1511,9 @@ pub fn status_run_with(
     today: &str,
     now_epoch: i64,
     is_mounted: &dyn Fn(&Path) -> bool,
+    fs_uuid: &dyn Fn(&Path) -> Option<String>,
 ) -> StatusRun {
-    let entries = status_with(cfg, host, today, is_mounted);
+    let entries = status_with(cfg, host, today, is_mounted, fs_uuid);
     let state_error = state_file.and_then(|p| write_state(p, &entries, now_epoch).err());
     let code = if state_error.is_some() {
         2
@@ -1494,7 +1528,8 @@ pub fn status_run_with(
 }
 
 /// One drive as JSON: `status` is `current`, `stale`, `unreadable` or
-/// `not_mounted`; `os` and `assessment` are null unless it was inspected. A
+/// `not_mounted`; `mount_uuid` is [`DriveEntry::mount_uuid`]; `os` and
+/// `assessment` are null unless it was inspected. A
 /// boot warning is in `assessment.warnings` and leaves `status` as it is.
 pub fn entry_json(entry: &DriveEntry) -> serde_json::Value {
     let (status, os, assessment, error) = match &entry.report {
@@ -1510,6 +1545,7 @@ pub fn entry_json(entry: &DriveEntry) -> serde_json::Value {
     serde_json::json!({
         "label": entry.label,
         "root": entry.root.display().to_string(),
+        "mount_uuid": entry.mount_uuid,
         "status": status,
         "error": error,
         "os": os,
@@ -3124,6 +3160,11 @@ mod tests {
 
     // ---- drives and status ----------------------------------------------
 
+    /// A filesystem probe that never knows.
+    fn no_uuid(_: &Path) -> Option<String> {
+        None
+    }
+
     fn mirror_config(mounts: &[(&str, &str)]) -> Config {
         let mut text = String::from(
             "[general]\nversion = \"0\"\ninstall_prefix = \"/usr\"\ndb_path = \"/x\"\n\
@@ -3186,7 +3227,7 @@ mod tests {
         ]);
         let mounted = [a.path().to_path_buf(), c.path().to_path_buf()];
         let is_mounted = |p: &Path| mounted.iter().any(|m| m == p);
-        let entries = status_with(&cfg, &host("7.2.8"), TODAY, &is_mounted);
+        let entries = status_with(&cfg, &host("7.2.8"), TODAY, &is_mounted, &no_uuid);
         let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, ["A", "B", "C"], "the primary is not a recovery OS");
         match &entries[0].report {
@@ -3210,6 +3251,7 @@ mod tests {
         let entry = |report| DriveEntry {
             label: "x".into(),
             root: PathBuf::new(),
+            mount_uuid: None,
             report,
         };
         let current = entry(DriveReport::Inspected {
@@ -3405,11 +3447,13 @@ mod tests {
         let off = DriveEntry {
             label: "B".into(),
             root: PathBuf::from("/mnt/b/@"),
+            mount_uuid: None,
             report: DriveReport::NotMounted,
         };
         let bad = DriveEntry {
             label: "C".into(),
             root: PathBuf::from("/mnt/c/@"),
+            mount_uuid: None,
             report: DriveReport::Unreadable("not a directory".into()),
         };
         let text = format_section(&[current, off, bad], &h);
@@ -3600,6 +3644,7 @@ mod tests {
         let b_bad = DriveEntry {
             label: "B".into(),
             root: PathBuf::from("/mnt/b/@"),
+            mount_uuid: None,
             report: DriveReport::Unreadable("not a directory".into()),
         };
         write_state(&path, &[a.clone(), b_bad], 1000).unwrap();
@@ -3615,6 +3660,7 @@ mod tests {
             st.drives["A"],
             StoredDrive {
                 checked_epoch: 1000,
+                mount_uuid: None,
                 os: Some(RecoveryOs::clone(os)),
                 error: None
             }
@@ -3623,6 +3669,7 @@ mod tests {
             st.drives["B"],
             StoredDrive {
                 checked_epoch: 1000,
+                mount_uuid: None,
                 os: None,
                 error: Some("not a directory".into())
             }
@@ -3633,6 +3680,7 @@ mod tests {
         let a_off = DriveEntry {
             label: "A".into(),
             root: PathBuf::new(),
+            mount_uuid: None,
             report: DriveReport::NotMounted,
         };
         write_state(&path, &[a_off, b], 2000).unwrap();
@@ -3683,6 +3731,7 @@ mod tests {
         let e = DriveEntry {
             label: "A".into(),
             root: PathBuf::new(),
+            mount_uuid: None,
             report: DriveReport::NotMounted,
         };
         let err = write_state(&path, &[e], 5).unwrap_err();
@@ -3718,6 +3767,7 @@ mod tests {
             "B".into(),
             StoredDrive {
                 checked_epoch: checked,
+                mount_uuid: None,
                 os: Some(fresh),
                 error: None,
             },
@@ -3726,6 +3776,7 @@ mod tests {
             "C".into(),
             StoredDrive {
                 checked_epoch: checked,
+                mount_uuid: None,
                 os: None,
                 error: Some("not a directory".into()),
             },
@@ -3772,6 +3823,7 @@ mod tests {
             "B".into(),
             StoredDrive {
                 checked_epoch: 0,
+                mount_uuid: None,
                 os: Some(os_with(Some("2026-08-01"), &["7.2.1"])),
                 error: None,
             },
@@ -3819,6 +3871,7 @@ mod tests {
             "B".into(),
             StoredDrive {
                 checked_epoch: 0,
+                mount_uuid: None,
                 os: Some(os.clone()),
                 error: None,
             },
@@ -3886,6 +3939,7 @@ mod tests {
                 label.to_string(),
                 StoredDrive {
                     checked_epoch: 0,
+                    mount_uuid: None,
                     os: Some(os),
                     error: None,
                 },
@@ -3954,6 +4008,7 @@ mod tests {
                 l.to_string(),
                 StoredDrive {
                     checked_epoch: 0,
+                    mount_uuid: None,
                     os: Some(os_with(Some(TODAY), &["7.2.1"])),
                     error: None,
                 },
@@ -3977,6 +4032,7 @@ mod tests {
             "B".into(),
             StoredDrive {
                 checked_epoch: 0,
+                mount_uuid: None,
                 os: Some(os_with(Some("2026-08-01"), &["7.2.1"])),
                 error: None,
             },
@@ -3999,7 +4055,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("recovery-os.json");
         let is_mounted = |p: &Path| p == a.path();
-        let run = status_run_with(&cfg, Some(&state), &host("7.2.8"), TODAY, 77, &is_mounted);
+        let run = status_run_with(
+            &cfg,
+            Some(&state),
+            &host("7.2.8"),
+            TODAY,
+            77,
+            &is_mounted,
+            &no_uuid,
+        );
         assert_eq!(run.code, 1, "A is stale");
         assert_eq!(run.state_error, None);
         assert_eq!(run.entries.len(), 2);
@@ -4009,7 +4073,7 @@ mod tests {
 
         // Without --state-file nothing is written.
         let other = dir.path().join("none.json");
-        let run = status_run_with(&cfg, None, &host("7.2.8"), TODAY, 78, &is_mounted);
+        let run = status_run_with(&cfg, None, &host("7.2.8"), TODAY, 78, &is_mounted, &no_uuid);
         assert_eq!(run.code, 1);
         assert!(!other.exists());
         assert_eq!(
@@ -4019,7 +4083,15 @@ mod tests {
 
         // A state file that cannot be written is exit 2, and says why.
         let bad = dir.path().join("missing-dir/recovery-os.json");
-        let run = status_run_with(&cfg, Some(&bad), &host("7.2.8"), TODAY, 79, &|_| false);
+        let run = status_run_with(
+            &cfg,
+            Some(&bad),
+            &host("7.2.8"),
+            TODAY,
+            79,
+            &|_| false,
+            &no_uuid,
+        );
         assert_eq!(run.code, 2);
         assert!(run.state_error.unwrap().contains("missing-dir"));
     }
@@ -4027,11 +4099,181 @@ mod tests {
     #[test]
     fn status_run_with_everything_unmounted_is_zero() {
         let cfg = mirror_config(&[("A", "/nonexistent/a")]);
-        let run = status_run_with(&cfg, None, &host("7.2.8"), TODAY, 1, &|_| false);
+        let run = status_run_with(&cfg, None, &host("7.2.8"), TODAY, 1, &|_| false, &no_uuid);
         assert_eq!(
             (run.code, run.entries[0].report.clone()),
             (0, DriveReport::NotMounted)
         );
+    }
+
+    // ---- the filesystem a reading was made of (bd DAS-Backup-Manager-df0) --
+
+    /// Each mounted drive's record names the filesystem that was mounted
+    /// there when it was read, also when its OS root could not be read; a
+    /// drive that was not mounted is never asked about.
+    #[test]
+    fn status_records_the_filesystem_each_reading_was_made_of() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        full_root(&a.path().join("@"));
+        let cfg = mirror_config(&[
+            ("A", a.path().to_str().unwrap()),
+            ("B", b.path().to_str().unwrap()),
+            ("C", "/nonexistent/c"),
+        ]);
+        let is_mounted = |p: &Path| p == a.path() || p == b.path();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fs_uuid = |p: &Path| {
+            asked.borrow_mut().push(p.to_path_buf());
+            if p == a.path() {
+                Some("uuid-a".to_string())
+            } else {
+                Some("uuid-b".to_string())
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("recovery-os.json");
+        let run = status_run_with(
+            &cfg,
+            Some(&state),
+            &host("7.2.8"),
+            TODAY,
+            5,
+            &is_mounted,
+            &fs_uuid,
+        );
+        assert_eq!(run.state_error, None);
+        let uuids: Vec<Option<&str>> = run
+            .entries
+            .iter()
+            .map(|e| e.mount_uuid.as_deref())
+            .collect();
+        assert_eq!(uuids, [Some("uuid-a"), Some("uuid-b"), None]);
+        assert!(
+            matches!(run.entries[1].report, DriveReport::Unreadable(_)),
+            "no @"
+        );
+        // `status --json` says so too.
+        assert_eq!(entry_json(&run.entries[0])["mount_uuid"], "uuid-a");
+        assert!(entry_json(&run.entries[2])["mount_uuid"].is_null());
+        assert_eq!(
+            *asked.borrow(),
+            [a.path(), a.path(), b.path(), b.path()],
+            "before and after each mounted reading, and never the unmounted one"
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(written["drives"]["A"]["mount_uuid"], "uuid-a");
+        assert_eq!(written["drives"]["B"]["mount_uuid"], "uuid-b");
+        assert_eq!(written["drives"]["B"]["os"], serde_json::Value::Null);
+        assert!(written["drives"].get("C").is_none());
+    }
+
+    /// A filesystem that cannot be named, or that is not the same one after
+    /// the reading as before it, is not named at all: written as null, which
+    /// the VM driver refuses.
+    #[test]
+    fn a_filesystem_that_cannot_be_told_or_changes_meanwhile_is_not_named() {
+        let a = tempfile::tempdir().unwrap();
+        full_root(&a.path().join("@"));
+        let cfg = mirror_config(&[("A", a.path().to_str().unwrap())]);
+        for (answers, want) in [
+            (vec![Some("u1"), Some("u1")], Some("u1")),
+            (vec![Some("u1"), Some("u2")], None),
+            (vec![Some("u1"), None], None),
+            (vec![None, Some("u1")], None),
+            (vec![None, None], None),
+        ] {
+            let left = std::cell::RefCell::new(answers.clone().into_iter());
+            let fs_uuid = |_: &Path| left.borrow_mut().next().flatten().map(str::to_string);
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("recovery-os.json");
+            let run = status_run_with(
+                &cfg,
+                Some(&state),
+                &host("7.2.8"),
+                TODAY,
+                5,
+                &|p: &Path| p == a.path(),
+                &fs_uuid,
+            );
+            assert_eq!(run.entries[0].mount_uuid.as_deref(), want, "{answers:?}");
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            let field = written["drives"]["A"].get("mount_uuid");
+            assert!(field.is_some(), "the key is always written: {written}");
+            assert_eq!(field.unwrap().as_str(), want, "{answers:?}");
+        }
+    }
+
+    /// A record written before the filesystem was kept loads with none, and
+    /// is written back with none -- never with another drive's -- while an
+    /// unmounted drive keeps the filesystem of its last reading.
+    #[test]
+    fn a_record_without_a_filesystem_stays_without_one_and_an_unmounted_drive_keeps_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-os.json");
+        let os = r#"{"os_name":"Arch Linux","last_full_upgrade_applied":null,"last_full_upgrade_attempted":null,"last_attempt_completed":false,"log_read":true,"modules_read":true,"kernels":[],"packages":{},"packages_read":true,"problems":[]}"#;
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema_version":3,"drives":{{"A":{{"checked_epoch":1,"os":{os},"error":null}},"B":{{"checked_epoch":2,"mount_uuid":"u-b","os":{os},"error":null}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = load_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.drives["A"].mount_uuid, None, "older writer: none");
+        assert_eq!(loaded.drives["B"].mount_uuid.as_deref(), Some("u-b"));
+        let cfg = mirror_config(&[("A", "/nonexistent/a"), ("B", "/nonexistent/b")]);
+        let run = status_run_with(
+            &cfg,
+            Some(&path),
+            &host("7.2.8"),
+            TODAY,
+            9,
+            &|_| false,
+            &|_| Some("u-elsewhere".to_string()),
+        );
+        assert_eq!(run.state_error, None);
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(written["drives"]["A"]["mount_uuid"].is_null(), "{written}");
+        assert!(
+            written["drives"]["A"].get("mount_uuid").is_some(),
+            "{written}"
+        );
+        assert_eq!(written["drives"]["B"]["mount_uuid"], "u-b");
+        assert_eq!(written["drives"]["B"]["checked_epoch"], 2);
+    }
+
+    /// The probe `status` runs with reaches the real `findmnt`: compared
+    /// with an independent invocation, since which filesystems exist is the
+    /// test machine's business; procfs has no UUID.
+    #[test]
+    fn mounted_uuid_names_what_findmnt_names() {
+        let listing = std::process::Command::new("findmnt")
+            .args(["-n", "-l", "-o", "UUID,TARGET"])
+            .output()
+            .expect("findmnt (util-linux) is required to run this test");
+        let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+        let target = listing.lines().find_map(|line| {
+            let mut cols = line.split_whitespace();
+            match (cols.next(), cols.next(), cols.next()) {
+                (Some(_), Some(t), None) if t.starts_with('/') => Some(t.to_string()),
+                _ => None,
+            }
+        });
+        // A container's mounts have no UUID; the mutation job runs on a real
+        // machine (see mount.rs's filesystem_uuid_at test).
+        match target {
+            Some(t) => {
+                let got = mounted_uuid(Path::new(&t));
+                assert!(got.as_deref().is_some_and(|u| !u.is_empty()), "{t}");
+                assert_eq!(got, crate::mount::filesystem_uuid_at(&t), "{t}");
+            }
+            None => eprintln!("SKIP mounted_uuid positive case: no filesystem with a UUID here"),
+        }
+        assert_eq!(mounted_uuid(Path::new("/proc")), None);
     }
 
     #[test]
@@ -4058,6 +4300,7 @@ mod tests {
         let bad = DriveEntry {
             label: "B".into(),
             root: PathBuf::from("/x/@"),
+            mount_uuid: None,
             report: DriveReport::Unreadable("gone".into()),
         };
         let j = entry_json(&bad);
@@ -4069,6 +4312,7 @@ mod tests {
         let off = DriveEntry {
             label: "C".into(),
             root: PathBuf::from("/y/@"),
+            mount_uuid: None,
             report: DriveReport::NotMounted,
         };
         assert_eq!(entry_json(&off)["status"], "not_mounted");
@@ -4185,6 +4429,7 @@ mod tests {
         let off = DriveEntry {
             label: "B".into(),
             root: PathBuf::new(),
+            mount_uuid: None,
             report: DriveReport::NotMounted,
         };
         write_state(&path, &[a, off], 5).unwrap();
@@ -4221,6 +4466,7 @@ mod tests {
             let off = DriveEntry {
                 label: "A".into(),
                 root: PathBuf::new(),
+                mount_uuid: None,
                 report: DriveReport::NotMounted,
             };
             assert_eq!(write_state(&path, &[off], 5).unwrap_err(), err);

@@ -1432,6 +1432,7 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
                 &today,
                 now,
                 &health::is_mountpoint,
+                &ros::mounted_uuid,
             );
             if json {
                 let all: Vec<_> = run.entries.iter().map(ros::entry_json).collect();

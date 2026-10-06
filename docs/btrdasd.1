@@ -2117,6 +2117,9 @@ Default:
 Print one JSON object:
 .BR label ,
 .BR root ,
+.B mount_uuid
+(null here: the root is no target's; see
+.BR "recovery\-os status" ),
 .B status
 .RB ( current ,
 .BR stale ,
@@ -2228,7 +2231,19 @@ Record what was read from each drive in
 .I PATH
 (JSON, replaced atomically, mode 644) for
 .BR "btrdasd health" .
-A drive that is not mounted keeps its earlier record. The record is schema
+A drive that is not mounted keeps its earlier record. Each record names the
+filesystem it was read from,
+.BR mount_uuid :
+the UUID
+.B findmnt
+gives for the target's mount point, asked before the reading and again after
+it, kept only when both answers agree, and null otherwise \(em also in a
+record written before it was kept, which loads, and is written back, with
+null.
+.B recovery\-os\-vm.sh
+refuses a record whose
+.B mount_uuid
+is not the target's configured one. The record is schema
 version 3. A version\-2 record, from before the units and btrbk were read,
 is read with those readings unknown \(em
 .B btrbk at boot
@@ -2254,7 +2269,10 @@ Print a JSON array of the per\-drive objects described under
 with
 .B status
 also
-.BR not_mounted .
+.BR not_mounted ,
+and
+.B mount_uuid
+the filesystem each mounted drive was read from.
 .PP
 Exit status:
 .B 0
@@ -2918,8 +2936,10 @@ read by
 .B "btrdasd health"
 and by
 .BR recovery\-os\-vm.sh ,
-which starts a session only when the drive's entry says btrbk will not run
-when its OS boots.
+which starts a session only when the drive's entry names the filesystem
+config mounts that target by
+.RB ( mount_uuid )
+and does not say btrbk will run when its OS boots.
 .TP
 .I /var/lib/das\-backup/recovery\-os\-vm\-sessions
 When

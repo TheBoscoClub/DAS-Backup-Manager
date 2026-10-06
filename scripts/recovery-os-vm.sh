@@ -56,8 +56,13 @@
 #          OS boots and again when the disk is back).
 #          --accept-boot-record-risk lets a "will", an age or a session
 #          through, loudly and into the summary -- never a record that is
-#          missing, of another schema, or says nothing about this drive. The
-#          rule that makes the verdict is btrdasd's; this only reads it (jq).
+#          missing, of another schema, or says nothing about this drive,
+#          and never one that is not of this drive's filesystem: its
+#          mount_uuid (bd df0) must be the one config mounts the target by,
+#          which partition 2 must carry too, so a label pointed at another
+#          drive, or a filesystem made again, never inherits the old verdict.
+#          The rule that makes the verdict is btrdasd's; this only reads it
+#          (jq).
 #          Advisory on its own: no static reading of shell and systemd is
 #          complete, and a stock install reads "may" for ever.
 #       2. The session guard, the enforcement. For this session only, the
@@ -266,6 +271,8 @@ readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
        "entry\tpresent",
        "checked\t\($d.checked_epoch | clean)",
        "checkedtype\t\($d.checked_epoch | type)",
+       "fs\t\(($d.mount_uuid // "") | clean)",
+       "fstype\t\($d.mount_uuid | type)",
        (if $d.error != null then "error\t\(($d.error | clean) as $e | if $e == "" then "an error without text" else $e end)"
         elif $d.os == null then "error\tno OS was inspected"
         else empty end),
@@ -470,7 +477,8 @@ whole disk passed through, to update it without rebooting the workstation.
                          lend one role = "mirror" drive to the VM, boot it
                          with the session guard (btrbk cannot run in it),
                          wait until it powers off, give the disk back --
-                         only when the nightly run's record does not say its
+                         only when the nightly run's record is of the
+                         drive's filesystem (mount_uuid), does not say its
                          OS will run btrbk at boot, is fresh, and is newer
                          than the drive's last session (the flag lets a
                          "will", an age or a session through, loudly)
@@ -840,7 +848,8 @@ resolve_disk() {
 
 # Partition 2 must carry the filesystem config mounts this target by: a
 # serial can be copied into the wrong entry by hand, a filesystem UUID read
-# off the disk cannot.
+# off the disk cannot. The boot record was held to the same mount_uuid
+# (check_boot_record), so it is then a record of this disk.
 check_filesystem_identity() {
     local want=${T_UUIDS[$LABEL]} part part_dev got
     if [[ -z "$want" ]]; then
@@ -1080,6 +1089,7 @@ resolve_os_state() {
 check_boot_record() {
     local file out rc=0 key value schemas=0 schema="" schematype="" entry="" checked="" checkedtype="" error=""
     local verdict="" units_state="" when now age p problems=() hints=() reasons=() units=() runners=() hint=""
+    local fs="" fstype="" want
     resolve_os_state
     file=$OS_STATE_FILE
     if [[ ! -e "$file" ]]; then
@@ -1100,6 +1110,8 @@ check_boot_record() {
             entry) entry=$value ;;
             checked) checked=$value ;;
             checkedtype) checkedtype=$value ;;
+            fs) fs=$value ;;
+            fstype) fstype=$value ;;
             error) error=$value ;;
             verdict) verdict=$value ;;
             reason) reasons+=("$value") ;;
@@ -1140,8 +1152,25 @@ check_boot_record() {
     if [[ "$verdict" != no && "$verdict" != will && "$verdict" != may ]]; then
         refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) has no btrbk-at-boot verdict ('$verdict')"
     fi
+    # The record must be of the filesystem config mounts this drive by (bd
+    # DAS-Backup-Manager-df0): a label pointed at another drive, or a
+    # filesystem made again, must never inherit the old one's verdict. Never
+    # overridable. Partition 2 is held to config's mount_uuid when the disk
+    # is resolved (check_filesystem_identity), so a record that passes here is
+    # of the disk that is lent -- the test hatch's loop file excepted.
+    want=${T_UUIDS[$LABEL]}
+    if [[ -z "$want" ]]; then
+        refuse "'$LABEL' has no mount_uuid in $DAS_CONFIG, so neither its drive nor its boot record can be tied to a filesystem -- add it (sudo btrdasd setup --check prints the line to add)"
+    fi
+    if [[ "$fstype" != string || -z "$fs" || "$fs" == unknown ]]; then
+        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) does not name the filesystem it was read from (a btrdasd older than this script wrote it, or the filesystem could not be told) -- a record not tied to the drive's filesystem is never trusted, whatever the options: let the next backup run, with this drive attached, record it again"
+    fi
+    if [[ "$fs" != "$want" ]]; then
+        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) was read from filesystem $(printable "$fs"), not $want, the mount_uuid of '$LABEL' in $DAS_CONFIG -- the label names another drive now, or its filesystem was made again since; never overridable: let the next backup run, with this drive attached, record it again"
+    fi
     log "boot record for $LABEL ($file, schema $schema):"
     log "  checked        $when, $(age_text "$age")"
+    log "  filesystem     $fs (the mount_uuid of $LABEL)"
     if [[ "$units_state" == listed ]]; then
         log "  enabled units  $(IFS=,; p="${units[*]}"; printf '%s' "${p//,/, }") (${#units[@]})"
     else

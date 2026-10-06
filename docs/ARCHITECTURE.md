@@ -626,7 +626,8 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `mount` | `src/mount.rs` | ~3640 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` |
 | `progress` | `src/progress.rs` | ~610 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~400 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
-| `recovery_os` | `src/recovery_os.rs` | ~2870 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` reads (`btrdasd recovery-os`) |
+| `recovery_os` | `src/recovery_os.rs` | ~4570 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from (`btrdasd recovery-os`) |
+| `recovery_os::boot` | `src/recovery_os/boot.rs` | ~10900 | Whether booting a recovery OS would run btrbk, and when: the units its boot starts, what they run (shell scripts included), its cron, and the btrbk config each would use, down to one verdict (`will`, `may`, `no`) |
 | `recovery_os::hold_disk` | `src/recovery_os/hold_disk.rs` | ~760 | `btrdasd recovery-os hold-disk`: the `O_EXCL` claim on a whole recovery disk that keeps the host from mounting it while `scripts/recovery-os-vm.sh` has lent it to the `recovery-os-updater` VM; held until SIGTERM/SIGINT/SIGHUP |
 | `report` | `src/report.rs` | ~770 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |

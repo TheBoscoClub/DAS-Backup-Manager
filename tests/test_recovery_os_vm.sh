@@ -161,18 +161,42 @@ fixture() {
     write_stubs
 }
 
+# The mount_uuid config gives a label now (the dump-env file): the filesystem
+# a record made of that drive names. Empty for a label config does not have.
+label_uuid() {
+    local i
+    for ((i = 0; i < 3; i++)); do
+        if grep -qxF "DAS_TARGET_${i}_LABEL='$1'" "$S/dump-env"; then
+            sed -n "s/^DAS_TARGET_${i}_MOUNT_UUID='\(.*\)'\$/\1/p" "$S/dump-env"
+            return
+        fi
+    done
+}
+
+# The "mount_uuid": field of a record (bd DAS-Backup-Manager-df0): $1 the
+# label, $2 empty for the filesystem config names for it, ABSENT for no field
+# at all (a record from before btrdasd kept one), else the raw JSON value.
+uuid_field() {
+    case "$2" in
+        "") printf '"mount_uuid":"%s",' "$(label_uuid "$1")" ;;
+        ABSENT) ;;
+        *) printf '"mount_uuid":%s,' "$2" ;;
+    esac
+}
+
 # One drive's entry in the boot record btrdasd keeps (`recovery-os status
-# --state-file`, schema 3), in the shape bd DAS-Backup-Manager-1yg defines:
-# $1 label, $2 verdict (no, will, may -- or anything, to test), $3 seconds
-# since it was checked (an hour if not given).
+# --state-file`, schema 3), in the shape bd DAS-Backup-Manager-1yg defines,
+# with the filesystem it was read from (df0): $1 label, $2 verdict (no, will,
+# may -- or anything, to test), $3 seconds since it was checked (an hour if
+# not given), $4 its mount_uuid as uuid_field takes it.
 record_json() {
     local reasons='[]'
     case "$2" in
         will) reasons='["btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot, with /etc/btrbk/btrbk.conf present"]' ;;
         may) reasons='["not read"]' ;;
     esac
-    printf '"%s":{"checked_epoch":%s,"os":{"btrbk_at_boot":{"verdict":"%s","reasons":%s,"runners":[]},"enabled_units":{"state":"listed","units":[{"name":"fstrim.timer","dirs":["etc/systemd/system/timers.target.wants"]},{"name":"sshd.service","dirs":["etc/systemd/system/multi-user.target.wants"]}]},"btrbk_config":{"state":"absent"}},"error":null}' \
-        "$1" "$(($(date +%s) - ${3:-3600}))" "$2" "$reasons"
+    printf '"%s":{"checked_epoch":%s,%s"os":{"btrbk_at_boot":{"verdict":"%s","reasons":%s,"runners":[]},"enabled_units":{"state":"listed","units":[{"name":"fstrim.timer","dirs":["etc/systemd/system/timers.target.wants"]},{"name":"sshd.service","dirs":["etc/systemd/system/multi-user.target.wants"]}]},"btrbk_config":{"state":"absent"}},"error":null}' \
+        "$1" "$(($(date +%s) - ${3:-3600}))" "$(uuid_field "$1" "${4:-}")" "$2" "$reasons"
 }
 
 # The test hatch reads its own boot record (DAS_RECOVERY_OS_STATE) and keeps
@@ -195,8 +219,8 @@ record_with_runners() {
     local label=$1 verdict=$2 reasons=$3 runners=$4 units='{"name":"fstrim.timer","dirs":["etc/systemd/system/timers.target.wants"]}' u
     shift 4
     for u in "$@"; do units+=",{\"name\":\"$u\",\"dirs\":[\"etc/systemd/system/multi-user.target.wants\"]}"; done
-    printf '"%s":{"checked_epoch":%s,"os":{"btrbk_at_boot":{"verdict":"%s","reasons":%s,"runners":%s},"enabled_units":{"state":"listed","units":[%s]},"btrbk_config":{"state":"absent"}},"error":null}' \
-        "$label" "$(($(date +%s) - 3600))" "$verdict" "$reasons" "$runners" "$units"
+    printf '"%s":{"checked_epoch":%s,%s"os":{"btrbk_at_boot":{"verdict":"%s","reasons":%s,"runners":%s},"enabled_units":{"state":"listed","units":[%s]},"btrbk_config":{"state":"absent"}},"error":null}' \
+        "$label" "$(($(date +%s) - 3600))" "$(uuid_field "$label" "")" "$verdict" "$reasons" "$runners" "$units"
 }
 
 # One credential of a domain definition, decoded: $1 the file, $2 its name
@@ -1895,6 +1919,206 @@ for t in '"015260430204"' '"089"' '"1791099438"' 0; do
     has "a check time of $t: said, not misread" "$OUT" "REFUSED: the boot record for 'system-recovery-A-2tb' has no check time"
 done
 
+echo "--- the boot record: the filesystem it was read from (bd DAS-Backup-Manager-df0)"
+# A record describes the filesystem it was read from, not a label: a label
+# pointed at another drive, or a filesystem made again, must never inherit the
+# old drive's verdict. Never overridable.
+fixture
+run_driver session A --dry-run
+check "df0, the record names config's filesystem: goes on" "$RC" "0"
+has "df0, the record names config's filesystem: shown" "$OUT" "  filesystem     $UUID_A (the mount_uuid of system-recovery-A-2tb)"
+for f in ABSENT null '"unknown"' '""' 7; do
+    for o in "" --accept-boot-record-risk; do
+        fixture
+        write_state 3 "$(record_json system-recovery-A-2tb no 3600 "$f")"
+        run_driver session A --dry-run $o
+        check "df0, a record naming no filesystem ($f)${o:+, $o}: refused" "$RC" "1"
+        has "df0, no filesystem ($f)${o:+, $o}: says so" "$OUT" "does not name the filesystem it was read from"
+        check "df0, no filesystem ($f)${o:+, $o}: nothing locked" "$(file "$S/flock.calls")" ""
+        check "df0, no filesystem ($f)${o:+, $o}: nothing held" "$(file "$S/holder.calls")" ""
+    done
+done
+for o in "" --accept-boot-record-risk; do
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb no 3600 '"ffffffff-0000-4000-8000-000000000000"')"
+    run_driver session A --dry-run $o
+    check "df0, a record of another filesystem${o:+, $o}: refused" "$RC" "1"
+    has "df0, another filesystem${o:+, $o}: says which, and which config names" "$OUT" "was read from filesystem ffffffff-0000-4000-8000-000000000000, not $UUID_A, the mount_uuid of 'system-recovery-A-2tb'"
+    check "df0, another filesystem${o:+, $o}: nothing locked" "$(file "$S/flock.calls")" ""
+    check "df0, another filesystem${o:+, $o}: nothing held" "$(file "$S/holder.calls")" ""
+done
+# The filesystem was made again: config and partition 2 both name the new
+# one, and the identity check passes -- only the record is of the old one.
+fixture
+dump_env ZK208Q77 ZFL41DNY system-recovery-B-2tb "ffffffff-0000-4000-8000-000000000000"
+printf '%s\n' "ffffffff-0000-4000-8000-000000000000" >"$S/lsblk.uuid.sdj2"
+run_driver session A --dry-run --accept-boot-record-risk
+check "df0, a filesystem made again since the record: refused" "$RC" "1"
+has "df0, made again: says so" "$OUT" "was read from filesystem $UUID_A, not ffffffff-0000-4000-8000-000000000000"
+check "df0, made again: nothing held" "$(file "$S/holder.calls")" ""
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
+run_driver session A --dry-run
+check "df0, made again, then recorded again: goes on" "$RC" "0"
+# The label pointed at another drive: config now gives A's label B's drive
+# (serial and filesystem); A's record is still of A's old drive.
+fixture
+dump_env ZFL41DNY ZFL41DNY system-recovery-B-2tb "$UUID_B"
+run_driver session A --dry-run --accept-boot-record-risk
+check "df0, the label pointed at another drive: refused" "$RC" "1"
+has "df0, another drive: says so" "$OUT" "was read from filesystem $UUID_A, not $UUID_B"
+check "df0, another drive: never held" "$(file "$S/holder.calls")" ""
+# Partition 2 is checked against config, and config against the record: a
+# record and config that agree, and a disk that does not, is refused too.
+fixture
+printf '%s\n' "ffffffff-0000-4000-8000-000000000000" >"$S/lsblk.uuid.sdj2"
+run_driver session A --dry-run --accept-boot-record-risk
+check "df0, the record and config agree, partition 2 does not: refused" "$RC" "1"
+has "df0, partition 2 differs: says which" "$OUT" "carries filesystem ffffffff-0000-4000-8000-000000000000, not $UUID_A"
+check "df0, partition 2 differs: never held" "$(file "$S/holder.calls")" ""
+# No mount_uuid in config: neither the drive nor its record can be tied to a
+# filesystem.
+fixture
+dump_env ZK208Q77 ZFL41DNY system-recovery-B-2tb ""
+run_driver session A --dry-run --accept-boot-record-risk
+check "df0, no mount_uuid in config: refused" "$RC" "1"
+has "df0, no mount_uuid in config: says so" "$OUT" "has no mount_uuid in"
+check "df0, no mount_uuid in config: nothing locked" "$(file "$S/flock.calls")" ""
+
+echo "--- the contract: the boot record as the real btrdasd writes it (bd 1yg, df0)"
+# Every test above reads a record this suite wrote to the contract. These read
+# one the real btrdasd wrote. `recovery-os status --state-file` reads only a
+# mounted target, and nothing here may mount, so the record is made in two
+# steps, each by the binary: `recovery-os inspect --json` reads a fixture root
+# as the drive's OS -- its `os` object is the very value the record stores per
+# drive -- and that reading is seeded as the drive's last record, with a key
+# btrdasd does not know; then `recovery-os status --state-file`, the drive not
+# mounted, rewrites the whole file through btrdasd's own record types, keeping
+# the drive's record as it was. The file the driver reads is the binary's: the
+# unknown key gone proves the rewrite, and a mount_uuid the types did not keep
+# would come back null, which the driver refuses. What only a mounted drive
+# shows -- status writing the mount_uuid it read -- is the Rust tests' (and the
+# first real run's): recovery_os.rs, status_records_the_filesystem_each_...
+if [[ -z "${REAL_BTRDASD:-}" ]]; then
+    echo "NOT RUN: the contract with the real btrdasd -- set REAL_BTRDASD to a built btrdasd (ctest does)"
+else
+    # A config the real btrdasd accepts, with the mirror target and the
+    # mount_uuid this suite's dump-env gives system-recovery-A-2tb; its mount
+    # point does not exist, so status finds the drive not mounted.
+    contract_config() {
+        cat >"$CW/config.toml" <<EOF
+[general]
+version = "0.7.22"
+install_prefix = "/usr"
+db_path = "$CW/index.db"
+[init]
+system = "systemd"
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+[[source]]
+label = "s"
+volume = "/vol"
+device = "UUID=abc"
+[[source.subvolumes]]
+name = "@"
+[[target]]
+label = "primary-22tb"
+serial = "ZXA1R71M"
+mount = "$CW/not-mounted/primary"
+role = "primary"
+[target.retention]
+daily = 7
+[[target]]
+label = "system-recovery-A-2tb"
+serial = "ZK208Q77"
+mount = "$CW/not-mounted/a"
+mount_uuid = "$UUID_A"
+role = "mirror"
+[target.retention]
+daily = 7
+[email]
+enabled = false
+[gui]
+enabled = false
+EOF
+    }
+    # An OS root whose btrbk.timer is enabled: $1 the root, $2 "config" to
+    # give it btrbk's config (then btrbk will run at boot; without, it stops
+    # at once, and the verdict is no).
+    contract_root() {
+        mkdir -p "$1/etc/systemd/system/timers.target.wants" "$1/usr/lib/systemd/system" "$1/usr/lib/modules/7.2.8-1-cachyos"
+        printf 'PRETTY_NAME="Fixture"\n' >"$1/etc/os-release"
+        printf '[Service]\nType=oneshot\nExecStart=/usr/bin/btrbk run\n' >"$1/usr/lib/systemd/system/btrbk.service"
+        printf '[Timer]\nOnCalendar=daily\nPersistent=true\n' >"$1/usr/lib/systemd/system/btrbk.timer"
+        ln -s /nonexistent/x/btrbk.timer "$1/etc/systemd/system/timers.target.wants/btrbk.timer"
+        if [[ "${2:-}" == config ]]; then
+            mkdir -p "$1/etc/btrbk"
+            echo "volume /x" >"$1/etc/btrbk/btrbk.conf"
+        fi
+    }
+    # The record, as above: $1 the root, $2 the seeded mount_uuid as
+    # uuid_field takes it (ABSENT: as a writer before df0 left it). Sets
+    # C_STATUS_RC; the record is $STATE_FILE.
+    contract_record() {
+        local entry os
+        # Its exit status is the reading's verdict (1: stale, which a fixture
+        # root without a pacman log is), not whether it printed the entry.
+        entry="$("$REAL_BTRDASD" --json recovery-os inspect --root "$1" --label system-recovery-A-2tb \
+            --config "$CW/config.toml" 2>&1)" || :
+        os="$(jq -c '.os' <<<"$entry" 2>&1)" || os=""
+        printf '{"schema_version":3,"drives":{"system-recovery-A-2tb":{"checked_epoch":%s,%s"os":%s,"error":null,"seeded":true}}}\n' \
+            "$(($(date +%s) - 3600))" "$(uuid_field system-recovery-A-2tb "$2")" "${os:-null}" >"$STATE_FILE"
+        C_STATUS_RC=0
+        "$REAL_BTRDASD" recovery-os status --config "$CW/config.toml" --state-file "$STATE_FILE" >/dev/null 2>&1 || C_STATUS_RC=$?
+    }
+    contract_get() { # contract_get <jq filter on the label's record>
+        jq -c --arg l system-recovery-A-2tb ".drives[\$l] | $1" "$STATE_FILE" 2>&1 || :
+    }
+
+    fixture
+    CW="$T/contract"
+    mkdir -p "$CW"
+    contract_config
+    contract_root "$CW/no"
+    contract_root "$CW/will" config
+
+    contract_record "$CW/no" ""
+    check "contract, no: the real status rewrote the record (exit 0)" "$C_STATUS_RC" "0"
+    check "contract, no: through btrdasd's own types (the seeded key gone)" "$(contract_get 'has("seeded")')" "false"
+    check "contract, no: the verdict the binary read" "$(contract_get '.os.btrbk_at_boot.verdict')" '"no"'
+    check "contract, no: the filesystem kept" "$(contract_get '.mount_uuid')" "\"$UUID_A\""
+    check "contract, no: schema 3" "$(jq -c '.schema_version' "$STATE_FILE")" "3"
+    run_driver session A --dry-run
+    check "contract, no: the driver goes on" "$RC" "0"
+    has "contract, no: the driver read the binary's verdict" "$OUT" "btrbk at boot  no"
+    has "contract, no: and its reason" "$OUT" "    - btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot, but /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent, so it stops at once"
+    has "contract, no: and its filesystem" "$OUT" "  filesystem     $UUID_A (the mount_uuid of system-recovery-A-2tb)"
+
+    contract_record "$CW/will" ""
+    rm -f "$S/flock.calls" "$S/holder.calls" # the dry run above took and gave back both
+    check "contract, will: the real status rewrote the record (exit 0)" "$C_STATUS_RC" "0"
+    check "contract, will: the verdict the binary read" "$(contract_get '.os.btrbk_at_boot.verdict')" '"will"'
+    run_driver session A --dry-run
+    check "contract, will: the driver refuses" "$RC" "1"
+    has "contract, will: because btrbk will run at boot" "$OUT" "REFUSED: btrbk will run when this OS boots"
+    check "contract, will: nothing locked" "$(file "$S/flock.calls")" ""
+    check "contract, will: nothing held" "$(file "$S/holder.calls")" ""
+
+    contract_record "$CW/no" ABSENT
+    check "contract, a record from before df0: rewritten (exit 0)" "$C_STATUS_RC" "0"
+    check "contract, a record from before df0: written back naming no filesystem" "$(contract_get 'has("mount_uuid"), .mount_uuid')" $'true\nnull'
+    run_driver session A --dry-run --accept-boot-record-risk
+    check "contract, a record from before df0: the driver refuses, overridden or not" "$RC" "1"
+    has "contract, a record from before df0: because it names no filesystem" "$OUT" "does not name the filesystem it was read from"
+
+    contract_record "$CW/no" '"ffffffff-0000-4000-8000-000000000000"'
+    check "contract, a record of another filesystem: kept by the binary" "$(contract_get '.mount_uuid')" '"ffffffff-0000-4000-8000-000000000000"'
+    run_driver session A --dry-run --accept-boot-record-risk
+    check "contract, a record of another filesystem: the driver refuses" "$RC" "1"
+    has "contract, a record of another filesystem: says which" "$OUT" "was read from filesystem ffffffff-0000-4000-8000-000000000000, not $UUID_A"
+fi
+
 echo "--- the boot record: where it is read from"
 fixture
 OS_STATE="$T/elsewhere.json"
@@ -3506,6 +3730,10 @@ hatch_state no
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: DAS_RECOVERY_OS_STATE honoured" "$RC" "0"
 has "hatch: says which record it read" "$OUT" "boot record for system-recovery-A-2tb ($T/hatch/recovery-os.json, schema 3)"
+printf '{"schema_version":3,"drives":{%s}}\n' "$(record_json system-recovery-A-2tb no 3600 '"ffffffff-0000-4000-8000-000000000000"')" >"$T/hatch/recovery-os.json"
+run_driver session system-recovery-A-2tb --dry-run
+check "hatch, df0: a record of another filesystem refused" "$RC" "1"
+has "hatch, df0: says which" "$OUT" "was read from filesystem ffffffff-0000-4000-8000-000000000000, not $UUID_A"
 OS_STATE=""
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: without its own record, refused" "$RC" "1"
