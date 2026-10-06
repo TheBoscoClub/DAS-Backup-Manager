@@ -429,7 +429,7 @@ impl HelperInterface {
                     Err(e) => return Err(format!("Could not acquire backup locks: {e}")),
                 };
                 let mut source_guard = mount::ensure_sources_mounted(&config, progress);
-                let res = match backup::create_snapshots(&config, &sources, progress) {
+                let res = match backup::create_snapshots(&config, Some(&sources), progress) {
                     Ok(n) => Ok(format!("{n} snapshots created")),
                     Err(e) => Err(format!("Snapshot failed: {e}")),
                 };
@@ -477,8 +477,7 @@ impl HelperInterface {
         let finisher = progress.clone();
         let jobs = self.jobs.clone();
         let jid = job_id.clone();
-        // Send from all sources to the specified targets.
-        let sources: Vec<String> = Vec::new();
+        // Send from all sources (`None`: not an empty list) to the specified targets.
 
         let handle = tokio::spawn(async move {
             let result: Result<String, String> = tokio::task::spawn_blocking(move || {
@@ -505,8 +504,7 @@ impl HelperInterface {
                     mount::ensure_targets_mounted(&config, progress, locks.maintenance())
                         .map_err(|e| format!("Mount failed: {e}"))?;
 
-                let res = match backup::send_snapshots(&config, &sources, &targets, false, progress)
-                {
+                let res = match backup::send_snapshots(&config, None, &targets, false, progress) {
                     Ok((sent, bytes)) => Ok(format!("{sent} snapshots sent ({bytes} bytes)")),
                     Err(e) => Err(format!("Send failed: {e}")),
                 };

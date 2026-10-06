@@ -2172,7 +2172,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                 let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                let count = buttered_dasd::backup::create_snapshots(&cfg, &sources, &progress)?;
+                let count = buttered_dasd::backup::create_snapshots(
+                    &cfg,
+                    flag_selection(sources).as_deref(),
+                    &progress,
+                )?;
                 let sources_still_mounted = source_guard.unmount(&progress);
                 println!("Created {count} snapshots");
                 mount::require_released(&sources_still_mounted)?;
@@ -2193,7 +2197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut guard =
                     mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
                 let result =
-                    buttered_dasd::backup::send_snapshots(&cfg, &[], &targets, false, &progress);
+                    buttered_dasd::backup::send_snapshots(&cfg, None, &targets, false, &progress);
                 let mut still_mounted = guard.unmount(&progress);
                 still_mounted.extend(source_guard.unmount(&progress));
                 let (sent, bytes) = result?;
