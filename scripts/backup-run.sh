@@ -1,9 +1,59 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.11.2
-# Date: 2026-10-04
+# Version: 4.11.3
+# Date: 2026-10-05
 #
 # Features:
+#   - The mount probe cannot be misread as "mounted" (v4.11.3): bash returns 0
+#     and an empty string for a command substitution it cannot make — no
+#     descriptor free for its pipe, measured at `ulimit -n` 3 and 4 — so the
+#     probe's three answers, read from `$(probe_mount_point …) || rc=$?`, had
+#     a fourth, silent one that read as "mounted": the boot-subvolume step went
+#     on to a target it had not looked at, and the unmount gate took a drive it
+#     could not ask about for one to unmount. probe_mount_point now prints its
+#     answer — "mounted", "not-mounted" or "unknown: <why>" — with mountpoint's
+#     own status inside its capture, and probe_state, its only caller, reads
+#     it: an empty or unrecognised answer is "unknown" at every use — the
+#     boot-subvolume step, the unmount gate's targets and the sources the run
+#     mounted (bd DAS-Backup-Manager-hhow; tests/test_unmount_all.sh,
+#     tests/test_early_exit_readers.sh).
+#   - A dry run's boot-archive cleanup is not a FAIL (v4.11.3):
+#     run_archive_cleanup() requires a per-target summary of the pruner, and
+#     looked only for the real run's, "Deleted N, kept N, errors N". The
+#     pruner's dry run printed "Would keep N, found expired archives above",
+#     so every dry run, the install script's included, logged "printed no
+#     per-target summary", recorded archive_cleanup as FAILED and exited 3,
+#     a false failure that trains the operator to ignore the line.
+#     boot-archive-cleanup.sh 2.1.2 now prints "Would delete N, kept N, errors
+#     N" in a dry run, one shape for both modes, and each mode here requires
+#     its own verb: a real run that printed the dry run's, or a dry run that
+#     printed the real run's, is still a FAIL, and so is a run with no summary
+#     at all. The detail it records for an OK joins the targets' summaries
+#     with "; " between them: it was joined with `tr '\n' '; '`, which writes
+#     ";" alone, so it read "a;b;" and even one summary ended in a stray ";"
+#     in the report line (bd DAS-Backup-Manager-zwr;
+#     tests/test_boot_archive_cleanup.sh).
+#   - The boot-subvolume step tells "not mounted" from "could not tell"
+#     (v4.11.3): update_boot_subvolumes() asks probe_mount_point, whose three
+#     answers it used to fold into two. A target whose mountpoint check could
+#     not run — a missing mountpoint program (exit 127), or no descriptor free
+#     for its redirection — read as "not mounted": it was skipped, counted as
+#     neither skipped nor failed, and the step recorded OK, 0 updated, 0
+#     skipped, a green result for work that was not looked at. "Could not
+#     tell" now fails the step: counted, said with the probe's message and the
+#     target's name, and the targets after it are still done. A mirror counts
+#     the same and says it could not be checked, not that its boot subvolumes
+#     were not updated, which this step never does for one. "Not mounted",
+#     and a path that is not there, stay a quiet skip (bd
+#     DAS-Backup-Manager-jlsz; tests/test_early_exit_readers.sh).
+#   - A pid is ASCII digits (v4.11.3): maintenance_holder() matches the pid in
+#     the lock file's record with [[:digit:]]. Under en_US.UTF-8, the host's
+#     locale, bash's regex [0-9] also matches digits of other scripts and
+#     superscripts, so a record whose "pid" was written in Arabic-Indic digits
+#     read as a pid whose process had gone, "no longer running", where it is a
+#     record with no pid in it. The other [0-9] and [A-Za-z] regex matches in
+#     the scripts got the same treatment (bd DAS-Backup-Manager-1bsx;
+#     tests/test_maintenance_lock.sh).
 #   - "DAS can be safely disconnected" only on knowledge (v4.11.2, with the
 #     entry below): the target unmount gate asks probe_mount_point, which
 #     tells "not mounted" from "could not tell". A mountpoint error on a
@@ -874,7 +924,7 @@ maintenance_holder() {
         return
     fi
     pid="${line##* pid }"
-    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[0-9]+$ ]]; then
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
         echo "an unknown holder (last recorded: $line)"
     elif [[ -d "/proc/$pid" ]]; then
         echo "$line"
@@ -1888,12 +1938,34 @@ update_boot_subvolumes() {
     # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
     # bootable systems and must never have their @ replaced with host snapshots.
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        if ! mountpoint -q "$mnt" 2>/dev/null; then
-            continue
-        fi
+        # Mounted, not mounted, or could not tell (probe_state). Only the second
+        # is a target to leave alone; the third — a probe that could not run, a
+        # capture bash could not make, an answer nobody recognises — is a
+        # failure of this step, counted and said. `mountpoint -q ... || continue`
+        # read every failure of the probe — a missing mountpoint program (exit
+        # 127), no descriptor free for its redirection — as "not mounted": the
+        # target was skipped, counted as neither skipped nor failed, and the
+        # step recorded OK, 0 updated, 0 skipped (bd DAS-Backup-Manager-jlsz,
+        # -hhow). A mirror counts the same way, and says what happened to it:
+        # this step never updates a mirror's boot subvolumes, so "NOT updated"
+        # would misstate the consequence — it could not be checked.
+        local mount_role="${MOUNT_ROLES[$mnt]:-}"
+        probe_state "$mnt"
+        case "$PROBE_STATE" in
+            mounted) ;;
+            not-mounted) continue ;;
+            *)
+                if [[ "$mount_role" == "mirror" ]]; then
+                    log_error "  Could not tell whether $mnt, a mirror, is mounted — $PROBE_WHY; it could not be checked (its boot subvolumes are never updated here)"
+                else
+                    log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY; its boot subvolumes were NOT updated"
+                fi
+                (( failed += 1 ))
+                continue
+                ;;
+        esac
 
         # Skip mirror targets — they have their own OS installations
-        local mount_role="${MOUNT_ROLES[$mnt]:-}"
         if [[ "$mount_role" == "mirror" ]]; then
             log_info "  [$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")] Skipping mirror target (independent OS)"
             (( skipped += 1 ))
@@ -2080,14 +2152,37 @@ run_archive_cleanup() {
         # whose value never varies is not a status field. Require a real
         # per-target summary line to be present before calling this OK.
         # bd nsp (c10).
-        local cleanup_summary
-        cleanup_summary=$(printf '%s\n' "$cleanup_output" \
-            | grep -oE 'Deleted [0-9]+, kept [0-9]+, errors [0-9]+' | tr '\n' '; ') || true
+        #
+        # The summary has one shape and this mode's own verb: a real run says
+        # "Deleted N, kept N, errors N", a dry run "Would delete N, kept N,
+        # errors N". Only the first was ever looked for, and the pruner's dry
+        # run printed another line, so every dry run said "no per-target
+        # summary" and was a FAIL (bd DAS-Backup-Manager-zwr). Each mode still
+        # accepts only its own: a real run that printed "Would delete" ran
+        # dry, and a dry run that printed "Deleted" ran for real, and
+        # neither did what it was asked to.
+        local summary_form="Deleted N, kept N, errors N"
+        local summary_re='Deleted [[:digit:]]+, kept [[:digit:]]+, errors [[:digit:]]+'
+        if [[ "$mode" == "dryrun" ]]; then
+            summary_form="Would delete N, kept N, errors N"
+            summary_re='Would delete [[:digit:]]+, kept [[:digit:]]+, errors [[:digit:]]+'
+        fi
+        # The detail is each target's summary, "; " between them and nothing
+        # after the last. It was joined with `tr '\n' '; '`, which writes ";"
+        # alone (tr drops the surplus of a longer second set), so the detail
+        # read "a;b;" and the trim of "; " that followed never matched: even a
+        # single summary ended in a stray ";" in the report. The separator is
+        # now put between the elements, so there is nothing to trim.
+        local cleanup_lines cleanup_summary="" summary_line
+        cleanup_lines=$(printf '%s\n' "$cleanup_output" | grep -oE "$summary_re") || true
+        while IFS= read -r summary_line; do
+            [[ -z "$summary_line" ]] || cleanup_summary+="${cleanup_summary:+; }$summary_line"
+        done <<<"$cleanup_lines"
         if [[ -z "$cleanup_summary" ]]; then
-            log_warn "Boot archive cleanup exited 0 but printed no per-target summary — treating as FAIL"
+            log_warn "Boot archive cleanup exited 0 but printed no per-target summary ($summary_form) — treating as FAIL"
             record_op "archive_cleanup" "FAIL" "exit 0 with no summary line; pruner may have examined nothing"
         else
-            record_op "archive_cleanup" "OK" "${cleanup_summary%; }"
+            record_op "archive_cleanup" "OK" "$cleanup_summary"
             log_info "Boot archive cleanup completed"
         fi
     else
@@ -2101,29 +2196,87 @@ run_archive_cleanup() {
 # kinds of "no" kept apart. util-linux exits 0 for a mount point, 32 for a
 # path that is not one, and 1 for a usage, permission or system error — and
 # 1 as well for a path that does not exist (measured, util-linux 2.42.4).
-# Returns 0 mounted, 1 not mounted, 2 could not tell, and for "could not
-# tell" prints the probe's own message. A path that does not exist is not
-# mounted (nothing can be mounted where there is nothing), and an
-# unavailable target's mount point is removed on purpose (create_mount_points),
-# so it is told from an error by mountpoint's message, read in the C locale;
-# any other answer is "could not tell". Read as "not mounted", an error left
-# the run's own source mount behind with nothing said (bd
-# DAS-Backup-Manager-8cf, review F1), and passed the target unmount gate
-# while a drive was mounted, so the run said the DAS could be disconnected
-# (bd DAS-Backup-Manager-jug6).
+#
+# The answer is the ONE LINE this prints, never a status: "mounted",
+# "not-mounted", or "unknown: <why>" with the probe's own message. A path that
+# does not exist is not mounted (nothing can be mounted where there is
+# nothing), and an unavailable target's mount point is removed on purpose
+# (create_mount_points), so it is told from an error by mountpoint's message,
+# read in the C locale; any other answer is "unknown". Read as "not mounted",
+# an error left the run's own source mount behind with nothing said (bd
+# DAS-Backup-Manager-8cf, review F1), and passed the target unmount gate while
+# a drive was mounted, so the run said the DAS could be disconnected (bd
+# DAS-Backup-Manager-jug6).
+#
+# Why a printed answer: bash returns 0 and an empty string for a command
+# substitution it cannot make — no descriptor free for its pipe (measured, bash
+# 5.3, `ulimit -n` 3 and 4) — and `$(probe …) || rc=$?` read exactly the probe
+# that could not run as "mounted" (bd DAS-Backup-Manager-hhow). So mountpoint's
+# own status travels inside ITS capture, on a last line of its own, and a
+# capture without that line is no answer, said as "unknown". Callers never
+# capture this themselves: they call probe_state, below.
 probe_mount_point() { # probe_mount_point <path>
-    local rc=0 err
-    err="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null)" || rc=$?
+    local out last rc err
+    out="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    rc="${last#status=}"
+    if [[ "$last" != status=* || ! "$rc" =~ ^[[:digit:]]+$ ]]; then
+        echo "unknown: no answer — the probe's output could not be captured (no descriptor free for its pipe?)"
+        return 0
+    fi
+    err="${out%"$last"}"
+    while [[ "$err" == *$'\n' ]]; do
+        err="${err%$'\n'}"
+    done
     case "$rc" in
-        0) return 0 ;;
-        32) return 1 ;;
+        0)
+            echo mounted
+            return 0
+            ;;
+        32)
+            echo not-mounted
+            return 0
+            ;;
     esac
     if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
-        return 1
+        echo not-mounted
+        return 0
     fi
     err="${err//$'\n'/; }"
-    printf '%s (exit %s)\n' "${err:-mountpoint printed nothing}" "$rc"
-    return 2
+    echo "unknown: ${err:-mountpoint printed nothing} (exit $rc)"
+}
+
+# Ask probe_mount_point and read what it printed into PROBE_STATE — "mounted",
+# "not-mounted" or "unknown" — and, for unknown, PROBE_WHY. THE reading of a
+# probe's answer and the only caller of probe_mount_point: an answer that is
+# empty (bash could not make the capture) or that says anything this does not
+# recognise is "unknown", never "mounted" and never "not mounted" (bd
+# DAS-Backup-Manager-hhow). Called directly, not captured, so there is no
+# second capture to fail silently. Every caller says what it does for
+# "unknown" and lets nothing else reach it.
+PROBE_STATE="unknown"
+PROBE_WHY="no mount probe has run"
+probe_state() { # probe_state <path>
+    local answer
+    answer="$(probe_mount_point "$1")"
+    case "$answer" in
+        mounted | not-mounted)
+            PROBE_STATE="$answer"
+            PROBE_WHY=""
+            ;;
+        "unknown: "?*)
+            PROBE_STATE="unknown"
+            PROBE_WHY="${answer#unknown: }"
+            ;;
+        "")
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed nothing (its capture failed?)"
+            ;;
+        *)
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed something unrecognised: ${answer:0:120}"
+            ;;
+    esac
 }
 
 # The same budget as the Rust path (mount.rs UMOUNT_ATTEMPTS / _RETRY_PAUSE).
@@ -2171,25 +2324,25 @@ unmount_all() {
     # umount did. A probe error used to read as "not mounted": the target
     # was skipped, the gate passed, and the run said the DAS could be
     # disconnected while a drive was mounted (bd DAS-Backup-Manager-jug6).
-    local mnt target_rc target_why
+    local mnt why
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
         mnt="${ALL_TARGET_MOUNTS[$i]}"
-        target_rc=0
-        target_why="$(probe_mount_point "$mnt")" || target_rc=$?
-        case "$target_rc" in
-            0)
+        probe_state "$mnt"
+        why="$PROBE_WHY"
+        case "$PROBE_STATE" in
+            mounted)
                 if ! umount_with_retry "$mnt"; then
                     log_error "  Failed to unmount $mnt"
                     still_mounted+=("$mnt")
                 fi
                 ;;
-            1) ;;
+            not-mounted) ;;
             *)
-                log_error "  Could not tell whether $mnt is mounted — $target_why; unmounting it anyway"
+                log_error "  Could not tell whether $mnt is mounted — $why; unmounting it anyway"
                 if umount_with_retry "$mnt"; then
-                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount then succeeded")
+                    not_known+=("could not tell whether $mnt is mounted — $why; umount then succeeded")
                 else
-                    not_known+=("could not tell whether $mnt is mounted — $target_why; umount failed too")
+                    not_known+=("could not tell whether $mnt is mounted — $why; umount failed too")
                 fi
                 ;;
         esac
@@ -2215,19 +2368,18 @@ unmount_all() {
     # umount's own message (which used to be discarded), is left as it is,
     # and stays the run's, for a later pass to try again.
     local -a owned=("${SOURCE_MOUNTS_OWNED[@]}")
-    local src_mnt umount_err probe_rc probe_why left
+    local src_mnt umount_err left
     for (( i=${#owned[@]}-1; i>=0; i-- )); do
         src_mnt="${owned[$i]}"
-        probe_rc=0
-        probe_why="$(probe_mount_point "$src_mnt")" || probe_rc=$?
-        if ((probe_rc == 1)); then
+        probe_state "$src_mnt"
+        if [[ "$PROBE_STATE" == not-mounted ]]; then
             disown_source_mount "$src_mnt"
             log_info "  Source volume $src_mnt, recorded as this run's, is not mounted now — nothing to unmount"
             continue
         fi
         left="left mounted"
-        if ((probe_rc != 0)); then
-            log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $probe_why; unmounting it anyway"
+        if [[ "$PROBE_STATE" != mounted ]]; then
+            log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $PROBE_WHY; unmounting it anyway"
             left="left as it is"
         fi
         if umount_err="$(umount "$src_mnt" 2>&1)"; then
@@ -2697,7 +2849,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.11.2
+  backup-run.sh v4.11.3
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT

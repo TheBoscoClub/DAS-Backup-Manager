@@ -1,7 +1,7 @@
 #!/bin/bash
 # boot-archive-cleanup.sh - Prune old boot subvolume archives from backup targets (config-driven)
-# Version: 2.1.1
-# Date: 2026-10-03
+# Version: 2.1.2
+# Date: 2026-10-05
 #
 # When backup-run.sh --full (or the Rust btrdasd manual path) recreates @ and
 # @home, it snapshots the old ones as @.archive.YYYYMMDDTHHMMSS before
@@ -10,6 +10,37 @@
 # via btrdasd. As of v4.2.4, backup-run.sh invokes this script automatically
 # at the end of every run (daily and full) while targets are still mounted —
 # it was previously installed but never called by anything (DAS-Backup-Manager-64h).
+#
+# v2.1.2: a target whose mount state cannot be told is a failure, not a skip.
+# cleanup_target asked `mountpoint -q ... 2>/dev/null` and read every failure
+# of it — a missing mountpoint program (exit 127), no descriptor free for its
+# redirection, an I/O error — as "not mounted - nothing examined", exit 0: the
+# target was never looked at, and with any other target examined the run was
+# OK. It asks the probe backup-run.sh's unmount gate asks, util-linux's exit
+# status (0 a mount point, 32 not one, anything else could not tell) read by
+# the same two functions, which tests/test_boot_archive_cleanup.sh holds
+# byte-identical between the scripts. Not mounted, and a path that is not
+# there (an absent drive's mount point), stay a quiet skip; could not tell
+# counts the target among those not examined, says why, and exits 1, which
+# backup-run.sh records as a FAIL (bd DAS-Backup-Manager-2dmn).
+#
+# v2.1.2: a dry run prints the same per-target summary as a real run — "Would
+# delete N, kept N, errors N" where a run says "Deleted N, kept N, errors N" —
+# and counts what it would delete. It printed "Would keep N, found expired
+# archives above", which backup-run.sh's check for a per-target summary never
+# matched, so every dry run of the backup, the install script's included,
+# recorded this step as FAILED and exited 3 (bd DAS-Backup-Manager-zwr;
+# tests/test_boot_archive_cleanup.sh).
+#
+# v2.1.2: the two guards that stand between a listing line and `btrfs
+# subvolume delete` name their characters outright. Under en_US.UTF-8 bash's
+# regex range [A-Za-z] also matches accented and fullwidth letters (about
+# 2,200 characters beyond ASCII) and [0-9] about 1,000 more digits (Arabic-
+# Indic, superscripts, fractions), so a name like @é.archive.20200101T000000
+# passed the guards and reached `btrfs subvolume delete`. The digits are now
+# [[:digit:]], ASCII in every locale, and the letters are listed; [[:alpha:]]
+# would be every letter of the locale (bd DAS-Backup-Manager-1bsx;
+# tests/test_boot_archive_cleanup.sh).
 #
 # v2.1.1: the last line is `main "$@"; exit $?`, so a copy over this file in
 # place while it runs (a plain `cp`) cannot have bash read the new file once
@@ -105,14 +136,93 @@ parse_archive_timestamp() {
     date -d "$formatted" '+%s' 2>/dev/null || echo "0"
 }
 
-cleanup_target() {
-    local mnt="$1"
-    local deleted=0 kept=0 errors=0
-
-    if ! mountpoint -q "$mnt" 2>/dev/null; then
-        log_info "  Skipping $mnt (not mounted - nothing examined)"
+# Whether a target is mounted, as backup-run.sh asks it before it unmounts one:
+# probe_mount_point prints "mounted", "not-mounted" or "unknown: <why>", and
+# probe_state reads that line into PROBE_STATE and PROBE_WHY, an empty or
+# unrecognised one included, as "unknown" (bd DAS-Backup-Manager-hhow). The two
+# functions and the two variables below are the very text of backup-run.sh's:
+# a standalone script cannot source its sibling, so
+# tests/test_boot_archive_cleanup.sh fails if either copy changes alone. Why
+# they exist: bash returns 0 and an empty string for a command substitution
+# it cannot make (no descriptor free for its pipe), and a status read from one
+# calls the probe that never ran a mount point.
+probe_mount_point() { # probe_mount_point <path>
+    local out last rc err
+    out="$(LC_ALL=C mountpoint "$1" 2>&1 >/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    rc="${last#status=}"
+    if [[ "$last" != status=* || ! "$rc" =~ ^[[:digit:]]+$ ]]; then
+        echo "unknown: no answer — the probe's output could not be captured (no descriptor free for its pipe?)"
         return 0
     fi
+    err="${out%"$last"}"
+    while [[ "$err" == *$'\n' ]]; do
+        err="${err%$'\n'}"
+    done
+    case "$rc" in
+        0)
+            echo mounted
+            return 0
+            ;;
+        32)
+            echo not-mounted
+            return 0
+            ;;
+    esac
+    if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
+        echo not-mounted
+        return 0
+    fi
+    err="${err//$'\n'/; }"
+    echo "unknown: ${err:-mountpoint printed nothing} (exit $rc)"
+}
+
+PROBE_STATE="unknown"
+PROBE_WHY="no mount probe has run"
+probe_state() { # probe_state <path>
+    local answer
+    answer="$(probe_mount_point "$1")"
+    case "$answer" in
+        mounted | not-mounted)
+            PROBE_STATE="$answer"
+            PROBE_WHY=""
+            ;;
+        "unknown: "?*)
+            PROBE_STATE="unknown"
+            PROBE_WHY="${answer#unknown: }"
+            ;;
+        "")
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed nothing (its capture failed?)"
+            ;;
+        *)
+            PROBE_STATE="unknown"
+            PROBE_WHY="the mount probe printed something unrecognised: ${answer:0:120}"
+            ;;
+    esac
+}
+
+cleanup_target() {
+    local mnt="$1"
+    local deleted=0 kept=0 errors=0 would_delete=0
+
+    # Three answers, and only the second is a skip: a target the probe cannot
+    # tell about was NOT examined, and the run says so and fails, as for a
+    # listing it could not get below (bd DAS-Backup-Manager-2dmn).
+    probe_state "$mnt"
+    case "$PROBE_STATE" in
+        mounted) ;;
+        not-mounted)
+            log_info "  Skipping $mnt (not mounted - nothing examined)"
+            return 0
+            ;;
+        *)
+            log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY"
+            log_error "  $mnt NOT pruned - state unknown"
+            TARGET_FAILURES=$(( TARGET_FAILURES + 1 ))
+            return 0
+            ;;
+    esac
 
     local label
     label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
@@ -148,6 +258,15 @@ cleanup_target() {
     fi
     rm -f "$listing_stderr"
 
+    # What an archive path and name may be made of, for the guard below. Each
+    # class is spelled out: a range is not ASCII under en_US.UTF-8 ([A-Za-z]
+    # also matches accented and fullwidth letters, [0-9] other scripts'
+    # digits), and [[:alpha:]] is every letter of the locale. [[:digit:]] is
+    # ASCII in every locale. bd DAS-Backup-Manager-1bsx.
+    local letters='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    local path_re="^[${letters}[:digit:]_@.+/-]+\$"
+    local name_re="^@[${letters}[:digit:]_-]*\\.archive\\.[[:digit:]]{8}T[[:digit:]]{6}\$"
+
     # Process archive subvolumes from the (successfully obtained) listing
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -170,8 +289,8 @@ cleanup_target() {
            || [[ "$subvol_path" == "$line" ]] \
            || [[ "$subvol_path" == /* ]] \
            || [[ "$subvol_path" == *".."* ]] \
-           || [[ ! "$subvol_path" =~ ^[A-Za-z0-9_@.+/-]+$ ]] \
-           || [[ ! "$subvol_name" =~ ^@[A-Za-z0-9_-]*\.archive\.[0-9]{8}T[0-9]{6}$ ]]; then
+           || [[ ! "$subvol_path" =~ $path_re ]] \
+           || [[ ! "$subvol_name" =~ $name_re ]]; then
             log_warn "  Unrecognized archive path - NOT deleted: $subvol_path"
             continue
         fi
@@ -187,6 +306,7 @@ cleanup_target() {
             local age_days=$(( ($(date '+%s') - archive_epoch) / 86400 ))
             if $DRYRUN; then
                 log_warn "  [DRYRUN] Would delete: $subvol_path ($age_days days old)"
+                (( would_delete += 1 ))
             else
                 local delete_err
                 # 2>&1 >/dev/null keeps stderr only: the errno text is the whole
@@ -206,8 +326,11 @@ cleanup_target() {
 
     DELETE_ERRORS=$(( DELETE_ERRORS + errors ))
 
+    # One shape for both modes: backup-run.sh reads it back, and requires this
+    # mode's own verb (bd DAS-Backup-Manager-zwr). A dry run deletes nothing, so
+    # its errors stay 0.
     if $DRYRUN; then
-        log_info "  [$label] Would keep $kept, found expired archives above"
+        log_info "  [$label] Would delete $would_delete, kept $kept, errors $errors"
     else
         log_info "  [$label] Deleted $deleted, kept $kept, errors $errors"
     fi

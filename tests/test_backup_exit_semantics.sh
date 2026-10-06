@@ -93,10 +93,19 @@ WORK="$(mktemp -d)" && [[ -d "$WORK" ]] || {
     exit 2
 }
 HOLDER_PID=""
+# The processes the liveness helper's own cases start (bd DAS-Backup-Manager-7q8o),
+# so a case that stopped half way leaves none behind. A case that stops one with
+# stop_proc takes it off this list: finish() signals what is left, and a pid
+# already collected may be another process's by then.
+TEST_PROCS=()
 finish() {
+    local p
     [[ -n "$HOLDER_PID" ]] && kill "$HOLDER_PID" 2>/dev/null && wait "$HOLDER_PID" 2>/dev/null
     # A case that failed may have left the stub mailx's processes running.
     declare -F reap_mail_stubs >/dev/null && reap_mail_stubs
+    for p in "${TEST_PROCS[@]:-}"; do
+        [[ -n "$p" ]] && kill "$p" 2>/dev/null
+    done
     rm -rf "${WORK:?}"
 }
 trap finish EXIT
@@ -479,8 +488,17 @@ fi
 exec "$(cat "$S/real_flock")" "$@"
 EOF
 
+# The two summaries the real pruner prints, a real run's and a dry run's (bd
+# DAS-Backup-Manager-zwr). The stub used to print the first whatever it was
+# asked, so a dry run passed here and failed on the host. This stub is only as
+# faithful as this text: tests/test_boot_archive_cleanup.sh runs the pruner
+# itself and reads its output back through run_archive_cleanup.
 stub boot-archive-cleanup.sh <<'EOF'
-echo "[das-backup-22tb] Deleted 0, kept 0, errors 0"
+if [[ " $* " == *" --dryrun "* ]]; then
+    echo "[das-backup-22tb] Would delete 0, kept 0, errors 0"
+else
+    echo "[das-backup-22tb] Deleted 0, kept 0, errors 0"
+fi
 EOF
 
 # ---------------------------------------------------------------------------
@@ -618,23 +636,37 @@ locks_free() {
 # parentheses and may itself hold spaces and parentheses.
 pid_alive() {
     local stat state
-    # Digits only. "" would read /proc/stat, and 0 is no process: `kill -0 0`
-    # signals the caller's own group and always succeeds.
-    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+    # ASCII digits only, none leading. "" would read /proc/stat, and 0 is no
+    # process: `kill -0 0` signals the caller's own group and always succeeds.
+    # [[:digit:]], not [0-9] or [1-9]: under en_US.UTF-8 bash's regex ranges
+    # also match digits of other scripts (bd DAS-Backup-Manager-1bsx).
+    [[ "${1:-}" =~ ^[[:digit:]]+$ && "$1" != 0* ]] || return 1
     # No /proc entry: reaped, or gone since the caller noted it. The braces
     # silence bash's own "No such file"; on the assignment alone it leaks.
     { stat="$(<"/proc/$1/stat")"; } 2>/dev/null || return 1
     read -r state _ <<<"${stat##*)}"
     [[ "$state" != Z ]]
 }
-# "yes" when none of the processes the stub mailx recorded is still running.
-mail_stubs_gone() {
-    local f
-    for f in "$STATE/mail_stall.pid" "$STATE/mail_stall_child.pid"; do
-        [[ -f "$f" ]] && pid_alive "$(cat "$f")" && {
+# "yes" when none of the processes the stub mailx recorded is still running,
+# "no" when one is, and "never ran" when it recorded nothing: with no pid file
+# there is no stall to have ended, and reading that as "gone" made the check
+# pass vacuously (bd DAS-Backup-Manager-7q8o). Its siblings — the bound's
+# elapsed time, the "did not finish" line — would fail too, but this one must
+# not rest on them. The pid files are the run's own, in $STATE, unless a
+# directory is named: the helper's own cases name one.
+mail_stubs_gone() { # mail_stubs_gone [<directory holding the pid files>]
+    local dir="${1:-$STATE}" f
+    for f in "$dir/mail_stall.pid" "$dir/mail_stall_child.pid"; do
+        if [[ ! -f "$f" ]]; then
+            echo "never ran"
+            return
+        fi
+    done
+    for f in "$dir/mail_stall.pid" "$dir/mail_stall_child.pid"; do
+        if pid_alive "$(cat "$f")"; then
             echo no
             return
-        }
+        fi
     done
     echo yes
 }
@@ -784,6 +816,184 @@ expect_not_started() { # expect_not_started <name>
     check "$1: no mail" "$(mails)" "0"
     check "$1: not recorded" "$(record_calls)" "0"
 }
+
+# ---------------------------------------------------------------------------
+echo "== pid_alive and mail_stubs_gone: the liveness helper's own branches (bd 7q8o)"
+# ---------------------------------------------------------------------------
+# pid_alive replaced `kill -0`, which is true of a zombie. Three of its branches
+# never ran on a developer's machine. The zombie one: on such a machine PID 1,
+# or a subreaper, collects an orphan at once, so only a container whose PID 1
+# collects nothing — GitHub's runs `tail -f /dev/null` — ever had a zombie to
+# test. The state read after the LAST ')' of stat: no process this suite
+# starts has a ')' in its name. And the pid guard. A later "simplification" to
+# `kill -0`, to a look at /proc/<pid> alone, or to the first ')' would have
+# stayed green here and turned CI red again. Each is a case below on real
+# processes, with a control that shows the case is what it says: a zombie is
+# shown to be one by the kernel (State: Z in /proc/<pid>/status, which
+# pid_alive does not read) and by `kill -0` still succeeding on it.
+liveness() { pid_alive "${1:-}" && echo alive || echo gone; }
+# The kernel's own word for a process's state — R, S, D, T, Z — read from
+# /proc/<pid>/status, or "absent".
+proc_state() {
+    local state
+    state="$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$1/status" 2>/dev/null)"
+    echo "${state:-absent}"
+}
+# live <program> [args]: start it, remember it for finish(); its pid in LIVE_PID.
+live() {
+    "$@" >/dev/null 2>&1 &
+    LIVE_PID=$!
+    TEST_PROCS+=("$LIVE_PID")
+}
+# stop_proc <pid>: kill and collect a process started above, and take it off
+# TEST_PROCS. finish() signals whatever is still on that list when the suite
+# ends, and a pid already collected may by then be another process's: one run
+# of this suite uses about 56,000 pids, so on a host at the kernel's default
+# pid_max of 32768 the counter wraps within it (independent review, M2).
+stop_proc() {
+    local pid="$1" p
+    local -a rest=()
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    for p in "${TEST_PROCS[@]:-}"; do
+        [[ -n "$p" && "$p" != "$pid" ]] && rest+=("$p")
+    done
+    TEST_PROCS=("${rest[@]:-}")
+}
+# How often a pid is on that list.
+procs_listed() { # procs_listed <pid>
+    local p n=0
+    for p in "${TEST_PROCS[@]:-}"; do
+        [[ "$p" == "$1" ]] && n=$((n + 1))
+    done
+    echo "$n"
+}
+# wait_comm <pid> <name>: until the kernel names the process so — comm is set
+# when it execs, a moment after the fork.
+wait_comm() {
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ "$(cat "/proc/$1/comm" 2>/dev/null)" == "$2" ]] && return 0
+        sleep 0.05
+    done
+    harness_broken "process $1 never got the name '$2' (it is '$(cat "/proc/$1/comm" 2>/dev/null)')"
+}
+# A real zombie: a child that has exited, whose parent never collects it. The
+# parent starts the child in the background, notes its pid, then becomes
+# `sleep`, which never calls wait, so the child stays a zombie on any machine,
+# whoever PID 1 is, until its parent is killed. ZOMBIE_PARENT and ZOMBIE_CHILD.
+make_zombie() { # make_zombie <child program> [args]
+    local pidfile="$WORK/zombie.child" i
+    rm -f "$pidfile"
+    (
+        "$@" >/dev/null 2>&1 &
+        echo "$!" >"$pidfile"
+        exec sleep 60
+    ) &
+    ZOMBIE_PARENT=$!
+    TEST_PROCS+=("$ZOMBIE_PARENT")
+    for ((i = 0; i < 100; i++)); do
+        [[ -s "$pidfile" ]] && break
+        sleep 0.05
+    done
+    ZOMBIE_CHILD="$(cat "$pidfile" 2>/dev/null)"
+    [[ -n "$ZOMBIE_CHILD" ]] || harness_broken "the zombie's parent never noted its child"
+    for ((i = 0; i < 100; i++)); do
+        [[ "$(proc_state "$ZOMBIE_CHILD")" == Z ]] && return 0
+        sleep 0.05
+    done
+    harness_broken "no zombie after 5 s: process $ZOMBIE_CHILD is '$(proc_state "$ZOMBIE_CHILD")' (is SIGCHLD ignored here?)"
+}
+# End the case: the parent is killed and collected; its orphan is then init's.
+end_zombie() {
+    stop_proc "$ZOMBIE_PARENT"
+}
+
+REAL_SLEEP="$(type -P sleep)" || harness_broken "no sleep on this system"
+ODDCOMM="$WORK/oddcomm"
+mkdir -p "$ODDCOMM"
+# Two names with ')' in them. A parse that cuts stat at the FIRST ')' reads the
+# state of the first as Z and of the second as S — each the wrong way round.
+LIVE_ODD="a) Z (b"
+ZOMBIE_ODD="z) S (z"
+ln -s "$REAL_SLEEP" "$ODDCOMM/$LIVE_ODD"
+ln -s "$REAL_SLEEP" "$ODDCOMM/$ZOMBIE_ODD"
+
+# A live process is alive; killed and collected, it is gone.
+live sleep 60
+check "pid_alive, a live process: alive" "$(liveness "$LIVE_PID")" "alive"
+check "cleanup list, a process still running: finish() would signal it" "$(procs_listed "$LIVE_PID")" "1"
+stop_proc "$LIVE_PID"
+check "pid_alive, the same process killed and collected: gone" "$(liveness "$LIVE_PID")" "gone"
+check "cleanup list, the same process, collected: no longer on it, so finish() cannot signal a reused pid" \
+    "$(procs_listed "$LIVE_PID")" "0"
+DEAD_PID="$LIVE_PID"
+
+# A zombie is gone, though kill -0 says otherwise; its parent, which has not
+# collected it, is not.
+make_zombie sleep 0
+check "zombie control: the kernel says it is a zombie" "$(proc_state "$ZOMBIE_CHILD")" "Z"
+check "zombie control: kill -0 still succeeds on it, which is why that was the wrong test" \
+    "$(kill -0 "$ZOMBIE_CHILD" 2>/dev/null && echo yes || echo no)" "yes"
+check "pid_alive, a zombie: gone" "$(liveness "$ZOMBIE_CHILD")" "gone"
+check "pid_alive, the zombie's parent, which never collects it: alive" "$(liveness "$ZOMBIE_PARENT")" "alive"
+end_zombie
+check "zombie case ended: its parent and the orphan are both gone" \
+    "$(liveness "$ZOMBIE_PARENT") $(liveness "$ZOMBIE_CHILD")" "gone gone"
+
+# A ')' in the name: the state is read after the LAST one.
+live "$ODDCOMM/$LIVE_ODD" 60
+ODD_PID="$LIVE_PID"
+wait_comm "$ODD_PID" "$LIVE_ODD"
+check "odd comm control: the kernel's name for the live process holds ') Z ('" \
+    "$(cat "/proc/$ODD_PID/comm")" "$LIVE_ODD"
+check "odd comm control: and it is running" "$(proc_state "$ODD_PID")" "S"
+check "pid_alive, a live process named '$LIVE_ODD': alive" "$(liveness "$ODD_PID")" "alive"
+stop_proc "$ODD_PID"
+check "pid_alive, the same process killed and collected: gone" "$(liveness "$ODD_PID")" "gone"
+
+make_zombie "$ODDCOMM/$ZOMBIE_ODD" 0
+check "odd comm control: the zombie is named '$ZOMBIE_ODD'" "$(cat "/proc/$ZOMBIE_CHILD/comm")" "$ZOMBIE_ODD"
+check "odd comm control: and the kernel says it is a zombie" "$(proc_state "$ZOMBIE_CHILD")" "Z"
+check "pid_alive, a zombie named '$ZOMBIE_ODD': gone" "$(liveness "$ZOMBIE_CHILD")" "gone"
+end_zombie
+
+# What is no pid is gone. "" and "self" are the ones that would read a file:
+# /proc//stat is /proc/stat, and /proc/self/stat is the reader's own.
+for bad in "" 0 007 abc -1 "1 2" self thread-self 4194304999; do
+    check "pid_alive '$bad': gone" "$(liveness "$bad")" "gone"
+done
+check "pid_alive, no argument: gone" "$(pid_alive && echo alive || echo gone)" "gone"
+
+# mail_stubs_gone: "never ran" when the stub recorded no pid, not "gone".
+live sleep 60
+LIVE_FOR_MAIL="$LIVE_PID"
+mail_state() { # mail_state [first pid-file's content [second's]]: what mail_stubs_gone says
+    local dir="$WORK/mail-state"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    [[ $# -ge 1 ]] && printf '%s\n' "$1" >"$dir/mail_stall.pid"
+    [[ $# -ge 2 ]] && printf '%s\n' "$2" >"$dir/mail_stall_child.pid"
+    mail_stubs_gone "$dir"
+}
+check "mail_stubs_gone, no pid recorded at all: never ran" "$(mail_state)" "never ran"
+check "mail_stubs_gone, only the first pid recorded: never ran" "$(mail_state "$DEAD_PID")" "never ran"
+check "mail_stubs_gone, both recorded, both gone: yes" "$(mail_state "$DEAD_PID" "$DEAD_PID")" "yes"
+check "mail_stubs_gone, both recorded, the first alive: no" "$(mail_state "$LIVE_FOR_MAIL" "$DEAD_PID")" "no"
+check "mail_stubs_gone, both recorded, the second alive: no" "$(mail_state "$DEAD_PID" "$LIVE_FOR_MAIL")" "no"
+stop_proc "$LIVE_FOR_MAIL"
+# Forgetting must be exact: with two running, stopping one leaves the other
+# listed, so a case that stops half way still leaves nothing behind.
+live sleep 60
+FIRST_LISTED="$LIVE_PID"
+live sleep 60
+SECOND_LISTED="$LIVE_PID"
+stop_proc "$FIRST_LISTED"
+check "cleanup list, stopping one of two running processes: it goes, the other stays" \
+    "$(procs_listed "$FIRST_LISTED") $(procs_listed "$SECOND_LISTED")" "0 1"
+stop_proc "$SECOND_LISTED"
+check "cleanup list, every process this section started has been collected: nothing is left for finish() to signal" \
+    "$(printf '%s' "${TEST_PROCS[*]:-}" | tr -d ' ')" ""
 
 # ---------------------------------------------------------------------------
 echo "== 0: the run executed and nothing failed"
@@ -1826,6 +2036,18 @@ check "probe cannot tell for a mounted target: the report's row" \
 check "probe cannot tell for a mounted target: the report's status" "$(report_status)" "FAILURES DETECTED"
 check "probe cannot tell for a mounted target: recorded as failed, with the reason" \
     "$(recorded_as) $(vector_value --errors | grep -c "^unmount: could not tell whether $PRIMARY_MNT is mounted")" "failure 1"
+# The same probe error reaches the boot-subvolume step, which runs after btrbk
+# and before the unmount (bd DAS-Backup-Manager-jlsz): it read the error as
+# "not mounted", skipped the target uncounted and recorded OK, with nothing said.
+# Now it fails the step, names the target and the probe's message, and touches
+# nothing on it.
+boot_row() { sed -n '/^  Boot subvolumes /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+check "probe cannot tell for a mounted target: the boot-subvolume step says so, naming the target" \
+    "$(grep -cF -- "Could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); its boot subvolumes were NOT updated" "$STATE/out")" "1"
+check "probe cannot tell for a mounted target: the report's boot-subvolume row is a FAIL" \
+    "$(boot_row)" "  Boot subvolumes       FAIL  (0 updated, 1 failed)"
+check "probe cannot tell for a mounted target: the boot-subvolume failure is in the history row" \
+    "$(vector_value --errors | grep -c '^boot_subvols: 0 updated, 1 failed')" "1"
 
 # A target that will not unmount: NOT safe, and the same line says which.
 fresh

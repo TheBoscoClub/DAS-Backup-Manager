@@ -53,7 +53,12 @@ readonly -a ARCH_MIRRORS=(
     'https://geo.mirror.pkgbuild.com/$repo/os/$arch'
 )
 readonly SERVER_LINE_RE='^[[:space:]]*Server[[:space:]]*='
-readonly SERVER_HOST_RE='^[[:space:]]*Server[[:space:]]*=[[:space:]]*[A-Za-z][A-Za-z0-9+.-]*://([^/[:space:]]+)'
+# A URL scheme is ASCII: a letter, then letters, digits, "+", "-" or ".". The
+# letters are listed, not ranged: under en_US.UTF-8 bash's regex [A-Za-z] also
+# matches accented and fullwidth letters, and [[:alpha:]] is every letter of
+# the locale. [[:digit:]] is ASCII in every locale (bd DAS-Backup-Manager-1bsx).
+readonly ASCII_LETTERS='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+readonly SERVER_HOST_RE="^[[:space:]]*Server[[:space:]]*=[[:space:]]*[${ASCII_LETTERS}][${ASCII_LETTERS}[:digit:]+.-]*://([^/[:space:]]+)"
 readonly PARALLEL_LINE_RE='^[[:space:]]*ParallelDownloads[[:space:]]*='
 
 WAITS=()
@@ -96,7 +101,7 @@ load_waits() {
         die 2 "need $((ATTEMPTS - 1)) waits in seconds, got ${#WAITS[@]}: '${WAITS[*]}'"
     fi
     for w in "${WAITS[@]}"; do
-        if [[ ! "$w" =~ ^[0-9]+$ ]]; then
+        if [[ ! "$w" =~ ^[[:digit:]]+$ ]]; then
             die 2 "wait '$w' is not a whole number of seconds"
         fi
     done

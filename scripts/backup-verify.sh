@@ -1,7 +1,13 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.1.2
-# Date: 2026-10-04
+# Version: 3.1.3
+# Date: 2026-10-05
+#
+# 3.1.3: a sector-count attribute is a number only if it is ASCII digits:
+# report_sector_attr() matches [[:digit:]], not [0-9], which under en_US.UTF-8
+# also matches digits of other scripts and superscripts, and printed such a
+# value as a count in yellow, returning success, where it is a reading no
+# one can use (bd DAS-Backup-Manager-1bsx; tests/test_early_exit_readers.sh).
 #
 # 3.1.2: the SMART health line is matched by bash itself, `[[ ]]`. Under
 # pipefail, `echo "$health" | grep -q PASSED` read a PASSED followed by
@@ -172,7 +178,7 @@ report_sector_attr() {
             return 0
             ;;
         *)
-            if [[ "$value" =~ ^[0-9]+$ ]]; then
+            if [[ "$value" =~ ^[[:digit:]]+$ ]]; then
                 echo -e "  $label: ${YELLOW}$value${NC}"
                 return 0
             fi

@@ -110,11 +110,48 @@ so a future audit is a diff against this list, not a re-read:
 | Shape | Substitutes | Why cautious |
 |:--|:--|:--|
 | `smartctl`/`blkid`/`findmnt`/`btrfs` probe → `unknown`, `?`, empty | "no reading" | never a fabricated measurement; `usb_link_mbit_s` stays a **string** for this reason |
-| `mountpoint -q … 2>/dev/null` | "not a mountpoint" | sends callers into skip/abort, which is the safe branch |
+| `mountpoint -q … 2>/dev/null`, at the two-answer sites listed after this table | "not a mountpoint", a failed probe included | refuse, skip, or mount-then-verify at each site, never "mounted"; the sites where "no" would be permissive do not use this shape (below) |
 | `btrfs filesystem label … \|\| echo "$mnt"` | the mount path | display-only fallback |
 | report gathering (`df`, `btrbk list latest`) → blank | "no data" | costs a report row, never a decision |
 | `date -d … \|\| echo 0` | epoch 0 | **explicitly handled**: `boot-archive-cleanup.sh` logs and `continue`s rather than deleting; the growth-log reader skips the entry |
 | `echo … > /sys/…/scheduler \|\| true` | kernel default | a performance hint, not correctness |
+
+#### The mount probe: three answers where "no" would be permissive (corrected 2026-10-05)
+
+The `mountpoint -q` row used to say every site reads a failed probe as "not a
+mountpoint" and that this sends callers into the safe branch. That held for some
+sites and was false for others: where a "no" releases something or counts as a
+pass, an error read as "not mounted" is the **permissive** direction (bd
+`jug6`, `jlsz`, `2dmn`). Bash adds a fourth answer of its own — a command
+substitution it cannot make (no descriptor free for its pipe) returns 0 with an
+empty string, so a status read from one reads as "mounted" (bd `hhow`, measured
+on bash 5.3). Those sites ask `probe_state`, which sets `PROBE_STATE` to one of
+three answers from util-linux's exit status: **mounted** (0), **not-mounted**
+(32, or 1 with "No such file or directory": an absent drive's mount point is
+removed on purpose) and **unknown** (anything else: no `mountpoint` program, exit
+2, a signal, an empty or unrecognised answer). `probe_mount_point` and
+`probe_state` are one text in `backup-run.sh` and `boot-archive-cleanup.sh` (a
+standalone script cannot source its sibling); `tests/test_boot_archive_cleanup.sh`
+fails if either copy changes alone.
+
+| Three-answer site | mounted | not mounted | could not tell |
+| :-- | :-- | :-- | :-- |
+| `update_boot_subvolumes` | goes on | skipped, quietly | a failed target, counted and said with the probe's message; the step records FAIL (`jlsz`) |
+| `unmount_all`, targets | unmounted; one that will not unmount fails the disconnect gate | nothing to do | said; unmounted anyway; the gate FAILS whatever umount answers, "NOT safe to disconnect" (`jug6`) |
+| `unmount_all`, sources the run mounted | unmounted, best effort | struck off the run's list, said | said as a WARN; unmounted anyway; best effort, outside the gate (`8cf`) |
+| `cleanup_target`, `boot-archive-cleanup.sh` | pruned | quiet skip, an absent mount point included | target NOT pruned, counted and said; the pruner exits 1 and `run_archive_cleanup` records FAIL (`2dmn`) |
+
+The sites that still read `mountpoint -q` are two-answer, and an error lands in
+"not a mountpoint". What that answer does at each is why it stays:
+
+| Two-answer site (`backup-run.sh`) | an error, read as "not a mountpoint", leads to |
+| :-- | :-- |
+| `create_mount_points` | the `rmdir` that follows, which a mounted or non-empty directory refuses: the bare-mountpoint abort, exit 3 |
+| `verify_sources_before_write`, `verify_targets_before_btrbk` | a violation, and the run aborts: these are the gates |
+| `mount_sources`, `mount_targets` | an attempt to mount, which those two gates then hold to the expected filesystem, or abort on |
+| `create_target_dirs` | the target's directories are not created |
+| `run_indexer` | `SKIP`, "primary target not mounted": recorded, never a pass |
+| `show_stats`, `capture_usage`, `capture_report_data`, `record_growth` | no `df` line, usage reading, report row or growth-log line for that target; what a consumer then does with a missing reading is a separate question |
 
 Two of these were checked closely because a `0` sentinel on a **deletion** path
 would be the permissive direction. Both are safe: `parse_archive_timestamp`
