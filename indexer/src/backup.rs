@@ -96,12 +96,13 @@ pub fn acquire_manual_locks(
 
 /// Whether to run an incremental or full backup.
 ///
-/// **Incremental**: `btrbk snapshot` + `btrbk --preserve resume` — creates
-/// snapshots, sends deltas, but skips retention cleanup.  Fast daily use.
+/// **Incremental**: `btrbk snapshot` then `btrbk resume` — two steps, so a run
+/// can take one of them alone (`snapshot_only`, `send_only`). Neither is given
+/// `--preserve`: btrbk applies the retention policy after the send.
 ///
-/// **Full**: `btrbk run` — creates snapshots, sends them, AND enforces
-/// retention policy (deletes old snapshots/backups outside retention windows).
-/// The complete backup lifecycle with housekeeping.
+/// **Full**: `btrbk run` — snapshot, send and retention cleanup as one btrbk
+/// run (deletes old snapshots/backups outside retention windows). The
+/// complete backup lifecycle with housekeeping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BackupMode {
     Incremental,
@@ -675,7 +676,8 @@ fn create_snapshots_with(
 /// does not fail the step; one that IS named and cannot be read still does.
 ///
 /// When `preserve` is true, passes `--preserve` to btrbk so retention cleanup
-/// is skipped (incremental mode).  When false, btrbk enforces retention policy
+/// is skipped (no run mode asks for it: `run_pipeline` and the CLI/helper pass
+/// false).  When false, btrbk enforces retention policy
 /// after sending (deletes old snapshots/backups outside the retention window).
 ///
 /// Returns (snapshots_sent, bytes_sent).
@@ -1922,11 +1924,11 @@ fn run_backup_with(
 
     // ---------- Live pipeline ----------
     //
-    // Incremental: `btrbk snapshot` + `btrbk --preserve resume`
-    //   Creates snapshots and sends deltas.  --preserve skips retention
-    //   cleanup so old snapshots/backups are kept.  Fast daily use.
+    // Incremental: `btrbk snapshot` + `btrbk resume` (no --preserve)
+    //   Two steps, so snapshot-only and send-only are possible.  btrbk
+    //   enforces the retention policy in both modes (`run_pipeline`).
     //
-    // Full: `btrbk run` (atomic snapshot + send + retention cleanup)
+    // Full: `btrbk run` (one run: snapshot + send + retention cleanup)
     //   The complete backup lifecycle including housekeeping.  Deletes
     //   snapshots and backups outside the configured retention windows.
 
