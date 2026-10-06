@@ -120,13 +120,6 @@ exclude_re = [
     # mount lookup and walk, and `run_backup_with` is tested against a scripted
     # `StepEnv::index`. Only the whole-body replacement is excluded.
     "replace index_mounted_targets -> bool with ",
-    # `sync_for_manual_step` is the binding of `sync_for_manual_step_with` to
-    # the real btrbk/btrfs runner, the real mount-point test and today's date:
-    # calling it from a test would sync this host's `config.toml` and
-    # `btrbk.conf`. The core is mutated and tested with a scripted runner (the
-    # config sync wrote is the one returned; a failed sync is refused); only
-    # the whole-body replacement is excluded.
-    "replace sync_for_manual_step -> Result<Config, String> with ",
 ]
 
 # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with

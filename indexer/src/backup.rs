@@ -6372,6 +6372,19 @@ mod tests {
         );
     }
 
+    /// The binding to the host's runner, reached without touching the host: a
+    /// config path that does not exist fails sync at its first step (loading
+    /// the config), before any command or mount test, so the binding must
+    /// refuse. Its whole-body mutant (`Ok(Default::default())`) fails here.
+    #[test]
+    fn the_host_binding_refuses_when_sync_cannot_even_load_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").join("config.toml");
+        let progress = TestProgress::new();
+        let err = sync_for_manual_step(&missing, &make_test_config(), &progress).unwrap_err();
+        assert!(err.contains("nothing was run"), "{err}");
+    }
+
     /// Before: a config that could not be loaded after sync was an `Err`,
     /// and the run stopped before anything was recorded. Now the run goes on
     /// with the config it had, and the sync section is failed and says why.
