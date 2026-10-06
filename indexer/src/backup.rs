@@ -1627,6 +1627,21 @@ fn effective_targets(config: &Config, options: &BackupOptions) -> Result<Vec<Str
     })
 }
 
+/// How the error of a failed btrbk step begins (see [`Pipeline::failed`]). The
+/// report reads them back to say whether btrbk failed: the text after them is
+/// btrbk's, or this module's own refusal ("none of the selected sources sends
+/// to a selected target"), which need not mention btrbk at all.
+const BTRBK_STEP_FAILURES: [&str; 3] = [
+    "Snapshot step failed",
+    "Send step failed",
+    "Full backup pipeline failed",
+];
+
+/// Whether `error` is the error of a failed btrbk step.
+pub fn is_btrbk_step_failure(error: &str) -> bool {
+    BTRBK_STEP_FAILURES.iter().any(|p| error.starts_with(p))
+}
+
 /// What the btrbk steps counted, and which of them failed.
 #[derive(Debug, PartialEq, Eq)]
 struct Pipeline {
@@ -1689,7 +1704,7 @@ fn run_pipeline(
         Ok(n) => done.created = Some(n),
         Err(e) => {
             done.created = None;
-            done.failed(progress, format!("Snapshot step failed: {e}"));
+            done.failed(progress, format!("{}: {e}", BTRBK_STEP_FAILURES[0]));
         }
     };
     let send = |done: &mut Pipeline| {
@@ -1701,7 +1716,7 @@ fn run_pipeline(
             }
             Err(e) => {
                 done.sent = None;
-                done.failed(progress, format!("Send step failed: {e}"));
+                done.failed(progress, format!("{}: {e}", BTRBK_STEP_FAILURES[1]));
             }
         }
     };
@@ -1718,7 +1733,7 @@ fn run_pipeline(
             Err(e) => {
                 // One btrbk run did all of it: what it created and sent is not known.
                 (done.created, done.sent) = (None, None);
-                done.failed(progress, format!("Full backup pipeline failed: {e}"));
+                done.failed(progress, format!("{}: {e}", BTRBK_STEP_FAILURES[2]));
             }
         },
         BackupMode::Incremental => {
