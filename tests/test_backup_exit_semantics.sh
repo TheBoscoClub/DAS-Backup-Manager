@@ -236,6 +236,10 @@ case "$1 ${2:-}" in
     printf 'RETIRED SUBVOLUMES\n  None.\n'
     exit "$(knob expire_rc 0)"
     ;;
+"backup boot-plan")
+    # The plan btrbk.conf gives: @ and @home on the nvme volume.
+    printf '@\troot-\tnvme\n@home\thome\tnvme\n'
+    ;;
 "recovery-os status")
     printf 'RECOVERY OS\n  stub reading\n'
     exit "$(knob recovery_rc 0)"
@@ -518,6 +522,7 @@ DAS_GROWTH_LOG='$WORK/lib/growth.log'
 DAS_LAST_REPORT='$WORK/lib/last-report.txt'
 DAS_BTRBK_CONF='$WORK/etc/btrbk.conf'
 DAS_IO_SCHEDULER='mq-deadline'
+DAS_BOOT_ENABLED='$(cat "$STATE/knobs/boot_enabled" 2>/dev/null || echo false)'
 DAS_MOUNT_OPTS='noatime,degraded'
 DAS_SOURCE_COUNT=1
 DAS_SOURCE_0_LABEL='nvme'
@@ -2021,6 +2026,9 @@ unmount_row() { sed -n '/^  Unmount targets /{p;q;}' "$WORK/lib/last-report.txt"
 
 fresh
 knob probe_fails_after_btrbk "$PRIMARY_MNT"
+# The boot step does nothing unless [boot] is enabled (dtm): enable it here.
+knob boot_enabled true
+write_env
 run_backup
 check "probe cannot tell for a mounted target: exit status (a FAIL)" "$RC" "3"
 show_tail 3

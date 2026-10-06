@@ -1,9 +1,16 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.11.3
-# Date: 2026-10-05
+# Version: 4.12.0
+# Date: 2026-10-06
 #
 # Features:
+#   - The boot step honours [boot] and reads its names from btrbk.conf (v4.12.0):
+#     [boot] enabled = false makes it a no-op; the subvolumes, snapshot_names and
+#     target_subdirs come from `btrdasd backup boot-plan` (the Rust step's own
+#     plan), matched by latest_boot_snapshot() with the library's rule; a name
+#     btrbk.conf lacks or a series with no snapshot is a WARN (COMPLETED WITH
+#     WARNINGS, exit 0), no longer a hardcoded pattern that could drift (bd
+#     DAS-Backup-Manager-dtm; tests/test_early_exit_readers.sh).
 #   - The mount probe cannot be misread as "mounted" (v4.11.3): bash returns 0
 #     and an empty string for a command substitution it cannot make — no
 #     descriptor free for its pipe, measured at `ulimit -n` 3 and 4 — so the
@@ -1926,9 +1933,200 @@ run_btrbk() {
     fi
 }
 
+# latest_boot_snapshot <listing> <snapshot_name> <subdirs, comma-separated>:
+# the newest "<subdir>/<snapshot_name>.<TS>" in a `btrfs subvolume list`
+# listing, in LATEST_BOOT_SNAPSHOT ("" = none). Newest = the greatest
+# timestamp (the part after "<subdir>/<name>."), compared bytewise, ties to
+# the bytewise-greater full path — never the greater path alone, which would
+# put "nvme/var.2026…" ahead of a later "ssd/var" only by directory name.
+# The rule is the Rust library's (backup::latest_matching_snapshot), pinned
+# for both by tests/fixtures/boot-subvol-listing.txt. Walked by parameter
+# expansion — no pipe (SIGPIPE under pipefail, bd wkvz), no here-string (a
+# temp file: a full /tmp read as "none"), no subshell. Literal prefix match,
+# so a snapshot name holding '.', '*' or '-' matches only itself, and the
+# timestamp must be btrbk's `long` format (8 digits, T, 4 digits, optional
+# _N), so "root-.latest" and "root-.<TS>.new" never match.
+latest_boot_snapshot() {
+    local listing=$1 name=$2 subdirs=$3 line path dir prefix ts rest best_ts=""
+    local LC_ALL=C
+    local -a dirs=()
+    rest=$subdirs
+    while [[ -n $rest ]]; do
+        dir=${rest%%,*}
+        if [[ $rest == *,* ]]; then rest=${rest#*,}; else rest=""; fi
+        dir=${dir#/}
+        dir=${dir%/}
+        [[ -n $dir ]] && dirs+=("$dir")
+    done
+    LATEST_BOOT_SNAPSHOT=""
+    rest=$listing
+    while [[ -n $rest ]]; do
+        line=${rest%%$'\n'*}
+        if [[ $rest == *$'\n'* ]]; then rest=${rest#*$'\n'}; else rest=""; fi
+        path=${line##* }
+        for dir in "${dirs[@]}"; do
+            prefix="$dir/$name."
+            [[ $path == "$prefix"* ]] || continue
+            ts=${path#"$prefix"}
+            [[ $ts =~ ^[[:digit:]]{8}T[[:digit:]]{4}(_[[:digit:]]+)?$ ]] || continue
+            if [[ -z $LATEST_BOOT_SNAPSHOT || $ts > $best_ts \
+                || ( $ts == "$best_ts" && $path > $LATEST_BOOT_SNAPSHOT ) ]]; then
+                LATEST_BOOT_SNAPSHOT=$path
+                best_ts=$ts
+            fi
+        done
+    done
+}
+
+# boot_path_state <path>: whether <path> exists, as BOOT_PATH_STATE — "exists",
+# "absent" or "unknown" (BOOT_PATH_WHY says why). A decision to create, archive
+# or delete rests on this, so only a stat that says "No such file or
+# directory" is "absent": any other failure (I/O error, a parent that is not a
+# directory, a stat that could not run, a capture bash could not make) is
+# "unknown" and the caller stops. `[[ -e ]]` could not tell the two apart, and
+# reading "cannot tell" as "absent" sends the step to snapshot into a path
+# that is there. Its status travels inside its own capture, as probe_mount_point's.
+BOOT_PATH_STATE="unknown"
+BOOT_PATH_WHY="no stat has run"
+boot_path_state() {
+    local out last rc err
+    out="$(LC_ALL=C stat -- "$1" 2>&1 >/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    rc="${last#status=}"
+    if [[ "$last" != status=* || ! "$rc" =~ ^[[:digit:]]+$ ]]; then
+        BOOT_PATH_STATE="unknown"
+        BOOT_PATH_WHY="no answer — stat's output could not be captured"
+        return 0
+    fi
+    err="${out%"$last"}"
+    while [[ "$err" == *$'\n' ]]; do
+        err="${err%$'\n'}"
+    done
+    if ((rc == 0)); then
+        BOOT_PATH_STATE="exists"
+        return 0
+    fi
+    if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
+        BOOT_PATH_STATE="absent"
+        return 0
+    fi
+    err="${err//$'\n'/; }"
+    BOOT_PATH_STATE="unknown"
+    BOOT_PATH_WHY="${err:-stat printed nothing} (exit $rc)"
+}
+
+# update_boot_subvol <label> <mnt> <subvol> <snapshot_name or -> <subdirs or -> <force> <listing> <ts>:
+# one boot subvolume on one target; counts into the caller's updated, skipped,
+# failed and warned (dynamic scope). The order is the Rust step's
+# (update_boot_subvol): the absence checks first (no name, no subdirs, no
+# matching snapshot: WARN, untouched), then every existence check, and only
+# then writes — so an incremental run with the subvolume present and no
+# snapshot of its series is a WARN, not a skip.
+update_boot_subvol() {
+    local label=$1 mnt=$2 subvol=$3 name=$4 subdirs=$5 force=$6 listing=$7 ts=$8
+    local live="$mnt/$subvol" staging="$mnt/$subvol.new"
+    local archive="$mnt/$subvol.archive.$ts" latest live_state staging_state=absent
+
+    if [[ "$name" == "-" ]]; then
+        log_warn "  [$label] $subvol has no snapshot_name in btrbk.conf — leaving it untouched"
+        (( warned += 1 ))
+        return
+    fi
+    if [[ "$subdirs" == "-" ]]; then
+        log_warn "  [$label] No source declares target_subdirs for $subvol — leaving it untouched"
+        (( warned += 1 ))
+        return
+    fi
+    latest_boot_snapshot "$listing" "$name" "$subdirs"
+    latest=$LATEST_BOOT_SNAPSHOT
+    if [[ -z "$latest" ]]; then
+        log_warn "  [$label] No btrbk snapshot named '$name' — leaving $subvol untouched"
+        (( warned += 1 ))
+        return
+    fi
+
+    boot_path_state "$live"
+    live_state=$BOOT_PATH_STATE
+    if [[ "$live_state" == unknown ]]; then
+        log_error "  [$label] Cannot tell whether $live exists ($BOOT_PATH_WHY) — leaving it untouched"
+        (( failed += 1 ))
+        return
+    fi
+
+    if [[ "$live_state" == exists && "$force" != "true" ]]; then
+        log_info "  [$label] $subvol exists, skipping (use --full to recreate)"
+        (( skipped += 1 ))
+        return
+    fi
+
+    # Absent, in either mode: create it from the newest snapshot. Nothing is
+    # there to lose.
+    if [[ "$live_state" == absent ]]; then
+        if btrfs subvolume snapshot "$mnt/$latest" "$live"; then
+            log_info "  [$label] Created $subvol from $latest"
+            (( updated += 1 ))
+        else
+            log_error "  [$label] Failed to create $subvol from $latest"
+            (( failed += 1 ))
+        fi
+        return
+    fi
+
+    # Full run, live subvolume present: archive -> clear a stale staging ->
+    # build staging -> delete live -> rename. Every existence check comes
+    # before the first write; the live subvolume is deleted only once its
+    # replacement exists beside it, so no failure leaves it absent.
+    boot_path_state "$staging"
+    staging_state=$BOOT_PATH_STATE
+    if [[ "$staging_state" == unknown ]]; then
+        log_error "  [$label] Cannot tell whether $staging exists ($BOOT_PATH_WHY) — leaving $subvol untouched"
+        (( failed += 1 ))
+        return
+    fi
+    if ! btrfs subvolume snapshot -r "$live" "$archive"; then
+        log_error "  [$label] Failed to archive $subvol -> $subvol.archive.$ts — skipping recreation (old $subvol preserved)"
+        (( failed += 1 ))
+        return
+    fi
+    if [[ "$staging_state" == exists ]] && ! btrfs subvolume delete "$staging"; then
+        log_error "  [$label] Stale $staging could not be removed — leaving $subvol untouched (archive $subvol.archive.$ts was created)"
+        (( failed += 1 ))
+        return
+    fi
+    if ! btrfs subvolume snapshot "$mnt/$latest" "$staging"; then
+        log_error "  [$label] Failed to create $staging from $latest — leaving $subvol untouched (archive $subvol.archive.$ts was created)"
+        (( failed += 1 ))
+        return
+    fi
+    if ! btrfs subvolume delete "$live"; then
+        log_error "  [$label] Failed to delete $live — discarding $staging"
+        if ! btrfs subvolume delete "$staging"; then
+            log_warn "  [$label] $staging could not be discarded — remove it by hand"
+        fi
+        (( failed += 1 ))
+        return
+    fi
+    if ! mv -T -- "$staging" "$live"; then
+        log_error "  [$label] Renamed nothing: $staging -> $live failed. The archive $subvol.archive.$ts on $mnt holds the previous contents."
+        (( failed += 1 ))
+        return
+    fi
+    log_info "  [$label] Recreated $subvol from $latest (archived old $subvol -> $subvol.archive.$ts)"
+    (( updated += 1 ))
+}
+
 update_boot_subvolumes() {
     local force="${1:-false}"
-    local updated=0 skipped=0 failed=0
+    local updated=0 skipped=0 failed=0 warned=0
+    # [boot] enabled = false in config.toml: this step does nothing, as the
+    # Rust step (backup::archive_boot) does nothing. Anything but the literal
+    # "true" — an unset or unreadable value included — is disabled: the step
+    # replaces live subvolumes, and only an explicit yes lets it near them.
+    if [[ "${DAS_BOOT_ENABLED:-}" != true ]]; then
+        log_info "Boot subvolumes: disabled in config ([boot] enabled = false)"
+        record_op "boot_subvols" "OK" "disabled in config"
+        return
+    fi
     # One timestamp per run (not per subvolume/target) — matches the Rust
     # archive_boot() format exactly so boot-archive-cleanup.sh's
     # parse_archive_timestamp() can parse either origin's archives.
@@ -1936,6 +2134,37 @@ update_boot_subvolumes() {
     ts=$(date +%Y%m%dT%H%M%S)
 
     log_info "Updating stable boot subvolumes..."
+
+    # The plan — which subvolumes, their snapshot_name and target_subdirs — is
+    # `btrdasd backup boot-plan`'s answer, read ONCE: the same answer the Rust
+    # step reads, from btrbk.conf, so the two cannot name different snapshots.
+    # Its status travels inside its own capture (bash returns 0 and an empty
+    # string for a capture it cannot make, and an empty plan would read as
+    # "nothing to do"). Declared first, assigned apart (`local x=$(cmd)` hides
+    # cmd's status). Any failure here is a FAIL with nothing touched.
+    local plan plan_out plan_err plan_last plan_rc
+    if ! plan_err=$(mktemp); then
+        log_error "  Could not make a temp file for the boot plan's errors — boot subvolumes NOT updated"
+        record_op "boot_subvols" "FAIL" "0 updated, 1 failed"
+        return
+    fi
+    plan_out="$("$BTRDASD_BIN" backup boot-plan --config "$DAS_CONFIG" 2>"$plan_err"; printf '\nstatus=%s' "$?")"
+    plan_last="${plan_out##*$'\n'}"
+    plan_rc="${plan_last#status=}"
+    if [[ "$plan_last" != status=* || ! "$plan_rc" =~ ^[[:digit:]]+$ ]]; then
+        log_error "  Could not read the boot plan: no answer (its output could not be captured) — boot subvolumes NOT updated"
+        rm -f "$plan_err"
+        record_op "boot_subvols" "FAIL" "0 updated, 1 failed"
+        return
+    fi
+    if (( plan_rc != 0 )); then
+        log_error "  Could not read the boot plan: $(tr '\n' ' ' <"$plan_err")(exit $plan_rc) — boot subvolumes NOT updated"
+        rm -f "$plan_err"
+        record_op "boot_subvols" "FAIL" "0 updated, 1 failed"
+        return
+    fi
+    rm -f "$plan_err"
+    plan="${plan_out%"$plan_last"}"
 
     # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
     # bootable systems and must never have their @ replaced with host snapshots.
@@ -1976,39 +2205,9 @@ update_boot_subvolumes() {
 
         local label
         label=$(btrfs filesystem label "$mnt" 2>/dev/null || echo "$mnt")
-        # `|| true` guards against `set -o pipefail` + `set -e` killing the run when
-        # grep finds zero matches — the empty-string check below is the intended path.
-        #
-        # Snapshot names come straight from /etc/btrbk/btrbk.conf's per-subvolume
-        # `snapshot_name` (nvme volume: @ -> "root-", @home -> "home"), so the
-        # on-disk names are "root-.<TS>" and "home.<TS>" -- NOT "root.<TS>". A
-        # bare `nvme/root\.` pattern (root immediately followed by a dot) has
-        # NEVER matched "root-.<TS>" (bd DAS-Backup-Manager-ycr, pre-existing at
-        # e363919, predates this file's v4.x history) -- it silently found zero
-        # snapshots on every run, so this whole function no-op'd on every target
-        # whose @ subvolume already existed, with no error, just a
-        # "No btrbk snapshots found, skipping" warning that looked like a benign
-        # first-run condition instead of a permanent pattern bug. Both patterns
-        # are anchored to a full `-<TS>`/`.<TS>` timestamp suffix so a rename in
-        # btrbk.conf breaks this loudly (empty match -> the skip warning below)
-        # rather than silently matching an unrelated subvolume (e.g.
-        # "root-root.<TS>", a different snapshot_name entirely, which the old
-        # unanchored pattern happened not to match only by the accident of "root"
-        # not being immediately followed by "."). bd DAS-Backup-Manager-01u (the
-        # config-vs-script drift detector) is the systemic guard against this
-        # class of bug recurring for a *different* rename in the future.
-        #
-        # Timestamp suffix is btrbk's default `timestamp_format long`
-        # (btrbk.conf(5)): YYYYMMDD<T>hhmm, i.e. 8 digits + T + 4 digits
-        # (HHMM, no seconds) — verified live against real snapshot names
-        # below, NOT hhmmss/6 digits. An optional "_N" collision suffix is
-        # appended by btrbk if two snapshots land on the exact same minute.
         # The subvolume listing is captured ONCE, with its status checked,
-        # before anything is matched against it. Previously each grep ran off
-        # its own `btrfs subvolume list ... 2>/dev/null || true`, so a failed
-        # listing produced an empty string that was indistinguishable from
-        # "this target genuinely has no snapshots" — and the latter is the
-        # benign, skip-quietly branch. bd DAS-Backup-Manager-nsp (c2/c3).
+        # before anything is matched against it: a failed listing must not
+        # read as "this target has no snapshots" (bd DAS-Backup-Manager-nsp).
         local subvol_listing subvol_err
         subvol_err="$(mktemp)"
         if ! subvol_listing=$(btrfs subvolume list "$mnt" 2>"$subvol_err"); then
@@ -2020,108 +2219,28 @@ update_boot_subvolumes() {
         fi
         rm -f "$subvol_err"
 
-        local latest_root latest_home
-        latest_root=$(printf '%s\n' "$subvol_listing" | grep -E 'nvme/root-\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
-        latest_home=$(printf '%s\n' "$subvol_listing" | grep -E 'nvme/home\.[0-9]{8}T[0-9]{4}(_[0-9]+)?$' | awk '{print $NF}' | sort | tail -1) || true
-
-        if [[ -z "$latest_root" || -z "$latest_home" ]]; then
-            # A target that HAS snapshots but matches neither pattern means the
-            # patterns above have drifted from btrbk.conf's snapshot_name --
-            # exactly the shape of bd 5ig on the Rust side, where a hardcoded
-            # "@" => "root" map stopped matching an on-disk "root-" prefix.
-            # That is a defect, not a skip, so it must not exit through the
-            # quiet branch.
-            #
-            # Matched by bash itself: no pipe, no file, no fd. Piped into
-            # grep -q, a listing longer than a pipe holds (the primary
-            # target's is near 64 KiB) left printf to die of SIGPIPE, which
-            # pipefail read as "no match" (bd DAS-Backup-Manager-wkvz); fed
-            # as a here-string, it went to a temp file, and a full /tmp or no
-            # fd to spare read as "no match" too (round 4, N3). Either way,
-            # straight into the quiet branch. [[:digit:]], not [0-9]: under
-            # en_US.UTF-8 bash's regex [0-9] also matches Arabic-Indic and
-            # fullwidth digits, where grep's matched ASCII only; [[:digit:]]
-            # is ASCII in every locale, the old meaning (round 5, N5).
-            if [[ $subvol_listing =~ [[:digit:]]{8}T[[:digit:]]{4} ]]; then
-                log_error "  [$label] Target HAS btrbk-shaped snapshots but none matched the expected names."
-                log_error "  [$label] The name patterns in this function have drifted from /etc/btrbk/btrbk.conf."
-                (( failed += 1 ))
-            else
-                log_warn "  [$label] No btrbk snapshots found, skipping"
-                (( skipped += 1 ))
-            fi
-            continue
-        fi
-
-        log_info "  [$label] Latest root: $latest_root"
-        log_info "  [$label] Latest home: $latest_home"
-
-        # Update @ subvolume (archive-then-swap: archive the outgoing @ as a
-        # read-only snapshot BEFORE the create-then-swap replacement, so the
-        # only copy of the outgoing subvolume is never destroyed. If the
-        # archive snapshot fails, skip the recreation entirely for this
-        # subvolume — never delete @ without a preserved archive.)
-        if btrfs subvolume show "$mnt/@" &>/dev/null; then
-            if [[ "$force" == "true" ]]; then
-                if ! btrfs subvolume snapshot -r "$mnt/@" "$mnt/@.archive.$ts"; then
-                    log_error "  [$label] Failed to archive @ -> @.archive.$ts — skipping recreation (old @ preserved)"
-                    (( failed += 1 ))
-                elif btrfs subvolume snapshot "$mnt/$latest_root" "$mnt/@.new" && \
-                     btrfs subvolume delete "$mnt/@" && \
-                     mv "$mnt/@.new" "$mnt/@"; then
-                    log_info "  [$label] Recreated @ from $latest_root (archived old @ -> @.archive.$ts)"
-                    (( updated += 1 ))
-                else
-                    log_error "  [$label] Failed to recreate @ (archive @.archive.$ts was created)"
-                    (( failed += 1 ))
-                fi
-            else
-                log_info "  [$label] @ exists, skipping (use --full to recreate)"
-                (( skipped += 1 ))
-            fi
-        else
-            if btrfs subvolume snapshot "$mnt/$latest_root" "$mnt/@"; then
-                log_info "  [$label] Created @ from $latest_root"
-                (( updated += 1 ))
-            else
-                log_error "  [$label] Failed to create @"
-                (( failed += 1 ))
-            fi
-        fi
-
-        # Update @home subvolume (archive-then-swap — see @ handling above for
-        # the archive-before-delete rationale).
-        if btrfs subvolume show "$mnt/@home" &>/dev/null; then
-            if [[ "$force" == "true" ]]; then
-                if ! btrfs subvolume snapshot -r "$mnt/@home" "$mnt/@home.archive.$ts"; then
-                    log_error "  [$label] Failed to archive @home -> @home.archive.$ts — skipping recreation (old @home preserved)"
-                    (( failed += 1 ))
-                elif btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home.new" && \
-                     btrfs subvolume delete "$mnt/@home" && \
-                     mv "$mnt/@home.new" "$mnt/@home"; then
-                    log_info "  [$label] Recreated @home from $latest_home (archived old @home -> @home.archive.$ts)"
-                    (( updated += 1 ))
-                else
-                    log_error "  [$label] Failed to recreate @home (archive @home.archive.$ts was created)"
-                    (( failed += 1 ))
-                fi
-            else
-                log_info "  [$label] @home exists, skipping (use --full to recreate)"
-                (( skipped += 1 ))
-            fi
-        else
-            if btrfs subvolume snapshot "$mnt/$latest_home" "$mnt/@home"; then
-                log_info "  [$label] Created @home from $latest_home"
-                (( updated += 1 ))
-            else
-                log_error "  [$label] Failed to create @home"
-                (( failed += 1 ))
-            fi
-        fi
+        # Walk the plan, one line per subvolume: "<subvol>\t<name or ->\t<subdirs or ->".
+        # Parameter expansion, not a pipe or a here-string (see latest_boot_snapshot).
+        local plan_rest=$plan plan_line plan_subvol plan_name plan_subdirs
+        while [[ -n $plan_rest ]]; do
+            plan_line=${plan_rest%%$'\n'*}
+            if [[ $plan_rest == *$'\n'* ]]; then plan_rest=${plan_rest#*$'\n'}; else plan_rest=""; fi
+            [[ -n $plan_line ]] || continue
+            plan_subvol=${plan_line%%$'\t'*}
+            plan_name=${plan_line#*$'\t'}
+            plan_subdirs=${plan_name#*$'\t'}
+            plan_name=${plan_name%%$'\t'*}
+            update_boot_subvol "$label" "$mnt" "$plan_subvol" "$plan_name" "$plan_subdirs" "$force" "$subvol_listing" "$ts"
+        done
     done
 
+    # The words are the Rust step's (BootOutcome::status): FAIL outranks WARN,
+    # and a WARN is not a failure — generate_report reads it as COMPLETED WITH
+    # WARNINGS and the run still exits 0 (.claude/rules/backup.md §Sentinel).
     if (( failed > 0 )); then
         record_op "boot_subvols" "FAIL" "$updated updated, $failed failed"
+    elif (( warned > 0 )); then
+        record_op "boot_subvols" "WARN" "$updated updated, $skipped skipped, $warned warnings"
     else
         record_op "boot_subvols" "OK" "$updated updated, $skipped skipped"
     fi
@@ -2851,7 +2970,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.11.3
+  backup-run.sh v4.12.0
   Next scheduled: $(systemctl show das-backup.timer --property=NextElapseUSecRealtime 2>/dev/null | cut -d= -f2 | sed 's/ [A-Z]*$//' || echo "unknown")
 ===============================================================
 REPORT
