@@ -1275,6 +1275,37 @@ fn prune_deleted_from_index(
     Ok(ids.len())
 }
 
+/// What `backup run` asks of the job: incremental unless `--full`, the
+/// selection its flags name (none given: not specified), everything after the
+/// btrbk steps on, and a report.
+fn backup_run_options(
+    dry_run: bool,
+    full: bool,
+    sources: Vec<String>,
+    targets: Vec<String>,
+) -> BackupOptions {
+    BackupOptions {
+        mode: if full {
+            Some(BackupMode::Full)
+        } else {
+            Some(BackupMode::Incremental)
+        },
+        sources: flag_selection(sources),
+        targets: flag_selection(targets),
+        dry_run,
+        boot_archive: true,
+        index_after: true,
+        send_report: true,
+        ..Default::default()
+    }
+}
+
+/// The status `backup run` exits with, if it is not 0 (see
+/// `BackupJobOutcome::exit_code`).
+fn backup_run_exit(code: i32) -> Option<i32> {
+    (code != 0).then_some(code)
+}
+
 /// A `--sources` / `--targets` flag as the selection the run is given: no flag
 /// is "not specified" (all); a flag that names something is exactly that. A
 /// flag that names nothing real (`--targets ''`) arrives as a list holding an
@@ -2079,20 +2110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 targets,
             } => {
                 let cfg = Config::load(&config)?;
-                let options = BackupOptions {
-                    mode: if full {
-                        Some(BackupMode::Full)
-                    } else {
-                        Some(BackupMode::Incremental)
-                    },
-                    sources: flag_selection(sources),
-                    targets: flag_selection(targets),
-                    dry_run,
-                    boot_archive: true,
-                    index_after: true,
-                    send_report: true,
-                    ..Default::default()
-                };
+                let options = backup_run_options(dry_run, full, sources, targets);
                 let progress = CliProgress;
                 // The same job the GUI runs (`backup::run_backup_job`): the
                 // interlock (bd DAS-Backup-Manager-pe6), subvolume sync, mounts,
@@ -2136,8 +2154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // A failed sync or a target left mounted did not stop the run;
                 // it is in the result, so the command fails (3) once the run
                 // has finished and been recorded.
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
+                if let Some(code) = backup_run_exit(exit_code) {
+                    std::process::exit(code);
                 }
             }
             BackupAction::Snapshot { config, sources } => {
@@ -2872,6 +2890,28 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn backup_run_asks_the_job_for_what_its_flags_say() {
+        let full = backup_run_options(true, true, vec!["a".into()], vec!["t1".into(), "t2".into()]);
+        assert_eq!(full.mode, Some(BackupMode::Full));
+        assert_eq!(full.sources, Some(vec!["a".to_string()]));
+        assert_eq!(full.targets, Some(vec!["t1".to_string(), "t2".to_string()]));
+        assert!(full.dry_run && full.boot_archive && full.index_after && full.send_report);
+        // No flags: incremental, nothing specified, not a dry run.
+        let plain = backup_run_options(false, false, vec![], vec![]);
+        assert_eq!(plain.mode, Some(BackupMode::Incremental));
+        assert_eq!((plain.sources, plain.targets), (None, None));
+        assert!(!plain.dry_run);
+        assert!(plain.boot_archive && plain.index_after && plain.send_report);
+    }
+
+    #[test]
+    fn backup_run_exits_with_the_jobs_status_unless_it_is_0() {
+        assert_eq!(backup_run_exit(0), None);
+        assert_eq!(backup_run_exit(3), Some(3));
+        assert_eq!(backup_run_exit(1), Some(1));
     }
 
     #[test]

@@ -370,7 +370,19 @@ struct StepEnv<'a> {
     verify: &'a VerifyTargets<'a>,
     /// Whether a path is a mount point now (`health::is_mountpoint`).
     is_mountpoint: &'a dyn Fn(&Path) -> bool,
+    /// Bytes in use across the mounted targets, read after a sync
+    /// ([`synced_target_usage`]): what `bytes_sent` is the difference of.
+    usage: &'a UsageOf<'a>,
+    /// Index the snapshots now on the mounted targets; whether any target was
+    /// indexed ([`index_mounted_targets`]).
+    index: &'a IndexTargets<'a>,
 }
+
+/// The step behind [`StepEnv::index`].
+type IndexTargets<'a> = dyn Fn(&Config, &dyn ProgressCallback) -> bool + 'a;
+
+/// The reading behind [`StepEnv::usage`].
+type UsageOf<'a> = dyn Fn(&Config, &dyn ProgressCallback) -> u64 + 'a;
 
 /// The check behind [`StepEnv::verify`]: the targets (all configured ones),
 /// the labels about to be written, and where to say what it found.
@@ -382,6 +394,8 @@ impl StepEnv<'static> {
         runner: &SystemRunner,
         verify: &mount::verify_write_targets,
         is_mountpoint: &health::is_mountpoint,
+        usage: &synced_target_usage,
+        index: &index_mounted_targets,
     };
 }
 
@@ -687,16 +701,15 @@ fn send_snapshots_with(
     // that was not selected must not be handed to it at all.
     cmd.arg("resume").args(&filters);
 
-    let mut snapshots_sent: usize = 0;
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
     let status = stream_command(&mut cmd, env.runner, progress, |line| {
         stdout_lines.push(line.to_string());
         let trimmed = line.trim_start();
-        // btrbk marks sends with >>> (incremental) or *** (full)
+        // btrbk marks sends with >>> (incremental) or *** (full). The count
+        // comes from the listing below; only a size btrbk prints is read here.
         if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
-            snapshots_sent += 1;
             bytes_sent += parse_btrbk_size_field(line);
         }
         // Parse throughput hints from btrbk progress lines.
@@ -727,7 +740,7 @@ fn send_snapshots_with(
 
     // Count from the machine-readable listing, not the human output.
     let full_output = stdout_lines.join("\n");
-    snapshots_sent = match btrbk_raw_listing(config, &filters, env.runner) {
+    let snapshots_sent = match btrbk_raw_listing(config, &filters, env.runner) {
         Some(raw) => parse_raw_send_count(&raw),
         None => {
             progress.on_log(
@@ -795,18 +808,15 @@ fn run_full_pipeline_with(
     cmd.arg("-c").arg(&config.general.btrbk_conf);
     cmd.arg("run").args(&filters);
 
-    let mut snapshots_created: usize = 0;
-    let mut snapshots_sent: usize = 0;
     let mut bytes_sent: u64 = 0;
     let mut stdout_lines = Vec::new();
 
     let status = stream_command(&mut cmd, env.runner, progress, |line| {
         stdout_lines.push(line.to_string());
+        // The counts come from the listing below; only a size btrbk prints on
+        // a send line is read here.
         let trimmed = line.trim_start();
-        if trimmed.starts_with("+++") {
-            snapshots_created += 1;
-        } else if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
-            snapshots_sent += 1;
+        if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
             bytes_sent += parse_btrbk_size_field(line);
         }
         let lower = line.to_lowercase();
@@ -845,20 +855,20 @@ fn run_full_pipeline_with(
         ),
     );
 
-    match btrbk_raw_listing(config, &filters, env.runner) {
-        Some(raw) => {
-            snapshots_created = parse_raw_snapshot_count(&raw);
-            snapshots_sent = parse_raw_send_count(&raw);
-        }
+    let (snapshots_created, snapshots_sent) = match btrbk_raw_listing(config, &filters, env.runner)
+    {
+        Some(raw) => (parse_raw_snapshot_count(&raw), parse_raw_send_count(&raw)),
         None => {
             progress.on_log(
                 LogLevel::Warning,
                 "btrbk --format=raw list latest failed — counts fall back to output markers",
             );
-            snapshots_created = parse_btrbk_snapshot_count(&full_output);
-            snapshots_sent = parse_btrbk_send_count(&full_output);
+            (
+                parse_btrbk_snapshot_count(&full_output),
+                parse_btrbk_send_count(&full_output),
+            )
         }
-    }
+    };
     // No raw equivalent exists for deletions, so this one still reads markers.
     // Same caveat as above: if btrbk restyles its `---` lines this silently
     // returns 0. Tracked with the rest of 06p.
@@ -947,8 +957,12 @@ fn parse_glued_throughput(token: &str) -> Option<u64> {
 /// Returns the size in bytes, or 0 if not parseable.
 fn parse_btrbk_size_field(line: &str) -> u64 {
     // Look for a parenthetical at the end containing a size.
+    // `get` is None for a `)` before the last `(`: no parenthetical, no size.
     let paren_content = match (line.rfind('('), line.rfind(')')) {
-        (Some(open), Some(close)) if close > open => &line[open + 1..close],
+        (Some(open), Some(close)) => match line.get(open + 1..close) {
+            Some(inside) => inside,
+            None => return 0,
+        },
         _ => return 0,
     };
     // Split on comma — size is usually the last segment: "incremental, 45.3 MiB"
@@ -990,6 +1004,19 @@ fn sync_targets(config: &Config) {
     }
 }
 
+/// Bytes in use across the mounted targets, after forcing their pending
+/// transactions out ([`sync_targets`]) so the reading is not stale.
+fn synced_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64 {
+    sync_targets(config);
+    measure_target_usage(config, progress)
+}
+
+/// Bytes in use on a filesystem from its `statvfs` block counts: the blocks it
+/// has less the blocks left for unprivileged users, times the block size.
+fn used_bytes(blocks: u64, available_blocks: u64, block_size: u64) -> u64 {
+    (blocks * block_size).saturating_sub(available_blocks * block_size)
+}
+
 /// Measure total used bytes across all mounted backup targets.
 ///
 /// Uses `statvfs(2)` to read filesystem usage directly (no child process).
@@ -1028,9 +1055,7 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
                 );
                 return None;
             }
-            let total = stat.f_blocks * stat.f_frsize;
-            let avail = stat.f_bavail * stat.f_frsize;
-            let used = total.saturating_sub(avail);
+            let used = used_bytes(stat.f_blocks, stat.f_bavail, stat.f_frsize);
             progress.on_log(
                 LogLevel::Debug,
                 &format!(
@@ -1648,6 +1673,77 @@ fn run_pipeline(
     done
 }
 
+/// Indexes one mounted tree into a database: [`indexer::walk`].
+type WalkTree<'a> =
+    dyn Fn(&Path, &Database) -> Result<indexer::WalkResult, Box<dyn std::error::Error>> + 'a;
+
+/// Walk every mounted target and index the snapshots that are new, so the
+/// content index follows the backup. Whether at least one target was indexed.
+/// Failures are non-fatal and logged (a target whose walk fails, a database
+/// that cannot be opened): the backup itself is safe.
+///
+/// `mount_of` finds where a target is mounted, `walk` indexes one tree;
+/// [`index_mounted_targets`] hands them the real ones.
+fn index_targets_with(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+    mount_of: &dyn Fn(&Target) -> Option<String>,
+    walk: &WalkTree<'_>,
+) -> bool {
+    let db = match Database::open(&config.general.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("Cannot open index DB for post-backup indexing (non-fatal): {e}"),
+            );
+            return false;
+        }
+    };
+    let mut targets_indexed = 0usize;
+    for target in &config.targets {
+        let Some(path) = mount_of(target) else {
+            continue;
+        };
+        progress.on_log(
+            LogLevel::Info,
+            &format!("Indexing target '{}' at {path}", target.label),
+        );
+        match walk(Path::new(&path), &db) {
+            Ok(result) => {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "Indexed '{}': {} new snapshots ({} files)",
+                        target.label,
+                        result.snapshots_indexed,
+                        result.results.iter().map(|r| r.files_total).sum::<usize>(),
+                    ),
+                );
+                targets_indexed += 1;
+            }
+            Err(e) => {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("Indexing target '{}' failed (non-fatal): {e}", target.label),
+                );
+            }
+        }
+    }
+    targets_indexed > 0
+}
+
+/// [`index_targets_with`] on this machine: the targets' real mounts, the real
+/// walk. What [`StepEnv::HOST`] runs.
+fn index_mounted_targets(config: &Config, progress: &dyn ProgressCallback) -> bool {
+    index_targets_with(
+        config,
+        progress,
+        &|target| health::find_any_mount(&target.mount, &target.serial, &target.role),
+        &indexer::walk,
+    )
+}
+
 /// Run a backup with the given options. Calls btrbk under the hood.
 /// The caller must ensure this runs with appropriate privileges (root).
 pub fn run_backup(
@@ -1807,8 +1903,7 @@ fn run_backup_with(
     // Measure target disk usage before btrbk runs so we can calculate
     // bytes_sent as the delta (btrbk doesn't report transfer sizes).
     // Sync first so both before/after measurements use committed metadata.
-    sync_targets(config);
-    let usage_before = measure_target_usage(config, progress);
+    let usage_before = (env.usage)(config, progress);
     progress.on_log(
         LogLevel::Info,
         &format!("Target usage before: {} bytes", usage_before),
@@ -1834,11 +1929,11 @@ fn run_backup_with(
     // cleanup) it's the net change, which may underestimate if old data was
     // purged. Still better than reporting 0.
     if bytes_sent == 0 && (snapshots_sent.unwrap_or(0) > 0 || snapshots_created.unwrap_or(0) > 0) {
-        // Force BTRFS to commit pending transactions so statvfs reflects the
-        // data that was just received. Without this, BTRFS defers metadata
-        // updates and statvfs returns stale values, making the delta zero.
-        sync_targets(config);
-        let usage_after = measure_target_usage(config, progress);
+        // `usage` forces BTRFS to commit pending transactions first, so statvfs
+        // reflects the data that was just received. Without that, BTRFS defers
+        // metadata updates and statvfs returns stale values, making the delta
+        // zero.
+        let usage_after = (env.usage)(config, progress);
         progress.on_log(
             LogLevel::Info,
             &format!(
@@ -1864,52 +1959,7 @@ fn run_backup_with(
 
     // Step (d): Index — walk each target's mount path to pick up new snapshots.
     if options.index_after {
-        match Database::open(&config.general.db_path) {
-            Ok(db) => {
-                let mut targets_indexed = 0usize;
-                for target in &config.targets {
-                    let mount = health::find_any_mount(&target.mount, &target.serial, &target.role);
-                    if let Some(path) = mount {
-                        progress.on_log(
-                            LogLevel::Info,
-                            &format!("Indexing target '{}' at {path}", target.label),
-                        );
-                        match indexer::walk(std::path::Path::new(&path), &db) {
-                            Ok(result) => {
-                                progress.on_log(
-                                    LogLevel::Info,
-                                    &format!(
-                                        "Indexed '{}': {} new snapshots ({} files)",
-                                        target.label,
-                                        result.snapshots_indexed,
-                                        result.results.iter().map(|r| r.files_total).sum::<usize>(),
-                                    ),
-                                );
-                                targets_indexed += 1;
-                            }
-                            Err(e) => {
-                                progress.on_log(
-                                    LogLevel::Warning,
-                                    &format!(
-                                        "Indexing target '{}' failed (non-fatal): {e}",
-                                        target.label
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                }
-                if targets_indexed > 0 {
-                    indexed = true;
-                }
-            }
-            Err(e) => {
-                progress.on_log(
-                    LogLevel::Warning,
-                    &format!("Cannot open index DB for post-backup indexing (non-fatal): {e}"),
-                );
-            }
-        }
+        indexed = (env.index)(config, progress);
     }
 
     // The report is written and emailed by `run_backup_job`, after the
@@ -3106,6 +3156,405 @@ mod tests {
         );
     }
 
+    // -- what the send and the full run read from btrbk's own output --
+
+    /// btrbk's lines for two sends with sizes, one without, and noise.
+    const SEND_LINES: &str = ">>> /t/a.1 (incremental, 1.0 MiB)\n\
+         *** /t/b.1 (full, 2.0 MiB)\n\
+         >>> /t/c.1\n\
+         not a send line (3.0 MiB)\n";
+
+    #[test]
+    fn the_sizes_btrbk_prints_on_its_send_lines_are_added_up_by_a_send_and_a_full_run() {
+        let f = primary_filters();
+        let send_only = BackupOptions {
+            send_only: true,
+            ..Default::default()
+        };
+        let (done, _, _) = pipeline(
+            send_only,
+            BackupMode::Incremental,
+            vec![
+                (btrbk(&format!("resume {f}")), 0, SEND_LINES.into()),
+                listing_of(String::new()),
+            ],
+        );
+        assert_eq!(
+            done.bytes,
+            3 * 1_048_576,
+            "1 MiB + 2 MiB, the other lines no size"
+        );
+        let (done, _, _) = pipeline(
+            BackupOptions::default(),
+            BackupMode::Full,
+            vec![
+                (btrbk(&format!("run {f}")), 0, SEND_LINES.into()),
+                listing_of(String::new()),
+            ],
+        );
+        assert_eq!(done.bytes, 3 * 1_048_576);
+    }
+
+    /// The progress lines btrbk (or `pv`) prints, one per unit, a zero rate and
+    /// a line that is no rate at all.
+    const RATE_LINES: &str =
+        "  10.0 KiB/s\n  10.0 MiB/s\n  1.0 GiB/s\n  0.0 MiB/s\n  no rate here\n";
+
+    #[test]
+    fn a_send_and_a_full_run_report_each_rate_btrbk_prints_and_never_a_zero_one() {
+        let f = primary_filters();
+        let want = [10 * 1_024, 10 * 1_048_576, 1_073_741_824];
+        let send_only = BackupOptions {
+            send_only: true,
+            ..Default::default()
+        };
+        let (_, _, progress) = pipeline(
+            send_only,
+            BackupMode::Incremental,
+            vec![
+                (btrbk(&format!("resume {f}")), 0, RATE_LINES.into()),
+                listing_of(String::new()),
+            ],
+        );
+        assert_eq!(*progress.throughput.lock().unwrap(), want);
+        let (_, _, progress) = pipeline(
+            BackupOptions::default(),
+            BackupMode::Full,
+            vec![
+                (btrbk(&format!("run {f}")), 0, RATE_LINES.into()),
+                listing_of(String::new()),
+            ],
+        );
+        assert_eq!(*progress.throughput.lock().unwrap(), want);
+    }
+
+    #[test]
+    fn a_rate_is_read_in_every_unit_btrbk_prints_it_in() {
+        for (line, bytes) in [
+            ("22.5 MiB/s", 23_592_960),
+            ("22.5 MB/s", 23_592_960),
+            ("2 GiB/s", 2_147_483_648),
+            ("2 GB/s", 2_147_483_648),
+            ("3 KiB/s", 3_072),
+            ("3 KB/s", 3_072),
+            ("5 B/s", 5),
+            ("22.5MiB/s", 23_592_960),
+            ("nothing", 0),
+        ] {
+            assert_eq!(parse_throughput_line(line), bytes, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_size_is_read_from_the_last_parenthetical_in_every_unit_btrbk_may_use() {
+        for (line, bytes) in [
+            (">>> /t/a (incremental, 1.5 TiB)", 1_649_267_441_664),
+            (">>> /t/a (incremental, 1 TB)", 1_099_511_627_776),
+            (">>> /t/a (full, 2 GiB)", 2_147_483_648),
+            (">>> /t/a (full, 2 MB)", 2_097_152),
+            (">>> /t/a (full, 3 KiB)", 3_072),
+            (">>> /t/a (full, 7 B)", 7),
+            (">>> /t/a (full, 7 parsecs)", 0),
+            (">>> /t/a (no size here)", 0),
+            (">>> /t/a with no parenthetical", 0),
+            // A `)` before the last `(` is no parenthetical.
+            (">>> /t/a ) then (", 0),
+        ] {
+            assert_eq!(parse_btrbk_size_field(line), bytes, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn used_bytes_is_the_blocks_in_use_times_the_block_size() {
+        assert_eq!(used_bytes(1_000, 400, 4_096), 600 * 4_096);
+        assert_eq!(used_bytes(1_000, 1_000, 4_096), 0);
+        // A reading with more available than total is zero, never a wrapped number.
+        assert_eq!(used_bytes(10, 20, 4_096), 0);
+    }
+
+    // -- the stage count a run announces --
+
+    #[test]
+    fn a_run_announces_one_stage_step_for_each_thing_it_will_do() {
+        let announced = |options: BackupOptions| {
+            let runner = Scripted::from_owned(vec![]);
+            let progress = TestProgress::new();
+            let options = BackupOptions {
+                dry_run: true,
+                targets: Some(labels(&["primary-22tb"])),
+                ..options
+            };
+            run_backup_with(&live_config(), &options, &progress, &env(&runner)).unwrap();
+            let stages = progress.stages.lock().unwrap();
+            stages
+                .iter()
+                .find(|(name, _)| name == "Backup")
+                .map(|(_, total)| *total)
+                .expect("the run announces its stage")
+        };
+        let with = |f: &dyn Fn(&mut BackupOptions)| {
+            let mut options = BackupOptions::default();
+            f(&mut options);
+            options
+        };
+        assert_eq!(announced(with(&|_| {})), 2, "snapshot + send");
+        assert_eq!(announced(with(&|o| o.send_only = true)), 1);
+        assert_eq!(announced(with(&|o| o.snapshot_only = true)), 1);
+        assert_eq!(announced(with(&|o| o.boot_archive = true)), 3);
+        assert_eq!(announced(with(&|o| o.index_after = true)), 3);
+        assert_eq!(announced(with(&|o| o.send_report = true)), 3);
+        assert_eq!(
+            announced(with(&|o| {
+                o.boot_archive = true;
+                o.index_after = true;
+                o.send_report = true;
+            })),
+            5
+        );
+        // Nothing asked for at all still announces one.
+        assert_eq!(
+            announced(with(&|o| {
+                o.send_only = true;
+                o.snapshot_only = true;
+            })),
+            1
+        );
+    }
+
+    // -- the index step --
+
+    fn walked() -> Result<indexer::WalkResult, Box<dyn std::error::Error>> {
+        Ok(indexer::WalkResult {
+            snapshots_discovered: 2,
+            snapshots_indexed: 2,
+            snapshots_skipped: 0,
+            presence_recorded: 0,
+            results: Vec::new(),
+        })
+    }
+
+    fn indexing_config(dir: &Path) -> Config {
+        let mut config = live_config();
+        config.general.db_path = dir.join("index.db").to_string_lossy().into_owned();
+        config
+    }
+
+    #[test]
+    fn the_index_step_walks_each_mounted_target_and_says_whether_any_was_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = indexing_config(dir.path());
+        let walked_paths = std::sync::Mutex::new(Vec::<String>::new());
+        let progress = TestProgress::new();
+        // Only the first target is mounted.
+        let indexed = index_targets_with(
+            &config,
+            &progress,
+            &|t| (t.label == "primary-22tb").then(|| "/mnt/primary".to_string()),
+            &|path, _| {
+                walked_paths
+                    .lock()
+                    .unwrap()
+                    .push(path.display().to_string());
+                walked()
+            },
+        );
+        assert!(indexed);
+        assert_eq!(*walked_paths.lock().unwrap(), ["/mnt/primary"]);
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "Indexed 'primary-22tb': 2 new snapshots (0 files)"
+        ));
+
+        // Nothing mounted: nothing walked, nothing indexed.
+        walked_paths.lock().unwrap().clear();
+        let indexed = index_targets_with(&config, &TestProgress::new(), &|_| None, &|path, _| {
+            walked_paths
+                .lock()
+                .unwrap()
+                .push(path.display().to_string());
+            walked()
+        });
+        assert!(!indexed);
+        assert!(walked_paths.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_target_whose_walk_fails_is_a_warning_and_indexes_nothing_but_the_others_still_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = indexing_config(dir.path());
+        let progress = TestProgress::new();
+        let indexed = index_targets_with(
+            &config,
+            &progress,
+            &|t| Some(format!("/mnt/{}", t.label)),
+            &|path, _| {
+                if path.ends_with("recovery") {
+                    walked()
+                } else {
+                    Err("walk failed".into())
+                }
+            },
+        );
+        assert!(indexed, "one target was indexed");
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            "Indexing target 'primary-22tb' failed (non-fatal): walk failed"
+        ));
+
+        let progress = TestProgress::new();
+        let indexed = index_targets_with(
+            &config,
+            &progress,
+            &|t| Some(format!("/mnt/{}", t.label)),
+            &|_, _| Err("walk failed".into()),
+        );
+        assert!(!indexed, "every walk failed");
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_opened_is_a_warning_and_nothing_is_walked() {
+        let mut config = live_config();
+        config.general.db_path = "/nonexistent-dir/index.db".into();
+        let progress = TestProgress::new();
+        let walks = std::cell::Cell::new(0);
+        let indexed = index_targets_with(
+            &config,
+            &progress,
+            &|_| Some("/mnt/x".to_string()),
+            &|_, _| {
+                walks.set(walks.get() + 1);
+                walked()
+            },
+        );
+        assert!(!indexed);
+        assert_eq!(walks.get(), 0);
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Warning
+                    && m.starts_with("Cannot open index DB for post-backup indexing (non-fatal)")),
+            "{:?}",
+            progress.logs.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_run_indexes_only_when_asked_and_reports_what_the_step_found() {
+        let f = "/proc/self/root /proc/self/home";
+        let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
+        let script = || {
+            vec![
+                (at(&format!("snapshot {f}")), 0, String::new()),
+                (at(&format!("resume {f}")), 0, String::new()),
+                (
+                    at(&format!("--format=raw list latest {f}")),
+                    0,
+                    String::new(),
+                ),
+            ]
+        };
+        let run = |index_after: bool, steps_find: bool| {
+            let runner = Scripted::from_owned(script());
+            let asked = std::cell::Cell::new(0);
+            let index = |_: &Config, _: &dyn ProgressCallback| {
+                asked.set(asked.get() + 1);
+                steps_find
+            };
+            let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+            let host = StepEnv {
+                is_mountpoint: &nvme_mounted,
+                index: &index,
+                ..env(&runner)
+            };
+            let options = BackupOptions {
+                index_after,
+                ..live_options()
+            };
+            let result =
+                run_backup_with(&live_config(), &options, &TestProgress::new(), &host).unwrap();
+            (result.indexed, asked.get())
+        };
+        assert_eq!(run(true, true), (true, 1));
+        assert_eq!(run(true, false), (false, 1));
+        assert_eq!(run(false, true), (false, 0), "not asked for: not run");
+    }
+
+    #[test]
+    fn a_source_with_nothing_declared_is_not_said_to_send_nowhere() {
+        // `hdd` has only a retired subvolume: it has no block in btrbk.conf, so
+        // there is nothing to say about it. `nvme-vm` is declared, sends to the
+        // primary target only, and is said.
+        let mut config = steps_config();
+        config.sources[2].subvolumes[0].retired = Some("2026-09-01".into());
+        let progress = TestProgress::new();
+        let filters = btrbk_filters(
+            &config,
+            &labels(&["nvme-root", "nvme-vm", "hdd"]),
+            Some(&labels(&["recovery"])),
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(
+            filters,
+            [
+                format!("{RECOVERY}/nvme-root/root"),
+                format!("{RECOVERY}/nvme-root/home")
+            ]
+        );
+        let warnings: Vec<String> = progress
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, _)| *l == LogLevel::Warning)
+            .map(|(_, m)| m.clone())
+            .collect();
+        assert_eq!(
+            warnings,
+            ["Source 'nvme-vm' sends to none of the selected targets — nothing is done for it"]
+        );
+    }
+
+    #[test]
+    fn each_source_snapshotted_is_logged_by_its_own_label_and_volume() {
+        let config = steps_config();
+        let runner = Scripted::from_owned(vec![
+            (
+                btrbk(&format!("snapshot {PRIMARY}/hdd/data")),
+                0,
+                String::new(),
+            ),
+            (
+                btrbk(&format!("--format=raw list latest {PRIMARY}/hdd/data")),
+                0,
+                String::new(),
+            ),
+        ]);
+        let progress = TestProgress::new();
+        create_snapshots_with(
+            &config,
+            &labels(&["hdd"]),
+            Some(&labels(&["primary-22tb"])),
+            &progress,
+            &runner,
+        )
+        .unwrap();
+        let said: Vec<String> = progress
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, m)| m.starts_with("Snapshotting source"))
+            .map(|(_, m)| m.clone())
+            .collect();
+        assert_eq!(said, ["Snapshotting source 'hdd' at /.btrfs-hdd"]);
+    }
+
     #[test]
     fn nothing_selected_is_an_error_and_never_an_empty_filter_list() {
         let config = steps_config();
@@ -4178,6 +4627,13 @@ mod tests {
         )
         .unwrap_err();
         assert_refused_for_a_bare_dir(&err, dir.path());
+        // And the usage it reads is the real one: the root filesystem of the
+        // host has bytes in use, no targets have none.
+        let mut config = make_test_config();
+        config.targets[0].mount = "/".into();
+        assert!((StepEnv::HOST.usage)(&config, &TestProgress::new()) > 0);
+        config.targets.clear();
+        assert_eq!((StepEnv::HOST.usage)(&config, &TestProgress::new()), 0);
     }
 
     #[test]
@@ -4374,6 +4830,8 @@ mod tests {
             runner,
             verify,
             is_mountpoint: &|_| true,
+            usage: &|_, _| 0,
+            index: &|_, _| false,
         }
     }
 
@@ -4428,6 +4886,15 @@ mod tests {
             LogLevel::Info,
             &format!("Created {m}/@ from nvme/root-.20261005T0100")
         ));
+        // One subvolume: started at 0 of the 1 the config names, done at 1.
+        assert_eq!(config.boot.subvolumes.len(), 1);
+        assert_eq!(
+            *progress.steps.lock().unwrap(),
+            [
+                (0, 1, "Archiving @".to_string()),
+                (1, 1, "Archived @".to_string())
+            ]
+        );
     }
 
     /// bd 5ig: no failure path may leave the live subvolume absent. Each step
@@ -4680,6 +5147,173 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         crate::report::record_backup_run(&db, result).unwrap();
         crate::report::get_backup_history(&db, 1).unwrap().remove(0)
+    }
+
+    // -- bytes_sent: the growth of the targets, measured around the btrbk steps --
+    //
+    // btrbk reports no transfer size, so the run reads the targets' usage
+    // before its steps and, when something was created or sent and the steps
+    // themselves reported no size, again after: the difference is what was
+    // sent. `readings` are what the usage reads in turn.
+
+    /// A live run of `options` with btrbk answering `script`, the usage
+    /// reading `readings` in turn (the last one repeats). Returns the result
+    /// and how many readings were taken.
+    fn live_run_measuring(
+        options: BackupOptions,
+        script: Vec<(String, i32, String)>,
+        readings: &[u64],
+    ) -> (BackupResult, usize) {
+        let runner = Scripted::from_owned(script);
+        let taken = std::cell::Cell::new(0usize);
+        let usage = |_: &Config, _: &dyn ProgressCallback| {
+            let n = taken.get();
+            taken.set(n + 1);
+            readings[n.min(readings.len() - 1)]
+        };
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            usage: &usage,
+            ..env(&runner)
+        };
+        let options = BackupOptions {
+            targets: Some(labels(&["primary-22tb"])),
+            ..options
+        };
+        let result =
+            run_backup_with(&live_config(), &options, &TestProgress::new(), &host).unwrap();
+        (result, taken.get())
+    }
+
+    /// The scripted btrbk of a live run: `snapshot`, `resume` (printing
+    /// `resume_out`, exiting `resume_status`) and the listing of `rows`.
+    fn btrbk_script(
+        resume_status: i32,
+        resume_out: &str,
+        rows: &str,
+    ) -> Vec<(String, i32, String)> {
+        let f = "/proc/self/root /proc/self/home";
+        let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
+        vec![
+            (at(&format!("snapshot {f}")), 0, String::new()),
+            (at(&format!("resume {f}")), resume_status, resume_out.into()),
+            (
+                at(&format!("--format=raw list latest {f}")),
+                0,
+                rows.to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn bytes_sent_is_the_growth_of_the_targets_when_something_was_created_and_sent() {
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let (result, taken) = live_run_measuring(
+            BackupOptions::default(),
+            btrbk_script(0, ">>> /t/a.1\n", &row),
+            &[1000, 5000],
+        );
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(1), Some(1))
+        );
+        assert_eq!(result.bytes_sent, 4000);
+        assert_eq!(taken, 2, "before the steps and after them");
+    }
+
+    #[test]
+    fn bytes_sent_is_measured_for_a_send_alone_and_for_a_snapshot_alone() {
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let send_only = BackupOptions {
+            send_only: true,
+            ..Default::default()
+        };
+        let (result, taken) = live_run_measuring(
+            send_only,
+            btrbk_script(0, ">>> /t/a.1\n", &row),
+            &[1000, 5000],
+        );
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(0), Some(1))
+        );
+        assert_eq!((result.bytes_sent, taken), (4000, 2));
+
+        let snapshot_only = BackupOptions {
+            snapshot_only: true,
+            ..Default::default()
+        };
+        let (result, taken) =
+            live_run_measuring(snapshot_only, btrbk_script(0, "", &row), &[1000, 5000]);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(1), Some(0))
+        );
+        assert_eq!((result.bytes_sent, taken), (4000, 2));
+    }
+
+    #[test]
+    fn a_step_that_failed_still_leaves_what_the_other_one_sent_to_be_measured() {
+        // The send fails (btrbk exit 10): its count is unknown, the snapshot
+        // step created one, so the targets are read again.
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let (result, taken) = live_run_measuring(
+            BackupOptions::default(),
+            btrbk_script(10, "", &row),
+            &[1000, 5000],
+        );
+        assert!(!result.success);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(1), None)
+        );
+        assert_eq!((result.bytes_sent, taken), (4000, 2));
+    }
+
+    #[test]
+    fn nothing_created_or_sent_reads_the_targets_once_and_sends_zero_bytes() {
+        let (result, taken) = live_run_measuring(
+            BackupOptions {
+                send_only: true,
+                ..Default::default()
+            },
+            btrbk_script(0, "", ""),
+            &[1000, 5000],
+        );
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (Some(0), Some(0))
+        );
+        assert_eq!((result.bytes_sent, taken), (0, 1), "no second reading");
+    }
+
+    #[test]
+    fn a_size_btrbk_reported_is_kept_and_the_targets_are_not_read_again() {
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let (result, taken) = live_run_measuring(
+            BackupOptions {
+                send_only: true,
+                ..Default::default()
+            },
+            btrbk_script(0, ">>> /t/a.1 (incremental, 2.0 MiB)\n", &row),
+            &[1000, 5000],
+        );
+        assert_eq!(result.bytes_sent, 2 * 1_048_576);
+        assert_eq!(taken, 1, "the step's own figure is the answer");
+    }
+
+    #[test]
+    fn a_target_that_shrank_during_the_run_sent_zero_bytes_not_a_wrapped_number() {
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let (result, taken) = live_run_measuring(
+            BackupOptions::default(),
+            btrbk_script(0, ">>> /t/a.1\n", &row),
+            &[5000, 1000],
+        );
+        assert_eq!((result.bytes_sent, taken), (0, 2));
     }
 
     #[test]
