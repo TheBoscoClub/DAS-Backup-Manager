@@ -2277,7 +2277,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
                 println!("Boot subvolumes: {}", step.row());
-                let failed = step.failed();
                 if let backup::BootStep::Ran(o) = &step {
                     for f in &o.failures {
                         println!("  FAIL  {f}");
@@ -2286,11 +2285,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  WARN  {w}");
                     }
                 }
-                mount::require_released(&still_mounted)?;
                 // The script's and the doctor's rule: 3 = it began and
-                // something failed; 1 stays "could not start".
-                if failed {
-                    std::process::exit(3);
+                // something failed (the step, or giving the mounts back);
+                // 1 stays "could not start".
+                let released = mount::require_released(&still_mounted);
+                if let Err(why) = &released {
+                    eprintln!("Error: {why}");
+                }
+                let code = step.exit_code(released.is_ok());
+                if code != 0 {
+                    std::process::exit(code);
                 }
             }
             BackupAction::BootPlan { config } => {
