@@ -4637,6 +4637,65 @@ mod tests {
         assert_eq!(runner.calls().len(), 4, "{:?}", runner.calls());
     }
 
+    /// bd DAS-Backup-Manager-7tx (review I2): a verifier that fails only for
+    /// the SECOND target. Verifying just the first target of two selected
+    /// would pass every other test here; this one pins that every target
+    /// written is verified, in send and in the full run.
+    #[test]
+    fn send_full_and_run_refuse_when_only_the_second_selected_target_fails_verification() {
+        let verify =
+            |_: &[Target], write: &[String], _: &dyn ProgressCallback| -> Result<(), String> {
+                if write.iter().any(|l| l == "recovery") {
+                    Err("recovery is not mounted".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+        let config = steps_config();
+        let both = labels(&["primary-22tb", "recovery"]);
+        let runner = Scripted::from_owned(vec![]);
+        let env = env_for(&runner, &verify);
+        let err = send_snapshots_with(&config, None, &both, false, &TestProgress::new(), &env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "recovery is not mounted");
+        let err = run_full_pipeline_with(&config, None, &both, &TestProgress::new(), &env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "recovery is not mounted");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+
+        // `run` verifies every selected target too (a dry run reaches the check).
+        let options = BackupOptions {
+            dry_run: true,
+            targets: Some(both.clone()),
+            ..Default::default()
+        };
+        let err = run_backup_with(
+            &live_config(),
+            &options,
+            &TestProgress::new(),
+            &env_for(&runner, &verify),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "recovery is not mounted");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+
+        // The control: the same verifier lets a selection of the first target
+        // alone through to btrbk.
+        let filters = primary_filters();
+        let runner = Scripted::from_owned(vec![
+            (btrbk(&format!("resume {filters}")), 0, String::new()),
+            (btrbk(&format!("run {filters}")), 0, String::new()),
+        ]);
+        let env = env_for(&runner, &verify);
+        let primary = labels(&["primary-22tb"]);
+        send_snapshots_with(&config, None, &primary, false, &TestProgress::new(), &env).unwrap();
+        run_full_pipeline_with(&config, None, &primary, &TestProgress::new(), &env).unwrap();
+        assert_eq!(runner.calls().len(), 4, "{:?}", runner.calls());
+    }
+
     #[test]
     fn a_step_whose_verification_fails_runs_nothing_and_says_why() {
         let verify = |_: &[Target], _: &[String], _: &dyn ProgressCallback| -> Result<(), String> {
