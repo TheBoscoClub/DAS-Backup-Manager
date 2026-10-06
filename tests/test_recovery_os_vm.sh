@@ -332,6 +332,17 @@ guest_step() {
                     skip=true
                     ;;
                 rotate) guest_rotate ;;
+                say)
+                    # One line now, before what follows in this same look.
+                    guest_line >>"$port"
+                    guest_sent
+                    ;;
+                drop)
+                    # virtlogd past max_backups: the oldest rotated file deleted.
+                    for ((i = 9; i >= 0; i--)); do
+                        if [[ -e "$port.$i" ]]; then rm -f "$port.$i"; break; fi
+                    done
+                    ;;
                 rotate-split)
                     # A line cut in two by the rotation.
                     line=$(guest_line)
@@ -342,6 +353,8 @@ guest_step() {
                     skip=true
                     ;;
                 truncate) : >"$port" ;;
+                # A line of the reset watch's record that cannot be parsed.
+                badreset) echo "reset ?" >>"$(echo "$DAS_RECOVERY_VM_TEST_ROOT"/run/das-recovery-os-vm/*.resets)" ;;
             esac
         done <"$S/guest.script"
     fi
@@ -383,12 +396,45 @@ case "$cmd" in
         while :; do
             m=$(cat "$S/reboots.pending" 2>/dev/null | wc -l)
             while ((n < m)); do
-                echo "event 'reboot' for domain 'recovery-os-updater'"
+                if [[ -f "$S/event_garbled" ]]; then
+                    # Output the watch does not recognise, that names a reboot.
+                    echo "event 'reboot' for domain: 'recovery-os-updater'"
+                else
+                    echo "event 'reboot' for domain 'recovery-os-updater'"
+                fi
                 n=$((n + 1))
             done
             sleep 0.02 &
             wait $!
         done
+        ;;
+    domstats)
+        # One read of the state and the vCPUs' time (libvirt: utime + stime of
+        # each vCPU thread): 0 until the guest has run.
+        [[ "$*" == "--state --vcpu recovery-os-updater" ]] || { echo "UNEXPECTED domstats $*" >>"$S/forbidden"; exit 99; }
+        [[ -f "$S/defined" ]] || nodomain
+        if [[ -f "$S/domstats_fail" ]]; then echo "error: failed to connect to the hypervisor" >&2; exit 1; fi
+        state=$(head -n 1 "$S/states")
+        case "$state" in
+            running) n=1 ;;
+            paused) n=3 ;;
+            "in shutdown") n=4 ;;
+            "shut off") n=5 ;;
+            *) n=0 ;;
+        esac
+        printf "Domain: 'recovery-os-updater'\n  state.state=%s\n  state.reason=1\n" "$n"
+        if [[ "$state" != "shut off" ]]; then
+            printf '  vcpu.current=4\n  vcpu.maximum=4\n'
+            # libvirt leaves the per-vCPU fields out when it cannot read them.
+            if [[ ! -f "$S/domstats_no_vcpu" ]]; then
+                for i in 0 1 2 3; do
+                    t=0
+                    if [[ -f "$S/resumed" ]] || [[ -f "$S/vcpu_ran" && "$i" == 2 ]]; then t=1530000000; fi
+                    printf '  vcpu.%s.state=1\n  vcpu.%s.time=%s\n  vcpu.%s.wait=0\n' "$i" "$i" "$t" "$i"
+                done
+            fi
+        fi
+        echo
         ;;
     domstate)
         [[ -f "$S/defined" ]] || nodomain
@@ -464,6 +510,8 @@ case "$cmd" in
         fi
         rm -f "$S/attached.xml"
         echo "virsh detach" >>"$S/events"
+        # What the reset watch recorded, before giving the disk back takes it away.
+        cat "$DAS_RECOVERY_VM_TEST_ROOT"/run/das-recovery-os-vm/*.resets >"$S/resets.at_detach" 2>/dev/null || :
         echo "Disk detached successfully"
         ;;
     start)
@@ -484,6 +532,8 @@ case "$cmd" in
     resume)
         echo "virsh resume" >>"$S/events"
         touch "$S/resumed"
+        # From here on the domain's state cannot be read.
+        if [[ -f "$S/domstate_fail_after_resume" ]]; then touch "$S/domstate_fail"; fi
         if [[ -f "$S/resume_fail" ]]; then echo "error: Failed to resume domain 'recovery-os-updater'" >&2; exit 1; fi
         cp "$S/states.running" "$S/states"
         # The guest runs: a healthy one's guard reports every mask it was given,
@@ -523,7 +573,7 @@ case "$cmd" in
     destroy)
         # Only a domain started paused and never resumed may be destroyed:
         # it has run nothing. Anything else is a running recovery OS.
-        if [[ -f "$S/resumed" || ! -f "$S/started" || "$(head -n 1 "$S/states")" != paused ]]; then
+        if [[ -f "$S/resumed" || -f "$S/vcpu_ran" || ! -f "$S/started" || "$(head -n 1 "$S/states")" != paused ]]; then
             echo "destroy of a domain that was resumed, is not paused, or never started ($(head -n 1 "$S/states")): $*" >>"$S/forbidden"
             echo "destroy after a resume (or of one not paused, or never started): $S" >>"${DESTROY_LOG:-/dev/null}"
             exit 1
@@ -1275,7 +1325,7 @@ has "SIGINT: the disk is still the VM's" "$(file "$S/attached.xml")" "$DISK_A"
 has "SIGINT: says how to finish" "$OUT" "session-end system-recovery-A-2tb"
 has "SIGINT: the guard engaged, and when it last reported" "$OUT" "the session guard is engaged (das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service; its last report 0h 00m 0"
 has "SIGINT: ...and that status judges it from here" "$OUT" "From here nothing watches it but $T/usr/lib/das-backup/recovery-os-vm.sh status, which judges its report again"
-has "SIGINT: ...and that status counts silence, blind to resets" "$OUT" "also counts 0h 00m 02s of silence as NOT confirmed, since it cannot see resets"
+has "SIGINT: ...and that status counts silence, blind to resets after this script" "$OUT" "also counts 0h 00m 02s of silence as NOT confirmed, since it cannot see a reset made after this script ended"
 matches "SIGINT: the record stays while the session holds the lock" "$(head -n 1 "$LOCK")" "$RECORD_A"
 has "SIGINT: never stop the holder's scope" "$OUT" "Never 'systemctl stop' das-recovery-os-holder-system-recovery-A-2tb.scope"
 check "SIGINT: the record names the holder, which outlives the driver" "$(head -n 1 "$LOCK")" \
@@ -2155,7 +2205,8 @@ check "guard missing, the destroy fails: kept (exit 3)" "$RC" "3"
 lacks "guard missing, the destroy fails: never said to be destroyed" "$OUT" "it was destroyed while still paused"
 has "guard missing, the destroy fails: said" "$OUT" "and it could not be destroyed: it is still paused, and has run nothing"
 has "guard missing, the destroy fails: says it never ran" "$OUT" "was started paused and never resumed: it has not run a single instruction"
-has "guard missing, the destroy fails: how to end it, once it reads paused" "$OUT" "virsh --connect qemu:///system domstate recovery-os-updater      (must say: paused)"
+has "guard missing, the destroy fails: how to end it, once it reads paused and never run" "$OUT" "virsh --connect qemu:///system domstats --state --vcpu recovery-os-updater"
+has "guard missing, the destroy fails: what the read must say" "$OUT" "(must say state.state=3, and vcpu.N.time=0 for every vCPU)"
 lacks "guard missing, the destroy fails: never resumed" "$(events)" "virsh resume"
 check "guard missing, the destroy fails: no forbidden destroy" "$(file "$S/forbidden")" ""
 rm -f "$S/destroy_fail"
@@ -2692,7 +2743,10 @@ write_state 3 "$(record_json system-recovery-A-2tb may)"
 runs_for 100
 printf '0 silence\n12 talk\n' >"$S/guest.script"
 GUARD_SECS=5 CLOCK_GAP=4 STOP_SECS=8 run_stopped session A
-check "stopped 8 s while the first report is due within 5 s: exit 0" "$RC" "0"
+# The gap is a warning (exit 5), never a failure: this script cannot tell a
+# host suspend from its own stop, and in the second the guest ran unwatched.
+check "stopped 8 s while the first report is due within 5 s: a warning, not a failure (exit 5)" "$RC" "5"
+matches "stopped 8 s while the first report is due within 5 s: the gap in the summary" "$OUT" "Warnings      0h 00m 0[89]s passed in 1 gap between two looks at the recovery OS, and the guard's deadlines and its silence did not count it"
 has "stopped 8 s while the first report is due within 5 s: the gap said" "$OUT" "passed between two looks at the recovery OS (a host suspend, or this script was stopped): the guard's deadlines and its silence do not count that time"
 lacks "stopped 8 s while the first report is due within 5 s: no failure" "$OUT" "did not confirm"
 fixture
@@ -2838,7 +2892,7 @@ touch -d '-20 minutes' "$STATE/system-recovery-A-2tb.guard"
 GUARD_SECS=300 run_driver status
 check "status, a report silent past the deadline, may: exit 6" "$RC" "6"
 has "status, a report silent past the deadline: said" "$OUT" "NOT confirmed: silent for 0h 20m"
-has "status, a report silent past the deadline: both causes" "$OUT" "the reporter stopped, or a boot came without the guard (status cannot see resets"
+has "status, a report silent past the deadline: both causes" "$OUT" "the reporter stopped, or a boot came without the guard (status cannot see a reset made after the session's driver ended"
 printf 'paused\n' >"$S/states"
 GUARD_SECS=300 run_driver status
 check "status, silent but paused: not counted (exit 0)" "$RC" "0"
@@ -2876,6 +2930,288 @@ touch "$S/list_fail"
 run_driver status
 check "status, the domain cannot be read: exit 6" "$RC" "6"
 has "status, the domain cannot be read: unknown" "$OUT" "Session guard     unknown"
+
+echo "--- round 4: a reset the watch read late is still a reset (I-1)"
+# The driver and its reset watch stopped -- as a Ctrl-Z to the session's
+# terminal stops them; not the stub's virsh event, whose stopped bash would
+# hang in its wait (a stub artifact) -- once the driver waits for the guest.
+# libvirt's reboot event is emitted into the stopped watch's pipe, then
+# DURING_STOP runs. The watch is let go first and given 3 s to record the
+# reset (WATCH_FIRST, the default), then the driver -- or both at once
+# (WATCH_FIRST=no). The driver then runs to its end.
+run_watch_stopped() {
+    local i dpid epid wpid ppid
+    RC=0
+    set -m
+    driver_env bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
+    dpid=$!
+    set +m
+    for ((i = 0; i < 200; i++)); do
+        grep -q 'waiting for the recovery OS to power off' "$T/driver.out" && break
+        sleep 0.05
+    done
+    sleep 0.3
+    epid=$(head -n 1 "$S/event.pids")
+    wpid=$(awk '{print $4}' "/proc/$epid/stat")
+    ppid=$(awk '{print $4}' "/proc/$wpid/stat")
+    if [[ "$ppid" != "$dpid" ]]; then
+        echo "(the reset watch was not found: $epid's parent $wpid has parent $ppid, not the driver $dpid)" >>"$T/driver.out"
+    fi
+    kill -STOP "$dpid" "$wpid"
+    echo reset >>"$S/reboots.pending"
+    sleep 0.3
+    if [[ -n "${DURING_STOP:-}" ]]; then eval "$DURING_STOP"; fi
+    if [[ "${WATCH_FIRST:-yes}" == yes ]]; then
+        kill -CONT "$wpid"
+        for ((i = 0; i < 60; i++)); do
+            grep -q '^reset ' "$STATE"/*.resets 2>/dev/null && break
+            sleep 0.05
+        done
+    fi
+    kill -CONT "$wpid" "$dpid"
+    for ((i = 0; i < 1200; i++)); do
+        kill -0 "$dpid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if kill -0 "$dpid" 2>/dev/null; then
+        kill -KILL "$dpid" 2>/dev/null || :
+        echo "(the driver did not end within 60s)" >>"$T/driver.out"
+    fi
+    wait "$dpid" || RC=$?
+    OUT="$(cat "$T/driver.out")"
+}
+# The guest's next boot (boot B) from the next look on: its line 1, unless silent.
+# shellcheck disable=SC2016 # expanded by run_watch_stopped's eval
+NEXT_BOOT_B='echo "$BOOT_B" >"$S/guest.boot"; echo 0 >"$S/guest.seq"; echo engaged >"$S/guest.mode"; : >"$S/guest.last"'
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 100
+DURING_STOP=$NEXT_BOOT_B GUARD_SECS=2 run_watch_stopped session A
+check "watch stopped across a reset, then the new boot engaged: exit 0" "$RC" "0"
+check "watch stopped across a reset, then the new boot engaged: the reset recorded whole" "$(grep -c '^reset ' "$S/resets.at_detach")" "1"
+lacks "watch stopped across a reset, then the new boot engaged: no half of it filed apart" "$(file "$S/resets.at_detach")" "said"
+has "watch stopped across a reset, then the new boot engaged: proof asked" "$OUT" "the recovery OS was reset (a reboot inside it, or virsh reset): a boot after that must report its guard engaged"
+has "watch stopped across a reset, then the new boot engaged: proof given" "$OUT" "the boot after the reset reports its guard engaged (boot $BOOT_B)"
+has "watch stopped across a reset, then the new boot engaged: in the summary" "$OUT" "Guard         engaged -- $ENG4 (2 boots; lifted 0 times; 1 reset)"
+
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 100
+DURING_STOP="$NEXT_BOOT_B; touch \"\$S/guest.silent\"" GUARD_SECS=2 run_watch_stopped session A
+check "watch stopped across a reset, then silence, may: shut down (exit 6)" "$RC" "6"
+has "watch stopped across a reset, then silence, may: said" "$OUT" "the session guard did not confirm: the recovery OS was reset, and no boot after that reported its guard engaged within 0h 00m 02s"
+has "watch stopped across a reset, then silence, may: asked to shut down" "$(events)" "virsh shutdown"
+check "watch stopped across a reset, then silence, may: never destroyed" "$(file "$S/forbidden")" ""
+
+# The new boot's line 1 written while the watch was stopped: the reset is
+# recorded where the report stood when the watch read it -- after that line
+# -- so the line cannot answer it, and a proof is still asked for. The
+# cautious side: a boot is never let off for want of knowing when the reset
+# was.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 100
+# shellcheck disable=SC2016 # expanded by run_watch_stopped's eval
+DURING_STOP="$NEXT_BOOT_B"'; line "$ENG4" "$BOOT_B" 1 >>"$(cat "$S/guard_port")"; echo 1 >"$S/guest.seq"; echo engaged >"$S/guest.last"' \
+    WATCH_FIRST=no GUARD_SECS=2 run_watch_stopped session A
+check "watch stopped, the new boot's line 1 before the watch read the reset, may: proof still asked (exit 6)" "$RC" "6"
+has "watch stopped, the new boot's line 1 before the watch read the reset: the reset recorded" "$OUT" "the recovery OS was reset (a reboot inside it, or virsh reset)"
+has "watch stopped, the new boot's line 1 before the watch read the reset: said" "$OUT" "no boot after that reported its guard engaged within 0h 00m 02s"
+
+# Output of the event stream not recognised, that names a reboot: a reset.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 60
+touch "$S/event_garbled"
+printf '3 reset %s\n3 silence\n' "$BOOT_B" >"$S/guest.script"
+DRIVER_TIMEOUT=40 GUARD_SECS=1 run_driver session A
+check "event output not recognised, naming a reboot, then silence, may: a reset (exit 6)" "$RC" "6"
+has "event output not recognised, naming a reboot: kept, said" "$(file "$S/resets.at_detach")" "said event 'reboot' for domain: 'recovery-os-updater'"
+has "event output not recognised, naming a reboot: proof asked" "$OUT" "the session guard did not confirm: the recovery OS was reset, and no boot after that reported its guard engaged"
+
+echo "--- round 4: a reset the session saw is honoured at its end, by status and by session-end (I-2)"
+for sig in INT HUP; do
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb may)"
+    for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+    printf '3 reset %s\n3 silence\n' "$BOOT_B" >"$S/guest.script"
+    # shellcheck disable=SC2016 # expanded by run_interrupted's eval
+    SIG=$sig BEFORE_SIG='for ((k = 0; k < 200; k++)); do grep -q "was reset" "$T/driver.out" && break; sleep 0.05; done' GUARD_SECS=300 run_interrupted session A
+    check "SIG$sig after a reset, the boot after it silent: kept (exit 3)" "$RC" "3"
+    has "SIG$sig after a reset, the boot after it silent: not judged, said" "$OUT" "THE BOOT AFTER THE RESET HAS NOT BEEN JUDGED: the recovery OS was reset, and no boot after that has reported its guard engaged yet"
+    lacks "SIG$sig after a reset, the boot after it silent: never called engaged" "$OUT" "the session guard is engaged (das-vm-guard"
+    lacks "SIG$sig after a reset, the boot after it silent: never told to let the update finish" "$OUT" "Let the update finish, then power the recovery OS off from inside it."
+    has "SIG$sig after a reset, the boot after it silent: status first" "$OUT" "0. Judge the guard first:"
+    GUARD_SECS=300 run_driver status
+    check "SIG$sig, status within the deadline after the reset: pending (exit 0)" "$RC" "0"
+    has "SIG$sig, status within the deadline after the reset: said" "$OUT" "Session guard     in the definition; pending: the recovery OS was reset 0h 00m"
+    lacks "SIG$sig, status within the deadline after the reset: never engaged" "$OUT" "in the definition; engaged"
+    # The reset 20 minutes ago (as the watch recorded it): past the deadline.
+    sed -i -E "s/^(reset [0-9-]+ [0-9]+) [0-9]+$/\\1 $(($(date +%s) - 1200))/" "$STATE/system-recovery-A-2tb.resets"
+    GUARD_SECS=300 run_driver status
+    check "SIG$sig, status past the deadline after the reset, may: exit 6" "$RC" "6"
+    has "SIG$sig, status past the deadline after the reset: said" "$OUT" "NOT confirmed: the recovery OS was reset 0h 20m"
+    printf 'paused\n' >"$S/states"
+    GUARD_SECS=300 run_driver status
+    check "SIG$sig, status after the reset, paused: pending (exit 0)" "$RC" "0"
+    has "SIG$sig, status after the reset, paused: time paused does not count" "$OUT" "it is paused, and time paused does not count"
+    printf 'shut off\n' >"$S/states"
+    GUARD_SECS=300 run_driver session-end A
+    check "SIG$sig, session-end after a reset no boot answered, may: exit 6" "$RC" "6"
+    has "SIG$sig, session-end after a reset no boot answered: said" "$OUT" "session guard: NOT confirmed: the recovery OS was reset, and was shut off before a boot after that reported its guard engaged"
+    check "SIG$sig, session-end after a reset no boot answered: the resets taken away with the guard" "$(ls "$STATE"/*.resets 2>/dev/null)" ""
+done
+# The same on a "no" record: 5.
+fixture
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+printf '3 reset %s\n3 silence\n' "$BOOT_B" >"$S/guest.script"
+# shellcheck disable=SC2016 # expanded by run_interrupted's eval
+BEFORE_SIG='for ((k = 0; k < 200; k++)); do grep -q "was reset" "$T/driver.out" && break; sleep 0.05; done' GUARD_SECS=300 run_interrupted session A
+printf 'shut off\n' >"$S/states"
+GUARD_SECS=300 run_driver session-end A
+check "session-end after a reset no boot answered, no record: exit 5" "$RC" "5"
+# Answered: a boot after the reset reported engaged -- engaged, exit 0.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+printf '3 reset %s\n' "$BOOT_B" >"$S/guest.script"
+# shellcheck disable=SC2016 # expanded by run_interrupted's eval
+BEFORE_SIG='for ((k = 0; k < 200; k++)); do grep -q "the boot after the reset reports" "$T/driver.out" && break; sleep 0.05; done' GUARD_SECS=300 run_interrupted session A
+check "interrupted after a reset the new boot answered: kept (exit 3)" "$RC" "3"
+has "interrupted after a reset the new boot answered: engaged" "$OUT" "the session guard is engaged (das-vm-guard"
+GUARD_SECS=300 run_driver status
+check "status after a reset the new boot answered: exit 0" "$RC" "0"
+has "status after a reset the new boot answered: said" "$OUT" "engaged (2 boots; lifted 0 times); each of its 1 reset answered by a boot reporting engaged"
+printf 'shut off\n' >"$S/states"
+GUARD_SECS=300 run_driver session-end A
+check "session-end after a reset the new boot answered: exit 0" "$RC" "0"
+
+# The deadline after a reset passed by the last look, at an interrupt: NOT
+# confirmed, as a look while it ran would have found -- said, never acted on.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+printf '1 reset %s\n1 silence\n' "$BOOT_B" >"$S/guest.script"
+# shellcheck disable=SC2016 # expanded by run_interrupted's eval
+POLL=4 BEFORE_SIG='for ((k = 0; k < 200; k++)); do grep -q "was reset" "$T/driver.out" && break; sleep 0.05; done; sleep 2' GUARD_SECS=1 run_interrupted session A
+check "interrupted after the deadline of a reset passed: kept (exit 3)" "$RC" "3"
+has "interrupted after the deadline of a reset passed: NOT confirmed, said" "$OUT" "THE RECOVERY OS IS RUNNING WITHOUT A CONFIRMED SESSION GUARD (the recovery OS was reset, and no boot after that reported its guard engaged within 0h 00m 01s"
+lacks "interrupted after the deadline of a reset passed: never asked to shut down by the last look" "$(events)" "virsh shutdown"
+# A line of the watch's record that cannot be parsed is still a reset.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 60
+printf '3 badreset\n3 silence\n' >"$S/guest.script"
+DRIVER_TIMEOUT=40 GUARD_SECS=1 run_driver session A
+check "a reset line that cannot be parsed, then silence, may: a reset (exit 6)" "$RC" "6"
+has "a reset line that cannot be parsed: said" "$OUT" "no boot after that reported its guard engaged within 0h 00m 01s"
+
+echo "--- round 4: a line left unfinished at power-off (M-1)"
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+{ line "$ENG4"; printf 'das-vm-guard NOT engaged: btrbk.timer is not masked (loaded); seq 2 boot %s' "$BOOT_A"; } >"$S/guard_reply"
+runs_for 3
+GUARD_SECS=300 run_driver session A
+check "off in the middle of a NOT engaged line, may: exit 6" "$RC" "6"
+has "off in the middle of a NOT engaged line: said" "$OUT" "the recovery OS powered off in the middle of a line that reports it NOT engaged: 'das-vm-guard NOT engaged: btrbk.timer is not masked (loaded); seq 2 boot"
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+{ line "$ENG4"; printf 'das-vm-guard N'; } >"$S/guard_reply"
+runs_for 3
+GUARD_SECS=300 run_driver session A
+check "off in the middle of a line only a NOT engaged one begins so, may: exit 6" "$RC" "6"
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+{ line "$ENG4"; printf 'das-vm-guard engaged 4 ma'; } >"$S/guard_reply"
+runs_for 3
+GUARD_SECS=300 run_driver session A
+check "off in the middle of another line: a warning (exit 5)" "$RC" "5"
+has "off in the middle of another line: in the summary" "$OUT" "Warnings      the session guard's report: the recovery OS powered off in the middle of a line, never finished: 'das-vm-guard engaged 4 ma'"
+# session-end judges a saved report the same way.
+for part in "das-vm-guard NOT engaged: btrbk.timer is not mas" "das-vm-guard engaged 4 ma"; do
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb may)"
+    for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+    GUARD_SECS=300 run_interrupted session A
+    touch "$S/guest.silent"
+    printf '%s' "$part" >>"$STATE/system-recovery-A-2tb.guard"
+    printf 'shut off\n' >"$S/states"
+    GUARD_SECS=300 run_driver session-end A
+    if [[ "$part" == *NOT* ]]; then
+        check "session-end, shut off in the middle of a NOT engaged line, may: exit 6" "$RC" "6"
+        has "session-end, shut off in the middle of a NOT engaged line: said" "$OUT" "NOT engaged: the recovery OS was shut off in the middle of a line that reports it NOT engaged"
+    else
+        check "session-end, shut off in the middle of another line: exit 5" "$RC" "5"
+        has "session-end, shut off in the middle of another line: said" "$OUT" "it was shut off in the middle of a line, never finished: 'das-vm-guard engaged 4 ma'"
+    fi
+done
+
+echo "--- round 4: the destroy reads the vCPUs' time with the state (M-2, ir5c)"
+# Resumed and paused again by something else before the check: paused, but
+# its vCPUs ran -- never destroyed.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/live_drops_guard" "$S/vcpu_ran"
+run_driver session A
+check "paused, its vCPUs ran (resumed and paused by another), may: kept (exit 3)" "$RC" "3"
+check "paused, its vCPUs ran: never destroyed" "$(file "$S/forbidden")" ""
+lacks "paused, its vCPUs ran: no destroy" "$(file "$S/virsh.calls")" "destroy"
+has "paused, its vCPUs ran: said" "$OUT" "not destroying recovery-os-updater: it is paused, but its vCPUs have run (1 of 4 with CPU time)"
+lacks "paused, its vCPUs ran: never said it ran nothing" "$OUT" "it has not run a single instruction"
+has "paused, its vCPUs ran: may have run" "$OUT" "It is paused, and its vCPUs have run: something other than this script resumed it: it may have run"
+has "paused, its vCPUs ran: the read made once, with the state" "$(file "$S/virsh.calls")" "domstats --state --vcpu recovery-os-updater"
+# Interrupted while paused, its vCPUs ran meanwhile: never destroyed.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/dumpxml_live_sleep" "$S/vcpu_ran"
+WAIT_FILE="$S/in_live_dumpxml" run_interrupted session A
+check "interrupted while paused, its vCPUs ran: kept (exit 3)" "$RC" "3"
+check "interrupted while paused, its vCPUs ran: never destroyed" "$(file "$S/forbidden")" ""
+# The read fails, or gives no vCPU time: nothing is destroyed.
+for how in domstats_fail domstats_no_vcpu; do
+    fixture
+    write_state 3 "$(record_json system-recovery-A-2tb may)"
+    touch "$S/live_drops_guard" "$S/$how"
+    run_driver session A
+    check "guard missing, $how: kept (exit 3)" "$RC" "3"
+    lacks "guard missing, $how: no destroy" "$(events)" "virsh destroy"
+    has "guard missing, $how: said" "$OUT" "not destroying recovery-os-updater: whether it ever ran cannot be read"
+    lacks "guard missing, $how: never resumed" "$(events)" "virsh resume"
+done
+
+echo "--- round 4: what three mutants of round 3 showed untested (M-3)"
+# The domain's state cannot be read once it runs: the guard's clock counts on
+# (it fails closed), never stopped as if paused.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent" "$S/domstate_fail_after_resume"
+DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
+check "state unreadable after the resume, no report, may: kept (exit 3)" "$RC" "3"
+has "state unreadable after the resume, no report: the clock counted on" "$OUT" "the session guard did not confirm: no report from the recovery OS within 0h 00m 01s of its start"
+has "state unreadable after the resume, no report: asked to shut down" "$(events)" "virsh shutdown"
+check "state unreadable after the resume, no report: never destroyed" "$(file "$S/forbidden")" ""
+# The file being read is gone (virtlogd past max_backups): the oldest file
+# not read yet is read first -- a NOT engaged line there is seen.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 60
+printf '3 rotate\n3 notengaged\n3 rotate\n3 drop\n' >"$S/guest.script"
+DRIVER_TIMEOUT=40 GUARD_SECS=300 run_driver session A
+check "the file being read gone, a NOT engaged line in the oldest unread, may: exit 6" "$RC" "6"
+has "the file being read gone: the loss said" "$OUT" "was gone before it could be read"
+has "the file being read gone: the NOT engaged line seen" "$OUT" "the recovery OS reports it NOT engaged: btrbk.timer is not masked (loaded);"
+# Two resets in one look, a new boot's line 1 between them: each reset is
+# placed where it was, so the first is answered and the second is not.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+runs_for 60
+printf '3 reset %s\n3 say\n3 reset %s\n3 silence\n' "$BOOT_B" "$BOOT_A" >"$S/guest.script"
+DRIVER_TIMEOUT=40 GUARD_SECS=1 run_driver session A
+check "two resets in one look, a boot between them, then silence, may: exit 6" "$RC" "6"
+check "two resets in one look: both recorded" "$(grep -c '^reset ' "$S/resets.at_detach")" "2"
+has "two resets in one look: the first answered" "$OUT" "the boot after the reset reports its guard engaged (boot $BOOT_B)"
+has "two resets in one look: the second not" "$OUT" "no boot after that reported its guard engaged within 0h 00m 01s"
 
 echo "--- the guard's scripts, run as the recovery OS runs them (stand-ins for mount, systemctl, findmnt, sleep)"
 fixture
