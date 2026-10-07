@@ -1944,8 +1944,9 @@ run_btrbk() {
 # the bytewise-greater full path — never the greater path alone, which would
 # put "nvme/var.2026…" ahead of a later "ssd/var" only by directory name.
 # The rule is the Rust library's (backup::latest_matching_snapshot), pinned
-# for both by tests/fixtures/boot-subvol-listing.txt. Walked by parameter
-# expansion — no pipe (SIGPIPE under pipefail, bd wkvz), no here-string (a
+# for both by tests/fixtures/boot-subvol-listing.txt. Walked by one word split
+# of the listing (linear; bd 5bwi) and parameter expansion — no pipe (SIGPIPE
+# under pipefail, bd wkvz), no here-string (a
 # temp file: a full /tmp read as "none"), no subshell. Literal prefix match,
 # so a snapshot name holding '.', '*' or '-' matches only itself, and the
 # timestamp must be btrbk's `long` format (8 digits, T, 4 digits, optional
@@ -1963,10 +1964,20 @@ latest_boot_snapshot() {
         [[ -n $dir ]] && dirs+=("$dir")
     done
     LATEST_BOOT_SNAPSHOT=""
-    rest=$listing
-    while [[ -n $rest ]]; do
-        line=${rest%%$'\n'*}
-        if [[ $rest == *$'\n'* ]]; then rest=${rest#*$'\n'}; else rest=""; fi
+    # One word split of the whole listing, on newlines only, globbing off: a
+    # single linear pass. Cutting the front off the string a line at a time
+    # copies the remainder each time: quadratic, 89 s at 15,000 lines (bd 5bwi).
+    # Blank lines vanish (they matched nothing anyway), each line stays one
+    # word (IFS is the newline alone), and the caller's globbing setting is put
+    # back before the first line is read.
+    local IFS=$'\n' noglob=""
+    local -a lines
+    [[ $- == *f* ]] && noglob=1
+    set -f
+    # shellcheck disable=SC2206  # the word split IS the walk
+    lines=($listing)
+    [[ -n $noglob ]] || set +f
+    for line in "${lines[@]}"; do
         path=${line##* }
         for dir in "${dirs[@]}"; do
             prefix="$dir/$name."
