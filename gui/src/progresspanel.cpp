@@ -38,8 +38,7 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     m_cancelButton = new QPushButton(
         QIcon::fromTheme(QStringLiteral("process-stop")),
         tr("Cancel"), this);
-    m_cancelButton->setToolTip(tr("Cancel the current operation"));
-    m_cancelButton->setEnabled(false);
+    showCancelIdle(false);
 
     row1->addWidget(m_operationLabel);
     row1->addWidget(m_stageLabel, 1);
@@ -121,7 +120,7 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
     m_etaLabel->clear();
     m_progressBar->setValue(0);
     m_progressBar->setStyleSheet(QString());  // reset any error styling
-    m_cancelButton->setEnabled(true);
+    showCancelIdle(true);
     m_logView->clear();
     m_userScrolledUp = false;
 
@@ -208,7 +207,7 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
         return;
     }
 
-    m_cancelButton->setEnabled(false);
+    showCancelIdle(false);
 
     if (success) {
         m_progressBar->setValue(100);
@@ -233,10 +232,34 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
 
 void ProgressPanel::cancelJob()
 {
-    if (!m_currentJobId.isEmpty()) {
-        m_client->jobCancel(m_currentJobId);
-        m_cancelButton->setEnabled(false);
+    if (m_currentJobId.isEmpty()) {
+        return;
     }
+    if (m_client->jobCancel(m_currentJobId)) {
+        showCancelRequested();
+    } else {
+        // Not accepted (the error is reported by the client): the job runs
+        // on, so the button stays usable.
+        showCancelIdle(true);
+    }
+}
+
+void ProgressPanel::showCancelRequested()
+{
+    m_cancelButton->setText(tr("Cancelling…"));
+    m_cancelButton->setToolTip(
+        tr("Cancel requested — the job stops at its next safe point, after "
+           "the step in progress finishes"));
+    m_cancelButton->setEnabled(false);
+}
+
+void ProgressPanel::showCancelIdle(bool enabled)
+{
+    m_cancelButton->setText(tr("Cancel"));
+    m_cancelButton->setToolTip(
+        tr("Cancel the current operation — it stops at its next safe point; "
+           "a step in progress, such as a send, is never cut off"));
+    m_cancelButton->setEnabled(enabled);
 }
 
 void ProgressPanel::toggleLog()
@@ -266,7 +289,7 @@ void ProgressPanel::resetPanel()
     m_stageLabel->clear();
     m_throughputLabel->clear();
     m_etaLabel->clear();
-    m_cancelButton->setEnabled(false);
+    showCancelIdle(false);
     m_userScrolledUp = false;
 
     hide();

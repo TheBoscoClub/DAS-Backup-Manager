@@ -30,7 +30,7 @@ use buttered_dasd::indexer;
 use buttered_dasd::maintenance::{self, LockSite};
 use buttered_dasd::mount;
 use buttered_dasd::progress::{
-    LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
+    self, LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
 };
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
@@ -1228,14 +1228,18 @@ impl HelperInterface {
             Some((_, _, owner)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
                 "Job '{job_id}' belongs to another client"
             ))),
-            // The work is NOT aborted: aborting the task only stopped the
-            // job from ever sending JobFinished while its blocking work went
-            // on as root, holding the backup locks. The job is marked
-            // cancelled — its progress is no longer sent — and it ends with
-            // exactly one JobFinished(false, "cancelled …") when the work
-            // really stops and its locks are released. Nothing in the
-            // library checks for cancellation, so a running btrbk send is
-            // not interrupted.
+            // The task is NOT aborted: that only stopped the job from ever
+            // sending JobFinished while its blocking work went on as root,
+            // holding the backup locks. The job is marked cancelled — its
+            // progress is no longer sent — and it stops at its next safe
+            // boundary: a lock wait at once, otherwise once the stage in
+            // progress (a btrbk send, a btrfs operation, a write, an
+            // unmount) has finished, never in the middle of one. It still
+            // unmounts what it mounted, lets go of its locks and records
+            // itself, then ends with exactly one JobFinished: failed,
+            // "cancelled …", when it stopped early; its real outcome, saying
+            // the cancel came too late, when nothing was left to stop
+            // (bd DAS-Backup-Manager-yq2).
             Some((_, progress, _)) => {
                 progress.cancel();
                 Ok(true)
@@ -1333,7 +1337,18 @@ fn index_walk_job(
     let mut errors = Vec::new();
 
     progress.on_stage("Indexing targets", paths.len() as u64);
+    let mut cancelled = None;
     for (i, path) in paths.iter().enumerate() {
+        // A boundary before each target: a walk in progress is never cut.
+        if progress::stop_requested(progress) {
+            let done = if i == 0 {
+                "mounting the targets".to_string()
+            } else {
+                format!("indexing {i} of {} targets", paths.len())
+            };
+            cancelled = Some(backup::cancelled_line(&done, &paths[i..].join(", ")));
+            break;
+        }
         progress.on_progress(
             (i + 1) as u64,
             paths.len() as u64,
@@ -1353,7 +1368,12 @@ fn index_walk_job(
 
     let still_mounted = guard.unmount(progress);
 
-    let res = if !errors.is_empty() && total_indexed == 0 {
+    let res = if let Some(cancelled) = cancelled {
+        Err(format!(
+            "{cancelled} — indexed {total_indexed} new snapshots \
+             ({total_discovered} discovered, {total_skipped} skipped)"
+        ))
+    } else if !errors.is_empty() && total_indexed == 0 {
         Err(format!("Indexing failed: {}", errors.join("; ")))
     } else {
         let mut msg = format!(
@@ -1381,24 +1401,29 @@ fn restore_files_job(
         .map_err(|e| format!("Mount failed: {e}"))?;
 
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-    let res = match restore::restore_files(
-        Path::new(snapshot),
-        &file_refs,
-        Path::new(dest),
-        &config.restore.allowed_roots,
-        &restore::snapshot_source_roots(config),
-        progress,
-    ) {
-        Ok(r) => Ok((
-            r.errors.is_empty(),
-            format!(
-                "Restored {} files ({} bytes), {} errors",
-                r.files_restored,
-                r.bytes_restored,
-                r.errors.len()
-            ),
-        )),
-        Err(e) => Err(format!("Restore failed: {e}")),
+    // A boundary: mounted, nothing restored yet.
+    let res = if progress::stop_requested(progress) {
+        Err(backup::cancelled_line("mounting the targets", "restore"))
+    } else {
+        match restore::restore_files(
+            Path::new(snapshot),
+            &file_refs,
+            Path::new(dest),
+            &config.restore.allowed_roots,
+            &restore::snapshot_source_roots(config),
+            progress,
+        ) {
+            Ok(r) => Ok((
+                r.errors.is_empty(),
+                format!(
+                    "Restored {} files ({} bytes), {} errors",
+                    r.files_restored,
+                    r.bytes_restored,
+                    r.errors.len()
+                ),
+            )),
+            Err(e) => Err(format!("Restore failed: {e}")),
+        }
     };
 
     let still_mounted = guard.unmount(progress);
@@ -1417,23 +1442,28 @@ fn restore_snapshot_job(
     let mut guard = mount::ensure_targets_mounted(config, progress, &held)
         .map_err(|e| format!("Mount failed: {e}"))?;
 
-    let res = match restore::restore_snapshot(
-        Path::new(snapshot),
-        Path::new(dest),
-        &config.restore.allowed_roots,
-        &restore::snapshot_source_roots(config),
-        progress,
-    ) {
-        Ok(r) => Ok((
-            r.errors.is_empty(),
-            format!(
-                "Snapshot restored: {} files ({} bytes), {} errors",
-                r.files_restored,
-                r.bytes_restored,
-                r.errors.len()
-            ),
-        )),
-        Err(e) => Err(format!("Snapshot restore failed: {e}")),
+    // A boundary: mounted, nothing restored yet.
+    let res = if progress::stop_requested(progress) {
+        Err(backup::cancelled_line("mounting the targets", "restore"))
+    } else {
+        match restore::restore_snapshot(
+            Path::new(snapshot),
+            Path::new(dest),
+            &config.restore.allowed_roots,
+            &restore::snapshot_source_roots(config),
+            progress,
+        ) {
+            Ok(r) => Ok((
+                r.errors.is_empty(),
+                format!(
+                    "Snapshot restored: {} files ({} bytes), {} errors",
+                    r.files_restored,
+                    r.bytes_restored,
+                    r.errors.len()
+                ),
+            )),
+            Err(e) => Err(format!("Snapshot restore failed: {e}")),
+        }
     };
 
     let still_mounted = guard.unmount(progress);
@@ -2044,5 +2074,62 @@ mod tests {
     #[test]
     fn restore_snapshot_stops_waiting_when_cancelled() {
         stops_waiting_when_cancelled(Job::RestoreSnapshot);
+    }
+
+    /// Cancelled with the lock free: the job mounts, then stops at the
+    /// boundary before the restore, lets go of the lock, restores nothing
+    /// and ends failed, "cancelled after …" (bd DAS-Backup-Manager-yq2).
+    fn a_cancelled_restore_stops_before_restoring(job: Job) {
+        let rig = JobRig::new();
+        let (progress, sent) = gui_progress();
+        progress.cancel();
+        let out = run_job(&rig, job, &progress);
+        assert_eq!(
+            out,
+            Err("cancelled after mounting the targets; not done: restore".into()),
+            "{job:?}"
+        );
+        assert!(rig.nothing_done(), "{job:?} restored nothing");
+        drop(rig.hold()); // the lock was let go
+        progress.finish(false, &out.unwrap_err());
+        match sent.lock().unwrap().last() {
+            Some(ProgressEvent::Finished { success, summary }) => {
+                assert!(!success);
+                assert_eq!(
+                    summary,
+                    "cancelled after mounting the targets; not done: restore"
+                );
+            }
+            other => panic!("{job:?} must end with Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_files_stops_before_restoring_when_cancelled() {
+        a_cancelled_restore_stops_before_restoring(Job::RestoreFiles);
+    }
+
+    #[test]
+    fn restore_snapshot_stops_before_restoring_when_cancelled() {
+        a_cancelled_restore_stops_before_restoring(Job::RestoreSnapshot);
+    }
+
+    /// Nothing is left to stop in an index walk with no target: the cancel
+    /// came too late, and the job ends with its real outcome.
+    #[test]
+    fn a_cancel_with_nothing_left_to_stop_ends_with_the_real_outcome() {
+        let rig = JobRig::new();
+        let (progress, sent) = gui_progress();
+        progress.cancel();
+        let out = run_job(&rig, Job::IndexWalk, &progress);
+        assert_proceeded(Job::IndexWalk, &out);
+        progress.finish(true, &out.unwrap());
+        match sent.lock().unwrap().last() {
+            Some(ProgressEvent::Finished { success, summary }) => {
+                assert!(success);
+                assert!(summary.contains("cancel requested too late"), "{summary}");
+            }
+            other => panic!("must end with Finished, got {other:?}"),
+        }
     }
 }

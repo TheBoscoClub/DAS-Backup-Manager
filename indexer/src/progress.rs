@@ -36,6 +36,67 @@ pub trait ProgressCallback: Send + Sync {
 
     /// Operation completed.
     fn on_complete(&self, success: bool, summary: &str);
+
+    /// The job's cancellation token, if it can be cancelled at all: the GUI's
+    /// jobs (the D-Bus helper) have one, the CLI's do not — `None` is never
+    /// cancelled, and waits the way it always did.
+    fn cancel_token(&self) -> Option<&CancelToken> {
+        None
+    }
+}
+
+/// A cancel asked for, and whether the work acted on it.
+///
+/// Cancel means *stop at the next safe boundary*: a stage in progress — a
+/// btrbk send or receive, a btrfs subvolume operation, a config or database
+/// write, an unmount — is never interrupted; the job stops before it begins
+/// the next stage, and still unmounts what it mounted, lets go of its locks
+/// and records what it did. A lock wait is a boundary at every look.
+#[derive(Debug, Default)]
+pub struct CancelToken {
+    requested: std::sync::atomic::AtomicBool,
+    honoured: std::sync::atomic::AtomicBool,
+}
+
+impl CancelToken {
+    /// The client asked for the job to stop.
+    pub fn cancel(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A boundary: `true` — stop here, and the job is now one that a cancel
+    /// cut short — when a cancel was asked for.
+    pub fn stop_here(&self) -> bool {
+        let stop = self.is_requested();
+        if stop {
+            self.honoured
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        stop
+    }
+
+    /// Whether the work stopped early because of the cancel. `false` with
+    /// [`is_requested`](Self::is_requested) means the cancel came too late
+    /// to stop anything.
+    pub fn honoured(&self) -> bool {
+        self.honoured.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A boundary in a job reporting to `progress`: whether to stop here. Never
+/// for a job with no [`CancelToken`].
+pub fn stop_requested(progress: &dyn ProgressCallback) -> bool {
+    progress.cancel_token().is_some_and(CancelToken::stop_here)
+}
+
+/// Whether a cancel stopped the job reporting to `progress` before its end.
+pub fn cut_short(progress: &dyn ProgressCallback) -> bool {
+    progress.cancel_token().is_some_and(CancelToken::honoured)
 }
 
 /// No-op implementation for when progress reporting isn't needed.
@@ -114,14 +175,15 @@ pub trait ProgressSink: Send + 'static {
 /// every log line still reaches `ProgressSink::journal`, because the work
 /// goes on as root after a cancel and its record must not go silent, and the
 /// end is never dropped.
-/// `finish` still sends exactly one `Finished`, failed and saying the job was
-/// cancelled, when the work really stops. Cancelling does not stop the work;
-/// the caller decides whether it can.
+/// `finish` still sends exactly one `Finished` when the work really stops:
+/// failed and saying `cancelled — …` when a boundary acted on the cancel
+/// ([`CancelToken::honoured`]); otherwise the work's real outcome, saying the
+/// cancel came too late to stop anything (bd DAS-Backup-Manager-yq2).
 pub struct OrderedProgress {
     /// Each event, and whether it still goes to the client.
     tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<(ProgressEvent, bool)>>>,
     drain: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    cancelled: std::sync::atomic::AtomicBool,
+    cancel: CancelToken,
 }
 
 impl OrderedProgress {
@@ -140,7 +202,7 @@ impl OrderedProgress {
         Self {
             tx: std::sync::Mutex::new(Some(tx)),
             drain: std::sync::Mutex::new(Some(drain)),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancel: CancelToken::default(),
         }
     }
 
@@ -148,12 +210,11 @@ impl OrderedProgress {
     /// still reach the journal), and end it as cancelled when `finish` is
     /// called.
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancel.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+        self.cancel.is_requested()
     }
 
     fn send(&self, event: ProgressEvent) {
@@ -177,11 +238,23 @@ impl OrderedProgress {
     pub fn finish(&self, success: bool, summary: &str) {
         let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(tx) = tx else { return };
-        let event = if self.is_cancelled() {
+        let event = if self.cancel.honoured() {
             ProgressEvent::Finished {
                 success: false,
+                summary: if summary.starts_with("cancelled") {
+                    summary.to_owned()
+                } else {
+                    format!("cancelled — {summary}")
+                },
+            }
+        } else if self.is_cancelled() {
+            // Asked for, but no boundary was left to act on it: the work ran
+            // to its end, and the end is what it was.
+            ProgressEvent::Finished {
+                success,
                 summary: format!(
-                    "cancelled — the job has stopped; it had got as far as: {summary}"
+                    "{summary}\n(cancel requested too late to stop anything: \
+                     the work had already finished)"
                 ),
             }
         } else {
@@ -229,6 +302,10 @@ impl ProgressCallback for OrderedProgress {
         });
     }
 
+    fn cancel_token(&self) -> Option<&CancelToken> {
+        Some(&self.cancel)
+    }
+
     fn on_complete(&self, success: bool, summary: &str) {
         self.send(ProgressEvent::Log {
             level: if success {
@@ -264,6 +341,8 @@ pub struct TestProgress {
     pub throughput: std::sync::Mutex<Vec<u64>>,
     pub logs: std::sync::Mutex<Vec<(LogLevel, String)>>,
     pub completed: std::sync::Mutex<Option<(bool, String)>>,
+    /// `Some` for a job that can be cancelled ([`TestProgress::cancellable`]).
+    pub cancel: Option<CancelToken>,
 }
 
 #[cfg(test)]
@@ -275,6 +354,7 @@ impl Default for TestProgress {
             throughput: std::sync::Mutex::new(Vec::new()),
             logs: std::sync::Mutex::new(Vec::new()),
             completed: std::sync::Mutex::new(None),
+            cancel: None,
         }
     }
 }
@@ -283,6 +363,14 @@ impl Default for TestProgress {
 impl TestProgress {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A job the GUI could cancel: it carries a [`CancelToken`].
+    pub fn cancellable() -> Self {
+        Self {
+            cancel: Some(CancelToken::default()),
+            ..Self::default()
+        }
     }
 }
 
@@ -312,6 +400,10 @@ impl ProgressCallback for TestProgress {
 
     fn on_complete(&self, success: bool, summary: &str) {
         *self.completed.lock().unwrap() = Some((success, summary.to_string()));
+    }
+
+    fn cancel_token(&self) -> Option<&CancelToken> {
+        self.cancel.as_ref()
     }
 }
 
@@ -526,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_job_drops_its_progress_but_ends_exactly_once_as_cancelled() {
+    fn a_cancel_too_late_to_stop_anything_ends_with_the_real_outcome() {
         let (progress, got) = collecting(None);
         progress.on_log(LogLevel::Info, "before");
         assert!(!progress.is_cancelled());
@@ -536,8 +628,9 @@ mod tests {
         progress.on_stage("Sending", 1);
         progress.on_progress(1, 1, "sent");
         progress.on_complete(true, "Backup succeeded");
-        // The work reports success when it really stops; the client asked
-        // for it to be cancelled, so it ends failed and says so.
+        // No boundary acted on the cancel: the work ran to its end, so the
+        // end is its own — success, as `backup_runs` records it (bd yq2) —
+        // and it says the cancel came too late.
         progress.finish(true, "Backup succeeded");
         progress.finish(true, "again");
         assert_eq!(
@@ -545,13 +638,55 @@ mod tests {
             vec![
                 log_msg("before"),
                 ProgressEvent::Finished {
-                    success: false,
-                    summary: "cancelled — the job has stopped; it had got as far as: \
-                              Backup succeeded"
+                    success: true,
+                    summary: "Backup succeeded\n(cancel requested too late to stop \
+                              anything: the work had already finished)"
                         .into()
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_job_a_cancel_cut_short_ends_failed_and_says_cancelled() {
+        let (progress, got) = collecting(None);
+        progress.cancel();
+        assert!(!cut_short(&progress), "asked for is not acted on");
+        assert!(stop_requested(&progress));
+        assert!(cut_short(&progress));
+        progress.finish(true, "stopped after mounting the sources");
+        progress.finish(true, "again");
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![ProgressEvent::Finished {
+                success: false,
+                summary: "cancelled — stopped after mounting the sources".into()
+            }]
+        );
+        // A summary that already says so is not said twice.
+        let (progress, got) = collecting(None);
+        progress.cancel();
+        assert!(stop_requested(&progress));
+        progress.finish(false, "cancelled after the snapshot step");
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![ProgressEvent::Finished {
+                success: false,
+                summary: "cancelled after the snapshot step".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_token_is_never_stopped() {
+        // No token at all — not a token that is never cancelled: a job with
+        // one waits for a lock by looking again, one without blocks.
+        assert!(NullProgress.cancel_token().is_none());
+        assert!(TestProgress::new().cancel_token().is_none());
+        assert!(!stop_requested(&NullProgress));
+        assert!(!cut_short(&NullProgress));
+        let token = CancelToken::default();
+        assert!(!token.stop_here() && !token.honoured());
     }
 
     #[test]
@@ -616,7 +751,7 @@ mod tests {
         assert_eq!(got[0], log_msg("before"));
         assert!(matches!(
             got[1],
-            ProgressEvent::Finished { success: false, .. }
+            ProgressEvent::Finished { success: true, .. }
         ));
     }
 }
