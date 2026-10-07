@@ -238,6 +238,12 @@ pub fn retire_root(
     })
 }
 
+/// The error a reconcile pass ends with when something it was asked to do
+/// failed (a refused `--forget-root`, a failed `--repair`), or `None`.
+pub fn failure_error(failures: &[String]) -> Option<String> {
+    (!failures.is_empty()).then(|| failures.join("; "))
+}
+
 /// Real-filesystem existence check used by the non-test driver.
 pub fn path_exists(path: &str) -> bool {
     Path::new(path).exists()
@@ -271,6 +277,15 @@ mod tests {
         let got = retire_root(&db, &[], "/mnt/t", false).unwrap();
         assert!(matches!(got, RootRetirement::Dropped(_)), "{got:?}");
         assert!(db.list_snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failures_join_into_one_error_and_none_is_no_error() {
+        assert_eq!(failure_error(&[]), None);
+        assert_eq!(
+            failure_error(&["a".to_string(), "b".to_string()]),
+            Some("a; b".to_string())
+        );
     }
 
     #[test]

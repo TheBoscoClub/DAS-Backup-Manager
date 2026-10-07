@@ -3378,6 +3378,22 @@ Total to scrub:   401.28MiB\n";
         assert_eq!(format_duration(90), "1m 30s");
     }
 
+    #[test]
+    fn a_path_override_is_read_from_the_environment_and_otherwise_the_default_holds() {
+        // A variable nothing else sets, so reading its absence cannot race
+        // the tests that set the real ones.
+        assert_eq!(
+            overridable("DAS_B1S_NEVER_SET", "/default/place"),
+            PathBuf::from("/default/place")
+        );
+        temp_env("DAS_B1S_NEVER_SET", "/elsewhere", || {
+            assert_eq!(
+                overridable("DAS_B1S_NEVER_SET", "/default/place"),
+                PathBuf::from("/elsewhere")
+            );
+        });
+    }
+
     /// Set an env var for the duration of `f`, restoring it afterwards.
     /// Serialized by a mutex because env vars are process-global.
     fn temp_env<R>(key: &str, value: &str, f: impl FnOnce() -> R) -> R {

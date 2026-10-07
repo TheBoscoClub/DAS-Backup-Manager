@@ -1946,10 +1946,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match reconcile::retire_root(&database, &configured, root, dry_run)? {
                     reconcile::RootRetirement::Refused(why) => {
                         eprintln!("{why}");
-                        failures.push(why);
                         let still_mounted = guard.unmount(&progress);
                         mount::require_released(&still_mounted)?;
-                        return Err(failures.join("; ").into());
+                        return Err(why.into());
                     }
                     reconcile::RootRetirement::NoRows => {
                         println!("No index rows under {root}.");
@@ -2040,8 +2039,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             mount::require_released(&still_mounted)?;
-            if !failures.is_empty() {
-                return Err(failures.join("; ").into());
+            if let Some(why) = reconcile::failure_error(&failures) {
+                return Err(why.into());
             }
         }
         Commands::Search { query, db, limit } => {
