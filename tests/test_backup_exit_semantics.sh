@@ -2140,6 +2140,24 @@ fi
 # bd DAS-Backup-Manager-7rf, which stopped CMake installing backup units; that
 # none is installed is checked by tests/test_install_destdir.sh.
 
+# ---------------------------------------------------------------------------
+echo "== 5bwi/nqbb: a boot-step WARN is a completed run (end to end)"
+# ---------------------------------------------------------------------------
+# The stub btrfs lists nothing (the mirror target is skipped: 1 skipped), so with [boot] enabled neither subvolume has a
+# snapshot to build from: the step is a WARN. A WARN is not a failure — the
+# report says COMPLETED WITH WARNINGS and the run exits 0, the unit staying
+# green. Mapped by the generic any_op_is path, shown here for this step.
+fresh
+knob boot_enabled true
+write_env
+run_backup
+check "boot step WARN, whole run: exit status 0" "$RC" "0"
+show_tail 0
+check "boot step WARN, whole run: the report's boot row is a WARN" \
+    "$(boot_row)" "  Boot subvolumes       WARN  (0 updated, 1 skipped, 2 warnings)"
+check "boot step WARN, whole run: the report's status" "$(report_status)" "COMPLETED WITH WARNINGS"
+check "boot step WARN, whole run: recorded as a success" "$(recorded_as)" "success"
+
 echo
 echo "passed=$pass failed=$fail"
 if ((NOT_RUN > 0)); then
