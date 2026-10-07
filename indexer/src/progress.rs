@@ -679,6 +679,10 @@ mod tests {
 
     #[test]
     fn a_job_with_no_token_is_never_stopped() {
+        // No token at all — not a token that is never cancelled: a job with
+        // one waits for a lock by looking again, one without blocks.
+        assert!(NullProgress.cancel_token().is_none());
+        assert!(TestProgress::new().cancel_token().is_none());
         assert!(!stop_requested(&NullProgress));
         assert!(!cut_short(&NullProgress));
         let token = CancelToken::default();
