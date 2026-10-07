@@ -2272,8 +2272,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return Ok(());
                         }
                     };
+                // The locks are held, so the command has begun: targets that
+                // will not mount are a target's state, 3 as `backup run`
+                // classifies it, not 1 ("could not start").
                 let mut guard =
-                    mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+                    match mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance()) {
+                        Ok(guard) => guard,
+                        Err(why) => {
+                            eprintln!("Error: {why}");
+                            std::process::exit(backup::BootStep::mount_failure_exit_code());
+                        }
+                    };
                 let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
                 println!("Boot subvolumes: {}", step.row());

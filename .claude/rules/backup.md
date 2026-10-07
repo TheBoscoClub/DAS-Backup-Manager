@@ -105,7 +105,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
   | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
   | Target not selected / not mounted (absent mount point) | not counted, Info |
-  | Mirror target (mounted; an unmounted one is the row above) | skipped (counted once per target), Info |
+  | Mirror target (mounted) | skipped (counted once per target), Info |
+  | Mirror target, not mounted | not counted, Info ("Not mounted — mirror target left alone"), both paths |
   | No targets configured | **WARN**, nothing run (both paths) |
   | Mount state of any target (Rust: any selected one) cannot be told (stat error; the script's probe) / write verification refuses | **FAIL** (whole step, checked for every target before the first write; the script says each such target and counts each) |
   | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
@@ -214,6 +215,10 @@ Checked before any directory is created, both roots compared **after resolution*
     already say what they saw — the journal's `status=3` and the log are its only trace.
   - `btrdasd backup run` (CLI, GUI; not run by the units; bd `vzsu`): the same 0 / 3 / 1 — see
     "The CLI/GUI Run Records Truthfully" below.
+  - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
+    step or the unmount after it failed, **or the targets would not mount once its locks were held**
+    (`BootStep::mount_failure_exit_code`; it had begun, as `backup run`'s Aborted), **1** only when
+    it could not start (config unreadable, locks).
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.

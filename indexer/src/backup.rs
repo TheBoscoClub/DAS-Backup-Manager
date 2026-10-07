@@ -314,6 +314,14 @@ impl BootStep {
         matches!(self, Self::Ran(o) if !o.failures.is_empty())
     }
 
+    /// The exit status of `backup boot-archive` when the targets will not mount
+    /// after the locks are held: it began, and stopped on a target's state, so
+    /// 3 as `backup run`'s `Aborted` is — never 1, "could not start" (nothing
+    /// was mounted or sent, and no lock was taken).
+    pub fn mount_failure_exit_code() -> i32 {
+        3
+    }
+
     /// The exit status of `backup boot-archive`, the doctor's rule: `None` clean, 3
     /// when it began and something failed — the step, or the unmount after it
     /// (`released` false) — and never 1, which is "could not start" and decided
@@ -7743,6 +7751,22 @@ mod tests {
         assert_eq!(ok.exit_code(false), Some(3), "step fine, unmount failed");
         assert_eq!(failed.exit_code(false), Some(3), "both");
         assert_eq!(BootStep::DisabledInConfig.exit_code(true), None);
+    }
+
+    /// bd azvo note 4: targets that will not mount once the locks are held is
+    /// the target's state, 3 — the same code `backup run` gives `Aborted` — and
+    /// not 1, which `CouldNotStart` keeps.
+    #[test]
+    fn boot_archive_targets_that_will_not_mount_exit_3_as_an_aborted_run_does() {
+        assert_eq!(BootStep::mount_failure_exit_code(), 3);
+        assert_eq!(
+            BootStep::mount_failure_exit_code(),
+            BackupJobOutcome::Aborted("x".into()).exit_code()
+        );
+        assert_ne!(
+            BootStep::mount_failure_exit_code(),
+            BackupJobOutcome::CouldNotStart("x".into()).exit_code()
+        );
     }
 
     // --- the sync that starts every backup, from the CLI and the GUI alike ---
