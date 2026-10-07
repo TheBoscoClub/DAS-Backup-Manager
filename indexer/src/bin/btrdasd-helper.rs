@@ -266,6 +266,27 @@ fn save_config(config: &Config) -> Result<(), fdo::Error> {
         .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
 }
 
+/// Run a read-modify-write of `config.toml`/`btrbk.conf` under the backup
+/// singleton (`/run/das-backup.lock`), as setup and every backup run do, so a
+/// GUI edit cannot interleave with them and be lost or lose theirs (bd
+/// DAS-Backup-Manager-lxw). Never waits: while a backup or setup holds it the
+/// call is refused with a message the GUI shows as it is, and nothing is
+/// written. Every method that saves the config goes through here.
+fn edit_config<T>(edit: impl FnOnce() -> fdo::Result<T>) -> fdo::Result<T> {
+    edit_config_at(Path::new(backup::BACKUP_LOCK_PATH), edit)
+}
+
+fn edit_config_at<T>(lock: &Path, edit: impl FnOnce() -> fdo::Result<T>) -> fdo::Result<T> {
+    match btrbk_conf::edit_config_under_backup_lock(lock, edit) {
+        Ok(btrbk_conf::ConfigEdit::Done(result)) => result,
+        Ok(btrbk_conf::ConfigEdit::Busy(why)) => Err(fdo::Error::Failed(why)),
+        Err(e) => Err(fdo::Error::Failed(format!(
+            "Not saved, nothing changed: cannot take {}: {e}",
+            lock.display()
+        ))),
+    }
+}
+
 /// The one index database this daemon will open.
 ///
 /// Every `Index*` method used to take the database path from the caller and
@@ -872,17 +893,19 @@ impl HelperInterface {
                 errors.join("; ")
             )));
         }
-        // Saving writes btrbk.conf as root at the path the config names, and
-        // polkit authorizes the action, never the path (see CANONICAL_CONFIG).
-        // A current config that does not load is compared with the default
-        // path instead, so the GUI can repair it.
-        btrbk_conf::refuse_moving_btrbk_conf_from(
-            Config::load(Path::new(CANONICAL_CONFIG)),
-            &config,
-        )
-        .map_err(fdo::Error::Failed)?;
+        edit_config(|| {
+            // Saving writes btrbk.conf as root at the path the config names, and
+            // polkit authorizes the action, never the path (see CANONICAL_CONFIG).
+            // A current config that does not load is compared with the default
+            // path instead, so the GUI can repair it.
+            btrbk_conf::refuse_moving_btrbk_conf_from(
+                Config::load(Path::new(CANONICAL_CONFIG)),
+                &config,
+            )
+            .map_err(fdo::Error::Failed)?;
 
-        save_config(&config)
+            save_config(&config)
+        })
     }
 
     /// Get the current backup schedule as JSON.
@@ -922,8 +945,6 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config()?;
-
         let inc = if incremental.is_empty() {
             None
         } else {
@@ -932,10 +953,12 @@ impl HelperInterface {
         let f = if full.is_empty() { None } else { Some(full) };
         let d = if delay == 0 { None } else { Some(delay) };
 
-        schedule::set_schedule(&mut config, inc, f, d)
-            .map_err(|e| fdo::Error::Failed(format!("Failed to set schedule: {e}")))?;
-
-        save_config(&config)
+        edit_config(|| {
+            let mut config = load_config()?;
+            schedule::set_schedule(&mut config, inc, f, d)
+                .map_err(|e| fdo::Error::Failed(format!("Failed to set schedule: {e}")))?;
+            save_config(&config)
+        })
     }
 
     /// Enable or disable scheduled backups.
@@ -962,9 +985,11 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config()?;
-        subvol::add_subvolume(&mut config, source, name, false).map_err(fdo::Error::Failed)?;
-        save_config(&config)
+        edit_config(|| {
+            let mut config = load_config()?;
+            subvol::add_subvolume(&mut config, source, name, false).map_err(fdo::Error::Failed)?;
+            save_config(&config)
+        })
     }
 
     /// Remove a subvolume from a source.
@@ -977,9 +1002,11 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config()?;
-        subvol::remove_subvolume(&mut config, source, name).map_err(fdo::Error::Failed)?;
-        save_config(&config)
+        edit_config(|| {
+            let mut config = load_config()?;
+            subvol::remove_subvolume(&mut config, source, name).map_err(fdo::Error::Failed)?;
+            save_config(&config)
+        })
     }
 
     /// Set the manual_only flag on a subvolume.
@@ -993,9 +1020,11 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
 
-        let mut config = load_config()?;
-        subvol::set_manual(&mut config, source, name, manual).map_err(fdo::Error::Failed)?;
-        save_config(&config)
+        edit_config(|| {
+            let mut config = load_config()?;
+            subvol::set_manual(&mut config, source, name, manual).map_err(fdo::Error::Failed)?;
+            save_config(&config)
+        })
     }
 
     /// Query system health and return a JSON report.
@@ -1599,6 +1628,66 @@ mod tests {
         assert_eq!(parse_mode("Incremental"), Ok(BackupMode::Incremental));
         for bad in ["", "weekly", "snapshot"] {
             assert!(parse_mode(bad).unwrap_err().contains("mode"), "{bad:?}");
+        }
+    }
+
+    // --- config writes take the backup singleton (bd DAS-Backup-Manager-lxw)
+
+    #[test]
+    fn a_config_write_is_refused_while_a_backup_or_setup_holds_the_singleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("das-backup.lock");
+        let _backup = buttered_dasd::scrub::FileLock::try_acquire(&lock)
+            .unwrap()
+            .unwrap();
+        let mut ran = false;
+        let err = edit_config_at(&lock, || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!ran, "the write ran while the singleton was held");
+        assert_eq!(
+            err,
+            fdo::Error::Failed(btrbk_conf::config_busy_line(&lock)),
+            "the GUI shows this message as it is"
+        );
+    }
+
+    #[test]
+    fn a_config_write_runs_and_returns_its_own_result_when_the_singleton_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("das-backup.lock");
+        assert_eq!(edit_config_at(&lock, || Ok(7)), Ok(7));
+        let failed = fdo::Error::Failed("Invalid source".into());
+        assert_eq!(
+            edit_config_at(&lock, || Err::<(), _>(failed.clone())),
+            Err(failed)
+        );
+        let err = edit_config_at(Path::new("/dev/null/das-backup.lock"), || Ok(())).unwrap_err();
+        assert!(matches!(err, fdo::Error::Failed(m) if m.contains("/dev/null/das-backup.lock")));
+    }
+
+    #[test]
+    fn every_method_that_saves_the_config_does_so_under_the_singleton() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        // Built at run time so this test does not count itself.
+        let save = format!("{}(&config)", "save_config");
+        let guarded = format!("{}(|| {{", "edit_config");
+        assert_eq!(body.matches(&save).count(), 5, "the five writing methods");
+        assert_eq!(body.matches(&guarded).count(), 5);
+        // Each save sits inside the edit_config closure that precedes it.
+        for (at, _) in body.match_indices(&save) {
+            let opened = body[..at]
+                .rfind(&guarded)
+                .expect("a save outside edit_config");
+            let between = &body[opened..at];
+            assert!(
+                !between.contains("async fn "),
+                "a save outside edit_config: {}",
+                &body[at.saturating_sub(200)..at]
+            );
         }
     }
 

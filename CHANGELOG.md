@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A GUI configuration edit can no longer race a backup or `btrdasd setup` and lose a write** (bd `DAS-Backup-Manager-lxw`) — the helper's `ConfigSet`, `ScheduleSet`, `SubvolAdd`, `SubvolRemove` and `SubvolSetManual` read, change and save `config.toml` and `btrbk.conf` holding `/run/das-backup.lock`, the lock every other writer of the two files already holds: `btrdasd setup` for each mode that writes, and every backup (`backup-run.sh`, `btrdasd backup` from the CLI or the GUI) from its start, so through the subvolume sync. Before, an edit could load the config, lose the race to one of those, and save over its write — last writer wins. The lock is tried, never waited for: while it is held the call is refused, nothing written, with "a backup or btrdasd setup is running … Try again when it finishes", which the GUI shows in its error box; the configuration editor keeps the edits and says so. The maintenance lock is not taken, so a scrub does not refuse an edit (`btrbk_conf::edit_config_under_backup_lock`)
+
 ## [0.7.23.0] - 2026-10-06
 
 ### Added

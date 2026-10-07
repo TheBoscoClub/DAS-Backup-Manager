@@ -236,6 +236,54 @@ fn save_config_and_btrbk_conf_with(
     Ok(())
 }
 
+/// What became of a configuration edit attempted under the backup singleton.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigEdit<T> {
+    /// The singleton was taken, the edit run — this is what it returned — and
+    /// the singleton let go again.
+    Done(T),
+    /// Another process holds the singleton, as this says. The edit was not
+    /// run: nothing was read for it and nothing written.
+    Busy(String),
+}
+
+/// Run `edit` — a read-modify-write of `config.toml` and `btrbk.conf` — holding
+/// the backup singleton (`/run/das-backup.lock` in production) from before its
+/// read until it returns, without waiting for it (bd DAS-Backup-Manager-lxw).
+///
+/// One lock serialises every writer of the two files: `btrdasd setup` holds
+/// it (with the maintenance lock) for every mode that writes, and a backup —
+/// `backup-run.sh`, or `btrdasd backup` from the CLI or the GUI — holds it from
+/// its start, so through the subvolume sync that rewrites both files. An
+/// editor that skipped it could load the config, lose the race to one of
+/// those, and save over its write: last writer wins. The maintenance lock is
+/// not taken: no holder of it alone writes either file, and a scrub, which
+/// holds it for hours, must not refuse an edit it cannot conflict with.
+///
+/// Not waiting is the point: the caller is an interactive edit (the GUI's
+/// D-Bus calls), and a backup can run for hours. A lock file that cannot be
+/// opened or locked is an error, never a free lock.
+pub fn edit_config_under_backup_lock<T>(
+    lock: &Path,
+    edit: impl FnOnce() -> T,
+) -> Result<ConfigEdit<T>, String> {
+    match crate::scrub::FileLock::try_acquire(lock).map_err(|e| e.to_string())? {
+        None => Ok(ConfigEdit::Busy(config_busy_line(lock))),
+        // `_held` is dropped as the arm ends, after `edit`.
+        Some(_held) => Ok(ConfigEdit::Done(edit())),
+    }
+}
+
+/// What a configuration edit says, and stops at, while the backup singleton
+/// at `path` is held.
+pub fn config_busy_line(path: &Path) -> String {
+    format!(
+        "Not saved, nothing changed: a backup or btrdasd setup is running (it holds {}) and \
+         may rewrite config.toml and btrbk.conf itself. Try again when it finishes.",
+        path.display()
+    )
+}
+
 /// The targets a source's volume block sends to.
 fn source_targets<'a>(config: &'a Config, source: &crate::config::Source) -> Vec<&'a Target> {
     config
@@ -891,6 +939,88 @@ enabled = false
             conf = dir.join("btrbk.conf").display(),
         );
         Config::from_toml(&text).unwrap()
+    }
+
+    // --- config edits serialise on the backup singleton (bd DAS-Backup-Manager-lxw)
+
+    /// A saved config, its path, and a scratch singleton beside it.
+    fn edit_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+        let lock = dir.path().join("das-backup.lock");
+        (dir, config_path, lock)
+    }
+
+    fn set_incremental(config_path: &Path, time: &str) -> Result<(), String> {
+        let mut cfg = Config::load(config_path).map_err(|e| e.to_string())?;
+        cfg.schedule.incremental = time.to_string();
+        save_config_and_btrbk_conf(&cfg, config_path).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_config_edit_is_refused_while_a_backup_or_setup_holds_the_singleton() {
+        let (_dir, config_path, lock) = edit_fixture();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        // The backup run (or setup), through its own open file description.
+        let held = crate::scrub::FileLock::try_acquire(&lock).unwrap().unwrap();
+        let ran = std::cell::Cell::new(false);
+        let outcome = edit_config_under_backup_lock(&lock, || {
+            ran.set(true);
+            set_incremental(&config_path, "05:55")
+        })
+        .unwrap();
+        assert_eq!(outcome, ConfigEdit::Busy(config_busy_line(&lock)));
+        assert!(!ran.get(), "the edit ran while the singleton was held");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+        assert!(config_busy_line(&lock).contains("Try again when it finishes"));
+        drop(held);
+    }
+
+    #[test]
+    fn a_config_edit_runs_when_the_singleton_is_free_and_lets_it_go() {
+        let (_dir, config_path, lock) = edit_fixture();
+        let outcome =
+            edit_config_under_backup_lock(&lock, || set_incremental(&config_path, "05:55"))
+                .unwrap();
+        assert_eq!(outcome, ConfigEdit::Done(Ok(())));
+        assert_eq!(
+            Config::load(&config_path).unwrap().schedule.incremental,
+            "05:55"
+        );
+        // Held only while the edit ran: a backup can take it now.
+        assert!(
+            crate::scrub::FileLock::try_acquire(&lock)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_singleton_is_held_while_the_edit_runs() {
+        let (_dir, _config_path, lock) = edit_fixture();
+        let outcome = edit_config_under_backup_lock(&lock, || {
+            crate::scrub::FileLock::try_acquire(&lock)
+                .unwrap()
+                .is_none()
+        })
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ConfigEdit::Done(true),
+            "a backup could start mid-edit"
+        );
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_opened_is_an_error_never_a_free_lock() {
+        let ran = std::cell::Cell::new(false);
+        let err =
+            edit_config_under_backup_lock(Path::new("/dev/null/das-backup.lock"), || ran.set(true))
+                .unwrap_err();
+        assert!(err.contains("/dev/null/das-backup.lock"), "{err}");
+        assert!(!ran.get());
     }
 
     #[test]
