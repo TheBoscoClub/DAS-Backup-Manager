@@ -106,14 +106,17 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
   | Target not selected / not mounted (absent mount point) | not counted, Info |
   | Mirror target (mounted; an unmounted one is the row above) | skipped (counted once per target), Info |
-  | Mount state cannot be told (stat error) / write verification refuses | **FAIL** (whole step) |
+  | No targets configured | **WARN**, nothing run (both paths) |
+  | Mount state of any target (Rust: any selected one) cannot be told (stat error; the script's probe) / write verification refuses | **FAIL** (whole step, checked for every target before the first write; the script says each such target and counts each) |
   | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
   | Target's subvolume listing cannot be read | **FAIL** (once per target) |
   | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
   | No source declares `target_subdirs` for it | **WARN** |
   | No snapshot of that series on the target | **WARN** |
+  | A symbolic link at `<mnt>/<subvol>` (dangling or not; never followed) | **FAIL** for that subvolume, either mode, nothing run |
   | Incremental, the subvolume exists on the target | skipped, Info |
   | The subvolume is absent (either mode) | create from the newest snapshot; failure **FAIL** |
+  | Full, it exists: the archive destination `<mnt>/<subvol>.archive.<TS>` exists (anything, a symlink included) or cannot be statted | **FAIL**, live untouched, nothing written |
   | Full, it exists: archive `-r` fails | **FAIL**, live untouched |
   | Full: stale `<subvol>.new` cannot be removed | **FAIL**, live untouched |
   | Full: building `<subvol>.new` fails | **FAIL**, live untouched |
@@ -126,8 +129,14 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   the run (exit 3); WARN does not (exit 0, report `COMPLETED WITH WARNINGS`). An incremental run
   creates a missing boot subvolume and never replaces one; only a full run (or `backup
   boot-archive`) archives and replaces. Snapshot match: a listing line's last field equals
-  `<subdir>/<snapshot_name>.<TS>`, `TS` = 8 ASCII digits, `T`, 4 ASCII digits, optionally `_` and
-  digits, `subdir` trimmed of leading and trailing `/`; the newest is the bytewise-greatest match.
+  `<subdir>/<snapshot_name>.<TS>` (that field is the last ASCII-whitespace-delimited one, trailing
+  space, tab and CR dropped first — both paths), `TS` = 8 ASCII digits, `T`, 4 ASCII digits,
+  optionally `_` and digits, `subdir` trimmed of leading and trailing `/`; the newest is the bytewise-greatest match.
+- **Order of one full-run subvolume, both paths, every check before the first mutation**: snapshot
+  found; live path state (symlink or unknown: FAIL); staging `.new` state (unknown: FAIL); archive
+  destination state (exists or unknown: FAIL); only then archive `-r`, clear stale staging, build
+  `.new`, delete live, rename. `Config::validate` rejects a repeated `[boot].subvolumes` entry and a
+  repeated `[[target]].label` (the Rust step keys mount state by label), so neither reaches the step.
 - **Snapshot names are read from `/etc/btrbk/btrbk.conf`, never re-derived**
   (`forget::live_subvol_snapshot_names()`). If it cannot be read, the whole step FAILs.
 - **Both paths, and the pruner, skip `role=mirror` targets entirely** — the recovery drives carry
