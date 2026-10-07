@@ -15,7 +15,7 @@ See global rule in `~/.claude/rules/development-tools.md` for the full policy. P
 - Use `std::filesystem` for all path operations
 
 ## CMake
-- Minimum CMake 3.25 (for Qt6 support); host has 4.4.3
+- Minimum CMake 3.25 (for Qt6 support); host has 4.4.4
 - Use ECM (Extra CMake Modules) for KDE integration
 - Use `target_link_libraries` with PRIVATE/PUBLIC correctly
 - Build type: RelWithDebInfo for dev, Release for install

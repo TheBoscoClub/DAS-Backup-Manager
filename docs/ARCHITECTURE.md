@@ -81,7 +81,7 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 |-----------|----------|--------|---------|
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 22 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 23 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (20 methods, 7 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
@@ -646,11 +646,11 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
 | `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
-| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1740 | D-Bus daemon (feature `dbus`): 20 methods, 3 signals, polkit checks, job ownership |
+| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~1920 | D-Bus daemon (feature `dbus`): 20 methods, 3 signals, polkit checks, job ownership |
 
 ### KDE Plasma GUI (`gui/src/`)
 
-18 C++ components implementing full backup management (the previous read-only `Database`
+20 C++ components implementing full backup management (the previous read-only `Database`
 QSqlDatabase wrapper was removed when the GUI's models were rewired to go through
 `DBusClient`/`btrdasd-helper` exclusively — see `dbusclient.h/cpp` below):
 
@@ -665,6 +665,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |
 | SnapshotBrowser | `snapshotbrowser.h/cpp` | Dolphin-style file browser; breadcrumb nav, detail/icon views, context menu, filter bar |
 | BackupPanel | `backuppanel.h/cpp` | Mode selection, operation checkboxes, source/target selection, dry-run support |
+| BackupSteps | `backupsteps.h/cpp` | The five operation ticks (snapshot, send, boot archive, index, email) as the `a{sv}` steps dictionary BackupRun carries |
 | PanelConfig | `panelconfig.h/cpp` | Pure reader of the labels and `[boot] enabled` the Backup panel needs from config.toml (trailing comments tolerated); unit-tested in `gui-smoketest` |
 | BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
@@ -683,10 +684,10 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 
 | Suite | Count | Framework |
 |-------|-------|-----------|
-| Rust unit tests | 1114 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 23 `pub mod`s) |
+| Rust unit tests | 1130 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 23 `pub mod`s) |
 | Rust CLI + setup tests | 263 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 13 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
-| Rust integration tests | 32 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (9), `recovery_os_cli.rs` (7), `record_run_contract.rs` (6), `setup_requires_root.rs` (1) |
+| Rust integration tests | 38 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (15), `recovery_os_cli.rs` (7), `record_run_contract.rs` (6), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 8 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (3), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
-| C++ GUI smoke tests | 18 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **1422 Rust (1430 incl. manual) + 18 Qt** | |
+| C++ GUI smoke tests | 22 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper. The click-simulation suites were removed 2026-03-01 |
+| **Total** | **1444 Rust (1452 incl. manual) + 22 Qt** | |

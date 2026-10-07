@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.7.22.3
+**Version**: 0.7.23.0
 
 ## 1. Rust Crate Dependencies
 
@@ -138,7 +138,7 @@ needed when building with `BUILD_GUI=ON` (the default).
 |-----------|---------------|---------|---------|
 | Qt6 | 6.6+ (tested 6.11.2) | UI framework: Core, Widgets, DBus, Charts (growth trendline) | LGPL-3.0 |
 | KDE Frameworks 6 (KF6) | 6.0+ (tested 6.30.0) | KXmlGuiWindow, KAboutData, KIO for restore operations, KDE HIG compliance | LGPL-2.1 / LGPL-3.0 |
-| CMake | >= 3.25 (tested 4.4.3) | Build system for the Qt/KF6 C++20 GUI component | BSD-3-Clause |
+| CMake | >= 3.25 (tested 4.4.4) | Build system for the Qt/KF6 C++20 GUI component | BSD-3-Clause |
 | Extra CMake Modules (ECM) | ships with KF6 | KDE-specific CMake macros and platform integration | BSD-2-Clause |
 
 ### KF6 Modules Used

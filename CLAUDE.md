@@ -6,7 +6,7 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 
 - **PUBLIC REPO** — TheBoscoClub/DAS-Backup-Manager on GitHub. Push allowed.
 - **Rust** — Library (`buttered_dasd`) + CLI (`btrdasd`): Rust 2024 edition, rusqlite 0.40 (bundled FTS5), clap 4.6, walkdir 2.5
-- **C++20** — GUI (`btrdasd-gui`): Qt6 6.11.2, KF6 6.30.0, CMake 4.4.3 (installed; minimums Qt 6.6, KF 6.0, CMake 3.25)
+- **C++20** — GUI (`btrdasd-gui`): Qt6 6.11.2, KF6 6.30.0, CMake 4.4.4 (installed; minimums Qt 6.6, KF 6.0, CMake 3.25)
 - **BTRFS RAID-1** — Backup targets on HDD RAID-1 and DAS enclosure
 
 ## Key Paths

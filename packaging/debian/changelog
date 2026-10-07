@@ -1,3 +1,14 @@
+das-backup-manager (0.7.23.0-1) unstable; urgency=medium
+
+  * GUI operations honoured: every ticked box reaches the helper, and Run needs Snapshot or Send
+  * One boot-step classification on the Rust path and in backup-run.sh 4.12.0
+  * The boot step's input is enforced where it is read, including refusing a staging symlink
+  * Snapshot walk is linear rather than repeated per node
+  * recovery-os-vm reset-watch race fixed
+  * Next scheduled is never blank in the GUI
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Tue, 06 Oct 2026 12:00:00 -0500
+
 das-backup-manager (0.7.20.0-1) unstable; urgency=medium
 
   * Security and correctness release from an independent privilege-boundary review

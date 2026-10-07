@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.22.3
+**Version**: 0.7.23.0
 
 ## Before You Begin
 
@@ -245,7 +245,7 @@ match your volumes and drives; every other key is in the
 <!-- tests/test_install_doc_config.sh validates the block below with the btrdasd the build makes -->
 ```toml
 [general]
-version = "0.7.22"                   # what `btrdasd --version` prints
+version = "0.7.23"                   # what `btrdasd --version` prints
 install_prefix = "/usr"              # the prefix btrdasd is installed under
 db_path = "/var/lib/das-backup/backup-index.db"
 
@@ -366,7 +366,7 @@ The installer generates `/etc/das-backup/config.toml` with the following section
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `version` | string | the running build's `CARGO_PKG_VERSION` (3-part semver, e.g. `"0.7.22"`) | Config format version |
+| `version` | string | the running build's `CARGO_PKG_VERSION` (3-part semver, e.g. `"0.7.23"`) | Config format version |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 | `log_file` | string | `"/var/log/das-backup.log"` | Backup log path |

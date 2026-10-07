@@ -58,6 +58,14 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Tue Oct 06 2026 TheBoscoClub <gjbr@pm.me> - 0.7.23.0-1
+- GUI operations honoured: every ticked box reaches the helper; Run needs Snapshot or Send
+- One boot-step classification on the Rust path and in backup-run.sh 4.12.0
+- The boot step's input is enforced where it is read, including refusing a staging symlink
+- Snapshot walk is linear rather than repeated per node
+- recovery-os-vm reset-watch race fixed
+- Next scheduled is never blank in the GUI
+
 * Fri Aug 28 2026 TheBoscoClub <gjbr@pm.me> - 0.7.20.0-1
 - Security and correctness release from an independent review of the privilege boundary
 - archive_boot no longer deletes the live @ before locating its replacement (bd 5ig)
