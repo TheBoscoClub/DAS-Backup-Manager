@@ -1,6 +1,7 @@
 #include "backuppanel.h"
 #include "backupsteps.h"
 #include "dbusclient.h"
+#include "panelconfig.h"
 
 #include <KLocalizedString>
 
@@ -166,6 +167,11 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
 
 void BackupPanel::loadConfig()
 {
+    applyConfig(m_client->configGet());
+}
+
+void BackupPanel::applyConfig(const QString &toml)
+{
     m_bootEnabledInConfig = true;
 
     // Clear any previously created dynamic checkboxes
@@ -178,8 +184,6 @@ void BackupPanel::loadConfig()
         cb->deleteLater();
     }
     m_targetChecks.clear();
-
-    const QString toml = m_client->configGet();
 
     if (toml.isEmpty()) {
         auto *errLabel = new QLabel(i18n("Could not load configuration"), m_sourcesGroup);
@@ -209,70 +213,10 @@ void BackupPanel::loadConfig()
     // The GUI shows source labels and target labels as checkboxes.
     // The Rust backend resolves subvolumes from labels internally.
 
-    QStringList sources;
-    QStringList targets;
-
-    enum class Section { None, Source, Target, Boot };
-    Section currentSection = Section::None;
-
-    const QStringList lines = toml.split(QLatin1Char('\n'));
-    for (const QString &rawLine : lines) {
-        const QString line = rawLine.trimmed();
-
-        // Detect section headers
-        if (line == QLatin1String("[[source]]")) {
-            currentSection = Section::Source;
-            continue;
-        }
-        if (line == QLatin1String("[[target]]")) {
-            currentSection = Section::Target;
-            continue;
-        }
-        if (line == QLatin1String("[boot]")) {
-            currentSection = Section::Boot;
-            continue;
-        }
-        // Any other section header resets context
-        if (line.startsWith(QLatin1Char('['))) {
-            currentSection = Section::None;
-            continue;
-        }
-
-        // Skip comments and empty lines
-        if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
-            continue;
-
-        // Parse key = value (handles quoted and unquoted values)
-        const int eqPos = line.indexOf(QLatin1Char('='));
-        if (eqPos < 0)
-            continue;
-
-        const QString key = line.left(eqPos).trimmed();
-        QString value = line.mid(eqPos + 1).trimmed();
-        // Strip surrounding quotes
-        if (value.length() >= 2
-            && value.startsWith(QLatin1Char('"'))
-            && value.endsWith(QLatin1Char('"'))) {
-            value = value.mid(1, value.length() - 2);
-        }
-
-        switch (currentSection) {
-        case Section::Source:
-            if (key == QLatin1String("label"))
-                sources.append(value);
-            break;
-        case Section::Target:
-            if (key == QLatin1String("label"))
-                targets.append(value);
-            break;
-        case Section::Boot:
-            if (key == QLatin1String("enabled") && value == QLatin1String("false"))
-                m_bootEnabledInConfig = false;
-            break;
-        case Section::None:
-            break;
-        }
-    }
+    const PanelConfig cfg = parsePanelConfig(toml);
+    const QStringList &sources = cfg.sources;
+    const QStringList &targets = cfg.targets;
+    m_bootEnabledInConfig = cfg.bootEnabled;
 
     auto *srcLayout = qobject_cast<QVBoxLayout *>(m_sourcesGroup->layout());
     if (sources.isEmpty()) {
@@ -314,12 +258,19 @@ void BackupPanel::loadConfig()
 void BackupPanel::updateBootArchive()
 {
     if (!m_bootEnabledInConfig) {
+        m_bootForcedOff = true;
         m_bootArchiveCheck->setChecked(false);
         m_bootArchiveCheck->setEnabled(false);
         m_bootArchiveCheck->setToolTip(i18n("Disabled in config.toml ([boot] enabled = false)"));
         return;
     }
     m_bootArchiveCheck->setEnabled(true);
+    // Only the disabled -> enabled transition re-ticks (the default is ticked);
+    // a later mode toggle must not undo the user's own untick.
+    if (m_bootForcedOff) {
+        m_bootForcedOff = false;
+        m_bootArchiveCheck->setChecked(true);
+    }
     m_bootArchiveCheck->setToolTip(m_fullRadio->isChecked()
         ? i18n("Archive each [boot] subvolume (@, @home) on primary targets read-only, then replace it from the newest snapshot. Mirror targets are never touched.")
         : i18n("Create a [boot] subvolume (@, @home) that is missing on a primary target from the newest snapshot. An existing one is never replaced. Mirror targets are never touched."));
