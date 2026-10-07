@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd-helper` answers the call that activates it** (bd `DAS-Backup-Manager-3i1`) — the helper requested its D-Bus name before its interface was served, and `ObjectServer::at` returns before the dispatch task is receiving, so the first call after activation was dropped and timed out (20 of 20 cold activations on a test VM). It now serves the interface, proves the dispatch task is live with a call to itself, and only then requests the name
+
 ## [0.7.23.0] - 2026-10-06
 
 ### Added
