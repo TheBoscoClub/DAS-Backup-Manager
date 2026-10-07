@@ -172,7 +172,8 @@
 //! `DAS_BTRFS_STATUS_DIR` and `DAS_SCRUB_STATE` relocate the btrfs status
 //! directory and the state file, mirroring the `DAS_REPORT_TO` /
 //! `DAS_REPORT_FROM` overrides in [`crate::report`]. Production leaves all of
-//! them unset.
+//! them unset, and a shipped build does not read them at all: they exist only
+//! under the `test-overrides` feature, which only the dev-dependency enables.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -664,11 +665,22 @@ pub fn parse_scrub_status(
     })
 }
 
+/// `default`, unless a test build (feature `test-overrides`, enabled only
+/// through the dev-dependency) sets `var`. A shipped binary never reads the
+/// environment here: a stray variable must not redirect the scrub state.
+#[cfg(feature = "test-overrides")]
+fn overridable(var: &str, default: &str) -> PathBuf {
+    PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
+}
+
+#[cfg(not(feature = "test-overrides"))]
+fn overridable(_var: &str, default: &str) -> PathBuf {
+    PathBuf::from(default)
+}
+
 /// Directory holding the btrfs status records (overridable for tests).
 fn btrfs_status_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("DAS_BTRFS_STATUS_DIR").unwrap_or_else(|_| BTRFS_STATUS_DIR.to_string()),
-    )
+    overridable("DAS_BTRFS_STATUS_DIR", BTRFS_STATUS_DIR)
 }
 
 /// Path of the status record for a filesystem UUID.
@@ -1030,7 +1042,7 @@ impl Default for ScrubState {
 
 /// Path of the state file (overridable for tests via `DAS_SCRUB_STATE`).
 pub fn state_path() -> PathBuf {
-    PathBuf::from(std::env::var("DAS_SCRUB_STATE").unwrap_or_else(|_| SCRUB_STATE_PATH.to_string()))
+    overridable("DAS_SCRUB_STATE", SCRUB_STATE_PATH)
 }
 
 /// Load the state file. A missing file yields the default (empty) state.

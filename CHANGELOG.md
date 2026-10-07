@@ -9,9 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`tests/test_parent_disk.sh`** (ctest `shell-parent-disk`, bd `DAS-Backup-Manager-b1s`) — `parent_disk` against a stub `lsblk`: an NVMe partition, a SATA partition, a whole disk, and the three ways lsblk cannot answer
+- **The product version is tested against the man page** — `indexer/build.rs` reads the four-segment version from `CMakeLists.txt`, and two unit tests fail when it is not four segments, differs from `CMakeLists.txt`, or differs from the `.TH` line of `docs/btrdasd.1`
+
 ### Changed
 
+- **`btrdasd --version` prints all four segments** (`btrdasd 0.7.23.0`, bd `DAS-Backup-Manager-b1s`) — it printed Cargo's three. The one source is `CMakeLists.txt`
+- **CI runs the shell suites and the GUI smoke suite as separate steps** — `ctest -R '^shell-'` and `ctest -E '^shell-'`, both failing on an empty selection, so a red shell suite is named as one
+- **The report's `DISK CAPACITY` table says its sizes are raw** (Rust report and `backup-run.sh` alike) — a RAID-1 target holds half as much data as the table's space
+- **`MountGuard` releasing source volumes reports the stage `Unmounting sources`**, not `Unmounting targets`
+- **`DAS_SCRUB_STATE` and `DAS_BTRFS_STATUS_DIR` are read only by a test build** (feature `test-overrides`, enabled through the dev-dependency) — a shipped `btrdasd` ignores them
+- **The `doctor` help and the generated unit's comment list a volume the check could not unmount again among the exit-3 causes**, as the man page already did
+- **`packaging/appimage/btrdasd-gui.desktop` is a symlink** to `gui/org.theboscoclub.btrdasd-gui.desktop`; it was a byte copy
+
+### Removed
+
+- **`gui/src/setupwizard.cpp` and `.h`** — compiled, never shown, and it would have sent `btrbk.conf` text to `ConfigSet`, which refuses it
+- **`cdylib` from the `buttered-dasd` crate types** — nothing links it since the FFI library was deleted
+
 ### Fixed
+
+- **`btrdasd reconcile --forget-root` on a configured target, and a failed `--repair`, now exit nonzero** (bd `DAS-Backup-Manager-b1s`) — both printed and exited 0. The targets are unmounted by the guard explicitly first
+- **`backup-run.sh` finds the disk under a partition with `lsblk`** (bd `DAS-Backup-Manager-b1s`), not by stripping digits (`nvme0n1p2` became `nvme0n1p`); where lsblk cannot say, the disk is unknown and the target check refuses rather than guesses. Its "indexer not built" hint names `cmake --build build`
 
 ## [0.7.23.0] - 2026-10-06
 

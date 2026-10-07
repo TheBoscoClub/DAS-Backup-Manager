@@ -142,6 +142,8 @@ const HOST_PROBES: MountProbes<'static> = MountProbes {
 pub struct MountGuard {
     newly_mounted: Vec<String>,
     runner: Arc<dyn CommandRunner>,
+    /// What this guard holds, for the progress stage it reports on release.
+    held_kind: &'static str,
 }
 
 /// How many times an unmount is tried before the mount point is reported as
@@ -186,7 +188,15 @@ impl MountGuard {
         Self {
             newly_mounted: Vec::new(),
             runner,
+            held_kind: "targets",
         }
+    }
+
+    /// A guard over the source volumes rather than the targets.
+    fn for_sources(runner: Arc<dyn CommandRunner>) -> Self {
+        let mut guard = Self::new(runner);
+        guard.held_kind = "sources";
+        guard
     }
 
     /// `umount` one mount point, up to [`UMOUNT_ATTEMPTS`] times with
@@ -224,7 +234,7 @@ impl MountGuard {
             return still_mounted;
         }
         let total = self.newly_mounted.len() as u64;
-        progress.on_stage("Unmounting targets", total);
+        progress.on_stage(&format!("Unmounting {}", self.held_kind), total);
         let held: Vec<String> = self.newly_mounted.drain(..).rev().collect();
         for (i, mount_point) in held.into_iter().enumerate() {
             let released = self.release(&mount_point, |msg| {
@@ -608,7 +618,7 @@ fn ensure_sources_mounted_with(
     probes: &MountProbes<'_>,
     runner: Arc<dyn CommandRunner>,
 ) -> MountGuard {
-    let mut guard = MountGuard::new(runner);
+    let mut guard = MountGuard::for_sources(runner);
 
     // Deduplicate: multiple sources can share a volume (e.g. hdd-projects
     // and hdd-audiobooks both use /.btrfs-hdd).
@@ -2521,6 +2531,21 @@ mod tests {
 
         drop(guard);
         assert_eq!(runner.calls()[1..], [status_call(&["umount", &vol])]);
+    }
+
+    /// Giving source volumes back is reported as unmounting sources, not targets.
+    #[test]
+    fn releasing_source_volumes_is_staged_as_sources() {
+        let scratch = Scratch::new();
+        let vol = scratch.path("vol/hdd");
+        let config = config_with(Vec::new(), vec![source("hdd", "/dev/fake-hdd", &vol)]);
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+        let mut guard = Host::default().mount_sources(&config, &progress, &runner);
+
+        assert!(guard.unmount(&progress).is_empty());
+
+        assert_eq!(progress.stages(), vec![("Unmounting sources".into(), 1)]);
     }
 
     #[test]

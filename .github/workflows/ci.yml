@@ -139,13 +139,22 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      # The shell regression suites (tests/test_*.sh) are their own step, so a
+      # red one is named as such and not folded into the GUI result. Every one
+      # is registered as shell-* in CMakeLists.txt; --no-tests=error makes an
+      # empty selection fail rather than pass.
+      - name: ctest (shell suites)
+        working-directory: build
+        run: ctest --output-on-failure --no-tests=error -R '^shell-'
+
       # Offscreen QPA so the GUI smoke suite needs no display or session bus.
       # --output-on-failure, because a bare pass/fail count is not a diagnosis.
-      - name: ctest (shell suites and GUI smoke suite)
+      # Everything that is not a shell suite: the GUI smoke suite.
+      - name: ctest (GUI smoke suite)
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --output-on-failure
+        run: ctest --output-on-failure --no-tests=error -E '^shell-'
 
   shell:
     name: Shell — shellcheck

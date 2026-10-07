@@ -670,7 +670,6 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
-| SetupWizard | `setupwizard.h/cpp` | QWizard first-run wizard: Welcome, Sources, Targets, Schedule, Summary |
 | SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
 | IndexRunner | `indexrunner.h/cpp` | D-Bus IndexWalk trigger (was QProcess, now D-Bus) |
 | SnapshotWatcher | `snapshotwatcher.h/cpp` | QFileSystemWatcher with 30s debounce |
