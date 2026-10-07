@@ -254,7 +254,18 @@
 #      or -- status, for one not shut off -- has been silent for GUARD_SECS
 #   A two-drive run exits with the gravest of its drives': 4, 3, 6, 7, 5,
 #   then 1 (a drive skipped is not one), else 0; and 5 when its egress rule
-#   could not be taken out.
+#   could not be taken out. Sequential, the second drive starts after a
+#   first that exited 0, or 5 for causes that stayed in its own session
+#   only: the guard unconfirmed on a "no" record, its reporter's lost or
+#   unfinished lines, the guard left in the domain's definition, the egress
+#   rule not taken out, a dry run with --accept-boot-record-risk. A 5 for
+#   the host, the enclosure or the mechanism -- the claim lost, the drive
+#   re-enumerated, a partition mounted afterwards (or not known), the device
+#   scan failed, time skipped, the reset watch stopped -- stops it, and so
+#   does a 5 with no cause recorded, unreadable, or not in either list (a
+#   real session's override, units the guard cannot mask, a silent
+#   reporter). The warnings and the run's closing lines name the cause.
+#   Any other exit (1, 3, 4, 6, 7) always stops it.
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
@@ -291,7 +302,9 @@
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
 # Set by a two-drive run for each drive's session, never by hand:
 #   DAS_RECOVERY_VM_LOCK_FD (the run's descriptor of the maintenance lock),
-#   DAS_RECOVERY_VM_MODE (sequential or parallel), DAS_RECOVERY_VM_EGRESS_HELD
+#   DAS_RECOVERY_VM_MODE (sequential or parallel), DAS_RECOVERY_VM_EGRESS_HELD,
+#   DAS_RECOVERY_VM_CAUSE_FILE (sequential: where the drive writes the causes
+#   of its exit 5, one word a line, for the run to read)
 
 set -euo pipefail
 # One locale: bracket ranges then mean ASCII (bd 1bsx's class), and virsh
@@ -595,6 +608,7 @@ PAIR_DONE=false PAIR_KEPT=false PAIR_RCS=() PAIR_LABELS=()
 # The maintenance lock's descriptor came from a two-drive run that holds it.
 LOCK_INHERITED=false
 EGRESS_HELD=false   # ...and so does its egress rule
+CAUSE_FILE=""       # ...and where a sequential one reads this drive's exit-5 causes
 EGRESS_OWNED=false  # this process put the egress rule in place (or took one over)
 EGRESS_SUBNET="" EGRESS_COUNT=0 EGRESS_FAILURE=""
 EGRESS_RESULT="not needed"
@@ -4147,6 +4161,7 @@ write_history() {
 # Every exit of a session that took the lock goes through here.
 session_exit() {
     write_history "$1"
+    write_causes "$1"
     exit "$1"
 }
 
@@ -4209,10 +4224,68 @@ cmd_clean_runs() {
 # ONE process holds the maintenance lock, once, for the whole run, and runs
 # each drive's session as its child with that lock's descriptor
 # (DAS_RECOVERY_VM_LOCK_FD): sequential runs the first drive to its end and
-# the second only if the first exited 0 -- a bad update must not reach both
+# the second only if the first exited 0, or 5 on warnings of its own session
+# (pair_judge_causes) -- a bad update must not reach both
 # -- and parallel runs both at once. The egress rule is this process's too,
 # put in place once and taken out at the end. Each drive's lines carry its
 # label; each drive's end is a DRIVE line here.
+
+# What a drive's exit-5 cause (exit5_causes) means, for people.
+cause_text() {
+    case "$1" in
+        guard-unconfirmed-no) printf 'the session guard did not confirm on a "no" record' ;;
+        report-lines-lost) printf "the guard's reporter lost lines or left its last one unfinished" ;;
+        guard-left) printf "the session guard could not be taken out of the domain's definition" ;;
+        egress-not-removed) printf 'the egress rule was not taken out' ;;
+        dry-run-override) printf 'a dry run with --accept-boot-record-risk' ;;
+        claim-lost) printf 'the claim was lost while the VM ran' ;;
+        reenumerated) printf 'the drive re-enumerated during the session' ;;
+        mounted-after) printf 'a partition was mounted afterwards' ;;
+        mount-unknown) printf 'whether a partition was mounted afterwards is not known' ;;
+        scan-failed) printf 'the btrfs device scan failed' ;;
+        clock-gap) printf 'time was skipped between two looks at the recovery OS' ;;
+        reset-watch-stopped) printf 'the reset watch stopped' ;;
+        boot-override) printf 'the boot-record check was overridden' ;;
+        unmaskable-units) printf 'the boot record names units the guard cannot mask' ;;
+        reporter-silent) printf "the guard's reporter went silent" ;;
+        *) printf 'an unknown cause' ;;
+    esac
+}
+
+# A sequential run's first drive exited 5: may the second start? $1 the file
+# its session wrote its causes to (write_causes). Sets PAIR_STOP (why not --
+# empty: it may) and PAIR_GO (the session-local warnings it went past). Only
+# a cause that stayed in that session lets the run go on (the operator's
+# decision 9, bd 8249); one of the host, the enclosure or the mechanism stops
+# it, and so -- the cautious way -- does no cause, a record that cannot be
+# read, and any cause not classified here.
+pair_judge_causes() {
+    local f=$1 line causes=() stop=() go=()
+    PAIR_STOP="" PAIR_GO=""
+    if [[ -L "$f" || ! -f "$f" ]] || ! mapfile -t causes <"$f" 2>/dev/null; then
+        PAIR_STOP="its causes cannot be read ($f)"
+        return 0
+    fi
+    for line in "${causes[@]}"; do
+        case "$line" in
+            guard-unconfirmed-no | report-lines-lost | guard-left | egress-not-removed | dry-run-override)
+                go+=("$(cause_text "$line")") ;;
+            claim-lost | reenumerated | mounted-after | mount-unknown | scan-failed | clock-gap | reset-watch-stopped)
+                stop+=("$(cause_text "$line")") ;;
+            "") ;;
+            *[!a-z-]*) stop+=("a cause that cannot be read") ;;
+            *) stop+=("an unclassified cause ($line)") ;;
+        esac
+    done
+    if ((${#stop[@]} == 0 && ${#go[@]} == 0)); then
+        PAIR_STOP="no cause was recorded"
+        return 0
+    fi
+    local IFS=';'
+    PAIR_STOP="${stop[*]}"
+    PAIR_GO="${go[*]}"
+    PAIR_STOP=${PAIR_STOP//;/; } PAIR_GO=${PAIR_GO//;/; }
+}
 
 # This run's status from the drives' ($@): a drive still held (4, then 3)
 # first, then 6, 7, 5, 1, 0 -- the gravest that still asks something of the
@@ -4237,7 +4310,7 @@ pair_status() {
 }
 
 cmd_session_pair() {
-    local first=$1 second=$2 labels=() l rcs=() pids=() i rc kept=false flags=()
+    local first=$1 second=$2 labels=() l rcs=() pids=() i rc kept=false flags=() cause_file="" why=()
     require_root
     command -v jq >/dev/null || refuse "jq is not installed: every session reads its boot record with it"
     load_targets
@@ -4280,20 +4353,38 @@ cmd_session_pair() {
         done
     else
         for i in 0 1; do
-            if ((i == 1)) && [[ "${rcs[0]}" != 0 ]]; then
+            if ((i == 1)) && [[ "${rcs[0]}" == 5 ]]; then
+                pair_judge_causes "$cause_file"
+                if [[ -n "$PAIR_STOP" ]]; then
+                    rcs[1]=skipped
+                    why[1]="skipped: ${labels[0]} exited 5 -- $PAIR_STOP"
+                    warn "${labels[1]} is not started: ${labels[0]} exited 5 -- $PAIR_STOP -- and a fault of the host, the enclosure or the mechanism may meet the next drive too"
+                    break
+                fi
+                why[0]="exit 5, went on past: $PAIR_GO"
+                warn "${labels[0]} exited 5 on warnings of its own session only ($PAIR_GO): ${labels[1]} is started"
+            elif ((i == 1)) && [[ "${rcs[0]}" != 0 ]]; then
                 rcs[1]=skipped
+                why[1]="skipped: ${labels[0]} exited ${rcs[0]}"
                 warn "${labels[1]} is not started: ${labels[0]} exited ${rcs[0]}, and a bad update must not reach both drives"
                 break
             fi
             rc=0
+            cause_file="$STATE_DIR/${labels[$i]}.exit5"
+            rm -f -- "$cause_file"
             DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=sequential \
-                bash "$SELF" session "${labels[$i]}" "${flags[@]}" || rc=$?
+                DAS_RECOVERY_VM_CAUSE_FILE=$cause_file bash "$SELF" session "${labels[$i]}" "${flags[@]}" || rc=$?
             rcs[i]=$rc
         done
+        rm -f -- "$STATE_DIR/${labels[0]}.exit5" "$STATE_DIR/${labels[1]}.exit5"
     fi
     for i in 0 1; do
         printf 'DRIVE %s %s\n' "${labels[$i]}" "${rcs[$i]}"
         [[ "${rcs[$i]}" != 3 && "${rcs[$i]}" != 4 ]] || kept=true
+    done
+    printf 'Both drives -- %s, %s\n' "$LABEL" "$PAIR_MODE"
+    for i in 0 1; do
+        printf '  %-22s %s\n' "${labels[$i]}" "${why[$i]:-exit ${rcs[$i]}}"
     done
     PAIR_RCS=("${rcs[@]}")
     PAIR_LABELS=("${labels[@]}")
@@ -4489,6 +4580,13 @@ parse_session_args() {
         fi
         EGRESS_HELD=true
     fi
+    if [[ -n "${DAS_RECOVERY_VM_CAUSE_FILE:-}" ]]; then
+        if [[ "$RUN_MODE" != sequential ]]; then
+            printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_CAUSE_FILE is set only by a sequential two-drive run\n' >&2
+            exit 2
+        fi
+        CAUSE_FILE=$DAS_RECOVERY_VM_CAUSE_FILE
+    fi
 }
 
 # Ask the recovery OS to power off (ACPI) because of $1, again every
@@ -4554,6 +4652,50 @@ wait_for_poweroff() {
     done
 }
 
+# Why this session needs a look -- the causes of its exit 5 -- one word per
+# line, in the summary's order; nothing when there is none. The one list
+# both session_status and a sequential two-drive run read (bd 8249, decision
+# 9): the run goes on to its second drive only past causes that stayed in
+# this session (pair_judge_causes), so a new one is added here AND classified
+# there, or it stops the run.
+exit5_causes() {
+    ((HOLDER_LOSSES == 0)) || echo claim-lost
+    [[ "$REENUMERATED" != true ]] || echo reenumerated
+    if ((${#BOOT_OVERRIDES[@]} > 0)); then
+        if [[ "$DRY_RUN" == true ]]; then echo dry-run-override; else echo boot-override; fi
+    fi
+    [[ "$DRY_RUN" != true ]] || return 0
+    [[ "$GUARD_FAILED" != true ]] || echo guard-unconfirmed-no
+    [[ -z "$GUARD_LEFT" ]] || echo guard-left
+    ((${#UNMASKABLE[@]} == 0)) || echo unmaskable-units
+    ((SILENCES == 0)) || echo reporter-silent
+    [[ -z "$RESET_WATCH_DOWN" ]] || echo reset-watch-stopped
+    ((${#REPORT_LOSSES[@]} == 0)) || echo report-lines-lost
+    ((G_GAP_SECS == 0)) || echo clock-gap
+    [[ "$EGRESS_RESULT" != "NOT taken out"* ]] || echo egress-not-removed
+    [[ "$SCAN_RESULT" != FAILED* ]] || echo scan-failed
+    # A drive that re-enumerated is looked at under both names.
+    case "$MOUNT_RESULT" in
+        *"MOUNTED: "*) echo mounted-after ;;
+        *unknown*) echo mount-unknown ;;
+        "no partition mounted"*) ;;
+        *) echo mount-unknown ;;
+    esac
+}
+
+# A sequential two-drive run's drive: write its exit-5 causes ($1 its exit
+# status; none unless 5) where the run reads them. A file that cannot be
+# written is said: the run then finds none and stops, the cautious way.
+write_causes() {
+    local tmp
+    [[ -n "$CAUSE_FILE" ]] || return 0
+    tmp="$CAUSE_FILE.tmp.$$"
+    if ! { if [[ "$1" == 5 ]]; then exit5_causes; fi; } >"$tmp" 2>/dev/null || ! mv -f -- "$tmp" "$CAUSE_FILE"; then
+        rm -f -- "$tmp"
+        warn "could not write this session's exit-5 causes to $CAUSE_FILE: the two-drive run will not start the other drive"
+    fi
+}
+
 # 6 when the session guard did not confirm on a record that does not rule
 # btrbk out; 5 when a session ended, everything given back, but something
 # needs a look; else 0.
@@ -4562,11 +4704,7 @@ session_status() {
         echo 6
     elif [[ -n "$UNATTENDED_FAILED" ]]; then
         echo 7
-    elif [[ "$EGRESS_RESULT" == "NOT taken out"* ]]; then
-        echo 5
-    elif [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
-        [[ "$GUARD_FAILED" == true || -n "$GUARD_LEFT" || -n "$RESET_WATCH_DOWN" ]] || ((${#UNMASKABLE[@]} > 0)) ||
-        ((HOLDER_LOSSES > 0 || ${#BOOT_OVERRIDES[@]} > 0 || SILENCES > 0 || ${#REPORT_LOSSES[@]} > 0 || G_GAP_SECS > 0)); then
+    elif [[ -n "$(exit5_causes)" ]]; then
         echo 5
     else
         echo 0
@@ -4650,6 +4788,7 @@ cmd_session() {
         log "dry run done: lock taken and released, holder started and stopped, nothing defined or attached"
         if ((${#BOOT_OVERRIDES[@]} > 0)); then
             warn "dry run: the boot-record check was overridden (--accept-boot-record-risk) -- exit 5"
+            write_causes 5
             exit 5
         fi
         exit 0
@@ -5133,4 +5272,7 @@ main() {
     esac
 }
 
-main "$@"
+# Sourced (the test suite's classifier checks): define, never run.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -4736,6 +4736,64 @@ fixture
 DAS_RECOVERY_VM_MODE=parallel run_driver session A
 check "DAS_RECOVERY_VM_MODE without the run's lock: a usage error" "$RC" "2"
 
+echo "--- both drives, sequential: past a 5 only on the first drive's own warnings (decision 9)"
+# The classifier, on its own: every cause both ways, and what has none.
+judge() {
+    # $1 the causes file's content ("-" for no file, "/" for a directory).
+    local cf="$T/judge.causes"
+    rm -rf -- "$cf"
+    case "$1" in
+        -) ;;
+        /) mkdir -p "$cf" ;;
+        *) printf '%s' "$1" >"$cf" ;;
+    esac
+    JUDGED="$(bash -c 'source "$1" && pair_judge_causes "$2" && printf "STOP=%s|GO=%s" "$PAIR_STOP" "$PAIR_GO"' _ "$DRIVER" "$cf" 2>&1)" || JUDGED="error: $JUDGED"
+}
+for c in guard-unconfirmed-no report-lines-lost guard-left egress-not-removed dry-run-override; do
+    judge "$c"$'\n'
+    matches "decision 9, $c alone: goes on" "$JUDGED" "^STOP=\|GO=.+"
+    judge "$c"$'\n'"scan-failed"$'\n'
+    matches "decision 9, $c beside a host cause: stops" "$JUDGED" "^STOP=the btrfs device scan failed\|"
+done
+for c in claim-lost reenumerated mounted-after mount-unknown scan-failed clock-gap reset-watch-stopped; do
+    judge "$c"$'\n'
+    matches "decision 9, $c: stops, named" "$JUDGED" "^STOP=[a-z].+\|GO=$"
+    lacks "decision 9, $c: never an unclassified one" "$JUDGED" "unclassified"
+done
+for c in boot-override unmaskable-units reporter-silent something-new; do
+    judge "$c"$'\n'
+    has "decision 9, $c (unclassified): stops" "$JUDGED" "STOP=an unclassified cause ($c)"
+done
+judge ""
+has "decision 9, exit 5 with no cause recorded: stops" "$JUDGED" "STOP=no cause was recorded|"
+judge "-"
+has "decision 9, no causes file: stops" "$JUDGED" "STOP=its causes cannot be read"
+judge "/"
+has "decision 9, causes not a file: stops" "$JUDGED" "STOP=its causes cannot be read"
+judge $'guard-left\nNOT A WORD\n'
+has "decision 9, a garbled cause: stops" "$JUDGED" "STOP=a cause that cannot be read|"
+
+# The whole run: a first drive's 5 on a dry-run override goes on to B...
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no $((9 * 86400)))" "$(record_json system-recovery-B-2tb no)"
+run_driver session A B --dry-run --accept-boot-record-risk
+check "decision 9, A's 5 on a dry-run override: exit 5" "$RC" "5"
+has "decision 9, A's own warning: B is started" "$OUT" "DRIVE system-recovery-B-2tb 0"
+has "decision 9, A's own warning: says it went on, and past what" "$OUT" "exited 5 on warnings of its own session only (a dry run with --accept-boot-record-risk)"
+has "decision 9, A's own warning: the closing lines say so" "$OUT" "exit 5, went on past: a dry run with --accept-boot-record-risk"
+check "decision 9: no causes file left behind" "$(find "$STATE" -name '*.exit5*' 2>/dev/null | wc -l)" "0"
+
+# ...one on a failed device scan stops it, and says which cause did.
+unattended_fixture
+touch "$S/scan_fail"
+run_driver session A B --unattended --mode sequential
+check "decision 9, A's 5 on a failed scan: exit 5" "$RC" "5"
+has "decision 9, a host cause: B not started" "$OUT" "DRIVE system-recovery-B-2tb skipped"
+lacks "decision 9, a host cause: B's domain never started" "$(file "$S/domB/events")" "virsh start"
+has "decision 9, a host cause: names it" "$OUT" "is not started: system-recovery-A-2tb exited 5 -- the btrfs device scan failed"
+has "decision 9, a host cause: the closing lines name it" "$OUT" "skipped: system-recovery-A-2tb exited 5 -- the btrfs device scan failed"
+check "decision 9, a host cause: lock free" "$(lock_state)" "free"
+
 echo "--- the console bridge (decision 2): one user, one connection, the session only"
 console_fixture() {
     fixture
