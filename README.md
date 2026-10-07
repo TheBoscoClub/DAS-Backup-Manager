@@ -49,7 +49,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
 | `scripts/das-partition-drives.sh` | DAS drive partitioning utility | Active |
 | `scripts/install-backup-timer.sh` | Former timer installer: now prints a pointer to `btrdasd setup`, which writes and enables the timers, and exits 1 | Deprecated |
-| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to the `recovery-os-updater` VM (`packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active |
+| `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to its own `recovery-os-updater-<label>` VM (template `packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
 | `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |

@@ -366,7 +366,7 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     );
     let kept: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
-    assert_eq!(kept["schema_version"], 3);
+    assert_eq!(kept["schema_version"], 4);
     assert_eq!(
         kept["drives"]["recovery-A"]["checked_epoch"],
         1790000000_i64
@@ -395,7 +395,7 @@ fn status_reports_an_unmounted_mirror_and_keeps_the_state_file() {
     let err = String::from_utf8_lossy(&out.stderr);
     let want = format!(
         "Error: could not record the result: {p}: record schema version 1, this btrdasd \
-         reads 2 and 3 — left as it is; remove it to start over: rm -- '{p}'",
+         reads 2, 3 and 4 — left as it is; remove it to start over: rm -- '{p}'",
         p = state.display()
     );
     assert_eq!(err.lines().next(), Some(want.as_str()), "{err}");
