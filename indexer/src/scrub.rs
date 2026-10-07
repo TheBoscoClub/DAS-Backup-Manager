@@ -889,6 +889,34 @@ impl FileLock {
         })
     }
 
+    /// [`acquire_blocking`](Self::acquire_blocking) for a job that can be
+    /// cancelled (bd DAS-Backup-Manager-yq2): a blocking `flock` cannot be
+    /// interrupted, so this looks again every `poll` and stops as soon as
+    /// `stop()` says so — `Ok(None)`, holding nothing. Logs `waiting_message`
+    /// once, when it first finds the lock held.
+    pub fn acquire_until(
+        path: impl AsRef<Path>,
+        progress: &dyn ProgressCallback,
+        waiting_message: &dyn Fn() -> String,
+        stop: &dyn Fn() -> bool,
+        poll: Duration,
+    ) -> Result<Option<FileLock>, ScrubError> {
+        let path = path.as_ref();
+        if let Some(lock) = Self::try_acquire(path)? {
+            return Ok(Some(lock));
+        }
+        progress.on_log(LogLevel::Info, &waiting_message());
+        loop {
+            if stop() {
+                return Ok(None);
+            }
+            std::thread::sleep(poll);
+            if let Some(lock) = Self::try_acquire(path)? {
+                return Ok(Some(lock));
+            }
+        }
+    }
+
     /// Path of the lock file.
     pub fn path(&self) -> &Path {
         &self.path

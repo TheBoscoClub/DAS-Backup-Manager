@@ -6,7 +6,7 @@ use crate::health;
 use crate::indexer;
 use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount;
-use crate::progress::{LogLevel, ProgressCallback};
+use crate::progress::{LogLevel, ProgressCallback, cut_short, stop_requested};
 use crate::scrub;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -36,6 +36,14 @@ impl HoldsMaintenance for BackupLocks {
         &self.maintenance
     }
 }
+
+/// How often a job that can be cancelled looks at a held maintenance lock —
+/// and so how long a cancel can take to stop its wait.
+pub const CANCELLABLE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Why a cancelled job stopped waiting for its locks.
+pub const CANCELLED_WAITING: &str =
+    "cancelled while waiting for the DAS maintenance lock; nothing was mounted";
 
 /// Outcome of trying to take the manual-backup locks.
 pub enum BackupLockAttempt {
@@ -74,7 +82,23 @@ pub fn acquire_manual_locks_at(
     let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
         return Ok(BackupLockAttempt::AlreadyRunning);
     };
-    let maintenance = MaintenanceHeld::acquire_blocking_at(maintenance_path, job, progress)?;
+    // A job that can be cancelled (the GUI's) stops waiting when it is; the
+    // singleton is let go as `singleton` drops. One that cannot waits as it
+    // always did (bd DAS-Backup-Manager-yq2).
+    let maintenance = match progress.cancel_token() {
+        None => MaintenanceHeld::acquire_blocking_at(maintenance_path, job, progress)?,
+        Some(token) => MaintenanceHeld::acquire_until_at(
+            maintenance_path,
+            job,
+            progress,
+            &|| token.stop_here(),
+            CANCELLABLE_LOCK_POLL,
+        )?
+        .ok_or_else(|| scrub::ScrubError::Lock {
+            path: maintenance_path.display().to_string(),
+            detail: CANCELLED_WAITING.into(),
+        })?,
+    };
     Ok(BackupLockAttempt::Acquired(Box::new(BackupLocks {
         maintenance,
         _singleton: singleton,
@@ -300,6 +324,8 @@ pub const BOOT_MESSAGE_LINES: usize = 5;
 pub enum BootStep {
     NotSelected,
     DisabledInConfig,
+    /// Selected, and not run: the job was cancelled before it (bd yq2).
+    Cancelled,
     Ran(BootOutcome),
 }
 
@@ -339,6 +365,7 @@ impl BootStep {
     pub fn has_nothing_to_report(&self) -> bool {
         match self {
             Self::NotSelected | Self::DisabledInConfig => true,
+            Self::Cancelled => false,
             Self::Ran(o) => o.status() == "OK" && o.updated == 0,
         }
     }
@@ -369,6 +396,7 @@ impl BootStep {
         match self {
             Self::NotSelected => "N/A  (not selected)".into(),
             Self::DisabledInConfig => "OK  (disabled in config)".into(),
+            Self::Cancelled => "N/A  (cancelled — not run)".into(),
             Self::Ran(o) => format!("{}  ({})", o.status(), o.detail()),
         }
     }
@@ -2368,7 +2396,16 @@ fn run_pipeline(
         }
         (BackupMode::Incremental, BtrbkSteps::SnapshotAndSend) => {
             snapshots(&mut done);
-            send(&mut done);
+            // A boundary: the snapshot step is done, the send not begun.
+            if stop_requested(progress) {
+                done.sent = None;
+                done.failed(
+                    progress,
+                    cancelled_line("the snapshot step", &not_done_after_btrbk(options, true)),
+                );
+            } else {
+                send(&mut done);
+            }
         }
     }
     done
@@ -2626,6 +2663,8 @@ fn run_backup_with(
         progress,
         env,
     );
+    // The pipeline stopped at its own boundary: nothing after it runs.
+    let done_cancelled = cut_short(progress);
     errors.extend(done.errors);
     let (snapshots_created, snapshots_sent, snapshots_cleaned) =
         (done.created, done.sent, done.cleaned);
@@ -2656,7 +2695,16 @@ fn run_backup_with(
     // Step (c): boot subvolumes — create a missing one on every run, archive
     // and replace on a full run, as backup-run.sh's update_boot_subvolumes does
     // (bd woq, dtm). A failure fails the run; an absence only warns.
-    let boot = if options.boot_archive {
+    // A boundary: btrbk is done, the boot step not begun (the index has its own).
+    let cancelled = options.boot_archive && !done_cancelled && stop_requested(progress);
+    if cancelled {
+        let msg = cancelled_line("btrbk", &not_done_after_btrbk(options, false));
+        progress.on_log(LogLevel::Error, &msg);
+        errors.push(msg);
+    }
+    let boot = if options.boot_archive && (cancelled || done_cancelled) {
+        BootStep::Cancelled
+    } else if options.boot_archive {
         let step = archive_boot_with(
             config,
             Some(&effective_targets),
@@ -2673,8 +2721,20 @@ fn run_backup_with(
     };
 
     // Step (d): Index — walk each target's mount path to pick up new snapshots.
-    if options.index_after {
-        indexed = (env.index)(config, progress);
+    // A boundary after the boot step, which a cancel does not interrupt.
+    if options.index_after && !cancelled && !done_cancelled {
+        if stop_requested(progress) {
+            let done = if options.boot_archive {
+                "the boot subvolume step"
+            } else {
+                "btrbk"
+            };
+            let msg = cancelled_line(done, "index");
+            progress.on_log(LogLevel::Error, &msg);
+            errors.push(msg);
+        } else {
+            indexed = (env.index)(config, progress);
+        }
     }
 
     // The report is written and emailed by `run_backup_job`, after the
@@ -2960,6 +3020,56 @@ fn with_still_mounted(msg: String, still_mounted: &[String]) -> String {
     }
 }
 
+/// What a job a cancel stopped says: `cancelled after <done>; not done:
+/// <not_done>` — the summary the GUI shows, and the error in its row.
+pub fn cancelled_line(done: &str, not_done: &str) -> String {
+    format!("cancelled after {done}; not done: {not_done}")
+}
+
+/// The selected steps a run skips when it stops after its btrbk step (or,
+/// `with_send`, after the snapshot half of it).
+fn not_done_after_btrbk(options: &BackupOptions, with_send: bool) -> String {
+    let mut steps = Vec::new();
+    if with_send {
+        steps.push("send");
+    }
+    if options.boot_archive {
+        steps.push("boot subvolumes");
+    }
+    if options.index_after {
+        steps.push("index");
+    }
+    steps.join(", ")
+}
+
+/// The job was cancelled at a boundary before btrbk: give back what it
+/// mounted (`mounts`, in release order) and record it as a cancelled run —
+/// every count unknown — saying what it did and what it did not.
+fn cancel_job(
+    host: &dyn BackupJobHost,
+    config: &Config,
+    options: &BackupOptions,
+    started: std::time::Instant,
+    (done, not_done): (&str, &str),
+    mounts: &mut [&mut Box<dyn Release>],
+    progress: &dyn ProgressCallback,
+) -> BackupJobOutcome {
+    let msg = cancelled_line(done, not_done);
+    progress.on_log(LogLevel::Warning, &msg);
+    let still: Vec<String> = mounts
+        .iter_mut()
+        .flat_map(|m| m.release(progress))
+        .collect();
+    abort_job(
+        host,
+        config,
+        options,
+        started,
+        with_still_mounted(msg, &still),
+        progress,
+    )
+}
+
 /// The job began and stopped on the state of a target or a source: the
 /// outcome, after recording it as a failed run — counts unknown, the reason as
 /// its error — unless it was a dry run, as `backup-run.sh` records an abort
@@ -3023,15 +3133,46 @@ pub fn run_backup_job(
     let locks = match host.acquire_locks(progress) {
         Ok(Some(locks)) => locks,
         Ok(None) => return BackupJobOutcome::Declined,
+        // Cancelled while it waited: it holds nothing, mounted nothing.
+        Err(_) if cut_short(progress) => {
+            return BackupJobOutcome::CouldNotStart(CANCELLED_WAITING.into());
+        }
         Err(e) => {
             return BackupJobOutcome::CouldNotStart(format!("Could not acquire backup locks: {e}"));
         }
     };
+    // Every stage below runs to its end; a cancel stops the job at the
+    // boundary after it (bd DAS-Backup-Manager-yq2).
     let mut sources = host.mount_sources(&config, progress);
+    if stop_requested(progress) {
+        return cancel_job(
+            host,
+            &config,
+            &options,
+            started,
+            (
+                "mounting the sources",
+                "subvolume sync, target mount, btrbk, report",
+            ),
+            &mut [&mut sources],
+            progress,
+        );
+    }
     // Same rule on every path: a failed sync never stops the run, but the
     // run's result, record and report all say it failed.
     let (config, sync) = host.sync(&config, options.dry_run, progress);
     options.subvolume_sync = Some(sync);
+    if stop_requested(progress) {
+        return cancel_job(
+            host,
+            &config,
+            &options,
+            started,
+            ("the subvolume sync", "target mount, btrbk, report"),
+            &mut [&mut sources],
+            progress,
+        );
+    }
     let mut targets = match host.mount_targets(&config, progress, locks.maintenance()) {
         Ok(targets) => targets,
         Err(e) => {
@@ -3046,6 +3187,17 @@ pub fn run_backup_job(
             );
         }
     };
+    if stop_requested(progress) {
+        return cancel_job(
+            host,
+            &config,
+            &options,
+            started,
+            ("mounting the targets", "btrbk, report"),
+            &mut [&mut targets, &mut sources],
+            progress,
+        );
+    }
     let ran = host.run(&config, &options, progress);
     // Capacity, SMART and the latest snapshots are read now, while the
     // targets are mounted; the report itself is built after the unmount so
@@ -8345,6 +8497,8 @@ mod tests {
         /// What `report` says became of the report.
         report_saved: Result<(), String>,
         report_emailed: bool,
+        /// The step during which the GUI's Cancel arrives (bd yq2).
+        cancel_during: Option<&'static str>,
     }
 
     impl Default for FakeHost {
@@ -8362,6 +8516,7 @@ mod tests {
                 record_fails: false,
                 report_saved: Ok(()),
                 report_emailed: true,
+                cancel_during: None,
             }
         }
     }
@@ -8372,6 +8527,14 @@ mod tests {
         }
         fn steps(&self) -> Vec<String> {
             self.steps.lock().unwrap().clone()
+        }
+        /// Cancel the job if this is the step the Cancel arrives during.
+        fn maybe_cancel(&self, step: &str, progress: &dyn ProgressCallback) {
+            if self.cancel_during == Some(step)
+                && let Some(token) = progress.cancel_token()
+            {
+                token.cancel();
+            }
         }
     }
 
@@ -8418,8 +8581,9 @@ mod tests {
                 got.then(|| Box::new(MaintenanceHeld::assumed()) as Box<dyn HoldsMaintenance>)
             })
         }
-        fn mount_sources(&self, _: &Config, _: &dyn ProgressCallback) -> Box<dyn Release> {
+        fn mount_sources(&self, _: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release> {
             self.step("mount sources");
+            self.maybe_cancel("mount sources", progress);
             Box::new(FakeMounts {
                 name: "sources",
                 left: self.sources_left.clone(),
@@ -8430,8 +8594,9 @@ mod tests {
             &self,
             before: &Config,
             dry_run: bool,
-            _: &dyn ProgressCallback,
+            progress: &dyn ProgressCallback,
         ) -> (Config, SyncSection) {
+            self.maybe_cancel("sync", progress);
             self.step(&format!(
                 "sync dry_run={dry_run} before={}",
                 before.general.version
@@ -8449,9 +8614,10 @@ mod tests {
         fn mount_targets(
             &self,
             config: &Config,
-            _: &dyn ProgressCallback,
+            progress: &dyn ProgressCallback,
             _: &MaintenanceHeld,
         ) -> Result<Box<dyn Release>, String> {
+            self.maybe_cancel("mount targets", progress);
             self.step(&format!("mount targets ({})", config.general.version));
             self.targets.clone().map(|left| {
                 Box::new(FakeMounts {
@@ -8465,8 +8631,9 @@ mod tests {
             &self,
             config: &Config,
             options: &BackupOptions,
-            _: &dyn ProgressCallback,
+            progress: &dyn ProgressCallback,
         ) -> Result<BackupResult, String> {
+            self.maybe_cancel("run", progress);
             self.step(&format!(
                 "run ({}, sync failed={:?})",
                 config.general.version,
@@ -8540,6 +8707,364 @@ mod tests {
         };
         let outcome = run_backup_job(host, make_test_config(), options, &progress);
         (outcome, progress)
+    }
+
+    // --- Cancel stops the work at the next safe boundary (bd yq2) -----------
+
+    fn cancellable_job(host: &FakeHost) -> (BackupJobOutcome, TestProgress) {
+        let progress = TestProgress::cancellable();
+        let outcome = run_backup_job(
+            host,
+            make_test_config(),
+            BackupOptions::default(),
+            &progress,
+        );
+        (outcome, progress)
+    }
+
+    #[test]
+    fn a_cancel_between_stages_stops_before_the_next_and_still_cleans_up() {
+        // Cancel arrives while each stage runs: that stage finishes, the next
+        // never starts, what was mounted is given back and the run is
+        // recorded as cancelled, every count unknown.
+        for (during, done_steps, said) in [
+            (
+                "mount sources",
+                vec!["locks", "mount sources", "release sources", "record"],
+                "cancelled after mounting the sources; not done: subvolume sync, \
+                 target mount, btrbk, report",
+            ),
+            (
+                "sync",
+                vec![
+                    "locks",
+                    "mount sources",
+                    "sync dry_run=false before=0.6.0",
+                    "release sources",
+                    "record",
+                ],
+                "cancelled after the subvolume sync; not done: target mount, btrbk, report",
+            ),
+            (
+                "mount targets",
+                vec![
+                    "locks",
+                    "mount sources",
+                    "sync dry_run=false before=0.6.0",
+                    "mount targets (after-sync)",
+                    "release targets",
+                    "release sources",
+                    "record",
+                ],
+                "cancelled after mounting the targets; not done: btrbk, report",
+            ),
+        ] {
+            let host = FakeHost {
+                cancel_during: Some(during),
+                ..Default::default()
+            };
+            let (outcome, progress) = cancellable_job(&host);
+            assert_eq!(host.steps(), done_steps, "cancelled during {during}");
+            match &outcome {
+                BackupJobOutcome::Aborted(why) => assert_eq!(why, said, "{during}"),
+                other => panic!("{during}: a cancelled job is cut short, got {other:?}"),
+            }
+            assert!(!outcome.success());
+            assert!(crate::progress::cut_short(&progress), "{during}");
+            let recorded = host.recorded.lock().unwrap();
+            assert_eq!(recorded.len(), 1, "{during}: one truthful row");
+            let row = &recorded[0];
+            assert!(!row.success);
+            assert_eq!(
+                (row.snapshots_created, row.snapshots_sent),
+                (None, None),
+                "{during}: unfinished counts are unknown, never 0"
+            );
+            assert_eq!(row.errors, vec![said.to_string()], "{during}");
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_last_stage_reports_the_real_outcome() {
+        // btrbk runs to its end, and nothing selected comes after it: the
+        // cancel stopped nothing, so the job is what it was.
+        let host = FakeHost {
+            cancel_during: Some("run"),
+            ..Default::default()
+        };
+        let (outcome, progress) = cancellable_job(&host);
+        assert!(outcome.success(), "{outcome:?}");
+        assert!(!crate::progress::cut_short(&progress));
+        assert!(progress.cancel.as_ref().unwrap().is_requested());
+        assert!(host.steps().contains(&"record".to_string()));
+        assert!(host.recorded.lock().unwrap()[0].success);
+    }
+
+    #[test]
+    fn a_job_that_cannot_be_cancelled_runs_every_stage() {
+        // The CLI's job carries no token: nothing about it changes.
+        let host = FakeHost {
+            cancel_during: Some("mount sources"),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success());
+        assert_eq!(host.steps().len(), 10, "{:?}", host.steps());
+    }
+
+    /// A runner that receives the GUI's Cancel while btrbk's snapshot step
+    /// runs, then answers as `inner` does.
+    struct CancelDuringSnapshot<'a> {
+        inner: &'a dyn CommandRunner,
+        token: &'a crate::progress::CancelToken,
+    }
+
+    impl CancelDuringSnapshot<'_> {
+        fn see(&self, cmd: &Command) {
+            if cmd.get_args().any(|a| a == "snapshot") {
+                self.token.cancel();
+            }
+        }
+    }
+
+    impl CommandRunner for CancelDuringSnapshot<'_> {
+        fn output(&self, cmd: &mut Command) -> std::io::Result<std::process::Output> {
+            self.see(cmd);
+            self.inner.output(cmd)
+        }
+        fn stream(
+            &self,
+            cmd: &mut Command,
+            on_line: &mut dyn FnMut(&str),
+        ) -> std::io::Result<std::process::Output> {
+            self.see(cmd);
+            self.inner.stream(cmd, on_line)
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_snapshot_step_lets_it_finish_and_sends_nothing() {
+        let f = primary_filters();
+        let snap = btrbk(&format!("snapshot {f}"));
+        let resume = btrbk(&format!("resume {f}"));
+        let scripted = Scripted::from_owned(vec![
+            (snap.clone(), 0, String::new()),
+            (resume.clone(), 0, String::new()),
+            listing_of(raw_row("/s/a.1", "/t1/a.1")),
+        ]);
+        let progress = TestProgress::cancellable();
+        let runner = CancelDuringSnapshot {
+            inner: &scripted,
+            token: progress.cancel.as_ref().unwrap(),
+        };
+        let options = BackupOptions {
+            boot_archive: true,
+            index_after: true,
+            ..Default::default()
+        };
+        let done = run_pipeline(
+            &steps_config(),
+            &options,
+            BackupMode::Incremental,
+            &labels(&["nvme-root", "nvme-vm", "hdd"]),
+            &labels(&["primary-22tb"]),
+            &progress,
+            &env(&runner),
+        );
+        let calls: Vec<_> = scripted
+            .calls()
+            .into_iter()
+            .filter(|c| !c.contains(" list "))
+            .collect();
+        assert_eq!(calls, vec![snap], "the send never started");
+        assert_eq!(done.created, Some(1), "the snapshot step finished");
+        assert_eq!(done.sent, None, "not sent is unknown, never 0");
+        assert_eq!(
+            done.errors,
+            vec!["cancelled after the snapshot step; not done: send, boot subvolumes, index"]
+        );
+        assert!(crate::progress::cut_short(&progress));
+    }
+
+    #[test]
+    fn a_cancel_after_btrbk_skips_the_boot_step_and_the_index() {
+        let runner = Scripted::from_owned(vec![]);
+        let progress = TestProgress::cancellable();
+        progress.cancel.as_ref().unwrap().cancel();
+        let indexed = std::cell::Cell::new(false);
+        let index = |_: &Config, _: &dyn ProgressCallback| {
+            indexed.set(true);
+            true
+        };
+        let env = StepEnv {
+            index: &index,
+            ..env(&runner)
+        };
+        let options = BackupOptions {
+            steps: BtrbkSteps::SendOnly,
+            boot_archive: true,
+            index_after: true,
+            ..live_options()
+        };
+        let result = run_backup_with(&live_config(), &options, &progress, &env).unwrap();
+        assert_eq!(result.boot, BootStep::Cancelled);
+        assert_eq!(result.boot.row(), "N/A  (cancelled — not run)");
+        assert!(!indexed.get(), "the index never started");
+        assert!(!result.success);
+        assert!(
+            result
+                .errors
+                .contains(&"cancelled after btrbk; not done: boot subvolumes, index".to_string()),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn a_cancel_after_btrbk_skips_the_index_when_no_boot_step_is_selected() {
+        let runner = Scripted::from_owned(vec![]);
+        let progress = TestProgress::cancellable();
+        progress.cancel.as_ref().unwrap().cancel();
+        let indexed = std::cell::Cell::new(false);
+        let index = |_: &Config, _: &dyn ProgressCallback| {
+            indexed.set(true);
+            true
+        };
+        let env = StepEnv {
+            index: &index,
+            ..env(&runner)
+        };
+        let options = BackupOptions {
+            steps: BtrbkSteps::SendOnly,
+            index_after: true,
+            ..live_options()
+        };
+        let result = run_backup_with(&live_config(), &options, &progress, &env).unwrap();
+        assert!(!indexed.get(), "the index never started");
+        assert_eq!(result.boot, BootStep::NotSelected);
+        assert!(
+            result
+                .errors
+                .contains(&"cancelled after btrbk; not done: index".to_string()),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn a_cancel_during_the_boot_step_lets_it_finish_and_skips_the_index() {
+        let runner = Scripted::from_owned(vec![]);
+        let progress = TestProgress::cancellable();
+        let token = progress.cancel.as_ref().unwrap();
+        // The run verifies its targets before btrbk and the send verifies
+        // again; the boot step's own verification is the third — the Cancel
+        // arrives then, while the boot step runs.
+        let verified = std::cell::Cell::new(0);
+        let verify = |_: &[Target], _: &[String], _: &dyn ProgressCallback| {
+            verified.set(verified.get() + 1);
+            if verified.get() == 3 {
+                token.cancel();
+            }
+            Ok(())
+        };
+        let indexed = std::cell::Cell::new(false);
+        let index = |_: &Config, _: &dyn ProgressCallback| {
+            indexed.set(true);
+            true
+        };
+        let env = StepEnv {
+            index: &index,
+            ..env_for(&runner, &verify)
+        };
+        let mut config = live_config();
+        config.boot.enabled = true;
+        let options = BackupOptions {
+            steps: BtrbkSteps::SendOnly,
+            boot_archive: true,
+            index_after: true,
+            ..live_options()
+        };
+        let result = run_backup_with(&config, &options, &progress, &env).unwrap();
+        assert!(matches!(result.boot, BootStep::Ran(_)), "{:?}", result.boot);
+        assert!(!indexed.get(), "the index never started");
+        assert!(
+            result
+                .errors
+                .contains(&"cancelled after the boot subvolume step; not done: index".to_string()),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn a_cancel_while_waiting_for_the_maintenance_lock_stops_at_once_holding_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = SystemBackupHost {
+            config_path: dir.path().join("config.toml"),
+            singleton_lock: dir.path().join("backup.lock"),
+            maintenance_lock: dir.path().join("maintenance.lock"),
+            job: "btrdasd-helper BackupRun job".into(),
+        };
+        let scrub = scrub::FileLock::try_acquire(&host.maintenance_lock)
+            .unwrap()
+            .expect("the fixture holds the maintenance lock");
+        let progress = std::sync::Arc::new(TestProgress::cancellable());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (job_progress, singleton, maintenance) = (
+            progress.clone(),
+            host.singleton_lock.clone(),
+            host.maintenance_lock.clone(),
+        );
+        let waiter = std::thread::spawn(move || {
+            let host = SystemBackupHost {
+                singleton_lock: singleton,
+                maintenance_lock: maintenance,
+                ..host
+            };
+            let outcome = run_backup_job(
+                &host,
+                make_test_config(),
+                BackupOptions::default(),
+                &*job_progress,
+            );
+            tx.send(outcome).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(600))
+                .is_err(),
+            "still waiting while the lock is held"
+        );
+        // While it waits it holds the singleton, as a backup should.
+        assert!(
+            scrub::FileLock::try_acquire(dir.path().join("backup.lock"))
+                .unwrap()
+                .is_none()
+        );
+        let asked = std::time::Instant::now();
+        progress.cancel.as_ref().unwrap().cancel();
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a cancel stops the wait promptly");
+        assert!(asked.elapsed() < std::time::Duration::from_secs(1));
+        waiter.join().unwrap();
+        match outcome {
+            BackupJobOutcome::CouldNotStart(why) => assert_eq!(why, CANCELLED_WAITING),
+            other => panic!("expected CouldNotStart, got {other:?}"),
+        }
+        assert!(crate::progress::cut_short(&*progress));
+        // It holds no lock: the singleton is free, and the maintenance lock
+        // is free the moment the scrub lets go.
+        assert!(
+            scrub::FileLock::try_acquire(dir.path().join("backup.lock"))
+                .unwrap()
+                .is_some()
+        );
+        drop(scrub);
+        assert!(
+            scrub::FileLock::try_acquire(dir.path().join("maintenance.lock"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

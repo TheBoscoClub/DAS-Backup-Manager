@@ -162,6 +162,19 @@ impl MaintenanceHeld {
             .map(|lock| Self::owned(lock, job))
     }
 
+    /// [`acquire_blocking_at`](Self::acquire_blocking_at) for a job that can
+    /// be cancelled: `Ok(None)`, holding nothing, once `stop()` says so.
+    pub fn acquire_until_at(
+        path: &Path,
+        job: &str,
+        progress: &dyn ProgressCallback,
+        stop: &dyn Fn() -> bool,
+        poll: std::time::Duration,
+    ) -> Result<Option<Self>, ScrubError> {
+        FileLock::acquire_until(path, progress, &|| blocked_line(path), stop, poll)
+            .map(|lock| lock.map(|lock| Self::owned(lock, job)))
+    }
+
     /// The lock as the process that started this one holds it: `fd` is that
     /// process's open descriptor on the lock file, inherited and named in
     /// [`DELEGATED_FD_ENV`]. Proven, never believed, in three steps: `fd` must
@@ -359,7 +372,7 @@ pub fn hold_for_job(
     job: &str,
     progress: &OrderedProgress,
 ) -> Result<MaintenanceHeld, String> {
-    let cancelled = || progress.is_cancelled();
+    let cancelled = || crate::progress::stop_requested(progress);
     // No callers to check: the helper's are the service manager's.
     match wait_for(site, job, false, None, &cancelled, progress) {
         Ok(Waited::Held(held)) => Ok(held),

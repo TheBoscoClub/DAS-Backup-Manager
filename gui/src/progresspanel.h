@@ -24,6 +24,10 @@ public Q_SLOTS:
                   const QString &message);
     void onJobFinished(const QString &jobId, bool success,
                        const QString &summary);
+    // The helper accepted the cancel: the job stops at its next safe
+    // boundary, which may be the end of a long btrbk send. Until its
+    // JobFinished arrives the button says "Cancelling…" and stays disabled.
+    void showCancelRequested();
 
 private Q_SLOTS:
     void cancelJob();
@@ -31,6 +35,8 @@ private Q_SLOTS:
 
 private:
     void resetPanel();
+    // The button as it is while no cancel is pending.
+    void showCancelIdle(bool enabled);
 
     DBusClient *m_client;
     QString m_currentJobId;
