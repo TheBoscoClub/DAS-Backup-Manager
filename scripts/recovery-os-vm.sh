@@ -388,6 +388,9 @@ GUARD_EXPECT_LIFTED_C=""
 GUARD_FILE=""       # where that report lands: the port's file on this host
 RESET_FILE=""       # the resets the reset watch saw, with where the report stood
 RESET_WATCH_PID=""  # the reset watch: a reader of libvirt's event stream
+RESET_VIRSH_PID=""  # the virsh whose event stream it reads: this script's child
+RESET_VIRSH_STARTING=false # set just before that virsh starts: on_exit uses $!
+RESET_VIRSH_BEFORE=""      # $! before that virsh started
 RESET_LINES_READ=0  # lines of RESET_FILE already taken
 RESET_WATCH_DOWN="" # why the reset watch is not running, once it stopped
 RESETS=0            # resets of the VM seen this session
@@ -1621,6 +1624,9 @@ remove_guard() {
         GUARD_LEFT="$DOMAIN's definition still carries it after defining $DOMAIN_XML"
     else
         GUARDED=false
+        # The reset watch goes before its file: it writes there, and a line
+        # it wrote after this would leave the file behind (bd lorz).
+        stop_reset_watch
         rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
         log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_XML again)"
         return 0
@@ -2289,19 +2295,23 @@ child_gone() {
 # half would be the event. And output not recognised that names a reboot at
 # all is taken as a reset too: a proof is asked for rather than a reset lost.
 # Each reset is recorded as "reset <inode> <size> <seconds since the epoch>".
+#
+# The virsh is started by this script, not by the watch (start_reset_watch),
+# and the watch reads it on descriptor $1: so its pid is this script's from
+# the moment it exists, and stop_reset_watch can always find and end it. A
+# watch that started it itself held its pid alone until it wrote it down, and
+# a signal in between left that virsh running with no one to end it (bd lorz).
 reset_watch() {
-    local line vpid st wfd buf="" rc
+    local line st wfd=$1 buf="" rc
     set +e
+    # Ended by stop_reset_watch, which then ends the virsh itself.
+    trap 'exit 0' TERM INT HUP
     # The maintenance lock is held by this script and the disk holder, never
     # by the watch or its virsh: inherited, its descriptor would keep the lock
     # held after this script let it go, for as long as the watch lived.
     if [[ -n "$LOCK_FD" ]]; then
         exec {LOCK_FD}>&-
     fi
-    exec {wfd}< <(exec virsh --connect "$LIBVIRT_URI" event --domain "$DOMAIN" --event reboot --loop 2>&1)
-    vpid=$!
-    printf 'virsh %s\n' "$vpid" >>"$RESET_FILE"
-    trap 'kill "$vpid" 2>/dev/null; exit 0' TERM INT HUP
     while :; do
         line=""
         IFS= read -r -t "$POLL_SECS" -u "$wfd" line
@@ -2321,39 +2331,112 @@ reset_watch() {
             fi
             ((rc == 0)) || break
         fi
-        kill -0 "$$" 2>/dev/null || break
+        if ! kill -0 "$$" 2>/dev/null; then
+            # This script is gone without ending the virsh: no one else will.
+            kill "$RESET_VIRSH_PID" 2>/dev/null
+            break
+        fi
     done
-    kill "$vpid" 2>/dev/null
+    # Else the stream ended: its virsh is gone, and this script reaps it.
     exit 0
 }
 
+# Start the virsh, then the watch that reads it. The virsh's pid is taken
+# from $! at once; an interrupt between its start and that (the traps run
+# between commands) reaches on_exit with RESET_VIRSH_STARTING still true, and
+# stop_reset_watch takes it from $! there -- as on_exit does for the holder --
+# if $! has moved from what it was before (RESET_VIRSH_BEFORE).
+# Its pid goes in RESET_FILE too, before the domain starts: the file then
+# exists for the whole session, and says which virsh it was.
 start_reset_watch() {
-    reset_watch &
+    local wfd
+    RESET_VIRSH_BEFORE=${!:-}
+    RESET_VIRSH_STARTING=true
+    exec {wfd}< <(
+        # The maintenance lock is never the virsh's to hold (see reset_watch).
+        if [[ -n "$LOCK_FD" ]]; then
+            exec {LOCK_FD}>&-
+        fi
+        exec virsh --connect "$LIBVIRT_URI" event --domain "$DOMAIN" --event reboot --loop 2>&1
+    )
+    RESET_VIRSH_PID=$!
+    RESET_VIRSH_STARTING=false
+    # Information only: the pid this script needs is the one it holds.
+    printf 'virsh %s\n' "$RESET_VIRSH_PID" >>"$RESET_FILE" || :
+    reset_watch "$wfd" &
     RESET_WATCH_PID=$!
+    # The watch's copy is the one read; this script's, closed, is not passed
+    # on to anything it starts later.
+    exec {wfd}<&-
     log "watching $DOMAIN for resets (libvirt's reboot event): a boot after one must report its guard engaged within $(format_duration "$GUARD_SECS")"
 }
 
-# End the reset watch, and the virsh it reads, and wait until they have --
-# five seconds at most, then killed.
+# Whether process $1, the reset watch's virsh, still runs: there, not a
+# zombie, and still this script's child -- a pid freed once bash reaped it
+# and taken by another process is not. Not by its command line: forked but
+# not yet become virsh (an interrupt in that instant), it still reads as
+# this script, and will run all the same.
+reset_virsh_runs() {
+    local st ppid
+    [[ -n "$1" ]] || return 1
+    { read -r st <"/proc/$1/stat"; } 2>/dev/null || return 1
+    st=${st##*) }
+    [[ "${st%% *}" != Z ]] || return 1
+    read -r _ ppid _ <<<"$st"
+    [[ "$ppid" == "$$" ]]
+}
+
+# End the reset watch, then the virsh it reads, and wait until each has --
+# five seconds each at most, then killed, and waited for again. The virsh is
+# this script's own child (start_reset_watch): SIGTERM from here, its time to
+# end on it, then SIGKILL, and reaped. Before bd lorz the virsh was the
+# watch's child, its pid known here only from RESET_FILE: killed at once, cut
+# short while still ending on a loaded host; not found at all where
+# remove_guard had already taken that file, or where a signal reached the
+# watch before it wrote the pid down. Either way the driver went on before it
+# had gone, or left it running. The watch still goes before its file
+# (remove_guard): it writes there.
 stop_reset_watch() {
-    local i vpid=""
-    [[ -n "$RESET_WATCH_PID" ]] || return 0
-    if [[ -f "$RESET_FILE" ]]; then
-        vpid="$(sed -n 's/^virsh \([0-9]*\)$/\1/p' -- "$RESET_FILE" 2>/dev/null | tail -n 1)" || vpid=""
+    local i
+    if [[ "$RESET_VIRSH_STARTING" == true && -z "$RESET_VIRSH_PID" && "${!:-}" != "$RESET_VIRSH_BEFORE" ]]; then
+        # Interrupted between the virsh's start and taking its pid: $! is
+        # it, since $! moved. Interrupted before its start, $! did not move,
+        # and there is no virsh.
+        RESET_VIRSH_PID=$!
     fi
-    kill "$RESET_WATCH_PID" 2>/dev/null
-    for ((i = 0; i < 50; i++)); do
-        child_gone "$RESET_WATCH_PID" && break
-        sleep 0.1
-    done
-    if ! child_gone "$RESET_WATCH_PID"; then
-        kill -KILL "$RESET_WATCH_PID" 2>/dev/null
+    RESET_VIRSH_STARTING=false
+    if [[ -n "$RESET_WATCH_PID" ]]; then
+        kill "$RESET_WATCH_PID" 2>/dev/null
+        for ((i = 0; i < 50; i++)); do
+            child_gone "$RESET_WATCH_PID" && break
+            sleep 0.1
+        done
+        if ! child_gone "$RESET_WATCH_PID"; then
+            kill -KILL "$RESET_WATCH_PID" 2>/dev/null
+        fi
+        wait "$RESET_WATCH_PID" 2>/dev/null || :
+        RESET_WATCH_PID=""
     fi
-    wait "$RESET_WATCH_PID" 2>/dev/null
-    if [[ -n "$vpid" && "$(tr '\0' ' ' 2>/dev/null <"/proc/$vpid/cmdline")" == *virsh*" event "* ]]; then
-        kill -KILL "$vpid" 2>/dev/null
+    [[ -n "$RESET_VIRSH_PID" ]] || return 0
+    if reset_virsh_runs "$RESET_VIRSH_PID"; then
+        kill "$RESET_VIRSH_PID" 2>/dev/null
+        for ((i = 0; i < 50; i++)); do
+            reset_virsh_runs "$RESET_VIRSH_PID" || break
+            sleep 0.1
+        done
+        if reset_virsh_runs "$RESET_VIRSH_PID"; then
+            kill -KILL "$RESET_VIRSH_PID" 2>/dev/null
+            for ((i = 0; i < 50; i++)); do
+                reset_virsh_runs "$RESET_VIRSH_PID" || break
+                sleep 0.1
+            done
+        fi
     fi
-    RESET_WATCH_PID=""
+    # Reaped once it has ended; never waited for while it may still run.
+    if ! reset_virsh_runs "$RESET_VIRSH_PID"; then
+        wait "$RESET_VIRSH_PID" 2>/dev/null || :
+    fi
+    RESET_VIRSH_PID=""
 }
 
 # Has the reset watch stopped? Then a reset can no longer be seen: said once,
