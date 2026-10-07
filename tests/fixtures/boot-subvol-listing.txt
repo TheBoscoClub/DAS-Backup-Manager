@@ -13,3 +13,6 @@ ID 320 gen 8 top level 5 path nvme/a.b.20261003T0100
 ID 321 gen 8 top level 5 path nvme/aXb.20261008T0100
 ID 330 gen 9 top level 5 path @
 ID 331 gen 9 top level 5 path @.archive.20261001T010203
+ID 340 gen 10 top level 5 path nvme/sp-.20261001T0100 
+ID 341 gen 10 top level 5 path nvme/tb-.20261001T0100	
+ID 342 gen 10 top level 5 path nvme/cr-.20261001T0100
