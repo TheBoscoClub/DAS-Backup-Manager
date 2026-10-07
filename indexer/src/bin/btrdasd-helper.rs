@@ -313,6 +313,9 @@ fn canonical_db_path() -> Result<String, fdo::Error> {
 // D-Bus interface
 // ---------------------------------------------------------------------------
 
+const HELPER_PATH: &str = "/org/dasbackup/Helper1";
+const HELPER_NAME: &str = "org.dasbackup.Helper1";
+
 struct HelperInterface {
     jobs: JobMap,
     conn: Connection,
@@ -1483,15 +1486,53 @@ fn compute_stats_entry(db_path: &str) -> Result<StatsCacheEntry, String> {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Serves `iface` on `conn`, and only then requests `name`.
+///
+/// The order is the whole point (bd 3i1): the bus delivers the message that
+/// activated the helper the moment the name is owned, so nothing may be
+/// unserved by then.
+async fn serve_then_claim_name(
+    conn: &Connection,
+    iface: HelperInterface,
+    name: &str,
+) -> zbus::Result<()> {
+    conn.object_server().at(HELPER_PATH, iface).await?;
+    await_object_server_ready(conn).await?;
+    conn.request_name(name).await?;
+    Ok(())
+}
+
+/// Returns only once the object server is receiving method calls.
+///
+/// `ObjectServer::at` returns while the dispatch task is still subscribing to
+/// the connection's method-call stream (zbus starts it lazily and does not wait
+/// for it), so a call that reaches the connection in that gap is dropped and its
+/// caller times out. `Builder::serve_at` waits for the task, but cannot be used
+/// here: the interface holds a clone of the connection it is served on. So the
+/// helper calls itself: an `Introspect` of its own object only gets an answer
+/// from a running dispatch task.
+async fn await_object_server_ready(conn: &Connection) -> zbus::Result<()> {
+    let own_name = conn
+        .unique_name()
+        .ok_or_else(|| zbus::Error::Failure("no unique name on the bus connection".into()))?
+        .to_owned();
+    conn.call_method(
+        Some(own_name),
+        HELPER_PATH,
+        Some("org.freedesktop.DBus.Introspectable"),
+        "Introspect",
+        &(),
+    )
+    .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
 
     // Build the system D-Bus connection and serve the interface.
-    let conn = Builder::system()?
-        .name("org.dasbackup.Helper1")?
-        .build()
-        .await?;
+    let conn = Builder::system()?.build().await?;
 
     let iface = HelperInterface {
         jobs: jobs.clone(),
@@ -1500,9 +1541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats_refresh_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
 
-    conn.object_server()
-        .at("/org/dasbackup/Helper1", iface)
-        .await?;
+    serve_then_claim_name(&conn, iface, HELPER_NAME).await?;
 
     eprintln!("btrdasd-helper: listening on system bus as org.dasbackup.Helper1");
 
