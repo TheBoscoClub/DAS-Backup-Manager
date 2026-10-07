@@ -1754,7 +1754,8 @@ struct BootRun<'a> {
 }
 
 /// One boot subvolume on one (mounted, verified, listed) target. Classifies
-/// as `.claude/rules/backup.md` §Boot Subvolume Archival says; every failure
+/// as `.claude/rules/backup.md` §Boot Subvolume Archival says (table in
+/// `.claude/docs/rules-reference/backup.md`, same heading); every failure
 /// stops this subvolume and leaves the live one as it was (until the delete,
 /// which is only reached once its replacement exists beside it).
 fn update_boot_subvol(
@@ -6272,8 +6273,8 @@ mod tests {
         }
     }
 
-    /// The classification table of `.claude/rules/backup.md` §Boot Subvolume
-    /// Archival, driven through `run_backup_with`: for every FAIL the run
+    /// The classification table of `.claude/docs/rules-reference/backup.md`
+    /// §Boot Subvolume Archival (summarised in `.claude/rules/backup.md`), driven through `run_backup_with`: for every FAIL the run
     /// fails, for every WARN (an absence) it does not, and the counts are the
     /// script's. One row per situation; do not shorten.
     #[test]
