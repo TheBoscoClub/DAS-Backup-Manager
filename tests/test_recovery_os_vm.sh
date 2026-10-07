@@ -1615,7 +1615,7 @@ has "session: summary" "$OUT" "Session done -- system-recovery-A-2tb"
 has "session: summary says no partition mounted" "$OUT" "no partition mounted"
 has "session: summary says the holder was stopped" "$OUT" "detached; holder stopped;"
 has "session: logged to the journal" "$(file "$S/logger.calls")" "-t das-recovery-os-vm -- attached $DISK_A"
-check "session: never destroyed" "$(file "$STUB/forbidden")" ""
+check "session: never destroyed" "$(file "$S/forbidden")" ""
 
 echo "--- shorthand B"
 fixture
@@ -1639,7 +1639,7 @@ printf 'running\n' >"$S/states.running"
 run_interrupted session A
 check "SIGINT: exit 3" "$RC" "3"
 lacks "SIGINT: nothing detached" "$(file "$S/virsh.calls")" "detach"
-check "SIGINT: never destroyed" "$(file "$STUB/forbidden")" ""
+check "SIGINT: never destroyed" "$(file "$S/forbidden")" ""
 pid="$(holder_pid A)"
 check "SIGINT: the holder outlives the driver" "$(alive "$pid")" "alive"
 # ...and it is the holder the session started: Ctrl-C did not reach it, so
@@ -1699,7 +1699,7 @@ printf 'running\n' >"$S/states.running"
 run_driver session A --timeout 1
 check "timeout: exit 3" "$RC" "3"
 check "timeout: asked once" "$(grep -c '^shutdown' "$S/virsh.calls")" "1"
-check "timeout: never destroyed" "$(file "$STUB/forbidden")" ""
+check "timeout: never destroyed" "$(file "$S/forbidden")" ""
 lacks "timeout: nothing detached" "$(file "$S/virsh.calls")" "detach"
 pid="$(holder_pid A)"
 check "timeout: claim kept" "$(alive "$pid")" "alive"
@@ -1937,27 +1937,25 @@ has "record no: the enabled units shown" "$OUT" "enabled units  fstrim.timer, ss
 matches "record no: when it was checked, and how long ago" "$OUT" "checked        [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC, 1h 00m ago"
 has "record no: which record" "$OUT" "boot record for system-recovery-A-2tb ($STATE_FILE, schema 3)"
 
-v=will
+# Attended, "will" goes on with a banner (decision 3 of bd 8249): the guard
+# stops btrbk, the operator disables it in the session.
 fixture
-write_state 3 "$(record_json system-recovery-A-2tb "$v")" "$(record_json system-recovery-B-2tb no)"
+write_state 3 "$(record_json system-recovery-A-2tb will)" "$(record_json system-recovery-B-2tb no)"
 run_driver session A --dry-run
-check "record $v: refused" "$RC" "1"
-has "record $v: says so" "$OUT" "btrbk $v run when this OS boots"
-has "record $v: says how to put it right" "$OUT" "fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again"
-has "record $v: with its age" "$OUT" "1h 00m ago"
-has "record $v: how to boot it without running btrbk" "$OUT" "systemd.unit=emergency.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1 on its kernel line"
-has "record $v: then power off" "$OUT" "then systemctl poweroff"
-has "record $v: never leave the emergency shell" "$OUT" "never exit or Ctrl-D"
-has "record $v: never Ctrl-Alt-Del" "$OUT" "never Ctrl-Alt-Del"
-has "record $v: hold the power button at a prompt" "$OUT" "hold the power button"
-check "record $v: nothing locked" "$(file "$S/flock.calls")" ""
-check "record $v: nothing held" "$(file "$S/holder.calls")" ""
-check "record $v: nothing attached" "$(file "$S/attach.log")" ""
+check "record will, attended: the session goes on (decision 3)" "$RC" "0"
+has "record will, attended: the banner" "$OUT" "WARNING: this OS runs btrbk at boot; the guard is stopping it now; disable it in this session"
+has "record will: the reason shown" "$OUT" "  - btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot"
+has "record will: the verdict shown" "$OUT" "btrbk at boot  will"
+lacks "record will, attended: not refused" "$OUT" "REFUSED"
+lacks "record will, attended: nothing overridden" "$OUT" "OVERRIDDEN"
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb will)"
-run_driver session A --dry-run
-has "record will: the reason shown" "$OUT" "  - btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot"
-matches "record will: the refusal itself says when the record was made" "$OUT" "REFUSED: btrbk will run when this OS boots \(the record was checked [0-9-]+ [0-9:]+ UTC, 1h 00m ago\)"
+run_driver session A
+check "record will, attended, a real session: ends clean" "$RC" "0"
+check "record will, attended, a real session: the banner before the boot and again once the guard confirms" "$(grep -c 'WARNING: this OS runs btrbk at boot; the guard is stopping it now' <<<"$OUT")" "2"
+fixture
+run_driver session A
+lacks "record no, a real session: no banner" "$OUT" "this OS runs btrbk at boot"
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
 run_driver session A --dry-run
@@ -2128,9 +2126,8 @@ echo "--- the boot record: --accept-boot-record-risk"
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb will)"
 run_driver session A --dry-run --accept-boot-record-risk
-check "override, will: goes on, flagged (exit 5)" "$RC" "5"
-has "override, will: the dry run says why it exits 5" "$OUT" "dry run: the boot-record check was overridden"
-has "override, will: said loudly" "$OUT" "OVERRIDDEN (--accept-boot-record-risk): btrbk will run when this OS boots"
+check "override, will: nothing to override attended (exit 0)" "$RC" "0"
+lacks "override, will: nothing said overridden" "$OUT" "OVERRIDDEN"
 
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
@@ -2142,6 +2139,7 @@ write_state 3 "$(record_json system-recovery-A-2tb no $((9 * 86400)))"
 run_driver session A --dry-run --accept-boot-record-risk
 check "override, 9 days old: goes on, flagged (exit 5)" "$RC" "5"
 has "override, 9 days old: said loudly" "$OUT" "OVERRIDDEN (--accept-boot-record-risk): the record is 9d 0h old"
+has "override, 9 days old: the dry run says why it exits 5" "$OUT" "dry run: the boot-record check was overridden"
 
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb no 7200)"
@@ -2151,10 +2149,10 @@ check "override, before the last session: goes on, flagged (exit 5)" "$RC" "5"
 has "override, before the last session: said loudly" "$OUT" "OVERRIDDEN (--accept-boot-record-risk): the record was made before this drive's last VM session ended"
 
 fixture
-write_state 3 "$(record_json system-recovery-A-2tb will)"
+write_state 3 "$(record_json system-recovery-A-2tb no $((9 * 86400)))"
 run_driver session A --accept-boot-record-risk
 check "override, a real session: ends, flagged" "$RC" "5"
-has "override, a real session: in the summary's warnings" "$OUT" "Warnings      the boot-record check was overridden (--accept-boot-record-risk): btrbk will run when this OS boots"
+has "override, a real session: in the summary's warnings" "$OUT" "Warnings      the boot-record check was overridden (--accept-boot-record-risk): the record is 9d 0h old"
 
 fixture
 rm "$STATE_FILE"
@@ -2393,7 +2391,7 @@ EOF
     check "contract, no: through btrdasd's own types (the seeded key gone)" "$(contract_get 'has("seeded")')" "false"
     check "contract, no: the verdict the binary read" "$(contract_get '.os.btrbk_at_boot.verdict')" '"no"'
     check "contract, no: the filesystem kept" "$(contract_get '.mount_uuid')" "\"$UUID_A\""
-    check "contract, no: schema 3" "$(jq -c '.schema_version' "$STATE_FILE")" "3"
+    check "contract, no: schema 4" "$(jq -c '.schema_version' "$STATE_FILE")" "4"
     run_driver session A --dry-run
     check "contract, no: the driver goes on" "$RC" "0"
     has "contract, no: the driver read the binary's verdict" "$OUT" "btrbk at boot  no"
@@ -2405,10 +2403,30 @@ EOF
     check "contract, will: the real status rewrote the record (exit 0)" "$C_STATUS_RC" "0"
     check "contract, will: the verdict the binary read" "$(contract_get '.os.btrbk_at_boot.verdict')" '"will"'
     run_driver session A --dry-run
-    check "contract, will: the driver refuses" "$RC" "1"
-    has "contract, will: because btrbk will run at boot" "$OUT" "REFUSED: btrbk will run when this OS boots"
-    check "contract, will: nothing locked" "$(file "$S/flock.calls")" ""
-    check "contract, will: nothing held" "$(file "$S/holder.calls")" ""
+    check "contract, will: the driver goes on attended, with the banner" "$RC" "0"
+    has "contract, will: the banner" "$OUT" "this OS runs btrbk at boot; the guard is stopping it now"
+    run_driver session A --dry-run --unattended
+    check "contract, will: the driver refuses unattended" "$RC" "1"
+    has "contract, will: because a will drive is attended only" "$OUT" "a \"will\" drive is updated attended only"
+
+    # The guest agent as the real binary reads it (schema 4): installed the
+    # way Arch's package lays it out, its udev rule starting it.
+    contract_root "$CW/agent"
+    mkdir -p "$CW/agent/var/lib/pacman/local/qemu-guest-agent-11.0.0-1" "$CW/agent/usr/lib/udev/rules.d"
+    printf '%%NAME%%\nqemu-guest-agent\n\n%%VERSION%%\n11.0.0-1\n' >"$CW/agent/var/lib/pacman/local/qemu-guest-agent-11.0.0-1/desc"
+    printf '[Service]\nExecStart=-/usr/bin/qemu-ga\n[Install]\n' >"$CW/agent/usr/lib/systemd/system/qemu-guest-agent.service"
+    printf 'SUBSYSTEM=="virtio-ports", ENV{SYSTEMD_WANTS}="qemu-guest-agent.service"\n' >"$CW/agent/usr/lib/udev/rules.d/99-qemu-guest-agent.rules"
+    contract_record "$CW/agent" ""
+    check "contract, agent: the real status rewrote the record (exit 0)" "$C_STATUS_RC" "0"
+    check "contract, agent: the binary read it installed and started at boot" "$(contract_get '.os.guest_agent | [.state, .installed, .enabled]')" '["read",true,true]'
+    run_driver session A --dry-run --unattended
+    check "contract, agent: the driver goes on unattended" "$RC" "0"
+    has "contract, agent: the driver read the binary's reading" "$OUT" "guest agent    read true true (started by usr/lib/udev/rules.d/99-qemu-guest-agent.rules"
+    contract_record "$CW/no" ""
+    check "contract, no agent: the binary read it unknown (no pacman database)" "$(contract_get '.os.guest_agent.state')" '"unreadable"'
+    run_driver session A --dry-run --unattended
+    check "contract, no agent: the driver refuses unattended" "$RC" "1"
+    has "contract, no agent: because the agent is not known to run" "$OUT" "an unattended session needs the recovery OS's QEMU guest agent installed and started at boot"
 
     contract_record "$CW/no" ABSENT
     check "contract, a record from before df0: rewritten (exit 0)" "$C_STATUS_RC" "0"
@@ -2624,7 +2642,7 @@ lacks "guard: out of the definition afterwards (strings)" "$(file "$S/defined.xm
 lacks "guard: ...(channel)" "$(file "$S/defined.xml")" "org.dasbackup.guard"
 lacks "guard: ...(smbios)" "$(file "$S/defined.xml")" "smbios"
 check "guard: nothing of it left in the session's directory" "$(ls -A "$STATE")" ""
-check "guard: never destroyed" "$(file "$STUB/forbidden")" ""
+check "guard: never destroyed" "$(file "$S/forbidden")" ""
 
 fixture
 GUARD_SECS=default run_driver session A --dry-run
@@ -2704,7 +2722,7 @@ has "guard not in the started domain, may: said" "$OUT" "the started domain does
 has "guard not in the started domain, may: destroyed while paused" "$(events)" "virsh start|virsh destroy|virsh detach|virsh define|holder released|"
 lacks "guard not in the started domain, may: never resumed" "$(events)" "virsh resume"
 has "guard not in the started domain, may: says it never ran" "$OUT" "it was destroyed while still paused, before it ran a single instruction"
-check "guard not in the started domain, may: no forbidden destroy" "$(file "$STUB/forbidden")" ""
+check "guard not in the started domain, may: no forbidden destroy" "$(file "$S/forbidden")" ""
 check "guard not in the started domain, may: lock free" "$(lock_state)" "free"
 
 fixture
@@ -2732,7 +2750,7 @@ run_driver session A
 check "start fails though the domain started: exit 1" "$RC" "1"
 has "start fails though the domain started: destroyed while paused" "$(events)" "virsh start|virsh destroy|virsh detach|"
 lacks "start fails though the domain started: never resumed" "$(events)" "virsh resume"
-check "start fails though the domain started: no forbidden destroy" "$(file "$STUB/forbidden")" ""
+check "start fails though the domain started: no forbidden destroy" "$(file "$S/forbidden")" ""
 check "start fails though the domain started: lock free" "$(lock_state)" "free"
 
 # Interrupted just as the recovery OS powered off: its report is judged before
@@ -2766,7 +2784,7 @@ has "guard missing, the destroy fails: says it never ran" "$OUT" "was started pa
 has "guard missing, the destroy fails: how to end it, once it reads paused and never run" "$OUT" "virsh --connect qemu:///system domstats --state --vcpu recovery-os-updater-system-recovery-A-2tb"
 has "guard missing, the destroy fails: what the read must say" "$OUT" "(must say state.state=3, and vcpu.N.time=0 for every vCPU)"
 lacks "guard missing, the destroy fails: never resumed" "$(events)" "virsh resume"
-check "guard missing, the destroy fails: no forbidden destroy" "$(file "$STUB/forbidden")" ""
+check "guard missing, the destroy fails: no forbidden destroy" "$(file "$S/forbidden")" ""
 rm -f "$S/destroy_fail"
 printf 'shut off\n' >"$S/states"
 run_driver session-end A
@@ -2780,7 +2798,7 @@ touch "$S/resume_fail"
 run_driver session A
 check "resume fails: the session is kept" "$RC" "3"
 lacks "resume fails: never destroyed" "$(file "$S/virsh.calls")" "destroy"
-check "resume fails: no forbidden destroy" "$(file "$STUB/forbidden")" ""
+check "resume fails: no forbidden destroy" "$(file "$S/forbidden")" ""
 has "resume fails: the guard not judged, said" "$OUT" "THE SESSION GUARD HAS NOT BEEN JUDGED"
 
 # I-1: a stop for the guard is ACPI, re-sent until the recovery OS is off.
@@ -2792,7 +2810,7 @@ echo 2 >"$S/shutdown_ignore"
 DRIVER_TIMEOUT=30 GRACE=10 RESEND=1 GUARD_SECS=1 run_driver session A
 check "guard silent, may, the first requests dropped: exit 6" "$RC" "6"
 check "guard silent, may, the first requests dropped: asked three times" "$(grep -c '^shutdown' "$S/virsh.calls")" "3"
-check "guard silent, may, the first requests dropped: never destroyed" "$(file "$STUB/forbidden")" ""
+check "guard silent, may, the first requests dropped: never destroyed" "$(file "$S/forbidden")" ""
 
 # ...and when it never goes: kept, and told plainly what to do -- not to let
 # an update finish.
@@ -2803,7 +2821,7 @@ for ((i = 0; i < 400; i++)); do echo running; done >"$S/states.running"
 DRIVER_TIMEOUT=30 GRACE=3 RESEND=1 GUARD_SECS=1 run_driver session A
 check "guard silent, may, the guest ignores every request: kept (exit 3)" "$RC" "3"
 matches "guard silent, may, the guest ignores every request: asked again and again" "$(grep -c '^shutdown' "$S/virsh.calls")" "^[2-9]$"
-check "guard silent, may, the guest ignores every request: never destroyed" "$(file "$STUB/forbidden")" ""
+check "guard silent, may, the guest ignores every request: never destroyed" "$(file "$S/forbidden")" ""
 has "guard silent, may, the guest ignores every request: says it is unguarded" "$OUT" "THE RECOVERY OS IS RUNNING WITHOUT A CONFIRMED SESSION GUARD"
 has "guard silent, may, the guest ignores every request: says to power it off now" "$OUT" "Power it off now"
 lacks "guard silent, may, the guest ignores every request: never says to let the update finish" "$OUT" "Let the update finish"
@@ -2819,7 +2837,7 @@ check "guard silent, may: exit 6" "$RC" "6"
 has "guard silent, may: said" "$OUT" "the session guard did not confirm: no report from the recovery OS within 0h 00m 01s of its start"
 has "guard silent, may: asked to shut down" "$(events)" "virsh start|virsh resume|virsh shutdown|virsh detach|virsh define|holder released|"
 check "guard silent, may: asked once" "$(grep -c '^shutdown' "$S/virsh.calls")" "1"
-check "guard silent, may: never destroyed" "$(file "$STUB/forbidden")" ""
+check "guard silent, may: never destroyed" "$(file "$S/forbidden")" ""
 has "guard silent, may: in the summary" "$OUT" "Guard         NOT confirmed: no report from the recovery OS"
 has "guard silent, may: a warning in the summary" "$OUT" "Warnings      the session guard did not confirm on a \"may\" record, so the recovery OS was asked to shut down"
 check "guard silent, may: the disk given back" "$(file "$S/attached.xml")" ""
@@ -2844,14 +2862,14 @@ check "guard silent, no record: exit 5" "$RC" "5"
 lacks "guard silent, no record: no shutdown" "$(events)" "virsh shutdown"
 has "guard silent, no record: a warning in the summary" "$OUT" "Warnings      the session guard did not confirm (no report from the recovery OS"
 
-# A "will" record let through with the override is no safer than "may".
+# A "will" record, attended (decision 3), is no safer than "may".
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb will)"
 touch "$S/guard_silent"
 keeps_running
-DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A --accept-boot-record-risk
-check "guard silent, will (overridden): exit 6" "$RC" "6"
-has "guard silent, will (overridden): shut down" "$(events)" "virsh shutdown"
+DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
+check "guard silent, will: exit 6" "$RC" "6"
+has "guard silent, will: shut down" "$(events)" "virsh shutdown"
 
 # Off before it reported: nothing to shut down, the same verdict.
 fixture
@@ -3150,7 +3168,7 @@ echo "3 silence" >"$S/guest.script"
 DRIVER_TIMEOUT=40 GUARD_SECS=1 run_driver session A
 check "reporter silent after it confirmed, may: a warning, not a stop (exit 5)" "$RC" "5"
 lacks "reporter silent after it confirmed, may: never asked to shut down" "$(events)" "virsh shutdown"
-check "reporter silent after it confirmed, may: never destroyed" "$(file "$STUB/forbidden")" ""
+check "reporter silent after it confirmed, may: never destroyed" "$(file "$S/forbidden")" ""
 matches "reporter silent after it confirmed, may: the warning, said again" "$(grep -c "THE SESSION GUARD'S REPORTER IS SILENT" <<<"$OUT")" "^([2-9]|[1-9][0-9]+)$"
 has "reporter silent after it confirmed, may: both causes it cannot tell apart" "$OUT" "Either its reporter stopped -- the guard itself, the bind mount and the masks, does not depend on it -- or the recovery OS has hung: this script cannot tell which, and does not stop it for that"
 has "reporter silent after it confirmed, may: how to look" "$OUT" "Look: virt-viewer --connect qemu:///system --attach recovery-os-updater-system-recovery-A-2tb (inside it: systemctl status das-vm-guard-report das-vm-guard)"
@@ -3170,7 +3188,7 @@ check "reset watch down, then silence, may: shut down (exit 6)" "$RC" "6"
 has "reset watch down, then silence, may: the watch's end said, with why" "$OUT" "THE RESET WATCH HAS STOPPED (libvirt's event stream ended: error: internal error: client socket is closed)"
 has "reset watch down, then silence, may: said" "$OUT" "with the reset watch down (libvirt's event stream ended"
 has "reset watch down, then silence, may: asked to shut down" "$(events)" "virsh shutdown"
-check "reset watch down, then silence, may: never destroyed" "$(file "$STUB/forbidden")" ""
+check "reset watch down, then silence, may: never destroyed" "$(file "$S/forbidden")" ""
 
 # A reset, then nothing from a new boot: a boot that came without the guard
 # says nothing -- shut down (ACPI), exit 6.
@@ -3183,7 +3201,7 @@ check "a reset, then silence, may: shut down (exit 6)" "$RC" "6"
 has "a reset, then silence, may: the reset seen" "$OUT" "the recovery OS was reset (a reboot inside it, or virsh reset): a boot after that must report its guard engaged within 0h 00m 01s"
 has "a reset, then silence, may: said" "$OUT" "the session guard did not confirm: the recovery OS was reset, and no boot after that reported its guard engaged within 0h 00m 01s"
 has "a reset, then silence, may: asked to shut down" "$(events)" "virsh resume|virsh shutdown|virsh detach"
-check "a reset, then silence, may: never destroyed" "$(file "$STUB/forbidden")" ""
+check "a reset, then silence, may: never destroyed" "$(file "$S/forbidden")" ""
 
 # A reset, then the new boot reports engaged: nothing to do.
 fixture
@@ -3374,7 +3392,7 @@ touch "$S/live_drops_guard" "$S/resume_at_live_dumpxml"
 runs_for 60
 DRIVER_TIMEOUT=40 run_driver session A
 check "resumed by another at the check, may: exit 6" "$RC" "6"
-check "resumed by another at the check, may: never destroyed" "$(file "$STUB/forbidden")" ""
+check "resumed by another at the check, may: never destroyed" "$(file "$S/forbidden")" ""
 lacks "resumed by another at the check, may: no destroy" "$(file "$S/virsh.calls")" "destroy"
 has "resumed by another at the check, may: said" "$OUT" "not destroying recovery-os-updater-system-recovery-A-2tb: it is running, not paused"
 has "resumed by another at the check, may: asked to shut down" "$(events)" "virsh start|virsh shutdown|virsh detach"
@@ -3386,7 +3404,7 @@ printf 'paused\nrunning\n' >"$S/states.after_start"
 touch "$S/dumpxml_live_sleep"
 WAIT_FILE="$S/in_live_dumpxml" run_interrupted session A
 check "interrupted while paused, resumed by another before the destroy: kept (exit 3)" "$RC" "3"
-check "interrupted while paused, resumed by another before the destroy: never destroyed" "$(file "$STUB/forbidden")" ""
+check "interrupted while paused, resumed by another before the destroy: never destroyed" "$(file "$S/forbidden")" ""
 has "interrupted while paused, resumed by another before the destroy: said" "$OUT" "not destroying recovery-os-updater-system-recovery-A-2tb: it is running, not paused"
 # Interrupted while paused, still paused: destroyed, and what that means said.
 fixture
@@ -3508,7 +3526,7 @@ touch "$S/event_terms_driver"
 run_driver session A
 check "a SIGTERM as the virsh starts: the virsh ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
 check "a SIGTERM as the virsh starts: gone when the driver ended" "$(event_virsh_state)" "gone"
-check "a SIGTERM as the virsh starts: nothing forbidden" "$(file "$STUB/forbidden")" ""
+check "a SIGTERM as the virsh starts: nothing forbidden" "$(file "$S/forbidden")" ""
 # No stub can reach the one window left -- the virsh started, its pid not yet
 # taken from $! -- so this test's copy of the driver signals itself there:
 # the trap runs between those two commands, and on_exit must still find the
@@ -3520,7 +3538,7 @@ run_driver session A
 # Ended so soon, it may not have become virsh yet, nor said it started: what
 # counts is that none of this fixture's runs on.
 check "a SIGTERM before the virsh's pid is taken: no virsh event left running" "$(virsh_events_left)" "0"
-check "a SIGTERM before the virsh's pid is taken: nothing forbidden" "$(file "$STUB/forbidden")" ""
+check "a SIGTERM before the virsh's pid is taken: nothing forbidden" "$(file "$S/forbidden")" ""
 # The same while the virsh is still forked but not yet virsh (held there a
 # second, in this copy only): its command line is still the driver's, so it
 # is known to run by being the driver's child, not by its name -- or it would
@@ -3660,7 +3678,7 @@ DURING_STOP="$NEXT_BOOT_B; touch \"\$S/guest.silent\"" GUARD_SECS=2 run_watch_st
 check "watch stopped across a reset, then silence, may: shut down (exit 6)" "$RC" "6"
 has "watch stopped across a reset, then silence, may: said" "$OUT" "the session guard did not confirm: the recovery OS was reset, and no boot after that reported its guard engaged within 0h 00m 02s"
 has "watch stopped across a reset, then silence, may: asked to shut down" "$(events)" "virsh shutdown"
-check "watch stopped across a reset, then silence, may: never destroyed" "$(file "$STUB/forbidden")" ""
+check "watch stopped across a reset, then silence, may: never destroyed" "$(file "$S/forbidden")" ""
 
 # The new boot's line 1 written while the watch was stopped: the reset is
 # recorded where the report stood when the watch read it -- after that line
@@ -3813,7 +3831,7 @@ write_state 3 "$(record_json system-recovery-A-2tb may)"
 touch "$S/live_drops_guard" "$S/vcpu_ran"
 run_driver session A
 check "paused, its vCPUs ran (resumed and paused by another), may: kept (exit 3)" "$RC" "3"
-check "paused, its vCPUs ran: never destroyed" "$(file "$STUB/forbidden")" ""
+check "paused, its vCPUs ran: never destroyed" "$(file "$S/forbidden")" ""
 lacks "paused, its vCPUs ran: no destroy" "$(file "$S/virsh.calls")" "destroy"
 has "paused, its vCPUs ran: said" "$OUT" "not destroying recovery-os-updater-system-recovery-A-2tb: it is paused, but its vCPUs have run (1 of 4 with CPU time)"
 lacks "paused, its vCPUs ran: never said it ran nothing" "$OUT" "it has not run a single instruction"
@@ -3825,7 +3843,7 @@ write_state 3 "$(record_json system-recovery-A-2tb may)"
 touch "$S/dumpxml_live_sleep" "$S/vcpu_ran"
 WAIT_FILE="$S/in_live_dumpxml" run_interrupted session A
 check "interrupted while paused, its vCPUs ran: kept (exit 3)" "$RC" "3"
-check "interrupted while paused, its vCPUs ran: never destroyed" "$(file "$STUB/forbidden")" ""
+check "interrupted while paused, its vCPUs ran: never destroyed" "$(file "$S/forbidden")" ""
 # The read fails, or gives no vCPU time: nothing is destroyed.
 for how in domstats_fail domstats_no_vcpu; do
     fixture
@@ -3848,7 +3866,7 @@ DRIVER_TIMEOUT=20 GUARD_SECS=1 run_driver session A
 check "state unreadable after the resume, no report, may: kept (exit 3)" "$RC" "3"
 has "state unreadable after the resume, no report: the clock counted on" "$OUT" "the session guard did not confirm: no report from the recovery OS within 0h 00m 01s of its start"
 has "state unreadable after the resume, no report: asked to shut down" "$(events)" "virsh shutdown"
-check "state unreadable after the resume, no report: never destroyed" "$(file "$STUB/forbidden")" ""
+check "state unreadable after the resume, no report: never destroyed" "$(file "$S/forbidden")" ""
 # The file being read is gone (virtlogd past max_backups): the oldest file
 # not read yet is read first -- a NOT engaged line there is seen.
 fixture
@@ -4165,8 +4183,9 @@ echo active >"$S/unit.das-backup.service"
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: the other checks still apply" "$RC" "1"
 rm "$S/unit.das-backup.service"
-# The hatch reads its own record, and nothing else: the usual one says will.
-write_state 3 "$(record_json system-recovery-A-2tb will)"
+# The hatch reads its own record, and nothing else: the usual one is of
+# another filesystem, refused whatever the options.
+write_state 3 "$(record_json system-recovery-A-2tb no 3600 '"eeeeeeee-0000-4000-8000-000000000000"')"
 hatch_state no
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: DAS_RECOVERY_OS_STATE honoured" "$RC" "0"
@@ -4254,7 +4273,7 @@ has "define per drive: B's from its rendering" "$(file "$S/virsh.calls")" "defin
 check "define per drive: A's is the template with A's identity" "$(file "$S/defined.xml")" "$(rendered A)"
 check "define per drive: B's is the template with B's identity" "$(file "$S/domB/defined.xml")" "$(rendered B)"
 lacks "define per drive: their MACs differ (two NICs on one network)" "$(grep -h '<mac ' "$S/defined.xml" "$S/domB/defined.xml" | sort | uniq -d)" "mac"
-check "define per drive: no rendering left behind" "$(ls -A "$STATE" | grep -c 'plain\.xml' || :)" "0"
+check "define per drive: no rendering left behind" "$(find "$STATE" -mindepth 1 -maxdepth 1 -name '*plain.xml*' | wc -l)" "0"
 lacks "define per drive: no shared domain touched" "$(file "$S/virsh.calls")" "undefine"
 check "define per drive: nothing unexpected" "$(file "$S/forbidden")" ""
 
@@ -4465,13 +4484,16 @@ has "unattended: its result" "$OUT" "RESULT system-recovery-A-2tb 0 clean"
 has "unattended: given back" "$(events)" "virsh detach"
 check "unattended: no egress rule left" "$(file "$S/ip.rules")" ""
 has "unattended: the egress step checks for the org it was given" "$(file "$S/stage.egress.sh")" "want=AS209"
+# shellcheck disable=SC2016 # the step's script, matched as written
 has "unattended: the snapshot is the guest's own, of its @" "$(file "$S/stage.snapshot.sh")" 'btrfs subvolume snapshot -r "$top/@" "$top/$name"'
 has "unattended: keeps the newest two" "$(file "$S/stage.snapshot.sh")" "head -n -2"
 has "unattended: the full upgrade" "$(file "$S/stage.upgrade.sh")" "pacman -Syu --noconfirm"
 has "unattended: the agent and the microcode" "$(file "$S/stage.packages.sh")" "pacman -S --needed --noconfirm qemu-guest-agent && pacman -S --noconfirm amd-ucode intel-ucode"
 has "unattended: the fallback preset, then every image" "$(file "$S/stage.initramfs.sh")" "mkinitcpio -P"
 has "unattended: btrbk as packaged" "$(file "$S/stage.verify-btrbk.sh")" "0 altered files"
+# shellcheck disable=SC2016 # the step's script, matched as written
 has "unattended: the loader's files and fstab's devices" "$(file "$S/stage.verify-boot.sh")" 'findfs "$spec"'
+# shellcheck disable=SC2016 # the step's script, matched as written
 has "unattended: the guard engaged again, every btrbk bound" "$(file "$S/stage.guard-engage.sh")" 'findmnt -rn --mountpoint "$p"'
 check "unattended: nothing unexpected" "$(file "$S/forbidden")" ""
 line=$(file "$T/var/lib/das-backup/recovery-os-vm-history.jsonl")
@@ -4664,12 +4686,12 @@ check "console: the state directory can be passed through, not listed" "$(stat -
 has "console: proxied to libvirt's VNC socket" "$(file "$S/socat.calls")" "UNIX-CONNECT:$T/var/lib/libvirt/qemu/domain-1-x/vnc.sock"
 has "console: one connection (no fork)" "$(tail -n 1 "$S/socat.calls")" "UNIX-LISTEN:$sock,mode=600,user=$me"
 lacks "console: never forks" "$(file "$S/socat.calls")" "fork"
-check "console: a new bridge replaced the old one" "$(ls -d "$STATE"/console-system-recovery-A-2tb-*/ 2>/dev/null | wc -l)" "1"
+check "console: a new bridge replaced the old one" "$(find "$STATE" -mindepth 1 -maxdepth 1 -type d -name 'console-system-recovery-A-2tb-*' | wc -l)" "1"
 bpid=$(head -n 1 "$STATE/system-recovery-A-2tb.console")
 printf 'shut off\n' >"$S/states"
 run_driver session-end A
 check "console: session-end exit 0" "$RC" "0"
-check "console: removed with the give-back" "$(ls -d "$STATE"/console-* 2>/dev/null | wc -l)" "0"
+check "console: removed with the give-back" "$(find "$STATE" -mindepth 1 -maxdepth 1 -name 'console-*' 2>/dev/null | wc -l)" "0"
 check "console: its process ended" "$([[ -d "/proc/$bpid" ]] && grep -q socat "/proc/$bpid/cmdline" 2>/dev/null && echo running || echo gone)" "gone"
 check "console: its record gone" "$([[ -e "$STATE/system-recovery-A-2tb.console" ]] && echo left || echo gone)" "gone"
 kill "$cholder" 2>/dev/null || :
@@ -4692,7 +4714,7 @@ printf 'running\n' >"$S/states"
 touch "$S/socat_fail"
 run_driver console-socket A "$me"
 check "console, socat fails: refused" "$RC" "1"
-check "console, socat fails: nothing left" "$(ls -d "$STATE"/console-* 2>/dev/null | wc -l)" "0"
+check "console, socat fails: nothing left" "$(find "$STATE" -mindepth 1 -maxdepth 1 -name 'console-*' 2>/dev/null | wc -l)" "0"
 mkdir -p "$T/nosocat"
 for t in bash env timeout readlink dirname basename cat head tr; do ln -sf "$(command -v "$t")" "$T/nosocat/$t"; done
 cp "$T/bin/id" "$T/nosocat/id"

@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **One libvirt domain per recovery drive** (bd `DAS-Backup-Manager-7wb`, the operator's decision of 2026-10-04) — `recovery-os-updater-<label>`, each with its own NVRAM, MAC address, console, log and guard channel, rendered by `define` from the one template with its UUID and MAC derived from the label (pinned by the suite). `define` defines them all and retires the shared `recovery-os-updater` of before only when nothing is lost by it (shut off, no disk, no guard, no managed-save image, no libvirt snapshots); every check of every domain comes before the first change. `status` shows each drive's domain; `screenshot` now takes the drive: `screenshot <label> <file.png>`. Run `define` after upgrading
 - **`recovery-os-vm.sh` reads boot records of schema 3 and 4**; `--unattended` needs schema 4
+- **An attended session boots a recovery OS whose record says btrbk `will` run at boot** (the operator's decision 3 of 2026-10-04, bd `DAS-Backup-Manager-8249`) — under the session guard, with the banner `this OS runs btrbk at boot; the guard is stopping it now; disable it in this session` before the boot and again once the guard confirms; it was refused unless `--accept-boot-record-risk`. `--unattended` still refuses a `will`, whatever the options, and a guard that does not confirm still shuts it down (exit status 6)
 
 ### Fixed
 
