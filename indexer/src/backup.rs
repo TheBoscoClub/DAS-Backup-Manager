@@ -1363,6 +1363,71 @@ pub fn boot_plan(config: &Config) -> Result<Vec<BootPlanItem>, String> {
         .collect())
 }
 
+/// The one `subvol<TAB>snapshot_name<TAB>subdirs` line `backup boot-plan` prints
+/// for `item` (`-` for an absent name or no subdirectories), or the reason
+/// `backup-run.sh` could not parse it back (bd aiqp). The producer refuses
+/// rather than print a line the consumer would misread: every refusal names
+/// the subvolume and the field.
+pub fn boot_plan_line(item: &BootPlanItem) -> Result<String, String> {
+    let refuse = |field: &str, why: &str| -> Result<String, String> {
+        Err(format!(
+            "boot subvolume {:?}: {field} {why}, which cannot be passed to backup-run.sh",
+            item.subvol
+        ))
+    };
+    let has_ws = |f: &str| f.chars().any(char::is_whitespace);
+    if item.subvol.is_empty() {
+        return refuse("subvolume name", "is empty");
+    }
+    if item.subvol.contains('/') {
+        return refuse("subvolume name", "contains a slash");
+    }
+    if has_ws(&item.subvol) {
+        return refuse(
+            "subvolume name",
+            "contains a tab, newline or other whitespace",
+        );
+    }
+    let name = match item.snapshot_name.as_deref() {
+        None => "-",
+        Some("") => return refuse("snapshot_name", "is empty"),
+        Some("-") => return refuse("snapshot_name", "is '-', ambiguous with an absent name"),
+        Some(n) if has_ws(n) => {
+            return refuse(
+                "snapshot_name",
+                "contains a tab, newline or other whitespace",
+            );
+        }
+        Some(n) => n,
+    };
+    for d in &item.subdirs {
+        if d.is_empty() {
+            return refuse(
+                "target subdirectory",
+                "is empty (a bare '/' trims to nothing)",
+            );
+        }
+        if d == "-" {
+            return refuse("target subdirectory", "is '-', ambiguous with none");
+        }
+        if d.contains(',') {
+            return refuse("target subdirectory", "contains a comma");
+        }
+        if has_ws(d) {
+            return refuse(
+                "target subdirectory",
+                "contains a tab, newline or other whitespace",
+            );
+        }
+    }
+    let dirs = if item.subdirs.is_empty() {
+        "-".to_string()
+    } else {
+        item.subdirs.join(",")
+    };
+    Ok(format!("{}\t{name}\t{dirs}", item.subvol))
+}
+
 /// Which `target_subdirs` a given boot subvolume's snapshots live under.
 fn subdirs_for_subvol(config: &Config, subvol: &str) -> Vec<String> {
     let mut dirs: Vec<String> = config
@@ -7173,6 +7238,36 @@ mod tests {
             "ID 1 path x\n".into(),
         )]);
         assert_eq!(subvolume_listing(&ok, "/m").unwrap(), "ID 1 path x\n");
+    }
+
+    #[test]
+    fn boot_plan_line_formats_valid_items_and_refuses_each_unparsable_field() {
+        let item = |s: &str, n: Option<&str>, d: &[&str]| BootPlanItem {
+            subvol: s.into(),
+            snapshot_name: n.map(Into::into),
+            subdirs: d.iter().map(|x| x.to_string()).collect(),
+        };
+        assert_eq!(
+            boot_plan_line(&item("@", Some("root-"), &["nvme", "ssd"])).unwrap(),
+            "@\troot-\tnvme,ssd"
+        );
+        assert_eq!(boot_plan_line(&item("@", None, &[])).unwrap(), "@\t-\t-");
+        for (bad, field) in [
+            (item("", Some("r"), &[]), "subvolume name"),
+            (item("a/b", Some("r"), &[]), "subvolume name"),
+            (item("a b", Some("r"), &[]), "subvolume name"),
+            (item("@", Some(""), &[]), "snapshot_name"),
+            (item("@", Some("-"), &[]), "snapshot_name"),
+            (item("@", Some("a b"), &[]), "snapshot_name"),
+            (item("@", Some("r"), &[""]), "target subdirectory"),
+            (item("@", Some("r"), &["-"]), "target subdirectory"),
+            (item("@", Some("r"), &["a,b"]), "target subdirectory"),
+            (item("@", Some("r"), &["a b"]), "target subdirectory"),
+        ] {
+            let why = boot_plan_line(&bad).unwrap_err();
+            assert!(why.contains(field), "{why}");
+            assert!(why.contains(&format!("{:?}", bad.subvol)), "{why}");
+        }
     }
 
     #[test]

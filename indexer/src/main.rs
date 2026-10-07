@@ -2310,24 +2310,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let mut lines = Vec::new();
                 for item in &plan {
-                    let name = item.snapshot_name.as_deref().unwrap_or("-");
-                    let dirs = if item.subdirs.is_empty() {
-                        "-".to_string()
-                    } else {
-                        item.subdirs.join(",")
-                    };
-                    let unsafe_field = [item.subvol.as_str(), name, dirs.as_str()]
-                        .iter()
-                        .any(|f| f.contains(['\t', '\n']))
-                        || item.subdirs.iter().any(|d| d.contains(','));
-                    if unsafe_field {
-                        eprintln!(
-                            "boot subvolume {:?}: a tab, newline or comma in a field cannot be passed to backup-run.sh",
-                            item.subvol
-                        );
-                        std::process::exit(2);
+                    match backup::boot_plan_line(item) {
+                        Ok(line) => lines.push(line),
+                        Err(why) => {
+                            eprintln!("{why}");
+                            std::process::exit(2);
+                        }
                     }
-                    lines.push(format!("{}\t{name}\t{dirs}", item.subvol));
                 }
                 for line in lines {
                     println!("{line}");
