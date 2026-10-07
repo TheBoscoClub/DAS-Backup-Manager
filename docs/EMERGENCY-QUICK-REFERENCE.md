@@ -14,7 +14,7 @@ This is the short version. For detailed steps, open `docs/DISASTER-RECOVERY-GUID
    - **ASUS**: F8 | **Gigabyte**: F12 | **MSI**: F11 | **Most others**: F12
 4. Select the DAS entry (look for "TerraMas" or the drive's serial number: bay 1 `ZK208Q77`, bay 4 `ZFL41DNY`). Never go by an entry number or by the name `UEFI OS` — the firmware gives every disk that name and renumbers entries after any NVRAM reset (the 2026-08-29 board swap did). The recovery ESPs are PARTUUID `fe640619-2c7b-457a-be77-61bc9aff4875` (`RECOV-ESP-1`, bay 1) and `ef19ce6e-de5e-4623-bed0-8717749916b8` (`RECOV-ESP-4`, bay 4)
 5. If you still have the last emailed backup report, read this drive's `RECOVERY OS` block: `btrbk at boot: will` means do not boot it bare (see the guide, "The session refuses"); `may` with `btrbk config: none` is safe — the drive's OS carries no btrbk configuration, so nothing on it touches the backups. Its boot menu cannot edit the kernel line (`editor no`): there is no emergency-shell route from the menu
-6. At its menu choose **CachyOS Emergency Recovery (Bay 1)** or **(Bay 4)**; the **— Fallback** entry is the same OS with the larger initramfs, for unfamiliar hardware. Nothing is lost by taking Fallback
+6. At its menu choose **CachyOS Emergency Recovery (Bay 1)** or **(Bay 4)**. The **— Fallback** entry boots the same OS from an initramfs built without hardware autodetection; on these drives the default image is built that way too, so either entry works on any machine
 
 **Login**: username `bosco`, password `__________` *(fill in and write on the printout)*
 
