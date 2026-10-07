@@ -8918,6 +8918,82 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_after_btrbk_skips_the_index_when_no_boot_step_is_selected() {
+        let runner = Scripted::from_owned(vec![]);
+        let progress = TestProgress::cancellable();
+        progress.cancel.as_ref().unwrap().cancel();
+        let indexed = std::cell::Cell::new(false);
+        let index = |_: &Config, _: &dyn ProgressCallback| {
+            indexed.set(true);
+            true
+        };
+        let env = StepEnv {
+            index: &index,
+            ..env(&runner)
+        };
+        let options = BackupOptions {
+            steps: BtrbkSteps::SendOnly,
+            index_after: true,
+            ..live_options()
+        };
+        let result = run_backup_with(&live_config(), &options, &progress, &env).unwrap();
+        assert!(!indexed.get(), "the index never started");
+        assert_eq!(result.boot, BootStep::NotSelected);
+        assert!(
+            result
+                .errors
+                .contains(&"cancelled after btrbk; not done: index".to_string()),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn a_cancel_during_the_boot_step_lets_it_finish_and_skips_the_index() {
+        let runner = Scripted::from_owned(vec![]);
+        let progress = TestProgress::cancellable();
+        let token = progress.cancel.as_ref().unwrap();
+        // The run verifies its targets before btrbk and the send verifies
+        // again; the boot step's own verification is the third — the Cancel
+        // arrives then, while the boot step runs.
+        let verified = std::cell::Cell::new(0);
+        let verify = |_: &[Target], _: &[String], _: &dyn ProgressCallback| {
+            verified.set(verified.get() + 1);
+            if verified.get() == 3 {
+                token.cancel();
+            }
+            Ok(())
+        };
+        let indexed = std::cell::Cell::new(false);
+        let index = |_: &Config, _: &dyn ProgressCallback| {
+            indexed.set(true);
+            true
+        };
+        let env = StepEnv {
+            index: &index,
+            ..env_for(&runner, &verify)
+        };
+        let mut config = live_config();
+        config.boot.enabled = true;
+        let options = BackupOptions {
+            steps: BtrbkSteps::SendOnly,
+            boot_archive: true,
+            index_after: true,
+            ..live_options()
+        };
+        let result = run_backup_with(&config, &options, &progress, &env).unwrap();
+        assert!(matches!(result.boot, BootStep::Ran(_)), "{:?}", result.boot);
+        assert!(!indexed.get(), "the index never started");
+        assert!(
+            result
+                .errors
+                .contains(&"cancelled after the boot subvolume step; not done: index".to_string()),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
     fn a_cancel_while_waiting_for_the_maintenance_lock_stops_at_once_holding_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let host = SystemBackupHost {
