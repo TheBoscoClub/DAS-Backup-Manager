@@ -9120,6 +9120,13 @@ mod tests {
                 "and 2 more"
             ]
         );
+        // Exactly the cap: every message shown, and no "and K more".
+        let five = ran(BootOutcome {
+            warnings: (0..5).map(|i| format!("w{i}")).collect(),
+            ..Default::default()
+        });
+        assert_eq!(five.lines().skip(1).count(), 5);
+        assert!(!five.contains("more"));
         // A clean or absent boot step adds nothing, and neither does a dry run.
         assert!(!ran(BootOutcome::default()).contains('\n'));
         assert!(
