@@ -52,8 +52,10 @@
 #       1. The boot record. The nightly backup run records, per drive, what
 #          booting its OS would run (`btrdasd recovery-os status
 #          --state-file`, /var/lib/das-backup/recovery-os.json) and one
-#          verdict: will, may or no. "will" is refused; "may" and "no" go on,
-#          the guard enforcing. The record must also be at most
+#          verdict: will, may or no. All three go on attended, the guard
+#          enforcing -- "will" with a banner telling the operator to disable
+#          it in the session (decision 3 of bd 8249); --unattended refuses
+#          "will", whatever the options. The record must also be at most
 #          MAX_RECORD_AGE_DAYS old and made after this drive's last session
 #          (the OS may have changed in it; the time of each session is kept
 #          in recovery-os-vm-sessions beside the record, written just before
@@ -61,7 +63,7 @@
 #          session that ended before the resume: that OS never ran, so its
 #          record still describes it and a retry is admitted, bd
 #          DAS-Backup-Manager-dmxt).
-#          --accept-boot-record-risk lets a "will", an age or a session
+#          --accept-boot-record-risk lets an age or a session
 #          through, loudly and into the summary -- never a record that is
 #          missing, of another schema, or says nothing about this drive,
 #          and never one that is not of this drive's filesystem: its
@@ -596,6 +598,9 @@ EGRESS_RESULT="not needed"
 HISTORY_FILE=""     # the session history, beside the boot record
 HISTORY_ARMED=false # this session took the lock: its end is written there
 HISTORY_FAILURE="" HISTORY_LINES=""
+# An attended session of a "will" drive (decision 3 of bd 8249).
+WILL_BANNER=false
+readonly WILL_BANNER_TEXT="this OS runs btrbk at boot; the guard is stopping it now; disable it in this session (mask the unit the boot record names), then let the next backup run record the drive again"
 REC_AGENT=""        # the record's guest agent: "read <installed> <enabled>", or why not
 REC_AGENT_WHY=""
 UNATTENDED_FAILED="" UNATTENDED_STAGE="" UNATTENDED_WHY="" UNATTENDED_DEADLINE=0
@@ -649,10 +654,11 @@ without rebooting the workstation.
                          with the session guard (btrbk cannot run in it),
                          wait until it powers off, give the disk back --
                          only when the nightly run's record is of the
-                         drive's filesystem (mount_uuid), does not say its
-                         OS will run btrbk at boot, is fresh, and is newer
-                         than the drive's last session (the flag lets a
-                         "will", an age or a session through, loudly).
+                         drive's filesystem (mount_uuid), is fresh, and is
+                         newer than the drive's last session (the flag lets
+                         an age or a session through, loudly); a record
+                         saying its OS will run btrbk at boot goes on with
+                         a banner: disable it in the session.
                          --unattended: the update itself, through the
                          recovery OS's guest agent (its record must say the
                          agent runs at boot; never on "will")
@@ -1474,9 +1480,15 @@ check_boot_record() {
             refuse "an unattended session needs the recovery OS's QEMU guest agent installed and started at boot, and its boot record says: ${REC_AGENT:-nothing}${REC_AGENT_WHY:+ ($REC_AGENT_WHY)} -- run one attended session and install it there (pacman -S qemu-guest-agent), then let a backup run record the drive again"
         fi
     fi
+    # Attended, a "will" drive goes on (decision 3 of bd 8249, 2026-10-04):
+    # the guard masks what the record names and binds a refusing btrbk, and
+    # the operator at the console disables it for good. Said before the boot
+    # and again once the guard confirms. A "will" whose guard does not
+    # confirm is shut down (exit 6), as a "may" is.
+    # (--unattended on "will" was refused above.)
     if [[ "$verdict" == will ]]; then
-        problems+=("btrbk will run when this OS boots")
-        hints+=("fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again (without starting btrbk: boot it with systemd.unit=emergency.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1 on its kernel line, remount / read-write if needed, mask the unit the record names, then systemctl poweroff -- never exit or Ctrl-D, and never Ctrl-Alt-Del: each boots it on; to stop at any prompt, hold the power button; see the disaster recovery guide)")
+        WILL_BANNER=true
+        warn "$WILL_BANNER_TEXT"
     fi
     if ((checked > now + 300)); then
         problems+=("the record is dated in the future ($when): the clock of the run that wrote it, or this one, is wrong")
@@ -2256,6 +2268,9 @@ guard_line_seen() {
     if [[ "$GUARD_CONFIRMED" != true ]]; then
         GUARD_CONFIRMED=true
         log "the session guard is engaged: $GUARD_EXPECT"
+        if [[ "$WILL_BANNER" == true ]]; then
+            warn "$WILL_BANNER_TEXT"
+        fi
     elif [[ "$J_NEW_BOOT" == true ]]; then
         log "the recovery OS booted again (boot $J_BOOT), and its guard is engaged ($(count_of "$J_BOOTS" boot) so far)"
     fi
