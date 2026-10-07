@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The GUI's Cancel button says `Cancelling…` until the job ends** (bd `DAS-Backup-Manager-yq2`) — disabled from the moment the helper accepts the cancel until the job's `JobFinished`, since the job may first finish a long send; a cancel the helper does not accept leaves it usable
+
 ### Fixed
+
+- **The GUI's Cancel now stops the work, not only the reporting** (bd `DAS-Backup-Manager-yq2`) — a cancellation token (`progress::CancelToken`) reaches the library through the job's progress, and a job stops at its next safe boundary: a backup waiting for the DAS maintenance lock stops at once and holds no lock (it looks again every 250 ms instead of blocking in `flock`); otherwise the stage in progress — mounting, the subvolume sync, btrbk's snapshot step or send, the boot subvolume step, an index walk of one target — runs to its end and the job stops before the next, still unmounts what it mounted, lets go of its locks and records a failed run whose error says `cancelled after <stage>; not done: …` with the counts of unfinished steps unknown (NULL), never 0; a skipped boot step reads `N/A  (cancelled — not run)`. Index and restore jobs stop before each target and before restoring. `JobFinished` is `false` with that summary only when the cancel cut the work short; a cancel that came after the last stage now ends with the job's real outcome, as its `backup_runs` row has it, and says the cancel came too late — before, it was always `false`. `btrdasd` jobs carry no token and behave as before
 
 ## [0.7.23.0] - 2026-10-06
 

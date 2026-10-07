@@ -129,6 +129,44 @@ private Q_SLOTS:
         QVERIFY(progress.metaObject() != nullptr);
     }
 
+    // --- Cancel says "Cancelling…" until the job really ends (bd yq2) ------
+    //
+    // A cancel stops the job at its next safe boundary, which can be the end
+    // of a long send: the button must not look as if nothing happened, nor
+    // offer to cancel again, until JobFinished arrives.
+
+    void cancelButtonSaysCancellingUntilTheJobFinishes()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        auto *cancel = panel.findChild<QPushButton *>();
+        QVERIFY(cancel != nullptr);
+
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Backup"));
+        QCOMPARE(cancel->text(), QStringLiteral("Cancel"));
+        QVERIFY(cancel->isEnabled());
+
+        // Not clicked: on a host with the helper running that would send a
+        // real JobCancel. The helper accepting it is what cancelJob reacts to.
+        panel.showCancelRequested();
+        QCOMPARE(cancel->text(), QStringLiteral("Cancelling…"));
+        QVERIFY(!cancel->isEnabled());
+
+        // Another job's end changes nothing.
+        panel.onJobFinished(QStringLiteral("job-2"), true, QStringLiteral("x"));
+        QCOMPARE(cancel->text(), QStringLiteral("Cancelling…"));
+
+        panel.onJobFinished(QStringLiteral("job-1"), false,
+                            QStringLiteral("cancelled after mounting the sources"));
+        QCOMPARE(cancel->text(), QStringLiteral("Cancel"));
+        QVERIFY(!cancel->isEnabled());
+
+        // The next job starts with a usable button.
+        panel.onJobStarted(QStringLiteral("job-3"), QStringLiteral("Backup"));
+        QCOMPARE(cancel->text(), QStringLiteral("Cancel"));
+        QVERIFY(cancel->isEnabled());
+    }
+
     // --- backup history: an unknown count is "unknown", never 0 -------------
     //
     // A run that could not count its snapshots is stored with NULL counts and

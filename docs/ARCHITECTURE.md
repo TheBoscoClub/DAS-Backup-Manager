@@ -153,8 +153,14 @@ steps run only in `backup-run.sh`, which the timers start: `btrdasd subvol expir
 the boot-archive pruner, the growth log, and the throughput log with its USB link
 check (see `THROUGHPUT-BASELINE.md`). In the helper, a job's
 progress goes through one ordered queue (`progress::OrderedProgress`) and ends with
-exactly one `JobFinished`; `JobCancel` stops the reporting, not the work — a running
-btrbk send is not interrupted, and the locks are held until it ends.
+exactly one `JobFinished`. `JobCancel` stops the work at its next safe boundary
+(`progress::CancelToken`, checked between stages): a lock wait stops at once, holding
+nothing; a stage in progress — a btrbk send, a btrfs operation, a config or database
+write, an unmount — runs to its end, and the job stops before the next one, still
+unmounts what it mounted, lets go of its locks and records itself, the counts of
+unfinished steps unknown. It then ends `JobFinished(false, "cancelled after <stage>;
+not done: …")`; a cancel that came after the last stage ends with the real outcome
+and says it came too late. The CLI's jobs carry no token and are never cancelled.
 
 ESP synchronization to recovery drives was removed 2026-04-10 after the ESP-overwrite
 incident — see `.claude/rules/esp-safety.md`. `backup-run.sh` has no ESP/rsync step.
