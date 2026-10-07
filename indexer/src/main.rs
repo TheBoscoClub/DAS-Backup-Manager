@@ -63,7 +63,7 @@ impl ProgressCallback for CliProgress {
 #[derive(Parser)]
 #[command(
     name = "btrdasd",
-    version,
+    version = buttered_dasd::VERSION,
     about = "ButteredDASD — DAS backup manager with btrbk integration",
     long_about = "ButteredDASD manages BTRFS backups to Direct-Attached Storage (DAS).\n\n\
         Features: btrbk orchestration, content indexing with FTS5 search,\n\
@@ -380,7 +380,9 @@ enum Commands {
     /// job — so das-backup-doctor.service carries SuccessExitStatus=1 and
     /// systemd does not mark the unit failed for it. 3 means at least one
     /// configured volume failed to mount/list while others were checked
-    /// successfully: those subvolumes went unexamined, which is an
+    /// successfully, or a volume the check mounted could not be unmounted
+    /// again: those subvolumes went unexamined (or a volume was left
+    /// mounted), which is an
     /// operational fault rather than a finding, so the unit DOES fail on it
     /// (and it outranks 1 when both occur). 2 means the check could not run
     /// at all: config load failure, lock I/O error, or every configured
@@ -1935,29 +1937,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
             let database = Database::open(&db)?;
 
+            // Failures that must fail the command, but only after the targets
+            // are given back: the guard unmounts explicitly, never by Drop.
+            let mut failures: Vec<String> = Vec::new();
+
             if let Some(root) = &forget_root {
                 let configured: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
-                if configured
-                    .iter()
-                    .any(|c| c.trim_end_matches('/') == root.trim_end_matches('/'))
-                {
-                    eprintln!(
-                        "refusing: {root} IS a configured target — reconcile handles it \
-                         normally, and dropping its rows would discard a live index"
-                    );
-                    return Ok(());
-                }
-                let ids = database.snapshots_under_root(root)?;
-                if ids.is_empty() {
-                    println!("No index rows under {root}.");
-                } else if dry_run {
-                    println!("Would drop {} index rows under {root}.", ids.len());
-                } else {
-                    let stats = database.prune_snapshots(&ids)?;
-                    println!(
+                match reconcile::retire_root(&database, &configured, root, dry_run)? {
+                    reconcile::RootRetirement::Refused(why) => {
+                        eprintln!("{why}");
+                        let still_mounted = guard.unmount(&progress);
+                        mount::require_released(&still_mounted)?;
+                        return Err(why.into());
+                    }
+                    reconcile::RootRetirement::NoRows => {
+                        println!("No index rows under {root}.");
+                    }
+                    reconcile::RootRetirement::WouldDrop(n) => {
+                        println!("Would drop {n} index rows under {root}.");
+                    }
+                    reconcile::RootRetirement::Dropped(stats) => println!(
                         "Retired {root}: dropped {} snapshots, {} spans, {} files",
                         stats.snapshots_removed, stats.spans_removed, stats.files_removed
-                    );
+                    ),
                 }
             }
 
@@ -1969,7 +1971,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok((spans, files)) => println!(
                             "Repaired: removed {spans} dangling spans, {files} orphaned files"
                         ),
-                        Err(e) => eprintln!("Repair failed: {e}"),
+                        Err(e) => {
+                            eprintln!("Repair failed: {e}");
+                            failures.push(format!("repair failed: {e}"));
+                        }
                     }
                 }
             }
@@ -2034,6 +2039,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             mount::require_released(&still_mounted)?;
+            if let Some(why) = reconcile::failure_error(&failures) {
+                return Err(why.into());
+            }
         }
         Commands::Search { query, db, limit } => {
             let database = Database::open(&db)?;

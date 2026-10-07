@@ -9,13 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`tests/test_parent_disk.sh`** (ctest `shell-parent-disk`, bd `DAS-Backup-Manager-b1s`) — `parent_disk` against a stub `lsblk`: an NVMe partition, a SATA partition, a whole disk, and the three ways lsblk cannot answer
+- **The product version is tested against the man page** — `indexer/build.rs` reads the four-segment version from `CMakeLists.txt`, and two unit tests fail when it is not four segments, differs from `CMakeLists.txt`, or differs from the `.TH` line of `docs/btrdasd.1`
+
 ### Changed
+
+- **`btrdasd --version` prints all four segments** (`btrdasd 0.7.23.0`, bd `DAS-Backup-Manager-b1s`) — it printed Cargo's three. The one source is `CMakeLists.txt`
+- **CI runs the shell suites and the GUI smoke suite as separate steps** — `ctest -R '^shell-'` and `ctest -E '^shell-'`, both failing on an empty selection, so a red shell suite is named as one
+- **The report's `DISK CAPACITY` table says its sizes are raw** (Rust report and `backup-run.sh` alike) — a RAID-1 target holds half as much data as the table's space
+- **`MountGuard` releasing source volumes reports the stage `Unmounting sources`**, not `Unmounting targets`
+- **`DAS_SCRUB_STATE` and `DAS_BTRFS_STATUS_DIR` are read only by a test build** (feature `test-overrides`, enabled through the dev-dependency) — a shipped `btrdasd` ignores them
+- **The `doctor` help and the generated unit's comment list a volume the check could not unmount again among the exit-3 causes**, as the man page already did
+- **`packaging/appimage/btrdasd-gui.desktop` is a symlink** to `gui/org.theboscoclub.btrdasd-gui.desktop`; it was a byte copy
+
+### Removed
+
+- **`gui/src/setupwizard.cpp` and `.h`** — compiled, never shown, and it would have sent `btrbk.conf` text to `ConfigSet`, which refuses it
+- **`cdylib` from the `buttered-dasd` crate types** — nothing links it since the FFI library was deleted
 
 ### Fixed
 
 - **The Backup panel's Run and Dry Run stay disabled until its own job finishes** (bd `DAS-Backup-Manager-fy2h`) — any other operation's error (a `ConfigGet` failure) or any other job finishing re-enabled them mid-run, promising an action the helper then refused; the panel now learns its job id from `jobStarted` and only that job's `jobFinished`, or a failed `BackupRun` call, ends the disabled state (a `JobFinished` that beats the method reply, as a helper refusal does, is remembered and honoured when `jobStarted` names the job)
 - **`BackupPanel::loadConfig` is idempotent** (bd `DAS-Backup-Manager-pxq3`) — a reload cleared the checkboxes by deferred delete and never cleared the placeholder labels, so a second call showed every row twice; both are now removed at once
 - **A GUI configuration edit can no longer race a backup or `btrdasd setup` and lose a write** (bd `DAS-Backup-Manager-lxw`) — the helper's `ConfigSet`, `ScheduleSet`, `SubvolAdd`, `SubvolRemove` and `SubvolSetManual` read, change and save `config.toml` and `btrbk.conf` holding `/run/das-backup.lock`, the lock every other writer of the two files already holds: `btrdasd setup` for each mode that writes, and every backup (`backup-run.sh`, `btrdasd backup` from the CLI or the GUI) from its start, so through the subvolume sync. Before, an edit could load the config, lose the race to one of those, and save over its write — last writer wins. The lock is tried, never waited for: while it is held the call is refused, nothing written, with "a backup or btrdasd setup is running … Try again when it finishes", which the GUI shows in its error box; the configuration editor keeps the edits and says so. The maintenance lock is not taken, so a scrub does not refuse an edit (`btrbk_conf::edit_config_under_backup_lock`)
+- **`btrdasd reconcile --forget-root` on a configured target, and a failed `--repair`, now exit nonzero** (bd `DAS-Backup-Manager-b1s`) — both printed and exited 0. The targets are unmounted by the guard explicitly first
+- **`backup-run.sh` finds the disk under a partition with `lsblk`** (bd `DAS-Backup-Manager-b1s`), not by stripping digits (`nvme0n1p2` became `nvme0n1p`); where lsblk cannot say, the disk is unknown and the target check refuses rather than guesses. Its "indexer not built" hint names `cmake --build build`
 
 ## [0.7.23.0] - 2026-10-06
 

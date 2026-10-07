@@ -8,7 +8,7 @@ license = "MIT"
 [lib]
 name = "buttered_dasd"
 path = "src/lib.rs"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "btrdasd"
@@ -22,6 +22,9 @@ required-features = ["dbus"]
 [features]
 default = []
 dbus = ["dep:zbus", "dep:tokio"]
+# Reads the DAS_SCRUB_STATE / DAS_BTRFS_STATUS_DIR overrides. Off in every
+# shipped build; the dev-dependency below turns it on for tests only.
+test-overrides = []
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -45,5 +48,6 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+buttered-dasd = { path = ".", features = ["test-overrides"] }
 tempfile = "3"
 filetime = "0.2"

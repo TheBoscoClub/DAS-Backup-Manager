@@ -139,6 +139,7 @@ pub fn render_capacity_and_smart(health: Option<&crate::health::HealthReport>) -
     let mut r = String::new();
     r.push_str(&format!("\nDISK CAPACITY\n{thin}\n"));
     r.push_str("  Target                   Used       Avail      Use%\n");
+    r.push_str("  (raw device space as df reports it; a RAID-1 target holds half as much data)\n");
     let Some(health) = health else {
         r.push_str("  (health data unavailable)\n");
         return r;
@@ -932,6 +933,10 @@ mod tests {
         };
         let text = render_capacity_and_smart(Some(&health));
         let (capacity, smart) = text.split_once("SMART STATUS").unwrap();
+        assert!(
+            capacity.contains("raw device space"),
+            "the capacity table says its sizes are raw: {text}"
+        );
         assert!(
             capacity.contains("  up                       1.00 GiB   3.00 GiB   25%\n"),
             "{text}"

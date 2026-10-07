@@ -172,7 +172,8 @@
 //! `DAS_BTRFS_STATUS_DIR` and `DAS_SCRUB_STATE` relocate the btrfs status
 //! directory and the state file, mirroring the `DAS_REPORT_TO` /
 //! `DAS_REPORT_FROM` overrides in [`crate::report`]. Production leaves all of
-//! them unset.
+//! them unset, and a shipped build does not read them at all: they exist only
+//! under the `test-overrides` feature, which only the dev-dependency enables.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -664,11 +665,20 @@ pub fn parse_scrub_status(
     })
 }
 
+/// `default`, unless a test build (feature `test-overrides`, enabled only
+/// through the dev-dependency) sets `var`. A shipped binary never reads the
+/// environment here: a stray variable must not redirect the scrub state.
+fn overridable(var: &str, default: &str) -> PathBuf {
+    if cfg!(feature = "test-overrides") {
+        PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
+    } else {
+        PathBuf::from(default)
+    }
+}
+
 /// Directory holding the btrfs status records (overridable for tests).
 fn btrfs_status_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("DAS_BTRFS_STATUS_DIR").unwrap_or_else(|_| BTRFS_STATUS_DIR.to_string()),
-    )
+    overridable("DAS_BTRFS_STATUS_DIR", BTRFS_STATUS_DIR)
 }
 
 /// Path of the status record for a filesystem UUID.
@@ -1030,7 +1040,7 @@ impl Default for ScrubState {
 
 /// Path of the state file (overridable for tests via `DAS_SCRUB_STATE`).
 pub fn state_path() -> PathBuf {
-    PathBuf::from(std::env::var("DAS_SCRUB_STATE").unwrap_or_else(|_| SCRUB_STATE_PATH.to_string()))
+    overridable("DAS_SCRUB_STATE", SCRUB_STATE_PATH)
 }
 
 /// Load the state file. A missing file yields the default (empty) state.
@@ -3364,6 +3374,22 @@ Total to scrub:   401.28MiB\n";
         assert_eq!(format_bytes(1_099_511_627_776), "1.00 TiB");
         assert_eq!(format_duration(6274), "1h 44m");
         assert_eq!(format_duration(90), "1m 30s");
+    }
+
+    #[test]
+    fn a_path_override_is_read_from_the_environment_and_otherwise_the_default_holds() {
+        // A variable nothing else sets, so reading its absence cannot race
+        // the tests that set the real ones.
+        assert_eq!(
+            overridable("DAS_B1S_NEVER_SET", "/default/place"),
+            PathBuf::from("/default/place")
+        );
+        temp_env("DAS_B1S_NEVER_SET", "/elsewhere", || {
+            assert_eq!(
+                overridable("DAS_B1S_NEVER_SET", "/default/place"),
+                PathBuf::from("/elsewhere")
+            );
+        });
     }
 
     /// Set an env var for the duration of `f`, restoring it afterwards.

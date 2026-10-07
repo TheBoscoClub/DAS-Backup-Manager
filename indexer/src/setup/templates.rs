@@ -287,7 +287,8 @@ pub fn render_systemd_doctor_service(config: &Config) -> String {
          #       below tells systemd not to fail the unit for it. The finding\n\
          #       travels by email (--email) and by the journal report.\n\
          #   3 = at least one configured volume failed to mount/list while others\n\
-         #       were checked — those subvolumes went unexamined. An operational\n\
+         #       were checked — those subvolumes went unexamined — or a volume\n\
+         #       the check mounted could not be unmounted again. An operational\n\
          #       fault, so the unit DOES fail. Outranks 1 when both occur: an\n\
          #       incomplete check cannot claim its drift list is complete.\n\
          #   2 = could not run at all — every configured source volume failed to\n\
@@ -818,6 +819,11 @@ mod tests {
         // split, mirroring das-scrub.service's precedent.
         assert!(result.contains("# Exit semantics"));
         assert!(result.contains("bd DAS-Backup-Manager-01u"));
+        // Exit 3 is also a volume the check could not unmount again
+        // (doctor::report.left_mounted); the unit's comment must say so.
+        let exit3 = result.split("#   3 = ").nth(1).expect("exit 3 row");
+        let exit3 = exit3.split("#   2 = ").next().unwrap();
+        assert!(exit3.contains("unmounted again"), "{exit3}");
         // Deliberately finite (unlike das-backup/das-scrub's infinity) — the
         // doctor's own lock acquisition is non-blocking, so it never has a
         // legitimate reason to run long.
