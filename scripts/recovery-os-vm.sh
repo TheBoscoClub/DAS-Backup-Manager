@@ -172,7 +172,7 @@
 #     it to 0).
 #   - console-socket: for a running session, the domain's VNC (libvirt's
 #     root-only socket) offered through a socket of its own -- mode 0600, of
-#     one user, in a fresh 0700 directory of that user's under
+#     one user, in a fresh 0711 directory of root's under
 #     /run/das-recovery-os-vm (0711) -- by socat, for one connection; taken
 #     away when the disk is given back. No libvirt group, no ACL is changed.
 #
@@ -238,7 +238,10 @@
 #   7  an unattended update stopped at a step (the summary and its PROGRESS
 #      fail line name it): the recovery OS was asked to power off -- its
 #      agent, and ACPI until it went; never destroyed -- and the disk was
-#      given back; nothing after that step ran. Not off within
+#      given back; nothing after that step ran. Stopped at keyrings,
+#      upgrade, packages or initramfs, the OS may be half-upgraded (the
+#      power-off may end pacman mid-transaction): the summary names the
+#      @.pre-update.<stamp> snapshot to roll back to. Not off within
 #      DAS_RECOVERY_VM_GRACE_SECS: 3, as above
 #   6  the session guard did not confirm on a "will" or "may" record: the
 #      recovery OS was asked to shut down (ACPI, again until it went; never
@@ -604,6 +607,8 @@ readonly WILL_BANNER_TEXT="this OS runs btrbk at boot; the guard is stopping it 
 REC_AGENT=""        # the record's guest agent: "read <installed> <enabled>", or why not
 REC_AGENT_WHY=""
 UNATTENDED_FAILED="" UNATTENDED_STAGE="" UNATTENDED_WHY="" UNATTENDED_DEADLINE=0
+UNATTENDED_HALF=""  # said when a step that changes the OS was stopped
+PRE_UPDATE_SNAPSHOT=""  # the snapshot step's @.pre-update.<stamp>
 KERNEL=""           # what an unattended session's reboot came back with
 STAGE_N=0 OUT_PART="" OUT_LAST=""
 GSH_RC="" GSH_OUT="" GSH_WHY="" AGENT_OUT=""
@@ -3424,6 +3429,13 @@ egress_add() {
     fi
     network_subnet || refuse "$EGRESS_FAILURE -- the VM's traffic cannot be routed direct; nothing was booted"
     egress_rule_count || refuse "$EGRESS_FAILURE -- nothing was booted"
+    # Owned, and noted, before the add: a signal (or a refusal) between the
+    # add and this would leave the rule in place with nothing to take it
+    # out. egress_remove takes a rule that never came out as already gone.
+    EGRESS_OWNED=true
+    if ! (umask 077 && printf '%s\n' "$EGRESS_SUBNET" >"$EGRESS_FILE"); then
+        warn "could not note the egress rule in $EGRESS_FILE: if this session is left running, take it out by hand: ip rule del from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY"
+    fi
     if ((EGRESS_COUNT > 0)); then
         warn "the egress rule (from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY) is already in place, left by a session that did not finish: this session takes it over and takes it out at the end"
     else
@@ -3432,10 +3444,6 @@ egress_add() {
         fi
         egress_rule_count || refuse "$EGRESS_FAILURE -- nothing was booted"
         ((EGRESS_COUNT > 0)) || refuse "ip rule add succeeded, but no rule from $EGRESS_SUBNET is at priority $EGRESS_PRIORITY -- nothing was booted"
-    fi
-    EGRESS_OWNED=true
-    if ! (umask 077 && printf '%s\n' "$EGRESS_SUBNET" >"$EGRESS_FILE"); then
-        warn "could not note the egress rule in $EGRESS_FILE: if this session is left running, take it out by hand: ip rule del from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY"
     fi
     EGRESS_RESULT="in place (from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY)"
     log "egress: the VM's subnet $EGRESS_SUBNET goes direct (ip rule priority $EGRESS_PRIORITY, above a VPN exit node's)"
@@ -3487,14 +3495,19 @@ other_domain_running() {
 
 # The rule, as status says it.
 egress_report() {
-    local subnet=""
+    local subnet="" rules count
     subnet="$(head -n 1 -- "$EGRESS_FILE" 2>/dev/null)" || subnet=""
     if [[ -z "$subnet" ]]; then
         printf 'none noted\n'
-    else
-        printf 'noted for %s (priority %s); in place now: %s\n' "$subnet" "$EGRESS_PRIORITY" \
-            "$(ip rule show priority "$EGRESS_PRIORITY" 2>/dev/null | grep -cF "from $subnet lookup main" || :)"
+        return 0
     fi
+    # ip failing is "unknown", never 0: a count it did not read is no count.
+    if rules="$(ip rule show priority "$EGRESS_PRIORITY" 2>&1)"; then
+        count="$(grep -cF "from $subnet lookup main" <<<"$rules")" || :
+    else
+        count="unknown (ip rule show failed: $(printable "$rules"))"
+    fi
+    printf 'noted for %s (priority %s); in place now: %s\n' "$subnet" "$EGRESS_PRIORITY" "$count"
 }
 
 # ---------------------------------------------------------------------------
@@ -3502,7 +3515,7 @@ egress_report() {
 # ---------------------------------------------------------------------------
 # For a running session only: the domain's VNC, which libvirt keeps on a
 # root-only socket, offered through a socket of its own that only one user
-# can open (0600, that user's, in a fresh 0700 directory of that user's), for
+# can open (0600, that user's, in a fresh 0711 directory of root's), for
 # one connection: socat accepts once and ends when it closes. Removed when the
 # disk is given back. No libvirt group, no ACL is changed.
 
@@ -3528,7 +3541,7 @@ stop_console_bridge() {
 }
 
 cmd_console_socket() {
-    local uid=$2 pw gid state xml vnc="" line dir sock pid i st
+    local uid=$2 pw gid state xml vnc="" line dir sock pid i st dst
     require_root
     command -v socat >/dev/null || refuse "socat is not installed: the console bridge is a socat between two sockets (Arch: pacman -S socat)"
     if [[ ! "$uid" =~ ^[[:digit:]]+$ ]]; then
@@ -3557,9 +3570,13 @@ cmd_console_socket() {
     stop_console_bridge
     make_state_dir || refuse "cannot create $STATE_DIR"
     dir="$(mktemp -d -- "$STATE_DIR/console-$LABEL-XXXXXXXXXXXX")" || refuse "cannot create a directory for the bridge under $STATE_DIR"
-    if ! chown -- "$uid:$gid" "$dir" || ! chmod 0700 -- "$dir"; then
+    # The directory stays root's (0711: passed through, not listed, written
+    # by root only); only the socket is the user's. A directory of the user's
+    # would let them put a symlink where socat applies user= and mode= by
+    # path, and have root chown whatever it names.
+    if ! chmod 0711 -- "$dir"; then
         rm -rf -- "$dir"
-        refuse "cannot give $dir to user $uid"
+        refuse "cannot set the mode of $dir"
     fi
     sock="$dir/vnc.sock"
     # Its own session, out of this command's: the caller reads this command's
@@ -3577,7 +3594,14 @@ cmd_console_socket() {
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
+    # stat without -L: the socket itself (a symlink is "symbolic link"), and
+    # its directory still root's alone.
     st="$(stat -c '%u %a %F' -- "$sock" 2>/dev/null)" || st=""
+    dst="$(stat -c '%u %a %F' -- "$dir" 2>/dev/null)" || dst=""
+    if [[ "$dst" != "$EUID 711 directory" ]]; then
+        stop_console_bridge
+        refuse "the bridge's directory $dir is not $EUID's, mode 0711 (${dst:-not there})"
+    fi
     if [[ "$st" != "$uid 600 socket" ]]; then
         stop_console_bridge
         refuse "the bridge's socket is not a socket of user $uid with mode 0600 (${st:-not there}): $(head -c 300 -- "$dir.err" 2>/dev/null)"
@@ -3688,6 +3712,14 @@ stage_failed() {
     UNATTENDED_STAGE=$1
     UNATTENDED_FAILED="$1: $2"
     warn "the unattended update stopped at '$1': $2"
+    # A step that changes the OS (pacman, mkinitcpio) stopped for any reason
+    # may still be running when the power-off ends it: mid-transaction.
+    case "$1" in
+        keyrings | upgrade | packages | initramfs)
+            UNATTENDED_HALF="the recovery OS may be half-upgraded ('$1' may have been ended by the power-off in the middle of its work): roll back to ${PRE_UPDATE_SNAPSHOT:-the @.pre-update.<YYYYMMDD-HHMM> snapshot this run took} (read-only, at its filesystem's top level), from inside that OS or a live system, before trusting it"
+            warn "$UNATTENDED_HALF"
+            ;;
+    esac
 }
 
 # The lines of what a step printed, as they arrive ($1 the step, $2 the new
@@ -3701,6 +3733,9 @@ stage_output() {
         printf 'OUTPUT %s %s %s\n' "$LABEL" "$1" "$line"
         logger -t "$LOG_TAG" -- "OUTPUT $LABEL $1 $line" || :
         [[ -z "${line//[[:space:]]/}" ]] || OUT_LAST=$line
+        if [[ "$1" == snapshot && "$line" =~ ^snapshot:\ (@\.pre-update\.[[:digit:]]{8}-[[:digit:]]{4})\ \(read-only\)$ ]]; then
+            PRE_UPDATE_SNAPSHOT=${BASH_REMATCH[1]}
+        fi
     done
     OUT_PART=$data
 }
@@ -4705,6 +4740,9 @@ cmd_session() {
     done
     if [[ "$UNATTENDED" == true && -n "$UNATTENDED_FAILED" ]]; then
         unattended_line=$'\n'"  Unattended    STOPPED at $UNATTENDED_FAILED -- the recovery OS was powered off; nothing after that step ran"
+        if [[ -n "$UNATTENDED_HALF" ]]; then
+            unattended_line+=$'\n'"  Unattended    WARNING: $UNATTENDED_HALF"
+        fi
     elif [[ "$UNATTENDED" == true ]]; then
         unattended_line=$'\n'"  Unattended    every step done; rebooted into kernel ${KERNEL:-unknown}"
     fi
