@@ -13,6 +13,10 @@ class BackupPanel : public QWidget
 public:
     explicit BackupPanel(DBusClient *client, QWidget *parent = nullptr);
 
+    // Rebuilds the source/target boxes and the Boot Archive state from config
+    // text. loadConfig() feeds it the helper's config; tests feed it directly.
+    void applyConfig(const QString &toml);
+
 private Q_SLOTS:
     void runBackup(bool dryRun);
     void loadConfig();
@@ -47,4 +51,5 @@ private:
     QPushButton *m_runButton = nullptr;
     bool m_jobRunning = false;
     bool m_bootEnabledInConfig = true;
+    bool m_bootForcedOff = false; // unticked by the config, re-ticked on re-enable
 };
