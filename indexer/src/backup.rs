@@ -290,6 +290,10 @@ impl BootOutcome {
     }
 }
 
+/// How many boot warning/failure messages the job-end text lists before
+/// summarising the rest as `and K more`.
+pub const BOOT_MESSAGE_LINES: usize = 5;
+
 /// The boot step of a run: not asked for, switched off in `config.toml`, or
 /// run with this outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +324,36 @@ impl BootStep {
     /// before the step runs.
     pub fn exit_code(&self, released: bool) -> Option<i32> {
         (self.failed() || !released).then_some(3)
+    }
+
+    /// Whether the step leaves nothing a summary must mention: it was not
+    /// asked for, is off in the config, or ran clean and replaced nothing.
+    pub fn has_nothing_to_report(&self) -> bool {
+        match self {
+            Self::NotSelected | Self::DisabledInConfig => true,
+            Self::Ran(o) => o.status() == "OK" && o.updated == 0,
+        }
+    }
+
+    /// The warning and failure messages of a boot step that ran, as lines for
+    /// the GUI's job-end text: failures first, so a cap can never hide one,
+    /// at most [`BOOT_MESSAGE_LINES`] of them, then `and K more`. Empty when
+    /// there is nothing to say.
+    pub fn message_lines(&self) -> String {
+        let Self::Ran(o) = self else {
+            return String::new();
+        };
+        let all: Vec<String> = o
+            .failures
+            .iter()
+            .map(|m| format!("boot FAIL: {m}"))
+            .chain(o.warnings.iter().map(|m| format!("boot WARN: {m}")))
+            .collect();
+        let mut lines: Vec<String> = all.iter().take(BOOT_MESSAGE_LINES).cloned().collect();
+        if all.len() > BOOT_MESSAGE_LINES {
+            lines.push(format!("and {} more", all.len() - BOOT_MESSAGE_LINES));
+        }
+        lines.join("\n")
     }
 
     /// The report's `Boot subvolumes` cell.
@@ -2532,6 +2566,7 @@ pub fn backup_summary(result: &BackupResult, dry_run: bool) -> String {
         && result.snapshots_created == Some(0)
         && result.snapshots_sent == Some(0)
         && result.snapshots_cleaned == 0
+        && result.boot.has_nothing_to_report()
     {
         return format!("Backup ({mode}): nothing to do — all snapshots up to date");
     }
@@ -2749,7 +2784,20 @@ impl BackupJobOutcome {
         match self {
             Self::Declined => (false, "A backup is already running — declined".to_string()),
             Self::CouldNotStart(why) | Self::Aborted(why) => (false, why.clone()),
-            Self::Ran(result) => (result.success, backup_summary(result, dry_run)),
+            Self::Ran(result) => {
+                let mut line = backup_summary(result, dry_run);
+                // A dry run changes nothing, so its boot step has nothing to add.
+                let messages = if dry_run {
+                    String::new()
+                } else {
+                    result.boot.message_lines()
+                };
+                if !messages.is_empty() {
+                    line.push('\n');
+                    line.push_str(&messages);
+                }
+                (result.success, line)
+            }
         }
     }
 }
@@ -8624,6 +8672,104 @@ mod tests {
         }
     }
 
+    fn quiet_boot(mut r: BackupResult) -> BackupResult {
+        r.boot = BootStep::Ran(BootOutcome::default());
+        r
+    }
+
+    fn with_boot(boot: BootStep) -> BackupResult {
+        let mut r = result_with(true, 0, 0, 0);
+        r.boot = boot;
+        r
+    }
+
+    #[test]
+    fn a_boot_step_that_did_something_is_never_nothing_to_do() {
+        let nothing = "Backup (full): nothing to do — all snapshots up to date";
+        for boot in [BootStep::NotSelected, BootStep::DisabledInConfig] {
+            assert_eq!(backup_summary(&with_boot(boot), false), nothing);
+        }
+        assert_eq!(
+            backup_summary(&with_boot(BootStep::Ran(BootOutcome::default())), false),
+            nothing,
+            "ran OK, 0 updated"
+        );
+        assert_eq!(
+            backup_summary(
+                &with_boot(BootStep::Ran(BootOutcome {
+                    updated: 1,
+                    ..Default::default()
+                })),
+                false
+            ),
+            "Backup succeeded (full): 0 snapshots created, 0 sent, boot subvolumes: OK  (1 updated, 0 skipped)"
+        );
+        assert_eq!(
+            backup_summary(
+                &with_boot(BootStep::Ran(BootOutcome {
+                    warnings: vec!["w".into()],
+                    ..Default::default()
+                })),
+                false
+            ),
+            "Backup succeeded (full): 0 snapshots created, 0 sent, boot subvolumes: WARN  (0 updated, 0 skipped, 1 warnings)"
+        );
+        assert_eq!(
+            backup_summary(
+                &with_boot(BootStep::Ran(BootOutcome {
+                    failures: vec!["f".into()],
+                    ..Default::default()
+                })),
+                false
+            ),
+            "Backup succeeded (full): 0 snapshots created, 0 sent, boot subvolumes: FAIL  (0 updated, 1 failed)"
+        );
+    }
+
+    #[test]
+    fn the_job_end_text_carries_boot_warnings_and_failures_failures_first() {
+        let ran = |o: BootOutcome| {
+            BackupJobOutcome::Ran(with_boot(BootStep::Ran(o)))
+                .finish_line(false)
+                .1
+        };
+        assert_eq!(
+            ran(BootOutcome {
+                warnings: vec!["w1".into()],
+                ..Default::default()
+            }),
+            "Backup succeeded (full): 0 snapshots created, 0 sent, boot subvolumes: WARN  (0 updated, 0 skipped, 1 warnings)\nboot WARN: w1"
+        );
+        let many = ran(BootOutcome {
+            warnings: (0..6).map(|i| format!("w{i}")).collect(),
+            failures: vec!["f0".into()],
+            ..Default::default()
+        });
+        let lines: Vec<&str> = many.lines().skip(1).collect();
+        assert_eq!(
+            lines,
+            [
+                "boot FAIL: f0",
+                "boot WARN: w0",
+                "boot WARN: w1",
+                "boot WARN: w2",
+                "boot WARN: w3",
+                "and 2 more"
+            ]
+        );
+        // A clean or absent boot step adds nothing, and neither does a dry run.
+        assert!(!ran(BootOutcome::default()).contains('\n'));
+        assert!(
+            !BackupJobOutcome::Ran(with_boot(BootStep::Ran(BootOutcome {
+                warnings: vec!["w".into()],
+                ..Default::default()
+            })))
+            .finish_line(true)
+            .1
+            .contains('\n')
+        );
+    }
+
     #[test]
     fn a_summary_never_prints_an_unknown_count_as_a_number() {
         let mut result = result_with(false, 0, 0, 0);
@@ -8660,7 +8806,7 @@ mod tests {
             "DRY RUN (full) FAILED — no changes made: a; b"
         );
         assert_eq!(
-            backup_summary(&result_with(true, 0, 0, 0), false),
+            backup_summary(&quiet_boot(result_with(true, 0, 0, 0)), false),
             "Backup (full): nothing to do — all snapshots up to date"
         );
         assert_eq!(
