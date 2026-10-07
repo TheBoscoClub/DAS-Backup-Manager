@@ -1967,7 +1967,10 @@ latest_boot_snapshot() {
     while [[ -n $rest ]]; do
         line=${rest%%$'\n'*}
         if [[ $rest == *$'\n'* ]]; then rest=${rest#*$'\n'}; else rest=""; fi
-        path=${line##* }
+        # The last whitespace-delimited field, trailing whitespace (a CR
+        # included) dropped first: the Rust step's listing_path (bd azvo).
+        line=${line%"${line##*[![:space:]]}"}
+        path=${line##*[[:space:]]}
         for dir in "${dirs[@]}"; do
             prefix="$dir/$name."
             [[ $path == "$prefix"* ]] || continue
@@ -1982,19 +1985,23 @@ latest_boot_snapshot() {
     done
 }
 
-# boot_path_state <path>: whether <path> exists, as BOOT_PATH_STATE — "exists",
-# "absent" or "unknown" (BOOT_PATH_WHY says why). A decision to create, archive
-# or delete rests on this, so only a stat that says "No such file or
-# directory" is "absent": any other failure (I/O error, a parent that is not a
-# directory, a stat that could not run, a capture bash could not make) is
-# "unknown" and the caller stops. `[[ -e ]]` could not tell the two apart, and
-# reading "cannot tell" as "absent" sends the step to snapshot into a path
-# that is there. Its status travels inside its own capture, as probe_mount_point's.
+# boot_path_state <path>: what is at <path>, as BOOT_PATH_STATE — "exists",
+# "symlink" (a symbolic link, dangling or not: stat without -L looks at the link
+# itself, as the Rust step's symlink_metadata does), "absent" or "unknown"
+# (BOOT_PATH_WHY says why). A decision to create, archive or delete rests on
+# this, so only a stat that says "No such file or directory" is "absent": any
+# other failure (I/O error, a parent that is not a directory, a stat that could
+# not run, a capture bash could not make) is "unknown" and the caller stops.
+# `[[ -e ]]` could not tell the two apart, and reading "cannot tell" as
+# "absent" sends the step to snapshot into a path that is there. Its status
+# travels inside its own capture, as probe_mount_point's; stat's stdout (the
+# file type, `-c %F`) and stderr share it, which is safe because a success has
+# no stderr and a failure no stdout.
 BOOT_PATH_STATE="unknown"
 BOOT_PATH_WHY="no stat has run"
 boot_path_state() {
     local out last rc err
-    out="$(LC_ALL=C stat -- "$1" 2>&1 >/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    out="$(LC_ALL=C stat -c %F -- "$1" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
     last="${out##*$'\n'}"
     rc="${last#status=}"
     if [[ "$last" != status=* || ! "$rc" =~ ^[[:digit:]]+$ ]]; then
@@ -2007,7 +2014,11 @@ boot_path_state() {
         err="${err%$'\n'}"
     done
     if ((rc == 0)); then
-        BOOT_PATH_STATE="exists"
+        if [[ "$err" == "symbolic link" ]]; then
+            BOOT_PATH_STATE="symlink"
+        else
+            BOOT_PATH_STATE="exists"
+        fi
         return 0
     fi
     if ((rc == 1)) && [[ "$err" == *": No such file or directory" ]]; then
@@ -2057,6 +2068,15 @@ update_boot_subvol() {
         return
     fi
 
+    # A symbolic link at the live path is neither a subvolume to archive nor an
+    # absence to create into (a snapshot written there goes through it): a
+    # FAIL for this subvolume in either mode, as the Rust step's (bd azvo).
+    if [[ "$live_state" == symlink ]]; then
+        log_error "  [$label] $live is a symbolic link, not a subvolume — leaving $subvol untouched"
+        (( failed += 1 ))
+        return
+    fi
+
     if [[ "$live_state" == exists && "$force" != "true" ]]; then
         log_info "  [$label] $subvol exists, skipping (use --full to recreate)"
         (( skipped += 1 ))
@@ -2087,6 +2107,25 @@ update_boot_subvol() {
         (( failed += 1 ))
         return
     fi
+    if [[ "$staging_state" == symlink ]]; then staging_state=exists; fi
+    # `btrfs subvolume snapshot -r <live> <existing directory>` does not
+    # refuse: it nests the snapshot inside that directory and succeeds. The
+    # archive destination must be absent, and a stat that cannot tell is a
+    # FAIL, before anything is written (bd tens).
+    boot_path_state "$archive"
+    case "$BOOT_PATH_STATE" in
+        absent) ;;
+        unknown)
+            log_error "  [$label] Cannot tell whether $archive exists ($BOOT_PATH_WHY) — leaving $subvol untouched"
+            (( failed += 1 ))
+            return
+            ;;
+        *)
+            log_error "  [$label] archive destination $archive already exists — leaving $subvol untouched"
+            (( failed += 1 ))
+            return
+            ;;
+    esac
     if ! btrfs subvolume snapshot -r "$live" "$archive"; then
         log_error "  [$label] Failed to archive $subvol -> $subvol.archive.$ts — skipping recreation (old $subvol preserved)"
         (( failed += 1 ))
@@ -2131,6 +2170,13 @@ update_boot_subvolumes() {
         record_op "boot_subvols" "OK" "disabled in config"
         return
     fi
+    # No targets at all: nothing to update, and not a quiet OK — a WARN, as
+    # the Rust step's (bd azvo).
+    if (( ${#ALL_TARGET_MOUNTS[@]} == 0 )); then
+        log_warn "  No backup targets configured — no boot subvolume updated"
+        record_op "boot_subvols" "WARN" "0 updated, 0 skipped, 1 warnings"
+        return
+    fi
     # One timestamp per run (not per subvolume/target) — matches the Rust
     # archive_boot() format exactly so boot-archive-cleanup.sh's
     # parse_archive_timestamp() can parse either origin's archives.
@@ -2170,25 +2216,28 @@ update_boot_subvolumes() {
     rm -f "$plan_err"
     plan="${plan_out%"$plan_last"}"
 
-    # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
-    # bootable systems and must never have their @ replaced with host snapshots.
+    # Mount state first, for EVERY target, before anything is written: a target
+    # whose state cannot be told fails the WHOLE step with nothing touched, as
+    # the Rust step's does (bd azvo; it used to fail that one target and go on
+    # to write the others). Mounted, not mounted, or could not tell
+    # (probe_state). Only the second is a target to leave alone; the third — a
+    # probe that could not run, a capture bash could not make, an answer
+    # nobody recognises — is a failure of this step, counted and said, one per
+    # target. `mountpoint -q ... || continue` read every failure of the probe —
+    # a missing mountpoint program (exit 127), no descriptor free for its
+    # redirection — as "not mounted": the target was skipped, counted as
+    # neither skipped nor failed, and the step recorded OK, 0 updated, 0
+    # skipped (bd DAS-Backup-Manager-jlsz, -hhow). A mirror counts the same
+    # way, and says what happened to it: this step never updates a mirror's
+    # boot subvolumes, so "NOT updated" would misstate the consequence — it
+    # could not be checked.
+    local -A mount_state=()
+    local mount_role
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        # Mounted, not mounted, or could not tell (probe_state). Only the second
-        # is a target to leave alone; the third — a probe that could not run, a
-        # capture bash could not make, an answer nobody recognises — is a
-        # failure of this step, counted and said. `mountpoint -q ... || continue`
-        # read every failure of the probe — a missing mountpoint program (exit
-        # 127), no descriptor free for its redirection — as "not mounted": the
-        # target was skipped, counted as neither skipped nor failed, and the
-        # step recorded OK, 0 updated, 0 skipped (bd DAS-Backup-Manager-jlsz,
-        # -hhow). A mirror counts the same way, and says what happened to it:
-        # this step never updates a mirror's boot subvolumes, so "NOT updated"
-        # would misstate the consequence — it could not be checked.
-        local mount_role="${MOUNT_ROLES[$mnt]:-}"
+        mount_role="${MOUNT_ROLES[$mnt]:-}"
         probe_state "$mnt"
         case "$PROBE_STATE" in
-            mounted) ;;
-            not-mounted) continue ;;
+            mounted | not-mounted) mount_state[$mnt]=$PROBE_STATE ;;
             *)
                 if [[ "$mount_role" == "mirror" ]]; then
                     log_error "  Could not tell whether $mnt, a mirror, is mounted — $PROBE_WHY; it could not be checked (its boot subvolumes are never updated here)"
@@ -2196,9 +2245,20 @@ update_boot_subvolumes() {
                     log_error "  Could not tell whether $mnt is mounted — $PROBE_WHY; its boot subvolumes were NOT updated"
                 fi
                 (( failed += 1 ))
-                continue
                 ;;
         esac
+    done
+    if (( failed > 0 )); then
+        log_error "  Mount state could not be told for every target — the step stopped before any target was written"
+        record_op "boot_subvols" "FAIL" "$updated updated, $failed failed"
+        return
+    fi
+
+    # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
+    # bootable systems and must never have their @ replaced with host snapshots.
+    for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
+        [[ "${mount_state[$mnt]}" == mounted ]] || continue
+        mount_role="${MOUNT_ROLES[$mnt]:-}"
 
         # Skip mirror targets — they have their own OS installations
         if [[ "$mount_role" == "mirror" ]]; then

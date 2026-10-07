@@ -739,6 +739,30 @@ impl Config {
             }
         }
 
+        // The boot step keys a target's state by its label, and a label names a
+        // mount in every log line: two targets sharing one would overwrite each
+        // other's entry (bd azvo).
+        let mut labels = std::collections::HashSet::new();
+        for tgt in &self.targets {
+            if !labels.insert(tgt.label.as_str()) {
+                errors.push(format!(
+                    "Target label '{}' is used by more than one [[target]] — labels must be unique",
+                    tgt.label
+                ));
+            }
+        }
+
+        // A boot subvolume listed twice is archived twice in one run, to the
+        // same `<subvol>.archive.<TS>` path (bd tens).
+        let mut boot_seen = std::collections::HashSet::new();
+        for sv in &self.boot.subvolumes {
+            if !boot_seen.insert(sv.as_str()) {
+                errors.push(format!(
+                    "[boot].subvolumes lists '{sv}' more than once — each entry must be unique"
+                ));
+            }
+        }
+
         for (i, tgt) in self.targets.iter().enumerate() {
             // A target needs at least one way to find its filesystem:
             // legacy `serial`, new `serials`, or `mount_uuid`. UUID-only is
@@ -985,6 +1009,46 @@ mod tests {
             "{}{}{ONE_TARGET}",
             source_with("one", "/vol", &[("x", Some("same"))]),
             source_with("two", "/other", &[("y", Some("same"))]),
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_rejects_a_boot_subvolume_listed_twice_and_names_it() {
+        let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a", None)]));
+        let mut cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        cfg.boot.subvolumes = vec!["@".into(), "@home".into(), "@".into()];
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("[boot].subvolumes") && errors[0].contains("'@'"),
+            "{errors:?}"
+        );
+        // The control: the same list without the repeat is accepted.
+        cfg.boot.subvolumes = vec!["@".into(), "@home".into()];
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_rejects_two_targets_sharing_a_label_and_names_it() {
+        let second = ONE_TARGET.replace("serial = \"X\"", "serial = \"Y\"");
+        let extra = format!(
+            "{}{ONE_TARGET}{second}",
+            source_with("s", "/vol", &[("a", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("label 't'") && errors[0].contains("unique"),
+            "{errors:?}"
+        );
+        // The control: distinct labels pass.
+        let second = second.replace("label = \"t\"", "label = \"u\"");
+        let extra = format!(
+            "{}{ONE_TARGET}{second}",
+            source_with("s", "/vol", &[("a", None)])
         );
         let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());

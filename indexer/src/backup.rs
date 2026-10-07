@@ -1307,6 +1307,15 @@ fn subvolume_listing(runner: &dyn CommandRunner, mount: &str) -> Result<String, 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The path of a `btrfs subvolume list` line: its last whitespace-delimited
+/// field, trailing whitespace (a CR included) ignored. ASCII whitespace only —
+/// space, tab, LF, VT, FF, CR — as the script's `[[:space:]]` under `LC_ALL=C`
+/// reads it (bd azvo).
+fn listing_path(line: &str) -> Option<&str> {
+    line.rsplit([' ', '\t', '\n', '\x0B', '\x0C', '\r'])
+        .find(|field| !field.is_empty())
+}
+
 /// The snapshot-match rule, pinned by `tests/fixtures/boot-subvol-listing.txt`
 /// (which the bash suite reads too). A path matches when it is
 /// `<subdir>/<snap_name>.<TS>` with `TS` a btrbk timestamp, so `root-root.*`,
@@ -1324,7 +1333,7 @@ fn latest_matching_snapshot<'a>(
         .collect();
     listing
         .lines()
-        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(listing_path)
         .filter_map(|path| {
             prefixes
                 .iter()
@@ -1401,17 +1410,32 @@ fn btrfs_step(
     }
 }
 
-/// Whether `path` exists, for a decision to create, archive, delete or build.
+/// What is at a path, for a decision to create, archive, delete or build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathState {
+    Absent,
+    /// Something is there that is not a symbolic link.
+    Present,
+    /// A symbolic link, dangling or not. Never followed: a link at a live
+    /// path is not a subvolume, and `try_exists` read a dangling one as
+    /// absent (bd DAS-Backup-Manager-azvo).
+    Symlink,
+}
+
+/// What `path` is, by `symlink_metadata` (the link itself, never its target).
 /// A stat that fails is not "absent": that reading sends a delete path down
 /// the wrong branch (a snapshot nested in a stale `.new`, then live replaced
-/// by it). It is a recorded failure (`None`) and the caller stops.
-fn exists_or_fail(
+/// by it). Only "no such file or directory" is [`PathState::Absent`]; anything
+/// else is a recorded failure (`None`) and the caller stops.
+fn path_state_or_fail(
     path: &str,
     out: &mut BootOutcome,
     progress: &dyn ProgressCallback,
-) -> Option<bool> {
-    match Path::new(path).try_exists() {
-        Ok(exists) => Some(exists),
+) -> Option<PathState> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => Some(PathState::Symlink),
+        Ok(_) => Some(PathState::Present),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(PathState::Absent),
         Err(e) => {
             out.fail(
                 progress,
@@ -1653,9 +1677,22 @@ fn update_boot_subvol(
     };
     let latest_path = format!("{tgt_mount}/{latest}");
     let live = format!("{tgt_mount}/{subvol}");
-    let Some(live_exists) = exists_or_fail(&live, out, progress) else {
+    let Some(live_state) = path_state_or_fail(&live, out, progress) else {
         return;
     };
+    // A symbolic link at the live path is neither a subvolume to archive nor
+    // an absence to create into (a snapshot written there would go through
+    // it): a failure for this subvolume, in either mode (bd azvo).
+    if live_state == PathState::Symlink {
+        out.fail(
+            progress,
+            format!(
+                "[{label}] {live} is a symbolic link, not a subvolume — leaving {subvol} untouched"
+            ),
+        );
+        return;
+    }
+    let live_exists = live_state == PathState::Present;
 
     if live_exists && !run.replace {
         progress.on_log(
@@ -1692,9 +1729,26 @@ fn update_boot_subvol(
     let archive_path = format!("{tgt_mount}/{archive_name}");
 
     // Every existence check comes before the first mutation.
-    let Some(staging_exists) = exists_or_fail(&staging, out, progress) else {
+    let Some(staging_state) = path_state_or_fail(&staging, out, progress) else {
         return;
     };
+    let staging_exists = staging_state != PathState::Absent;
+    // `btrfs subvolume snapshot -r <live> <existing directory>` does not
+    // refuse: it nests the snapshot inside that directory and reports
+    // success. So the archive destination must be absent (bd tens).
+    match path_state_or_fail(&archive_path, out, progress) {
+        None => return,
+        Some(PathState::Absent) => {}
+        Some(_) => {
+            out.fail(
+                progress,
+                format!(
+                    "[{label}] archive destination {archive_path} already exists — leaving {subvol} untouched"
+                ),
+            );
+            return;
+        }
+    }
 
     // Step 1: archive the outgoing subvolume read-only.
     match btrfs_step(
@@ -6241,15 +6295,22 @@ mod tests {
     }
 
     /// A stat that fails is a FAIL and nothing is mutated — never "absent".
-    /// Live: `@` is a symlink to itself, so its stat fails with ELOOP — an
-    /// error root cannot bypass (a mode-000 directory would pass as root, as
-    /// CI's container runs).
+    /// Live: a subvolume name one byte over the 255-byte file-name limit, so
+    /// its stat fails with ENAMETOOLONG — an error root cannot bypass (a
+    /// mode-000 directory would pass as root, as CI's container runs).
     #[test]
     fn a_live_subvolume_that_cannot_be_statted_fails_and_nothing_runs_after_it() {
         let dir = tempfile::tempdir().unwrap();
         let m = dir.path().display().to_string();
-        std::os::unix::fs::symlink("@", dir.path().join("@")).unwrap();
-        let (config, _conf) = archive_fixture(dir.path());
+        let name = "v".repeat(256);
+        let conf = write_btrbk_conf(&name, "root-");
+        let (mut config, _unused) = archive_fixture(dir.path());
+        config.general.btrbk_conf = conf.path().to_string_lossy().into_owned();
+        config.boot.subvolumes = vec![name.clone()];
+        config.sources[0].subvolumes = vec![SubvolConfig {
+            name: name.clone(),
+            ..Default::default()
+        }];
         let runner = Scripted::from_owned(vec![(
             format!("btrfs subvolume list {m}"),
             0,
@@ -6259,7 +6320,7 @@ mod tests {
         let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
         assert!(
             matches!(&step, BootStep::Ran(o) if o.status() == "FAIL" && o.updated == 0
-                && o.failures[0].contains("Cannot tell whether") && o.failures[0].contains(&format!("{m}/@"))),
+                && o.failures[0].contains("Cannot tell whether") && o.failures[0].contains(&name)),
             "{step:?}"
         );
         assert_eq!(runner.calls(), [format!("btrfs subvolume list {m}")]);
@@ -6303,6 +6364,185 @@ mod tests {
         );
         assert_eq!(calls.len(), 1, "only the listing ran: {calls:?}");
         assert!(dir.path().join(&name).is_dir());
+    }
+
+    /// What the step does for one boot subvolume, called directly so the
+    /// archive timestamp is the test's, not the clock's.
+    fn one_boot_subvol(
+        dir: &Path,
+        runner: &dyn CommandRunner,
+        replace: bool,
+    ) -> (BootOutcome, TestProgress) {
+        let (config, _conf) = archive_fixture(dir);
+        let progress = TestProgress::new();
+        let mut out = BootOutcome::default();
+        let run = BootRun {
+            runner,
+            btrbk_conf: &config.general.btrbk_conf,
+            replace,
+            ts: "20261006T000000",
+        };
+        let item = BootPlanItem {
+            subvol: "@".into(),
+            snapshot_name: Some("root-".into()),
+            subdirs: vec!["nvme".into()],
+        };
+        update_boot_subvol(
+            &run,
+            &config.targets[0],
+            &item,
+            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n",
+            &mut out,
+            &progress,
+        );
+        (out, progress)
+    }
+
+    /// bd tens: `btrfs subvolume snapshot -r <live> <existing directory>`
+    /// nests inside it and succeeds, so an archive destination that exists —
+    /// a directory, a file, or a symlink, dangling or not — is a FAIL before
+    /// anything is written. Control: with it absent the same call archives.
+    #[test]
+    fn an_archive_destination_that_exists_fails_before_anything_is_written() {
+        for kind in ["dir", "file", "dangling-symlink"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("@")).unwrap();
+            let archive = dir.path().join("@.archive.20261006T000000");
+            match kind {
+                "dir" => std::fs::create_dir(&archive).unwrap(),
+                "file" => std::fs::write(&archive, b"x").unwrap(),
+                _ => std::os::unix::fs::symlink("nowhere", &archive).unwrap(),
+            }
+            let runner = Scripted::from_owned(vec![]).snapshotting();
+            let (out, _p) = one_boot_subvol(dir.path(), &runner, true);
+            assert_eq!(out.status(), "FAIL", "{kind}: {out:?}");
+            assert!(
+                out.failures[0].contains("archive destination")
+                    && out.failures[0].contains("already exists")
+                    && out.failures[0].contains("leaving @ untouched"),
+                "{kind}: {:?}",
+                out.failures
+            );
+            assert!(runner.calls().is_empty(), "{kind}: {:?}", runner.calls());
+            assert!(dir.path().join("@").is_dir(), "{kind}");
+        }
+        // The control: nothing at the archive path, so the step archives.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("@")).unwrap();
+        let runner = Scripted::from_owned(vec![]).snapshotting();
+        let (_out, _p) = one_boot_subvol(dir.path(), &runner, true);
+        assert!(
+            runner.calls()[0].starts_with("btrfs subvolume snapshot -r "),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// bd tens, end to end: a subvolume named twice reaches the step twice in
+    /// one run with one timestamp. The first archives and replaces; the second
+    /// finds its archive destination taken and stops, leaving the live
+    /// subvolume alone. Without the check its archive nested inside the first.
+    #[test]
+    fn a_boot_subvolume_listed_twice_is_archived_once_and_the_second_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().display().to_string();
+        std::fs::create_dir(dir.path().join("@")).unwrap();
+        let (mut config, _conf) = archive_fixture(dir.path());
+        config.boot.subvolumes = vec!["@".into(), "@".into()];
+        let runner = Scripted::from_owned(vec![(
+            format!("btrfs subvolume list {m}"),
+            0,
+            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".into(),
+        )])
+        .snapshotting()
+        .deleting_too(vec![format!("{m}/@")]);
+        let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
+        let BootStep::Ran(o) = &step else {
+            panic!("{step:?}")
+        };
+        assert_eq!(
+            (o.status(), o.updated, o.failures.len()),
+            ("FAIL", 1, 1),
+            "{o:?}"
+        );
+        assert!(o.failures[0].contains("archive destination"), "{o:?}");
+        let calls = runner.calls();
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("snapshot -r")).count(),
+            1,
+            "one archive only: {calls:?}"
+        );
+        assert_eq!(calls.len(), 4, "list, archive, build, delete: {calls:?}");
+        assert!(dir.path().join("@").is_dir());
+    }
+
+    /// bd azvo (i): a symlink at the live path is not a subvolume. Dangling
+    /// (`try_exists` read it as absent and would create through it) or not,
+    /// in either mode: a FAIL for that subvolume and nothing is run.
+    #[test]
+    fn a_symlink_at_the_live_path_fails_in_either_mode_and_nothing_runs() {
+        for (kind, target) in [("dangling", "nowhere"), ("to-a-directory", "real")] {
+            for replace in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::create_dir(dir.path().join("real")).unwrap();
+                std::os::unix::fs::symlink(target, dir.path().join("@")).unwrap();
+                let runner = Scripted::from_owned(vec![]).snapshotting();
+                let (out, _p) = one_boot_subvol(dir.path(), &runner, replace);
+                assert_eq!(out.status(), "FAIL", "{kind} {replace}: {out:?}");
+                assert!(
+                    out.failures[0].contains("is a symbolic link, not a subvolume"),
+                    "{kind} {replace}: {:?}",
+                    out.failures
+                );
+                assert_eq!((out.updated, out.skipped), (0, 0), "{kind} {replace}");
+                assert!(
+                    runner.calls().is_empty(),
+                    "{kind} {replace}: {:?}",
+                    runner.calls()
+                );
+                assert!(
+                    std::fs::symlink_metadata(dir.path().join("@"))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{kind} {replace}: the link is as it was"
+                );
+            }
+        }
+    }
+
+    /// bd azvo (ii): no targets configured is a WARN, never a quiet OK.
+    #[test]
+    fn no_targets_configured_is_a_warn_and_nothing_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _conf) = archive_fixture(dir.path());
+        config.targets.clear();
+        let runner = Scripted::from_owned(vec![]);
+        let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
+        assert!(
+            matches!(&step, BootStep::Ran(o) if o.status() == "WARN" && o.warnings.len() == 1),
+            "{step:?}"
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    /// bd azvo (iv): the listing path is the last whitespace-delimited field,
+    /// trailing whitespace and CR ignored — the script's rule, from the shared
+    /// fixture's rows (the bash suite asserts the same answers).
+    #[test]
+    fn the_listing_path_ignores_trailing_whitespace_and_cr() {
+        for (line, want) in [
+            ("ID 1 gen 2 top level 5 path a/b", Some("a/b")),
+            ("ID 1 gen 2 top level 5 path a/b ", Some("a/b")),
+            ("ID 1 gen 2 top level 5 path a/b\t", Some("a/b")),
+            ("ID 1 gen 2 top level 5 path a/b\r", Some("a/b")),
+            ("ID 1 gen 2 top level 5 path a/b \t\r", Some("a/b")),
+            ("ID 1 gen 2 top level 5 path a/b\x0B\x0C", Some("a/b")),
+            ("   \t ", None),
+            ("", None),
+        ] {
+            assert_eq!(listing_path(line), want, "{line:?}");
+        }
     }
 
     #[test]
@@ -7109,7 +7349,7 @@ mod tests {
 
     #[test]
     fn the_snapshot_match_rule_is_the_one_the_script_uses() {
-        let cases: [(&[&str], &str, Option<&str>); 7] = [
+        let cases: [(&[&str], &str, Option<&str>); 10] = [
             (&["nvme"], "root-", Some("nvme/root-.20261005T0100_1")),
             (&["/nvme/"], "root-", Some("nvme/root-.20261005T0100_1")),
             (&["nvme"], "home", Some("nvme/home.20261005T0100")),
@@ -7117,6 +7357,10 @@ mod tests {
             (&["nvme", "ssd"], "var", Some("nvme/var.20261009T0100")),
             (&["nvme"], "a.b", Some("nvme/a.b.20261003T0100")),
             (&["nvme"], "log", None),
+            // Trailing space, tab and CR on the listing line (bd azvo).
+            (&["nvme"], "sp-", Some("nvme/sp-.20261001T0100")),
+            (&["nvme"], "tb-", Some("nvme/tb-.20261001T0100")),
+            (&["nvme"], "cr-", Some("nvme/cr-.20261001T0100")),
         ];
         for (subdirs, name, want) in cases {
             let subdirs: Vec<String> = subdirs.iter().map(|s| s.to_string()).collect();
