@@ -1028,6 +1028,7 @@ printf '%s\n' "$*" >>"$STUB/ip.calls"
 rules="$STUB/ip.rules"
 case "$*" in
     "-j rule show priority 5100")
+        if [[ -f "$STUB/ip_show_fail_next" ]]; then rm -f "$STUB/ip_show_fail_next"; echo "RTNETLINK answers: Operation not permitted" >&2; exit 2; fi
         if [[ -f "$STUB/ip_show_fail" ]]; then echo "RTNETLINK answers: Operation not permitted" >&2; exit 2; fi
         printf '['
         sep=""
@@ -1039,12 +1040,14 @@ case "$*" in
         printf ']\n'
         ;;
     "rule show priority 5100")
+        if [[ -f "$STUB/ip_show_fail" ]]; then echo "RTNETLINK answers: Operation not permitted" >&2; exit 2; fi
         while read -r r; do [[ -z "$r" ]] || printf '5100:\tfrom %s lookup main\n' "$r"; done < <(cat "$rules" 2>/dev/null)
         ;;
     "rule add from "*" lookup main priority 5100")
         if [[ -f "$STUB/ip_add_fail" ]]; then echo "RTNETLINK answers: Operation not permitted" >&2; exit 2; fi
         read -r _ _ _ subnet _ <<<"$*"
         [[ -f "$STUB/ip_add_noop" ]] || echo "$subnet" >>"$rules"
+        if [[ -f "$STUB/ip_show_fail_after_add" ]]; then touch "$STUB/ip_show_fail_next"; fi
         ;;
     "rule del from "*" lookup main priority 5100")
         if [[ -f "$STUB/ip_del_fail" ]]; then echo "RTNETLINK answers: Operation not permitted" >&2; exit 2; fi
@@ -1057,24 +1060,47 @@ esac
 STUB
 
     # socat for the console bridge: a real listening socket at the path its
-    # UNIX-LISTEN names (mode 0600), accepting once; "socat" in its command
-    # line, as the real one's.
+    # UNIX-LISTEN names, accepting once; "socat" in its command line, as the
+    # real one's. Only the options it is given shape the socket, as socat's
+    # do: mode= is applied, else the umask decides; user= is applied (this
+    # suite runs unprivileged, so only to the runner itself), else the socket
+    # would be root's -- which an unprivileged stub cannot make, so it says so
+    # and makes none. unlink-early removes what is at the path first; an
+    # option it does not know is refused, as socat refuses one.
     cat >"$T/bin/socat" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >>"$STUB/socat.calls"
 if [[ -f "$STUB/socat_fail" ]]; then echo "socat: E bind: Permission denied" >&2; exit 1; fi
-listen=${1#UNIX-LISTEN:}
-listen=${listen%%,*}
 exec -a socat python3 -c '
-import os, socket, sys
-p = sys.argv[1]
+import os, pwd, socket, sys
+addr = sys.argv[1]
+if not addr.startswith("UNIX-LISTEN:"):
+    sys.exit("socat stub: E first address is not UNIX-LISTEN")
+path, *opts = addr[len("UNIX-LISTEN:"):].split(",")
+o = {}
+for opt in opts:
+    k, _, v = opt.partition("=")
+    if k not in ("mode", "user", "group", "unlink-early"):
+        sys.exit("socat stub: E unknown option " + k)
+    o[k] = v
+if "user" not in o:
+    sys.exit("socat stub: E no user= -- the socket would be root\x27s")
+uid = int(o["user"]) if o["user"].isdigit() else pwd.getpwnam(o["user"]).pw_uid
+gid = int(o["group"]) if o.get("group", "").isdigit() else -1
+if "unlink-early" in o:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 s = socket.socket(socket.AF_UNIX)
-s.bind(p)
-os.chmod(p, 0o600)
+s.bind(path)
+if "mode" in o:
+    os.chmod(path, int(o["mode"], 8))
+os.chown(path, uid, gid)
 s.listen(1)
 c, _ = s.accept()
 c.close()
-' "$listen" "$@"
+' "$@"
 STUB
 
     chmod +x "$T/bin/"*
@@ -4407,6 +4433,27 @@ check "egress, one left in place: exit 0" "$RC" "0"
 has "egress, one left in place: taken over, said" "$OUT" "already in place, left by a session that did not finish"
 lacks "egress, one left in place: not added twice" "$(file "$S/ip.calls")" "rule add"
 check "egress, one left in place: taken out at the end" "$(file "$S/ip.rules")" ""
+# The add worked and the proof after it could not be read: refused, and the
+# rule, owned and noted before the add, is taken out on the way out.
+fixture
+touch "$S/ip_show_fail_after_add"
+run_driver session A
+check "egress, unreadable after the add: refused" "$RC" "1"
+lacks "egress, unreadable after the add: nothing booted" "$(events)" "virsh start"
+check "egress, unreadable after the add: the rule taken out, not left ownerless" "$(file "$S/ip.rules")" ""
+has "egress, unreadable after the add: deleted" "$(file "$S/ip.calls")" "rule del from 192.168.122.0/24 lookup main priority 5100"
+check "egress, unreadable after the add: no note left" "$([[ -e "$STATE/egress.rule" ]] && echo left || echo gone)" "gone"
+# status: a count ip could not read is unknown, never 0.
+fixture
+mkdir -p "$STATE"
+printf '192.168.122.0/24\n' >"$STATE/egress.rule"
+printf '192.168.122.0/24\n' >"$S/ip.rules"
+run_driver status
+has "egress status: the count read" "$OUT" "noted for 192.168.122.0/24 (priority 5100); in place now: 1"
+touch "$S/ip_show_fail"
+run_driver status
+has "egress status, ip fails: unknown" "$OUT" "in place now: unknown (ip rule show failed: RTNETLINK answers: Operation not permitted)"
+lacks "egress status, ip fails: never 0" "$OUT" "in place now: 0"
 fixture
 touch "$S/ip_del_fail"
 run_driver session A
@@ -4556,6 +4603,34 @@ touch "$S/stage.upgrade.hangs"
 run_driver session A --unattended --timeout 1
 check "unattended, --timeout: exit 7" "$RC" "7"
 has "unattended, --timeout: said" "$OUT" "the --timeout of 1 minute(s) has passed"
+# A step that changes the OS, stopped: the power-off may end pacman
+# mid-transaction, so the summary says so and names the way back.
+for step in keyrings upgrade packages initramfs; do
+    unattended_fixture
+    printf 'snapshot: @.pre-update.20261007-1200 (read-only)\n' >"$S/stage.snapshot.out"
+    echo 1 >"$S/stage.$step.rc"
+    run_driver session A --unattended
+    check "unattended, $step stopped: exit 7" "$RC" "7"
+    has "unattended, $step stopped: at that step" "$OUT" "PROGRESS system-recovery-A-2tb $step fail exit status 1"
+    has "unattended, $step stopped: half-upgraded, said in the summary" "$OUT" "  Unattended    WARNING: the recovery OS may be half-upgraded ('$step' may have been ended by the power-off"
+    has "unattended, $step stopped: the snapshot to roll back to, named" "$OUT" "roll back to @.pre-update.20261007-1200 (read-only"
+done
+# The case it is for: pacman past its limit, still running at the power-off.
+unattended_fixture
+printf 'snapshot: @.pre-update.20261007-1200 (read-only)\n' >"$S/stage.snapshot.out"
+touch "$S/stage.upgrade.hangs"
+DAS_RECOVERY_VM_UPDATE_SECS=1 run_driver session A --unattended
+has "unattended, upgrade past its limit: half-upgraded, the snapshot named" "$OUT" "  Unattended    WARNING: the recovery OS may be half-upgraded ('upgrade' may have been ended by the power-off in the middle of its work): roll back to @.pre-update.20261007-1200"
+unattended_fixture
+touch "$S/stage.upgrade.hangs"
+DAS_RECOVERY_VM_UPDATE_SECS=1 run_driver session A --unattended
+has "unattended, upgrade stopped, no snapshot name read: still said" "$OUT" "roll back to the @.pre-update.<YYYYMMDD-HHMM> snapshot this run took"
+for step in snapshot verify-boot; do
+    unattended_fixture
+    echo 3 >"$S/stage.$step.rc"
+    run_driver session A --unattended
+    lacks "unattended, $step fails: nothing changed the OS, no half-upgrade said" "$OUT" "half-upgraded"
+done
 
 echo "--- the session history and the clean-run count (decision 7)"
 fixture
@@ -4681,7 +4756,9 @@ check "console: exit 0" "$RC" "0"
 sock=$(driver_env bash "$DRIVER" console-socket A "$me" 2>/dev/null) || sock=""
 matches "console: prints only the socket's path on stdout" "$sock" "^$STATE/console-system-recovery-A-2tb-[A-Za-z0-9]+/vnc\.sock$"
 check "console: the socket is the user's, 0600" "$(stat -c '%u %a %F' "$sock" 2>/dev/null)" "$me 600 socket"
-check "console: in a directory of the user's, 0700" "$(stat -c '%u %a' "$(dirname "$sock")" 2>/dev/null)" "$me 700"
+check "console: in a directory of root's (the runner's), 0711 -- never the user's" "$(stat -c '%u %a' "$(dirname "$sock")" 2>/dev/null)" "$(id -u) 711"
+has "console: the socket's mode asked of socat" "$(tail -n 1 "$S/socat.calls")" ",mode=600,"
+has "console: the socket's user asked of socat" "$(tail -n 1 "$S/socat.calls")" ",user=$me,"
 check "console: the state directory can be passed through, not listed" "$(stat -c %a "$STATE")" "711"
 has "console: proxied to libvirt's VNC socket" "$(file "$S/socat.calls")" "UNIX-CONNECT:$T/var/lib/libvirt/qemu/domain-1-x/vnc.sock"
 has "console: one connection (no fork)" "$(tail -n 1 "$S/socat.calls")" "UNIX-LISTEN:$sock,mode=600,user=$me"
