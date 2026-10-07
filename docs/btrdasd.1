@@ -2305,12 +2305,21 @@ null.
 refuses a record whose
 .B mount_uuid
 is not the target's configured one. The record is schema
-version 3. A version\-2 record, from before the units and btrbk were read,
-is read with those readings unknown \(em
+version 4: each OS also carries
+.BR guest_agent ,
+whether its QEMU guest agent is installed and started at boot (its unit
+enabled, or the package's udev rule there, with nothing in
+.I etc
+masking or replacing either), which
+.B "recovery\-os\-vm.sh session \-\-unattended"
+requires; a package database that cannot be read in full makes it unknown,
+never "not installed". A version\-3 record is read with that reading
+unknown. A version\-2 record, from before the units and btrbk were read,
+is read with those readings unknown too \(em
 .B btrbk at boot
 is
 .B may
-until the drive is read again \(em and written back as version 3. An
+until the drive is read again. Either is written back as version 4. An
 existing file that cannot be read or parsed, or of any other version, is
 left as it is and the command exits 2, its error naming the file, the
 version found and the command that clears it; every later run fails the
