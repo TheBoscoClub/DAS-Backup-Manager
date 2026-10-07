@@ -250,8 +250,11 @@ void ConfigDialog::saveConfig()
         m_originalContent = currentContent;
         m_statusLabel->setText(i18n("Configuration saved successfully."));
     } else {
-        // DBusClient emits errorOccurred for the main window to handle;
-        // also show a local note so the user knows the save did not complete.
-        m_statusLabel->setText(i18n("Save failed. Check the progress panel for details."));
+        // DBusClient emits errorOccurred, which the main window shows in a
+        // message box with the helper's reason — among them "a backup or
+        // btrdasd setup is running … Try again when it finishes" (bd lxw).
+        // The edits stay in the editor, so Save can simply be pressed again.
+        m_statusLabel->setText(i18n("Not saved — see the error message for why. "
+                                    "Your edits are kept; save again once the cause is gone."));
     }
 }
