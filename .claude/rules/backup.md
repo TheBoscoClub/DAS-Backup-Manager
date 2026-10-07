@@ -104,12 +104,13 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   | --- | --- |
   | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
   | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
-  | Target not selected / not mounted (absent mount point) | not counted, Info |
+  | Target not selected / not mounted (absent mount point) | not counted, Info ("Not mounted — boot subvolumes not updated on '<label>'", both paths) |
   | Mirror target (mounted) | skipped (counted once per target), Info |
   | Mirror target, not mounted | not counted, Info ("Not mounted — mirror target left alone"), both paths |
   | No targets configured | **WARN**, nothing run (both paths) |
   | Mount state of any target (Rust: any selected one) cannot be told (stat error; the script's probe) / write verification refuses | **FAIL** (whole step, checked for every target before the first write; the script says each such target and counts each) |
   | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
+  | A boot-plan field the script could not pass on (empty or whitespace name, a lone `-`, a comma or whitespace in a subdirectory) | `backup boot-plan` exits 2, nothing on stdout; script **FAIL** (whole step) |
   | Target's subvolume listing cannot be read | **FAIL** (once per target) |
   | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
   | No source declares `target_subdirs` for it | **WARN** |
