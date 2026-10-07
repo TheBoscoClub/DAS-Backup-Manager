@@ -25,7 +25,7 @@
 #   backup-run.sh          update_boot_subvolumes  the match against a
 #                          target's subvolume listing (exposed: the primary
 #                          target's listing is near 64 KiB and grows), now
-#                          latest_boot_snapshot's walk by parameter expansion
+#                          latest_boot_snapshot's walk by word split
 #   backup-verify.sh       check_smart_health      the SMART health line
 #   das-partition-drives.sh check_smart_tests      the self-test gate
 #
@@ -138,6 +138,7 @@ done
 run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
     : >"$WORK/btrfs.calls"
     : >"$WORK/btrdasd.calls"
+    : >"$WORK/mktemp.calls"
     (
         set -euo pipefail
         # shellcheck source=/dev/null
@@ -188,6 +189,21 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         mv() {
             printf 'mv %s\n' "$*" >>"$WORK/btrfs.calls"
             [[ "${BOOT_MV_FAILS:-}" != 1 ]]
+        }
+        # BOOT_MKTEMP_FAIL_NTH: the Nth mktemp of the step fails (1 = the
+        # boot plan's error file, 2 = the first target's listing capture).
+        # The count lives in a file: each call runs in a command substitution.
+        mktemp() {
+            local n=0
+            if [[ -n "${BOOT_MKTEMP_FAIL_NTH:-}" ]]; then
+                echo x >>"$WORK/mktemp.calls"
+                while read -r _; do ((n += 1)); done <"$WORK/mktemp.calls"
+                if ((n == BOOT_MKTEMP_FAIL_NTH)); then
+                    echo "mktemp: failed to create file (stub)" >&2
+                    return 1
+                fi
+            fi
+            command mktemp "$@"
         }
         declare -A OP_STATUS=()
         declare -A MOUNT_ROLES=()
@@ -1296,8 +1312,8 @@ with_no_fd_to_spare() { # with_no_fd_to_spare <condition> <variable> <value>
         if eval "$1"; then echo match; else echo "no match"; fi
     ) 2>/dev/null
 }
-# The boot step's matcher is latest_boot_snapshot now: a walk by parameter
-# expansion and `[[ =~ ]]`, which need no descriptor either.
+# The boot step's matcher is latest_boot_snapshot now: one word split and
+# `[[ =~ ]]`, which need no descriptor either.
 no_fd_boot_walk() {
     (
         set -euo pipefail
@@ -1496,6 +1512,84 @@ echo "== no producer | grep -q left in scripts/"
 # the shape above. None may come back; a comment may still quote one.
 left="$(awk '!/^[[:space:]]*#/ && /\|[[:space:]]*grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q/ { print FILENAME ":" FNR ": " $0 }' "$ROOT"/scripts/*.sh)"
 check "no 'producer | grep -q' in scripts/" "${left:-none}" "none"
+
+# ---------------------------------------------------------------------------
+echo "--- 5bwi/nqbb: linear walk and boot coverage"
+# ---------------------------------------------------------------------------
+# 5bwi: the listing walk is one word split, so its cost grows with the listing
+# and not with its square (0.27 s at 1,500 lines, 27 s at 15,000 before). The
+# checks: the answer at the three sizes the cost was measured at, the match
+# last (the whole listing must be read), and a wall-clock bound generous for a
+# loaded host yet far below the quadratic's time at 15,000 lines.
+walk_big() { # walk_big <lines>: the answer, the match being the listing's last line
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        listing="$(filler "$1")"$'\n''ID 900 gen 9 top level 5 path nvme/root-.20261010T0100'
+        latest_boot_snapshot "$listing" root- nvme
+        printf '%s' "$LATEST_BOOT_SNAPSHOT"
+    )
+}
+for n in 1500 5000 15000; do
+    start=$EPOCHREALTIME
+    got="$(walk_big "$n")"
+    end=$EPOCHREALTIME
+    check "walk, $n lines with the match last: found" "$got" "nvme/root-.20261010T0100"
+    # EPOCHREALTIME is "sec.usec": dropping the point leaves microseconds.
+    us=$((${end/./} - ${start/./}))
+    verdict=fast
+    ((us < 5000000)) || verdict="slow: $us us"
+    check "walk, $n lines: under 5 s (the quadratic walk took 0.6 s, 9 s and 89 s at these sizes)" "$verdict" "fast"
+done
+# The word split must neither glob nor lose a field, and must leave the
+# caller's globbing setting as it found it.
+glob_probe() { # glob_probe <noglob|glob>: "<answer> <globbing after>"
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        [[ $1 == noglob ]] && set -f
+        listing=$'ID 1 gen 9 top level 5 path *\n\n*\nID 2 gen 9 top level 5 path nvme/root-.20261010T0100\n?'
+        cd "$WORK"
+        latest_boot_snapshot "$listing" root- nvme
+        if [[ $- == *f* ]]; then g=off; else g=on; fi
+        printf '%s globbing-%s' "$LATEST_BOOT_SNAPSHOT" "$g"
+    )
+}
+check "walk: glob characters and blank lines in a listing change nothing; globbing was on, stays on" \
+    "$(glob_probe glob)" "nvme/root-.20261010T0100 globbing-on"
+check "walk: globbing was off, stays off" \
+    "$(glob_probe noglob)" "nvme/root-.20261010T0100 globbing-off"
+
+# nqbb (b): a mirror target whose listing WOULD match, full run, live present:
+# it is skipped before anything is listed, and nothing on it is written.
+check "boot full, mirror, listing that matches, live present: skipped, nothing written" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PRESENT="/mnt/t/@ /mnt/t/@home" run_boot_subvols "$SHARED") $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "OK|0 updated, 1 skipped 0 0 0"
+check "boot full, mirror: the listing is never even read" "$(calls_of 'subvolume list')" "0"
+# nqbb (c): full run, live absent: one create from the newest snapshot, no archive.
+check "boot full, live absent: created, counted" \
+    "$(BOOT_PLAN=$ONE run_boot_subvols "$SHARED")" "OK|1 updated, 0 skipped"
+check "boot full, live absent: exactly one create, from the newest snapshot, no delete, rename or archive" \
+    "$(boot_seq)" "subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@;"
+# nqbb (d): the create itself fails: FAIL, nothing else called.
+check "boot full, live absent, the create fails: FAIL, counted" \
+    "$(BOOT_FAIL_ON="snapshot /mnt/t/nvme" BOOT_PLAN=$ONE run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot full, live absent, the create fails: only the one attempt, nothing deleted or renamed" \
+    "$(boot_seq) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@; 0 0"
+check "boot full, live absent, the create fails: said" \
+    "$(said_boot 'Failed to create @ from nvme/root-.20261005T0100_1')" "1"
+# nqbb (e): the listing's temp file cannot be made: FAIL for the target, and
+# btrfs is never asked for the listing (the plan's own mktemp is the first).
+check "boot, the listing's mktemp fails: FAIL for the target, counted once" \
+    "$(BOOT_MKTEMP_FAIL_NTH=2 run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot, the listing's mktemp fails: said, and no listing, snapshot, delete or rename" \
+    "$(said_boot 'Could not make a temp file to list its subvolumes') $(calls_of 'subvolume list') $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "1 0 0 0 0"
+check "boot, the plan's mktemp fails: FAIL, nothing asked of btrfs" \
+    "$(BOOT_MKTEMP_FAIL_NTH=1 run_boot_subvols "$SHARED") $(boot_btrfs_calls)" "FAIL|0 updated, 1 failed none"
 
 echo ""
 echo "passed=$pass failed=$fail"
