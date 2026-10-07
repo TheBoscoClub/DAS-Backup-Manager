@@ -2257,8 +2257,14 @@ update_boot_subvolumes() {
     # Update boot subvolumes on PRIMARY targets only — mirror targets are independent
     # bootable systems and must never have their @ replaced with host snapshots.
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        [[ "${mount_state[$mnt]}" == mounted ]] || continue
         mount_role="${MOUNT_ROLES[$mnt]:-}"
+        if [[ "${mount_state[$mnt]}" != mounted ]]; then
+            # Not counted, as the Rust step's (its Info line, same words).
+            if [[ "$mount_role" == "mirror" ]]; then
+                log_info "  [$mnt] Not mounted — mirror target left alone (independent OS)"
+            fi
+            continue
+        fi
 
         # Skip mirror targets — they have their own OS installations
         if [[ "$mount_role" == "mirror" ]]; then

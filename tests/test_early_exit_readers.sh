@@ -1558,6 +1558,15 @@ check "boot, no targets configured: WARN, not OK" \
 check "boot, no targets configured: said, and neither btrfs nor the plan asked" \
     "$(said_boot 'No backup targets configured') $(boot_btrfs_calls) $(wc -c <"$WORK/btrdasd.calls")" "1 none 0"
 
+# bd azvo note 2: an unmounted mirror is said (the Rust step's Info line), and
+# still not counted.
+check "boot, a mirror that is not mounted: said, counts unchanged" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot '[INFO]   [/mnt/t] Not mounted — mirror target left alone (independent OS)')" \
+    "OK|0 updated, 0 skipped 1"
+check "boot, a primary that is not mounted: nothing said about a mirror" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'mirror target left alone')" \
+    "OK|0 updated, 0 skipped 0"
+
 # bd azvo (iv): the listing path is the last whitespace-delimited field,
 # trailing whitespace and CR dropped; the same rows the Rust suite asserts.
 check "shared listing: a trailing space on the line" "$(latest_of nvme sp-)" "nvme/sp-.20261001T0100"
