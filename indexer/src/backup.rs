@@ -2725,8 +2725,13 @@ fn run_backup_with(
     // Step (d): Index — walk each target's mount path to pick up new snapshots.
     // A boundary after the boot step, which a cancel does not interrupt.
     if options.index_after && !cancelled && !done_cancelled {
-        if options.boot_archive && stop_requested(progress) {
-            let msg = cancelled_line("the boot subvolume step", "index");
+        if stop_requested(progress) {
+            let done = if options.boot_archive {
+                "the boot subvolume step"
+            } else {
+                "btrbk"
+            };
+            let msg = cancelled_line(done, "index");
             progress.on_log(LogLevel::Error, &msg);
             errors.push(msg);
         } else {
