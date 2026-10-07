@@ -1392,6 +1392,16 @@ fn latest_matching_snapshot<'a>(
 /// What both `archive_boot` and `backup-run.sh` (through `backup boot-plan`)
 /// act on, so the names are derived in one place (bd dtm).
 pub fn boot_plan(config: &Config) -> Result<Vec<BootPlanItem>, String> {
+    // The boot step's input is checked where it is read: `Config::load` does
+    // not run `validate`, and this is reached by `backup boot-plan` (so by the
+    // script) and by `archive_boot_with`, before any btrfs call.
+    let bad = config.boot_input_errors();
+    if !bad.is_empty() {
+        return Err(format!(
+            "Boot step refused, nothing touched: {}",
+            bad.join("; ")
+        ));
+    }
     let conf = Path::new(&config.general.btrbk_conf);
     let names = crate::forget::live_subvol_snapshot_names(conf).map_err(|e| {
         format!(
@@ -1839,6 +1849,18 @@ fn update_boot_subvol(
     let Some(staging_state) = path_state_or_fail(&staging, out, progress) else {
         return;
     };
+    // `btrfs subvolume delete` resolves a link, so a symbolic link at the
+    // staging path would have step 2 delete whatever it points at: a FAIL
+    // before the first write, as at the live path.
+    if staging_state == PathState::Symlink {
+        out.fail(
+            progress,
+            format!(
+                "[{label}] {staging} is a symbolic link, not a staging subvolume — leaving {subvol} untouched"
+            ),
+        );
+        return;
+    }
     let staging_exists = staging_state != PathState::Absent;
     // `btrfs subvolume snapshot -r <live> <existing directory>` does not
     // refuse: it nests the snapshot inside that directory and reports
@@ -6559,44 +6581,6 @@ mod tests {
         );
     }
 
-    /// bd tens, end to end: a subvolume named twice reaches the step twice in
-    /// one run with one timestamp. The first archives and replaces; the second
-    /// finds its archive destination taken and stops, leaving the live
-    /// subvolume alone. Without the check its archive nested inside the first.
-    #[test]
-    fn a_boot_subvolume_listed_twice_is_archived_once_and_the_second_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = dir.path().display().to_string();
-        std::fs::create_dir(dir.path().join("@")).unwrap();
-        let (mut config, _conf) = archive_fixture(dir.path());
-        config.boot.subvolumes = vec!["@".into(), "@".into()];
-        let runner = Scripted::from_owned(vec![(
-            format!("btrfs subvolume list {m}"),
-            0,
-            "ID 257 gen 9 top level 5 path nvme/root-.20261005T0100\n".into(),
-        )])
-        .snapshotting()
-        .deleting_too(vec![format!("{m}/@")]);
-        let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
-        let BootStep::Ran(o) = &step else {
-            panic!("{step:?}")
-        };
-        assert_eq!(
-            (o.status(), o.updated, o.failures.len()),
-            ("FAIL", 1, 1),
-            "{o:?}"
-        );
-        assert!(o.failures[0].contains("archive destination"), "{o:?}");
-        let calls = runner.calls();
-        assert_eq!(
-            calls.iter().filter(|c| c.contains("snapshot -r")).count(),
-            1,
-            "one archive only: {calls:?}"
-        );
-        assert_eq!(calls.len(), 4, "list, archive, build, delete: {calls:?}");
-        assert!(dir.path().join("@").is_dir());
-    }
-
     /// bd azvo (i): a symlink at the live path is not a subvolume. Dangling
     /// (`try_exists` read it as absent and would create through it) or not,
     /// in either mode: a FAIL for that subvolume and nothing is run.
@@ -6629,6 +6613,91 @@ mod tests {
                     "{kind} {replace}: the link is as it was"
                 );
             }
+        }
+    }
+
+    /// A symlink at `<subvol>.new` (dangling or not): `btrfs subvolume delete`
+    /// would follow it, so it is a FAIL before the first write (archive
+    /// included), not a "stale staging" to delete.
+    #[test]
+    fn a_symlink_at_the_staging_path_fails_before_any_write() {
+        for (kind, target) in [("dangling", "nowhere"), ("to-a-directory", "real")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("real")).unwrap();
+            std::fs::create_dir(dir.path().join("@")).unwrap();
+            std::os::unix::fs::symlink(target, dir.path().join("@.new")).unwrap();
+            let runner = Scripted::from_owned(vec![]).snapshotting();
+            let (out, _p) = one_boot_subvol(dir.path(), &runner, true);
+            assert_eq!(out.status(), "FAIL", "{kind}: {out:?}");
+            assert!(
+                out.failures[0].contains("@.new is a symbolic link"),
+                "{kind}: {:?}",
+                out.failures
+            );
+            assert!(runner.calls().is_empty(), "{kind}: {:?}", runner.calls());
+            assert!(
+                std::fs::symlink_metadata(dir.path().join("@.new"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{kind}: the link is as it was"
+            );
+        }
+    }
+
+    /// `Config::load` does not run `validate`: `archive_boot_with` itself
+    /// refuses a repeated boot subvolume, a repeated target label or mount, and
+    /// a `.`/`..` subvolume, as a whole-step FAIL before any btrfs call.
+    #[test]
+    fn archive_boot_refuses_an_invalid_boot_input_before_any_btrfs_call() {
+        type Break = fn(&mut Config, &Path);
+        let cases: [(&str, Break, &str); 4] = [
+            (
+                "repeated subvolume",
+                |c, _| c.boot.subvolumes = vec!["@".into(), "@".into()],
+                "more than once",
+            ),
+            (
+                "dot subvolume",
+                |c, _| c.boot.subvolumes = vec!["..".into()],
+                "'.' or '..'",
+            ),
+            (
+                "repeated label",
+                |c, d| {
+                    let t = another_target(c, "t-other", &d.join("x"), TargetRole::Primary);
+                    c.targets.push(Target {
+                        label: c.targets[0].label.clone(),
+                        ..t
+                    });
+                },
+                "labels must be unique",
+            ),
+            (
+                "repeated mount",
+                |c, _| {
+                    let t = Target {
+                        label: "other".into(),
+                        ..c.targets[0].clone()
+                    };
+                    c.targets.push(t);
+                },
+                "mounts must be unique",
+            ),
+        ];
+        for (name, brk, needle) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("@")).unwrap();
+            let (mut config, _conf) = archive_fixture(dir.path());
+            brk(&mut config, dir.path());
+            let runner = Scripted::from_owned(vec![]).snapshotting();
+            let step = archive_boot_with(&config, None, true, &TestProgress::new(), &env(&runner));
+            let BootStep::Ran(o) = &step else {
+                panic!("{name}: {step:?}")
+            };
+            assert_eq!(o.status(), "FAIL", "{name}: {step:?}");
+            assert!(o.failures[0].contains(needle), "{name}: {:?}", o.failures);
+            assert!(runner.calls().is_empty(), "{name}: {:?}", runner.calls());
         }
     }
 

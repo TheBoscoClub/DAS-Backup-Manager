@@ -2126,7 +2126,14 @@ update_boot_subvol() {
         (( failed += 1 ))
         return
     fi
-    if [[ "$staging_state" == symlink ]]; then staging_state=exists; fi
+    # `btrfs subvolume delete` resolves a link: a symlink here would have the
+    # stale-staging delete below remove whatever it points at. FAIL before the
+    # first write, as for the live path.
+    if [[ "$staging_state" == symlink ]]; then
+        log_error "  [$label] $staging is a symbolic link, not a staging subvolume — leaving $subvol untouched"
+        (( failed += 1 ))
+        return
+    fi
     # `btrfs subvolume snapshot -r <live> <existing directory>` does not
     # refuse: it nests the snapshot inside that directory and succeeds. The
     # archive destination must be absent, and a stat that cannot tell is a

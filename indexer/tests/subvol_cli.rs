@@ -399,6 +399,44 @@ fn backup_boot_plan_refuses_a_subdirectory_that_is_empty_dash_or_has_whitespace(
     }
 }
 
+/// `Config::load` does not run `validate`, so `boot-plan` enforces the boot
+/// step's uniqueness and shape rules itself: exit 2, nothing on stdout.
+#[test]
+fn backup_boot_plan_refuses_repeated_or_dot_boot_subvolumes() {
+    for (subvol_toml, subvol, needle) in [
+        ("\"@\", \"@\"", "@", "more than once"),
+        ("\"..\"", "..", "'.' or '..'"),
+        ("\"@\", \".\"", "'.'", "'.' or '..'"),
+    ] {
+        let out = boot_plan_refusal(subvol_toml, GOOD_CONF, "[\"nvme\"]");
+        assert_refused(&out, subvol, needle);
+    }
+}
+
+#[test]
+fn backup_boot_plan_refuses_two_targets_sharing_a_label_or_a_mount() {
+    let second = "[[target]]\nlabel = \"{L}\"\nserial = \"Y\"\nmount = \"{M}\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n";
+    for (label, mount, needle) in [
+        ("t", "/mnt/u", "label 't'"),
+        ("u", "/mnt/t", "mount '/mnt/t'"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = boot_plan_config(dir.path(), Some("[\"nvme\"]"));
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&second.replace("{L}", label).replace("{M}", mount));
+        std::fs::write(&config, text).unwrap();
+        let out = btrdasd(&["backup", "boot-plan", "--config", config.to_str().unwrap()]);
+        assert_refused(&out, "unique", needle);
+    }
+    // The control: distinct label and mount print the plan.
+    let dir = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(dir.path(), Some("[\"nvme\"]"));
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&second.replace("{L}", "u").replace("{M}", "/mnt/u"));
+    std::fs::write(&config, text).unwrap();
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme\n");
+}
+
 #[test]
 fn backup_boot_plan_refuses_a_config_it_cannot_load() {
     let dir = tempfile::tempdir().unwrap();
