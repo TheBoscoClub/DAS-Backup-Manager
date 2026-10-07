@@ -2695,10 +2695,8 @@ fn run_backup_with(
     // Step (c): boot subvolumes — create a missing one on every run, archive
     // and replace on a full run, as backup-run.sh's update_boot_subvolumes does
     // (bd woq, dtm). A failure fails the run; an absence only warns.
-    // A boundary: btrbk is done; the boot step and the index not begun.
-    let cancelled = (options.boot_archive || options.index_after)
-        && !done_cancelled
-        && stop_requested(progress);
+    // A boundary: btrbk is done, the boot step not begun (the index has its own).
+    let cancelled = options.boot_archive && !done_cancelled && stop_requested(progress);
     if cancelled {
         let msg = cancelled_line("btrbk", &not_done_after_btrbk(options, false));
         progress.on_log(LogLevel::Error, &msg);
