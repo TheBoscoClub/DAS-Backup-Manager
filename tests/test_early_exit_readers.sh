@@ -220,10 +220,11 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             command mktemp "$@"
         }
         declare -A OP_STATUS=()
-        declare -A MOUNT_ROLES=()
+        declare -A MOUNT_ROLES=() TARGET_MOUNTS=()
         read -r -a ALL_TARGET_MOUNTS <<<"${BOOT_MOUNTS:-/mnt/t}"
         for m in "${ALL_TARGET_MOUNTS[@]}"; do
             MOUNT_ROLES[$m]=primary
+            TARGET_MOUNTS["label-${m##*/}"]=$m
         done
         # BOOT_MIRRORS: the mount points among them that are mirrors.
         for m in ${BOOT_MIRRORS:-}; do
@@ -1582,6 +1583,9 @@ check "boot, a mirror that is not mounted: said, counts unchanged" \
 check "boot, a primary that is not mounted: nothing said about a mirror" \
     "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'mirror target left alone')" \
     "OK|0 updated, 0 skipped 0"
+check "boot, a primary that is not mounted: said with its configured label, counts unchanged" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot "[INFO]   [/mnt/t] Not mounted — boot subvolumes not updated on 'label-t'")" \
+    "OK|0 updated, 0 skipped 1"
 
 # bd azvo (iv): the listing path is the last whitespace-delimited field,
 # trailing whitespace and CR dropped; the same rows the Rust suite asserts.

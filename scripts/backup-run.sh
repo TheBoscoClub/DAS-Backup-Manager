@@ -2273,6 +2273,13 @@ update_boot_subvolumes() {
             # Not counted, as the Rust step's (its Info line, same words).
             if [[ "$mount_role" == "mirror" ]]; then
                 log_info "  [$mnt] Not mounted — mirror target left alone (independent OS)"
+            else
+                # The configured label, as the Rust step says it (bd azvo).
+                local cfg_label="$mnt" tl
+                for tl in "${!TARGET_MOUNTS[@]}"; do
+                    [[ "${TARGET_MOUNTS[$tl]}" == "$mnt" ]] && cfg_label="$tl"
+                done
+                log_info "  [$mnt] Not mounted — boot subvolumes not updated on '$cfg_label'"
             fi
             continue
         fi
