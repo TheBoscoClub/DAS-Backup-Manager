@@ -3988,7 +3988,10 @@ for p in /etc/mkinitcpio.d/*.preset; do
     [ -e "$p" ] || break
     found=1
     if grep -q "^PRESETS=(.*'fallback'" "$p"; then echo "$p: has the fallback image"; continue; fi
-    if ! grep -qx "PRESETS=('default')" "$p" || grep -q '^fallback_' "$p"; then
+    shape=stock
+    grep -qx "PRESETS=('default')" "$p" || shape=other
+    if grep -q '^fallback_' "$p"; then shape=other; fi
+    if [ "$shape" != stock ]; then
         echo "$p: has no fallback image and is not of the shape this edits -- put it right by hand"
         exit 3
     fi
@@ -4008,7 +4011,9 @@ step_verify_btrbk() {
 out=$(pacman -Qkk btrbk 2>&1); rc=$?
 printf '%s\n' "$out"
 [ "$rc" -eq 0 ] || { echo "pacman -Qkk btrbk: exit status $rc"; exit 3; }
-printf '%s\n' "$out" | grep -Eq '^btrbk: [[:digit:]]+ total files, 0 altered files$' || { echo "btrbk's files are not as packaged"; exit 3; }
+grep -Eq '^btrbk: [[:digit:]]+ total files, 0 altered files$' <<OUT || { echo "btrbk's files are not as packaged"; exit 3; }
+$out
+OUT
 EOF
 }
 
