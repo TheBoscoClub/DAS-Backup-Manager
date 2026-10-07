@@ -668,14 +668,12 @@ pub fn parse_scrub_status(
 /// `default`, unless a test build (feature `test-overrides`, enabled only
 /// through the dev-dependency) sets `var`. A shipped binary never reads the
 /// environment here: a stray variable must not redirect the scrub state.
-#[cfg(feature = "test-overrides")]
 fn overridable(var: &str, default: &str) -> PathBuf {
-    PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
-}
-
-#[cfg(not(feature = "test-overrides"))]
-fn overridable(_var: &str, default: &str) -> PathBuf {
-    PathBuf::from(default)
+    if cfg!(feature = "test-overrides") {
+        PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
+    } else {
+        PathBuf::from(default)
+    }
 }
 
 /// Directory holding the btrfs status records (overridable for tests).
