@@ -25,7 +25,7 @@
 #   backup-run.sh          update_boot_subvolumes  the match against a
 #                          target's subvolume listing (exposed: the primary
 #                          target's listing is near 64 KiB and grows), now
-#                          latest_boot_snapshot's walk by parameter expansion
+#                          latest_boot_snapshot's walk by word split
 #   backup-verify.sh       check_smart_health      the SMART health line
 #   das-partition-drives.sh check_smart_tests      the self-test gate
 #
@@ -138,6 +138,7 @@ done
 run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<detail>"
     : >"$WORK/btrfs.calls"
     : >"$WORK/btrdasd.calls"
+    : >"$WORK/mktemp.calls"
     (
         set -euo pipefail
         # shellcheck source=/dev/null
@@ -168,15 +169,29 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             fi
             printf '%b' "${BOOT_PLAN-@\troot-\tnvme\n@home\thome\tnvme\n}"
         }
-        # stat as the helper asks it: a path in BOOT_PRESENT exists, one in
-        # BOOT_STAT_ERR cannot be told, anything else is not there.
+        # stat as the helper asks it (`-c %F -- <path>`): a path in
+        # BOOT_PRESENT exists (a directory), one in BOOT_SYMLINK is a symbolic
+        # link, one in BOOT_STAT_ERR cannot be told, anything else is not there.
+        # Each entry is a glob (the archive's name carries the run's clock).
         stat() {
             local p="${!#}" q
             for q in ${BOOT_PRESENT:-}; do
-                [[ "$q" == "$p" ]] && return 0
+                # shellcheck disable=SC2053  # the patterns are globs, on purpose
+                if [[ "$p" == $q ]]; then
+                    echo directory
+                    return 0
+                fi
+            done
+            for q in ${BOOT_SYMLINK:-}; do
+                # shellcheck disable=SC2053
+                if [[ "$p" == $q ]]; then
+                    echo "symbolic link"
+                    return 0
+                fi
             done
             for q in ${BOOT_STAT_ERR:-}; do
-                if [[ "$q" == "$p" ]]; then
+                # shellcheck disable=SC2053
+                if [[ "$p" == $q ]]; then
                     echo "stat: cannot statx '$p': Input/output error" >&2
                     return 1
                 fi
@@ -189,11 +204,27 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
             printf 'mv %s\n' "$*" >>"$WORK/btrfs.calls"
             [[ "${BOOT_MV_FAILS:-}" != 1 ]]
         }
+        # BOOT_MKTEMP_FAIL_NTH: the Nth mktemp of the step fails (1 = the
+        # boot plan's error file, 2 = the first target's listing capture).
+        # The count lives in a file: each call runs in a command substitution.
+        mktemp() {
+            local n=0
+            if [[ -n "${BOOT_MKTEMP_FAIL_NTH:-}" ]]; then
+                echo x >>"$WORK/mktemp.calls"
+                while read -r _; do ((n += 1)); done <"$WORK/mktemp.calls"
+                if ((n == BOOT_MKTEMP_FAIL_NTH)); then
+                    echo "mktemp: failed to create file (stub)" >&2
+                    return 1
+                fi
+            fi
+            command mktemp "$@"
+        }
         declare -A OP_STATUS=()
-        declare -A MOUNT_ROLES=()
+        declare -A MOUNT_ROLES=() TARGET_MOUNTS=()
         read -r -a ALL_TARGET_MOUNTS <<<"${BOOT_MOUNTS:-/mnt/t}"
         for m in "${ALL_TARGET_MOUNTS[@]}"; do
             MOUNT_ROLES[$m]=primary
+            TARGET_MOUNTS["label-${m##*/}"]=$m
         done
         # BOOT_MIRRORS: the mount points among them that are mirrors.
         for m in ${BOOT_MIRRORS:-}; do
@@ -505,13 +536,17 @@ check "boot subvolumes, no mountpoint program: said, with the shell's own words 
     "$(grep -c '\[ERROR\]   Could not tell whether /mnt/t is mounted — .*mountpoint: command not found (exit 127); its boot subvolumes were NOT updated' "$WORK/boot.out")" "1"
 check "boot subvolumes, no mountpoint program: btrfs never asked" "$(boot_btrfs_calls)" "none"
 
-# One target the probe cannot tell about does not stop the others, in either order.
-check "boot subvolumes, first target cannot tell, second mounted: FAIL, the second is still done" \
+# One target the probe cannot tell about fails the WHOLE step, in either order:
+# nothing is asked of btrfs on any target, as the Rust step's (bd azvo).
+check "boot subvolumes, first target cannot tell, second mounted: FAIL, the second is NOT done" \
     "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=mounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot "No btrbk snapshot named 'root-'") $(boot_btrfs_calls)" \
-    "FAIL|0 updated, 1 failed 1 filesystem label /mnt/u;subvolume list /mnt/u;"
-check "boot subvolumes, first target mounted, second cannot tell: FAIL, the first was done" \
+    "FAIL|0 updated, 1 failed 0 none"
+check "boot subvolumes, first target mounted, second cannot tell: FAIL, the first is NOT done" \
     "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=mounted /mnt/u=error" run_boot_subvols "$WORK/none-big.txt") $(said_boot "No btrbk snapshot named 'root-'") $(boot_btrfs_calls)" \
-    "FAIL|0 updated, 1 failed 1 filesystem label /mnt/t;subvolume list /mnt/t;"
+    "FAIL|0 updated, 1 failed 0 none"
+check "boot subvolumes, cannot tell on one target, a replaceable @ on the other: nothing written" \
+    "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=mounted /mnt/u=error" BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "FAIL|0 updated, 1 failed 0 0 0"
 check "boot subvolumes, one target cannot tell, one not mounted: FAIL, counted once" \
     "$(BOOT_MOUNTS="/mnt/t /mnt/u" BOOT_PROBES="/mnt/t=error /mnt/u=notmounted" run_boot_subvols "$WORK/none-big.txt")" "FAIL|0 updated, 1 failed"
 
@@ -1296,8 +1331,8 @@ with_no_fd_to_spare() { # with_no_fd_to_spare <condition> <variable> <value>
         if eval "$1"; then echo match; else echo "no match"; fi
     ) 2>/dev/null
 }
-# The boot step's matcher is latest_boot_snapshot now: a walk by parameter
-# expansion and `[[ =~ ]]`, which need no descriptor either.
+# The boot step's matcher is latest_boot_snapshot now: one word split and
+# `[[ =~ ]]`, which need no descriptor either.
 no_fd_boot_walk() {
     (
         set -euo pipefail
@@ -1496,6 +1531,152 @@ echo "== no producer | grep -q left in scripts/"
 # the shape above. None may come back; a comment may still quote one.
 left="$(awk '!/^[[:space:]]*#/ && /\|[[:space:]]*grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q/ { print FILENAME ":" FNR ": " $0 }' "$ROOT"/scripts/*.sh)"
 check "no 'producer | grep -q' in scripts/" "${left:-none}" "none"
+
+echo "--- tens/azvo: archive destination and symmetry"
+# bd tens: `btrfs subvolume snapshot -r <live> <existing directory>` nests the
+# snapshot inside it and succeeds, so the archive destination is checked
+# (fail-closed, like the live and staging paths) before anything is written.
+no_writes() { echo "$(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')"; }
+check "boot full, the archive destination exists: FAIL, nothing written" \
+    "$(BOOT_PRESENT="/mnt/t/@ /mnt/t/@.archive.*" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot full, the archive destination exists: said, naming it, live left untouched" \
+    "$(said_boot 'archive destination /mnt/t/@.archive.') $(said_boot 'already exists — leaving @ untouched')" "1 1"
+check "boot full, the archive destination is a symlink: FAIL, nothing written" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_SYMLINK="/mnt/t/@.archive.*" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot full, the archive destination cannot be statted: FAIL BEFORE any write" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_STAT_ERR="/mnt/t/@.archive.*" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot full, the archive destination cannot be statted: said" \
+    "$(said_boot 'Cannot tell whether /mnt/t/@.archive.')" "1"
+check "boot full, the archive destination absent (the control): the archive is made" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(snap_calls)" "OK|1 updated, 0 skipped 2"
+check "boot incremental, @ present, an archive path in the way: skipped, never reached" \
+    "$(BOOT_FORCE=false BOOT_PRESENT="/mnt/t/@ /mnt/t/@.archive.*" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "OK|0 updated, 1 skipped 0 0 0"
+
+# bd azvo (i): a symlink at the live path is no subvolume, in either mode.
+check "boot full, a symlink at the live path: FAIL, nothing written" \
+    "$(BOOT_SYMLINK="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot full, a symlink at the live path: said" \
+    "$(said_boot '/mnt/t/@ is a symbolic link, not a subvolume — leaving @ untouched')" "1"
+check "boot incremental, a symlink at the live path: FAIL, not a skip and not a create" \
+    "$(BOOT_FORCE=false BOOT_SYMLINK="/mnt/t/@" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot, a symlink at the live path and a plain directory for the next subvolume: only the first fails" \
+    "$(BOOT_FORCE=false BOOT_SYMLINK="/mnt/t/@" BOOT_PRESENT="/mnt/t/@home" run_boot_subvols "$SHARED") $(said_boot '@home exists, skipping')" \
+    "FAIL|0 updated, 1 failed 1"
+
+# A symlink at <subvol>.new: btrfs subvolume delete follows it, so FAIL before any write.
+check "boot full, a symlink at the staging path: FAIL, nothing written (archive included)" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_SYMLINK="/mnt/t/@.new" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot full, a symlink at the staging path: said" \
+    "$(said_boot '/mnt/t/@.new is a symbolic link, not a staging subvolume — leaving @ untouched')" "1"
+
+# bd azvo (ii): no targets configured is a WARN, with nothing asked of anything.
+check "boot, no targets configured: WARN, not OK" \
+    "$(BOOT_MOUNTS=" " run_boot_subvols "$SHARED")" "WARN|0 updated, 0 skipped, 1 warnings"
+check "boot, no targets configured: said, and neither btrfs nor the plan asked" \
+    "$(said_boot 'No backup targets configured') $(boot_btrfs_calls) $(wc -c <"$WORK/btrdasd.calls")" "1 none 0"
+
+# bd azvo note 2: an unmounted mirror is said (the Rust step's Info line), and
+# still not counted.
+check "boot, a mirror that is not mounted: said, counts unchanged" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot '[INFO]   [/mnt/t] Not mounted — mirror target left alone (independent OS)')" \
+    "OK|0 updated, 0 skipped 1"
+check "boot, a primary that is not mounted: nothing said about a mirror" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot 'mirror target left alone')" \
+    "OK|0 updated, 0 skipped 0"
+check "boot, a primary that is not mounted: said with its configured label, counts unchanged" \
+    "$(BOOT_PROBES="/mnt/t=notmounted" run_boot_subvols "$WORK/none-big.txt") $(said_boot "[INFO]   [/mnt/t] Not mounted — boot subvolumes not updated on 'label-t'")" \
+    "OK|0 updated, 0 skipped 1"
+
+# bd azvo (iv): the listing path is the last whitespace-delimited field,
+# trailing whitespace and CR dropped; the same rows the Rust suite asserts.
+check "shared listing: a trailing space on the line" "$(latest_of nvme sp-)" "nvme/sp-.20261001T0100"
+check "shared listing: a trailing tab on the line" "$(latest_of nvme tb-)" "nvme/tb-.20261001T0100"
+check "shared listing: a trailing CR on the line (CRLF)" "$(latest_of nvme cr-)" "nvme/cr-.20261001T0100"
+
+# ---------------------------------------------------------------------------
+echo "--- 5bwi/nqbb: linear walk and boot coverage"
+# ---------------------------------------------------------------------------
+# 5bwi: the listing walk is one word split, so its cost grows with the listing
+# and not with its square (0.27 s at 1,500 lines, 27 s at 15,000 before). The
+# checks: the answer at the three sizes the cost was measured at, the match
+# last (the whole listing must be read), and a wall-clock bound generous for a
+# loaded host yet far below the quadratic's time at 15,000 lines.
+walk_big() { # walk_big <lines>: the answer, the match being the listing's last line
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        listing="$(filler "$1")"$'\n''ID 900 gen 9 top level 5 path nvme/root-.20261010T0100'
+        latest_boot_snapshot "$listing" root- nvme
+        printf '%s' "$LATEST_BOOT_SNAPSHOT"
+    )
+}
+for n in 1500 5000 15000; do
+    start=$EPOCHREALTIME
+    got="$(walk_big "$n")"
+    end=$EPOCHREALTIME
+    check "walk, $n lines with the match last: found" "$got" "nvme/root-.20261010T0100"
+    # EPOCHREALTIME is "sec.usec": dropping the point leaves microseconds.
+    us=$((${end/./} - ${start/./}))
+    verdict=fast
+    ((us < 5000000)) || verdict="slow: $us us"
+    check "walk, $n lines: under 5 s (the quadratic walk took 0.6 s, 9 s and 89 s at these sizes)" "$verdict" "fast"
+done
+# The word split must neither glob nor lose a field, and must leave the
+# caller's globbing setting as it found it.
+glob_probe() { # glob_probe <noglob|glob>: "<answer> <globbing after>"
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/latest_boot_snapshot.sh"
+        [[ $1 == noglob ]] && set -f
+        listing=$'ID 1 gen 9 top level 5 path *\n\n*\nID 2 gen 9 top level 5 path nvme/root-.20261010T0100\n?'
+        cd "$WORK"
+        latest_boot_snapshot "$listing" root- nvme
+        if [[ $- == *f* ]]; then g=off; else g=on; fi
+        printf '%s globbing-%s' "$LATEST_BOOT_SNAPSHOT" "$g"
+    )
+}
+check "walk: glob characters and blank lines in a listing change nothing; globbing was on, stays on" \
+    "$(glob_probe glob)" "nvme/root-.20261010T0100 globbing-on"
+check "walk: globbing was off, stays off" \
+    "$(glob_probe noglob)" "nvme/root-.20261010T0100 globbing-off"
+
+# nqbb (b): a mirror target whose listing WOULD match, full run, live present:
+# it is skipped before anything is listed, and nothing on it is written.
+check "boot full, mirror, listing that matches, live present: skipped, nothing written" \
+    "$(BOOT_MIRRORS=/mnt/t BOOT_PRESENT="/mnt/t/@ /mnt/t/@home" run_boot_subvols "$SHARED") $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "OK|0 updated, 1 skipped 0 0 0"
+check "boot full, mirror: the listing is never even read" "$(calls_of 'subvolume list')" "0"
+# nqbb (c): full run, live absent: one create from the newest snapshot, no archive.
+check "boot full, live absent: created, counted" \
+    "$(BOOT_PLAN=$ONE run_boot_subvols "$SHARED")" "OK|1 updated, 0 skipped"
+check "boot full, live absent: exactly one create, from the newest snapshot, no delete, rename or archive" \
+    "$(boot_seq)" "subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@;"
+# nqbb (d): the create itself fails: FAIL, nothing else called.
+check "boot full, live absent, the create fails: FAIL, counted" \
+    "$(BOOT_FAIL_ON="snapshot /mnt/t/nvme" BOOT_PLAN=$ONE run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot full, live absent, the create fails: only the one attempt, nothing deleted or renamed" \
+    "$(boot_seq) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "subvolume snapshot /mnt/t/nvme/root-.20261005T0100_1 /mnt/t/@; 0 0"
+check "boot full, live absent, the create fails: said" \
+    "$(said_boot 'Failed to create @ from nvme/root-.20261005T0100_1')" "1"
+# nqbb (e): the listing's temp file cannot be made: FAIL for the target, and
+# btrfs is never asked for the listing (the plan's own mktemp is the first).
+check "boot, the listing's mktemp fails: FAIL for the target, counted once" \
+    "$(BOOT_MKTEMP_FAIL_NTH=2 run_boot_subvols "$SHARED")" "FAIL|0 updated, 1 failed"
+check "boot, the listing's mktemp fails: said, and no listing, snapshot, delete or rename" \
+    "$(said_boot 'Could not make a temp file to list its subvolumes') $(calls_of 'subvolume list') $(snap_calls) $(calls_of 'subvolume delete') $(calls_of '^mv')" \
+    "1 0 0 0 0"
+check "boot, the plan's mktemp fails: FAIL, nothing asked of btrfs" \
+    "$(BOOT_MKTEMP_FAIL_NTH=1 run_boot_subvols "$SHARED") $(boot_btrfs_calls)" "FAIL|0 updated, 1 failed none"
 
 echo ""
 echo "passed=$pass failed=$fail"

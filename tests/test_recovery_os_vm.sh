@@ -409,12 +409,23 @@ case "$cmd" in
         # reset (a line in reboots.pending), until it is ended -- or dies.
         [[ "$*" == "--domain recovery-os-updater --event reboot --loop" ]] || { echo "UNEXPECTED event $*" >>"$S/forbidden"; exit 99; }
         echo $$ >>"$S/event.pids"
-        # The driver is the reset watch's parent: whether it still runs when
-        # this ends says whether the driver ended it on its way out.
-        st=$(<"/proc/$PPID/stat")
-        read -r _ driver _ <<<"${st##*) }"
+        # The driver starts this itself, beside the reset watch that reads it:
+        # whether the driver still runs when this ends says whether the
+        # driver ended it on its way out.
+        driver=$PPID
         echo "started" >>"$S/event.log"
-        trap 'if [[ -d /proc/$driver ]] && ! grep -q "^State:[[:space:]]*Z" "/proc/$driver/status" 2>/dev/null; then echo "ended while the driver ran" >>"$S/event.log"; else echo "ended after the driver" >>"$S/event.log"; fi; exit 0' TERM INT HUP
+        # Slow to end on a signal (event_slow_end), as on a loaded host: the
+        # driver must wait for it, not kill it -- killed, it can say nothing.
+        # Or deaf to SIGTERM (event_ignores_term): only a SIGKILL ends it.
+        # It ends once: a second signal while it ends (a Ctrl-C reaches it
+        # beside the watch's SIGTERM) is not a second end.
+        slow=0
+        [[ ! -f "$S/event_slow_end" ]] || slow=1
+        trap 'trap "" TERM INT HUP; ((slow == 0)) || sleep 1; if [[ -d /proc/$driver ]] && ! grep -q "^State:[[:space:]]*Z" "/proc/$driver/status" 2>/dev/null; then echo "ended while the driver ran" >>"$S/event.log"; else echo "ended after the driver" >>"$S/event.log"; fi; exit 0' TERM INT HUP
+        [[ ! -f "$S/event_ignores_term" ]] || trap '' TERM
+        # A SIGTERM to the driver the moment this exists (event_terms_driver):
+        # as close to this virsh's start as an interrupt can come from here.
+        [[ ! -f "$S/event_terms_driver" ]] || kill -TERM "$driver"
         if [[ -f "$S/event_dies" ]]; then echo "error: internal error: client socket is closed" >&2; exit 1; fi
         n=0
         while :; do
@@ -1014,6 +1025,63 @@ watch_ended() {
     started=$(grep -c '^started$' "$S/event.log" 2>/dev/null) || started=0
     ended=$(grep -c '^ended while the driver ran$' "$S/event.log" 2>/dev/null) || ended=0
     echo "$started started, $ended ended by the driver"
+}
+
+# The reset watch of driver $2: the child of it that reads the output of
+# virsh event $1 -- holds the read end of that virsh's stdout -- found by
+# provenance, never by name. Fails when there is none.
+reset_watch_of() {
+    local epid=$1 dpid=$2 pipe p st ppid f
+    pipe=$(readlink "/proc/$epid/fd/1") || return 1
+    [[ "$pipe" == pipe:* ]] || return 1
+    for p in /proc/[0-9]*; do
+        p=${p#/proc/}
+        [[ "$p" != "$epid" ]] || continue
+        { read -r st <"/proc/$p/stat"; } 2>/dev/null || continue
+        read -r _ ppid _ <<<"${st##*) }"
+        [[ "$ppid" == "$dpid" ]] || continue
+        for f in "/proc/$p/fd/"*; do
+            if [[ "$(readlink "$f" 2>/dev/null)" == "$pipe" ]]; then
+                echo "$p"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# The driver in the background; once it waits for the guest, its reset watch
+# is stopped (SIGSTOP) and never let go -- a watch that cannot end on the
+# SIGTERM it is sent -- and the driver runs on to its end, 60 s at most.
+# WATCH_PID is the watch it stopped ("" when none was found).
+run_watch_hung() {
+    local i dpid epid
+    RC=0 WATCH_PID=""
+    set -m
+    driver_env bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
+    dpid=$!
+    set +m
+    for ((i = 0; i < 200; i++)); do
+        grep -q 'waiting for the recovery OS to power off' "$T/driver.out" && break
+        sleep 0.05
+    done
+    epid=$(head -n 1 "$S/event.pids") || epid=""
+    if [[ -n "$epid" ]] && WATCH_PID=$(reset_watch_of "$epid" "$dpid"); then
+        kill -STOP "$WATCH_PID"
+    else
+        WATCH_PID=""
+        echo "(the reset watch was not found: no child of the driver $dpid reads virsh event $epid)" >>"$T/driver.out"
+    fi
+    for ((i = 0; i < 1200; i++)); do
+        kill -0 "$dpid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if kill -0 "$dpid" 2>/dev/null; then
+        kill -KILL -- "-$dpid" 2>/dev/null || :
+        echo "(the driver did not end within 60s)" >>"$T/driver.out"
+    fi
+    wait "$dpid" || RC=$?
+    OUT="$(cat "$T/driver.out")"
 }
 
 # ============================================================================
@@ -3101,6 +3169,107 @@ has "paused after a failed resume: resume it first" "$OUT" "virsh --connect qemu
 lacks "paused after a failed resume: never systemctl poweroff in a paused guest" "$OUT" "systemctl poweroff"
 has "paused after a failed resume: or destroy, as the operator's choice" "$OUT" "on one side, a paused recovery OS that may have run"
 
+echo "--- lorz: the reset watch's virsh is waited for, and killed only past its time"
+# Whether the reset watch's virsh (the first the stub recorded) still runs.
+event_virsh_state() {
+    local pid st
+    pid=$(head -n 1 "$S/event.pids") || pid=""
+    [[ -n "$pid" ]] || { echo "never started"; return; }
+    [[ -d "/proc/$pid" ]] || { echo gone; return; }
+    st=$(awk '/^State:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || st=""
+    case "$st" in
+    Z) echo gone ;;
+    "") if [[ -d "/proc/$pid" ]]; then echo "unreadable"; else echo gone; fi ;;
+    *) echo "still runs ($st)" ;;
+    esac
+}
+# How many of this fixture's stub virsh event processes run (not zombies):
+# found by their command line, which names this fixture's own stub, so one
+# that never got as far as writing its pid down is counted too.
+virsh_events_left() {
+    local p cmd st n=0 args=()
+    for p in /proc/[0-9]*; do
+        { mapfile -d '' -t args <"$p/cmdline"; } 2>/dev/null || continue
+        cmd="${args[*]} "
+        [[ "$cmd" == *"$T/bin/virsh "*" event "* ]] || continue
+        { read -r st <"$p/stat"; } 2>/dev/null || continue
+        st=${st##*) }
+        [[ "${st%% *}" == Z ]] || n=$((n + 1))
+    done
+    echo "$n"
+}
+# Slow to end on the SIGTERM it was sent, as on a loaded host: waited for,
+# so it ends on that signal -- killed at once, it could say nothing, and the
+# driver went on before it had gone.
+fixture
+touch "$S/event_slow_end"
+run_driver session A
+check "a virsh slow to end: exit 0" "$RC" "0"
+check "a virsh slow to end: the reset watch ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
+check "a virsh slow to end: gone when the driver ended" "$(event_virsh_state)" "gone"
+# The same where the session is kept (the guard and its files stay).
+fixture
+touch "$S/event_slow_end"
+printf 'running\n' >"$S/states.running"
+run_driver session A --timeout 1
+check "a virsh slow to end, session kept: exit 3" "$RC" "3"
+check "a virsh slow to end, session kept: the reset watch ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
+check "a virsh slow to end, session kept: gone when the driver ended" "$(event_virsh_state)" "gone"
+# Deaf to SIGTERM: killed past its time, and gone before the driver ends.
+fixture
+touch "$S/event_ignores_term"
+run_driver session A
+check "a virsh deaf to SIGTERM: exit 0" "$RC" "0"
+check "a virsh deaf to SIGTERM: killed before the driver ended" "$(event_virsh_state)" "gone"
+check "a virsh deaf to SIGTERM: killed, it said nothing" "$(watch_ended)" "1 started, 0 ended by the driver"
+# The watch itself cannot end on its SIGTERM (stopped, and never let go):
+# killed past its time, and the virsh -- which it never told -- ended by the
+# driver's own SIGTERM, on which it says it ended.
+fixture
+for ((i = 0; i < 60; i++)); do echo running; done >"$S/states.running"
+echo "shut off" >>"$S/states.running"
+run_watch_hung session A
+check "a watch that cannot end: found, and stopped" "${WATCH_PID:+found}" "found"
+check "a watch that cannot end: exit 0" "$RC" "0"
+check "a watch that cannot end: killed before the driver ended" "$(if [[ -n "$WATCH_PID" && -d "/proc/$WATCH_PID" ]]; then echo "still there"; else echo gone; fi)" "gone"
+check "a watch that cannot end: its virsh ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
+check "a watch that cannot end: its virsh gone when the driver ended" "$(event_virsh_state)" "gone"
+# A SIGTERM to the driver the moment its virsh exists -- the start of the
+# watch is no window in which that virsh can be lost: ended by the driver,
+# and gone when it ends.
+fixture
+touch "$S/event_terms_driver"
+run_driver session A
+check "a SIGTERM as the virsh starts: the virsh ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
+check "a SIGTERM as the virsh starts: gone when the driver ended" "$(event_virsh_state)" "gone"
+check "a SIGTERM as the virsh starts: nothing forbidden" "$(file "$S/forbidden")" ""
+# No stub can reach the one window left -- the virsh started, its pid not yet
+# taken from $! -- so this test's copy of the driver signals itself there:
+# the trap runs between those two commands, and on_exit must still find the
+# virsh, end it, and leave nothing running.
+fixture
+sed -i '/^    RESET_VIRSH_PID=\$!$/i\    kill -TERM $$' "$DRIVER"
+check "a SIGTERM before the virsh's pid is taken: injected, once" "$(grep -c '^    kill -TERM \$\$$' "$DRIVER")" "1"
+run_driver session A
+# Ended so soon, it may not have become virsh yet, nor said it started: what
+# counts is that none of this fixture's runs on.
+check "a SIGTERM before the virsh's pid is taken: no virsh event left running" "$(virsh_events_left)" "0"
+check "a SIGTERM before the virsh's pid is taken: nothing forbidden" "$(file "$S/forbidden")" ""
+# The same while the virsh is still forked but not yet virsh (held there a
+# second, in this copy only): its command line is still the driver's, so it
+# is known to run by being the driver's child, not by its name -- or it would
+# be waited for, and become a virsh no one ends.
+fixture
+# shellcheck disable=SC2016 # lines of the driver, matched and inserted as written
+sed -i -e '/^    RESET_VIRSH_PID=\$!$/i\    kill -TERM $$' \
+    -e '/^        exec virsh --connect "\$LIBVIRT_URI" event /i\        sleep 1' "$DRIVER"
+check "a SIGTERM before the virsh has become virsh: injected, once each" \
+    "$(grep -c '^    kill -TERM \$\$$' "$DRIVER") $(grep -c '^        sleep 1$' "$DRIVER")" "1 1"
+DRIVER_TIMEOUT=20 run_driver session A
+check "a SIGTERM before the virsh has become virsh: the driver ended (not timed out)" "$([[ "$RC" != 124 ]] && echo ended)" "ended"
+sleep 1.5
+check "a SIGTERM before the virsh has become virsh: no virsh event left running" "$(virsh_events_left)" "0"
+
 echo "--- N4: status counts silence (it cannot see resets); information only"
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
@@ -3164,7 +3333,7 @@ echo "--- round 4: a reset the watch read late is still a reset (I-1)"
 # reset (WATCH_FIRST, the default), then the driver -- or both at once
 # (WATCH_FIRST=no). The driver then runs to its end.
 run_watch_stopped() {
-    local i dpid epid wpid ppid
+    local i dpid epid wpid
     RC=0
     set -m
     driver_env bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
@@ -3176,10 +3345,9 @@ run_watch_stopped() {
     done
     sleep 0.3
     epid=$(head -n 1 "$S/event.pids")
-    wpid=$(awk '{print $4}' "/proc/$epid/stat")
-    ppid=$(awk '{print $4}' "/proc/$wpid/stat")
-    if [[ "$ppid" != "$dpid" ]]; then
-        echo "(the reset watch was not found: $epid's parent $wpid has parent $ppid, not the driver $dpid)" >>"$T/driver.out"
+    if ! wpid=$(reset_watch_of "$epid" "$dpid"); then
+        echo "(the reset watch was not found: no child of the driver $dpid reads virsh event $epid)" >>"$T/driver.out"
+        wpid=$dpid
     fi
     kill -STOP "$dpid" "$wpid"
     echo reset >>"$S/reboots.pending"
