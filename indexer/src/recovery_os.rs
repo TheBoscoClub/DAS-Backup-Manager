@@ -4703,6 +4703,44 @@ mod tests {
     }
 
     #[test]
+    fn the_guest_agents_unit_and_rule_must_be_regular_files() {
+        // The unit a link (to a real file, even): not the package's unit.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        let unit = dir.path().join(VENDOR).join("qemu-guest-agent.service");
+        let elsewhere = dir.path().join("elsewhere.service");
+        fs::rename(&unit, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &unit).unwrap();
+        assert_eq!(
+            inspect(dir.path()).guest_agent,
+            agent(
+                true,
+                false,
+                "usr/lib/systemd/system/qemu-guest-agent.service is not there as a file"
+            )
+        );
+        // The rule a directory, the unit not enabled: nothing starts it.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        let rule = dir
+            .path()
+            .join("usr/lib/udev/rules.d/99-qemu-guest-agent.rules");
+        fs::remove_file(&rule).unwrap();
+        fs::create_dir(&rule).unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(
+                true,
+                false,
+                "not enabled, and usr/lib/udev/rules.d/99-qemu-guest-agent.rules, which would \
+                 start it, is not there as a file"
+            )
+        );
+        assert!(!os.guest_agent.runs_at_boot());
+    }
+
+    #[test]
     fn the_guest_agent_is_unknown_when_pacmans_database_is_not_whole() {
         // An entry without its desc might be the agent's.
         let dir = tempfile::tempdir().unwrap();
