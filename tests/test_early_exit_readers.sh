@@ -1569,6 +1569,13 @@ check "boot, a symlink at the live path and a plain directory for the next subvo
     "$(BOOT_FORCE=false BOOT_SYMLINK="/mnt/t/@" BOOT_PRESENT="/mnt/t/@home" run_boot_subvols "$SHARED") $(said_boot '@home exists, skipping')" \
     "FAIL|0 updated, 1 failed 1"
 
+# A symlink at <subvol>.new: btrfs subvolume delete follows it, so FAIL before any write.
+check "boot full, a symlink at the staging path: FAIL, nothing written (archive included)" \
+    "$(BOOT_PRESENT="/mnt/t/@" BOOT_SYMLINK="/mnt/t/@.new" BOOT_PLAN=$ONE run_boot_subvols "$SHARED") $(no_writes)" \
+    "FAIL|0 updated, 1 failed 0 0 0"
+check "boot full, a symlink at the staging path: said" \
+    "$(said_boot '/mnt/t/@.new is a symbolic link, not a staging subvolume — leaving @ untouched')" "1"
+
 # bd azvo (ii): no targets configured is a WARN, with nothing asked of anything.
 check "boot, no targets configured: WARN, not OK" \
     "$(BOOT_MOUNTS=" " run_boot_subvols "$SHARED")" "WARN|0 updated, 0 skipped, 1 warnings"
