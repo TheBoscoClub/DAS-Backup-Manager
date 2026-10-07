@@ -3558,7 +3558,8 @@ report_unrecorded_run() {
 # FAILED, else 0 — a WARN (a stale recovery OS) is not a failure. The same
 # test run_status() makes for the history row and generate_report() for its
 # status line, on the operations recorded by then. Three FAILs can come after
-# the report is built: email delivery (the history row then says FAILURE),
+# the report is built: email delivery when the report could not be saved
+# either (a saved report that was not mailed is only a WARN, bd dlpr),
 # the history record itself (report_unrecorded_run sends the report again
 # saying so), and, with email off, a report that could not be saved either
 # (send_report records it; the row says FAILURE and why, while the journal's
@@ -4078,11 +4079,21 @@ main() {
         if ! send_report "$report" "$(subject_status)"; then
             # With email off, send_report fails only when the report could
             # not be saved either, and records that itself (round 4, N4).
+            # With email on, a failed send whose report WAS saved loses only
+            # delivery: a WARN, and the run's status stands — the same rule as
+            # the CLI/GUI path (operator decision 2026-10-07, bd
+            # DAS-Backup-Manager-dlpr). Saved nowhere and sent nowhere is a FAIL.
             if [[ "${DAS_EMAIL_ENABLED:-false}" == "true" ]]; then
                 log_warn "Email delivery failed (run status was: $overall_status)"
-                record_op "email" "FAIL" "delivery failed; $(report_whereabouts)"
+                if [[ "$REPORT_SAVED" == "true" ]]; then
+                    record_op "email" "WARN" "delivery failed; $(report_whereabouts)"
+                else
+                    record_op "email" "FAIL" "delivery failed; $(report_whereabouts)"
+                    overall_status="FAILURE"
+                fi
+            else
+                overall_status="FAILURE"
             fi
-            overall_status="FAILURE"
         fi
         # From here an abort has a report already: cleanup() sends no
         # ABORTED one (bd DAS-Backup-Manager-2my).

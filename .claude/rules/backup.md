@@ -143,7 +143,8 @@ Checked before any directory is created, both roots compared **after resolution*
 - The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only. A
   write that fails is logged as such, and the not-emailed lines then name the journal instead.
   With email off, an unsavable report is a FAIL (exit 3, `report:` in the row): the journal has
-  the only copy.
+  the only copy. **One rule on both paths** (operator, 2026-10-07, bd `dlpr`): a failed email
+  beside a saved report is a WARN, the run's status stands; saved nowhere and mailed nowhere is a FAIL.
 - **Unattended (no-session) delivery is proven in production — do not re-test it.**
 - Diagnose with `journalctl -u das-backup`, `journalctl -u postfix`, `mailq`. `status=sent` means
   the provider accepted it, not that it reached the inbox.

@@ -1488,12 +1488,13 @@ check "abort, relay stalls: the stalled mailx is gone" "$(mail_stubs_gone)" "yes
 fresh
 knob mail_stalls 1
 run_backup_within 30
-check "clean run, relay stalls: exit status (email FAILED)" "$RC" "3"
+check "clean run, relay stalls: exit status (report saved, email only a WARN — dlpr)" "$RC" "0"
 show_tail 3
 check "clean run, relay stalls: over within the bound" "$((ELAPSED <= 15))" "1"
 check "clean run, relay stalls: says why it was not emailed" \
     "$(grep -c 'did not finish within 2 s' "$STATE/out")" "1"
-check "clean run, relay stalls: recorded as failed" "$(recorded_as)" "failure"
+check "clean run, relay stalls: recorded as a success (report saved — dlpr)" "$(recorded_as)" "success"
+check "clean run, relay stalls: the failed delivery is still logged" "$(grep -c "Email delivery failed" "$STATE/out")" "1"
 check "clean run, relay stalls: nothing left mounted" "$(left_mounted)" "nothing"
 check "clean run, relay stalls: both locks free" "$(locks_free)" "yes"
 check "clean run, relay stalls: the stalled mailx is gone" "$(mail_stubs_gone)" "yes"
@@ -1503,7 +1504,7 @@ check "clean run, relay stalls: the stalled mailx is gone" "$(mail_stubs_gone)" 
 fresh
 knob mail_stall_escapes 1
 run_backup_within 30
-check "clean run, mail helper escapes: exit status" "$RC" "3"
+check "clean run, mail helper escapes: exit status (report saved — dlpr)" "$RC" "0"
 show_tail 3
 check "clean run, mail helper escapes: over within the bound" "$((ELAPSED <= 15))" "1"
 check "clean run, mail helper escapes: the helper is still alive" \
