@@ -161,6 +161,38 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
         runBackup(false);
     });
 
+    // Buttons follow the state of this panel's own backup job, nothing else
+    // (bd DAS-Backup-Manager-fy2h). jobStarted names the job; jobFinished for
+    // any other job (index walk, restore) and errors of any other operation
+    // (ConfigGet, health...) say nothing about it and must not re-enable Run.
+    connect(m_client, &DBusClient::jobStarted, this,
+            [this](const QString &jobId, const QString &operation) {
+                if (!(m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun")))
+                    return;
+                // jobStarted comes from the method reply, JobFinished from the
+                // job thread's own signal: a job that ends at once (a refusal)
+                // can finish first.
+                if (m_earlyFinished.contains(jobId))
+                    jobEnded();
+                else
+                    m_jobId = jobId;
+            });
+    connect(m_client, &DBusClient::jobFinished, this,
+            [this](const QString &jobId, bool /*success*/, const QString & /*summary*/) {
+                if (!m_jobRunning)
+                    return;
+                if (m_jobId.isEmpty())
+                    m_earlyFinished.insert(jobId); // not yet named: remember it
+                else if (jobId == m_jobId)
+                    jobEnded();
+            });
+    connect(m_client, &DBusClient::errorOccurred, this,
+            [this](const QString &operation, const QString & /*error*/) {
+                // The call itself failed (e.g. polkit denied): no job exists
+                if (m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun"))
+                    jobEnded();
+            });
+
     // Populate sources and targets from config
     loadConfig();
 }
@@ -174,16 +206,19 @@ void BackupPanel::applyConfig(const QString &toml)
 {
     m_bootEnabledInConfig = true;
 
-    // Clear any previously created dynamic checkboxes
-    for (QCheckBox *cb : std::as_const(m_sourceChecks)) {
-        cb->deleteLater();
-    }
+    // Empty both groups first: the boxes and the placeholder labels alike.
+    // Deleted now, not deleteLater(): a deferred delete leaves the old widgets
+    // as children (and in the layout) until the event loop runs, so a reload
+    // would show every row twice in the meantime (bd DAS-Backup-Manager-pxq3).
     m_sourceChecks.clear();
-
-    for (QCheckBox *cb : std::as_const(m_targetChecks)) {
-        cb->deleteLater();
-    }
     m_targetChecks.clear();
+    for (QGroupBox *group : {m_sourcesGroup, m_targetsGroup}) {
+        QLayout *layout = group->layout();
+        while (QLayoutItem *item = layout->takeAt(0)) {
+            delete item->widget();
+            delete item;
+        }
+    }
 
     if (toml.isEmpty()) {
         auto *errLabel = new QLabel(i18n("Could not load configuration"), m_sourcesGroup);
@@ -252,6 +287,14 @@ void BackupPanel::applyConfig(const QString &toml)
         }
     }
     updateBootArchive();
+    updateRunEnabled();
+}
+
+void BackupPanel::jobEnded()
+{
+    m_jobRunning = false;
+    m_jobId.clear();
+    m_earlyFinished.clear();
     updateRunEnabled();
 }
 
@@ -329,24 +372,13 @@ void BackupPanel::runBackup(bool dryRun)
     if (sources.isEmpty() || targets.isEmpty() || !steps.runsBtrbk())
         return;
 
+    // Disabled from here until THIS job finishes (see the connections in the
+    // constructor): the id is learned from jobStarted, and until then any
+    // BackupRun error ends it.
     m_jobRunning = true;
+    m_jobId.clear();
+    m_earlyFinished.clear();
     updateRunEnabled();
-
-    // Re-enable the buttons once the job completes (success or failure)
-    connect(m_client, &DBusClient::jobFinished, this,
-            [this](const QString & /*jobId*/, bool /*success*/, const QString & /*summary*/) {
-                m_jobRunning = false;
-                updateRunEnabled();
-            },
-            Qt::SingleShotConnection);
-
-    // Re-enable buttons if the D-Bus call itself fails (e.g. polkit denied)
-    connect(m_client, &DBusClient::errorOccurred, this,
-            [this](const QString & /*operation*/, const QString & /*error*/) {
-                m_jobRunning = false;
-                updateRunEnabled();
-            },
-            Qt::SingleShotConnection);
 
     m_client->backupRun(mode, sources, targets, dryRun, steps);
 }

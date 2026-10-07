@@ -22,6 +22,8 @@
 #include <QAbstractItemModel>
 #include <QJsonValue>
 #include <QCheckBox>
+#include <QGroupBox>
+#include <QLabel>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QTableView>
@@ -528,6 +530,126 @@ private Q_SLOTS:
         p.full->setChecked(true);
         p.incremental->setChecked(true);
         QVERIFY(!p.boot->isChecked());
+    }
+
+    // Rows the panel shows now (no event-loop turn: a deferred delete must not count)
+    static int rowsShown(BackupPanel &panel, int &boxes, int &labels)
+    {
+        boxes = 0;
+        labels = 0;
+        const auto groups = panel.findChildren<QGroupBox *>();
+        for (QGroupBox *g : groups) {
+            if (g->title() != QLatin1String("Sources") && g->title() != QLatin1String("Targets"))
+                continue;
+            boxes += g->findChildren<QCheckBox *>().size();
+            labels += g->findChildren<QLabel *>().size();
+        }
+        return boxes + labels;
+    }
+
+    void panelReloadDoesNotDuplicateRows()
+    {
+        DBusClient client;
+        BackupPanel panel(&client);
+        int boxes = 0, labels = 0;
+        // No helper: loadConfig() takes the placeholder-label path
+        rowsShown(panel, boxes, labels);
+        QCOMPARE(labels, 2);
+        QMetaObject::invokeMethod(&panel, "loadConfig", Qt::DirectConnection);
+        rowsShown(panel, boxes, labels);
+        QCOMPARE(labels, 2);
+
+        panel.applyConfig(liveShapedConfig());
+        rowsShown(panel, boxes, labels);
+        const int firstBoxes = boxes;
+        QVERIFY(firstBoxes > 0);
+        QCOMPARE(labels, 0);
+        panel.applyConfig(liveShapedConfig());
+        rowsShown(panel, boxes, labels);
+        QCOMPARE(boxes, firstBoxes);
+        QCOMPARE(labels, 0);
+        QMetaObject::invokeMethod(&panel, "loadConfig", Qt::DirectConnection);
+        rowsShown(panel, boxes, labels);
+        QCOMPARE(boxes, 0);
+        QCOMPARE(labels, 2);
+    }
+
+    void panelButtonsFollowTheBackupJob()
+    {
+        DBusClient client;
+        BackupPanel panel(&client);
+        panel.applyConfig(liveShapedConfig());
+        const PanelParts p = partsOf(panel);
+        QVERIFY(p.ok());
+        QVERIFY(p.run->isEnabled());
+
+        p.run->click(); // job requested
+        QVERIFY(!p.run->isEnabled());
+        QVERIFY(!p.dryRun->isEnabled());
+        Q_EMIT client.jobStarted(QStringLiteral("job-1"), QStringLiteral("BackupRun"));
+        QVERIFY(!p.run->isEnabled());
+
+        // Selection toggles meanwhile
+        const auto boxes = panel.findChildren<QCheckBox *>();
+        for (QCheckBox *cb : boxes) {
+            if (!cb->property("originalLabel").isValid())
+                continue;
+            cb->setChecked(false);
+            cb->setChecked(true);
+        }
+        p.send->setChecked(false);
+        p.send->setChecked(true);
+        QVERIFY(!p.run->isEnabled());
+        QVERIFY(!p.dryRun->isEnabled());
+
+        // A config reload meanwhile
+        panel.applyConfig(liveShapedConfig());
+        QVERIFY(!p.run->isEnabled());
+
+        // Another operation failing, or another job finishing, is not this job ending
+        Q_EMIT client.errorOccurred(QStringLiteral("ConfigGet"), QStringLiteral("x"));
+        QVERIFY(!p.run->isEnabled());
+        Q_EMIT client.jobFinished(QStringLiteral("job-other"), true, QString());
+        QVERIFY(!p.run->isEnabled());
+
+        // This job finishing is
+        Q_EMIT client.jobFinished(QStringLiteral("job-1"), true, QString());
+        QVERIFY(p.run->isEnabled());
+        QVERIFY(p.dryRun->isEnabled());
+    }
+
+    void panelButtonsComeBackWhenTheJobFinishesBeforeItsReply()
+    {
+        DBusClient client;
+        BackupPanel panel(&client);
+        panel.applyConfig(liveShapedConfig());
+        const PanelParts p = partsOf(panel);
+        QVERIFY(p.ok());
+        p.run->click();
+        QVERIFY(!p.run->isEnabled());
+        // A refusal ends at once: the signal beats the method reply
+        Q_EMIT client.jobFinished(QStringLiteral("job-9"), false, QStringLiteral("refused"));
+        Q_EMIT client.jobStarted(QStringLiteral("job-9"), QStringLiteral("BackupRun"));
+        QVERIFY(p.run->isEnabled());
+        QVERIFY(p.dryRun->isEnabled());
+        // Counter-case: a finish for a different id does not end the next job
+        p.run->click();
+        Q_EMIT client.jobFinished(QStringLiteral("job-other"), true, QString());
+        Q_EMIT client.jobStarted(QStringLiteral("job-10"), QStringLiteral("BackupRun"));
+        QVERIFY(!p.run->isEnabled());
+    }
+
+    void panelButtonsComeBackWhenTheCallItselfFails()
+    {
+        DBusClient client;
+        BackupPanel panel(&client);
+        panel.applyConfig(liveShapedConfig());
+        const PanelParts p = partsOf(panel);
+        QVERIFY(p.ok());
+        p.run->click();
+        QVERIFY(!p.run->isEnabled());
+        Q_EMIT client.errorOccurred(QStringLiteral("BackupRun"), QStringLiteral("denied"));
+        QVERIFY(p.run->isEnabled());
     }
 };
 
