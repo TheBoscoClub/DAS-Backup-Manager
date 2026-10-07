@@ -618,6 +618,27 @@ private Q_SLOTS:
         QVERIFY(p.dryRun->isEnabled());
     }
 
+    void panelButtonsComeBackWhenTheJobFinishesBeforeItsReply()
+    {
+        DBusClient client;
+        BackupPanel panel(&client);
+        panel.applyConfig(liveShapedConfig());
+        const PanelParts p = partsOf(panel);
+        QVERIFY(p.ok());
+        p.run->click();
+        QVERIFY(!p.run->isEnabled());
+        // A refusal ends at once: the signal beats the method reply
+        Q_EMIT client.jobFinished(QStringLiteral("job-9"), false, QStringLiteral("refused"));
+        Q_EMIT client.jobStarted(QStringLiteral("job-9"), QStringLiteral("BackupRun"));
+        QVERIFY(p.run->isEnabled());
+        QVERIFY(p.dryRun->isEnabled());
+        // Counter-case: a finish for a different id does not end the next job
+        p.run->click();
+        Q_EMIT client.jobFinished(QStringLiteral("job-other"), true, QString());
+        Q_EMIT client.jobStarted(QStringLiteral("job-10"), QStringLiteral("BackupRun"));
+        QVERIFY(!p.run->isEnabled());
+    }
+
     void panelButtonsComeBackWhenTheCallItselfFails()
     {
         DBusClient client;

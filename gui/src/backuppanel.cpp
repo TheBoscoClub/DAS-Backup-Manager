@@ -167,12 +167,23 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     // (ConfigGet, health...) say nothing about it and must not re-enable Run.
     connect(m_client, &DBusClient::jobStarted, this,
             [this](const QString &jobId, const QString &operation) {
-                if (m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun"))
+                if (!(m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun")))
+                    return;
+                // jobStarted comes from the method reply, JobFinished from the
+                // job thread's own signal: a job that ends at once (a refusal)
+                // can finish first.
+                if (m_earlyFinished.contains(jobId))
+                    jobEnded();
+                else
                     m_jobId = jobId;
             });
     connect(m_client, &DBusClient::jobFinished, this,
             [this](const QString &jobId, bool /*success*/, const QString & /*summary*/) {
-                if (m_jobRunning && !m_jobId.isEmpty() && jobId == m_jobId)
+                if (!m_jobRunning)
+                    return;
+                if (m_jobId.isEmpty())
+                    m_earlyFinished.insert(jobId); // not yet named: remember it
+                else if (jobId == m_jobId)
                     jobEnded();
             });
     connect(m_client, &DBusClient::errorOccurred, this,
@@ -283,6 +294,7 @@ void BackupPanel::jobEnded()
 {
     m_jobRunning = false;
     m_jobId.clear();
+    m_earlyFinished.clear();
     updateRunEnabled();
 }
 
@@ -365,6 +377,7 @@ void BackupPanel::runBackup(bool dryRun)
     // BackupRun error ends it.
     m_jobRunning = true;
     m_jobId.clear();
+    m_earlyFinished.clear();
     updateRunEnabled();
 
     m_client->backupRun(mode, sources, targets, dryRun, steps);
