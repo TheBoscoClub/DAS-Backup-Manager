@@ -762,8 +762,15 @@ failure is printed as
 and each warning as
 .BR WARN .
 Exit status: 0 when nothing failed (a warning is still 0), 3 when it began and
-something failed, 1 when it could not start; another backup holding the
-singleton lock is a decline, exit 0.
+something failed, 1 when it could not start (configuration unreadable, locks
+not taken); another backup holding the singleton lock is a decline, exit 0.
+Targets that will not mount once the locks are held are a target's state, not a
+failure to start: exit 3, as for
+.BR "backup run" .
+A step that cannot tell whether a target is mounted, a repeated
+.B [boot].subvolumes
+entry or a repeated target label are failures too (the last two are refused
+when the configuration is loaded).
 .PP
 .B btrdasd backup boot\-archive
 .RB [ \-\-config
@@ -782,9 +789,15 @@ subdirectories, comma-joined
 for no snapshot name or no subdirectory). It mounts nothing.
 .B backup\-run.sh
 reads it so that the script and the library derive the same names. Exit status
-2, with the reason on standard error, when a configuration file cannot be read
-or a field holds a tab, a newline or (in a subdirectory) a comma, which the
-script could not pass on.
+2, with the reason on standard error and nothing on standard output, when a
+configuration file cannot be read or a field is one the script could not pass
+on: a subvolume name that is empty, is
+.BR / ,
+or holds whitespace; a snapshot name that is empty, is a lone
+.BR \- ,
+or holds whitespace; a subdirectory that is empty, is a lone
+.BR \- ,
+or holds a comma or whitespace.
 .PP
 .B btrdasd backup boot\-plan
 .RB [ \-\-config
