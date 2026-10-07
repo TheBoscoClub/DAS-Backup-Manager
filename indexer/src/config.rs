@@ -695,6 +695,50 @@ impl Config {
         out
     }
 
+    /// The uniqueness and shape rules the boot step's input must meet, in ONE
+    /// place: `validate` includes them, and `backup::boot_plan` (so `backup
+    /// boot-plan`, the script's boot step and `archive_boot`) enforces them
+    /// itself, because `Config::load` does not run `validate`.
+    pub fn boot_input_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        // The boot step keys a target's state by its label, and a label names a
+        // mount in every log line: two targets sharing one would overwrite each
+        // other's entry (bd azvo).
+        let mut labels = std::collections::HashSet::new();
+        let mut mounts = std::collections::HashSet::new();
+        for tgt in &self.targets {
+            if !labels.insert(tgt.label.as_str()) {
+                errors.push(format!(
+                    "Target label '{}' is used by more than one [[target]] — labels must be unique",
+                    tgt.label
+                ));
+            }
+            if !mounts.insert(tgt.mount.as_str()) {
+                errors.push(format!(
+                    "Target mount '{}' is used by more than one [[target]] — mounts must be unique",
+                    tgt.mount
+                ));
+            }
+        }
+        // A boot subvolume listed twice is archived twice in one run, to the
+        // same `<subvol>.archive.<TS>` path (bd tens).
+        let mut boot_seen = std::collections::HashSet::new();
+        for sv in &self.boot.subvolumes {
+            if !boot_seen.insert(sv.as_str()) {
+                errors.push(format!(
+                    "[boot].subvolumes lists '{sv}' more than once — each entry must be unique"
+                ));
+            }
+            // `.` would snapshot the target's whole top level; `..` leaves it.
+            if sv.split('/').any(|c| c == "." || c == "..") {
+                errors.push(format!(
+                    "[boot].subvolumes entry '{sv}' has a '.' or '..' path component"
+                ));
+            }
+        }
+        errors
+    }
+
     /// Validate the config and return a list of human-readable error messages.
     /// An empty vec means the config is valid.
     pub fn validate(&self) -> Vec<String> {
@@ -738,6 +782,8 @@ impl Config {
                 ));
             }
         }
+
+        errors.extend(self.boot_input_errors());
 
         for (i, tgt) in self.targets.iter().enumerate() {
             // A target needs at least one way to find its filesystem:
@@ -988,6 +1034,78 @@ mod tests {
         );
         let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_rejects_a_boot_subvolume_listed_twice_and_names_it() {
+        let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a", None)]));
+        let mut cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        cfg.boot.subvolumes = vec!["@".into(), "@home".into(), "@".into()];
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("[boot].subvolumes") && errors[0].contains("'@'"),
+            "{errors:?}"
+        );
+        // The control: the same list without the repeat is accepted.
+        cfg.boot.subvolumes = vec!["@".into(), "@home".into()];
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_rejects_two_targets_sharing_a_label_and_names_it() {
+        let second = ONE_TARGET
+            .replace("serial = \"X\"", "serial = \"Y\"")
+            .replace("/mnt/t", "/mnt/u");
+        let extra = format!(
+            "{}{ONE_TARGET}{second}",
+            source_with("s", "/vol", &[("a", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("label 't'") && errors[0].contains("unique"),
+            "{errors:?}"
+        );
+        // The control: distinct labels pass.
+        let second = second.replace("label = \"t\"", "label = \"u\"");
+        let extra = format!(
+            "{}{ONE_TARGET}{second}",
+            source_with("s", "/vol", &[("a", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_rejects_two_targets_sharing_a_mount_and_dot_boot_components() {
+        let second = ONE_TARGET
+            .replace("serial = \"X\"", "serial = \"Y\"")
+            .replace("label = \"t\"", "label = \"u\"");
+        let extra = format!(
+            "{}{ONE_TARGET}{second}",
+            source_with("s", "/vol", &[("a", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        let errors = cfg.boot_input_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("mount '/mnt/t'"), "{errors:?}");
+        assert_eq!(cfg.validate(), errors);
+        for bad in [".", "..", "a/../b", "./a"] {
+            let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a", None)]));
+            let mut cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+            cfg.boot.subvolumes = vec![bad.into()];
+            let errors = cfg.boot_input_errors();
+            assert_eq!(errors.len(), 1, "{bad}: {errors:?}");
+            assert!(errors[0].contains("'.' or '..'"), "{bad}: {errors:?}");
+        }
+        for ok in ["@", "@home", "..x", ".hidden"] {
+            let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a", None)]));
+            let mut cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+            cfg.boot.subvolumes = vec![ok.into()];
+            assert!(cfg.boot_input_errors().is_empty(), "{ok}");
+        }
     }
 
     #[test]

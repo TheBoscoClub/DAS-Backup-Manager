@@ -104,17 +104,23 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   | --- | --- |
   | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
   | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
-  | Target not selected / not mounted (absent mount point) | not counted, Info |
-  | Mirror target (mounted; an unmounted one is the row above) | skipped (counted once per target), Info |
-  | Mount state cannot be told (stat error) / write verification refuses | **FAIL** (whole step) |
+  | Target not selected / not mounted (absent mount point) | not counted, Info ("Not mounted — boot subvolumes not updated on '<label>'", both paths) |
+  | Mirror target (mounted) | skipped (counted once per target), Info |
+  | Mirror target, not mounted | not counted, Info ("Not mounted — mirror target left alone"), both paths |
+  | No targets configured | **WARN**, nothing run (both paths) |
+  | Mount state of any target (Rust: any selected one) cannot be told (stat error; the script's probe) / write verification refuses | **FAIL** (whole step, checked for every target before the first write; the script says each such target and counts each) |
   | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
+  | A boot-plan field the script could not pass on (empty or whitespace name, a lone `-`, a comma or whitespace in a subdirectory) | `backup boot-plan` exits 2, nothing on stdout; script **FAIL** (whole step) |
   | Target's subvolume listing cannot be read | **FAIL** (once per target) |
   | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
   | No source declares `target_subdirs` for it | **WARN** |
   | No snapshot of that series on the target | **WARN** |
+  | A symbolic link at `<mnt>/<subvol>` (dangling or not; never followed) | **FAIL** for that subvolume, either mode, nothing run |
   | Incremental, the subvolume exists on the target | skipped, Info |
   | The subvolume is absent (either mode) | create from the newest snapshot; failure **FAIL** |
+  | Full, it exists: the archive destination `<mnt>/<subvol>.archive.<TS>` exists (anything, a symlink included) or cannot be statted | **FAIL**, live untouched, nothing written |
   | Full, it exists: archive `-r` fails | **FAIL**, live untouched |
+  | Full: a symbolic link at `<subvol>.new` (dangling or not; `btrfs subvolume delete` would follow it) | **FAIL**, live untouched, nothing written |
   | Full: stale `<subvol>.new` cannot be removed | **FAIL**, live untouched |
   | Full: building `<subvol>.new` fails | **FAIL**, live untouched |
   | Full: deleting the live one fails | **FAIL**, staging discarded |
@@ -126,8 +132,18 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   the run (exit 3); WARN does not (exit 0, report `COMPLETED WITH WARNINGS`). An incremental run
   creates a missing boot subvolume and never replaces one; only a full run (or `backup
   boot-archive`) archives and replaces. Snapshot match: a listing line's last field equals
-  `<subdir>/<snapshot_name>.<TS>`, `TS` = 8 ASCII digits, `T`, 4 ASCII digits, optionally `_` and
-  digits, `subdir` trimmed of leading and trailing `/`; the newest is the bytewise-greatest match.
+  `<subdir>/<snapshot_name>.<TS>` (that field is the last ASCII-whitespace-delimited one, trailing
+  space, tab and CR dropped first — both paths), `TS` = 8 ASCII digits, `T`, 4 ASCII digits,
+  optionally `_` and digits, `subdir` trimmed of leading and trailing `/`; the newest is the match with the greatest timestamp, a tie going to the bytewise-greater full path.
+- **Order of one full-run subvolume, both paths, every check before the first mutation**: snapshot
+  found; live path state (symlink or unknown: FAIL); staging `.new` state (symlink or unknown: FAIL); archive
+  destination state (exists or unknown: FAIL); only then archive `-r`, clear stale staging, build
+  `.new`, delete live, rename. `Config::load` does NOT run
+  `validate`, so the boot step enforces its own input (`Config::boot_input_errors`, shared with
+  `validate`) where it reads it: `backup::boot_plan`, called by `archive_boot_with` (whole-step FAIL
+  before any btrfs call) and by `backup boot-plan` (exit 2, nothing on stdout, so the script's boot
+  step FAILs). It refuses a repeated `[boot].subvolumes` entry, a `.` or `..` path component in one,
+  and a repeated `[[target]].label` or `mount`.
 - **Snapshot names are read from `/etc/btrbk/btrbk.conf`, never re-derived**
   (`forget::live_subvol_snapshot_names()`). If it cannot be read, the whole step FAILs.
 - **Both paths, and the pruner, skip `role=mirror` targets entirely** — the recovery drives carry
@@ -205,6 +221,10 @@ Checked before any directory is created, both roots compared **after resolution*
     already say what they saw — the journal's `status=3` and the log are its only trace.
   - `btrdasd backup run` (CLI, GUI; not run by the units; bd `vzsu`): the same 0 / 3 / 1 — see
     "The CLI/GUI Run Records Truthfully" below.
+  - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
+    step or the unmount after it failed, **or the targets would not mount once its locks were held**
+    (`BootStep::mount_failure_exit_code`; it had begun, as `backup run`'s Aborted), **1** only when
+    it could not start (config unreadable, locks).
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.

@@ -665,6 +665,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |
 | SnapshotBrowser | `snapshotbrowser.h/cpp` | Dolphin-style file browser; breadcrumb nav, detail/icon views, context menu, filter bar |
 | BackupPanel | `backuppanel.h/cpp` | Mode selection, operation checkboxes, source/target selection, dry-run support |
+| PanelConfig | `panelconfig.h/cpp` | Pure reader of the labels and `[boot] enabled` the Backup panel needs from config.toml (trailing comments tolerated); unit-tested in `gui-smoketest` |
 | BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |

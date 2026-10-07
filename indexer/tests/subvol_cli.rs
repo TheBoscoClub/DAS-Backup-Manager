@@ -317,3 +317,133 @@ fn backup_boot_plan_refuses_an_unreadable_btrbk_conf() {
     assert!(err.contains("btrbk.conf"), "{err}");
     assert!(out.stdout.is_empty());
 }
+
+/// A boot plan whose `[boot]` subvolume is `subvol_toml` (a TOML string
+/// literal, quotes included), whose `btrbk.conf` carries `conf` verbatim and
+/// whose source has `subdirs_toml` as `target_subdirs`.
+fn boot_plan_refusal(subvol_toml: &str, conf: &str, subdirs_toml: &str) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    let anchor = "device = \"UUID=abc\"\n";
+    text = text.replacen(
+        anchor,
+        &format!("{anchor}target_subdirs = {subdirs_toml}\n"),
+        1,
+    );
+    std::fs::write(
+        &config,
+        format!("{text}[boot]\nsubvolumes = [{subvol_toml}]\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("btrbk.conf"), conf).unwrap();
+    btrdasd(&["backup", "boot-plan", "--config", config.to_str().unwrap()])
+}
+
+const GOOD_CONF: &str = "volume /vol\n  subvolume  @\n    snapshot_name  root-\n";
+
+/// Exit 2, nothing on stdout, and stderr naming the subvolume and containing
+/// `needle` (the field).
+fn assert_refused(out: &std::process::Output, subvol: &str, needle: &str) {
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(err.contains(subvol), "{err}");
+    assert!(err.contains(needle), "{err}");
+}
+
+#[test]
+fn backup_boot_plan_refuses_a_subvolume_name_the_script_could_not_parse() {
+    let out = boot_plan_refusal("\"\"", GOOD_CONF, "[\"nvme\"]");
+    assert_refused(&out, "\"\"", "subvolume name");
+    let out = boot_plan_refusal("\"a/b\"", GOOD_CONF, "[\"nvme\"]");
+    assert_refused(&out, "a/b", "slash");
+    let out = boot_plan_refusal("\"a b\"", GOOD_CONF, "[\"nvme\"]");
+    assert_refused(&out, "a b", "whitespace");
+    let out = boot_plan_refusal("\"a\\tb\"", GOOD_CONF, "[\"nvme\"]");
+    assert_refused(&out, "a\\tb", "whitespace");
+    let out = boot_plan_refusal("\"a\\nb\"", GOOD_CONF, "[\"nvme\"]");
+    assert_refused(&out, "a\\nb", "whitespace");
+}
+
+#[test]
+fn backup_boot_plan_refuses_a_snapshot_name_the_script_could_not_parse() {
+    let conf = "volume /vol\n  subvolume  @\n    snapshot_name  root x\n";
+    let out = boot_plan_refusal("\"@\"", conf, "[\"nvme\"]");
+    assert_refused(&out, "@", "snapshot_name");
+    let conf = "volume /vol\n  subvolume  @\n    snapshot_name  a\tb\n";
+    let out = boot_plan_refusal("\"@\"", conf, "[\"nvme\"]");
+    assert_refused(&out, "@", "snapshot_name");
+    // A name of exactly `-` is the "absent" marker: ambiguous.
+    let conf = "volume /vol\n  subvolume  @\n    snapshot_name  -\n";
+    let out = boot_plan_refusal("\"@\"", conf, "[\"nvme\"]");
+    assert_refused(&out, "@", "ambiguous");
+}
+
+#[test]
+fn backup_boot_plan_refuses_a_subdirectory_that_is_empty_dash_or_has_whitespace() {
+    for (subdirs, needle) in [
+        ("[\"/\"]", "empty"),
+        ("[\"nvme\", \"//\"]", "empty"),
+        ("[\"-\"]", "ambiguous"),
+        ("[\"a b\"]", "whitespace"),
+        ("[\"a\\tb\"]", "whitespace"),
+        ("[\"a\\nb\"]", "whitespace"),
+    ] {
+        let out = boot_plan_refusal("\"@\"", GOOD_CONF, subdirs);
+        assert_refused(&out, "@", needle);
+    }
+}
+
+/// `Config::load` does not run `validate`, so `boot-plan` enforces the boot
+/// step's uniqueness and shape rules itself: exit 2, nothing on stdout.
+#[test]
+fn backup_boot_plan_refuses_repeated_or_dot_boot_subvolumes() {
+    for (subvol_toml, subvol, needle) in [
+        ("\"@\", \"@\"", "@", "more than once"),
+        ("\"..\"", "..", "'.' or '..'"),
+        ("\"@\", \".\"", "'.'", "'.' or '..'"),
+    ] {
+        let out = boot_plan_refusal(subvol_toml, GOOD_CONF, "[\"nvme\"]");
+        assert_refused(&out, subvol, needle);
+    }
+}
+
+#[test]
+fn backup_boot_plan_refuses_two_targets_sharing_a_label_or_a_mount() {
+    let second = "[[target]]\nlabel = \"{L}\"\nserial = \"Y\"\nmount = \"{M}\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n";
+    for (label, mount, needle) in [
+        ("t", "/mnt/u", "label 't'"),
+        ("u", "/mnt/t", "mount '/mnt/t'"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = boot_plan_config(dir.path(), Some("[\"nvme\"]"));
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&second.replace("{L}", label).replace("{M}", mount));
+        std::fs::write(&config, text).unwrap();
+        let out = btrdasd(&["backup", "boot-plan", "--config", config.to_str().unwrap()]);
+        assert_refused(&out, "unique", needle);
+    }
+    // The control: distinct label and mount print the plan.
+    let dir = tempfile::tempdir().unwrap();
+    let config = boot_plan_config(dir.path(), Some("[\"nvme\"]"));
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&second.replace("{L}", "u").replace("{M}", "/mnt/u"));
+    std::fs::write(&config, text).unwrap();
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme\n");
+}
+
+#[test]
+fn backup_boot_plan_refuses_a_config_it_cannot_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent.toml");
+    let out = btrdasd(&["backup", "boot-plan", "--config", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot read"), "{err}");
+}
