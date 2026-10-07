@@ -5,8 +5,9 @@
 // What the Backup panel reads out of config.toml: the labels it offers as
 // checkboxes and whether [boot] is enabled. Pure text in, struct out, so the
 // parsing is testable without a widget or a D-Bus helper (bd 51j6).
-// `bootEnabled` defaults to true for display only: the backend refuses the
-// boot step unless [boot] enabled is an explicit true.
+// `bootEnabled` defaults to true, as the backend does: `[boot] enabled` defaults
+// to true in config.rs (`default_true`), so an absent key or section runs the
+// boot step on every path, the script included.
 struct PanelConfig {
     QStringList sources;
     QStringList targets;
