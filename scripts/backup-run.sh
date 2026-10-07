@@ -954,6 +954,25 @@ maintenance_holder() {
     fi
 }
 
+# The whole disk a block device sits on: /dev/nvme0n1p2 -> /dev/nvme0n1,
+# /dev/sde1 -> /dev/sde, and a device that already is a disk -> itself. Read
+# from lsblk, never by stripping digits from the name (that turns nvme0n1p2
+# into nvme0n1p, which is no device). Prints nothing and returns 1 when lsblk
+# cannot say -- the caller must treat that as "unknown", never guess a name.
+parent_disk() { # parent_disk <block device>
+    local dev="$1" kind parent
+    kind="$(lsblk -dno TYPE "$dev" 2>/dev/null)" || return 1
+    case "$kind" in
+        disk) printf '%s\n' "$dev" ;;
+        part)
+            parent="$(lsblk -no PKNAME "$dev" 2>/dev/null | head -n 1)" || return 1
+            [[ -n "$parent" ]] || return 1
+            printf '/dev/%s\n' "$parent"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # Find device by serial number
 find_device_by_serial() {
     local serial="$1"
@@ -1028,7 +1047,16 @@ check_das_connected() {
                 # FS UUID resolves on this host even without a configured serial
                 # match (e.g. a replacement drive with a yet-unknown serial).
                 available="true"
-                first_dev="$(blkid -U "$uuid" 2>/dev/null | sed 's/[0-9]*$//')"
+                # The disk under the partition blkid names, for the I/O
+                # scheduler and the SMART section. If lsblk cannot say, the
+                # target is still available (its UUID resolves) but its disk
+                # is unknown: first_dev stays empty and both callers skip it.
+                local fs_dev
+                fs_dev="$(blkid -U "$uuid" 2>/dev/null)" || fs_dev=""
+                if ! first_dev="$(parent_disk "$fs_dev")"; then
+                    first_dev=""
+                    log_warn "  $label: could not resolve the disk under '${fs_dev:-?}' (lsblk) -- no I/O scheduler or SMART for it"
+                fi
             fi
         else
             # Path 2: legacy device-by-serial only
@@ -1870,7 +1898,12 @@ verify_targets_before_btrbk() {
             violations+=("$label: $mnt is a mountpoint but findmnt could not resolve its source device")
             continue
         fi
-        local mount_dev="${mount_src%%[0-9]*}"   # /dev/sde1 → /dev/sde
+        local mount_dev
+        # findmnt prints a btrfs subvolume as /dev/sde1[/@sub]: keep the device.
+        if ! mount_dev="$(parent_disk "${mount_src%%\[*}")"; then
+            violations+=("$label: $mnt is mounted from $mount_src, whose disk lsblk could not resolve -- cannot check its serial")
+            continue
+        fi
         local got_serial
         got_serial=$(smartctl -i "$mount_dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
         local serial_match="false"
@@ -2968,7 +3001,7 @@ get_smart_summary() {
 
 run_indexer() {
     if [[ ! -x "$BTRDASD_BIN" ]]; then
-        log_warn "Content indexer not built -- skipping (build with: cargo build --release --manifest-path indexer/Cargo.toml)"
+        log_warn "Content indexer not built -- skipping (build with: cmake --build build)"
         record_op "indexer" "SKIP" "binary not found"
         return
     fi
@@ -3150,6 +3183,7 @@ generate_throughput_section() {
 
 generate_capacity_section() {
     printf "  %-24s %-10s %-10s %s\n" "Target" "Used" "Avail" "Use%"
+    printf "  %s\n" "(raw device space as df reports it; a RAID-1 target holds half as much data)"
 
     # Reads ONLY the cache populated by capture_report_data() while targets
     # were still mounted — no live mountpoint/df calls here. See
