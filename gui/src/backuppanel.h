@@ -1,4 +1,5 @@
 #pragma once
+#include <QSet>
 #include <QWidget>
 
 class QRadioButton;
@@ -27,6 +28,7 @@ private Q_SLOTS:
     // Boot Archive says what it does in the selected mode, and is unticked and
     // disabled, with the reason, when [boot] enabled = false in config.toml.
     void updateBootArchive();
+    void jobEnded();
 
 private:
     DBusClient *m_client;
@@ -50,6 +52,8 @@ private:
     QPushButton *m_dryRunButton = nullptr;
     QPushButton *m_runButton = nullptr;
     bool m_jobRunning = false;
+    QSet<QString> m_earlyFinished; // JobFinished ids seen before jobStarted named the job
+    QString m_jobId; // this panel's running job; empty until jobStarted names it
     bool m_bootEnabledInConfig = true;
     bool m_bootForcedOff = false; // unticked by the config, re-ticked on re-enable
 };

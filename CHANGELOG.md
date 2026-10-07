@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Backup panel's Run and Dry Run stay disabled until its own job finishes** (bd `DAS-Backup-Manager-fy2h`) — any other operation's error (a `ConfigGet` failure) or any other job finishing re-enabled them mid-run, promising an action the helper then refused; the panel now learns its job id from `jobStarted` and only that job's `jobFinished`, or a failed `BackupRun` call, ends the disabled state (a `JobFinished` that beats the method reply, as a helper refusal does, is remembered and honoured when `jobStarted` names the job)
+- **`BackupPanel::loadConfig` is idempotent** (bd `DAS-Backup-Manager-pxq3`) — a reload cleared the checkboxes by deferred delete and never cleared the placeholder labels, so a second call showed every row twice; both are now removed at once
+
 ## [0.7.23.0] - 2026-10-06
 
 ### Added
