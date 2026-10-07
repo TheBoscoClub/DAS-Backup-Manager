@@ -377,7 +377,51 @@ carry this note because `Config::save` drops comments (bd a53).
 - **Both code paths now skip `role=mirror` targets identically, fixed 2026-08-02 (`bd DAS-Backup-Manager-am1`)**: `system-recovery-A-2tb`/`system-recovery-B-2tb` carry their own independent `das-recovery-bay1` Arch install under `@`/`@home` — archiving/recreating those would destroy a bootable OS that has nothing to do with this host's boot subvolumes. Both `update_boot_subvolumes()` (bash) and `archive_boot()` (Rust, `indexer/src/backup.rs`) check the target's role and log the identical `"Skipping mirror target (independent OS)"` line before touching any subvolume on a mirror. Mirrors are unaffected by this skip everywhere else — ordinary btrbk send/receive to `system-recovery-A-2tb`/`system-recovery-B-2tb` continues normally; only the boot-subvol archive/replace step is scoped away from them.
 - **The pruner (`boot-archive-cleanup.sh`, v2.1.0+) also skips `role=mirror` targets entirely**, for the same reason and with the same log wording, built from the same `MOUNT_ROLES` map (sourced from `btrdasd config dump-env`'s per-target `ROLE` field) that `backup-run.sh` already uses. Before this fix, a `@.archive.*` snapshot left on a mirror by an `am1`-affected manual run could be the **last surviving copy** of that mirror's independent install once past the 60-day retention window — the pruner would have deleted it. It never will now.
 - **Historical archives from before this fix are not retroactively cleaned up.** Any `@.archive.*`/`@home.archive.*` snapshots already present on `system-recovery-A-2tb`/`system-recovery-B-2tb` from May/June 2026 manual runs (from when `archive_boot()` had no mirror skip) persist until manually reviewed and removed — they are not touched by this change in either direction.
-- **One classification, and boot failures fail the run (operator decisions of 2026-10-06, bd `woq`, `dtm`).** Before it, the Rust path logged most boot failures at Warning and returned a bare `bool`, so a run whose `@` could not be replaced still recorded success; and `archive_boot` replaced an existing boot subvolume on every run, incremental ones included, while the script replaced only on `--full`. The decisions: an absence (no `snapshot_name`, no `target_subdirs`, no snapshot of the series) is a WARN, because nothing was meant to be there to act on; anything that was meant to work and did not (an unreadable `btrbk.conf` or listing, a refused verification, any of the replacement steps, a `btrfs` that cannot run) is a FAIL and fails the run, because a run that could not refresh the boot subvolume must not report success; an incremental run creates a missing boot subvolume (a target with none is not bootable) but never replaces one (replacement is the full run's archive-then-swap). An unreadable listing is a FAIL, never "no snapshots" (the fail-silent rule on empty output read as a negative answer). The table lives in the rules file so both paths read one copy; the Rust path's table-driven test (`every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns`) pins it.
+- **One classification, and boot failures fail the run (operator decisions of 2026-10-06, bd `woq`, `dtm`).** Before it, the Rust path logged most boot failures at Warning and returned a bare `bool`, so a run whose `@` could not be replaced still recorded success; and `archive_boot` replaced an existing boot subvolume on every run, incremental ones included, while the script replaced only on `--full`. The decisions: an absence (no `snapshot_name`, no `target_subdirs`, no snapshot of the series) is a WARN, because nothing was meant to be there to act on; anything that was meant to work and did not (an unreadable `btrbk.conf` or listing, a refused verification, any of the replacement steps, a `btrfs` that cannot run) is a FAIL and fails the run, because a run that could not refresh the boot subvolume must not report success; an incremental run creates a missing boot subvolume (a target with none is not bootable) but never replaces one (replacement is the full run's archive-then-swap). An unreadable listing is a FAIL, never "no snapshots" (the fail-silent rule on empty output read as a negative answer). The table is here (moved from the rules file 2026-10-07 to keep the auto-loaded instruction set under its size limit; the rule keeps the binding summary); the Rust path's table-driven test (`every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns`) pins it.
+
+- **The classification table.** Per target, per configured boot
+  subvolume; the Rust path is `archive_boot_with` (`BootOutcome`, `BootStep`), the script's rows
+  and words are the same:
+
+  | Situation | Outcome |
+  | --- | --- |
+  | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
+  | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
+  | Target not selected / not mounted (absent mount point) | not counted, Info ("Not mounted — boot subvolumes not updated on '<label>'", both paths) |
+  | Mirror target (mounted) | skipped (counted once per target), Info |
+  | Mirror target, not mounted | not counted, Info ("Not mounted — mirror target left alone"), both paths |
+  | No targets configured | **WARN**, nothing run (both paths) |
+  | Mount state of any target (Rust: any selected one) cannot be told (stat error; the script's probe) / write verification refuses | **FAIL** (whole step, checked for every target before the first write; the script says each such target and counts each) |
+  | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
+  | A boot-plan field the script could not pass on (empty or whitespace name, a lone `-`, a comma or whitespace in a subdirectory) | `backup boot-plan` exits 2, nothing on stdout; script **FAIL** (whole step) |
+  | Target's subvolume listing cannot be read | **FAIL** (once per target) |
+  | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
+  | No source declares `target_subdirs` for it | **WARN** |
+  | No snapshot of that series on the target | **WARN** |
+  | A symbolic link at `<mnt>/<subvol>` (dangling or not; never followed) | **FAIL** for that subvolume, either mode, nothing run |
+  | Incremental, the subvolume exists on the target | skipped, Info |
+  | The subvolume is absent (either mode) | create from the newest snapshot; failure **FAIL** |
+  | Full, it exists: the archive destination `<mnt>/<subvol>.archive.<TS>` exists (anything, a symlink included) or cannot be statted | **FAIL**, live untouched, nothing written |
+  | Full, it exists: archive `-r` fails | **FAIL**, live untouched |
+  | Full: a symbolic link at `<subvol>.new` (dangling or not; `btrfs subvolume delete` would follow it) | **FAIL**, live untouched, nothing written |
+  | Full: stale `<subvol>.new` cannot be removed | **FAIL**, live untouched |
+  | Full: building `<subvol>.new` fails | **FAIL**, live untouched |
+  | Full: deleting the live one fails | **FAIL**, staging discarded |
+  | Full: the rename fails | **FAIL** (archive holds the old) |
+  | `btrfs` cannot be run at all | **FAIL** |
+
+  Status: any FAIL gives `FAIL (<u> updated, <f> failed)`; else any WARN gives
+  `WARN (<u> updated, <s> skipped, <w> warnings)`; else `OK (<u> updated, <s> skipped)`. FAIL fails
+  the run (exit 3); WARN does not (exit 0, report `COMPLETED WITH WARNINGS`). An incremental run
+  creates a missing boot subvolume and never replaces one; only a full run (or `backup
+  boot-archive`) archives and replaces. Snapshot match: a listing line's last field equals
+  `<subdir>/<snapshot_name>.<TS>` (that field is the last ASCII-whitespace-delimited one, trailing
+  space, tab and CR dropped first — both paths), `TS` = 8 ASCII digits, `T`, 4 ASCII digits,
+  optionally `_` and digits, `subdir` trimmed of leading and trailing `/`; the newest is the match with the greatest timestamp, a tie going to the bytewise-greater full path.
+- **Order of one full-run subvolume, both paths, every check before the first mutation**: snapshot
+  found; live path state (symlink or unknown: FAIL); staging `.new` state (symlink or unknown: FAIL); archive
+  destination state (exists or unknown: FAIL); only then archive `-r`, clear stale staging, build
+  `.new`, delete live, rename.
 - Archives are read-only snapshots on the backup target
 - The pruner (`boot-archive-cleanup.sh`) runs at the end of every `backup-run.sh` run, daily and full alike, while targets are still mounted — see the retention line above. It only ever deletes `@.archive.*` / `@home.archive.*` snapshots past retention on non-mirror targets; it never touches the live `@`/`@home`, btrbk-managed snapshots, or anything on a `role=mirror` target.
 

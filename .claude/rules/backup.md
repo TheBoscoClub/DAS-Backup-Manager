@@ -10,14 +10,9 @@ reproduction commands behind every section live under the **same heading** in
 - Config at `/etc/btrbk/btrbk.conf` (canonical, generated from `config.toml`; never hand-edit).
 
 ## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
-Bash reads a running script as it goes. `setup` renames a new file into place, and the three
-scripts end with `main "$@"; exit $?` (once `main` runs, bash never reads its file again), so a
-running script is never read from a rewritten file. `cmake --install` (CMake 4.4.3, measured)
-unlinks each file and creates a new one, executable once complete: a run already going keeps its
-script but calls the new sibling scripts and `btrdasd` later. A run *starting* in that instant
-mostly fails loudly (203/EXEC or 127), but bash reopens the script by path after the exec and can
-find the new file still empty: **it exits 0 having done nothing** (measured: see the reference).
-**`setup` refuses by itself**:
+A running `backup-run.sh` survives an install (the scripts end with `main "$@"; exit $?`), but a run
+*starting* during `cmake --install` can reopen a still-empty file and **exit 0 having done nothing**
+(measured; mechanism in the reference). **`setup` refuses by itself**:
 every mode that writes or removes installed files takes `/run/das-backup.lock`, then
 `/run/das-maintenance.lock`, non-blocking, before its first write, holds both to the end, and exits
 75 (on stderr) having changed nothing if either is held. **`cmake --install` takes no lock** —
@@ -43,9 +38,9 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   otherwise nothing on it is adopted or retired and the run is marked failed.
 - A gone subvolume's entry is **retired**, not an error: it leaves `btrbk.conf`. `subvol expire`
   (after btrbk) deletes its snapshots per target once retirement + that target's longest
-  retention window has passed. No retention, unmounted, unreadable, shared directory,
-  unrecognised names, source unmounted, name back, snapshot newer than retirement, clock < 2026, sync
-  failed: kept and reported. The last config entry and an entry sending nowhere stay.
+  retention window has passed; anything doubtful (no retention, unmounted or unreadable target, a
+  shared directory, the name back, a snapshot newer than retirement, a failed sync) is kept and
+  reported. The last config entry and an entry sending nowhere stay.
 - A **Missing** or **Stale** finding from the weekly drift check now means sync itself failed.
 - **Target scoping is part of the entry.** Bulk data gets `target_labels = ["primary-22tb"]`;
   only system-recovery data goes to the two 2 TB recovery drives. `target_labels = []` fans out
@@ -55,18 +50,15 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 - A bulk payload inside a broadly-scoped subvolume defeats scoping invisibly (a directory has no
   entry to scope). Give it its own subvolume: `chattr +C` **before** any file lands, and copy
   with `cp --reflink=never`.
-- When measuring btrbk's exit status, never read `$?` after a pipeline — it is the last
-  command's. Use `${PIPESTATUS[0]}` and a positive control.
 - Verify a mechanism actually fired (`backup_runs`) before describing it in the past tense.
 
 ## DAS Enclosure (Author's Setup)
 - TerraMaster D6-320, 6-bay USB 3.2 Gen2 JBOD. **Gen2 is the rating; check the negotiated
   rate**: `cat /sys/bus/usb/devices/*/speed` must read `10000` (Mbit/s, link speed). It sat at
-  `480` for nine days undetected. **Throughput does not reveal this** — only the link speed does.
+  `480` for nine days undetected; throughput does not reveal this, only the link speed does.
 - Bay map: `docs/examples/author-bay-mapping.md`; generic guide `docs/DAS-BAY-MAPPING.md`.
 - **Targets are hidden from udisks** by the generated `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`
-  (rendered from `[[target]]` serials + `mount_uuid`; never hand-edit). `btrdasd setup --check` reads
-  back whether each attached target carries the flag. Nothing may mount them under `/run/media`.
+  (never hand-edit; `btrdasd setup --check` reads the flag back). Nothing may mount them under `/run/media`.
 - Targets are mounted only by this project's jobs, by `mount_uuid`, never by fstab. The 22 TB
   primary is BTRFS RAID-1 across two drives; the two 2 TB recovery drives are independent single-device filesystems.
 
@@ -96,50 +88,19 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 - Two code paths, which must stay symmetric: bash `update_boot_subvolumes()` in
   `scripts/backup-run.sh` (every run) and Rust `archive_boot_with` in
   `indexer/src/backup.rs`. **Both locate the replacement BEFORE deleting anything**; none found is a WARN.
-- **One classification, both paths** (bd woq, dtm, 2026-10-06). Per target, per configured boot
-  subvolume; the Rust path is `archive_boot_with` (`BootOutcome`, `BootStep`), the script's rows
-  and words are the same:
-
-  | Situation | Outcome |
-  | --- | --- |
-  | `[boot] enabled = false` | step not run; row `OK (disabled in config)` |
-  | GUI Boot Archive unticked | step not run; row `N/A (not selected)` (Rust only) |
-  | Target not selected / not mounted (absent mount point) | not counted, Info ("Not mounted — boot subvolumes not updated on '<label>'", both paths) |
-  | Mirror target (mounted) | skipped (counted once per target), Info |
-  | Mirror target, not mounted | not counted, Info ("Not mounted — mirror target left alone"), both paths |
-  | No targets configured | **WARN**, nothing run (both paths) |
-  | Mount state of any target (Rust: any selected one) cannot be told (stat error; the script's probe) / write verification refuses | **FAIL** (whole step, checked for every target before the first write; the script says each such target and counts each) |
-  | `btrbk.conf` cannot be read (no boot plan) | **FAIL** (whole step) |
-  | A boot-plan field the script could not pass on (empty or whitespace name, a lone `-`, a comma or whitespace in a subdirectory) | `backup boot-plan` exits 2, nothing on stdout; script **FAIL** (whole step) |
-  | Target's subvolume listing cannot be read | **FAIL** (once per target) |
-  | A boot subvolume with no `snapshot_name` in `btrbk.conf` | **WARN** |
-  | No source declares `target_subdirs` for it | **WARN** |
-  | No snapshot of that series on the target | **WARN** |
-  | A symbolic link at `<mnt>/<subvol>` (dangling or not; never followed) | **FAIL** for that subvolume, either mode, nothing run |
-  | Incremental, the subvolume exists on the target | skipped, Info |
-  | The subvolume is absent (either mode) | create from the newest snapshot; failure **FAIL** |
-  | Full, it exists: the archive destination `<mnt>/<subvol>.archive.<TS>` exists (anything, a symlink included) or cannot be statted | **FAIL**, live untouched, nothing written |
-  | Full, it exists: archive `-r` fails | **FAIL**, live untouched |
-  | Full: a symbolic link at `<subvol>.new` (dangling or not; `btrfs subvolume delete` would follow it) | **FAIL**, live untouched, nothing written |
-  | Full: stale `<subvol>.new` cannot be removed | **FAIL**, live untouched |
-  | Full: building `<subvol>.new` fails | **FAIL**, live untouched |
-  | Full: deleting the live one fails | **FAIL**, staging discarded |
-  | Full: the rename fails | **FAIL** (archive holds the old) |
-  | `btrfs` cannot be run at all | **FAIL** |
-
-  Status: any FAIL gives `FAIL (<u> updated, <f> failed)`; else any WARN gives
-  `WARN (<u> updated, <s> skipped, <w> warnings)`; else `OK (<u> updated, <s> skipped)`. FAIL fails
-  the run (exit 3); WARN does not (exit 0, report `COMPLETED WITH WARNINGS`). An incremental run
-  creates a missing boot subvolume and never replaces one; only a full run (or `backup
-  boot-archive`) archives and replaces. Snapshot match: a listing line's last field equals
-  `<subdir>/<snapshot_name>.<TS>` (that field is the last ASCII-whitespace-delimited one, trailing
-  space, tab and CR dropped first — both paths), `TS` = 8 ASCII digits, `T`, 4 ASCII digits,
-  optionally `_` and digits, `subdir` trimmed of leading and trailing `/`; the newest is the match with the greatest timestamp, a tie going to the bytewise-greater full path.
-- **Order of one full-run subvolume, both paths, every check before the first mutation**: snapshot
-  found; live path state (symlink or unknown: FAIL); staging `.new` state (symlink or unknown: FAIL); archive
-  destination state (exists or unknown: FAIL); only then archive `-r`, clear stale staging, build
-  `.new`, delete live, rename. `Config::load` does NOT run
-  `validate`, so the boot step enforces its own input (`Config::boot_input_errors`, shared with
+- **One classification, both paths** (bd woq, dtm, 2026-10-06): the Rust path (`archive_boot_with`:
+  `BootOutcome`, `BootStep`) and the script produce the same rows and words. **The situation → outcome
+  table, the snapshot-match rule and the full-run mutation order live in the reference under this
+  heading**, pinned row by row by the Rust test `every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns`.
+  Binding summary: an absence (no `snapshot_name`, no `target_subdirs`, no snapshot of the series) is
+  a WARN; anything meant to work that did not (an unreadable `btrbk.conf` or listing, a refused
+  verification, any replacement step, a `btrfs` that cannot run, a symlink where a subvolume or
+  staging path belongs) is a FAIL. Every check runs before the first mutation. Status
+  `FAIL (<u> updated, <f> failed)` / `WARN (<u> updated, <s> skipped, <w> warnings)` /
+  `OK (<u> updated, <s> skipped)`; FAIL fails the run (exit 3), WARN does not. An incremental run
+  creates a missing boot subvolume and never replaces one; only a full run (or `backup boot-archive`)
+  archives and replaces.
+- `Config::load` does NOT run `validate`, so the boot step enforces its own input (`Config::boot_input_errors`, shared with
   `validate`) where it reads it: `backup::boot_plan`, called by `archive_boot_with` (whole-step FAIL
   before any btrfs call) and by `backup boot-plan` (exit 2, nothing on stdout, so the script's boot
   step FAILs). It refuses a repeated `[boot].subvolumes` entry, a `.` or `..` path component in one,
@@ -213,18 +174,15 @@ Checked before any directory is created, both roots compared **after resolution*
     something FAILED, or it aborted on a target's or a source's state; **1** = could not start
     (nothing mounted or sent); **128+N** = stopped by HUP INT USR1 PIPE ALRM or TERM (129 130
     138 141 142 143), the unit fails. Both backup units carry `SuccessExitStatus=3`, and that line is load-bearing.
-  - A 3 is not silent: the report says FAILURES DETECTED (for a FAIL recorded after the report is
-    built — email delivery, the history record, a report saved nowhere — the row says it), and an
-    abort before the report sends one **ABORTED** report (what, why, targets seen, log) and records
-    a failed history row (bd `2my`).
-    The one exception: an abort *after* the report went out exits 3 under a report and a row that
-    already say what they saw — the journal's `status=3` and the log are its only trace.
+  - A 3 is not silent: the report says FAILURES DETECTED (a FAIL recorded after the report is built
+    is named in the history row), and an abort before the report sends one **ABORTED** report and
+    records a failed row (bd `2my`). Only an abort *after* the report went out leaves the journal's
+    `status=3` and the log as its trace.
   - `btrdasd backup run` (CLI, GUI; not run by the units; bd `vzsu`): the same 0 / 3 / 1 — see
     "The CLI/GUI Run Records Truthfully" below.
   - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
-    step or the unmount after it failed, **or the targets would not mount once its locks were held**
-    (`BootStep::mount_failure_exit_code`; it had begun, as `backup run`'s Aborted), **1** only when
-    it could not start (config unreadable, locks).
+    step, the unmount after it, or the mount once its locks were held failed
+    (`BootStep::mount_failure_exit_code`), **1** only when it could not start (config, locks).
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some
     volume failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`, and that line is load-bearing.
