@@ -231,6 +231,7 @@ out/
 
 # WORKTREES
 .worktrees/
+.claude/worktrees/
 
 # TEST SANDBOX
 sandbox-*/
