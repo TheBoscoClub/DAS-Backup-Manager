@@ -1621,6 +1621,9 @@ remove_guard() {
         GUARD_LEFT="$DOMAIN's definition still carries it after defining $DOMAIN_XML"
     else
         GUARDED=false
+        # The reset watch goes before its file: that file names its virsh,
+        # which stop_reset_watch must find to wait for (bd lorz).
+        stop_reset_watch
         rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
         log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_XML again)"
         return 0
@@ -2333,10 +2336,27 @@ start_reset_watch() {
     log "watching $DOMAIN for resets (libvirt's reboot event): a boot after one must report its guard engaged within $(format_duration "$GUARD_SECS")"
 }
 
-# End the reset watch, and the virsh it reads, and wait until they have --
-# five seconds at most, then killed.
+# Whether process $1 is still the reset watch's virsh: its command line says
+# so. Gone, a zombie (its command line is empty: it has finished all it
+# does) or the pid reused by another, it is not.
+watch_virsh_runs() {
+    local cmd
+    cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline")" || return 1
+    [[ "$cmd" == *virsh*" event "* ]]
+}
+
+# End the reset watch, and the virsh it reads, and wait until each has --
+# five seconds each at most, then killed, and waited for again. The watch
+# passes its SIGTERM on to its virsh (sent from here only when the watch had
+# to be killed, and so never passed it on), and the virsh is given its time
+# to end on it. It is not this script's child, so it is waited for by its
+# pid -- read from RESET_FILE, which therefore outlives the watch
+# (remove_guard) -- and its command line. Before bd lorz the virsh was
+# killed at once, cut short while still ending on a loaded host, and where
+# remove_guard had already taken RESET_FILE it was not found at all: either
+# way the driver went on before it had gone.
 stop_reset_watch() {
-    local i vpid=""
+    local i vpid="" watch_killed=false
     [[ -n "$RESET_WATCH_PID" ]] || return 0
     if [[ -f "$RESET_FILE" ]]; then
         vpid="$(sed -n 's/^virsh \([0-9]*\)$/\1/p' -- "$RESET_FILE" 2>/dev/null | tail -n 1)" || vpid=""
@@ -2348,10 +2368,24 @@ stop_reset_watch() {
     done
     if ! child_gone "$RESET_WATCH_PID"; then
         kill -KILL "$RESET_WATCH_PID" 2>/dev/null
+        watch_killed=true
     fi
     wait "$RESET_WATCH_PID" 2>/dev/null
-    if [[ -n "$vpid" && "$(tr '\0' ' ' 2>/dev/null <"/proc/$vpid/cmdline")" == *virsh*" event "* ]]; then
-        kill -KILL "$vpid" 2>/dev/null
+    if [[ -n "$vpid" ]] && watch_virsh_runs "$vpid"; then
+        if [[ "$watch_killed" == true ]]; then
+            kill "$vpid" 2>/dev/null
+        fi
+        for ((i = 0; i < 50; i++)); do
+            watch_virsh_runs "$vpid" || break
+            sleep 0.1
+        done
+        if watch_virsh_runs "$vpid"; then
+            kill -KILL "$vpid" 2>/dev/null
+            for ((i = 0; i < 50; i++)); do
+                watch_virsh_runs "$vpid" || break
+                sleep 0.1
+            done
+        fi
     fi
     RESET_WATCH_PID=""
 }

@@ -414,7 +414,15 @@ case "$cmd" in
         st=$(<"/proc/$PPID/stat")
         read -r _ driver _ <<<"${st##*) }"
         echo "started" >>"$S/event.log"
-        trap 'if [[ -d /proc/$driver ]] && ! grep -q "^State:[[:space:]]*Z" "/proc/$driver/status" 2>/dev/null; then echo "ended while the driver ran" >>"$S/event.log"; else echo "ended after the driver" >>"$S/event.log"; fi; exit 0' TERM INT HUP
+        # Slow to end on a signal (event_slow_end), as on a loaded host: the
+        # driver must wait for it, not kill it -- killed, it can say nothing.
+        # Or deaf to SIGTERM (event_ignores_term): only a SIGKILL ends it.
+        # It ends once: a second signal while it ends (a Ctrl-C reaches it
+        # beside the watch's SIGTERM) is not a second end.
+        slow=0
+        [[ ! -f "$S/event_slow_end" ]] || slow=1
+        trap 'trap "" TERM INT HUP; ((slow == 0)) || sleep 1; if [[ -d /proc/$driver ]] && ! grep -q "^State:[[:space:]]*Z" "/proc/$driver/status" 2>/dev/null; then echo "ended while the driver ran" >>"$S/event.log"; else echo "ended after the driver" >>"$S/event.log"; fi; exit 0' TERM INT HUP
+        [[ ! -f "$S/event_ignores_term" ]] || trap '' TERM
         if [[ -f "$S/event_dies" ]]; then echo "error: internal error: client socket is closed" >&2; exit 1; fi
         n=0
         while :; do
@@ -3100,6 +3108,45 @@ check "paused after a failed resume: kept (exit 3)" "$RC" "3"
 has "paused after a failed resume: resume it first" "$OUT" "virsh --connect qemu:///system resume recovery-os-updater"
 lacks "paused after a failed resume: never systemctl poweroff in a paused guest" "$OUT" "systemctl poweroff"
 has "paused after a failed resume: or destroy, as the operator's choice" "$OUT" "on one side, a paused recovery OS that may have run"
+
+echo "--- lorz: the reset watch's virsh is waited for, and killed only past its time"
+# Whether the reset watch's virsh (the first the stub recorded) still runs.
+event_virsh_state() {
+    local pid st
+    pid=$(head -n 1 "$S/event.pids") || pid=""
+    [[ -n "$pid" ]] || { echo "never started"; return; }
+    [[ -d "/proc/$pid" ]] || { echo gone; return; }
+    st=$(awk '/^State:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || st=""
+    case "$st" in
+    Z) echo gone ;;
+    "") if [[ -d "/proc/$pid" ]]; then echo "unreadable"; else echo gone; fi ;;
+    *) echo "still runs ($st)" ;;
+    esac
+}
+# Slow to end on the SIGTERM it was sent, as on a loaded host: waited for,
+# so it ends on that signal -- killed at once, it could say nothing, and the
+# driver went on before it had gone.
+fixture
+touch "$S/event_slow_end"
+run_driver session A
+check "a virsh slow to end: exit 0" "$RC" "0"
+check "a virsh slow to end: the reset watch ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
+check "a virsh slow to end: gone when the driver ended" "$(event_virsh_state)" "gone"
+# The same where the session is kept (the guard and its files stay).
+fixture
+touch "$S/event_slow_end"
+printf 'running\n' >"$S/states.running"
+run_driver session A --timeout 1
+check "a virsh slow to end, session kept: exit 3" "$RC" "3"
+check "a virsh slow to end, session kept: the reset watch ended by the driver" "$(watch_ended)" "1 started, 1 ended by the driver"
+check "a virsh slow to end, session kept: gone when the driver ended" "$(event_virsh_state)" "gone"
+# Deaf to SIGTERM: killed past its time, and gone before the driver ends.
+fixture
+touch "$S/event_ignores_term"
+run_driver session A
+check "a virsh deaf to SIGTERM: exit 0" "$RC" "0"
+check "a virsh deaf to SIGTERM: killed before the driver ended" "$(event_virsh_state)" "gone"
+check "a virsh deaf to SIGTERM: killed, it said nothing" "$(watch_ended)" "1 started, 0 ended by the driver"
 
 echo "--- N4: status counts silence (it cannot see resets); information only"
 fixture
