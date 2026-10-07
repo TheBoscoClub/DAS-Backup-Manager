@@ -8,6 +8,14 @@
 #     next run EMPTY, exit 0, while the timer's own service runs, and the old
 #     one-liner put that blank in the report; next_scheduled() prints
 #     "unknown" for an empty, n/a or failed reading (bd DAS-Backup-Manager-hyvh).
+#   - Boot-step follow-ups (v4.12.0, unreleased): an unmounted primary is said
+#     as the Rust step says it ("Not mounted — boot subvolumes not updated on
+#     '<label>'", bd azvo); a symlink at the live path, or an archive
+#     destination that exists or cannot be statted, is a FAIL before the first
+#     mutation (bd tens); no targets is a WARN and an untellable mount state
+#     fails the whole step (bd azvo); latest_boot_snapshot() walks the listing
+#     in linear time (bd 5bwi) and drops trailing whitespace and CR as the
+#     library does (tests/test_early_exit_readers.sh; bd nqbb).
 #   - The boot step honours [boot] and reads its names from btrbk.conf (v4.12.0):
 #     [boot] enabled = false makes it a no-op; the subvolumes, snapshot_names and
 #     target_subdirs come from `btrdasd backup boot-plan` (the Rust step's own
