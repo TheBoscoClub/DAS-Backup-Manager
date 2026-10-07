@@ -312,6 +312,12 @@ if(BUILD_TESTING)
         NAME shell-script-rewrite
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_script_rewrite.sh
     )
+    # parent_disk: the disk under a partition comes from lsblk, and an answer
+    # lsblk cannot give is "unknown" (bd DAS-Backup-Manager-b1s).
+    add_test(
+        NAME shell-parent-disk
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parent_disk.sh
+    )
     add_test(
         NAME shell-early-exit-readers
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_exit_readers.sh

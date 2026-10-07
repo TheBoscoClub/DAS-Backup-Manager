@@ -198,6 +198,52 @@ pub fn verified_mounted_roots(target_roots: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What `reconcile --forget-root` did with the root it was given.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RootRetirement {
+    /// The root is a configured target: nothing was touched, and the command
+    /// has failed — dropping its rows would discard a live index.
+    Refused(String),
+    /// No index rows sit under the root.
+    NoRows,
+    /// Dry run: this many rows would be dropped.
+    WouldDrop(usize),
+    Dropped(PruneStats),
+}
+
+/// Retire the index rows under `root`, a mount path no longer configured.
+/// A root that IS one of `configured_mounts` is refused, untouched.
+pub fn retire_root(
+    database: &crate::db::Database,
+    configured_mounts: &[String],
+    root: &str,
+    dry_run: bool,
+) -> rusqlite::Result<RootRetirement> {
+    if configured_mounts
+        .iter()
+        .any(|c| c.trim_end_matches('/') == root.trim_end_matches('/'))
+    {
+        return Ok(RootRetirement::Refused(format!(
+            "refusing: {root} IS a configured target — reconcile handles it \
+             normally, and dropping its rows would discard a live index"
+        )));
+    }
+    let ids = database.snapshots_under_root(root)?;
+    Ok(if ids.is_empty() {
+        RootRetirement::NoRows
+    } else if dry_run {
+        RootRetirement::WouldDrop(ids.len())
+    } else {
+        RootRetirement::Dropped(database.prune_snapshots(&ids)?)
+    })
+}
+
+/// The error a reconcile pass ends with when something it was asked to do
+/// failed (a refused `--forget-root`, a failed `--repair`), or `None`.
+pub fn failure_error(failures: &[String]) -> Option<String> {
+    (!failures.is_empty()).then(|| failures.join("; "))
+}
+
 /// Real-filesystem existence check used by the non-test driver.
 pub fn path_exists(path: &str) -> bool {
     Path::new(path).exists()
@@ -216,6 +262,30 @@ mod tests {
             path: path.to_string(),
             indexed_at: 0,
         }
+    }
+
+    #[test]
+    fn retiring_a_configured_root_is_refused_and_touches_nothing() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.insert_snapshot("a", "20260101T0300", "s", "/mnt/t/s/a.20260101T0300")
+            .unwrap();
+        let configured = vec!["/mnt/t/".to_string()];
+        let got = retire_root(&db, &configured, "/mnt/t", false).unwrap();
+        assert!(matches!(got, RootRetirement::Refused(_)), "{got:?}");
+        assert_eq!(db.list_snapshots().unwrap().len(), 1);
+        // The counter-case: an unconfigured root is dropped.
+        let got = retire_root(&db, &[], "/mnt/t", false).unwrap();
+        assert!(matches!(got, RootRetirement::Dropped(_)), "{got:?}");
+        assert!(db.list_snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failures_join_into_one_error_and_none_is_no_error() {
+        assert_eq!(failure_error(&[]), None);
+        assert_eq!(
+            failure_error(&["a".to_string(), "b".to_string()]),
+            Some("a; b".to_string())
+        );
     }
 
     #[test]

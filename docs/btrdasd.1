@@ -211,13 +211,16 @@ a mount path that is no longer a configured target (one retired by a rename,
 for example). Such rows can never be reconciled, because that root is never
 mounted again. A
 .I PATH
-that is a configured target is refused, and nothing else is done.
+that is a configured target is refused: nothing else is done, the targets are
+unmounted, and the command exits nonzero.
 .TP
 .B \-\-repair
 First delete spans whose endpoints name snapshots that do not exist, and the
 files left with no span. Needed on an index carrying such rows, because foreign
 keys are enforced and they cannot be rewritten. Has no effect with
 .BR \-\-dry\-run .
+If the repair fails the pass still finishes and unmounts the targets, and the
+command then exits nonzero.
 .\"
 .SS reindex
 Re-index every mounted backup target.
@@ -2726,7 +2729,8 @@ mail relay's upstream credential.
 .TP
 .BR DAS_SCRUB_STATE ", " DAS_BTRFS_STATUS_DIR
 Override the scrub state file and the directory of btrfs scrub status
-records. Meant for tests only.
+records. Meant for tests only: they are read only by a test build, and a
+shipped binary ignores them.
 .TP
 .B DAS_MAINTENANCE_LOCK_FD
 The number of an open descriptor on

@@ -53,7 +53,6 @@ target_sources(btrdasd-gui PRIVATE
     src/healthdashboard.cpp
     src/configdialog.cpp
     src/snapshotbrowser.cpp
-    src/setupwizard.cpp
 )
 
 target_compile_features(btrdasd-gui PRIVATE cxx_std_20)
