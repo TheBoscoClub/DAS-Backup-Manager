@@ -13,7 +13,8 @@ This is the short version. For detailed steps, open `docs/DISASTER-RECOVERY-GUID
 3. Press the boot menu key repeatedly during startup:
    - **ASUS**: F8 | **Gigabyte**: F12 | **MSI**: F11 | **Most others**: F12
 4. Select the DAS entry (look for "TerraMas" or the drive's serial number: bay 1 `ZK208Q77`, bay 4 `ZFL41DNY`). Never go by an entry number or by the name `UEFI OS` — the firmware gives every disk that name and renumbers entries after any NVRAM reset (the 2026-08-29 board swap did). The recovery ESPs are PARTUUID `fe640619-2c7b-457a-be77-61bc9aff4875` (`RECOV-ESP-1`, bay 1) and `ef19ce6e-de5e-4623-bed0-8717749916b8` (`RECOV-ESP-4`, bay 4)
-5. At the bootloader menu, select **CachyOS (Fallback Initramfs)** for maximum hardware compatibility
+5. If you still have the last emailed backup report, read this drive's `RECOVERY OS` block: `btrbk at boot: will` means do not boot it bare (see the guide, "The session refuses"); `may` with `btrbk config: none` is safe — the drive's OS carries no btrbk configuration, so nothing on it touches the backups. Its boot menu cannot edit the kernel line (`editor no`): there is no emergency-shell route from the menu
+6. At its menu choose **CachyOS Emergency Recovery (Bay 1)** or **(Bay 4)**; the **— Fallback** entry is the same OS with the larger initramfs, for unfamiliar hardware. Nothing is lost by taking Fallback
 
 **Login**: username `bosco`, password `__________` *(fill in and write on the printout)*
 
@@ -21,14 +22,14 @@ This is the short version. For detailed steps, open `docs/DISASTER-RECOVERY-GUID
 
 ## I Need To...
 
+`/dev/<my-nvme-partition>` is the broken system's BTRFS root. If one of its two NVMe drives is dead, mount it with `-o subvol=@,degraded`.
+
 ### Reset my root password
 
 ```bash
+sudo mkdir -p /mnt/broken
 sudo mount -o subvol=@ /dev/<my-nvme-partition> /mnt/broken
-sudo mount --bind /dev /mnt/broken/dev
-sudo mount --bind /proc /mnt/broken/proc
-sudo mount --bind /sys /mnt/broken/sys
-sudo chroot /mnt/broken
+sudo arch-chroot /mnt/broken   # mounts /dev, /proc, /sys (with EFI variables) and /run itself
 passwd root
 exit
 sudo umount -R /mnt/broken
@@ -38,6 +39,7 @@ sudo reboot
 ### Fix /etc/fstab (system won't boot, "emergency mode")
 
 ```bash
+sudo mkdir -p /mnt/broken
 sudo mount -o subvol=@ /dev/<my-nvme-partition> /mnt/broken
 sudo nano /mnt/broken/etc/fstab
 # Fix or comment out the broken line
@@ -50,12 +52,10 @@ sudo reboot
 ### Fix a broken bootloader
 
 ```bash
+sudo mkdir -p /mnt/broken
 sudo mount -o subvol=@ /dev/<my-nvme-partition> /mnt/broken
 sudo mount /dev/<my-esp-partition> /mnt/broken/boot
-sudo mount --bind /dev /mnt/broken/dev
-sudo mount --bind /proc /mnt/broken/proc
-sudo mount --bind /sys /mnt/broken/sys
-sudo chroot /mnt/broken
+sudo arch-chroot /mnt/broken   # not plain chroot: bootctl needs the EFI variables it mounts
 bootctl install           # reinstall systemd-boot
 mkinitcpio -P             # rebuild all initramfs images
 exit
@@ -66,6 +66,7 @@ sudo reboot
 ### Stop a service that hangs boot
 
 ```bash
+sudo mkdir -p /mnt/broken
 sudo mount -o subvol=@ /dev/<my-nvme-partition> /mnt/broken
 # Remove the service's enable symlink:
 sudo rm /mnt/broken/etc/systemd/system/multi-user.target.wants/<service-name>.service
@@ -95,7 +96,7 @@ sudo cp -a /mnt/snapshot/path/to/file /where/you/want/it
 sudo umount /mnt/snapshot /mnt/backup
 ```
 
-Not there? A subvolume adopted automatically by a backup run is under `/mnt/backup/<first-source>-adopted/` (e.g. `ssd-adopted/`). A subvolume that was deleted is "retired": its last snapshots stay where they were until that target's retention window has passed (kept for 372 days after the retirement date on the primary and deleted by the first `backup-run.sh` run on or after day 373; kept 7 days on the recovery drives, deleted on or after day 8). The 2TB recovery drives hold only the last 7 daily snapshots, and their `@`/`@home` are their own OS, not yours. On the running system, check first that no backup, scrub, restore, index, reconcile or doctor run holds the DAS: `sudo flock -n /run/das-maintenance.lock true || echo WAIT` (`cat /run/das-maintenance.lock` shows what the holder recorded).
+Not there? A subvolume adopted automatically by a backup run is under `/mnt/backup/<first-source>-adopted/` (e.g. `ssd-adopted/`). A subvolume that was deleted is "retired": its last snapshots stay where they were until that target's retention window has passed (kept for 372 days after the retirement date on the primary and deleted by the first `backup-run.sh` run on or after day 373; kept 7 days on the recovery drives, deleted on or after day 8). The 2TB recovery drives hold only the last 7 daily snapshots, and their `@`/`@home` are their own OS, not yours. On the running system, check first that no backup, scrub, restore, index, reconcile or doctor run, or recovery-OS VM session, holds the DAS: `sudo flock -n /run/das-maintenance.lock true || echo WAIT` (`cat /run/das-maintenance.lock` shows what the holder recorded).
 
 ### One of the two 22TB backup drives failed (RAID-1 degraded)
 
@@ -103,26 +104,33 @@ The two 22TB drives in bays 2 and 5 are a BTRFS RAID-1 pair. If one fails, your 
 
 **1. Confirm the failure**
 ```bash
-sudo btrfs filesystem show /mnt/backup-22tb
+sudo btrfs filesystem show das-backup-22tb   # by label: the array is unmounted between backups
 # A line saying "*** Some devices missing" means one leg failed
-sudo btrfs device stats /mnt/backup-22tb
-# Look for a device with non-zero error counters
 ```
 
 **2. Mount the surviving leg (degraded)**
 
-If `/mnt/backup-22tb` is not currently mounted (or won't mount normally) — first make sure no backup, scrub, restore, index, reconcile or doctor run holds the DAS (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`; `cat /run/das-maintenance.lock` shows what the holder recorded):
+If `/mnt/backup-22tb` is not currently mounted (or won't mount normally) — first make sure no backup, scrub, restore, index, reconcile or doctor run, or recovery-OS VM session, holds the DAS (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`; `cat /run/das-maintenance.lock` shows what the holder recorded):
 ```bash
 sudo mkdir -p /mnt/backup-22tb
 sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=120,nossd,degraded \
     UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
+sudo btrfs device stats /mnt/backup-22tb   # a device with non-zero error counters is the failing one
 ```
 
-The system's automatic backups already mount by UUID with `degraded` in their mount options, so the next nightly backup runs even with one drive missing. The backup log says so (`journalctl -u das-backup | grep 'RAID-1 degraded'`); the emailed report has no line of its own for it, so do not wait for the email to tell you.
+The system's automatic backups already mount by UUID with `degraded` in their mount options, so the next nightly backup runs even with one drive missing. The backup log says so (`journalctl -u das-backup -u das-backup-full | grep 'RAID-1 degraded'` — Sunday's full run logs under the second); the emailed report has no line of its own for it, so do not wait for the email to tell you.
 
 **3. Replace the failed drive**
 
-Power down the DAS, swap in a new 22TB drive of equal or larger capacity (Seagate ST22000NM000C-3WC103 recommended for matching speed), power up.
+Hold the maintenance lock from here to the end of step 8: a backup run unmounts the array when it ends, even in the middle of a replace. On `WAIT` (a backup, scrub or recovery-OS VM session holds the DAS) never power the DAS off — wait:
+
+```bash
+sudo flock -n /run/das-maintenance.lock true || echo WAIT
+sudo flock /run/das-maintenance.lock bash   # a root shell holding the lock: do steps 3-8 in it; backups wait
+sudo umount /mnt/backup-22tb                 # if it is mounted
+```
+
+Power down the DAS, swap in a new 22TB drive of equal or larger capacity (Seagate ST22000NM000C-3WC103 recommended for matching speed), power up, run `sudo btrfs device scan`, and mount the array again with step 2's `mount` command (skip its lock check: you hold the lock).
 
 **4. Find the new drive — by serial, never by letter**
 ```bash
@@ -131,7 +139,7 @@ lsblk -o NAME,SIZE,SERIAL,TRAN
 NEW=/dev/disk/by-id/ata-ST22000NM000C-3WC103_<new-serial>   # adjust model if different
 ```
 
-**5. Partition the new drive identically to the surviving one**
+**5. Partition the new drive identically to the surviving one** (`sgdisk` is in the `gptfdisk` package: `sudo pacman -S gptfdisk` if it is missing)
 ```bash
 sudo sgdisk --zap-all "$NEW"
 sudo sgdisk --new=1:2048:42970644446 --typecode=1:8300 \
@@ -142,15 +150,15 @@ sudo partprobe "$NEW"
 **6. Replace the failed device in the BTRFS array**
 ```bash
 # Get the missing devid from `btrfs filesystem show`
-sudo btrfs filesystem show /mnt/backup-22tb
+sudo btrfs filesystem show das-backup-22tb
 # Look for the devid line marked MISSING — note its number
 # (today bay 2 ZXA1R71M is devid 2, bay 5 ZXA1NYGZ is devid 1)
 
-# Start the replace (this can take 24-48 hours for 5+ TiB of data over USB)
-sudo btrfs replace start <missing-devid> "$NEW"-part1 /mnt/backup-22tb
+# Replace, in the foreground: returns when done (24-48 hours for 5+ TiB over USB)
+sudo btrfs replace start -B <missing-devid> "$NEW"-part1 /mnt/backup-22tb
 
-# Watch progress
-sudo btrfs replace status /mnt/backup-22tb
+# Watch progress from another terminal
+sudo btrfs replace status -1 /mnt/backup-22tb
 ```
 
 **7. After replace completes — scrub, then restore RAID-1 chunks that were written `single` while degraded**
@@ -167,6 +175,7 @@ sudo btrfs device stats /mnt/backup-22tb   # All counters should be 0
 ```bash
 sudo btrfs device stats --reset /mnt/backup-22tb
 sudo umount /mnt/backup-22tb          # the next backup mounts it itself
+exit                                  # leave the lock shell from step 3: backups go on
 ```
 Put the new serial in place of the failed one in `serials` of the `primary-22tb` target in `/etc/das-backup/config.toml`, then `sudo btrdasd setup --upgrade` and `sudo btrdasd setup --check`.
 
@@ -226,7 +235,7 @@ sudo btrfs filesystem show
 
 ## Emergency Contacts & Resources
 
-- **BTRFS Wiki**: https://btrfs.wiki.kernel.org
+- **BTRFS documentation**: https://btrfs.readthedocs.io
 - **Arch Wiki**: https://wiki.archlinux.org
 - **CachyOS**: https://cachyos.org
 - **btrbk**: https://github.com/digint/btrbk

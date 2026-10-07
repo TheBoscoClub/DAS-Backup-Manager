@@ -144,7 +144,7 @@ Use the credentials you configured for the recovery environment.
 **Symptoms**: System still boots but shows "degraded array" warnings.
 
 **What to do**:
-1. Boot into your normal system (it should still work on the surviving mirror)
+1. Boot into your normal system on the surviving mirror. A BTRFS RAID-1 root with a device missing mounts only with `degraded`, and on the author's system the default boot entry does not carry it: at the boot menu choose **CachyOS (Safe Mode)**, **CachyOS (Fallback Initramfs)** or **CachyOS (CLI Only)**, whose `rootflags=subvol=/@,degraded` let it mount
 2. Open a terminal and check array status:
    ```bash
    sudo btrfs device stats /
@@ -188,9 +188,9 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 **Applies if** your primary backup is a BTRFS RAID-1 across two large drives (in this setup: 22TB Exos drives in DAS bays 2 and 5, sharing BTRFS UUID `b2dbe07d-40b9-422e-8ccf-ef4931c40457`).
 
 **Symptoms**:
-- The backup log (`journalctl -u das-backup`) says `primary-22tb: present=[…] missing=[…] — RAID-1 degraded, proceeding`. As of `backup-run.sh` v4.7.1 the emailed report has no line of its own for this and its SMART section shows one serial per target, so a clean-looking email does not prove both legs are present
-- `sudo btrfs filesystem show /mnt/backup-22tb` says `*** Some devices missing`
-- `sudo btrfs device stats /mnt/backup-22tb` shows non-zero error counters on one leg
+- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary-22tb: present=[…] missing=[…] — RAID-1 degraded, proceeding`. As of `backup-run.sh` v4.12.0 the emailed report has no line of its own for this and its SMART section shows one serial per target, so a clean-looking email does not prove both legs are present
+- `sudo btrfs filesystem show das-backup-22tb` says `*** Some devices missing` — ask by label: between backups the array is not mounted, and `btrfs filesystem show /mnt/backup-22tb` then answers only `not a valid btrfs filesystem`
+- Once it is mounted (Step 2), `sudo btrfs device stats /mnt/backup-22tb` shows non-zero error counters on one leg
 
 **Why this is a separate scenario**: This array is not in `/etc/fstab` and has nothing to do with system boot. The system continues booting and running normally on its NVMe RAID-1. What needs recovery is the *backup target itself* — so that incremental backups, restores, and disaster-recovery procedures keep working during the days it takes to replace a 22TB drive.
 
@@ -201,17 +201,16 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 #### Step 1: Confirm which leg failed
 
 ```bash
-sudo btrfs filesystem show /mnt/backup-22tb
+sudo btrfs filesystem show das-backup-22tb
 # Output looks like:
 #   Label: 'das-backup-22tb' uuid: b2dbe07d-40b9-422e-8ccf-ef4931c40457
 #       Total devices 2 FS bytes used X.XTiB
 #       devid    1 size 20.01TiB used Y path /dev/sdX1
 #       devid    2 size 0 used 0 path MISSING
 # (the "MISSING" line — note that devid number)
-
-sudo btrfs device stats /mnt/backup-22tb
-# Look for non-zero counters: write_io_errs, read_io_errs, corruption_errs
 ```
+
+The error counters need the array mounted: they come after Step 2.
 
 Cross-reference the device serial against your bay map (`docs/examples/author-bay-mapping.md`):
 - `ZXA1R71M` (bay 2, devid 2) — RMA replacement for failed `ZXA0LMAE` since 2026-05-15. Note: devid numbering was reversed by the 2026-05-07 `mkfs.btrfs` rebuild — the surviving leg became devid 1.
@@ -222,15 +221,20 @@ Cross-reference the device serial against your bay map (`docs/examples/author-ba
 The `backup-run.sh` script always mounts by UUID with `[das].mount_opts` (which include `degraded`), so scheduled backups continue. For interactive use, mount the same way:
 
 ```bash
-# Is a backup, scrub, restore, index, reconcile or doctor run holding the DAS?
-# They mount and unmount this target themselves, and all hold this lock while
-# they do; `cat /run/das-maintenance.lock` shows what the holder recorded.
+# Is a backup, scrub, restore, index, reconcile or doctor run, or a recovery-OS
+# VM session, holding the DAS? The runs mount and unmount this target themselves
+# (a VM session holds a drive), and all hold this lock while they do;
+# `cat /run/das-maintenance.lock` shows what the holder recorded.
 sudo flock -n /run/das-maintenance.lock true || echo "WAIT"
 
 # If /mnt/backup-22tb is not currently mounted
 sudo mkdir -p /mnt/backup-22tb
 sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=120,nossd,degraded \
     UUID=b2dbe07d-40b9-422e-8ccf-ef4931c40457 /mnt/backup-22tb
+
+# Now that it is mounted: look for non-zero counters
+# (write_io_errs, read_io_errs, corruption_errs)
+sudo btrfs device stats /mnt/backup-22tb
 ```
 
 A backup that starts while you have it mounted uses your mount and unmounts it when it finishes; unmount it yourself when you are done.
@@ -270,15 +274,25 @@ sudo smartctl -l selftest -d sat "$NEW"
 # All tests should show "Completed without error"
 ```
 
-You can begin Step 5 in parallel with the long test — the test runs in the drive's firmware in offline mode and yields to host I/O.
+Do not power-cycle the DAS (Step 5) while a SMART test runs on any drive inside it — the surviving leg's from Step 3, or this one's if you test it in a bay: cutting the power aborts the test. `sudo smartctl -c -d sat <drive>` shows its `Self-test execution status`; wait until no test is in progress. The test runs in the drive's firmware and yields to host I/O, so backups can go on meanwhile.
 
 #### Step 5: Power off DAS, swap drive in, power up
 
 Use your bay map to identify the failed drive's bay before pulling. The DAS does not require host shutdown — only DAS power-cycling.
 
+Nothing may be using the DAS while it is off, and a backup run unmounts the array when it ends — even in the middle of the replace in Step 7. So take the maintenance lock now and hold it until the end of Step 9: in a terminal that will stay open for the next two days (closing it lets the lock go), open a root shell that holds it, and do Steps 5–9 in that shell (what you set before does not carry into it: set `NEW` there again, as in Step 4). Check first: `WAIT` means a backup, scrub or recovery-OS VM session holds the DAS — never power it off then; wait, and check again.
+
+```bash
+sudo flock -n /run/das-maintenance.lock true || echo WAIT
+sudo flock /run/das-maintenance.lock bash   # a root shell holding the lock; backups and scrubs due meanwhile wait
+sudo umount /mnt/backup-22tb                 # if you mounted it in Step 2
+```
+
+Then power the DAS off, swap the drive, and power it on. Once it is up, run `sudo btrfs device scan` and mount the array again with Step 2's `mount` command (skip its lock check: you hold the lock).
+
 #### Step 6: Partition the new drive identically
 
-The replacement must have a GPT partition that exactly matches the surviving leg's geometry. Address it by its serial (`$NEW` from Step 4) — `--zap-all` on the wrong drive destroys it, and `/dev/sdX` letters move on every reconnect. Confirm with `lsblk -o NAME,SIZE,SERIAL,TRAN` that the serial is the new drive's and that it has no partitions:
+The replacement must have a GPT partition that exactly matches the surviving leg's geometry. Address it by its serial (`$NEW` from Step 4) — `--zap-all` on the wrong drive destroys it, and `/dev/sdX` letters move on every reconnect. Confirm with `lsblk -o NAME,SIZE,SERIAL,TRAN` that the serial is the new drive's and that it has no partitions. `sgdisk` is in the `gptfdisk` package; install it (`sudo pacman -S gptfdisk`) if it is missing:
 
 ```bash
 sudo sgdisk --zap-all "$NEW"
@@ -295,14 +309,15 @@ Verify with `sudo sgdisk --print "$NEW"` — the partition should be sectors 204
 # Get the missing devid from `btrfs filesystem show` (Step 1)
 MISSING_DEVID=<number from "MISSING" line>
 
-# Start the replace — runs in background by default
-sudo btrfs replace start "$MISSING_DEVID" "$NEW"-part1 /mnt/backup-22tb
+# Replace in the foreground (-B): the command returns when the replace is done,
+# ~24-48 hours for ~5 TiB over USB — only then go on to Step 8
+sudo btrfs replace start -B "$MISSING_DEVID" "$NEW"-part1 /mnt/backup-22tb
 
-# Monitor (recover takes ~24-48 hours for ~5 TiB over USB)
-watch -n 60 sudo btrfs replace status /mnt/backup-22tb
+# Monitor from another terminal (-1 prints once, so watch can repeat it)
+watch -n 60 sudo btrfs replace status -1 /mnt/backup-22tb
 ```
 
-`btrfs replace` reads from the surviving leg, writes to the new device, and updates the superblock. It is online — backups can continue running concurrently (slower).
+`btrfs replace` reads from the surviving leg, writes to the new device, and updates the superblock. The filesystem stays usable while it runs, but no backup may run meanwhile: a backup run unmounts the array when it ends (Step 2). That is why you hold the maintenance lock until Step 9 — a backup due meanwhile waits for it, and runs afterwards.
 
 #### Step 8: Scrub, then restore RAID-1 across single-profile chunks
 
@@ -340,7 +355,7 @@ sudo btrfs filesystem df /mnt/backup-22tb
 # Expect: Data, RAID1 / Metadata, RAID1 / System, RAID1 (no `single` lines)
 ```
 
-Unmount it when you are done (`sudo umount /mnt/backup-22tb`); the next backup mounts it itself.
+Unmount it when you are done (`sudo umount /mnt/backup-22tb`), then `exit` the root shell from Step 5 to let the maintenance lock go: the backups that waited run now, and Step 10's `btrdasd setup` refuses while the lock is held. The next backup mounts the array itself.
 
 #### Step 10: Update the config, bay map and CHANGELOG
 
@@ -402,8 +417,9 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    # Note the devid of the missing device
    sudo btrfs filesystem show /mnt
 
-   # Rebuild the missing copy onto the new partition
-   sudo btrfs replace start <missing-devid> /dev/<new-drive-btrfs-partition> /mnt
+   # Rebuild the missing copy onto the new partition, in the foreground (-B),
+   # so the balance below starts only once the replace is done
+   sudo btrfs replace start -B <missing-devid> /dev/<new-drive-btrfs-partition> /mnt
 
    # Anything written while degraded is in `single` chunks: convert back
    sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /mnt
@@ -463,7 +479,9 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    sudo parted /dev/<drive> mkpart ESP fat32 1MiB 4GiB
    sudo parted /dev/<drive> set 1 esp on
    sudo parted /dev/<drive> mkpart primary 4GiB 100%
-   sudo mkfs.fat -F32 /dev/<drive-esp-partition>
+   # Label the ESP as your fstab and ESP mirroring expect (author's: EFI on the
+   # first drive, EFI-BACKUP on the second) — fstab mounts /boot by LABEL=EFI
+   sudo mkfs.fat -F32 -n <esp-label> /dev/<drive-esp-partition>
    ```
 
 3. **Create BTRFS filesystem** on the main partitions:
@@ -510,7 +528,7 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    # Restore home from the snapshot of the same time
    sudo rsync -aAXHv --info=progress2 /mnt/backup/nvme/home.<TIMESTAMP>/ /mnt/target/@home/
    ```
-   The subvolume names above are the author's (`btrdasd subvol list` shows yours); a snapshot holds an empty directory where a nested subvolume sat, so restore each nested one from its own snapshot.
+   The subvolume names above are the author's (`btrdasd subvol list` shows yours); a snapshot holds an empty directory where a nested subvolume sat, so restore each nested one from its own snapshot. The author's `@/@audiobooks-db` is snapshotted as `nvme/-audiobooks-db.<TIMESTAMP>`: a name that begins with `-` is read as an option by most commands, so always give it as a full path (`/mnt/backup/nvme/-audiobooks-db.<TIMESTAMP>/`), or put `--` before it.
 
 7. **Install bootloader**:
    ```bash
@@ -523,8 +541,17 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
 
    bootctl install                    # For systemd-boot
    # Or: grub-install /dev/<drive>    # For GRUB
+
+   # The new ESP is empty: nothing has put a kernel, initramfs or microcode on it
+   # (mkinitcpio -P alone fails without the kernel image). Install them in ONE
+   # transaction — amd-ucode owns /boot/amd-ucode.img, not the kernel package —
+   # with every kernel you had (pacman -Qq | grep '^linux-cachyos'):
+   pacman -S amd-ucode linux-cachyos
+   sdboot-manage gen                  # writes the loader entries
    exit
    ```
+
+   Then check the loader entries: every `root=UUID=` in `/mnt/target/@/boot/loader/entries/*.conf` must be the new BTRFS filesystem's UUID (`sudo blkid /dev/<drive1-btrfs-partition>`); correct any that is not. Put back by hand, with the new UUID, every entry no generator writes (the author's Safe Mode and CLI entries: `examples/author-storage-reference.md` §2a).
 
 8. **Update fstab with new UUIDs**:
    ```bash
@@ -536,6 +563,8 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    sudo nano /mnt/target/@/etc/fstab
    # Replace old UUIDs with new ones
    ```
+
+   Also change every line that mounts a subvolume by `subvolid=`: a restored subvolume is a new one with a new id, and a line naming the old id stops the boot in emergency mode. Name it by path instead. On the author's system `/var/lib/audiobooks/db` is mounted with `subvolid=2816`; after a restore that line must say `subvol=/@/@audiobooks-db`.
 
 9. **Unmount and reboot**:
    ```bash
@@ -600,20 +629,21 @@ Before any repair below, you need to mount the broken system's root filesystem. 
 lsblk -f
 # Look for the BTRFS partition with your system's UUID or label
 
-# 2. Mount it
+# 2. Mount it (with one drive of a RAID-1 root missing: -o subvol=@,degraded)
 sudo mkdir -p /mnt/broken
 sudo mount -o subvol=@ /dev/<broken-system-partition> /mnt/broken
 
 # 3. If you also need to fix boot files, mount the ESP
 sudo mount /dev/<broken-system-esp> /mnt/broken/boot
 
-# 4. For operations that need a running system (mkinitcpio, passwd, systemctl),
-#    set up a chroot:
-sudo mount --bind /dev  /mnt/broken/dev
-sudo mount --bind /proc /mnt/broken/proc
-sudo mount --bind /sys  /mnt/broken/sys
-sudo mount --bind /run  /mnt/broken/run
-sudo chroot /mnt/broken
+# 4. For operations that need a running system (mkinitcpio, passwd, systemctl,
+#    bootctl), enter it with arch-chroot. It mounts /dev, /proc, /sys — with the
+#    EFI variables (efivarfs) bootctl needs — and /run, and takes them down on exit:
+sudo arch-chroot /mnt/broken
+#    Without arch-chroot (package arch-install-scripts), bind them recursively:
+#    a plain --bind of /sys leaves efivarfs out, and bootctl cannot write its entry.
+#      for d in dev proc sys run; do sudo mount --rbind /$d /mnt/broken/$d && sudo mount --make-rslave /mnt/broken/$d; done
+#      sudo chroot /mnt/broken
 ```
 
 When you are done with any repair, exit the chroot and unmount:
@@ -803,11 +833,10 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 
 2. **Find the failing service**. If you saw the service name on screen during the hang, use that. Otherwise:
    ```bash
-   # List services that failed on last boot
-   systemctl --root=/mnt/broken list-units --state=failed
-
-   # Or from inside chroot:
-   journalctl -b -1 -p err    # errors from last boot
+   # The broken system's journal, read from outside the chroot: its boots,
+   # newest last, then the errors of its last boot (-b -1 for the one before)
+   sudo journalctl -D /mnt/broken/var/log/journal --list-boots
+   sudo journalctl -D /mnt/broken/var/log/journal -b -0 -p err
    ```
 
 3. **Disable the problem service** so the system can boot:
@@ -1013,6 +1042,11 @@ sudo btrfs subvolume snapshot /mnt/target/root-.20261002T1500 /mnt/target/@
 # 7. IMPORTANT: Update /etc/fstab in the restored subvolume
 #    The backup snapshot's fstab has the UUIDs from when it was taken.
 #    If you're restoring to different drives, update the UUIDs.
+#    A nested subvolume is not in the snapshot (an empty directory stands where
+#    it sat): restore it from its own snapshot, and mount it by path, never by
+#    subvolid= — a restored subvolume has a new id, and a line naming the old one
+#    stops the boot in emergency mode (author's: /var/lib/audiobooks/db,
+#    subvolid=2816 must become subvol=/@/@audiobooks-db).
 sudo nano /mnt/target/@/etc/fstab
 
 # 8. Clean up: delete the broken subvolume (when you're sure the restore works)
@@ -1047,7 +1081,7 @@ sudo umount /mnt/snapshot /mnt/target
 
 Each recovery drive boots its own independent OS. It is what you boot when the host cannot, so it has to mount and `btrfs receive` what the host's current kernel and btrfs-progs wrote: a kernel older than a filesystem feature the backups use refuses the mount or the receive. An install left alone for months also stops being able to update itself, because its keyring no longer verifies the packages it is offered.
 
-Every backup run reads each recovery OS (read-only) and adds a `RECOVERY OS` section to the report: install date, last full upgrade and its age (counted from the install when it was never upgraded: `never upgraded since install on <date> (<N> days)`), newest kernel against the host's, btrfs-progs against the host's — and what booting it would start: `Enabled timers` (by unit tree), `btrbk config` (btrbk's default config, present or absent) and `btrbk at boot` (`will`, `may` or `no`, with its reasons; `will` or `may` adds a `WARNING` row). Past `[recovery_os].max_age_days` (default 60), with a kernel series behind the host's, or with either unreadable, it says `STALE`; that or a `WARNING` makes the run status read `COMPLETED WITH WARNINGS`. `btrdasd health` shows the last reading between runs. The reading is kept in `/var/lib/das-backup/recovery-os.json`, each drive's with the UUID of the filesystem it was read from (`mount_uuid`).
+Every backup run reads each recovery OS (read-only) and adds a `RECOVERY OS` section to the report: install date, last full upgrade and its age (counted from the install when it was never upgraded: the `Age` row then reads `<N> days since install`), newest kernel against the host's, btrfs-progs against the host's — and what booting it would start: `Enabled timers` (by unit tree), `btrbk config` (btrbk's default config, present or absent) and `btrbk at boot` (`will`, `may` or `no`; for `no` the row says what was ruled out, while a `will` or `may` adds a `WARNING` row that carries its reasons). It says `STALE`, with its reasons, when the last applied upgrade is older than `[recovery_os].max_age_days` (default 60) — or, never upgraded, the install is: `STALE — never upgraded since install on <date> (<N> days)` — or cannot be dated; when a later upgrade attempt did not complete; when its newest kernel's series is behind the host's, or either kernel is unknown; or when its btrfs-progs is older than the host's. That or a `WARNING` makes the run status read `COMPLETED WITH WARNINGS`. `btrdasd health` shows the last reading between runs. The reading is kept in `/var/lib/das-backup/recovery-os.json`, each drive's with the UUID of the filesystem it was read from (`mount_uuid`).
 
 **Before booting a recovery OS anywhere — in the VM or on bare metal — read its `RECOVERY OS` block** in the last backup report (or `btrdasd health`): `Enabled timers`, `btrbk at boot` and any `WARNING`. If btrbk would run at boot, disable `btrbk.timer` (and whatever else the reasons name) from bare metal first, from its emergency shell — see "The session refuses: `btrbk will run when this OS boots`" below. The VM session reads the same record itself and refuses a `will`; on bare metal nothing does.
 
@@ -1056,9 +1090,9 @@ To update one, boot it — never update it from the host. There are two ways:
 - **In the `recovery-os-updater` VM**, without rebooting the workstation: the drive's own OS boots in a virtual machine that is lent the whole physical disk — [below](#in-the-recovery-os-updater-vm).
 - **On bare metal**: reboot the workstation into the recovery drive — [further below](#on-bare-metal).
 
-Either way, do one drive at a time, so one known-good recovery OS exists throughout. The next backup run reads the new state; `STALE` clears once the last *applied* upgrade is recent and the kernel series and btrfs-progs have caught up with the host's. An upgrade that failed or was declined shows as a `Last attempt … (did not complete)` — the report only counts one whose transaction completed.
+Either way, do one drive at a time, so one known-good recovery OS exists throughout. The next backup run reads the new state; `STALE` clears once the last *applied* upgrade is recent, no later attempt failed, and the kernel series and btrfs-progs have caught up with the host's. An upgrade that failed or was declined shows as a `Last attempt … (did not complete)` — the report only counts one whose transaction completed.
 
-**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly what `.claude/rules/esp-safety.md` rule 1 forbids — the 2026-03-05 incident destroyed both recovery boot configurations this way. Booted — on bare metal or in the VM — every write, its ESP included, is made by the drive's own OS, which the rule permits.
+**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly what `.claude/rules/esp-safety.md` rule 1 forbids — the 2026-03-05 incident destroyed both recovery boot configurations this way. Booted — on bare metal or in the VM — every write, its ESP included, is made by the drive's own OS, which rule 4 of the same file permits.
 
 ### In the recovery-os-updater VM
 
@@ -1076,15 +1110,15 @@ Either way, do one drive at a time, so one known-good recovery OS exists through
 
    Masked here means: for that boot, each unit is replaced by an empty one that systemd refuses to start (systemd 262 lists it as a "bad unit file setting", and the boot log shows those units failing to load: that is the guard), **and** given a drop-in, `zzzzzzzz-das-vm-guard.conf`, whose condition can never hold. A drop-in of the OS's own that gives the unit a command again (`systemctl edit` writes `override.conf`) makes the unit load, but it still never starts: the guard's condition applies after it. Only a drop-in that sorts after the guard's could undo that, and the report then names the unit: the guard is not engaged.
 
-   The session prints the first line: `das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service`. **Every line is judged:** each boot must begin with its line 1, engaged, and no line may say NOT engaged. **A boot must prove itself:** the first boot within 15 minutes of the start, and — since a boot that came without the guard writes nothing at all — every boot after a **reset**. The session watches libvirt's reboot event for the VM (a reboot inside it, or `virsh reset`), and after each one a new boot must report engaged within 15 minutes of the first reset not yet answered; more resets do not push that out. Each reset is read whole even when the session reads it late (its script stopped, say by a Ctrl-Z), and is placed where the report stood when it was read — so a new boot's line written before that cannot answer it, and that boot is asked again: the cautious side. Output of the event stream the session does not recognise but that names a reboot counts as a reset too. A failure on a `will` or `may` record asks the recovery OS to shut down — never forced off — and the session ends with exit status 6; on a `no` record it is a warning (exit status 5), and the session goes on. A recovery OS whose systemd is older than 256 ignores the strings and never reports, which is how that is caught.
+   For a record that names no unit, the first line reads `das-vm-guard engaged 4 masks btrbk.service,btrbk.timer,cronie.service,crond.service`; every unit the record names adds a mask. These drives' records name `mkinitcpio-generate-shutdown-ramfs.service`, so their sessions print `das-vm-guard engaged 5 masks …,mkinitcpio-generate-shutdown-ramfs.service` (observed 2026-10-07). **Every line is judged:** each boot must begin with its line 1, engaged, and no line may say NOT engaged. **A boot must prove itself:** the first boot within 15 minutes of the start, and — since a boot that came without the guard writes nothing at all — every boot after a **reset**. The session watches libvirt's reboot event for the VM (a reboot inside it, or `virsh reset`), and after each one a new boot must report engaged within 15 minutes of the first reset not yet answered; more resets do not push that out. Each reset is read whole even when the session reads it late (its script stopped, say by a Ctrl-Z), and is placed where the report stood when it was read — so a new boot's line written before that cannot answer it, and that boot is asked again: the cautious side. Output of the event stream the session does not recognise but that names a reboot counts as a reset too. A failure on a `will` or `may` record asks the recovery OS to shut down — never forced off — and the session ends with exit status 6; on a `no` record it is a warning (exit status 5), and the session goes on. A recovery OS whose systemd is older than 256 ignores the strings and never reports, which is how that is caught.
 
-   **Silence after a boot proved itself is a warning, never a stop.** The guard's enforcement — the bind mount, the masks — does not depend on its reporter, so 15 minutes without a line and without a reset means its reporter stopped or the recovery OS hung, and the session cannot tell which: it says `THE SESSION GUARD'S REPORTER IS SILENT` (again every 15 minutes, with how to look), and the summary carries it (exit status 5). Two exceptions. If libvirt's event stream ends (`THE RESET WATCH HAS STOPPED`, a libvirt restart), a reset can no longer be ruled out, and from then on 15 minutes of silence fails as above. And neither a host suspend nor a paused VM is silence: time the VM is paused, and a gap between two of the session's looks far longer than a look takes (`DAS_RECOVERY_VM_CLOCK_GAP_SECS`, 120 s), are not counted — the session says so, and puts the time skipped in the summary's Warnings (exit status 5): it cannot tell a host suspend from its own script stopped, and in the second the recovery OS ran that long unwatched, every deadline moved out by as much. Lines lost from the report (a gap in a boot's numbers, a file cut in place) are said and put in the summary (exit status 5), never a failure: the boot was seen to begin engaged. So is a line left unfinished when the recovery OS powers off — unless only a NOT engaged line begins so, which fails.
+   **Silence after a boot proved itself is a warning, never a stop.** The guard's enforcement — the bind mount, the masks — does not depend on its reporter, so 15 minutes without a line and without a reset means its reporter stopped or the recovery OS hung, and the session cannot tell which: it says `THE SESSION GUARD'S REPORTER IS SILENT` (again every 15 minutes, with how to look), and the summary carries it (exit status 5). Two exceptions. If libvirt's event stream ends (`THE RESET WATCH HAS STOPPED`, a libvirt restart), a reset can no longer be ruled out, and from then on 15 minutes of silence fails as above. And neither a host suspend nor a paused VM is silence. Time the VM is paused is not counted, and nothing is said of it. A gap between two of the session's looks far longer than a look takes (`DAS_RECOVERY_VM_CLOCK_GAP_SECS`, 120 s) is not counted either, and the session says so; unless the VM read paused at the looks on both sides of it, the time skipped also goes into the summary's Warnings (exit status 5): the session cannot tell a host suspend from its own script stopped, and in the second the recovery OS ran that long unwatched, every deadline moved out by as much. Lines lost from the report (a gap in a boot's numbers, a file cut in place) are said and put in the summary (exit status 5), never a failure: the boot was seen to begin engaged. So is a line left unfinished when the recovery OS powers off — unless only a NOT engaged line begins so, which fails.
 
    **What it cannot see:** a new boot that comes *without* a reset — `kexec`, say — and without the guard writes nothing, and is only silence: a warning, not a stop. A new boot that does report is judged like any other (it must begin with its line 1, engaged).
 
-   **It boots only guarded.** The domain is started *paused* and afresh (`--force-boot`: never from a saved image, and a session refuses while one exists, 2 above), its live definition read back, and resumed only if it carries the guard. If it does not (a `define` or `session-end` run at that very moment) it is destroyed while still paused — the one thing this script ever destroys, a domain that has not run a single instruction — and nothing boots. The destroy reads the domain's state and its vCPUs' time in one read right before it (`virsh domstats --state --vcpu`), and refuses anything not paused, or paused with vCPU time — something other than the session resumed it (and paused it again): it may have run, and is treated as an OS without the guard. A read that fails, or lacks a vCPU's time, destroys nothing. libvirt counts a vCPU's time in whole clock ticks (10 ms), so a resume and pause by someone else within that still reads 0. Inside the VM, `systemctl stop das-vm-guard` lifts the bind mount for the update ([below](#the-first-update-at-the-vm-console)); the masks stay until the VM powers off. Afterwards the domain is defined from its template again, which carries no guard; `session-end` does that too for a session that ended before it could. `status` and `session-end` read and judge the guard's report — before anything is removed — and exit 6 (5 on a `no` record) when it says not engaged, is missing for a recovery OS that ran, or cannot be read. They honour the resets the session saw: a reset no boot after it answered is `pending` while the recovery OS runs and less than 15 minutes have passed since it (exit status 0 — treat it as unguarded until it says engaged; time paused does not count), and `NOT confirmed` once it is shut off or that time has passed (exit status 6, or 5 on `no`). `status` also counts silence, since it cannot see a reset made after the session's script ended: for a recovery OS that is neither shut off nor paused, a report last written 15 minutes ago or more is `NOT confirmed: silent for …` — the reporter stopped, or a boot came without the guard. That is information only: `status` never stops anything. **On bare metal there is no guard** — see [On bare metal](#on-bare-metal).
+   **It boots only guarded.** The domain is started *paused* and afresh (`--force-boot`: never from a saved image, and a session refuses while one exists, 2 above), its live definition read back, and resumed only if it carries the guard. If it does not (a `define` or `session-end` run at that very moment) it is destroyed while still paused — the one thing this script ever destroys, a domain that has not run a single instruction — and nothing boots. The destroy reads the domain's state and its vCPUs' time in one read right before it (`virsh domstats --state --vcpu`), and refuses anything not paused, or paused with vCPU time — something other than the session resumed it (and paused it again): it may have run, and is treated as an OS without the guard. A read that fails, or lacks a vCPU's time, destroys nothing. libvirt counts a vCPU's time in whole clock ticks (10 ms), so a resume and pause by someone else within that still reads 0. Inside the VM, `systemctl stop das-vm-guard` lifts the bind mount for the update ([below](#the-first-update-at-the-vm-console)); the masks stay until the VM powers off. Afterwards the domain is defined from its template again, which carries no guard; `session-end` does that too for a session that ended before it could. `status` and `session-end` read and judge the guard's report — before anything is removed — and exit 6 (5 on a `no` record) when it says not engaged, is missing for a recovery OS that ran, or cannot be read. They honour the resets the session saw: a reset no boot after it answered is `pending` while the recovery OS is paused, or runs and less than 15 minutes have passed since the reset by the wall clock, time it spent paused included (exit status 0 — treat it as unguarded until it says engaged), and `NOT confirmed` once it is shut off or that time has passed (exit status 6, or 5 on `no`). `status` also counts silence, since it cannot see a reset made after the session's script ended: for a recovery OS that is neither shut off nor paused, a report last written 15 minutes ago or more is `NOT confirmed: silent for …` — the reporter stopped, or a boot came without the guard. That is information only: `status` never stops anything. **On bare metal there is no guard** — see [On bare metal](#on-bare-metal).
 5. **The maintenance lock**, `/run/das-maintenance.lock`, taken without waiting and held for the whole session. A backup or scrub that starts meanwhile waits for it; the jobs that would otherwise mount a target defer. Its first line names the session and the process holding it — `recovery-os VM session <label> pid <pid>`, the disk holder's pid once it holds — and a refusal elsewhere prints it; it is emptied again before the lock is let go.
-6. **The claim.** `btrdasd recovery-os hold-disk` holds the whole disk open exclusively (`O_EXCL`). While it does, the kernel refuses to mount any partition of the drive on the host — by device or by UUID, from any program — while the VM's own non-exclusive open still works. The holder runs in a session of its own (no Ctrl-C or hangup reaches it) and in a systemd scope of its own (`das-recovery-os-holder-<label>.scope`, outside your login session), and it also holds the lock: a closed terminal, a Ctrl-C or a killed script leaves the drive claimed and the backups waiting for as long as the VM may be using it. A holder that dies while the VM runs is replaced at the next check (the VM's own open does not stand in the way), and the summary says so. A session refuses to start without `systemd-run`. Even so, do not stop your user session manager (`loginctl kill-user`, `systemctl stop user@…`) while a session runs. And never `systemctl stop` a `das-recovery-os-holder-*` scope during a session: that ends the claim and the lock at once — a running session claims the disk again at its next check (every 5 seconds), one left in place (exit status 3) does not. A lost claim, even one taken again, ends the session with exit status 5, and the summary says whether it was taken again.
+6. **The claim.** `btrdasd recovery-os hold-disk` holds the whole disk open exclusively (`O_EXCL`). While it does, the kernel refuses to mount any partition of the drive on the host — by device or by UUID, from any program — while the VM's own non-exclusive open still works. The holder runs in a session of its own (no Ctrl-C or hangup reaches it) and in a systemd scope of its own (`das-recovery-os-holder-<label>.scope`, outside your login session), and it also holds the lock: a closed terminal, a Ctrl-C or a killed script leaves the drive claimed and the backups waiting for as long as the VM may be using it. A holder that dies while the VM runs is replaced at the next check (the VM's own open does not stand in the way), and the summary says so. A session refuses to start without `systemd-run`. Even so, do not stop your user session manager (`loginctl kill-user`, `systemctl stop user@…`) while a session runs. And never `systemctl stop` a `das-recovery-os-holder-*` scope during a session: that ends the claim at once, and the lock with it unless the session's script still runs (the script holds the lock too) — a running session claims the disk again at its next check (every 5 seconds), one left in place (exit status 3) does not. A lost claim, even one taken again, ends the session with exit status 5, and the summary says whether it was taken again.
 7. **SATA, not virtio.** The whole disk is attached as a SATA disk with boot order 1 — the VM's network card has 2, so the network is tried only after the disk. The recovery OS's initramfs almost certainly lacks the virtio drivers. Its default image finds its root on SATA only if it was built with `ahci` — that is, if the OS was installed on a machine with an AHCI controller. If it was installed with the drive already in the USB enclosure, the default image may carry only the USB storage drivers; the first boot in the VM then needs the **fallback** entry (see below). That is the documented path, not a defect.
 8. **It waits** until the recovery OS powers itself off — and, from its start and from every reset, at most 15 minutes for a boot's first line (it reports every minute after). Reboots inside the VM are part of the job; the guard comes back at every boot, and each boot's lines are judged.
 9. **Giving it back:** detach the disk, define the domain from its template again (no guard), stop the holder, `btrfs device scan` the drive's partition 2 so the host's kernel reads what the other kernel wrote, check that no partition is mounted, release the lock, print a summary.
@@ -1093,7 +1127,7 @@ The host never writes to the drive: no mount, no chroot, no copy. The script nev
 
 #### Running it
 
-As root. The script is in `/usr/lib/das-backup/` on a `/usr` install, `${prefix}/lib/das-backup/` otherwise; it needs libvirt with KVM, the UEFI firmware (`edk2-ovmf`), libvirt's NAT network `default` and `systemd-run` — see [INSTALL.md](INSTALL.md#recovery-os-vm-optional). Once after installing, and again whenever an upgrade of this project changes the VM's definition (the VM must be shut off, with no disk):
+As root. The script is in `/usr/lib/das-backup/` on a `/usr` install, `${prefix}/lib/das-backup/` otherwise; it needs libvirt with KVM, the UEFI firmware (`edk2-ovmf`), libvirt's NAT network `default`, `systemd-run`, `jq` (a session refuses without it) and, for `screenshot`, ImageMagick's `magick` — see [INSTALL.md](INSTALL.md#recovery-os-vm-optional). Once after installing, and again whenever an upgrade of this project changes the VM's definition (the VM must be shut off, with no disk):
 
 ```bash
 sudo /usr/lib/das-backup/recovery-os-vm.sh define
@@ -1119,7 +1153,7 @@ Other commands:
 
 - `session A --timeout 120` — after 120 minutes, ask the recovery OS to shut down and wait 10 more; it is never forced off. If it is still running then, the session is left in place (exit status 3).
 - `session A --accept-boot-record-risk` — only when you know why the boot record says what it says (3 above): the session goes on despite a `will` verdict, an old record, or a session since the record was made, and its summary says so. The guard (4) still applies, and a guard that does not confirm still shuts the recovery OS down.
-- `status` — the VM's state, the disk it holds, the session guard and its report's judgement (`engaged` with its last report's age, `no report yet`, `pending: the recovery OS was reset …`, `NOT engaged: …`, `NOT confirmed: the recovery OS was reset …`, or `NOT confirmed: silent for …`; exit status 6, or 5 on a `no` record, for the last three), the holder and its scope, and who holds the maintenance lock. A VM that is not defined at all has no guard (exit status 0).
+- `status` — the VM's state, the disk it holds, the session guard and its report's judgement (`engaged` with its last report's age, `no report yet`, `never ran`, `pending: the recovery OS was reset …`, `NOT engaged: …`, `NOT confirmed: the recovery OS was reset …`, `NOT confirmed: silent for …`, `cannot be judged: …` when its session state is gone — a host restart clears `/run` — or, with the guard in the definition and no session state at all, `cannot be judged: no session state for it`; exit status 6, or 5 on a `no` record, for the three that begin with NOT, and 6 for the two that cannot be judged), the holder and its scope, and who holds the maintenance lock. A definition virsh cannot read makes the guard `unknown (virsh: …)`, exit status 6. A VM that is not defined at all has no guard (exit status 0).
 - `screenshot screen.png` — the VM's screen, while it runs (read through QEMU's monitor, so it does not need the VNC socket).
 - `session-end A` — finishes a session whose script was interrupted or killed (exit status 3 or 4), once the recovery OS is powered off: judges the guard's report first and says what it found (exit status 6, or 5 on a `no` record, when it was not engaged, is missing for a recovery OS that ran, cannot be read, or a reset the session saw was never answered by a boot reporting engaged; 5 when its last line was left unfinished), detaches, defines the VM from its template again (no guard), stops the holder (which releases the lock), rescans. With no disk attached it still takes out a guard left in the definition. Whenever it changes the VM's definition with no live holder, it takes the maintenance lock first, and refuses while another job holds it.
 
@@ -1240,7 +1274,7 @@ If something goes wrong at the console:
   - `the recovery OS was reset, and no boot after that reported its guard engaged within 0h 15m 00s`: it rebooted and came back without the guard (no units from the SMBIOS strings at all — a boot that says nothing), or it is stuck in its firmware, boot menu or an emergency shell.
   - `the recovery OS stopped reporting … with the reset watch down`: libvirt's event stream ended during the session, so a reset could no longer be seen, and from then on 15 minutes of silence counts as a boot without the guard.
 - **`THE SESSION GUARD'S REPORTER IS SILENT`** (a warning, said again every 15 minutes; the summary's Warnings line, exit status 5): no line for 15 minutes, and no reset since its last one. The guard itself does not depend on its reporter, so nothing is stopped for it: either the reporter died for good (it is restarted when it fails, at most four starts an hour, and never after a `systemctl stop`) or the recovery OS hung. Look at its console (`virt-viewer --connect qemu:///system --attach recovery-os-updater`; inside it: `systemctl status das-vm-guard-report das-vm-guard`). The one case this cannot catch: a new boot *without* a reset (`kexec`) that came without the guard — it too is only silence.
-- **The session refuses: `the started domain does not carry the session guard`** (or `cannot read the started domain's definition`): something defined the VM again between the session's checks and its start — a `define` or `session-end` run at that very moment. The domain was destroyed while still paused, before it ran a single instruction — no firmware, no OS, no write to the disk; nothing booted, and the session says so. **A retry is safe**: run the session again. **If it fails the same way again**, the cause is persistent — libvirt not applying the session guard's SMBIOS strings to the started domain, for one — and needs a fix before any session can boot. If it adds `and it could not be destroyed`, the session is kept instead (exit status 3) and says the domain `was started paused and never resumed`: it has still run nothing. First check it is still paused and has never run — `sudo virsh --connect qemu:///system domstats --state --vcpu recovery-os-updater` must say `state.state=3` and `vcpu.N.time=0` for every vCPU; anything else means something other than the session resumed it, and it may be running (or have run) without the guard (`status`) — and only then tear it down: `sudo virsh --connect qemu:///system destroy recovery-os-updater`. Then `session-end`, which reports the guard as `never ran`. If the session says `not destroying recovery-os-updater: it is running, not paused`, something resumed it between the start and the check: it is treated as an OS without the guard (asked to shut down on a `will` or `may` record). `it is paused, but its vCPUs have run`: something resumed it and paused it again; it is kept (exit status 3) as an OS that may have run — resume it and judge it, or destroy it as your choice. `whether it ever ran cannot be read`: nothing is destroyed, and it is kept (exit status 3) with the check above.
+- **The session refuses: `the started domain does not carry the session guard`** (or `cannot read the started domain's definition`): something defined the VM again between the session's checks and its start — a `define` or `session-end` run at that very moment. The domain was destroyed while still paused, before it ran a single instruction — no firmware, no OS, no write to the disk; nothing booted, and the session says so. It failed after the session recorded its start, though, and a retry is let through only when a session failed before it tried to start the recovery OS. So let a backup run, with the drive attached, record the drive again first, then run the session again — the session's own message says to run it again at once, but the next session refuses until the drive is recorded again. **If it fails the same way again**, the cause is persistent — libvirt not applying the session guard's SMBIOS strings to the started domain, for one — and needs a fix before any session can boot. If it adds `and it could not be destroyed`, the session is kept instead (exit status 3) and says the domain `was started paused and never resumed`: it has still run nothing. First check it is still paused and has never run — `sudo virsh --connect qemu:///system domstats --state --vcpu recovery-os-updater` must say `state.state=3` and `vcpu.N.time=0` for every vCPU; anything else means something other than the session resumed it, and it may be running (or have run) without the guard (`status`) — and only then tear it down: `sudo virsh --connect qemu:///system destroy recovery-os-updater`. Then `session-end`, which reports the guard as `never ran`. If the session says `not destroying recovery-os-updater: it is running, not paused`, something resumed it between the start and the check: it is treated as an OS without the guard (asked to shut down on a `will` or `may` record). `it is paused, but its vCPUs have run`: something resumed it and paused it again; it is kept (exit status 3) as an OS that may have run — resume it and judge it, or destroy it as your choice. `whether it ever ran cannot be read`: nothing is destroyed, and it is kept (exit status 3) with the check above.
 - **The session refuses: `has a managed-save image`**: the VM holds the saved memory of a recovery OS that was running when it was saved, and a start would resume it — its disk included — instead of booting it afresh. The session never discards it. If you decide that state can go (whatever that OS had not yet written to its disk is lost): `sudo virsh --connect qemu:///system managedsave-remove recovery-os-updater`, then run the session again. **Never let anything save this VM:** do not enable `libvirt-guests.service` (its default here is `ON_SHUTDOWN=suspend`) for it, and keep virtqemud's `auto_shutdown_try_save` off — a host shutdown during a session would otherwise save the recovery OS with its disk, and the next host boot could restore it with no claim and no lock while backups mount the same partition.
 - **The session refuses: `names units the session guard cannot mask`**: the boot record says btrbk may (or will) run and names a unit the guard cannot put into a credential — a template (`name@.service`), a name with `:` or a non-ASCII character, a target — or more than 64 of them. Put it right in the recovery OS on bare metal, as for `btrbk will run when this OS boots` below, then let a backup run record it again.
 
@@ -1259,10 +1293,10 @@ If something goes wrong at the console:
   Then let the next backup run, with the drive attached, record it again.
 - **The session refuses: `cannot tell when this drive's last VM session ended`**: the session-times file, `/var/lib/das-backup/recovery-os-vm-sessions`, is empty or has a line that is not `<label> <seconds>` (a hand edit, or a crash during a write). A new boot record does not help here: the file itself has to be put right. Remove the bad line, or the whole file, then run a backup with the drive attached, so that the record is newer than any session you are unsure of. (A session forced through with `--accept-boot-record-risk` rewrites the file from its well-formed lines and says what it did: another drive's line with no readable time comes back as that drive's line at the session's time, anything else is dropped.)
 - **The session refuses: the record is older than 8 days, or was made before this drive's last VM session ended**: let a backup run, with the drive attached, record it again.
-- **The session refuses: `no boot record`, `cannot be read`, `is schema N, not 3` or `has no entry`**: the same — the record comes from a backup run that checked this drive, and no flag stands in for it.
+- **The session refuses: `no boot record`, `cannot be read`, `is not one JSON document`, `is not one this script can read` (a schema that is not a number), `is schema N, not 3`, `has no entry`, `has no check time`, `has a check time this host cannot read as a date`, `is dated more than a day in the future`, `has no inspected OS` or `has no btrbk-at-boot verdict`**: the same — the record comes from a backup run that checked this drive, and no flag stands in for it.
 - **The session refuses: `does not name the filesystem it was read from`, or `was read from filesystem X, not Y`**: the record was written by a btrdasd from before it named the filesystem, or its filesystem could not be told, or it is of another filesystem than the one `config.toml` now mounts the target by — the label was pointed at another drive, or the drive's filesystem was made again. The same again: let a backup run, with the drive attached, record it; no flag stands in for it. (If `config.toml` is what is wrong, put its `mount_uuid` right first: `sudo btrdasd setup --check` prints the line.)
 - **The session refuses: `Unit das-recovery-os-holder-<label>.scope already exists`**: the scope of an earlier holder is still loaded, usually failed. If `status` shows no session running, clear it with `sudo systemctl reset-failed das-recovery-os-holder-<label>.scope` and run the session again.
-- **`virsh start failed: … network 'default' is not active`**: `sudo virsh net-start default && sudo virsh net-autostart default`, then run the session again — the failed start gave everything back.
+- **`virsh start failed: … network 'default' is not active`**: `sudo virsh net-start default && sudo virsh net-autostart default`. The failed start gave everything back, but it came after the session recorded its start, and a retry is let through only when a session failed before it tried to start the recovery OS: let a backup run, with the drive attached, record the drive again, then run the session again.
 
 ### On bare metal
 
@@ -1351,7 +1385,7 @@ dmesg | tail -50 | grep -i "usb\|sd"
 # 4. Try a different USB cable
 ```
 
-On the system that runs the backups, the backup targets never appear in a file manager or under `/run/media`: they are hidden from udisks on purpose. Look for them with `lsblk -o NAME,SERIAL,LABEL,UUID` and mount them by UUID. After reconnecting the enclosure, run `sudo btrfs device scan` so the two-drive primary is registered before mounting it.
+On the system that runs the backups, check before reconnecting or power-cycling the enclosure that nothing holds it: `sudo flock -n /run/das-maintenance.lock true || echo WAIT` — on `WAIT` a backup, scrub or recovery-OS VM session is using it; leave it alone until that ends. The backup targets never appear in a file manager or under `/run/media`: they are hidden from udisks on purpose. Look for them with `lsblk -o NAME,SERIAL,LABEL,UUID` and mount them by UUID. After reconnecting the enclosure, run `sudo btrfs device scan` so the two-drive primary is registered before mounting it.
 
 ---
 
@@ -1420,7 +1454,7 @@ btrdasd config show
 
 ## Getting Help
 
-1. **BTRFS Wiki**: https://btrfs.wiki.kernel.org
+1. **BTRFS documentation**: https://btrfs.readthedocs.io
 2. **Arch Wiki (BTRFS)**: https://wiki.archlinux.org/title/Btrfs
 3. **btrbk Documentation**: https://github.com/digint/btrbk
 4. **Your distro's support forum** -- for distro-specific recovery steps

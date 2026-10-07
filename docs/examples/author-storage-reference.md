@@ -50,8 +50,8 @@
 | 20465F802394 | WD Black SN850X (WDS100T1X0E-00AFY0) | 1 TB (931.5G) | NVMe RAID-1, mirror ESP (`EFI-BACKUP`) | 2 | nvme0n1 |
 | S5HVNA0N303556E | Samsung SSD 860 PRO 1TB | 1 TB (953.9G) | SSD pool (`sata_pool`) | 1 | sde |
 | S246NWAG500270V | Samsung SSD 850 EVO mSATA 1TB | 1 TB (931.5G) | SSD pool (`sata_pool`) | 2 | sdg |
-| ZXA0MHSK | Seagate Exos X24 (ST24000DM001-3Y7103) | 24 TB (21.83 TiB) | HDD RAID-1 | 1 | sdh |
-| ZXA0V0EY | Seagate Exos X24 (ST24000DM001-3Y7103) | 24 TB (21.83 TiB) | HDD RAID-1 | 2 | sdb |
+| ZXA0MHSK | Seagate ST24000DM001-3Y7103 | 24 TB (21.83 TiB) | HDD RAID-1 | 1 | sdh |
+| ZXA0V0EY | Seagate ST24000DM001-3Y7103 | 24 TB (21.83 TiB) | HDD RAID-1 | 2 | sdb |
 
 The internal `dasRaid0` array (4 × 2 TB) and the USB-attached DAS backup drives are documented in [author-bay-mapping.md](author-bay-mapping.md).
 
@@ -125,7 +125,7 @@ Profiles read from `/sys/fs/btrfs/<uuid>/allocation/` on 2026-10-02.
 |                                                                     |
 |  Top-level subvolumes:                                              |
 |  +- ClaudeCodeProjects -> /hddRaid1/ClaudeCodeProjects              |
-|  |  (25 project subvolumes, see section 2c)                         |
+|  |  (24 project subvolumes, see section 2c)                         |
 |  +- Audiobooks -> /hddRaid1/Audiobooks                              |
 |  +- SteamLibrary -> /hddRaid1/SteamLibrary                          |
 |  +- SteamLibrary-local -> ~/.local/share/Steam                      |
@@ -228,7 +228,12 @@ not to DAS-Backup-Manager — see `.claude/rules/esp-safety.md` for the boundary
 
 #### ESP Sync Chain
 
-1. Pacman installs/upgrades kernel, initramfs, or bootloader
+1. A pacman transaction installs, upgrades or removes a file the hook watches: a
+   kernel image (`usr/lib/modules/*/vmlinuz`), anything under `usr/lib/initcpio/`,
+   or anything a package puts under `boot/`. A systemd-boot update does not fire
+   it: `bootctl update` writes `/boot/EFI` outside pacman's file list, so the
+   mirror catches up at the next transaction that does, or at a manual
+   `sudo /usr/local/bin/esp-sync.sh`
 2. Pacman hook `/etc/pacman.d/hooks/esp-mirror.hook` fires (PostTransaction)
 3. Calls `/usr/local/bin/esp-sync.sh`
 4. The script walks `/boot` file-by-file, compares `md5sum` against the mirror,
@@ -258,29 +263,32 @@ the script's `is_unique_file()` and are never synced in either direction.
 
 #### Boot Entries (systemd-boot)
 
-*Not re-verified on 2026-10-02: `/boot` is readable by root only, and this audit ran unprivileged. Check with `sudo ls /boot/loader/entries`.*
+*Read from the running system on 2026-10-07 (`sudo cat /boot/loader/entries/*.conf`; `/boot` is readable by root only).*
 
-**Default** (`linux-cachyos.conf`):
+**Default** (`linux-cachyos.conf`) -- no `degraded`, so it cannot mount the root with one NVMe missing:
 ```
-title Linux Cachyos
-options root=UUID=20b5fa7e-d8c0-4035-ae45-f80263073a96 rw rootflags=subvol=/@ zswap.enabled=0 nowatchdog quiet splash
+title Linux CachyOS
+options root=UUID=20b5fa7e-d8c0-4035-ae45-f80263073a96 rw rootflags=subvol=/@ zswap.enabled=0 nowatchdog mitigations=off pci=realloc amdgpu.gpu_recovery=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xffffffff amdgpu.mcbp=0 mem_sleep_default=s2idle quiet splash
 linux /vmlinuz-linux-cachyos
+initrd amd-ucode.img
 initrd /initramfs-linux-cachyos.img
 ```
 
 **Safe Mode** (`linux-cachyos-safe.conf`) -- for degraded boot:
 ```
 title   CachyOS (Safe Mode)
+sort-key 02
 options root=UUID=20b5fa7e-d8c0-4035-ae45-f80263073a96 rw rootflags=subvol=/@,degraded btrfs.device_scan_wait=1 nomodeset
 linux   /vmlinuz-linux-cachyos
 initrd  /amd-ucode.img
 initrd  /initramfs-linux-cachyos.img
 ```
 
-**CLI Only** (`linux-cachyos-cli.conf`) -- no GUI:
+**CLI Only** (`linux-cachyos-cli.conf`) -- no GUI, mounts degraded:
 ```
 title CachyOS (CLI Only)
-options root=UUID=20b5fa7e-d8c0-4035-ae45-f80263073a96 rw rootflags=subvol=/@ zswap.enabled=0 nowatchdog systemd.unit=multi-user.target
+sort-key 04
+options root=UUID=20b5fa7e-d8c0-4035-ae45-f80263073a96 rw rootflags=subvol=/@,degraded zswap.enabled=0 nowatchdog mitigations=off workqueue.power_efficient=0 amdgpu.gpu_recovery=1 amdgpu.reset_method=-1 mem_sleep_default=s2idle systemd.unit=multi-user.target
 linux /vmlinuz-linux-cachyos
 initrd /amd-ucode.img
 initrd /initramfs-linux-cachyos.img
@@ -312,7 +320,7 @@ initrd /initramfs-linux-cachyos.img
 
 ### 2c. HDD RAID-1 -- Mass Storage
 
-**Devices**: serial `ZXA0MHSK` (Exos X24, 21.83 TiB, devid 1; `sdh` on 2026-10-02) + serial `ZXA0V0EY` (Exos X24, 21.83 TiB, devid 2; `sdb` on 2026-10-02)
+**Devices**: serial `ZXA0MHSK` (ST24000DM001, 21.83 TiB, devid 1; `sdh` on 2026-10-02) + serial `ZXA0V0EY` (ST24000DM001, 21.83 TiB, devid 2; `sdb` on 2026-10-02)
 **BTRFS UUID**: `8b66e847-4273-4e2a-ad53-b312b3b3ee6d`
 **Profile**: Data RAID-1, Metadata RAID-1
 **Current usage** (2026-10-02): 8.27 TiB of data; 8.34 TiB of each 21.83 TiB device allocated
@@ -334,11 +342,11 @@ initrd /initramfs-linux-cachyos.img
 
 The `ai-models-*` subvolumes and `VirtualMachines` listed in earlier revisions no longer exist on this filesystem.
 
-#### Project Subvolumes (under ClaudeCodeProjects, 2026-10-02)
+#### Project Subvolumes (under ClaudeCodeProjects, 2026-10-07)
 
 Each is an independent BTRFS subvolume with its own `config.toml` entry (source `hdd-projects`, all three targets); a project created later is adopted into that source by the next backup run. Only some have a Snapper config (§8e):
 
-adaptive-tuning-agent, Audiobook-Manager, CachyOS-Kernel, cachyos-sentinel, ccp, claude-code-streaming-feature, claude-cowork-desktop-maintenance, claude-test-skill, cloudflare-manager, cloud-gpu-toolkit, DAS-Backup-Manager, General-Chat, github-maintenance, gstack, hibp-project, libvirt-vm-manager, mcp-workspace, powershell-scripts, scx-autoswitch, steam-sam-optimizer, stremio-manager, the_bosco_club, the-last-shave, website-dev, .repo-templates
+Audiobook-Manager, CachyOS-Kernel, cachyos-sentinel, ccp, claude-code-streaming-feature, claude-cowork-desktop-maintenance, claude-test-skill, cloudflare-manager, cloud-gpu-toolkit, DAS-Backup-Manager, General-Chat, github-maintenance, gstack, hibp-project, libvirt-vm-manager, mcp-workspace, powershell-scripts, scx-autoswitch, steam-sam-optimizer, stremio-manager, the_bosco_club, the-last-shave, website-dev, .repo-templates
 
 ---
 
@@ -359,8 +367,8 @@ re-enumeration:
 ```bash
 sudo smartctl -a /dev/disk/by-id/ata-Samsung_SSD_860_PRO_1TB_*      # 860 PRO
 sudo smartctl -a /dev/disk/by-id/ata-Samsung_SSD_850_EVO_mSATA_1TB_*  # 850 EVO
-sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0MHSK   # Exos X24
-sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0V0EY   # Exos X24
+sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0MHSK   # 24 TB HDD
+sudo smartctl -a /dev/disk/by-id/ata-ST24000DM001-3Y7103_ZXA0V0EY   # 24 TB HDD
 
 # To see the current letter-to-serial mapping at any moment:
 for d in /dev/sd?; do
@@ -464,7 +472,7 @@ When you suspect a drive failure:
   | NVMe `204445805771` or `20465F802394` | WD Black SN850X 1TB NVMe M.2 2280 (WDS100T1X0E) | 931.5G (1 TB) |
   | SSD `S5HVNA0N303556E` (860 PRO) | Any 1TB SATA SSD | 931.51G (1 TB) |
   | SSD `S246NWAG500270V` (850 EVO) | Any 1TB SATA SSD | 931.51G (1 TB) |
-  | HDD `ZXA0MHSK` or `ZXA0V0EY` | Seagate Exos X24 24TB (ST24000DM001) | 21.83 TiB (24 TB) |
+  | HDD `ZXA0MHSK` or `ZXA0V0EY` | Seagate ST24000DM001 (24 TB) | 21.83 TiB (24 TB) |
 
 ---
 
@@ -560,7 +568,8 @@ sudo mkfs.vfat -F32 -n EFI "${NEW}p3"
 ```bash
 # Find the devid of the missing device
 sudo btrfs filesystem show /
-# Look for the line with "*** Some devices missing" -- note the devid
+# "*** Some devices missing" means one is gone; its devid is on the line
+# that ends in MISSING -- note that number
 # (the boot drive 204445805771 is devid 1)
 
 # Start replacement
@@ -589,8 +598,8 @@ pacman runs hooks in filename order, so `esp-mirror.hook` syncs *before*
 `sdboot-kernel-update.hook` writes the generated entries: those come back with the
 last sync below. Anything nothing regenerates must be on `/boot` before the
 transaction, or the mirror you just booted from loses it for good. That means
-`amd-ucode.img` (owned by `amd-ucode`, not the kernel package, and named in every
-entry's `initrd` line) and the hand-written `linux-cachyos-safe.conf` and
+`amd-ucode.img` (owned by `amd-ucode`, not the kernel package, and named in the
+`initrd` line of every entry except the fallback) and the hand-written `linux-cachyos-safe.conf` and
 `linux-cachyos-cli.conf` (§2a, Boot Entries).
 
 ```bash
@@ -750,7 +759,7 @@ sudo btrfs scrub start -B /opt      # Full integrity check
 
 ## 7. Recovery: HDD Failure
 
-**Devices**: serial `ZXA0MHSK` (Exos X24, devid 1) + serial `ZXA0V0EY` (Exos X24, devid 2)
+**Devices**: serial `ZXA0MHSK` (ST24000DM001, devid 1) + serial `ZXA0V0EY` (ST24000DM001, devid 2)
 **Mount**: /hddRaid1 and all subvolumes
 
 RAID-1 balance is **COMPLETE** as of 2026-04-06. All data is fully mirrored. Standard recovery applies:
@@ -769,9 +778,10 @@ sudo mount -o degraded,noatime,nossd,space_cache=v2 \
 NEW=/dev/disk/by-id/ata-<model>_<new-serial>
 sudo wipefs -a "$NEW"
 
-# 4. Replace (this will take DAYS for 24TB drives)
-sudo btrfs replace start <missing-devid> "$NEW" /hddRaid1
-# Monitor: sudo btrfs replace status /hddRaid1
+# 4. Replace (this will take DAYS for 24TB drives), in the foreground (-B):
+#    it returns when the replace is done, and only then may the balance start
+sudo btrfs replace start -B <missing-devid> "$NEW" /hddRaid1
+# Monitor from another terminal: sudo btrfs replace status -1 /hddRaid1
 
 # 5. Convert anything written while degraded back to RAID-1
 sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /hddRaid1
@@ -779,7 +789,7 @@ sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /hddRaid1
 # Expect 24-72 hours depending on data volume (~8.3 TiB to sync, 2026-10-02)
 ```
 
-**Replacement must be**: >= 21.83 TiB (24 TB class Seagate Exos or equivalent)
+**Replacement must be**: >= 21.83 TiB (24 TB, such as the ST24000DM001, or equivalent)
 
 ---
 
@@ -872,7 +882,7 @@ efibootmgr                   # Boot order correct
 |---------|------|-----------|
 | NVMe BTRFS | `20b5fa7e-d8c0-4035-ae45-f80263073a96` | partition 2 of NVMe `204445805771` + `20465F802394` |
 | SSD BTRFS (`sata_pool`) | `2638d087-0be1-436e-bfe4-8d6551ec02be` | 860 PRO + 850 EVO mSATA (letters drift) |
-| HDD BTRFS | `8b66e847-4273-4e2a-ad53-b312b3b3ee6d` | Exos X24 `ZXA0V0EY` + `ZXA0MHSK` (letters drift) |
+| HDD BTRFS | `8b66e847-4273-4e2a-ad53-b312b3b3ee6d` | ST24000DM001 `ZXA0V0EY` + `ZXA0MHSK` (letters drift) |
 | dasRaid0 BTRFS | `d29fdda7-a1e5-4640-996e-2b78569cb65d` | 4 × 2TB, internal SATA ([bay map](author-bay-mapping.md)) |
 | DAS primary backup | `b2dbe07d-40b9-422e-8ccf-ef4931c40457` | `das-backup-22tb`, 22TB `ZXA1R71M` + `ZXA1NYGZ` |
 | DAS recovery A | `60b05268-7f8f-47b5-a38a-752576a1172a` | `das-backup-system-recovery-A`, 2TB `ZK208Q77` p2 |
@@ -893,8 +903,8 @@ efibootmgr                   # Boot order correct
 | `20465F802394` | WD Black SN850X 1TB | NVMe mirror drive | nvme0n1 |
 | `S5HVNA0N303556E` | Samsung 860 PRO 1TB | SSD pool | sde |
 | `S246NWAG500270V` | Samsung 850 EVO mSATA 1TB | SSD pool | sdg |
-| `ZXA0MHSK` | Seagate Exos X24 24TB | HDD RAID-1 | sdh |
-| `ZXA0V0EY` | Seagate Exos X24 24TB | HDD RAID-1 | sdb |
+| `ZXA0MHSK` | Seagate ST24000DM001 (24 TB) | HDD RAID-1 | sdh |
+| `ZXA0V0EY` | Seagate ST24000DM001 (24 TB) | HDD RAID-1 | sdb |
 
 Names drift; the serial does not. The DAS and `dasRaid0` drives are listed in [author-bay-mapping.md](author-bay-mapping.md).
 
@@ -947,18 +957,18 @@ sudo snapper list-configs              # Verify snapper configs
 - NVMe: WD Black SN850X 1TB (WDS100T1X0E-00AFY0)
 - SSD (`S5HVNA0N303556E`): Samsung 860 PRO 1TB
 - SSD (`S246NWAG500270V`): Samsung 850 EVO mSATA 1TB
-- HDD: Seagate Exos X24 24TB (ST24000DM001-3Y7103)
+- HDD: Seagate ST24000DM001-3Y7103 (24 TB)
 
 ---
 
 ## 10. Offline Backup Plan
 
-A comprehensive offline backup strategy is documented separately in [`OFFLINE-BACKUP-PLAN.md`](OFFLINE-BACKUP-PLAN.md).
+A comprehensive offline backup strategy is documented separately in [`OFFLINE-BACKUP-PLAN.md`](../OFFLINE-BACKUP-PLAN.md).
 
 **Summary**:
 - **Hardware**: TerraMaster D6-320 (6-bay USB 3.2 Gen2 JBOD) — 4 of 6 bays occupied (bays 3 and 6 empty). *Gen2 is the rating, not a promise*: the tree ran at **480 Mbit/s** for nine days in August 2026 with no symptom other than slower backups. Verify with `cat /sys/bus/usb/devices/*/speed`, expect **10000** (Mbit/s)
 - **Primary Backup (BTRFS RAID-1)**: 2x 22TB Exos (ST22000NM000C-3WC103) in bays 2 (`ZXA1R71M`, RMA replacement for failed `ZXA0LMAE` since 2026-05-15) and 5 (`ZXA1NYGZ`), single BTRFS filesystem `das-backup-22tb` UUID `b2dbe07d-40b9-422e-8ccf-ef4931c40457`. Mounted with `degraded` so single-leg failure does not interrupt backups, restores, or recovery.
-- **Recovery Drives**: 2x 2TB Barracuda (independent, NOT a RAID pair) in bays 1 (`ZK208Q77`, `das-backup-system-recovery-A`) and 4 (`ZFL41DNY`, `das-backup-system-recovery-B`) — each can boot the system standalone via its own ESP
+- **Recovery Drives**: 2x 2TB Barracuda (independent, NOT a RAID pair) in bays 1 (`ZK208Q77`, `das-backup-system-recovery-A`) and 4 (`ZFL41DNY`, `das-backup-system-recovery-B`) — each boots its own independent OS from its own ESP, not this system
 - **Internal SATA**: dasRaid0 (4x 2TB Barracuda RAID0, general storage) — moved from DAS 2026-04-06
 - **Offline spares**: 1x 2TB Barracuda (ZFL416F6, cold spare for dasRaid0)
 - **Software**: btrbk 0.32.7 + mbuffer (installed; btrbk version as of 2026-10-02), orchestrated by DAS-Backup-Manager 0.7.23.0
@@ -969,4 +979,4 @@ A comprehensive offline backup strategy is documented separately in [`OFFLINE-BA
 
 ---
 
-*Document generated: 2026-02-01, updated 2026-05-06 (added second 22TB CMR drive in bay 5, das-backup-22tb converted to BTRFS RAID-1), 2026-10-02 (re-keyed by serial after the board swap; SSD pool profile, subvolumes, swap, boot entries). UUIDs, serials, PARTUUIDs, profiles and partition layouts verified against the running system on 2026-10-02; the systemd-boot entry files were not (root-only).*
+*Document generated: 2026-02-01, updated 2026-05-06 (added second 22TB CMR drive in bay 5, das-backup-22tb converted to BTRFS RAID-1), 2026-10-02 (re-keyed by serial after the board swap; SSD pool profile, subvolumes, swap, boot entries), 2026-10-07 (boot entries read from the live files, 24 project subvolumes, replace and ESP-sync corrections). UUIDs, serials, PARTUUIDs, profiles and partition layouts verified against the running system on 2026-10-02, the systemd-boot entry files on 2026-10-07.*
