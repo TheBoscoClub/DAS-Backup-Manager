@@ -356,8 +356,12 @@ fn session_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String>
 /// holder lives — and a running session spends time shut off with its holder
 /// alive (before start, and while giving the disk back), so ending it then
 /// would pull the disk, guard and holder from under the running script.
-fn session_end_busy(jobs: &[(&str, &str)]) -> Option<String> {
-    session_busy(jobs, &[])
+///
+/// A running scheduled-session service (`units`, as for [`session_busy`])
+/// refuses it too, naming the unit: its session holds a drive just the same,
+/// with its holder alive.
+fn session_end_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String> {
+    session_busy(jobs, units)
 }
 
 /// The polkit action `JobCancel` checks for a job of `kind`: the one that
@@ -492,10 +496,267 @@ fn run_script_merged(
     Ok((status, String::from_utf8_lossy(&buf).into_owned()))
 }
 
+/// Whether `/proc/locks` text shows an exclusive `flock` (a `FLOCK …
+/// WRITE` line, not a waiter's `->` line) on the file at
+/// `dev_major:dev_minor:inode` — the kernel's own record, read without
+/// taking the lock.
+fn lock_held_in(proc_locks: &str, dev_major: u64, dev_minor: u64, inode: u64) -> bool {
+    proc_locks.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [_, kind, _, access, _, file, ..] = words.as_slice() else {
+            return false;
+        };
+        if *kind != "FLOCK" || *access != "WRITE" {
+            return false;
+        }
+        let mut ids = file.split(':');
+        let (Some(maj), Some(min), Some(ino), None) =
+            (ids.next(), ids.next(), ids.next(), ids.next())
+        else {
+            return false;
+        };
+        u64::from_str_radix(maj, 16) == Ok(dev_major)
+            && u64::from_str_radix(min, 16) == Ok(dev_minor)
+            && ino.parse::<u64>() == Ok(inode)
+    })
+}
+
+/// A `st_dev` split as Linux encodes it (`major(3)`, `minor(3)`).
+fn dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
+}
+
+/// Who holds the lock file at `path`, by the kernel's record in
+/// `proc_locks`: `None` when no exclusive flock is on it (or the file does
+/// not exist, so nothing can hold it), its first line when one is. The probe
+/// never takes the lock, so a doctor or reconcile arriving at that moment is
+/// not turned away by it. A lock that cannot be checked is
+/// `Some("unknown: …")`, never "free".
+fn lock_holder_at(path: &Path, proc_locks: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(format!(
+                "unknown: the maintenance lock {} cannot be examined: {e}",
+                path.display()
+            ));
+        }
+    };
+    let locks = match std::fs::read_to_string(proc_locks) {
+        Ok(l) => l,
+        Err(e) => {
+            return Some(format!(
+                "unknown: {} cannot be read to check the maintenance lock: {e}",
+                proc_locks.display()
+            ));
+        }
+    };
+    let (major, minor) = dev_major_minor(meta.dev());
+    lock_held_in(&locks, major, minor, meta.ino()).then(|| maintenance::holder_of(path))
+}
+
+/// Parse a `Some("@<secs>")` timestamp of `systemctl show --timestamp=unix`:
+/// empty, `n/a` or `0` is no reading; anything else is an error.
+fn unix_stamp(key: &str, value: Option<&str>) -> Result<Option<i64>, String> {
+    match value.map(str::trim) {
+        None | Some("" | "n/a" | "0") => Ok(None),
+        Some(v) => v
+            .strip_prefix('@')
+            .and_then(|n| n.parse::<i64>().ok())
+            .map(Some)
+            .ok_or_else(|| format!("systemctl gave {key}={v}, not a @<seconds> timestamp")),
+    }
+}
+
+/// [`panel::UnitFacts`] from `systemctl show --timestamp=unix -p LoadState,
+/// ActiveState,NextElapseUSecRealtime,LastTriggerUSec,Result,ExecMainStatus,
+/// ExecMainStartTimestamp`. `LoadState=not-found` is a unit that does not
+/// exist; no `LoadState` or `ActiveState`, or a timestamp that does not
+/// parse, is an error, never default facts. `ExecMainStatus` of a run that
+/// never started is no reading, not 0. The unit file's values and the
+/// journal are added by the caller.
+fn unit_facts_from(show: &str) -> Result<panel::UnitFacts, String> {
+    let props: HashMap<&str, &str> = show.lines().filter_map(|l| l.split_once('=')).collect();
+    let load = props
+        .get("LoadState")
+        .filter(|v| !v.is_empty())
+        .ok_or("systemctl show gave no LoadState")?;
+    let active = props
+        .get("ActiveState")
+        .filter(|v| !v.is_empty())
+        .ok_or("systemctl show gave no ActiveState")?;
+    let started = unix_stamp(
+        "ExecMainStartTimestamp",
+        props.get("ExecMainStartTimestamp").copied(),
+    )?;
+    let status = match props.get("ExecMainStatus") {
+        Some(v) if started.is_some() => Some(
+            v.parse::<i32>()
+                .map_err(|e| format!("systemctl gave ExecMainStatus={v}: {e}"))?,
+        ),
+        _ => None,
+    };
+    Ok(panel::UnitFacts {
+        exists: *load != "not-found",
+        active_state: active.to_string(),
+        next_elapse_epoch: unix_stamp(
+            "NextElapseUSecRealtime",
+            props.get("NextElapseUSecRealtime").copied(),
+        )?,
+        last_trigger_epoch: unix_stamp("LastTriggerUSec", props.get("LastTriggerUSec").copied())?,
+        result: props
+            .get("Result")
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string()),
+        exec_main_status: status,
+        exec_main_start_epoch: started,
+        ..Default::default()
+    })
+}
+
+/// The last `<key>=` value in a unit file's text.
+fn unit_file_value(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .next_back()
+        .map(|v| v.trim().to_string())
+}
+
+/// `systemctl <args>`: `Err` carries its stderr.
+type Systemctl<'a> = &'a dyn Fn(&[&str]) -> Result<(), String>;
+
+/// The real `systemctl`, its stderr kept for the error.
+fn system_systemctl(args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new("systemctl")
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("Cannot run systemctl {}: {e}", args.join(" ")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "systemctl {} failed ({}): {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Seconds since the epoch; a clock before 1970 is an error, never 0.
+fn now_epoch() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|e| format!("The system clock reads before 1970: {e}"))
+}
+
+/// One at a time: two `RecoveryOsScheduleSet` calls must not interleave
+/// their writes, reloads and removals.
+static SCHEDULE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The schedule unit bases (`das-recovery-os-update-<x>`) whose timer file
+/// is in `unit_dir`, sorted. A directory that cannot be listed is an error,
+/// never "none".
+fn existing_schedule_bases(unit_dir: &Path) -> Result<Vec<String>, String> {
+    let entries = std::fs::read_dir(unit_dir)
+        .map_err(|e| format!("Cannot list {}: {e}", unit_dir.display()))?;
+    let mut bases = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Cannot list {}: {e}", unit_dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(base) = name.strip_suffix(".timer")
+            && base.starts_with(panel::UNIT_PREFIX)
+        {
+            bases.push(base.to_string());
+        }
+    }
+    bases.sort();
+    Ok(bases)
+}
+
+/// Remove `<base>.service` and `<base>.timer` from `unit_dir`; one already
+/// gone is fine. Returns what could not be removed.
+fn remove_schedule_files(unit_dir: &Path, base: &str) -> Vec<String> {
+    ["service", "timer"]
+        .iter()
+        .filter_map(|suffix| {
+            let path = unit_dir.join(format!("{base}.{suffix}"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => Some(format!("{} could not be removed: {e}", path.display())),
+            }
+        })
+        .collect()
+}
+
+/// Write the schedule's service and timer (mode 0644), reload systemd and
+/// enable-and-start the timer. Any failure after the first write removes
+/// both files again (and reloads), so no half-installed pair is ever left;
+/// the error says so.
+fn schedule_install(
+    unit_dir: &Path,
+    labels: &[String],
+    at_epoch: i64,
+    mode: Option<&str>,
+    script: &Path,
+    systemctl: Systemctl,
+) -> Result<(), String> {
+    let base = panel::unit_base(labels);
+    let undo = |why: String| -> String {
+        let left = remove_schedule_files(unit_dir, &base);
+        let reload = systemctl(&["daemon-reload"]).err();
+        let mut msg = format!("{why}; the schedule's unit files were removed again");
+        if !left.is_empty() {
+            msg = format!(
+                "{why}; removing the unit files again failed: {}",
+                left.join("; ")
+            );
+        }
+        if let Some(r) = reload {
+            msg.push_str(&format!(" (and the reload after it failed: {r})"));
+        }
+        msg
+    };
+    let write = |suffix: &str, text: String| {
+        let path = unit_dir.join(format!("{base}.{suffix}"));
+        buttered_dasd::fsutil::write_atomic_mode(&path, text.as_bytes(), Some(0o644))
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    };
+    write("service", panel::render_service(labels, mode, script)).map_err(undo)?;
+    write("timer", panel::render_timer(labels, at_epoch)).map_err(undo)?;
+    systemctl(&["daemon-reload"]).map_err(undo)?;
+    systemctl(&["enable", "--now", &format!("{base}.timer")]).map_err(undo)?;
+    Ok(())
+}
+
+/// Clear a schedule: disable and stop its timer (one systemd does not know is
+/// already off), remove both files, reload. A service already running is
+/// left to finish.
+fn schedule_clear(unit_dir: &Path, base: &str, systemctl: Systemctl) -> Result<(), String> {
+    if let Err(e) = systemctl(&["disable", "--now", &format!("{base}.timer")])
+        && !(e.contains("not loaded") || e.contains("does not exist"))
+    {
+        return Err(e);
+    }
+    let left = remove_schedule_files(unit_dir, base);
+    if !left.is_empty() {
+        return Err(format!("The timer is disabled, but {}", left.join("; ")));
+    }
+    systemctl(&["daemon-reload"])
+}
+
 /// The panel's system reads: the installed script, `virsh`, the
 /// maintenance lock.
 struct SystemPanelReads {
     script: PathBuf,
+    /// The helper's running session job, read from the job map.
+    running_job: Option<String>,
 }
 
 impl panel::PanelReads for SystemPanelReads {
@@ -507,10 +768,58 @@ impl panel::PanelReads for SystemPanelReads {
         history_from(&run_script(&self.script, &["history", label])?)
     }
 
-    fn unit(&self, _name: &str) -> Result<panel::UnitFacts, String> {
-        // Scheduled sessions arrive with RecoveryOsScheduleSet (Task 6); until
-        // then there is nothing to read, and no fabricated facts either.
-        Err("not read until schedules exist".into())
+    fn unit(&self, name: &str) -> Result<panel::UnitFacts, String> {
+        let out = std::process::Command::new("systemctl")
+            .args([
+                "show",
+                "--timestamp=unix",
+                "-p",
+                "LoadState,ActiveState,NextElapseUSecRealtime,LastTriggerUSec,Result,\
+                 ExecMainStatus,ExecMainStartTimestamp",
+                name,
+            ])
+            .env("LC_ALL", "C")
+            .output()
+            .map_err(|e| format!("Cannot ask systemctl about {name}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "systemctl show {name} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut facts = unit_facts_from(&String::from_utf8_lossy(&out.stdout))?;
+        if !facts.exists {
+            return Ok(facts);
+        }
+        let file = Path::new(panel::UNIT_DIR).join(name);
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                facts.on_calendar = unit_file_value(&text, "OnCalendar");
+                facts.exec_start = unit_file_value(&text, "ExecStart");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Cannot read {}: {e}", file.display())),
+        }
+        if name.ends_with(".service") {
+            let out = std::process::Command::new("journalctl")
+                .args(["-u", name, "-n", "5", "-o", "cat", "--no-pager"])
+                .env("LC_ALL", "C")
+                .output()
+                .map_err(|e| format!("Cannot read {name}'s journal: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "journalctl -u {name} failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            facts.last_journal = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect();
+        }
+        Ok(facts)
     }
 
     fn domain_state(&self, label: &str) -> Option<String> {
@@ -524,16 +833,14 @@ impl panel::PanelReads for SystemPanelReads {
     }
 
     fn lock_holder(&self) -> Option<String> {
-        let path = Path::new(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH);
-        match buttered_dasd::scrub::FileLock::try_acquire(path) {
-            // Free: the probe's own hold ends as it drops.
-            Ok(Some(_probe)) => None,
-            Ok(None) => Some(maintenance::holder_of(path)),
-            // Never "free" on a lock that could not be checked.
-            Err(e) => Some(format!(
-                "unknown: the maintenance lock cannot be checked: {e}"
-            )),
-        }
+        lock_holder_at(
+            Path::new(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH),
+            Path::new("/proc/locks"),
+        )
+    }
+
+    fn running_job(&self) -> Option<String> {
+        self.running_job.clone()
     }
 }
 
@@ -1447,17 +1754,26 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
         let config = load_config()?;
+        let running_job = self
+            .jobs
+            .lock()
+            .await
+            .iter()
+            .find(|(_, (_, _, _, kind))| *kind == SESSION_KIND)
+            .map(|(id, _)| id.clone());
         tokio::task::spawn_blocking(move || {
             let state = recovery_os::load_state(&recovery_os::state_path());
             let host = recovery_os::host_versions();
             let today = buttered_dasd::caldate::today();
             let reads = SystemPanelReads {
                 script: PathBuf::from(session::SCRIPT),
+                running_job,
             };
-            panel::status_json(&config, &state, &host, &today, &reads).to_string()
+            let now = now_epoch().map_err(fdo::Error::Failed)?;
+            Ok(panel::status_json(&config, &state, &host, &today, now, &reads).to_string())
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("The recovery-OS status task panicked: {e}")))
+        .map_err(|e| fdo::Error::Failed(format!("The recovery-OS status task panicked: {e}")))?
     }
 
     /// Start a recovery-OS session (`recovery-os-vm.sh session …`) as a job;
@@ -1557,13 +1873,22 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
 
         let label = configured_mirror_label(label)?;
+        let units = update_unit_names(&load_config()?);
+        let states = tokio::task::spawn_blocking(move || read_active_states(&units))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
+            .map_err(fdo::Error::Failed)?;
         {
             let jobs = self.jobs.lock().await;
             let running: Vec<(&str, &str)> = jobs
                 .iter()
                 .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
                 .collect();
-            if let Some(why) = session_end_busy(&running) {
+            let unit_states: Vec<(&str, &str)> = states
+                .iter()
+                .map(|(u, s)| (u.as_str(), s.as_str()))
+                .collect();
+            if let Some(why) = session_end_busy(&running, &unit_states) {
                 return Err(fdo::Error::Failed(why));
             }
         }
@@ -1577,6 +1902,82 @@ impl HelperInterface {
         .map_err(|e| fdo::Error::Failed(format!("The session-end task panicked: {e}")))?
         .map_err(fdo::Error::Failed)?;
         Ok((status.success(), last_lines(&text, 12)))
+    }
+
+    /// Schedule an unattended session of `labels` (one drive, or both) at
+    /// `at_epoch` (seconds since the epoch, at least 120 s ahead) as the
+    /// generated pair `das-recovery-os-update-<label|both>.{service,timer}`
+    /// in /etc/systemd/system; `at_epoch == 0` clears that schedule. `mode`
+    /// is `sequential`, `parallel`, or empty. Refused (InvalidArgs, with the
+    /// reason) for anything `panel::validate_schedule` refuses; every
+    /// systemctl failure is `Failed` with its stderr, and a failed enable
+    /// leaves no unit file behind.
+    async fn recovery_os_schedule_set(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        labels: Vec<String>,
+        at_epoch: i64,
+        mode: &str,
+    ) -> fdo::Result<()> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let config = load_config()?;
+        let mode = (!mode.is_empty()).then(|| mode.to_string());
+        tokio::task::spawn_blocking(move || -> fdo::Result<()> {
+            let _one = SCHEDULE_WRITE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let unit_dir = Path::new(panel::UNIT_DIR);
+            if at_epoch == 0 {
+                session::SessionRequest {
+                    labels: labels.clone(),
+                    unattended: true,
+                    mode: mode.clone(),
+                    accept_boot_record_risk: false,
+                }
+                .validate(&config)
+                .map_err(fdo::Error::InvalidArgs)?;
+                return schedule_clear(unit_dir, &panel::unit_base(&labels), &system_systemctl)
+                    .map_err(fdo::Error::Failed);
+            }
+            let state = match recovery_os::load_state(&recovery_os::state_path()) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Err(fdo::Error::InvalidArgs(
+                        "There is no boot record yet, so no drive can be scheduled unattended (let a backup run record the drives).".into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(fdo::Error::Failed(format!(
+                        "The boot record cannot be read: {e}"
+                    )));
+                }
+            };
+            let existing = existing_schedule_bases(unit_dir).map_err(fdo::Error::Failed)?;
+            let now = now_epoch().map_err(fdo::Error::Failed)?;
+            panel::validate_schedule(
+                &config,
+                &state,
+                &labels,
+                at_epoch,
+                mode.as_deref(),
+                now,
+                &existing,
+            )
+            .map_err(fdo::Error::InvalidArgs)?;
+            schedule_install(
+                unit_dir,
+                &labels,
+                at_epoch,
+                mode.as_deref(),
+                Path::new(session::SCRIPT),
+                &system_systemctl,
+            )
+            .map_err(fdo::Error::Failed)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The schedule task panicked: {e}")))?
     }
 
     /// The VNC socket of a drive's running session, made reachable by the
@@ -2105,6 +2506,7 @@ mod tests {
             "async fn recovery_os_session(",
             "async fn recovery_os_session_end(",
             "async fn recovery_os_console(",
+            "async fn recovery_os_schedule_set(",
         ] {
             let at = body.find(m).unwrap_or_else(|| panic!("{m} missing"));
             let after = &body[at..at + 1200];
@@ -2130,10 +2532,14 @@ mod tests {
 
     #[test]
     fn session_end_is_refused_while_any_session_job_runs() {
-        assert_eq!(session_end_busy(&[("job-1", "backup")]), None);
-        assert_eq!(session_end_busy(&[]), None);
+        assert_eq!(session_end_busy(&[("job-1", "backup")], &[]), None);
+        assert_eq!(session_end_busy(&[], &[]), None);
         assert_eq!(
-            session_end_busy(&[("job-1", "restore"), ("job-3", "recovery-os-session")]).unwrap(),
+            session_end_busy(
+                &[("job-1", "restore"), ("job-3", "recovery-os-session")],
+                &[]
+            )
+            .unwrap(),
             "a recovery-OS session is already running as job job-3"
         );
         let src = include_str!("btrdasd-helper.rs");
@@ -2152,6 +2558,250 @@ mod tests {
             lock < check && check < run,
             "the check must come before the script runs"
         );
+    }
+
+    #[test]
+    fn session_end_is_refused_while_a_scheduled_session_runs_naming_its_unit() {
+        let unit = "das-recovery-os-update-system-recovery-A-2tb.service";
+        assert_eq!(
+            session_end_busy(&[], &[(unit, "active")]).unwrap(),
+            format!("a scheduled recovery-OS session is running: {unit} (active)")
+        );
+        assert_eq!(session_end_busy(&[], &[(unit, "inactive")]), None);
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let end = method_body(body, "recovery_os_session_end");
+        let read = end
+            .find("read_active_states(")
+            .expect("session-end reads the schedule units' states");
+        let check = end.find("session_end_busy(").unwrap();
+        assert!(read < check, "the states are read before the check");
+        assert!(
+            !end.contains("session_end_busy(&running, &[])"),
+            "the unit states must reach the check"
+        );
+    }
+
+    #[test]
+    fn a_flock_write_entry_on_the_files_device_and_inode_is_a_hold() {
+        // Pasted from this host's /proc/locks, 2026-10-08, plus a waiter line.
+        let sample = "\
+1: POSIX  ADVISORY  WRITE 110131 00:1a:55254 0 0
+8: FLOCK  ADVISORY  WRITE 8371 00:99:202 0 EOF
+11: FLOCK  ADVISORY  READ 3714 00:34:43555949 0 EOF
+12: FLOCK  ADVISORY  WRITE 4716 103:0a:16799 0 EOF
+12: -> FLOCK  ADVISORY  WRITE 4800 00:1a:16800 0 EOF
+";
+        assert!(lock_held_in(sample, 0x103, 0x0a, 16799));
+        assert!(
+            !lock_held_in(sample, 0x00, 0x1a, 55254),
+            "a POSIX lock is not the flock"
+        );
+        assert!(
+            !lock_held_in(sample, 0x00, 0x34, 43_555_949),
+            "a shared (READ) flock is not the exclusive hold"
+        );
+        assert!(
+            !lock_held_in(sample, 0x00, 0x1a, 16800),
+            "a waiter does not hold it"
+        );
+        assert!(
+            !lock_held_in(sample, 0x00, 0x1a, 16799),
+            "another device's inode"
+        );
+        assert!(!lock_held_in("", 0, 0x1a, 16799));
+        assert_eq!(dev_major_minor(26), (0, 0x1a));
+        assert_eq!(dev_major_minor(0x10300 | 0x0a), (0x103, 0x0a));
+    }
+
+    #[test]
+    fn the_lock_probe_sees_a_real_flock_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maint.lock");
+        std::fs::write(
+            &path,
+            "recovery-os VM session system-recovery-A-2tb pid 1\n",
+        )
+        .unwrap();
+        assert_eq!(lock_holder_at(&path, Path::new("/proc/locks")), None);
+        let held = buttered_dasd::scrub::FileLock::try_acquire(&path)
+            .unwrap()
+            .unwrap();
+        assert!(
+            lock_holder_at(&path, Path::new("/proc/locks")).is_some(),
+            "a held lock reads held"
+        );
+        // The probe took nothing: the holder still holds it, and a second
+        // taker is still refused.
+        assert!(
+            buttered_dasd::scrub::FileLock::try_acquire(&path)
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        assert_eq!(lock_holder_at(&path, Path::new("/proc/locks")), None);
+        let unknown = lock_holder_at(&path, &dir.path().join("no-proc-locks")).unwrap();
+        assert!(unknown.starts_with("unknown:"), "{unknown}");
+        assert_eq!(
+            lock_holder_at(&dir.path().join("absent"), Path::new("/proc/locks")),
+            None,
+            "no file: nothing can hold it"
+        );
+    }
+
+    #[test]
+    fn unit_facts_are_read_from_systemctl_show_and_never_invented() {
+        let timer = unit_facts_from(
+            "LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=@1791600000\nLastTriggerUSec=\nResult=success\n",
+        )
+        .unwrap();
+        assert!(timer.exists);
+        assert_eq!(timer.active_state, "active");
+        assert_eq!(timer.next_elapse_epoch, Some(1_791_600_000));
+        assert_eq!(timer.last_trigger_epoch, None);
+        let service = unit_facts_from(
+            "LoadState=loaded\nActiveState=inactive\nResult=exit-code\nExecMainStatus=1\nExecMainStartTimestamp=@1791490001\n",
+        )
+        .unwrap();
+        assert_eq!(service.exec_main_status, Some(1));
+        assert_eq!(service.exec_main_start_epoch, Some(1_791_490_001));
+        assert_eq!(service.result.as_deref(), Some("exit-code"));
+        let never_ran = unit_facts_from(
+            "LoadState=loaded\nActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainStartTimestamp=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            never_ran.exec_main_status, None,
+            "a status of a run that never started is not 0"
+        );
+        let gone = unit_facts_from("LoadState=not-found\nActiveState=inactive\n").unwrap();
+        assert!(!gone.exists);
+        assert!(
+            unit_facts_from("ActiveState=active\n").is_err(),
+            "no LoadState: not a reading"
+        );
+        assert!(
+            unit_facts_from(
+                "LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=Thu 2026-10-08\n"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            unit_file_value(
+                "[Timer]\nOnCalendar=2026-10-09 22:00:00\nPersistent=false\n",
+                "OnCalendar"
+            )
+            .as_deref(),
+            Some("2026-10-09 22:00:00")
+        );
+        assert_eq!(unit_file_value("[Timer]\n", "OnCalendar"), None);
+    }
+
+    /// A scripted `systemctl`: records each call, fails those whose words
+    /// contain any of `failing`.
+    struct ScriptedSystemctl {
+        calls: std::cell::RefCell<Vec<String>>,
+        failing: Vec<&'static str>,
+    }
+
+    impl ScriptedSystemctl {
+        fn new(failing: &[&'static str]) -> Self {
+            Self {
+                calls: Default::default(),
+                failing: failing.to_vec(),
+            }
+        }
+        fn run(&self, args: &[&str]) -> Result<(), String> {
+            let call = args.join(" ");
+            self.calls.borrow_mut().push(call.clone());
+            match self.failing.iter().find(|f| call.contains(*f)) {
+                Some(f) => Err(format!("Failed: {f} (scripted)")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_schedule_is_written_reloaded_and_armed_and_a_failed_enable_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let labels = vec!["system-recovery-A-2tb".to_string()];
+        let base = "das-recovery-os-update-system-recovery-A-2tb";
+        let sc = ScriptedSystemctl::new(&[]);
+        schedule_install(
+            dir.path(),
+            &labels,
+            1_791_600_000,
+            None,
+            Path::new("/x.sh"),
+            &|a| sc.run(a),
+        )
+        .unwrap();
+        assert_eq!(
+            *sc.calls.borrow(),
+            ["daemon-reload", &format!("enable --now {base}.timer")]
+        );
+        for suffix in ["service", "timer"] {
+            let f = dir.path().join(format!("{base}.{suffix}"));
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "{suffix}"
+            );
+        }
+        assert_eq!(existing_schedule_bases(dir.path()).unwrap(), [base]);
+
+        let failing = ScriptedSystemctl::new(&["enable"]);
+        let err = schedule_install(
+            dir.path(),
+            &labels,
+            1_791_600_000,
+            None,
+            Path::new("/x.sh"),
+            &|a| failing.run(a),
+        )
+        .unwrap_err();
+        assert!(err.contains("Failed: enable (scripted)"), "{err}");
+        assert!(
+            existing_schedule_bases(dir.path()).unwrap().is_empty(),
+            "a failed enable leaves no half-installed pair"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "nothing left at all"
+        );
+
+        schedule_install(
+            dir.path(),
+            &labels,
+            1_791_600_000,
+            None,
+            Path::new("/x.sh"),
+            &|a| sc.run(a),
+        )
+        .unwrap();
+        let clear = ScriptedSystemctl::new(&[]);
+        schedule_clear(dir.path(), base, &|a| clear.run(a)).unwrap();
+        assert_eq!(
+            *clear.calls.borrow(),
+            [&format!("disable --now {base}.timer"), "daemon-reload"]
+        );
+        assert!(existing_schedule_bases(dir.path()).unwrap().is_empty());
+
+        // Clearing what is not loaded is still a clear; any other failure is an error.
+        let not_loaded = ScriptedSystemctl::new(&["disable"]);
+        let real = schedule_clear(dir.path(), base, &|a| not_loaded.run(a)).unwrap_err();
+        assert!(real.contains("scripted"), "{real}");
+        schedule_clear(dir.path(), base, &|a: &[&str]| {
+            if a[0] == "disable" {
+                Err(format!(
+                    "Failed to disable unit: Unit file {base}.timer does not exist."
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
     }
 
     #[test]

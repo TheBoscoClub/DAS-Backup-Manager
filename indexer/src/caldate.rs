@@ -2,6 +2,9 @@
 //!
 //! Retirement and expiry only ever ask "how many days apart are these two
 //! dates", so this is the proleptic Gregorian day count and nothing more.
+//! The two local-time helpers at the end ([`local_datetime`],
+//! [`local_epoch`]) exist for the one consumer that must speak the host's
+//! wall clock: a systemd timer's `OnCalendar=`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,6 +104,69 @@ pub fn untrusted_clock(today: &str) -> Option<String> {
             "the system clock reads {today}, before {EARLIEST_TRUSTED_DATE} — it cannot be trusted to date a retirement or an expiry"
         )
     })
+}
+
+/// `epoch` as `YYYY-MM-DD HH:MM:SS` in the host's local time zone (the zone
+/// systemd reads an `OnCalendar=` without a zone in), or `None` if the C
+/// library cannot convert it.
+// `time_t` is `i64` on the 64-bit targets this ships for; the conversions
+// stay so a 32-bit `time_t` refuses an epoch it cannot hold.
+#[allow(clippy::useless_conversion)]
+pub fn local_datetime(epoch: i64) -> Option<String> {
+    let t: libc::time_t = epoch.try_into().ok()?;
+    // SAFETY: an all-zero `tm` is a valid value of a plain C struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are to live locals; localtime_r writes only `tm`
+    // and is the reentrant form.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        i64::from(tm.tm_year) + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    ))
+}
+
+/// The epoch of a local `YYYY-MM-DD HH:MM:SS` (what [`local_datetime`]
+/// writes), or `None` if the text is not exactly that shape, not a real date
+/// and time, or the C library cannot convert it. A time a DST change makes
+/// ambiguous is resolved by `mktime`.
+#[allow(clippy::useless_conversion)] // see `local_datetime`
+pub fn local_epoch(text: &str) -> Option<i64> {
+    let (date, time) = text.split_once(' ')?;
+    // A real calendar date, not merely the shape of one.
+    day_number(date)?;
+    let parts: Vec<&str> = time.split(':').collect();
+    let [h, m, s] = parts.as_slice() else {
+        return None;
+    };
+    let field = |f: &str, max: i32| -> Option<i32> {
+        (f.len() == 2 && f.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| f.parse::<i32>().ok())
+            .flatten()
+            .filter(|v| *v <= max)
+    };
+    let (h, m, s) = (field(h, 23)?, field(m, 59)?, field(s, 59)?);
+    let year: i32 = date.get(0..4)?.parse().ok()?;
+    let month: i32 = date.get(5..7)?.parse().ok()?;
+    let mday: i32 = date.get(8..10)?.parse().ok()?;
+    // SAFETY: an all-zero `tm` is a valid value of a plain C struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = mday;
+    tm.tm_hour = h;
+    tm.tm_min = m;
+    tm.tm_sec = s;
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is a live local; mktime reads and normalises only it.
+    let t = unsafe { libc::mktime(&mut tm) };
+    (t != -1).then_some(i64::from(t))
 }
 
 #[cfg(test)]
@@ -270,5 +336,44 @@ mod tests {
         // An unreadable date is refused where it is used (it never compares
         // as expired), so it is not this check's to report.
         assert_eq!(untrusted_clock("garbage"), None);
+    }
+
+    /// The system `date` is the oracle for the host's zone; setting `TZ`
+    /// in-process is not reliable while other test threads run.
+    fn date_oracle(epoch: i64) -> String {
+        let out = std::process::Command::new("date")
+            .args(["-d", &format!("@{epoch}"), "+%F %T"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn local_datetime_is_the_hosts_wall_clock_and_reads_back() {
+        for epoch in [
+            1_791_500_000_i64,
+            1_791_446_400,
+            1_767_225_600,
+            1_800_000_000,
+        ] {
+            let local = local_datetime(epoch).unwrap();
+            assert_eq!(local.len(), 19, "{local}");
+            assert_eq!(&local[4..5], "-");
+            assert_eq!(&local[10..11], " ");
+            assert_eq!(local, date_oracle(epoch));
+            assert_eq!(local_epoch(&local), Some(epoch), "{local}");
+        }
+        for bad in [
+            "",
+            "2026-10-08",
+            "2026-10-08 3:00:00",
+            "2026-10-08 24:00:00",
+            "2026-02-30 03:00:00",
+            "2026-10-08T03:00:00",
+            "2026-10-08 03:00",
+        ] {
+            assert_eq!(local_epoch(bad), None, "{bad}");
+        }
     }
 }
