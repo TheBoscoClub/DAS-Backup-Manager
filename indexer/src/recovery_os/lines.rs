@@ -198,6 +198,13 @@ mod tests {
             "RESULT x notanumber clean",
             "progress a b c",
             "DRIVE x -1x",
+            "PROGRESS a b weird",
+            "RESULT a +5 clean",
+            "RESULT a 5",
+            "OUTPUT a b",
+            "PROGRESS  b ok",
+            "DRIVE a 0 extra",
+            "RESULT a 99999999999 clean",
         ] {
             assert_eq!(
                 parse_session_line(other),
