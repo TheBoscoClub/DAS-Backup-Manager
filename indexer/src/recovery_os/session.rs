@@ -9,7 +9,7 @@
 //! job then reads on to the script's real end.
 
 use std::io::{self, BufRead, Read};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -104,14 +104,16 @@ impl SessionRequest {
 /// The command for `script args`, with an environment built, never
 /// inherited: exactly [`SCRIPT_ENV`], so no `DAS_RECOVERY_*`, `DAS_CONFIG`,
 /// `BTRDASD_BIN` or `DAS_RECOVERY_OS_STATE` seam reaches the script. Stdin is
-/// closed; the working directory is `/`.
+/// closed; the working directory is `/`. The script leads a process group of
+/// its own, so a cancel can reach it the way a terminal's Ctrl-C does.
 pub fn script_command(script: &Path, args: &[String]) -> Command {
     let mut cmd = Command::new(script);
     cmd.args(args)
         .env_clear()
         .envs(SCRIPT_ENV)
         .current_dir("/")
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .process_group(0);
     cmd
 }
 
@@ -131,7 +133,7 @@ pub trait SessionChild {
     /// Reap the script. An error reading its output is reported here, after
     /// the script is reaped.
     fn wait(&mut self) -> io::Result<ExitStatus>;
-    /// SIGINT to the script's pid.
+    /// SIGINT to the script's process group, as a terminal's Ctrl-C sends it.
     fn interrupt(&self) -> io::Result<()>;
 }
 
@@ -235,17 +237,22 @@ impl SessionChild for SystemChild {
     }
 
     fn interrupt(&self) -> io::Result<()> {
-        // A pid that does not fit, or 0 (which would signal our own process
-        // group), is refused rather than converted.
+        // A pid that does not fit, or 0 (whose negation would signal our own
+        // process group), is refused rather than converted.
         let pid = libc::pid_t::try_from(self.child.id())
             .ok()
             .filter(|p| *p > 0)
             .ok_or_else(|| {
                 io::Error::other(format!("pid {} cannot be signalled", self.child.id()))
             })?;
+        // The whole group, never the pid alone: the pair driver traps INT to
+        // `:` and relies on its foreground drive session receiving the same
+        // Ctrl-C, and bash defers a SIGINT its foreground child never got —
+        // a pid-only signal let a two-drive run go on to drive 2, exit 0.
+        // The script leads its group (`script_command`'s process_group(0)).
         // SAFETY: kill(2) takes plain integers; the child is not reaped yet
-        // (wait() has not returned), so the pid is still the script's.
-        if unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
+        // (wait() has not returned), so the group id is still the script's.
+        if unsafe { libc::kill(-pid, libc::SIGINT) } == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -423,7 +430,7 @@ pub fn run_session(
             match child.interrupt() {
                 Ok(()) => progress.on_log(
                     LogLevel::Warning,
-                    "cancel: sent SIGINT to the session script; waiting for it to finish",
+                    "cancel: sent SIGINT to the session script's process group; waiting for it to finish",
                 ),
                 Err(e) => progress.on_log(
                     LogLevel::Error,
@@ -453,15 +460,32 @@ mod tests {
     use super::*;
     use crate::progress::{CancelToken, LogLevel, ProgressCallback};
     use crate::recovery_os::panel::tests::two_mirrors_and_a_primary;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// An executable at `path`, written so no fd open for writing on it
+    /// ever exists in this process. A file this (multi-threaded) test
+    /// process wrote itself can be inherited, still open for writing, by a
+    /// child another test is forking at that moment, and exec then fails with
+    /// ETXTBSY (seen: 3 of 25 full-suite runs). The draft is written here;
+    /// the executable is a fresh copy `install` makes in its own process.
+    fn write_executable(path: &Path, content: &str) {
+        let draft = path.with_extension("draft");
+        std::fs::write(&draft, content).unwrap();
+        let status = Command::new("install")
+            .arg("-m")
+            .arg("755")
+            .arg(&draft)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "install {} failed", path.display());
+    }
+
     fn stub_script(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("recovery-os-vm.sh");
-        std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&p, &format!("#!/bin/bash\n{body}\n"));
         p
     }
 
@@ -838,6 +862,51 @@ exit 0"#,
     }
 
     #[test]
+    fn a_stop_request_reaches_the_drive_session_running_in_the_foreground() {
+        let dir = tempfile::tempdir().unwrap();
+        // The pair driver ignores INT itself and relies on its foreground
+        // drive session getting the terminal's Ctrl-C (the whole group).
+        let drive = dir.path().join("drive.sh");
+        write_executable(
+            &drive,
+            r#"#!/bin/bash
+trap 'echo "interrupted: drive 1 left running"; exit 3' INT
+echo "PROGRESS system-recovery-A-2tb wait start"
+for i in $(seq 1 30); do sleep 0.1; done
+exit 0
+"#,
+        );
+        let script = stub_script(
+            dir.path(),
+            &format!(
+                r#"
+trap ':' INT TERM HUP
+{}
+rc=$?
+[ "$rc" -eq 0 ] || exit "$rc"
+echo "drive 2"
+exit 0"#,
+                drive.display()
+            ),
+        );
+        let sink = CapturingProgress::default();
+        sink.cancel_after_first_stage();
+        let spawner = CountingSpawner::default();
+        let out = run_session(
+            &spawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        let logs = sink.logs();
+        assert!(!logs.iter().any(|l| l == "drive 2"), "{logs:?}");
+        assert_eq!(out.exit, Some(3), "{logs:?}");
+        assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_stop_request_is_seen_without_a_line_arriving() {
         let dir = tempfile::tempdir().unwrap();
         // Silent after its one stage: only the tick can see the cancel.
@@ -854,7 +923,12 @@ exit 0"#,
         let started = std::time::Instant::now();
         let out = std::thread::scope(|s| {
             s.spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // After the script's first line (its trap is set by then),
+                // never on a fixed clock that a slow start could beat.
+                while sink.stages().is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
                 sink.cancel.cancel();
             });
             run_session(
