@@ -622,7 +622,9 @@ fn uninstall_with(
             eprintln!("Warning: {unit} may still be enabled: {e}");
         }
     }
-    remove_schedule_units(unit_dir, systemctl);
+    for w in remove_schedule_units(unit_dir, systemctl) {
+        eprintln!("Warning: {w}");
+    }
 
     let (removed, problems) = uninstall_from_manifest(manifest_path);
     println!("Removed {} files.", removed);
@@ -662,18 +664,19 @@ fn uninstall_with(
 /// (`das-recovery-os-update-*.{service,timer}`; they are in no manifest):
 /// `disable --now` each timer, then remove every such file. A schedule left
 /// behind would start a VM session from a script that is gone. Every failure
-/// is a warning, as for the other units; the caller's daemon-reload follows.
-fn remove_schedule_units(unit_dir: &Path, systemctl: UnitRunner) {
+/// is a warning, returned (without its `Warning: ` prefix) for the caller to print, as for the other units; the caller's daemon-reload follows.
+fn remove_schedule_units(unit_dir: &Path, systemctl: UnitRunner) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
     use buttered_dasd::recovery_os::panel::UNIT_PREFIX;
     let entries = match std::fs::read_dir(unit_dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return warnings,
         Err(e) => {
-            eprintln!(
-                "Warning: could not list {} ({e}) — recovery-OS schedule units there, if any, are LEFT BEHIND",
+            warnings.push(format!(
+                "could not list {} ({e}) — recovery-OS schedule units there, if any, are LEFT BEHIND",
                 unit_dir.display()
-            );
-            return;
+            ));
+            return warnings;
         }
     };
     let mut found: Vec<String> = Vec::new();
@@ -687,25 +690,26 @@ fn remove_schedule_units(unit_dir: &Path, systemctl: UnitRunner) {
                     found.push(name);
                 }
             }
-            Err(e) => eprintln!(
-                "Warning: could not read an entry of {} ({e}) — a recovery-OS schedule unit may be LEFT BEHIND",
+            Err(e) => warnings.push(format!(
+                "could not read an entry of {} ({e}) — a recovery-OS schedule unit may be LEFT BEHIND",
                 unit_dir.display()
-            ),
+            )),
         }
     }
     found.sort();
     for timer in found.iter().filter(|n| n.ends_with(".timer")) {
         if let Err(e) = systemctl(&["disable", "--now", timer]) {
-            eprintln!("Warning: {timer} may still be enabled: {e}");
+            warnings.push(format!("{timer} may still be enabled: {e}"));
         }
     }
     for name in &found {
         let path = unit_dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => println!("Removed schedule unit: {}", path.display()),
-            Err(e) => eprintln!("Warning: could not remove {}: {e}", path.display()),
+            Err(e) => warnings.push(format!("could not remove {}: {e}", path.display())),
         }
     }
+    warnings
 }
 
 /// Create the parent directory of `db_path`, describing the failure instead of
@@ -2646,6 +2650,37 @@ auth = "starttls""#,
             "both schedule units are removed"
         );
         assert!(other.exists(), "a unit this tool did not write survives");
+    }
+
+    #[test]
+    fn a_missing_unit_dir_is_silent_but_an_unreadable_one_is_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+        // Nothing to remove, nothing to say.
+        let missing = dir.path().join("no-such-dir");
+        assert_eq!(
+            remove_schedule_units(&missing, &|a| systemctl.run(a)),
+            Vec::<String>::new()
+        );
+        // A directory that cannot be listed may hide a schedule that would
+        // start a VM session from a script that is gone: say so.
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let warnings = remove_schedule_units(&locked, &|a| systemctl.run(a));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            unreadable,
+            "mode 000 did not stop this user listing the directory (running as root?)"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("could not list") && warnings[0].contains("LEFT BEHIND"),
+            "{warnings:?}"
+        );
+        assert!(systemctl.calls().is_empty(), "{:?}", systemctl.calls());
     }
 
     #[test]

@@ -207,6 +207,16 @@ impl SessionSpawner for SystemSpawner {
     }
 }
 
+/// A pid that fits `pid_t` and is above 0. One that does not fit, or 0
+/// (whose negation would signal our own process group), is refused rather
+/// than converted.
+fn signalable_pid(id: u32) -> io::Result<libc::pid_t> {
+    libc::pid_t::try_from(id)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| io::Error::other(format!("pid {id} cannot be signalled")))
+}
+
 impl SessionChild for SystemChild {
     fn pid(&self) -> u32 {
         self.child.id()
@@ -237,14 +247,7 @@ impl SessionChild for SystemChild {
     }
 
     fn interrupt(&self) -> io::Result<()> {
-        // A pid that does not fit, or 0 (whose negation would signal our own
-        // process group), is refused rather than converted.
-        let pid = libc::pid_t::try_from(self.child.id())
-            .ok()
-            .filter(|p| *p > 0)
-            .ok_or_else(|| {
-                io::Error::other(format!("pid {} cannot be signalled", self.child.id()))
-            })?;
+        let pid = signalable_pid(self.child.id())?;
         // The whole group, never the pid alone: the pair driver traps INT to
         // `:` and relies on its foreground drive session receiving the same
         // Ctrl-C, and bash defers a SIGINT its foreground child never got —
@@ -527,12 +530,50 @@ mod tests {
         }
     }
 
+    /// Ends the whole test process if its owner outlives 12 s. Every session
+    /// test builds one (through `CapturingProgress`), so a read loop that
+    /// never sees its stream end — a mutated `pump` spins forever on EOF, and
+    /// `wait()` then joins it — fails the run, instead of hanging it until
+    /// the harness gives up. Normal tests take well under a second.
+    struct Watchdog(Option<mpsc::Sender<()>>);
+
+    impl Default for Watchdog {
+        fn default() -> Self {
+            let (tx, rx) = mpsc::channel::<()>();
+            let name = std::thread::current().name().unwrap_or("?").to_string();
+            std::thread::spawn(move || {
+                if rx.recv_timeout(Duration::from_secs(12)) == Err(mpsc::RecvTimeoutError::Timeout)
+                {
+                    // Straight to stderr (`eprintln!` is captured per test and
+                    // would be lost) and `_exit`, not abort: no core dump to
+                    // delay the exit past a harness timeout.
+                    let _ = io::Write::write_all(
+                        &mut io::stderr(),
+                        format!("watchdog: {name} still running after 12 s; ending the run\n")
+                            .as_bytes(),
+                    );
+                    // SAFETY: _exit(2) takes a plain integer and never returns.
+                    unsafe { libc::_exit(101) };
+                }
+            });
+            Watchdog(Some(tx))
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            self.0.take();
+        }
+    }
+
     /// Records stages and logs; with `cancel_after_first_stage`, its cancel
     /// token is set by the first `on_stage`.
     #[derive(Default)]
     struct CapturingProgress {
         stages: Mutex<Vec<String>>,
         logs: Mutex<Vec<String>>,
+        levelled: Mutex<Vec<(LogLevel, String)>>,
+        _watchdog: Watchdog,
         cancel: CancelToken,
         cancel_on_stage: std::sync::atomic::AtomicBool,
     }
@@ -547,6 +588,14 @@ mod tests {
         fn logs(&self) -> Vec<String> {
             self.logs.lock().unwrap().clone()
         }
+        fn level_of(&self, message: &str) -> Option<LogLevel> {
+            self.levelled
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, m)| m == message)
+                .map(|(l, _)| *l)
+        }
     }
 
     impl ProgressCallback for CapturingProgress {
@@ -558,7 +607,11 @@ mod tests {
         }
         fn on_progress(&self, _: u64, _: u64, _: &str) {}
         fn on_throughput(&self, _: u64) {}
-        fn on_log(&self, _: LogLevel, message: &str) {
+        fn on_log(&self, level: LogLevel, message: &str) {
+            self.levelled
+                .lock()
+                .unwrap()
+                .push((level, message.to_string()));
             self.logs.lock().unwrap().push(message.to_string());
         }
         fn on_complete(&self, _: bool, _: &str) {}
@@ -954,7 +1007,14 @@ exit 0"#,
             s.spawn(|| {
                 // After the script's first line (its trap is set by then),
                 // never on a fixed clock that a slow start could beat.
+                // Bounded: a run that never records the stage must fail
+                // this test, not hang it (a mutated parser did, as a timeout).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while sink.stages().is_empty() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no stage was recorded within 10 s"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
@@ -972,6 +1032,99 @@ exit 0"#,
         assert_eq!(out.exit, Some(3));
         assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_result_line_is_logged_at_the_level_its_exit_status_earns() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub_script(
+            dir.path(),
+            r#"
+echo "RESULT system-recovery-A-2tb 0 clean"
+echo "RESULT system-recovery-B-2tb 5 warnings"
+echo "RESULT system-recovery-C-2tb 7 failed"
+exit 7"#,
+        );
+        let sink = CapturingProgress::default();
+        run_session(
+            &SystemSpawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.level_of("[system-recovery-A-2tb] result: clean (exit 0)"),
+            Some(LogLevel::Info)
+        );
+        assert_eq!(
+            sink.level_of("[system-recovery-B-2tb] result: warnings (exit 5)"),
+            Some(LogLevel::Warning)
+        );
+        assert_eq!(
+            sink.level_of("[system-recovery-C-2tb] result: failed (exit 7)"),
+            Some(LogLevel::Error)
+        );
+    }
+
+    #[test]
+    fn a_pid_is_signalled_only_when_it_fits_and_is_above_zero() {
+        assert!(signalable_pid(0).is_err(), "0 would signal our own group");
+        assert_eq!(signalable_pid(1).unwrap(), 1);
+        assert_eq!(signalable_pid(4_000_000).unwrap(), 4_000_000);
+        assert!(signalable_pid(u32::MAX).is_err());
+        assert!(
+            signalable_pid(0).unwrap_err().to_string().contains("pid 0"),
+            "the refusal names the pid"
+        );
+    }
+
+    #[test]
+    fn pump_sends_every_line_stripped_and_prefixed_and_stops_at_the_end() {
+        // Each run is on its own thread with a deadline: a pump that never
+        // sees the end of its input spins forever, and must fail here
+        // rather than hang the suite.
+        let run = |input: &'static [u8]| {
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let (tx, rx) = mpsc::channel();
+                let result = pump(io::Cursor::new(input), "p: ", &tx);
+                drop(tx);
+                let _ = done_tx.send((result.is_ok(), rx.iter().collect::<Vec<_>>()));
+            });
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pump did not return at the end of its input")
+        };
+        assert_eq!(
+            run(b"one\r\ntwo\nlast"),
+            (
+                true,
+                vec!["p: one".to_string(), "p: two".into(), "p: last".into()]
+            )
+        );
+        assert_eq!(run(b""), (true, Vec::new()));
+        assert_eq!(
+            run(b"bad \xff byte\n"),
+            (true, vec!["p: bad \u{fffd} byte".to_string()])
+        );
+    }
+
+    #[test]
+    fn interrupt_reports_what_kill_reported() {
+        use std::os::unix::process::ExitStatusExt;
+        let _watchdog = Watchdog::default();
+        // A live script leading its own group: the signal is delivered.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exec sleep 5"]).process_group(0);
+        let mut child = SystemSpawner.spawn(cmd).unwrap();
+        child.interrupt().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+        // The same child once reaped: its group is gone, kill says so.
+        let err = child.interrupt().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "{err}");
     }
 
     /// `/proc/<pid>/stat`'s state letter, or `None` once the pid is gone.
