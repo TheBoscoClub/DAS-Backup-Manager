@@ -12,27 +12,23 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 ## Key Paths
 
 - **Backup DB**: `/var/lib/das-backup/backup-index.db`
-- **Config**: `/etc/das-backup/config.toml` (source of truth); **btrbk config** `/etc/btrbk/btrbk.conf` is generated from it — never hand-edit
-- **Email transport**: local mail relay at `127.0.0.1:25`, unauthenticated. This project stores **no** mail credential — see `.claude/rules/backup.md` §Email Reports
+- **Config**: `/etc/das-backup/config.toml` (source of truth); `/etc/btrbk/btrbk.conf` is generated from it — never hand-edit
+- **Email**: local relay `127.0.0.1:25`, unauthenticated; this project stores **no** mail credential — `.claude/rules/backup.md` §Email Reports
 - **Growth log**: `/var/lib/das-backup/growth.log`
 
 ## Build
 
 ```bash
-# Everything — Rust is built by CMake into build/cargo-target/; never a bare `cargo build`
+# Rust is built by CMake into build/cargo-target/; never a bare `cargo build`
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-
 # Rust tests (target dir on tmpfs, not the array)
 cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 ```
 
-## Detailed Rules
+## Detailed Rules (`.claude/rules/`)
 
-See `.claude/rules/` for project-specific rules:
 - `esp-safety.md` — **CRITICAL** — DAS ESP partition safety (never sync host ESP onto DAS drives)
-- `build.md` — CMake, Qt6/KF6, C++20 build conventions
-- `backup.md` — btrbk, DAS, retention, boot archival
+- `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
+- `backup.md` — btrbk, DAS, retention, boot archival, email, exit codes, locks
 - `fail-silent.md` — which error suppressions are legitimate here, and which are always defects
-
-
