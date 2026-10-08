@@ -163,7 +163,8 @@
 #   - Both drives in one run (session A B --mode sequential|parallel): ONE
 #     process holds the maintenance lock, once, and the egress rule, and runs
 #     each drive's session as its child through that lock's descriptor;
-#     sequential runs the second drive only if the first exited 0, parallel
+#     sequential runs the second drive only after a first that exited 0, or
+#     5 on warnings of its own session alone (decision 9, below); parallel
 #     runs both at once.
 #   - The session history: one JSON line per drive per session that took
 #     the lock, in recovery-os-vm-history.jsonl beside the boot record;
@@ -683,8 +684,9 @@ without rebooting the workstation.
                          agent runs at boot; never on "will")
   session <A|B|label> <A|B|label> [--mode sequential|parallel] [...]
                          both drives in one run, under one lock: one after
-                         the other (the default; the second only if the
-                         first exited 0), or at once
+                         the other (the default; the second only after a
+                         first that exited 0, or 5 on its own session's
+                         warnings alone), or at once
   session-end <A|B|label>
                          finish a session whose driver died (VM shut off);
                          judges the guard's report before removing anything
