@@ -63,6 +63,13 @@ const PACMAN_LOCAL: &str = "var/lib/pacman/local";
 const BTRBK_CONFIGS: [&str; 2] = ["etc/btrbk.conf", "etc/btrbk/btrbk.conf"];
 /// What a reading holds before it is taken: unknown, never "none".
 const NOT_READ: &str = "not read";
+/// The QEMU guest agent: its package, its unit, and the udev rule through
+/// which Arch starts that unit (the unit has an empty `[Install]`, so it is
+/// never "enabled" by a link: `systemctl is-enabled` says `static`, and the
+/// rule pulls it in when the agent's virtio port appears).
+const GUEST_AGENT_PACKAGE: &str = "qemu-guest-agent";
+const GUEST_AGENT_UNIT: &str = "qemu-guest-agent.service";
+const GUEST_AGENT_RULE: &str = "99-qemu-guest-agent.rules";
 
 /// What was read from one recovery OS root.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -112,6 +119,13 @@ pub struct RecoveryOs {
     /// this OS, so it cannot go stale between readings.
     #[serde(default)]
     pub btrbk_at_boot: BtrbkAtBoot,
+    /// Whether this OS runs the QEMU guest agent when booted in the update VM
+    /// (bd DAS-Backup-Manager-8249): `recovery-os-vm.sh session --unattended`
+    /// is allowed only when it is installed and starts at boot. A record of
+    /// schema version 3 or older has none; it loads "not read" — unknown,
+    /// never "not installed".
+    #[serde(default)]
+    pub guest_agent: GuestAgent,
     /// Every item that is there but could not be read, as
     /// `<path relative to root>: <why>`. An absent item is not a problem: it
     /// is recorded by the `*_read` flags, the `None`s and the `Absent`s alone.
@@ -247,6 +261,49 @@ impl Default for BtrbkConfig {
         Self::Unreadable {
             reason: NOT_READ.to_string(),
         }
+    }
+}
+
+/// Whether the QEMU guest agent runs in a recovery OS once it boots.
+///
+/// Stored as `{"state": "read", "installed": bool, "enabled": bool, "why":
+/// "..."}` or `{"state": "unreadable", "reason": "..."}`. `enabled` is true
+/// only when `installed` is: the package's unit file is there, nothing in
+/// `etc` overrides it or its udev rule, and either the unit is enabled by a
+/// link or the package's udev rule starts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GuestAgent {
+    /// Read: `why` says what decided `enabled`.
+    Read {
+        installed: bool,
+        enabled: bool,
+        why: String,
+    },
+    /// Something that decides it could not be read: unknown, never "no".
+    Unreadable { reason: String },
+}
+
+/// Not read is unknown: the cautious default, never "not installed".
+impl Default for GuestAgent {
+    fn default() -> Self {
+        Self::Unreadable {
+            reason: NOT_READ.to_string(),
+        }
+    }
+}
+
+impl GuestAgent {
+    /// Installed and started at boot: what an unattended session needs.
+    pub fn runs_at_boot(&self) -> bool {
+        matches!(
+            self,
+            Self::Read {
+                installed: true,
+                enabled: true,
+                ..
+            }
+        )
     }
 }
 
@@ -624,34 +681,154 @@ fn inspect_with(root: &Path, probe: MountFlags) -> RecoveryOs {
         }
         Err(e) => unreadable(e, &mut os.problems),
     }
+    // Whether the guest agent's package is in the database: None when that
+    // cannot be told (the database not listed, or an entry in it unreadable,
+    // which might be that package's).
+    let mut agent_installed: Option<bool> = None;
     match list_in_root(root, PACMAN_LOCAL) {
         Ok(entries) => {
             os.packages_read = true;
+            let mut seen = Some(false);
             for entry in entries {
                 let rel = format!("{PACMAN_LOCAL}/{entry}/desc");
                 match read_in_root(root, &rel) {
                     Ok(text) => {
-                        if let Some((name, version)) = parse_desc(&text)
-                            && WATCHED_PACKAGES.contains(&name.as_str())
-                        {
-                            os.packages.insert(name, version);
+                        if let Some((name, version)) = parse_desc(&text) {
+                            if name == GUEST_AGENT_PACKAGE && seen.is_some() {
+                                seen = Some(true);
+                            }
+                            if WATCHED_PACKAGES.contains(&name.as_str()) {
+                                os.packages.insert(name, version);
+                            }
                         }
                     }
                     // An entry without its desc is a damaged database, not
                     // an absent package: the entry might be a watched one.
-                    Err(ReadErr::Absent) => os.problems.push(format!("{rel}: absent")),
-                    Err(ReadErr::Unreadable(why)) => os.problems.push(why),
+                    Err(ReadErr::Absent) => {
+                        seen = None;
+                        os.problems.push(format!("{rel}: absent"));
+                    }
+                    Err(ReadErr::Unreadable(why)) => {
+                        seen = None;
+                        os.problems.push(why);
+                    }
                 }
             }
+            agent_installed = seen;
         }
         Err(e) => unreadable(e, &mut os.problems),
     }
     let boot = boot::read_with(root, probe);
+    os.guest_agent = guest_agent_in(root, agent_installed, &boot.units);
     os.enabled_units = boot.units;
     os.btrbk_config = boot.config;
     os.btrbk_at_boot = boot.at_boot;
     os.problems.extend(boot.problems);
     os
+}
+
+/// What is at `rel` under `root`, without following a link at its end:
+/// `None` when nothing is there. A link on the way to it, or an `lstat` that
+/// fails for any reason but "not there", is unreadable.
+fn lstat_in_root(root: &Path, rel: &str) -> Result<Option<fs::FileType>, ReadErr> {
+    let path = Path::new(rel);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(ReadErr::Unreadable(format!(
+            "{rel}: not a plain relative path"
+        )));
+    };
+    let dir = match resolve_in_root(root, &parent.to_string_lossy()) {
+        Ok(dir) => dir,
+        Err(ReadErr::Absent) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match fs::symlink_metadata(dir.join(name)) {
+        Ok(meta) => Ok(Some(meta.file_type())),
+        Err(e) => match io_error(rel, &e) {
+            ReadErr::Absent => Ok(None),
+            other => Err(other),
+        },
+    }
+}
+
+/// Whether the guest agent runs when this OS boots ([`GuestAgent`]):
+/// `installed` from pacman's database (`None`: not known), `units` the
+/// enabled units read from the same root. Anything in `etc` in the place of
+/// its unit or its rule -- a mask (a link to /dev/null) or a replacement --
+/// counts as "not enabled": the cautious answer, since a replacement is not
+/// the unit this was written for.
+fn guest_agent_in(root: &Path, installed: Option<bool>, units: &EnabledUnits) -> GuestAgent {
+    let unreadable = |e: ReadErr| GuestAgent::Unreadable {
+        reason: match e {
+            ReadErr::Absent => "absent".to_string(),
+            ReadErr::Unreadable(why) => why,
+        },
+    };
+    let read = |enabled: bool, why: String| GuestAgent::Read {
+        installed: true,
+        enabled,
+        why,
+    };
+    match installed {
+        None => {
+            return GuestAgent::Unreadable {
+                reason: "pacman's database could not be read in full".to_string(),
+            };
+        }
+        Some(false) => {
+            return GuestAgent::Read {
+                installed: false,
+                enabled: false,
+                why: format!("{GUEST_AGENT_PACKAGE} is not installed"),
+            };
+        }
+        Some(true) => {}
+    }
+    let etc_unit = format!("etc/systemd/system/{GUEST_AGENT_UNIT}");
+    match lstat_in_root(root, &etc_unit) {
+        Ok(Some(_)) => {
+            return read(
+                false,
+                format!("{etc_unit} masks or replaces the package's unit"),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return unreadable(e),
+    }
+    let lib_unit = format!("usr/lib/systemd/system/{GUEST_AGENT_UNIT}");
+    match lstat_in_root(root, &lib_unit) {
+        Ok(Some(t)) if t.is_file() => {}
+        Ok(_) => return read(false, format!("{lib_unit} is not there as a file")),
+        Err(e) => return unreadable(e),
+    }
+    if let EnabledUnits::Listed { units } = units
+        && let Some(u) = units.iter().find(|u| u.name == GUEST_AGENT_UNIT)
+    {
+        return read(true, format!("enabled in {}", u.dirs.join(", ")));
+    }
+    let etc_rule = format!("etc/udev/rules.d/{GUEST_AGENT_RULE}");
+    match lstat_in_root(root, &etc_rule) {
+        Ok(Some(_)) => {
+            return read(
+                false,
+                format!("{etc_rule} masks or replaces the rule that starts it"),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return unreadable(e),
+    }
+    let lib_rule = format!("usr/lib/udev/rules.d/{GUEST_AGENT_RULE}");
+    match lstat_in_root(root, &lib_rule) {
+        Ok(Some(t)) if t.is_file() => read(
+            true,
+            format!("started by {lib_rule} when the agent's virtio port appears"),
+        ),
+        Ok(_) => read(
+            false,
+            format!("not enabled, and {lib_rule}, which would start it, is not there as a file"),
+        ),
+        Err(e) => unreadable(e),
+    }
 }
 
 /// The leading numeric `major.minor[.patch]` of a kernel release, or `None`.
@@ -1268,13 +1445,14 @@ pub struct StoredDrive {
     pub error: Option<String>,
 }
 
-/// The version written: 3 since `enabled_units`, `btrbk_config` and
-/// `btrbk_at_boot` were added (2 added `installed`).
-const STATE_SCHEMA_VERSION: u32 = 3;
-/// The versions read. A version-2 record has none of the readings 3 added;
-/// they load as "not read" — unknown, so its boot verdict is "may" — and the
-/// next write records it as version 3. Anything else is refused.
-const STATE_SCHEMA_READ: [u64; 2] = [2, 3];
+/// The version written: 4 since `guest_agent` was added (3 added
+/// `enabled_units`, `btrbk_config` and `btrbk_at_boot`; 2 added `installed`).
+const STATE_SCHEMA_VERSION: u32 = 4;
+/// The versions read. An older record lacks the readings a later one added;
+/// they load as "not read" — unknown, so a version-2 record's boot verdict is
+/// "may", and an older record's guest agent unknown — and the next write
+/// records it as version 4. Anything else is refused.
+const STATE_SCHEMA_READ: [u64; 3] = [2, 3, 4];
 
 /// The state file, overridable for tests and the VM rig via
 /// `DAS_RECOVERY_OS_STATE`.
@@ -1305,7 +1483,7 @@ pub fn load_state(path: &Path) -> Result<Option<StoredState>, String> {
         .and_then(serde_json::Value::as_u64);
     if !version.is_some_and(|v| STATE_SCHEMA_READ.contains(&v)) {
         return Err(fail(format!(
-            "record schema version {}, this btrdasd reads 2 and 3",
+            "record schema version {}, this btrdasd reads 2, 3 and 4",
             version.map_or_else(|| "none".to_string(), |v| v.to_string())
         )));
     }
@@ -3651,7 +3829,7 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         let st = load_state(&path).unwrap().unwrap();
-        assert_eq!(st.schema_version, 3);
+        assert_eq!(st.schema_version, 4);
         let DriveReport::Inspected { os, .. } = &a.report else {
             panic!()
         };
@@ -4358,6 +4536,267 @@ mod tests {
         );
     }
 
+    /// A root with the guest agent installed the way Arch's package lays it
+    /// out: its package, its static unit and the udev rule that starts it.
+    fn agent_root(root: &Path) {
+        full_root(root);
+        add_pkg(
+            root,
+            "qemu-guest-agent-11.0.0-1",
+            "qemu-guest-agent",
+            "11.0.0-1",
+        );
+        write(
+            root,
+            "usr/lib/systemd/system/qemu-guest-agent.service",
+            "[Unit]\nDescription=QEMU Guest Agent\n[Service]\nExecStart=-/usr/bin/qemu-ga\n[Install]\n",
+        );
+        write(
+            root,
+            "usr/lib/udev/rules.d/99-qemu-guest-agent.rules",
+            "SUBSYSTEM==\"virtio-ports\", ATTR{name}==\"org.qemu.guest_agent.0\", TAG+=\"systemd\" \
+             ENV{SYSTEMD_WANTS}=\"qemu-guest-agent.service\"\n",
+        );
+    }
+
+    fn agent(installed: bool, enabled: bool, why: &str) -> GuestAgent {
+        GuestAgent::Read {
+            installed,
+            enabled,
+            why: why.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_guest_agent_installed_with_its_udev_rule_runs_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(
+                true,
+                true,
+                "started by usr/lib/udev/rules.d/99-qemu-guest-agent.rules when the agent's \
+                 virtio port appears"
+            )
+        );
+        assert!(os.guest_agent.runs_at_boot());
+        // Stored as the driver reads it.
+        let j = serde_json::to_value(&os).unwrap();
+        assert_eq!(j["guest_agent"]["state"], "read");
+        assert_eq!(j["guest_agent"]["installed"], true);
+        assert_eq!(j["guest_agent"]["enabled"], true);
+    }
+
+    #[test]
+    fn the_guest_agent_not_installed_is_said_so_and_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        full_root(dir.path());
+        // Its unit and rule lying about without the package do not count.
+        write(
+            dir.path(),
+            "usr/lib/udev/rules.d/99-qemu-guest-agent.rules",
+            "x\n",
+        );
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(false, false, "qemu-guest-agent is not installed")
+        );
+        assert!(!os.guest_agent.runs_at_boot());
+        let j = serde_json::to_value(&os).unwrap();
+        assert_eq!(j["guest_agent"]["installed"], false);
+    }
+
+    #[test]
+    fn the_guest_agent_masked_or_overridden_in_etc_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::create_dir_all(dir.path().join(ETC)).unwrap();
+        std::os::unix::fs::symlink(
+            "/dev/null",
+            dir.path().join(ETC).join("qemu-guest-agent.service"),
+        )
+        .unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(
+                true,
+                false,
+                "etc/systemd/system/qemu-guest-agent.service masks or replaces the package's unit"
+            )
+        );
+        assert!(!os.guest_agent.runs_at_boot());
+
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::create_dir_all(dir.path().join("etc/udev/rules.d")).unwrap();
+        std::os::unix::fs::symlink(
+            "/dev/null",
+            dir.path()
+                .join("etc/udev/rules.d/99-qemu-guest-agent.rules"),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect(dir.path()).guest_agent,
+            agent(
+                true,
+                false,
+                "etc/udev/rules.d/99-qemu-guest-agent.rules masks or replaces the rule that \
+                 starts it"
+            )
+        );
+    }
+
+    #[test]
+    fn the_guest_agent_needs_its_unit_and_something_that_starts_it() {
+        // No unit file.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::remove_file(dir.path().join(VENDOR).join("qemu-guest-agent.service")).unwrap();
+        assert_eq!(
+            inspect(dir.path()).guest_agent,
+            agent(
+                true,
+                false,
+                "usr/lib/systemd/system/qemu-guest-agent.service is not there as a file"
+            )
+        );
+        // No rule, not enabled.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::remove_file(
+            dir.path()
+                .join("usr/lib/udev/rules.d/99-qemu-guest-agent.rules"),
+        )
+        .unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(
+                true,
+                false,
+                "not enabled, and usr/lib/udev/rules.d/99-qemu-guest-agent.rules, which would \
+                 start it, is not there as a file"
+            )
+        );
+        assert!(!os.guest_agent.runs_at_boot());
+        // No rule, but enabled by a link: it runs.
+        enable(
+            dir.path(),
+            ETC,
+            "multi-user.target.wants",
+            "qemu-guest-agent.service",
+        );
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(
+                true,
+                true,
+                "enabled in etc/systemd/system/multi-user.target.wants"
+            )
+        );
+        assert!(os.guest_agent.runs_at_boot());
+    }
+
+    #[test]
+    fn the_guest_agents_unit_and_rule_must_be_regular_files() {
+        // The unit a link (to a real file, even): not the package's unit.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        let unit = dir.path().join(VENDOR).join("qemu-guest-agent.service");
+        let elsewhere = dir.path().join("elsewhere.service");
+        fs::rename(&unit, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &unit).unwrap();
+        assert_eq!(
+            inspect(dir.path()).guest_agent,
+            agent(
+                true,
+                false,
+                "usr/lib/systemd/system/qemu-guest-agent.service is not there as a file"
+            )
+        );
+        // The rule a directory, the unit not enabled: nothing starts it.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        let rule = dir
+            .path()
+            .join("usr/lib/udev/rules.d/99-qemu-guest-agent.rules");
+        fs::remove_file(&rule).unwrap();
+        fs::create_dir(&rule).unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            agent(
+                true,
+                false,
+                "not enabled, and usr/lib/udev/rules.d/99-qemu-guest-agent.rules, which would \
+                 start it, is not there as a file"
+            )
+        );
+        assert!(!os.guest_agent.runs_at_boot());
+    }
+
+    #[test]
+    fn the_guest_agent_is_unknown_when_pacmans_database_is_not_whole() {
+        // An entry without its desc might be the agent's.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/broken-1-1")).unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            GuestAgent::Unreadable {
+                reason: "pacman's database could not be read in full".into()
+            }
+        );
+        assert!(!os.guest_agent.runs_at_boot());
+        // No database at all.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::remove_dir_all(dir.path().join("var/lib/pacman/local")).unwrap();
+        assert_eq!(
+            inspect(dir.path()).guest_agent,
+            GuestAgent::Unreadable {
+                reason: "pacman's database could not be read in full".into()
+            }
+        );
+        // Not read at all is unknown too.
+        assert_eq!(
+            GuestAgent::default(),
+            GuestAgent::Unreadable {
+                reason: "not read".into()
+            }
+        );
+        assert!(!GuestAgent::default().runs_at_boot());
+    }
+
+    #[test]
+    fn a_link_on_the_way_to_the_agents_unit_is_unreadable_never_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        // etc/systemd/system itself a link: not followed, and not "absent".
+        let real = dir.path().join("elsewhere");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(dir.path().join("etc/systemd")).unwrap();
+        let sys = dir.path().join(ETC);
+        if sys.exists() {
+            fs::remove_dir_all(&sys).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &sys).unwrap();
+        let GuestAgent::Unreadable { reason } = inspect(dir.path()).guest_agent else {
+            panic!("a link on the way read as an answer")
+        };
+        assert!(reason.contains("is a symlink, not followed"), "{reason}");
+        assert_eq!(
+            lstat_in_root(dir.path(), "no/such/dir/file").map(|t| t.is_some()),
+            Ok(false)
+        );
+    }
+
     #[test]
     fn the_kernel_row_names_the_host_kernel_whichever_is_newer() {
         let dir = tempfile::tempdir().unwrap();
@@ -4421,7 +4860,7 @@ mod tests {
             "{:?}",
             h.warnings
         );
-        // The next write records version 3, the unmounted drive's reading
+        // The next write records version 4, the unmounted drive's reading
         // carried over as it was read.
         let roots = tempfile::tempdir().unwrap();
         full_root(&roots.path().join("a"));
@@ -4435,7 +4874,7 @@ mod tests {
         write_state(&path, &[a, off], 5).unwrap();
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written["schema_version"], 3);
+        assert_eq!(written["schema_version"], 4);
         assert_eq!(written["drives"]["B"]["checked_epoch"], 1);
         assert_eq!(
             written["drives"]["B"]["os"]["btrbk_at_boot"]["verdict"],
@@ -4445,20 +4884,25 @@ mod tests {
             written["drives"]["A"]["os"]["btrbk_at_boot"]["verdict"],
             "no"
         );
-        assert_eq!(load_state(&path).unwrap().unwrap().schema_version, 3);
+        assert_eq!(load_state(&path).unwrap().unwrap().schema_version, 4);
+        // An older record's guest agent loads unknown, never "not installed".
+        assert_eq!(
+            written["drives"]["B"]["os"]["guest_agent"],
+            serde_json::json!({"state": "unreadable", "reason": "not read"})
+        );
 
         // Version 1, no version, and a newer one are refused, and left alone.
         for (record, found) in [
             (r#"{"schema_version":1,"drives":{}}"#, "1"),
             (r#"{"drives":{}}"#, "none"),
-            (r#"{"schema_version":4,"drives":{}}"#, "4"),
+            (r#"{"schema_version":5,"drives":{}}"#, "5"),
         ] {
             fs::write(&path, record).unwrap();
             let err = load_state(&path).unwrap_err();
             assert_eq!(
                 err,
                 format!(
-                    "{}: record schema version {found}, this btrdasd reads 2 and 3 — left as it \
+                    "{}: record schema version {found}, this btrdasd reads 2, 3 and 4 — left as it \
                      is; {hint}",
                     path.display()
                 )

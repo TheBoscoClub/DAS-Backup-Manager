@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  recovery-os-updater: the libvirt domain that boots ONE recovery drive's own
-  operating system at a time, so it can be updated without rebooting the
-  workstation (DAS-Backup-Manager, bd DAS-Backup-Manager-7wb).
+  recovery-os-updater: the template of the libvirt domains that boot a
+  recovery drive's own operating system, so it can be updated without
+  rebooting the workstation (DAS-Backup-Manager, bd DAS-Backup-Manager-7wb).
+  Each role = "mirror" target has a domain of its own,
+  recovery-os-updater-<label> (bd DAS-Backup-Manager-8249): `define` renders
+  it from this file with its own <name>, <uuid>, NVRAM file and <mac>,
+  derived from the label, and nothing else changed. Each of those lines must
+  stay here exactly once, on its own line, or `define` refuses.
 
-  This file is the single source of the definition. CMake installs it to
+  This file is the single source of the definitions. CMake installs it to
   ${prefix}/lib/das-backup/libvirt/, and `recovery-os-vm.sh define` defines
-  the domain from that installed copy. To change the VM, edit this file,
-  reinstall, and run `define` again (the domain must be shut off, with no
-  disk attached). Every session defines the domain anew as well: from this
+  the domains from that installed copy. To change the VMs, edit this file,
+  reinstall, and run `define` again (each domain must be shut off, with no
+  disk attached). Every session defines its domain anew as well: from this
   file plus that session's guard (SMBIOS strings and a virtio port, which
   keep btrbk from running in the booted OS), and afterwards from this file
   alone. So a change made in libvirt by hand (virsh edit) does not last, and
@@ -24,9 +29,10 @@
 -->
 <domain type='kvm'>
   <name>recovery-os-updater</name>
-  <!-- Fixed, so that `define` updates this domain in place: libvirt refuses
-       to redefine a domain under a name it already knows with a different
-       UUID, and generates a new one when none is given. -->
+  <!-- Fixed per drive, so that `define` updates each domain in place:
+       libvirt refuses to redefine a domain under a name it already knows
+       with a different UUID, and generates a new one when none is given.
+       `define` replaces this one with one derived from the drive's label. -->
   <uuid>8a60e198-02b3-4db9-ad4e-2962b1b6e542</uuid>
   <title>DAS recovery OS updater</title>
   <description>Boots one DAS recovery drive's own OS, whole disk passed through, to update it. Managed by recovery-os-vm.sh (DAS-Backup-Manager); never attach a disk by hand.</description>
@@ -88,7 +94,9 @@
          os/boot elements"). -->
     <!-- A fixed address: each session defines the domain anew, and libvirt
          gives an interface without one a new address every time, so the
-         recovery OS would find a new network card at every session. -->
+         recovery OS would find a new network card at every session. `define`
+         replaces it with one derived from the drive's label: two drives' VMs
+         running at once must not share one. -->
     <interface type='network'>
       <mac address='52:54:00:8a:60:e1'/>
       <source network='default'/>
