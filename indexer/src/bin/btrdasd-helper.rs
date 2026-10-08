@@ -574,11 +574,11 @@ fn unix_stamp(key: &str, value: Option<&str>) -> Result<Option<i64>, String> {
 
 /// [`panel::UnitFacts`] from `systemctl show --timestamp=unix -p LoadState,
 /// ActiveState,NextElapseUSecRealtime,LastTriggerUSec,Result,ExecMainStatus,
-/// ExecMainStartTimestamp`. `LoadState=not-found` is a unit that does not
+/// ExecMainStartTimestamp,ExecMainExitTimestamp`. `LoadState=not-found` is a unit that does not
 /// exist; no `LoadState` or `ActiveState`, or a timestamp that does not
 /// parse, is an error, never default facts. `ExecMainStatus` of a run that
 /// never started is no reading, not 0. The unit file's values and the
-/// journal are added by the caller.
+/// journal are added by others.
 fn unit_facts_from(show: &str) -> Result<panel::UnitFacts, String> {
     let props: HashMap<&str, &str> = show.lines().filter_map(|l| l.split_once('=')).collect();
     let load = props
@@ -614,6 +614,10 @@ fn unit_facts_from(show: &str) -> Result<panel::UnitFacts, String> {
             .map(|v| v.to_string()),
         exec_main_status: status,
         exec_main_start_epoch: started,
+        exec_main_exit_epoch: unix_stamp(
+            "ExecMainExitTimestamp",
+            props.get("ExecMainExitTimestamp").copied(),
+        )?,
         ..Default::default()
     })
 }
@@ -814,6 +818,25 @@ fn schedule_clear(unit_dir: &Path, base: &str, systemctl: Systemctl) -> fdo::Res
     systemctl(&["daemon-reload"]).map_err(fdo::Error::Failed)
 }
 
+/// `journalctl`'s arguments for the last 5 lines `unit`'s own processes
+/// logged since `since_epoch`: `_SYSTEMD_UNIT=` leaves out systemd's own
+/// lines about the unit ("Deactivated successfully", "Consumed … CPU time"),
+/// `--since` an earlier run's, `-q` the "-- No entries --" banner.
+fn journal_args(unit: &str, since_epoch: i64) -> Vec<String> {
+    [
+        "-q".to_string(),
+        format!("_SYSTEMD_UNIT={unit}"),
+        "--since".to_string(),
+        format!("@{since_epoch}"),
+        "-n".to_string(),
+        "5".to_string(),
+        "-o".to_string(),
+        "cat".to_string(),
+        "--no-pager".to_string(),
+    ]
+    .into()
+}
+
 /// The panel's system reads: the installed script, `virsh`, the
 /// maintenance lock.
 struct SystemPanelReads {
@@ -838,7 +861,7 @@ impl panel::PanelReads for SystemPanelReads {
                 "--timestamp=unix",
                 "-p",
                 "LoadState,ActiveState,NextElapseUSecRealtime,LastTriggerUSec,Result,\
-                 ExecMainStatus,ExecMainStartTimestamp",
+                 ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp",
                 name,
             ])
             .env("LC_ALL", "C")
@@ -864,25 +887,26 @@ impl panel::PanelReads for SystemPanelReads {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("Cannot read {}: {e}", file.display())),
         }
-        if name.ends_with(".service") {
-            let out = std::process::Command::new("journalctl")
-                .args(["-u", name, "-n", "5", "-o", "cat", "--no-pager"])
-                .env("LC_ALL", "C")
-                .output()
-                .map_err(|e| format!("Cannot read {name}'s journal: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "journalctl -u {name} failed ({}): {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            facts.last_journal = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect();
-        }
         Ok(facts)
+    }
+
+    fn journal(&self, unit: &str, since_epoch: i64) -> Result<Vec<String>, String> {
+        let out = std::process::Command::new("journalctl")
+            .args(journal_args(unit, since_epoch))
+            .env("LC_ALL", "C")
+            .output()
+            .map_err(|e| format!("Cannot read {unit}'s journal: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "journalctl for {unit} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
     }
 
     fn domain_state(&self, label: &str) -> Option<String> {
@@ -2713,6 +2737,24 @@ mod tests {
     }
 
     #[test]
+    fn the_journal_is_asked_for_the_units_own_lines_since_the_trigger_only() {
+        assert_eq!(
+            journal_args("das-recovery-os-update-both.service", 1_791_490_000),
+            [
+                "-q",
+                "_SYSTEMD_UNIT=das-recovery-os-update-both.service",
+                "--since",
+                "@1791490000",
+                "-n",
+                "5",
+                "-o",
+                "cat",
+                "--no-pager"
+            ]
+        );
+    }
+
+    #[test]
     fn unit_facts_are_read_from_systemctl_show_and_never_invented() {
         let timer = unit_facts_from(
             "LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=@1791600000\nLastTriggerUSec=\nResult=success\n",
@@ -2723,11 +2765,13 @@ mod tests {
         assert_eq!(timer.next_elapse_epoch, Some(1_791_600_000));
         assert_eq!(timer.last_trigger_epoch, None);
         let service = unit_facts_from(
-            "LoadState=loaded\nActiveState=inactive\nResult=exit-code\nExecMainStatus=1\nExecMainStartTimestamp=@1791490001\n",
+            "LoadState=loaded\nActiveState=inactive\nResult=exit-code\nExecMainStatus=1\nExecMainStartTimestamp=@1791490001\nExecMainExitTimestamp=@1791490061\n",
         )
         .unwrap();
         assert_eq!(service.exec_main_status, Some(1));
         assert_eq!(service.exec_main_start_epoch, Some(1_791_490_001));
+        assert_eq!(service.exec_main_exit_epoch, Some(1_791_490_061));
+        assert_eq!(timer.exec_main_exit_epoch, None, "no reading is None");
         assert_eq!(service.result.as_deref(), Some("exit-code"));
         let never_ran = unit_facts_from(
             "LoadState=loaded\nActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainStartTimestamp=\n",
