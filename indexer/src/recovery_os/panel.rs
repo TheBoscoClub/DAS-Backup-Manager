@@ -387,18 +387,7 @@ pub fn status_json(
     };
     let both = format!("{UNIT_PREFIX}both");
     let (pair_schedule, pair_schedule_error) = schedule_of(&both, pair_newest, now_epoch, reads);
-    let (pair_session, pair_session_error) = match running_service(&both, reads) {
-        Ok(found) => (
-            found.map(|(name, facts)| Session {
-                by: format!("unit:{name}"),
-                since_epoch: facts.exec_main_start_epoch,
-                domain_state: None,
-                attended: Some(false),
-            }),
-            None,
-        ),
-        Err(e) => (None, Some(e)),
-    };
+    let (pair_session, pair_session_error) = pair_session_of(now.holder, now.job, reads);
     let mode_default = if drives.len() == 2 {
         pair_mode_default(&[drives[0].clean_runs, drives[1].clean_runs])
     } else {
@@ -833,6 +822,43 @@ fn schedule_of(
     (Some(s), None)
 }
 
+/// Who holds both drives as a pair: the pair's schedule service when it
+/// runs (`unit:<name>`); else a two-drive run's lock line `<a>+<b>` —
+/// `job:<id>` when the helper's session job runs, `other:<line>` when not.
+/// The pair's service that cannot be read is the error, reported whatever
+/// else was found.
+fn pair_session_of(
+    holder: Option<&str>,
+    job: Option<&str>,
+    reads: &dyn PanelReads,
+) -> (Option<Session>, Option<String>) {
+    let both = format!("{UNIT_PREFIX}both");
+    let (unit, error) = match running_service(&both, reads) {
+        Ok(found) => (found, None),
+        Err(e) => (None, Some(e)),
+    };
+    if let Some((name, facts)) = unit {
+        let s = Session {
+            by: format!("unit:{name}"),
+            since_epoch: facts.exec_main_start_epoch,
+            domain_state: None,
+            attended: Some(false),
+        };
+        return (Some(s), error);
+    }
+    let pair = holder.filter(|h| holder_labels(h).len() == 2);
+    let s = pair.map(|h| Session {
+        by: match job {
+            Some(id) => format!("job:{id}"),
+            None => format!("other:{h}"),
+        },
+        since_epoch: None,
+        domain_state: None,
+        attended: None,
+    });
+    (s, error)
+}
+
 /// A schedule service that is running now: `(unit, facts)`; `Ok(None)` when
 /// it is not (or does not exist). A unit that cannot be read is an error,
 /// never "not running".
@@ -847,13 +873,25 @@ fn running_service(
     Ok(matches!(facts.active_state.as_str(), "active" | "activating").then_some((name, facts)))
 }
 
+/// The drives a maintenance-lock line `recovery-os VM session <label> pid N`
+/// names: one, or both of a two-drive run's `<a>+<b>`. Any other line names
+/// none.
+fn holder_labels(holder: &str) -> Vec<&str> {
+    holder
+        .strip_prefix("recovery-os VM session ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|token| token.split('+').filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 /// Who holds `label` now. A schedule service covering it (its own or the
 /// pair's) that is active or activating is `unit:<name>` — unless the
 /// helper's session job is running and the lock names this drive, when it is
 /// `job:<id>` (a timer that fires during a Now session waits on the lock,
 /// it does not hold the drive). A lock line `recovery-os VM session <label>
-/// …` with neither is `other:<line>`. A job without the lock naming a drive
-/// is not attributed to one: the helper does not keep a job's labels.
+/// …` with neither is `other:<line>`; a two-drive run's line names
+/// `<a>+<b>`, and holds both. A job without the lock naming a drive is not
+/// attributed to one: the helper does not keep a job's labels.
 ///
 /// The second value says which schedule service could not be read; it is
 /// reported whatever else was found, since an unreadable unit may be the
@@ -864,11 +902,7 @@ fn session_of(
     job: Option<&str>,
     reads: &dyn PanelReads,
 ) -> (Option<Session>, Option<String>) {
-    let held_here = holder.is_some_and(|h| {
-        h.strip_prefix("recovery-os VM session ")
-            .and_then(|rest| rest.split_whitespace().next())
-            == Some(label)
-    });
+    let held_here = holder.is_some_and(|h| holder_labels(h).contains(&label));
     let mut errors = Vec::new();
     let mut unit = None;
     for base in [
@@ -2175,6 +2209,48 @@ pub(crate) mod tests {
             assert_eq!(d["session"]["attended"], false);
         }
         assert_eq!(j["pair"]["session"]["by"], format!("unit:{both}.service"));
+    }
+
+    #[test]
+    fn a_two_drive_runs_lock_line_holds_both_drives_and_the_pair() {
+        let cfg = two_mirrors_and_a_primary();
+        let line = "recovery-os VM session system-recovery-A-2tb+system-recovery-B-2tb pid 4242";
+        // The helper's job holds the pair: both drives and the pair are it.
+        let job = Scripted {
+            job: Some("job-9".into()),
+            lock: Some(line.into()),
+            ..Default::default()
+        };
+        let j = status_json(&cfg, &Ok(None), &host(), "2026-10-08", 1_791_500_000, &job);
+        for d in j["drives"].as_array().unwrap() {
+            assert_eq!(d["session"]["by"], "job:job-9", "{d}");
+        }
+        assert_eq!(j["pair"]["session"]["by"], "job:job-9");
+        // Run from the CLI (no job): other, on both drives and the pair.
+        let cli = Scripted {
+            lock: Some(line.into()),
+            ..Default::default()
+        };
+        let j = status_json(&cfg, &Ok(None), &host(), "2026-10-08", 1_791_500_000, &cli);
+        for d in j["drives"].as_array().unwrap() {
+            assert_eq!(d["session"]["by"], format!("other:{line}"), "{d}");
+        }
+        assert_eq!(j["pair"]["session"]["by"], format!("other:{line}"));
+        // A one-drive line holds that drive only, never the pair; a label
+        // that merely starts like another is not it.
+        let one = Scripted {
+            lock: Some("recovery-os VM session system-recovery-A-2tb pid 1".into()),
+            ..Default::default()
+        };
+        let j = status_json(&cfg, &Ok(None), &host(), "2026-10-08", 1_791_500_000, &one);
+        assert!(j["drives"][0]["session"]["by"].is_string());
+        assert!(j["drives"][1]["session"].is_null());
+        assert!(j["pair"]["session"].is_null());
+        assert_eq!(
+            holder_labels("recovery-os VM session system-recovery-A-2tbX+other pid 1"),
+            ["system-recovery-A-2tbX", "other"]
+        );
+        assert!(holder_labels("backup pid 7").is_empty());
     }
 
     #[test]
