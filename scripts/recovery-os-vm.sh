@@ -514,92 +514,92 @@ readonly VNC_SOCKET_RE="socket='([^']+)'"
 # ---------------------------------------------------------------------------
 # Session state, read by the EXIT trap
 # ---------------------------------------------------------------------------
-LABEL=""            # the target's config label
+LABEL=""             # the target's config label
 LABEL_EXPLICIT=false # given in full, not as a one-letter shorthand
 SERIAL=""
-DISK=""             # the whole-disk path lent to the VM (by-id, or the test loop)
-DISK_DEV=""         # what it resolved to (/dev/sdX) when the session began
-HOLDER_FILE=""      # record: holder pid, the disk path, the holder's scope
-HOLDER_OUT=""       # the holder's stdout (its one `held` line)
-HOLDER_ERR=""       # the holder's stderr
+DISK=""        # the whole-disk path lent to the VM (by-id, or the test loop)
+DISK_DEV=""    # what it resolved to (/dev/sdX) when the session began
+HOLDER_FILE="" # record: holder pid, the disk path, the holder's scope
+HOLDER_OUT=""  # the holder's stdout (its one `held` line)
+HOLDER_ERR=""  # the holder's stderr
 DISK_XML_FILE=""
-LOCK_FD=""          # set while THIS process holds the maintenance lock's descriptor
+LOCK_FD="" # set while THIS process holds the maintenance lock's descriptor
 HOLDER_PID=""
 HOLDER_STARTING=false
-HOLDER_SIGNALLED=false # stop_holder found it running and sent SIGTERM
-HOLDER_FAILURE=""   # why start_holder failed
-HOLDER_LOSSES=0     # holders that died while the VM may have used the disk
-HOLDER_STARTS=0     # holders started this session (names their scopes)
-HOLDER_UNIT=""      # the current holder's scope unit
-REENUMERATED=false  # the by-id link led elsewhere during the session
-CLAIM_GAP=false     # the claim was lost and no claim holds yet
-HOLDER_RESULT="no holder left to stop" # what giving the disk back did with the holder
+HOLDER_SIGNALLED=false                                         # stop_holder found it running and sent SIGTERM
+HOLDER_FAILURE=""                                              # why start_holder failed
+HOLDER_LOSSES=0                                                # holders that died while the VM may have used the disk
+HOLDER_STARTS=0                                                # holders started this session (names their scopes)
+HOLDER_UNIT=""                                                 # the current holder's scope unit
+REENUMERATED=false                                             # the by-id link led elsewhere during the session
+CLAIM_GAP=false                                                # the claim was lost and no claim holds yet
+HOLDER_RESULT="no holder left to stop"                         # what giving the disk back did with the holder
 OS_STATE_FILE="$TEST_ROOT/var/lib/das-backup/recovery-os.json" # the boot record
-SESSIONS_FILE=""    # the session times, beside the boot record
-SESSIONS_FAILURE="" # why they could not be read or written
-LAST_SESSION=""     # this label's last session time, if one is recorded
+SESSIONS_FILE=""                                               # the session times, beside the boot record
+SESSIONS_FAILURE=""                                            # why they could not be read or written
+LAST_SESSION=""                                                # this label's last session time, if one is recorded
 ACCEPT_BOOT_RISK=false
-BOOT_OVERRIDES=()   # what --accept-boot-record-risk let through
-VERDICT=""          # the boot record's btrbk-at-boot verdict: will, may or no
-REC_UNITS=()        # the record's enabled units, when it lists them
-REC_REASONS=()      # what its verdict rests on
-REC_RUNNERS=()      # the name each runner it found would be masked by
-MASKS=()            # the units the session guard masks
-GUARD_ENTRIES=()    # the SMBIOS strings that carry the guard
-GUARD_EXPECT=""     # the one line a recovery OS whose guard holds reports
-GUARD_EXPECT_C=""   # ...in short: the mask list as its digest
+BOOT_OVERRIDES=() # what --accept-boot-record-risk let through
+VERDICT=""        # the boot record's btrbk-at-boot verdict: will, may or no
+REC_UNITS=()      # the record's enabled units, when it lists them
+REC_REASONS=()    # what its verdict rests on
+REC_RUNNERS=()    # the name each runner it found would be masked by
+MASKS=()          # the units the session guard masks
+GUARD_ENTRIES=()  # the SMBIOS strings that carry the guard
+GUARD_EXPECT=""   # the one line a recovery OS whose guard holds reports
+GUARD_EXPECT_C="" # ...in short: the mask list as its digest
 GUARD_EXPECT_LIFTED_C=""
-GUARD_FILE=""       # where that report lands: the port's file on this host
-RESET_FILE=""       # the resets the reset watch saw, with where the report stood
-RESET_WATCH_PID=""  # the reset watch: a reader of libvirt's event stream
-RESET_VIRSH_PID=""  # the virsh whose event stream it reads: this script's child
+GUARD_FILE=""              # where that report lands: the port's file on this host
+RESET_FILE=""              # the resets the reset watch saw, with where the report stood
+RESET_WATCH_PID=""         # the reset watch: a reader of libvirt's event stream
+RESET_VIRSH_PID=""         # the virsh whose event stream it reads: this script's child
 RESET_VIRSH_STARTING=false # set just before that virsh starts: on_exit uses $!
 RESET_VIRSH_BEFORE=""      # $! before that virsh started
-RESET_LINES_READ=0  # lines of RESET_FILE already taken
-RESET_WATCH_DOWN="" # why the reset watch is not running, once it stopped
-RESETS=0            # resets of the VM seen this session
-DESTROYED=false     # destroy_never_resumed destroyed the domain
-DESTROY_STATE=""    # what destroy_never_resumed read the domain's state as
-MAY_HAVE_RUN=false  # ...and found it resumed by something else (not paused, or its vCPUs ran)
-GUARD_XML_FILE=""   # the domain definition with the guard, as defined
-GUARDED=false       # the guard MAY be in the domain's definition (set before defining)
+RESET_LINES_READ=0         # lines of RESET_FILE already taken
+RESET_WATCH_DOWN=""        # why the reset watch is not running, once it stopped
+RESETS=0                   # resets of the VM seen this session
+DESTROYED=false            # destroy_never_resumed destroyed the domain
+DESTROY_STATE=""           # what destroy_never_resumed read the domain's state as
+MAY_HAVE_RUN=false         # ...and found it resumed by something else (not paused, or its vCPUs ran)
+GUARD_XML_FILE=""          # the domain definition with the guard, as defined
+GUARDED=false              # the guard MAY be in the domain's definition (set before defining)
 GUARD_CONFIRMED=false
-GUARD_FAILED=false  # it did not confirm (GUARD_RESULT says how)
+GUARD_FAILED=false    # it did not confirm (GUARD_RESULT says how)
 GUARD_SHUT_DOWN=false # ...and the recovery OS was asked to shut down for it
 GUARD_RESULT="not booted"
-GUARD_LEFT=""       # why the guard could not be taken out of the definition
+GUARD_LEFT=""          # why the guard could not be taken out of the definition
 GUARD_EXPECT_LIFTED="" # the line of a recovery OS whose guard is lifted for the update
-GUARD_STATE_FILE="" # the session's guard state, for status and session-end
-UNMASKABLE=()       # what the record names that the guard cannot mask
+GUARD_STATE_FILE=""    # the session's guard state, for status and session-end
+UNMASKABLE=()          # what the record names that the guard cannot mask
 # The guard's clock: seconds the recovery OS could run, counted from its
 # resume -- not while it is paused, not across a gap between two looks.
 GCLOCK=0
-G_TICK_AT=0         # SECONDS at the last look
-G_LAST_LINE=0       # GCLOCK when the last report line arrived
-G_GAPS=0            # gaps between two looks (a host suspend, or this script stopped), unless
-G_GAP_SECS=0        # the domain read paused on both sides -- and the time they took
-G_TICK_STATE=""     # the domain's state at the last look
+G_TICK_AT=0     # SECONDS at the last look
+G_LAST_LINE=0   # GCLOCK when the last report line arrived
+G_GAPS=0        # gaps between two looks (a host suspend, or this script stopped), unless
+G_GAP_SECS=0    # the domain read paused on both sides -- and the time they took
+G_TICK_STATE="" # the domain's state at the last look
 # What must still prove itself: "start" (the first boot) or "reset" (the boot
 # after one), from a boot whose first line comes at or after PROOF_POS in
 # the report, before GCLOCK reaches PROOF_DEADLINE. Empty: nothing.
 PROOF_WHY=""
 PROOF_POS=0
 PROOF_DEADLINE=0
-PROOF_AT=0          # when the first reset not answered was (seconds since the epoch)
-PROOF_ANSWERED=""   # what the line just judged answered: start, reset, or nothing
-SILENT=false        # silent past GUARD_SECS now, with no reset since (a warning)
-SILENT_NEXT=0       # GCLOCK at which that is said again
-SILENCES=0          # how many times it went silent
+PROOF_AT=0        # when the first reset not answered was (seconds since the epoch)
+PROOF_ANSWERED="" # what the line just judged answered: start, reset, or nothing
+SILENT=false      # silent past GUARD_SECS now, with no reset since (a warning)
+SILENT_NEXT=0     # GCLOCK at which that is said again
+SILENCES=0        # how many times it went silent
 SILENCE_LONGEST=0
-G_WATCH_DOWN_AT=0   # GCLOCK when the reset watch was found stopped
-G_LIFTS_SAID=0      # lifts already said
-REPORT_LOSSES=()    # what of the report was lost (cut, or gone before it was read)
-SHUTDOWN_ASKED=0    # how often the recovery OS was asked to shut down
-SHUTDOWN_SECS=0     # ...over how long
+G_WATCH_DOWN_AT=0      # GCLOCK when the reset watch was found stopped
+G_LIFTS_SAID=0         # lifts already said
+REPORT_LOSSES=()       # what of the report was lost (cut, or gone before it was read)
+SHUTDOWN_ASKED=0       # how often the recovery OS was asked to shut down
+SHUTDOWN_SECS=0        # ...over how long
 RESUME_ATTEMPTED=false # `virsh resume` was tried: never destroy from here on
-ATTACHED=false      # the disk MAY be in the domain's definition (set before attaching)
-STARTED=false       # `virsh start` was attempted, so the guest may have written
-DONE=false          # nothing left for the trap to undo
+ATTACHED=false         # the disk MAY be in the domain's definition (set before attaching)
+STARTED=false          # `virsh start` was attempted, so the guest may have written
+DONE=false             # nothing left for the trap to undo
 KEEP_REASON=""
 RETURN_FAILURE=""
 SCAN_RESULT="not needed"
@@ -611,16 +611,16 @@ TARGET_ARG=""
 SESSION_START=0
 VM_START=0
 SESSION_EPOCH=0
-UNATTENDED=false    # session --unattended
-RUN_MODE=single     # single, or a two-drive run's: sequential or parallel
+UNATTENDED=false # session --unattended
+RUN_MODE=single  # single, or a two-drive run's: sequential or parallel
 PAIR_MODE=sequential
-TARGET_ARG2=""      # the second drive of a two-drive run
+TARGET_ARG2="" # the second drive of a two-drive run
 PAIR_DONE=false PAIR_KEPT=false PAIR_RCS=() PAIR_LABELS=()
 # The maintenance lock's descriptor came from a two-drive run that holds it.
 LOCK_INHERITED=false
-EGRESS_HELD=false   # ...and so does its egress rule
-CAUSE_FILE=""       # ...and where a sequential one reads this drive's exit-5 causes
-EGRESS_OWNED=false  # this process put the egress rule in place (or took one over)
+EGRESS_HELD=false  # ...and so does its egress rule
+CAUSE_FILE=""      # ...and where a sequential one reads this drive's exit-5 causes
+EGRESS_OWNED=false # this process put the egress rule in place (or took one over)
 EGRESS_SUBNET="" EGRESS_COUNT=0 EGRESS_FAILURE=""
 EGRESS_RESULT="not needed"
 HISTORY_FILE=""     # the session history, beside the boot record
@@ -629,15 +629,15 @@ HISTORY_FAILURE="" HISTORY_LINES=""
 # An attended session of a "will" drive (decision 3 of bd 8249).
 WILL_BANNER=false
 readonly WILL_BANNER_TEXT="this OS runs btrbk at boot; the guard is stopping it now; disable it in this session (mask the unit the boot record names), then let the next backup run record the drive again"
-REC_AGENT=""        # the record's guest agent: "read <installed> <enabled>", or why not
+REC_AGENT="" # the record's guest agent: "read <installed> <enabled>", or why not
 REC_AGENT_WHY=""
 UNATTENDED_FAILED="" UNATTENDED_STAGE="" UNATTENDED_WHY="" UNATTENDED_DEADLINE=0
-UNATTENDED_HALF=""  # said when a step that changes the OS was stopped
-PRE_UPDATE_SNAPSHOT=""  # the snapshot step's @.pre-update.<stamp>
-KERNEL=""           # what an unattended session's reboot came back with
+UNATTENDED_HALF=""     # said when a step that changes the OS was stopped
+PRE_UPDATE_SNAPSHOT="" # the snapshot step's @.pre-update.<stamp>
+KERNEL=""              # what an unattended session's reboot came back with
 STAGE_N=0 OUT_PART="" OUT_LAST=""
 GSH_RC="" GSH_OUT="" GSH_WHY="" AGENT_OUT=""
-CONSOLE_FILE=""     # the console bridge's record: pid, directory
+CONSOLE_FILE="" # the console bridge's record: pid, directory
 RENDER_FAILURE=""
 D_UUID="" D_MAC=""
 LOG_PREFIX=""       # "[label] " in a drive's session of a two-drive run
@@ -1519,7 +1519,11 @@ check_boot_record() {
     log "  checked        $when, $(age_text "$age")"
     log "  filesystem     $fs (the mount_uuid of $LABEL)"
     if [[ "$units_state" == listed ]]; then
-        log "  enabled units  $(IFS=,; p="${units[*]}"; printf '%s' "${p//,/, }") (${#units[@]})"
+        log "  enabled units  $(
+            IFS=,
+            p="${units[*]}"
+            printf '%s' "${p//,/, }"
+        ) (${#units[@]})"
     else
         log "  enabled units  $units_state"
     fi
@@ -1591,7 +1595,10 @@ check_boot_record() {
     for p in "${hints[@]}"; do
         [[ "; $hint; " == *"; $p; "* ]] || hint+="${hint:+; }$p"
     done
-    refuse "$(IFS=';'; printf '%s' "${problems[*]}" | sed 's/;/; /g') (the record was checked $when, $(age_text "$age")) -- $hint"
+    refuse "$(
+        IFS=';'
+        printf '%s' "${problems[*]}" | sed 's/;/; /g'
+    ) (the record was checked $when, $(age_text "$age")) -- $hint"
 }
 
 # ---------------------------------------------------------------------------
@@ -1695,7 +1702,10 @@ build_guard() {
         fi
     fi
     MASKS=("${GUARD_DEFAULT_MASKS[@]}" "${sorted[@]}")
-    list="$(IFS=,; printf '%s' "${MASKS[*]}")"
+    list="$(
+        IFS=,
+        printf '%s' "${MASKS[*]}"
+    )"
     # A heartbeat names the masks by a digest of their list: the first 16
     # hex digits of its SHA-256. Computed here and given to the reporter, so
     # the recovery OS needs no tool for it.
@@ -1723,7 +1733,11 @@ build_guard() {
         GUARD_ENTRIES+=("io.systemd.credential:systemd.extra-unit.$u=")
         GUARD_ENTRIES+=("io.systemd.credential.binary:systemd.unit-dropin.$u~$GUARD_MASK_DROPIN=$never_b64")
     done
-    log "session guard: a refusing btrbk bound over $(join_and "${GUARD_BTRBK_PATHS[@]}") where present; masks $(IFS=,; p="${MASKS[*]}"; printf '%s' "${p//,/, }")"
+    log "session guard: a refusing btrbk bound over $(join_and "${GUARD_BTRBK_PATHS[@]}") where present; masks $(
+        IFS=,
+        p="${MASKS[*]}"
+        printf '%s' "${p//,/, }"
+    )"
 }
 
 # What the recovery OS reads at its console and above every login prompt
@@ -1822,7 +1836,10 @@ EOF
 # minutes; ordered before nothing.
 guard_report_text() {
     local script n=${#MASKS[@]} list digest
-    list="$(IFS=,; printf '%s' "${MASKS[*]}")"
+    list="$(
+        IFS=,
+        printf '%s' "${MASKS[*]}"
+    )"
     digest=${GUARD_EXPECT_C##*sha256:}
     script="port=/dev/virtio-ports/$GUARD_PORT; st=/run/das-vm-guard/report.state; "
     script+="boot=\$\$(cat /proc/sys/kernel/random/boot_id) || exit 1; n=0; "
@@ -3857,7 +3874,10 @@ run_stage() {
                 fi
                 bytes=$(wc -c <"$tmp")
                 off=$((off + bytes))
-                stage_output "$stage" "$(cat -- "$tmp"; printf x)"
+                stage_output "$stage" "$(
+                    cat -- "$tmp"
+                    printf x
+                )"
                 OUT_PART=${OUT_PART%x}
                 rm -f -- "$tmp"
             elif [[ -n "$rc" ]]; then
@@ -4320,9 +4340,11 @@ pair_judge_causes() {
     for line in "${causes[@]}"; do
         case "$line" in
             guard-unconfirmed-no | report-lines-lost | guard-left | egress-not-removed | dry-run-override)
-                go+=("$(cause_text "$line")") ;;
+                go+=("$(cause_text "$line")")
+                ;;
             claim-lost | reenumerated | mounted-after | mount-unknown | scan-failed | clock-gap | reset-watch-stopped)
-                stop+=("$(cause_text "$line")") ;;
+                stop+=("$(cause_text "$line")")
+                ;;
             "") ;;
             *[!a-z-]*) stop+=("a cause that cannot be read") ;;
             *) stop+=("an unclassified cause ($line)") ;;
