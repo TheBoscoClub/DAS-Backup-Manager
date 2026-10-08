@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.0.0
-# Date: 2026-10-07
+# Version: 2.1.0
+# Date: 2026-10-08
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -160,6 +160,13 @@
 #     and whose agent answers); kernel (uname -r); poweroff. Anything
 #     unexpected stops it: the recovery OS is asked to power off (its agent,
 #     then ACPI until it has; never destroyed), the disk is given back, exit 7.
+#   - --wait-lock <minutes>: a scheduled session (the GUI's helper writes a
+#     timer for it) may fire while a backup runs: instead of refusing at
+#     once, wait up to that long for the target units to be inactive and the
+#     maintenance lock to be free, looking every POLL_SECS, then go on as
+#     usual (the lock is still taken without waiting: a job that slips in
+#     between is refused there). Past the bound: refused, nothing held. A
+#     two-drive run waits once, before taking the lock; its children do not.
 #   - Both drives in one run (session A B --mode sequential|parallel): ONE
 #     process holds the maintenance lock, once, and the egress rule, and runs
 #     each drive's session as its child through that lock's descriptor;
@@ -180,10 +187,12 @@
 # Usage (as root; history and clean-runs need only read access):
 #   recovery-os-vm.sh define
 #   recovery-os-vm.sh session <A|B|label> [--unattended] [--dry-run]
-#                             [--timeout <minutes>] [--accept-boot-record-risk]
+#                             [--timeout <minutes>] [--wait-lock <minutes>]
+#                             [--accept-boot-record-risk]
 #   recovery-os-vm.sh session <A|B|label> <A|B|label>
 #                             [--mode sequential|parallel] [--unattended]
 #                             [--dry-run] [--timeout <minutes>]
+#                             [--wait-lock <minutes>]
 #                             [--accept-boot-record-risk]
 #   recovery-os-vm.sh session-end <A|B|label>
 #   recovery-os-vm.sh status
@@ -597,6 +606,7 @@ SCAN_RESULT="not needed"
 MOUNT_RESULT="not checked"
 DRY_RUN=false
 TIMEOUT_MIN=""
+WAIT_LOCK_MIN="" # session --wait-lock
 TARGET_ARG=""
 SESSION_START=0
 VM_START=0
@@ -669,7 +679,7 @@ without rebooting the workstation.
                          and retire the shared $LEGACY_DOMAIN of before (each
                          shut off, with no disk attached)
   session <A|B|label> [--unattended] [--dry-run] [--timeout <minutes>]
-          [--accept-boot-record-risk]
+          [--wait-lock <minutes>] [--accept-boot-record-risk]
                          lend one role = "mirror" drive to its VM, boot it
                          with the session guard (btrbk cannot run in it),
                          wait until it powers off, give the disk back --
@@ -682,6 +692,9 @@ without rebooting the workstation.
                          --unattended: the update itself, through the
                          recovery OS's guest agent (its record must say the
                          agent runs at boot; never on "will")
+                         --wait-lock: wait up to that many minutes for a
+                         running backup or scrub to finish, instead of
+                         refusing at once
   session <A|B|label> <A|B|label> [--mode sequential|parallel] [...]
                          both drives in one run, under one lock: one after
                          the other (the default; the second only after a
@@ -1157,14 +1170,18 @@ check_filesystem_identity() {
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-check_units() {
+# The target units that are not inactive or failed, "unit is state" joined by
+# ", " (empty: none). 1, with systemctl's text on stdout, when its answer does
+# not have one line per unit.
+busy_units() {
     local out states=() i busy=""
     # is-active exits non-zero whenever a unit is not active; the answer is
     # in its output, one line per unit, which is read strictly instead.
     out="$(systemctl is-active "${TARGET_UNITS[@]}" 2>&1)" || :
     mapfile -t states <<<"$out"
     if ((${#states[@]} != ${#TARGET_UNITS[@]})); then
-        refuse "cannot tell whether ${TARGET_UNITS[*]} are running (systemctl said: $out)"
+        printf '%s\n' "$out"
+        return 1
     fi
     for i in "${!TARGET_UNITS[@]}"; do
         case "${states[$i]}" in
@@ -1172,6 +1189,38 @@ check_units() {
             *) busy+="${busy:+, }${TARGET_UNITS[$i]} is ${states[$i]}" ;;
         esac
     done
+    printf '%s\n' "$busy"
+}
+
+# --wait-lock: wait for the target units to be inactive and the maintenance
+# lock to be free, up to WAIT_LOCK_MIN minutes, looking every POLL_SECS.
+# Only looks: the lock is taken by take_lock, non-blocking, as always, so a
+# job that slips in between is still refused there, never raced.
+wait_for_lock() {
+    local deadline busy holder
+    [[ -n "$WAIT_LOCK_MIN" ]] || return 0
+    deadline=$((SECONDS + WAIT_LOCK_MIN * MINUTE_SECS))
+    while :; do
+        busy="$(busy_units)" || refuse "cannot tell whether ${TARGET_UNITS[*]} are running (systemctl said: $busy)"
+        if [[ -z "$busy" ]]; then
+            # A lock file that does not exist yet is free: take_lock creates it.
+            if [[ ! -e "$MAINTENANCE_LOCK" ]] || (flock -n 9) 9<"$MAINTENANCE_LOCK"; then
+                return 0
+            fi
+            holder="$(head -n 1 -- "$MAINTENANCE_LOCK" 2>/dev/null)" || holder=""
+            busy="the DAS maintenance lock (held by: ${holder:-(no holder line)})"
+        fi
+        if ((SECONDS >= deadline)); then
+            refuse "waited $WAIT_LOCK_MIN min for $busy -- nothing held; try again, or let it finish"
+        fi
+        log "waiting for $busy"
+        sleep "$POLL_SECS"
+    done
+}
+
+check_units() {
+    local busy
+    busy="$(busy_units)" || refuse "cannot tell whether ${TARGET_UNITS[*]} are running (systemctl said: $busy)"
     if [[ -n "$busy" ]]; then
         refuse "$busy -- wait until it has finished"
     fi
@@ -4329,6 +4378,7 @@ cmd_session_pair() {
     [[ "$ACCEPT_BOOT_RISK" != true ]] || flags+=(--accept-boot-record-risk)
     [[ -z "$TIMEOUT_MIN" ]] || flags+=(--timeout "$TIMEOUT_MIN")
     make_state_dir || refuse "cannot create $STATE_DIR"
+    wait_for_lock
     take_lock
     trap 'pair_on_exit' EXIT
     # An interrupt reaches the drives' sessions themselves (they are in this
@@ -4518,6 +4568,12 @@ parse_session_args() {
                 shift
                 ;;
             --timeout=*) TIMEOUT_MIN=${1#*=} ;;
+            --wait-lock)
+                (($# >= 2)) || usage
+                WAIT_LOCK_MIN=$2
+                shift
+                ;;
+            --wait-lock=*) WAIT_LOCK_MIN=${1#*=} ;;
             --unattended) UNATTENDED=true ;;
             --mode)
                 (($# >= 2)) || usage
@@ -4558,6 +4614,14 @@ parse_session_args() {
     fi
     if [[ "$DRY_RUN" == true && -n "$TIMEOUT_MIN" ]]; then
         printf 'recovery-os-vm.sh: --timeout has no meaning with --dry-run (nothing is booted)\n' >&2
+        exit 2
+    fi
+    if [[ -n "$WAIT_LOCK_MIN" && ! "$WAIT_LOCK_MIN" =~ ^[123456789][[:digit:]]*$ ]]; then
+        printf 'recovery-os-vm.sh: --wait-lock takes a whole number of minutes, at least 1\n' >&2
+        exit 2
+    fi
+    if [[ "$DRY_RUN" == true && -n "$WAIT_LOCK_MIN" ]]; then
+        printf 'recovery-os-vm.sh: --wait-lock has no meaning with --dry-run (nothing is booted, and the lock is only tried)\n' >&2
         exit 2
     fi
     # A drive's session of a two-drive run: its mode, and what the run holds.
@@ -4749,6 +4813,7 @@ cmd_session() {
     fi
     resolve_disk
     log "session for $LABEL: $DISK ($DISK_DEV)$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
+    wait_for_lock
     check_units
     check_not_mounted
     check_domain_idle
