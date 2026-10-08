@@ -1363,6 +1363,24 @@ sudo /usr/lib/das-backup/recovery-os-vm.sh console-socket A 1000    # prints the
 
 It offers the VM's VNC, which libvirt keeps on a socket only root can open, through a socket of its own: in a fresh directory `/run/das-recovery-os-vm/console-<label>-<random>/` (mode 0711, root's: passed through, not listed, and only root writes in it — a directory of the user's would let them swap a symlink in where `socat` applies the socket's owner by path), the socket `vnc.sock` (mode 0600, the user's), proxied by `socat` for **one** connection — a viewer that disconnects needs a new one (run it again; the new one replaces the old). Only while a session of that drive runs; taken away when its disk is given back (`session-end` too). `/run/das-recovery-os-vm` is `0711`, so the user can reach that one directory and list nothing.
 
+#### Scheduled sessions
+
+The helper's `RecoveryOsScheduleSet` (the GUI's panel; polkit action `org.dasbackup.recovery-os`) arms one unattended session for a time at least 2 minutes ahead, as a generated pair in `/etc/systemd/system`: `das-recovery-os-update-<label>.{service,timer}` for one drive, `das-recovery-os-update-both.{service,timer}` for the two (optionally `--mode parallel`). The service is a oneshot that runs `recovery-os-vm.sh session <labels> --unattended --wait-lock 180`; the timer is a single `OnCalendar=` in the host's local time with `Persistent=false`.
+
+- **`--wait-lock 180`** (minutes: 3 hours) makes the script wait for the `das-backup`, `das-backup-full`, `das-scrub` and `das-backup-doctor` units to be inactive and for `/run/das-maintenance.lock` to be free, looking only; the lock is still taken without waiting, so a job that slips in between is refused, never raced. After 3 hours it refuses (exit 1, in the service's journal), having held nothing. This, not the helper, is what keeps a schedule from colliding with a backup that overran or the other drive's schedule.
+- **`Persistent=false`**: a time that passed while the host was off is not run at the next boot. The status document reads such a schedule as **`missed`** (the time passed, or the timer was stopped, without a trigger); the other states are `pending` (the timer has a next elapse), `running` and `fired` (with the newest history line's outcome, or `refused:` and the service's last journal lines when the session never took the lock).
+- **The service carries `SuccessExitStatus=1 3 4 5 6 7`**, so a session that refused, warned or failed is not a failed unit (cachyos-sentinel restarts failed units); the outcome is in the session history ([above](#the-session-history)), never in a failed unit.
+- **`SessionEnd` is refused** while a session job or a scheduled unit runs, naming it.
+- **A cancel** (`JobCancel` on the session job) sends the script one SIGINT, to its process group, as Ctrl-C would. **In `--mode parallel` that does not yet stop the drive sessions themselves** (script defect, bd `DAS-Backup-Manager-c8lf`): a cancelled parallel run goes on to its own end.
+- **A masked (symlinked) unit is refused**, on set and on clear: "unmask it or clear the schedule first". The helper never writes through a link.
+- **Uninstall** (`btrdasd setup --uninstall`) stops and removes every `das-recovery-os-update-*` unit.
+
+To clear a schedule by hand (what setting the time to 0 does):
+
+```bash
+systemctl disable --now das-recovery-os-update-<label>.timer && rm /etc/systemd/system/das-recovery-os-update-<label>.{timer,service} && systemctl daemon-reload
+```
+
 #### Progress lines
 
 Every session prints, beside its lines for people, lines for programs: `PROGRESS <label> <step> <start|ok|fail> [message]` (steps: `preflight`, `start`, `wait` for an attended session's wait, `boot`, the unattended steps above, `giveback`), `OUTPUT <label> <step> <text>` (what a step printed in the recovery OS), `RESULT <label> <exit> <outcome>` (a session that took the lock ended; outcome as in the history) and, for two drives, `DRIVE <label> <exit|skipped>`. The script's header holds the same grammar.
