@@ -1,15 +1,19 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 1.0.0
-# Date: 2026-10-04
+# Version: 2.0.0
+# Date: 2026-10-07
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
 # @ on partition 2 -- and that partition-2 filesystem also receives backups
-# from the host. This boots that OS in the libvirt domain recovery-os-updater
-# with the WHOLE physical disk passed through, so it can be updated from
-# inside -- keyring, full upgrade, reboot, verify -- without rebooting the
-# workstation. bd DAS-Backup-Manager-7wb.
+# from the host. This boots that OS in a libvirt domain of its own --
+# recovery-os-updater-<label>, one per role = "mirror" target, each with its
+# own NVRAM, console, log and guard channel, all rendered from one template
+# (define) -- with the WHOLE physical disk passed through, so it can be
+# updated from inside -- keyring, full upgrade, reboot, verify -- without
+# rebooting the workstation. bd DAS-Backup-Manager-7wb; the unattended
+# update, both drives in one run, the egress rule, the session history and
+# the console bridge: bd DAS-Backup-Manager-8249.
 #
 # What a session guarantees, and how:
 #   - The host never mounts or writes the drive while the VM has it. Two
@@ -48,13 +52,18 @@
 #       1. The boot record. The nightly backup run records, per drive, what
 #          booting its OS would run (`btrdasd recovery-os status
 #          --state-file`, /var/lib/das-backup/recovery-os.json) and one
-#          verdict: will, may or no. "will" is refused; "may" and "no" go on,
-#          the guard enforcing. The record must also be at most
+#          verdict: will, may or no. All three go on attended, the guard
+#          enforcing -- "will" with a banner telling the operator to disable
+#          it in the session (decision 3 of bd 8249); --unattended refuses
+#          "will", whatever the options. The record must also be at most
 #          MAX_RECORD_AGE_DAYS old and made after this drive's last session
 #          (the OS may have changed in it; the time of each session is kept
-#          in recovery-os-vm-sessions beside the record, written before the
-#          OS boots and again when the disk is back).
-#          --accept-boot-record-risk lets a "will", an age or a session
+#          in recovery-os-vm-sessions beside the record, written just before
+#          the OS is resumed and again when the disk is back -- never for a
+#          session that ended before the resume: that OS never ran, so its
+#          record still describes it and a retry is admitted, bd
+#          DAS-Backup-Manager-dmxt).
+#          --accept-boot-record-risk lets an age or a session
 #          through, loudly and into the summary -- never a record that is
 #          missing, of another schema, or says nothing about this drive,
 #          and never one that is not of this drive's filesystem: its
@@ -123,14 +132,81 @@
 #     it was not judged.
 #   - The host never writes the drive: no mount, no chroot, no copy. Every
 #     write -- its ESP included -- is made by its own OS, booted in the VM.
+#   - The VM's traffic goes direct (decision 5 of 2026-10-07): before the
+#     domain starts, `ip rule add from <the subnet of libvirt's network
+#     default> lookup main priority 5100` -- above a VPN exit node's lookup
+#     (Tailscale's 5270), for that subnet only -- and it is taken out when the
+#     disk is given back, on every way out that gives it back. A session left
+#     running (exit 3) leaves it; session-end takes it out once no recovery
+#     OS runs. One found in place (a session that did not finish) is taken
+#     over and taken out.
+#   - --unattended (decisions 1 and 3-8 of bd 8249): the update runs through
+#     the recovery OS's own QEMU guest agent (virsh qemu-agent-command,
+#     guest-exec; no SSH, no password), only when the boot record says the
+#     agent is installed and started at boot, and never on a "will" record.
+#     Its steps, each a transient unit in the recovery OS (it outlives a
+#     restart of the agent): wait for the guard and the agent; egress -- the
+#     VM's public address must belong to EGRESS_ORG, else nothing is updated;
+#     snapshot -- the OS snapshots its own @ read-only to
+#     @.pre-update.<YYYYMMDD-HHMM>, keeping the newest 2 (its own btrfs,
+#     never the host's); guard-lift (systemctl stop das-vm-guard); keyrings;
+#     upgrade (pacman -Syu --noconfirm); packages (qemu-guest-agent, and
+#     amd-ucode intel-ucode reinstalled); initramfs (the fallback image added
+#     to a preset that lacks it, then mkinitcpio -P); verify-btrbk (pacman
+#     -Qkk btrbk: 0 altered files); verify-boot (every file the loader
+#     entries name is on the ESP, every LABEL=/UUID= of /etc/fstab
+#     resolves -- bd ac82, read inside the OS); guard-engage (started again,
+#     every btrbk bound); reboot (a new boot whose guard reports engaged
+#     and whose agent answers); kernel (uname -r); poweroff. Anything
+#     unexpected stops it: the recovery OS is asked to power off (its agent,
+#     then ACPI until it has; never destroyed), the disk is given back, exit 7.
+#   - Both drives in one run (session A B --mode sequential|parallel): ONE
+#     process holds the maintenance lock, once, and the egress rule, and runs
+#     each drive's session as its child through that lock's descriptor;
+#     sequential runs the second drive only after a first that exited 0, or
+#     5 on warnings of its own session alone (decision 9, below); parallel
+#     runs both at once.
+#   - The session history: one JSON line per drive per session that took
+#     the lock, in recovery-os-vm-history.jsonl beside the boot record;
+#     `history` prints it and `clean-runs` counts a drive's consecutive clean
+#     unattended sessions (any failed, kept, warned or overridden one resets
+#     it to 0).
+#   - console-socket: for a running session, the domain's VNC (libvirt's
+#     root-only socket) offered through a socket of its own -- mode 0600, of
+#     one user, in a fresh 0711 directory of root's under
+#     /run/das-recovery-os-vm (0711) -- by socat, for one connection; taken
+#     away when the disk is given back. No libvirt group, no ACL is changed.
 #
-# Usage (as root):
+# Usage (as root; history and clean-runs need only read access):
 #   recovery-os-vm.sh define
-#   recovery-os-vm.sh session <A|B|label> [--dry-run] [--timeout <minutes>]
+#   recovery-os-vm.sh session <A|B|label> [--unattended] [--dry-run]
+#                             [--timeout <minutes>] [--accept-boot-record-risk]
+#   recovery-os-vm.sh session <A|B|label> <A|B|label>
+#                             [--mode sequential|parallel] [--unattended]
+#                             [--dry-run] [--timeout <minutes>]
 #                             [--accept-boot-record-risk]
 #   recovery-os-vm.sh session-end <A|B|label>
 #   recovery-os-vm.sh status
-#   recovery-os-vm.sh screenshot <file.png>
+#   recovery-os-vm.sh screenshot <A|B|label> <file.png>
+#   recovery-os-vm.sh console-socket <A|B|label> <uid>
+#   recovery-os-vm.sh history [<A|B|label>]
+#   recovery-os-vm.sh clean-runs <A|B|label>
+#
+# Progress, for the GUI's helper to parse (one line each, on stdout; the
+# label never holds a space):
+#   PROGRESS <label> <step> <event>[ <message>]
+#       step: preflight, start, wait, boot, egress, snapshot, guard-lift,
+#       keyrings, upgrade, packages, initramfs, verify-btrbk, verify-boot,
+#       guard-engage, reboot, kernel, poweroff, giveback; event: start, ok,
+#       fail (the message says why). An attended session has preflight,
+#       start, wait and giveback only.
+#   OUTPUT <label> <step> <text>      a line a step printed in the recovery OS
+#   RESULT <label> <exit> <outcome>   a drive's session ended (after it took
+#                                     the lock): outcome clean (0), warnings
+#                                     (5), kept (3, 4) or failed (any other)
+#   DRIVE <label> <exit|skipped>      a two-drive run: each drive's end
+#   Every other line is for people. console-socket prints only the socket's
+#   path on stdout; clean-runs only the count.
 #
 # A and B are shorthands for the one role = "mirror" target whose label
 # contains that letter as a dash-separated word (system-recovery-A-2tb).
@@ -160,6 +236,14 @@
 #      was skipped between two looks (a host suspend, or this script
 #      stopped: the guest may have run unwatched), the reset watch stopped,
 #      or it could not be taken out of the domain's definition again
+#   7  an unattended update stopped at a step (the summary and its PROGRESS
+#      fail line name it): the recovery OS was asked to power off -- its
+#      agent, and ACPI until it went; never destroyed -- and the disk was
+#      given back; nothing after that step ran. Stopped at keyrings,
+#      upgrade, packages or initramfs, the OS may be half-upgraded (the
+#      power-off may end pacman mid-transaction): the summary names the
+#      @.pre-update.<stamp> snapshot to roll back to. Not off within
+#      DAS_RECOVERY_VM_GRACE_SECS: 3, as above
 #   6  the session guard did not confirm on a "will" or "may" record: the
 #      recovery OS was asked to shut down (ACPI, again until it went; never
 #      destroyed) and powered off, or powered off by itself without
@@ -169,6 +253,20 @@
 #      ran, cannot be read, shows a reset the session saw that no boot after
 #      it answered (once shut off, or GUARD_SECS after it; pending before),
 #      or -- status, for one not shut off -- has been silent for GUARD_SECS
+#   A two-drive run exits with the gravest of its drives': 4, 3, 6, 7, 5,
+#   then 1 (a drive skipped is not one), else 0; and 5 when its egress rule
+#   could not be taken out. Sequential, the second drive starts after a
+#   first that exited 0, or 5 for causes that stayed in its own session
+#   only: the guard unconfirmed on a "no" record, its reporter's lost or
+#   unfinished lines, the guard left in the domain's definition, the egress
+#   rule not taken out, a dry run with --accept-boot-record-risk. A 5 for
+#   the host, the enclosure or the mechanism -- the claim lost, the drive
+#   re-enumerated, a partition mounted afterwards (or not known), the device
+#   scan failed, time skipped, the reset watch stopped -- stops it, and so
+#   does a 5 with no cause recorded, unreadable, or not in either list (a
+#   real session's override, units the guard cannot mask, a silent
+#   reporter). The warnings and the run's closing lines name the cause.
+#   Any other exit (1, 3, 4, 6, 7) always stops it.
 #
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
@@ -188,11 +286,26 @@
 #                               a real drive's backups safe from its own OS, the
 #                               hatch lends a loop file, and a hatch session must
 #                               never count as a session of the real drive.
+#   DAS_RECOVERY_VM_TEST_NO_EGRESS_RULE
+#                               with the hatch only: put no egress rule in
+#                               place (the unattended egress check's
+#                               counter-test, on a real VM)
 #   DAS_RECOVERY_VM_POLL_SECS (5), DAS_RECOVERY_VM_MINUTE_SECS (60),
 #   DAS_RECOVERY_VM_GRACE_SECS (600), DAS_RECOVERY_VM_GUARD_SECS (900),
-#   DAS_RECOVERY_VM_RESEND_SECS (20), DAS_RECOVERY_VM_CLOCK_GAP_SECS (120)
-#                               faster clocks
+#   DAS_RECOVERY_VM_RESEND_SECS (20), DAS_RECOVERY_VM_CLOCK_GAP_SECS (120),
+#   DAS_RECOVERY_VM_UPDATE_SECS (7200: the full upgrade's limit),
+#   DAS_RECOVERY_VM_AGENT_SECS (GUARD_SECS: the agent's to answer after the
+#   start), DAS_RECOVERY_VM_AGENT_GRACE_SECS (300: its silence while a step
+#   runs)                       clocks
+#   DAS_RECOVERY_VM_EGRESS_ORG  what the direct path egresses as (ipinfo.io's
+#                               org line begins with it): AS209 by default,
+#                               the author's ISP -- set it for yours
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
+# Set by a two-drive run for each drive's session, never by hand:
+#   DAS_RECOVERY_VM_LOCK_FD (the run's descriptor of the maintenance lock),
+#   DAS_RECOVERY_VM_MODE (sequential or parallel), DAS_RECOVERY_VM_EGRESS_HELD,
+#   DAS_RECOVERY_VM_CAUSE_FILE (sequential: where the drive writes the causes
+#   of its exit 5, one word a line, for the run to read)
 
 set -euo pipefail
 # One locale: bracket ranges then mean ASCII (bd 1bsx's class), and virsh
@@ -208,8 +321,19 @@ set +m
 # The holder's transient scope: <prefix>-<label>, -<n> for a replacement.
 readonly HOLDER_UNIT_PREFIX="das-recovery-os-holder"
 
-readonly DOMAIN="recovery-os-updater"
+# One libvirt domain per role = "mirror" target (bd DAS-Backup-Manager-7wb,
+# the operator's decision of 2026-10-04): recovery-os-updater-<label>, each
+# with its own NVRAM, console, log and guard channel, rendered from the one
+# template. DOMAIN is the domain of the drive a command is about
+# (set_domain); LEGACY_DOMAIN is the one shared domain of before, which
+# define retires.
+readonly DOMAIN_BASE="recovery-os-updater"
+readonly LEGACY_DOMAIN="$DOMAIN_BASE"
+DOMAIN=""
 readonly LIBVIRT_URI="qemu:///system"
+# The NAT network the template puts the VM on: its subnet is what the egress
+# rule routes (decision 5 of 2026-10-07).
+readonly LIBVIRT_NETWORK="default"
 readonly LOG_TAG="das-recovery-os-vm"
 # Every unit that mounts the backup targets. Not named DAS_*: load_targets
 # evals `btrdasd config dump-env`, which writes that namespace.
@@ -242,19 +366,36 @@ readonly RESEND_SECS="${DAS_RECOVERY_VM_RESEND_SECS:-20}"
 # guard's clock does not count that time. A look takes at most about 45 s
 # (a holder claimed again), so this is well above any look's own length.
 readonly CLOCK_GAP_SECS="${DAS_RECOVERY_VM_CLOCK_GAP_SECS:-120}"
+# Unattended sessions: how long the full upgrade may take, how long the guest
+# agent has to answer after the start, and how long it may be silent while a
+# step runs (pacman restarting it, or systemd re-executing).
+readonly UPDATE_SECS="${DAS_RECOVERY_VM_UPDATE_SECS:-7200}"
+readonly AGENT_SECS="${DAS_RECOVERY_VM_AGENT_SECS:-$GUARD_SECS}"
+readonly AGENT_GRACE_SECS="${DAS_RECOVERY_VM_AGENT_GRACE_SECS:-300}"
+# What the VM's direct path egresses as, the start of ipinfo.io's org line
+# (decision 5 of 2026-10-07): the author's ISP by default, AS209.
+readonly EGRESS_ORG="${DAS_RECOVERY_VM_EGRESS_ORG:-AS209}"
+# The egress rule's priority: above Tailscale's lookup 52 (5270).
+readonly EGRESS_PRIORITY=5100
 
 # Installed side by side by CMake: ${prefix}/lib/das-backup/{this script,libvirt/}.
-readonly DOMAIN_XML="$SCRIPT_DIR/libvirt/$DOMAIN.xml"
+# The template; each drive's definition is rendered from it (render_domain_xml)
+# into DOMAIN_XML, beside the session's other state.
+readonly DOMAIN_TEMPLATE="$SCRIPT_DIR/libvirt/$DOMAIN_BASE.xml"
+DOMAIN_XML=""
 # Must match indexer/src/scrub.rs MAINTENANCE_LOCK_PATH and backup-run.sh.
 readonly MAINTENANCE_LOCK="$TEST_ROOT/run/das-maintenance.lock"
 readonly STATE_DIR="$TEST_ROOT/run/das-recovery-os-vm"
+# The egress rule's subnet, while a rule this script put in place is there.
+readonly EGRESS_FILE="$STATE_DIR/egress.rule"
 readonly BY_ID="$TEST_ROOT/dev/disk/by-id"
 readonly SYS_BLOCK="$TEST_ROOT/sys/block"
 
-# The boot record (bd DAS-Backup-Manager-1yg): the schema this reads, and the
-# age past which it no longer describes the drive (the nightly run rewrites it
-# daily; a week of misses is not a record of today's OS).
-readonly OS_STATE_SCHEMA=3
+# The boot record (bd DAS-Backup-Manager-1yg): the schemas this reads (4 adds
+# the guest agent, which only --unattended needs), and the age past which it
+# no longer describes the drive (the nightly run rewrites it daily; a week of
+# misses is not a record of today's OS).
+readonly OS_STATE_SCHEMAS="3 4"
 readonly MAX_RECORD_AGE_DAYS=8
 # One line per fact; every string cleaned of control characters, since unit
 # names and reasons come from the recovery OS itself. A runner is said by the
@@ -264,7 +405,7 @@ readonly MAX_RECORD_AGE_DAYS=8
 readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
 "schema\t\(.schema_version | clean)",
 "schematype\t\(.schema_version | type)",
-(if .schema_version == 3 then
+(if .schema_version == 3 or .schema_version == 4 then
    .drives[$label] as $d
    | if $d == null then "entry\tnone"
      else
@@ -282,6 +423,10 @@ readonly BOOT_RECORD_JQ='def clean: tostring | gsub("[[:cntrl:]]"; "?");
           (($d.os.btrbk_at_boot.runners // [])[]
            | (if ((.source // "") | tostring | contains("/")) then .via else .source end) // ""
            | "runner\t\(clean)"),
+          ($d.os.guest_agent as $g
+           | if $g == null then "agent\tnot recorded (a record of schema 3, made before it was read)"
+             elif $g.state == "read" then "agent\tread \($g.installed == true) \($g.enabled == true)", "agentwhy\t\(($g.why // "") | clean)"
+             else "agent\t\(($g.state // "unknown") | clean)", "agentwhy\t\(($g.reason // "") | clean)" end),
           ($d.os.enabled_units as $u
            | if $u == null then "units\tnot recorded"
              elif $u.state == "listed" then "units\tlisted", (($u.units // [])[] | "unit\t\(.name | clean)")
@@ -328,7 +473,7 @@ readonly UNIT_NAME_RE='^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012
 readonly REPORT_LINE_RE='^(.*) seq ([123456789][0123456789]{0,8}) boot ([0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12})$'
 # What libvirt's event stream says when the domain is reset -- a reboot
 # inside it, or virsh reset (virsh-domain-event.c, the generic print).
-readonly RESET_EVENT="event 'reboot' for domain '$DOMAIN'"
+RESET_EVENT=""
 # How many rotated files of the report virtlogd keeps (.0 the newest) are
 # looked for at most; its max_backups is 3 by default.
 readonly REPORT_BACKUPS_MAX=10
@@ -346,6 +491,16 @@ readonly LOADER_RE="<loader [^>]*>([^<]+)</loader>"
 readonly TEMPLATE_RE="<nvram template='([^']+)'"
 readonly SOURCE_RE="<source (dev|file)='([^']*)'"
 readonly HELD_RE="^held (.+) pid ([[:digit:]]+)$"
+# The template's lines each drive's domain makes its own (render_domain_xml).
+readonly UUID_LINE_RE="^  <uuid>[^<]+</uuid>$"
+readonly NVRAM_LINE_RE="^( +<nvram template='[^']+'>)[^<]+(</nvram>)$"
+readonly MAC_LINE_RE="^( +)<mac address='[^']+'/>$"
+# libvirt's network address, and the live domain's VNC socket.
+readonly NET_ADDR_RE="address='([^']+)'"
+readonly NET_PREFIX_RE="prefix='([[:digit:]]+)'"
+readonly NET_MASK_RE="netmask='([^']+)'"
+readonly IPV4_RE="^[[:digit:]]{1,3}\\.[[:digit:]]{1,3}\\.[[:digit:]]{1,3}\\.[[:digit:]]{1,3}$"
+readonly VNC_SOCKET_RE="socket='([^']+)'"
 
 # ---------------------------------------------------------------------------
 # Session state, read by the EXIT trap
@@ -445,52 +600,105 @@ TIMEOUT_MIN=""
 TARGET_ARG=""
 SESSION_START=0
 VM_START=0
+SESSION_EPOCH=0
+UNATTENDED=false    # session --unattended
+RUN_MODE=single     # single, or a two-drive run's: sequential or parallel
+PAIR_MODE=sequential
+TARGET_ARG2=""      # the second drive of a two-drive run
+PAIR_DONE=false PAIR_KEPT=false PAIR_RCS=() PAIR_LABELS=()
+# The maintenance lock's descriptor came from a two-drive run that holds it.
+LOCK_INHERITED=false
+EGRESS_HELD=false   # ...and so does its egress rule
+CAUSE_FILE=""       # ...and where a sequential one reads this drive's exit-5 causes
+EGRESS_OWNED=false  # this process put the egress rule in place (or took one over)
+EGRESS_SUBNET="" EGRESS_COUNT=0 EGRESS_FAILURE=""
+EGRESS_RESULT="not needed"
+HISTORY_FILE=""     # the session history, beside the boot record
+HISTORY_ARMED=false # this session took the lock: its end is written there
+HISTORY_FAILURE="" HISTORY_LINES=""
+# An attended session of a "will" drive (decision 3 of bd 8249).
+WILL_BANNER=false
+readonly WILL_BANNER_TEXT="this OS runs btrbk at boot; the guard is stopping it now; disable it in this session (mask the unit the boot record names), then let the next backup run record the drive again"
+REC_AGENT=""        # the record's guest agent: "read <installed> <enabled>", or why not
+REC_AGENT_WHY=""
+UNATTENDED_FAILED="" UNATTENDED_STAGE="" UNATTENDED_WHY="" UNATTENDED_DEADLINE=0
+UNATTENDED_HALF=""  # said when a step that changes the OS was stopped
+PRE_UPDATE_SNAPSHOT=""  # the snapshot step's @.pre-update.<stamp>
+KERNEL=""           # what an unattended session's reboot came back with
+STAGE_N=0 OUT_PART="" OUT_LAST=""
+GSH_RC="" GSH_OUT="" GSH_WHY="" AGENT_OUT=""
+CONSOLE_FILE=""     # the console bridge's record: pid, directory
+RENDER_FAILURE=""
+D_UUID="" D_MAC=""
+LOG_PREFIX=""       # "[label] " in a drive's session of a two-drive run
+LOG_TO_STDERR=false # console-socket prints only the socket path on stdout
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 log() {
-    printf '%s\n' "$*"
-    logger -t "$LOG_TAG" -- "$*" || :
+    if [[ "$LOG_TO_STDERR" == true ]]; then
+        printf '%s%s\n' "$LOG_PREFIX" "$*" >&2
+    else
+        printf '%s%s\n' "$LOG_PREFIX" "$*"
+    fi
+    logger -t "$LOG_TAG" -- "$LOG_PREFIX$*" || :
 }
 
 warn() {
-    printf 'WARNING: %s\n' "$*" >&2
-    logger -p user.warning -t "$LOG_TAG" -- "WARNING: $*" || :
+    printf '%sWARNING: %s\n' "$LOG_PREFIX" "$*" >&2
+    logger -p user.warning -t "$LOG_TAG" -- "${LOG_PREFIX}WARNING: $*" || :
 }
 
 refuse() {
-    printf 'REFUSED: %s\n' "$*" >&2
-    logger -p user.err -t "$LOG_TAG" -- "REFUSED: $*" || :
+    printf '%sREFUSED: %s\n' "$LOG_PREFIX" "$*" >&2
+    logger -p user.err -t "$LOG_TAG" -- "${LOG_PREFIX}REFUSED: $*" || :
     exit 1
 }
 
 usage_text() {
     cat <<EOF
-Usage: $(basename -- "$SELF") COMMAND   (as root)
+Usage: $(basename -- "$SELF") COMMAND   (as root; history and clean-runs read only)
 
-Boot one recovery drive's own OS in the libvirt domain $DOMAIN, with the
-whole disk passed through, to update it without rebooting the workstation.
+Boot one recovery drive's own OS in a libvirt domain of its own
+($DOMAIN_BASE-<label>), with the whole disk passed through, to update it
+without rebooting the workstation.
 
-  define                 define or update the domain from
-                         $DOMAIN_XML
-                         (it must be shut off, with no disk attached)
-  session <A|B|label> [--dry-run] [--timeout <minutes>]
+  define                 define or update every recovery drive's domain from
+                         $DOMAIN_TEMPLATE,
+                         and retire the shared $LEGACY_DOMAIN of before (each
+                         shut off, with no disk attached)
+  session <A|B|label> [--unattended] [--dry-run] [--timeout <minutes>]
           [--accept-boot-record-risk]
-                         lend one role = "mirror" drive to the VM, boot it
+                         lend one role = "mirror" drive to its VM, boot it
                          with the session guard (btrbk cannot run in it),
                          wait until it powers off, give the disk back --
                          only when the nightly run's record is of the
-                         drive's filesystem (mount_uuid), does not say its
-                         OS will run btrbk at boot, is fresh, and is newer
-                         than the drive's last session (the flag lets a
-                         "will", an age or a session through, loudly)
+                         drive's filesystem (mount_uuid), is fresh, and is
+                         newer than the drive's last session (the flag lets
+                         an age or a session through, loudly); a record
+                         saying its OS will run btrbk at boot goes on with
+                         a banner: disable it in the session.
+                         --unattended: the update itself, through the
+                         recovery OS's guest agent (its record must say the
+                         agent runs at boot; never on "will")
+  session <A|B|label> <A|B|label> [--mode sequential|parallel] [...]
+                         both drives in one run, under one lock: one after
+                         the other (the default; the second only after a
+                         first that exited 0, or 5 on its own session's
+                         warnings alone), or at once
   session-end <A|B|label>
                          finish a session whose driver died (VM shut off);
                          judges the guard's report before removing anything
-  status                 domain state, attached disk, the guard's report,
-                         holder, lock
-  screenshot <file.png>  the VM's screen as a PNG, while it runs
+  status                 each drive's domain, attached disk and guard;
+                         holder, lock, egress rule
+  screenshot <A|B|label> <file.png>
+                         that drive's VM screen as a PNG, while it runs
+  console-socket <A|B|label> <uid>
+                         for a running session: its VNC through a socket
+                         only user <uid> can open, once; prints its path
+  history [<A|B|label>]  the session history, one JSON line per session
+  clean-runs <A|B|label> consecutive clean unattended sessions of the drive
 
 Exit status: 0 done; 1 refused, failed or interrupted, nothing held;
 2 usage; 3 the recovery OS is still running and keeps the disk and the lock;
@@ -498,10 +706,13 @@ Exit status: 0 done; 1 refused, failed or interrupted, nothing held;
 session-end); 5 done and given back, but see the summary's warnings (a dry
 run that needed --accept-boot-record-risk exits 5 too); 6 the session guard
 did not confirm on a "will" or "may" record, so the recovery OS was shut down
-(never destroyed) and the disk given back. status and session-end exit 6 (5
-on a "no" record) when the guard's report says it is not engaged, cannot be
-judged, shows a reset its session saw that no boot after it answered in
-time, or -- for a recovery OS not shut off -- has been silent too long.
+(never destroyed) and the disk given back; 7 an unattended update stopped at
+a step (named), the recovery OS was powered off and the disk given back.
+status and session-end exit 6 (5 on a "no" record) when the guard's report
+says it is not engaged, cannot be judged, shows a reset its session saw that
+no boot after it answered in time, or -- for a recovery OS not shut off --
+has been silent too long. Progress lines (PROGRESS, OUTPUT, RESULT, DRIVE):
+see the script's header.
 EOF
 }
 
@@ -759,6 +970,83 @@ resolve_label() {
     GUARD_XML_FILE="$STATE_DIR/$LABEL.domain.xml"
     GUARD_STATE_FILE="$STATE_DIR/$LABEL.guard.state"
     RESET_FILE="$STATE_DIR/$LABEL.resets"
+    CONSOLE_FILE="$STATE_DIR/$LABEL.console"
+    set_domain "$LABEL"
+}
+
+# The domain of drive $1: recovery-os-updater-<label>. Its definition is
+# rendered from the template into DOMAIN_XML (render_domain_xml) when a
+# command needs it.
+set_domain() {
+    if [[ ! "$1" =~ ^[${ASCII_LETTERS}[:digit:]._-]+$ ]]; then
+        refuse "the label '$1' has characters this script will not put in a libvirt domain's name (letters, digits, '.', '_' and '-' only)"
+    fi
+    DOMAIN="$DOMAIN_BASE-$1"
+    DOMAIN_XML="$STATE_DIR/$1.plain.xml"
+    # What libvirt's event stream says when the domain is reset -- a reboot
+    # inside it, or virsh reset (virsh-domain-event.c, the generic print).
+    RESET_EVENT="event 'reboot' for domain '$DOMAIN'"
+}
+
+# The fixed identity of drive $1's domain, derived from its label so that
+# every define gives the same one (libvirt refuses to redefine a name under
+# another UUID; a new MAC is a new network card to the recovery OS): D_UUID
+# and D_MAC, from the SHA-256 of the label.
+domain_identity() {
+    local h
+    h="$(printf 'das-backup %s %s' "$DOMAIN_BASE" "$1" | sha256sum)" || refuse "cannot derive the identity of $1's domain"
+    h=${h:0:64}
+    [[ "$h" =~ ^[0123456789abcdef]{64}$ ]] || refuse "cannot derive the identity of $1's domain"
+    D_UUID="${h:0:8}-${h:8:4}-8${h:13:3}-a${h:17:3}-${h:20:12}"
+    D_MAC="52:54:00:${h:32:2}:${h:34:2}:${h:36:2}"
+}
+
+# Drive $LABEL's definition, rendered from the template into DOMAIN_XML: its
+# name, UUID, NVRAM file and MAC address are its own; nothing else differs.
+# Each line replaced must be in the template exactly once, and the network
+# must be LIBVIRT_NETWORK, or nothing is written: 1, with RENDER_FAILURE set.
+# Never a refusal itself: giving a disk back renders it too, and must go on.
+render_domain_xml() {
+    local line n_name=0 n_uuid=0 n_nvram=0 n_mac=0 n_net=0 out
+    RENDER_FAILURE=""
+    if [[ ! -r "$DOMAIN_TEMPLATE" ]]; then
+        RENDER_FAILURE="the domain template $DOMAIN_TEMPLATE is missing -- install the project (cmake --install) first"
+        return 1
+    fi
+    domain_identity "$LABEL"
+    out=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "  <name>$DOMAIN_BASE</name>" ]]; then
+            n_name=$((n_name + 1)) line="  <name>$DOMAIN</name>"
+        elif [[ "$line" =~ $UUID_LINE_RE ]]; then
+            n_uuid=$((n_uuid + 1)) line="  <uuid>$D_UUID</uuid>"
+        elif [[ "$line" =~ $NVRAM_LINE_RE ]]; then
+            n_nvram=$((n_nvram + 1)) line="${BASH_REMATCH[1]}/var/lib/libvirt/qemu/nvram/${DOMAIN}_VARS.fd${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ $MAC_LINE_RE ]]; then
+            n_mac=$((n_mac + 1)) line="${BASH_REMATCH[1]}<mac address='$D_MAC'/>"
+        elif [[ "$line" == "  <title>DAS recovery OS updater</title>" ]]; then
+            line="  <title>DAS recovery OS updater: $LABEL</title>"
+        fi
+        [[ "$line" != *"<source network='$LIBVIRT_NETWORK'/>"* ]] || n_net=$((n_net + 1))
+        out+="$line"$'\n'
+    done <"$DOMAIN_TEMPLATE"
+    if ((n_name != 1 || n_uuid != 1 || n_nvram != 1 || n_mac != 1 || n_net != 1)); then
+        RENDER_FAILURE="$DOMAIN_TEMPLATE is not of the shape this script renders each drive's domain from: <name>$DOMAIN_BASE</name>, <uuid>, <nvram>, one <mac> and <source network='$LIBVIRT_NETWORK'/> each once (found $n_name, $n_uuid, $n_nvram, $n_mac, $n_net)"
+        return 1
+    fi
+    if ! make_state_dir || ! (umask 077 && printf '%s' "$out" >"$DOMAIN_XML.new" && mv -f -- "$DOMAIN_XML.new" "$DOMAIN_XML"); then
+        rm -f -- "$DOMAIN_XML.new"
+        RENDER_FAILURE="cannot write $DOMAIN_XML"
+        return 1
+    fi
+}
+
+# The session state directory: root's, 0711 -- nothing in it can be listed
+# by anyone else, and every file in it is root's and 0600, but a console
+# bridge's own directory in it (console-socket) must be reachable by the user
+# it is made for.
+make_state_dir() {
+    install -d -m 0711 -- "$STATE_DIR" && chmod 0711 -- "$STATE_DIR"
 }
 
 # The allow-list is config's, never a list in this script: the serial must
@@ -937,6 +1225,10 @@ check_no_live_holder() {
     local f
     shopt -s nullglob
     for f in "$STATE_DIR"/*.holder; do
+        # In a two-drive run the other drive's holder is the run's own.
+        if [[ -n "${DAS_RECOVERY_VM_LOCK_FD:-}" && "$f" != "$HOLDER_FILE" ]]; then
+            continue
+        fi
         if ! read_record "$f"; then
             refuse "unreadable holder record $f -- check '$SELF status', then remove it"
         fi
@@ -1083,6 +1375,7 @@ resolve_os_state() {
         warn "TEST: the boot record is read from $OS_STATE_FILE (DAS_RECOVERY_OS_STATE)"
     fi
     SESSIONS_FILE="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-sessions"
+    HISTORY_FILE="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-history.jsonl"
 }
 
 # Read this drive's boot record and go on only when it does not say btrbk
@@ -1121,16 +1414,18 @@ check_boot_record() {
             runner) runners+=("$value") ;;
             units) units_state=$value ;;
             unit) units+=("$value") ;;
+            agent) REC_AGENT=$value ;;
+            agentwhy) REC_AGENT_WHY=$value ;;
         esac
     done <<<"$out"
     if ((schemas != 1)); then
         refuse "the boot record $file is not one JSON document ($schemas found)"
     fi
     if [[ "$schematype" != number ]]; then
-        refuse "the boot record $file is not one this script can read: its schema_version is not the number $OS_STATE_SCHEMA ('$schema', a $schematype)"
+        refuse "the boot record $file is not one this script can read: its schema_version is not a number ('$schema', a $schematype)"
     fi
-    if [[ "$schema" != "$OS_STATE_SCHEMA" ]]; then
-        refuse "the boot record $file is schema $schema, not $OS_STATE_SCHEMA -- this script reads schema $OS_STATE_SCHEMA only (an older record has no btrbk-at-boot verdict); the next backup run writes it again"
+    if [[ " $OS_STATE_SCHEMAS " != *" $schema "* ]]; then
+        refuse "the boot record $file is schema $schema -- this script reads schemas ${OS_STATE_SCHEMAS// / and } only (an older record has no btrbk-at-boot verdict); the next backup run writes it again"
     fi
     if [[ "$entry" != present ]]; then
         refuse "the boot record $file has no entry for '$LABEL' -- the nightly backup run writes one when it checks this drive; let one run with it attached"
@@ -1183,6 +1478,7 @@ check_boot_record() {
     for p in "${reasons[@]}"; do
         log "    - $p"
     done
+    log "  guest agent    ${REC_AGENT:-not recorded}${REC_AGENT_WHY:+ ($REC_AGENT_WHY)}"
     VERDICT=$verdict
     REC_REASONS=("${reasons[@]}")
     REC_RUNNERS=("${runners[@]}")
@@ -1194,9 +1490,26 @@ check_boot_record() {
     if [[ "$verdict" == may ]]; then
         log "boot record: btrbk may run when this OS boots: the session guard is what keeps it from running"
     fi
+    # Unattended (decisions 1 and 3): only through an agent the record says
+    # runs at boot, and never on "will" -- that is for an operator at the
+    # console. Neither is for --accept-boot-record-risk to let through.
+    if [[ "$UNATTENDED" == true ]]; then
+        if [[ "$verdict" == will ]]; then
+            refuse "the boot record says btrbk will run when this OS boots: a \"will\" drive is updated attended only, never --unattended (its operator disables that in the session) -- whatever the options"
+        fi
+        if [[ "$REC_AGENT" != "read true true" ]]; then
+            refuse "an unattended session needs the recovery OS's QEMU guest agent installed and started at boot, and its boot record says: ${REC_AGENT:-nothing}${REC_AGENT_WHY:+ ($REC_AGENT_WHY)} -- run one attended session and install it there (pacman -S qemu-guest-agent), then let a backup run record the drive again"
+        fi
+    fi
+    # Attended, a "will" drive goes on (decision 3 of bd 8249, 2026-10-04):
+    # the guard masks what the record names and binds a refusing btrbk, and
+    # the operator at the console disables it for good. Said before the boot
+    # and again once the guard confirms. A "will" whose guard does not
+    # confirm is shut down (exit 6), as a "may" is.
+    # (--unattended on "will" was refused above.)
     if [[ "$verdict" == will ]]; then
-        problems+=("btrbk will run when this OS boots")
-        hints+=("fix it from inside the recovery OS on bare metal, or check its config, then let the next backup run record it again (without starting btrbk: boot it with systemd.unit=emergency.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1 on its kernel line, remount / read-write if needed, mask the unit the record names, then systemctl poweroff -- never exit or Ctrl-D, and never Ctrl-Alt-Del: each boots it on; to stop at any prompt, hold the power button; see the disaster recovery guide)")
+        WILL_BANNER=true
+        warn "$WILL_BANNER_TEXT"
     fi
     if ((checked > now + 300)); then
         problems+=("the record is dated in the future ($when): the clock of the run that wrote it, or this one, is wrong")
@@ -1592,10 +1905,12 @@ define_guard() {
     if [[ -e "$GUARD_FILE" || -e "$GUARD_FILE.0" || -e "$GUARD_STATE_FILE" || -e "$RESET_FILE" ]]; then
         refuse "cannot remove an old $GUARD_FILE, its state or its resets: a stale report could pass for this session's -- nothing was booted"
     fi
+    render_domain_xml || refuse "$RENDER_FAILURE -- nothing was booted"
     if ! (umask 077 && guarded_domain_xml >"$GUARD_XML_FILE"); then
-        rm -f -- "$GUARD_XML_FILE"
+        rm -f -- "$GUARD_XML_FILE" "$DOMAIN_XML"
         refuse "cannot add the session guard to $DOMAIN_XML (each of '  </os>' and '  </devices>' once, and no SMBIOS strings or $GUARD_PORT port of its own, are needed) -- nothing was booted"
     fi
+    rm -f -- "$DOMAIN_XML"
     write_guard_state "verdict=$VERDICT" "engaged=$GUARD_EXPECT" "lifted=$GUARD_EXPECT_LIFTED" \
         "engaged_short=$GUARD_EXPECT_C" "lifted_short=$GUARD_EXPECT_LIFTED_C"
     # Set first: if the define half-happens, the cleanup must look.
@@ -1616,21 +1931,25 @@ define_guard() {
 # only keeps btrbk from running in that VM.
 remove_guard() {
     local out xml
-    if ! out="$(virsh_ define --validate "$DOMAIN_XML" 2>&1)"; then
+    if ! render_domain_xml; then
+        GUARD_LEFT="$RENDER_FAILURE"
+    elif ! out="$(virsh_ define --validate "$DOMAIN_XML" 2>&1)"; then
         GUARD_LEFT="virsh define $DOMAIN_XML failed: $out"
     elif ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
         GUARD_LEFT="cannot read $DOMAIN's definition back: $xml"
     elif guard_in "$xml"; then
         GUARD_LEFT="$DOMAIN's definition still carries it after defining $DOMAIN_XML"
     else
+        rm -f -- "$DOMAIN_XML"
         GUARDED=false
         # The reset watch goes before its file: it writes there, and a line
         # it wrote after this would leave the file behind (bd lorz).
         stop_reset_watch
         rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
-        log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_XML again)"
+        log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_TEMPLATE again)"
         return 0
     fi
+    rm -f -- "$DOMAIN_XML"
     warn "the session guard is still in $DOMAIN's definition: $GUARD_LEFT. It only keeps btrbk from running in that VM; once it is shut off, run: $SELF define"
     return 1
 }
@@ -1970,6 +2289,9 @@ guard_line_seen() {
     if [[ "$GUARD_CONFIRMED" != true ]]; then
         GUARD_CONFIRMED=true
         log "the session guard is engaged: $GUARD_EXPECT"
+        if [[ "$WILL_BANNER" == true ]]; then
+            warn "$WILL_BANNER_TEXT"
+        fi
     elif [[ "$J_NEW_BOOT" == true ]]; then
         log "the recovery OS booted again (boot $J_BOOT), and its guard is engaged ($(count_of "$J_BOOTS" boot) so far)"
     fi
@@ -2350,6 +2672,7 @@ reset_watch() {
 # exists for the whole session, and says which virsh it was.
 start_reset_watch() {
     local wfd
+    (umask 077 && : >>"$RESET_FILE") || refuse "cannot create $RESET_FILE -- nothing was booted"
     RESET_VIRSH_BEFORE=${!:-}
     RESET_VIRSH_STARTING=true
     exec {wfd}< <(
@@ -2506,6 +2829,14 @@ start_guarded() {
         missing="$(guard_missing "$xml")"
         [[ -z "$missing" ]] || missing="the started domain does not carry the session guard (missing: $missing)"
     fi
+    # From the resume on the OS may change, so a record made before it no
+    # longer describes it: the time is recorded now, or nothing is resumed
+    # (the domain, paused, is torn down -- it ran nothing). Not before: a
+    # session that ends before this point never ran the OS, so its record
+    # still describes it and a retry is admitted (bd DAS-Backup-Manager-dmxt).
+    if [[ -z "$missing" ]] && ! record_session_time "$(date +%s)"; then
+        missing="cannot record the start of this session ($SESSIONS_FAILURE): without it, the next session could trust a boot record made before this one"
+    fi
     if [[ -n "$missing" ]]; then
         destroy_never_resumed || rc=$?
         case "$rc" in
@@ -2531,7 +2862,22 @@ start_guarded() {
 # Taking and giving back
 # ---------------------------------------------------------------------------
 take_lock() {
-    local holder
+    local holder fd=${DAS_RECOVERY_VM_LOCK_FD:-}
+    # A drive's session in a two-drive run: the run holds the lock, once,
+    # and this session holds it through the run's descriptor -- which must
+    # be that lock file, and held.
+    if [[ -n "$fd" ]]; then
+        if [[ ! "$fd" =~ ^[[:digit:]]+$ || "$(readlink -f -- "/proc/$$/fd/$fd" 2>/dev/null)" != "$(readlink -f -- "$MAINTENANCE_LOCK" 2>/dev/null)" ]]; then
+            refuse "DAS_RECOVERY_VM_LOCK_FD=$fd is not an open descriptor of $MAINTENANCE_LOCK"
+        fi
+        if ! flock -n "$fd"; then
+            refuse "DAS_RECOVERY_VM_LOCK_FD=$fd does not hold $MAINTENANCE_LOCK"
+        fi
+        LOCK_FD=$fd
+        LOCK_INHERITED=true
+        log "holding the DAS maintenance lock $MAINTENANCE_LOCK through the two-drive run that took it"
+        return 0
+    fi
     if ! exec {LOCK_FD}<>"$MAINTENANCE_LOCK"; then
         LOCK_FD=""
         refuse "cannot open $MAINTENANCE_LOCK"
@@ -2552,6 +2898,8 @@ take_lock() {
 # is provably this session's. Display only: a record that cannot be written
 # costs the name, never the lock.
 write_lock_record() {
+    # A two-drive run's record is the run's.
+    [[ "$LOCK_INHERITED" != true ]] || return 0
     if ! printf 'recovery-os VM session %s pid %s\n' "$LABEL" "$1" >"$MAINTENANCE_LOCK"; then
         warn "could not record pid $1 as the holder of $MAINTENANCE_LOCK"
     fi
@@ -2561,6 +2909,7 @@ write_lock_record() {
 # session's -- this script holds it, or this session's holder still runs --
 # so the record of whoever takes it next is never erased.
 clear_lock_record() {
+    [[ "$LOCK_INHERITED" != true ]] || return 0
     if ! : >"$MAINTENANCE_LOCK"; then
         warn "could not empty the holder record in $MAINTENANCE_LOCK"
     fi
@@ -2573,7 +2922,11 @@ release_lock() {
         clear_lock_record
         exec {LOCK_FD}>&-
         LOCK_FD=""
-        log "released the DAS maintenance lock"
+        if [[ "$LOCK_INHERITED" == true ]]; then
+            log "let go of this drive's hold on the DAS maintenance lock (the two-drive run still holds it)"
+        else
+            log "released the DAS maintenance lock"
+        fi
     fi
 }
 
@@ -2766,11 +3119,20 @@ return_disk() {
     if [[ "$STARTED" == true ]]; then
         rescan_disk
         check_left_unmounted
+    fi
+    # Only an OS that was resumed can have changed (bd DAS-Backup-Manager-dmxt):
+    # one started paused and torn down, or never started, ran nothing, and its
+    # record still describes it.
+    if [[ "$RESUME_ATTEMPTED" == true ]]; then
         if [[ -z "$SESSIONS_FILE" ]]; then
             warn "no place to record the end of this session (the boot record was never resolved)"
         elif ! record_session_time "$(date +%s)"; then
             warn "could not record the end of this session ($SESSIONS_FAILURE); its start is recorded, so the next session waits for a new boot record all the same"
         fi
+    fi
+    stop_console_bridge
+    if [[ "$EGRESS_OWNED" == true ]]; then
+        egress_remove
     fi
     release_lock
     check_lock_let_go
@@ -2785,7 +3147,7 @@ return_disk() {
 # moment to write it); anything else is said as loudly as it deserves.
 check_lock_let_go() {
     local i first
-    if [[ -z "$HOLDER_FAILURE" || -n "$LOCK_FD" ]]; then
+    if [[ -z "$HOLDER_FAILURE" || -n "$LOCK_FD" || "$LOCK_INHERITED" == true ]]; then
         return 0
     fi
     for ((i = 0; i < 10; i++)); do
@@ -2916,6 +3278,8 @@ The recovery OS keeps $DISK:
     and the other jobs that mount targets defer.
 Never 'systemctl stop' ${HOLDER_UNIT:-the scope of the holder}: that ends the claim and the lock
 at once, and with this script gone nothing takes them again.
+The egress rule (if one is in place) and a console bridge stay too:
+session-end takes them out.
 Nothing was detached and nothing was destroyed. To finish:
 EOF
     if [[ "$never_ran" == true ]]; then
@@ -3003,6 +3367,1067 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# The egress rule (decision 5 of 2026-10-07, bd DAS-Backup-Manager-8249)
+# ---------------------------------------------------------------------------
+# The VM's traffic leaves through libvirt's NAT, and so follows the host's
+# default route: through a VPN exit node when one is up (Tailscale's
+# `lookup 52` at priority 5270), where a full update crawled at ~0.1 MB/s on
+# 2026-10-07. A policy rule above it sends the VM's subnet -- and nothing
+# else -- by the main table, direct. It is put in place before the domain
+# starts and taken out when the disk is given back, on every way out that
+# gives it back; a session left running (exit 3) leaves it, and session-end
+# takes it out. Its subnet is in EGRESS_FILE while it is this script's.
+
+# The subnet of libvirt's network LIBVIRT_NETWORK ("192.168.122.0/24") into
+# EGRESS_SUBNET; 1, with EGRESS_FAILURE set, when it cannot be read: exactly
+# one IPv4 address with a netmask or prefix is required.
+network_subnet() {
+    local xml line addr="" bits="" n=0 mask o a b c d m i net=""
+    EGRESS_FAILURE=""
+    if ! xml="$(virsh_ net-dumpxml "$LIBVIRT_NETWORK" 2>&1)"; then
+        EGRESS_FAILURE="cannot read libvirt's network '$LIBVIRT_NETWORK': $(printable "$xml")"
+        return 1
+    fi
+    while IFS= read -r line; do
+        [[ "$line" == *"<ip "* ]] || continue
+        [[ "$line" != *"family='ipv6'"* && "$line" != *'family="ipv6"'* ]] || continue
+        n=$((n + 1))
+        if [[ "$line" =~ $NET_ADDR_RE ]]; then addr=${BASH_REMATCH[1]}; fi
+        if [[ "$line" =~ $NET_PREFIX_RE ]]; then
+            bits=${BASH_REMATCH[1]}
+        elif [[ "$line" =~ $NET_MASK_RE ]]; then
+            mask=${BASH_REMATCH[1]} bits=0
+            IFS=. read -r a b c d <<<"$mask"
+            for o in "$a" "$b" "$c" "$d"; do
+                for ((i = 7; i >= 0; i--)); do
+                    if (((o >> i) & 1)); then bits=$((bits + 1)); fi
+                done
+            done
+        fi
+    done <<<"$xml"
+    if ((n != 1)) || [[ ! "$addr" =~ $IPV4_RE || ! "$bits" =~ ^[[:digit:]]+$ ]] || ((bits < 8 || bits > 30)); then
+        EGRESS_FAILURE="libvirt's network '$LIBVIRT_NETWORK' does not have exactly one IPv4 address with a netmask ($n found; address '${addr}', prefix '${bits}')"
+        return 1
+    fi
+    IFS=. read -r a b c d <<<"$addr"
+    m=$(((0xffffffff << (32 - bits)) & 0xffffffff))
+    i=$((((a << 24) | (b << 16) | (c << 8) | d) & m))
+    net="$(((i >> 24) & 255)).$(((i >> 16) & 255)).$(((i >> 8) & 255)).$((i & 255))"
+    EGRESS_SUBNET="$net/$bits"
+}
+
+# How many rules "from EGRESS_SUBNET lookup main" are at EGRESS_PRIORITY now
+# (ip -j: never a match on text); 1, with EGRESS_FAILURE set, when that cannot
+# be read.
+egress_rule_count() {
+    local out
+    if ! out="$(ip -j rule show priority "$EGRESS_PRIORITY" 2>&1)"; then
+        EGRESS_FAILURE="ip rule show failed: $(printable "$out")"
+        return 1
+    fi
+    if ! EGRESS_COUNT="$(jq --arg src "${EGRESS_SUBNET%/*}" --argjson len "${EGRESS_SUBNET#*/}" \
+        '[.[] | select(.src == $src and .srclen == $len and .table == "main")] | length' <<<"${out:-[]}" 2>&1)" ||
+        [[ ! "$EGRESS_COUNT" =~ ^[[:digit:]]+$ ]]; then
+        EGRESS_FAILURE="cannot read ip's rules: $(printable "$EGRESS_COUNT")"
+        return 1
+    fi
+}
+
+# Put the rule in place, or take over one that is there (left by a session
+# that did not finish; the maintenance lock says none is running): either way
+# this process takes it out again. Refuses when it cannot be proven in place.
+egress_add() {
+    local out
+    if [[ -n "$TEST_LOOP" && -n "${DAS_RECOVERY_VM_TEST_NO_EGRESS_RULE:-}" ]]; then
+        warn "TEST (DAS_RECOVERY_VM_TEST_NO_EGRESS_RULE): no egress rule -- the VM's traffic follows the host's default route"
+        EGRESS_RESULT="not put in place (test)"
+        return 0
+    fi
+    network_subnet || refuse "$EGRESS_FAILURE -- the VM's traffic cannot be routed direct; nothing was booted"
+    egress_rule_count || refuse "$EGRESS_FAILURE -- nothing was booted"
+    # Owned, and noted, before the add: a signal (or a refusal) between the
+    # add and this would leave the rule in place with nothing to take it
+    # out. egress_remove takes a rule that never came out as already gone.
+    EGRESS_OWNED=true
+    if ! (umask 077 && printf '%s\n' "$EGRESS_SUBNET" >"$EGRESS_FILE"); then
+        warn "could not note the egress rule in $EGRESS_FILE: if this session is left running, take it out by hand: ip rule del from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY"
+    fi
+    if ((EGRESS_COUNT > 0)); then
+        warn "the egress rule (from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY) is already in place, left by a session that did not finish: this session takes it over and takes it out at the end"
+    else
+        if ! out="$(ip rule add from "$EGRESS_SUBNET" lookup main priority "$EGRESS_PRIORITY" 2>&1)"; then
+            refuse "cannot put the egress rule in place (ip rule add from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY: $(printable "$out")) -- nothing was booted"
+        fi
+        egress_rule_count || refuse "$EGRESS_FAILURE -- nothing was booted"
+        ((EGRESS_COUNT > 0)) || refuse "ip rule add succeeded, but no rule from $EGRESS_SUBNET is at priority $EGRESS_PRIORITY -- nothing was booted"
+    fi
+    EGRESS_RESULT="in place (from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY)"
+    log "egress: the VM's subnet $EGRESS_SUBNET goes direct (ip rule priority $EGRESS_PRIORITY, above a VPN exit node's)"
+}
+
+# Take the rule out, every copy of it, and prove it gone. A rule that stays
+# is said (exit 5): it routes only the VMs' subnet, but it was not meant to
+# outlive the session.
+egress_remove() {
+    local out i
+    if [[ -z "$EGRESS_SUBNET" ]] && ! EGRESS_SUBNET="$(head -n 1 -- "$EGRESS_FILE" 2>/dev/null)"; then
+        EGRESS_SUBNET=""
+    fi
+    if [[ ! "$EGRESS_SUBNET" =~ ^[[:digit:].]+/[[:digit:]]+$ ]]; then
+        EGRESS_RESULT="NOT taken out: which subnet it routes is not known ($EGRESS_FILE)"
+        warn "the egress rule: $EGRESS_RESULT -- see: ip rule show priority $EGRESS_PRIORITY"
+        return 0
+    fi
+    for ((i = 0; i < 5; i++)); do
+        if ! egress_rule_count; then
+            break
+        fi
+        if ((EGRESS_COUNT == 0)); then
+            EGRESS_OWNED=false
+            rm -f -- "$EGRESS_FILE"
+            EGRESS_RESULT="taken out"
+            log "egress: took the rule for $EGRESS_SUBNET out (priority $EGRESS_PRIORITY)"
+            return 0
+        fi
+        out="$(ip rule del from "$EGRESS_SUBNET" lookup main priority "$EGRESS_PRIORITY" 2>&1)" || EGRESS_FAILURE="ip rule del: $(printable "$out")"
+    done
+    EGRESS_RESULT="NOT taken out (${EGRESS_FAILURE:-it is still there}): ip rule del from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY"
+    warn "the egress rule: $EGRESS_RESULT"
+}
+
+# Whether any recovery drive's domain other than this one ($DOMAIN) is not
+# shut off -- it may still need the rule. Unreadable is "yes".
+other_domain_running() {
+    local label state
+    for label in "${TARGET_LABELS[@]}"; do
+        [[ "${T_ROLE[$label]}" == mirror && "$DOMAIN_BASE-$label" != "$DOMAIN" ]] || continue
+        # Not defined: nothing of it runs.
+        virsh_ dominfo "$DOMAIN_BASE-$label" >/dev/null 2>&1 || continue
+        state="$(virsh_ domstate "$DOMAIN_BASE-$label" 2>&1)" || return 0
+        [[ "$state" == "shut off" ]] || return 0
+    done
+    return 1
+}
+
+# The rule, as status says it.
+egress_report() {
+    local subnet="" rules count
+    subnet="$(head -n 1 -- "$EGRESS_FILE" 2>/dev/null)" || subnet=""
+    if [[ -z "$subnet" ]]; then
+        printf 'none noted\n'
+        return 0
+    fi
+    # ip failing is "unknown", never 0: a count it did not read is no count.
+    if rules="$(ip rule show priority "$EGRESS_PRIORITY" 2>&1)"; then
+        count="$(grep -cF "from $subnet lookup main" <<<"$rules")" || :
+    else
+        count="unknown (ip rule show failed: $(printable "$rules"))"
+    fi
+    printf 'noted for %s (priority %s); in place now: %s\n' "$subnet" "$EGRESS_PRIORITY" "$count"
+}
+
+# ---------------------------------------------------------------------------
+# The console bridge (decision 2 of 2026-10-04, bd DAS-Backup-Manager-8249)
+# ---------------------------------------------------------------------------
+# For a running session only: the domain's VNC, which libvirt keeps on a
+# root-only socket, offered through a socket of its own that only one user
+# can open (0600, that user's, in a fresh 0711 directory of root's), for
+# one connection: socat accepts once and ends when it closes. Removed when the
+# disk is given back. No libvirt group, no ACL is changed.
+
+# End the bridge this drive's record names, and remove its directory.
+stop_console_bridge() {
+    local pid="" dir="" i
+    [[ -n "$CONSOLE_FILE" && -e "$CONSOLE_FILE" ]] || return 0
+    { IFS= read -r pid && IFS= read -r dir; } <"$CONSOLE_FILE" 2>/dev/null || :
+    if [[ "$pid" =~ ^[[:digit:]]+$ && -n "$dir" ]] &&
+        [[ "$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline")" == *"socat"*"$dir/"* ]]; then
+        kill "$pid" 2>/dev/null || :
+        for ((i = 0; i < 50; i++)); do
+            [[ -d "/proc/$pid" ]] || break
+            sleep 0.1
+        done
+        kill -KILL "$pid" 2>/dev/null || :
+    fi
+    if [[ "$dir" == "$STATE_DIR/console-$LABEL-"* && "$dir" != *..* ]]; then
+        rm -rf -- "$dir" "$dir.err"
+    fi
+    rm -f -- "$CONSOLE_FILE"
+    log "console bridge for $LABEL removed"
+}
+
+cmd_console_socket() {
+    local uid=$2 pw gid state xml vnc="" line dir sock pid i st dst
+    require_root
+    command -v socat >/dev/null || refuse "socat is not installed: the console bridge is a socat between two sockets (Arch: pacman -S socat)"
+    if [[ ! "$uid" =~ ^[[:digit:]]+$ ]]; then
+        refuse "'$uid' is not a numeric user id"
+    fi
+    pw="$(getent passwd "$uid")" || refuse "no user has the id $uid"
+    IFS=: read -r _ _ _ gid _ <<<"$pw"
+    load_targets
+    resolve_label "$1"
+    LOG_TO_STDERR=true
+    if [[ ! -e "$HOLDER_FILE" ]] || ! read_record "$HOLDER_FILE" || ! holder_alive "$REC_PID" "$REC_DEV"; then
+        refuse "no session of $LABEL is running (no live disk holder): a console bridge is only for a running session"
+    fi
+    state="$(current_state)"
+    [[ "$state" == running ]] || refuse "$DOMAIN is $state -- a console bridge needs it running"
+    xml="$(virsh_ dumpxml "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's live definition: $(printable "$xml")"
+    while IFS= read -r line; do
+        if [[ "$line" == *"<graphics type='vnc'"* && "$line" =~ $VNC_SOCKET_RE ]]; then
+            vnc=${BASH_REMATCH[1]}
+        fi
+    done <<<"$xml"
+    [[ -n "$vnc" ]] || refuse "$DOMAIN's live definition names no VNC socket"
+    check_path_chars "$vnc"
+    [[ -S "$TEST_ROOT$vnc" ]] || refuse "$vnc is not a socket"
+    # One bridge per drive: a new one replaces the old.
+    stop_console_bridge
+    make_state_dir || refuse "cannot create $STATE_DIR"
+    dir="$(mktemp -d -- "$STATE_DIR/console-$LABEL-XXXXXXXXXXXX")" || refuse "cannot create a directory for the bridge under $STATE_DIR"
+    # The directory stays root's (0711: passed through, not listed, written
+    # by root only); only the socket is the user's. A directory of the user's
+    # would let them put a symlink where socat applies user= and mode= by
+    # path, and have root chown whatever it names.
+    if ! chmod 0711 -- "$dir"; then
+        rm -rf -- "$dir"
+        refuse "cannot set the mode of $dir"
+    fi
+    sock="$dir/vnc.sock"
+    # Its own session, out of this command's: the caller reads this command's
+    # output to its end, which must not wait for the bridge.
+    setsid socat "UNIX-LISTEN:$sock,mode=600,user=$uid,group=$gid,unlink-early" "UNIX-CONNECT:$TEST_ROOT$vnc" \
+        </dev/null >/dev/null 2>"$dir.err" &
+    pid=$!
+    if ! (umask 077 && printf '%s\n%s\n' "$pid" "$dir" >"$CONSOLE_FILE"); then
+        kill "$pid" 2>/dev/null || :
+        rm -rf -- "$dir" "$dir.err"
+        refuse "cannot record the bridge in $CONSOLE_FILE"
+    fi
+    for ((i = 0; i < 50; i++)); do
+        [[ -S "$sock" ]] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    # stat without -L: the socket itself (a symlink is "symbolic link"), and
+    # its directory still root's alone.
+    st="$(stat -c '%u %a %F' -- "$sock" 2>/dev/null)" || st=""
+    dst="$(stat -c '%u %a %F' -- "$dir" 2>/dev/null)" || dst=""
+    if [[ "$dst" != "$EUID 711 directory" ]]; then
+        stop_console_bridge
+        refuse "the bridge's directory $dir is not $EUID's, mode 0711 (${dst:-not there})"
+    fi
+    if [[ "$st" != "$uid 600 socket" ]]; then
+        stop_console_bridge
+        refuse "the bridge's socket is not a socket of user $uid with mode 0600 (${st:-not there}): $(head -c 300 -- "$dir.err" 2>/dev/null)"
+    fi
+    rm -f -- "$dir.err"
+    log "console bridge for $LABEL: $sock (user $uid, one connection; removed when the disk is given back)"
+    printf '%s\n' "$sock"
+}
+
+# ---------------------------------------------------------------------------
+# Unattended sessions (bd DAS-Backup-Manager-8249, decisions 1 and 3-8)
+# ---------------------------------------------------------------------------
+# The update an operator runs at the console, run instead through the
+# recovery OS's own QEMU guest agent -- virsh qemu-agent-command, guest-exec:
+# no SSH, no password. Only for a drive whose record says the agent is
+# installed and starts at boot, and never on a "will" record. Each step runs
+# in the recovery OS as a transient systemd unit of its own, so a restart of
+# the agent (pacman upgrading it) or of systemd does not end it; this script
+# looks at its exit status and output every POLL_SECS, and between two looks
+# watches the claim and the guard as an attended session does. Anything
+# unexpected stops the update: the recovery OS is asked to power off
+# (through its agent, and by ACPI until it has; never destroyed), the disk is
+# given back, and the session exits 7 naming the step.
+
+# One progress line (the grammar is in the header): $1 the step, $2 the
+# event, the rest a message.
+progress() {
+    local stage=$1 event=$2
+    shift 2
+    printf 'PROGRESS %s %s %s%s\n' "$LABEL" "$stage" "$event" "${*:+ $*}"
+    logger -t "$LOG_TAG" -- "PROGRESS $LABEL $stage $event${*:+ $*}" || :
+}
+
+# A command to the guest agent ($1, JSON), answered within $2 seconds:
+# AGENT_OUT is the answer, or what virsh said.
+agent_call() {
+    AGENT_OUT="$(virsh_ qemu-agent-command "$DOMAIN" --timeout "${2:-30}" "$1" 2>&1)"
+}
+
+# Run $2 (sh) in the recovery OS through the agent and wait for it, $1
+# seconds at most: 0 once it has ended (GSH_RC its exit status, GSH_OUT what
+# it printed, stdout then stderr); 1 when the agent did not run it or did not
+# say it ended (GSH_WHY says why).
+guest_sh() {
+    local json pid start=$SECONDS exited rc out err
+    GSH_RC="" GSH_OUT="" GSH_WHY=""
+    json="$(jq -cn --arg s "$2" '{execute: "guest-exec", arguments: {path: "/bin/sh", arg: ["-c", $s], "capture-output": true}}')" || {
+        GSH_WHY="cannot encode the command"
+        return 1
+    }
+    if ! agent_call "$json" 30; then
+        GSH_WHY="the guest agent did not take the command: $(printable "$AGENT_OUT")"
+        return 1
+    fi
+    pid="$(jq -r '.return.pid // empty' <<<"$AGENT_OUT" 2>/dev/null)" || pid=""
+    if [[ ! "$pid" =~ ^[[:digit:]]+$ ]]; then
+        GSH_WHY="the guest agent gave no process for the command: $(printable "$AGENT_OUT")"
+        return 1
+    fi
+    while :; do
+        if agent_call "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 30; then
+            exited="$(jq -r '.return.exited' <<<"$AGENT_OUT" 2>/dev/null)" || exited=""
+            if [[ "$exited" == true ]]; then
+                rc="$(jq -r '.return.exitcode // .return.signal // empty | tostring' <<<"$AGENT_OUT" 2>/dev/null)" || rc=""
+                out="$(jq -r '.return["out-data"] // empty' <<<"$AGENT_OUT" 2>/dev/null)" || out=""
+                err="$(jq -r '.return["err-data"] // empty' <<<"$AGENT_OUT" 2>/dev/null)" || err=""
+                GSH_OUT="$(printf '%s' "$out" | base64 -d 2>/dev/null)$(printf '%s' "$err" | base64 -d 2>/dev/null)" || :
+                # An end without an exit status (a signal) is never 0.
+                GSH_RC=${rc:-signalled}
+                [[ "$GSH_RC" =~ ^[[:digit:]]+$ ]] || GSH_RC="ended by signal ${GSH_RC}"
+                return 0
+            fi
+        else
+            GSH_WHY="the guest agent did not answer: $(printable "$AGENT_OUT")"
+        fi
+        if ((SECONDS - start >= $1)); then
+            GSH_WHY="no end within $(format_duration "$1")${GSH_WHY:+ ($GSH_WHY)}"
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# One look while an unattended step runs or waits: the domain's state, the
+# claim, the guard, the --timeout. 1, with UNATTENDED_WHY set, when the update
+# cannot go on.
+watch_tick() {
+    local state
+    state="$(current_state)"
+    if [[ "$state" == "shut off" ]]; then
+        UNATTENDED_WHY="the recovery OS powered off by itself"
+        return 1
+    fi
+    keep_claim || :
+    check_guard running "$state"
+    if [[ "$GUARD_FAILED" == true ]]; then
+        UNATTENDED_WHY="the session guard did not confirm (${GUARD_RESULT#NOT confirmed: })"
+        return 1
+    fi
+    if ((UNATTENDED_DEADLINE > 0 && SECONDS >= UNATTENDED_DEADLINE)); then
+        UNATTENDED_WHY="the --timeout of $TIMEOUT_MIN minute(s) has passed"
+        return 1
+    fi
+}
+
+stage_failed() {
+    progress "$1" fail "$2"
+    UNATTENDED_STAGE=$1
+    UNATTENDED_FAILED="$1: $2"
+    warn "the unattended update stopped at '$1': $2"
+    # A step that changes the OS (pacman, mkinitcpio) stopped for any reason
+    # may still be running when the power-off ends it: mid-transaction.
+    case "$1" in
+        keyrings | upgrade | packages | initramfs)
+            UNATTENDED_HALF="the recovery OS may be half-upgraded ('$1' may have been ended by the power-off in the middle of its work): roll back to ${PRE_UPDATE_SNAPSHOT:-the @.pre-update.<YYYYMMDD-HHMM> snapshot this run took} (read-only, at its filesystem's top level), from inside that OS or a live system, before trusting it"
+            warn "$UNATTENDED_HALF"
+            ;;
+    esac
+}
+
+# The lines of what a step printed, as they arrive ($1 the step, $2 the new
+# text): OUTPUT lines, an unfinished last line kept for the next.
+stage_output() {
+    local data=$OUT_PART$2 line
+    while [[ "$data" == *$'\n'* ]]; do
+        line=${data%%$'\n'*}
+        data=${data#*$'\n'}
+        line="$(printable "${line//$'\r'/}")"
+        printf 'OUTPUT %s %s %s\n' "$LABEL" "$1" "$line"
+        logger -t "$LOG_TAG" -- "OUTPUT $LABEL $1 $line" || :
+        [[ -z "${line//[[:space:]]/}" ]] || OUT_LAST=$line
+        if [[ "$1" == snapshot && "$line" =~ ^snapshot:\ (@\.pre-update\.[[:digit:]]{8}-[[:digit:]]{4})\ \(read-only\)$ ]]; then
+            PRE_UPDATE_SNAPSHOT=${BASH_REMATCH[1]}
+        fi
+    done
+    OUT_PART=$data
+}
+
+# Run step $1 in the recovery OS, $2 seconds at most, as the sh script $3:
+# a transient unit of its own (it outlives a restart of the agent), its
+# output and exit status in /run/das-vm-update. 0 when it ended with 0.
+run_stage() {
+    local stage=$1 limit=$2 n unit dir=/run/das-vm-update b64 runb64 start=$SECONDS last_ok=$SECONDS off=0 rc chunk bytes tmp
+    STAGE_N=$((STAGE_N + 1))
+    n=$STAGE_N
+    unit="das-vm-update-$n-$stage"
+    OUT_PART="" OUT_LAST=""
+    progress "$stage" start
+    b64="$(printf '%s\n' "$3" | base64 -w0)" || b64=""
+    runb64="$(printf 'sh %s/%s.sh >%s/%s.out 2>&1; echo $? >%s/%s.rc.new && mv -f %s/%s.rc.new %s/%s.rc\n' \
+        "$dir" "$n" "$dir" "$n" "$dir" "$n" "$dir" "$n" "$dir" "$n" | base64 -w0)" || runb64=""
+    if [[ -z "$b64" || -z "$runb64" ]]; then
+        stage_failed "$stage" "cannot encode it"
+        return 1
+    fi
+    if ! guest_sh 60 "set -e; mkdir -p $dir; printf '%s' '$b64' | base64 -d >$dir/$n.sh; printf '%s' '$runb64' | base64 -d >$dir/$n.run; rm -f $dir/$n.rc $dir/$n.out; systemd-run --quiet --collect --no-block --unit=$unit --property=Type=oneshot /bin/sh $dir/$n.run"; then
+        stage_failed "$stage" "it could not be started in the recovery OS: $GSH_WHY"
+        return 1
+    fi
+    if [[ "$GSH_RC" != 0 ]]; then
+        stage_failed "$stage" "it could not be started in the recovery OS (exit status $GSH_RC: $(printable "$GSH_OUT"))"
+        return 1
+    fi
+    tmp="$STATE_DIR/$LABEL.stage.chunk"
+    while :; do
+        sleep "$POLL_SECS"
+        if ! watch_tick; then
+            stage_failed "$stage" "$UNATTENDED_WHY"
+            return 1
+        fi
+        if guest_sh 30 "r=; if [ -e $dir/$n.rc ]; then r=\$(cat $dir/$n.rc); fi; printf 'rc=%s\\n' \"\$r\"; tail -c +$((off + 1)) $dir/$n.out 2>/dev/null | head -c 65536 | base64 -w0; echo" &&
+            [[ "$GSH_RC" == 0 && "$GSH_OUT" == rc=* ]]; then
+            last_ok=$SECONDS
+            rc=${GSH_OUT%%$'\n'*}
+            rc=${rc#rc=}
+            # Command substitution took the trailing newline: with no output
+            # yet, the answer is its first line alone.
+            chunk=""
+            if [[ "$GSH_OUT" == *$'\n'* ]]; then
+                chunk=${GSH_OUT#*$'\n'}
+                chunk=${chunk//[[:space:]]/}
+            fi
+            if [[ -n "$chunk" ]]; then
+                if ! printf '%s' "$chunk" | base64 -d >"$tmp" 2>/dev/null; then
+                    stage_failed "$stage" "its output came back unreadable"
+                    rm -f -- "$tmp"
+                    return 1
+                fi
+                bytes=$(wc -c <"$tmp")
+                off=$((off + bytes))
+                stage_output "$stage" "$(cat -- "$tmp"; printf x)"
+                OUT_PART=${OUT_PART%x}
+                rm -f -- "$tmp"
+            elif [[ -n "$rc" ]]; then
+                # Ended, and all it printed has been read.
+                [[ -z "$OUT_PART" ]] || stage_output "$stage" $'\n'
+                if [[ "$rc" == 0 ]]; then
+                    progress "$stage" ok "${OUT_LAST:+$OUT_LAST}"
+                    return 0
+                fi
+                stage_failed "$stage" "exit status $(printable "$rc")${OUT_LAST:+ -- $OUT_LAST}"
+                return 1
+            fi
+        elif ((SECONDS - last_ok >= AGENT_GRACE_SECS)); then
+            stage_failed "$stage" "the guest agent has not answered for $(format_duration $((SECONDS - last_ok))): ${GSH_WHY:-$(printable "$GSH_OUT")}"
+            return 1
+        fi
+        if ((SECONDS - start >= limit)); then
+            stage_failed "$stage" "not done within $(format_duration "$limit") (it may still run in the recovery OS)"
+            return 1
+        fi
+    done
+}
+
+# The recovery OS answers through its agent, and its guard has reported
+# engaged with nothing left to prove: within $1 seconds.
+wait_guest_ready() {
+    local start=$SECONDS
+    while :; do
+        sleep "$POLL_SECS"
+        if ! watch_tick; then
+            stage_failed boot "$UNATTENDED_WHY"
+            return 1
+        fi
+        if [[ "$GUARD_CONFIRMED" == true && -z "$PROOF_WHY" ]] && agent_call '{"execute":"guest-ping"}' 10; then
+            return 0
+        fi
+        if ((SECONDS - start >= $1)); then
+            if [[ "$GUARD_CONFIRMED" == true ]]; then
+                stage_failed boot "the guest agent did not answer within $(format_duration "$1") of the start (its record says it starts at boot): $(printable "$AGENT_OUT")"
+            else
+                stage_failed boot "the session guard did not report within $(format_duration "$1")"
+            fi
+            return 1
+        fi
+    done
+}
+
+# Reboot the recovery OS from inside, and wait for a new boot (another boot
+# id) whose guard reports engaged, answering the reset, and whose agent
+# answers.
+reboot_guest() {
+    local before now resets=$RESETS boots=$J_BOOTS start=$SECONDS
+    progress reboot start
+    if ! guest_sh 30 'cat /proc/sys/kernel/random/boot_id' || [[ "$GSH_RC" != 0 ]]; then
+        stage_failed reboot "cannot read the boot id: ${GSH_WHY:-$(printable "$GSH_OUT")}"
+        return 1
+    fi
+    before=${GSH_OUT//[[:space:]]/}
+    agent_call "$(jq -cn '{execute: "guest-exec", arguments: {path: "/usr/bin/systemctl", arg: ["reboot"]}}')" 30 || :
+    while :; do
+        sleep "$POLL_SECS"
+        if ! watch_tick; then
+            stage_failed reboot "$UNATTENDED_WHY"
+            return 1
+        fi
+        if ((RESETS > resets && J_BOOTS > boots)) && [[ -z "$PROOF_WHY" ]] &&
+            guest_sh 15 'cat /proc/sys/kernel/random/boot_id' && [[ "$GSH_RC" == 0 ]]; then
+            now=${GSH_OUT//[[:space:]]/}
+            if [[ -n "$now" && "$now" != "$before" ]]; then
+                progress reboot ok "boot $now, its guard engaged"
+                return 0
+            fi
+        fi
+        if ((SECONDS - start >= GUARD_SECS + AGENT_GRACE_SECS)); then
+            stage_failed reboot "no new boot with its guard engaged and its agent answering within $(format_duration $((GUARD_SECS + AGENT_GRACE_SECS)))"
+            return 1
+        fi
+    done
+}
+
+# Ask the recovery OS to power off -- through its agent, and by ACPI until it
+# has (request_shutdown: never destroyed, exit 3 at the bound). $1 why.
+power_off_guest() {
+    if [[ "$(current_state)" == "shut off" ]]; then
+        return 0
+    fi
+    agent_call '{"execute":"guest-shutdown","arguments":{"mode":"powerdown"}}' 10 || :
+    request_shutdown "$1" unattended
+}
+
+# The steps, in order: name, limit in seconds, the function that writes its
+# script. The guard is lifted for pacman (it cannot replace a file something
+# is mounted on) and engaged again before the reboot.
+UNATTENDED_STEPS=(
+    "egress 300 step_egress"
+    "snapshot 900 step_snapshot"
+    "guard-lift 120 step_guard_lift"
+    "keyrings 1800 step_keyrings"
+    "upgrade UPDATE step_upgrade"
+    "packages 1800 step_packages"
+    "initramfs 1800 step_initramfs"
+    "verify-btrbk 300 step_verify_btrbk"
+    "verify-boot 300 step_verify_boot"
+    "guard-engage 120 step_guard_engage"
+)
+
+run_unattended() {
+    local entry name limit fn
+    UNATTENDED_DEADLINE=0
+    if [[ -n "$TIMEOUT_MIN" ]]; then
+        UNATTENDED_DEADLINE=$((SECONDS + TIMEOUT_MIN * MINUTE_SECS))
+    fi
+    progress boot start "waiting for the session guard and the guest agent"
+    if ! wait_guest_ready "$AGENT_SECS"; then
+        progress poweroff start "the update stopped at boot"
+        power_off_guest "the unattended update stopped at boot"
+        progress poweroff ok
+        return 0
+    fi
+    progress boot ok "the session guard is engaged and the guest agent answers"
+    for entry in "${UNATTENDED_STEPS[@]}"; do
+        read -r name limit fn <<<"$entry"
+        [[ "$limit" != UPDATE ]] || limit=$UPDATE_SECS
+        if ! run_stage "$name" "$limit" "$("$fn")"; then
+            progress poweroff start "the update stopped at $name"
+            power_off_guest "the unattended update stopped at $name"
+            progress poweroff ok
+            return 0
+        fi
+    done
+    if ! reboot_guest; then
+        progress poweroff start "the update stopped at reboot"
+        power_off_guest "the unattended update stopped at reboot"
+        progress poweroff ok
+        return 0
+    fi
+    if guest_sh 30 'uname -r' && [[ "$GSH_RC" == 0 ]]; then
+        KERNEL="$(printable "${GSH_OUT//[[:space:]]/}")"
+        progress kernel ok "$KERNEL"
+    else
+        stage_failed kernel "cannot read the running kernel: ${GSH_WHY:-$(printable "$GSH_OUT")}"
+        progress poweroff start "the update stopped at kernel"
+        power_off_guest "the unattended update stopped at kernel"
+        progress poweroff ok
+        return 0
+    fi
+    progress poweroff start "the update is done"
+    power_off_guest "the unattended update is done"
+    progress poweroff ok
+}
+
+# The steps' scripts: plain sh, run as root in the recovery OS. Each prints
+# what it found; a nonzero exit stops the update.
+
+step_egress() {
+    printf 'want=%s\n' "$EGRESS_ORG"
+    cat <<'EOF'
+ip=$(curl -fsS --max-time 20 https://api.ipify.org) || { echo "cannot read this VM's public address"; exit 2; }
+org=$(curl -fsS --max-time 20 "https://ipinfo.io/$ip/org") || { echo "cannot read who owns $ip"; exit 2; }
+echo "egress: $ip, $org"
+case "$org" in
+    "$want "*) echo "egress is direct ($want)" ;;
+    *) echo "egress is $org, not $want: the update would go through another path (a VPN exit node) -- refused"; exit 3 ;;
+esac
+EOF
+}
+
+# The OS snapshots its own @ read-only before pacman touches it, and keeps
+# the newest two: written by the drive's own OS, never by the host
+# (decision 6).
+step_snapshot() {
+    cat <<'EOF'
+set -eu
+src=$(findmnt -no SOURCE /)
+fsroot=$(findmnt -no FSROOT /)
+[ "$fsroot" = /@ ] || { echo "/ is $fsroot, not the subvolume @: not the layout this snapshots"; exit 3; }
+dev=${src%%[*}
+top=/run/das-vm-update/top
+mkdir -p "$top"
+mount -o subvolid=5 "$dev" "$top"
+trap 'umount "$top"' EXIT
+name="@.pre-update.$(date +%Y%m%d-%H%M)"
+btrfs subvolume snapshot -r "$top/@" "$top/$name"
+echo "snapshot: $name (read-only)"
+ls -d "$top"/@.pre-update.* | while read -r p; do
+    case "${p##*/}" in
+        @.pre-update.[[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]]-[[:digit:]][[:digit:]][[:digit:]][[:digit:]]) echo "$p" ;;
+    esac
+done | sort | head -n -2 | while read -r old; do
+    btrfs subvolume delete "$old"
+    echo "removed the older snapshot ${old##*/}"
+done
+EOF
+}
+
+step_guard_lift() {
+    cat <<'EOF'
+systemctl stop das-vm-guard
+if systemctl is-active --quiet das-vm-guard; then echo "das-vm-guard is still active"; exit 3; fi
+echo "guard lifted for the update (its masks hold)"
+EOF
+}
+
+step_keyrings() {
+    printf '%s\n' 'pacman -Sy --noconfirm --needed archlinux-keyring cachyos-keyring'
+}
+
+step_upgrade() {
+    printf '%s\n' 'pacman -Syu --noconfirm'
+}
+
+# The agent with --needed; the microcode images always reinstalled: on
+# 2026-10-07 drive B's packages were installed and their images were not on
+# its ESP (bd DAS-Backup-Manager-ac82), which --needed would have left so.
+step_packages() {
+    printf '%s\n' 'pacman -S --needed --noconfirm qemu-guest-agent && pacman -S --noconfirm amd-ucode intel-ucode'
+}
+
+# Every mkinitcpio preset carries the fallback image (decision 8: drive A's
+# had only 'default' while its loader named the fallback), added only where
+# it is missing and the preset is of the stock shape; then every image is
+# built again.
+step_initramfs() {
+    cat <<'EOF'
+set -u
+found=0
+for p in /etc/mkinitcpio.d/*.preset; do
+    [ -e "$p" ] || break
+    found=1
+    if grep -q "^PRESETS=(.*'fallback'" "$p"; then echo "$p: has the fallback image"; continue; fi
+    shape=stock
+    grep -qx "PRESETS=('default')" "$p" || shape=other
+    if grep -q '^fallback_' "$p"; then shape=other; fi
+    if [ "$shape" != stock ]; then
+        echo "$p: has no fallback image and is not of the shape this edits -- put it right by hand"
+        exit 3
+    fi
+    def=$(sed -n 's/^default_image="\(.*\)\.img"$/\1/p' "$p")
+    [ -n "$def" ] || { echo "$p: no default_image line to derive the fallback from"; exit 3; }
+    sed -i "s/^PRESETS=('default')\$/PRESETS=('default' 'fallback')/" "$p"
+    printf '\nfallback_image="%s-fallback.img"\nfallback_options="-S autodetect"\n' "$def" >>"$p"
+    echo "$p: added the fallback image ($def-fallback.img)"
+done
+[ "$found" = 1 ] || { echo "no mkinitcpio preset in /etc/mkinitcpio.d"; exit 3; }
+mkinitcpio -P
+EOF
+}
+
+step_verify_btrbk() {
+    cat <<'EOF'
+out=$(pacman -Qkk btrbk 2>&1); rc=$?
+printf '%s\n' "$out"
+[ "$rc" -eq 0 ] || { echo "pacman -Qkk btrbk: exit status $rc"; exit 3; }
+grep -Eq '^btrbk: [[:digit:]]+ total files, 0 altered files$' <<OUT || { echo "btrbk's files are not as packaged"; exit 3; }
+$out
+OUT
+EOF
+}
+
+# What the drive's own loader and fstab need, read inside it (bd
+# DAS-Backup-Manager-ac82): every linux/initrd/efi file each loader entry
+# names is on the ESP, and every LABEL=, UUID=, PARTUUID= and PARTLABEL= of
+# /etc/fstab resolves to a device.
+step_verify_boot() {
+    cat <<'EOF'
+esp=$(bootctl --print-esp-path 2>/dev/null) || esp=/boot
+bad=0
+n=0
+for e in "$esp"/loader/entries/*.conf; do
+    [ -e "$e" ] || break
+    n=$((n + 1))
+    while read -r k v rest; do
+        case "$k" in
+            linux | initrd | efi)
+                for f in $v $rest; do
+                    if [ -f "$esp/${f#/}" ]; then :; else echo "$e: $k $f is not on the ESP ($esp)"; bad=1; fi
+                done
+                ;;
+        esac
+    done <"$e"
+done
+[ "$n" -gt 0 ] || { echo "no loader entries under $esp/loader/entries"; bad=1; }
+while read -r spec mp rest; do
+    case "$spec" in
+        "" | \#*) ;;
+        LABEL=* | UUID=* | PARTUUID=* | PARTLABEL=*)
+            findfs "$spec" >/dev/null 2>&1 || { echo "/etc/fstab: $spec (for $mp) resolves to no device"; bad=1; }
+            ;;
+    esac
+done </etc/fstab
+[ "$bad" = 0 ] || exit 3
+echo "loader entries: $n, every file they name on the ESP; /etc/fstab: every device it names resolves"
+EOF
+}
+
+step_guard_engage() {
+    printf 'paths="%s"\n' "${GUARD_BTRBK_PATHS[*]}"
+    cat <<'EOF'
+systemctl start das-vm-guard
+systemctl is-active --quiet das-vm-guard || { echo "das-vm-guard did not start"; exit 3; }
+for p in $paths; do
+    [ -e "$p" ] || continue
+    findmnt -rn --mountpoint "$p" >/dev/null || { echo "$p is not bound by the guard"; exit 3; }
+done
+echo "guard engaged again: btrbk is bound over every btrbk present"
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# The session history (bd DAS-Backup-Manager-8249, decision 7)
+# ---------------------------------------------------------------------------
+# One JSON line per drive per session that took the lock, appended when it
+# ends: label, start and end (seconds since the epoch), mode (single,
+# sequential, parallel), unattended, outcome (clean = exit 0, warnings = 5,
+# kept = 3 or 4: the recovery OS or the disk still held, failed = anything
+# else), exit, overridden (--accept-boot-record-risk let something through),
+# kernel (an unattended session's, after its reboot; else null) and
+# stopped_at (the step an unattended update stopped at; else null). Beside
+# the boot record, readable by all.
+
+outcome_of() {
+    case "$1" in
+        0) printf 'clean' ;;
+        5) printf 'warnings' ;;
+        3 | 4) printf 'kept' ;;
+        *) printf 'failed' ;;
+    esac
+}
+
+# Append this session's line ($1 its exit status), once, and say its result.
+write_history() {
+    local line overridden=false outcome
+    [[ "$HISTORY_ARMED" == true ]] || return 0
+    HISTORY_ARMED=false
+    outcome="$(outcome_of "$1")"
+    ((${#BOOT_OVERRIDES[@]} == 0)) || overridden=true
+    printf 'RESULT %s %s %s\n' "$LABEL" "$1" "$outcome"
+    if ! line="$(jq -cn --arg label "$LABEL" --argjson start "$SESSION_EPOCH" --argjson end "$(date +%s)" \
+        --arg mode "$RUN_MODE" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
+        --argjson overridden "$overridden" --arg kernel "$KERNEL" --arg stage "$UNATTENDED_STAGE" \
+        '{label: $label, start: $start, end: $end, mode: $mode, unattended: $unattended, outcome: $outcome,
+          exit: $exit, overridden: $overridden, kernel: (if $kernel == "" then null else $kernel end),
+          stopped_at: (if $stage == "" then null else $stage end)}' 2>&1)"; then
+        warn "could not write this session into the history: $line"
+        return 0
+    fi
+    if ! (umask 022 && printf '%s\n' "$line" >>"$HISTORY_FILE"); then
+        warn "could not append this session to $HISTORY_FILE: $line"
+    fi
+}
+
+# Every exit of a session that took the lock goes through here.
+session_exit() {
+    write_history "$1"
+    write_causes "$1"
+    exit "$1"
+}
+
+# The history's lines, each checked to be one JSON object with a label: 1,
+# with HISTORY_FAILURE set, when any is not -- a count read past a bad line
+# would be a guess.
+read_history() {
+    local out
+    HISTORY_FAILURE="" HISTORY_LINES=""
+    [[ -e "$HISTORY_FILE" ]] || return 0
+    if [[ -L "$HISTORY_FILE" || ! -f "$HISTORY_FILE" ]]; then
+        HISTORY_FAILURE="$HISTORY_FILE is not a regular file"
+        return 1
+    fi
+    if ! out="$(jq -cR 'fromjson | if type == "object" and (.label | type) == "string" then . else error("not a session line") end' <"$HISTORY_FILE" 2>&1)"; then
+        HISTORY_FAILURE="$HISTORY_FILE cannot be read as the session history: $(printable "$out")"
+        return 1
+    fi
+    HISTORY_LINES=$out
+}
+
+cmd_history() {
+    load_targets
+    resolve_os_state
+    if [[ -n "${1:-}" ]]; then
+        resolve_label "$1"
+    fi
+    read_history || refuse "$HISTORY_FAILURE"
+    [[ -n "$HISTORY_LINES" ]] || return 0
+    if [[ -n "$LABEL" ]]; then
+        jq -c --arg l "$LABEL" 'select(.label == $l)' <<<"$HISTORY_LINES"
+    else
+        printf '%s\n' "$HISTORY_LINES"
+    fi
+}
+
+# Consecutive clean unattended sessions of one drive, newest last: a session
+# that failed, was kept, ended with warnings, or was overridden sets it to 0;
+# a clean attended one leaves it as it is.
+cmd_clean_runs() {
+    local n
+    load_targets
+    resolve_os_state
+    resolve_label "$1"
+    read_history || refuse "$HISTORY_FAILURE"
+    if [[ -z "$HISTORY_LINES" ]]; then
+        printf '0\n'
+        return 0
+    fi
+    n="$(jq -s --arg l "$LABEL" 'reduce (.[] | select(.label == $l)) as $s (0;
+        if ($s.overridden != false) or ($s.outcome != "clean") then 0
+        elif $s.unattended == true then . + 1
+        else . end)' <<<"$HISTORY_LINES")" || refuse "cannot count $LABEL's clean runs"
+    printf '%s\n' "$n"
+}
+
+# ---------------------------------------------------------------------------
+# Both drives in one run (the operator's decision of 2026-10-04 11:39)
+# ---------------------------------------------------------------------------
+# ONE process holds the maintenance lock, once, for the whole run, and runs
+# each drive's session as its child with that lock's descriptor
+# (DAS_RECOVERY_VM_LOCK_FD): sequential runs the first drive to its end and
+# the second only if the first exited 0, or 5 on warnings of its own session
+# (pair_judge_causes) -- a bad update must not reach both
+# -- and parallel runs both at once. The egress rule is this process's too,
+# put in place once and taken out at the end. Each drive's lines carry its
+# label; each drive's end is a DRIVE line here.
+
+# What a drive's exit-5 cause (exit5_causes) means, for people.
+cause_text() {
+    case "$1" in
+        guard-unconfirmed-no) printf 'the session guard did not confirm on a "no" record' ;;
+        report-lines-lost) printf "the guard's reporter lost lines or left its last one unfinished" ;;
+        guard-left) printf "the session guard could not be taken out of the domain's definition" ;;
+        egress-not-removed) printf 'the egress rule was not taken out' ;;
+        dry-run-override) printf 'a dry run with --accept-boot-record-risk' ;;
+        claim-lost) printf 'the claim was lost while the VM ran' ;;
+        reenumerated) printf 'the drive re-enumerated during the session' ;;
+        mounted-after) printf 'a partition was mounted afterwards' ;;
+        mount-unknown) printf 'whether a partition was mounted afterwards is not known' ;;
+        scan-failed) printf 'the btrfs device scan failed' ;;
+        clock-gap) printf 'time was skipped between two looks at the recovery OS' ;;
+        reset-watch-stopped) printf 'the reset watch stopped' ;;
+        boot-override) printf 'the boot-record check was overridden' ;;
+        unmaskable-units) printf 'the boot record names units the guard cannot mask' ;;
+        reporter-silent) printf "the guard's reporter went silent" ;;
+        *) printf 'an unknown cause' ;;
+    esac
+}
+
+# A sequential run's first drive exited 5: may the second start? $1 the file
+# its session wrote its causes to (write_causes). Sets PAIR_STOP (why not --
+# empty: it may) and PAIR_GO (the session-local warnings it went past). Only
+# a cause that stayed in that session lets the run go on (the operator's
+# decision 9, bd 8249); one of the host, the enclosure or the mechanism stops
+# it, and so -- the cautious way -- does no cause, a record that cannot be
+# read, and any cause not classified here.
+pair_judge_causes() {
+    local f=$1 line causes=() stop=() go=()
+    PAIR_STOP="" PAIR_GO=""
+    if [[ -L "$f" || ! -f "$f" ]] || ! mapfile -t causes <"$f" 2>/dev/null; then
+        PAIR_STOP="its causes cannot be read ($f)"
+        return 0
+    fi
+    for line in "${causes[@]}"; do
+        case "$line" in
+            guard-unconfirmed-no | report-lines-lost | guard-left | egress-not-removed | dry-run-override)
+                go+=("$(cause_text "$line")") ;;
+            claim-lost | reenumerated | mounted-after | mount-unknown | scan-failed | clock-gap | reset-watch-stopped)
+                stop+=("$(cause_text "$line")") ;;
+            "") ;;
+            *[!a-z-]*) stop+=("a cause that cannot be read") ;;
+            *) stop+=("an unclassified cause ($line)") ;;
+        esac
+    done
+    if ((${#stop[@]} == 0 && ${#go[@]} == 0)); then
+        PAIR_STOP="no cause was recorded"
+        return 0
+    fi
+    local IFS=';'
+    PAIR_STOP="${stop[*]}"
+    PAIR_GO="${go[*]}"
+    PAIR_STOP=${PAIR_STOP//;/; } PAIR_GO=${PAIR_GO//;/; }
+}
+
+# This run's status from the drives' ($@): a drive still held (4, then 3)
+# first, then 6, 7, 5, 1, 0 -- the gravest that still asks something of the
+# operator.
+pair_status() {
+    local want rc
+    for want in 4 3 6 7 5 1; do
+        for rc in "$@"; do
+            if [[ "$rc" == "$want" ]]; then
+                printf '%s\n' "$want"
+                return 0
+            fi
+        done
+    done
+    for rc in "$@"; do
+        if [[ "$rc" != 0 && "$rc" != skipped ]]; then
+            printf '1\n'
+            return 0
+        fi
+    done
+    printf '0\n'
+}
+
+cmd_session_pair() {
+    local first=$1 second=$2 labels=() l rcs=() pids=() i rc kept=false flags=() cause_file="" why=()
+    require_root
+    command -v jq >/dev/null || refuse "jq is not installed: every session reads its boot record with it"
+    load_targets
+    for l in "$first" "$second"; do
+        resolve_label "$l"
+        labels+=("$LABEL")
+    done
+    if [[ "${labels[0]}" == "${labels[1]}" ]]; then
+        refuse "'$first' and '$second' are the same drive (${labels[0]})"
+    fi
+    LABEL="${labels[0]}+${labels[1]}"
+    [[ "$DRY_RUN" != true ]] || flags+=(--dry-run)
+    [[ "$UNATTENDED" != true ]] || flags+=(--unattended)
+    [[ "$ACCEPT_BOOT_RISK" != true ]] || flags+=(--accept-boot-record-risk)
+    [[ -z "$TIMEOUT_MIN" ]] || flags+=(--timeout "$TIMEOUT_MIN")
+    make_state_dir || refuse "cannot create $STATE_DIR"
+    take_lock
+    trap 'pair_on_exit' EXIT
+    # An interrupt reaches the drives' sessions themselves (they are in this
+    # process group); this one waits for them to end.
+    trap ':' INT TERM HUP
+    if [[ "$DRY_RUN" != true ]]; then
+        egress_add
+    fi
+    log "both drives, $PAIR_MODE: ${labels[0]}, then ${labels[1]}$([[ "$PAIR_MODE" == parallel ]] && printf ' -- at once')"
+    if [[ "$PAIR_MODE" == parallel ]]; then
+        for l in "${labels[@]}"; do
+            DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=parallel \
+                bash "$SELF" session "$l" "${flags[@]}" &
+            pids+=($!)
+        done
+        for i in 0 1; do
+            rc=0
+            while :; do
+                wait "${pids[$i]}" && rc=0 || rc=$?
+                # A wait cut short by a signal to this process: wait again.
+                kill -0 "${pids[$i]}" 2>/dev/null || break
+            done
+            rcs[i]=$rc
+        done
+    else
+        for i in 0 1; do
+            if ((i == 1)) && [[ "${rcs[0]}" == 5 ]]; then
+                pair_judge_causes "$cause_file"
+                if [[ -n "$PAIR_STOP" ]]; then
+                    rcs[1]=skipped
+                    why[1]="skipped: ${labels[0]} exited 5 -- $PAIR_STOP"
+                    warn "${labels[1]} is not started: ${labels[0]} exited 5 -- $PAIR_STOP -- and a fault of the host, the enclosure or the mechanism may meet the next drive too"
+                    break
+                fi
+                why[0]="exit 5, went on past: $PAIR_GO"
+                warn "${labels[0]} exited 5 on warnings of its own session only ($PAIR_GO): ${labels[1]} is started"
+            elif ((i == 1)) && [[ "${rcs[0]}" != 0 ]]; then
+                rcs[1]=skipped
+                why[1]="skipped: ${labels[0]} exited ${rcs[0]}"
+                warn "${labels[1]} is not started: ${labels[0]} exited ${rcs[0]}, and a bad update must not reach both drives"
+                break
+            fi
+            rc=0
+            cause_file="$STATE_DIR/${labels[$i]}.exit5"
+            rm -f -- "$cause_file"
+            DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=sequential \
+                DAS_RECOVERY_VM_CAUSE_FILE=$cause_file bash "$SELF" session "${labels[$i]}" "${flags[@]}" || rc=$?
+            rcs[i]=$rc
+        done
+        rm -f -- "$STATE_DIR/${labels[0]}.exit5" "$STATE_DIR/${labels[1]}.exit5"
+    fi
+    for i in 0 1; do
+        printf 'DRIVE %s %s\n' "${labels[$i]}" "${rcs[$i]}"
+        [[ "${rcs[$i]}" != 3 && "${rcs[$i]}" != 4 ]] || kept=true
+    done
+    printf 'Both drives -- %s, %s\n' "$LABEL" "$PAIR_MODE"
+    for i in 0 1; do
+        printf '  %-22s %s\n' "${labels[$i]}" "${why[$i]:-exit ${rcs[$i]}}"
+    done
+    PAIR_RCS=("${rcs[@]}")
+    PAIR_LABELS=("${labels[@]}")
+    PAIR_KEPT=$kept
+    PAIR_DONE=true
+    rc="$(pair_status "${rcs[@]}")"
+    exit "$rc"
+}
+
+# The end of a two-drive run, on every way out: the egress rule out unless a
+# drive's recovery OS may still run (a drive kept: session-end takes it out),
+# the lock released (a kept drive's holder holds it on).
+pair_on_exit() {
+    local rc=$? i
+    set +e
+    trap '' INT TERM HUP
+    if [[ "$EGRESS_OWNED" == true ]]; then
+        if [[ "$PAIR_DONE" == true && "$PAIR_KEPT" != true ]]; then
+            egress_remove
+        else
+            warn "the egress rule stays in place (from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY): a drive's session is left in place; session-end takes it out once no recovery OS runs"
+        fi
+    fi
+    release_lock
+    # A kept drive's holder holds the lock on: the record names it, as a
+    # single session's does.
+    for i in "${!PAIR_LABELS[@]}"; do
+        if [[ "${PAIR_RCS[$i]}" == 3 || "${PAIR_RCS[$i]}" == 4 ]] && read_record "$STATE_DIR/${PAIR_LABELS[$i]}.holder" &&
+            holder_alive "$REC_PID" "$REC_DEV"; then
+            LABEL=${PAIR_LABELS[$i]}
+            write_lock_record "$REC_PID"
+            break
+        fi
+    done
+    if [[ "$EGRESS_RESULT" == "NOT taken out"* && "$rc" == 0 ]]; then
+        rc=5
+    fi
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------------------
 # The EXIT trap of a session
 # ---------------------------------------------------------------------------
 on_exit() {
@@ -3044,7 +4469,7 @@ on_exit() {
                 check_guard final "$state"
             fi
             keep_session "${KEEP_REASON:-the driver stopped while the recovery OS is $state}" "$state"
-            exit 3
+            session_exit 3
         fi
         # It ran and is off: its report is judged before giving the disk back
         # takes the report away with the guard.
@@ -3054,18 +4479,18 @@ on_exit() {
     fi
     if ! return_disk; then
         keep_after_failure
-        exit 4
+        session_exit 4
     fi
     # Both ways to a destroy end here (a start that did not carry the guard,
     # and a session stopped while paused): the one place that says what it
     # means.
     if [[ "$DESTROYED" == true ]]; then
         warn "session for $LABEL ended; the disk is the host's again and nothing is held. $(never_ran_text)"
-        exit 1
+        session_exit 1
     fi
     if [[ "$GUARD_FAILED" == true && "$VERDICT" != no ]]; then
         warn "session for $LABEL ended early; the disk is the host's again and nothing is held -- but the session guard did not confirm on a \"$VERDICT\" record (${GUARD_RESULT#NOT confirmed: }): look at the recovery OS's journal for what ran (journalctl -b -1 inside it, at its next boot)"
-        exit 6
+        session_exit 6
     fi
     if [[ "$RESUME_ATTEMPTED" == true ]]; then
         log "session guard: $GUARD_RESULT"
@@ -3073,15 +4498,16 @@ on_exit() {
     log "session for $LABEL ended early; the disk is the host's again and nothing is held"
     # A guard that did not confirm on a "no" record: as a finished session.
     if [[ "$GUARD_FAILED" == true ]]; then
-        exit 5
+        session_exit 5
     fi
-    exit 1
+    session_exit 1
 }
 
 # ---------------------------------------------------------------------------
 # session
 # ---------------------------------------------------------------------------
 parse_session_args() {
+    local mode_given=""
     while (($#)); do
         case "$1" in
             --dry-run) DRY_RUN=true ;;
@@ -3092,15 +4518,40 @@ parse_session_args() {
                 shift
                 ;;
             --timeout=*) TIMEOUT_MIN=${1#*=} ;;
+            --unattended) UNATTENDED=true ;;
+            --mode)
+                (($# >= 2)) || usage
+                mode_given=$2
+                shift
+                ;;
+            --mode=*) mode_given=${1#*=} ;;
             -*) usage ;;
             *)
-                [[ -z "$TARGET_ARG" ]] || usage
-                TARGET_ARG=$1
+                if [[ -z "$TARGET_ARG" ]]; then
+                    TARGET_ARG=$1
+                elif [[ -z "$TARGET_ARG2" ]]; then
+                    TARGET_ARG2=$1
+                else
+                    usage
+                fi
                 ;;
         esac
         shift
     done
     [[ -n "$TARGET_ARG" ]] || usage
+    if [[ -n "$mode_given" ]]; then
+        if [[ -z "$TARGET_ARG2" ]]; then
+            printf 'recovery-os-vm.sh: --mode is for a session of two drives (session A B --mode sequential|parallel)\n' >&2
+            exit 2
+        fi
+        case "$mode_given" in
+            sequential | parallel) PAIR_MODE=$mode_given ;;
+            *)
+                printf 'recovery-os-vm.sh: --mode takes sequential or parallel\n' >&2
+                exit 2
+                ;;
+        esac
+    fi
     if [[ -n "$TIMEOUT_MIN" && ! "$TIMEOUT_MIN" =~ ^[123456789][[:digit:]]*$ ]]; then
         printf 'recovery-os-vm.sh: --timeout takes a whole number of minutes, at least 1\n' >&2
         exit 2
@@ -3108,6 +4559,35 @@ parse_session_args() {
     if [[ "$DRY_RUN" == true && -n "$TIMEOUT_MIN" ]]; then
         printf 'recovery-os-vm.sh: --timeout has no meaning with --dry-run (nothing is booted)\n' >&2
         exit 2
+    fi
+    # A drive's session of a two-drive run: its mode, and what the run holds.
+    case "${DAS_RECOVERY_VM_MODE:-}" in
+        "") ;;
+        sequential | parallel)
+            if [[ -n "$TARGET_ARG2" || -z "${DAS_RECOVERY_VM_LOCK_FD:-}" ]]; then
+                printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_MODE is set only by a two-drive run, for one drive, with its lock\n' >&2
+                exit 2
+            fi
+            RUN_MODE=$DAS_RECOVERY_VM_MODE
+            ;;
+        *)
+            printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_MODE takes sequential or parallel\n' >&2
+            exit 2
+            ;;
+    esac
+    if [[ -n "${DAS_RECOVERY_VM_EGRESS_HELD:-}" ]]; then
+        if [[ -z "${DAS_RECOVERY_VM_LOCK_FD:-}" ]]; then
+            printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_EGRESS_HELD is set only by a two-drive run\n' >&2
+            exit 2
+        fi
+        EGRESS_HELD=true
+    fi
+    if [[ -n "${DAS_RECOVERY_VM_CAUSE_FILE:-}" ]]; then
+        if [[ "$RUN_MODE" != sequential ]]; then
+            printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_CAUSE_FILE is set only by a sequential two-drive run\n' >&2
+            exit 2
+        fi
+        CAUSE_FILE=$DAS_RECOVERY_VM_CAUSE_FILE
     fi
 }
 
@@ -3174,15 +4654,59 @@ wait_for_poweroff() {
     done
 }
 
+# Why this session needs a look -- the causes of its exit 5 -- one word per
+# line, in the summary's order; nothing when there is none. The one list
+# both session_status and a sequential two-drive run read (bd 8249, decision
+# 9): the run goes on to its second drive only past causes that stayed in
+# this session (pair_judge_causes), so a new one is added here AND classified
+# there, or it stops the run.
+exit5_causes() {
+    ((HOLDER_LOSSES == 0)) || echo claim-lost
+    [[ "$REENUMERATED" != true ]] || echo reenumerated
+    if ((${#BOOT_OVERRIDES[@]} > 0)); then
+        if [[ "$DRY_RUN" == true ]]; then echo dry-run-override; else echo boot-override; fi
+    fi
+    [[ "$DRY_RUN" != true ]] || return 0
+    [[ "$GUARD_FAILED" != true ]] || echo guard-unconfirmed-no
+    [[ -z "$GUARD_LEFT" ]] || echo guard-left
+    ((${#UNMASKABLE[@]} == 0)) || echo unmaskable-units
+    ((SILENCES == 0)) || echo reporter-silent
+    [[ -z "$RESET_WATCH_DOWN" ]] || echo reset-watch-stopped
+    ((${#REPORT_LOSSES[@]} == 0)) || echo report-lines-lost
+    ((G_GAP_SECS == 0)) || echo clock-gap
+    [[ "$EGRESS_RESULT" != "NOT taken out"* ]] || echo egress-not-removed
+    [[ "$SCAN_RESULT" != FAILED* ]] || echo scan-failed
+    # A drive that re-enumerated is looked at under both names.
+    case "$MOUNT_RESULT" in
+        *"MOUNTED: "*) echo mounted-after ;;
+        *unknown*) echo mount-unknown ;;
+        "no partition mounted"*) ;;
+        *) echo mount-unknown ;;
+    esac
+}
+
+# A sequential two-drive run's drive: write its exit-5 causes ($1 its exit
+# status; none unless 5) where the run reads them. A file that cannot be
+# written is said: the run then finds none and stops, the cautious way.
+write_causes() {
+    local tmp
+    [[ -n "$CAUSE_FILE" ]] || return 0
+    tmp="$CAUSE_FILE.tmp.$$"
+    if ! { if [[ "$1" == 5 ]]; then exit5_causes; fi; } >"$tmp" 2>/dev/null || ! mv -f -- "$tmp" "$CAUSE_FILE"; then
+        rm -f -- "$tmp"
+        warn "could not write this session's exit-5 causes to $CAUSE_FILE: the two-drive run will not start the other drive"
+    fi
+}
+
 # 6 when the session guard did not confirm on a record that does not rule
 # btrbk out; 5 when a session ended, everything given back, but something
 # needs a look; else 0.
 session_status() {
     if [[ "$GUARD_FAILED" == true && "$VERDICT" != no ]]; then
         echo 6
-    elif [[ "$REENUMERATED" == true || "$MOUNT_RESULT" != "no partition mounted" || "$SCAN_RESULT" == FAILED* ]] ||
-        [[ "$GUARD_FAILED" == true || -n "$GUARD_LEFT" || -n "$RESET_WATCH_DOWN" ]] || ((${#UNMASKABLE[@]} > 0)) ||
-        ((HOLDER_LOSSES > 0 || ${#BOOT_OVERRIDES[@]} > 0 || SILENCES > 0 || ${#REPORT_LOSSES[@]} > 0 || G_GAP_SECS > 0)); then
+    elif [[ -n "$UNATTENDED_FAILED" ]]; then
+        echo 7
+    elif [[ -n "$(exit5_causes)" ]]; then
         echo 5
     else
         echo 0
@@ -3191,6 +4715,9 @@ session_status() {
 
 cmd_session() {
     parse_session_args "$@"
+    if [[ -n "$TARGET_ARG2" ]]; then
+        cmd_session_pair "$TARGET_ARG" "$TARGET_ARG2"
+    fi
     require_root
     # No fallback: a holder in the login session ends with it, taking the
     # claim and the lock while the VM may still use the disk.
@@ -3202,8 +4729,14 @@ cmd_session() {
     fi
     load_targets
     resolve_label "$TARGET_ARG"
+    if [[ "$RUN_MODE" != single ]]; then
+        LOG_PREFIX="[$LABEL] "
+    fi
     if [[ ! "$LABEL" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
+    fi
+    if [[ "$UNATTENDED" == true ]] && ! command -v base64 >/dev/null; then
+        refuse "base64 is not installed: an unattended session reads the guest agent's answers with it"
     fi
     check_boot_record
     build_guard
@@ -3220,7 +4753,7 @@ cmd_session() {
     check_not_mounted
     check_domain_idle
     check_no_live_holder
-    install -d -m 0700 -- "$STATE_DIR"
+    make_state_dir || refuse "cannot create $STATE_DIR"
 
     SESSION_START=$SECONDS
     trap on_exit EXIT
@@ -3229,6 +4762,16 @@ cmd_session() {
     trap 'exit 129' HUP
 
     take_lock
+    if [[ "$DRY_RUN" != true ]]; then
+        # From here every end of this session is written into the history.
+        SESSION_EPOCH=$(date +%s)
+        HISTORY_ARMED=true
+    fi
+    if [[ "$UNATTENDED" == true ]]; then
+        progress preflight ok "lock taken; unattended, $RUN_MODE"
+    else
+        progress preflight ok "lock taken; attended, $RUN_MODE"
+    fi
     if ! start_holder; then
         refuse "could not hold $DISK ($HOLDER_FAILURE)"
     fi
@@ -3247,6 +4790,7 @@ cmd_session() {
         log "dry run done: lock taken and released, holder started and stopped, nothing defined or attached"
         if ((${#BOOT_OVERRIDES[@]} > 0)); then
             warn "dry run: the boot-record check was overridden (--accept-boot-record-risk) -- exit 5"
+            write_causes 5
             exit 5
         fi
         exit 0
@@ -3258,30 +4802,37 @@ cmd_session() {
     if [[ "$(readlink -f -- "$DISK")" != "$DISK_DEV" ]]; then
         refuse "$DISK no longer leads to $DISK_DEV (the drive re-enumerated) -- start again"
     fi
-    # From here on the OS may change, so a record made before now no longer
-    # describes it. Recorded first, or not booted at all.
-    if ! record_session_time "$(date +%s)"; then
-        refuse "cannot record the start of this session ($SESSIONS_FAILURE): without it, the next session could trust a boot record made before this one -- not booting"
+    if [[ "$EGRESS_HELD" != true ]]; then
+        egress_add
     fi
+    progress start start "booting $DOMAIN from $DISK"
     start_guarded
+    progress start ok "the recovery OS is booting"
     log "the recovery OS is booting from $DISK"
-    log "console: virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN (its VNC is a libvirt-private socket; '$SELF screenshot <file.png>' works too)"
+    log "console: virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN (its VNC is a libvirt-private socket; '$SELF screenshot $LABEL <file.png>' works too)"
     log "serial console: virsh --connect $LIBVIRT_URI console $DOMAIN"
-    log "inside it, before updating: systemctl stop das-vm-guard; after: pacman -Qkk btrbk must find 0 altered files, then systemctl start das-vm-guard"
 
-    wait_for_poweroff
+    if [[ "$UNATTENDED" == true ]]; then
+        run_unattended
+    else
+        log "inside it, before updating: systemctl stop das-vm-guard; after: pacman -Qkk btrbk must find 0 altered files, then systemctl start das-vm-guard"
+        progress wait start "waiting for the recovery OS to power off"
+        wait_for_poweroff
+    fi
     # It may have reported between two looks, or never.
     check_guard off
 
     log "the recovery OS powered off after $(format_duration $((SECONDS - VM_START))) -- giving $DISK back to the host"
+    progress giveback start
     trap '' INT TERM HUP
     if ! return_disk; then
         keep_after_failure
         DONE=true
-        exit 4
+        session_exit 4
     fi
     DONE=true
-    local claim="held throughout" warnings=() w lines="" joined="" asked=""
+    progress giveback ok "detached; $HOLDER_RESULT; egress rule $EGRESS_RESULT"
+    local claim="held throughout" warnings=() w lines="" joined="" asked="" unattended_line=""
     if ((HOLDER_LOSSES > 0)) && [[ "$CLAIM_GAP" == true ]]; then
         claim="LOST $HOLDER_LOSSES time(s); NOT claimed again -- see the warnings above"
         warnings+=("the claim was lost and not taken again: until the recovery OS was off, nothing kept this host off the drive")
@@ -3321,22 +4872,34 @@ cmd_session() {
     if ((G_GAP_SECS > 0)); then
         warnings+=("$(format_duration "$G_GAP_SECS") passed in $(count_of "$G_GAPS" gap) between two looks at the recovery OS, and the guard's deadlines and its silence did not count it: a host suspend (the recovery OS did not run either), or this script stopped (a Ctrl-Z) -- and then the recovery OS ran that long unwatched, every deadline moved out by as much; its report was still read in full after the gap")
     fi
+    if [[ "$EGRESS_RESULT" == "NOT taken out"* ]]; then
+        warnings+=("the egress rule was $EGRESS_RESULT")
+    fi
     for w in "${warnings[@]}"; do
         lines+=$'\n'"  Warnings      $w"
         joined+="; $w"
     done
+    if [[ "$UNATTENDED" == true && -n "$UNATTENDED_FAILED" ]]; then
+        unattended_line=$'\n'"  Unattended    STOPPED at $UNATTENDED_FAILED -- the recovery OS was powered off; nothing after that step ran"
+        if [[ -n "$UNATTENDED_HALF" ]]; then
+            unattended_line+=$'\n'"  Unattended    WARNING: $UNATTENDED_HALF"
+        fi
+    elif [[ "$UNATTENDED" == true ]]; then
+        unattended_line=$'\n'"  Unattended    every step done; rebooted into kernel ${KERNEL:-unknown}"
+    fi
     cat <<EOF
 Session done -- $LABEL
   Disk          $DISK ($DISK_DEV)
-  VM ran        $(format_duration $((SECONDS - VM_START))); whole session $(format_duration $((SECONDS - SESSION_START)))
+  VM ran        $(format_duration $((SECONDS - VM_START))); whole session $(format_duration $((SECONDS - SESSION_START)))$unattended_line
   Guard         $GUARD_RESULT
   Claim         $claim
   Given back    detached; $HOLDER_RESULT; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
+  Egress rule   $EGRESS_RESULT
   Lock          released$lines
   Next          the next backup run reads the updated OS (RECOVERY OS in its report)
 EOF
-    logger -t "$LOG_TAG" -- "session for $LABEL done: guard $GUARD_RESULT; claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT$joined" || :
-    exit "$(session_status)"
+    logger -t "$LOG_TAG" -- "session for $LABEL done: guard $GUARD_RESULT; claim $claim; scan $SCAN_RESULT; $MOUNT_RESULT${UNATTENDED_FAILED:+; unattended update stopped at $UNATTENDED_FAILED}$joined" || :
+    session_exit "$(session_status)"
 }
 
 # ---------------------------------------------------------------------------
@@ -3362,8 +4925,18 @@ cmd_session_end() {
     if guard_in "$xml"; then
         GUARDED=true
     fi
+    # The egress rule is taken out once no recovery OS runs: this one is
+    # shut off; another drive's may still need it.
+    if [[ -e "$EGRESS_FILE" ]] && ! other_domain_running; then
+        EGRESS_OWNED=true
+    fi
     if [[ -z "$DISK" && ${#attached[@]} -eq 0 && "$GUARDED" != true && ! -e "$GUARD_STATE_FILE" ]]; then
+        stop_console_bridge
+        if [[ "$EGRESS_OWNED" == true ]]; then
+            egress_remove
+        fi
         log "nothing to end for $LABEL: no holder record, no disk attached to $DOMAIN and no session guard"
+        [[ "$EGRESS_RESULT" != "NOT taken out"* ]] || return 5
         return 0
     fi
     # The domain's definition changes only under the maintenance lock. This
@@ -3395,6 +4968,13 @@ cmd_session_end() {
         elif ((judged == 0)); then
             judged=5
         fi
+        stop_console_bridge
+        if [[ "$EGRESS_OWNED" == true ]]; then
+            egress_remove
+        fi
+        if [[ "$EGRESS_RESULT" == "NOT taken out"* ]] && ((judged == 0)); then
+            judged=5
+        fi
         release_lock
         exit "$judged"
     fi
@@ -3409,8 +4989,13 @@ cmd_session_end() {
     if ((${#attached[@]} > 0)); then
         ATTACHED=true
     fi
-    # Whatever ran may have written the filesystem: rescan it.
+    # Whatever ran may have written the filesystem: rescan it. And unless its
+    # state says it was never resumed, it may have changed the OS: record it.
     STARTED=true
+    RESUME_ATTEMPTED=true
+    if read_guard_state "$GUARD_STATE_FILE" && [[ -z "$GS_RESUMED" ]]; then
+        RESUME_ATTEMPTED=false
+    fi
     DISK_DEV="$(readlink -f -- "$DISK" 2>/dev/null)" || DISK_DEV=$DISK
     if ! return_disk; then
         keep_after_failure
@@ -3428,78 +5013,154 @@ cmd_session_end() {
 # ---------------------------------------------------------------------------
 # define, status, screenshot
 # ---------------------------------------------------------------------------
-cmd_define() {
-    local name loader template state xml sources out
-    require_root
-    [[ -r "$DOMAIN_XML" ]] || refuse "the domain definition $DOMAIN_XML is missing -- install the project (cmake --install) first"
-    name="$(xml_value "$NAME_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no domain"
-    if [[ "$name" != "$DOMAIN" ]]; then
-        refuse "$DOMAIN_XML defines '$name', not $DOMAIN"
+# The checks every domain definition must pass before define replaces it: it
+# is shut off, has no disk, and -- $2 "legacy" -- nothing else of a session or
+# of libvirt's own that a retirement would lose. $1 the domain. Prints
+# nothing; refuses.
+check_redefinable() {
+    local state xml sources out snaps
+    state="$(virsh_ domstate "$1" 2>&1)" || refuse "cannot read the state of $1: $state"
+    if [[ "$state" != "shut off" ]]; then
+        refuse "$1 is $state -- define replaces or retires only a shut-off domain"
     fi
-    loader="$(xml_value "$LOADER_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no firmware loader"
-    # libvirt creates the VM's variable store from this template at its first
-    # start, and keeps it afterwards; define never touches it.
-    template="$(xml_value "$TEMPLATE_RE" "$DOMAIN_XML")" || refuse "$DOMAIN_XML names no NVRAM template"
-    [[ -r "$TEST_ROOT$loader" ]] || refuse "the UEFI firmware $loader is not installed (Arch: edk2-ovmf) -- $DOMAIN_XML names it"
-    [[ -r "$TEST_ROOT$template" ]] || refuse "the UEFI variable template $template is not installed (Arch: edk2-ovmf)"
-    if virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
-        state="$(virsh_ domstate "$DOMAIN" 2>&1)" || refuse "cannot read the state of $DOMAIN: $state"
-        if [[ "$state" != "shut off" ]]; then
-            refuse "$DOMAIN is $state -- define replaces only a shut-off domain"
-        fi
-        xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $xml"
-        sources="$(disk_sources "$xml")"
-        if [[ -n "$sources" ]]; then
-            refuse "$DOMAIN has a disk attached (${sources//$'\n'/, }) -- a session was not ended: $SELF session-end <label>"
-        fi
-        log "updating $DOMAIN from $DOMAIN_XML"
-    else
-        log "defining $DOMAIN from $DOMAIN_XML"
+    xml="$(virsh_ dumpxml --inactive "$1" 2>&1)" || refuse "cannot read $1's definition: $xml"
+    sources="$(disk_sources "$xml")"
+    if [[ -n "$sources" ]]; then
+        refuse "$1 has a disk attached (${sources//$'\n'/, }) -- a session was not ended: $SELF session-end <label>"
     fi
-    out="$(virsh_ define --validate "$DOMAIN_XML" 2>&1)" || refuse "virsh define failed: $out"
-    log "$out"
-    if ! virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
-        refuse "virsh define reported success, but $DOMAIN is not defined"
+    [[ "${2:-}" == legacy ]] || return 0
+    if guard_in "$xml"; then
+        refuse "$1 still carries a session guard in its definition -- a session was not ended; end it with the release that started it, then run define again"
+    fi
+    out="$(virsh_ dominfo "$1" 2>&1)" || refuse "cannot read $1's information: $out"
+    if ! grep -Eq '^Managed save:[[:space:]]+no$' <<<"$out"; then
+        refuse "$1 has a managed-save image, or whether it has one cannot be told -- retiring it would throw that state away; that is your decision (virsh --connect $LIBVIRT_URI managedsave-remove $1), then run define again"
+    fi
+    snaps="$(virsh_ snapshot-list --name "$1" 2>&1)" || refuse "cannot list $1's snapshots: $snaps"
+    if [[ -n "${snaps//[[:space:]]/}" ]]; then
+        refuse "$1 has libvirt snapshots (${snaps//$'\n'/ }) -- define never retires a domain that has them; they are yours to keep or remove"
     fi
 }
 
-cmd_status() {
-    local state xml sources f any=false rc=0 saved=() names
+# Define one domain per role = "mirror" target from the template, and retire
+# the shared domain of before (recovery-os-updater) once nothing is lost by
+# it: shut off, no disk, no guard, no managed-save image, no snapshots. Every
+# check, of every domain, comes before the first change. Only these names are
+# ever touched: no other VM, and none of their snapshots, is read or changed.
+cmd_define() {
+    local label loader template labels=() name out ids=() id legacy=false
     require_root
+    [[ -r "$DOMAIN_TEMPLATE" ]] || refuse "the domain template $DOMAIN_TEMPLATE is missing -- install the project (cmake --install) first"
+    name="$(xml_value "$NAME_RE" "$DOMAIN_TEMPLATE")" || refuse "$DOMAIN_TEMPLATE names no domain"
+    if [[ "$name" != "$DOMAIN_BASE" ]]; then
+        refuse "$DOMAIN_TEMPLATE defines '$name', not $DOMAIN_BASE"
+    fi
+    loader="$(xml_value "$LOADER_RE" "$DOMAIN_TEMPLATE")" || refuse "$DOMAIN_TEMPLATE names no firmware loader"
+    # libvirt creates each VM's variable store from this template at its
+    # first start, and keeps it afterwards; define never touches it.
+    template="$(xml_value "$TEMPLATE_RE" "$DOMAIN_TEMPLATE")" || refuse "$DOMAIN_TEMPLATE names no NVRAM template"
+    [[ -r "$TEST_ROOT$loader" ]] || refuse "the UEFI firmware $loader is not installed (Arch: edk2-ovmf) -- $DOMAIN_TEMPLATE names it"
+    [[ -r "$TEST_ROOT$template" ]] || refuse "the UEFI variable template $template is not installed (Arch: edk2-ovmf)"
+    load_targets
+    for label in "${TARGET_LABELS[@]}"; do
+        [[ "${T_ROLE[$label]}" != mirror ]] || labels+=("$label")
+    done
+    ((${#labels[@]} > 0)) || refuse "$DAS_CONFIG has no role = \"mirror\" target: there is no recovery drive to define a domain for"
+    # Every check first.
+    for label in "${labels[@]}"; do
+        resolve_label "$label"
+        domain_identity "$label"
+        for id in "${ids[@]}"; do
+            if [[ "$id" == "$D_UUID" || "$id" == "$D_MAC" ]]; then
+                refuse "two recovery drives' domains would share an identity ($id) -- rename one target's label"
+            fi
+        done
+        ids+=("$D_UUID" "$D_MAC")
+        if virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
+            check_redefinable "$DOMAIN"
+        fi
+    done
+    if virsh_ dominfo "$LEGACY_DOMAIN" >/dev/null 2>&1; then
+        check_redefinable "$LEGACY_DOMAIN" legacy
+        legacy=true
+    fi
+    for label in "${labels[@]}"; do
+        resolve_label "$label"
+        render_domain_xml || refuse "$RENDER_FAILURE"
+        if virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
+            log "updating $DOMAIN (for $label) from $DOMAIN_TEMPLATE"
+        else
+            log "defining $DOMAIN (for $label) from $DOMAIN_TEMPLATE"
+        fi
+        out="$(virsh_ define --validate "$DOMAIN_XML" 2>&1)" || refuse "virsh define of $DOMAIN failed: $out"
+        log "$out"
+        if ! virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
+            refuse "virsh define reported success, but $DOMAIN is not defined"
+        fi
+        rm -f -- "$DOMAIN_XML"
+    done
+    if [[ "$legacy" == true ]]; then
+        # Its NVRAM goes with it: firmware state of that one VM, nothing of
+        # either drive's (each drive's own boot entries live on its ESP).
+        out="$(virsh_ undefine --nvram "$LEGACY_DOMAIN" 2>&1)" || refuse "could not retire the shared domain $LEGACY_DOMAIN: $out -- the per-drive domains are defined; run define again"
+        if virsh_ dominfo "$LEGACY_DOMAIN" >/dev/null 2>&1; then
+            refuse "virsh undefine reported success, but $LEGACY_DOMAIN is still defined"
+        fi
+        log "retired the shared domain $LEGACY_DOMAIN (one domain per recovery drive now): $out"
+    fi
+}
+
+# One drive's domain, as status shows it: its state, attached disk and
+# session guard (judged as session-end would, without removing anything).
+# Sets ST_RC to 6 (5 on a "no" record) when its guard is not engaged or
+# cannot be judged.
+status_of_domain() {
+    local state xml sources names
+    ST_RC=0
     state="$(current_state)"
-    printf 'Domain            %s: %s\n' "$DOMAIN" "$state"
+    printf 'Domain            %s (%s): %s\n' "$DOMAIN" "$LABEL" "$state"
     if xml="$(virsh_ dumpxml "$DOMAIN" 2>&1)"; then
         sources="$(disk_sources "$xml")"
-        printf 'Attached disk     %s\n' "${sources:-none}"
+        printf '  Attached disk   %s\n' "${sources:-none}"
     else
-        printf 'Attached disk     unknown (virsh: %s)\n' "$xml"
+        printf '  Attached disk   unknown (virsh: %s)\n' "$xml"
     fi
     if ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
         # Not defined at all is no guard; anything else cannot be told.
         if names="$(virsh_ list --all --name 2>&1)" && ! grep -qxF -- "$DOMAIN" <<<"$names"; then
-            printf 'Session guard     none (%s is not defined)\n' "$DOMAIN"
+            printf '  Session guard   none (%s is not defined: %s define)\n' "$DOMAIN" "$SELF"
         else
-            printf 'Session guard     unknown (virsh: %s)\n' "$xml"
-            rc=6
+            printf '  Session guard   unknown (virsh: %s)\n' "$xml"
+            ST_RC=6
         fi
     elif guard_in "$xml"; then
-        # Judged as session-end would, without removing anything.
-        shopt -s nullglob
-        saved=("$STATE_DIR"/*.guard.state)
-        shopt -u nullglob
-        if ((${#saved[@]} == 0)); then
-            printf 'Session guard     in the definition; cannot be judged: no session state for it (a session not ended, or a host restart cleared /run): session-end <label>\n'
-            rc=6
+        if [[ ! -e "$GUARD_STATE_FILE" ]]; then
+            printf '  Session guard   in the definition; cannot be judged: no session state for it (a session not ended, or a host restart cleared /run): session-end %s\n' "$LABEL"
+            ST_RC=6
+        else
+            judge_saved_guard "$GUARD_STATE_FILE" "$GUARD_FILE" "$state" "$RESET_FILE"
+            printf '  Session guard   in the definition; %s\n' "$GJ_TEXT"
+            ST_RC=$GJ_STATUS
         fi
-        for f in "${saved[@]}"; do
-            judge_saved_guard "$f" "${f%.state}" "$state" "${f%.guard.state}.resets"
-            printf 'Session guard     in the definition; %s\n' "$GJ_TEXT"
-            if ((GJ_STATUS > rc)); then
-                rc=$GJ_STATUS
-            fi
-        done
     else
-        printf 'Session guard     none\n'
+        printf '  Session guard   none\n'
+    fi
+}
+
+cmd_status() {
+    local f any=false rc=0 label
+    require_root
+    load_targets
+    for label in "${TARGET_LABELS[@]}"; do
+        [[ "${T_ROLE[$label]}" == mirror ]] || continue
+        resolve_label "$label"
+        status_of_domain
+        if ((ST_RC > rc)); then
+            rc=$ST_RC
+        fi
+    done
+    if virsh_ dominfo "$LEGACY_DOMAIN" >/dev/null 2>&1; then
+        printf 'Domain            %s: %s -- the shared domain of before; %s define retires it\n' "$LEGACY_DOMAIN" "$(DOMAIN=$LEGACY_DOMAIN current_state)" "$SELF"
     fi
     shopt -s nullglob
     for f in "$STATE_DIR"/*.holder; do
@@ -3518,14 +5179,17 @@ cmd_status() {
         printf 'Holder            none\n'
     fi
     printf 'Maintenance lock  %s\n' "$(lock_report)"
+    printf 'Egress rule       %s\n' "$(egress_report)"
     # 6 (5 on a "no" record) when a guard's report says it is not engaged, or
     # cannot be judged.
     return "$rc"
 }
 
 cmd_screenshot() {
-    local out=$1 state tmp err
+    local out=$2 state tmp err
     require_root
+    load_targets
+    resolve_label "$1"
     state="$(current_state)"
     if [[ "$state" != running ]]; then
         refuse "$DOMAIN is $state -- a screenshot needs it running"
@@ -3549,8 +5213,15 @@ cmd_screenshot() {
 check_knobs() {
     if [[ ! "$POLL_SECS" =~ ^[[:digit:]]+(\.[[:digit:]]+)?$ || ! "$POLL_SECS" =~ [123456789] || ! "$MINUTE_SECS" =~ ^[123456789][[:digit:]]*$ ||
         ! "$GRACE_SECS" =~ ^[123456789][[:digit:]]*$ || ! "$GUARD_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$RESEND_SECS" =~ ^[123456789][[:digit:]]{0,4}$ ||
-        ! "$CLOCK_GAP_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
-        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS and _CLOCK_GAP_SECS take numbers above 0\n' >&2
+        ! "$CLOCK_GAP_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$UPDATE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ||
+        ! "$AGENT_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$AGENT_GRACE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS and _AGENT_GRACE_SECS take numbers above 0\n' >&2
+        exit 2
+    fi
+    # It goes into a shell script in the recovery OS: letters, digits and
+    # spaces only.
+    if [[ ! "$EGRESS_ORG" =~ ^[${ASCII_LETTERS}[:digit:]][${ASCII_LETTERS}[:digit:]\ ]*$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_EGRESS_ORG takes letters, digits and spaces (an AS number: AS209)\n' >&2
         exit 2
     fi
     if [[ -n "$TEST_ROOT" ]]; then
@@ -3584,11 +5255,26 @@ main() {
             cmd_status
             ;;
         screenshot)
+            if (($# != 2)) || [[ -z "$1" || -z "$2" ]]; then usage; fi
+            cmd_screenshot "$1" "$2"
+            ;;
+        console-socket)
+            if (($# != 2)) || [[ -z "$1" || -z "$2" ]]; then usage; fi
+            cmd_console_socket "$1" "$2"
+            ;;
+        history)
+            (($# <= 1)) || usage
+            cmd_history "${1:-}"
+            ;;
+        clean-runs)
             if (($# != 1)) || [[ -z "$1" ]]; then usage; fi
-            cmd_screenshot "$1"
+            cmd_clean_runs "$1"
             ;;
         *) usage ;;
     esac
 }
 
-main "$@"
+# Sourced (the test suite's classifier checks): define, never run.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
