@@ -364,6 +364,10 @@ mod tests {
             assert_eq!(local, date_oracle(epoch));
             assert_eq!(local_epoch(&local), Some(epoch), "{local}");
         }
+        // mktime's -1 is its failure value: the one instant it cannot tell
+        // from a failure reads as None, and epoch 1 (not -1) is a plain Some.
+        assert_eq!(local_epoch(&local_datetime(1).unwrap()), Some(1));
+        assert_eq!(local_epoch(&local_datetime(-1).unwrap()), None);
         for bad in [
             "",
             "2026-10-08",

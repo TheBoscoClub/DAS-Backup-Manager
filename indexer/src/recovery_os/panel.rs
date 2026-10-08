@@ -1521,6 +1521,198 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_guest_agent_is_put_in_the_exact_words_the_gui_shows() {
+        assert_eq!(agent_words(&agent_at_boot()), "installed, enabled");
+        assert_eq!(
+            agent_words(&GuestAgent::Read {
+                installed: true,
+                enabled: false,
+                why: "x".into()
+            }),
+            "installed, not enabled"
+        );
+        assert_eq!(agent_words(&agent_not_installed()), "not installed");
+        assert_eq!(
+            agent_words(&GuestAgent::Unreadable {
+                reason: "no log".into()
+            }),
+            "unreadable: no log"
+        );
+        // And the sentence a refusal carries.
+        let target = mirror_target("system-recovery-A-2tb", Some(UUID_A));
+        let no_agent = stored_drive(agent_not_installed(), BootVerdict::May, Some(uuid_a()));
+        let state = state_v(4, &[("system-recovery-A-2tb", no_agent.clone())]);
+        assert!(
+            unattended_possible(&target, &state, Some(&no_agent))
+                .unwrap_err()
+                .contains("in system-recovery-A-2tb's OS (not installed);")
+        );
+    }
+
+    #[test]
+    fn a_pending_timer_is_due_now_exactly_when_its_next_elapse_is_not_after_now() {
+        let now = 1_791_500_000;
+        let service = UnitFacts {
+            exists: true,
+            active_state: "inactive".into(),
+            ..Default::default()
+        };
+        let pending = |next: i64| {
+            let timer = UnitFacts {
+                exists: true,
+                active_state: "active".into(),
+                next_elapse_epoch: Some(next),
+                ..Default::default()
+            };
+            schedule_state(&timer, &service, None, now)
+        };
+        let at = |epoch: i64| crate::caldate::local_datetime(epoch).unwrap();
+        // The sentence is pinned whole, local time included.
+        assert_eq!(
+            pending(now + 1).detail,
+            format!("The session will run unattended at {}.", at(now + 1))
+        );
+        assert_eq!(
+            pending(now).detail,
+            format!("The session will run unattended at {} (due now).", at(now))
+        );
+        assert_eq!(
+            pending(now - 1).detail,
+            format!(
+                "The session will run unattended at {} (due now).",
+                at(now - 1)
+            )
+        );
+        assert_eq!(pending(now).state, "pending");
+    }
+
+    #[test]
+    fn local_times_in_sentences_are_the_hosts_wall_clock() {
+        let service_running = UnitFacts {
+            exists: true,
+            active_state: "active".into(),
+            exec_main_start_epoch: Some(1_791_499_000),
+            ..Default::default()
+        };
+        let timer = UnitFacts::default();
+        let s = schedule_state(&timer, &service_running, None, 1_791_500_000);
+        assert_eq!(
+            s.detail,
+            format!(
+                "The scheduled session is running since {}.",
+                crate::caldate::local_datetime(1_791_499_000).unwrap()
+            )
+        );
+        let fired = UnitFacts {
+            exists: true,
+            active_state: "active".into(),
+            last_trigger_epoch: Some(1_791_490_000),
+            ..Default::default()
+        };
+        let idle = UnitFacts {
+            exists: true,
+            active_state: "inactive".into(),
+            ..Default::default()
+        };
+        let s = schedule_state(&fired, &idle, None, 1_791_500_000);
+        assert!(
+            s.detail.contains(&format!(
+                "(fired at {};",
+                crate::caldate::local_datetime(1_791_490_000).unwrap()
+            )),
+            "{}",
+            s.detail
+        );
+        // No local time to give: the epoch itself.
+        assert_eq!(local_words(i64::MAX), format!("epoch {}", i64::MAX));
+    }
+
+    #[test]
+    fn a_timer_that_never_fired_says_why_by_its_own_state() {
+        let idle = UnitFacts {
+            exists: true,
+            active_state: "inactive".into(),
+            ..Default::default()
+        };
+        let with = |state: &str| {
+            let timer = UnitFacts {
+                exists: true,
+                active_state: state.into(),
+                on_calendar: Some("2026-10-08 03:00:00".into()),
+                ..Default::default()
+            };
+            let s = schedule_state(&timer, &idle, None, 1_791_500_000);
+            assert_eq!(s.state, "missed");
+            s.detail
+        };
+        assert_eq!(
+            with("active"),
+            "The time 2026-10-08 03:00:00 passed without the timer firing (the host was off, or asleep); it will not run until it is scheduled again."
+        );
+        assert_eq!(
+            with("inactive"),
+            "The timer for 2026-10-08 03:00:00 is inactive and never fired; it will not run until it is scheduled again."
+        );
+        assert_eq!(
+            with(""),
+            "The timer for 2026-10-08 03:00:00 is in a state systemctl did not name and never fired; it will not run until it is scheduled again."
+        );
+    }
+
+    #[test]
+    fn a_label_that_cannot_name_a_unit_is_refused_on_either_count_alone() {
+        let mut cfg = two_mirrors_and_a_primary();
+        // Both are configured mirrors, so the request itself is valid; only
+        // the unit-name rule can refuse them.
+        cfg.targets.push(mirror_target("both", Some(UUID_A)));
+        cfg.targets.push(mirror_target("has space", Some(UUID_A)));
+        let state = state_v(4, &[]);
+        let now = 1_791_500_000;
+        for label in ["both", "has space"] {
+            let err = validate_schedule(
+                &cfg,
+                &state,
+                &[label.to_string()],
+                now + 600,
+                None,
+                now,
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("cannot name a schedule unit"),
+                "{label}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_running_schedule_service_is_the_one_named() {
+        let a = "system-recovery-A-2tb";
+        let own = format!("{UNIT_PREFIX}{a}.service");
+        let pair = format!("{UNIT_PREFIX}both.service");
+        let running = |state: &str| {
+            Ok(UnitFacts {
+                exists: true,
+                active_state: state.into(),
+                exec_main_start_epoch: Some(1_791_499_000),
+                ..Default::default()
+            })
+        };
+        let mut reads = Scripted::default();
+        reads.units.insert(own.clone(), running("active"));
+        reads.units.insert(pair.clone(), running("activating"));
+        let (s, err) = session_of(a, None, None, &reads);
+        assert_eq!(err, None);
+        assert_eq!(s.unwrap().by, format!("unit:{own}"));
+        // Only the pair's running: that one.
+        let mut reads = Scripted::default();
+        reads.units.insert(pair.clone(), running("active"));
+        let (s, _) = session_of(a, None, None, &reads);
+        assert_eq!(s.unwrap().by, format!("unit:{pair}"));
+    }
+
+    #[test]
     fn status_fills_schedules_and_sessions_from_units_jobs_and_the_lock() {
         let cfg = two_mirrors_and_a_primary();
         let a_base = format!("{UNIT_PREFIX}system-recovery-A-2tb");
