@@ -9,7 +9,7 @@
 //! Run:   activated on-demand by D-Bus (see `org.dasbackup.Helper1.service`)
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::signal::unix::{SignalKind, signal};
@@ -32,6 +32,7 @@ use buttered_dasd::mount;
 use buttered_dasd::progress::{
     self, LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
 };
+use buttered_dasd::recovery_os::{self, panel, session};
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
 use buttered_dasd::subvol;
@@ -41,15 +42,17 @@ use buttered_dasd::subvol;
 // ---------------------------------------------------------------------------
 
 /// Live jobs, keyed by id: `(task handle, the job's progress queue, owning
-/// D-Bus sender)`. The queue is also how a job is cancelled
-/// (`OrderedProgress::cancel`).
+/// D-Bus sender, kind)`. The queue is also how a job is cancelled
+/// (`OrderedProgress::cancel`). The kind (`"backup"`, `"index"`,
+/// `"restore"`, [`SESSION_KIND`]) is how a second recovery-OS session is
+/// refused while one runs (`session_busy`).
 ///
 /// The sender is what makes `job_cancel` authorizable. Without it the map held
 /// no notion of ownership at all, so a polkit check for
 /// `org.dasbackup.backup` — a question about the CALLER, not about the JOB —
 /// was the only gate, and any authorized caller could abort anyone's in-flight
 /// backup or restore (bd DAS-Backup-Manager-h2s).
-type JobEntry = (JoinHandle<()>, Arc<OrderedProgress>, String);
+type JobEntry = (JoinHandle<()>, Arc<OrderedProgress>, String, &'static str);
 type JobMap = Arc<Mutex<HashMap<String, JobEntry>>>;
 
 /// Cache of IndexStats JSON keyed by DB path.  Cold COUNT(*) on a 13.7M-row
@@ -310,6 +313,211 @@ fn canonical_db_path() -> Result<String, fdo::Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery-OS sessions (bd DAS-Backup-Manager-8249 stage 2)
+// ---------------------------------------------------------------------------
+
+/// The `JobMap` kind of a `RecoveryOsSession` job.
+const SESSION_KIND: &str = "recovery-os-session";
+
+/// The scheduled-session services a session must not overlap: one per
+/// `role = "mirror"` target, and the one that runs both.
+fn update_unit_names(cfg: &Config) -> Vec<String> {
+    cfg.targets
+        .iter()
+        .filter(|t| t.role == buttered_dasd::config::TargetRole::Mirror)
+        .map(|t| format!("das-recovery-os-update-{}.service", t.label))
+        .chain(std::iter::once(
+            "das-recovery-os-update-both.service".to_string(),
+        ))
+        .collect()
+}
+
+/// Why a new session must not start, naming what already runs: a session
+/// job (`jobs` are `(id, kind)`), or a scheduled-session service whose
+/// `ActiveState` (`units` are `(unit, state)`) is anything but `inactive` or
+/// `failed`. `None`: nothing in the way.
+fn session_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String> {
+    if let Some((id, _)) = jobs.iter().find(|(_, kind)| *kind == SESSION_KIND) {
+        return Some(format!(
+            "a recovery-OS session is already running as job {id}"
+        ));
+    }
+    units
+        .iter()
+        .find(|(_, state)| !matches!(*state, "inactive" | "failed"))
+        .map(|(unit, state)| {
+            format!("a scheduled recovery-OS session is running: {unit} ({state})")
+        })
+}
+
+/// Each unit's `ActiveState`, from `systemctl show -P ActiveState`. A
+/// systemctl that cannot answer is an error, never "inactive": a session
+/// started over a running scheduled one would contend for its drive.
+fn read_active_states(units: &[String]) -> Result<Vec<(String, String)>, String> {
+    units
+        .iter()
+        .map(|unit| {
+            let out = std::process::Command::new("systemctl")
+                .args(["show", "-P", "ActiveState", unit])
+                .env("LC_ALL", "C")
+                .output()
+                .map_err(|e| format!("Cannot ask systemctl for {unit}'s state: {e}"))?;
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !out.status.success() || state.is_empty() {
+                return Err(format!(
+                    "Cannot read {unit}'s state from systemctl ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok((unit.clone(), state))
+        })
+        .collect()
+}
+
+/// What a script run that failed said: its stderr, else its stdout, else
+/// its exit status.
+fn script_failure(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("{} ended with {}", session::SCRIPT, out.status)
+}
+
+/// `recovery-os-vm.sh clean-runs <label>`: its stdout is the count and
+/// nothing else. Anything else is an error, never 0.
+fn clean_runs_from(out: &std::process::Output) -> Result<u32, String> {
+    if !out.status.success() {
+        return Err(script_failure(out));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse::<u32>()
+        .map_err(|e| format!("The clean-run count {:?} is not a number: {e}", text.trim()))
+}
+
+/// `recovery-os-vm.sh history <label>`: one JSON object per line. A line
+/// that does not parse fails the whole read, never a shorter list.
+fn history_from(out: &std::process::Output) -> Result<Vec<serde_json::Value>, String> {
+    if !out.status.success() {
+        return Err(script_failure(out));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .enumerate()
+        .map(|(n, line)| {
+            serde_json::from_str(line)
+                .map_err(|e| format!("History line {} is not JSON: {e}", n + 1))
+        })
+        .collect()
+}
+
+/// `recovery-os-vm.sh console-socket <label> <uid>`: on success its stdout
+/// is exactly one absolute path; on failure its refusal is the error.
+fn console_path_from(out: &std::process::Output) -> Result<String, String> {
+    if !out.status.success() {
+        return Err(script_failure(out));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    match lines.as_slice() {
+        [path] if path.starts_with('/') => Ok((*path).to_string()),
+        _ => Err(format!(
+            "The console socket was not named: the script printed {:?}",
+            text.trim()
+        )),
+    }
+}
+
+/// The last `n` lines of `text`, in order, joined by `\n`.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// `recovery-os-vm.sh <args>` with stdout and stderr separate.
+fn run_script(script: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    session::script_command(script, &args)
+        .output()
+        .map_err(|e| format!("Cannot run {}: {e}", script.display()))
+}
+
+/// `recovery-os-vm.sh <args>` with stdout and stderr on one pipe, so its
+/// lines keep the order the script wrote them in.
+fn run_script_merged(
+    script: &Path,
+    args: &[String],
+) -> Result<(std::process::ExitStatus, String), String> {
+    use std::io::Read;
+    let cannot = |e: std::io::Error| format!("Cannot run {}: {e}", script.display());
+    let (mut reader, writer) = std::io::pipe().map_err(cannot)?;
+    let mut child = {
+        // The command holds both write ends; it goes out of scope here so
+        // the read below sees end-of-file when the script exits.
+        let mut cmd = session::script_command(script, args);
+        cmd.stdout(writer.try_clone().map_err(cannot)?)
+            .stderr(writer);
+        cmd.spawn().map_err(cannot)?
+    };
+    let mut buf = Vec::new();
+    let read = reader.read_to_end(&mut buf);
+    let status = child.wait().map_err(cannot)?;
+    read.map_err(cannot)?;
+    Ok((status, String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// The panel's system reads: the installed script, `virsh`, the
+/// maintenance lock.
+struct SystemPanelReads {
+    script: PathBuf,
+}
+
+impl panel::PanelReads for SystemPanelReads {
+    fn clean_runs(&self, label: &str) -> Result<u32, String> {
+        clean_runs_from(&run_script(&self.script, &["clean-runs", label])?)
+    }
+
+    fn history(&self, label: &str) -> Result<Vec<serde_json::Value>, String> {
+        history_from(&run_script(&self.script, &["history", label])?)
+    }
+
+    fn unit(&self, _name: &str) -> Result<panel::UnitFacts, String> {
+        // Scheduled sessions arrive with RecoveryOsScheduleSet (Task 6); until
+        // then there is nothing to read, and no fabricated facts either.
+        Err("not read until schedules exist".into())
+    }
+
+    fn domain_state(&self, label: &str) -> Option<String> {
+        let out = std::process::Command::new("virsh")
+            .args(["domstate", &format!("recovery-os-updater-{label}")])
+            .env("LC_ALL", "C")
+            .output()
+            .ok()?;
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !state.is_empty()).then_some(state)
+    }
+
+    fn lock_holder(&self) -> Option<String> {
+        let path = Path::new(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH);
+        match buttered_dasd::scrub::FileLock::try_acquire(path) {
+            // Free: the probe's own hold ends as it drops.
+            Ok(Some(_probe)) => None,
+            Ok(None) => Some(maintenance::holder_of(path)),
+            // Never "free" on a lock that could not be checked.
+            Err(e) => Some(format!(
+                "unknown: the maintenance lock cannot be checked: {e}"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // D-Bus interface
 // ---------------------------------------------------------------------------
 
@@ -419,7 +627,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "backup"));
         Ok(job_id)
     }
 
@@ -463,7 +671,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "index"));
         Ok(job_id)
     }
 
@@ -806,7 +1014,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "restore"));
         Ok(job_id)
     }
 
@@ -855,7 +1063,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "restore"));
         Ok(job_id)
     }
 
@@ -1211,6 +1419,172 @@ impl HelperInterface {
         json_str.map_err(fdo::Error::Failed)
     }
 
+    /// The recovery-drive panel's document (bd DAS-Backup-Manager-8249).
+    async fn recovery_os_status(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
+        let config = load_config()?;
+        tokio::task::spawn_blocking(move || {
+            let state = recovery_os::load_state(&recovery_os::state_path());
+            let host = recovery_os::host_versions();
+            let today = buttered_dasd::caldate::today();
+            let reads = SystemPanelReads {
+                script: PathBuf::from(session::SCRIPT),
+            };
+            panel::status_json(&config, &state, &host, &today, &reads).to_string()
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The recovery-OS status task panicked: {e}")))
+    }
+
+    /// Start a recovery-OS session (`recovery-os-vm.sh session …`) as a job;
+    /// returns its id. `mode` is `sequential`, `parallel`, or empty for none
+    /// (one drive, or the script's choice for two). Refused before the script
+    /// starts while another session job or a scheduled-session service runs,
+    /// naming it. `JobCancel` is the only way to stop it: it sends SIGINT to
+    /// the script's process group once. In `--mode parallel` that does not
+    /// yet stop the drive sessions themselves — a script defect, bd
+    /// DAS-Backup-Manager-c8lf — so a cancelled parallel run goes on to its
+    /// own end; parallel is not refused for it.
+    async fn recovery_os_session(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        labels: Vec<String>,
+        unattended: bool,
+        mode: &str,
+        accept_boot_record_risk: bool,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let config = load_config()?;
+        // An `as` argument cannot say "not specified": an empty list is a
+        // selection of nothing, and validate refuses it.
+        let req = session::SessionRequest {
+            labels,
+            unattended,
+            mode: (!mode.is_empty()).then(|| mode.to_string()),
+            accept_boot_record_risk,
+        };
+        req.validate(&config).map_err(fdo::Error::InvalidArgs)?;
+
+        let units = update_unit_names(&config);
+        let states = tokio::task::spawn_blocking(move || read_active_states(&units))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
+            .map_err(fdo::Error::Failed)?;
+
+        // Held from the check to the insert, so two calls cannot both pass.
+        let mut jobs_guard = self.jobs.lock().await;
+        let running: Vec<(&str, &str)> = jobs_guard
+            .iter()
+            .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
+            .collect();
+        let unit_states: Vec<(&str, &str)> = states
+            .iter()
+            .map(|(u, s)| (u.as_str(), s.as_str()))
+            .collect();
+        if let Some(why) = session_busy(&running, &unit_states) {
+            return Err(fdo::Error::Failed(why));
+        }
+
+        let job_id = new_job_id();
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
+        let finisher = progress.clone();
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+
+        let handle = tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                session::run_session(
+                    &session::SystemSpawner,
+                    Path::new(session::SCRIPT),
+                    &config,
+                    &req,
+                    &*progress,
+                )
+            })
+            .await;
+            let (success, summary) = match result {
+                // Exit 0 only; exit 5 is `false`, "warnings: …".
+                Ok(Ok(out)) => (out.success(), out.summary()),
+                Ok(Err(e)) => (false, e),
+                Err(e) => (false, format!("The recovery-OS session task panicked: {e}")),
+            };
+            finish_job(finisher, success, summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        jobs_guard.insert(
+            job_id.clone(),
+            (handle, cancel, sender.clone(), SESSION_KIND),
+        );
+        Ok(job_id)
+    }
+
+    /// End a drive's session (`recovery-os-vm.sh session-end <label>`):
+    /// `(exit 0, the script's last lines)`.
+    async fn recovery_os_session_end(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+    ) -> fdo::Result<(bool, String)> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let label = configured_mirror_label(label)?;
+        let (status, text) = tokio::task::spawn_blocking(move || {
+            run_script_merged(
+                Path::new(session::SCRIPT),
+                &["session-end".to_string(), label],
+            )
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The session-end task panicked: {e}")))?
+        .map_err(fdo::Error::Failed)?;
+        Ok((status.success(), last_lines(&text, 12)))
+    }
+
+    /// The VNC socket of a drive's running session, made reachable by the
+    /// CALLER's uid (`recovery-os-vm.sh console-socket <label> <uid>`).
+    async fn recovery_os_console(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let label = configured_mirror_label(label)?;
+        // The caller's uid, from the bus; a failed lookup is an error, never
+        // uid 0.
+        let no_uid = |e: String| fdo::Error::Failed(format!("Cannot name the caller's uid: {e}"));
+        let bus_name =
+            zbus::names::BusName::try_from(sender.as_str()).map_err(|e| no_uid(e.to_string()))?;
+        let uid = fdo::DBusProxy::new(&self.conn)
+            .await
+            .map_err(|e| no_uid(e.to_string()))?
+            .get_connection_unix_user(bus_name)
+            .await
+            .map_err(|e| no_uid(e.to_string()))?;
+
+        tokio::task::spawn_blocking(move || {
+            let uid = uid.to_string();
+            run_script(
+                Path::new(session::SCRIPT),
+                &["console-socket", &label, &uid],
+            )
+            .and_then(|out| console_path_from(&out))
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The console task panicked: {e}")))?
+        .map_err(fdo::Error::Failed)
+    }
+
     /// Cancel a running job.
     async fn job_cancel(
         &self,
@@ -1225,7 +1599,7 @@ impl HelperInterface {
         // question about the caller. Check both.
         match jobs.get(job_id) {
             None => Ok(false),
-            Some((_, _, owner)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
+            Some((_, _, owner, _)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
                 "Job '{job_id}' belongs to another client"
             ))),
             // The task is NOT aborted: that only stopped the job from ever
@@ -1240,7 +1614,7 @@ impl HelperInterface {
             // "cancelled …", when it stopped early; its real outcome, saying
             // the cancel came too late, when nothing was left to stop
             // (bd DAS-Backup-Manager-yq2).
-            Some((_, progress, _)) => {
+            Some((_, progress, _, _)) => {
                 progress.cancel();
                 Ok(true)
             }
@@ -1474,6 +1848,21 @@ fn restore_snapshot_job(
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// `label` if the configuration lists it as a `role = "mirror"` target, by
+/// the session request's own rule; refused (`InvalidArgs`) otherwise, before
+/// anything reaches the script.
+fn configured_mirror_label(label: &str) -> fdo::Result<String> {
+    let req = session::SessionRequest {
+        labels: vec![label.to_string()],
+        unattended: false,
+        mode: None,
+        accept_boot_record_risk: false,
+    };
+    req.validate(&load_config()?)
+        .map_err(fdo::Error::InvalidArgs)?;
+    Ok(label.to_string())
+}
+
 /// Extract the sender bus name from a D-Bus message header.
 fn sender_from_header(header: &zbus::message::Header<'_>) -> Result<String, fdo::Error> {
     header
@@ -1653,7 +2042,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut active_jobs = jobs.lock().await;
         let entries: Vec<(String, JobEntry)> = active_jobs.drain().collect();
-        for (id, (handle, progress, _owner)) in entries {
+        for (id, (handle, progress, _owner, _kind)) in entries {
             eprintln!("btrdasd-helper: cancelling job {id}");
             progress.cancel();
             handle.abort();
@@ -1667,6 +2056,134 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- recovery-OS methods (bd DAS-Backup-Manager-8249 stage 2)
+
+    #[test]
+    fn the_recovery_os_methods_check_polkit_with_the_recovery_os_action() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        for m in [
+            "async fn recovery_os_session(",
+            "async fn recovery_os_session_end(",
+            "async fn recovery_os_console(",
+        ] {
+            let at = body.find(m).unwrap_or_else(|| panic!("{m} missing"));
+            let after = &body[at..at + 1200];
+            assert!(
+                after.contains("check_polkit(&self.conn, &sender, \"org.dasbackup.recovery-os\")"),
+                "{m} does not check org.dasbackup.recovery-os"
+            );
+        }
+        let at = body.find("async fn recovery_os_status(").unwrap();
+        assert!(body[at..at + 600].contains("\"org.dasbackup.health\""));
+    }
+
+    #[test]
+    fn a_second_session_job_is_refused_naming_the_first() {
+        assert_eq!(session_busy(&[("job-1", "backup")], &[]), None);
+        assert_eq!(
+            session_busy(&[("job-2", "recovery-os-session")], &[]).unwrap(),
+            "a recovery-OS session is already running as job job-2"
+        );
+        assert_eq!(
+            session_busy(
+                &[],
+                &[("das-recovery-os-update-both.service", "activating")]
+            )
+            .unwrap(),
+            "a scheduled recovery-OS session is running: das-recovery-os-update-both.service (activating)"
+        );
+        assert_eq!(
+            session_busy(
+                &[],
+                &[(
+                    "das-recovery-os-update-system-recovery-A-2tb.service",
+                    "inactive"
+                )]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_polkit_policy_declares_the_recovery_os_action_as_auth_admin_keep() {
+        let policy = include_str!("../../../polkit/org.dasbackup.policy");
+        let at = policy
+            .find("action id=\"org.dasbackup.recovery-os\"")
+            .expect("action declared");
+        let block = &policy[at..policy[at..].find("</action>").unwrap() + at];
+        assert!(
+            block.contains("<allow_any>no</allow_any>")
+                && block.contains("<allow_active>auth_admin_keep</allow_active>"),
+            "{block}"
+        );
+    }
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn clean_runs_is_a_count_or_an_error_never_zero_by_default() {
+        assert_eq!(clean_runs_from(&output(0, "3\n", "")), Ok(3));
+        for bad in [
+            output(0, "", ""),
+            output(0, "three\n", ""),
+            output(0, "-1\n", ""),
+            output(2, "0\n", "no such drive"),
+        ] {
+            assert!(clean_runs_from(&bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            clean_runs_from(&output(2, "", "no such drive\n")),
+            Err("no such drive".to_string())
+        );
+    }
+
+    #[test]
+    fn history_is_every_line_as_json_or_an_error_never_a_partial_list() {
+        let got = history_from(&output(0, "{\"a\":1}\n{\"b\":2}\n", "")).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(history_from(&output(0, "", "")), Ok(vec![]));
+        assert!(history_from(&output(0, "{\"a\":1}\nnot json\n", "")).is_err());
+        assert!(history_from(&output(1, "{\"a\":1}\n", "cannot read")).is_err());
+    }
+
+    #[test]
+    fn the_console_socket_is_one_path_or_the_scripts_refusal() {
+        assert_eq!(
+            console_path_from(&output(0, "/run/das-recovery-os/A/vnc.sock\n", "")),
+            Ok("/run/das-recovery-os/A/vnc.sock".to_string())
+        );
+        assert_eq!(
+            console_path_from(&output(3, "", "no session is running for A\n")),
+            Err("no session is running for A".to_string())
+        );
+        for bad in [
+            output(0, "", ""),
+            output(0, "/a\n/b\n", ""),
+            output(0, "relative\n", ""),
+        ] {
+            assert!(console_path_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn last_lines_keeps_the_tail_in_order() {
+        let text: String = (1..=15).map(|n| format!("line {n}\n")).collect();
+        let got = last_lines(&text, 12);
+        assert!(
+            got.starts_with("line 4\n") && got.ends_with("line 15"),
+            "{got}"
+        );
+        assert_eq!(last_lines("", 12), "");
+    }
 
     #[test]
     fn a_step_value_that_is_not_a_boolean_reaches_the_library_as_none() {
