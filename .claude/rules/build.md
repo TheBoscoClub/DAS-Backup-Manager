@@ -5,14 +5,14 @@ Policy: `~/.claude/rules/development-tools.md`. Canonical locations here:
 - **Version**: `CMakeLists.txt` `project(VERSION ...)`; Rust from `Cargo.toml`; GUI via `target_compile_definitions(BTRDASD_VERSION="${CMAKE_PROJECT_VERSION}")`.
 - **btrbk config**: `/etc/btrbk/btrbk.conf` (canonical); `/etc/das-backup/btrbk.conf` is a symlink; `/usr/lib/das-backup/config/btrbk.conf` is a reference template only.
 - **Binaries**: cmake installs to `/usr/bin/` and `/usr/libexec/`; symlinks only if other paths need them.
-- **Build artifacts**: `cmake --build build` only (uses `build/cargo-target/`).
+- **Build artifacts**: `cmake --build build` only (uses `build/cargo-target/`); never bare `cargo build`.
 
 ## C++20 Standards
 - Use concepts, ranges, std::format, designated initializers; `std::filesystem` for all paths
 - `-Wall -Wextra -Wpedantic -Werror`
 
 ## CMake
-- Minimum 3.25 (Qt6 support); host 4.4.4. ECM for KDE integration
+- Minimum 3.25 (Qt6 support); host 4.4.4; ECM for KDE integration
 - `target_link_libraries` with correct PRIVATE/PUBLIC
 - RelWithDebInfo for dev, Release for install
 

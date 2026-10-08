@@ -26,7 +26,7 @@ cmake --build build
 cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 ```
 
-## Detailed Rules (`.claude/rules/`)
+## Detailed Rules
 
 - `esp-safety.md` — **CRITICAL** — DAS ESP partition safety (never sync host ESP onto DAS drives)
 - `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
