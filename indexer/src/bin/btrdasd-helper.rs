@@ -350,6 +350,26 @@ fn session_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String>
         })
 }
 
+/// Why `session-end` must not run now: any live session job, whichever drive
+/// it holds (a pair job holds both). The script's own `session-end` refuses
+/// only a domain that is not shut off and skips its lock while the session's
+/// holder lives — and a running session spends time shut off with its holder
+/// alive (before start, and while giving the disk back), so ending it then
+/// would pull the disk, guard and holder from under the running script.
+fn session_end_busy(jobs: &[(&str, &str)]) -> Option<String> {
+    session_busy(jobs, &[])
+}
+
+/// The polkit action `JobCancel` checks for a job of `kind`: the one that
+/// authorized starting it.
+fn cancel_action(kind: &str) -> &'static str {
+    if kind == SESSION_KIND {
+        "org.dasbackup.recovery-os"
+    } else {
+        "org.dasbackup.backup"
+    }
+}
+
 /// Each unit's `ActiveState`, from `systemctl show -P ActiveState`. A
 /// systemctl that cannot answer is an error, never "inactive": a session
 /// started over a running scheduled one would contend for its drive.
@@ -1537,6 +1557,16 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
 
         let label = configured_mirror_label(label)?;
+        {
+            let jobs = self.jobs.lock().await;
+            let running: Vec<(&str, &str)> = jobs
+                .iter()
+                .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
+                .collect();
+            if let Some(why) = session_end_busy(&running) {
+                return Err(fdo::Error::Failed(why));
+            }
+        }
         let (status, text) = tokio::task::spawn_blocking(move || {
             run_script_merged(
                 Path::new(session::SCRIPT),
@@ -1592,7 +1622,15 @@ impl HelperInterface {
         job_id: &str,
     ) -> fdo::Result<bool> {
         let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+        // The action that authorized starting a job of this kind; an unknown
+        // id is checked as a backup job, as before.
+        let kind = self
+            .jobs
+            .lock()
+            .await
+            .get(job_id)
+            .map_or("", |(_, _, _, kind)| *kind);
+        check_polkit(&self.conn, &sender, cancel_action(kind)).await?;
 
         let jobs = self.jobs.lock().await;
         // Ownership is a property of the JOB, and polkit only answered a
@@ -2077,6 +2115,65 @@ mod tests {
         }
         let at = body.find("async fn recovery_os_status(").unwrap();
         assert!(body[at..at + 600].contains("\"org.dasbackup.health\""));
+    }
+
+    /// The body of `async fn <name>(`, up to the next method.
+    fn method_body<'a>(body: &'a str, name: &str) -> &'a str {
+        let at = body
+            .find(&format!("async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let end = body[at + 1..]
+            .find("async fn ")
+            .map_or(body.len(), |n| at + 1 + n);
+        &body[at..end]
+    }
+
+    #[test]
+    fn session_end_is_refused_while_any_session_job_runs() {
+        assert_eq!(session_end_busy(&[("job-1", "backup")]), None);
+        assert_eq!(session_end_busy(&[]), None);
+        assert_eq!(
+            session_end_busy(&[("job-1", "restore"), ("job-3", "recovery-os-session")]).unwrap(),
+            "a recovery-OS session is already running as job job-3"
+        );
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let end = method_body(body, "recovery_os_session_end");
+        let lock = end
+            .find("self.jobs.lock()")
+            .expect("session-end reads the job map");
+        let check = end
+            .find("session_end_busy(")
+            .expect("session-end checks for a session job");
+        let run = end
+            .find("run_script_merged(")
+            .expect("session-end runs the script");
+        assert!(
+            lock < check && check < run,
+            "the check must come before the script runs"
+        );
+    }
+
+    #[test]
+    fn job_cancel_checks_the_action_of_the_jobs_own_kind() {
+        assert_eq!(
+            cancel_action("recovery-os-session"),
+            "org.dasbackup.recovery-os"
+        );
+        for kind in ["backup", "index", "restore", ""] {
+            assert_eq!(cancel_action(kind), "org.dasbackup.backup", "{kind:?}");
+        }
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let cancel = method_body(body, "job_cancel");
+        assert!(
+            cancel.contains("check_polkit(&self.conn, &sender, cancel_action("),
+            "{cancel}"
+        );
+        assert!(
+            !cancel.contains("\"org.dasbackup.backup\""),
+            "a fixed action in job_cancel"
+        );
     }
 
     #[test]
