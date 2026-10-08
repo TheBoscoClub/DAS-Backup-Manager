@@ -1,0 +1,886 @@
+//! Running `recovery-os-vm.sh session …` as a job (bd 8249 stage 2).
+//!
+//! The D-Bus helper calls [`run_session`]: it validates the request, starts
+//! the script in an environment built from nothing (no test seam of the
+//! script's is reachable from the bus), turns the script's machine lines into
+//! stages, percents and log lines, and returns the outcome the script's own
+//! exit status gives. A cancel sends the script one SIGINT — the driver's
+//! trap leaves a recovery OS it already started running and says so — and the
+//! job then reads on to the script's real end.
+
+use std::io::{self, BufRead, Read};
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use crate::config::{Config, TargetRole};
+use crate::progress::{self, LogLevel, ProgressCallback};
+use crate::recovery_os::lines::{STEPS, SessionLine, parse_session_line, step_percent};
+
+/// The installed driver; run by this absolute path, never found on `PATH`.
+pub const SCRIPT: &str = "/usr/lib/das-backup/recovery-os-vm.sh";
+
+/// The whole environment the script gets.
+const SCRIPT_ENV: [(&str, &str); 3] = [
+    ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"),
+    ("LC_ALL", "C"),
+    ("HOME", "/root"),
+];
+
+/// How often a silent script is checked for a cancel.
+const CANCEL_TICK: Duration = Duration::from_millis(250);
+
+/// Human lines the outcome keeps for its summary.
+const LAST_LINES: usize = 12;
+
+/// One session the helper was asked to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
+    /// One or two `role = "mirror"` target labels.
+    pub labels: Vec<String>,
+    pub unattended: bool,
+    /// `sequential` or `parallel`; only with two labels.
+    pub mode: Option<String>,
+    pub accept_boot_record_risk: bool,
+}
+
+impl SessionRequest {
+    /// Refuses before anything runs: no label, more than two, a repeated one,
+    /// a label the configuration does not list as role mirror, a mode with one
+    /// label or an unknown mode.
+    pub fn validate(&self, cfg: &Config) -> Result<(), String> {
+        match self.labels.len() {
+            0 => return Err("no drive given: name one or two recovery drives".into()),
+            1 | 2 => {}
+            n => return Err(format!("at most two drives per session ({n} given)")),
+        }
+        if self.labels.len() == 2 && self.labels[0] == self.labels[1] {
+            return Err(format!("{} is named twice", self.labels[0]));
+        }
+        for label in &self.labels {
+            match cfg.targets.iter().find(|t| &t.label == label) {
+                None => return Err(format!("{label} is not in the configuration")),
+                Some(t) if t.role != TargetRole::Mirror => {
+                    return Err(format!(
+                        "{label} is not a recovery drive (its role is not mirror)"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(mode) = &self.mode {
+            if self.labels.len() != 2 {
+                return Err(format!("--mode {mode} needs two drives"));
+            }
+            if !matches!(mode.as_str(), "sequential" | "parallel") {
+                return Err(format!("mode {mode}: must be sequential or parallel"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The script's argument vector:
+    /// `session <l1> [<l2>] [--unattended] [--mode m] [--accept-boot-record-risk]`.
+    pub fn args(&self) -> Vec<String> {
+        let mut args = vec!["session".to_string()];
+        args.extend(self.labels.iter().cloned());
+        if self.unattended {
+            args.push("--unattended".into());
+        }
+        if let Some(mode) = &self.mode {
+            args.push("--mode".into());
+            args.push(mode.clone());
+        }
+        if self.accept_boot_record_risk {
+            args.push("--accept-boot-record-risk".into());
+        }
+        args
+    }
+}
+
+/// The command for `script args`, with an environment built, never
+/// inherited: exactly [`SCRIPT_ENV`], so no `DAS_RECOVERY_*`, `DAS_CONFIG`,
+/// `BTRDASD_BIN` or `DAS_RECOVERY_OS_STATE` seam reaches the script. Stdin is
+/// closed; the working directory is `/`.
+pub fn script_command(script: &Path, args: &[String]) -> Command {
+    let mut cmd = Command::new(script);
+    cmd.args(args)
+        .env_clear()
+        .envs(SCRIPT_ENV)
+        .current_dir("/")
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// How the job starts the script; the helper uses [`SystemSpawner`], tests
+/// may wrap it.
+pub trait SessionSpawner {
+    fn spawn(&self, cmd: Command) -> io::Result<Box<dyn SessionChild>>;
+}
+
+/// A started script.
+pub trait SessionChild {
+    fn pid(&self) -> u32;
+    /// Every stdout line as it arrives, and every stderr line prefixed
+    /// `stderr: `, without the `\n` (or `\r\n`). The channel disconnects when
+    /// both streams have ended. Handed out once.
+    fn lines(&mut self) -> io::Result<mpsc::Receiver<String>>;
+    /// Reap the script. An error reading its output is reported here, after
+    /// the script is reaped.
+    fn wait(&mut self) -> io::Result<ExitStatus>;
+    /// SIGINT to the script's pid.
+    fn interrupt(&self) -> io::Result<()>;
+}
+
+/// Starts the script as a real child process.
+pub struct SystemSpawner;
+
+struct SystemChild {
+    child: Child,
+    lines: Option<mpsc::Receiver<String>>,
+    readers: Vec<JoinHandle<io::Result<()>>>,
+}
+
+/// Send each line of `reader` (lossy UTF-8, `\n`/`\r\n` stripped) to `tx`
+/// with `prefix`, until EOF. A receiver gone is not an error: the job stopped
+/// listening, and the stream is still drained so the script never blocks.
+fn pump(mut reader: impl BufRead, prefix: &str, tx: &mpsc::Sender<String>) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if line.ends_with(b"\n") {
+            line.pop();
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+        }
+        let _ = tx.send(format!("{prefix}{}", String::from_utf8_lossy(&line)));
+    }
+}
+
+fn start_reader(
+    name: &str,
+    stream: impl Read + Send + 'static,
+    prefix: &'static str,
+    tx: mpsc::Sender<String>,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || pump(io::BufReader::new(stream), prefix, &tx))
+}
+
+impl SessionSpawner for SystemSpawner {
+    fn spawn(&self, mut cmd: Command) -> io::Result<Box<dyn SessionChild>> {
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        // Both streams are drained from the start, each on its own thread: a
+        // full stderr pipe would block the script, and with it stdout (the
+        // hazard `fsutil::SystemRunner::stream` documents).
+        let (tx, rx) = mpsc::channel();
+        let mut readers = Vec::new();
+        let streams = (child.stdout.take(), child.stderr.take());
+        let started = match streams {
+            (Some(out), Some(err)) => start_reader("session-stdout", out, "", tx.clone())
+                .map(|h| readers.push(h))
+                .and_then(|()| start_reader("session-stderr", err, "stderr: ", tx))
+                .map(|h| readers.push(h)),
+            _ => Err(io::Error::other("the script's output is not piped")),
+        };
+        if let Err(e) = started {
+            // Never leave a started script behind unreaped.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        Ok(Box::new(SystemChild {
+            child,
+            lines: Some(rx),
+            readers,
+        }))
+    }
+}
+
+impl SessionChild for SystemChild {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn lines(&mut self) -> io::Result<mpsc::Receiver<String>> {
+        self.lines
+            .take()
+            .ok_or_else(|| io::Error::other("the script's lines were already handed out"))
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        let mut failed = None;
+        for reader in self.readers.drain(..) {
+            match reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failed = Some(e.to_string()),
+                Err(_) => failed = Some("a reader thread panicked".into()),
+            }
+        }
+        match failed {
+            None => Ok(status),
+            Some(e) => Err(io::Error::other(format!(
+                "reading the script's output failed ({e}); it ended with {status}"
+            ))),
+        }
+    }
+
+    fn interrupt(&self) -> io::Result<()> {
+        // A pid that does not fit, or 0 (which would signal our own process
+        // group), is refused rather than converted.
+        let pid = libc::pid_t::try_from(self.child.id())
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| {
+                io::Error::other(format!("pid {} cannot be signalled", self.child.id()))
+            })?;
+        // SAFETY: kill(2) takes plain integers; the child is not reaped yet
+        // (wait() has not returned), so the pid is still the script's.
+        if unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+/// How a session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOutcome {
+    /// The script's exit status; `None` when a signal killed it.
+    pub exit: Option<i32>,
+    /// The signal that killed it, when `exit` is `None`.
+    pub signal: Option<i32>,
+    /// Each `RESULT <label> <exit> <outcome>` line.
+    pub results: Vec<(String, i32, String)>,
+    /// Each `DRIVE <label> <exit|skipped>` line (`None`: skipped).
+    pub drives: Vec<(String, Option<i32>)>,
+    /// The last `PROGRESS … fail` line: step and message.
+    pub failed_step: Option<(String, String)>,
+    /// The last 12 human lines (not machine lines; stderr ones prefixed).
+    pub last_lines: Vec<String>,
+}
+
+impl SessionOutcome {
+    pub fn success(&self) -> bool {
+        self.exit == Some(0)
+    }
+
+    /// `clean` | `warnings: …` | `kept (exit 3): …` | `failed (exit N): …` |
+    /// `stopped at <step> (exit 7): …` | `killed by signal N: …`.
+    pub fn summary(&self) -> String {
+        let tail = self.last_lines.join("; ");
+        let with = |head: String, detail: &str| {
+            if detail.is_empty() {
+                head
+            } else {
+                format!("{head}: {detail}")
+            }
+        };
+        match self.exit {
+            Some(0) => "clean".into(),
+            Some(5) => with("warnings".into(), &tail),
+            Some(3) => with("kept (exit 3)".into(), &tail),
+            Some(7) => match &self.failed_step {
+                Some((step, message)) => {
+                    let detail = [message.as_str(), tail.as_str()]
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    with(format!("stopped at {step} (exit 7)"), &detail)
+                }
+                None => with("failed (exit 7)".into(), &tail),
+            },
+            Some(n) => with(format!("failed (exit {n})"), &tail),
+            None => {
+                let head = match self.signal {
+                    Some(sig) => format!("killed by signal {sig}"),
+                    None => "killed by signal".into(),
+                };
+                with(head, &tail)
+            }
+        }
+    }
+}
+
+/// What one line of the script's output does to the job and its outcome.
+fn take_line(line: &str, out: &mut SessionOutcome, progress: &dyn ProgressCallback) {
+    match parse_session_line(line) {
+        SessionLine::Progress {
+            label,
+            step,
+            event,
+            message,
+        } => {
+            if event == "start" {
+                progress.on_stage(&format!("{label}:{step}"), STEPS.len() as u64);
+            }
+            let text = if message.is_empty() {
+                format!("[{label}] {step} {event}")
+            } else {
+                format!("[{label}] {step} {event}: {message}")
+            };
+            match step_percent(step) {
+                Some(pct) => progress.on_progress(pct as u64, 100, &text),
+                None => progress.on_log(LogLevel::Warning, &format!("unknown step: {line}")),
+            }
+            if event == "fail" {
+                out.failed_step = Some((step.to_string(), message.to_string()));
+                progress.on_log(LogLevel::Error, &text);
+            }
+        }
+        SessionLine::Output { label, step, text } => {
+            progress.on_log(LogLevel::Info, &format!("[{label}] {step}: {text}"));
+        }
+        SessionLine::Result {
+            label,
+            exit,
+            outcome,
+        } => {
+            out.results
+                .push((label.to_string(), exit, outcome.to_string()));
+            let level = match exit {
+                0 => LogLevel::Info,
+                5 => LogLevel::Warning,
+                _ => LogLevel::Error,
+            };
+            progress.on_log(level, &format!("[{label}] result: {outcome} (exit {exit})"));
+        }
+        SessionLine::Drive { label, exit } => {
+            out.drives.push((label.to_string(), exit));
+            let text = match exit {
+                Some(n) => format!("[{label}] drive done (exit {n})"),
+                None => format!("[{label}] drive skipped"),
+            };
+            progress.on_log(LogLevel::Info, &text);
+        }
+        SessionLine::Other(text) => {
+            progress.on_log(LogLevel::Info, text);
+            if out.last_lines.len() == LAST_LINES {
+                out.last_lines.remove(0);
+            }
+            out.last_lines.push(text.to_string());
+        }
+    }
+}
+
+/// Runs the script to its end, mapping lines to progress: `PROGRESS` → stage
+/// `<label>:<step>` (on `start`) and percent; `OUTPUT` → log `[<label>]
+/// <step>: <text>`; `RESULT`/`DRIVE` → recorded and logged; anything else →
+/// logged verbatim and kept for the summary. When `stop_requested(progress)`
+/// becomes true — checked on every line, and every 250 ms when none arrives —
+/// the script gets one SIGINT and the job reads on to its end. The outcome is
+/// the script's exit status, never the lines. `Err` only when the request is
+/// refused or the script could not be run or reaped.
+pub fn run_session(
+    spawner: &dyn SessionSpawner,
+    script: &Path,
+    cfg: &Config,
+    req: &SessionRequest,
+    progress: &dyn ProgressCallback,
+) -> Result<SessionOutcome, String> {
+    req.validate(cfg)?;
+    let mut child = spawner
+        .spawn(script_command(script, &req.args()))
+        .map_err(|e| format!("could not start {}: {e}", script.display()))?;
+    let rx = match child.lines() {
+        Ok(rx) => rx,
+        Err(e) => {
+            // Never leave it running unwatched: stop it and reap it.
+            let _ = child.interrupt();
+            let _ = child.wait();
+            return Err(format!("could not read {}: {e}", script.display()));
+        }
+    };
+    let mut out = SessionOutcome {
+        exit: None,
+        signal: None,
+        results: Vec::new(),
+        drives: Vec::new(),
+        failed_step: None,
+        last_lines: Vec::new(),
+    };
+    let mut interrupted = false;
+    loop {
+        match rx.recv_timeout(CANCEL_TICK) {
+            Ok(line) => take_line(&line, &mut out, progress),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !interrupted && progress::stop_requested(progress) {
+            interrupted = true;
+            match child.interrupt() {
+                Ok(()) => progress.on_log(
+                    LogLevel::Warning,
+                    "cancel: sent SIGINT to the session script; waiting for it to finish",
+                ),
+                Err(e) => progress.on_log(
+                    LogLevel::Error,
+                    &format!("cancel: could not signal the session script: {e}"),
+                ),
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("{}: {e}", script.display()))?;
+    out.exit = status.code();
+    out.signal = status.signal();
+    match (out.exit, out.signal) {
+        (Some(0), _) => progress.on_log(LogLevel::Info, "session script exited 0"),
+        (Some(n), _) => progress.on_log(LogLevel::Error, &format!("session script exited {n}")),
+        (None, sig) => progress.on_log(
+            LogLevel::Error,
+            &format!("session script killed by signal {}", sig.unwrap_or(-1)),
+        ),
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::progress::{CancelToken, LogLevel, ProgressCallback};
+    use crate::recovery_os::panel::tests::two_mirrors_and_a_primary;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn stub_script(dir: &Path, body: &str) -> PathBuf {
+        let p = dir.join("recovery-os-vm.sh");
+        std::fs::write(&p, format!("#!/bin/bash\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn one_drive() -> SessionRequest {
+        SessionRequest {
+            labels: vec!["system-recovery-A-2tb".into()],
+            unattended: false,
+            mode: None,
+            accept_boot_record_risk: false,
+        }
+    }
+
+    /// Records stages and logs; with `cancel_after_first_stage`, its cancel
+    /// token is set by the first `on_stage`.
+    #[derive(Default)]
+    struct CapturingProgress {
+        stages: Mutex<Vec<String>>,
+        logs: Mutex<Vec<String>>,
+        cancel: CancelToken,
+        cancel_on_stage: std::sync::atomic::AtomicBool,
+    }
+
+    impl CapturingProgress {
+        fn cancel_after_first_stage(&self) {
+            self.cancel_on_stage.store(true, Ordering::SeqCst);
+        }
+        fn stages(&self) -> Vec<String> {
+            self.stages.lock().unwrap().clone()
+        }
+        fn logs(&self) -> Vec<String> {
+            self.logs.lock().unwrap().clone()
+        }
+    }
+
+    impl ProgressCallback for CapturingProgress {
+        fn on_stage(&self, stage: &str, _: u64) {
+            self.stages.lock().unwrap().push(stage.to_string());
+            if self.cancel_on_stage.load(Ordering::SeqCst) {
+                self.cancel.cancel();
+            }
+        }
+        fn on_progress(&self, _: u64, _: u64, _: &str) {}
+        fn on_throughput(&self, _: u64) {}
+        fn on_log(&self, _: LogLevel, message: &str) {
+            self.logs.lock().unwrap().push(message.to_string());
+        }
+        fn on_complete(&self, _: bool, _: &str) {}
+        fn cancel_token(&self) -> Option<&CancelToken> {
+            Some(&self.cancel)
+        }
+    }
+
+    /// `SystemSpawner`, counting the interrupts its child is sent.
+    #[derive(Default)]
+    struct CountingSpawner {
+        interrupts: std::sync::Arc<AtomicUsize>,
+    }
+
+    struct CountingChild {
+        inner: Box<dyn SessionChild>,
+        interrupts: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl SessionSpawner for CountingSpawner {
+        fn spawn(&self, cmd: Command) -> io::Result<Box<dyn SessionChild>> {
+            Ok(Box::new(CountingChild {
+                inner: SystemSpawner.spawn(cmd)?,
+                interrupts: self.interrupts.clone(),
+            }))
+        }
+    }
+
+    impl SessionChild for CountingChild {
+        fn pid(&self) -> u32 {
+            self.inner.pid()
+        }
+        fn lines(&mut self) -> io::Result<mpsc::Receiver<String>> {
+            self.inner.lines()
+        }
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.inner.wait()
+        }
+        fn interrupt(&self) -> io::Result<()> {
+            self.interrupts.fetch_add(1, Ordering::SeqCst);
+            self.inner.interrupt()
+        }
+    }
+
+    #[test]
+    fn a_request_is_validated_before_anything_runs() {
+        let cfg = two_mirrors_and_a_primary();
+        let ok = one_drive();
+        assert_eq!(ok.validate(&cfg), Ok(()));
+        let bad = |labels: &[&str], mode: Option<&str>| {
+            SessionRequest {
+                labels: labels.iter().map(|s| s.to_string()).collect(),
+                unattended: true,
+                mode: mode.map(String::from),
+                accept_boot_record_risk: false,
+            }
+            .validate(&cfg)
+            .unwrap_err()
+        };
+        assert!(bad(&[], None).contains("no drive"));
+        assert!(bad(&["primary-22tb"], None).contains("not a recovery drive"));
+        assert!(bad(&["nope"], None).contains("not in the configuration"));
+        assert!(bad(&["system-recovery-A-2tb", "system-recovery-A-2tb"], None).contains("twice"));
+        assert!(
+            bad(
+                &[
+                    "system-recovery-A-2tb",
+                    "system-recovery-B-2tb",
+                    "system-recovery-A-2tb"
+                ],
+                None
+            )
+            .contains("at most two")
+        );
+        assert!(bad(&["system-recovery-A-2tb"], Some("parallel")).contains("two drives"));
+        assert!(
+            bad(
+                &["system-recovery-A-2tb", "system-recovery-B-2tb"],
+                Some("fast")
+            )
+            .contains("sequential or parallel")
+        );
+        assert_eq!(
+            SessionRequest {
+                labels: vec![
+                    "system-recovery-A-2tb".into(),
+                    "system-recovery-B-2tb".into()
+                ],
+                unattended: true,
+                mode: Some("parallel".into()),
+                accept_boot_record_risk: true
+            }
+            .args(),
+            [
+                "session",
+                "system-recovery-A-2tb",
+                "system-recovery-B-2tb",
+                "--unattended",
+                "--mode",
+                "parallel",
+                "--accept-boot-record-risk"
+            ]
+        );
+        assert_eq!(one_drive().args(), ["session", "system-recovery-A-2tb"]);
+    }
+
+    #[test]
+    fn an_invalid_request_never_starts_the_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let script = stub_script(dir.path(), &format!("touch {}", marker.display()));
+        let req = SessionRequest {
+            labels: vec!["primary-22tb".into()],
+            ..one_drive()
+        };
+        let err = run_session(
+            &SystemSpawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &req,
+            &CapturingProgress::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a recovery drive"), "{err}");
+        assert!(!marker.exists(), "the script ran for a refused request");
+    }
+
+    #[test]
+    fn the_script_runs_in_a_built_environment_with_no_seam_reachable() {
+        const POISON: [(&str, &str); 4] = [
+            ("DAS_RECOVERY_VM_TEST_ROOT", "/tmp/poison"),
+            ("DAS_RECOVERY_OS_STATE", "/tmp/poison.json"),
+            ("DAS_CONFIG", "/tmp/poison.toml"),
+            ("BTRDASD_BIN", "/tmp/poison-bin"),
+        ];
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub_script(dir.path(), "env | sort; exit 0");
+        let previous: Vec<_> = POISON.iter().map(|(k, _)| std::env::var_os(k)).collect();
+        // Poison the parent's environment the way a misconfigured unit might.
+        // SAFETY: only this test mutates these variables, under ENV_LOCK; the
+        // one library reader (`recovery_os::state_path`) is given a path that
+        // does not exist, which it already handles.
+        unsafe {
+            for (k, v) in POISON {
+                std::env::set_var(k, v);
+            }
+        }
+        let sink = CapturingProgress::default();
+        let out = run_session(
+            &SystemSpawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        );
+        unsafe {
+            for ((k, _), prev) in POISON.iter().zip(previous) {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let out = out.unwrap();
+        assert_eq!(out.exit, Some(0));
+        let env = sink.logs().join("\n");
+        for v in ["DAS_RECOVERY", "DAS_CONFIG", "BTRDASD_BIN"] {
+            assert!(!env.contains(v), "{v} reached the script:\n{env}");
+        }
+        assert!(
+            env.contains("LC_ALL=C")
+                && env.contains("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin")
+                && env.contains("HOME=/root"),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn lines_become_stages_logs_results_and_the_exit_is_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub_script(
+            dir.path(),
+            r#"
+echo "took the DAS maintenance lock"
+echo "PROGRESS system-recovery-A-2tb preflight ok lock taken; unattended, single"
+echo "PROGRESS system-recovery-A-2tb upgrade start"
+echo "OUTPUT system-recovery-A-2tb upgrade :: Starting full system upgrade..."
+printf 'a CRLF line\r\n'
+echo "a line on stderr" >&2
+echo "DRIVE system-recovery-A-2tb skipped"
+echo "PROGRESS system-recovery-A-2tb upgrade fail pacman exited 1"
+echo "RESULT system-recovery-A-2tb 7 failed"
+exit 7"#,
+        );
+        let sink = CapturingProgress::default();
+        let out = run_session(
+            &SystemSpawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(out.exit, Some(7));
+        assert_eq!(
+            out.results,
+            vec![("system-recovery-A-2tb".to_string(), 7, "failed".to_string())]
+        );
+        assert_eq!(
+            out.drives,
+            vec![("system-recovery-A-2tb".to_string(), None)]
+        );
+        assert!(
+            sink.stages()
+                .contains(&"system-recovery-A-2tb:upgrade".to_string())
+        );
+        let logs = sink.logs();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains(":: Starting full system upgrade"))
+        );
+        assert!(
+            logs.iter().any(|l| l == "took the DAS maintenance lock"),
+            "human lines are logged, not lost"
+        );
+        assert!(logs.iter().any(|l| l == "a CRLF line"), "{logs:?}");
+        assert!(
+            logs.iter().any(|l| l == "stderr: a line on stderr"),
+            "{logs:?}"
+        );
+        assert!(!out.success());
+        let s = out.summary();
+        assert!(s.starts_with("stopped at upgrade (exit 7)"), "{s}");
+        assert!(s.contains("pacman exited 1"));
+    }
+
+    #[test]
+    fn exit_5_is_not_success_and_the_summary_begins_with_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |body: &str| {
+            let script = stub_script(dir.path(), body);
+            run_session(
+                &SystemSpawner,
+                &script,
+                &two_mirrors_and_a_primary(),
+                &one_drive(),
+                &CapturingProgress::default(),
+            )
+            .unwrap()
+        };
+        let out = run(
+            "echo 'RESULT system-recovery-A-2tb 5 warnings'; echo 'WARNING: the claim was lost while the VM ran'; exit 5",
+        );
+        assert!(!out.success());
+        assert!(out.summary().starts_with("warnings"), "{}", out.summary());
+        assert!(out.summary().contains("claim was lost"));
+        let out = run("echo 'RESULT system-recovery-A-2tb 0 clean'; exit 0");
+        assert!(out.success());
+        assert_eq!(out.summary(), "clean");
+        let out = run("echo 'RESULT system-recovery-A-2tb 3 kept'; exit 3");
+        assert!(
+            out.summary().starts_with("kept (exit 3)"),
+            "{}",
+            out.summary()
+        );
+        let out = run("echo 'something broke'; exit 2");
+        assert!(
+            out.summary()
+                .starts_with("failed (exit 2): something broke"),
+            "{}",
+            out.summary()
+        );
+        // A clean RESULT line does not make a failing exit a success.
+        let out = run("echo 'RESULT system-recovery-A-2tb 0 clean'; exit 1");
+        assert!(!out.success());
+        assert!(
+            out.summary().starts_with("failed (exit 1)"),
+            "{}",
+            out.summary()
+        );
+    }
+
+    #[test]
+    fn a_script_killed_by_a_signal_has_no_exit_and_is_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub_script(dir.path(), "echo 'going down'; kill -KILL $$");
+        let out = run_session(
+            &SystemSpawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &CapturingProgress::default(),
+        )
+        .unwrap();
+        assert_eq!(out.exit, None);
+        assert!(!out.success());
+        let s = out.summary();
+        assert!(s.starts_with("killed by signal"), "{s}");
+        assert!(s.contains("9"), "{s}");
+    }
+
+    #[test]
+    fn a_stop_request_interrupts_once_and_the_job_ends_with_the_scripts_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // The stub traps INT like the driver: says so, exits 3 (VM left running).
+        let script = stub_script(
+            dir.path(),
+            r#"
+trap 'echo "interrupted: the recovery OS is still running; finish with session-end"; exit 3' INT
+echo "PROGRESS system-recovery-A-2tb wait start"
+for i in $(seq 1 100); do sleep 0.1; done
+exit 0"#,
+        );
+        let sink = CapturingProgress::default();
+        sink.cancel_after_first_stage();
+        let spawner = CountingSpawner::default();
+        let out = run_session(
+            &spawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(out.exit, Some(3));
+        assert!(out.summary().contains("session-end"), "{}", out.summary());
+        assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stop_request_is_seen_without_a_line_arriving() {
+        let dir = tempfile::tempdir().unwrap();
+        // Silent after its one stage: only the tick can see the cancel.
+        let script = stub_script(
+            dir.path(),
+            r#"
+trap 'echo "interrupted"; exit 3' INT
+echo "PROGRESS system-recovery-A-2tb wait start"
+for i in $(seq 1 100); do sleep 0.1; done
+exit 0"#,
+        );
+        let sink = CapturingProgress::default();
+        let spawner = CountingSpawner::default();
+        let started = std::time::Instant::now();
+        let out = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                sink.cancel.cancel();
+            });
+            run_session(
+                &spawner,
+                &script,
+                &two_mirrors_and_a_primary(),
+                &one_drive(),
+                &sink,
+            )
+            .unwrap()
+        });
+        assert_eq!(out.exit, Some(3));
+        assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_script_that_cannot_start_is_an_error_not_an_outcome() {
+        let err = run_session(
+            &SystemSpawner,
+            Path::new("/nonexistent/recovery-os-vm.sh"),
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &CapturingProgress::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("/nonexistent/recovery-os-vm.sh"));
+    }
+}

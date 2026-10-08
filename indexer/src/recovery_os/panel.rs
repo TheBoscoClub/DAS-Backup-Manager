@@ -336,7 +336,7 @@ pub fn status_json(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Retention;
     use std::collections::HashMap;
@@ -404,7 +404,7 @@ mod tests {
         }
     }
 
-    fn two_mirrors_and_a_primary() -> Config {
+    pub(crate) fn two_mirrors_and_a_primary() -> Config {
         let mut cfg = Config::default();
         let mut primary = mirror_target("primary-22tb", None);
         primary.role = TargetRole::Primary;
