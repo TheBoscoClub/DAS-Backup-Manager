@@ -260,6 +260,35 @@ impl SessionChild for SystemChild {
     }
 }
 
+/// A child dropped before `wait()` reaped it — a progress callback that
+/// panicked inside [`run_session`] unwinds past the wait — is reaped on a
+/// detached thread, so the script never lingers as a zombie under the helper.
+/// It is never killed: a session left running keeps its own guard and is
+/// ended with `session-end`, as the script says.
+impl Drop for SystemChild {
+    fn drop(&mut self) {
+        // `try_wait` reaps a child that already ended; `Ok(None)` is one still
+        // running, `Err` one already reaped (nothing left to do either way).
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let Ok(pid) = libc::pid_t::try_from(self.child.id()) else {
+            return;
+        };
+        let reaper = std::thread::Builder::new()
+            .name("session-reaper".into())
+            .spawn(move || {
+                let mut status = 0;
+                // SAFETY: waitpid(2) on our own unreaped child; `Child` is
+                // being dropped, so nothing else will wait for this pid.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+            });
+        if let Err(e) = reaper {
+            eprintln!("recovery-os session: pid {pid} left unreaped: no reaper thread: {e}");
+        }
+    }
+}
+
 /// How a session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOutcome {
@@ -943,6 +972,59 @@ exit 0"#,
         assert_eq!(out.exit, Some(3));
         assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// `/proc/<pid>/stat`'s state letter, or `None` once the pid is gone.
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    fn wait_for_state(pid: u32, want: impl Fn(Option<char>) -> bool) -> bool {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < until {
+            if want(proc_state(pid)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_child_dropped_unwaited_is_reaped_never_left_a_zombie() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        let child = SystemSpawner.spawn(cmd).unwrap();
+        let pid = child.pid();
+        assert!(
+            wait_for_state(pid, |s| s == Some('Z')),
+            "the child never exited"
+        );
+        drop(child);
+        assert!(
+            wait_for_state(pid, |s| s.is_none()),
+            "pid {pid} left a zombie after its SessionChild was dropped"
+        );
+    }
+
+    #[test]
+    fn dropping_a_running_child_never_kills_it() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 0.5"]);
+        let child = SystemSpawner.spawn(cmd).unwrap();
+        let pid = child.pid();
+        drop(child);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            matches!(proc_state(pid), Some(c) if c != 'Z'),
+            "the dropped child stopped running: {:?}",
+            proc_state(pid)
+        );
+        assert!(
+            wait_for_state(pid, |s| s.is_none()),
+            "pid {pid} was not reaped once it ended"
+        );
     }
 
     #[test]
