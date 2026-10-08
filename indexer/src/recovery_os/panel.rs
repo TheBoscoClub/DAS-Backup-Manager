@@ -189,6 +189,7 @@ pub struct DriveStatus {
     pub clean_runs: Option<u32>,
     pub clean_runs_error: Option<String>,
     pub history: Vec<Value>,
+    pub history_error: Option<String>,
     pub schedule: Option<Schedule>,
     pub session: Option<Session>,
 }
@@ -213,6 +214,7 @@ impl DriveStatus {
             "clean_runs": self.clean_runs,
             "clean_runs_error": self.clean_runs_error,
             "history": self.history,
+            "history_error": self.history_error,
             "schedule": self.schedule,
             "session": self.session,
         })
@@ -279,7 +281,10 @@ fn drive_status(
         Ok(n) => (Some(n), None),
         Err(e) => (None, Some(e)),
     };
-    let history = reads.history(&target.label).unwrap_or_default();
+    let (history, history_error) = match reads.history(&target.label) {
+        Ok(h) => (h, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     let skip = history.len().saturating_sub(HISTORY_SHOWN);
     DriveStatus {
         label: target.label.clone(),
@@ -295,6 +300,7 @@ fn drive_status(
         clean_runs,
         clean_runs_error,
         history: history.into_iter().skip(skip).collect(),
+        history_error,
         schedule: None,
         session: None,
     }
@@ -374,6 +380,7 @@ mod tests {
         let mut os = RecoveryOs {
             guest_agent: agent,
             kernels: vec!["6.17.1-1-cachyos".into()],
+            log_read: true,
             installed: Some("2026-01-01".into()),
             last_full_upgrade_applied: Some("2026-09-20".into()),
             ..Default::default()
@@ -621,6 +628,7 @@ mod tests {
             "clean_runs",
             "clean_runs_error",
             "history",
+            "history_error",
             "schedule",
             "session",
         ] {
@@ -646,6 +654,7 @@ mod tests {
         assert_eq!(a["clean_runs"], 2);
         assert!(a["clean_runs_error"].is_null());
         assert_eq!(a["history"].as_array().unwrap().len(), 1);
+        assert!(a["history_error"].is_null());
         let b = &j["drives"][1];
         assert!(
             b["record"].is_null() && b["checked_epoch"].is_null(),
@@ -693,5 +702,42 @@ mod tests {
         assert_eq!(h[0]["n"], 5);
         assert_eq!(h[19]["n"], 24, "newest last");
         assert_eq!(j["pair"]["mode_default"], "parallel");
+    }
+
+    #[test]
+    fn an_unreadable_history_is_an_error_not_an_empty_list() {
+        let cfg = two_mirrors_and_a_primary();
+        let reads = Scripted {
+            history: [("system-recovery-A-2tb", Err("history is corrupt".into()))].into(),
+            ..Default::default()
+        };
+        let j = status_json(&cfg, &Ok(None), &host(), "2026-10-08", &reads);
+        let a = &j["drives"][0];
+        assert_eq!(a["history_error"], "history is corrupt");
+        assert!(a["history"].as_array().unwrap().is_empty());
+        // B has no scripted error: an empty history is a reading, no error.
+        assert!(j["drives"][1]["history_error"].is_null());
+    }
+
+    #[test]
+    fn due_reaches_the_document_only_for_a_drive_stale_by_age() {
+        let cfg = two_mirrors_and_a_primary();
+        let state = Ok(Some(state_v(
+            4,
+            &[(
+                "system-recovery-A-2tb",
+                stored_drive(agent_at_boot(), BootVerdict::May, Some(uuid_a())),
+            )],
+        )));
+        // Last full upgrade 2026-09-20: 18 days old on 2026-10-08, 103 on 2027-01-01.
+        let fresh = status_json(&cfg, &state, &host(), "2026-10-08", &Scripted::default());
+        assert_eq!(fresh["max_age_days"], 60);
+        assert_eq!(fresh["drives"][0]["due"], false);
+        let old = status_json(&cfg, &state, &host(), "2027-01-01", &Scripted::default());
+        assert_eq!(old["max_age_days"], cfg.recovery_os.max_age_days);
+        assert!(old["drives"][0]["assessment"]["age_days"].as_i64().unwrap() >= 60);
+        assert_eq!(old["drives"][0]["due"], true);
+        // B has no reading: nothing to be due.
+        assert_eq!(old["drives"][1]["due"], false);
     }
 }
