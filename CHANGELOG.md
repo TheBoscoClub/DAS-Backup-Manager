@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The mutation gate fails on resource exhaustion** (`.github/scripts/mutants-gate.py` re-installed from the canonical template; rule 1b of 2026-10-07, cachyos-sentinel pnpl) — a mutant whose build died of a full disk or exhausted memory was filed by cargo-mutants under `unviable`, so a full `/tmp` silently shrank the verified set and the gate printed OK; the gate now scans the mutant logs and fails naming the count and an example. Falsified: an outcomes directory with one ENOSPC log passes the old copy and fails the new one
 - **Debian and Fedora packages recommend TigerVNC's viewer, Arch lists it in `optdepends`** for the recovery-drive console (virt-viewer stays suggested for `recovery-os-vm.sh`'s own console advice); the Flatpak and Snap manifests note that inside a sandbox the GUI shows the console socket's path instead
 - **`btrdasd --version` prints all four segments** (`btrdasd 0.7.23.0`, bd `DAS-Backup-Manager-b1s`) — it printed Cargo's three. The one source is `CMakeLists.txt`
 - **CI runs the shell suites and the GUI smoke suite as separate steps** — `ctest -R '^shell-'` and `ctest -E '^shell-'`, both failing on an empty selection, so a red shell suite is named as one

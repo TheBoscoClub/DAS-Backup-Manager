@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Fail a cargo-mutants run that verified nothing.
+# INSTANTIATED FROM ~/.claude/templates/mutants-gate.py — do not edit here.
+# Canonical source and rationale: ~/.claude/rules/mutation-testing.md
+# After changing the canonical copy, re-run ~/.claude/tests/test-mutants-gate.sh
+# and re-install into every project's .github/scripts/.
 
 WHY THIS EXISTS
     `cargo mutants` exits 0 when every mutant was CAUGHT and also when every
@@ -19,6 +23,7 @@ WHAT IT ENFORCES
     0. The run was not corrupted before scoring (CARGO_TARGET_DIR unset)
     1. No mutant survived        (missed == 0 and timeout == 0)
     2. Something was actually tested   (viable > 0 whenever mutants existed)
+    1b. No mutant build died of resource exhaustion (pnpl, 2026-10-07)
     3. The check itself ran      (a missing/!unreadable outcomes.json is a
                                   FAILURE, never a pass — a check that cannot
                                   report failure is not a check)
@@ -43,6 +48,19 @@ RULE 0, added 2026-09-01 (cachyos-sentinel m4wn)
     buys nothing and costs correctness. Run `env -u CARGO_TARGET_DIR cargo
     mutants ...` in any shell where the build-to-RAM export is active.
 
+RULE 1b, added 2026-10-07 (cachyos-sentinel pnpl)
+    A mutant whose build dies of ENOSPC ("No space left on device", os error
+    28) or memory exhaustion is recorded by cargo-mutants as UNVIABLE — the
+    same bucket as a type error. A full /tmp therefore silently converts real
+    mutants into unviable ones and the gate prints OK. Measured 2026-10-06:
+    21 of 141 mutant logs held ENOSPC, 22 fewer mutants were verified than on
+    a clean re-run of the same diff, and this gate exited 0.
+    The gate now scans <outcomes dir>/log/ (one file per mutant) and
+    <outcomes dir>/debug.log for exhaustion signatures and FAILS, naming the
+    count and an example. The OOM signatures are a best effort (rustc killed
+    by the kernel OOM-killer, allocator abort, ENOMEM); a false positive
+    fails closed and costs a re-run, a miss costs a silent hole.
+
 USAGE
     mutants-gate.py [--outcomes PATH] [--label NAME] [--allow-zero-total]
 
@@ -59,10 +77,21 @@ EXIT
 
 Dependency-free. Python 3.8+.
 """
+
 import argparse
 import json
 import os
+import re
 import sys
+
+# Build-death signatures that cargo-mutants files under "unviable".
+EXHAUSTION_RE = re.compile(
+    r"No space left on device|os error 28"
+    r"|memory allocation of \d+ bytes failed"
+    r"|Cannot allocate memory|os error 12\b|out of memory"
+    r"|signal: 9, SIGKILL",
+    re.IGNORECASE,
+)
 
 
 def emit(line: str) -> None:
@@ -80,6 +109,25 @@ def emit(line: str) -> None:
 def fail(msg: str) -> "int":
     print(f"MUTANTS GATE: FAIL — {msg}", file=sys.stderr)
     return 1
+
+
+def exhausted_logs(outcomes_path: str) -> "list[str]":
+    """Names of mutant logs next to outcomes.json that show resource exhaustion."""
+    out_dir = os.path.dirname(os.path.abspath(outcomes_path))
+    candidates = [os.path.join(out_dir, "debug.log")]
+    log_dir = os.path.join(out_dir, "log")
+    if os.path.isdir(log_dir):
+        for root, _dirs, files in os.walk(log_dir):
+            candidates.extend(os.path.join(root, f) for f in sorted(files))
+    hits = []
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                if any(EXHAUSTION_RE.search(line) for line in fh):
+                    hits.append(os.path.relpath(path, out_dir))
+        except OSError:
+            continue  # absent debug.log is normal; the outcomes check is rule 3
+    return sorted(hits)
 
 
 def main() -> int:
@@ -143,6 +191,17 @@ def main() -> int:
         f"mutants {tag}total={total} caught={caught} missed={missed} "
         f"timeout={timeout} unviable={unviable} viable={viable}"
     )
+
+    # Rule 1b — resource exhaustion hides inside "unviable".
+    exhausted = exhausted_logs(args.outcomes)
+    if exhausted:
+        return fail(
+            f"{tag}resource exhaustion (disk full / out of memory) in "
+            f"{len(exhausted)} mutant log(s), e.g. {exhausted[0]}. cargo-mutants "
+            "files such a build death under 'unviable', so real mutants were "
+            "silently dropped from the verified set. Free space (scope TMPDIR "
+            "per job, lower -j) and re-run; this result is not evidence."
+        )
 
     # Rule 1 — a surviving mutant is a test that cannot fail.
     if missed or timeout:
