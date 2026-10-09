@@ -1592,6 +1592,8 @@ run_driver session A --wait-lock 0
 check "wait-lock 0: usage" "$RC" "2"
 run_driver session A --wait-lock x
 check "wait-lock x: usage" "$RC" "2"
+run_driver session A --wait-lock=0
+check "wait-lock=0: usage" "$RC" "2"
 
 fixture
 (
@@ -1611,6 +1613,20 @@ check "wait-lock waits, then the session goes through: exit 0" "$RC" "0"
 has "wait-lock: says it is waiting, naming the holder" "$OUT" "waiting for the DAS maintenance lock (held by: stub holder pid 77)"
 has "wait-lock: then takes the lock" "$OUT" "took the DAS maintenance lock"
 check "wait-lock: lock free at the end" "$(lock_state)" "free"
+
+# The --wait-lock=N form waits the same way.
+fixture
+start_blocker
+(
+    sleep 1
+    kill "$blocker" 2>/dev/null || :
+) &
+unblocker=$!
+run_driver session A --wait-lock=20
+wait "$unblocker"
+stop_blocker
+check "wait-lock=N: waits, then the session goes through: exit 0" "$RC" "0"
+has "wait-lock=N: says it is waiting" "$OUT" "waiting for the DAS maintenance lock"
 
 # The boot record is read AFTER the wait: the run a scheduled session waits
 # for is the backup, and that run rewrites the record (final review I2).
@@ -4816,6 +4832,16 @@ has "both, parallel: B started" "$(file "$S/domB/events")" "virsh start"
 check "both, parallel: two history lines" "$(jq -r '.mode' "$H" | sort | uniq -c | tr -s ' ')" " 2 parallel"
 check "both, parallel: lock free" "$(lock_state)" "free"
 check "both, parallel: no egress rule left" "$(file "$S/ip.rules")" ""
+
+# --wait-lock is the run's, never its drives': a drive given it would wait on
+# the run's own lock, then refuse (final review M19).
+for mode in sequential parallel; do
+    unattended_fixture
+    run_driver session A B --unattended --mode "$mode" --wait-lock 2
+    check "both, $mode, --wait-lock: exit 0" "$RC" "0"
+    lacks "both, $mode, --wait-lock: no drive waited on the run's own lock" "$OUT" "waiting for the DAS maintenance lock"
+    check "both, $mode, --wait-lock: two history lines" "$(jq -r '.mode' "$H" | sort | uniq -c | tr -s ' ')" " 2 $mode"
+done
 
 fixture
 run_driver session A system-recovery-A-2tb
