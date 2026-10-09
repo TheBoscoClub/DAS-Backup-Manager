@@ -689,6 +689,34 @@ private Q_SLOTS:
         Q_EMIT client.errorOccurred(QStringLiteral("BackupRun"), QStringLiteral("denied"));
         QVERIFY(p.run->isEnabled());
     }
+
+    void consoleCommandIsRemoteViewerOnTheUnixSocket()
+    {
+        const auto [program, args] = DBusClient::consoleCommand(QStringLiteral("/run/das-recovery-os-vm/1000/system-recovery-A-2tb.vnc"));
+        QCOMPARE(program, QStringLiteral("remote-viewer"));
+        QCOMPARE(args, QStringList{QStringLiteral("vnc+unix:///run/das-recovery-os-vm/1000/system-recovery-A-2tb.vnc")});
+    }
+
+    void sessionEndUsesATenMinuteTimeout()
+    {
+        DBusClient client;
+        QCOMPARE(client.sessionEndTimeoutMs(), 600000);
+    }
+
+    void recoveryCallsOnAnUnavailableHelperAnswerEmptyNotSilent()
+    {
+        DBusClient client;
+        if (client.isAvailable())
+            QSKIP("a helper is reachable; this pins the unavailable path");
+        QSignalSpy status(&client, &DBusClient::recoveryOsStatusResult);
+        client.recoveryOsStatusAsync();
+        QCOMPARE(status.count(), 1);
+        QVERIFY(status.at(0).at(0).toString().isEmpty());
+        QSignalSpy end(&client, &DBusClient::recoveryOsSessionEndResult);
+        client.recoveryOsSessionEnd(QStringLiteral("system-recovery-A-2tb"));
+        QCOMPARE(end.count(), 1);
+        QVERIFY(!end.at(0).at(1).toBool());
+    }
 };
 
 QTEST_MAIN(GuiSmokeTest)
