@@ -60,14 +60,17 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
     connect(m_timer, &QTimer::timeout, this, &RecoveryPanel::refresh);
 
     connect(m_client, &DBusClient::recoveryOsStatusResult, this, &RecoveryPanel::onStatusResult);
+    connect(m_client, &DBusClient::recoveryOsStatusError, this, &RecoveryPanel::onStatusError);
     connect(m_client, &DBusClient::jobStarted, this, &RecoveryPanel::onJobStarted);
     connect(m_client, &DBusClient::jobFinished, this, &RecoveryPanel::onJobFinished);
     connect(m_client, &DBusClient::recoveryOsSessionEndResult, this, &RecoveryPanel::onSessionEndResult);
     connect(m_client, &DBusClient::recoveryOsScheduleResult, this, &RecoveryPanel::onScheduleResult);
     connect(m_client, &DBusClient::recoveryOsConsoleResult, this, &RecoveryPanel::onConsoleResult);
+    m_confirm = [this](const QString &title, const QString &text) {
+        return QMessageBox::warning(this, title, text, QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
+            == QMessageBox::Yes;
+    };
     connect(m_client, &DBusClient::errorOccurred, this, [this](const QString &op, const QString &) {
-        if (op == QLatin1String("RecoveryOsStatus"))
-            m_refreshInFlight = false;
         // A refused RecoveryOsSession call: the request is over, nothing runs.
         if (op == Operation)
             m_jobRequested = false;
@@ -175,10 +178,13 @@ void RecoveryPanel::applyDocument(const QByteArray &json)
         m_doc.reset();
         m_parseError = err;
     } else {
-        // A parse error the status line reported is over once a document reads.
-        if (!m_parseError.isEmpty() && m_status->text() == m_parseError)
+        // A parse error or a failed refresh the status line reported is over
+        // once a document reads.
+        if ((!m_parseError.isEmpty() && m_status->text() == m_parseError)
+            || (!m_staleReason.isEmpty() && m_status->text() == m_staleReason))
             m_status->clear();
         m_parseError.clear();
+        m_staleReason.clear();
         const int keep = m_selector->currentIndex();
         m_doc = std::move(doc);
         m_selector->blockSignals(true);
@@ -362,6 +368,14 @@ void RecoveryPanel::rederive()
             m_status->setText(m_parseError);
         return;
     }
+    if (!m_staleReason.isEmpty()) {
+        // The cards show the last document; nothing may act on it.
+        const Action stale{false, i18n("the last status refresh failed: %1", m_staleReason)};
+        for (QPushButton *b : {m_upgrade, m_schedule, m_clear, m_console, m_end})
+            bind(b, stale);
+        m_status->setText(m_staleReason);
+        return;
+    }
     const GuiFacts g = facts();
     if (both) {
         const PairActions p = derivePairActions(*m_doc, g);
@@ -371,7 +385,7 @@ void RecoveryPanel::rederive()
         bind(m_console, {false, i18n("pick one drive to open its console")});
         bind(m_end, {false, i18n("pick one drive to end its session")});
     } else if (const DriveView *d = selectedDrive()) {
-        const DriveActions a = deriveActions(*d, m_doc->pair, g);
+        const DriveActions a = deriveActions(*d, *m_doc, g);
         bind(m_upgrade, a.upgrade);
         bind(m_schedule, a.schedule);
         bind(m_clear, a.clearSchedule);
@@ -397,16 +411,19 @@ void RecoveryPanel::onUpgrade()
         return;
     const bool unattended = m_unattended->isChecked();
     if (!unattended) {
-        if (const DriveView *d = selectedDrive(); d && d->verdict == QLatin1String("will")) {
-            const auto answer = QMessageBox::warning(
-                this, i18n("This recovery OS runs btrbk at boot"),
-                i18n("%1\n\nThe session boots it under the guard. At the console, disable what the "
-                     "record's reasons name before you power off. Continue?",
-                     Banner),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-            if (answer != QMessageBox::Yes)
-                return;
-        }
+        // The banner, for every selected drive whose record says `will` —
+        // the rules decide (bannerNeeded), the panel only asks.
+        const GuiFacts g = facts();
+        QStringList will;
+        for (const DriveView &d : m_doc->drives)
+            if (labels.contains(d.label) && deriveActions(d, *m_doc, g).bannerNeeded)
+                will << d.displayName;
+        if (!will.isEmpty()
+            && !m_confirm(i18n("This recovery OS runs btrbk at boot"),
+                          i18n("%1: %2\n\nThe session boots it under the guard. At the console, disable what "
+                               "the record's reasons name before you power off. Continue?",
+                               will.join(QStringLiteral(", ")), Banner)))
+            return;
     }
     m_jobRequested = true;
     m_ownJobAttended = !unattended;
@@ -497,8 +514,15 @@ void RecoveryPanel::onScheduleResult(const QString &unit)
     refresh();
 }
 
+void RecoveryPanel::setConfirmer(Confirmer confirmer)
+{
+    m_confirm = std::move(confirmer);
+}
+
 void RecoveryPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
+    // Any job may be a session another window started: the document says.
+    refresh();
     if (operation != Operation)
         return;
     if (m_earlyFinished.remove(jobId)) {
@@ -518,8 +542,10 @@ void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QStr
 {
     if (m_ownJobId.isEmpty() && m_jobRequested)
         m_earlyFinished.insert(jobId);
-    if (jobId != m_ownJobId)
+    if (jobId != m_ownJobId) {
+        refresh();
         return;
+    }
     m_ownJobId.clear();
     if (success)
         m_status->setText(i18n("Done: %1", summary));
@@ -543,8 +569,15 @@ void RecoveryPanel::onStatusResult(const QString &json)
 {
     m_refreshInFlight = false;
     if (json.isEmpty())
-        return; // the error was reported by the client
+        return; // unavailable, or the error came by onStatusError
     applyDocument(json.toUtf8());
+}
+
+void RecoveryPanel::onStatusError(const QString &reason)
+{
+    m_refreshInFlight = false;
+    m_staleReason = reason;
+    rederive();
 }
 
 void RecoveryPanel::setShown(bool shown)

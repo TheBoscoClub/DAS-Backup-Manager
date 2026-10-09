@@ -34,6 +34,7 @@
 #include <QComboBox>
 #include <QDateTimeEdit>
 
+#include <functional>
 #include <optional>
 
 #include "../src/dbusclient.h"
@@ -1129,18 +1130,31 @@ private:
                 w.findChild<QDateTimeEdit *>(QStringLiteral("when"))};
     }
 
-    // The fixture's drive A with its running job removed, then Upgrade
-    // clicked: the panel now awaits jobStarted for a session of its own.
-    static void requestSession(RecoveryPanel &panel, const RecoveryParts &p)
+    // The fixture with drive A idle (no session) and drive B a copy of A under
+    // its own label, each then edited by the caller.
+    static QByteArray twoIdleDrives(const std::function<void(QJsonObject &a, QJsonObject &b)> &edit)
     {
         const QJsonDocument d = QJsonDocument::fromJson(fixture());
         QJsonObject o = d.object();
         QJsonArray drives = o[QStringLiteral("drives")].toArray();
         QJsonObject a = drives[0].toObject();
         a[QStringLiteral("session")] = QJsonValue::Null;
+        QJsonObject b = a;
+        b[QStringLiteral("label")] = QStringLiteral("system-recovery-B-2tb");
+        b[QStringLiteral("display_name")] = QStringLiteral("Drive system-recovery-B-2tb");
+        edit(a, b);
         drives[0] = a;
+        drives[1] = b;
         o[QStringLiteral("drives")] = drives;
-        panel.applyDocument(QJsonDocument(o).toJson());
+        return QJsonDocument(o).toJson();
+    }
+
+    // Two idle, readable drives (the fixture's drive B has an unreadable
+    // session, which rightly blocks a session on A too), then Upgrade
+    // clicked: the panel now awaits jobStarted for a session of its own.
+    static void requestSession(RecoveryPanel &panel, const RecoveryParts &p)
+    {
+        panel.applyDocument(twoIdleDrives([](QJsonObject &, QJsonObject &) {}));
         p.selector->setCurrentIndex(0);
         p.attended->setChecked(true);
         QVERIFY(p.upgrade->isEnabled());
@@ -1268,6 +1282,105 @@ private Q_SLOTS:
         panel.onJobStarted(QStringLiteral("job-8"), QStringLiteral("Recovery OS session"));
         QVERIFY(panel.facts().ownJobId.isEmpty());
         QVERIFY(p.upgrade->isEnabled());
+    }
+
+    // --- Final review fixes (8249 stage 3) ----------------------------------
+
+private:
+private Q_SLOTS:
+    void upgradeIsBlockedWhileAnyDrivesSessionRuns()
+    {
+        Scenario s = idleA();
+        s.b() = s.a();
+        s.b().label = QStringLiteral("system-recovery-B-2tb");
+        s.b().displayName = QStringLiteral("Drive system-recovery-B-2tb");
+        QVERIFY(deriveActions(s.b(), s.doc, s.facts).upgrade.enabled);
+
+        s.a().session = SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt};
+        DriveActions b = deriveActions(s.b(), s.doc, s.facts);
+        QVERIFY(!b.upgrade.enabled);
+        QVERIFY2(b.upgrade.why.contains(QStringLiteral("system-recovery-A-2tb")), qPrintable(b.upgrade.why));
+
+        s.a().session.reset();
+        s.a().sessionError = QStringLiteral("x.service cannot be read: boom");
+        b = deriveActions(s.b(), s.doc, s.facts);
+        QVERIFY(!b.upgrade.enabled);
+        QCOMPARE(b.upgrade.why, *s.a().sessionError);
+
+        // Scheduling B is not blocked by A's session
+        s.facts.unattended = true;
+        s.facts.chosenNow = false;
+        s.facts.chosenEpoch = s.facts.nowEpoch + 600;
+        QVERIFY(deriveActions(s.b(), s.doc, s.facts).schedule.enabled);
+    }
+
+    void thePanelRefreshesOnAnyJobSignal()
+    {
+        DBusClient client; // unavailable: recoveryOsStatusAsync answers at once with an empty document
+        RecoveryPanel panel(&client);
+        QSignalSpy spy(&client, &DBusClient::recoveryOsStatusResult);
+        Q_EMIT client.jobStarted(QStringLiteral("x"), QStringLiteral("BackupRun"));
+        QCOMPARE(spy.count(), 1);
+        Q_EMIT client.jobFinished(QStringLiteral("x"), true, QString());
+        QCOMPARE(spy.count(), 2);
+    }
+
+    void theBannerShowsForAnAttendedPairWhenEitherDriveIsWill()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        panel.applyDocument(twoIdleDrives([](QJsonObject &, QJsonObject &b) {
+            b[QStringLiteral("verdict")] = QStringLiteral("will");
+        }));
+        QStringList prompts;
+        panel.setConfirmer([&prompts](const QString &, const QString &text) {
+            prompts << text;
+            return false; // declined
+        });
+        p.attended->setChecked(true);
+        p.selector->setCurrentIndex(2); // both
+        QVERIFY2(p.upgrade->isEnabled(), qPrintable(p.upgrade->toolTip()));
+        p.upgrade->click();
+        QCOMPARE(prompts.size(), 1);
+        QVERIFY(prompts[0].contains(QStringLiteral("this OS runs btrbk at boot")));
+        QVERIFY(prompts[0].contains(QStringLiteral("system-recovery-B-2tb")));
+        QVERIFY(p.upgrade->isEnabled()); // declined: nothing was requested
+
+        p.selector->setCurrentIndex(1); // B alone, will
+        p.upgrade->click();
+        QCOMPARE(prompts.size(), 2);
+        QVERIFY(p.upgrade->isEnabled());
+
+        p.selector->setCurrentIndex(0); // A alone, may: no banner, requested
+        p.upgrade->click();
+        QCOMPARE(prompts.size(), 2);
+        QVERIFY(!p.upgrade->isEnabled());
+    }
+
+    void aFailedRefreshDisablesEverythingWithoutLosingTheCards()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.clear->isEnabled());
+
+        Q_EMIT client.recoveryOsStatusError(QStringLiteral("polkit denied the status read"));
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end}) {
+            QVERIFY(!b->isEnabled());
+            QVERIFY2(b->toolTip().contains(QStringLiteral("polkit denied")), qPrintable(b->toolTip()));
+        }
+        QCOMPARE(p.selector->count(), 3); // the cards and the selection are kept
+        QVERIFY(panel.statusLine().contains(QStringLiteral("polkit denied")));
+
+        // The next good document recovers it
+        panel.applyDocument(fixture());
+        QVERIFY(p.clear->isEnabled());
+        QVERIFY(!panel.statusLine().contains(QStringLiteral("polkit denied")));
     }
 };
 
