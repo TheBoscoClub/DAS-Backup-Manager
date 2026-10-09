@@ -1722,6 +1722,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_start_window_after_a_restart_is_three_hours_ten_minutes_to_the_second() {
+        // The window is the 3 h lock wait the unit asks for plus 10 minutes
+        // for the script's start. Pinned in absolute seconds, written as
+        // hours and minutes, so the constant's own arithmetic is what is
+        // tested: a line built from the constant would move with a mutant.
+        let window: i64 = (3 * 60 + 10) * 60;
+        assert_eq!(SCHEDULE_START_WINDOW, window);
+        let at = "2026-10-08 03:00:00";
+        let at_epoch = crate::caldate::local_epoch(at).unwrap();
+        let timer = UnitFacts {
+            exists: true,
+            active_state: "active".into(),
+            on_calendar: Some(at.into()),
+            ..Default::default()
+        };
+        let idle = UnitFacts {
+            exists: true,
+            active_state: "inactive".into(),
+            ..Default::default()
+        };
+        let now = at_epoch + 86_400;
+        let line = |start: i64| serde_json::json!({"start": start, "outcome": "clean", "exit": 0, "unattended": true});
+        let last = line(at_epoch + window);
+        let s = schedule_state(&timer, &idle, Ok(&[&last]), now);
+        assert_eq!(
+            s.state, "fired",
+            "the last second of the window: {}",
+            s.detail
+        );
+        let beyond = line(at_epoch + window + 1);
+        let s = schedule_state(&timer, &idle, Ok(&[&beyond]), now);
+        assert_eq!(s.state, "missed", "one second past it: {}", s.detail);
+    }
+
+    #[test]
     fn a_fired_schedules_history_line_is_one_that_started_inside_the_services_run() {
         let timer = UnitFacts {
             exists: true,
