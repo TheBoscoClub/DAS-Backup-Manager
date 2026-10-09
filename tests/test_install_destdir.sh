@@ -39,6 +39,13 @@
 #      das-* units (bd DAS-Backup-Manager-7rf). Until then CMake installed its
 #      own das-backup{,-full}.{service,timer}, which systemd ran whenever
 #      setup's were gone.
+#   7. every destination follows the prefix: a second install with
+#      `--prefix <scratch>` puts every manifest entry under that prefix. Until
+#      bd DAS-Backup-Manager-laj the CLI, helper, scripts, D-Bus, polkit and
+#      man destinations were absolute strings built from the prefix at
+#      configure time — before the GUI's KDEInstallDirs reset the cached
+#      prefix to /usr — so a default configure split one install between
+#      /usr/local and /usr, and `--prefix` could not move those files.
 # Out of its sight: install-time code that writes outside DESTDIR without
 # running a command (a file(WRITE) to an absolute path) — neither under DESTDIR
 # nor in the manifest. Configuring with a scratch prefix exposes that too:
@@ -202,6 +209,19 @@ done
 
 check "6. no backup unit is installed" \
     "$(grep -E '/systemd/system/das-[^/]*$' "$manifest" 2>/dev/null | paste -sd ' ' -)" ""
+
+# A relative DESTINATION is resolved against the prefix at install time, so
+# `--prefix` moves it; an absolute one was frozen at configure time and stays.
+dest2="$work/destdir2"
+prefix2="/opt/das-prefix-check"
+rm -f "$manifest"
+out="$(PATH="$work/bin:$PATH" DESTDIR="$dest2" "$cmake" --install "$build" --prefix "$prefix2" 2>&1)"
+rc=$?
+check "7. the install with --prefix succeeds" "$rc" "0"
+((rc == 0)) || printf '%s\n' "$out" | tail -n 20
+check "7. the manifest after --prefix is not empty" "$([[ -s "$manifest" ]] && echo yes || echo no)" "yes"
+check "7. every manifest entry is under --prefix" \
+    "$(grep -v "^$prefix2/" "$manifest" 2>/dev/null | paste -sd ' ' -)" ""
 
 if ((fails > 0)); then
     echo "INSTALL DESTDIR SUITE RED ($fails failed)"

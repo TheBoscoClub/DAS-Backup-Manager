@@ -72,7 +72,9 @@ The recommended installation method builds all components and runs the setup wiz
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# 2. Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, man page, icons)
+# 2. Install all components (binaries, scripts, the helper's unit, D-Bus, polkit, man page, icons).
+#    The prefix is /usr unless the configure passed -DCMAKE_INSTALL_PREFIX;
+#    `cmake --install build --prefix <dir>` relocates the whole install.
 sudo cmake --install build
 
 # 3. Run the interactive setup wizard

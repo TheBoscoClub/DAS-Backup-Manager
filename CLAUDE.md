@@ -20,6 +20,7 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 
 ```bash
 # Rust is built by CMake into build/cargo-target/; never a bare `cargo build`
+# Install prefix defaults to /usr (not CMake's /usr/local); packaging passes it explicitly
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 # Rust tests (target dir on tmpfs, not the array)

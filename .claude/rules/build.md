@@ -4,7 +4,7 @@
 Policy: `~/.claude/rules/development-tools.md`. Canonical locations here:
 - **Version**: `CMakeLists.txt` `project(VERSION ...)`; Rust from `Cargo.toml`; GUI via `target_compile_definitions(BTRDASD_VERSION="${CMAKE_PROJECT_VERSION}")`.
 - **btrbk config**: `/etc/btrbk/btrbk.conf` (canonical); `/etc/das-backup/btrbk.conf` is a symlink; `/usr/lib/das-backup/config/btrbk.conf` is a reference template only.
-- **Binaries**: cmake installs to `/usr/bin/` and `/usr/libexec/`; symlinks only if other paths need them.
+- **Binaries**: cmake installs to `/usr/bin/` and `/usr/libexec/`; symlinks only if other paths need them. The prefix defaults to `/usr` at the top of `CMakeLists.txt` and every `DESTINATION` is prefix-relative (bd `laj`); never build an absolute destination from `${CMAKE_INSTALL_PREFIX}` at configure time — the GUI's `KDEInstallDirs` resets the cached prefix later.
 - **Build artifacts**: `cmake --build build` only (uses `build/cargo-target/`); never bare `cargo build`.
 
 ## C++20 Standards

@@ -1,4 +1,15 @@
 cmake_minimum_required(VERSION 3.25)
+
+# The install prefix is /usr unless the configure names one. CMake's own
+# default is /usr/local, but the GUI's KDEInstallDirs (gui/CMakeLists.txt)
+# resets the cached prefix to /usr when it is included, so a prefix read
+# before that line and one read after it disagreed (bd DAS-Backup-Manager-laj).
+# This runs before project(), which is what initialises the prefix, so every
+# later reader sees one value; packaging keeps passing -DCMAKE_INSTALL_PREFIX.
+if(NOT DEFINED CMAKE_INSTALL_PREFIX)
+    set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "Install prefix" FORCE)
+endif()
+
 project(DAS-Backup-Manager
     VERSION 0.7.23.0
     DESCRIPTION "DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI"
@@ -86,7 +97,7 @@ if(BUILD_INDEXER)
     das_require_nonzero_artifact("${CARGO_TARGET_DIR}/release/btrdasd"
                                   "btrdasd CLI binary")
     install(PROGRAMS "${CARGO_TARGET_DIR}/release/btrdasd"
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
+        DESTINATION bin)
 endif()
 
 # =============================================================================
@@ -112,7 +123,7 @@ if(BUILD_HELPER)
     das_require_nonzero_artifact("${CARGO_TARGET_DIR}/release/btrdasd-helper"
                                   "btrdasd-helper D-Bus daemon")
     install(PROGRAMS "${CARGO_TARGET_DIR}/release/btrdasd-helper"
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/libexec")
+        DESTINATION libexec)
 endif()
 
 
@@ -120,7 +131,9 @@ endif()
 # Install targets for reference scripts and config
 # =============================================================================
 
-set(DAS_SCRIPT_DIR "${CMAKE_INSTALL_PREFIX}/lib/das-backup")
+# Relative to the prefix, resolved at install time: `cmake --install --prefix`
+# and DESTDIR both move it (bd DAS-Backup-Manager-laj).
+set(DAS_SCRIPT_DIR "lib/das-backup")
 
 install(PROGRAMS
     scripts/backup-run.sh
@@ -164,13 +177,13 @@ install(FILES
 
 if(BUILD_HELPER)
     install(FILES dbus/org.dasbackup.Helper1.conf
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/share/dbus-1/system.d")
+        DESTINATION share/dbus-1/system.d)
 
     install(FILES dbus/org.dasbackup.Helper1.service
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/share/dbus-1/system-services")
+        DESTINATION share/dbus-1/system-services)
 
     install(FILES polkit/org.dasbackup.policy
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/share/polkit-1/actions")
+        DESTINATION share/polkit-1/actions)
 
     install(FILES systemd/btrdasd-helper.service
         DESTINATION lib/systemd/system)
@@ -189,7 +202,7 @@ endif()
 # Man page
 # =============================================================================
 
-install(FILES docs/btrdasd.1 DESTINATION "${CMAKE_INSTALL_PREFIX}/share/man/man1")
+install(FILES docs/btrdasd.1 DESTINATION share/man/man1)
 
 # =============================================================================
 # Shell completions (generated at build time, installed as files)

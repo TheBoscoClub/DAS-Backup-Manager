@@ -134,6 +134,14 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
           -DREQUIRE_ALL_SHELL_CASES=ON
 
+      # No -DCMAKE_INSTALL_PREFIX above, on purpose: a default configure must
+      # land on /usr, where the GUI's KDEInstallDirs puts the rest, or one
+      # install is split between /usr/local and /usr (bd DAS-Backup-Manager-laj).
+      # The shell-install-destdir suite below proves every destination then
+      # follows the prefix.
+      - name: Default install prefix is /usr
+        run: grep -x 'CMAKE_INSTALL_PREFIX:PATH=/usr' build/CMakeCache.txt
+
       # Always via cmake — a bare `cargo build` writes to a different target dir
       # and the install step then picks up a stale binary.
       - name: Build
