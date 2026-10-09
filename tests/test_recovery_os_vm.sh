@@ -1505,7 +1505,7 @@ for unit in das-backup.service das-backup-full.service das-scrub.service das-bac
     echo activating >"$S/unit.$unit"
     run_driver session A --dry-run
     check "$unit activating: refused" "$RC" "1"
-    has "$unit activating: named" "$OUT" "$unit is activating"
+    has "$unit activating: named" "$OUT" "$unit (activating)"
     check "$unit activating: no lock taken" "$(file "$S/flock.calls")" ""
 done
 fixture
@@ -1513,7 +1513,7 @@ echo active >"$S/unit.das-scrub.service"
 echo failed >"$S/unit.das-backup.service"
 run_driver session A --dry-run
 check "active scrub: refused" "$RC" "1"
-lacks "a failed unit is not running: not listed" "$OUT" "das-backup.service is failed"
+lacks "a failed unit is not running: not listed" "$OUT" "das-backup.service (failed)"
 
 fixture
 touch "$S/systemctl_fail"
@@ -1676,14 +1676,14 @@ echo active >"$S/unit.das-backup.service"
 unitwaiter=$!
 run_driver session A --wait-lock 20
 wait "$unitwaiter"
-has "wait-lock for a unit: waits for it" "$OUT" "waiting for das-backup.service is active"
+has "wait-lock for a unit: waits for it" "$OUT" "waiting for das-backup.service (active)"
 check "wait-lock for a unit: goes on once it is inactive" "$RC" "0"
 
 fixture
 echo active >"$S/unit.das-scrub.service"
 run_driver session A --wait-lock 2
 check "wait-lock for a unit that never ends: refused at the bound" "$RC" "1"
-has "wait-lock for a unit that never ends: names it" "$OUT" "waited 2 min for das-scrub.service is active"
+has "wait-lock for a unit that never ends: names it" "$OUT" "waited 2 min for das-scrub.service (active)"
 
 fixture
 touch "$S/systemctl_fail"

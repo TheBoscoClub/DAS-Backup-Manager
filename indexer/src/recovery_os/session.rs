@@ -4,9 +4,13 @@
 //! the script in an environment built from nothing (no test seam of the
 //! script's is reachable from the bus), turns the script's machine lines into
 //! stages, percents and log lines, and returns the outcome the script's own
-//! exit status gives. A cancel sends the script one SIGINT — the driver's
-//! trap leaves a recovery OS it already started running and says so — and the
-//! job then reads on to the script's real end.
+//! exit status gives. The script runs in a process group of its own
+//! (`process_group(0)`), and a cancel sends that whole group one SIGINT
+//! (`kill(-pid, SIGINT)`), as a terminal's Ctrl-C would: a two-drive run's
+//! parent traps it and waits, while the drive session in the foreground acts
+//! on it — the driver's trap leaves a recovery OS it already started running
+//! and says so. The job then reads on to the script's real end; the helper's
+//! own process group is never signalled.
 
 use std::io::{self, BufRead, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
