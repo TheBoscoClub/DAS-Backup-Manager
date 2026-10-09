@@ -329,7 +329,7 @@ GuiFacts RecoveryPanel::facts() const
     GuiFacts g;
     g.ownJobId = m_ownJobId;
     g.ownJobAttended = m_ownJobAttended;
-    g.viewerInstalled = !QStandardPaths::findExecutable(QStringLiteral("remote-viewer")).isEmpty();
+    g.viewerInstalled = !QStandardPaths::findExecutable(QStringLiteral("vncviewer")).isEmpty();
     g.nowEpoch = QDateTime::currentSecsSinceEpoch();
     g.chosenNow = m_now->isChecked();
     g.chosenEpoch = m_when->dateTime().toSecsSinceEpoch();
@@ -500,7 +500,7 @@ void RecoveryPanel::onConsoleResult(const QString &label, const QString &path)
         return;
     }
     QMessageBox box(QMessageBox::Information, i18n("Console socket"),
-                    i18n("%1 is not installed (package virt-viewer). Connect any VNC viewer that speaks "
+                    i18n("%1 is not installed (package tigervnc). Connect any VNC viewer that speaks "
                          "UNIX sockets to:\n\n%2\n\nThe socket accepts one connection and is removed when "
                          "the drive is given back.",
                          program, path),

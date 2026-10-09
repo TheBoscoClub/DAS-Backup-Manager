@@ -565,8 +565,9 @@ void DBusClient::recoveryOsConsole(const QString &label)
 
 QPair<QString, QStringList> DBusClient::consoleCommand(const QString &socketPath)
 {
-    return {QStringLiteral("remote-viewer"),
-            {QStringLiteral("vnc+unix://") + socketPath}};
+    // TigerVNC's viewer takes a UNIX socket path as its server. remote-viewer's
+    // unix-path is SPICE-only and gvncviewer takes host:display (2026-10-09).
+    return {QStringLiteral("vncviewer"), {socketPath}};
 }
 
 int DBusClient::sessionEndTimeoutMs() const

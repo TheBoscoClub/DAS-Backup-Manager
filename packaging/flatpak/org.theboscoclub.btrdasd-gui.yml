@@ -5,7 +5,7 @@ sdk: org.kde.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 command: btrdasd-gui
-# The recovery-drive console opens remote-viewer on the host; inside this
+# The recovery-drive console opens TigerVNC's vncviewer on the host; inside this
 # sandbox the GUI shows the console socket's path instead (8249 stage 3).
 
 finish-args:
