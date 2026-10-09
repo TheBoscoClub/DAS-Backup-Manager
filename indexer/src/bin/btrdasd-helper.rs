@@ -534,6 +534,13 @@ fn dev_major_minor(dev: u64) -> (u64, u64) {
 /// never takes the lock, so a doctor or reconcile arriving at that moment is
 /// not turned away by it. A lock that cannot be checked is
 /// `Some("unknown: …")`, never "free".
+///
+/// The file is matched by its `st_dev` and inode against `/proc/locks`,
+/// which names the device of the superblock. The two are equal on tmpfs,
+/// where `/run/das-maintenance.lock` lives; on a btrfs subvolume `st_dev` is
+/// an anonymous per-subvolume device and nothing would ever match — every
+/// lock would read free. Use it for a lock file on such a filesystem only
+/// after making the match by the superblock's device.
 fn lock_holder_at(path: &Path, proc_locks: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = match std::fs::metadata(path) {

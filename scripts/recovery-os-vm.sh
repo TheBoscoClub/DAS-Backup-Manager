@@ -1186,7 +1186,7 @@ busy_units() {
     for i in "${!TARGET_UNITS[@]}"; do
         case "${states[$i]}" in
             inactive | failed) ;;
-            *) busy+="${busy:+, }${TARGET_UNITS[$i]} is ${states[$i]}" ;;
+            *) busy+="${busy:+, }${TARGET_UNITS[$i]} (${states[$i]})" ;;
         esac
     done
     printf '%s\n' "$busy"
