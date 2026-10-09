@@ -21,7 +21,13 @@ DBusClient::DBusClient(QObject *parent)
     , m_interface(new QDBusInterface(
           ServiceName, ObjectPath, InterfaceName,
           QDBusConnection::systemBus(), this))
+    , m_slowInterface(new QDBusInterface(
+          ServiceName, ObjectPath, InterfaceName,
+          QDBusConnection::systemBus(), this))
 {
+    // A recovery-drive give-back can outlast Qt's 25 s default (bd k84b).
+    m_slowInterface->setTimeout(SessionEndTimeoutMs);
+
     // QDBusInterface::isValid() only verifies the proxy object was constructed
     // — it does NOT verify the remote service can be activated. To know whether
     // org.dasbackup.Helper1 is actually reachable, we have to round-trip a real
@@ -445,6 +451,126 @@ void DBusClient::onJobFinished(const QString &jobId, bool success,
                                 const QString &summary)
 {
     Q_EMIT jobFinished(jobId, success, summary);
+}
+
+// --- Recovery drives ---
+
+void DBusClient::recoveryOsStatusAsync()
+{
+    if (!m_available) {
+        Q_EMIT recoveryOsStatusResult({});
+        return;
+    }
+    QDBusPendingCall pending = m_interface->asyncCall(
+        QStringLiteral("RecoveryOsStatus"));
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError()) {
+            Q_EMIT errorOccurred(QStringLiteral("RecoveryOsStatus"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+            Q_EMIT recoveryOsStatusResult({});
+        } else {
+            Q_EMIT recoveryOsStatusResult(reply.value());
+        }
+        w->deleteLater();
+    });
+}
+
+void DBusClient::recoveryOsSession(const QStringList &labels, bool unattended,
+                                   const QString &mode)
+{
+    // accept_boot_record_risk is always false from the GUI (spec 3.3).
+    callAsync(QStringLiteral("RecoveryOsSession"),
+              {QVariant::fromValue(labels), unattended, mode, false},
+              QStringLiteral("Recovery OS session"));
+}
+
+void DBusClient::recoveryOsSessionEnd(const QString &label)
+{
+    if (!m_available) {
+        Q_EMIT recoveryOsSessionEndResult(label, false, unavailableReason());
+        return;
+    }
+    QDBusPendingCall pending = m_slowInterface->asyncCall(
+        QStringLiteral("RecoveryOsSessionEnd"), label);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this, label](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<bool, QString> reply = *w;
+        if (reply.isError()) {
+            const QString text = mapDBusError(reply.error().name(),
+                                              reply.error().message());
+            Q_EMIT errorOccurred(QStringLiteral("RecoveryOsSessionEnd"), text);
+            Q_EMIT recoveryOsSessionEndResult(label, false, text);
+        } else {
+            Q_EMIT recoveryOsSessionEndResult(label, reply.argumentAt<0>(),
+                                              reply.argumentAt<1>());
+        }
+        w->deleteLater();
+    });
+}
+
+void DBusClient::recoveryOsScheduleSet(const QStringList &labels,
+                                       qint64 atEpoch, const QString &mode)
+{
+    if (!m_available) {
+        Q_EMIT errorOccurred(QStringLiteral("RecoveryOsScheduleSet"),
+                             unavailableReason());
+        return;
+    }
+    // qlonglong so the bus sees "x" (the helper's i64).
+    QDBusPendingCall pending = m_interface->asyncCallWithArgumentList(
+        QStringLiteral("RecoveryOsScheduleSet"),
+        {QVariant::fromValue(labels), QVariant::fromValue<qlonglong>(atEpoch), mode});
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError())
+            Q_EMIT errorOccurred(QStringLiteral("RecoveryOsScheduleSet"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+        else
+            Q_EMIT recoveryOsScheduleResult(reply.value());
+        w->deleteLater();
+    });
+}
+
+void DBusClient::recoveryOsConsole(const QString &label)
+{
+    if (!m_available) {
+        Q_EMIT errorOccurred(QStringLiteral("RecoveryOsConsole"),
+                             unavailableReason());
+        return;
+    }
+    QDBusPendingCall pending = m_interface->asyncCall(
+        QStringLiteral("RecoveryOsConsole"), label);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this, label](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError())
+            Q_EMIT errorOccurred(QStringLiteral("RecoveryOsConsole"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
+        else
+            Q_EMIT recoveryOsConsoleResult(label, reply.value());
+        w->deleteLater();
+    });
+}
+
+QPair<QString, QStringList> DBusClient::consoleCommand(const QString &socketPath)
+{
+    return {QStringLiteral("remote-viewer"),
+            {QStringLiteral("vnc+unix://") + socketPath}};
+}
+
+int DBusClient::sessionEndTimeoutMs() const
+{
+    return m_slowInterface ? m_slowInterface->timeout() : -1;
 }
 
 // --- Private helpers ---

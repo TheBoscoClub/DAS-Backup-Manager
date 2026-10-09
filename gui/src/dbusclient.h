@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QPair>
 #include <QString>
 #include <QStringList>
 
@@ -60,6 +61,20 @@ public:
     QString indexBackupHistory(qint64 limit);
     QString indexSnapshotPath(qint64 snapshotId);
 
+    // --- Recovery drives (bd DAS-Backup-Manager-8249 stage 3) ---
+    void recoveryOsStatusAsync();                                   // -> recoveryOsStatusResult(json); empty on error/unavailable
+    void recoveryOsSession(const QStringList &labels, bool unattended,
+                           const QString &mode);                    // a job: jobStarted(id, "Recovery OS session"); never passes accept_boot_record_risk
+    void recoveryOsSessionEnd(const QString &label);                // -> recoveryOsSessionEndResult(label, ok, lines); 10-minute timeout
+    void recoveryOsScheduleSet(const QStringList &labels, qint64 atEpoch,
+                               const QString &mode);                // -> recoveryOsScheduleResult(unit); atEpoch 0 clears
+    void recoveryOsConsole(const QString &label);                   // -> recoveryOsConsoleResult(label, path)
+    // The viewer to launch for a console socket: program and arguments. Pure,
+    // so the test can pin it without a socket.
+    [[nodiscard]] static QPair<QString, QStringList> consoleCommand(const QString &socketPath);
+    static constexpr int SessionEndTimeoutMs = 600000;
+    [[nodiscard]] int sessionEndTimeoutMs() const; // what the session-end interface is really set to
+
 Q_SIGNALS:
     void jobStarted(const QString &jobId, const QString &operation);
     void jobProgress(const QString &jobId, const QString &stage,
@@ -81,6 +96,10 @@ Q_SIGNALS:
     void scheduleGetResult(const QString &json);
     void indexStatsResult(const QString &json);
     void indexListSnapshotsResult(const QString &json);
+    void recoveryOsStatusResult(const QString &json);
+    void recoveryOsSessionEndResult(const QString &label, bool ok, const QString &lines);
+    void recoveryOsScheduleResult(const QString &unit);
+    void recoveryOsConsoleResult(const QString &label, const QString &path);
 
 private Q_SLOTS:
     void onJobProgress(const QString &jobId, const QString &stage,
@@ -102,6 +121,9 @@ private:
                    const QString &operation);
 
     QDBusInterface *m_interface = nullptr;
+    // Same service, path and name; only the call timeout differs
+    // (QDBusAbstractInterface::setTimeout is per interface object).
+    QDBusInterface *m_slowInterface = nullptr;
     bool m_available = false;
     QString m_unavailableReason;
 };
