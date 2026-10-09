@@ -2670,4 +2670,95 @@ pub(crate) mod tests {
                 .contains("why")
         );
     }
+
+    /// The GUI's contract: gui/tests/fixtures/recovery-status.json IS this
+    /// output. Regenerate with RECOVERY_FIXTURE_WRITE=1; otherwise the
+    /// committed file must equal it byte for byte, so a key or wording
+    /// change on either side fails here and in gui-smoketest.
+    #[test]
+    fn the_gui_fixture_is_this_status_document() {
+        let cfg = two_mirrors_and_a_primary();
+        let state = Ok(Some(state_v(
+            4,
+            &[(
+                "system-recovery-A-2tb",
+                stored_drive(agent_at_boot(), BootVerdict::May, Some(uuid_a())),
+            )],
+        )));
+        let mut units = HashMap::new();
+        units.insert(
+            "das-recovery-os-update-system-recovery-A-2tb.timer".to_string(),
+            // A missed timer with no OnCalendar renders without any local
+            // time: the fixture must be the same in every time zone (CI
+            // runs in UTC, the author's host does not).
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "inactive".into(),
+                ..Default::default()
+            }),
+        );
+        units.insert(
+            "das-recovery-os-update-system-recovery-A-2tb.service".to_string(),
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "inactive".into(),
+                exec_start: Some(
+                    "/usr/lib/das-backup/recovery-os-vm.sh session system-recovery-A-2tb --unattended --wait-lock 180"
+                        .into(),
+                ),
+                ..Default::default()
+            }),
+        );
+        units.insert(
+            "das-recovery-os-update-system-recovery-B-2tb.timer".to_string(),
+            Err("systemctl show failed: Connection refused".into()),
+        );
+        units.insert(
+            "das-recovery-os-update-system-recovery-B-2tb.service".to_string(),
+            Err("systemctl show failed: Connection refused".into()),
+        );
+        let reads = Scripted {
+            clean: [
+                ("system-recovery-A-2tb", Ok(2)),
+                (
+                    "system-recovery-B-2tb",
+                    Err("history cannot be read: line 3 is not JSON".into()),
+                ),
+            ]
+            .into(),
+            history: [
+                (
+                    "system-recovery-A-2tb",
+                    Ok(vec![
+                        json!({"label":"system-recovery-A-2tb","start":1_791_300_000,"end":1_791_300_310,"mode":null,"unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"7.2.9-1-cachyos","stopped_at":null}),
+                        json!({"label":"system-recovery-A-2tb","start":1_791_400_000,"end":1_791_400_290,"mode":null,"unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"7.2.9-1-cachyos","stopped_at":null}),
+                    ]),
+                ),
+                (
+                    "system-recovery-B-2tb",
+                    Err("history cannot be read: line 3 is not JSON".into()),
+                ),
+            ]
+            .into(),
+            units,
+            lock: Some("recovery-os VM session system-recovery-A-2tb pid 4242".into()),
+            domain: Some("running".into()),
+            job: Some("job-7".into()),
+            ..Default::default()
+        };
+        let j = status_json(&cfg, &state, &host(), "2026-10-09", 1_791_500_000, &reads);
+        let text = serde_json::to_string_pretty(&j).unwrap() + "\n";
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../gui/tests/fixtures/recovery-status.json"
+        );
+        if std::env::var_os("RECOVERY_FIXTURE_WRITE").is_some() {
+            std::fs::write(path, &text).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            on_disk, text,
+            "the fixture is stale: RECOVERY_FIXTURE_WRITE=1 cargo test the_gui_fixture"
+        );
+    }
 }

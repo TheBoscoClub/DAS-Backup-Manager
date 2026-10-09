@@ -51,6 +51,7 @@ target_sources(btrdasd-gui PRIVATE
     src/panelconfig.cpp
     src/backupsteps.cpp
     src/healthdashboard.cpp
+    src/recoverystatus.cpp
     src/configdialog.cpp
     src/snapshotbrowser.cpp
 )
@@ -108,7 +109,11 @@ if(BUILD_TESTING)
         src/panelconfig.cpp
         src/progresspanel.cpp
         src/indexrunner.cpp
+        src/recoverystatus.cpp
     )
+    # The status-document contract: the file a panel.rs test writes.
+    target_compile_definitions(gui-smoketest PRIVATE
+        RECOVERY_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/recovery-status.json")
     target_link_libraries(gui-smoketest PRIVATE
         Qt6::Test
         Qt6::Widgets

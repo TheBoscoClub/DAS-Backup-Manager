@@ -1,0 +1,124 @@
+{
+  "drives": [
+    {
+      "assessment": {
+        "age_basis": "last_applied_upgrade",
+        "age_days": 19,
+        "reasons": [],
+        "stale": false,
+        "warnings": [
+          "btrbk may run when this OS boots — not read: check what it starts at boot and its btrbk config before booting it, on bare metal or in the update VM"
+        ]
+      },
+      "checked_epoch": 1791448102,
+      "clean_runs": 2,
+      "clean_runs_error": null,
+      "display_name": "Drive system-recovery-A-2tb",
+      "due": false,
+      "history": [
+        {
+          "end": 1791300310,
+          "exit": 0,
+          "kernel": "7.2.9-1-cachyos",
+          "label": "system-recovery-A-2tb",
+          "mode": null,
+          "outcome": "clean",
+          "overridden": false,
+          "start": 1791300000,
+          "stopped_at": null,
+          "unattended": true
+        },
+        {
+          "end": 1791400290,
+          "exit": 0,
+          "kernel": "7.2.9-1-cachyos",
+          "label": "system-recovery-A-2tb",
+          "mode": null,
+          "outcome": "clean",
+          "overridden": false,
+          "start": 1791400000,
+          "stopped_at": null,
+          "unattended": true
+        }
+      ],
+      "history_error": null,
+      "label": "system-recovery-A-2tb",
+      "record": {
+        "btrbk": null,
+        "btrfs_progs": null,
+        "guest_agent": {
+          "enabled": true,
+          "installed": true,
+          "state": "read",
+          "why": "started by udev"
+        },
+        "host_btrfs_progs": "6.17-1",
+        "host_kernel": "6.17.2-1-cachyos",
+        "installed": "2026-01-01",
+        "kernel": "6.17.1-1-cachyos",
+        "last_full_upgrade": "2026-09-20",
+        "os": null,
+        "packages_read": false
+      },
+      "record_error": null,
+      "schedule": {
+        "at_epoch": null,
+        "detail": "The timer for a time that cannot be read from the timer is inactive and never fired; it will not run until it is scheduled again.",
+        "mode": null,
+        "state": "missed",
+        "unit": "das-recovery-os-update-system-recovery-A-2tb.timer"
+      },
+      "schedule_error": null,
+      "serials": [
+        "SER-system-recovery-A-2tb"
+      ],
+      "session": {
+        "attended": null,
+        "by": "job:job-7",
+        "domain_state": "running",
+        "since_epoch": null
+      },
+      "session_error": null,
+      "unattended": {
+        "possible": true,
+        "why": ""
+      },
+      "verdict": "may"
+    },
+    {
+      "assessment": null,
+      "checked_epoch": null,
+      "clean_runs": null,
+      "clean_runs_error": "history cannot be read: line 3 is not JSON",
+      "display_name": "Drive system-recovery-B-2tb",
+      "due": false,
+      "history": [],
+      "history_error": "history cannot be read: line 3 is not JSON",
+      "label": "system-recovery-B-2tb",
+      "record": null,
+      "record_error": "no record of system-recovery-B-2tb",
+      "schedule": null,
+      "schedule_error": "das-recovery-os-update-system-recovery-B-2tb.timer cannot be read: systemctl show failed: Connection refused",
+      "serials": [
+        "SER-system-recovery-B-2tb"
+      ],
+      "session": null,
+      "session_error": "das-recovery-os-update-system-recovery-B-2tb.service cannot be read: systemctl show failed: Connection refused",
+      "unattended": {
+        "possible": false,
+        "why": "no record of system-recovery-B-2tb (let a backup run record it)"
+      },
+      "verdict": null
+    }
+  ],
+  "max_age_days": 60,
+  "pair": {
+    "mode_default": "sequential",
+    "schedule": null,
+    "schedule_error": null,
+    "session": null,
+    "session_error": null
+  },
+  "schema": 1,
+  "today": "2026-10-09"
+}
