@@ -212,6 +212,8 @@ pub struct DriveStatus {
     pub clean_runs: Option<u32>,
     pub clean_runs_error: Option<String>,
     pub history: Vec<Value>,
+    /// Every history line, newest last; the pair's firing is searched here, not in the display cut.
+    pub full_history: Vec<Value>,
     pub history_error: Option<String>,
     pub schedule: Option<Schedule>,
     /// Why this drive's schedule units could not be read.
@@ -332,6 +334,7 @@ fn drive_status(
         Ok(h) => (h, None),
         Err(e) => (Vec::new(), Some(e)),
     };
+    let full_history = history.clone();
     let skip = history.len().saturating_sub(HISTORY_SHOWN);
     let lines: Vec<&Value> = history.iter().collect();
     let readable = match &history_error {
@@ -359,6 +362,7 @@ fn drive_status(
         clean_runs,
         clean_runs_error,
         history: history.into_iter().skip(skip).collect(),
+        full_history,
         history_error,
         schedule,
         schedule_error,
@@ -394,7 +398,7 @@ pub fn status_json(
         .collect();
     // The pair's history is both drives' lines (a two-drive run writes one
     // into each); either history unreadable leaves it unknown.
-    let pair_lines: Vec<&Value> = drives.iter().flat_map(|d| &d.history).collect();
+    let pair_lines: Vec<&Value> = drives.iter().flat_map(|d| &d.full_history).collect();
     let pair_history = match drives.iter().find_map(|d| d.history_error.as_deref()) {
         Some(e) => Err(e),
         None => Ok(pair_lines.as_slice()),
@@ -531,7 +535,7 @@ fn local_words(epoch: i64) -> String {
 /// gone (the host restarted since).
 const SCHEDULE_START_WINDOW: i64 = SCHEDULE_WAIT_LOCK_MIN as i64 * 60 + 600;
 
-/// The latest-starting history line that started inside `[from, to]` (`to`
+/// The earliest-starting history line that started inside `[from, to]` (`to`
 /// `None`: no upper bound) — searched through the whole history, so a later
 /// session's line never hides this one; with `unattended_only`, a line of an
 /// unattended session only.
@@ -550,7 +554,7 @@ fn line_in<'a>(
                 .is_some_and(|start| start >= from && to.is_none_or(|to| start <= to))
                 && (!unattended_only || h.get("unattended").and_then(Value::as_bool) == Some(true))
         })
-        .max_by_key(|h| h.get("start").and_then(Value::as_i64))
+        .min_by_key(|h| h.get("start").and_then(Value::as_i64))
 }
 
 /// Whether a service in `active_state` is running, for a schedule.
@@ -587,7 +591,7 @@ fn journal_words(service: &UnitFacts) -> String {
 /// reloading); **pending** (the timer has a next elapse — it comes before
 /// fired, so a timer that also still shows an earlier trigger reads as what
 /// it will do next); **fired** (the timer triggered: the detail is the
-/// `<outcome> (exit <n>)` of the latest history line that started inside
+/// `<outcome> (exit <n>)` of the earliest history line that started inside
 /// the service's run — at or after the trigger and the run's start, not after
 /// its end — else `refused: <the service's journal lines>`, since a session
 /// that wrote no history line never took the lock; with the history
@@ -2398,6 +2402,111 @@ pub(crate) mod tests {
             assert_eq!(d["session"]["attended"], false);
         }
         assert_eq!(j["pair"]["session"]["by"], format!("unit:{both}.service"));
+    }
+
+    fn fired_pair_units(
+        trigger: i64,
+        start: i64,
+        exit: i64,
+    ) -> HashMap<String, Result<UnitFacts, String>> {
+        let both = format!("{UNIT_PREFIX}both");
+        let mut units = HashMap::new();
+        units.insert(
+            format!("{both}.timer"),
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "active".into(),
+                last_trigger_epoch: Some(trigger),
+                on_calendar: Some("2026-10-09 03:00:00".into()),
+                ..Default::default()
+            }),
+        );
+        units.insert(
+            format!("{both}.service"),
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "inactive".into(),
+                exec_main_start_epoch: Some(start),
+                exec_main_exit_epoch: Some(exit),
+                exec_main_status: Some(0),
+                result: Some("success".into()),
+                exec_start: Some(
+                    "/x.sh session a b --mode sequential --unattended --wait-lock 180".into(),
+                ),
+                ..Default::default()
+            }),
+        );
+        units
+    }
+
+    #[test]
+    fn a_pair_firing_older_than_the_display_cut_is_still_found() {
+        // 25 later lines per drive push the pair's firing out of the 20-line
+        // display cut; the pair must still read its outcome (bd 6obo 1).
+        let cfg = two_mirrors_and_a_primary();
+        let trigger = 1_791_000_000;
+        let mut a_lines = vec![
+            json!({"label":"system-recovery-A-2tb","start":trigger+5,"end":trigger+900,"mode":"sequential","unattended":true,"outcome":"clean","exit":0}),
+        ];
+        let mut b_lines = vec![
+            json!({"label":"system-recovery-B-2tb","start":trigger+905,"end":trigger+1800,"mode":"sequential","unattended":true,"outcome":"clean","exit":0}),
+        ];
+        for i in 0..25 {
+            let s = trigger + 10_000 + i * 1000;
+            a_lines.push(json!({"label":"system-recovery-A-2tb","start":s,"end":s+10,"mode":null,"unattended":false,"outcome":"clean","exit":0}));
+            b_lines.push(json!({"label":"system-recovery-B-2tb","start":s,"end":s+10,"mode":null,"unattended":false,"outcome":"clean","exit":0}));
+        }
+        let reads = Scripted {
+            history: [
+                ("system-recovery-A-2tb", Ok(a_lines)),
+                ("system-recovery-B-2tb", Ok(b_lines)),
+            ]
+            .into(),
+            units: fired_pair_units(trigger, trigger + 2, trigger + 1801),
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-09",
+            trigger + 50_000,
+            &reads,
+        );
+        assert_eq!(j["pair"]["schedule"]["state"], "fired");
+        assert!(
+            j["pair"]["schedule"]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("clean (exit 0)"),
+            "{}",
+            j["pair"]["schedule"]["detail"]
+        );
+        assert_eq!(
+            j["drives"][0]["history"].as_array().unwrap().len(),
+            20,
+            "display cut unchanged"
+        );
+    }
+
+    #[test]
+    fn a_firing_without_its_own_exec_readings_takes_the_earliest_line_after_the_trigger() {
+        // Exec readings older than the trigger bound nothing; the window is
+        // open-ended, and the line of THIS firing is the earliest after it,
+        // not a later Now session's (bd 6obo 2).
+        let trigger = 1_791_000_000;
+        let lines = [
+            json!({"start":trigger+5,"outcome":"refused","exit":1,"unattended":true}),
+            json!({"start":trigger+9000,"outcome":"clean","exit":0,"unattended":false}),
+        ];
+        let refs: Vec<&Value> = lines.iter().collect();
+        let found = line_in(&refs, trigger, None, false).unwrap();
+        assert_eq!(found["outcome"], "refused");
+        // Bounded: the earliest inside the window is still the right one.
+        let found = line_in(&refs, trigger, Some(trigger + 10_000), false).unwrap();
+        assert_eq!(found["outcome"], "refused");
+        // Nothing at or after `from`: none.
+        assert!(line_in(&refs, trigger + 20_000, None, false).is_none());
     }
 
     #[test]
