@@ -621,7 +621,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `adopt` | `src/adopt.rs` | ~2600 | Subvolume sync: lists each verified source volume, adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
 | `backup` | `src/backup.rs` | ~3670 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
 | `btrbk_conf` | `src/btrbk_conf.rs` | ~1030 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
-| `caldate` | `src/caldate.rs` | ~270 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates |
+| `caldate` | `src/caldate.rs` | ~450 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates; local date and time for schedules (the zone read again on every call) |
 | `config` | `src/config.rs` | ~1810 | TOML config types, DAS/source/target models |
 | `db` | `src/db.rs` | ~2580 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
 | `doctor` | `src/doctor.rs` | ~1070 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
@@ -637,9 +637,9 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `recovery_os` | `src/recovery_os.rs` | ~4970 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from and whether its QEMU guest agent runs at boot (schema 4; `--unattended` sessions need it) (`btrdasd recovery-os`) |
 | `recovery_os::boot` | `src/recovery_os/boot.rs` | ~10900 | Whether booting a recovery OS would run btrbk, and when: the units its boot starts, what they run (shell scripts included), its cron, and the btrbk config each would use, down to one verdict (`will`, `may`, `no`) |
 | `recovery_os::hold_disk` | `src/recovery_os/hold_disk.rs` | ~760 | `btrdasd recovery-os hold-disk`: the `O_EXCL` claim on a whole recovery disk that keeps the host from mounting it while `scripts/recovery-os-vm.sh` has lent it to that drive's `recovery-os-updater-<label>` VM; held until SIGTERM/SIGINT/SIGHUP |
-| `recovery_os::panel` | `src/recovery_os/panel.rs` | ~1650 | The drive panel's rules and `RecoveryOsStatus` document: per drive the record, history, schedule (`pending`, `fired`, `running`, `missed`) and session, each with its own `history_error`/`schedule_error`/`session_error` key when its read failed; the generated `das-recovery-os-update-<label\|both>.{service,timer}` pair and the validation of a schedule |
+| `recovery_os::panel` | `src/recovery_os/panel.rs` | ~2430 | The drive panel's rules and `RecoveryOsStatus` document: per drive the record, history, schedule (`pending`, `fired`, `running`, `missed`) and session, each with its own `history_error`/`schedule_error`/`session_error` key when its read failed; the generated `das-recovery-os-update-<label\|both>.{service,timer}` pair and the validation of a schedule |
 | `recovery_os::lines` | `src/recovery_os/lines.rs` | ~230 | The parser of the script's `PROGRESS`/`OUTPUT`/`RESULT`/`DRIVE` lines |
-| `recovery_os::session` | `src/recovery_os/session.rs` | ~1040 | `recovery-os-vm.sh session` as a helper job: built environment, lines to the job's signals, one SIGINT to the script's process group on cancel |
+| `recovery_os::session` | `src/recovery_os/session.rs` | ~1290 | `recovery-os-vm.sh session` as a helper job: built environment, lines to the job's signals, one SIGINT to the script's process group on cancel |
 | `report` | `src/report.rs` | ~770 | Backup report formatting |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
@@ -655,7 +655,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
 | `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
-| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~3570 | D-Bus daemon (feature `dbus`): 25 methods, 3 signals, polkit checks, job ownership |
+| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~3730 | D-Bus daemon (feature `dbus`): 25 methods, 3 signals, polkit checks, job ownership |
 
 ### KDE Plasma GUI (`gui/src/`)
 
