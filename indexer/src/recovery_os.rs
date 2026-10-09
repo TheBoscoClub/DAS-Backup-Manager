@@ -22,6 +22,9 @@
 //! recovery-os-updater VM has it (bd DAS-Backup-Manager-7wb).
 
 pub mod hold_disk;
+pub mod lines;
+pub mod panel;
+pub mod session;
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -569,15 +569,21 @@ pub fn uninstall(remove_db: bool, _held: &SetupLocks) -> Result<(), Box<dyn std:
         Path::new(CONFIG_FILE),
         Path::new(MANIFEST_FILE),
         remove_db,
+        Path::new(SCHEDULE_UNIT_DIR),
         &|args| command_status(SYSTEMCTL, args),
     )
 }
 
-/// `uninstall` against an explicit config and manifest (for testing).
+/// Where the helper writes the recovery-OS schedule units.
+const SCHEDULE_UNIT_DIR: &str = buttered_dasd::recovery_os::panel::UNIT_DIR;
+
+/// `uninstall` against an explicit config, manifest and directory of the
+/// recovery-OS schedule units (for testing).
 fn uninstall_with(
     config_path: &Path,
     manifest_path: &Path,
     remove_db: bool,
+    unit_dir: &Path,
     systemctl: UnitRunner,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !manifest_path.exists() {
@@ -616,6 +622,9 @@ fn uninstall_with(
             eprintln!("Warning: {unit} may still be enabled: {e}");
         }
     }
+    for w in remove_schedule_units(unit_dir, systemctl) {
+        eprintln!("Warning: {w}");
+    }
 
     let (removed, problems) = uninstall_from_manifest(manifest_path);
     println!("Removed {} files.", removed);
@@ -649,6 +658,58 @@ fn uninstall_with(
 
     println!("Uninstall complete.");
     Ok(())
+}
+
+/// Remove the recovery-OS schedule units the helper wrote in `unit_dir`
+/// (`das-recovery-os-update-*.{service,timer}`; they are in no manifest):
+/// `disable --now` each timer, then remove every such file. A schedule left
+/// behind would start a VM session from a script that is gone. Every failure
+/// is a warning, returned (without its `Warning: ` prefix) for the caller to print, as for the other units; the caller's daemon-reload follows.
+fn remove_schedule_units(unit_dir: &Path, systemctl: UnitRunner) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+    use buttered_dasd::recovery_os::panel::UNIT_PREFIX;
+    let entries = match std::fs::read_dir(unit_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return warnings,
+        Err(e) => {
+            warnings.push(format!(
+                "could not list {} ({e}) — recovery-OS schedule units there, if any, are LEFT BEHIND",
+                unit_dir.display()
+            ));
+            return warnings;
+        }
+    };
+    let mut found: Vec<String> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(UNIT_PREFIX)
+                    && (name.ends_with(".timer") || name.ends_with(".service"))
+                {
+                    found.push(name);
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "could not read an entry of {} ({e}) — a recovery-OS schedule unit may be LEFT BEHIND",
+                unit_dir.display()
+            )),
+        }
+    }
+    found.sort();
+    for timer in found.iter().filter(|n| n.ends_with(".timer")) {
+        if let Err(e) = systemctl(&["disable", "--now", timer]) {
+            warnings.push(format!("{timer} may still be enabled: {e}"));
+        }
+    }
+    for name in &found {
+        let path = unit_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("Removed schedule unit: {}", path.display()),
+            Err(e) => warnings.push(format!("could not remove {}: {e}", path.display())),
+        }
+    }
+    warnings
 }
 
 /// Create the parent directory of `db_path`, describing the failure instead of
@@ -1447,7 +1508,13 @@ fn uninstall_all_with(
     };
 
     // Phase 1: run the standard uninstall (manifest files, timers, config dir)
-    uninstall_with(config_path, manifest_path, remove_db, systemctl)?;
+    uninstall_with(
+        config_path,
+        manifest_path,
+        remove_db,
+        &under_root(root, SCHEDULE_UNIT_DIR),
+        systemctl,
+    )?;
 
     // Phase 2: stop the helper service
     if let Err(e) = systemctl(&["disable", "--now", "btrdasd-helper.service"]) {
@@ -2220,6 +2287,11 @@ auth = "starttls""#,
         )
     }
 
+    /// Where the schedule units would be under `base`.
+    fn units_dir(base: &Path) -> PathBuf {
+        base.join("etc/systemd/system")
+    }
+
     /// Install `config` under `base`, as `install` does under `/`.
     fn install_config_into(config: &Config, base: &Path) -> (PathBuf, PathBuf) {
         let (config_path, manifest_path) = installed_paths(base);
@@ -2471,9 +2543,13 @@ auth = "starttls""#,
         Config::default().save(&config_path).unwrap();
         let systemctl = FakeSystemctl::new(&[]);
 
-        uninstall_with(&config_path, &manifest_path, true, &|args| {
-            systemctl.run(args)
-        })
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            true,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
         .unwrap();
 
         assert_eq!(systemctl.calls(), Vec::<String>::new());
@@ -2491,9 +2567,13 @@ auth = "starttls""#,
         std::fs::write(&db, "index").unwrap();
         let systemctl = FakeSystemctl::new(&[]);
 
-        uninstall_with(&config_path, &manifest_path, false, &|args| {
-            systemctl.run(args)
-        })
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            false,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
         .unwrap();
 
         // A timer left enabled keeps firing at 03:00 against files that are
@@ -2522,9 +2602,13 @@ auth = "starttls""#,
         std::fs::write(&operator_file, "mine").unwrap();
         let systemctl = FakeSystemctl::new(&[]);
 
-        uninstall_with(&config_path, &manifest_path, true, &|args| {
-            systemctl.run(args)
-        })
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            true,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
         .unwrap();
 
         assert!(!db.exists(), "--remove-db was asked for");
@@ -2533,6 +2617,76 @@ auth = "starttls""#,
             operator_file.exists(),
             "a file this tool did not install must survive the uninstall"
         );
+    }
+
+    #[test]
+    fn uninstall_removes_schedule_units_it_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) =
+            install_config_into(&valid_config(dir.path()), dir.path());
+        let units = units_dir(dir.path());
+        std::fs::create_dir_all(&units).unwrap();
+        let service = units.join("das-recovery-os-update-both.service");
+        let timer = units.join("das-recovery-os-update-both.timer");
+        let other = units.join("someone-elses.timer");
+        for f in [&service, &timer, &other] {
+            std::fs::write(f, "[Unit]\n").unwrap();
+        }
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_with(&config_path, &manifest_path, false, &units, &|args| {
+            systemctl.run(args)
+        })
+        .unwrap();
+
+        let calls = systemctl.calls();
+        assert!(
+            calls.contains(&"disable --now das-recovery-os-update-both.timer".to_string()),
+            "{calls:?}"
+        );
+        assert_eq!(calls.last().map(String::as_str), Some("daemon-reload"));
+        assert!(
+            !service.exists() && !timer.exists(),
+            "both schedule units are removed"
+        );
+        assert!(other.exists(), "a unit this tool did not write survives");
+    }
+
+    #[test]
+    fn a_missing_unit_dir_is_silent_but_an_unreadable_one_is_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+        // Nothing to remove, nothing to say.
+        let missing = dir.path().join("no-such-dir");
+        assert_eq!(
+            remove_schedule_units(&missing, &|a| systemctl.run(a)),
+            Vec::<String>::new()
+        );
+        // A directory that cannot be listed may hide a schedule that would
+        // start a VM session from a script that is gone: say so. Mode 000
+        // stops no one as root, so there the case cannot be built.
+        // SAFETY: geteuid() has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped the unreadable-directory case: running as root");
+            return;
+        }
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let warnings = remove_schedule_units(&locked, &|a| systemctl.run(a));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            unreadable,
+            "mode 000 did not stop this user listing the directory"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("could not list") && warnings[0].contains("LEFT BEHIND"),
+            "{warnings:?}"
+        );
+        assert!(systemctl.calls().is_empty(), "{:?}", systemctl.calls());
     }
 
     #[test]
@@ -2545,9 +2699,13 @@ auth = "starttls""#,
         let installed = manifest_lines(&manifest_path);
         let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
 
-        uninstall_with(&config_path, &manifest_path, false, &|args| {
-            systemctl.run(args)
-        })
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            false,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
         .unwrap();
 
         assert_eq!(systemctl.calls(), UNINSTALL_UNIT_CALLS);
@@ -3658,7 +3816,13 @@ auth = "starttls""#,
         let systemctl = |args: &[&str]| systemctl.run(args);
         match mode {
             Mode::Install => install_to_prefix(config, base, &config_path, &manifest_path),
-            Mode::Uninstall => uninstall_with(&config_path, &manifest_path, true, &systemctl),
+            Mode::Uninstall => uninstall_with(
+                &config_path,
+                &manifest_path,
+                true,
+                &units_dir(base),
+                &systemctl,
+            ),
             Mode::UninstallAll => {
                 uninstall_all_with(base, &config_path, &manifest_path, true, &systemctl)
             }
@@ -4422,9 +4586,13 @@ auth = "starttls""#,
         let uninstall =
             |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
                 step(&format!("uninstall remove_db={remove_db}"));
-                uninstall_with(&config_path, &manifest_path, remove_db, &|a| {
-                    systemctl.run(a)
-                })
+                uninstall_with(
+                    &config_path,
+                    &manifest_path,
+                    remove_db,
+                    &units_dir(base),
+                    &|a| systemctl.run(a),
+                )
             };
         let uninstall_all =
             |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {

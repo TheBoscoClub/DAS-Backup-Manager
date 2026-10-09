@@ -1505,7 +1505,7 @@ for unit in das-backup.service das-backup-full.service das-scrub.service das-bac
     echo activating >"$S/unit.$unit"
     run_driver session A --dry-run
     check "$unit activating: refused" "$RC" "1"
-    has "$unit activating: named" "$OUT" "$unit is activating"
+    has "$unit activating: named" "$OUT" "$unit (activating)"
     check "$unit activating: no lock taken" "$(file "$S/flock.calls")" ""
 done
 fixture
@@ -1513,7 +1513,7 @@ echo active >"$S/unit.das-scrub.service"
 echo failed >"$S/unit.das-backup.service"
 run_driver session A --dry-run
 check "active scrub: refused" "$RC" "1"
-lacks "a failed unit is not running: not listed" "$OUT" "das-backup.service is failed"
+lacks "a failed unit is not running: not listed" "$OUT" "das-backup.service (failed)"
 
 fixture
 touch "$S/systemctl_fail"
@@ -1582,6 +1582,128 @@ check "lock held: no holder started" "$(file "$S/holder.calls")" ""
 check "lock held: nothing attached" "$(file "$S/attach.log")" ""
 check "lock held: the holder's record left alone" "$(head -n 1 "$LOCK")" "backup-run.sh pid 4242"
 stop_blocker
+
+echo "--- --wait-lock: a scheduled session waits for backups (bd 8249 stage 2)"
+fixture
+run_driver session A --dry-run --wait-lock 5
+check "wait-lock with dry-run: usage" "$RC" "2"
+has "wait-lock with dry-run: says why" "$OUT" "--wait-lock has no meaning with --dry-run"
+run_driver session A --wait-lock 0
+check "wait-lock 0: usage" "$RC" "2"
+run_driver session A --wait-lock x
+check "wait-lock x: usage" "$RC" "2"
+run_driver session A --wait-lock=0
+check "wait-lock=0: usage" "$RC" "2"
+
+fixture
+(
+    exec 9<>"$LOCK"
+    if "$REAL_FLOCK" -n 9; then
+        printf 'stub holder pid 77\n' >&9
+        : >"$S/blocker.locked"
+    fi
+    exec sleep 2
+) &
+blocker=$!
+for ((i = 0; i < 200; i++)); do [[ -e "$S/blocker.locked" ]] && break; sleep 0.05; done
+check "wait-lock: precondition, the stub holds the lock" "$(blocker_holds)" "held"
+run_driver session A --wait-lock 20
+stop_blocker
+check "wait-lock waits, then the session goes through: exit 0" "$RC" "0"
+has "wait-lock: says it is waiting, naming the holder" "$OUT" "waiting for the DAS maintenance lock (held by: stub holder pid 77)"
+has "wait-lock: then takes the lock" "$OUT" "took the DAS maintenance lock"
+check "wait-lock: lock free at the end" "$(lock_state)" "free"
+
+# The --wait-lock=N form waits the same way.
+fixture
+start_blocker
+(
+    sleep 1
+    kill "$blocker" 2>/dev/null || :
+) &
+unblocker=$!
+run_driver session A --wait-lock=20
+wait "$unblocker"
+stop_blocker
+check "wait-lock=N: waits, then the session goes through: exit 0" "$RC" "0"
+has "wait-lock=N: says it is waiting" "$OUT" "waiting for the DAS maintenance lock"
+
+# The boot record is read AFTER the wait: the run a scheduled session waits
+# for is the backup, and that run rewrites the record (final review I2).
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
+(
+    exec 9<>"$LOCK"
+    if "$REAL_FLOCK" -n 9; then
+        printf 'stub backup pid 78\n' >&9
+        : >"$S/blocker.locked"
+    fi
+    # Rewrite the record only once the driver has probed the lock (the stub
+    # flock logs the probe): the probe is wait_for_lock's, so a driver that
+    # read the record BEFORE it reads the stale one -- ordered by the
+    # driver's own steps, not by a sleep.
+    for ((j = 0; j < 400; j++)); do
+        [[ -s "$S/flock.calls" ]] && break
+        sleep 0.05
+    done
+    write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":{\"btrbk_at_boot\":{\"verdict\":\"sometimes\",\"reasons\":[]}},\"error\":null}"
+    exec sleep 1
+) &
+blocker=$!
+for ((i = 0; i < 200; i++)); do
+    [[ -e "$S/blocker.locked" ]] && break
+    sleep 0.05
+done
+check "wait-lock, record rewritten while waiting: precondition, the stub holds the lock" "$(blocker_holds)" "held"
+run_driver session A --wait-lock 20
+stop_blocker
+has "wait-lock, record rewritten while waiting: it waited" "$OUT" "waiting for the DAS maintenance lock (held by: stub backup pid 78)"
+check "wait-lock, record rewritten while waiting: the new record refuses" "$RC" "1"
+has "wait-lock, record rewritten while waiting: names the new reading" "$OUT" "has no btrbk-at-boot verdict ('sometimes')"
+check "wait-lock, record rewritten while waiting: nothing booted" "$(file "$S/virsh.calls" | grep -c 'start --paused' || :)" "0"
+
+fixture
+printf 'backup-run.sh pid 4242\n' >"$LOCK"
+start_blocker
+check "wait-lock bound: precondition, the lock is held" "$(blocker_holds)" "held"
+run_driver session A --wait-lock 2
+stop_blocker
+check "wait-lock past the bound: refused" "$RC" "1"
+has "wait-lock past the bound: says how long and for what" "$OUT" "waited 2 min for the DAS maintenance lock"
+check "wait-lock past the bound: nothing booted" "$(file "$S/virsh.calls" | grep -c 'start --paused' || :)" "0"
+check "wait-lock past the bound: nothing held" "$(lock_state)" "free"
+check "wait-lock past the bound: the holder's record left alone" "$(head -n 1 "$LOCK")" "backup-run.sh pid 4242"
+
+fixture
+echo active >"$S/unit.das-backup.service"
+(
+    sleep 1
+    rm -f "$S/unit.das-backup.service"
+) &
+unitwaiter=$!
+run_driver session A --wait-lock 20
+wait "$unitwaiter"
+has "wait-lock for a unit: waits for it" "$OUT" "waiting for das-backup.service (active)"
+check "wait-lock for a unit: goes on once it is inactive" "$RC" "0"
+
+fixture
+echo active >"$S/unit.das-scrub.service"
+run_driver session A --wait-lock 2
+check "wait-lock for a unit that never ends: refused at the bound" "$RC" "1"
+has "wait-lock for a unit that never ends: names it" "$OUT" "waited 2 min for das-scrub.service (active)"
+
+fixture
+touch "$S/systemctl_fail"
+run_driver session A --wait-lock 2
+check "wait-lock, unit states unreadable: refused at once" "$RC" "1"
+has "wait-lock, unit states unreadable: says so" "$OUT" "cannot tell whether"
+
+fixture
+start_blocker
+run_driver session A B --wait-lock 2
+stop_blocker
+check "wait-lock, both drives, lock held: refused at the bound" "$RC" "1"
+has "wait-lock, both drives: the run itself waited" "$OUT" "waited 2 min for the DAS maintenance lock"
 
 echo "--- the holder cannot claim the disk"
 fixture
@@ -4717,6 +4839,16 @@ has "both, parallel: B started" "$(file "$S/domB/events")" "virsh start"
 check "both, parallel: two history lines" "$(jq -r '.mode' "$H" | sort | uniq -c | tr -s ' ')" " 2 parallel"
 check "both, parallel: lock free" "$(lock_state)" "free"
 check "both, parallel: no egress rule left" "$(file "$S/ip.rules")" ""
+
+# --wait-lock is the run's, never its drives': a drive given it would wait on
+# the run's own lock, then refuse (final review M19).
+for mode in sequential parallel; do
+    unattended_fixture
+    run_driver session A B --unattended --mode "$mode" --wait-lock 2
+    check "both, $mode, --wait-lock: exit 0" "$RC" "0"
+    lacks "both, $mode, --wait-lock: no drive waited on the run's own lock" "$OUT" "waiting for the DAS maintenance lock"
+    check "both, $mode, --wait-lock: two history lines" "$(jq -r '.mode' "$H" | sort | uniq -c | tr -s ' ')" " 2 $mode"
+done
 
 fixture
 run_driver session A system-recovery-A-2tb

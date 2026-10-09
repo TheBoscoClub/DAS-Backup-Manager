@@ -94,6 +94,15 @@ pub fn stop_requested(progress: &dyn ProgressCallback) -> bool {
     progress.cancel_token().is_some_and(CancelToken::stop_here)
 }
 
+/// Whether a cancel was asked for the job reporting to `progress`, without
+/// acting on it: unlike [`stop_requested`], the job is not yet one a cancel
+/// cut short. For work that must first see whether the cancel stopped it.
+pub fn cancel_requested(progress: &dyn ProgressCallback) -> bool {
+    progress
+        .cancel_token()
+        .is_some_and(CancelToken::is_requested)
+}
+
 /// Whether a cancel stopped the job reporting to `progress` before its end.
 pub fn cut_short(progress: &dyn ProgressCallback) -> bool {
     progress.cancel_token().is_some_and(CancelToken::honoured)

@@ -9,7 +9,7 @@
 //! Run:   activated on-demand by D-Bus (see `org.dasbackup.Helper1.service`)
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::signal::unix::{SignalKind, signal};
@@ -32,6 +32,7 @@ use buttered_dasd::mount;
 use buttered_dasd::progress::{
     self, LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
 };
+use buttered_dasd::recovery_os::{self, panel, session};
 use buttered_dasd::restore;
 use buttered_dasd::schedule;
 use buttered_dasd::subvol;
@@ -41,15 +42,17 @@ use buttered_dasd::subvol;
 // ---------------------------------------------------------------------------
 
 /// Live jobs, keyed by id: `(task handle, the job's progress queue, owning
-/// D-Bus sender)`. The queue is also how a job is cancelled
-/// (`OrderedProgress::cancel`).
+/// D-Bus sender, kind)`. The queue is also how a job is cancelled
+/// (`OrderedProgress::cancel`). The kind (`"backup"`, `"index"`,
+/// `"restore"`, [`SESSION_KIND`]) is how a second recovery-OS session is
+/// refused while one runs (`session_busy`).
 ///
 /// The sender is what makes `job_cancel` authorizable. Without it the map held
 /// no notion of ownership at all, so a polkit check for
 /// `org.dasbackup.backup` — a question about the CALLER, not about the JOB —
 /// was the only gate, and any authorized caller could abort anyone's in-flight
 /// backup or restore (bd DAS-Backup-Manager-h2s).
-type JobEntry = (JoinHandle<()>, Arc<OrderedProgress>, String);
+type JobEntry = (JoinHandle<()>, Arc<OrderedProgress>, String, &'static str);
 type JobMap = Arc<Mutex<HashMap<String, JobEntry>>>;
 
 /// Cache of IndexStats JSON keyed by DB path.  Cold COUNT(*) on a 13.7M-row
@@ -310,6 +313,657 @@ fn canonical_db_path() -> Result<String, fdo::Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery-OS sessions (bd DAS-Backup-Manager-8249 stage 2)
+// ---------------------------------------------------------------------------
+
+/// The `JobMap` kind of a `RecoveryOsSession` job.
+const SESSION_KIND: &str = "recovery-os-session";
+
+/// The scheduled-session services a session must not overlap: one per
+/// `role = "mirror"` target, and the one that runs both.
+fn update_unit_names(cfg: &Config) -> Vec<String> {
+    cfg.targets
+        .iter()
+        .filter(|t| t.role == buttered_dasd::config::TargetRole::Mirror)
+        .map(|t| {
+            format!(
+                "{}.service",
+                panel::unit_base(std::slice::from_ref(&t.label))
+            )
+        })
+        .chain(std::iter::once(format!(
+            "{}both.service",
+            panel::UNIT_PREFIX
+        )))
+        .collect()
+}
+
+/// Why a new session must not start, naming what already runs: a session
+/// job (`jobs` are `(id, kind)`), or a scheduled-session service whose
+/// `ActiveState` (`units` are `(unit, state)`) is anything but `inactive` or
+/// `failed`. `None`: nothing in the way.
+fn session_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String> {
+    if let Some((id, _)) = jobs.iter().find(|(_, kind)| *kind == SESSION_KIND) {
+        return Some(format!(
+            "a recovery-OS session is already running as job {id}"
+        ));
+    }
+    units
+        .iter()
+        .find(|(_, state)| !matches!(*state, "inactive" | "failed"))
+        .map(|(unit, state)| {
+            format!("a scheduled recovery-OS session is running: {unit} ({state})")
+        })
+}
+
+/// Why `session-end` must not run now: any live session job, whichever drive
+/// it holds (a pair job holds both). The script's own `session-end` refuses
+/// only a domain that is not shut off and skips its lock while the session's
+/// holder lives — and a running session spends time shut off with its holder
+/// alive (before start, and while giving the disk back), so ending it then
+/// would pull the disk, guard and holder from under the running script.
+///
+/// A running scheduled-session service (`units`, as for [`session_busy`])
+/// refuses it too, naming the unit: its session holds a drive just the same,
+/// with its holder alive.
+fn session_end_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String> {
+    session_busy(jobs, units)
+}
+
+/// The polkit action `JobCancel` checks for a job of `kind`: the one that
+/// authorized starting it.
+fn cancel_action(kind: &str) -> &'static str {
+    if kind == SESSION_KIND {
+        "org.dasbackup.recovery-os"
+    } else {
+        "org.dasbackup.backup"
+    }
+}
+
+/// Each unit's `ActiveState`, from `systemctl show -P ActiveState`. A
+/// systemctl that cannot answer is an error, never "inactive": a session
+/// started over a running scheduled one would contend for its drive.
+fn read_active_states(units: &[String]) -> Result<Vec<(String, String)>, String> {
+    units
+        .iter()
+        .map(|unit| {
+            let out = std::process::Command::new("systemctl")
+                .args(["show", "-P", "ActiveState", unit])
+                .env("LC_ALL", "C")
+                .output()
+                .map_err(|e| format!("Cannot ask systemctl for {unit}'s state: {e}"))?;
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !out.status.success() || state.is_empty() {
+                return Err(format!(
+                    "Cannot read {unit}'s state from systemctl ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok((unit.clone(), state))
+        })
+        .collect()
+}
+
+/// What a script run that failed said: its stderr, else its stdout, else
+/// its exit status.
+fn script_failure(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("{} ended with {}", session::SCRIPT, out.status)
+}
+
+/// `recovery-os-vm.sh clean-runs <label>`: its stdout is the count and
+/// nothing else. Anything else is an error, never 0.
+fn clean_runs_from(out: &std::process::Output) -> Result<u32, String> {
+    if !out.status.success() {
+        return Err(script_failure(out));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse::<u32>()
+        .map_err(|e| format!("The clean-run count {:?} is not a number: {e}", text.trim()))
+}
+
+/// `recovery-os-vm.sh history <label>`: one JSON object per line. A line
+/// that does not parse fails the whole read, never a shorter list.
+fn history_from(out: &std::process::Output) -> Result<Vec<serde_json::Value>, String> {
+    if !out.status.success() {
+        return Err(script_failure(out));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .enumerate()
+        .map(|(n, line)| {
+            serde_json::from_str(line)
+                .map_err(|e| format!("History line {} is not JSON: {e}", n + 1))
+        })
+        .collect()
+}
+
+/// `recovery-os-vm.sh console-socket <label> <uid>`: on success its stdout
+/// is exactly one absolute path; on failure its refusal is the error.
+fn console_path_from(out: &std::process::Output) -> Result<String, String> {
+    if !out.status.success() {
+        return Err(script_failure(out));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    match lines.as_slice() {
+        [path] if path.starts_with('/') => Ok((*path).to_string()),
+        _ => Err(format!(
+            "The console socket was not named: the script printed {:?}",
+            text.trim()
+        )),
+    }
+}
+
+/// The last `n` lines of `text`, in order, joined by `\n`.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// `recovery-os-vm.sh <args>` with stdout and stderr separate.
+fn run_script(script: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    session::script_command(script, &args)
+        .output()
+        .map_err(|e| format!("Cannot run {}: {e}", script.display()))
+}
+
+/// `recovery-os-vm.sh <args>` with stdout and stderr on one pipe, so its
+/// lines keep the order the script wrote them in.
+fn run_script_merged(
+    script: &Path,
+    args: &[String],
+) -> Result<(std::process::ExitStatus, String), String> {
+    use std::io::Read;
+    let cannot = |e: std::io::Error| format!("Cannot run {}: {e}", script.display());
+    let (mut reader, writer) = std::io::pipe().map_err(cannot)?;
+    let mut child = {
+        // The command holds both write ends; it goes out of scope here so
+        // the read below sees end-of-file when the script exits.
+        let mut cmd = session::script_command(script, args);
+        cmd.stdout(writer.try_clone().map_err(cannot)?)
+            .stderr(writer);
+        cmd.spawn().map_err(cannot)?
+    };
+    let mut buf = Vec::new();
+    let read = reader.read_to_end(&mut buf);
+    let status = child.wait().map_err(cannot)?;
+    read.map_err(cannot)?;
+    Ok((status, String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// Whether `/proc/locks` text shows an exclusive `flock` (a `FLOCK …
+/// WRITE` line, not a waiter's `->` line) on the file at
+/// `dev_major:dev_minor:inode` — the kernel's own record, read without
+/// taking the lock.
+fn lock_held_in(proc_locks: &str, dev_major: u64, dev_minor: u64, inode: u64) -> bool {
+    proc_locks.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [_, kind, _, access, _, file, ..] = words.as_slice() else {
+            return false;
+        };
+        if *kind != "FLOCK" || *access != "WRITE" {
+            return false;
+        }
+        let mut ids = file.split(':');
+        let (Some(maj), Some(min), Some(ino), None) =
+            (ids.next(), ids.next(), ids.next(), ids.next())
+        else {
+            return false;
+        };
+        u64::from_str_radix(maj, 16) == Ok(dev_major)
+            && u64::from_str_radix(min, 16) == Ok(dev_minor)
+            && ino.parse::<u64>() == Ok(inode)
+    })
+}
+
+/// A `st_dev` split as Linux encodes it (`major(3)`, `minor(3)`).
+fn dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
+}
+
+/// Who holds the lock file at `path`, by the kernel's record in
+/// `proc_locks`: `None` when no exclusive flock is on it (or the file does
+/// not exist, so nothing can hold it), its first line when one is. The probe
+/// never takes the lock, so a doctor or reconcile arriving at that moment is
+/// not turned away by it. A lock that cannot be checked is
+/// `Some("unknown: …")`, never "free".
+///
+/// The file is matched by its `st_dev` and inode against `/proc/locks`,
+/// which names the device of the superblock. The two are equal on tmpfs,
+/// where `/run/das-maintenance.lock` lives; on a btrfs subvolume `st_dev` is
+/// an anonymous per-subvolume device and nothing would ever match — every
+/// lock would read free. Use it for a lock file on such a filesystem only
+/// after making the match by the superblock's device.
+fn lock_holder_at(path: &Path, proc_locks: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(format!(
+                "unknown: the maintenance lock {} cannot be examined: {e}",
+                path.display()
+            ));
+        }
+    };
+    let locks = match std::fs::read_to_string(proc_locks) {
+        Ok(l) => l,
+        Err(e) => {
+            return Some(format!(
+                "unknown: {} cannot be read to check the maintenance lock: {e}",
+                proc_locks.display()
+            ));
+        }
+    };
+    let (major, minor) = dev_major_minor(meta.dev());
+    lock_held_in(&locks, major, minor, meta.ino()).then(|| maintenance::holder_of(path))
+}
+
+/// Parse a `Some("@<secs>")` timestamp of `systemctl show --timestamp=unix`:
+/// empty, `n/a` or `0` is no reading; anything else is an error.
+fn unix_stamp(key: &str, value: Option<&str>) -> Result<Option<i64>, String> {
+    match value.map(str::trim) {
+        None | Some("" | "n/a" | "0") => Ok(None),
+        Some(v) => v
+            .strip_prefix('@')
+            .and_then(|n| n.parse::<i64>().ok())
+            .map(Some)
+            .ok_or_else(|| format!("systemctl gave {key}={v}, not a @<seconds> timestamp")),
+    }
+}
+
+/// [`panel::UnitFacts`] from `systemctl show --timestamp=unix -p LoadState,
+/// ActiveState,NextElapseUSecRealtime,LastTriggerUSec,Result,ExecMainStatus,
+/// ExecMainStartTimestamp,ExecMainExitTimestamp`. `LoadState=not-found` is a unit that does not
+/// exist; no `LoadState` or `ActiveState`, or a timestamp that does not
+/// parse, is an error, never default facts. `ExecMainStatus` of a run that
+/// never started is no reading, not 0. The unit file's values and the
+/// journal are added by others.
+fn unit_facts_from(show: &str) -> Result<panel::UnitFacts, String> {
+    let props: HashMap<&str, &str> = show.lines().filter_map(|l| l.split_once('=')).collect();
+    let load = props
+        .get("LoadState")
+        .filter(|v| !v.is_empty())
+        .ok_or("systemctl show gave no LoadState")?;
+    let active = props
+        .get("ActiveState")
+        .filter(|v| !v.is_empty())
+        .ok_or("systemctl show gave no ActiveState")?;
+    let started = unix_stamp(
+        "ExecMainStartTimestamp",
+        props.get("ExecMainStartTimestamp").copied(),
+    )?;
+    let status = match props.get("ExecMainStatus") {
+        Some(v) if started.is_some() => Some(
+            v.parse::<i32>()
+                .map_err(|e| format!("systemctl gave ExecMainStatus={v}: {e}"))?,
+        ),
+        _ => None,
+    };
+    Ok(panel::UnitFacts {
+        exists: *load != "not-found",
+        active_state: active.to_string(),
+        next_elapse_epoch: unix_stamp(
+            "NextElapseUSecRealtime",
+            props.get("NextElapseUSecRealtime").copied(),
+        )?,
+        last_trigger_epoch: unix_stamp("LastTriggerUSec", props.get("LastTriggerUSec").copied())?,
+        result: props
+            .get("Result")
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string()),
+        exec_main_status: status,
+        exec_main_start_epoch: started,
+        exec_main_exit_epoch: unix_stamp(
+            "ExecMainExitTimestamp",
+            props.get("ExecMainExitTimestamp").copied(),
+        )?,
+        ..Default::default()
+    })
+}
+
+/// The last `<key>=` value in a unit file's text.
+fn unit_file_value(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .next_back()
+        .map(|v| v.trim().to_string())
+}
+
+/// `systemctl <args>`: `Err` carries its stderr.
+type Systemctl<'a> = &'a dyn Fn(&[&str]) -> Result<(), String>;
+
+/// The real `systemctl`, its stderr kept for the error.
+fn system_systemctl(args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new("systemctl")
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("Cannot run systemctl {}: {e}", args.join(" ")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "systemctl {} failed ({}): {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Seconds since the epoch; a clock before 1970 is an error, never 0.
+fn now_epoch() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|e| format!("The system clock reads before 1970: {e}"))
+}
+
+/// One at a time: two `RecoveryOsScheduleSet` calls must not interleave
+/// their writes, reloads and removals.
+static SCHEDULE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The schedule unit bases (`das-recovery-os-update-<x>`) whose timer file
+/// is in `unit_dir`, sorted. A directory that cannot be listed is an error,
+/// never "none".
+fn existing_schedule_bases(unit_dir: &Path) -> Result<Vec<String>, String> {
+    let entries = std::fs::read_dir(unit_dir)
+        .map_err(|e| format!("Cannot list {}: {e}", unit_dir.display()))?;
+    let mut bases = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Cannot list {}: {e}", unit_dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(base) = name.strip_suffix(".timer")
+            && base.starts_with(panel::UNIT_PREFIX)
+        {
+            bases.push(base.to_string());
+        }
+    }
+    bases.sort();
+    Ok(bases)
+}
+
+/// Remove `<base>.service` and `<base>.timer` from `unit_dir`; one already
+/// gone is fine. Returns what could not be removed.
+fn remove_schedule_files(unit_dir: &Path, base: &str) -> Vec<String> {
+    ["service", "timer"]
+        .iter()
+        .filter_map(|suffix| {
+            let path = unit_dir.join(format!("{base}.{suffix}"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => Some(format!("{} could not be removed: {e}", path.display())),
+            }
+        })
+        .collect()
+}
+
+/// Refuse a schedule whose unit file is a symlink: a masked unit is a link
+/// to /dev/null, and `fsutil::write_atomic_mode` writes through a link —
+/// as root it would replace /dev/null with a regular file. Never written
+/// through, never removed: `InvalidArgs`, before anything is written or
+/// asked of systemd. A path that cannot be examined is `Failed`. The
+/// refusal names the way out: unmask, then set again or clear (`clearing`:
+/// the clear itself was refused, so never "clear the schedule first").
+fn refuse_symlinked_units(unit_dir: &Path, base: &str, clearing: bool) -> fdo::Result<()> {
+    for suffix in ["service", "timer"] {
+        let name = format!("{base}.{suffix}");
+        let path = unit_dir.join(&name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let then = if clearing {
+                    ", then clear the schedule"
+                } else {
+                    " or clear the schedule first"
+                };
+                return Err(fdo::Error::InvalidArgs(format!(
+                    "{} is a symlink (masked or linked); unmask it (systemctl unmask {name}){then}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(fdo::Error::Failed(format!(
+                    "Cannot examine {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `systemctl <verb> <base>.timer`, where a timer systemd does not have
+/// ("not loaded", "does not exist") is already what `stop` or `disable`
+/// asks for.
+fn timer_verb(verb: &str, base: &str, systemctl: Systemctl) -> Result<(), String> {
+    match systemctl(&[verb, &format!("{base}.timer")]) {
+        Err(e) if !(e.contains("not loaded") || e.contains("does not exist")) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// `systemctl stop <base>.timer` ([`timer_verb`]).
+fn stop_timer(base: &str, systemctl: Systemctl) -> Result<(), String> {
+    timer_verb("stop", base, systemctl)
+}
+
+/// Write the schedule's service and timer (mode 0644), reload systemd,
+/// enable the timer (its install link) and restart it — restart arms it in
+/// every state; an elapsed one-shot timer stays elapsed through a reload,
+/// and `enable --now` does nothing to an active unit. A unit file that is a
+/// symlink is refused first ([`refuse_symlinked_units`]).
+///
+/// Any failure after that stops the timer, disables it (an enable that
+/// succeeded left an install link), THEN removes both files and reloads, so no half-installed pair is left and no timer lingers loaded
+/// without its files. The previous files of the same schedule are not kept:
+/// a failed re-schedule drops the previous schedule, and the error says so.
+/// If the stop itself fails the files stay, so what may still be armed is
+/// visible, and the error says that instead.
+fn schedule_install(
+    unit_dir: &Path,
+    labels: &[String],
+    at_epoch: i64,
+    mode: Option<&str>,
+    script: &Path,
+    systemctl: Systemctl,
+) -> fdo::Result<String> {
+    let base = panel::unit_base(labels);
+    refuse_symlinked_units(unit_dir, &base, false)?;
+    let undo = |why: String| -> fdo::Error {
+        if let Err(e) = stop_timer(&base, systemctl) {
+            return fdo::Error::Failed(format!(
+                "{why}; the timer could not be stopped ({e}), so its unit files were left in place — check {base}.timer"
+            ));
+        }
+        // An enable that succeeded left a timers.target.wants link; without
+        // the disable it would dangle once the files are gone.
+        let disable = timer_verb("disable", &base, systemctl).err();
+        let left = remove_schedule_files(unit_dir, &base);
+        let reload = systemctl(&["daemon-reload"]).err();
+        let mut msg = if left.is_empty() {
+            format!(
+                "{why}; the timer was stopped and the unit files removed: no schedule is set, and any previous schedule of {base} was dropped"
+            )
+        } else {
+            format!(
+                "{why}; the timer was stopped, but removing its unit files failed: {}; any previous schedule of {base} was dropped",
+                left.join("; ")
+            )
+        };
+        if let Some(d) = disable {
+            msg.push_str(&format!(
+                " (and disabling it failed: {d}; a {base}.timer link may be left in timers.target.wants)"
+            ));
+        }
+        if let Some(r) = reload {
+            msg.push_str(&format!(" (and the reload after it failed: {r})"));
+        }
+        fdo::Error::Failed(msg)
+    };
+    let write = |suffix: &str, text: String| {
+        let path = unit_dir.join(format!("{base}.{suffix}"));
+        buttered_dasd::fsutil::write_atomic_mode(&path, text.as_bytes(), Some(0o644))
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    };
+    let timer = format!("{base}.timer");
+    write("service", panel::render_service(labels, mode, script)).map_err(undo)?;
+    write("timer", panel::render_timer(labels, at_epoch)).map_err(undo)?;
+    systemctl(&["daemon-reload"]).map_err(undo)?;
+    systemctl(&["enable", &timer]).map_err(undo)?;
+    systemctl(&["restart", &timer]).map_err(undo)?;
+    Ok(timer)
+}
+
+/// Clear a schedule: stop its timer (also one systemd still has loaded after
+/// its files went), disable it, remove both files, reload. "Not loaded" and
+/// "does not exist" are tolerated from stop and disable, nothing else. A
+/// symlinked (masked) unit is refused, never removed. A service already
+/// running is left to finish.
+fn schedule_clear(unit_dir: &Path, base: &str, systemctl: Systemctl) -> fdo::Result<String> {
+    refuse_symlinked_units(unit_dir, base, true)?;
+    stop_timer(base, systemctl).map_err(fdo::Error::Failed)?;
+    timer_verb("disable", base, systemctl).map_err(fdo::Error::Failed)?;
+    let left = remove_schedule_files(unit_dir, base);
+    if !left.is_empty() {
+        return Err(fdo::Error::Failed(format!(
+            "The timer is stopped and disabled, but {}",
+            left.join("; ")
+        )));
+    }
+    systemctl(&["daemon-reload"]).map_err(fdo::Error::Failed)?;
+    Ok(format!("{base}.timer"))
+}
+
+/// `journalctl`'s arguments for the last 5 lines `unit`'s own processes
+/// logged since `since_epoch`: `_SYSTEMD_UNIT=` leaves out systemd's own
+/// lines about the unit ("Deactivated successfully", "Consumed … CPU time"),
+/// `--since` an earlier run's, `-q` the "-- No entries --" banner.
+fn journal_args(unit: &str, since_epoch: i64) -> Vec<String> {
+    [
+        "-q".to_string(),
+        format!("_SYSTEMD_UNIT={unit}"),
+        "--since".to_string(),
+        format!("@{since_epoch}"),
+        "-n".to_string(),
+        "5".to_string(),
+        "-o".to_string(),
+        "cat".to_string(),
+        "--no-pager".to_string(),
+    ]
+    .into()
+}
+
+/// The panel's system reads: the installed script, `virsh`, the
+/// maintenance lock.
+struct SystemPanelReads {
+    script: PathBuf,
+    /// The helper's running session job, read from the job map.
+    running_job: Option<String>,
+}
+
+impl panel::PanelReads for SystemPanelReads {
+    fn clean_runs(&self, label: &str) -> Result<u32, String> {
+        clean_runs_from(&run_script(&self.script, &["clean-runs", label])?)
+    }
+
+    fn history(&self, label: &str) -> Result<Vec<serde_json::Value>, String> {
+        history_from(&run_script(&self.script, &["history", label])?)
+    }
+
+    fn unit(&self, name: &str) -> Result<panel::UnitFacts, String> {
+        let out = std::process::Command::new("systemctl")
+            .args([
+                "show",
+                "--timestamp=unix",
+                "-p",
+                "LoadState,ActiveState,NextElapseUSecRealtime,LastTriggerUSec,Result,\
+                 ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp",
+                name,
+            ])
+            .env("LC_ALL", "C")
+            .output()
+            .map_err(|e| format!("Cannot ask systemctl about {name}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "systemctl show {name} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut facts = unit_facts_from(&String::from_utf8_lossy(&out.stdout))?;
+        if !facts.exists {
+            return Ok(facts);
+        }
+        let file = Path::new(panel::UNIT_DIR).join(name);
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                facts.on_calendar = unit_file_value(&text, "OnCalendar");
+                facts.exec_start = unit_file_value(&text, "ExecStart");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Cannot read {}: {e}", file.display())),
+        }
+        Ok(facts)
+    }
+
+    fn journal(&self, unit: &str, since_epoch: i64) -> Result<Vec<String>, String> {
+        let out = std::process::Command::new("journalctl")
+            .args(journal_args(unit, since_epoch))
+            .env("LC_ALL", "C")
+            .output()
+            .map_err(|e| format!("Cannot read {unit}'s journal: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "journalctl for {unit} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
+    fn domain_state(&self, label: &str) -> Option<String> {
+        let out = std::process::Command::new("virsh")
+            .args(["domstate", &format!("recovery-os-updater-{label}")])
+            .env("LC_ALL", "C")
+            .output()
+            .ok()?;
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !state.is_empty()).then_some(state)
+    }
+
+    fn lock_holder(&self) -> Option<String> {
+        lock_holder_at(
+            Path::new(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH),
+            Path::new("/proc/locks"),
+        )
+    }
+
+    fn running_job(&self) -> Option<String> {
+        self.running_job.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // D-Bus interface
 // ---------------------------------------------------------------------------
 
@@ -419,7 +1073,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "backup"));
         Ok(job_id)
     }
 
@@ -463,7 +1117,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "index"));
         Ok(job_id)
     }
 
@@ -806,7 +1460,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "restore"));
         Ok(job_id)
     }
 
@@ -855,7 +1509,7 @@ impl HelperInterface {
         self.jobs
             .lock()
             .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone()));
+            .insert(job_id.clone(), (handle, cancel, sender.clone(), "restore"));
         Ok(job_id)
     }
 
@@ -1211,6 +1865,277 @@ impl HelperInterface {
         json_str.map_err(fdo::Error::Failed)
     }
 
+    /// The recovery-drive panel's document (bd DAS-Backup-Manager-8249).
+    async fn recovery_os_status(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
+        let config = load_config()?;
+        let running_job = self
+            .jobs
+            .lock()
+            .await
+            .iter()
+            .find(|(_, (_, _, _, kind))| *kind == SESSION_KIND)
+            .map(|(id, _)| id.clone());
+        tokio::task::spawn_blocking(move || {
+            let state = recovery_os::load_state(&recovery_os::state_path());
+            let host = recovery_os::host_versions();
+            let today = buttered_dasd::caldate::today();
+            let reads = SystemPanelReads {
+                script: PathBuf::from(session::SCRIPT),
+                running_job,
+            };
+            let now = now_epoch().map_err(fdo::Error::Failed)?;
+            Ok(panel::status_json(&config, &state, &host, &today, now, &reads).to_string())
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The recovery-OS status task panicked: {e}")))?
+    }
+
+    /// Start a recovery-OS session (`recovery-os-vm.sh session …`) as a job;
+    /// returns its id. `mode` is `sequential`, `parallel`, or empty for none
+    /// (one drive, or the script's choice for two). Refused before the script
+    /// starts while another session job or a scheduled-session service runs,
+    /// naming it. `JobCancel` is the only way to stop it: it sends SIGINT to
+    /// the script's process group once. In `--mode parallel` that does not
+    /// yet stop the drive sessions themselves — a script defect, bd
+    /// DAS-Backup-Manager-c8lf — so a cancelled parallel run goes on to its
+    /// own end; parallel is not refused for it.
+    async fn recovery_os_session(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        labels: Vec<String>,
+        unattended: bool,
+        mode: &str,
+        accept_boot_record_risk: bool,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let config = load_config()?;
+        // An `as` argument cannot say "not specified": an empty list is a
+        // selection of nothing, and validate refuses it.
+        let req = session::SessionRequest {
+            labels,
+            unattended,
+            mode: (!mode.is_empty()).then(|| mode.to_string()),
+            accept_boot_record_risk,
+        };
+        req.validate(&config).map_err(fdo::Error::InvalidArgs)?;
+
+        let units = update_unit_names(&config);
+        let states = tokio::task::spawn_blocking(move || read_active_states(&units))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
+            .map_err(fdo::Error::Failed)?;
+
+        // Held from the check to the insert, so two calls cannot both pass.
+        let mut jobs_guard = self.jobs.lock().await;
+        let running: Vec<(&str, &str)> = jobs_guard
+            .iter()
+            .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
+            .collect();
+        let unit_states: Vec<(&str, &str)> = states
+            .iter()
+            .map(|(u, s)| (u.as_str(), s.as_str()))
+            .collect();
+        if let Some(why) = session_busy(&running, &unit_states) {
+            return Err(fdo::Error::Failed(why));
+        }
+
+        let job_id = new_job_id();
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
+        let finisher = progress.clone();
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+
+        let handle = tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                session::run_session(
+                    &session::SystemSpawner,
+                    Path::new(session::SCRIPT),
+                    &config,
+                    &req,
+                    &*progress,
+                )
+            })
+            .await;
+            let (success, summary) = match result {
+                // Exit 0 only; exit 5 is `false`, "warnings: …".
+                Ok(Ok(out)) => (out.success(), out.summary()),
+                Ok(Err(e)) => (false, e),
+                Err(e) => (false, format!("The recovery-OS session task panicked: {e}")),
+            };
+            finish_job(finisher, success, summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        jobs_guard.insert(
+            job_id.clone(),
+            (handle, cancel, sender.clone(), SESSION_KIND),
+        );
+        Ok(job_id)
+    }
+
+    /// End a drive's session (`recovery-os-vm.sh session-end <label>`):
+    /// `(exit 0, the script's last lines)`.
+    async fn recovery_os_session_end(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+    ) -> fdo::Result<(bool, String)> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let label = configured_mirror_label(label)?;
+        let units = update_unit_names(&load_config()?);
+        let states = tokio::task::spawn_blocking(move || read_active_states(&units))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
+            .map_err(fdo::Error::Failed)?;
+        {
+            let jobs = self.jobs.lock().await;
+            let running: Vec<(&str, &str)> = jobs
+                .iter()
+                .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
+                .collect();
+            let unit_states: Vec<(&str, &str)> = states
+                .iter()
+                .map(|(u, s)| (u.as_str(), s.as_str()))
+                .collect();
+            if let Some(why) = session_end_busy(&running, &unit_states) {
+                return Err(fdo::Error::Failed(why));
+            }
+        }
+        let (status, text) = tokio::task::spawn_blocking(move || {
+            run_script_merged(
+                Path::new(session::SCRIPT),
+                &["session-end".to_string(), label],
+            )
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The session-end task panicked: {e}")))?
+        .map_err(fdo::Error::Failed)?;
+        Ok((status.success(), last_lines(&text, 12)))
+    }
+
+    /// Schedule an unattended session of `labels` (one drive, or both) at
+    /// `at_epoch` (seconds since the epoch, at least 120 s ahead) as the
+    /// generated pair `das-recovery-os-update-<label|both>.{service,timer}`
+    /// in /etc/systemd/system; `at_epoch == 0` clears that schedule. `mode`
+    /// is `sequential`, `parallel`, or empty. Returns the timer's unit name
+    /// (`<base>.timer`), set or cleared. Refused (InvalidArgs, with the
+    /// reason) for anything `panel::validate_schedule` refuses, and for a
+    /// unit file that is a symlink (a masked unit: never written through);
+    /// every systemctl failure is `Failed` with its stderr, and a failed
+    /// reload, enable or restart stops the timer and leaves no unit file
+    /// behind (dropping any previous schedule of the same unit, as it says).
+    async fn recovery_os_schedule_set(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        labels: Vec<String>,
+        at_epoch: i64,
+        mode: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let config = load_config()?;
+        let mode = (!mode.is_empty()).then(|| mode.to_string());
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+            let _one = SCHEDULE_WRITE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let unit_dir = Path::new(panel::UNIT_DIR);
+            if at_epoch == 0 {
+                session::SessionRequest {
+                    labels: labels.clone(),
+                    unattended: true,
+                    mode: mode.clone(),
+                    accept_boot_record_risk: false,
+                }
+                .validate(&config)
+                .map_err(fdo::Error::InvalidArgs)?;
+                return schedule_clear(unit_dir, &panel::unit_base(&labels), &system_systemctl);
+            }
+            let state = match recovery_os::load_state(&recovery_os::state_path()) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Err(fdo::Error::InvalidArgs(
+                        "There is no boot record yet, so no drive can be scheduled unattended (let a backup run record the drives).".into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(fdo::Error::Failed(format!(
+                        "The boot record cannot be read: {e}"
+                    )));
+                }
+            };
+            let existing = existing_schedule_bases(unit_dir).map_err(fdo::Error::Failed)?;
+            let now = now_epoch().map_err(fdo::Error::Failed)?;
+            panel::validate_schedule(
+                &config,
+                &state,
+                &labels,
+                at_epoch,
+                mode.as_deref(),
+                now,
+                &existing,
+            )
+            .map_err(fdo::Error::InvalidArgs)?;
+            schedule_install(
+                unit_dir,
+                &labels,
+                at_epoch,
+                mode.as_deref(),
+                Path::new(session::SCRIPT),
+                &system_systemctl,
+            )
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The schedule task panicked: {e}")))?
+    }
+
+    /// The VNC socket of a drive's running session, made reachable by the
+    /// CALLER's uid (`recovery-os-vm.sh console-socket <label> <uid>`).
+    async fn recovery_os_console(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let label = configured_mirror_label(label)?;
+        // The caller's uid, from the bus; a failed lookup is an error, never
+        // uid 0.
+        let no_uid = |e: String| fdo::Error::Failed(format!("Cannot name the caller's uid: {e}"));
+        let bus_name =
+            zbus::names::BusName::try_from(sender.as_str()).map_err(|e| no_uid(e.to_string()))?;
+        let uid = fdo::DBusProxy::new(&self.conn)
+            .await
+            .map_err(|e| no_uid(e.to_string()))?
+            .get_connection_unix_user(bus_name)
+            .await
+            .map_err(|e| no_uid(e.to_string()))?;
+
+        tokio::task::spawn_blocking(move || {
+            let uid = uid.to_string();
+            run_script(
+                Path::new(session::SCRIPT),
+                &["console-socket", &label, &uid],
+            )
+            .and_then(|out| console_path_from(&out))
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("The console task panicked: {e}")))?
+        .map_err(fdo::Error::Failed)
+    }
+
     /// Cancel a running job.
     async fn job_cancel(
         &self,
@@ -1218,14 +2143,22 @@ impl HelperInterface {
         job_id: &str,
     ) -> fdo::Result<bool> {
         let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
+        // The action that authorized starting a job of this kind; an unknown
+        // id is checked as a backup job, as before.
+        let kind = self
+            .jobs
+            .lock()
+            .await
+            .get(job_id)
+            .map_or("", |(_, _, _, kind)| *kind);
+        check_polkit(&self.conn, &sender, cancel_action(kind)).await?;
 
         let jobs = self.jobs.lock().await;
         // Ownership is a property of the JOB, and polkit only answered a
         // question about the caller. Check both.
         match jobs.get(job_id) {
             None => Ok(false),
-            Some((_, _, owner)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
+            Some((_, _, owner, _)) if *owner != sender => Err(fdo::Error::AccessDenied(format!(
                 "Job '{job_id}' belongs to another client"
             ))),
             // The task is NOT aborted: that only stopped the job from ever
@@ -1240,7 +2173,7 @@ impl HelperInterface {
             // "cancelled …", when it stopped early; its real outcome, saying
             // the cancel came too late, when nothing was left to stop
             // (bd DAS-Backup-Manager-yq2).
-            Some((_, progress, _)) => {
+            Some((_, progress, _, _)) => {
                 progress.cancel();
                 Ok(true)
             }
@@ -1474,6 +2407,21 @@ fn restore_snapshot_job(
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// `label` if the configuration lists it as a `role = "mirror"` target, by
+/// the session request's own rule; refused (`InvalidArgs`) otherwise, before
+/// anything reaches the script.
+fn configured_mirror_label(label: &str) -> fdo::Result<String> {
+    let req = session::SessionRequest {
+        labels: vec![label.to_string()],
+        unattended: false,
+        mode: None,
+        accept_boot_record_risk: false,
+    };
+    req.validate(&load_config()?)
+        .map_err(fdo::Error::InvalidArgs)?;
+    Ok(label.to_string())
+}
+
 /// Extract the sender bus name from a D-Bus message header.
 fn sender_from_header(header: &zbus::message::Header<'_>) -> Result<String, fdo::Error> {
     header
@@ -1653,7 +2601,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut active_jobs = jobs.lock().await;
         let entries: Vec<(String, JobEntry)> = active_jobs.drain().collect();
-        for (id, (handle, progress, _owner)) in entries {
+        for (id, (handle, progress, _owner, _kind)) in entries {
             eprintln!("btrdasd-helper: cancelling job {id}");
             progress.cancel();
             handle.abort();
@@ -1667,6 +2615,651 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- recovery-OS methods (bd DAS-Backup-Manager-8249 stage 2)
+
+    #[test]
+    fn the_recovery_os_methods_check_polkit_before_their_first_side_effect() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        for (m, action) in [
+            ("recovery_os_status", "org.dasbackup.health"),
+            ("recovery_os_session", "org.dasbackup.recovery-os"),
+            ("recovery_os_session_end", "org.dasbackup.recovery-os"),
+            ("recovery_os_console", "org.dasbackup.recovery-os"),
+            ("recovery_os_schedule_set", "org.dasbackup.recovery-os"),
+        ] {
+            let method = method_body(body, m);
+            let polkit = method
+                .find(&format!("check_polkit(&self.conn, &sender, \"{action}\")"))
+                .unwrap_or_else(|| panic!("{m} does not check {action}"));
+            // Reading config, the job map, a spawn, a script or a file: none
+            // before polkit has said yes.
+            let effects: Vec<(&str, usize)> = [
+                "load_config(",
+                "spawn_blocking(",
+                "self.jobs",
+                "run_script",
+                "Command::new",
+                "std::fs::",
+            ]
+            .into_iter()
+            .filter_map(|e| method.find(e).map(|at| (e, at)))
+            .collect();
+            assert!(!effects.is_empty(), "{m}: no side effect found to order");
+            for (e, at) in effects {
+                assert!(polkit < at, "{m}: {e} comes before check_polkit");
+            }
+        }
+    }
+
+    /// The body of `async fn <name>(`, up to the next method.
+    fn method_body<'a>(body: &'a str, name: &str) -> &'a str {
+        let at = body
+            .find(&format!("async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let end = body[at + 1..]
+            .find("async fn ")
+            .map_or(body.len(), |n| at + 1 + n);
+        &body[at..end]
+    }
+
+    #[test]
+    fn the_update_units_are_the_panels_names_for_each_mirror_and_the_pair() {
+        use buttered_dasd::config::{Retention, Target, TargetRole};
+        let target = |label: &str, role: TargetRole| Target {
+            label: label.to_string(),
+            serial: String::new(),
+            serials: vec![],
+            mount_uuid: None,
+            mount: format!("/mnt/{label}"),
+            role,
+            retention: Retention::default(),
+            display_name: label.to_string(),
+        };
+        let cfg = Config {
+            targets: vec![
+                target("primary-22tb", TargetRole::Primary),
+                target("system-recovery-A-2tb", TargetRole::Mirror),
+                target("system-recovery-B-2tb", TargetRole::Mirror),
+            ],
+            ..Config::default()
+        };
+        assert_eq!(
+            update_unit_names(&cfg),
+            [
+                "das-recovery-os-update-system-recovery-A-2tb.service",
+                "das-recovery-os-update-system-recovery-B-2tb.service",
+                "das-recovery-os-update-both.service",
+            ]
+        );
+    }
+
+    #[test]
+    fn session_end_is_refused_while_any_session_job_runs() {
+        assert_eq!(session_end_busy(&[("job-1", "backup")], &[]), None);
+        assert_eq!(session_end_busy(&[], &[]), None);
+        assert_eq!(
+            session_end_busy(
+                &[("job-1", "restore"), ("job-3", "recovery-os-session")],
+                &[]
+            )
+            .unwrap(),
+            "a recovery-OS session is already running as job job-3"
+        );
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let end = method_body(body, "recovery_os_session_end");
+        let lock = end
+            .find("self.jobs.lock()")
+            .expect("session-end reads the job map");
+        let check = end
+            .find("session_end_busy(")
+            .expect("session-end checks for a session job");
+        let run = end
+            .find("run_script_merged(")
+            .expect("session-end runs the script");
+        assert!(
+            lock < check && check < run,
+            "the check must come before the script runs"
+        );
+    }
+
+    #[test]
+    fn session_end_is_refused_while_a_scheduled_session_runs_naming_its_unit() {
+        let unit = "das-recovery-os-update-system-recovery-A-2tb.service";
+        assert_eq!(
+            session_end_busy(&[], &[(unit, "active")]).unwrap(),
+            format!("a scheduled recovery-OS session is running: {unit} (active)")
+        );
+        assert_eq!(session_end_busy(&[], &[(unit, "inactive")]), None);
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let end = method_body(body, "recovery_os_session_end");
+        let read = end
+            .find("read_active_states(")
+            .expect("session-end reads the schedule units' states");
+        let check = end.find("session_end_busy(").unwrap();
+        assert!(read < check, "the states are read before the check");
+        assert!(
+            !end.contains("session_end_busy(&running, &[])"),
+            "the unit states must reach the check"
+        );
+    }
+
+    #[test]
+    fn a_flock_write_entry_on_the_files_device_and_inode_is_a_hold() {
+        // Pasted from this host's /proc/locks, 2026-10-08, plus a waiter line.
+        let sample = "\
+1: POSIX  ADVISORY  WRITE 110131 00:1a:55254 0 0
+8: FLOCK  ADVISORY  WRITE 8371 00:99:202 0 EOF
+11: FLOCK  ADVISORY  READ 3714 00:34:43555949 0 EOF
+12: FLOCK  ADVISORY  WRITE 4716 103:0a:16799 0 EOF
+12: -> FLOCK  ADVISORY  WRITE 4800 00:1a:16800 0 EOF
+";
+        assert!(lock_held_in(sample, 0x103, 0x0a, 16799));
+        assert!(
+            !lock_held_in(sample, 0x00, 0x1a, 55254),
+            "a POSIX lock is not the flock"
+        );
+        assert!(
+            !lock_held_in(sample, 0x00, 0x34, 43_555_949),
+            "a shared (READ) flock is not the exclusive hold"
+        );
+        assert!(
+            !lock_held_in(sample, 0x00, 0x1a, 16800),
+            "a waiter does not hold it"
+        );
+        assert!(
+            !lock_held_in(sample, 0x00, 0x1a, 16799),
+            "another device's inode"
+        );
+        assert!(!lock_held_in("", 0, 0x1a, 16799));
+        assert_eq!(dev_major_minor(26), (0, 0x1a));
+        assert_eq!(dev_major_minor(0x10300 | 0x0a), (0x103, 0x0a));
+    }
+
+    #[test]
+    fn the_lock_probe_sees_a_real_flock_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maint.lock");
+        std::fs::write(
+            &path,
+            "recovery-os VM session system-recovery-A-2tb pid 1\n",
+        )
+        .unwrap();
+        assert_eq!(lock_holder_at(&path, Path::new("/proc/locks")), None);
+        let held = buttered_dasd::scrub::FileLock::try_acquire(&path)
+            .unwrap()
+            .unwrap();
+        assert!(
+            lock_holder_at(&path, Path::new("/proc/locks")).is_some(),
+            "a held lock reads held"
+        );
+        // The probe took nothing: the holder still holds it, and a second
+        // taker is still refused.
+        assert!(
+            buttered_dasd::scrub::FileLock::try_acquire(&path)
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        assert_eq!(lock_holder_at(&path, Path::new("/proc/locks")), None);
+        let unknown = lock_holder_at(&path, &dir.path().join("no-proc-locks")).unwrap();
+        assert!(unknown.starts_with("unknown:"), "{unknown}");
+        assert_eq!(
+            lock_holder_at(&dir.path().join("absent"), Path::new("/proc/locks")),
+            None,
+            "no file: nothing can hold it"
+        );
+    }
+
+    #[test]
+    fn the_journal_is_asked_for_the_units_own_lines_since_the_trigger_only() {
+        assert_eq!(
+            journal_args("das-recovery-os-update-both.service", 1_791_490_000),
+            [
+                "-q",
+                "_SYSTEMD_UNIT=das-recovery-os-update-both.service",
+                "--since",
+                "@1791490000",
+                "-n",
+                "5",
+                "-o",
+                "cat",
+                "--no-pager"
+            ]
+        );
+    }
+
+    #[test]
+    fn unit_facts_are_read_from_systemctl_show_and_never_invented() {
+        let timer = unit_facts_from(
+            "LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=@1791600000\nLastTriggerUSec=\nResult=success\n",
+        )
+        .unwrap();
+        assert!(timer.exists);
+        assert_eq!(timer.active_state, "active");
+        assert_eq!(timer.next_elapse_epoch, Some(1_791_600_000));
+        assert_eq!(timer.last_trigger_epoch, None);
+        let service = unit_facts_from(
+            "LoadState=loaded\nActiveState=inactive\nResult=exit-code\nExecMainStatus=1\nExecMainStartTimestamp=@1791490001\nExecMainExitTimestamp=@1791490061\n",
+        )
+        .unwrap();
+        assert_eq!(service.exec_main_status, Some(1));
+        assert_eq!(service.exec_main_start_epoch, Some(1_791_490_001));
+        assert_eq!(service.exec_main_exit_epoch, Some(1_791_490_061));
+        assert_eq!(timer.exec_main_exit_epoch, None, "no reading is None");
+        assert_eq!(service.result.as_deref(), Some("exit-code"));
+        let never_ran = unit_facts_from(
+            "LoadState=loaded\nActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainStartTimestamp=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            never_ran.exec_main_status, None,
+            "a status of a run that never started is not 0"
+        );
+        let gone = unit_facts_from("LoadState=not-found\nActiveState=inactive\n").unwrap();
+        assert!(!gone.exists);
+        assert!(
+            unit_facts_from("ActiveState=active\n").is_err(),
+            "no LoadState: not a reading"
+        );
+        assert!(
+            unit_facts_from(
+                "LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=Thu 2026-10-08\n"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            unit_file_value(
+                "[Timer]\nOnCalendar=2026-10-09 22:00:00\nPersistent=false\n",
+                "OnCalendar"
+            )
+            .as_deref(),
+            Some("2026-10-09 22:00:00")
+        );
+        assert_eq!(unit_file_value("[Timer]\n", "OnCalendar"), None);
+    }
+
+    /// A scripted `systemctl`: records each call, fails those whose words
+    /// contain any of `failing`.
+    struct ScriptedSystemctl {
+        calls: std::cell::RefCell<Vec<String>>,
+        failing: Vec<&'static str>,
+    }
+
+    impl ScriptedSystemctl {
+        fn new(failing: &[&'static str]) -> Self {
+            Self {
+                calls: Default::default(),
+                failing: failing.to_vec(),
+            }
+        }
+        fn run(&self, args: &[&str]) -> Result<(), String> {
+            let call = args.join(" ");
+            self.calls.borrow_mut().push(call.clone());
+            match self.failing.iter().find(|f| call.contains(*f)) {
+                Some(f) => Err(format!("Failed: {f} (scripted)")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// The message of a schedule error, whichever kind.
+    fn msg(e: &fdo::Error) -> String {
+        match e {
+            fdo::Error::InvalidArgs(m) | fdo::Error::Failed(m) => m.clone(),
+            other => format!("{other}"),
+        }
+    }
+
+    fn install_a(dir: &Path, sc: Systemctl) -> fdo::Result<String> {
+        schedule_install(
+            dir,
+            &["system-recovery-A-2tb".to_string()],
+            1_791_600_000,
+            None,
+            Path::new("/x.sh"),
+            sc,
+        )
+    }
+
+    const BASE_A: &str = "das-recovery-os-update-system-recovery-A-2tb";
+
+    #[test]
+    fn a_schedule_is_written_reloaded_enabled_and_restarted_and_a_failed_arm_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = BASE_A;
+        let sc = ScriptedSystemctl::new(&[]);
+        assert_eq!(
+            install_a(dir.path(), &|a| sc.run(a)).unwrap(),
+            format!("{base}.timer"),
+            "the unit name is returned"
+        );
+        // restart arms the timer in every state: an elapsed one-shot timer is
+        // left elapsed by daemon-reload, and enable --now is a no-op on it.
+        assert_eq!(
+            *sc.calls.borrow(),
+            [
+                "daemon-reload",
+                &format!("enable {base}.timer"),
+                &format!("restart {base}.timer")
+            ]
+        );
+        for suffix in ["service", "timer"] {
+            let f = dir.path().join(format!("{base}.{suffix}"));
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "{suffix}"
+            );
+        }
+        assert_eq!(existing_schedule_bases(dir.path()).unwrap(), [base]);
+
+        for step in ["enable", "restart"] {
+            // A re-schedule over the pair just written: the undo stops the
+            // timer while its files are still there, then removes them.
+            install_a(dir.path(), &|a| sc.run(a)).unwrap();
+            let calls = std::cell::RefCell::new(Vec::<String>::new());
+            let unit_dir = dir.path().to_path_buf();
+            let err = install_a(dir.path(), &|a: &[&str]| {
+                let call = a.join(" ");
+                if a[0] == "stop" {
+                    assert!(
+                        unit_dir.join(format!("{base}.timer")).exists(),
+                        "stop must come before the files are removed"
+                    );
+                }
+                calls.borrow_mut().push(call);
+                if a[0] == step {
+                    Err(format!("Failed: {step} (scripted)"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            let m = msg(&err);
+            assert!(matches!(err, fdo::Error::Failed(_)), "{err:?}");
+            assert!(m.contains(&format!("Failed: {step} (scripted)")), "{m}");
+            assert!(
+                m.contains("previous schedule"),
+                "the drop is said plainly: {m}"
+            );
+            let calls = calls.into_inner();
+            let stop = calls
+                .iter()
+                .position(|c| *c == format!("stop {base}.timer"))
+                .unwrap_or_else(|| panic!("no stop in {calls:?}"));
+            // An enable that succeeded left a timers.target.wants link: the
+            // undo disables it, after the stop.
+            let disable = calls
+                .iter()
+                .position(|c| *c == format!("disable {base}.timer"))
+                .unwrap_or_else(|| panic!("no disable in {calls:?}"));
+            assert_eq!(calls.last().unwrap(), "daemon-reload", "{calls:?}");
+            assert!(stop < disable && disable < calls.len() - 1, "{calls:?}");
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a failed {step} leaves no half-installed pair"
+            );
+        }
+
+        // A disable that fails (other than "not there") is said; the files go.
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let no_disable = ScriptedSystemctl::new(&["restart", "disable"]);
+        let m = msg(&install_a(dir.path(), &|a| no_disable.run(a)).unwrap_err());
+        assert!(
+            m.contains("disabling it failed: Failed: disable (scripted)"),
+            "{m}"
+        );
+        assert!(existing_schedule_bases(dir.path()).unwrap().is_empty());
+        // A timer systemd does not have is not a disable failure.
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let m = msg(&install_a(dir.path(), &|a: &[&str]| match a[0] {
+            "restart" => Err("Failed: restart (scripted)".to_string()),
+            "disable" => Err(format!("Unit file {base}.timer does not exist.")),
+            _ => Ok(()),
+        })
+        .unwrap_err());
+        assert!(!m.contains("disabling it failed"), "{m}");
+
+        // An undo whose stop really fails leaves the files, so what may still
+        // be armed is visible.
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let stuck = ScriptedSystemctl::new(&["restart", "stop"]);
+        let m = msg(&install_a(dir.path(), &|a| stuck.run(a)).unwrap_err());
+        assert!(m.contains("Failed: stop (scripted)"), "{m}");
+        assert_eq!(existing_schedule_bases(dir.path()).unwrap(), [base]);
+    }
+
+    #[test]
+    fn clear_stops_disables_removes_and_reloads_and_a_lingering_timer_is_stopped_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = BASE_A;
+        let sc = ScriptedSystemctl::new(&[]);
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let clear = ScriptedSystemctl::new(&[]);
+        assert_eq!(
+            schedule_clear(dir.path(), base, &|a| clear.run(a)).unwrap(),
+            format!("{base}.timer"),
+            "the unit name is returned"
+        );
+        assert_eq!(
+            *clear.calls.borrow(),
+            [
+                &format!("stop {base}.timer"),
+                &format!("disable {base}.timer"),
+                "daemon-reload"
+            ]
+        );
+        assert!(existing_schedule_bases(dir.path()).unwrap().is_empty());
+
+        // A timer whose files are gone but which systemd still has loaded:
+        // disable says "does not exist", the stop still reaches it.
+        let stopped = std::cell::Cell::new(false);
+        schedule_clear(dir.path(), base, &|a: &[&str]| match a[0] {
+            "stop" => {
+                stopped.set(true);
+                Ok(())
+            }
+            "disable" => Err(format!(
+                "Failed to disable unit: Unit file {base}.timer does not exist."
+            )),
+            _ => Ok(()),
+        })
+        .unwrap();
+        assert!(stopped.get());
+        // Nothing loaded and nothing on disk: still a clear.
+        schedule_clear(dir.path(), base, &|a: &[&str]| match a[0] {
+            "stop" => Err(format!(
+                "Failed to stop {base}.timer: Unit {base}.timer not loaded."
+            )),
+            "disable" => Err(format!("Unit file {base}.timer does not exist.")),
+            _ => Ok(()),
+        })
+        .unwrap();
+        // Any other stop failure is an error, and the files stay.
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let stuck = ScriptedSystemctl::new(&["stop"]);
+        let m = msg(&schedule_clear(dir.path(), base, &|a| stuck.run(a)).unwrap_err());
+        assert!(m.contains("scripted"), "{m}");
+        assert_eq!(existing_schedule_bases(dir.path()).unwrap(), [base]);
+    }
+
+    #[test]
+    fn a_symlinked_unit_is_refused_and_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("null");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.path().join(format!("{BASE_A}.timer"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let sc = ScriptedSystemctl::new(&[]);
+
+        let err = install_a(dir.path(), &|a| sc.run(a)).unwrap_err();
+        let m = msg(&err);
+        assert!(matches!(err, fdo::Error::InvalidArgs(_)), "{err:?}");
+        assert_eq!(
+            m,
+            format!(
+                "{} is a symlink (masked or linked); unmask it (systemctl unmask {BASE_A}.timer) or clear the schedule first",
+                link.display()
+            )
+        );
+        let err = schedule_clear(dir.path(), BASE_A, &|a| sc.run(a)).unwrap_err();
+        assert!(matches!(err, fdo::Error::InvalidArgs(_)), "{err:?}");
+        assert_eq!(
+            msg(&err),
+            format!(
+                "{} is a symlink (masked or linked); unmask it (systemctl unmask {BASE_A}.timer), then clear the schedule",
+                link.display()
+            ),
+            "never 'clear the schedule first' on the clear path"
+        );
+
+        assert!(sc.calls.borrow().is_empty(), "nothing was asked of systemd");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !dir.path().join(format!("{BASE_A}.service")).exists(),
+            "the refusal comes before any write"
+        );
+    }
+
+    #[test]
+    fn job_cancel_checks_the_action_of_the_jobs_own_kind() {
+        assert_eq!(
+            cancel_action("recovery-os-session"),
+            "org.dasbackup.recovery-os"
+        );
+        for kind in ["backup", "index", "restore", ""] {
+            assert_eq!(cancel_action(kind), "org.dasbackup.backup", "{kind:?}");
+        }
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let cancel = method_body(body, "job_cancel");
+        assert!(
+            cancel.contains("check_polkit(&self.conn, &sender, cancel_action("),
+            "{cancel}"
+        );
+        assert!(
+            !cancel.contains("\"org.dasbackup.backup\""),
+            "a fixed action in job_cancel"
+        );
+    }
+
+    #[test]
+    fn a_second_session_job_is_refused_naming_the_first() {
+        assert_eq!(session_busy(&[("job-1", "backup")], &[]), None);
+        assert_eq!(
+            session_busy(&[("job-2", "recovery-os-session")], &[]).unwrap(),
+            "a recovery-OS session is already running as job job-2"
+        );
+        assert_eq!(
+            session_busy(
+                &[],
+                &[("das-recovery-os-update-both.service", "activating")]
+            )
+            .unwrap(),
+            "a scheduled recovery-OS session is running: das-recovery-os-update-both.service (activating)"
+        );
+        assert_eq!(
+            session_busy(
+                &[],
+                &[(
+                    "das-recovery-os-update-system-recovery-A-2tb.service",
+                    "inactive"
+                )]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_polkit_policy_declares_the_recovery_os_action_as_auth_admin_keep() {
+        let policy = include_str!("../../../polkit/org.dasbackup.policy");
+        let at = policy
+            .find("action id=\"org.dasbackup.recovery-os\"")
+            .expect("action declared");
+        let block = &policy[at..policy[at..].find("</action>").unwrap() + at];
+        assert!(
+            block.contains("<allow_any>no</allow_any>")
+                && block.contains("<allow_active>auth_admin_keep</allow_active>"),
+            "{block}"
+        );
+    }
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn clean_runs_is_a_count_or_an_error_never_zero_by_default() {
+        assert_eq!(clean_runs_from(&output(0, "3\n", "")), Ok(3));
+        for bad in [
+            output(0, "", ""),
+            output(0, "three\n", ""),
+            output(0, "-1\n", ""),
+            output(2, "0\n", "no such drive"),
+        ] {
+            assert!(clean_runs_from(&bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            clean_runs_from(&output(2, "", "no such drive\n")),
+            Err("no such drive".to_string())
+        );
+    }
+
+    #[test]
+    fn history_is_every_line_as_json_or_an_error_never_a_partial_list() {
+        let got = history_from(&output(0, "{\"a\":1}\n{\"b\":2}\n", "")).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(history_from(&output(0, "", "")), Ok(vec![]));
+        assert!(history_from(&output(0, "{\"a\":1}\nnot json\n", "")).is_err());
+        assert!(history_from(&output(1, "{\"a\":1}\n", "cannot read")).is_err());
+    }
+
+    #[test]
+    fn the_console_socket_is_one_path_or_the_scripts_refusal() {
+        assert_eq!(
+            console_path_from(&output(0, "/run/das-recovery-os/A/vnc.sock\n", "")),
+            Ok("/run/das-recovery-os/A/vnc.sock".to_string())
+        );
+        assert_eq!(
+            console_path_from(&output(3, "", "no session is running for A\n")),
+            Err("no session is running for A".to_string())
+        );
+        for bad in [
+            output(0, "", ""),
+            output(0, "/a\n/b\n", ""),
+            output(0, "relative\n", ""),
+        ] {
+            assert!(console_path_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn last_lines_keeps_the_tail_in_order() {
+        let text: String = (1..=15).map(|n| format!("line {n}\n")).collect();
+        let got = last_lines(&text, 12);
+        assert!(
+            got.starts_with("line 4\n") && got.ends_with("line 15"),
+            "{got}"
+        );
+        assert_eq!(last_lines("", 12), "");
+    }
 
     #[test]
     fn a_step_value_that_is_not_a_boolean_reaches_the_library_as_none() {
