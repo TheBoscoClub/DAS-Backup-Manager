@@ -325,10 +325,16 @@ fn update_unit_names(cfg: &Config) -> Vec<String> {
     cfg.targets
         .iter()
         .filter(|t| t.role == buttered_dasd::config::TargetRole::Mirror)
-        .map(|t| format!("das-recovery-os-update-{}.service", t.label))
-        .chain(std::iter::once(
-            "das-recovery-os-update-both.service".to_string(),
-        ))
+        .map(|t| {
+            format!(
+                "{}.service",
+                panel::unit_base(std::slice::from_ref(&t.label))
+            )
+        })
+        .chain(std::iter::once(format!(
+            "{}both.service",
+            panel::UNIT_PREFIX
+        )))
         .collect()
 }
 
@@ -2656,6 +2662,35 @@ mod tests {
             .find("async fn ")
             .map_or(body.len(), |n| at + 1 + n);
         &body[at..end]
+    }
+
+    #[test]
+    fn the_update_units_are_the_panels_names_for_each_mirror_and_the_pair() {
+        use buttered_dasd::config::{Retention, Target, TargetRole};
+        let target = |label: &str, role: TargetRole| Target {
+            label: label.to_string(),
+            serial: String::new(),
+            serials: vec![],
+            mount_uuid: None,
+            mount: format!("/mnt/{label}"),
+            role,
+            retention: Retention::default(),
+            display_name: label.to_string(),
+        };
+        let mut cfg = Config::default();
+        cfg.targets = vec![
+            target("primary-22tb", TargetRole::Primary),
+            target("system-recovery-A-2tb", TargetRole::Mirror),
+            target("system-recovery-B-2tb", TargetRole::Mirror),
+        ];
+        assert_eq!(
+            update_unit_names(&cfg),
+            [
+                "das-recovery-os-update-system-recovery-A-2tb.service",
+                "das-recovery-os-update-system-recovery-B-2tb.service",
+                "das-recovery-os-update-both.service",
+            ]
+        );
     }
 
     #[test]
