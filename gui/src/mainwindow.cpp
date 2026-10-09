@@ -11,6 +11,7 @@
 #include "searchmodel.h"
 #include "settingsdialog.h"
 #include "sidebar.h"
+#include "recoverypanel.h"
 #include "snapshotmodel.h"
 #include "snapshotwatcher.h"
 #include "snapshottimeline.h"
@@ -169,6 +170,10 @@ void MainWindow::setupUi()
     // Page 4: Health Dashboard (tabs: Drives, Growth, Status)
     m_healthDashboard = new HealthDashboard(m_dbusClient, this);
     m_stack->addWidget(m_healthDashboard); // index 4
+
+    // Page 5: Recovery drives (bd DAS-Backup-Manager-8249 stage 3)
+    m_recoveryPanel = new RecoveryPanel(m_dbusClient, this);
+    m_stack->addWidget(m_recoveryPanel); // index 5
 
     // --- Main layout: sidebar | stack ---
     auto *mainSplitter = new QSplitter(Qt::Horizontal, this);
@@ -367,6 +372,9 @@ void MainWindow::setupActions()
 
 void MainWindow::onSectionChanged(SidebarSection section)
 {
+    // The recovery panel refreshes on a timer only while it is shown.
+    if (m_recoveryPanel && section != SidebarSection::RecoveryDrives)
+        m_recoveryPanel->setShown(false);
     switch (section) {
     case SidebarSection::BrowseSnapshots:
         m_stack->setCurrentIndex(0);
@@ -400,6 +408,10 @@ void MainWindow::onSectionChanged(SidebarSection section)
     case SidebarSection::HealthStatus:
         m_stack->setCurrentIndex(4);
         m_healthDashboard->setActiveTab(2);
+        break;
+    case SidebarSection::RecoveryDrives:
+        m_stack->setCurrentIndex(5);
+        m_recoveryPanel->setShown(true);
         break;
     }
 }
