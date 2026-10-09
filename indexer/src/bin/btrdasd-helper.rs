@@ -2677,12 +2677,14 @@ mod tests {
             retention: Retention::default(),
             display_name: label.to_string(),
         };
-        let mut cfg = Config::default();
-        cfg.targets = vec![
-            target("primary-22tb", TargetRole::Primary),
-            target("system-recovery-A-2tb", TargetRole::Mirror),
-            target("system-recovery-B-2tb", TargetRole::Mirror),
-        ];
+        let cfg = Config {
+            targets: vec![
+                target("primary-22tb", TargetRole::Primary),
+                target("system-recovery-A-2tb", TargetRole::Mirror),
+                target("system-recovery-B-2tb", TargetRole::Mirror),
+            ],
+            ..Config::default()
+        };
         assert_eq!(
             update_unit_names(&cfg),
             [
