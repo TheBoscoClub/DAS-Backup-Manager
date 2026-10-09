@@ -1371,7 +1371,7 @@ The helper's `RecoveryOsScheduleSet` (the GUI's panel; polkit action `org.dasbac
 - **`Persistent=false`**: a time that passed while the host was off is not run at the next boot. The status document reads such a schedule as **`missed`**. systemd keeps such a timer's trigger time in memory only, so after a restart of the host a schedule that fired before it is told apart by what it left: **`fired`**, "ran before the host restarted", when the history holds a line of an unattended session that started within the lock wait (3 hours, plus 10 minutes) after the time; `fired` and `refused:` when the service's own journal has lines since then; when neither tells, the detail says "missed, or fired before a restart". The other states are `pending` (the timer has a next elapse), `running` and `fired` (with the outcome of the history line that started inside the service's run; `refused:` and the last lines the service's own processes logged since the trigger when the session never took the lock; `outcome unknown` when the history cannot be read).
 - **The service carries `SuccessExitStatus=1 3 4 5 6 7`**, so a session that refused, warned or failed is not a failed unit (cachyos-sentinel restarts failed units); the outcome is in the session history ([above](#the-session-history)), never in a failed unit.
 - **`SessionEnd` is refused** while a session job or a scheduled unit runs, naming it.
-- **A cancel** (`JobCancel` on the session job) sends the script one SIGINT, to its process group, as Ctrl-C would. **In `--mode parallel` that does not yet stop the drive sessions themselves** (script defect, bd `DAS-Backup-Manager-c8lf`): a cancelled parallel run goes on to its own end.
+- **A cancel** (`JobCancel` on the session job) sends the script one SIGINT, to its process group, as Ctrl-C would; in `--mode parallel` it reaches both drives' sessions (the run starts them with SIGINT deliverable, script 2.1.1), and both end with exit status 3, the lock kept and the recovery OSes left running for `session-end`.
 - **A masked (symlinked) unit is refused**, on set and on clear: "unmask it or clear the schedule first". The helper never writes through a link.
 - **Uninstall** (`btrdasd setup --uninstall`) stops and removes every `das-recovery-os-update-*` unit.
 
@@ -1380,6 +1380,15 @@ To clear a schedule by hand (what setting the time to 0 does):
 ```bash
 systemctl disable --now das-recovery-os-update-<label>.timer && rm /etc/systemd/system/das-recovery-os-update-<label>.{timer,service} && systemctl daemon-reload
 ```
+
+#### From the GUI
+
+`btrdasd-gui` → **Recovery drives** shows one card per recovery drive from the helper's status document (OS, installed, last full upgrade and its age, kernel and btrfs-progs against the host, btrbk, current or **STALE** with the reasons, what booting it would run, the record's age, clean unattended runs, schedule, session, and **UPDATE DUE** past `[recovery_os].max_age_days`), and a card for both drives. A part the helper could not read is shown in its place in the warning colour, and every button that depends on it is disabled with that error as its tooltip — every button's tooltip says what it does, or why it is disabled.
+
+- **Upgrade** starts a session now for the selected drive, or both (one after the other by default until each drive has 3 clean unattended runs; in parallel by choice). *Attended*: the recovery OS boots in its VM and **Open console** opens it in `remote-viewer` through the helper's private socket (when virt-viewer is not installed, the socket's path is shown to copy into any VNC viewer that speaks UNIX sockets); a drive whose record says btrbk **will** run at boot shows the banner first and goes on only on your yes. *Unattended*: allowed only when the record admits it (schema 4, the guest agent installed and started at boot, not `will`); the reason is the tooltip otherwise.
+- **Schedule** arms an unattended session at the chosen date and time (at least 2 minutes ahead; untick **Now**); an existing schedule is replaced only after a confirmation naming it. **Clear schedule** removes a `pending` or `missed` one.
+- **End session** gives a drive back when a holder is neither a helper job nor a scheduled unit — a driver that crashed; a running job is stopped with **Cancel** in the progress panel, a scheduled unit gives the drive back itself. The GUI waits up to 10 minutes for the give-back.
+- The session's lines stream into the progress panel. A session that ended with warnings (exit status 5) reads **Needs a look** with its summary; anything else that was not clean reads **Failed**.
 
 #### Progress lines
 

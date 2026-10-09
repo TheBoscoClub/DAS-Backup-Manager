@@ -305,6 +305,7 @@ btrdasd-gui
          │         ├──▶ IndexBackupHistory()   → BackupHistoryView
          │         ├──▶ IndexSnapshotPath()    → Snapshot path resolution
          │         ├──▶ HealthQuery()          → HealthDashboard (SMART, growth, services)
+         │         ├──▶ RecoveryOsStatus()     → RecoveryPanel (recovery drives: records, schedules, sessions)
          │         └──▶ ConfigGet()            → BackupPanel, ConfigDialog
          │
          ├──▶ SnapshotTimeline            Custom QPainter widget (visual timeline)
@@ -659,14 +660,14 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 
 ### KDE Plasma GUI (`gui/src/`)
 
-20 C++ components implementing full backup management (the previous read-only `Database`
+22 C++ components implementing full backup management (the previous read-only `Database`
 QSqlDatabase wrapper was removed when the GUI's models were rewired to go through
 `DBusClient`/`btrdasd-helper` exclusively — see `dbusclient.h/cpp` below):
 
 | Component | Files | Purpose |
 |-----------|-------|---------|
 | MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with sidebar + QStackedWidget, rich status bar, keyboard shortcuts |
-| Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health sections) |
+| Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health, Recovery drives sections) |
 | DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
 | ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, resizable raw log (native dock resize), smart auto-scroll |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
@@ -678,6 +679,8 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | PanelConfig | `panelconfig.h/cpp` | Pure reader of the labels and `[boot] enabled` the Backup panel needs from config.toml (trailing comments tolerated); unit-tested in `gui-smoketest` |
 | BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
+| RecoveryStatus | `recoverystatus.h/cpp` | Pure model (QtCore only) of `RecoveryOsStatus`'s document and the Recovery drives panel's enablement rules (`deriveActions`, `derivePairActions`); unit-tested in `gui-smoketest` against `gui/tests/fixtures/recovery-status.json`, which a `panel.rs` test writes and compares byte for byte |
+| RecoveryPanel | `recoverypanel.h/cpp` | Recovery drives: one card per drive, a selector (one drive or both), attended/unattended, sequential/parallel, Now or a time; Upgrade / Schedule / Clear schedule / Open console (remote-viewer on the helper's console socket) / End session, every button bound to `{enabled, why}` |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
 | SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
 | IndexRunner | `indexrunner.h/cpp` | D-Bus IndexWalk trigger (was QProcess, now D-Bus) |
@@ -697,5 +700,5 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 | D-Bus helper tests | 13 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
 | Rust integration tests | 38 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (15), `recovery_os_cli.rs` (7), `record_run_contract.rs` (6), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 8 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (3), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
-| C++ GUI smoke tests | 22 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper. The click-simulation suites were removed 2026-03-01 |
+| C++ GUI smoke tests | 53 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
 | **Total** | **1444 Rust (1452 incl. manual) + 22 Qt** | |

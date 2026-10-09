@@ -63,6 +63,8 @@ parts:
 apps:
   btrdasd:
     command: usr/bin/btrdasd
+  # The recovery-drive console opens remote-viewer on the host; inside this
+  # sandbox the GUI shows the console socket's path instead (8249 stage 3).
   btrdasd-gui:
     command: usr/bin/btrdasd-gui
     desktop: usr/share/applications/org.theboscoclub.btrdasd-gui.desktop
