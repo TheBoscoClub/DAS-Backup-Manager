@@ -867,7 +867,7 @@ fn pair_session_of(
             domain_state: None,
             attended: Some(false),
         };
-        return (Some(s), error);
+        return (Some(s), with_lock_failure(error, holder));
     }
     let pair = holder.filter(|h| holder_labels(h).len() == 2);
     let s = pair.map(|h| Session {
@@ -879,7 +879,7 @@ fn pair_session_of(
         domain_state: None,
         attended: None,
     });
-    (s, error)
+    (s, with_lock_failure(error, holder))
 }
 
 /// A schedule service that is running now: `(unit, facts)`; `Ok(None)` when
@@ -894,6 +894,27 @@ fn running_service(
         .unit(&name)
         .map_err(|e| format!("{name} cannot be read: {e}"))?;
     Ok(matches!(facts.active_state.as_str(), "active" | "activating").then_some((name, facts)))
+}
+
+/// The reason the maintenance lock could not be examined, when the helper's
+/// probe said so (`lock_holder` returns `unknown: <why>` for a lock it
+/// cannot check, never `None`): the words for a `session_error`. A holder
+/// line, or no holder, is a reading and gives `None`.
+fn lock_probe_failure(holder: Option<&str>) -> Option<String> {
+    holder.and_then(|h| h.strip_prefix("unknown:")).map(|why| {
+        format!(
+            "cannot tell whether a session holds the drive: the maintenance lock could not be examined ({})",
+            why.trim()
+        )
+    })
+}
+
+/// `error` with the lock probe's failure joined on, both reported.
+fn with_lock_failure(error: Option<String>, holder: Option<&str>) -> Option<String> {
+    match (error, lock_probe_failure(holder)) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 /// The drives a maintenance-lock line `recovery-os VM session <label> pid N`
@@ -916,7 +937,8 @@ fn holder_labels(holder: &str) -> Vec<&str> {
 /// `<a>+<b>`, and holds both. A job without the lock naming a drive is not
 /// attributed to one: the helper does not keep a job's labels.
 ///
-/// The second value says which schedule service could not be read; it is
+/// The second value says which schedule service could not be read, or that
+/// the lock itself could not be examined; it is
 /// reported whatever else was found, since an unreadable unit may be the
 /// one that holds the drive.
 fn session_of(
@@ -938,7 +960,7 @@ fn session_of(
             Err(e) => errors.push(e),
         }
     }
-    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    let error = with_lock_failure((!errors.is_empty()).then(|| errors.join("; ")), holder);
     if held_here && let Some(id) = job {
         let s = Session {
             by: format!("job:{id}"),
@@ -2425,6 +2447,83 @@ pub(crate) mod tests {
                 .as_str()
                 .unwrap()
                 .contains("bus unreachable")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_lock_probe_is_a_session_error_never_no_session() {
+        let cfg = two_mirrors_and_a_primary();
+        let why = "unknown: /proc/locks cannot be read to check the maintenance lock: \
+                   permission denied (scripted)";
+        let reads = Scripted {
+            lock: Some(why.to_string()),
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-08",
+            1_791_500_000,
+            &reads,
+        );
+        for (name, doc) in [
+            ("drive A", &j["drives"][0]),
+            ("drive B", &j["drives"][1]),
+            ("pair", &j["pair"]),
+        ] {
+            assert!(doc["session"].is_null(), "{name}: missing is null: {doc}");
+            let e = doc["session_error"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: no session_error: {doc}"));
+            assert!(e.contains("permission denied (scripted)"), "{name}: {e}");
+            assert!(
+                e.contains("cannot tell whether a session holds"),
+                "{name}: wording for a tooltip: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_probe_failure_beside_an_unreadable_unit_reports_both() {
+        let cfg = two_mirrors_and_a_primary();
+        let mut units = HashMap::new();
+        units.insert(
+            format!("{UNIT_PREFIX}both.service"),
+            Err("bus unreachable (scripted)".to_string()),
+        );
+        let reads = Scripted {
+            units,
+            lock: Some("unknown: the lock is gone (scripted)".to_string()),
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-08",
+            1_791_500_000,
+            &reads,
+        );
+        for doc in [&j["drives"][0], &j["pair"]] {
+            let e = doc["session_error"].as_str().unwrap();
+            assert!(e.contains("bus unreachable"), "{e}");
+            assert!(e.contains("the lock is gone (scripted)"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_holder_line_is_not_a_probe_failure_by_shape_alone() {
+        // An identity is a holder, even one that merely mentions unknown.
+        assert_eq!(
+            lock_probe_failure(Some("backup-run.sh pid 7 (unknown: x)")),
+            None
+        );
+        assert_eq!(lock_probe_failure(None), None);
+        assert!(
+            lock_probe_failure(Some("unknown: why"))
+                .unwrap()
+                .contains("why")
         );
     }
 }
