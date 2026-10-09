@@ -1638,7 +1638,14 @@ write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-re
         printf 'stub backup pid 78\n' >&9
         : >"$S/blocker.locked"
     fi
-    sleep 1
+    # Rewrite the record only once the driver has probed the lock (the stub
+    # flock logs the probe): the probe is wait_for_lock's, so a driver that
+    # read the record BEFORE it reads the stale one -- ordered by the
+    # driver's own steps, not by a sleep.
+    for ((j = 0; j < 400; j++)); do
+        [[ -s "$S/flock.calls" ]] && break
+        sleep 0.05
+    done
     write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":{\"btrbk_at_boot\":{\"verdict\":\"sometimes\",\"reasons\":[]}},\"error\":null}"
     exec sleep 1
 ) &
