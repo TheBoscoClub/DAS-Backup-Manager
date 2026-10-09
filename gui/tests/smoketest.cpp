@@ -1382,6 +1382,33 @@ private Q_SLOTS:
         QVERIFY(p.clear->isEnabled());
         QVERIFY(!panel.statusLine().contains(QStringLiteral("polkit denied")));
     }
+
+    // --- Live-panel findings (Task 8, 2026-10-09) ----------------------------
+
+    void tooltipsWrapAndCardTitlesDoNotRepeatTheSerial()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(twoIdleDrives([](QJsonObject &a, QJsonObject &b) {
+            // A display name that already carries the serial, as the author's config does
+            a[QStringLiteral("display_name")] = QStringLiteral("2TB Recovery A (Bay 1, SER-system-recovery-A-2tb)");
+            b[QStringLiteral("display_name")] = QStringLiteral("Drive B");
+        }));
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        // Qt wraps only rich-text tooltips: every tooltip is one
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end})
+            QVERIFY2(b->toolTip().startsWith(QStringLiteral("<qt>")), qPrintable(b->toolTip()));
+        QVERIFY(p.attended->toolTip().startsWith(QStringLiteral("<qt>")));
+        QVERIFY(p.selector->toolTip().startsWith(QStringLiteral("<qt>")));
+        // The serial is appended only when the display name lacks it
+        const auto boxes = panel.findChildren<QGroupBox *>();
+        QStringList titles;
+        for (QGroupBox *g : boxes)
+            titles << g->title();
+        QVERIFY2(titles.contains(QStringLiteral("2TB Recovery A (Bay 1, SER-system-recovery-A-2tb)")), qPrintable(titles.join(QStringLiteral(" | "))));
+        QVERIFY2(titles.contains(QStringLiteral("Drive B (SER-system-recovery-A-2tb)")), qPrintable(titles.join(QStringLiteral(" | "))));
+    }
 };
 
 QTEST_MAIN(GuiSmokeTest)
