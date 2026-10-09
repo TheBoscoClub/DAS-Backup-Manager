@@ -21,6 +21,10 @@
 #include <QSignalSpy>
 #include <QAbstractItemModel>
 #include <QJsonValue>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QFile>
 #include <QCheckBox>
 #include <QGroupBox>
 #include <QLabel>
@@ -31,6 +35,7 @@
 #include <optional>
 
 #include "../src/dbusclient.h"
+#include "../src/recoverystatus.h"
 #include "../src/filemodel.h"
 #include "../src/healthdashboard.h"
 #include "../src/backuphistory.h"
@@ -716,6 +721,124 @@ private Q_SLOTS:
         client.recoveryOsSessionEnd(QStringLiteral("system-recovery-A-2tb"));
         QCOMPARE(end.count(), 1);
         QVERIFY(!end.at(0).at(1).toBool());
+    }
+
+    // --- Recovery drives: the status document (8249 stage 3) ----------------
+    //
+    // gui/tests/fixtures/recovery-status.json is written by a panel.rs test
+    // from a fixed scripted scenario and must equal status_json's output
+    // byte for byte; this side parses the same file. Drive A: a record
+    // (verdict may), a running helper job, a missed schedule, 2 clean runs.
+    // Drive B: no record, every part unreadable.
+
+    static QByteArray fixture()
+    {
+        QFile f(QStringLiteral(RECOVERY_FIXTURE_PATH));
+        if (!f.open(QIODevice::ReadOnly))
+            return {};
+        return f.readAll();
+    }
+
+    void parseReadsEveryPartOfTheFixture()
+    {
+        QString err;
+        const auto doc = RecoveryDocument::parse(fixture(), &err);
+        QVERIFY2(doc.has_value(), qPrintable(err));
+        QCOMPARE(doc->schema, 1);
+        QCOMPARE(doc->maxAgeDays, 60);
+        QCOMPARE(doc->today, QStringLiteral("2026-10-09"));
+        QCOMPARE(doc->pair.modeDefault, QStringLiteral("sequential"));
+        QVERIFY(!doc->pair.schedule.has_value());
+        QVERIFY(!doc->pair.scheduleError.has_value());
+        QCOMPARE(doc->drives.size(), 2);
+
+        const DriveView &a = doc->drives[0];
+        QCOMPARE(a.label, QStringLiteral("system-recovery-A-2tb"));
+        QCOMPARE(a.displayName, QStringLiteral("Drive system-recovery-A-2tb"));
+        QCOMPARE(a.serials, QStringList{QStringLiteral("SER-system-recovery-A-2tb")});
+        QCOMPARE(a.checkedEpoch, std::optional<qint64>(1791448102));
+        QVERIFY(!a.recordError.has_value());
+        QVERIFY(a.record.has_value());
+        QCOMPARE(a.record->kernel, QStringLiteral("6.17.1-1-cachyos"));
+        QCOMPARE(a.record->hostKernel, QStringLiteral("6.17.2-1-cachyos"));
+        QCOMPARE(a.record->lastFullUpgrade, QStringLiteral("2026-09-20"));
+        QVERIFY(!a.record->packagesRead); // the scenario's package database was not read
+        QVERIFY(a.record->btrbk.isEmpty()); // null, not "not installed"
+        QCOMPARE(a.record->guestAgent.state, QStringLiteral("read"));
+        QCOMPARE(a.record->guestAgent.installed, std::optional<bool>(true));
+        QCOMPARE(a.record->guestAgent.enabled, std::optional<bool>(true));
+        QVERIFY(a.assessment.has_value());
+        QCOMPARE(a.assessment->ageDays, std::optional<qint64>(19));
+        QVERIFY(!a.assessment->stale);
+        QCOMPARE(a.assessment->warnings.size(), 1);
+        QVERIFY(!a.due);
+        QCOMPARE(a.verdict, QStringLiteral("may"));
+        QVERIFY(a.unattendedPossible);
+        QVERIFY(a.unattendedWhy.isEmpty());
+        QCOMPARE(a.cleanRuns, std::optional<qint64>(2));
+        QVERIFY(!a.cleanRunsError.has_value());
+        QCOMPARE(a.history.size(), 2);
+        QCOMPARE(a.history[1][QStringLiteral("outcome")].toString(), QStringLiteral("clean"));
+        QVERIFY(!a.historyError.has_value());
+        QVERIFY(a.schedule.has_value());
+        QCOMPARE(a.schedule->state, QStringLiteral("missed"));
+        QCOMPARE(a.schedule->unit, QStringLiteral("das-recovery-os-update-system-recovery-A-2tb.timer"));
+        QVERIFY(!a.schedule->atEpoch.has_value());
+        QVERIFY(a.schedule->mode.isEmpty());
+        QVERIFY(!a.schedule->detail.isEmpty());
+        QVERIFY(!a.scheduleError.has_value());
+        QVERIFY(a.session.has_value());
+        QCOMPARE(a.session->by, QStringLiteral("job:job-7"));
+        QCOMPARE(a.session->domainState, QStringLiteral("running"));
+        QVERIFY(!a.session->sinceEpoch.has_value());
+        QVERIFY(!a.session->attended.has_value()); // null in the document
+        QVERIFY(!a.sessionError.has_value());
+
+        const DriveView &b = doc->drives[1];
+        QCOMPARE(b.label, QStringLiteral("system-recovery-B-2tb"));
+        QVERIFY(b.recordError.has_value());
+        QVERIFY(b.recordError->contains(QStringLiteral("no record")));
+        QVERIFY(!b.record.has_value());
+        QVERIFY(!b.assessment.has_value());
+        QVERIFY(b.verdict.isEmpty());
+        QVERIFY(!b.unattendedPossible);
+        QVERIFY(b.unattendedWhy.contains(QStringLiteral("no record")));
+        QVERIFY(!b.cleanRuns.has_value());
+        QVERIFY(b.cleanRunsError.has_value());
+        QVERIFY(b.history.isEmpty());
+        QVERIFY(b.historyError.has_value());
+        QVERIFY(!b.schedule.has_value());
+        QVERIFY(b.scheduleError.has_value());
+        QVERIFY(b.scheduleError->contains(QStringLiteral("cannot be read")));
+        QVERIFY(!b.session.has_value());
+        QVERIFY(b.sessionError.has_value());
+    }
+
+    void parseRefusesAnotherSchemaAndAMissingKey()
+    {
+        QString err;
+        QVERIFY(!RecoveryDocument::parse("not json", &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("not JSON")), qPrintable(err));
+
+        const QJsonDocument d = QJsonDocument::fromJson(fixture());
+        QJsonObject o = d.object();
+        o[QStringLiteral("schema")] = 2;
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("schema 2")), qPrintable(err));
+
+        o = d.object();
+        QJsonArray drives = o[QStringLiteral("drives")].toArray();
+        QJsonObject drive = drives[1].toObject();
+        drive.remove(QStringLiteral("unattended"));
+        drives[1] = drive;
+        o[QStringLiteral("drives")] = drives;
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("drives[1]")) && err.contains(QStringLiteral("unattended")), qPrintable(err));
+
+        o = d.object();
+        o.remove(QStringLiteral("pair"));
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("pair")), qPrintable(err));
     }
 };
 
