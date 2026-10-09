@@ -314,7 +314,13 @@ fn drive_status(
     if state.as_ref().is_ok_and(Option::is_some) {
         record_error = match drive {
             None => Some(format!("no record of {}", target.label)),
-            Some(d) => d.error.clone(),
+            Some(d) => match (&d.os, &d.error) {
+                (_, Some(e)) => Some(e.clone()),
+                // Neither a reading nor an error is no reading: said, never
+                // `record: null` beside `record_error: null`.
+                (None, None) => Some(format!("the record of {} holds no reading", target.label)),
+                (Some(_), None) => None,
+            },
         };
     }
     let assessment = os.map(|os| assess(os, host, today, max_age));
@@ -1745,6 +1751,33 @@ pub(crate) mod tests {
             "{}",
             s.detail
         );
+    }
+
+    #[test]
+    fn a_record_with_neither_reading_nor_error_says_so_in_record_error() {
+        let cfg = two_mirrors_and_a_primary();
+        let empty = StoredDrive {
+            checked_epoch: 1_791_448_102,
+            mount_uuid: None,
+            os: None,
+            error: None,
+        };
+        let state = state_v(4, &[("system-recovery-A-2tb", empty)]);
+        let j = status_json(
+            &cfg,
+            &Ok(Some(state)),
+            &host(),
+            "2026-10-08",
+            1_791_500_000,
+            &Scripted::default(),
+        );
+        let a = &j["drives"][0];
+        assert!(a["record"].is_null());
+        assert_eq!(
+            a["record_error"],
+            "the record of system-recovery-A-2tb holds no reading"
+        );
+        assert_eq!(a["unattended"]["why"], a["record_error"]);
     }
 
     #[test]
