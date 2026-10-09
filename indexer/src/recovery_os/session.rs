@@ -362,7 +362,8 @@ fn take_line(line: &str, out: &mut SessionOutcome, progress: &dyn ProgressCallba
             event,
             message,
         } => {
-            if event == "start" {
+            // An unknown step is logged, never mapped to a stage.
+            if event == "start" && step_percent(step).is_some() {
                 progress.on_stage(&format!("{label}:{step}"), STEPS.len() as u64);
             }
             let text = if message.is_empty() {
@@ -417,10 +418,11 @@ fn take_line(line: &str, out: &mut SessionOutcome, progress: &dyn ProgressCallba
 /// Runs the script to its end, mapping lines to progress: `PROGRESS` → stage
 /// `<label>:<step>` (on `start`) and percent; `OUTPUT` → log `[<label>]
 /// <step>: <text>`; `RESULT`/`DRIVE` → recorded and logged; anything else →
-/// logged verbatim and kept for the summary. When `stop_requested(progress)`
-/// becomes true — checked on every line, and every 250 ms when none arrives —
-/// the script gets one SIGINT and the job reads on to its end. The outcome is
-/// the script's exit status, never the lines. `Err` only when the request is
+/// logged verbatim and kept for the summary. When a cancel is asked for —
+/// checked on every line, and every 250 ms when none arrives — the script
+/// gets one SIGINT and the job reads on to its end; the job counts as cut
+/// short by the cancel only when the script then does not exit 0. The
+/// outcome is the script's exit status, never the lines. `Err` only when the request is
 /// refused or the script could not be run or reaped.
 pub fn run_session(
     spawner: &dyn SessionSpawner,
@@ -457,7 +459,7 @@ pub fn run_session(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if !interrupted && progress::stop_requested(progress) {
+        if !interrupted && progress::cancel_requested(progress) {
             interrupted = true;
             match child.interrupt() {
                 Ok(()) => progress.on_log(
@@ -476,6 +478,12 @@ pub fn run_session(
         .map_err(|e| format!("{}: {e}", script.display()))?;
     out.exit = status.code();
     out.signal = status.signal();
+    // The cancel cut the job short only when the script did not end clean:
+    // an exit 0 after the SIGINT is a cancel that came too late to stop
+    // anything, and the job ends with that outcome.
+    if interrupted && out.exit != Some(0) {
+        progress::stop_requested(progress);
+    }
     match (out.exit, out.signal) {
         (Some(0), _) => progress.on_log(LogLevel::Info, "session script exited 0"),
         (Some(n), _) => progress.on_log(LogLevel::Error, &format!("session script exited {n}")),
@@ -941,6 +949,83 @@ exit 0"#,
         assert_eq!(out.exit, Some(3));
         assert!(out.summary().contains("session-end"), "{}", out.summary());
         assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_cancel_is_honoured_only_when_the_script_did_not_end_clean() {
+        // The script was already done: it takes the SIGINT and exits 0. The
+        // cancel came too late — never a job that a cancel cut short.
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub_script(
+            dir.path(),
+            r#"
+trap 'echo "nothing left to stop"; exit 0' INT
+echo "PROGRESS system-recovery-A-2tb wait start"
+for i in $(seq 1 100); do sleep 0.1; done
+exit 0"#,
+        );
+        let sink = CapturingProgress::default();
+        sink.cancel_after_first_stage();
+        let spawner = CountingSpawner::default();
+        let out = run_session(
+            &spawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(spawner.interrupts.load(Ordering::SeqCst), 1);
+        assert_eq!(out.exit, Some(0));
+        assert!(sink.cancel.is_requested());
+        assert!(!sink.cancel.honoured(), "an exit 0 is not cut short");
+        // The script stopped short (exit 3): the cancel was acted on.
+        let script = stub_script(
+            dir.path(),
+            r#"
+trap 'echo "interrupted"; exit 3' INT
+echo "PROGRESS system-recovery-A-2tb wait start"
+for i in $(seq 1 100); do sleep 0.1; done
+exit 0"#,
+        );
+        let sink = CapturingProgress::default();
+        sink.cancel_after_first_stage();
+        let out = run_session(
+            &CountingSpawner::default(),
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(out.exit, Some(3));
+        assert!(sink.cancel.honoured());
+    }
+
+    #[test]
+    fn an_unknown_progress_step_is_never_a_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub_script(
+            dir.path(),
+            r#"
+echo "PROGRESS system-recovery-A-2tb frobnicate start"
+echo "PROGRESS system-recovery-A-2tb wait start"
+exit 0"#,
+        );
+        let sink = CapturingProgress::default();
+        run_session(
+            &SystemSpawner,
+            &script,
+            &two_mirrors_and_a_primary(),
+            &one_drive(),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(sink.stages(), ["system-recovery-A-2tb:wait"]);
+        assert_eq!(
+            sink.level_of("unknown step: PROGRESS system-recovery-A-2tb frobnicate start"),
+            Some(LogLevel::Warning)
+        );
     }
 
     #[test]
