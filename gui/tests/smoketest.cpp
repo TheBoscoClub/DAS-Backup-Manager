@@ -699,11 +699,14 @@ private Q_SLOTS:
         QVERIFY(p.run->isEnabled());
     }
 
-    void consoleCommandIsRemoteViewerOnTheUnixSocket()
+    // TigerVNC's viewer takes a UNIX socket path as its server; remote-viewer's
+    // unix-path is SPICE-only and gvncviewer takes host:display (found on the
+    // host, 2026-10-09: the first form failed with 'host != NULL').
+    void consoleCommandIsTigerVncOnTheUnixSocket()
     {
-        const auto [program, args] = DBusClient::consoleCommand(QStringLiteral("/run/das-recovery-os-vm/1000/system-recovery-A-2tb.vnc"));
-        QCOMPARE(program, QStringLiteral("remote-viewer"));
-        QCOMPARE(args, QStringList{QStringLiteral("vnc+unix:///run/das-recovery-os-vm/1000/system-recovery-A-2tb.vnc")});
+        const auto [program, args] = DBusClient::consoleCommand(QStringLiteral("/run/das-recovery-os-vm/x/vnc.sock"));
+        QCOMPARE(program, QStringLiteral("vncviewer"));
+        QCOMPARE(args, QStringList{QStringLiteral("/run/das-recovery-os-vm/x/vnc.sock")});
     }
 
     void sessionEndUsesATenMinuteTimeout()
@@ -1009,7 +1012,7 @@ private Q_SLOTS:
         s.facts.viewerInstalled = false;
         a = deriveActions(s.a(), s.doc.pair, s.facts);
         QVERIFY(a.console.enabled);
-        QVERIFY(a.console.why.contains(QStringLiteral("virt-viewer")));
+        QVERIFY(a.console.why.contains(QStringLiteral("tigervnc")));
     }
 
     void endSessionIsForAHolderThatIsNeitherAJobNorAUnit()

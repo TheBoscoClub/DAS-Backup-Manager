@@ -680,7 +680,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
 | RecoveryStatus | `recoverystatus.h/cpp` | Pure model (QtCore only) of `RecoveryOsStatus`'s document and the Recovery drives panel's enablement rules (`deriveActions`, `derivePairActions`); unit-tested in `gui-smoketest` against `gui/tests/fixtures/recovery-status.json`, which a `panel.rs` test writes and compares byte for byte |
-| RecoveryPanel | `recoverypanel.h/cpp` | Recovery drives: one card per drive, a selector (one drive or both), attended/unattended, sequential/parallel, Now or a time; Upgrade / Schedule / Clear schedule / Open console (remote-viewer on the helper's console socket) / End session, every button bound to `{enabled, why}` |
+| RecoveryPanel | `recoverypanel.h/cpp` | Recovery drives: one card per drive, a selector (one drive or both), attended/unattended, sequential/parallel, Now or a time; Upgrade / Schedule / Clear schedule / Open console (TigerVNC's vncviewer on the helper's console socket) / End session, every button bound to `{enabled, why}` |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
 | SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
 | IndexRunner | `indexrunner.h/cpp` | D-Bus IndexWalk trigger (was QProcess, now D-Bus) |

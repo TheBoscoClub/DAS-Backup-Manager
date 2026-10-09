@@ -17,6 +17,7 @@ optdepends=('s-nail: email backup reports (mailx)'
             'qemu-base: the recovery-os-updater VM'
             'edk2-ovmf: UEFI firmware for the recovery-os-updater VM'
             'virt-viewer: console of the recovery-os-updater VM'
+            'tigervnc: the GUI opens a recovery drive\'s console with vncviewer on the helper\'s socket'
             'imagemagick: recovery-os-vm.sh screenshot'
             'jq: recovery-os-vm.sh reads the boot record of a recovery OS')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')

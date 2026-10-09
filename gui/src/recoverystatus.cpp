@@ -319,9 +319,9 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
         else if (!attended)
             a.console = refused(QStringLiteral("an unattended session has no console to attend"));
         else if (g.viewerInstalled)
-            a.console = allowed(QStringLiteral("Open the recovery OS's console in remote-viewer"));
+            a.console = allowed(QStringLiteral("Open the recovery OS's console in TigerVNC's vncviewer"));
         else
-            a.console = allowed(QStringLiteral("virt-viewer is not installed: shows the console socket's "
+            a.console = allowed(QStringLiteral("tigervnc is not installed: shows the console socket's "
                                                "path to connect a VNC viewer by hand"));
     }
 

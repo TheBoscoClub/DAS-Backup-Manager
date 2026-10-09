@@ -109,7 +109,7 @@ struct RecoveryDocument {
 struct GuiFacts {
     QString ownJobId;             // this window's running session job, empty if none
     bool ownJobAttended = false;  // how this window started that job
-    bool viewerInstalled = false; // remote-viewer found on PATH
+    bool viewerInstalled = false; // TigerVNC's vncviewer found on PATH
     qint64 nowEpoch = 0;
     bool chosenNow = true;        // the Now checkbox
     qint64 chosenEpoch = 0;       // the date-time picker
