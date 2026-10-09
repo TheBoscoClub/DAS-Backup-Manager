@@ -468,9 +468,10 @@ void DBusClient::recoveryOsStatusAsync()
             this, [this](QDBusPendingCallWatcher *w) {
         QDBusPendingReply<QString> reply = *w;
         if (reply.isError()) {
-            Q_EMIT errorOccurred(QStringLiteral("RecoveryOsStatus"),
-                                 mapDBusError(reply.error().name(),
-                                              reply.error().message()));
+            // Not errorOccurred: the panel refreshes every 30 s and shows
+            // the failure in place; a modal per tick is not a notification.
+            Q_EMIT recoveryOsStatusError(mapDBusError(reply.error().name(),
+                                                      reply.error().message()));
             Q_EMIT recoveryOsStatusResult({});
         } else {
             Q_EMIT recoveryOsStatusResult(reply.value());

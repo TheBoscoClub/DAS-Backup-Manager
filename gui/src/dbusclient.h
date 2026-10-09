@@ -97,6 +97,10 @@ Q_SIGNALS:
     void indexStatsResult(const QString &json);
     void indexListSnapshotsResult(const QString &json);
     void recoveryOsStatusResult(const QString &json);
+    // A RecoveryOsStatus call that failed: the panel shows it in place and
+    // disables its buttons; it is not errorOccurred, which the main window
+    // turns into a modal dialog and the panel refreshes every 30 s.
+    void recoveryOsStatusError(const QString &reason);
     void recoveryOsSessionEndResult(const QString &label, bool ok, const QString &lines);
     void recoveryOsScheduleResult(const QString &unit);
     void recoveryOsConsoleResult(const QString &label, const QString &path);

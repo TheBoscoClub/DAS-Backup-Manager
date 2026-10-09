@@ -142,6 +142,10 @@ struct PairActions {
 constexpr qint64 ScheduleMinLeadSeconds = 120; // panel.rs SCHEDULE_MIN_LEAD
 
 // The cautious side wins: the first failing condition's words are the tooltip.
+// The document form also refuses Upgrade while ANY drive's session runs or
+// cannot be read (one maintenance lock for all); the pair form knows only
+// the drive and the pair.
+DriveActions deriveActions(const DriveView &d, const RecoveryDocument &doc, const GuiFacts &g);
 DriveActions deriveActions(const DriveView &d, const PairView &p, const GuiFacts &g);
 PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g);
 

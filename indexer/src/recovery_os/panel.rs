@@ -545,16 +545,27 @@ fn line_in<'a>(
     to: Option<i64>,
     unattended_only: bool,
 ) -> Option<&'a Value> {
-    history
-        .iter()
-        .copied()
-        .filter(|h| {
-            h.get("start")
-                .and_then(Value::as_i64)
-                .is_some_and(|start| start >= from && to.is_none_or(|to| start <= to))
-                && (!unattended_only || h.get("unattended").and_then(Value::as_bool) == Some(true))
-        })
-        .min_by_key(|h| h.get("start").and_then(Value::as_i64))
+    let start_of = |h: &&Value| h.get("start").and_then(Value::as_i64);
+    let lines = history.iter().copied().filter(|h| {
+        start_of(h).is_some_and(|start| start >= from && to.is_none_or(|to| start <= to))
+            && (!unattended_only || h.get("unattended").and_then(Value::as_bool) == Some(true))
+    });
+    match to {
+        // A bounded window is the service's own run: every line inside it is
+        // this firing's, and a two-drive run writes one per drive. The worst
+        // outcome is the one to show (a clean A must not hide a failed B);
+        // among equals, the earliest.
+        Some(_) => lines.min_by_key(|h| (clean(h), start_of(h))),
+        // Open-ended (no exec readings of this firing): the earliest line
+        // after the trigger is this firing's; a later session's is not.
+        None => lines.min_by_key(start_of),
+    }
+}
+
+/// `true` only for a line that recorded exit status 0; a missing exit
+/// counts as not clean (cautious).
+fn clean(h: &Value) -> bool {
+    h.get("exit").and_then(Value::as_i64) == Some(0)
 }
 
 /// Whether a service in `active_state` is running, for a schedule.
@@ -591,7 +602,7 @@ fn journal_words(service: &UnitFacts) -> String {
 /// reloading); **pending** (the timer has a next elapse — it comes before
 /// fired, so a timer that also still shows an earlier trigger reads as what
 /// it will do next); **fired** (the timer triggered: the detail is the
-/// `<outcome> (exit <n>)` of the earliest history line that started inside
+/// `<outcome> (exit <n>)` of the worst-outcome (then earliest) history line that started inside
 /// the service's run — at or after the trigger and the run's start, not after
 /// its end — else `refused: <the service's journal lines>`, since a session
 /// that wrote no history line never took the lock; with the history
@@ -2759,6 +2770,87 @@ pub(crate) mod tests {
         assert_eq!(
             on_disk, text,
             "the fixture is stale: RECOVERY_FIXTURE_WRITE=1 cargo test the_gui_fixture"
+        );
+    }
+
+    /// Final review of 8249 stage 3, Important 1: inside the service's run
+    /// window every line belongs to this firing, and a pair writes one per
+    /// drive; the pair's detail must show the failure, not drive A's clean.
+    #[test]
+    fn a_pair_firing_whose_second_drive_failed_reads_the_failure_not_the_first_drives_clean() {
+        let cfg = two_mirrors_and_a_primary();
+        let trigger = 1_791_000_000;
+        let a = vec![
+            json!({"label":"system-recovery-A-2tb","start":trigger+5,"end":trigger+900,"mode":"sequential","unattended":true,"outcome":"clean","exit":0}),
+        ];
+        let b = vec![
+            json!({"label":"system-recovery-B-2tb","start":trigger+905,"end":trigger+1300,"mode":"sequential","unattended":true,"outcome":"stopped","exit":7}),
+        ];
+        let reads = Scripted {
+            history: [
+                ("system-recovery-A-2tb", Ok(a)),
+                ("system-recovery-B-2tb", Ok(b)),
+            ]
+            .into(),
+            units: fired_pair_units(trigger, trigger + 2, trigger + 1301),
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-09",
+            trigger + 50_000,
+            &reads,
+        );
+        assert_eq!(j["pair"]["schedule"]["state"], "fired");
+        assert_eq!(
+            j["pair"]["schedule"]["detail"], "stopped (exit 7)",
+            "{}",
+            j["pair"]["schedule"]["detail"]
+        );
+    }
+
+    #[test]
+    fn a_bounded_window_reports_the_worst_line_an_open_one_the_earliest() {
+        let t = 1_791_000_000;
+        let lines = [
+            json!({"start":t+5,"outcome":"clean","exit":0,"unattended":true}),
+            json!({"start":t+905,"outcome":"stopped","exit":7,"unattended":true}),
+            json!({"start":t+9000,"outcome":"clean","exit":0,"unattended":false}),
+        ];
+        let refs: Vec<&Value> = lines.iter().collect();
+        // Bounded: the run's window holds both drives' lines; the failure wins.
+        assert_eq!(
+            line_in(&refs, t, Some(t + 2000), false).unwrap()["outcome"],
+            "stopped"
+        );
+        // Bounded, all clean: the earliest.
+        let clean = [
+            json!({"start":t+5,"outcome":"clean","exit":0}),
+            json!({"start":t+905,"outcome":"clean","exit":0}),
+        ];
+        let crefs: Vec<&Value> = clean.iter().collect();
+        assert_eq!(
+            line_in(&crefs, t, Some(t + 2000), false).unwrap()["start"],
+            t + 5
+        );
+        // Open-ended: the earliest after the trigger, never a later session's failure.
+        let later_fail = [
+            json!({"start":t+5,"outcome":"clean","exit":0}),
+            json!({"start":t+9000,"outcome":"stopped","exit":7}),
+        ];
+        let lrefs: Vec<&Value> = later_fail.iter().collect();
+        assert_eq!(line_in(&lrefs, t, None, false).unwrap()["outcome"], "clean");
+        // A line with no exit recorded counts as not clean.
+        let no_exit = [
+            json!({"start":t+5,"outcome":"clean","exit":0}),
+            json!({"start":t+905,"outcome":"kept"}),
+        ];
+        let nrefs: Vec<&Value> = no_exit.iter().collect();
+        assert_eq!(
+            line_in(&nrefs, t, Some(t + 2000), false).unwrap()["outcome"],
+            "kept"
         );
     }
 }

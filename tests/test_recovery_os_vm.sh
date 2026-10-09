@@ -4854,7 +4854,8 @@ BEFORE_SIG='for ((k = 0; k < 400; k++)); do [[ "$(grep -c . "$S/stages.log" 2>/d
 check "both, parallel, SIGINT: the run exits 3" "$RC" "3"
 has "both, parallel, SIGINT: A stopped" "$OUT" "DRIVE system-recovery-A-2tb 3"
 has "both, parallel, SIGINT: B stopped" "$OUT" "DRIVE system-recovery-B-2tb 3"
-has "both, parallel, SIGINT: both drives had started" "$(file "$S/domB/events")$(events)" "virsh start"
+has "both, parallel, SIGINT: drive A had started" "$(events)" "virsh start"
+has "both, parallel, SIGINT: drive B had started" "$(file "$S/domB/events")" "virsh start"
 check "both, parallel, SIGINT: no drive ran its upgrade step" "$(grep -c upgrade "$S/stages.log" || :)" "0"
 check "both, parallel, SIGINT: never destroyed" "$(file "$S/forbidden")" ""
 

@@ -249,12 +249,31 @@ Action clearAction(const std::optional<QString> &error, const std::optional<Sche
 
 } // namespace
 
-DriveActions deriveActions(const DriveView &d, const PairView &p, const GuiFacts &g)
+namespace {
+
+// The other drives' sessions: one maintenance lock serves them all, so a
+// session on any drive refuses a session on this one.
+QString othersBlocker(const DriveView &d, const RecoveryDocument &doc, const GuiFacts &g)
+{
+    for (const DriveView &o : doc.drives) {
+        if (o.label == d.label)
+            continue;
+        if (o.sessionError)
+            return *o.sessionError;
+        if (o.session)
+            return QStringLiteral("a session holds %1 (%2)").arg(o.displayName, sessionWords(*o.session, g.nowEpoch));
+    }
+    return {};
+}
+
+DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiFacts &g, const QString &others)
 {
     DriveActions a;
 
     // Upgrade
     QString why = d.recordError ? *d.recordError : sessionBlocker(d, p, g);
+    if (why.isEmpty())
+        why = others;
     if (why.isEmpty() && !d.record)
         why = QStringLiteral("no record of this drive yet");
     if (why.isEmpty() && g.unattended)
@@ -323,6 +342,18 @@ DriveActions deriveActions(const DriveView &d, const PairView &p, const GuiFacts
     return a;
 }
 
+} // namespace
+
+DriveActions deriveActions(const DriveView &d, const PairView &p, const GuiFacts &g)
+{
+    return deriveActionsWith(d, p, g, {});
+}
+
+DriveActions deriveActions(const DriveView &d, const RecoveryDocument &doc, const GuiFacts &g)
+{
+    return deriveActionsWith(d, doc.pair, g, othersBlocker(d, doc, g));
+}
+
 PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g)
 {
     PairActions p;
@@ -339,7 +370,7 @@ PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g)
     QString upgradeWhy;
     QString scheduleWhy;
     for (const DriveView &d : doc.drives) {
-        const DriveActions a = deriveActions(d, doc.pair, g);
+        const DriveActions a = deriveActions(d, doc, g);
         if (!a.upgrade.enabled && upgradeWhy.isEmpty())
             upgradeWhy = QStringLiteral("%1: %2").arg(d.label, a.upgrade.why);
         if (!a.schedule.enabled && scheduleWhy.isEmpty())
