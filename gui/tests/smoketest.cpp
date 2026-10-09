@@ -31,11 +31,14 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QTableView>
+#include <QComboBox>
+#include <QDateTimeEdit>
 
 #include <optional>
 
 #include "../src/dbusclient.h"
 #include "../src/recoverystatus.h"
+#include "../src/recoverypanel.h"
 #include "../src/filemodel.h"
 #include "../src/healthdashboard.h"
 #include "../src/backuphistory.h"
@@ -1095,6 +1098,176 @@ private Q_SLOTS:
                  QStringLiteral("running as scheduled unit x.service since 10 minutes ago, unattended (VM state unknown)"));
         QCOMPARE(scheduleWords(ScheduleView{QStringLiteral("u"), std::nullopt, QString(), QStringLiteral("missed"), QStringLiteral("The time passed.")}),
                  QStringLiteral("missed: The time passed."));
+    }
+
+    // --- Recovery drives: the panel binds the rules (spec §3.2, §5) ---------
+
+private:
+    struct RecoveryParts {
+        QPushButton *upgrade, *schedule, *clear, *console, *end;
+        QComboBox *selector;
+        QRadioButton *attended, *unattended;
+        QCheckBox *now;
+        QDateTimeEdit *when;
+        bool ok() const
+        {
+            return upgrade && schedule && clear && console && end && selector && attended && unattended && now && when;
+        }
+    };
+
+    static RecoveryParts recoveryPartsOf(QWidget &w)
+    {
+        return {w.findChild<QPushButton *>(QStringLiteral("upgrade")),
+                w.findChild<QPushButton *>(QStringLiteral("schedule")),
+                w.findChild<QPushButton *>(QStringLiteral("clearSchedule")),
+                w.findChild<QPushButton *>(QStringLiteral("console")),
+                w.findChild<QPushButton *>(QStringLiteral("endSession")),
+                w.findChild<QComboBox *>(QStringLiteral("selector")),
+                w.findChild<QRadioButton *>(QStringLiteral("attended")),
+                w.findChild<QRadioButton *>(QStringLiteral("unattended")),
+                w.findChild<QCheckBox *>(QStringLiteral("now")),
+                w.findChild<QDateTimeEdit *>(QStringLiteral("when"))};
+    }
+
+    // The fixture's drive A with its running job removed, then Upgrade
+    // clicked: the panel now awaits jobStarted for a session of its own.
+    static void requestSession(RecoveryPanel &panel, const RecoveryParts &p)
+    {
+        const QJsonDocument d = QJsonDocument::fromJson(fixture());
+        QJsonObject o = d.object();
+        QJsonArray drives = o[QStringLiteral("drives")].toArray();
+        QJsonObject a = drives[0].toObject();
+        a[QStringLiteral("session")] = QJsonValue::Null;
+        drives[0] = a;
+        o[QStringLiteral("drives")] = drives;
+        panel.applyDocument(QJsonDocument(o).toJson());
+        p.selector->setCurrentIndex(0);
+        p.attended->setChecked(true);
+        QVERIFY(p.upgrade->isEnabled());
+        p.upgrade->click(); // verdict "may": no banner dialog
+        QVERIFY(!p.upgrade->isEnabled());
+    }
+
+private Q_SLOTS:
+    void recoveryPanelConstructsWithoutAHelperAndDisablesEverything()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end}) {
+            QVERIFY(!b->isEnabled());
+            QVERIFY(!b->toolTip().isEmpty());
+        }
+    }
+
+    void recoveryPanelBindsTheDocument()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        QCOMPARE(p.selector->count(), 3); // A, B, both
+        QCOMPARE(p.selector->itemText(2), QStringLiteral("Both drives"));
+        QVERIFY(p.attended->isChecked());
+        QVERIFY(p.now->isChecked());
+        QVERIFY(!p.when->isEnabled());
+
+        // Drive A has a running job and a missed schedule in the fixture
+        p.selector->setCurrentIndex(0);
+        QVERIFY(!p.upgrade->isEnabled());
+        QVERIFY(p.upgrade->toolTip().contains(QStringLiteral("a session holds")));
+        QVERIFY(p.clear->isEnabled());
+        QVERIFY(!p.end->isEnabled());
+        QVERIFY(p.end->toolTip().contains(QStringLiteral("Cancel")));
+
+        // Drive B is all errors
+        p.selector->setCurrentIndex(1);
+        QVERIFY(!p.upgrade->isEnabled());
+        QVERIFY(p.upgrade->toolTip().contains(QStringLiteral("no record")));
+        QVERIFY(!p.clear->isEnabled());
+
+        // The cards show every error in its place
+        bool sawError = false;
+        const auto labels = panel.findChildren<QLabel *>();
+        for (QLabel *l : labels)
+            if (l->text().contains(QStringLiteral("cannot be read")))
+                sawError = true;
+        QVERIFY(sawError);
+    }
+
+    void panelShowsTheParseErrorAndDisablesEverything()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        panel.applyDocument("{\"schema\": 2}");
+        QVERIFY2(panel.statusLine().contains(QStringLiteral("schema 2")), qPrintable(panel.statusLine()));
+        const RecoveryParts p = recoveryPartsOf(panel);
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end})
+            QVERIFY(!b->isEnabled());
+        // A good document afterwards recovers it
+        panel.applyDocument(fixture());
+        QVERIFY(!panel.statusLine().contains(QStringLiteral("schema 2")));
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.clear->isEnabled());
+    }
+
+    void aWarnedSessionNeedsALookAFailedOneFailed()
+    {
+        DBusClient client; // unavailable: a click reaches no helper, but the request is remembered
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-1"), false, QStringLiteral("warnings: the guard was not confirmed on a no record"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Needs a look")), qPrintable(panel.statusLine()));
+
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-2"), false, QStringLiteral("exit 7 at upgrade"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Failed")), qPrintable(panel.statusLine()));
+
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobStarted(QStringLiteral("job-3"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-3"), true, QStringLiteral("clean"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Done")), qPrintable(panel.statusLine()));
+
+        // Another operation's job, and a session job nothing here requested,
+        // are not this panel's
+        panel.onJobStarted(QStringLiteral("job-4"), QStringLiteral("BackupRun"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+        panel.onJobStarted(QStringLiteral("job-6"), QStringLiteral("Recovery OS session"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+    }
+
+    void thePanelKnowsItsOwnJobAndItsAttendedness()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled()); // requested, attended
+        panel.onJobStarted(QStringLiteral("job-5"), QStringLiteral("Recovery OS session"));
+        QCOMPARE(panel.facts().ownJobId, QStringLiteral("job-5"));
+        QVERIFY(panel.facts().ownJobAttended);
+        panel.onJobFinished(QStringLiteral("job-5"), true, QStringLiteral("clean"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+
+        // A JobFinished that beats the method reply (a helper refusal) is
+        // honoured when jobStarted names the job
+        requestSession(panel, p);
+        panel.onJobFinished(QStringLiteral("job-8"), false, QStringLiteral("refused: a session job is running"));
+        panel.onJobStarted(QStringLiteral("job-8"), QStringLiteral("Recovery OS session"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+        QVERIFY(p.upgrade->isEnabled());
     }
 };
 
