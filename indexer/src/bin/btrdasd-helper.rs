@@ -1900,10 +1900,9 @@ impl HelperInterface {
     /// (one drive, or the script's choice for two). Refused before the script
     /// starts while another session job or a scheduled-session service runs,
     /// naming it. `JobCancel` is the only way to stop it: it sends SIGINT to
-    /// the script's process group once. In `--mode parallel` that does not
-    /// yet stop the drive sessions themselves — a script defect, bd
-    /// DAS-Backup-Manager-c8lf — so a cancelled parallel run goes on to its
-    /// own end; parallel is not refused for it.
+    /// the script's process group once. In --mode parallel the signal reaches
+    /// both drives' sessions (the script starts them with SIGINT deliverable;
+    /// bd DAS-Backup-Manager-c8lf).
     async fn recovery_os_session(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
