@@ -68,6 +68,13 @@ void Sidebar::buildTree()
                QStringLiteral("office-chart-line"));
     addSection(health, tr("Status"), SidebarSection::HealthStatus,
                QStringLiteral("security-high"));
+
+    // Recovery drives (leaf — no children)
+    auto *recovery = new QTreeWidgetItem(this);
+    recovery->setText(0, tr("Recovery drives"));
+    recovery->setIcon(0, QIcon::fromTheme(QStringLiteral("system-reboot")));
+    recovery->setToolTip(0, tr("Each recovery drive's CachyOS: its status, and updating it in a VM"));
+    recovery->setData(0, SectionRole, static_cast<int>(SidebarSection::RecoveryDrives));
 }
 
 QTreeWidgetItem *Sidebar::addSection(QTreeWidgetItem *parent,

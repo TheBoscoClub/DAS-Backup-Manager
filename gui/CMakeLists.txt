@@ -28,6 +28,7 @@ find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS
     KIO
     Notifications
     StatusNotifierItem
+    ColorScheme
 )
 
 add_executable(btrdasd-gui)
@@ -51,6 +52,8 @@ target_sources(btrdasd-gui PRIVATE
     src/panelconfig.cpp
     src/backupsteps.cpp
     src/healthdashboard.cpp
+    src/recoverystatus.cpp
+    src/recoverypanel.cpp
     src/configdialog.cpp
     src/snapshotbrowser.cpp
 )
@@ -74,6 +77,7 @@ target_link_libraries(btrdasd-gui PRIVATE
     KF6::KIOWidgets
     KF6::Notifications
     KF6::StatusNotifierItem
+    KF6::ColorScheme
 )
 
 install(TARGETS btrdasd-gui ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
@@ -108,7 +112,12 @@ if(BUILD_TESTING)
         src/panelconfig.cpp
         src/progresspanel.cpp
         src/indexrunner.cpp
+        src/recoverystatus.cpp
+        src/recoverypanel.cpp
     )
+    # The status-document contract: the file a panel.rs test writes.
+    target_compile_definitions(gui-smoketest PRIVATE
+        RECOVERY_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/recovery-status.json")
     target_link_libraries(gui-smoketest PRIVATE
         Qt6::Test
         Qt6::Widgets
@@ -124,6 +133,7 @@ if(BUILD_TESTING)
         KF6::KIOWidgets
         KF6::Notifications
         KF6::StatusNotifierItem
+        KF6::ColorScheme
     )
     add_test(NAME gui-smoketest COMMAND gui-smoketest)
     # The suite assumes no helper is reachable. On a host where btrdasd-helper

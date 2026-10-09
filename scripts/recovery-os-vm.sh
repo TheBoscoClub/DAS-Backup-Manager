@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.1.0
-# Date: 2026-10-08
+# Version: 2.1.1
+# Date: 2026-10-09
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -4404,7 +4404,8 @@ cmd_session_pair() {
     take_lock
     trap 'pair_on_exit' EXIT
     # An interrupt reaches the drives' sessions themselves (they are in this
-    # process group); this one waits for them to end.
+    # process group, and the parallel branch starts them with SIGINT
+    # deliverable); this one waits for them to end.
     trap ':' INT TERM HUP
     if [[ "$DRY_RUN" != true ]]; then
         egress_add
@@ -4412,8 +4413,11 @@ cmd_session_pair() {
     log "both drives, $PAIR_MODE: ${labels[0]}, then ${labels[1]}$([[ "$PAIR_MODE" == parallel ]] && printf ' -- at once')"
     if [[ "$PAIR_MODE" == parallel ]]; then
         for l in "${labels[@]}"; do
+            # Started with `&`, a child begins with SIGINT ignored and cannot
+            # take that back; env resets it before the exec, so Ctrl-C and
+            # the helper's JobCancel reach both drives' sessions (bd c8lf).
             DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=parallel \
-                bash "$SELF" session "$l" "${flags[@]}" &
+                env --default-signal=INT bash "$SELF" session "$l" "${flags[@]}" &
             pids+=($!)
         done
         for i in 0 1; do
