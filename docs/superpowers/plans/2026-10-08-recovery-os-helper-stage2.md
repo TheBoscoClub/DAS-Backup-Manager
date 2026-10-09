@@ -307,7 +307,7 @@ pub trait PanelReads {
  "pair": {"mode_default": "sequential", "schedule": null, "session": null},
  "drives": [ {"label": "...", "display_name": "...", "serials": ["..."], "checked_epoch": 1791448102,
    "record_error": null, "record": {"os": "...", "installed": "...", "last_full_upgrade": "...", "kernel": "...",
-     "host_kernel": "...", "btrfs_progs": "...", "host_btrfs_progs": "...", "btrbk": "...", "guest_agent": {...}},
+     "host_kernel": "...", "btrfs_progs": "...", "host_btrfs_progs": "...", "btrbk": "...", "packages_read": true, "guest_agent": {...}},
    "assessment": {...}, "due": false, "verdict": "may",
    "unattended": {"possible": true, "why": ""}, "clean_runs": 1, "clean_runs_error": null,
    "history": [ {...last 20 lines, newest last...} ],

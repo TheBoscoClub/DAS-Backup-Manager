@@ -26,6 +26,13 @@
 # to park inconvenient failures: everything here must be untestable in principle,
 # not merely awkward.
 exclude_re = [
+    # `signalable_pid` refuses pid 0 because `kill(-0, SIGINT)` is
+    # `kill(0, SIGINT)`: the caller's own process group. Replacing the whole
+    # body with `Ok(Default::default())` (pid 0) makes every test that
+    # interrupts a real child signal the test run itself — cargo-mutants
+    # included — so the run dies instead of failing an assertion. The guard's
+    # own mutants (`> 0`, the fit check) and the refusal of 0 are tested.
+    "replace signalable_pid -> io::Result<libc::pid_t> with Ok\\(Default::default\\(\\)\\)",
     # `Drop for Database` issues `PRAGMA optimize` on close. SQLite exposes no
     # observable result from it — no return value, no state change a query can
     # see — so there is no assertion that distinguishes the real impl from an

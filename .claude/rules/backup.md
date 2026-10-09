@@ -180,6 +180,10 @@ Checked before any directory is created, both roots compared **after resolution*
   - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some volume
     failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`; that line is load-bearing.
+  - `das-recovery-os-update-*.service` (the helper's generated scheduled recovery-drive sessions)
+    carries `SuccessExitStatus=1 3 4 5 6 7`; that line is load-bearing. A refused, warned or failed
+    session is not a failed unit: the outcome is in the session history
+    (`recovery-os-vm-history.jsonl`), never a restart.
 - Sentinel matches unit names by exact string — no globs. Prefer single non-template units.
 
 ## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
