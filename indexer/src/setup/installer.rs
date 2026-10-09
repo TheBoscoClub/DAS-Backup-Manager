@@ -2664,7 +2664,13 @@ auth = "starttls""#,
             Vec::<String>::new()
         );
         // A directory that cannot be listed may hide a schedule that would
-        // start a VM session from a script that is gone: say so.
+        // start a VM session from a script that is gone: say so. Mode 000
+        // stops no one as root, so there the case cannot be built.
+        // SAFETY: geteuid() has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped the unreadable-directory case: running as root");
+            return;
+        }
         let locked = dir.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -2673,7 +2679,7 @@ auth = "starttls""#,
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             unreadable,
-            "mode 000 did not stop this user listing the directory (running as root?)"
+            "mode 000 did not stop this user listing the directory"
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
