@@ -17,6 +17,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QScrollArea>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -34,6 +35,12 @@ QString orWords(const QString &value, const QString &absent)
     return value.isEmpty() ? absent : value;
 }
 
+// Qt wraps a tooltip only when it is rich text; a plain one runs off the window.
+QString tip(const QString &text)
+{
+    return QStringLiteral("<qt>%1</qt>").arg(text.toHtmlEscaped());
+}
+
 QString negative(const QString &text)
 {
     const QColor c = KColorScheme(QPalette::Active).foreground(KColorScheme::NegativeText).color();
@@ -46,10 +53,17 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
     , m_client(client)
 {
     auto *layout = new QVBoxLayout(this);
-    m_cards = new QVBoxLayout;
-    layout->addLayout(m_cards);
+    // The cards scroll: a word-wrapped card must take its natural height,
+    // not be clipped to the window's share.
+    auto *scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *cardsHost = new QWidget(scroll);
+    m_cards = new QVBoxLayout(cardsHost);
+    m_cards->addStretch();
+    scroll->setWidget(cardsHost);
+    layout->addWidget(scroll, 1);
     buildControls();
-    layout->addStretch();
     m_status = new QLabel(this);
     m_status->setObjectName(QStringLiteral("statusLine"));
     m_status->setWordWrap(true);
@@ -161,6 +175,9 @@ void RecoveryPanel::buildControls()
     buttons->addStretch();
     outer->addLayout(buttons);
 
+    for (QWidget *w : std::initializer_list<QWidget *>{m_selector, m_attended, m_unattended, m_sequential, m_parallel, m_now, m_when})
+        w->setToolTip(tip(w->toolTip()));
+
     connect(m_selector, &QComboBox::currentIndexChanged, this, &RecoveryPanel::rederive);
     connect(m_attended, &QRadioButton::toggled, this, &RecoveryPanel::rederive);
     connect(m_now, &QCheckBox::toggled, this, [this](bool now) {
@@ -224,7 +241,7 @@ void RecoveryPanel::rebuildCards()
             err->setWordWrap(true);
             v->addWidget(err);
         }
-        m_cards->addWidget(box);
+        m_cards->insertWidget(m_cards->count() - 1, box); // before the stretch
         m_cardWidgets << box;
     };
     const auto esc = [](const QString &s) { return s.toHtmlEscaped(); };
@@ -278,7 +295,13 @@ void RecoveryPanel::rebuildCards()
             lines << i18n("Session: none");
         if (d.due)
             lines << QStringLiteral("<b>%1</b>").arg(i18n("UPDATE DUE"));
-        addCard(QStringLiteral("%1 (%2)").arg(orWords(d.displayName, d.label), d.serials.join(QStringLiteral(", "))), lines, errors);
+        // The configured display name often carries the serial already.
+        QStringList missing;
+        for (const QString &serial : d.serials)
+            if (!d.displayName.contains(serial))
+                missing << serial;
+        const QString name = orWords(d.displayName, d.label);
+        addCard(missing.isEmpty() ? name : QStringLiteral("%1 (%2)").arg(name, missing.join(QStringLiteral(", "))), lines, errors);
     }
     if (m_doc->drives.size() == 2) {
         const PairView &p = m_doc->pair;
@@ -358,7 +381,7 @@ void RecoveryPanel::rederive()
     m_parallel->setVisible(both);
     auto bind = [](QPushButton *b, const Action &a) {
         b->setEnabled(a.enabled);
-        b->setToolTip(a.why);
+        b->setToolTip(tip(a.why));
     };
     if (!m_doc || !m_parseError.isEmpty()) {
         const Action off{false, m_parseError.isEmpty() ? i18n("no status document yet") : m_parseError};
@@ -483,7 +506,7 @@ void RecoveryPanel::onConsoleResult(const QString &label, const QString &path)
                          program, path),
                     QMessageBox::Ok, this);
     QPushButton *copy = box.addButton(i18n("Copy path"), QMessageBox::ActionRole);
-    copy->setToolTip(i18n("Copy the socket's path to the clipboard"));
+    copy->setToolTip(tip(i18n("Copy the socket's path to the clipboard")));
     box.exec();
     if (box.clickedButton() == copy)
         QGuiApplication::clipboard()->setText(path);
