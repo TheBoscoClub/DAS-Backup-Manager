@@ -840,6 +840,262 @@ private Q_SLOTS:
         QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
         QVERIFY2(err.contains(QStringLiteral("pair")), qPrintable(err));
     }
+
+    // --- Recovery drives: the enablement rules (spec §4), both ways -------
+
+private:
+    struct Scenario {
+        RecoveryDocument doc;
+        GuiFacts facts;
+        DriveView &a() { return doc.drives[0]; }
+        DriveView &b() { return doc.drives[1]; }
+    };
+
+    // Drive A of the fixture with its running job and its schedule removed:
+    // a drive on which everything is allowed. nowEpoch is the fixture's clock.
+    static Scenario idleA()
+    {
+        QString err;
+        Scenario s{*RecoveryDocument::parse(fixture(), &err), {}};
+        s.a().session.reset();
+        s.a().schedule.reset();
+        s.facts.nowEpoch = 1791500000;
+        s.facts.chosenNow = true;
+        s.facts.viewerInstalled = true;
+        return s;
+    }
+
+private Q_SLOTS:
+    void upgradeAttendedNeedsARecordAndNoSession()
+    {
+        Scenario s = idleA();
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY2(a.upgrade.enabled, qPrintable(a.upgrade.why));
+        QVERIFY(!a.bannerNeeded);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("attended")));
+
+        Scenario r = idleA();
+        r.a().record.reset();
+        r.a().recordError = QStringLiteral("the record of system-recovery-A-2tb holds no reading");
+        a = deriveActions(r.a(), r.doc.pair, r.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QCOMPARE(a.upgrade.why, *r.a().recordError);
+
+        Scenario h = idleA();
+        h.a().session = SessionView{QStringLiteral("other:recovery-os VM session system-recovery-A-2tb pid 1"), 1791400000, QStringLiteral("running"), std::nullopt};
+        a = deriveActions(h.a(), h.doc.pair, h.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("a session holds")));
+
+        Scenario pr = idleA();
+        pr.doc.pair.session = SessionView{QStringLiteral("unit:das-recovery-os-update-both.service"), 1791400000, QString(), false};
+        a = deriveActions(pr.a(), pr.doc.pair, pr.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("both drives")));
+
+        Scenario j = idleA();
+        j.facts.ownJobId = QStringLiteral("job-9");
+        a = deriveActions(j.a(), j.doc.pair, j.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("this window")));
+    }
+
+    void upgradeUnattendedFollowsTheDocumentsPossible()
+    {
+        Scenario s = idleA();
+        s.facts.unattended = true;
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY2(a.upgrade.enabled, qPrintable(a.upgrade.why));
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("unattended")));
+
+        s.a().unattendedPossible = false;
+        s.a().unattendedWhy = QStringLiteral("the boot record says btrbk will run");
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QCOMPARE(a.upgrade.why, s.a().unattendedWhy);
+    }
+
+    void theBannerIsNeededForAttendedOnAWillRecordOnly()
+    {
+        Scenario s = idleA();
+        s.a().verdict = QStringLiteral("will");
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(a.upgrade.enabled);
+        QVERIFY(a.bannerNeeded);
+        s.facts.unattended = true;
+        s.a().unattendedPossible = false;
+        s.a().unattendedWhy = QStringLiteral("the boot record says btrbk will run");
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(!a.bannerNeeded);
+        s.facts.unattended = false;
+        s.a().verdict = QStringLiteral("may");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).bannerNeeded);
+    }
+
+    void scheduleNeedsATimeTwoMinutesAhead()
+    {
+        Scenario s = idleA();
+        s.facts.unattended = true;
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.schedule.enabled); // Now is ticked
+        QVERIFY(a.schedule.why.contains(QStringLiteral("untick Now")));
+
+        s.facts.chosenNow = false;
+        s.facts.chosenEpoch = s.facts.nowEpoch + ScheduleMinLeadSeconds - 1;
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.schedule.enabled);
+        QVERIFY(a.schedule.why.contains(QStringLiteral("2 minutes")));
+
+        s.facts.chosenEpoch = s.facts.nowEpoch - 3600;
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).schedule.enabled);
+
+        s.facts.chosenEpoch = s.facts.nowEpoch + ScheduleMinLeadSeconds;
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY2(a.schedule.enabled, qPrintable(a.schedule.why));
+
+        // A running session does not block scheduling; the attended radio does not either
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QString(), std::nullopt};
+        s.facts.unattended = false;
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).schedule.enabled);
+
+        s.a().unattendedPossible = false;
+        s.a().unattendedWhy = QStringLiteral("no guest agent");
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.schedule.enabled);
+        QCOMPARE(a.schedule.why, s.a().unattendedWhy);
+    }
+
+    void clearScheduleNeedsAPendingOrMissedOne()
+    {
+        Scenario s = idleA();
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule = ScheduleView{QStringLiteral("u.timer"), 1791600000, QString(), QStringLiteral("pending"), QString()};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule->state = QStringLiteral("missed");
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule->state = QStringLiteral("fired");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule->state = QStringLiteral("running");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+    }
+
+    void consoleNeedsAnAttendedSessionThisWindowKnows()
+    {
+        Scenario s = idleA();
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QStringLiteral("running"), true};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.a().session->domainState = QStringLiteral("shut off");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+
+        // A job session: attended is null; only this window's attended job qualifies
+        s.a().session = SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt};
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.console.enabled);
+        QVERIFY(a.console.why.contains(QStringLiteral("cannot tell")));
+        s.facts.ownJobId = QStringLiteral("job-7");
+        s.facts.ownJobAttended = false;
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.facts.ownJobAttended = true;
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+
+        // The viewer missing keeps the button enabled (the click shows the path)
+        s.facts.viewerInstalled = false;
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(a.console.enabled);
+        QVERIFY(a.console.why.contains(QStringLiteral("virt-viewer")));
+    }
+
+    void endSessionIsForAHolderThatIsNeitherAJobNorAUnit()
+    {
+        Scenario s = idleA();
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+        s.a().session = SessionView{QStringLiteral("other:recovery-os VM session system-recovery-A-2tb pid 1"), std::nullopt, QString(), std::nullopt};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+        s.a().session->by = QStringLiteral("job:job-7");
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.endSession.enabled);
+        QVERIFY(a.endSession.why.contains(QStringLiteral("Cancel")));
+        s.a().session->by = QStringLiteral("unit:das-recovery-os-update-system-recovery-A-2tb.service");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+    }
+
+    void anErrorInAPartDisablesWhatDependsOnIt()
+    {
+        Scenario s = idleA();
+        s.a().sessionError = QStringLiteral("das-recovery-os-update-both.service cannot be read: boom");
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QStringLiteral("running"), true};
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QCOMPARE(a.upgrade.why, *s.a().sessionError);
+        QVERIFY(!a.console.enabled);
+        QCOMPARE(a.console.why, *s.a().sessionError);
+        QVERIFY(!a.endSession.enabled);
+        QCOMPARE(a.endSession.why, *s.a().sessionError);
+
+        Scenario t = idleA();
+        t.a().scheduleError = QStringLiteral("x.timer cannot be read: boom");
+        t.a().schedule = ScheduleView{QStringLiteral("x.timer"), std::nullopt, QString(), QStringLiteral("pending"), QString()};
+        t.facts.unattended = true;
+        t.facts.chosenNow = false;
+        t.facts.chosenEpoch = t.facts.nowEpoch + 600;
+        a = deriveActions(t.a(), t.doc.pair, t.facts);
+        QVERIFY(!a.schedule.enabled);
+        QCOMPARE(a.schedule.why, *t.a().scheduleError);
+        QVERIFY(!a.clearSchedule.enabled);
+
+        // The pair's session error blocks the drive's upgrade too
+        Scenario u = idleA();
+        u.doc.pair.sessionError = QStringLiteral("pair boom");
+        QVERIFY(!deriveActions(u.a(), u.doc.pair, u.facts).upgrade.enabled);
+    }
+
+    void pairActionsNeedBothDrivesAndNoPairError()
+    {
+        Scenario s = idleA();
+        s.facts.unattended = true;
+        // Drive B of the fixture is all errors: the pair is refused with B's reason
+        PairActions p = derivePairActions(s.doc, s.facts);
+        QVERIFY(!p.upgrade.enabled);
+        QVERIFY(p.upgrade.why.contains(QStringLiteral("system-recovery-B-2tb")));
+        QCOMPARE(p.modeDefault, QStringLiteral("sequential"));
+
+        // Make B a copy of A: allowed
+        s.b() = s.a();
+        s.b().label = QStringLiteral("system-recovery-B-2tb");
+        p = derivePairActions(s.doc, s.facts);
+        QVERIFY2(p.upgrade.enabled, qPrintable(p.upgrade.why));
+        s.facts.chosenNow = false;
+        s.facts.chosenEpoch = s.facts.nowEpoch + 600;
+        QVERIFY(derivePairActions(s.doc, s.facts).schedule.enabled);
+
+        s.doc.pair.scheduleError = QStringLiteral("both boom");
+        p = derivePairActions(s.doc, s.facts);
+        QVERIFY(!p.schedule.enabled);
+        QCOMPARE(p.schedule.why, *s.doc.pair.scheduleError);
+
+        // One drive only: no pair
+        s.doc.drives.removeLast();
+        QVERIFY(!derivePairActions(s.doc, s.facts).upgrade.enabled);
+    }
+
+    void wordsForTheCards()
+    {
+        QCOMPARE(ageWords(std::nullopt, 100), QStringLiteral("unknown"));
+        QCOMPARE(ageWords(1791500000 - 3 * 86400, 1791500000), QStringLiteral("3 days ago"));
+        QCOMPARE(ageWords(1791500000 - 3600, 1791500000), QStringLiteral("today"));
+        QCOMPARE(ageWords(1791500000 - 86400, 1791500000), QStringLiteral("1 day ago"));
+        QCOMPARE(verdictWords(QStringLiteral("will")), QStringLiteral("will run btrbk at boot"));
+        QCOMPARE(verdictWords(QString()), QStringLiteral("unknown"));
+        QCOMPARE(sessionWords(SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt}, 0),
+                 QStringLiteral("running as helper job job-7 (VM running)"));
+        QCOMPARE(sessionWords(SessionView{QStringLiteral("unit:x.service"), 1791500000 - 600, QString(), false}, 1791500000),
+                 QStringLiteral("running as scheduled unit x.service since 10 minutes ago, unattended (VM state unknown)"));
+        QCOMPARE(scheduleWords(ScheduleView{QStringLiteral("u"), std::nullopt, QString(), QStringLiteral("missed"), QStringLiteral("The time passed.")}),
+                 QStringLiteral("missed: The time passed."));
+    }
 };
 
 QTEST_MAIN(GuiSmokeTest)

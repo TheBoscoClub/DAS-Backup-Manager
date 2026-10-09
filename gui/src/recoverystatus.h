@@ -102,3 +102,51 @@ struct RecoveryDocument {
     // really "absent".
     static std::optional<RecoveryDocument> parse(const QByteArray &json, QString *error);
 };
+
+// --- The enablement rules (spec §4) ----------------------------------------
+
+// What only the window knows.
+struct GuiFacts {
+    QString ownJobId;             // this window's running session job, empty if none
+    bool ownJobAttended = false;  // how this window started that job
+    bool viewerInstalled = false; // remote-viewer found on PATH
+    qint64 nowEpoch = 0;
+    bool chosenNow = true;        // the Now checkbox
+    qint64 chosenEpoch = 0;       // the date-time picker
+    bool unattended = false;      // the radio
+};
+
+// `why` is the tooltip in both states: what the button does when enabled,
+// why not when disabled.
+struct Action {
+    bool enabled = false;
+    QString why;
+};
+
+struct DriveActions {
+    Action upgrade; // for the chosen attended/unattended radio
+    Action schedule;
+    Action clearSchedule;
+    Action console;
+    Action endSession;
+    bool bannerNeeded = false; // attended on a `will` record: show the banner before the call
+};
+
+struct PairActions {
+    Action upgrade;
+    Action schedule;
+    Action clearSchedule;
+    QString modeDefault;
+};
+
+constexpr qint64 ScheduleMinLeadSeconds = 120; // panel.rs SCHEDULE_MIN_LEAD
+
+// The cautious side wins: the first failing condition's words are the tooltip.
+DriveActions deriveActions(const DriveView &d, const PairView &p, const GuiFacts &g);
+PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g);
+
+// Words for the cards.
+QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch); // "3 days ago" | "today" | "unknown"
+QString verdictWords(const QString &verdict);                   // will | may | no | "" → unknown
+QString sessionWords(const SessionView &s, qint64 nowEpoch);
+QString scheduleWords(const ScheduleView &s); // "<state>: <detail>"
