@@ -527,6 +527,14 @@ mod tests {
         assert!(status.success(), "install {} failed", path.display());
     }
 
+    /// A stub that traps INT must not put a `$(...)` after its stage line:
+    /// bash 5.2 (Ubuntu 24.04, the CI runner) runs a pending trap from inside
+    /// the parser while it is still inside a command substitution, the
+    /// handler then fails to parse ("unexpected EOF while looking for
+    /// matching `)'") and the SIGINT is lost — the script runs on to exit 0.
+    /// Bash 5.3 defers the trap until the parse is done. Reproduced 1 in 10
+    /// under bash 5.2.37 with `for i in $(seq 1 100)`; `for ((...))` has no
+    /// such window.
     fn stub_script(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("recovery-os-vm.sh");
         write_executable(&p, &format!("#!/bin/bash\n{body}\n"));
@@ -936,7 +944,7 @@ exit 7"#,
             r#"
 trap 'echo "interrupted: the recovery OS is still running; finish with session-end"; exit 3' INT
 echo "PROGRESS system-recovery-A-2tb wait start"
-for i in $(seq 1 100); do sleep 0.1; done
+for ((i = 0; i < 100; i++)); do sleep 0.1; done
 exit 0"#,
         );
         let sink = CapturingProgress::default();
@@ -965,7 +973,7 @@ exit 0"#,
             r#"
 trap 'echo "nothing left to stop"; exit 0' INT
 echo "PROGRESS system-recovery-A-2tb wait start"
-for i in $(seq 1 100); do sleep 0.1; done
+for ((i = 0; i < 100; i++)); do sleep 0.1; done
 exit 0"#,
         );
         let sink = CapturingProgress::default();
@@ -989,7 +997,7 @@ exit 0"#,
             r#"
 trap 'echo "interrupted"; exit 3' INT
 echo "PROGRESS system-recovery-A-2tb wait start"
-for i in $(seq 1 100); do sleep 0.1; done
+for ((i = 0; i < 100; i++)); do sleep 0.1; done
 exit 0"#,
         );
         let sink = CapturingProgress::default();
@@ -1043,7 +1051,7 @@ exit 0"#,
             r#"#!/bin/bash
 trap 'echo "interrupted: drive 1 left running"; exit 3' INT
 echo "PROGRESS system-recovery-A-2tb wait start"
-for i in $(seq 1 30); do sleep 0.1; done
+for ((i = 0; i < 30; i++)); do sleep 0.1; done
 exit 0
 "#,
         );
@@ -1086,7 +1094,7 @@ exit 0"#,
             r#"
 trap 'echo "interrupted"; exit 3' INT
 echo "PROGRESS system-recovery-A-2tb wait start"
-for i in $(seq 1 100); do sleep 0.1; done
+for ((i = 0; i < 100; i++)); do sleep 0.1; done
 exit 0"#,
         );
         let sink = CapturingProgress::default();
