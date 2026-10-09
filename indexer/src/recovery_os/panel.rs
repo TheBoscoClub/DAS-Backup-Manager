@@ -318,13 +318,14 @@ fn drive_status(
         Err(e) => (Vec::new(), Some(e)),
     };
     let skip = history.len().saturating_sub(HISTORY_SHOWN);
-    let newest = match &history_error {
+    let lines: Vec<&Value> = history.iter().collect();
+    let readable = match &history_error {
         Some(e) => Err(e.as_str()),
-        None => Ok(history.last()),
+        None => Ok(lines.as_slice()),
     };
     let (schedule, schedule_error) = schedule_of(
         &format!("{UNIT_PREFIX}{}", target.label),
-        newest,
+        readable,
         now.epoch,
         reads,
     );
@@ -376,17 +377,15 @@ pub fn status_json(
         .filter(|t| t.role == TargetRole::Mirror)
         .map(|t| drive_status(cfg, t, state, host, today, &now, reads))
         .collect();
-    // The pair's newest history line is the later-starting of the two
-    // drives' newest; either history unreadable leaves it unknown.
-    let pair_newest = match drives.iter().find_map(|d| d.history_error.as_deref()) {
+    // The pair's history is both drives' lines (a two-drive run writes one
+    // into each); either history unreadable leaves it unknown.
+    let pair_lines: Vec<&Value> = drives.iter().flat_map(|d| &d.history).collect();
+    let pair_history = match drives.iter().find_map(|d| d.history_error.as_deref()) {
         Some(e) => Err(e),
-        None => Ok(drives
-            .iter()
-            .filter_map(|d| d.history.last())
-            .max_by_key(|h| h.get("start").and_then(Value::as_i64))),
+        None => Ok(pair_lines.as_slice()),
     };
     let both = format!("{UNIT_PREFIX}both");
-    let (pair_schedule, pair_schedule_error) = schedule_of(&both, pair_newest, now_epoch, reads);
+    let (pair_schedule, pair_schedule_error) = schedule_of(&both, pair_history, now_epoch, reads);
     let (pair_session, pair_session_error) = pair_session_of(now.holder, now.job, reads);
     let mode_default = if drives.len() == 2 {
         pair_mode_default(&[drives[0].clean_runs, drives[1].clean_runs])
@@ -517,14 +516,26 @@ fn local_words(epoch: i64) -> String {
 /// gone (the host restarted since).
 const SCHEDULE_START_WINDOW: i64 = SCHEDULE_WAIT_LOCK_MIN as i64 * 60 + 600;
 
-/// The newest history line, when it started inside `[from, to]` (`to` `None`:
-/// no upper bound).
-fn line_in(newest: Option<&Value>, from: i64, to: Option<i64>) -> Option<&Value> {
-    newest.filter(|h| {
-        h.get("start")
-            .and_then(Value::as_i64)
-            .is_some_and(|start| start >= from && to.is_none_or(|to| start <= to))
-    })
+/// The latest-starting history line that started inside `[from, to]` (`to`
+/// `None`: no upper bound) — searched through the whole history, so a later
+/// session's line never hides this one; with `unattended_only`, a line of an
+/// unattended session only.
+fn line_in<'a>(
+    history: &[&'a Value],
+    from: i64,
+    to: Option<i64>,
+    unattended_only: bool,
+) -> Option<&'a Value> {
+    history
+        .iter()
+        .copied()
+        .filter(|h| {
+            h.get("start")
+                .and_then(Value::as_i64)
+                .is_some_and(|start| start >= from && to.is_none_or(|to| start <= to))
+                && (!unattended_only || h.get("unattended").and_then(Value::as_bool) == Some(true))
+        })
+        .max_by_key(|h| h.get("start").and_then(Value::as_i64))
 }
 
 /// Whether a service in `active_state` is running, for a schedule.
@@ -561,13 +572,13 @@ fn journal_words(service: &UnitFacts) -> String {
 /// reloading); **pending** (the timer has a next elapse — it comes before
 /// fired, so a timer that also still shows an earlier trigger reads as what
 /// it will do next); **fired** (the timer triggered: the detail is the
-/// newest history line's `<outcome> (exit <n>)` when that line started inside
+/// `<outcome> (exit <n>)` of the latest history line that started inside
 /// the service's run — at or after the trigger and the run's start, not after
 /// its end — else `refused: <the service's journal lines>`, since a session
 /// that wrote no history line never took the lock; with the history
 /// unreadable, `outcome unknown: the history cannot be read`); **missed**
-/// (anything else). `history_newest` is the newest history line, or why the
-/// history cannot be read.
+/// (anything else). `history` is the drive's (or both drives') history lines,
+/// searched whole, or why the history cannot be read.
 ///
 /// `Persistent=false` keeps the trigger time only in memory, so after a
 /// restart of the host a timer that fired reads like one that never did:
@@ -581,7 +592,7 @@ fn journal_words(service: &UnitFacts) -> String {
 pub fn schedule_state(
     timer: &UnitFacts,
     service: &UnitFacts,
-    history_newest: Result<Option<&Value>, &str>,
+    history: Result<&[&Value], &str>,
     now_epoch: i64,
 ) -> Schedule {
     let at_epoch = timer
@@ -620,11 +631,11 @@ pub fn schedule_state(
             _ => (trigger, None),
         };
         let fired_at = local_words(trigger);
-        let detail = match history_newest {
+        let detail = match history {
             Err(e) => {
                 format!("outcome unknown: the history cannot be read ({e}); fired at {fired_at}")
             }
-            Ok(newest) => match line_in(newest, from, to) {
+            Ok(history) => match line_in(history, from, to, false) {
                 Some(h) => outcome_words(h),
                 None => {
                     let result = service.result.as_deref().unwrap_or("unknown");
@@ -641,11 +652,8 @@ pub fn schedule_state(
         ("fired", detail)
     } else if timer.active_state == "active" {
         // No trigger: never fired, or fired before the host restarted.
-        let unattended = |h: &&Value| h.get("unattended").and_then(Value::as_bool) == Some(true);
-        let ran = match (&history_newest, at_epoch) {
-            (Ok(newest), Some(at)) => {
-                line_in(*newest, at, Some(at + SCHEDULE_START_WINDOW)).filter(unattended)
-            }
+        let ran = match (&history, at_epoch) {
+            (Ok(history), Some(at)) => line_in(history, at, Some(at + SCHEDULE_START_WINDOW), true),
             _ => None,
         };
         let restart = "the trigger time is not kept across a restart of the host";
@@ -655,7 +663,7 @@ pub fn schedule_state(
                 format!("ran before the host restarted: {}", outcome_words(h)),
             )
         } else if !service.last_journal.is_empty() {
-            let detail = match history_newest {
+            let detail = match history {
                 Err(e) => format!(
                     "outcome unknown: the history cannot be read ({e}); it fired before the host restarted ({restart}): {}",
                     journal_words(service)
@@ -667,7 +675,7 @@ pub fn schedule_state(
             };
             ("fired", detail)
         } else {
-            let unread = match history_newest {
+            let unread = match history {
                 Err(e) => format!(" The history cannot be read ({e})."),
                 Ok(_) => String::new(),
             };
@@ -782,7 +790,7 @@ pub fn validate_schedule(
 /// its `OnCalendar=` time — and a journal that cannot be read is an error too.
 fn schedule_of(
     base: &str,
-    history_newest: Result<Option<&Value>, &str>,
+    history: Result<&[&Value], &str>,
     now_epoch: i64,
     reads: &dyn PanelReads,
 ) -> (Option<Schedule>, Option<String>) {
@@ -817,7 +825,7 @@ fn schedule_of(
             }
         }
     }
-    let mut s = schedule_state(&timer, &service, history_newest, now_epoch);
+    let mut s = schedule_state(&timer, &service, history, now_epoch);
     s.unit = timer_name;
     (Some(s), None)
 }
@@ -1541,7 +1549,7 @@ pub(crate) mod tests {
             active_state: "inactive".into(),
             ..Default::default()
         };
-        let s = schedule_state(&timer, &service, Ok(None), 1791500000);
+        let s = schedule_state(&timer, &service, Ok(&[]), 1791500000);
         assert_eq!(s.state, "missed");
         assert!(s.detail.contains("2026-10-08 03:00:00"));
     }
@@ -1562,16 +1570,16 @@ pub(crate) mod tests {
             last_journal: vec!["refuse: the boot record says btrbk will run".into()],
             ..Default::default()
         };
-        let s = schedule_state(&timer, &service, Ok(None), 1791500000);
+        let s = schedule_state(&timer, &service, Ok(&[]), 1791500000);
         assert_eq!(s.state, "fired");
         assert!(s.detail.starts_with("refused:"), "{}", s.detail);
         assert!(s.detail.contains("will run"));
         let newer = serde_json::json!({"start": 1791490100, "outcome": "clean", "exit": 0});
-        let s = schedule_state(&timer, &service, Ok(Some(&newer)), 1791500000);
+        let s = schedule_state(&timer, &service, Ok(&[&newer]), 1791500000);
         assert_eq!(s.detail, "clean (exit 0)");
         let older = serde_json::json!({"start": 1791000000, "outcome": "clean", "exit": 0});
         assert!(
-            schedule_state(&timer, &service, Ok(Some(&older)), 1791500000)
+            schedule_state(&timer, &service, Ok(&[&older]), 1791500000)
                 .detail
                 .starts_with("refused:"),
             "an older history line is not this firing's"
@@ -1583,7 +1591,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(
-            schedule_state(&timer, &running, Ok(None), 1791500000).state,
+            schedule_state(&timer, &running, Ok(&[]), 1791500000).state,
             "running"
         );
         let pending = UnitFacts {
@@ -1593,7 +1601,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(
-            schedule_state(&pending, &service, Ok(None), 1791500000).state,
+            schedule_state(&pending, &service, Ok(&[]), 1791500000).state,
             "pending"
         );
     }
@@ -1619,13 +1627,13 @@ pub(crate) mod tests {
         let line = |start: i64, unattended: bool| serde_json::json!({"start": start, "outcome": "clean", "exit": 0, "unattended": unattended});
         // A line of an unattended session after the time: it ran.
         let ran = line(at_epoch + 90, true);
-        let s = schedule_state(&timer, &idle, Ok(Some(&ran)), now);
+        let s = schedule_state(&timer, &idle, Ok(&[&ran]), now);
         assert_eq!(s.state, "fired", "{}", s.detail);
         assert_eq!(s.detail, "ran before the host restarted: clean (exit 0)");
         // After a three-hour lock wait, still this schedule's.
         let late = line(at_epoch + 180 * 60 + 30, true);
         assert_eq!(
-            schedule_state(&timer, &idle, Ok(Some(&late)), now).state,
+            schedule_state(&timer, &idle, Ok(&[&late]), now).state,
             "fired"
         );
         // An attended session, one before the time, or one long after the
@@ -1635,7 +1643,7 @@ pub(crate) mod tests {
             line(at_epoch - 60, true),
             line(at_epoch + SCHEDULE_START_WINDOW + 1, true),
         ] {
-            let s = schedule_state(&timer, &idle, Ok(Some(&other)), now);
+            let s = schedule_state(&timer, &idle, Ok(&[&other]), now);
             assert_eq!(s.state, "missed", "{other}: {}", s.detail);
             assert!(
                 s.detail.contains("or fired before a restart"),
@@ -1649,7 +1657,7 @@ pub(crate) mod tests {
             last_journal: vec!["refuse: the boot record says btrbk will run".into()],
             ..idle.clone()
         };
-        let s = schedule_state(&timer, &refused, Ok(None), now);
+        let s = schedule_state(&timer, &refused, Ok(&[]), now);
         assert_eq!(s.state, "fired");
         assert!(
             s.detail
@@ -1696,7 +1704,7 @@ pub(crate) mod tests {
         };
         // A Now session that started after the refused run ended is not it.
         let later_now = serde_json::json!({"start": 1_791_495_000, "outcome": "clean", "exit": 0});
-        let s = schedule_state(&timer, &refused, Ok(Some(&later_now)), 1_791_500_000);
+        let s = schedule_state(&timer, &refused, Ok(&[&later_now]), 1_791_500_000);
         assert!(
             s.detail.starts_with("refused: refuse: the lock is held"),
             "{}",
@@ -1705,7 +1713,7 @@ pub(crate) mod tests {
         // A line inside the run is.
         let own = serde_json::json!({"start": 1_791_490_030, "outcome": "kept", "exit": 3});
         assert_eq!(
-            schedule_state(&timer, &refused, Ok(Some(&own)), 1_791_500_000).detail,
+            schedule_state(&timer, &refused, Ok(&[&own]), 1_791_500_000).detail,
             "kept (exit 3)"
         );
         // Exec readings older than the trigger are an earlier run's: the
@@ -1716,7 +1724,7 @@ pub(crate) mod tests {
             ..refused.clone()
         };
         assert_eq!(
-            schedule_state(&timer, &stale, Ok(Some(&later_now)), 1_791_500_000).detail,
+            schedule_state(&timer, &stale, Ok(&[&later_now]), 1_791_500_000).detail,
             "clean (exit 0)"
         );
         // An unreadable history: the outcome is unknown, never "refused".
@@ -1726,6 +1734,70 @@ pub(crate) mod tests {
                 .starts_with("outcome unknown: the history cannot be read (cannot read it)"),
             "{}",
             s.detail
+        );
+    }
+
+    #[test]
+    fn a_later_session_never_hides_the_line_a_fired_schedule_wrote() {
+        // The schedule's own line is not the newest once a Now session ran
+        // after it: the whole history is searched, never only its last line.
+        let cfg = two_mirrors_and_a_primary();
+        let a_base = format!("{UNIT_PREFIX}system-recovery-A-2tb");
+        let at = "2026-10-08 03:00:00";
+        let at_epoch = crate::caldate::local_epoch(at).unwrap();
+        let own = serde_json::json!({"start": at_epoch + 30, "outcome": "kept", "exit": 3, "unattended": true});
+        let later_now = serde_json::json!({"start": at_epoch + 20_000, "outcome": "clean", "exit": 0, "unattended": false});
+        let with_trigger = |trigger: Option<i64>| {
+            let mut units = HashMap::new();
+            units.insert(
+                format!("{a_base}.timer"),
+                Ok(UnitFacts {
+                    exists: true,
+                    active_state: "active".into(),
+                    last_trigger_epoch: trigger,
+                    on_calendar: Some(at.into()),
+                    ..Default::default()
+                }),
+            );
+            units.insert(
+                format!("{a_base}.service"),
+                Ok(UnitFacts {
+                    exists: true,
+                    active_state: "inactive".into(),
+                    exec_main_status: Some(3),
+                    exec_main_start_epoch: trigger.map(|t| t + 1),
+                    exec_main_exit_epoch: trigger.map(|t| t + 600),
+                    ..Default::default()
+                }),
+            );
+            let reads = Scripted {
+                history: [(
+                    "system-recovery-A-2tb",
+                    Ok(vec![own.clone(), later_now.clone()]),
+                )]
+                .into(),
+                units,
+                ..Default::default()
+            };
+            status_json(
+                &cfg,
+                &Ok(None),
+                &host(),
+                "2026-10-08",
+                at_epoch + 30_000,
+                &reads,
+            )
+        };
+        // The trigger is known: the line inside the service's run.
+        let j = with_trigger(Some(at_epoch));
+        assert_eq!(j["drives"][0]["schedule"]["detail"], "kept (exit 3)");
+        // The host restarted since (no trigger): the unattended line inside
+        // the start window.
+        let j = with_trigger(None);
+        assert_eq!(j["drives"][0]["schedule"]["state"], "fired");
+        assert_eq!(
+            j["drives"][0]["schedule"]["detail"],
+            "ran before the host restarted: kept (exit 3)"
         );
     }
 
@@ -1754,7 +1826,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let reads = with_timer(fired.clone());
-        let _ = schedule_of(&base, Ok(None), 1_791_500_000, &reads);
+        let _ = schedule_of(&base, Ok(&[]), 1_791_500_000, &reads);
         assert_eq!(
             *reads.journal_reads.lock().unwrap(),
             vec![(service.clone(), 1_791_490_000)]
@@ -1764,7 +1836,7 @@ pub(crate) mod tests {
             last_trigger_epoch: None,
             ..fired.clone()
         });
-        let _ = schedule_of(&base, Ok(None), 1_791_500_000, &reads);
+        let _ = schedule_of(&base, Ok(&[]), 1_791_500_000, &reads);
         assert_eq!(
             *reads.journal_reads.lock().unwrap(),
             vec![(
@@ -1777,14 +1849,14 @@ pub(crate) mod tests {
             next_elapse_epoch: Some(1_791_600_000),
             ..fired.clone()
         });
-        let _ = schedule_of(&base, Ok(None), 1_791_500_000, &reads);
+        let _ = schedule_of(&base, Ok(&[]), 1_791_500_000, &reads);
         assert!(reads.journal_reads.lock().unwrap().is_empty());
         // A journal that cannot be read is an error, never "no lines".
         let mut reads = with_timer(fired);
         reads
             .journals
             .insert(service.clone(), Err("journal: no access".into()));
-        let (s, e) = schedule_of(&base, Ok(None), 1_791_500_000, &reads);
+        let (s, e) = schedule_of(&base, Ok(&[]), 1_791_500_000, &reads);
         assert_eq!(s, None);
         assert!(e.unwrap().contains("journal: no access"));
     }
@@ -1808,7 +1880,7 @@ pub(crate) mod tests {
             ),
             ..Default::default()
         };
-        let s = schedule_state(&timer, &service, Ok(None), 1791500000);
+        let s = schedule_state(&timer, &service, Ok(&[]), 1791500000);
         assert_eq!(s.state, "pending");
         assert_eq!(s.mode.as_deref(), Some("parallel"));
         assert_eq!(
@@ -1821,7 +1893,7 @@ pub(crate) mod tests {
             ..timer
         };
         assert_eq!(
-            schedule_state(&unread, &service, Ok(None), 1791500000).at_epoch,
+            schedule_state(&unread, &service, Ok(&[]), 1791500000).at_epoch,
             None
         );
     }
@@ -1973,7 +2045,7 @@ pub(crate) mod tests {
                 next_elapse_epoch: Some(next),
                 ..Default::default()
             };
-            schedule_state(&timer, &service, Ok(None), now)
+            schedule_state(&timer, &service, Ok(&[]), now)
         };
         let at = |epoch: i64| crate::caldate::local_datetime(epoch).unwrap();
         // The sentence is pinned whole, local time included.
@@ -2004,7 +2076,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let timer = UnitFacts::default();
-        let s = schedule_state(&timer, &service_running, Ok(None), 1_791_500_000);
+        let s = schedule_state(&timer, &service_running, Ok(&[]), 1_791_500_000);
         assert_eq!(
             s.detail,
             format!(
@@ -2023,7 +2095,7 @@ pub(crate) mod tests {
             active_state: "inactive".into(),
             ..Default::default()
         };
-        let s = schedule_state(&fired, &idle, Ok(None), 1_791_500_000);
+        let s = schedule_state(&fired, &idle, Ok(&[]), 1_791_500_000);
         assert!(
             s.detail.contains(&format!(
                 "(fired at {};",
@@ -2050,7 +2122,7 @@ pub(crate) mod tests {
                 on_calendar: Some("2026-10-08 03:00:00".into()),
                 ..Default::default()
             };
-            let s = schedule_state(&timer, &idle, Ok(None), 1_791_500_000);
+            let s = schedule_state(&timer, &idle, Ok(&[]), 1_791_500_000);
             assert_eq!(s.state, "missed");
             s.detail
         };
