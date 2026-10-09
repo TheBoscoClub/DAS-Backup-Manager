@@ -252,7 +252,9 @@ fn verdict_word(v: BootVerdict) -> &'static str {
     }
 }
 
-/// The trimmed reading the panel shows; a version not read is `null`.
+/// The trimmed reading the panel shows; a version not read is `null`. A
+/// package's `null` is "not installed" only with `packages_read` true; with
+/// it false, pacman's database could not be read and the version is unknown.
 fn record_value(os: &RecoveryOs, host: &HostVersions) -> Value {
     json!({
         "os": os.os_name,
@@ -263,6 +265,7 @@ fn record_value(os: &RecoveryOs, host: &HostVersions) -> Value {
         "btrfs_progs": os.packages.get("btrfs-progs"),
         "host_btrfs_progs": host.btrfs_progs,
         "btrbk": os.packages.get("btrbk"),
+        "packages_read": os.packages_read,
         "guest_agent": os.guest_agent,
     })
 }
@@ -1297,6 +1300,7 @@ pub(crate) mod tests {
             "btrfs_progs",
             "host_btrfs_progs",
             "btrbk",
+            "packages_read",
             "guest_agent",
         ] {
             assert!(a["record"].get(key).is_some(), "record missing {key}");
@@ -1735,6 +1739,23 @@ pub(crate) mod tests {
             "{}",
             s.detail
         );
+    }
+
+    #[test]
+    fn a_package_version_not_read_is_told_apart_from_one_not_installed() {
+        let os = |read: bool| -> RecoveryOs {
+            serde_json::from_str(&format!(
+                r#"{{"os_name":"Arch Linux","last_full_upgrade_applied":null,"last_full_upgrade_attempted":null,"last_attempt_completed":false,"log_read":true,"modules_read":true,"kernels":[],"packages":{{}},"packages_read":{read},"problems":[]}}"#
+            ))
+            .unwrap()
+        };
+        // Both versions are null; only packages_read says which null it is.
+        let absent = record_value(&os(true), &host());
+        assert!(absent["btrbk"].is_null() && absent["btrfs_progs"].is_null());
+        assert_eq!(absent["packages_read"], true, "{absent}");
+        let unread = record_value(&os(false), &host());
+        assert!(unread["btrbk"].is_null() && unread["btrfs_progs"].is_null());
+        assert_eq!(unread["packages_read"], false, "{unread}");
     }
 
     #[test]
