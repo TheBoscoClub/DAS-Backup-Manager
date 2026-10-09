@@ -703,14 +703,22 @@ fn remove_schedule_files(unit_dir: &Path, base: &str) -> Vec<String> {
 /// to /dev/null, and `fsutil::write_atomic_mode` writes through a link —
 /// as root it would replace /dev/null with a regular file. Never written
 /// through, never removed: `InvalidArgs`, before anything is written or
-/// asked of systemd. A path that cannot be examined is `Failed`.
-fn refuse_symlinked_units(unit_dir: &Path, base: &str) -> fdo::Result<()> {
+/// asked of systemd. A path that cannot be examined is `Failed`. The
+/// refusal names the way out: unmask, then set again or clear (`clearing`:
+/// the clear itself was refused, so never "clear the schedule first").
+fn refuse_symlinked_units(unit_dir: &Path, base: &str, clearing: bool) -> fdo::Result<()> {
     for suffix in ["service", "timer"] {
-        let path = unit_dir.join(format!("{base}.{suffix}"));
+        let name = format!("{base}.{suffix}");
+        let path = unit_dir.join(&name);
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_symlink() => {
+                let then = if clearing {
+                    ", then clear the schedule"
+                } else {
+                    " or clear the schedule first"
+                };
                 return Err(fdo::Error::InvalidArgs(format!(
-                    "{} is a symlink (masked or linked); unmask it or clear the schedule first",
+                    "{} is a symlink (masked or linked); unmask it (systemctl unmask {name}){then}",
                     path.display()
                 )));
             }
@@ -727,13 +735,19 @@ fn refuse_symlinked_units(unit_dir: &Path, base: &str) -> fdo::Result<()> {
     Ok(())
 }
 
-/// `systemctl stop <base>.timer`, where a timer systemd does not have
-/// ("not loaded", "does not exist") is already stopped.
-fn stop_timer(base: &str, systemctl: Systemctl) -> Result<(), String> {
-    match systemctl(&["stop", &format!("{base}.timer")]) {
+/// `systemctl <verb> <base>.timer`, where a timer systemd does not have
+/// ("not loaded", "does not exist") is already what `stop` or `disable`
+/// asks for.
+fn timer_verb(verb: &str, base: &str, systemctl: Systemctl) -> Result<(), String> {
+    match systemctl(&[verb, &format!("{base}.timer")]) {
         Err(e) if !(e.contains("not loaded") || e.contains("does not exist")) => Err(e),
         _ => Ok(()),
     }
+}
+
+/// `systemctl stop <base>.timer` ([`timer_verb`]).
+fn stop_timer(base: &str, systemctl: Systemctl) -> Result<(), String> {
+    timer_verb("stop", base, systemctl)
 }
 
 /// Write the schedule's service and timer (mode 0644), reload systemd,
@@ -742,8 +756,8 @@ fn stop_timer(base: &str, systemctl: Systemctl) -> Result<(), String> {
 /// and `enable --now` does nothing to an active unit. A unit file that is a
 /// symlink is refused first ([`refuse_symlinked_units`]).
 ///
-/// Any failure after that stops the timer, THEN removes both files and
-/// reloads, so no half-installed pair is left and no timer lingers loaded
+/// Any failure after that stops the timer, disables it (an enable that
+/// succeeded left an install link), THEN removes both files and reloads, so no half-installed pair is left and no timer lingers loaded
 /// without its files. The previous files of the same schedule are not kept:
 /// a failed re-schedule drops the previous schedule, and the error says so.
 /// If the stop itself fails the files stay, so what may still be armed is
@@ -755,15 +769,18 @@ fn schedule_install(
     mode: Option<&str>,
     script: &Path,
     systemctl: Systemctl,
-) -> fdo::Result<()> {
+) -> fdo::Result<String> {
     let base = panel::unit_base(labels);
-    refuse_symlinked_units(unit_dir, &base)?;
+    refuse_symlinked_units(unit_dir, &base, false)?;
     let undo = |why: String| -> fdo::Error {
         if let Err(e) = stop_timer(&base, systemctl) {
             return fdo::Error::Failed(format!(
                 "{why}; the timer could not be stopped ({e}), so its unit files were left in place — check {base}.timer"
             ));
         }
+        // An enable that succeeded left a timers.target.wants link; without
+        // the disable it would dangle once the files are gone.
+        let disable = timer_verb("disable", &base, systemctl).err();
         let left = remove_schedule_files(unit_dir, &base);
         let reload = systemctl(&["daemon-reload"]).err();
         let mut msg = if left.is_empty() {
@@ -776,6 +793,11 @@ fn schedule_install(
                 left.join("; ")
             )
         };
+        if let Some(d) = disable {
+            msg.push_str(&format!(
+                " (and disabling it failed: {d}; a {base}.timer link may be left in timers.target.wants)"
+            ));
+        }
         if let Some(r) = reload {
             msg.push_str(&format!(" (and the reload after it failed: {r})"));
         }
@@ -792,7 +814,7 @@ fn schedule_install(
     systemctl(&["daemon-reload"]).map_err(undo)?;
     systemctl(&["enable", &timer]).map_err(undo)?;
     systemctl(&["restart", &timer]).map_err(undo)?;
-    Ok(())
+    Ok(timer)
 }
 
 /// Clear a schedule: stop its timer (also one systemd still has loaded after
@@ -800,14 +822,10 @@ fn schedule_install(
 /// "does not exist" are tolerated from stop and disable, nothing else. A
 /// symlinked (masked) unit is refused, never removed. A service already
 /// running is left to finish.
-fn schedule_clear(unit_dir: &Path, base: &str, systemctl: Systemctl) -> fdo::Result<()> {
-    refuse_symlinked_units(unit_dir, base)?;
+fn schedule_clear(unit_dir: &Path, base: &str, systemctl: Systemctl) -> fdo::Result<String> {
+    refuse_symlinked_units(unit_dir, base, true)?;
     stop_timer(base, systemctl).map_err(fdo::Error::Failed)?;
-    if let Err(e) = systemctl(&["disable", &format!("{base}.timer")])
-        && !(e.contains("not loaded") || e.contains("does not exist"))
-    {
-        return Err(fdo::Error::Failed(e));
-    }
+    timer_verb("disable", base, systemctl).map_err(fdo::Error::Failed)?;
     let left = remove_schedule_files(unit_dir, base);
     if !left.is_empty() {
         return Err(fdo::Error::Failed(format!(
@@ -815,7 +833,8 @@ fn schedule_clear(unit_dir: &Path, base: &str, systemctl: Systemctl) -> fdo::Res
             left.join("; ")
         )));
     }
-    systemctl(&["daemon-reload"]).map_err(fdo::Error::Failed)
+    systemctl(&["daemon-reload"]).map_err(fdo::Error::Failed)?;
+    Ok(format!("{base}.timer"))
 }
 
 /// `journalctl`'s arguments for the last 5 lines `unit`'s own processes
@@ -1995,7 +2014,8 @@ impl HelperInterface {
     /// `at_epoch` (seconds since the epoch, at least 120 s ahead) as the
     /// generated pair `das-recovery-os-update-<label|both>.{service,timer}`
     /// in /etc/systemd/system; `at_epoch == 0` clears that schedule. `mode`
-    /// is `sequential`, `parallel`, or empty. Refused (InvalidArgs, with the
+    /// is `sequential`, `parallel`, or empty. Returns the timer's unit name
+    /// (`<base>.timer`), set or cleared. Refused (InvalidArgs, with the
     /// reason) for anything `panel::validate_schedule` refuses, and for a
     /// unit file that is a symlink (a masked unit: never written through);
     /// every systemctl failure is `Failed` with its stderr, and a failed
@@ -2007,13 +2027,13 @@ impl HelperInterface {
         labels: Vec<String>,
         at_epoch: i64,
         mode: &str,
-    ) -> fdo::Result<()> {
+    ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
 
         let config = load_config()?;
         let mode = (!mode.is_empty()).then(|| mode.to_string());
-        tokio::task::spawn_blocking(move || -> fdo::Result<()> {
+        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let _one = SCHEDULE_WRITE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2836,7 +2856,7 @@ mod tests {
         }
     }
 
-    fn install_a(dir: &Path, sc: Systemctl) -> fdo::Result<()> {
+    fn install_a(dir: &Path, sc: Systemctl) -> fdo::Result<String> {
         schedule_install(
             dir,
             &["system-recovery-A-2tb".to_string()],
@@ -2854,7 +2874,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = BASE_A;
         let sc = ScriptedSystemctl::new(&[]);
-        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        assert_eq!(
+            install_a(dir.path(), &|a| sc.run(a)).unwrap(),
+            format!("{base}.timer"),
+            "the unit name is returned"
+        );
         // restart arms the timer in every state: an elapsed one-shot timer is
         // left elapsed by daemon-reload, and enable --now is a no-op on it.
         assert_eq!(
@@ -2910,13 +2934,38 @@ mod tests {
                 .iter()
                 .position(|c| *c == format!("stop {base}.timer"))
                 .unwrap_or_else(|| panic!("no stop in {calls:?}"));
+            // An enable that succeeded left a timers.target.wants link: the
+            // undo disables it, after the stop.
+            let disable = calls
+                .iter()
+                .position(|c| *c == format!("disable {base}.timer"))
+                .unwrap_or_else(|| panic!("no disable in {calls:?}"));
             assert_eq!(calls.last().unwrap(), "daemon-reload", "{calls:?}");
-            assert!(stop < calls.len() - 1);
+            assert!(stop < disable && disable < calls.len() - 1, "{calls:?}");
             assert!(
                 std::fs::read_dir(dir.path()).unwrap().next().is_none(),
                 "a failed {step} leaves no half-installed pair"
             );
         }
+
+        // A disable that fails (other than "not there") is said; the files go.
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let no_disable = ScriptedSystemctl::new(&["restart", "disable"]);
+        let m = msg(&install_a(dir.path(), &|a| no_disable.run(a)).unwrap_err());
+        assert!(
+            m.contains("disabling it failed: Failed: disable (scripted)"),
+            "{m}"
+        );
+        assert!(existing_schedule_bases(dir.path()).unwrap().is_empty());
+        // A timer systemd does not have is not a disable failure.
+        install_a(dir.path(), &|a| sc.run(a)).unwrap();
+        let m = msg(&install_a(dir.path(), &|a: &[&str]| match a[0] {
+            "restart" => Err("Failed: restart (scripted)".to_string()),
+            "disable" => Err(format!("Unit file {base}.timer does not exist.")),
+            _ => Ok(()),
+        })
+        .unwrap_err());
+        assert!(!m.contains("disabling it failed"), "{m}");
 
         // An undo whose stop really fails leaves the files, so what may still
         // be armed is visible.
@@ -2934,7 +2983,11 @@ mod tests {
         let sc = ScriptedSystemctl::new(&[]);
         install_a(dir.path(), &|a| sc.run(a)).unwrap();
         let clear = ScriptedSystemctl::new(&[]);
-        schedule_clear(dir.path(), base, &|a| clear.run(a)).unwrap();
+        assert_eq!(
+            schedule_clear(dir.path(), base, &|a| clear.run(a)).unwrap(),
+            format!("{base}.timer"),
+            "the unit name is returned"
+        );
         assert_eq!(
             *clear.calls.borrow(),
             [
@@ -2993,13 +3046,20 @@ mod tests {
         assert_eq!(
             m,
             format!(
-                "{} is a symlink (masked or linked); unmask it or clear the schedule first",
+                "{} is a symlink (masked or linked); unmask it (systemctl unmask {BASE_A}.timer) or clear the schedule first",
                 link.display()
             )
         );
         let err = schedule_clear(dir.path(), BASE_A, &|a| sc.run(a)).unwrap_err();
         assert!(matches!(err, fdo::Error::InvalidArgs(_)), "{err:?}");
-        assert!(msg(&err).contains("is a symlink (masked or linked)"));
+        assert_eq!(
+            msg(&err),
+            format!(
+                "{} is a symlink (masked or linked); unmask it (systemctl unmask {BASE_A}.timer), then clear the schedule",
+                link.display()
+            ),
+            "never 'clear the schedule first' on the clear path"
+        );
 
         assert!(sc.calls.borrow().is_empty(), "nothing was asked of systemd");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
