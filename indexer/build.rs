@@ -6,7 +6,14 @@
 
 fn cmake_version() -> Option<String> {
     let text = std::fs::read_to_string("../CMakeLists.txt").ok()?;
-    let rest = text.split("project(").nth(1)?;
+    // The `project(` call itself: the line that starts with it. A comment
+    // that mentions `project(` must not count (one did, bd
+    // DAS-Backup-Manager-laj: `split("project(").nth(1)` is the text between
+    // the first two occurrences, which was then that comment's tail).
+    let rest = text
+        .split_inclusive('\n')
+        .skip_while(|line| !line.starts_with("project("))
+        .collect::<String>();
     let after = rest.split("VERSION").nth(1)?;
     let version: String = after
         .trim_start()
