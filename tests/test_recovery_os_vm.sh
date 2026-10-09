@@ -1612,6 +1612,33 @@ has "wait-lock: says it is waiting, naming the holder" "$OUT" "waiting for the D
 has "wait-lock: then takes the lock" "$OUT" "took the DAS maintenance lock"
 check "wait-lock: lock free at the end" "$(lock_state)" "free"
 
+# The boot record is read AFTER the wait: the run a scheduled session waits
+# for is the backup, and that run rewrites the record (final review I2).
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
+(
+    exec 9<>"$LOCK"
+    if "$REAL_FLOCK" -n 9; then
+        printf 'stub backup pid 78\n' >&9
+        : >"$S/blocker.locked"
+    fi
+    sleep 1
+    write_state 3 "\"system-recovery-A-2tb\":{\"checked_epoch\":$(($(date +%s) - 60)),\"os\":{\"btrbk_at_boot\":{\"verdict\":\"sometimes\",\"reasons\":[]}},\"error\":null}"
+    exec sleep 1
+) &
+blocker=$!
+for ((i = 0; i < 200; i++)); do
+    [[ -e "$S/blocker.locked" ]] && break
+    sleep 0.05
+done
+check "wait-lock, record rewritten while waiting: precondition, the stub holds the lock" "$(blocker_holds)" "held"
+run_driver session A --wait-lock 20
+stop_blocker
+has "wait-lock, record rewritten while waiting: it waited" "$OUT" "waiting for the DAS maintenance lock (held by: stub backup pid 78)"
+check "wait-lock, record rewritten while waiting: the new record refuses" "$RC" "1"
+has "wait-lock, record rewritten while waiting: names the new reading" "$OUT" "has no btrbk-at-boot verdict ('sometimes')"
+check "wait-lock, record rewritten while waiting: nothing booted" "$(file "$S/virsh.calls" | grep -c 'start --paused' || :)" "0"
+
 fixture
 printf 'backup-run.sh pid 4242\n' >"$LOCK"
 start_blocker

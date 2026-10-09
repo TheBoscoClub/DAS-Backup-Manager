@@ -4824,6 +4824,11 @@ cmd_session() {
     if [[ "$UNATTENDED" == true ]] && ! command -v base64 >/dev/null; then
         refuse "base64 is not installed: an unattended session reads the guest agent's answers with it"
     fi
+    # Wait (--wait-lock) BEFORE the record is read: what a scheduled session
+    # waits for is usually the backup, and that run rewrites the record, the
+    # mount and the units the guard masks. As in the two-drive run, every
+    # check below reads the state after the wait.
+    wait_for_lock
     check_boot_record
     build_guard
     # Every unit the record names must be masked when it says btrbk may (or,
@@ -4835,7 +4840,6 @@ cmd_session() {
     fi
     resolve_disk
     log "session for $LABEL: $DISK ($DISK_DEV)$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
-    wait_for_lock
     check_units
     check_not_mounted
     check_domain_idle
