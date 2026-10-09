@@ -2606,24 +2606,38 @@ mod tests {
     // --- recovery-OS methods (bd DAS-Backup-Manager-8249 stage 2)
 
     #[test]
-    fn the_recovery_os_methods_check_polkit_with_the_recovery_os_action() {
+    fn the_recovery_os_methods_check_polkit_before_their_first_side_effect() {
         let src = include_str!("btrdasd-helper.rs");
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
-        for m in [
-            "async fn recovery_os_session(",
-            "async fn recovery_os_session_end(",
-            "async fn recovery_os_console(",
-            "async fn recovery_os_schedule_set(",
+        for (m, action) in [
+            ("recovery_os_status", "org.dasbackup.health"),
+            ("recovery_os_session", "org.dasbackup.recovery-os"),
+            ("recovery_os_session_end", "org.dasbackup.recovery-os"),
+            ("recovery_os_console", "org.dasbackup.recovery-os"),
+            ("recovery_os_schedule_set", "org.dasbackup.recovery-os"),
         ] {
-            let at = body.find(m).unwrap_or_else(|| panic!("{m} missing"));
-            let after = &body[at..at + 1200];
-            assert!(
-                after.contains("check_polkit(&self.conn, &sender, \"org.dasbackup.recovery-os\")"),
-                "{m} does not check org.dasbackup.recovery-os"
-            );
+            let method = method_body(body, m);
+            let polkit = method
+                .find(&format!("check_polkit(&self.conn, &sender, \"{action}\")"))
+                .unwrap_or_else(|| panic!("{m} does not check {action}"));
+            // Reading config, the job map, a spawn, a script or a file: none
+            // before polkit has said yes.
+            let effects: Vec<(&str, usize)> = [
+                "load_config(",
+                "spawn_blocking(",
+                "self.jobs",
+                "run_script",
+                "Command::new",
+                "std::fs::",
+            ]
+            .into_iter()
+            .filter_map(|e| method.find(e).map(|at| (e, at)))
+            .collect();
+            assert!(!effects.is_empty(), "{m}: no side effect found to order");
+            for (e, at) in effects {
+                assert!(polkit < at, "{m}: {e} comes before check_polkit");
+            }
         }
-        let at = body.find("async fn recovery_os_status(").unwrap();
-        assert!(body[at..at + 600].contains("\"org.dasbackup.health\""));
     }
 
     /// The body of `async fn <name>(`, up to the next method.

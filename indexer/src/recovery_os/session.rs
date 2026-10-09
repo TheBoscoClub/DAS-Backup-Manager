@@ -1248,16 +1248,20 @@ exit 7"#,
 
     #[test]
     fn dropping_a_running_child_never_kills_it() {
+        // A child far longer-lived than the check, so a loaded machine cannot
+        // let it end on its own first; the test ends it after the check.
         let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "sleep 0.5"]);
+        cmd.args(["-c", "sleep 5"]);
         let child = SystemSpawner.spawn(cmd).unwrap();
         let pid = child.pid();
         drop(child);
         std::thread::sleep(std::time::Duration::from_millis(150));
+        let state = proc_state(pid);
+        // SAFETY: kill(2) with a pid this test spawned and a valid signal.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         assert!(
-            matches!(proc_state(pid), Some(c) if c != 'Z'),
-            "the dropped child stopped running: {:?}",
-            proc_state(pid)
+            matches!(state, Some(c) if c != 'Z'),
+            "the dropped child stopped running: {state:?}"
         );
         assert!(
             wait_for_state(pid, |s| s.is_none()),
