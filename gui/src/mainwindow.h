@@ -27,6 +27,7 @@ class ProgressPanel;
 class BackupHistoryView;
 class BackupPanel;
 class HealthDashboard;
+class RecoveryPanel;
 class ConfigDialog;
 
 class MainWindow : public KXmlGuiWindow
@@ -97,6 +98,7 @@ private:
     BackupHistoryView *m_backupHistoryPage = nullptr;
     QWidget *m_configPage = nullptr;
     HealthDashboard *m_healthDashboard = nullptr;
+    RecoveryPanel *m_recoveryPanel = nullptr;
 
     qint64 m_currentSnapshotId = -1;
 

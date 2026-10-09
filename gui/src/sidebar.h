@@ -11,6 +11,7 @@ enum class SidebarSection {
     HealthDrives,
     HealthGrowth,
     HealthStatus,
+    RecoveryDrives,
 };
 
 class Sidebar : public QTreeWidget

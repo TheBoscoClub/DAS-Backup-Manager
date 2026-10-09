@@ -21,16 +21,25 @@
 #include <QSignalSpy>
 #include <QAbstractItemModel>
 #include <QJsonValue>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QFile>
 #include <QCheckBox>
 #include <QGroupBox>
 #include <QLabel>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QTableView>
+#include <QComboBox>
+#include <QDateTimeEdit>
 
+#include <functional>
 #include <optional>
 
 #include "../src/dbusclient.h"
+#include "../src/recoverystatus.h"
+#include "../src/recoverypanel.h"
 #include "../src/filemodel.h"
 #include "../src/healthdashboard.h"
 #include "../src/backuphistory.h"
@@ -688,6 +697,690 @@ private Q_SLOTS:
         QVERIFY(!p.run->isEnabled());
         Q_EMIT client.errorOccurred(QStringLiteral("BackupRun"), QStringLiteral("denied"));
         QVERIFY(p.run->isEnabled());
+    }
+
+    void consoleCommandIsRemoteViewerOnTheUnixSocket()
+    {
+        const auto [program, args] = DBusClient::consoleCommand(QStringLiteral("/run/das-recovery-os-vm/1000/system-recovery-A-2tb.vnc"));
+        QCOMPARE(program, QStringLiteral("remote-viewer"));
+        QCOMPARE(args, QStringList{QStringLiteral("vnc+unix:///run/das-recovery-os-vm/1000/system-recovery-A-2tb.vnc")});
+    }
+
+    void sessionEndUsesATenMinuteTimeout()
+    {
+        DBusClient client;
+        QCOMPARE(client.sessionEndTimeoutMs(), 600000);
+    }
+
+    void recoveryCallsOnAnUnavailableHelperAnswerEmptyNotSilent()
+    {
+        DBusClient client;
+        if (client.isAvailable())
+            QSKIP("a helper is reachable; this pins the unavailable path");
+        QSignalSpy status(&client, &DBusClient::recoveryOsStatusResult);
+        client.recoveryOsStatusAsync();
+        QCOMPARE(status.count(), 1);
+        QVERIFY(status.at(0).at(0).toString().isEmpty());
+        QSignalSpy end(&client, &DBusClient::recoveryOsSessionEndResult);
+        client.recoveryOsSessionEnd(QStringLiteral("system-recovery-A-2tb"));
+        QCOMPARE(end.count(), 1);
+        QVERIFY(!end.at(0).at(1).toBool());
+    }
+
+    // --- Recovery drives: the status document (8249 stage 3) ----------------
+    //
+    // gui/tests/fixtures/recovery-status.json is written by a panel.rs test
+    // from a fixed scripted scenario and must equal status_json's output
+    // byte for byte; this side parses the same file. Drive A: a record
+    // (verdict may), a running helper job, a missed schedule, 2 clean runs.
+    // Drive B: no record, every part unreadable.
+
+    static QByteArray fixture()
+    {
+        QFile f(QStringLiteral(RECOVERY_FIXTURE_PATH));
+        if (!f.open(QIODevice::ReadOnly))
+            return {};
+        return f.readAll();
+    }
+
+    void parseReadsEveryPartOfTheFixture()
+    {
+        QString err;
+        const auto doc = RecoveryDocument::parse(fixture(), &err);
+        QVERIFY2(doc.has_value(), qPrintable(err));
+        QCOMPARE(doc->schema, 1);
+        QCOMPARE(doc->maxAgeDays, 60);
+        QCOMPARE(doc->today, QStringLiteral("2026-10-09"));
+        QCOMPARE(doc->pair.modeDefault, QStringLiteral("sequential"));
+        QVERIFY(!doc->pair.schedule.has_value());
+        QVERIFY(!doc->pair.scheduleError.has_value());
+        QCOMPARE(doc->drives.size(), 2);
+
+        const DriveView &a = doc->drives[0];
+        QCOMPARE(a.label, QStringLiteral("system-recovery-A-2tb"));
+        QCOMPARE(a.displayName, QStringLiteral("Drive system-recovery-A-2tb"));
+        QCOMPARE(a.serials, QStringList{QStringLiteral("SER-system-recovery-A-2tb")});
+        QCOMPARE(a.checkedEpoch, std::optional<qint64>(1791448102));
+        QVERIFY(!a.recordError.has_value());
+        QVERIFY(a.record.has_value());
+        QCOMPARE(a.record->kernel, QStringLiteral("6.17.1-1-cachyos"));
+        QCOMPARE(a.record->hostKernel, QStringLiteral("6.17.2-1-cachyos"));
+        QCOMPARE(a.record->lastFullUpgrade, QStringLiteral("2026-09-20"));
+        QVERIFY(!a.record->packagesRead); // the scenario's package database was not read
+        QVERIFY(a.record->btrbk.isEmpty()); // null, not "not installed"
+        QCOMPARE(a.record->guestAgent.state, QStringLiteral("read"));
+        QCOMPARE(a.record->guestAgent.installed, std::optional<bool>(true));
+        QCOMPARE(a.record->guestAgent.enabled, std::optional<bool>(true));
+        QVERIFY(a.assessment.has_value());
+        QCOMPARE(a.assessment->ageDays, std::optional<qint64>(19));
+        QVERIFY(!a.assessment->stale);
+        QCOMPARE(a.assessment->warnings.size(), 1);
+        QVERIFY(!a.due);
+        QCOMPARE(a.verdict, QStringLiteral("may"));
+        QVERIFY(a.unattendedPossible);
+        QVERIFY(a.unattendedWhy.isEmpty());
+        QCOMPARE(a.cleanRuns, std::optional<qint64>(2));
+        QVERIFY(!a.cleanRunsError.has_value());
+        QCOMPARE(a.history.size(), 2);
+        QCOMPARE(a.history[1][QStringLiteral("outcome")].toString(), QStringLiteral("clean"));
+        QVERIFY(!a.historyError.has_value());
+        QVERIFY(a.schedule.has_value());
+        QCOMPARE(a.schedule->state, QStringLiteral("missed"));
+        QCOMPARE(a.schedule->unit, QStringLiteral("das-recovery-os-update-system-recovery-A-2tb.timer"));
+        QVERIFY(!a.schedule->atEpoch.has_value());
+        QVERIFY(a.schedule->mode.isEmpty());
+        QVERIFY(!a.schedule->detail.isEmpty());
+        QVERIFY(!a.scheduleError.has_value());
+        QVERIFY(a.session.has_value());
+        QCOMPARE(a.session->by, QStringLiteral("job:job-7"));
+        QCOMPARE(a.session->domainState, QStringLiteral("running"));
+        QVERIFY(!a.session->sinceEpoch.has_value());
+        QVERIFY(!a.session->attended.has_value()); // null in the document
+        QVERIFY(!a.sessionError.has_value());
+
+        const DriveView &b = doc->drives[1];
+        QCOMPARE(b.label, QStringLiteral("system-recovery-B-2tb"));
+        QVERIFY(b.recordError.has_value());
+        QVERIFY(b.recordError->contains(QStringLiteral("no record")));
+        QVERIFY(!b.record.has_value());
+        QVERIFY(!b.assessment.has_value());
+        QVERIFY(b.verdict.isEmpty());
+        QVERIFY(!b.unattendedPossible);
+        QVERIFY(b.unattendedWhy.contains(QStringLiteral("no record")));
+        QVERIFY(!b.cleanRuns.has_value());
+        QVERIFY(b.cleanRunsError.has_value());
+        QVERIFY(b.history.isEmpty());
+        QVERIFY(b.historyError.has_value());
+        QVERIFY(!b.schedule.has_value());
+        QVERIFY(b.scheduleError.has_value());
+        QVERIFY(b.scheduleError->contains(QStringLiteral("cannot be read")));
+        QVERIFY(!b.session.has_value());
+        QVERIFY(b.sessionError.has_value());
+    }
+
+    void parseRefusesAnotherSchemaAndAMissingKey()
+    {
+        QString err;
+        QVERIFY(!RecoveryDocument::parse("not json", &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("not JSON")), qPrintable(err));
+
+        const QJsonDocument d = QJsonDocument::fromJson(fixture());
+        QJsonObject o = d.object();
+        o[QStringLiteral("schema")] = 2;
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("schema 2")), qPrintable(err));
+
+        o = d.object();
+        QJsonArray drives = o[QStringLiteral("drives")].toArray();
+        QJsonObject drive = drives[1].toObject();
+        drive.remove(QStringLiteral("unattended"));
+        drives[1] = drive;
+        o[QStringLiteral("drives")] = drives;
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("drives[1]")) && err.contains(QStringLiteral("unattended")), qPrintable(err));
+
+        o = d.object();
+        o.remove(QStringLiteral("pair"));
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("pair")), qPrintable(err));
+    }
+
+    // --- Recovery drives: the enablement rules (spec §4), both ways -------
+
+private:
+    struct Scenario {
+        RecoveryDocument doc;
+        GuiFacts facts;
+        DriveView &a() { return doc.drives[0]; }
+        DriveView &b() { return doc.drives[1]; }
+    };
+
+    // Drive A of the fixture with its running job and its schedule removed:
+    // a drive on which everything is allowed. nowEpoch is the fixture's clock.
+    static Scenario idleA()
+    {
+        QString err;
+        Scenario s{*RecoveryDocument::parse(fixture(), &err), {}};
+        s.a().session.reset();
+        s.a().schedule.reset();
+        s.facts.nowEpoch = 1791500000;
+        s.facts.chosenNow = true;
+        s.facts.viewerInstalled = true;
+        return s;
+    }
+
+private Q_SLOTS:
+    void upgradeAttendedNeedsARecordAndNoSession()
+    {
+        Scenario s = idleA();
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY2(a.upgrade.enabled, qPrintable(a.upgrade.why));
+        QVERIFY(!a.bannerNeeded);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("attended")));
+
+        Scenario r = idleA();
+        r.a().record.reset();
+        r.a().recordError = QStringLiteral("the record of system-recovery-A-2tb holds no reading");
+        a = deriveActions(r.a(), r.doc.pair, r.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QCOMPARE(a.upgrade.why, *r.a().recordError);
+
+        Scenario h = idleA();
+        h.a().session = SessionView{QStringLiteral("other:recovery-os VM session system-recovery-A-2tb pid 1"), 1791400000, QStringLiteral("running"), std::nullopt};
+        a = deriveActions(h.a(), h.doc.pair, h.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("a session holds")));
+
+        Scenario pr = idleA();
+        pr.doc.pair.session = SessionView{QStringLiteral("unit:das-recovery-os-update-both.service"), 1791400000, QString(), false};
+        a = deriveActions(pr.a(), pr.doc.pair, pr.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("both drives")));
+
+        Scenario j = idleA();
+        j.facts.ownJobId = QStringLiteral("job-9");
+        a = deriveActions(j.a(), j.doc.pair, j.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("this window")));
+    }
+
+    void upgradeUnattendedFollowsTheDocumentsPossible()
+    {
+        Scenario s = idleA();
+        s.facts.unattended = true;
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY2(a.upgrade.enabled, qPrintable(a.upgrade.why));
+        QVERIFY(a.upgrade.why.contains(QStringLiteral("unattended")));
+
+        s.a().unattendedPossible = false;
+        s.a().unattendedWhy = QStringLiteral("the boot record says btrbk will run");
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QCOMPARE(a.upgrade.why, s.a().unattendedWhy);
+    }
+
+    void theBannerIsNeededForAttendedOnAWillRecordOnly()
+    {
+        Scenario s = idleA();
+        s.a().verdict = QStringLiteral("will");
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(a.upgrade.enabled);
+        QVERIFY(a.bannerNeeded);
+        s.facts.unattended = true;
+        s.a().unattendedPossible = false;
+        s.a().unattendedWhy = QStringLiteral("the boot record says btrbk will run");
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QVERIFY(!a.bannerNeeded);
+        s.facts.unattended = false;
+        s.a().verdict = QStringLiteral("may");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).bannerNeeded);
+    }
+
+    void scheduleNeedsATimeTwoMinutesAhead()
+    {
+        Scenario s = idleA();
+        s.facts.unattended = true;
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.schedule.enabled); // Now is ticked
+        QVERIFY(a.schedule.why.contains(QStringLiteral("untick Now")));
+
+        s.facts.chosenNow = false;
+        s.facts.chosenEpoch = s.facts.nowEpoch + ScheduleMinLeadSeconds - 1;
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.schedule.enabled);
+        QVERIFY(a.schedule.why.contains(QStringLiteral("2 minutes")));
+
+        s.facts.chosenEpoch = s.facts.nowEpoch - 3600;
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).schedule.enabled);
+
+        s.facts.chosenEpoch = s.facts.nowEpoch + ScheduleMinLeadSeconds;
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY2(a.schedule.enabled, qPrintable(a.schedule.why));
+
+        // A running session does not block scheduling; the attended radio does not either
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QString(), std::nullopt};
+        s.facts.unattended = false;
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).schedule.enabled);
+
+        s.a().unattendedPossible = false;
+        s.a().unattendedWhy = QStringLiteral("no guest agent");
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.schedule.enabled);
+        QCOMPARE(a.schedule.why, s.a().unattendedWhy);
+    }
+
+    void clearScheduleNeedsAPendingOrMissedOne()
+    {
+        Scenario s = idleA();
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule = ScheduleView{QStringLiteral("u.timer"), 1791600000, QString(), QStringLiteral("pending"), QString()};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule->state = QStringLiteral("missed");
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule->state = QStringLiteral("fired");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+        s.a().schedule->state = QStringLiteral("running");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).clearSchedule.enabled);
+    }
+
+    void consoleNeedsAnAttendedSessionThisWindowKnows()
+    {
+        Scenario s = idleA();
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QStringLiteral("running"), true};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.a().session->domainState = QStringLiteral("shut off");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+
+        // A job session: attended is null; only this window's attended job qualifies
+        s.a().session = SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt};
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.console.enabled);
+        QVERIFY(a.console.why.contains(QStringLiteral("cannot tell")));
+        s.facts.ownJobId = QStringLiteral("job-7");
+        s.facts.ownJobAttended = false;
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.facts.ownJobAttended = true;
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+
+        // The viewer missing keeps the button enabled (the click shows the path)
+        s.facts.viewerInstalled = false;
+        a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(a.console.enabled);
+        QVERIFY(a.console.why.contains(QStringLiteral("virt-viewer")));
+    }
+
+    void endSessionIsForAHolderThatIsNeitherAJobNorAUnit()
+    {
+        Scenario s = idleA();
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+        s.a().session = SessionView{QStringLiteral("other:recovery-os VM session system-recovery-A-2tb pid 1"), std::nullopt, QString(), std::nullopt};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+        s.a().session->by = QStringLiteral("job:job-7");
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.endSession.enabled);
+        QVERIFY(a.endSession.why.contains(QStringLiteral("Cancel")));
+        s.a().session->by = QStringLiteral("unit:das-recovery-os-update-system-recovery-A-2tb.service");
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+    }
+
+    void anErrorInAPartDisablesWhatDependsOnIt()
+    {
+        Scenario s = idleA();
+        s.a().sessionError = QStringLiteral("das-recovery-os-update-both.service cannot be read: boom");
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QStringLiteral("running"), true};
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.upgrade.enabled);
+        QCOMPARE(a.upgrade.why, *s.a().sessionError);
+        QVERIFY(!a.console.enabled);
+        QCOMPARE(a.console.why, *s.a().sessionError);
+        QVERIFY(!a.endSession.enabled);
+        QCOMPARE(a.endSession.why, *s.a().sessionError);
+
+        Scenario t = idleA();
+        t.a().scheduleError = QStringLiteral("x.timer cannot be read: boom");
+        t.a().schedule = ScheduleView{QStringLiteral("x.timer"), std::nullopt, QString(), QStringLiteral("pending"), QString()};
+        t.facts.unattended = true;
+        t.facts.chosenNow = false;
+        t.facts.chosenEpoch = t.facts.nowEpoch + 600;
+        a = deriveActions(t.a(), t.doc.pair, t.facts);
+        QVERIFY(!a.schedule.enabled);
+        QCOMPARE(a.schedule.why, *t.a().scheduleError);
+        QVERIFY(!a.clearSchedule.enabled);
+
+        // The pair's session error blocks the drive's upgrade too
+        Scenario u = idleA();
+        u.doc.pair.sessionError = QStringLiteral("pair boom");
+        QVERIFY(!deriveActions(u.a(), u.doc.pair, u.facts).upgrade.enabled);
+    }
+
+    void pairActionsNeedBothDrivesAndNoPairError()
+    {
+        Scenario s = idleA();
+        s.facts.unattended = true;
+        // Drive B of the fixture is all errors: the pair is refused with B's reason
+        PairActions p = derivePairActions(s.doc, s.facts);
+        QVERIFY(!p.upgrade.enabled);
+        QVERIFY(p.upgrade.why.contains(QStringLiteral("system-recovery-B-2tb")));
+        QCOMPARE(p.modeDefault, QStringLiteral("sequential"));
+
+        // Make B a copy of A: allowed
+        s.b() = s.a();
+        s.b().label = QStringLiteral("system-recovery-B-2tb");
+        p = derivePairActions(s.doc, s.facts);
+        QVERIFY2(p.upgrade.enabled, qPrintable(p.upgrade.why));
+        s.facts.chosenNow = false;
+        s.facts.chosenEpoch = s.facts.nowEpoch + 600;
+        QVERIFY(derivePairActions(s.doc, s.facts).schedule.enabled);
+
+        s.doc.pair.scheduleError = QStringLiteral("both boom");
+        p = derivePairActions(s.doc, s.facts);
+        QVERIFY(!p.schedule.enabled);
+        QCOMPARE(p.schedule.why, *s.doc.pair.scheduleError);
+
+        // One drive only: no pair
+        s.doc.drives.removeLast();
+        QVERIFY(!derivePairActions(s.doc, s.facts).upgrade.enabled);
+    }
+
+    void wordsForTheCards()
+    {
+        QCOMPARE(ageWords(std::nullopt, 100), QStringLiteral("unknown"));
+        QCOMPARE(ageWords(1791500000 - 3 * 86400, 1791500000), QStringLiteral("3 days ago"));
+        QCOMPARE(ageWords(1791500000 - 3600, 1791500000), QStringLiteral("today"));
+        QCOMPARE(ageWords(1791500000 - 86400, 1791500000), QStringLiteral("1 day ago"));
+        QCOMPARE(verdictWords(QStringLiteral("will")), QStringLiteral("will run btrbk at boot"));
+        QCOMPARE(verdictWords(QString()), QStringLiteral("unknown"));
+        QCOMPARE(sessionWords(SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt}, 0),
+                 QStringLiteral("running as helper job job-7 (VM running)"));
+        QCOMPARE(sessionWords(SessionView{QStringLiteral("unit:x.service"), 1791500000 - 600, QString(), false}, 1791500000),
+                 QStringLiteral("running as scheduled unit x.service since 10 minutes ago, unattended (VM state unknown)"));
+        QCOMPARE(scheduleWords(ScheduleView{QStringLiteral("u"), std::nullopt, QString(), QStringLiteral("missed"), QStringLiteral("The time passed.")}),
+                 QStringLiteral("missed: The time passed."));
+    }
+
+    // --- Recovery drives: the panel binds the rules (spec §3.2, §5) ---------
+
+private:
+    struct RecoveryParts {
+        QPushButton *upgrade, *schedule, *clear, *console, *end;
+        QComboBox *selector;
+        QRadioButton *attended, *unattended;
+        QCheckBox *now;
+        QDateTimeEdit *when;
+        bool ok() const
+        {
+            return upgrade && schedule && clear && console && end && selector && attended && unattended && now && when;
+        }
+    };
+
+    static RecoveryParts recoveryPartsOf(QWidget &w)
+    {
+        return {w.findChild<QPushButton *>(QStringLiteral("upgrade")),
+                w.findChild<QPushButton *>(QStringLiteral("schedule")),
+                w.findChild<QPushButton *>(QStringLiteral("clearSchedule")),
+                w.findChild<QPushButton *>(QStringLiteral("console")),
+                w.findChild<QPushButton *>(QStringLiteral("endSession")),
+                w.findChild<QComboBox *>(QStringLiteral("selector")),
+                w.findChild<QRadioButton *>(QStringLiteral("attended")),
+                w.findChild<QRadioButton *>(QStringLiteral("unattended")),
+                w.findChild<QCheckBox *>(QStringLiteral("now")),
+                w.findChild<QDateTimeEdit *>(QStringLiteral("when"))};
+    }
+
+    // The fixture with drive A idle (no session) and drive B a copy of A under
+    // its own label, each then edited by the caller.
+    static QByteArray twoIdleDrives(const std::function<void(QJsonObject &a, QJsonObject &b)> &edit)
+    {
+        const QJsonDocument d = QJsonDocument::fromJson(fixture());
+        QJsonObject o = d.object();
+        QJsonArray drives = o[QStringLiteral("drives")].toArray();
+        QJsonObject a = drives[0].toObject();
+        a[QStringLiteral("session")] = QJsonValue::Null;
+        QJsonObject b = a;
+        b[QStringLiteral("label")] = QStringLiteral("system-recovery-B-2tb");
+        b[QStringLiteral("display_name")] = QStringLiteral("Drive system-recovery-B-2tb");
+        edit(a, b);
+        drives[0] = a;
+        drives[1] = b;
+        o[QStringLiteral("drives")] = drives;
+        return QJsonDocument(o).toJson();
+    }
+
+    // Two idle, readable drives (the fixture's drive B has an unreadable
+    // session, which rightly blocks a session on A too), then Upgrade
+    // clicked: the panel now awaits jobStarted for a session of its own.
+    static void requestSession(RecoveryPanel &panel, const RecoveryParts &p)
+    {
+        panel.applyDocument(twoIdleDrives([](QJsonObject &, QJsonObject &) {}));
+        p.selector->setCurrentIndex(0);
+        p.attended->setChecked(true);
+        QVERIFY(p.upgrade->isEnabled());
+        p.upgrade->click(); // verdict "may": no banner dialog
+        QVERIFY(!p.upgrade->isEnabled());
+    }
+
+private Q_SLOTS:
+    void recoveryPanelConstructsWithoutAHelperAndDisablesEverything()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end}) {
+            QVERIFY(!b->isEnabled());
+            QVERIFY(!b->toolTip().isEmpty());
+        }
+    }
+
+    void recoveryPanelBindsTheDocument()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        QCOMPARE(p.selector->count(), 3); // A, B, both
+        QCOMPARE(p.selector->itemText(2), QStringLiteral("Both drives"));
+        QVERIFY(p.attended->isChecked());
+        QVERIFY(p.now->isChecked());
+        QVERIFY(!p.when->isEnabled());
+
+        // Drive A has a running job and a missed schedule in the fixture
+        p.selector->setCurrentIndex(0);
+        QVERIFY(!p.upgrade->isEnabled());
+        QVERIFY(p.upgrade->toolTip().contains(QStringLiteral("a session holds")));
+        QVERIFY(p.clear->isEnabled());
+        QVERIFY(!p.end->isEnabled());
+        QVERIFY(p.end->toolTip().contains(QStringLiteral("Cancel")));
+
+        // Drive B is all errors
+        p.selector->setCurrentIndex(1);
+        QVERIFY(!p.upgrade->isEnabled());
+        QVERIFY(p.upgrade->toolTip().contains(QStringLiteral("no record")));
+        QVERIFY(!p.clear->isEnabled());
+
+        // The cards show every error in its place
+        bool sawError = false;
+        const auto labels = panel.findChildren<QLabel *>();
+        for (QLabel *l : labels)
+            if (l->text().contains(QStringLiteral("cannot be read")))
+                sawError = true;
+        QVERIFY(sawError);
+    }
+
+    void panelShowsTheParseErrorAndDisablesEverything()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        panel.applyDocument("{\"schema\": 2}");
+        QVERIFY2(panel.statusLine().contains(QStringLiteral("schema 2")), qPrintable(panel.statusLine()));
+        const RecoveryParts p = recoveryPartsOf(panel);
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end})
+            QVERIFY(!b->isEnabled());
+        // A good document afterwards recovers it
+        panel.applyDocument(fixture());
+        QVERIFY(!panel.statusLine().contains(QStringLiteral("schema 2")));
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.clear->isEnabled());
+    }
+
+    void aWarnedSessionNeedsALookAFailedOneFailed()
+    {
+        DBusClient client; // unavailable: a click reaches no helper, but the request is remembered
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-1"), false, QStringLiteral("warnings: the guard was not confirmed on a no record"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Needs a look")), qPrintable(panel.statusLine()));
+
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-2"), false, QStringLiteral("exit 7 at upgrade"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Failed")), qPrintable(panel.statusLine()));
+
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobStarted(QStringLiteral("job-3"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-3"), true, QStringLiteral("clean"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Done")), qPrintable(panel.statusLine()));
+
+        // Another operation's job, and a session job nothing here requested,
+        // are not this panel's
+        panel.onJobStarted(QStringLiteral("job-4"), QStringLiteral("BackupRun"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+        panel.onJobStarted(QStringLiteral("job-6"), QStringLiteral("Recovery OS session"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+    }
+
+    void thePanelKnowsItsOwnJobAndItsAttendedness()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        requestSession(panel, p);
+        QVERIFY(!p.upgrade->isEnabled()); // requested, attended
+        panel.onJobStarted(QStringLiteral("job-5"), QStringLiteral("Recovery OS session"));
+        QCOMPARE(panel.facts().ownJobId, QStringLiteral("job-5"));
+        QVERIFY(panel.facts().ownJobAttended);
+        panel.onJobFinished(QStringLiteral("job-5"), true, QStringLiteral("clean"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+
+        // A JobFinished that beats the method reply (a helper refusal) is
+        // honoured when jobStarted names the job
+        requestSession(panel, p);
+        panel.onJobFinished(QStringLiteral("job-8"), false, QStringLiteral("refused: a session job is running"));
+        panel.onJobStarted(QStringLiteral("job-8"), QStringLiteral("Recovery OS session"));
+        QVERIFY(panel.facts().ownJobId.isEmpty());
+        QVERIFY(p.upgrade->isEnabled());
+    }
+
+    // --- Final review fixes (8249 stage 3) ----------------------------------
+
+private:
+private Q_SLOTS:
+    void upgradeIsBlockedWhileAnyDrivesSessionRuns()
+    {
+        Scenario s = idleA();
+        s.b() = s.a();
+        s.b().label = QStringLiteral("system-recovery-B-2tb");
+        s.b().displayName = QStringLiteral("Drive system-recovery-B-2tb");
+        QVERIFY(deriveActions(s.b(), s.doc, s.facts).upgrade.enabled);
+
+        s.a().session = SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt};
+        DriveActions b = deriveActions(s.b(), s.doc, s.facts);
+        QVERIFY(!b.upgrade.enabled);
+        QVERIFY2(b.upgrade.why.contains(QStringLiteral("system-recovery-A-2tb")), qPrintable(b.upgrade.why));
+
+        s.a().session.reset();
+        s.a().sessionError = QStringLiteral("x.service cannot be read: boom");
+        b = deriveActions(s.b(), s.doc, s.facts);
+        QVERIFY(!b.upgrade.enabled);
+        QCOMPARE(b.upgrade.why, *s.a().sessionError);
+
+        // Scheduling B is not blocked by A's session
+        s.facts.unattended = true;
+        s.facts.chosenNow = false;
+        s.facts.chosenEpoch = s.facts.nowEpoch + 600;
+        QVERIFY(deriveActions(s.b(), s.doc, s.facts).schedule.enabled);
+    }
+
+    void thePanelRefreshesOnAnyJobSignal()
+    {
+        DBusClient client; // unavailable: recoveryOsStatusAsync answers at once with an empty document
+        RecoveryPanel panel(&client);
+        QSignalSpy spy(&client, &DBusClient::recoveryOsStatusResult);
+        Q_EMIT client.jobStarted(QStringLiteral("x"), QStringLiteral("BackupRun"));
+        QCOMPARE(spy.count(), 1);
+        Q_EMIT client.jobFinished(QStringLiteral("x"), true, QString());
+        QCOMPARE(spy.count(), 2);
+    }
+
+    void theBannerShowsForAnAttendedPairWhenEitherDriveIsWill()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        panel.applyDocument(twoIdleDrives([](QJsonObject &, QJsonObject &b) {
+            b[QStringLiteral("verdict")] = QStringLiteral("will");
+        }));
+        QStringList prompts;
+        panel.setConfirmer([&prompts](const QString &, const QString &text) {
+            prompts << text;
+            return false; // declined
+        });
+        p.attended->setChecked(true);
+        p.selector->setCurrentIndex(2); // both
+        QVERIFY2(p.upgrade->isEnabled(), qPrintable(p.upgrade->toolTip()));
+        p.upgrade->click();
+        QCOMPARE(prompts.size(), 1);
+        QVERIFY(prompts[0].contains(QStringLiteral("this OS runs btrbk at boot")));
+        QVERIFY(prompts[0].contains(QStringLiteral("system-recovery-B-2tb")));
+        QVERIFY(p.upgrade->isEnabled()); // declined: nothing was requested
+
+        p.selector->setCurrentIndex(1); // B alone, will
+        p.upgrade->click();
+        QCOMPARE(prompts.size(), 2);
+        QVERIFY(p.upgrade->isEnabled());
+
+        p.selector->setCurrentIndex(0); // A alone, may: no banner, requested
+        p.upgrade->click();
+        QCOMPARE(prompts.size(), 2);
+        QVERIFY(!p.upgrade->isEnabled());
+    }
+
+    void aFailedRefreshDisablesEverythingWithoutLosingTheCards()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.clear->isEnabled());
+
+        Q_EMIT client.recoveryOsStatusError(QStringLiteral("polkit denied the status read"));
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end}) {
+            QVERIFY(!b->isEnabled());
+            QVERIFY2(b->toolTip().contains(QStringLiteral("polkit denied")), qPrintable(b->toolTip()));
+        }
+        QCOMPARE(p.selector->count(), 3); // the cards and the selection are kept
+        QVERIFY(panel.statusLine().contains(QStringLiteral("polkit denied")));
+
+        // The next good document recovers it
+        panel.applyDocument(fixture());
+        QVERIFY(p.clear->isEnabled());
+        QVERIFY(!panel.statusLine().contains(QStringLiteral("polkit denied")));
     }
 };
 

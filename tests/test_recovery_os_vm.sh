@@ -4840,6 +4840,25 @@ check "both, parallel: two history lines" "$(jq -r '.mode' "$H" | sort | uniq -c
 check "both, parallel: lock free" "$(lock_state)" "free"
 check "both, parallel: no egress rule left" "$(file "$S/ip.rules")" ""
 
+# bd c8lf: a child started with `&` begins with SIGINT ignored, and nothing
+# in the child can undo that; the parent must start it with the default
+# disposition. Before the fix a Ctrl-C (or the helper's JobCancel) stopped
+# nothing in parallel mode: both drives ran to the end. Each drive's first
+# step hangs, so the signal lands after both sessions started their domain
+# and launched a step, and before either reaches its upgrade.
+unattended_fixture
+touch "$S/stage.egress.hangs"
+# shellcheck disable=SC2016 # expanded by run_interrupted's eval, at the signal
+BEFORE_SIG='for ((k = 0; k < 400; k++)); do [[ "$(grep -c . "$S/stages.log" 2>/dev/null)" -ge 2 ]] && break; sleep 0.05; done' \
+    run_interrupted session A B --unattended --mode parallel
+check "both, parallel, SIGINT: the run exits 3" "$RC" "3"
+has "both, parallel, SIGINT: A stopped" "$OUT" "DRIVE system-recovery-A-2tb 3"
+has "both, parallel, SIGINT: B stopped" "$OUT" "DRIVE system-recovery-B-2tb 3"
+has "both, parallel, SIGINT: drive A had started" "$(events)" "virsh start"
+has "both, parallel, SIGINT: drive B had started" "$(file "$S/domB/events")" "virsh start"
+check "both, parallel, SIGINT: no drive ran its upgrade step" "$(grep -c upgrade "$S/stages.log" || :)" "0"
+check "both, parallel, SIGINT: never destroyed" "$(file "$S/forbidden")" ""
+
 # --wait-lock is the run's, never its drives': a drive given it would wait on
 # the run's own lock, then refuse (final review M19).
 for mode in sequential parallel; do
