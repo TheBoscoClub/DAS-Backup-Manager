@@ -482,11 +482,6 @@ void DBusClient::recoveryOsStatusAsync()
 void DBusClient::recoveryOsSession(const QStringList &labels, bool unattended,
                                    const QString &mode)
 {
-    if (!m_available) {
-        Q_EMIT errorOccurred(QStringLiteral("Recovery OS session"),
-                             unavailableReason());
-        return;
-    }
     // accept_boot_record_risk is always false from the GUI (spec 3.3).
     callAsync(QStringLiteral("RecoveryOsSession"),
               {QVariant::fromValue(labels), unattended, mode, false},
