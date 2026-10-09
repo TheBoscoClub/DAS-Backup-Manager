@@ -105,10 +105,16 @@ fn agent_words(a: &GuestAgent) -> String {
     }
 }
 
-/// Whether `label`'s record admits an unattended session, by the script's own
-/// rule: schema 4, a reading (not an error), the guest agent installed and
+/// Whether `label`'s record admits an unattended session, by the record's own
+/// facts: schema 4, a reading (not an error), the guest agent installed and
 /// started at boot, verdict not `will`, and the record's mount_uuid equal to
 /// the target's. `Err` carries the one sentence the GUI shows.
+///
+/// This is not the whole of the script's rule: `check_boot_record` also
+/// refuses a record older than `MAX_RECORD_AGE_DAYS` (8), one dated in the
+/// future, and one made before the drive's last session ended — so right
+/// after a session this can say possible and the script still refuse until
+/// a backup run records the drive again.
 pub fn unattended_possible(
     target: &Target,
     state: &StoredState,
