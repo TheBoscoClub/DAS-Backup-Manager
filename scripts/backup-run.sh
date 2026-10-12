@@ -3048,32 +3048,83 @@ run_indexer() {
 # the indexer updated it, so every target's copy of the index matches the
 # data it received tonight. One btrbk call, one filter per MOUNTED target
 # (filters are a union), `run` not `dryrun`. $1 is the run mode; a dry run
-# sends nothing. An absent target is left out, not failed; a failed send is
-# a WARN with btrbk's words (the data went out already, only the index copy
-# is a night old) -- never recorded as OK. "nvme" is the root volume's
-# directory on every target (the rendered btrbk.conf's `target <mount>/nvme`).
+# sends nothing.
+#
+# The filters come from the RENDERED config, never from a guess: in the
+# btrbk.conf the pass reads (${DAS_BTRBK_STATE_CONF:-$DAS_BTRBK_CONF}), the
+# `snapshot_name das-state` entry sits in a `volume` block whose `target`
+# lines name each target's directory; the filter is `<that path>/das-state`.
+# A target line under no configured mount is ignored with a log line; one
+# under an unmounted target is left out (absent, not failed). No das-state
+# entry at all is a SKIP: the state subvolume is not configured yet. A failed
+# send is a WARN with btrbk's words (the data went out already, only the
+# index copy is a night old) -- never recorded as OK. The size is the growth
+# of the mounted targets' used space across the send (df, as the throughput
+# log measures it); a reading that fails is "bytes unknown", never 0.
 run_state_pass() {
     local mode="${1:-run}"
     if [[ "$mode" == "dryrun" ]]; then
         record_op "state" "SKIP" "dry run"
         return 0
     fi
-    local filters=() label mnt out why rc start
-    for label in "${!TARGET_MOUNTS[@]}"; do
-        mnt="${TARGET_MOUNTS[$label]}"
-        mountpoint -q "$mnt" 2>/dev/null || continue
-        filters+=("$mnt/nvme/das-state")
-    done
+    local conf="${DAS_BTRBK_STATE_CONF:-$DAS_BTRBK_CONF}"
+    local parsed
+    if ! parsed=$(awk '
+        /^[[:space:]]*volume[[:space:]]/ { n = 0; next }
+        /^[[:space:]]+target[[:space:]]/ { t[++n] = $NF; next }
+        /^[[:space:]]+snapshot_name[[:space:]]+das-state[[:space:]]*$/ {
+            print "E"
+            for (i = 1; i <= n; i++) print "T " t[i]
+        }' "$conf" 2>&1); then
+        record_op "state" "WARN" "cannot read $conf: ${parsed:-awk failed}"
+        log_warn "State pass: cannot read $conf -- skipping"
+        return 0
+    fi
+    if [[ "$parsed" != E* ]]; then
+        record_op "state" "SKIP" "no das-state entry in btrbk.conf (the state subvolume is not configured yet)"
+        log_info "State pass: no das-state entry in $conf -- skipping"
+        return 0
+    fi
+    local filters=() mounts=() line path label mnt hit
+    while IFS= read -r line; do
+        [[ "$line" == "T "* ]] || continue
+        path="${line#T }"
+        hit=""
+        for label in "${!TARGET_MOUNTS[@]}"; do
+            mnt="${TARGET_MOUNTS[$label]}"
+            if [[ "$path" == "$mnt" || "$path" == "$mnt"/* ]]; then hit="$mnt"; break; fi
+        done
+        if [[ -z "$hit" ]]; then
+            log_info "State pass: target $path belongs to no configured mount -- ignored"
+            continue
+        fi
+        mountpoint -q "$hit" 2>/dev/null || continue
+        filters+=("$path/das-state")
+        mounts+=("$hit")
+    done <<<"$parsed"
     if ((${#filters[@]} == 0)); then
         log_warn "State pass: no target mounted -- skipping"
         record_op "state" "SKIP" "no target mounted"
         return 0
     fi
+    local before=0 after=0 v known=true out why rc start
+    for mnt in "${mounts[@]}"; do
+        v=$(get_used_bytes "$mnt") || v=""
+        [[ "$v" =~ ^[0-9]+$ ]] && before=$((before + v)) || known=false
+    done
     log_info "Sending the state subvolume after indexing (${#filters[@]} target(s))..."
     start=$SECONDS
-    if out=$(btrbk -c "$DAS_BTRBK_CONF" run "${filters[@]}" 2>&1); then
-        record_op "state" "OK" "$((SECONDS - start))s, ${#filters[@]} target(s)"
-        log_info "State subvolume sent: $((SECONDS - start))s"
+    if out=$(btrbk -c "$conf" run "${filters[@]}" 2>&1); then
+        for mnt in "${mounts[@]}"; do
+            v=$(get_used_bytes "$mnt") || v=""
+            [[ "$v" =~ ^[0-9]+$ ]] && after=$((after + v)) || known=false
+        done
+        local size="bytes unknown"
+        if [[ "$known" == true ]]; then
+            size="$(format_bytes $((after > before ? after - before : 0)))"
+        fi
+        record_op "state" "OK" "$((SECONDS - start))s, ${#filters[@]} target(s), $size"
+        log_info "State subvolume sent: $((SECONDS - start))s, $size"
     else
         rc=$?
         why=$(printf '%s\n' "$out" | grep -m1 -iE 'error|fail' || true)
