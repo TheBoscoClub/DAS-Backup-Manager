@@ -91,9 +91,10 @@ every session is; a p2 whose UUID differs is a refusal before anything is writte
 `@`, `@home`, `@.pre-update.*`, `@.half-upgraded.*`, `@rescue`. Each is renamed to
 `<name>.replaced.<stamp>` first and deleted only after Phase 3's first boot succeeded, so a
 failed provision can be undone by renaming back (the old OS is intact until then).
-**Everything not on that list is kept untouched**: every received backup subvolume, and
-**OPEN D7** the two `@.archive.*` boot archives on A (June 2026, left for manual review by
-the pruner's rule) — keep (default) or delete.
+**Everything not on that list is kept untouched**: every received backup subvolume.
+**D7 (decided 2026-10-12)**: the two `@.archive.*` boot archives on A (June 2026, left for
+manual review by the pruner's rule) are **deleted** during A's rebuild — named one by one in
+the plan, never by a glob; `@.archive.*` joins the allowlist for A only.
 
 ### 3.3 Boot (systemd-boot, written from inside the VM)
 
@@ -104,11 +105,11 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
 - `cachyos-recovery.conf` — "CachyOS Emergency Recovery (Bay N)", kernel `linux-cachyos`,
   `amd-ucode` + `intel-ucode` + default initramfs, `root=UUID=<p2> rw rootflags=subvol=/@`.
 - `cachyos-recovery-fallback.conf` — "… — Fallback (Bay N)", the fallback initramfs.
-- **OPEN D1** `cachyos-recovery-previous.conf` — "… — Previous root, read-only (Bay N)":
+- **D1 (accepted 2026-10-12)** `cachyos-recovery-previous.conf` — "… — Previous root, read-only (Bay N)":
   `rootflags=subvol=/@.pre-update.<newest>`, rewritten by the pipeline after each
   successful upgrade. Boots last week's known-good root for inspection and rollback
   without external media (what `@rescue` was for, with zero maintenance). Read-only root:
-  for inspection, not daily use. Strike or accept.
+  for inspection, not daily use.
 
 `mkinitcpio` preset `linux-cachyos` with `default` and `fallback` images (the pipeline's
 `initramfs` step already adds `fallback` to a preset lacking it).
@@ -323,10 +324,10 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 
 | Id | Question | Recommendation |
 | --- | --- | --- |
-| D1 | previous-root loader entry | accept |
+| D1 | previous-root loader entry | **accepted** |
 | D2 | sshd on the drives | on, key-only, both drives |
 | D3 | package release to pin | promote 0.7.23.0 first, pin to it |
 | D4 | recovery-mode config: template vs `btrdasd --recovery` | template now |
 | D5 | printing stack | keep (already there; harmless) |
 | D6 | Flatpak runtime preinstalled | no; add on a named need |
-| D7 | the two `@.archive.*` boot archives on A | keep |
+| D7 | the two `@.archive.*` boot archives on A | **delete** (operator) |
