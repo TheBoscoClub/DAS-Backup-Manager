@@ -569,7 +569,7 @@ Update `docs/examples/author-bay-mapping.md` with the new drive's serial, PARTUU
    # Restore home from the snapshot of the same time
    sudo rsync -aAXHv --info=progress2 /mnt/backup/nvme/home.<TIMESTAMP>/ /mnt/target/@home/
    ```
-   The subvolume names above are the author's (`btrdasd subvol list` shows yours); a snapshot holds an empty directory where a nested subvolume sat, so restore each nested one from its own snapshot. The author's `@/@audiobooks-db` is snapshotted as `nvme/-audiobooks-db.<TIMESTAMP>`: a name that begins with `-` is read as an option by most commands, so always give it as a full path (`/mnt/backup/nvme/-audiobooks-db.<TIMESTAMP>/`), or put `--` before it.
+   The subvolume names above are the author's (`btrdasd subvol list` shows yours); a snapshot holds nothing where a nested subvolume sat (an empty directory in the host's own snapshot, no entry at all in the received copy on a target — observed 2026-10-12 on `root-.<stamp>/var/lib/das-backup`), so restore each nested one from its own snapshot. The author's `@/@audiobooks-db` is snapshotted as `nvme/-audiobooks-db.<TIMESTAMP>`: a name that begins with `-` is read as an option by most commands, so always give it as a full path (`/mnt/backup/nvme/-audiobooks-db.<TIMESTAMP>/`), or put `--` before it.
 
 7. **Install bootloader**:
    ```bash
@@ -1083,8 +1083,8 @@ sudo btrfs subvolume snapshot /mnt/target/root-.20261002T1500 /mnt/target/@
 # 7. IMPORTANT: Update /etc/fstab in the restored subvolume
 #    The backup snapshot's fstab has the UUIDs from when it was taken.
 #    If you're restoring to different drives, update the UUIDs.
-#    A nested subvolume is not in the snapshot (an empty directory stands where
-#    it sat): restore it from its own snapshot, and mount it by path, never by
+#    A nested subvolume is not in the snapshot (an empty directory in the host's
+#    own snapshot, no entry at all in the received copy): restore it from its own snapshot, and mount it by path, never by
 #    subvolid= — a restored subvolume has a new id, and a line naming the old one
 #    stops the boot in emergency mode (author's: /var/lib/audiobooks/db,
 #    subvolid=2816 must become subvol=/@/@audiobooks-db).

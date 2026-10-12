@@ -618,7 +618,7 @@ sudo mount -o subvolid=5,ro UUID=60b05268-7f8f-47b5-a38a-752576a1172a /mnt/tmp-A
 # On whichever target is mounted by the run: the newest das-state snapshot's DB must be NEWER than the newest root- snapshot's copy
 ```
 
-The proof: `ls -t <target>/nvme/ | head` shows `das-state.<stamp>` with the same stamp as tonight's `root-.<stamp>`, and `stat` of `backup-index.db` inside it is newer than the one inside `root-.<stamp>/var/lib/das-backup/` (which, now that it is a nested subvolume, is an empty directory — that emptiness is itself the proof that the state moved).
+The proof: `ls -t <target>/nvme/ | head` shows `das-state.<stamp>` with the same stamp as tonight's `root-.<stamp>`, and `stat` of `backup-index.db` inside it is newer than the one inside `root-.<stamp>/var/lib/das-backup/` (which, now that it is a nested subvolume, is absent from the received copy — an empty directory exists only in the host's own snapshot; observed 2026-10-12: `root-.20261012T1456/var/lib/das-backup` does not exist on target A while `das-state.20261012T1533/backup-index.db` is 15,417,663,488 bytes stamped 15:33, after indexing — that absence is itself the proof that the state moved).
 
 Then `sudo rm -rf /var/lib/das-backup.dir-before-subvol` and note it in the session record.
 
