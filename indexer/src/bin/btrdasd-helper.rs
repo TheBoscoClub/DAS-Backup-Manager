@@ -1403,10 +1403,18 @@ impl HelperInterface {
         tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let db = Database::open(&db_path)
                 .map_err(|e| fdo::Error::Failed(format!("DB open failed: {e}")))?;
+            // On a recovery drive's own OS the booted drive's copy is the one
+            // to read (targets[0], by derive-recovery); an unreadable
+            // configuration only costs that preference.
+            let prefer_root = load_config().ok().and_then(|c| c.recovery_preferred_root());
             let path = db
-                .snapshot_path_by_id(snapshot_id)
+                .snapshot_path_present(snapshot_id, prefer_root.as_deref(), &|p| p.is_dir())
                 .map_err(|e| fdo::Error::Failed(format!("Path query failed: {e}")))?
-                .ok_or_else(|| fdo::Error::Failed(format!("No snapshot with id {snapshot_id}")))?;
+                .ok_or_else(|| {
+                    fdo::Error::Failed(format!(
+                        "No copy of snapshot {snapshot_id} is present on this machine                          (the target it was indexed from is not mounted, and no other                          target holding it is)"
+                    ))
+                })?;
             Ok(path)
         })
         .await

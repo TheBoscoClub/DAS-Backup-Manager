@@ -3427,6 +3427,7 @@ mod tests {
                 growth_log: "/tmp/growth.log".into(),
                 last_report: "/tmp/last-report.txt".into(),
                 btrbk_conf: "/nonexistent/btrbk.conf".into(),
+                recovery_drive: false,
             },
             init: Init {
                 system: InitSystem::Systemd,

@@ -140,6 +140,12 @@ pub struct General {
     pub last_report: String,
     #[serde(default = "default_btrbk_conf")]
     pub btrbk_conf: String,
+    /// This configuration was derived for a recovery drive's own OS
+    /// (`btrdasd config derive-recovery`): no sources, every target kept with
+    /// the booted drive first, and restores allowed only under the recovery
+    /// roots.
+    #[serde(default)]
+    pub recovery_drive: bool,
 }
 
 fn default_log_file() -> String {
@@ -614,6 +620,7 @@ impl Default for Config {
                 growth_log: default_growth_log(),
                 last_report: default_last_report(),
                 btrbk_conf: default_btrbk_conf(),
+                recovery_drive: false,
             },
             init: Init {
                 system: InitSystem::Systemd,
@@ -737,6 +744,17 @@ impl Config {
             }
         }
         errors
+    }
+
+    /// The mount of the target a snapshot should be read from first: on a
+    /// recovery drive's own OS (`general.recovery_drive`) the booted drive,
+    /// which `derive-recovery` puts at `targets[0]`; `None` on a host.
+    pub fn recovery_preferred_root(&self) -> Option<String> {
+        if self.general.recovery_drive {
+            self.targets.first().map(|t| t.mount.clone())
+        } else {
+            None
+        }
     }
 
     /// Validate the config and return a list of human-readable error messages.
@@ -949,6 +967,17 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn recovery_preferred_root_is_the_first_target_only_on_a_recovery_drive() {
+        let cfg = Config::from_toml(&minimal_toml(ONE_TARGET)).unwrap();
+        assert_eq!(cfg.recovery_preferred_root(), None);
+        let mut rec = cfg.clone();
+        rec.general.recovery_drive = true;
+        assert_eq!(rec.recovery_preferred_root().as_deref(), Some("/mnt/t"));
+        rec.targets.clear();
+        assert_eq!(rec.recovery_preferred_root(), None);
     }
 
     const ONE_TARGET: &str = "[[target]]\nlabel = \"t\"\nserial = \"X\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n";

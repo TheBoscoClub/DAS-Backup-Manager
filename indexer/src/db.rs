@@ -850,6 +850,37 @@ impl Database {
         rows.collect()
     }
 
+    /// A path of `snapshot_id` that exists on this machine: the preferred
+    /// target's copy first (a recovery drive's own, `prefer_root`), then the
+    /// primary path the snapshot was indexed from, then every other recorded
+    /// copy in `target_root` order. `None` when nothing exists or the id is
+    /// unknown. `exists` is the probe (a seam for the tests): the real caller
+    /// passes `Path::is_dir`.
+    pub fn snapshot_path_present(
+        &self,
+        snapshot_id: i64,
+        prefer_root: Option<&str>,
+        exists: &dyn Fn(&Path) -> bool,
+    ) -> SqlResult<Option<String>> {
+        let Some(primary) = self.snapshot_path_by_id(snapshot_id)? else {
+            return Ok(None);
+        };
+        let copies = self.targets_for_snapshot(snapshot_id)?;
+        if let Some(root) = prefer_root
+            && let Some((_, p)) = copies.iter().find(|(r, _)| r == root)
+            && exists(Path::new(p))
+        {
+            return Ok(Some(p.clone()));
+        }
+        if exists(Path::new(&primary)) {
+            return Ok(Some(primary));
+        }
+        Ok(copies
+            .into_iter()
+            .map(|(_, p)| p)
+            .find(|p| exists(Path::new(p))))
+    }
+
     /// Resolve a snapshot id from its identity, for recording a copy found on
     /// another target.
     pub fn snapshot_id_by_key(&self, source: &str, name: &str, ts: &str) -> SqlResult<Option<i64>> {
@@ -2282,6 +2313,82 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert_eq!(fk, 1);
+    }
+
+    const SPR_PRIMARY: &str = "/mnt/backup-22tb/nvme/root-.20261012T0348";
+    const SPR_REC: &str = "/mnt/backup-system-recovery-A/nvme/root-.20261012T0348";
+
+    fn spr_db() -> (Database, i64) {
+        let db = Database::open(":memory:").unwrap();
+        let id = db
+            .insert_snapshot("root-", "20261012T0348", "nvme", SPR_PRIMARY)
+            .unwrap();
+        db.record_snapshot_target(id, "/mnt/backup-system-recovery-A", SPR_REC)
+            .unwrap();
+        (db, id)
+    }
+
+    #[test]
+    fn snapshot_path_present_prefers_the_primary_path_when_it_exists() {
+        let (db, id) = spr_db();
+        let exists = |_: &Path| true;
+        assert_eq!(
+            db.snapshot_path_present(id, None, &exists)
+                .unwrap()
+                .as_deref(),
+            Some(SPR_PRIMARY)
+        );
+    }
+
+    #[test]
+    fn snapshot_path_present_falls_back_to_a_copy_that_exists() {
+        let (db, id) = spr_db();
+        let exists = |p: &Path| p.starts_with("/mnt/backup-system-recovery-A");
+        assert_eq!(
+            db.snapshot_path_present(id, None, &exists)
+                .unwrap()
+                .as_deref(),
+            Some(SPR_REC)
+        );
+    }
+
+    #[test]
+    fn snapshot_path_present_prefers_own_target_in_recovery() {
+        // Review focus 4: primary present but stale beside a booted recovery drive.
+        let (db, id) = spr_db();
+        let exists = |_: &Path| true;
+        assert_eq!(
+            db.snapshot_path_present(id, Some("/mnt/backup-system-recovery-A"), &exists)
+                .unwrap()
+                .as_deref(),
+            Some(SPR_REC)
+        );
+    }
+
+    #[test]
+    fn snapshot_path_present_preferred_copy_missing_falls_to_primary() {
+        let (db, id) = spr_db();
+        let exists = |p: &Path| p.starts_with("/mnt/backup-22tb");
+        assert_eq!(
+            db.snapshot_path_present(id, Some("/mnt/backup-system-recovery-A"), &exists)
+                .unwrap()
+                .as_deref(),
+            Some(SPR_PRIMARY)
+        );
+    }
+
+    #[test]
+    fn snapshot_path_present_is_none_when_no_copy_exists() {
+        let (db, id) = spr_db();
+        let exists = |_: &Path| false;
+        assert_eq!(db.snapshot_path_present(id, None, &exists).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_path_present_unknown_id_is_none() {
+        let (db, _) = spr_db();
+        let exists = |_: &Path| true;
+        assert_eq!(db.snapshot_path_present(404, None, &exists).unwrap(), None);
     }
 
     #[test]
