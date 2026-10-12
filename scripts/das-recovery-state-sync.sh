@@ -6,7 +6,7 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.0.0
+# Version: 1.0.1
 # Date: 2026-10-12
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
@@ -142,8 +142,9 @@ else
         die "setting the old state aside failed: state left as it was"
     }
     "$MV" "$STATE_DIR.new" "$STATE_DIR" || {
-        "$MV" "$STATE_DIR.old" "$STATE_DIR" || :
         cleanup_new
+        "$MV" "$STATE_DIR.old" "$STATE_DIR" ||
+            die "swap failed and the previous state could not be restored: it is in $STATE_DIR.old"
         die "installing the new state failed: previous state restored"
     }
     rm -rf "$STATE_DIR.old" || say "das-recovery-state-sync: could not remove $STATE_DIR.old" >&2
@@ -157,7 +158,6 @@ stamp=${state_snap##*.}
 data_stamp=${root_snap##*.}
 if [[ "$stamp" < "$data_stamp" ]]; then
     # The state is older than the data: catch up in the background.
-    status "synced $stamp; catch-up index running (data $data_stamp)"
     say "state $stamp is older than the newest data $data_stamp: starting an incremental index catch-up"
     # walk wants a target ROOT (it holds source dirs such as nvme/) and mounts
     # it itself by mount_uuid from the derived configuration, independent of
@@ -169,12 +169,17 @@ if [[ "$stamp" < "$data_stamp" ]]; then
         eval "$env_text"
         printf '%s' "${DAS_TARGET_0_MOUNT:-}"
     ) || walk_mount=
+    # The status is written only after the attempt: it never claims a
+    # catch-up that did not start.
     if [[ -z "$walk_mount" ]]; then
         say "could not start the catch-up (the derived configuration names no target mount): search is current to $stamp only" >&2
+        status "synced $stamp; catch-up NOT started: no target mount from dump-env"
+    elif "$SYSTEMD_RUN" --quiet --collect --unit=das-recovery-state-catchup --property=Type=oneshot \
+        "$BTRDASD" walk "$walk_mount" --db "$STATE_DIR/backup-index.db" --config "$CONFIG_OUT"; then
+        status "synced $stamp; catch-up index running (data $data_stamp)"
     else
-        "$SYSTEMD_RUN" --quiet --collect --unit=das-recovery-state-catchup --property=Type=oneshot \
-            "$BTRDASD" walk "$walk_mount" --db "$STATE_DIR/backup-index.db" --config "$CONFIG_OUT" ||
-            say "could not start the catch-up (systemd-run failed): search is current to $stamp only" >&2
+        say "could not start the catch-up (systemd-run failed): search is current to $stamp only" >&2
+        status "synced $stamp; catch-up NOT started: systemd-run failed"
     fi
 else
     status "synced $stamp"

@@ -53,7 +53,7 @@ if [[ "\$1 \$2" == "config derive-recovery" ]]; then
         shift
     done
     echo "recovery_drive = true" >"\$out"
-elif [[ "\$1 \$2" == "config dump-env" ]]; then
+elif [[ "\$1 \$2" == "config dump-env" && -z "\${STUB_DUMPENV_EMPTY:-}" ]]; then
     echo "DAS_TARGET_COUNT=2"
     echo "DAS_TARGET_0_MOUNT='$WALK_MOUNT'"
 fi
@@ -61,6 +61,7 @@ S
 cat >"$BIN/systemd-run" <<'S'
 #!/bin/bash
 echo "systemd-run $*" >>"$STUB_LOG"
+[[ -z "${STUB_SYSTEMD_RUN_FAIL:-}" ]]
 S
 cat >"$BIN/mount" <<'S'
 #!/bin/bash
@@ -81,14 +82,25 @@ else
     printf '%s\n' "$3" "	Received UUID: 		aaaaaaaa-0000-1111-2222-333333333333" "	Flags: 			readonly"
 fi
 S
-# mv: passes through to the real one; with STUB_MV_FAIL=<flagfile> the first
-# real call (not --help) fails once.
+# mv: passes through to the real one. STUB_MV_FAIL_AT="1 3" fails the 1st and
+# 3rd real call (counted in $STUB_MV_COUNT; --help is not counted).
+# STUB_MV_NO_EXCHANGE=1 hides --exchange from --help, so the script takes its
+# two-step fallback.
 cat >"$BIN/mv" <<'S'
 #!/bin/bash
-if [[ "${1:-}" != --help && -n "${STUB_MV_FAIL:-}" && ! -e "$STUB_MV_FAIL" ]]; then
-    : >"$STUB_MV_FAIL"
-    echo "mv: stub failure" >&2
-    exit 1
+if [[ "${1:-}" == --help ]]; then
+    if [[ -n "${STUB_MV_NO_EXCHANGE:-}" ]]; then /usr/bin/mv --help | grep -v -- --exchange; else /usr/bin/mv --help; fi
+    exit 0
+fi
+if [[ -n "${STUB_MV_FAIL_AT:-}" ]]; then
+    n=$(($(cat "$STUB_MV_COUNT" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$STUB_MV_COUNT"
+    for f in $STUB_MV_FAIL_AT; do
+        if [[ "$f" == "$n" ]]; then
+            echo "mv: stub failure (call $n)" >&2
+            exit 1
+        fi
+    done
 fi
 exec /usr/bin/mv "$@"
 S
@@ -98,6 +110,7 @@ fixture() {
     chmod -R u+rwX "$R" 2>/dev/null || :
     rm -rf "$R"
     : >"$LOG"
+    rm -f "$WORK/mv-count"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
     : >"$R/etc/das-backup/recovery-drive"
@@ -110,7 +123,7 @@ RC=0
 OUT=
 run() { # run [VAR=value ...]: the script under the seams; RC and OUT hold the result
     RC=0
-    OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" DAS_STATE_SYNC_ROOT="$R" DAS_STATE_SYNC_TOP="$R" \
+    OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" STUB_MV_COUNT="$WORK/mv-count" DAS_STATE_SYNC_ROOT="$R" DAS_STATE_SYNC_TOP="$R" \
         DAS_STATE_SYNC_BTRDASD="$BIN/btrdasd" DAS_STATE_SYNC_FINDMNT="$BIN/findmnt" \
         DAS_STATE_SYNC_SYSTEMD_RUN="$BIN/systemd-run" DAS_STATE_SYNC_MOUNT="$BIN/mount" \
         DAS_STATE_SYNC_UMOUNT="$BIN/umount" DAS_STATE_SYNC_BTRFS="$BIN/btrfs" \
@@ -212,13 +225,51 @@ fi
 
 echo "== swap (mv) fails"
 fixture
-run STUB_MV_FAIL="$WORK/mv-failed"
+run STUB_MV_FAIL_AT="1"
 check "mv: exit 1" test "$RC" -eq 1
 check "mv: previous state intact" has "$R/var/lib/das-backup/previous" previous
 check "mv: index not installed" test ! -e "$R/var/lib/das-backup/backup-index.db"
 check "mv: no config written" test ! -e "$R/etc/das-backup/config.toml"
 check "mv: no leftovers" no_leftovers
 check "mv: status is a failure" grep -q '^failed: ' "$R/run/das-recovery-state/status"
+
+echo "== swap fallback (no mv --exchange)"
+fixture
+run STUB_MV_NO_EXCHANGE=1
+check "fallback: exit 0" test "$RC" -eq 0
+check "fallback: state replaced" has "$R/var/lib/das-backup/backup-index.db" db-0348
+check "fallback: previous gone" test ! -e "$R/var/lib/das-backup/previous"
+check "fallback: no leftovers" no_leftovers
+fixture
+run STUB_MV_NO_EXCHANGE=1 STUB_MV_FAIL_AT="2"
+check "fallback 2nd move fails: exit 1" test "$RC" -eq 1
+check "fallback 2nd move fails: previous state restored" has "$R/var/lib/das-backup/previous" previous
+check "fallback 2nd move fails: new state not installed" test ! -e "$R/var/lib/das-backup/backup-index.db"
+check "fallback 2nd move fails: no leftovers" no_leftovers
+check "fallback 2nd move fails: status" status_is "failed: installing the new state failed: previous state restored"
+fixture
+run STUB_MV_NO_EXCHANGE=1 STUB_MV_FAIL_AT="2 3"
+check "fallback undo fails: exit 1" test "$RC" -eq 1
+check "fallback undo fails: previous state kept in .old" has "$R/var/lib/das-backup.old/previous" previous
+check "fallback undo fails: never claims restored" hasnt "$R/run/das-recovery-state/status" "previous state restored"
+check "fallback undo fails: status says where it is" \
+    status_is "failed: swap failed and the previous state could not be restored: it is in $R/var/lib/das-backup.old"
+check "fallback undo fails: no .new left" test ! -e "$R/var/lib/das-backup.new"
+
+echo "== catch-up that did not start"
+fixture
+mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
+echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
+run STUB_DUMPENV_EMPTY=1
+check "no mount: exit 0 (the sync itself succeeded)" test "$RC" -eq 0
+check "no mount: systemd-run not called" hasnt "$LOG" systemd-run
+check "no mount: status says NOT started" status_is "synced 20261012T0348; catch-up NOT started: no target mount from dump-env"
+fixture
+mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
+echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
+run STUB_SYSTEMD_RUN_FAIL=1
+check "systemd-run fails: exit 0" test "$RC" -eq 0
+check "systemd-run fails: status says NOT started" status_is "synced 20261012T0348; catch-up NOT started: systemd-run failed"
 
 echo "== real mount path (ROOT empty, every path through its seam)"
 fixture
