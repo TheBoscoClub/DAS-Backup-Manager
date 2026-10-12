@@ -146,6 +146,10 @@ install(PROGRAMS
     DESTINATION "${DAS_SCRIPT_DIR}"
 )
 
+# Installed whether or not the helper is built: the unit runs a script, not the helper.
+install(FILES systemd/das-recovery-state-sync.service
+    DESTINATION lib/systemd/system)
+
 install(FILES
     config/btrbk.conf
     DESTINATION "${DAS_SCRIPT_DIR}/config"
@@ -187,7 +191,6 @@ if(BUILD_HELPER)
         DESTINATION share/polkit-1/actions)
 
     install(FILES systemd/btrdasd-helper.service
-        systemd/das-recovery-state-sync.service
         DESTINATION lib/systemd/system)
 
     # Installing enables and reloads nothing. The helper needs no enabling:
