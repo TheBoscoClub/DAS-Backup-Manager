@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Every backup target carries an index that matches the data it received that night, and a recovery drive's own OS, at boot, has a current copy of btrdasd's state and a configuration that lets btrdasd, the helper and ButteredDASD restore from the drive itself with no manual step.
+**Goal:** Every backup target carries an index that matches the data it received that night, and a recovery drive's own OS, at boot, has a current copy of btrdasd's state and a configuration that lets btrdasd, the helper and ButteredDASD restore from the drive itself — or from the 22 TB pair when it is attached, for what only the pair holds — with no manual step.
 
-**Architecture:** (1) `/var/lib/das-backup` becomes its own nested subvolume, sent by a second small btrbk pass after indexing (spec D8). (2) `btrdasd config derive-recovery` turns the host's backed-up `config.toml` into a recovery-drive configuration with the real parser (spec D4, option C). (3) A boot-time unit on the recovery OS reflinks the state out of the newest received `das-state` snapshot, derives the configuration from the newest received `root-` snapshot, and runs an incremental index catch-up only when the state is older than the data. (4) The helper resolves a snapshot to a copy that exists on this machine, so the GUI restores from the drive's own received snapshot when the primary target is absent.
+**Architecture:** (1) `/var/lib/das-backup` becomes its own nested subvolume, sent by a second small btrbk pass after indexing (spec D8). (2) `btrdasd config derive-recovery` turns the host's backed-up `config.toml` into a recovery-drive configuration with the real parser (spec D4, option C): no sources, every target kept with the booted drive's first, so an attached 22 TB pair is mountable by UUID as on the host. (3) A boot-time unit on the recovery OS reflinks the state out of the newest received `das-state` snapshot, derives the configuration from the newest received `root-` snapshot, and runs an incremental index catch-up only when the state is older than the data. (4) The helper resolves a snapshot to a copy that exists on this machine, so the GUI restores from the drive's own received snapshot when the primary target is absent.
 
 **Tech Stack:** bash (`scripts/backup-run.sh`, new `scripts/das-recovery-state-sync.sh`), Rust 2024 (`indexer/src/config.rs`, `db.rs`, `main.rs`, `bin/btrdasd-helper.rs`), systemd unit, CMake install, the project's bash test style (`tests/test_record_run.sh`: extract functions, stub tools, `set -euo pipefail`), cargo tests with `cargo-mutants` in CI.
 
@@ -161,7 +161,7 @@ pub recovery_drive: bool,
 
 Add `recovery_drive: false` wherever `General` is constructed literally (grep `General {`); `Default` derives keep it false.
 
-In `indexer/src/bin/btrdasd-helper.rs` `IndexSnapshotPath` (lines 1398-1416): load the config with `Config::load(Path::new(DEFAULT_CONFIG))` as the other methods do; compute `prefer_root` as the mount of the first target when `cfg.general.recovery_drive` is true, else `None`; replace the `snapshot_path_by_id` call with:
+In `indexer/src/bin/btrdasd-helper.rs` `IndexSnapshotPath` (lines 1398-1416): load the config with `Config::load(Path::new(DEFAULT_CONFIG))` as the other methods do; compute `prefer_root` as `cfg.targets[0].mount` when `cfg.general.recovery_drive` is true (Task 2 puts the booted drive first), else `None`; replace the `snapshot_path_by_id` call with:
 
 ```rust
 let path = db
@@ -198,7 +198,7 @@ git commit -m "helper: a snapshot resolves to a copy that exists here, the boote
 **Interfaces:**
 
 - Consumes: `Config::load`, `Config::to_toml`, `Config::validate`, `Target.mount_uuid: Option<String>`, `Target.mount: String`, `Restore.allowed_roots`, `Email.enabled`, `Scrub.enabled`, `Boot.enabled`, `General.recovery_drive` (Task 1).
-- Produces: `Config::derive_recovery(&self, booted_uuid: &str) -> Result<Config, String>`; CLI `btrdasd config derive-recovery --from <path> --booted-uuid <uuid> [--out <path>]` (prints the TOML to stdout when `--out` is absent; exit 1 with the reason on stderr when it refuses). Task 5 calls it.
+- Produces: `Config::derive_recovery(&self, booted_uuid: &str) -> Result<Config, String>` — every target kept, the booted one first (`targets[0]`), so Task 1's helper can take `targets[0].mount` as the preferred root; CLI `btrdasd config derive-recovery --from <path> --booted-uuid <uuid> [--out <path>]` (prints the TOML to stdout when `--out` is absent; exit 1 with the reason on stderr when it refuses). Task 4 calls it.
 
 Constants, in `config.rs`:
 
@@ -211,13 +211,15 @@ pub const RECOVERY_ALLOWED_ROOTS: [&str; 2] = ["/mnt/restore", "/home/restore-te
 
 ```rust
 #[test]
-fn derive_recovery_keeps_only_the_booted_target_and_drops_the_host() {
+fn derive_recovery_keeps_every_target_with_the_booted_one_first_and_drops_the_sources() {
     let cfg = test_config_with_three_targets(); // helper below
     let r = cfg.derive_recovery("7c7ae72d-09d6-4086-b249-1ac60f21b73b").unwrap();
     assert!(r.general.recovery_drive);
     assert!(r.sources.is_empty());
-    assert_eq!(r.targets.len(), 1);
-    assert_eq!(r.targets[0].label, "system-recovery-B-2tb");
+    let labels: Vec<&str> = r.targets.iter().map(|t| t.label.as_str()).collect();
+    // the booted drive first, the others in their original order: the 22 TB
+    // pair stays mountable by UUID for what only it holds
+    assert_eq!(labels, vec!["system-recovery-B-2tb", "primary-22tb", "system-recovery-A-2tb"]);
     assert_eq!(r.targets[0].mount, "/mnt/backup-system-recovery-B");
     assert!(!r.email.enabled);
     assert!(!r.scrub.enabled);
@@ -250,7 +252,8 @@ fn derive_recovery_output_validates_and_round_trips() {
     assert!(r.validate().is_empty(), "{:?}", r.validate());
     let again = Config::from_toml(&r.to_toml().unwrap()).unwrap();
     assert!(again.general.recovery_drive);
-    assert_eq!(again.targets.len(), 1);
+    assert_eq!(again.targets.len(), 3);
+    assert_eq!(again.targets[0].label, "system-recovery-B-2tb");
 }
 
 #[test]
@@ -289,18 +292,23 @@ In `config.rs`, `impl Config`:
 
 ```rust
 /// The configuration a recovery drive's own OS runs with, derived from the
-/// host's (spec D4): no sources, the one target whose filesystem the OS
-/// booted from (by `mount_uuid`), email, scrub and the boot step off, and
-/// restores allowed only under `RECOVERY_ALLOWED_ROOTS`. Refuses when no
-/// target, or more than one, names `booted_uuid` — never a guess.
+/// host's (spec D4): no sources; every target kept — the one whose
+/// filesystem the OS booted from (by `mount_uuid`) moved first, the rest in
+/// their order, so an attached 22 TB pair is still mounted by UUID for what
+/// only it holds (the resolver, `Database::snapshot_path_present`, prefers
+/// `targets[0]`); email, scrub and the boot step off; restores allowed only
+/// under `RECOVERY_ALLOWED_ROOTS`. Refuses when no target, or more than one,
+/// names `booted_uuid` — never a guess.
 pub fn derive_recovery(&self, booted_uuid: &str) -> Result<Config, String> {
-    let matching: Vec<&Target> = self
+    let matching: Vec<usize> = self
         .targets
         .iter()
-        .filter(|t| t.mount_uuid.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(booted_uuid)))
+        .enumerate()
+        .filter(|(_, t)| t.mount_uuid.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(booted_uuid)))
+        .map(|(i, _)| i)
         .collect();
-    let target = match matching.as_slice() {
-        [one] => (*one).clone(),
+    let booted = match matching.as_slice() {
+        [one] => *one,
         [] => {
             let known: Vec<&str> = self.targets.iter().map(|t| t.label.as_str()).collect();
             return Err(format!(
@@ -309,7 +317,7 @@ pub fn derive_recovery(&self, booted_uuid: &str) -> Result<Config, String> {
             ));
         }
         many => {
-            let labels: Vec<&str> = many.iter().map(|t| t.label.as_str()).collect();
+            let labels: Vec<&str> = many.iter().map(|&i| self.targets[i].label.as_str()).collect();
             return Err(format!(
                 "two targets name filesystem {booted_uuid}: {} — fix the configuration, nothing is derived",
                 labels.join(", ")
@@ -319,7 +327,8 @@ pub fn derive_recovery(&self, booted_uuid: &str) -> Result<Config, String> {
     let mut r = self.clone();
     r.general.recovery_drive = true;
     r.sources.clear();
-    r.targets = vec![target];
+    let own = r.targets.remove(booted);
+    r.targets.insert(0, own);
     r.email.enabled = false;
     r.scrub.enabled = false;
     r.scrub.targets.clear();
@@ -383,7 +392,7 @@ Expected: all PASS, including the five new ones.
 cmake --build /tmp/das-backup-build
 B=/tmp/das-backup-build/cargo-target/release/btrdasd
 sudo $B config derive-recovery --from /etc/das-backup/config.toml --booted-uuid 60b05268-7f8f-47b5-a38a-752576a1172a | grep -E '^recovery_drive|^\[\[target\]\]|^label|^allowed_roots' 
-# Expected: recovery_drive = true, exactly one [[target]] with label = "system-recovery-A-2tb", the two roots.
+# Expected: recovery_drive = true, three [[target]] blocks with label = "system-recovery-A-2tb" FIRST, then primary-22tb, then system-recovery-B-2tb; the two roots; no [[source]].
 sudo $B config derive-recovery --from /etc/das-backup/config.toml --booted-uuid 00000000-0000-0000-0000-000000000000; echo "rc=$?"
 # Expected: "derive-recovery: no target of filesystem 0000…" on stderr, rc=1, nothing on stdout.
 ```
