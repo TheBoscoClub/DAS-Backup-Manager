@@ -127,6 +127,9 @@ pub const RESTORE_DENIED_ROOTS: &[&str] = &[
     "/var/spool",
 ];
 
+/// Where a recovery boot may restore to, and nowhere else (spec D4).
+pub const RECOVERY_ALLOWED_ROOTS: [&str; 2] = ["/mnt/restore", "/home/restore-test"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct General {
     pub version: String,
@@ -757,6 +760,63 @@ impl Config {
         }
     }
 
+    /// The configuration a recovery drive's own OS runs with, derived from the
+    /// host's (spec D4): no sources; every target kept, the one whose
+    /// filesystem the OS booted from (by `mount_uuid`) moved first and the rest
+    /// left in their order, so an attached 22 TB pair is still mounted by UUID
+    /// for what only it holds (`recovery_preferred_root` takes `targets[0]`);
+    /// email, scrub and the boot step off; restores allowed only under
+    /// `RECOVERY_ALLOWED_ROOTS`. Refuses when no target, or more than one,
+    /// names `booted_uuid` — never a guess. Target `mount` strings are kept
+    /// as they are: the index's `target_root` was recorded with the same ones.
+    pub fn derive_recovery(&self, booted_uuid: &str) -> Result<Config, String> {
+        let matching: Vec<usize> = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.mount_uuid
+                    .as_deref()
+                    .is_some_and(|u| u.eq_ignore_ascii_case(booted_uuid))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let booted = match matching.as_slice() {
+            [one] => *one,
+            [] => {
+                let known: Vec<&str> = self.targets.iter().map(|t| t.label.as_str()).collect();
+                return Err(format!(
+                    "no target of filesystem {booted_uuid} in this configuration (targets: {})",
+                    known.join(", ")
+                ));
+            }
+            many => {
+                let labels: Vec<&str> = many
+                    .iter()
+                    .map(|&i| self.targets[i].label.as_str())
+                    .collect();
+                return Err(format!(
+                    "two targets name filesystem {booted_uuid}: {} — fix the configuration, nothing is derived",
+                    labels.join(", ")
+                ));
+            }
+        };
+        let mut r = self.clone();
+        r.general.recovery_drive = true;
+        r.sources.clear();
+        let own = r.targets.remove(booted);
+        r.targets.insert(0, own);
+        r.email.enabled = false;
+        r.scrub.enabled = false;
+        r.scrub.targets.clear();
+        r.boot.enabled = false;
+        r.restore.allowed_roots = RECOVERY_ALLOWED_ROOTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        Ok(r)
+    }
+
     /// Validate the config and return a list of human-readable error messages.
     /// An empty vec means the config is valid.
     pub fn validate(&self) -> Vec<String> {
@@ -778,7 +838,8 @@ impl Config {
             );
         }
 
-        if self.sources.is_empty() {
+        // A recovery drive's own OS backs nothing up: it has no sources by design.
+        if self.sources.is_empty() && !self.general.recovery_drive {
             errors.push("No backup sources defined — add at least one [[source]]".into());
         }
 
@@ -1752,6 +1813,131 @@ enabled = false
     /// optional sections a test appends. Parsing real TOML (rather than calling
     /// the `default_*` fns) is the point: it exercises the `#[serde(default)]`
     /// wiring an on-disk config.toml actually goes through.
+    const BOOTED_B: &str = "5eed0010-0000-4000-8000-000000000010";
+
+    fn test_config_with_three_targets() -> Config {
+        let target = |label: &str, uuid: &str, mount: &str, role: &str| {
+            format!(
+                "[[target]]\nlabel = \"{label}\"\nserial = \"S-{label}\"\nmount_uuid = \"{uuid}\"\nmount = \"{mount}\"\nrole = \"{role}\"\n[target.retention]\ndaily = 7\n"
+            )
+        };
+        let extra = format!(
+            "{}{}{}{}[scrub]\nenabled = true\ntargets = [\"primary-22tb\"]\n",
+            source_with("s", "/vol", &[("a", None)]),
+            target(
+                "primary-22tb",
+                "5eed0016-0000-4000-8000-000000000016",
+                "/mnt/backup-22tb",
+                "primary"
+            ),
+            target(
+                "system-recovery-A-2tb",
+                "5eed0008-0000-4000-8000-000000000008",
+                "/mnt/backup-system-recovery-A",
+                "mirror"
+            ),
+            target(
+                "system-recovery-B-2tb",
+                BOOTED_B,
+                "/mnt/backup-system-recovery-B",
+                "mirror"
+            ),
+        );
+        let mut cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        cfg.email.enabled = true;
+        cfg
+    }
+
+    #[test]
+    fn derive_recovery_keeps_every_target_with_the_booted_one_first_and_drops_the_sources() {
+        let cfg = test_config_with_three_targets();
+        let r = cfg.derive_recovery(BOOTED_B).unwrap();
+        assert!(r.general.recovery_drive);
+        assert!(r.sources.is_empty());
+        let labels: Vec<&str> = r.targets.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "system-recovery-B-2tb",
+                "primary-22tb",
+                "system-recovery-A-2tb"
+            ]
+        );
+        assert_eq!(r.targets[0].mount, "/mnt/backup-system-recovery-B");
+        assert_eq!(r.targets[1].mount, "/mnt/backup-22tb");
+        assert!(!r.email.enabled);
+        assert!(!r.scrub.enabled);
+        assert!(r.scrub.targets.is_empty());
+        assert!(!r.boot.enabled);
+        assert_eq!(
+            r.restore.allowed_roots,
+            vec!["/mnt/restore".to_string(), "/home/restore-test".to_string()]
+        );
+        // The input is untouched, and a host is not a recovery drive.
+        assert!(!cfg.general.recovery_drive && !cfg.sources.is_empty() && cfg.email.enabled);
+    }
+
+    #[test]
+    fn derive_recovery_matches_the_uuid_case_insensitively() {
+        let cfg = test_config_with_three_targets();
+        let r = cfg.derive_recovery(&BOOTED_B.to_uppercase()).unwrap();
+        assert_eq!(r.targets[0].label, "system-recovery-B-2tb");
+    }
+
+    #[test]
+    fn derive_recovery_refuses_an_unknown_uuid_naming_the_targets() {
+        let cfg = test_config_with_three_targets();
+        let e = cfg
+            .derive_recovery("00000000-0000-0000-0000-000000000000")
+            .unwrap_err();
+        assert!(
+            e.contains("no target of filesystem 00000000-0000-0000-0000-000000000000"),
+            "{e}"
+        );
+        assert!(
+            e.contains("primary-22tb")
+                && e.contains("system-recovery-A-2tb")
+                && e.contains("system-recovery-B-2tb"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn derive_recovery_refuses_an_ambiguous_uuid() {
+        // Review focus 5: two targets with the same mount_uuid (a hand edit).
+        let mut cfg = test_config_with_three_targets();
+        cfg.targets[0].mount_uuid = cfg.targets[2].mount_uuid.clone();
+        let e = cfg.derive_recovery(BOOTED_B).unwrap_err();
+        assert!(
+            e.contains("two targets")
+                && e.contains("primary-22tb")
+                && e.contains("system-recovery-B-2tb"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn derive_recovery_output_validates_and_round_trips() {
+        let cfg = test_config_with_three_targets();
+        let r = cfg.derive_recovery(BOOTED_B).unwrap();
+        assert!(r.validate().is_empty(), "{:?}", r.validate());
+        let again = Config::from_toml(&r.to_toml().unwrap()).unwrap();
+        assert!(again.general.recovery_drive);
+        assert_eq!(again.targets.len(), 3);
+        assert_eq!(again.targets[0].label, "system-recovery-B-2tb");
+    }
+
+    #[test]
+    fn validate_still_requires_a_source_when_not_a_recovery_drive() {
+        let mut cfg = test_config_with_three_targets();
+        cfg.sources.clear();
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|e| e.contains("No backup sources"))
+        );
+    }
+
     fn minimal_toml(extra: &str) -> String {
         format!(
             r#"
