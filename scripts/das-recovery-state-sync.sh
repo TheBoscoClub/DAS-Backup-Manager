@@ -192,11 +192,10 @@ data_stamp=${root_snap##*.}
 if [[ "$stamp" < "$data_stamp" ]]; then
     # The state is older than the data: catch up in the background.
     say "state $stamp is older than the newest data $data_stamp: starting an incremental index catch-up"
-    # walk wants a target ROOT (it holds source dirs such as nvme/) and mounts
-    # it itself by mount_uuid from the derived configuration, independent of
-    # $TOP (which is unmounted when this script exits). The derived config
-    # lists the booted drive's own target first; its mount comes from
-    # `config dump-env` (DAS_TARGET_0_MOUNT), the interface backup-run.sh uses.
+    # walk wants a target ROOT (it holds source dirs such as nvme/). The own
+    # target was mounted above at subvolid=5 (read-only, by UUID) and verified,
+    # so walk's --config mount step takes its already-mounted branch and never
+    # bind-mounts the booted root.
     env_text=$("$BTRDASD" config dump-env --config "$CONFIG_OUT") || env_text=
     walk_mount=$(
         eval "$env_text"
