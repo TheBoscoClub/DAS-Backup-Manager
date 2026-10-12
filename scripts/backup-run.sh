@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.12.0
-# Date: 2026-10-06
+# Version: 4.13.0
+# Date: 2026-10-12
 #
 # Features:
+#   - State index pass (v4.13.0): after the indexer, run_state_pass() sends
+#     the /var/lib/das-backup state subvolume (snapshot series das-state) to
+#     every mounted target in one btrbk call, so each target's index copy
+#     matches the data it received that night (spec D8). A failed send is a
+#     WARN, an absent target is left out, a dry run sends nothing.
 #   - "Next scheduled:" is never blank (v4.12.0): systemd reports the timer's
 #     next run EMPTY, exit 0, while the timer's own service runs, and the old
 #     one-liner put that blank in the report; next_scheduled() prints
@@ -3038,6 +3043,47 @@ run_indexer() {
     fi
 }
 
+# The second, small send after indexing (spec D8): the state subvolume
+# (/var/lib/das-backup — the index, the records, the history) goes out AFTER
+# the indexer updated it, so every target's copy of the index matches the
+# data it received tonight. One btrbk call, one filter per MOUNTED target
+# (filters are a union), `run` not `dryrun`. $1 is the run mode; a dry run
+# sends nothing. An absent target is left out, not failed; a failed send is
+# a WARN with btrbk's words (the data went out already, only the index copy
+# is a night old) -- never recorded as OK. "nvme" is the root volume's
+# directory on every target (the rendered btrbk.conf's `target <mount>/nvme`).
+run_state_pass() {
+    local mode="${1:-run}"
+    if [[ "$mode" == "dryrun" ]]; then
+        record_op "state" "SKIP" "dry run"
+        return 0
+    fi
+    local filters=() label mnt out why rc start
+    for label in "${!TARGET_MOUNTS[@]}"; do
+        mnt="${TARGET_MOUNTS[$label]}"
+        mountpoint -q "$mnt" 2>/dev/null || continue
+        filters+=("$mnt/nvme/das-state")
+    done
+    if ((${#filters[@]} == 0)); then
+        log_warn "State pass: no target mounted -- skipping"
+        record_op "state" "SKIP" "no target mounted"
+        return 0
+    fi
+    log_info "Sending the state subvolume after indexing (${#filters[@]} target(s))..."
+    start=$SECONDS
+    if out=$(btrbk -c "$DAS_BTRBK_CONF" run "${filters[@]}" 2>&1); then
+        record_op "state" "OK" "$((SECONDS - start))s, ${#filters[@]} target(s)"
+        log_info "State subvolume sent: $((SECONDS - start))s"
+    else
+        rc=$?
+        why=$(printf '%s\n' "$out" | grep -m1 -iE 'error|fail' || true)
+        [[ -n "$why" ]] || why=$(printf '%s\n' "$out" | tail -n1)
+        record_op "state" "WARN" "state send failed: ${why:-btrbk exit $rc}"
+        log_warn "State subvolume send failed: ${why:-no output} -- the targets' index copy is a night old"
+    fi
+    return 0
+}
+
 # ============================================================================
 # EMAIL REPORT
 # ============================================================================
@@ -3119,6 +3165,7 @@ BACKUP OPERATIONS
   Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
   Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
+  State index pass      ${OP_STATUS[state]:-N/A}  (${OP_STATUS[state_detail]:-n/a})
   Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
   Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
   Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})
@@ -4035,6 +4082,7 @@ main() {
         update_boot_subvolumes "$force_full"
         show_stats
         run_indexer
+        run_state_pass "$mode"
 
         # Record growth data — must still run before unmount (writes to
         # GROWTH_LOG using live per-target usage figures).
