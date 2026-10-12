@@ -419,7 +419,17 @@ Subvolumes are an array of tables, `[[source.subvolumes]]`, one per subvolume (a
 | `name` | string | — | Subvolume path on the volume (e.g., `"@home"`) |
 | `manual_only` | bool | `false` | Flag set by `btrdasd subvol set-manual` / `set-auto` and inherited by nested adoptions. Not consulted by `btrbk.conf` rendering or `backup-run.sh`, so it does not keep a subvolume out of scheduled backups; `btrdasd backup run` (with no `--sources`) skips a source only when every one of its subvolumes is manual-only (tracked as bd `9ry`) |
 | `snapshot_name` | string | derived | Overrides the snapshot name btrbk would derive (adopted entries always carry one) |
+| `after_index` | bool | `false` | Snapshotted and sent only by the backup run's state pass, after the indexer: rendered into `/etc/btrbk/btrbk-state.conf` (beside `btrbk.conf`), never into `btrbk.conf`. For the state subvolume — commented example below |
 | `adopted`, `retired` | date | absent | Written by the backup run; see `[subvolumes]` below |
+
+The state subvolume (`/var/lib/das-backup`, nested in `@`) is sent after indexing, so the targets (and a recovery OS) hold an index as new as the data; one-time setup is in the [Disaster Recovery Guide](DISASTER-RECOVERY-GUIDE.md#the-state-subvolume-on-the-host):
+
+```toml
+[[source.subvolumes]]
+name = "@/var/lib/das-backup"
+snapshot_name = "das-state"   # the series name the state pass sends
+after_index = true            # rendered into btrbk-state.conf, sent after the indexer ran
+```
 
 ### `[[target]]` (array)
 

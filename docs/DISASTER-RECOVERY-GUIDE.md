@@ -29,7 +29,9 @@ This guide is written for users with minimal technical experience. Follow each s
    - [Browse Backup Snapshots](#browse-backup-snapshots)
    - [Restore a Single File](#restore-a-single-file)
    - [Restore an Entire Subvolume](#restore-an-entire-subvolume)
+   - [Restoring from a recovery drive's own copy](#restoring-from-a-recovery-drives-own-copy)
 8. [Keeping the recovery OSes current](#keeping-the-recovery-oses-current)
+   - [What the recovery OS knows at boot](#what-the-recovery-os-knows-at-boot)
 9. [Troubleshooting](#troubleshooting)
 10. [Reference Information](#reference-information)
 
@@ -65,6 +67,45 @@ Every snapshot sits at `<target mount>/<source target_subdir>/<snapshot_name>.<Y
 - **Subvolumes adopted automatically**: every backup run adopts new subvolumes. One nested inside a configured subvolume joins that entry's source (same directory, same targets). Any other lands in a source named `<first source on that volume>-adopted`, sent to the **primary target only** — look under `<primary mount>/<first-source>-adopted/` (e.g. `/mnt/backup-22tb/ssd-adopted/`).
 - **Retired subvolumes**: when a subvolume disappears its entry is marked `retired` and no new snapshots are taken, but its last snapshots stay on each target and are restorable until that target's longest retention window has passed since the retirement date; then the run deletes them.
 - **Boot copies (primary target only)**: the top level of the primary target holds writable `@` and `@home` made from the latest `root-`/`home` snapshots (rebuilt on full runs), plus `@.archive.<TS>` / `@home.archive.<TS>` of the ones they replaced (kept 60 days by default). On a recovery drive, `@` and `@home` are that drive's **own** OS — never restore your system from them.
+
+### The state subvolume on the host
+
+`/var/lib/das-backup` (the index, the run records, the history) is a nested subvolume of `@` with `after_index = true`, snapshotted as `das-state`. A nested subvolume is not inside the `@` snapshot, so it needs its own entry; `after_index` keeps it out of the main `btrbk.conf` and renders it into `/etc/btrbk/btrbk-state.conf` instead (written beside `btrbk.conf` by `btrdasd setup --upgrade`, by the nightly subvolume sync and by every configuration save; removed when no entry has the flag). The reason: the main btrbk run takes the day's snapshot *before* the indexer, and btrbk would keep that stale snapshot as the day's. After the indexer, `backup-run.sh` runs the **state pass**: one `btrbk … run <target dir>/das-state` per mounted target, with the configuration named by `DAS_BTRBK_STATE_CONF` (exported by `btrdasd config dump-env`).
+
+**How the entry comes to exist** (once, with the backup lock free):
+
+```bash
+# 1. nothing may run
+systemctl stop das-backup.timer das-backup-full.timer das-scrub.timer das-backup-doctor.timer
+sudo flock -n /run/das-backup.lock true && sudo flock -n /run/das-maintenance.lock true || { echo busy; exit 1; }
+# 2. a nested subvolume beside the directory, filled by reflink (same filesystem: instant, no space)
+sudo btrfs subvolume create /var/lib/das-backup.subvol
+sudo cp -a --reflink=always /var/lib/das-backup/. /var/lib/das-backup.subvol/
+# 3. swap, keeping the old directory until the next run proved the new one
+sudo mv /var/lib/das-backup /var/lib/das-backup.dir-before-subvol && sudo mv /var/lib/das-backup.subvol /var/lib/das-backup
+sudo btrfs subvolume show /var/lib/das-backup | head -3   # must print a subvolume, not an error
+sudo sqlite3 /var/lib/das-backup/backup-index.db 'pragma quick_check;'   # ok
+# 4. the entry: sync adopts nested subvolumes (backup.md); give it the clean snapshot name
+sudo btrdasd subvol sync --config /etc/das-backup/config.toml
+sudo grep -n -A3 'name = "@/var/lib/das-backup"' /etc/das-backup/config.toml   # the adopted entry
+# add `snapshot_name = "das-state"` AND `after_index = true` to that entry by hand, then:
+sudo btrdasd config validate && sudo btrdasd setup --upgrade   # re-renders btrbk.conf and btrbk-state.conf
+sudo grep -n -B1 'snapshot_name       das-state' /etc/btrbk/btrbk-state.conf        # the rendered entry
+systemctl start das-backup.timer das-backup-full.timer das-scrub.timer das-backup-doctor.timer
+```
+
+If `subvol sync` does not adopt a subvolume nested three directories deep, add the entry with `sudo btrdasd subvol add nvme @/var/lib/das-backup` and set the snapshot name the same way. `/var/lib/das-backup.dir-before-subvol` is deleted after the first clean run that reports the state pass.
+
+**The report row `State index pass`** (and the matching line in the log):
+
+| Row | Meaning |
+| --- | --- |
+| `OK` — `<N>s, <k> target(s), <bytes> total` (or `bytes unknown`) | the state was sent to every mounted target; the bytes are the targets' used-space growth, `bytes unknown` when a reading failed or the used space fell (a prune in the same run) |
+| `WARN` — `state send failed: …` | the send failed; **the targets' index copy is a night old** (the previous state is still there; a recovery OS catches up at boot) |
+| `SKIP` — `no das-state entry in btrbk.conf (the state subvolume is not configured yet)` | not set up (the steps above) |
+| `SKIP` — `das-state entry declares no target` | the entry is rendered but sends nowhere |
+| `SKIP` — `no target mounted` | none of its targets was mounted |
+| `SKIP` — `dry run` | `--dryrun` |
 
 ### Backup Schedule
 
@@ -1075,6 +1116,20 @@ sudo umount /mnt/snapshot /mnt/target
 - Boot entries in `/boot/loader/entries/` — root UUID must be correct
 - Regenerate initramfs, with the ESP mounted inside the restored root first — where `/boot` is the ESP (as on the author's system), skipping the mount writes the initramfs into the subvolume's own `/boot` directory, which the bootloader never reads. Method 1 (`/mnt/target` is the top level): `sudo mount LABEL=EFI /mnt/target/@/boot && sudo arch-chroot /mnt/target/@ mkinitcpio -P`. Method 2 (with the target mounted again): `sudo mount LABEL=EFI /mnt/target/boot && sudo arch-chroot /mnt/target mkinitcpio -P`. Use your primary ESP's label; unmount it before unmounting the target
 
+### Restoring from a recovery drive's own copy
+
+A recovery drive holds its own short window of the snapshots (see [Where Each Backup Lives on a Target](#where-each-backup-lives-on-a-target)). When the host is gone and you boot a recovery drive, the 22 TB pair may not be attached; restore from what this drive holds.
+
+- **GUI.** The helper resolves the snapshot you picked to a copy present on this machine: on a recovery drive, the booted drive's own target first, then any other mounted target that holds the same snapshot. If none does, the restore stops with: `No copy of snapshot … is present on this machine (the target it was indexed from is not mounted, and no other target holding it is)`. Attach and mount a target that holds it, or pick a snapshot the drive has.
+- **CLI.** Mount the drive's partition 2 read-only (by UUID, as in [Browse Backup Snapshots](#browse-backup-snapshots)) unless the backup tooling already mounted it, and name the snapshot under its mount:
+
+  ```bash
+  sudo btrdasd restore file /mnt/backup-system-recovery-A/nvme/root-.20261002T1500 /mnt/restore etc/fstab
+  ```
+
+  On a recovery drive the destination must be `/mnt/restore` or `/home/restore-test` (see [What the recovery OS knows at boot](#what-the-recovery-os-knows-at-boot)).
+- **What the drive has.** Only the sources whose `target_labels` is empty reach a recovery drive, with its short retention. **Bulk subvolumes (media, VM images) are on the 22 TB pair only**; restoring one needs that pair.
+
 ---
 
 ## Keeping the recovery OSes current
@@ -1424,6 +1479,31 @@ grep -A8 'label = "system-recovery-A-2tb"' /etc/das-backup/config.toml | grep mo
    ```
 
 4. Reboot into the same recovery drive and confirm it comes up — boot menu entry, kernel, login. Only then go back to the host.
+
+### What the recovery OS knows at boot
+
+A recovery drive's OS is its own install, so by itself it knows nothing of your sources, your targets or your backup index. Two things bring it up to date at every boot, run by `das-recovery-state-sync.service` (script `/usr/lib/das-backup/das-recovery-state-sync.sh`), and both come from what the backup runs already sent to the drive's own backup partition (partition 2):
+
+- **The state.** `/var/lib/das-backup` (the search index, the run records, the history) is replaced by a reflink copy of the newest received `das-state.<stamp>` snapshot — the same btrfs, so it is instant and costs no space. Search and the restore browser in the GUI work on the host's index, as of the last backup run.
+- **The configuration.** The host's `config.toml` is read from the newest received `root-.<stamp>` snapshot (`etc/das-backup/config.toml`) and derived into this OS's `/etc/das-backup/config.toml` by `btrdasd config derive-recovery --from <file> --booted-uuid <uuid>`. Every target is kept, the one this drive booted from first, so the GUI resolves a snapshot to the drive's own copy; no sources are kept; email, scrub and the boot step are off; `[general] recovery_drive = true`. Restores are allowed only under **`/mnt/restore`** and **`/home/restore-test`** — nowhere else (system paths stay refused whatever the file says). Create the destination first (`sudo mkdir -p /mnt/restore`).
+
+Only a *complete* receive counts: a snapshot that is not read-only, or has no Received UUID (an interrupted `btrfs receive`), is skipped, with a line in the journal. Nothing is replaced until both the state copy and the derived configuration are ready; each is swapped in whole (`mv --exchange` where coreutils has it, else set aside and restored on failure), so a failure leaves what was there — never an empty database.
+
+**The catch-up.** The state pass of a backup run sends the state after the indexer finished, so normally the state is as new as the data. When the newest `das-state` stamp is *older* than the newest `root-` stamp (a night the state pass failed — see [The state subvolume on the host](#the-state-subvolume-on-the-host)), the script starts `btrdasd walk <the drive's own target mount> --db /var/lib/das-backup/backup-index.db` in the background as the transient unit `das-recovery-state-catchup`; search is complete once it ends (`systemctl status das-recovery-state-catchup`). When the stamps agree, no catch-up runs.
+
+**The status file** `/run/das-recovery-state/status` holds one line:
+
+| Status | Meaning |
+| --- | --- |
+| `synced <stamp>` | state and configuration are in place; the state is as new as the data |
+| `synced <stamp>; catch-up index running (data <stamp>)` | in place, but a night behind; the background index walk is running — the second stamp is the data's |
+| `synced <stamp>; catch-up NOT started: …` | in place, but the walk could not be started (the reason follows: `no target mount from dump-env` or `systemd-run failed`); search is current to the first stamp only |
+| `no state snapshot` | no `das-state` snapshot has been received on this drive yet; the previous state is left as it was. The next backup run that has this drive attached sends one |
+| `failed: …` | nothing was replaced; the reason follows (no received `root-` snapshot, `derive-recovery` refused — no target, or two, with this filesystem's UUID — or a copy or swap step failed). The same words are in the journal: `journalctl -u das-recovery-state-sync` |
+
+`no state snapshot` is the normal state of a drive until the first backup run after the state subvolume was set up; it is not damage.
+
+**Not on by default.** The unit is installed with the package but not enabled, and it is gated by `ConditionPathExists=/etc/das-backup/recovery-drive`: on the host the marker does not exist, so the unit cannot run there. Writing the marker and enabling the unit is the job of recovery-drive provisioning (plan 2), not of the package.
 
 ---
 

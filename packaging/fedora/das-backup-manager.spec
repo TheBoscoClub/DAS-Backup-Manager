@@ -56,6 +56,7 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_datadir}/dbus-1/system-services/org.dasbackup.Helper1.service
 %{_datadir}/polkit-1/actions/org.dasbackup.policy
 %{_unitdir}/btrdasd-helper.service
+%{_unitdir}/das-recovery-state-sync.service
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg
 %{_mandir}/man1/btrdasd.1*
 

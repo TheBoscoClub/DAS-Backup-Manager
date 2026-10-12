@@ -145,6 +145,7 @@ Checked before any directory is created, both roots compared **after resolution*
 ## Content Indexer
 - Database `/var/lib/das-backup/backup-index.db`; span-based storage, FTS5 search, incremental.
 - Soft-fail: indexing errors do not abort the backup, but must still reach the report.
+- **The state subvolume (`/var/lib/das-backup`, `after_index = true`) is sent after indexing** by `run_state_pass` from `/etc/btrbk/btrbk-state.conf`, never by the main btrbk run (which would keep a pre-index snapshot as the day's). A `State index pass` WARN means the targets' index copy is a night old. A recovery OS reads it at boot through `das-recovery-state-sync` (guide: "What the recovery OS knows at boot").
 
 ## Scrub Ownership Boundary — exclusive in both directions (user decision 2026-08-02)
 - **This project is the ONLY thing that scrubs the three `[scrub].targets` DAS filesystems**, and
