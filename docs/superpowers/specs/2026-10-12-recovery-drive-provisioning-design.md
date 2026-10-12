@@ -128,12 +128,13 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
 
 - **Package**: `das-backup-manager` built from `packaging/arch/PKGBUILD` at a **pinned
   release tag** and installed with pacman inside the chroot. The tag must exist as a
-  GitHub release at rebuild time. **D3 (decided 2026-10-12)**: the rebuild pins the release
-  cut **after** the provisioning work is complete, because that work (state-sync unit,
-  recovery-mode config, guest installer, previous-root entry) is itself package content a
-  drive needs; an earlier tag would be missing it. Order: finish the code → release →
-  rehearse against that release → rebuild. `0.7.23.0`'s staged promotion is unrelated and
-  stays on the operator's own schedule.
+  GitHub release at rebuild time. **D3 (decided 2026-10-12)**: the rebuild pins **`0.7.23.0`**,
+  which stays the *staged* release while the provisioning work (state-sync unit,
+  recovery-mode config, guest installer, previous-root entry — all package content a drive
+  needs) rolls into it; it is promoted to GitHub only after that work is finished, with the
+  `.staged-release` breadcrumb advanced to the final commit. The published tag stays
+  `0.7.22.3` until then. Order: finish the code → promote 0.7.23.0 → rehearse against it →
+  rebuild.
 - **Timers masked**: `das-backup.timer`, `das-backup-full.timer`, `das-scrub.timer`,
   `das-backup-doctor.timer`, and `btrbk.timer`/`btrbk.service`, so the boot record reads
   `btrbk at boot: no`.
@@ -329,7 +330,7 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 | --- | --- | --- |
 | D1 | previous-root loader entry | **accepted** |
 | D2 | sshd on the drives | on, key-only, both drives |
-| D3 | package release to pin | **the release cut after this work; promote nothing for it** |
+| D3 | package release to pin | **0.7.23.0, staged until the work is done, then promoted** |
 | D4 | recovery-mode config: template vs `btrdasd --recovery` | template now |
 | D5 | printing stack | keep (already there; harmless) |
 | D6 | Flatpak runtime preinstalled | no; add on a named need |
