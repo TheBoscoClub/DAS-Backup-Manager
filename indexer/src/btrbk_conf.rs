@@ -240,10 +240,7 @@ fn save_config_and_btrbk_conf_with(
     // The state series' file goes beside it, or goes away when no entry needs
     // it (a missing file is not an error); a failure here undoes the first
     // write as a failed config save does.
-    let state_written = match render_state_conf(cfg) {
-        Some(text) => crate::fsutil::write_atomic(&state_path, &text).map_err(Into::into),
-        None => remove_if_present(&state_path),
-    };
+    let state_written = write_or_remove(&state_path, render_state_conf(cfg).as_deref());
     // Every error here names its own file; the messages add no path.
     let failure = state_written.err().or_else(|| save(cfg, config_path).err());
     if let Some(e) = failure {
@@ -280,6 +277,16 @@ fn read_previous(path: &Path) -> Result<Option<String>, Box<dyn std::error::Erro
     }
 }
 
+/// Write `text` to `path`, or remove the file when there is none (already
+/// absent is not an error). The one rule for the state conf, shared by the
+/// sync writer above and `btrdasd setup`'s install, so the two cannot drift.
+pub fn write_or_remove(path: &Path, text: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    match text {
+        Some(text) => Ok(crate::fsutil::write_atomic(path, text)?),
+        None => remove_if_present(path),
+    }
+}
+
 /// Remove a file; already absent is the wanted state, not an error.
 fn remove_if_present(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     match std::fs::remove_file(path) {
@@ -291,10 +298,7 @@ fn remove_if_present(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Put a file back as it was: its old text, or gone.
 fn restore(path: &Path, previous: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    match previous {
-        Some(text) => Ok(crate::fsutil::write_atomic(path, text)?),
-        None => remove_if_present(path),
-    }
+    write_or_remove(path, previous)
 }
 
 /// What became of a configuration edit attempted under the backup singleton.

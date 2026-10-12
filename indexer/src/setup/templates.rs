@@ -5,7 +5,7 @@
 
 use super::config::*;
 
-pub use buttered_dasd::btrbk_conf::{GENERATED_HEADER, render_btrbk_conf};
+pub use buttered_dasd::btrbk_conf::{GENERATED_HEADER, render_btrbk_conf, render_state_conf};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -445,6 +445,9 @@ pub struct GeneratedFiles {
     pub files: Vec<(String, String)>,
 }
 
+/// Where `setup` installs the state series' btrbk config, beside the main one.
+pub const STATE_CONF_PATH: &str = "/etc/btrbk/btrbk-state.conf";
+
 impl GeneratedFiles {
     /// Generate all operational files from a Config. Includes systemd units OR cron
     /// entries based on init system, plus btrbk.conf, the backup scripts and the udisks-ignore
@@ -458,6 +461,11 @@ impl GeneratedFiles {
             "/etc/btrbk/btrbk.conf".to_string(),
             render_btrbk_conf(config),
         ));
+        // Its companion for the entries sent after the indexer ran (bd 9eq9);
+        // present only when some entry is flagged `after_index`.
+        if let Some(state) = render_state_conf(config) {
+            files.push((STATE_CONF_PATH.to_string(), state));
+        }
 
         // Real production scripts (embedded in binary, config-driven via eval),
         // installed flat — matches cmake's install layout (single canonical
@@ -905,6 +913,46 @@ mod tests {
         assert!(
             !manifest.contains("das-backup/scripts/"),
             "scripts/ subdir layout must not reappear — flat layout is canonical"
+        );
+    }
+
+    fn with_state_entry(mut config: Config) -> Config {
+        config.sources[0].subvolumes.push(SubvolConfig {
+            name: "@/var/lib/das-backup".to_string(),
+            snapshot_name: Some("das-state".to_string()),
+            after_index: true,
+            ..Default::default()
+        });
+        config
+    }
+
+    fn generated_text<'a>(g: &'a GeneratedFiles, path: &str) -> Option<&'a str> {
+        g.files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, t)| t.as_str())
+    }
+
+    #[test]
+    fn an_after_index_entry_generates_the_state_conf_beside_the_main_one() {
+        let config = with_state_entry(test_config());
+        let generated = GeneratedFiles::generate(&config);
+        let main = generated_text(&generated, "/etc/btrbk/btrbk.conf").unwrap();
+        let state = generated_text(&generated, "/etc/btrbk/btrbk-state.conf")
+            .expect("the state conf is generated");
+        assert!(!main.contains("das-state"), "{main}");
+        assert!(state.contains("snapshot_name       das-state"), "{state}");
+    }
+
+    #[test]
+    fn no_after_index_entry_generates_only_the_main_conf() {
+        let generated = GeneratedFiles::generate(&test_config());
+        assert!(generated_text(&generated, "/etc/btrbk/btrbk.conf").is_some());
+        assert!(
+            !generated
+                .files
+                .iter()
+                .any(|(p, _)| p.contains("btrbk-state.conf"))
         );
     }
 
