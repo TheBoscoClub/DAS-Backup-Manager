@@ -3169,7 +3169,7 @@ run_state_pass() {
     local before=0 after=0 v known=true out why rc start
     for mnt in "${mounts[@]}"; do
         v=$(get_used_bytes "$mnt") || v=""
-        [[ "$v" =~ ^[0-9]+$ ]] && before=$((before + v)) || known=false
+        [[ "$v" =~ ^[[:digit:]]+$ ]] && before=$((before + v)) || known=false
     done
     log_info "Sending the state subvolume after indexing (${#filters[@]} target(s))..."
     start=$SECONDS
@@ -3179,7 +3179,7 @@ run_state_pass() {
         for mnt in "${mounts[@]}"; do
             btrfs filesystem sync "$mnt" >/dev/null 2>&1 || known=false
             v=$(get_used_bytes "$mnt") || v=""
-            [[ "$v" =~ ^[0-9]+$ ]] && after=$((after + v)) || known=false
+            [[ "$v" =~ ^[[:digit:]]+$ ]] && after=$((after + v)) || known=false
         done
         # Used space that FELL (the same run can prune older das-state copies)
         # is not a size: a clamped 0 would be a made-up measurement.

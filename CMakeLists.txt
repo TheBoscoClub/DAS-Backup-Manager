@@ -146,9 +146,12 @@ install(PROGRAMS
     DESTINATION "${DAS_SCRIPT_DIR}"
 )
 
-# Installed whether or not the helper is built: the unit runs a script, not the helper.
+# Shipped beside the script, NOT into lib/systemd/system: `btrdasd setup` is
+# the only writer of das-* units on a host (bd DAS-Backup-Manager-7rf), and
+# this one belongs to a recovery drive's OS, where provisioning installs it
+# into /etc/systemd/system and enables it (plan 2). The host never runs it.
 install(FILES systemd/das-recovery-state-sync.service
-    DESTINATION lib/systemd/system)
+    DESTINATION "${DAS_SCRIPT_DIR}")
 
 install(FILES
     config/btrbk.conf
