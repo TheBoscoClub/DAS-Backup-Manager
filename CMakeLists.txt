@@ -335,6 +335,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_state_pass.sh
     )
     add_test(
+        NAME shell-run-indexer
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_run_indexer.sh
+    )
+    add_test(
         NAME shell-script-rewrite
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_script_rewrite.sh
     )
