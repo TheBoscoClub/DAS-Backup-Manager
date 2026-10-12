@@ -54,7 +54,7 @@ are automatically installed; they must be present before running the scripts.
 |------|-----------------|---------|---------|
 | `btrbk` | >= 0.32 (AUR/pacman) | `backup-run.sh`, `backup-verify.sh` | BTRFS snapshot creation and send/receive to DAS targets |
 | `btrfs-progs` | system (`btrfs` CLI) | `backup-run.sh`, `backup-verify.sh`, `btrdasd setup`, `btrdasd scrub`, `btrdasd doctor` | BTRFS subvolume operations, `btrfs scrub start`/`status`, subvolume listing for drift detection |
-| `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh`, `das-partition-drives.sh`, `btrdasd health` | Drive serial number detection, SMART health, temperature, power-on hours; the self-test gate before partitioning (`das-partition-drives.sh --run` refuses unless every drive's most recent self-test passed: ATA `Completed without error`, SCSI `Completed`; read as `smartctl -b exit -c -l selftest`, so a test running now — the drive's current execution status, which its log can lag — or an invalid SMART checksum refuses it too) |
+| `smartmontools` | system (`smartctl`) | `backup-run.sh`, `backup-verify.sh`, `das-wipe-all-drives-and-partition-from-scratch.sh`, `btrdasd health` | Drive serial number detection, SMART health, temperature, power-on hours; the self-test gate before partitioning (`das-wipe-all-drives-and-partition-from-scratch.sh --run` refuses unless every drive's most recent self-test passed: ATA `Completed without error`, SCSI `Completed`; read as `smartctl -b exit -c -l selftest`, so a test running now — the drive's current execution status, which its log can lag — or an invalid SMART checksum refuses it too) |
 | `rsync` | system | Manual disaster-recovery restores only (see `docs/DISASTER-RECOVERY-GUIDE.md`) | Not used by any automated script — ESP synchronization was removed 2026-04-10/12 (`.claude/rules/esp-safety.md`) |
 | `s-nail` (mailx) | system | `backup-run.sh`, `indexer/src/report.rs` | Submits email backup reports to the local mail relay; invoked as `mailx` |
 | a local mail relay | system (optional) | `backup-run.sh`, `indexer/src/report.rs` | Anything accepting SMTP on `[email].smtp_host:smtp_port` — a Postfix null-client smarthost here. Required only when `[email].enabled = true`; without it reports are written to disk and the send is logged as failed |
@@ -63,7 +63,7 @@ are automatically installed; they must be present before running the scripts.
 | `date` | system (coreutils) | All scripts | Timestamp generation and ISO 8601 epoch arithmetic |
 | `awk` | system (gawk) | All scripts | Parsing smartctl and df output |
 | `bash` | >= 4.0 | All scripts | Runtime shell; scripts use `#!/bin/bash` with `set -euo pipefail` |
-| `parted` / `mkfs.btrfs` / `mkfs.fat` | system | `das-partition-drives.sh` | Initial drive partitioning and formatting (one-time setup only) |
+| `parted` / `mkfs.btrfs` / `mkfs.fat` | system | `das-wipe-all-drives-and-partition-from-scratch.sh` | Initial drive partitioning and formatting (one-time setup only) |
 | `mbuffer` | system (optional) | `btrbk` (via config) | Buffered stream transfers with progress; btrbk uses it if configured |
 | `lsblk` | system (util-linux) | `btrdasd setup` | Block device detection via JSON output |
 | `blkid` / `findmnt` | system (util-linux) | `backup-run.sh`, `btrdasd` (mount, doctor, scrub) | Finds a target by `mount_uuid` (`blkid -U`) and checks what is mounted where |

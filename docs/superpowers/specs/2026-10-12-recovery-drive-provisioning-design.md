@@ -28,15 +28,21 @@ Operator decisions, 2026-10-11/12, that this design implements:
 - **btrdasd, the helper and ButteredDASD, with a current copy of the index and state, are
   on the drives**, so a restore needs no manual digging in the backup partitions.
 - `@rescue` (a February 2026 second Arch root nothing can boot) is **dropped**.
+- **The rebuild replaces only the OS; it never reformats a partition that holds backup data,
+  on any disk** (operator, 2026-10-12). `das-wipe-all-drives-and-partition-from-scratch.sh` (renamed from
+  `das-partition-drives.sh` the same day so its effect is in its name) is a fresh-enclosure
+  tool that reformats every configured drive at once, the 22 TB pair included; the rebuild
+  does not call it and it gains no one-drive mode. A separate mechanism replaces the OS
+  subvolumes on the recovery drive's existing btrfs and reformats only its ESP, inside the VM.
 - Nothing is rebuilt until this design and the plan that follows it are reviewed.
 
 ## 2. Hard constraints (not design choices)
 
 1. **ESP ownership** (`~/.claude/rules/esp-ownership.md`, `.claude/rules/esp-safety.md`):
-   only this project touches a `RECOV-ESP-*` partition. The host formats it with
-   `scripts/das-partition-drives.sh` (an existing, permitted step of this project) and
-   **writes nothing else to it, ever**. Every file on it — bootloader, kernel, initramfs,
-   microcode, loader entries — is written by the drive's own OS running inside its VM
+   only this project touches a `RECOV-ESP-*` partition, and **the host writes nothing to
+   it, ever — not even a format**. The ESP is re-formatted and populated — bootloader,
+   kernel, initramfs, microcode, loader entries — by the live system or the drive's own OS
+   running inside its VM
    (`recovery-os-updater-<label>`), exactly as the upgrade pipeline already does.
    No ESP discovery loop anywhere: the drive is named by serial, never found by type.
 2. **The recovery OS never runs btrbk, btrdasd's timers or a scrub.** Its boot record must
@@ -59,17 +65,18 @@ Operator decisions, 2026-10-11/12, that this design implements:
 
 ## 3. What a rebuilt drive looks like
 
-### 3.1 Partition layout (unchanged; `das-partition-drives.sh`)
+### 3.1 Partition layout (unchanged; the partition table is not touched)
 
-| Partition | Size | FS | Label | Written by |
+| Partition | Size | FS | Label | Rebuild action |
 | --- | --- | --- | --- | --- |
-| p1 | 1.5 GiB | FAT32 | `RECOV-ESP-<bay>` | formatted by the host (this project); populated only by the drive's OS in its VM |
-| p2 | rest | btrfs | `das-backup-system-recovery-<A\|B>` | formatted by the host; OS subvolumes written in the VM; backups received by btrbk |
+| p1 | 1.5 GiB | FAT32 | `RECOV-ESP-<bay>` | **re-formatted inside the VM** by the live system (FAT32, bay label), then populated by the new OS in its chroot |
+| p2 | rest | btrfs | `das-backup-system-recovery-<A\|B>` | **never formatted**; the OS subvolumes on it are replaced, every received backup subvolume stays |
 
-`das-partition-drives.sh` today partitions **every** drive the configuration names. The
-rebuild touches one drive. It gains `--only <serial>`, accepted only for a `role = "mirror"`
-drive, refusing any other serial and refusing when more than one serial is given. The
-SMART-self-test gate stays.
+No partition table is written, no btrfs filesystem is made, and no drive other than the one
+lent to the VM is reachable from the live system (the VM has exactly that one disk and
+the ISO). p2 is identified by the `mount_uuid` `config.toml` names for the target, as
+every session is; a p2 whose UUID differs is a refusal before anything is written.
+`das-wipe-all-drives-and-partition-from-scratch.sh` remains the fresh-enclosure tool and is not used.
 
 ### 3.2 Subvolumes on p2 (top level)
 
@@ -80,7 +87,13 @@ SMART-self-test gate stays.
 | `@.pre-update.<stamp>` | written by the upgrade pipeline, newest two kept (exists today) |
 | received backup subvolumes | written by btrbk from the host, as today; **re-seeded by the first run after the rebuild** |
 
-Not recreated: `@rescue`, `@.archive.*`, `@.half-upgraded.*`.
+**OS subvolumes replaced** (an explicit allowlist of names; nothing else is touched):
+`@`, `@home`, `@.pre-update.*`, `@.half-upgraded.*`, `@rescue`. Each is renamed to
+`<name>.replaced.<stamp>` first and deleted only after Phase 3's first boot succeeded, so a
+failed provision can be undone by renaming back (the old OS is intact until then).
+**Everything not on that list is kept untouched**: every received backup subvolume, and
+**OPEN D7** the two `@.archive.*` boot archives on A (June 2026, left for manual review by
+the pruner's rule) — keep (default) or delete.
 
 ### 3.3 Boot (systemd-boot, written from inside the VM)
 
@@ -185,12 +198,13 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
 - A `--dry-run` prints the plan: serial, device, labels, hostname, bay, entry titles,
   package count, and exits.
 
-### Phase 1 — partition (host; this project's existing tool)
+### Phase 1 — nothing on the host
 
-- `das-partition-drives.sh --run --only <serial>` after its SMART gate. From here the
-  drive holds no backups: the first backup run afterwards is a **full send** (≈ 585 GiB per
-  drive today; at the measured 11–20 MiB/s incremental-run rates, 8–15 hours; the full-send
-  rate will be measured on the first rebuild and recorded in `THROUGHPUT-BASELINE.md`).
+- The host writes nothing to the drive. There is no partitioning phase: the partition table,
+  p2's filesystem and every received backup subvolume survive the rebuild, so the first
+  backup run afterwards is an **ordinary incremental**, not a full send. The SMART self-test
+  gate of the wipe tool is reproduced in preflight (same rule: the newest self-test PASSED,
+  none running), since a drive about to be rewritten should be healthy.
 
 ### Phase 2 — install (inside the drive's VM, from the live ISO)
 
@@ -201,8 +215,11 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
   steps run, each step a transient unit in the live system with its output and exit
   status polled (the ea3u-hardened probe).
 - Steps (each a function writing a `sh` script, like `step_egress`): `egress` (the same
-  check), `mount` (p2 by PARTUUID at `/mnt/target`, create `@` and `@home`, mount them,
-  p1 at `/mnt/target/boot`), `pacstrap` (the live system's own CachyOS repo order, the
+  check), `replace-os` (p2 by `mount_uuid` at
+  `/mnt/top` with `subvolid=5`; refuse if its UUID is not the configured one or if it holds
+  no received backup subvolume — a wrong or empty disk; rename the allowlisted OS
+  subvolumes to `*.replaced.<stamp>`; create `@` and `@home`; format p1 FAT32 with the bay
+  label; mount `@` at `/mnt/target`, `@home` and p1 under it), `pacstrap` (the live system's own CachyOS repo order, the
   baseline list), `configure` (fstab by UUID, hostname, locale, tz, keymap, user, sudoers,
   autologin, pacman.conf order check, mkinitcpio preset), `package` (`pacman -U` the
   project package in the chroot, mask the timers, write the recovery-mode config, the
@@ -212,8 +229,10 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
   entries name is on the ESP; every fstab device resolves; `btrdasd recovery-os inspect`
   against the new root says `btrbk at boot: no` and names the agent), `unmount`, power off.
 - Anything unexpected stops it the way the pipeline stops: the live system is powered
-  off, the disk given back, exit 7 naming the step. A stopped provision leaves a drive
-  with a partition table and whatever was written; `provision` is re-runnable from Phase 1.
+  off, the disk given back, exit 7 naming the step. A stopped provision leaves the
+  `*.replaced.<stamp>` subvolumes in place and the backups untouched; `provision --undo
+  <label>` renames them back (refusing if a new `@` booted since); `provision` is
+  re-runnable.
 
 ### Phase 3 — first boot and proof (inside the VM, from the disk)
 
@@ -222,17 +241,18 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
   pipeline's `reboot` step), then: `uname -r` is the installed kernel; the state-sync
   unit reports no snapshot yet and left no database (the "no snapshot" direction of its
   test, observed on a real drive); a screenshot shows the Plasma desktop; `kwin_wayland`
-  and `plasmashell` are running. Power off, give back.
+  and `plasmashell` are running. Then, and only then, the `*.replaced.<stamp>` subvolumes are
+  deleted (inside the VM, by the new OS, named one by one — never a glob over the top
+  level). Power off, give back.
 
-### Phase 4 — re-seed (the ordinary backup run)
+### Phase 4 — the next backup run
 
-- The next nightly run (or `backup-run.sh` by hand) sends every configured subvolume in
-  full to the new p2, records the OS (a `no` record with the agent installed), and the
-  following session is admitted. Only then is the drive back in service; the guide says
-  so, and `provision` prints it as its last line.
+- The next nightly run (or `backup-run.sh` by hand) sends its ordinary incrementals to the
+  untouched received subvolumes, records the new OS (a `no` record with the agent
+  installed), and the following session is admitted. Only then is the drive back in
+  service; the guide says so, and `provision` prints it as its last line.
 
-Then the second drive, only after the first one's re-seed run completed and its record
-reads `no`.
+Then the second drive, only after the first one's run completed and its record reads `no`.
 
 ### Phase 5 — restore proof (operator requirement, 2026-10-12: "the only good backup is a backup that has been successfully restored")
 
@@ -267,7 +287,7 @@ After **both** drives are rebuilt and re-seeded, each drive proves a real restor
 
 | Component | Where | Tests |
 | --- | --- | --- |
-| `--only <serial>` for one mirror drive | `scripts/das-partition-drives.sh` | `tests/test_esp_label_derivation.sh` style: refuses a non-mirror serial, two serials, unknown serial; plans exactly one drive |
+| `scripts/recovery-os-install.sh` — the guest-side installer (runs in the live system; `replace-os`, `pacstrap`, `configure`, `package`, `boot`, `repos`, `verify`, `unmount`, `undo`) | new file, installed under `/usr/lib/das-backup/` and shipped into the VM by the driver | `tests/test_recovery_os_install.sh` against a fixture tree and stub tools: the allowlist (a received subvolume is never renamed or deleted), the UUID refusal, the empty-disk refusal, `undo` refusing after a new boot, every step's failure direction |
 | `provision` subcommand, steps, dry run, history row | `scripts/recovery-os-vm.sh` | `tests/test_recovery_os_vm.sh` stubs (new section): step order, every refusal, the generated step scripts run standalone against stub tools as the `repos`/`egress` tests do |
 | `das-recovery-state-sync.service` + script | `config/` or `scripts/`, installed by the package | a bash test with a fixture btrfs-like tree: copies from the newest snapshot; no snapshot / unreadable → refuses, previous copy intact |
 | recovery-mode `config.toml` template | `config/recovery-config.toml` | `btrdasd config validate` in CI against it |
@@ -285,11 +305,12 @@ desktop and a `no` record. That is the falsification of the procedure itself.
 
 | Risk | Bound |
 | --- | --- |
-| wrong drive wiped | serial pinned at every phase; `--only` refuses anything but one mirror drive; dry run prints the device; partition step keeps its SMART gate |
+| wrong drive touched | the VM holds exactly the one disk the session lent it, by serial; p2 is refused unless its UUID is the configured target's and it holds received backups; no partition table and no btrfs format anywhere in the flow |
+| backup data lost on the drive | nothing on p2 is deleted except names on the OS allowlist, and those only after the new OS booted; `*.replaced.<stamp>` keeps the old OS until then; the suite's falsification renames a received subvolume to look like an OS one and watches the allowlist refuse it |
 | both recovery drives unusable at once | preflight refuses unless the other drive's last session is `clean` and its record `no` |
 | host writes the ESP | the host only formats it; every write is a guest-exec inside the VM; the guard's bind of btrbk is the same mechanism the pipeline trusts |
 | the live ISO changes shape (no agent, different tools) | ISO pinned by sha256; preflight checks `qemu-guest-agent` and `pacstrap` exist in the live system before Phase 1 |
-| re-seed takes a long time | expected and reported; the drive is "not in service" until the first run completed; the second drive waits |
+| the next run is a full send after all | it is not: received subvolumes are untouched; the first run's report is checked for incremental sends, and a full send is a finding, not a plan |
 | the state-sync leaves a stale index | by design it is as current as the last run; the unit prints the snapshot's date on the desktop notification and `btrdasd health` shows it |
 | timers run on the recovery OS | masked at provisioning; `btrdasd recovery-os inspect` in Phase 2 and the nightly record both must read `no`, or the procedure fails |
 
@@ -308,3 +329,4 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 | D4 | recovery-mode config: template vs `btrdasd --recovery` | template now |
 | D5 | printing stack | keep (already there; harmless) |
 | D6 | Flatpak runtime preinstalled | no; add on a named need |
+| D7 | the two `@.archive.*` boot archives on A | keep |

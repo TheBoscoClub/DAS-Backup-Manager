@@ -197,7 +197,7 @@ fn cmake_installed_paths(prefix: &str) -> Vec<String> {
         p("lib/das-backup/backup-run.sh"),
         p("lib/das-backup/backup-verify.sh"),
         p("lib/das-backup/boot-archive-cleanup.sh"),
-        p("lib/das-backup/das-partition-drives.sh"),
+        p("lib/das-backup/das-wipe-all-drives-and-partition-from-scratch.sh"),
         p("lib/das-backup/install-backup-timer.sh"),
         p("lib/das-backup/config/btrbk.conf"),
         p("lib/das-backup/config/das-backup-email.conf.example"),

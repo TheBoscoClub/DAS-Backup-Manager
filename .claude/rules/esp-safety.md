@@ -8,7 +8,7 @@ Two 2 TB drives in the TerraMaster D6-320 (bays 1 and 4) hold **fully independen
 - Serial ZFL41DNY (bay 4, was bay 3 before 2026-05-06): p1 (1.5G, vfat, **LABEL=RECOV-ESP-4**, UUID `6CAB-B04D`, PARTUUID `ef19ce6e-de5e-4623-bed0-8717749916b8`) + p2 (das-backup-system-recovery-B; was `das-backup-system` before the 2026-05-17 rename)
 
 Both ESPs were labelled `BACKUP-ESP` until relabelled in place (vfat UUIDs unchanged). A shared
-label is itself a defect: `scripts/das-partition-drives.sh` (v2.1.0+) derives the unique
+label is itself a defect: `scripts/das-wipe-all-drives-and-partition-from-scratch.sh` (v2.1.0+) derives the unique
 bay-numbered label and refuses on collision (`tests/test_esp_label_derivation.sh`).
 Full account: `.claude/docs/rules-reference/esp-safety.md`.
 

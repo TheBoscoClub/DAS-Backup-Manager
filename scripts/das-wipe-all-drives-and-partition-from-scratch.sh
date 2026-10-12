@@ -1,9 +1,16 @@
 #!/bin/bash
-# das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
+# das-wipe-all-drives-and-partition-from-scratch.sh - WIPE EVERY DAS DRIVE THE CONFIG NAMES AND PARTITION THEM FROM SCRATCH
 # Version: 2.3.5
 # Date: 2026-10-12
 #
-# WARNING: This script DESTROYS ALL DATA on the target drives!
+# WARNING: --run DESTROYS ALL DATA ON EVERY DRIVE config.toml NAMES -- the 22 TB
+#     backup pair AND both recovery drives, backups included -- and partitions
+#     them from scratch. It is the fresh-enclosure tool. It has no one-drive
+#     mode and must never be used to rebuild a recovery drive's OS: that is
+#     done inside the drive's VM without touching any data partition
+#     (docs/superpowers/specs/2026-10-12-recovery-drive-provisioning-design.md).
+#     Renamed from das-partition-drives.sh on 2026-10-12 so the effect is in the name.
+#     --check only prints the plan.
 #     --run refuses unless every drive's most recent SMART self-test PASSED:
 #     ATA "Completed without error" or SCSI "Completed" as the log's newest
 #     entry, with smartctl's exit status flagging nothing beyond bit 2 or 6
@@ -25,8 +32,8 @@
 #     - Whole disk BTRFS
 #
 # Usage:
-#   sudo ./das-partition-drives.sh --check   # Verify drives, show plan
-#   sudo ./das-partition-drives.sh --run     # Execute partitioning
+#   sudo ./das-wipe-all-drives-and-partition-from-scratch.sh --check   # Verify drives, show plan
+#   sudo ./das-wipe-all-drives-and-partition-from-scratch.sh --run     # Execute partitioning
 
 set -euo pipefail
 # ============================================================================

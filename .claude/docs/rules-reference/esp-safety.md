@@ -21,7 +21,7 @@ to:
 - **A single shared label was itself the defect.** `blkid -t LABEL=BACKUP-ESP -o
   device` returned *both* partitions, so any consumer had to guess which
   recovery system it meant. The bay-numbered form is unique per drive and is the
-  form to keep. `scripts/das-partition-drives.sh` (v2.1.0+) derives it per drive
+  form to keep. `scripts/das-wipe-all-drives-and-partition-from-scratch.sh` (v2.1.0+) derives it per drive
   and refuses to run if two targets would collide; `tests/test_esp_label_derivation.sh`
   exercises both the success and the refusal paths.
 

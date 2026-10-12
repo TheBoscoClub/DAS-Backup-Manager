@@ -98,7 +98,7 @@ Either drive can boot independently if the other fails. Nothing syncs one recove
 > reformat — the filesystems are the originals. The bay-numbered form is the
 > correct one to keep: a single shared label made
 > `blkid -t LABEL=BACKUP-ESP -o device` return *both* partitions, so any lookup
-> had to guess which recovery system it meant. `scripts/das-partition-drives.sh`
+> had to guess which recovery system it meant. `scripts/das-wipe-all-drives-and-partition-from-scratch.sh`
 > derives this label per drive and refuses to run if two targets would collide.
 
 ## Role Summary

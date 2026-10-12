@@ -139,7 +139,7 @@ install(PROGRAMS
     scripts/backup-run.sh
     scripts/backup-verify.sh
     scripts/boot-archive-cleanup.sh
-    scripts/das-partition-drives.sh
+    scripts/das-wipe-all-drives-and-partition-from-scratch.sh
     scripts/install-backup-timer.sh
     scripts/recovery-os-vm.sh
     DESTINATION "${DAS_SCRIPT_DIR}"

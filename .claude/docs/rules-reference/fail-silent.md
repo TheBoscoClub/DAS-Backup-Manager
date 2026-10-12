@@ -159,7 +159,7 @@ returning `0` reaches `if (( archive_epoch == 0 )); then log_warn; continue`, so
 an unparsable archive is **skipped, never pruned**.
 
 One real defect was found and fixed: `resolve_fs_label` in
-`das-partition-drives.sh` read `blkid`'s empty output as "unlabelled", which
+`das-wipe-all-drives-and-partition-from-scratch.sh` read `blkid`'s empty output as "unlabelled", which
 conflates *no LABEL* with *blkid could not tell me*. On the second reading the
 caller went on to **write** the fallback label — silently renaming a filesystem,
 the exact renaming that function exists to prevent (`bd 5j7`). Now split by exit
