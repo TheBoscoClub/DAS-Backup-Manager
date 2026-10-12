@@ -346,6 +346,13 @@ pub struct SubvolConfig {
     /// to btrbk; its existing backups expire (`expire.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retired: Option<String>,
+    /// Snapshotted and sent only by the backup run's state pass, AFTER the
+    /// indexer ran (the state subvolume, bd 9eq9): rendered into
+    /// `btrbk-state.conf`, never into the main `btrbk.conf`, so the main run
+    /// cannot take a pre-index snapshot that btrbk would then keep as the
+    /// day's.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub after_index: bool,
 }
 
 impl<'de> Deserialize<'de> for SubvolConfig {
@@ -367,6 +374,8 @@ impl<'de> Deserialize<'de> for SubvolConfig {
                 adopted: Option<String>,
                 #[serde(default)]
                 retired: Option<String>,
+                #[serde(default)]
+                after_index: bool,
             },
         }
 
@@ -381,12 +390,14 @@ impl<'de> Deserialize<'de> for SubvolConfig {
                 snapshot_name,
                 adopted,
                 retired,
+                after_index,
             } => Ok(SubvolConfig {
                 name,
                 manual_only,
                 snapshot_name,
                 adopted,
                 retired,
+                after_index,
             }),
         }
     }
@@ -1064,6 +1075,34 @@ mod tests {
             again.sources[0].subvolumes[1].retired.as_deref(),
             Some("2026-11-14")
         );
+    }
+
+    #[test]
+    fn after_index_round_trips_and_defaults_false() {
+        // Adapted from the plan's `parse_sources_fixture`: the module's own
+        // `minimal_toml` + `source_with` helpers build the document.
+        let extra = format!(
+            "{}[[source.subvolumes]]\nname = \"@/var/lib/das-backup\"\nsnapshot_name = \"das-state\"\nafter_index = true\n{ONE_TARGET}",
+            source_with("s", "/vol", &[("a", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        assert!(!cfg.sources[0].subvolumes[0].after_index);
+        assert!(cfg.sources[0].subvolumes[1].after_index);
+        let out = cfg.to_toml().unwrap();
+        assert_eq!(out.matches("after_index").count(), 1, "{out}");
+        assert!(out.contains("after_index = true"), "{out}");
+        let again = Config::from_toml(&out).unwrap();
+        assert!(again.sources[0].subvolumes[1].after_index);
+        assert!(!again.sources[0].subvolumes[0].after_index);
+    }
+
+    #[test]
+    fn a_bare_string_subvolume_is_not_after_index() {
+        let cfg = Config::from_toml(&minimal_toml(&format!(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\nsubvolumes = [\"@\"]\n{ONE_TARGET}"
+        )))
+        .unwrap();
+        assert!(!cfg.sources[0].subvolumes[0].after_index);
     }
 
     #[test]

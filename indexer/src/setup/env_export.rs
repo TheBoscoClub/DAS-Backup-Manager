@@ -13,6 +13,10 @@ pub fn dump_env(config: &Config) -> String {
     out.push_str(&kv("DAS_GROWTH_LOG", &config.general.growth_log));
     out.push_str(&kv("DAS_LAST_REPORT", &config.general.last_report));
     out.push_str(&kv("DAS_BTRBK_CONF", &config.general.btrbk_conf));
+    out.push_str(&kv(
+        "DAS_BTRBK_STATE_CONF",
+        &buttered_dasd::btrbk_conf::state_conf_path(config).to_string_lossy(),
+    ));
 
     // Init
     let init_str = match config.init.system {
@@ -263,6 +267,17 @@ mod tests {
         ));
         assert!(output.contains("DAS_SCRUB_WARN_AGE_DAYS=45"));
         assert!(output.contains("DAS_SCRUB_FAIL_AGE_DAYS=75"));
+    }
+
+    #[test]
+    fn dump_env_exports_the_state_conf_path() {
+        let mut config = test_config();
+        config.general.btrbk_conf = "/etc/btrbk/btrbk.conf".to_string();
+        let output = dump_env(&config);
+        assert!(
+            output.contains("DAS_BTRBK_STATE_CONF='/etc/btrbk/btrbk-state.conf'\n"),
+            "{output}"
+        );
     }
 
     #[test]

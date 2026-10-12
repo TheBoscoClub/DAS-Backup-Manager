@@ -368,6 +368,7 @@ pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Result<Confi
             snapshot_name: Some(snapshot_name),
             adopted: Some(today.to_string()),
             retired: None,
+            after_index: false,
         });
     }
     Ok(out)

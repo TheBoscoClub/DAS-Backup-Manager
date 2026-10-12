@@ -3,7 +3,7 @@
 //! Lives in the library, not in `setup/`, because the backup run itself
 //! regenerates this file when it adopts or retires a subvolume (`adopt.rs`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::{Config, Retention, Source, SubvolConfig, Target, TargetRole};
 
@@ -13,7 +13,35 @@ pub const GENERATED_HEADER: &str = "\
 
 /// Generate btrbk.conf with global settings, per-source volume blocks (one block
 /// per source with all matching targets), and per-subvolume snapshot names.
+/// Entries flagged `after_index` are not in it: they live in
+/// [`render_state_conf`]'s file, so the main run never snapshots them.
 pub fn render_btrbk_conf(config: &Config) -> String {
+    render_with(config, |sv| sv.retired.is_none() && !sv.after_index)
+}
+
+/// Where the state series' own config lives: beside the main one.
+pub fn state_conf_path(config: &Config) -> PathBuf {
+    Path::new(&config.general.btrbk_conf)
+        .parent()
+        .unwrap_or_else(|| Path::new("/etc/btrbk"))
+        .join("btrbk-state.conf")
+}
+
+/// The config for the `after_index` entries — same globals, same target
+/// lines, only those entries — or `None` when no live entry is flagged. The
+/// backup run's state pass sends from it after the indexer ran (bd 9eq9).
+pub fn render_state_conf(config: &Config) -> Option<String> {
+    let any = config
+        .sources
+        .iter()
+        .flat_map(|s| &s.subvolumes)
+        .any(|sv| sv.retired.is_none() && sv.after_index);
+    any.then(|| render_with(config, |sv| sv.retired.is_none() && sv.after_index))
+}
+
+/// The shared renderer: globals, then a volume block per source holding only
+/// the subvolumes `keep` accepts. A source left with none has no block.
+fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> String {
     let mut out = String::from(GENERATED_HEADER);
     out.push('\n');
 
@@ -51,13 +79,15 @@ pub fn render_btrbk_conf(config: &Config) -> String {
             continue;
         }
 
-        // Retired entries are not sent; a source left with none has no block.
+        // Entries `keep` refuses are not written; a source left with none has
+        // no block. Names are resolved over ALL entries, so a name does not
+        // change with the file it lands in.
         let snap_names = resolve_snapshot_names(&source.subvolumes);
         let live: Vec<(&SubvolConfig, &String)> = source
             .subvolumes
             .iter()
             .zip(snap_names.iter())
-            .filter(|(sv, _)| sv.retired.is_none())
+            .filter(|(sv, _)| keep(sv))
             .collect();
         if live.is_empty() {
             continue;
@@ -200,40 +230,71 @@ fn save_config_and_btrbk_conf_with(
         return Err(errors.join("\n").into());
     }
     let conf_path = Path::new(&cfg.general.btrbk_conf);
+    let state_path = state_conf_path(cfg);
     // Absent is a state to restore (by removing what we write); unreadable is
-    // not, because then a failed save could not be undone. Refuse that case.
-    let previous = match std::fs::read_to_string(conf_path) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(format!(
-                "cannot read {} to keep a rollback copy: {e}",
-                conf_path.display()
-            )
-            .into());
-        }
-    };
+    // not, because then a failed save could not be undone. Refuse that case,
+    // for both files, before writing either.
+    let previous = read_previous(conf_path)?;
+    let previous_state = read_previous(&state_path)?;
     crate::fsutil::write_atomic(conf_path, &render_btrbk_conf(cfg))?;
+    // The state series' file goes beside it, or goes away when no entry needs
+    // it (a missing file is not an error); a failure here undoes the first
+    // write as a failed config save does.
+    let state_written = match render_state_conf(cfg) {
+        Some(text) => crate::fsutil::write_atomic(&state_path, &text).map_err(Into::into),
+        None => remove_if_present(&state_path),
+    };
     // Every error here names its own file; the messages add no path.
-    if let Err(e) = save(cfg, config_path) {
-        let rollback = match &previous {
-            Some(text) => crate::fsutil::write_atomic(conf_path, text),
-            None => std::fs::remove_file(conf_path).map_err(|re| {
-                std::io::Error::new(
-                    re.kind(),
-                    format!("cannot remove {}: {re}", conf_path.display()),
-                )
-            }),
-        };
-        if let Err(re) = rollback {
+    let failure = state_written.err().or_else(|| save(cfg, config_path).err());
+    if let Some(e) = failure {
+        let mut failed = Vec::new();
+        if let Err(re) = restore(conf_path, previous.as_deref()) {
+            failed.push(re.to_string());
+        }
+        if let Err(re) = restore(&state_path, previous_state.as_deref()) {
+            failed.push(re.to_string());
+        }
+        if !failed.is_empty() {
             return Err(format!(
-                "{e}; rolling back also failed: {re} — the two files may disagree"
+                "{e}; rolling back also failed: {} — the files may disagree",
+                failed.join("; ")
             )
             .into());
         }
         return Err(e);
     }
     Ok(())
+}
+
+/// A file's text, `None` when it is absent; unreadable is an error naming it,
+/// because a rollback copy cannot be kept.
+fn read_previous(path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read {} to keep a rollback copy: {e}",
+            path.display()
+        )
+        .into()),
+    }
+}
+
+/// Remove a file; already absent is the wanted state, not an error.
+fn remove_if_present(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display()).into()),
+    }
+}
+
+/// Put a file back as it was: its old text, or gone.
+fn restore(path: &Path, previous: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    match previous {
+        Some(text) => Ok(crate::fsutil::write_atomic(path, text)?),
+        None => remove_if_present(path),
+    }
 }
 
 /// What became of a configuration edit attempted under the backup singleton.
@@ -362,7 +423,7 @@ pub fn declared_pairs(config: &Config) -> Vec<DeclaredPair<'_>> {
         let targets = source_targets(config, source);
         let names = resolve_snapshot_names(&source.subvolumes);
         for (subvolume, snapshot_name) in source.subvolumes.iter().zip(names) {
-            if subvolume.retired.is_some() {
+            if subvolume.retired.is_some() || subvolume.after_index {
                 continue;
             }
             for target in &targets {
@@ -1407,5 +1468,179 @@ enabled = false
             declared.len(),
             "no pair is listed twice"
         );
+    }
+
+    fn state_entry() -> SubvolConfig {
+        SubvolConfig {
+            name: "@/var/lib/das-backup".into(),
+            snapshot_name: Some("das-state".into()),
+            after_index: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_after_index_entry_is_left_out_of_the_main_conf_and_rendered_into_the_state_conf() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(state_entry());
+        let main = render_btrbk_conf(&cfg);
+        assert!(
+            !main.contains("das-state"),
+            "main conf must not carry the state series:\n{main}"
+        );
+        let state = render_state_conf(&cfg).expect("a state conf");
+        assert!(
+            state.contains(
+                "  subvolume             @/var/lib/das-backup\n    snapshot_name       das-state\n"
+            ),
+            "{state}"
+        );
+        // Same globals and the same target lines as the main conf.
+        for needle in [
+            "transaction_log",
+            "stream_compress",
+            "target_preserve_min",
+            "  target                ",
+        ] {
+            assert!(
+                state.contains(needle),
+                "state conf lacks {needle}:\n{state}"
+            );
+        }
+        // Only that entry: the source's other subvolumes stay in the main conf.
+        assert_eq!(state.matches("  subvolume             ").count(), 1);
+        assert_eq!(
+            main.matches("  subvolume             ").count(),
+            cfg.sources
+                .iter()
+                .map(|s| s.subvolumes.len())
+                .sum::<usize>()
+                - 1
+        );
+    }
+
+    #[test]
+    fn a_source_with_only_after_index_entries_has_no_block_in_the_main_conf() {
+        let mut cfg = test_config();
+        for sv in &mut cfg.sources[0].subvolumes {
+            sv.after_index = true;
+        }
+        let main = render_btrbk_conf(&cfg);
+        assert!(
+            !main.contains(&format!("# {}\n", cfg.sources[0].label)),
+            "{main}"
+        );
+        assert_eq!(main.matches("  subvolume             ").count(), 0);
+        let state = render_state_conf(&cfg).unwrap();
+        assert_eq!(state.matches("  subvolume             ").count(), 2);
+    }
+
+    #[test]
+    fn no_after_index_entry_means_no_state_conf() {
+        assert_eq!(render_state_conf(&test_config()), None);
+    }
+
+    #[test]
+    fn a_retired_after_index_entry_is_rendered_nowhere() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(SubvolConfig {
+            retired: Some("2026-10-12".into()),
+            ..state_entry()
+        });
+        assert!(!render_btrbk_conf(&cfg).contains("das-state"));
+        assert_eq!(render_state_conf(&cfg), None);
+    }
+
+    #[test]
+    fn declared_pairs_leave_after_index_entries_out() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(state_entry());
+        assert!(!declared_pairs(&cfg).is_empty());
+        assert!(
+            declared_pairs(&cfg)
+                .iter()
+                .all(|p| p.snapshot_name != "das-state")
+        );
+    }
+
+    #[test]
+    fn state_conf_path_sits_beside_the_main_conf() {
+        let mut cfg = test_config();
+        cfg.general.btrbk_conf = "/etc/btrbk/btrbk.conf".into();
+        assert_eq!(
+            state_conf_path(&cfg),
+            std::path::PathBuf::from("/etc/btrbk/btrbk-state.conf")
+        );
+    }
+
+    fn with_state_entry(mut cfg: Config) -> Config {
+        cfg.sources[0].subvolumes.push(state_entry());
+        cfg
+    }
+
+    #[test]
+    fn save_writes_the_state_conf_beside_the_main_one_and_removes_it_when_none_is_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = with_state_entry(saveable_config(dir.path()));
+        let config_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("btrbk-state.conf");
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            render_state_conf(&cfg).unwrap()
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join("btrbk.conf"))
+                .unwrap()
+                .contains("das-state")
+        );
+        // The entry goes: the stale state conf is removed.
+        let plain = saveable_config(dir.path());
+        save_config_and_btrbk_conf(&plain, &config_path).unwrap();
+        assert!(!state_path.exists());
+        // And saving again with none due and none present is not an error.
+        save_config_and_btrbk_conf(&plain, &config_path).unwrap();
+    }
+
+    #[test]
+    fn failed_config_save_restores_the_previous_state_conf_and_removes_one_that_was_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = with_state_entry(saveable_config(dir.path()));
+        let state_path = dir.path().join("btrbk-state.conf");
+        let config_path = dir.path().join(format!("{}.toml", "x".repeat(250)));
+
+        // Previous state conf exists: restored.
+        std::fs::write(&state_path, "previous state\n").unwrap();
+        assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            "previous state\n"
+        );
+
+        // None existed: the new one is removed again.
+        std::fs::remove_file(&state_path).unwrap();
+        assert!(save_config_and_btrbk_conf(&cfg, &config_path).is_err());
+        assert!(!state_path.exists());
+
+        // One existed but none is due now: the removal is undone too.
+        std::fs::write(&state_path, "previous state\n").unwrap();
+        let plain = saveable_config(dir.path());
+        assert!(save_config_and_btrbk_conf(&plain, &config_path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            "previous state\n"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_previous_state_conf_refuses_the_edit_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        std::fs::create_dir(dir.path().join("btrbk-state.conf")).unwrap();
+        let config_path = dir.path().join("config.toml");
+        let err = save_config_and_btrbk_conf(&cfg, &config_path).unwrap_err();
+        assert!(err.to_string().contains("rollback copy"), "{err}");
+        assert!(!config_path.exists());
+        assert!(!dir.path().join("btrbk.conf").exists());
     }
 }
