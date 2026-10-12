@@ -3085,10 +3085,11 @@ run_state_pass() {
         log_info "State pass: no das-state entry in $conf -- skipping"
         return 0
     fi
-    local filters=() mounts=() line path label mnt hit
+    local filters=() mounts=() line path label mnt hit declared=0
     while IFS= read -r line; do
         [[ "$line" == "T "* ]] || continue
         path="${line#T }"
+        declared=$((declared + 1))
         hit=""
         for label in "${!TARGET_MOUNTS[@]}"; do
             mnt="${TARGET_MOUNTS[$label]}"
@@ -3102,6 +3103,11 @@ run_state_pass() {
         filters+=("$path/das-state")
         mounts+=("$hit")
     done <<<"$parsed"
+    if ((declared == 0)); then
+        log_warn "State pass: the das-state entry declares no target -- skipping"
+        record_op "state" "SKIP" "das-state entry declares no target"
+        return 0
+    fi
     if ((${#filters[@]} == 0)); then
         log_warn "State pass: no target mounted -- skipping"
         record_op "state" "SKIP" "no target mounted"
@@ -3115,13 +3121,19 @@ run_state_pass() {
     log_info "Sending the state subvolume after indexing (${#filters[@]} target(s))..."
     start=$SECONDS
     if out=$(btrbk -c "$conf" run "${filters[@]}" 2>&1); then
+        # The targets mount with commit=120: df right after a receive can lag,
+        # so flush each one first; a flush that fails makes the reading unknown.
         for mnt in "${mounts[@]}"; do
+            btrfs filesystem sync "$mnt" >/dev/null 2>&1 || known=false
             v=$(get_used_bytes "$mnt") || v=""
             [[ "$v" =~ ^[0-9]+$ ]] && after=$((after + v)) || known=false
         done
+        # Used space that FELL (the same run can prune older das-state copies)
+        # is not a size: a clamped 0 would be a made-up measurement.
+        ((after >= before)) || known=false
         local size="bytes unknown"
         if [[ "$known" == true ]]; then
-            size="$(format_bytes $((after > before ? after - before : 0)))"
+            size="$(format_bytes $((after - before))) total"
         fi
         record_op "state" "OK" "$((SECONDS - start))s, ${#filters[@]} target(s), $size"
         log_info "State subvolume sent: $((SECONDS - start))s, $size"
