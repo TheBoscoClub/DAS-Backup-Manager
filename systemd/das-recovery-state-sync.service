@@ -1,0 +1,14 @@
+[Unit]
+Description=Recovery drive: sync btrdasd state and configuration from the newest received snapshot
+ConditionPathExists=/etc/das-backup/recovery-drive
+After=local-fs.target
+Before=display-manager.service btrdasd-helper.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/das-backup/das-recovery-state-sync.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
