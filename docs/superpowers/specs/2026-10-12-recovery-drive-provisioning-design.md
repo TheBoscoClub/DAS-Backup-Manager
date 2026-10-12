@@ -62,7 +62,7 @@ Operator decisions, 2026-10-11/12, that this design implements:
 ### 3.1 Partition layout (unchanged; `das-partition-drives.sh`)
 
 | Partition | Size | FS | Label | Written by |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | p1 | 1.5 GiB | FAT32 | `RECOV-ESP-<bay>` | formatted by the host (this project); populated only by the drive's OS in its VM |
 | p2 | rest | btrfs | `das-backup-system-recovery-<A\|B>` | formatted by the host; OS subvolumes written in the VM; backups received by btrbk |
 
@@ -74,7 +74,7 @@ SMART-self-test gate stays.
 ### 3.2 Subvolumes on p2 (top level)
 
 | Subvolume | Role |
-|---|---|
+| --- | --- |
 | `@` | the OS root; `rootflags=subvol=/@` |
 | `@home` | home; separate so a root rollback keeps the user's files |
 | `@.pre-update.<stamp>` | written by the upgrade pipeline, newest two kept (exists today) |
@@ -148,7 +148,7 @@ a reviewer sees why each is there. CachyOS meta packages come from the ISO's own
 `cachyos-keyring`).
 
 | Role | Packages |
-|---|---|
+| --- | --- |
 | base and boot | `base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode intel-ucode mkinitcpio efibootmgr efitools sbctl sudo` |
 | filesystems | `btrfs-progs compsize duperemove snapper e2fsprogs xfsprogs f2fs-tools exfatprogs ntfs-3g dosfstools squashfs-tools lvm2 mdadm cryptsetup nfs-utils cifs-utils smbclient` |
 | diagnostic and analysis | `smartmontools nvme-cli hdparm hwinfo lshw dmidecode i2c-tools pciutils usbutils memtester stress iotop-c btop htop lsof strace tcpdump nmap traceroute bind` |
@@ -232,7 +232,7 @@ reads `no`.
 ## 5. Components to build (the plan's tasks come from this list)
 
 | Component | Where | Tests |
-|---|---|---|
+| --- | --- | --- |
 | `--only <serial>` for one mirror drive | `scripts/das-partition-drives.sh` | `tests/test_esp_label_derivation.sh` style: refuses a non-mirror serial, two serials, unknown serial; plans exactly one drive |
 | `provision` subcommand, steps, dry run, history row | `scripts/recovery-os-vm.sh` | `tests/test_recovery_os_vm.sh` stubs (new section): step order, every refusal, the generated step scripts run standalone against stub tools as the `repos`/`egress` tests do |
 | `das-recovery-state-sync.service` + script | `config/` or `scripts/`, installed by the package | a bash test with a fixture btrfs-like tree: copies from the newest snapshot; no snapshot / unreadable → refuses, previous copy intact |
@@ -250,7 +250,7 @@ desktop and a `no` record. That is the falsification of the procedure itself.
 ## 6. Risks and what bounds them
 
 | Risk | Bound |
-|---|---|
+| --- | --- |
 | wrong drive wiped | serial pinned at every phase; `--only` refuses anything but one mirror drive; dry run prints the device; partition step keeps its SMART gate |
 | both recovery drives unusable at once | preflight refuses unless the other drive's last session is `clean` and its record `no` |
 | host writes the ESP | the host only formats it; every write is a guest-exec inside the VM; the guard's bind of btrbk is the same mechanism the pipeline trusts |
@@ -267,7 +267,7 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 ## 8. Open decisions, collected
 
 | Id | Question | Recommendation |
-|---|---|---|
+| --- | --- | --- |
 | D1 | previous-root loader entry | accept |
 | D2 | sshd on the drives | on, key-only, both drives |
 | D3 | package release to pin | promote 0.7.23.0 first, pin to it |
