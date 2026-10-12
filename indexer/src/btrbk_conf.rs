@@ -236,13 +236,11 @@ fn save_config_and_btrbk_conf_with(
     // for both files, before writing either.
     let previous = read_previous(conf_path)?;
     let previous_state = read_previous(&state_path)?;
-    crate::fsutil::write_atomic(conf_path, &render_btrbk_conf(cfg))?;
-    // The state series' file goes beside it, or goes away when no entry needs
-    // it (a missing file is not an error); a failure here undoes the first
-    // write as a failed config save does.
-    let state_written = write_or_remove(&state_path, render_state_conf(cfg).as_deref());
+    // Both files, or the failure undone below as a failed config save is.
     // Every error here names its own file; the messages add no path.
-    let failure = state_written.err().or_else(|| save(cfg, config_path).err());
+    let failure = write_rendered_confs(cfg)
+        .err()
+        .or_else(|| save(cfg, config_path).err());
     if let Some(e) = failure {
         let mut failed = Vec::new();
         if let Err(re) = restore(conf_path, previous.as_deref()) {
@@ -261,6 +259,30 @@ fn save_config_and_btrbk_conf_with(
         return Err(e);
     }
     Ok(())
+}
+
+/// Write what `cfg` renders to: `btrbk.conf`, then its companion
+/// `btrbk-state.conf` (written, or removed when no live entry is `after_index`;
+/// a missing file is not an error). Every writer of `btrbk.conf` — the config
+/// save above, the nightly subvolume sync, `setup`'s install for the state
+/// half — goes through this or [`write_or_remove`], so the two files cannot
+/// drift apart by one route.
+pub fn write_rendered_confs(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    crate::fsutil::write_atomic(Path::new(&cfg.general.btrbk_conf), &render_btrbk_conf(cfg))?;
+    write_or_remove(&state_conf_path(cfg), render_state_conf(cfg).as_deref())
+}
+
+/// Do both files on disk say exactly what `cfg` renders to? A missing or
+/// unreadable file, or a state conf where none is due, is "no".
+pub fn confs_are_current(cfg: &Config) -> bool {
+    let same = |path: &Path, want: Option<String>| match std::fs::read_to_string(path) {
+        Ok(text) => want.is_some_and(|w| w == text),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound && want.is_none(),
+    };
+    same(
+        Path::new(&cfg.general.btrbk_conf),
+        Some(render_btrbk_conf(cfg)),
+    ) && same(&state_conf_path(cfg), render_state_conf(cfg))
 }
 
 /// A file's text, `None` when it is absent; unreadable is an error naming it,
@@ -1385,6 +1407,13 @@ enabled = false
                 SubvolConfig {
                     retired: Some("2026-01-01".into()),
                     ..sv("@gone")
+                },
+                // Rendered into the state conf only: the pin must see the
+                // flag, or it stays green when the main render ignores it.
+                SubvolConfig {
+                    snapshot_name: Some("das-state".into()),
+                    after_index: true,
+                    ..sv("@state")
                 },
             ],
         ));

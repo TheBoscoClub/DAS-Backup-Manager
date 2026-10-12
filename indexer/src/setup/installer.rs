@@ -508,13 +508,14 @@ fn install_to_prefix(
 
     // No `after_index` entry: no state conf. One a sync wrote earlier, or an
     // earlier setup, must not outlive the entry that justified it.
+    let state_conf = buttered_dasd::btrbk_conf::state_conf_path(config);
     if !generated
         .files
         .iter()
-        .any(|(p, _)| p == super::templates::STATE_CONF_PATH)
+        .any(|(p, _)| Path::new(p) == state_conf)
     {
         buttered_dasd::btrbk_conf::write_or_remove(
-            &root.join(super::templates::STATE_CONF_PATH.trim_start_matches('/')),
+            &root.join(state_conf.strip_prefix("/").unwrap_or(&state_conf)),
             None,
         )?;
     }
