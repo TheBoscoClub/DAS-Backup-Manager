@@ -201,8 +201,13 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   installs and which holds the screen until the display manager starts) carries a
   message written by the sync unit through `plymouth display-message`, one line per phase
   — "DAS recovery drive (Bay N): finding the newest backup", "copying the backup index",
-  "preparing the configuration" — each prefixed with the fixed sentence **"Do not power
-  off. This takes longer than a normal boot."** The unit records each phase's measured
+  "preparing the configuration" — each under a fixed header that says what is happening
+  and why, in plain words (operator, 2026-10-12: the instruction alone is not enough; say
+  the reason): **"DAS recovery disk, Bay N. Recovery disk boots take significantly longer
+  than a normal boot: this disk is a 2 TB USB drive, and it copies the latest backup index
+  and settings before the desktop appears. Do not power off or unplug it — the copy would
+  be left incomplete and the disk would start again from the previous copy."** The unit
+  records each phase's measured
   duration in its status file on the drive's own OS, and on the next boot shows a
   countdown computed from the previous measurement and named as such ("about 40 s, measured
   at the last boot"); with no measurement (the first boot after a rebuild) it shows the phase
