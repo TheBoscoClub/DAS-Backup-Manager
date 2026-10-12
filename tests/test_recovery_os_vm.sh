@@ -165,8 +165,12 @@ fixture() {
     : >"$S/events"
     dump_env ZK208Q77 ZFL41DNY
     write_state 3 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
+    # The driver's own cgroup: a login session's scope unless a test says.
+    mkdir -p "$T/proc/self"
+    cgroup /user.slice/user-1000.slice/session-2.scope
     write_stubs
 }
+cgroup() { printf '0::%s\n' "$1" >"$T/proc/self/cgroup"; }
 
 # The mount_uuid config gives a label now (the dump-env file): the filesystem
 # a record made of that drive names. Empty for a label config does not have.
@@ -752,7 +756,7 @@ case "$cmd" in
                 script=$(jq -r '.arguments.arg[1] // .arguments.arg[0] // empty' <<<"$json")
                 n=$(($(cat "$S/ge/next" 2>/dev/null || echo 1000)))
                 echo $((n + 1)) >"$S/ge/next"
-                rc=0 out=""
+                rc=0 out="" err=""
                 if [[ "$path" == /usr/bin/systemctl && "$script" == reboot ]]; then
                     # A reboot: libvirt's reset event first, then the new boot.
                     echo "guest reboot" >>"$STUB/events"
@@ -798,6 +802,18 @@ case "$cmd" in
                     if [[ -f "$STUB/stage.$stage.hangs" ]]; then r=""; fi
                     chunk=$(printf '%s' "$full" | tail -c +"$off" | head -c 65536 | base64 -w0)
                     out=$(printf 'rc=%s\n%s\n' "$r" "$chunk")
+                    # The probe's own head missing for an instant (coreutils
+                    # being replaced): its shell's complaint on stderr, no
+                    # chunk -- for the first N looks (stage.<step>.probe_garbage),
+                    # or, as a variant, the complaint where the status goes.
+                    garbage=$(cat "$STUB/stage.$stage.probe_garbage" 2>/dev/null || echo 0)
+                    if ((p <= garbage)); then
+                        if [[ -f "$STUB/stage.$stage.probe_garbage_rc" ]]; then
+                            out=$'rc=/bin/sh: line 1: head: command not found\n'
+                        else
+                            out=$'rc=\n\n' err=$'/bin/sh: line 1: head: command not found\n'
+                        fi
+                    fi
                 elif [[ "$script" == "cat /proc/sys/kernel/random/boot_id" ]]; then
                     out=$(cat "$S/guest.boot")
                 elif [[ "$script" == "uname -r" ]]; then
@@ -806,8 +822,8 @@ case "$cmd" in
                     echo "UNEXPECTED guest-exec $path $script" >>"$STUB/forbidden"
                     rc=127
                 fi
-                jq -cn --argjson rc "$rc" --arg out "$(printf '%s' "$out" | base64 -w0)" \
-                    '{return: {exited: true, exitcode: $rc, "out-data": $out}}' >"$S/ge/$n.json"
+                jq -cn --argjson rc "$rc" --arg out "$(printf '%s' "$out" | base64 -w0)" --arg err "$(printf '%s' "${err:-}" | base64 -w0)" \
+                    '{return: {exited: true, exitcode: $rc, "out-data": $out, "err-data": $err}}' >"$S/ge/$n.json"
                 echo "{\"return\":{\"pid\":$n}}"
                 ;;
             guest-exec-status)
@@ -859,6 +875,23 @@ STUB
     cat >"$T/bin/systemctl" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >>"$STUB/systemctl.calls"
+if [[ "$1" == show ]]; then
+    # show -p MainPID -p SuccessExitStatus -p Restart -- <unit>: the lines in
+    # stub/unit.show.<unit>, @DRIVER@ standing for the driver's pid (the
+    # topmost bash ancestor running recovery-os-vm.sh: a subshell of it has
+    # the same command line, timeout above it another comm).
+    [[ -f "$STUB/systemctl_show_fail" ]] && { echo "Failed to get properties: Connection timed out" >&2; exit 1; }
+    unit=${!#}
+    [[ -f "$STUB/unit.show.$unit" ]] || { echo "stub systemctl: no show answer for $unit" >&2; exit 99; }
+    pid=$PPID drv=""
+    while ((pid > 1)); do
+        if [[ "$(cat /proc/$pid/comm 2>/dev/null)" == bash ]] && tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | grep -q 'recovery-os-vm.sh'; then drv=$pid; fi
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
+        [[ -n "$pid" ]] || break
+    done
+    sed "s/@DRIVER@/$drv/" "$STUB/unit.show.$unit"
+    exit 0
+fi
 if [[ "$1" != is-active ]]; then echo "stub systemctl: unexpected $*" >&2; exit 99; fi
 if [[ -f "$STUB/systemctl_fail" ]]; then echo "Failed to connect to bus" >&2; exit 1; fi
 shift
@@ -1003,13 +1036,19 @@ while (($#)); do
     case "$1" in
         --scope) scope=true ;;
         --unit=*) unit=${1#--unit=} ;;
-        --quiet | --expand-environment=no) ;;
+        --quiet | --expand-environment=no | --collect | --description=* | --property=* | --setenv=*) ;;
         --) shift; break ;;
         *) echo "stub systemd-run: unexpected option $1" >&2; exit 98 ;;
     esac
     shift
 done
-if [[ "$scope" != true || -z "$unit" ]]; then echo "stub systemd-run: needs --scope and --unit" >&2; exit 98; fi
+if [[ "$scope" != true ]]; then
+    # session --detach: a transient service unit. Recorded, never run here.
+    [[ -n "$unit" ]] || { echo "stub systemd-run: needs --unit" >&2; exit 98; }
+    if [[ -f "$STUB/systemd_run_detach_fail" ]]; then echo "Failed to start transient service unit: Unit $unit.service already exists." >&2; exit 1; fi
+    exit 0
+fi
+if [[ -z "$unit" ]]; then echo "stub systemd-run: needs --scope and --unit" >&2; exit 98; fi
 echo active >"$STUB/unit.$unit.scope"
 if [[ -f "$STUB/systemd_run_forks" ]]; then
     "$@" &
@@ -5009,6 +5048,115 @@ check "console, no socat: refused" "$RC" "1"
 has "console, no socat: says so" "$OUT" "socat is not installed"
 kill "$cholder" 2>/dev/null || :
 wait "$cholder" 2>/dev/null || :
+
+echo "--- a probe that could not run is asked again, never read as the step's end (ea3u)"
+unattended_fixture
+echo 2 >"$S/stage.upgrade.probe_garbage"
+echo 4 >"$S/stage.upgrade.polls"
+run_driver session A --unattended
+check "probe garbage, then answers: exit 0" "$RC" "0"
+check "probe garbage, then answers: every step ran" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+has "probe garbage, then answers: the step's output still read" "$OUT" "OUTPUT system-recovery-A-2tb upgrade did upgrade"
+lacks "probe garbage, then answers: never 'stopped at'" "$OUT" "stopped at"
+lacks "probe garbage, then answers: the complaint is not a status" "$OUT" "exit status /bin/sh"
+unattended_fixture
+echo 2 >"$S/stage.upgrade.probe_garbage"
+touch "$S/stage.upgrade.probe_garbage_rc"
+echo 4 >"$S/stage.upgrade.polls"
+run_driver session A --unattended
+check "probe garbage where the status goes: exit 0" "$RC" "0"
+lacks "probe garbage where the status goes: never a status" "$OUT" "exit status /bin/sh"
+# ...and a probe that never comes back readable ends the step after the grace, as a silent agent does -- never as a status.
+unattended_fixture
+echo 999 >"$S/stage.upgrade.probe_garbage"
+DAS_RECOVERY_VM_AGENT_GRACE_SECS=1 run_driver session A --unattended
+check "probe garbage past the grace: exit 7" "$RC" "7"
+has "probe garbage past the grace: says what it could not read" "$OUT" "upgrade fail no readable answer about it for"
+has "probe garbage past the grace: ...and the answer" "$OUT" "the probe's answer is no exit status: /bin/sh: line 1: head: command not found"
+lacks "probe garbage past the grace: never a status" "$OUT" "exit status /bin/sh"
+check "probe garbage past the grace: stopped at upgrade" "$(jq -r '.stopped_at' "$T/var/lib/das-backup/recovery-os-vm-history.jsonl")" "upgrade"
+# The counter-control: a numeric status from the runner is still the step's end.
+unattended_fixture
+echo 1 >"$S/stage.upgrade.probe_garbage"
+echo 3 >"$S/stage.upgrade.rc"
+echo 3 >"$S/stage.upgrade.polls"
+run_driver session A --unattended
+check "probe garbage, then a real status 3: exit 7" "$RC" "7"
+has "probe garbage, then a real status 3: that status" "$OUT" "PROGRESS system-recovery-A-2tb upgrade fail exit status 3"
+
+echo "--- the unit around a session: never one cachyos-sentinel would run again (01ne)"
+fixture
+run_driver session A --dry-run
+check "a login session's scope: the dry run goes on" "$RC" "0"
+lacks "a login session's scope: no unit looked up" "$(file "$S/systemctl.calls")" "show"
+U=das-recovery-os-update-system-recovery-A-2tb.service
+cgroup "/system.slice/$U"
+printf 'MainPID=@DRIVER@\nSuccessExitStatus=1 3 4 5 6 7\nRestart=no\n' >"$S/unit.show.$U"
+run_driver session A --dry-run
+check "the generated unit's shape: goes on" "$RC" "0"
+has "the generated unit's shape: looked up" "$(file "$S/systemctl.calls")" "show -p MainPID -p SuccessExitStatus -p Restart -- $U"
+printf 'MainPID=@DRIVER@\nSuccessExitStatus=1 3 4 5 6 7 SIGTERM\nRestart=no\n' >"$S/unit.show.$U"
+run_driver session A --dry-run
+check "a unit that also counts a signal: goes on" "$RC" "0"
+U=das-recovery-os-manual-B-1301.service
+cgroup "/system.slice/$U"
+printf 'MainPID=@DRIVER@\nSuccessExitStatus=\nRestart=no\n' >"$S/unit.show.$U"
+: >"$S/flock.calls" # the dry runs above tried the lock
+run_driver session A --dry-run
+check "an ad-hoc unit with no SuccessExitStatus: refused" "$RC" "1"
+has "an ad-hoc unit with no SuccessExitStatus: the unit and the codes" "$OUT" "main process of $U, which counts a session that exits 1 3 4 5 6 7 as a failed unit (SuccessExitStatus=nothing)"
+has "an ad-hoc unit with no SuccessExitStatus: why" "$OUT" "cachyos-sentinel restarts failed units"
+has "an ad-hoc unit with no SuccessExitStatus: the way" "$OUT" "--detach"
+check "an ad-hoc unit with no SuccessExitStatus: nothing taken" "$(file "$S/flock.calls")" ""
+lacks "an ad-hoc unit with no SuccessExitStatus: no preflight" "$OUT" "PROGRESS"
+printf 'MainPID=@DRIVER@\nSuccessExitStatus=3 5\nRestart=no\n' >"$S/unit.show.$U"
+run_driver session A --dry-run
+check "a unit missing some codes: refused" "$RC" "1"
+has "a unit missing some codes: names the missing ones" "$OUT" "exits 1 4 6 7 as a failed unit (SuccessExitStatus=3 5)"
+printf 'MainPID=@DRIVER@\nSuccessExitStatus=1 3 4 5 6 7\nRestart=on-failure\n' >"$S/unit.show.$U"
+run_driver session A --dry-run
+check "a unit with Restart=: refused" "$RC" "1"
+has "a unit with Restart=: says so" "$OUT" "has Restart=on-failure: systemd itself would run the session again"
+printf 'MainPID=1\nSuccessExitStatus=\nRestart=always\n' >"$S/unit.show.$U"
+run_driver session A --dry-run
+check "a child of a unit (the helper's job), not its main process: goes on" "$RC" "0"
+touch "$S/systemctl_show_fail"
+run_driver session A --dry-run
+check "the unit cannot be read: refused" "$RC" "1"
+has "the unit cannot be read: says so" "$OUT" "its properties cannot be read (systemctl said: Failed to get properties"
+rm "$S/systemctl_show_fail" "$T/proc/self/cgroup"
+run_driver session A --dry-run
+check "the cgroup cannot be read: refused" "$RC" "1"
+has "the cgroup cannot be read: says so" "$OUT" "cannot read $T/proc/self/cgroup"
+
+echo "--- session --detach: the session in a unit no outcome of it leaves failed"
+fixture
+run_driver session A --unattended --detach
+check "detach: exit 0" "$RC" "0"
+call=$(grep -v -- '--scope' "$S/systemd-run.calls" | tail -n 1)
+has "detach: a transient unit named for the drive" "$call" "--unit=das-recovery-os-session-A-"
+has "detach: every outcome counts as success" "$call" "--property=SuccessExitStatus=1 3 4 5 6 7"
+has "detach: systemd never restarts it" "$call" "--property=Restart=no"
+has "detach: collected when it ends" "$call" "--collect"
+has "detach: runs this script's session" "$call" " -- $(readlink -f "$DRIVER") session A --unattended"
+lacks "detach: --detach is not passed on" "${call##* -- }" "--detach"
+has "detach: this environment's DAS_RECOVERY_* settings go with it" "$call" "--setenv=DAS_RECOVERY_VM_POLL_SECS=0.05"
+has "detach: prints the unit" "$OUT" "session started as das-recovery-os-session-A-"
+lacks "detach: no session ran here" "$OUT" "PROGRESS"
+check "detach: nothing taken here" "$(file "$S/flock.calls")" ""
+run_driver session A B --unattended --detach
+has "detach, both drives: named for both" "$(grep -v -- '--scope' "$S/systemd-run.calls" | tail -n 1)" "--unit=das-recovery-os-session-A-B-"
+run_driver session A --dry-run --detach
+check "detach with --dry-run: exit 2" "$RC" "2"
+has "detach with --dry-run: said why" "$OUT" "--detach has no meaning with --dry-run"
+touch "$S/systemd_run_detach_fail"
+run_driver session A --unattended --detach
+check "detach, systemd-run fails: refused" "$RC" "1"
+has "detach, systemd-run fails: says so" "$OUT" "systemd-run could not start the session's unit"
+rm "$S/systemd_run_detach_fail" "$T/bin/systemd-run"
+DRIVER_PATH="$(minimal_path)" run_driver session A --unattended --detach
+check "detach, no systemd-run: refused" "$RC" "1"
+has "detach, no systemd-run: says so" "$OUT" "systemd-run is not available: --detach"
 
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
 check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"

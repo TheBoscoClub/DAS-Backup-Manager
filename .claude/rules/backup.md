@@ -183,7 +183,13 @@ Checked before any directory is created, both roots compared **after resolution*
   - `das-recovery-os-update-*.service` (the helper's generated scheduled recovery-drive sessions)
     carries `SuccessExitStatus=1 3 4 5 6 7`; that line is load-bearing. A refused, warned or failed
     session is not a failed unit: the outcome is in the session history
-    (`recovery-os-vm-history.jsonl`), never a restart.
+    (`recovery-os-vm-history.jsonl`), never a restart. **Sentinel is never the tool that retries a
+    recovery-drive session** (operator, 2026-10-11, bd `01ne`): a session in a hand-made unit without
+    that line was restarted three times on 2026-10-10, each run booting the drive again and replacing
+    its pre-update snapshot. `recovery-os-vm.sh session` now refuses to be the main process of such a
+    unit; `session ... --detach` is the way to run one in the background; the three generated unit
+    names are in `/etc/sentinel/sentinel.toml` `never_touch.units` (exact names, sentinel has no
+    configurable prefix list).
 - Sentinel matches unit names by exact string — no globs. Prefer single non-template units.
 
 ## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
