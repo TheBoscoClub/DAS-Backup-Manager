@@ -59,7 +59,13 @@ Operator decisions, 2026-10-11/12, that this design implements:
    writes the same order and runs the same check before the first boot.
 6. **Pinned inputs**: ISO by sha256, project package by release tag, base image digests
    where any container is used (none planned).
-7. **Build nothing from AUR**: no AUR helper, no `base-devel`-driven builds on the drives.
+7. **Possession is the credential.** Partition 2 is plain btrfs (so the host receives into
+   it unattended and the OS boots with no passphrase), the OS autologs `bosco` into Plasma
+   with `NOPASSWD` sudo: whoever holds the physical disk holds every backup on it and a
+   root shell. sshd hardening (D2) governs only remote access to a booted drive; it is not
+   data protection. Encrypting p2 is a separate decision (unlock secret at the nightly run
+   and at the firmware menu) and is out of this rebuild's scope unless the operator asks.
+8. **Build nothing from AUR**: no AUR helper, no `base-devel`-driven builds on the drives.
    (`base-devel` stays in the baseline because `arch-install-scripts` and chroot repair
    work need it; it is not an AUR enabler by itself.)
 
@@ -120,9 +126,11 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   the way the ESP label is (B still says `bay3` today, stale since 2026-05-06).
 - User `bosco` uid 1000, `NOPASSWD: ALL` sudoers drop-in, SDDM autologin to Plasma (as today).
 - Locale `en_US.UTF-8`, timezone `America/Chicago`, keymap `us` (as today).
-- `sshd` enabled with key-only auth, the project's `~/.claude/ssh/id_ed25519.pub` and the
-  operator's key authorised (B has sshd enabled today; A does not — **OPEN D2**: keep
-  sshd on both, key-only, or off).
+- **OPEN D2** `sshd` on both drives, key-only (`PasswordAuthentication no`,
+  `PermitRootLogin no`, `KbdInteractiveAuthentication no`), the operator's key and the
+  project's `~/.claude/ssh/id_ed25519.pub` authorised for `bosco` (no other account). The
+  VM path never needs it (guest agent); it serves bare-metal use and the Phase 5 bare-metal
+  restore proof. Or: the operator's key only, or off. (B has sshd enabled today; A does not.)
 
 ### 3.5 The project's own tooling on the drive (operator decision)
 
