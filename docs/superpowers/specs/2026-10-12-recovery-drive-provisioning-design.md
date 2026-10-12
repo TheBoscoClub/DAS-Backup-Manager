@@ -234,6 +234,35 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
 Then the second drive, only after the first one's re-seed run completed and its record
 reads `no`.
 
+### Phase 5 — restore proof (operator requirement, 2026-10-12: "the only good backup is a backup that has been successfully restored")
+
+After **both** drives are rebuilt and re-seeded, each drive proves a real restore, two ways:
+
+- **Test data**: a dedicated subvolume on the host (`@restore-test`, under a source that
+  fans out to all three targets) populated with unimportant files of mixed sizes
+  (including a sparse file, a hard link, a symlink, a file with a space in its name, and
+  one over 4 GiB), with a `sha256sum` manifest written beside it; backed up by an
+  ordinary run so the recovery drives hold it as a received snapshot.
+- **Way 1 — in the VM**: an attended session of the drive with a **scratch disk image on
+  the NVMe** (`/hddRaid1`-free: `/var/lib/libvirt/images/restore-test-<label>.qcow2`)
+  attached as a second SATA disk; inside the recovery OS, restore the test subvolume from
+  the drive's own received snapshot onto that disk (btrdasd restore with the recovery-mode
+  config, destination on the scratch disk). The VM cannot see the host's root pool; the
+  data still crosses from the recovery drive to NVMe-backed storage.
+- **Way 2 — bare metal (BMR mode)**: boot the drive on the real hardware from the
+  firmware menu, restore the same subvolume onto the host's NVMe under a root the restore
+  policy allows (`[restore] allowed_roots`: `/home/restore-test/`), **through
+  ButteredDASD** for at least one of the two drives — the path a stressed person would
+  use. Afterwards run a backup with the drive attached before its next VM session (a
+  bare-metal boot leaves no session record; the guide's rule).
+- **Pass**: for all four restores, `sha256sum -c` against the manifest reports every file
+  OK, file count and sizes match, and the restore's own report says it restored
+  everything. Any mismatch fails the rebuild of that drive. Results go in the guide's
+  "Last proven restore" table (drive, date, way, files, bytes, duration) and in the
+  session history.
+- The test subvolume and `/home/restore-test/` are deleted after the proof; the scratch
+  images are deleted with their libvirt definitions.
+
 ## 5. Components to build (the plan's tasks come from this list)
 
 | Component | Where | Tests |
@@ -243,7 +272,7 @@ reads `no`.
 | `das-recovery-state-sync.service` + script | `config/` or `scripts/`, installed by the package | a bash test with a fixture btrfs-like tree: copies from the newest snapshot; no snapshot / unreadable → refuses, previous copy intact |
 | recovery-mode `config.toml` template | `config/recovery-config.toml` | `btrdasd config validate` in CI against it |
 | previous-root loader entry (D1) | the pipeline's `verify-boot`/a new `loader` step | entry rewritten after a clean upgrade; absent when no snapshot |
-| guide section "Building a recovery drive" + quick-reference line | `docs/DISASTER-RECOVERY-GUIDE.md`, `docs/EMERGENCY-QUICK-REFERENCE.md` | markdownlint; the install and session lines quoted verbatim from the script's usage |
+| guide section "Building a recovery drive" + "Proving a restore" + "Last proven restore" table + quick-reference line | `docs/DISASTER-RECOVERY-GUIDE.md`, `docs/EMERGENCY-QUICK-REFERENCE.md` | markdownlint; the install and session lines quoted verbatim from the script's usage |
 | packaging | every format in `packaging/` gets the new unit and template | the existing packaging checks |
 
 **Rehearsal before any real drive**: the whole `provision` flow runs first against a
