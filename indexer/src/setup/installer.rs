@@ -506,6 +506,19 @@ fn install_to_prefix(
         manifest_entries.push(full_path.to_string_lossy().to_string());
     }
 
+    // No `after_index` entry: no state conf. One a sync wrote earlier, or an
+    // earlier setup, must not outlive the entry that justified it.
+    if !generated
+        .files
+        .iter()
+        .any(|(p, _)| p == super::templates::STATE_CONF_PATH)
+    {
+        buttered_dasd::btrbk_conf::write_or_remove(
+            &root.join(super::templates::STATE_CONF_PATH.trim_start_matches('/')),
+            None,
+        )?;
+    }
+
     // Write manifest
     if let Some(parent) = manifest_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -749,12 +762,23 @@ fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
     };
 
     let mut removed = 0;
-    for line in content.lines() {
-        let path = Path::new(line.trim());
+    // The state conf sits beside every listed btrbk.conf; a sync may have
+    // written it after the manifest was, so it is named from the sibling.
+    let siblings: Vec<PathBuf> = content
+        .lines()
+        .map(|l| Path::new(l.trim()))
+        .filter(|p| p.file_name().is_some_and(|n| n == "btrbk.conf"))
+        .map(|p| p.with_file_name("btrbk-state.conf"))
+        .collect();
+    for path in content
+        .lines()
+        .map(|l| PathBuf::from(l.trim()))
+        .chain(siblings)
+    {
         if !path.exists() {
             continue;
         }
-        match std::fs::remove_file(path) {
+        match std::fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(e) => problems.push(format!("could not remove {}: {e}", path.display())),
         }
@@ -1890,6 +1914,90 @@ mod tests {
             b"stale contents\n".to_vec(),
             "an older script must still be refreshed"
         );
+    }
+
+    fn state_entry_config(base: &Path) -> Config {
+        let mut config = valid_config(base);
+        config.sources[0].subvolumes.push(SubvolConfig {
+            name: "@/var/lib/das-backup".to_string(),
+            snapshot_name: Some("das-state".to_string()),
+            after_index: true,
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn install_writes_the_state_conf_and_a_later_upgrade_without_it_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("etc/btrbk/btrbk-state.conf");
+        let (config_path, manifest_path) =
+            install_config_into(&state_entry_config(dir.path()), dir.path());
+        let text = std::fs::read_to_string(&state).expect("install writes the state conf");
+        assert!(text.contains("das-state"), "{text}");
+        assert!(manifest_lines(&manifest_path).contains(&state.to_string_lossy().into_owned()));
+
+        // The entry is dropped: the upgrade removes the file.
+        install_to_prefix(
+            &valid_config(dir.path()),
+            dir.path(),
+            &config_path,
+            &manifest_path,
+        )
+        .unwrap();
+        assert!(!state.exists(), "a stale state conf must be removed");
+
+        // A state conf the sync writer made, never in any manifest, goes too.
+        std::fs::write(&state, "# written by the sync writer\n").unwrap();
+        install_to_prefix(
+            &valid_config(dir.path()),
+            dir.path(),
+            &config_path,
+            &manifest_path,
+        )
+        .unwrap();
+        assert!(
+            !state.exists(),
+            "an unlisted stale state conf must be removed"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_the_state_conf_even_when_the_manifest_does_not_list_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let state = dir.path().join("etc/btrbk/btrbk-state.conf");
+        std::fs::write(&state, "# written by the sync writer\n").unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            false,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
+        .unwrap();
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn uninstall_removes_the_state_conf_the_manifest_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = state_entry_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let state = dir.path().join("etc/btrbk/btrbk-state.conf");
+        assert!(state.exists());
+        let systemctl = FakeSystemctl::new(&[]);
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            false,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
+        .unwrap();
+        assert!(!state.exists());
     }
 
     #[test]
