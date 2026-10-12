@@ -1,7 +1,9 @@
 # Recovery Drive Provisioning — Design
 
 Status: REVIEWED 2026-10-12 — every decision D1–D8 settled by the operator (§8). Nothing in
-this document has been built; the implementation plans follow from it.
+this document has been built. Plans: `docs/superpowers/plans/2026-10-12-recovery-state-plan.md`
+(plan 1: D4, D8, the resolver), plan 2 (provision subcommand, guest installer, D1, docs) and
+plan 3 (rehearsal, rebuild, Phase 5 restore proof) follow.
 
 ## 1. Why
 
@@ -182,6 +184,11 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   background after the desktop is up, saying so on the desktop. Decided: both, 1 as the
   mechanism, 2 as the fallback the sync unit performs only when it detects the gap; both
   measured in the nightly report.
+- **The GUI restores from the drive's own copy.** The index records every target holding
+  a copy of each snapshot (`snapshot_targets`, bd `gt0`); the helper's `IndexSnapshotPath`
+  now resolves a snapshot to a copy that exists on this machine, the booted drive's own
+  target first when the configuration carries `[general] recovery_drive = true` (the flag
+  `derive-recovery` sets; the validator then allows a configuration with no sources).
 - **GUI**: `btrdasd-gui` installed; desktop file present; the two guides symlinked on the
   Desktop as today ("Quick Reference — PRINT THIS.md", "Recovery Guide.md" →
   `/usr/share/das-backup/docs/…`), plus `STORAGE-ARCHITECTURE-AND-RECOVERY.md`.
