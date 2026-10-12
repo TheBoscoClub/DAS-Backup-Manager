@@ -127,6 +127,16 @@ exclude_re = [
     # mount lookup and walk, and `run_backup_with` is tested against a scripted
     # `StepEnv::index`. Only the whole-body replacement is excluded.
     "replace index_mounted_targets -> bool with ",
+    # `find_mount_for_device` binds its core to the host: the real
+    # `/dev/disk/by-id` serial lookup and the real `/proc/mounts`. A test can
+    # tell it from `None` only with a drive carrying a known serial mounted at
+    # its filesystem's top level, which neither this crate's tests nor a CI
+    # runner (no such by-id drive) can supply. Only the whole-body replacement
+    # by `None` is excluded: every decision is in `find_mount_for_device_with`
+    # (serial -> device, partition per role, symlink canonicalised, top-level
+    # entry chosen, nothing found), mutated and tested with a scripted
+    # resolver and mount text, and `top_level_mount_of` is tested on its own.
+    "replace find_mount_for_device -> Option<String> with None",
 ]
 
 # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with

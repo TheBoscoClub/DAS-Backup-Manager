@@ -4478,4 +4478,50 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         }
         drop(holder);
     }
+
+    #[test]
+    fn run_reconcile_prunes_a_snapshot_absent_from_a_verified_root_unless_dry_run() {
+        let root = tempfile::tempdir().unwrap();
+        let root_s = root.path().to_string_lossy().to_string();
+        let gone = format!("{root_s}/series.20260101T0000");
+        let cfg = Config {
+            targets: vec![test_target("t", "uuid", &root_s)],
+            ..Default::default()
+        };
+        let verified = reconcile::VerifiedRoots {
+            roots: vec![root_s.clone()],
+            ..Default::default()
+        };
+        let db_dir = tempfile::tempdir().unwrap();
+        let database = Database::open(db_dir.path().join("i.db")).unwrap();
+        database
+            .insert_snapshot("series", "20260101T0000", "src", &gone)
+            .unwrap();
+
+        let dry = run_reconcile(&database, &cfg, &verified, true).unwrap();
+        assert_eq!(dry, reconcile::PruneStats::default());
+        assert_eq!(
+            database.list_snapshots().unwrap().len(),
+            1,
+            "dry run keeps the row"
+        );
+
+        let real = run_reconcile(&database, &cfg, &verified, false).unwrap();
+        assert_eq!(real.snapshots_removed, 1);
+        assert!(database.list_snapshots().unwrap().is_empty(), "row pruned");
+    }
+
+    #[test]
+    fn checked_roots_keeps_a_mounted_serial_only_target_and_names_it_unchecked() {
+        let mut target = test_target("serial-only", "", "/");
+        target.mount_uuid = None;
+        let cfg = Config {
+            targets: vec![target],
+            ..Default::default()
+        };
+        let verified = checked_roots(&cfg);
+        assert_eq!(verified.roots, vec!["/".to_string()]);
+        assert_eq!(verified.unchecked, vec!["serial-only".to_string()]);
+        assert!(verified.refused.is_empty());
+    }
 }
