@@ -437,6 +437,19 @@ enum ConfigAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Derive a recovery drive's configuration from the host's (no sources,
+    /// every target kept with the booted drive first, email/scrub/boot off)
+    DeriveRecovery {
+        /// The host's config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        from: PathBuf,
+        /// Filesystem UUID of the drive the OS booted from (a target's mount_uuid)
+        #[arg(long)]
+        booted_uuid: String,
+        /// Write the derived TOML here instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2140,6 +2153,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !status.success() {
                     eprintln!("Editor exited with non-zero status");
                     std::process::exit(1);
+                }
+            }
+            ConfigAction::DeriveRecovery {
+                from,
+                booted_uuid,
+                out,
+            } => {
+                let cfg = Config::load(&from)?;
+                let derived = match cfg.derive_recovery(&booted_uuid) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("derive-recovery: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let errors = derived.validate();
+                if !errors.is_empty() {
+                    for e in &errors {
+                        eprintln!("derive-recovery: derived configuration is invalid: {e}");
+                    }
+                    std::process::exit(1);
+                }
+                let text = derived.to_toml()?;
+                match out {
+                    Some(path) => std::fs::write(&path, text)?,
+                    None => print!("{text}"),
                 }
             }
         },

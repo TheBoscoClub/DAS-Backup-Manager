@@ -563,6 +563,45 @@ Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
 .\"
+.SS config derive\-recovery
+Derive the configuration a recovery drive's own OS runs with from the host's.
+No sources are kept; every target is kept, the one whose filesystem the OS
+booted from first and the rest in their original order; email, scrub and the
+boot step are turned off; restores are allowed only under
+.I /mnt/restore
+and
+.IR /home/restore\-test .
+The derived file sets
+.B recovery_drive = true
+in
+.BR [general] .
+The booted drive is matched by a target's
+.B mount_uuid
+(case\-insensitive).
+If no target, or more than one, names the UUID, nothing is written, the reason
+is printed on stderr prefixed
+.BR derive\-recovery: ,
+and the exit status is 1.
+.PP
+.B btrdasd config derive\-recovery
+.RB [ \-\-from
+.IR PATH ]
+.BI \-\-booted\-uuid " UUID"
+.RB [ \-\-out
+.IR PATH ]
+.TP
+.BI \-\-from " PATH"
+The host's config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.BI \-\-booted\-uuid " UUID"
+Filesystem UUID of the drive the OS booted from.
+.TP
+.BI \-\-out " PATH"
+Write the derived TOML here.
+Default: standard output.
+.\"
 .SS backup run
 Run the full backup pipeline: sync subvolumes, snapshot, send, boot archive, index, and email report.
 Before btrbk runs, the same sync step as
