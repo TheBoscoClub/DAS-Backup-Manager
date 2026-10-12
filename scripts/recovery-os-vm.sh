@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.1.1
-# Date: 2026-10-09
+# Version: 2.1.2
+# Date: 2026-10-12
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -145,8 +145,9 @@
 #     guest-exec; no SSH, no password), only when the boot record says the
 #     agent is installed and started at boot, and never on a "will" record.
 #     Its steps, each a transient unit in the recovery OS (it outlives a
-#     restart of the agent): wait for the guard and the agent; egress -- the
-#     VM's public address must belong to EGRESS_ORG, else nothing is updated;
+#     restart of the agent): wait for the guard and the agent; egress -- once
+#     the OS's network answers (NET_SECS: the agent is up before the NIC is),
+#     the VM's public address must belong to EGRESS_ORG, else nothing is updated;
 #     snapshot -- the OS snapshots its own @ read-only to
 #     @.pre-update.<YYYYMMDD-HHMM>, keeping the newest 2 (its own btrfs,
 #     never the host's); guard-lift (systemctl stop das-vm-guard); keyrings;
@@ -320,7 +321,8 @@
 #   DAS_RECOVERY_VM_UPDATE_SECS (7200: the full upgrade's limit),
 #   DAS_RECOVERY_VM_AGENT_SECS (GUARD_SECS: the agent's to answer after the
 #   start), DAS_RECOVERY_VM_AGENT_GRACE_SECS (300: its silence while a step
-#   runs)                       clocks
+#   runs), DAS_RECOVERY_VM_NET_SECS (120: the egress step's wait for the
+#   recovery OS's network)      clocks
 #   DAS_RECOVERY_VM_EGRESS_ORG  what the direct path egresses as (ipinfo.io's
 #                               org line begins with it): AS64500 by default,
 #                               the author's ISP -- set it for yours
@@ -396,6 +398,10 @@ readonly CLOCK_GAP_SECS="${DAS_RECOVERY_VM_CLOCK_GAP_SECS:-120}"
 readonly UPDATE_SECS="${DAS_RECOVERY_VM_UPDATE_SECS:-7200}"
 readonly AGENT_SECS="${DAS_RECOVERY_VM_AGENT_SECS:-$GUARD_SECS}"
 readonly AGENT_GRACE_SECS="${DAS_RECOVERY_VM_AGENT_GRACE_SECS:-300}"
+# How long the egress step waits for the recovery OS's network before it
+# judges: the guest agent answers before NetworkManager has a lease (bd slu9,
+# 2026-10-12: the step ran 0.5 s before the NIC began activating).
+readonly NET_SECS="${DAS_RECOVERY_VM_NET_SECS:-120}"
 # What the VM's direct path egresses as, the start of ipinfo.io's org line
 # (decision 5 of 2026-10-07): the author's ISP by default, AS64500.
 readonly EGRESS_ORG="${DAS_RECOVERY_VM_EGRESS_ORG:-AS64500}"
@@ -4080,9 +4086,18 @@ run_unattended() {
 # what it found; a nonzero exit stops the update.
 
 step_egress() {
-    printf 'want=%s\n' "$EGRESS_ORG"
+    printf 'want=%s\nnet_secs=%s\npace=%s\n' "$EGRESS_ORG" "$NET_SECS" "$POLL_SECS"
     cat <<'EOF'
-ip=$(curl -fsS --max-time 20 https://api.ipify.org) || { echo "cannot read this VM's public address"; exit 2; }
+# The agent answers before the OS has a lease: wait for the network, then judge.
+start=$(date +%s); said=
+while :; do
+    if ip=$(curl -fsS --max-time 20 https://api.ipify.org 2>&1); then break; fi
+    if [ $(( $(date +%s) - start )) -ge "$net_secs" ]; then
+        echo "cannot read this VM's public address: no answer from api.ipify.org for ${net_secs}s after the agent answered -- the recovery OS's network may not be up ($ip)"; exit 2
+    fi
+    [ -n "$said" ] || { echo "waiting for the recovery OS's network (up to ${net_secs}s): $ip"; said=1; }
+    sleep "$pace"
+done
 org=$(curl -fsS --max-time 20 "https://ipinfo.io/$ip/org") || { echo "cannot read who owns $ip"; exit 2; }
 echo "egress: $ip, $org"
 case "$org" in
@@ -5442,8 +5457,9 @@ check_knobs() {
     if [[ ! "$POLL_SECS" =~ ^[[:digit:]]+(\.[[:digit:]]+)?$ || ! "$POLL_SECS" =~ [123456789] || ! "$MINUTE_SECS" =~ ^[123456789][[:digit:]]*$ ||
         ! "$GRACE_SECS" =~ ^[123456789][[:digit:]]*$ || ! "$GUARD_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$RESEND_SECS" =~ ^[123456789][[:digit:]]{0,4}$ ||
         ! "$CLOCK_GAP_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$UPDATE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ||
-        ! "$AGENT_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$AGENT_GRACE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
-        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS and _AGENT_GRACE_SECS take numbers above 0\n' >&2
+        ! "$AGENT_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$AGENT_GRACE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ||
+        ! "$NET_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS, _AGENT_GRACE_SECS and _NET_SECS take numbers above 0\n' >&2
         exit 2
     fi
     # It goes into a shell script in the recovery OS: letters, digits and

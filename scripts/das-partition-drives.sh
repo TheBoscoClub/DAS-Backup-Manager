@@ -1,7 +1,7 @@
 #!/bin/bash
 # das-partition-drives.sh - Partition and format DAS backup drives (config-driven)
-# Version: 2.3.4
-# Date: 2026-10-05
+# Version: 2.3.5
+# Date: 2026-10-12
 #
 # WARNING: This script DESTROYS ALL DATA on the target drives!
 #     --run refuses unless every drive's most recent SMART self-test PASSED:
@@ -18,7 +18,7 @@
 #
 # Drive Layout (from config):
 #   Bootable targets (role with ESP):
-#     - Partition 1: 1.5G ESP (FAT32) - clone of /boot
+#     - Partition 1: 1.5G ESP (FAT32), label RECOV-ESP-<bay> - empty; the drive's own independent OS installs its bootloader there (never a copy of the host's)
 #     - Partition 2: remainder BTRFS - system subvolumes
 #
 #   Primary/data targets (no ESP):

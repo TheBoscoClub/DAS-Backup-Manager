@@ -3210,7 +3210,7 @@ has "guard, dry run: the guard it would carry, shown" "$OUT" "session guard: a r
 for knob in 0 12x; do
     GUARD_SECS=$knob run_driver status
     check "guard knob $knob: a usage error" "$RC" "2"
-    has "guard knob $knob: says which" "$OUT" "_GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS and _AGENT_GRACE_SECS take numbers above 0"
+    has "guard knob $knob: says which" "$OUT" "_GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS, _AGENT_GRACE_SECS and _NET_SECS take numbers above 0"
 done
 RESEND=0 run_driver status
 check "resend knob 0: a usage error" "$RC" "2"
@@ -5157,6 +5157,57 @@ rm "$S/systemd_run_detach_fail" "$T/bin/systemd-run"
 DRIVER_PATH="$(minimal_path)" run_driver session A --unattended --detach
 check "detach, no systemd-run: refused" "$RC" "1"
 has "detach, no systemd-run: says so" "$OUT" "systemd-run is not available: --detach"
+
+echo "--- the egress step waits for the recovery OS's network before judging (slu9)"
+# The step's script as the driver generates it, run here against a stub curl:
+# the guest agent answers before NetworkManager has a lease (A, 2026-10-12:
+# the step was dispatched 0.5 s before the NIC began activating).
+curl_stub() { # <n>: a curl that cannot resolve n times, then answers as the direct path
+    mkdir -p "$T/curlstub"
+    printf '%s\n' "$1" >"$T/curlstub/fail_first"
+    : >"$T/curlstub/calls"
+    cat >"$T/curlstub/curl" <<'EOF'
+#!/bin/bash
+d=$(dirname "$0"); echo "$*" >>"$d/calls"
+if (($(wc -l <"$d/calls") <= $(cat "$d/fail_first"))); then echo "curl: (6) Could not resolve host: api.ipify.org" >&2; exit 6; fi
+case "$*" in *ipify*) echo 203.0.113.7 ;; *ipinfo*) echo "AS64500 Example ISP" ;; esac
+EOF
+    chmod +x "$T/curlstub/curl"
+}
+run_egress_script() { # runs the captured step script; OUT and RC as run_driver
+    RC=0
+    OUT="$(PATH="$T/curlstub:$PATH" sh "$S/stage.egress.sh" 2>&1)" || RC=$?
+}
+unattended_fixture
+DAS_RECOVERY_VM_NET_SECS=30 run_driver session A --unattended
+check "egress wait: the driver still runs every step" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+has "egress wait: the budget goes into the step" "$(file "$S/stage.egress.sh")" "net_secs=30"
+has "egress wait: at the driver's pace" "$(file "$S/stage.egress.sh")" "pace=0.05"
+curl_stub 2
+run_egress_script
+check "egress wait, network up on the third try: exit 0" "$RC" "0"
+has "egress wait, network up on the third try: said it waited" "$OUT" "waiting for the recovery OS's network (up to 30s): curl: (6) Could not resolve host: api.ipify.org"
+has "egress wait, network up on the third try: then judged" "$OUT" "egress is direct (AS64500)"
+check "egress wait, network up on the third try: two refusals, the address, the owner" "$(wc -l <"$T/curlstub/calls")" "4"
+curl_stub 0
+run_egress_script
+check "egress wait, network up at once: exit 0" "$RC" "0"
+lacks "egress wait, network up at once: never waited" "$OUT" "waiting for the recovery OS's network"
+has "egress wait, network up at once: judged" "$OUT" "egress is direct (AS64500)"
+unattended_fixture
+DAS_RECOVERY_VM_NET_SECS=1 run_driver session A --unattended
+curl_stub 1000
+before=$SECONDS
+run_egress_script
+check "egress wait, network never up: exit 2" "$RC" "2"
+has "egress wait, network never up: says so, with the budget" "$OUT" "cannot read this VM's public address: no answer from api.ipify.org for 1s after the agent answered -- the recovery OS's network may not be up (curl: (6) Could not resolve host: api.ipify.org)"
+matches "egress wait, network never up: waited the budget out" "$((SECONDS - before))" "^[1-9][0-9]*$"
+matches "egress wait, network never up: asked more than once" "$(wc -l <"$T/curlstub/calls")" "^([2-9]|[1-9][0-9]+)$"
+for knob in 0 12x; do
+    DAS_RECOVERY_VM_NET_SECS=$knob run_driver status
+    check "net knob $knob: a usage error" "$RC" "2"
+    has "net knob $knob: says which" "$OUT" "_AGENT_GRACE_SECS and _NET_SECS take numbers above 0"
+done
 
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
 check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"
