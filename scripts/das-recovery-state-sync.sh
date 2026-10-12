@@ -6,13 +6,21 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.0.1
+# Version: 1.0.2
 # Date: 2026-10-12
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
 # in the unit, and the marker is written only by provisioning. A failure
 # leaves whatever /var/lib/das-backup held — never an empty database — and
-# exits 1 with the reason in the journal and in $STATUS_FILE.
+# exits 1 with the reason in the journal and in $STATUS_FILE. Exit 2 (the unit
+# lists it in SuccessExitStatus) is "no state snapshot yet": a normal first
+# boot before any backup, not a failure.
+#
+# The catch-up walks the drive's OWN target, so that target is mounted here at
+# subvolid=5 (its top level, by the booted UUID) before walk starts: walk then
+# finds it mounted and never binds the running `/` (subvolume @) at its path.
+# It is left mounted for the rest of the recovery session (the GUI restore
+# reads it); it is deliberately not in the EXIT trap.
 set -euo pipefail
 
 ROOT="${DAS_STATE_SYNC_ROOT:-}" # test seam: a fake filesystem tree
@@ -100,7 +108,7 @@ if [[ -z "$state_snap" ]]; then
     # Not die(): the status word for this case is exactly "no state snapshot".
     say "das-recovery-state-sync: no received das-state snapshot yet (the next backup run sends one): state left as it was" >&2
     status "no state snapshot"
-    exit 1
+    exit 2
 fi
 
 # Config first: derive-recovery refuses before anything is replaced when the
@@ -154,6 +162,31 @@ fi
     die "installing the derived configuration failed: state is new, configuration is the previous one"
 }
 
+# top_level_of <mountpoint>: "UUID FSROOT" of what is mounted there; empty and
+# nonzero when nothing is.
+top_level_of() { "$FINDMNT" -no UUID,FSROOT -M "$1" 2>/dev/null; }
+
+# ensure_own_target <mountpoint>: this drive's own filesystem mounted there at
+# its top level, read-only. Already a mountpoint: its UUID must be this
+# drive's and its FSROOT "/", else die (a bind of the running `/` would make
+# every snapshot path under it absent). Returns 1 if the mount itself fails;
+# the result is read back before it is believed.
+ensure_own_target() {
+    local mp=$1 seen u r
+    mkdir -p "$mp" || return 1
+    if seen=$(top_level_of "$mp") && [[ -n "$seen" ]]; then
+        read -r u r <<<"$seen"
+        [[ "${u,,}" == "${uuid,,}" && "$r" == "/" ]] ||
+            die "$walk_mount is mounted but not this drive's top level (uuid ${u:-unknown}, fsroot ${r:-unknown})"
+        return 0
+    fi
+    "$MOUNT" -o subvolid=5,ro "UUID=$uuid" "$mp" || return 1
+    seen=$(top_level_of "$mp") || return 1
+    read -r u r <<<"$seen"
+    [[ "${u,,}" == "${uuid,,}" && "$r" == "/" ]] ||
+        die "$walk_mount is mounted but not this drive's top level (uuid ${u:-unknown}, fsroot ${r:-unknown})"
+}
+
 stamp=${state_snap##*.}
 data_stamp=${root_snap##*.}
 if [[ "$stamp" < "$data_stamp" ]]; then
@@ -174,6 +207,9 @@ if [[ "$stamp" < "$data_stamp" ]]; then
     if [[ -z "$walk_mount" ]]; then
         say "could not start the catch-up (the derived configuration names no target mount): search is current to $stamp only" >&2
         status "synced $stamp; catch-up NOT started: no target mount from dump-env"
+    elif ! ensure_own_target "$ROOT$walk_mount"; then
+        say "could not start the catch-up (cannot mount $walk_mount at its top level): search is current to $stamp only" >&2
+        status "synced $stamp; catch-up NOT started: cannot mount $walk_mount"
     elif "$SYSTEMD_RUN" --quiet --collect --unit=das-recovery-state-catchup --property=Type=oneshot \
         "$BTRDASD" walk "$walk_mount" --db "$STATE_DIR/backup-index.db" --config "$CONFIG_OUT"; then
         status "synced $stamp; catch-up index running (data $data_stamp)"
