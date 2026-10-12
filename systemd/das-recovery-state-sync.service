@@ -3,7 +3,6 @@ Description=Recovery drive: sync btrdasd state and configuration from the newest
 ConditionPathExists=/etc/das-backup/recovery-drive
 After=local-fs.target
 Before=display-manager.service btrdasd-helper.service
-DefaultDependencies=no
 
 [Service]
 Type=oneshot
