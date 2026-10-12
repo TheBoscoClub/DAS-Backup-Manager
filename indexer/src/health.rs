@@ -544,15 +544,71 @@ pub fn find_mount_for_device(serial: &str, role: &TargetRole) -> Option<String> 
         .unwrap_or(part);
 
     let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    top_level_mount_of(&mounts, &canonical_part)
+}
+
+/// The first mount of `device` in `/proc/mounts` text that shows the
+/// filesystem's TOP LEVEL, never a subvolume of it. Binding a subvolume mount
+/// (a booted recovery drive's `/`, subvolume `@`) at a target path would put a
+/// different tree where the target's snapshots are expected. A BTRFS entry
+/// qualifies on `subvolid=5`; an entry with a `subvol=`/`subvolid=` option that
+/// says otherwise is skipped; a filesystem with neither option has no
+/// subvolumes and qualifies.
+fn top_level_mount_of(mounts: &str, device: &str) -> Option<String> {
     for line in mounts.lines() {
-        let mut cols = line.splitn(3, ' ');
-        if let (Some(device), Some(mountpoint)) = (cols.next(), cols.next())
-            && device == canonical_part
-        {
+        let mut cols = line.split(' ');
+        let (Some(dev), Some(mountpoint)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        if dev != device {
+            continue;
+        }
+        let opts: Vec<&str> = cols.nth(1).unwrap_or("").split(',').collect();
+        let top = if opts.contains(&"subvolid=5") {
+            true
+        } else {
+            !opts
+                .iter()
+                .any(|o| o.starts_with("subvolid=") || o.starts_with("subvol="))
+        };
+        if top {
             return Some(mountpoint.to_string());
         }
     }
     None
+}
+
+/// `(filesystem UUID, FSROOT)` of the mount at `path`: what is mounted there
+/// and which part of it (`/` is the top level; `/@` is a subvolume).
+pub fn mount_uuid_fsroot(path: &Path) -> Option<(String, String)> {
+    mount_uuid_fsroot_with(&crate::fsutil::SystemRunner, path)
+}
+
+/// [`mount_uuid_fsroot`] with `findmnt` run by `runner`. `None` when it fails
+/// or does not print exactly two fields (an empty UUID prints one) — the
+/// caller reads that as "not verified". Stacked mounts print several lines;
+/// the last is the one on top.
+pub fn mount_uuid_fsroot_with(
+    runner: &dyn crate::fsutil::CommandRunner,
+    path: &Path,
+) -> Option<(String, String)> {
+    let out = runner
+        .output(
+            std::process::Command::new("findmnt")
+                .args(["-no", "UUID,FSROOT"])
+                .arg(path),
+        )
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let mut f = line.split_whitespace();
+    let (uuid, fsroot) = (f.next()?, f.next()?);
+    f.next()
+        .is_none()
+        .then(|| (uuid.to_string(), fsroot.to_string()))
 }
 
 /// Find the effective mount path for a target, checking both the configured
@@ -1757,6 +1813,59 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         );
         assert_eq!(device_for_fs_uuid_with(&runner, ""), None);
         assert_eq!(runner.calls().len(), 5, "an empty UUID runs nothing");
+    }
+
+    #[test]
+    fn a_bind_never_takes_a_subvolume_mount_of_the_device() {
+        // The booted recovery drive: its `/` is subvolume @ (listed first),
+        // and the same partition's top level is mounted elsewhere.
+        let mounts = "\
+/dev/sdk2 / btrfs rw,noatime,subvolid=256,subvol=/@ 0 0
+/dev/sdk2 /home btrfs rw,subvolid=257,subvol=/@home 0 0
+/dev/sdb1 /srv ext4 rw 0 0
+/dev/sdk2 /run/media/b/top btrfs rw,subvolid=5,subvol=/ 0 0
+";
+        assert_eq!(
+            top_level_mount_of(mounts, "/dev/sdk2").as_deref(),
+            Some("/run/media/b/top")
+        );
+        // Only subvolume mounts: nothing to bind.
+        let only_sub = "/dev/sdk2 / btrfs rw,subvolid=256,subvol=/@ 0 0\n";
+        assert_eq!(top_level_mount_of(only_sub, "/dev/sdk2"), None);
+        // A subvol= with no id is still a subvolume.
+        let named = "/dev/sdk2 / btrfs rw,subvol=/@ 0 0\n";
+        assert_eq!(top_level_mount_of(named, "/dev/sdk2"), None);
+        // A filesystem without subvolumes qualifies; another device does not match.
+        assert_eq!(
+            top_level_mount_of(mounts, "/dev/sdb1").as_deref(),
+            Some("/srv")
+        );
+        assert_eq!(top_level_mount_of(mounts, "/dev/sdz9"), None);
+    }
+
+    #[test]
+    fn mount_uuid_fsroot_reads_two_fields_and_nothing_else() {
+        use crate::fsutil::testing::Scripted;
+        let runner = Scripted::new(&[
+            ("findmnt -no UUID,FSROOT /m/a", 0, "60b0-aa /\n"),
+            ("findmnt -no UUID,FSROOT /m/b", 0, "60b0-aa /@\n"),
+            ("findmnt -no UUID,FSROOT /m/c", 0, "/\n"),
+            ("findmnt -no UUID,FSROOT /m/d", 1, "60b0-aa /\n"),
+            ("findmnt -no UUID,FSROOT /m/e", 0, "1111-x /@\n60b0-aa /\n"),
+            ("findmnt -no UUID,FSROOT /m/f", 0, ""),
+        ]);
+        let at = |p: &str| mount_uuid_fsroot_with(&runner, Path::new(p));
+        assert_eq!(at("/m/a"), Some(("60b0-aa".into(), "/".into())));
+        assert_eq!(at("/m/b"), Some(("60b0-aa".into(), "/@".into())));
+        assert_eq!(at("/m/c"), None, "empty UUID prints one field");
+        assert_eq!(at("/m/d"), None, "findmnt failed");
+        assert_eq!(
+            at("/m/e"),
+            Some(("60b0-aa".into(), "/".into())),
+            "the mount on top"
+        );
+        assert_eq!(at("/m/f"), None);
+        assert_eq!(at("/m/unscripted"), None);
     }
 
     #[test]

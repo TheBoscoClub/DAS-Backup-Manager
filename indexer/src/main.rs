@@ -194,15 +194,34 @@ where
 /// Per-target reindex outcome: label, snapshots indexed, snapshots on disk.
 type ReindexOutcome = Vec<(String, usize, usize, usize)>;
 
+/// The configured target roots that are mounted AND are their filesystem's top
+/// level (`findmnt`), with every refusal and every unchecked target (no
+/// `mount_uuid`) said on stderr. A refused root is never walked or reconciled.
+fn checked_roots(cfg: &Config) -> reconcile::VerifiedRoots {
+    let verified = reconcile::verify_target_roots(
+        &cfg.targets,
+        &buttered_dasd::health::is_mountpoint,
+        &buttered_dasd::health::mount_uuid_fsroot,
+    );
+    for (_, why) in &verified.refused {
+        eprintln!("{why}");
+    }
+    for label in &verified.unchecked {
+        eprintln!("{label}: no mount_uuid configured — mount identity not verified");
+    }
+    verified
+}
+
 fn run_reconcile(
     database: &Database,
     cfg: &Config,
+    verified: &reconcile::VerifiedRoots,
     dry_run: bool,
 ) -> rusqlite::Result<reconcile::PruneStats> {
     let roots: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
-    let mounted = reconcile::verified_mounted_roots(&roots);
+    let mounted = &verified.roots;
     let snapshots = database.list_snapshots()?;
-    let plan = reconcile::plan_reconcile(&snapshots, &mounted, &roots, reconcile::path_exists);
+    let plan = reconcile::plan_reconcile(&snapshots, mounted, &roots, reconcile::path_exists);
     if dry_run || plan.is_empty() {
         return Ok(reconcile::PruneStats::default());
     }
@@ -1576,11 +1595,22 @@ fn cmd_walk(
     };
     let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
     let database = Database::open(db)?;
-    let result = indexer::walk(target, &database);
+    // A mount point is not an identity: the root must be the configured
+    // filesystem's top level before anything is read from or pruned under it.
+    let verified = checked_roots(&cfg);
+    let refusal = verified.refusal_for(target).map(str::to_string);
+    let result = match &refusal {
+        Some(_) => None,
+        None => Some(indexer::walk(target, &database)),
+    };
     // Reconcile while the targets are still mounted — the prune is only
-    // ever safe under a verified mountpoint (bd DAS-Backup-Manager-cu8).
-    let reconciled = run_reconcile(&database, &cfg, false);
+    // ever safe under a verified top-level mount (bd DAS-Backup-Manager-cu8).
+    let reconciled = run_reconcile(&database, &cfg, &verified, false);
     let still_mounted = guard.unmount(progress);
+    let Some(result) = result else {
+        mount::require_released(&still_mounted)?;
+        return Err(refusal.unwrap_or_default().into());
+    };
     let result = result?;
     let (out, warning) = walk_report(json, &result, &reconciled);
     print!("{out}");
@@ -1854,6 +1884,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
             let database = Database::open(&db)?;
+            let verified = checked_roots(&cfg);
 
             let outcome = (|| -> Result<ReindexOutcome, Box<dyn std::error::Error>> {
                 if rebuild {
@@ -1866,6 +1897,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !buttered_dasd::health::is_mountpoint(root) {
                         println!("  {} — not mounted, skipping", target.label);
                         continue;
+                    }
+                    if verified.refusal_for(root).is_some() {
+                        continue; // already said on stderr; the exit reflects it
                     }
                     println!("  {} — indexing {}", target.label, target.mount);
                     let r = buttered_dasd::indexer::walk(root, &database)?;
@@ -1920,6 +1954,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Total newly indexed: {total}");
             }
             mount::require_released(&still_mounted)?;
+            let refused: Vec<String> = verified.refused.iter().map(|(_, w)| w.clone()).collect();
+            if let Some(why) = reconcile::failure_error(&refused) {
+                return Err(why.into());
+            }
         }
         Commands::Reconcile {
             db,
@@ -1993,7 +2031,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let roots: Vec<String> = cfg.targets.iter().map(|t| t.mount.clone()).collect();
-            let mounted = reconcile::verified_mounted_roots(&roots);
+            let verified = checked_roots(&cfg);
+            failures.extend(verified.refused.iter().map(|(_, why)| why.clone()));
+            let mounted = verified.roots;
             let snapshots = database.list_snapshots();
             let outcome = snapshots.map(|snaps| {
                 let plan =

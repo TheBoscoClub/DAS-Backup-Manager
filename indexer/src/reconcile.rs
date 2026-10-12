@@ -28,7 +28,6 @@
 use std::path::Path;
 
 use crate::db::Snapshot;
-use crate::health::is_mountpoint;
 use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::scrub;
 
@@ -189,13 +188,82 @@ where
     plan
 }
 
-/// Filter configured target roots down to those that are genuinely mounted.
-pub fn verified_mounted_roots(target_roots: &[String]) -> Vec<String> {
-    target_roots
-        .iter()
-        .filter(|r| is_mountpoint(Path::new(r)))
-        .cloned()
-        .collect()
+/// What the host says about a mount point: `(filesystem UUID, FSROOT)`, from
+/// `findmnt -no UUID,FSROOT <path>`. `None` when it cannot say.
+pub type RootProbe<'a> = &'a dyn Fn(&Path) -> Option<(String, String)>;
+
+/// The configured target roots a pass may trust.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct VerifiedRoots {
+    /// Mount points that are the configured filesystem's top level, plus
+    /// those of targets without a `mount_uuid` (see `unchecked`).
+    pub roots: Vec<String>,
+    /// Labels of mounted targets without a `mount_uuid` (serial-only): their
+    /// identity cannot be checked, they are kept as before. For the caller to log.
+    pub unchecked: Vec<String>,
+    /// `(mount, message)` for each mount point that IS mounted but is not the
+    /// configured filesystem's top level. Never walked, never reconciled.
+    pub refused: Vec<(String, String)>,
+}
+
+impl VerifiedRoots {
+    /// The refusal message when `path` is a refused mount point.
+    pub fn refusal_for(&self, path: &Path) -> Option<&str> {
+        let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.refused.iter().find_map(|(mount, why)| {
+            let m = Path::new(mount);
+            let m = m.canonicalize().unwrap_or_else(|_| m.to_path_buf());
+            (m == want).then_some(why.as_str())
+        })
+    }
+}
+
+/// Filter configured targets down to the roots that are genuinely mounted AND
+/// are the configured filesystem's top level.
+///
+/// A mount point is not an identity: on a booted recovery drive the
+/// configured path can hold a bind of the running `/` (subvolume `@`), under
+/// which every recorded snapshot path is "absent" and a prune would delete the
+/// drive's own rows. For a target with a `mount_uuid`, `probe` must therefore
+/// report that UUID (case-insensitive) and FSROOT `/`; anything else —
+/// including a probe that cannot answer — is refused (the cautious reading).
+pub fn verify_target_roots(
+    targets: &[crate::config::Target],
+    is_mount: &dyn Fn(&Path) -> bool,
+    probe: RootProbe<'_>,
+) -> VerifiedRoots {
+    let mut out = VerifiedRoots::default();
+    for t in targets {
+        if !is_mount(Path::new(&t.mount)) {
+            continue;
+        }
+        let Some(want) = t.mount_uuid.as_deref().filter(|u| !u.is_empty()) else {
+            out.unchecked.push(t.label.clone());
+            out.roots.push(t.mount.clone());
+            continue;
+        };
+        let seen = probe(Path::new(&t.mount));
+        match &seen {
+            Some((uuid, fsroot)) if uuid.eq_ignore_ascii_case(want) && fsroot == "/" => {
+                out.roots.push(t.mount.clone());
+            }
+            _ => {
+                let (uuid, fsroot) = match &seen {
+                    Some((u, r)) => (u.as_str(), r.as_str()),
+                    None => ("unknown", "unknown"),
+                };
+                out.refused.push((
+                    t.mount.clone(),
+                    format!(
+                        "{}: mounted but not the configured filesystem's top level \
+                         (uuid {uuid}, fsroot {fsroot}) — skipped",
+                        t.label
+                    ),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// What `reconcile --forget-root` did with the root it was given.
@@ -401,17 +469,121 @@ mod tests {
         assert!(!plan.is_empty());
     }
 
+    fn tgt(label: &str, mount: &str, uuid: Option<&str>) -> crate::config::Target {
+        crate::config::Target {
+            label: label.to_string(),
+            serial: String::new(),
+            serials: vec![],
+            mount_uuid: uuid.map(str::to_string),
+            mount: mount.to_string(),
+            role: crate::config::TargetRole::Primary,
+            retention: crate::config::Retention {
+                weekly: 4,
+                monthly: 2,
+                daily: 7,
+                yearly: 1,
+            },
+            display_name: String::new(),
+        }
+    }
+
+    const U: &str = "5eed0008-1111-2222-3333-444444444444";
+
+    fn answers(uuid: &str, fsroot: &str) -> impl Fn(&Path) -> Option<(String, String)> {
+        let (u, r) = (uuid.to_string(), fsroot.to_string());
+        move |_| Some((u.clone(), r.clone()))
+    }
+
     #[test]
-    fn verified_mounted_roots_keeps_real_mounts_and_drops_the_rest() {
-        // "/" is always a mountpoint; "/etc" exists but is not one; the third
-        // does not exist at all. A constant-empty or constant-passthrough
-        // implementation fails this.
-        let roots = vec![
-            "/".to_string(),
-            "/etc".to_string(),
-            "/nonexistent-xyzzy-12345".to_string(),
+    fn a_mount_that_is_the_configured_top_level_is_verified() {
+        let t = [tgt("rec-A", "/mnt/a", Some(U))];
+        // Upper-case UUID from the host: matched case-insensitively.
+        let v = verify_target_roots(&t, &|_| true, &answers(&U.to_uppercase(), "/"));
+        assert_eq!(v.roots, vec!["/mnt/a".to_string()]);
+        assert!(v.refused.is_empty() && v.unchecked.is_empty());
+    }
+
+    #[test]
+    fn a_mount_of_another_filesystem_is_refused_with_its_identity() {
+        let t = [tgt("rec-A", "/mnt/a", Some(U))];
+        let v = verify_target_roots(&t, &|_| true, &answers("dead-beef", "/"));
+        assert!(v.roots.is_empty());
+        assert_eq!(
+            v.refused[0].1,
+            "rec-A: mounted but not the configured filesystem's top level \
+             (uuid dead-beef, fsroot /) — skipped"
+        );
+    }
+
+    #[test]
+    fn a_subvolume_mount_of_the_right_filesystem_is_refused() {
+        // The bind of the booted drive's `/` shows its own UUID, FSROOT /@.
+        let t = [tgt("rec-A", "/mnt/a", Some(U))];
+        let v = verify_target_roots(&t, &|_| true, &answers(U, "/@"));
+        assert!(v.roots.is_empty());
+        assert!(v.refused[0].1.contains(&format!("(uuid {U}, fsroot /@)")));
+        assert_eq!(
+            v.refusal_for(Path::new("/mnt/a")),
+            Some(v.refused[0].1.as_str())
+        );
+        assert_eq!(v.refusal_for(Path::new("/mnt/other")), None);
+    }
+
+    #[test]
+    fn a_probe_that_cannot_answer_refuses_the_root() {
+        let t = [tgt("rec-A", "/mnt/a", Some(U))];
+        let v = verify_target_roots(&t, &|_| true, &|_| None);
+        assert!(v.roots.is_empty());
+        assert!(v.refused[0].1.contains("(uuid unknown, fsroot unknown)"));
+    }
+
+    #[test]
+    fn an_unmounted_target_is_neither_verified_nor_refused_and_is_not_probed() {
+        let t = [tgt("rec-A", "/mnt/a", Some(U))];
+        let probe = |_: &Path| -> Option<(String, String)> { panic!("probed an unmounted root") };
+        let v = verify_target_roots(&t, &|_| false, &probe);
+        assert_eq!(v, VerifiedRoots::default());
+    }
+
+    #[test]
+    fn a_target_without_a_uuid_keeps_the_mountpoint_check_and_is_listed() {
+        let t = [
+            tgt("serial-only", "/mnt/s", None),
+            tgt("empty", "/mnt/e", Some("")),
         ];
-        assert_eq!(verified_mounted_roots(&roots), vec!["/".to_string()]);
+        let probe = |_: &Path| -> Option<(String, String)> { panic!("no uuid to compare") };
+        let v = verify_target_roots(&t, &|_| true, &probe);
+        assert_eq!(v.roots, vec!["/mnt/s".to_string(), "/mnt/e".to_string()]);
+        assert_eq!(
+            v.unchecked,
+            vec!["serial-only".to_string(), "empty".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_refused_root_is_never_reconciled() {
+        // Every recorded path under the refused root is absent, and a pass
+        // that trusted the bind would doom them all. Through the same
+        // verification the commands use, none is doomed.
+        let t = [
+            tgt("rec-A", "/mnt/a", Some(U)),
+            tgt("ok", "/mnt/ok", Some(U)),
+        ];
+        let snaps = vec![
+            snap(1, "/mnt/a/nvme/root-.1"),
+            snap(2, "/mnt/ok/nvme/root-.2"),
+        ];
+        let roots: Vec<String> = t.iter().map(|x| x.mount.clone()).collect();
+        let probe = |p: &Path| {
+            Some((
+                U.to_string(),
+                if p == Path::new("/mnt/a") { "/@" } else { "/" }.to_string(),
+            ))
+        };
+        let v = verify_target_roots(&t, &|_| true, &probe);
+        let plan = plan_reconcile(&snaps, &v.roots, &roots, |_| false);
+        assert_eq!(plan.doomed, vec![2], "only the verified root's row can go");
+        assert_eq!(plan.skipped_unmounted, 1, "the refused root's row is kept");
     }
 
     #[test]

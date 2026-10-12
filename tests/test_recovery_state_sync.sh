@@ -32,9 +32,16 @@ status_is() { [[ "$(cat "$R/run/das-recovery-state/status" 2>/dev/null)" == "$1"
 no_leftovers() { test ! -e "$R/var/lib/das-backup.new" -a ! -e "$R/var/lib/das-backup.old" -a ! -e "$R/etc/das-backup/config.toml.new"; }
 
 mkdir -p "$BIN"
+# findmnt -no UUID,FSROOT -M <mp>: the own target's mount state. STUB_MNT (a
+# full "UUID FSROOT" line) forces it already mounted as that; otherwise it is
+# mounted (as this drive's top level) only after the mount stub ran for it.
 cat >"$BIN/findmnt" <<S
 #!/bin/bash
 case "\$*" in
+*FSROOT*)
+    if [[ -n "\${STUB_MNT:-}" ]]; then echo "\$STUB_MNT"
+    elif [[ -e "\$STUB_LOG.mounted" ]]; then echo "$UUID_STUB /"
+    else exit 1; fi ;;
 *UUID*) echo "$UUID_STUB" ;;
 *SOURCE*) echo "/dev/stub[/@]" ;;
 esac
@@ -66,6 +73,8 @@ S
 cat >"$BIN/mount" <<'S'
 #!/bin/bash
 echo "mount $*" >>"$STUB_LOG"
+[[ -z "${STUB_MOUNT_FAIL:-}" ]] || exit 32
+[[ "$*" != *UUID=* ]] || : >"$STUB_LOG.mounted"
 S
 cat >"$BIN/umount" <<'S'
 #!/bin/bash
@@ -110,7 +119,7 @@ fixture() {
     chmod -R u+rwX "$R" 2>/dev/null || :
     rm -rf "$R"
     : >"$LOG"
-    rm -f "$WORK/mv-count"
+    rm -f "$WORK/mv-count" "$LOG.mounted"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
     : >"$R/etc/das-backup/recovery-drive"
@@ -158,6 +167,41 @@ check "gap: catch-up via systemd-run" has "$LOG" "systemd-run"
 check "gap: walk of the derived config's first target mount, --db, --config" \
     has "$LOG" "walk $WALK_MOUNT --db $R/var/lib/das-backup/backup-index.db --config $R/etc/das-backup/config.toml"
 check "gap: walk is NOT given the top-level mount" file_lacks "$LOG" "walk $R"
+check "gap: own target mounted at subvolid=5,ro by the booted uuid" \
+    has "$LOG" "mount -o subvolid=5,ro UUID=$UUID_STUB $R$WALK_MOUNT"
+check "gap: mount happens before the catch-up" \
+    test "$(grep -n 'mount -o subvolid=5,ro UUID=' "$LOG" | head -1 | cut -d: -f1)" -lt "$(grep -n 'systemd-run' "$LOG" | head -1 | cut -d: -f1)"
+check "gap: own target is NOT unmounted (left for the recovery session)" file_lacks "$LOG" "umount $R$WALK_MOUNT"
+check "gap: mount point created" test -d "$R$WALK_MOUNT"
+
+echo "== gap: own target already mounted"
+fixture
+mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
+echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
+run STUB_MNT="$UUID_STUB /"
+check "already top level: exit 0" test "$RC" -eq 0
+check "already top level: not mounted again" file_lacks "$LOG" "mount -o subvolid=5,ro UUID="
+check "already top level: catch-up starts" has "$LOG" "systemd-run"
+fixture
+mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
+echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
+run STUB_MNT="$UUID_STUB /@"
+check "bind of @: exit 1" test "$RC" -eq 1
+check "bind of @: status" status_is "failed: $WALK_MOUNT is mounted but not this drive's top level (uuid $UUID_STUB, fsroot /@)"
+check "bind of @: no catch-up" file_lacks "$LOG" systemd-run
+fixture
+mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
+echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
+run STUB_MNT="OTHER-UUID /"
+check "other filesystem: exit 1" test "$RC" -eq 1
+check "other filesystem: no catch-up" file_lacks "$LOG" systemd-run
+fixture
+mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
+echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
+run STUB_MOUNT_FAIL=1
+check "mount fails: exit 0 (the sync itself succeeded)" test "$RC" -eq 0
+check "mount fails: no catch-up" file_lacks "$LOG" systemd-run
+check "mount fails: status says NOT started" status_is "synced 20261012T0348; catch-up NOT started: cannot mount $WALK_MOUNT"
 
 echo "== state newer than data (the normal nightly layout)"
 fixture
@@ -183,7 +227,8 @@ echo "== no state snapshot"
 fixture
 rm -rf "$R"/nvme/das-state.*
 run
-check "nosnap: exit 1" test "$RC" -eq 1
+check "nosnap: exit 2 (the unit's SuccessExitStatus), not 1" test "$RC" -eq 2
+check "nosnap: the unit lists exit 2 as success" grep -q '^SuccessExitStatus=2$' "$(dirname "$SCRIPT")/../systemd/das-recovery-state-sync.service"
 check "nosnap: previous state intact" has "$R/var/lib/das-backup/previous" previous
 check "nosnap: no config written" test ! -e "$R/etc/das-backup/config.toml"
 check "nosnap: status" status_is "no state snapshot"
