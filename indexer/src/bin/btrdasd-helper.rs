@@ -1412,7 +1412,7 @@ impl HelperInterface {
                 .map_err(|e| fdo::Error::Failed(format!("Path query failed: {e}")))?
                 .ok_or_else(|| {
                     fdo::Error::Failed(format!(
-                        "No copy of snapshot {snapshot_id} is present on this machine                          (the target it was indexed from is not mounted, and no other                          target holding it is)"
+                        "No copy of snapshot {snapshot_id} is present on this machine (the target it was indexed from is not mounted, and no other                          target holding it is)"
                     ))
                 })?;
             Ok(path)
