@@ -534,7 +534,19 @@ pub fn device_info_from_serial(serial: &str) -> Option<(String, bool)> {
 /// actual mount path (which may be `/run/media/…` from udisks2, or the
 /// configured `/mnt/backup-…`, or wherever the kernel says it is).
 pub fn find_mount_for_device(serial: &str, role: &TargetRole) -> Option<String> {
-    let dev = device_from_serial(serial)?;
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    find_mount_for_device_with(&device_from_serial, &mounts, serial, role)
+}
+
+/// [`find_mount_for_device`] with the serial lookup and the `/proc/mounts`
+/// text supplied.
+pub fn find_mount_for_device_with(
+    dev_of_serial: &dyn Fn(&str) -> Option<String>,
+    mounts_text: &str,
+    serial: &str,
+    role: &TargetRole,
+) -> Option<String> {
+    let dev = dev_of_serial(serial)?;
     let part = crate::mount::partition_device(&dev, role);
     // Canonicalize the partition device so we match /proc/mounts entries that
     // use the real path (e.g. /dev/sdk1) rather than a symlink.
@@ -542,9 +554,7 @@ pub fn find_mount_for_device(serial: &str, role: &TargetRole) -> Option<String> 
         .ok()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or(part);
-
-    let mounts = fs::read_to_string("/proc/mounts").ok()?;
-    top_level_mount_of(&mounts, &canonical_part)
+    top_level_mount_of(mounts_text, &canonical_part)
 }
 
 /// The first mount of `device` in `/proc/mounts` text that shows the
@@ -1841,6 +1851,79 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             Some("/srv")
         );
         assert_eq!(top_level_mount_of(mounts, "/dev/sdz9"), None);
+    }
+
+    /// Real `findmnt` on `/`: the production wrapper must return exactly what
+    /// the tool prints (any filesystem type with a UUID, not only btrfs).
+    #[test]
+    fn mount_uuid_fsroot_matches_findmnt_on_this_machine() {
+        let findmnt = |col: &str| {
+            std::process::Command::new("findmnt")
+                .args(["-no", col, "/"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        if std::process::Command::new("findmnt")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: findmnt not installed");
+            return;
+        }
+        let uuid = findmnt("UUID").unwrap();
+        if uuid.is_empty() {
+            eprintln!("SKIP: / has no filesystem UUID on this machine");
+            return;
+        }
+        let fsroot = findmnt("FSROOT").unwrap();
+        assert_eq!(mount_uuid_fsroot(Path::new("/")), Some((uuid, fsroot)));
+    }
+
+    #[test]
+    fn find_mount_for_device_with_resolves_serial_partition_and_top_level_mount() {
+        let dir = std::env::temp_dir().join(format!("fmfd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `<dev>1` and `<dev>2` are symlinks to the real partition nodes.
+        let (real1, real2) = (dir.join("real1"), dir.join("real2"));
+        std::fs::write(&real1, "").unwrap();
+        std::fs::write(&real2, "").unwrap();
+        let dev = dir.join("disk").to_string_lossy().to_string();
+        std::os::unix::fs::symlink(&real1, format!("{dev}1")).unwrap();
+        std::os::unix::fs::symlink(&real2, format!("{dev}2")).unwrap();
+        let (c1, c2) = (
+            real1.canonicalize().unwrap().to_string_lossy().to_string(),
+            real2.canonicalize().unwrap().to_string_lossy().to_string(),
+        );
+        let mounts = format!(
+            "{c1} /mnt/one btrfs rw,subvolid=5,subvol=/ 0 0\n\
+             {c2} /sub btrfs rw,subvolid=256,subvol=/@ 0 0\n\
+             {c2} /mnt/two btrfs rw,subvolid=5,subvol=/ 0 0\n"
+        );
+        let resolver = |s: &str| (s == "SER").then(|| dev.clone());
+        let find = |serial: &str, role: &TargetRole| {
+            find_mount_for_device_with(&resolver, &mounts, serial, role)
+        };
+        assert_eq!(
+            find("SER", &TargetRole::Primary).as_deref(),
+            Some("/mnt/one")
+        );
+        assert_eq!(
+            find("SER", &TargetRole::Mirror).as_deref(),
+            Some("/mnt/two")
+        );
+        assert_eq!(
+            find("OTHER", &TargetRole::Primary),
+            None,
+            "serial not found"
+        );
+        assert_eq!(
+            find_mount_for_device_with(&resolver, "", "SER", &TargetRole::Primary),
+            None,
+            "not mounted"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
