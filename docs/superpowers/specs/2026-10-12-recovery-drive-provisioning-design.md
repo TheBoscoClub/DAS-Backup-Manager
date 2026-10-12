@@ -171,7 +171,8 @@ driver already owns everything the job needs: the maintenance lock, the exclusiv
 claim, the per-drive VM with its guard, the egress rule, guest-agent execution, machine
 lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
 
-**Phase 0 — preflight (host, nothing changed)**
+#### Phase 0 — preflight (host, nothing changed)
+
 - Backup, scrub and doctor units inactive; maintenance lock taken; the drive claimed.
 - The other recovery drive's last session `clean` and its boot record `no` (never two
   drives down at once).
@@ -184,13 +185,15 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
 - A `--dry-run` prints the plan: serial, device, labels, hostname, bay, entry titles,
   package count, and exits.
 
-**Phase 1 — partition (host; this project's existing tool)**
+#### Phase 1 — partition (host; this project's existing tool)
+
 - `das-partition-drives.sh --run --only <serial>` after its SMART gate. From here the
   drive holds no backups: the first backup run afterwards is a **full send** (≈ 585 GiB per
   drive today; at the measured 11–20 MiB/s incremental-run rates, 8–15 hours; the full-send
   rate will be measured on the first rebuild and recorded in `THROUGHPUT-BASELINE.md`).
 
-**Phase 2 — install (inside the drive's VM, from the live ISO)**
+#### Phase 2 — install (inside the drive's VM, from the live ISO)
+
 - The driver defines the VM as for a session, attaches p2's whole disk as SATA (boot
   order 2) and the ISO as a read-only SATA cdrom with **boot order 1**, and boots. The
   live CachyOS system carries `qemu-guest-agent` and `arch-install-scripts` (verified
@@ -212,7 +215,8 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
   off, the disk given back, exit 7 naming the step. A stopped provision leaves a drive
   with a partition table and whatever was written; `provision` is re-runnable from Phase 1.
 
-**Phase 3 — first boot and proof (inside the VM, from the disk)**
+#### Phase 3 — first boot and proof (inside the VM, from the disk)
+
 - The driver reboots the VM with the ISO detached, boot order disk first, under the
   session guard. It must come back with the guard engaged and the agent answering (the
   pipeline's `reboot` step), then: `uname -r` is the installed kernel; the state-sync
@@ -220,7 +224,8 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
   test, observed on a real drive); a screenshot shows the Plasma desktop; `kwin_wayland`
   and `plasmashell` are running. Power off, give back.
 
-**Phase 4 — re-seed (the ordinary backup run)**
+#### Phase 4 — re-seed (the ordinary backup run)
+
 - The next nightly run (or `backup-run.sh` by hand) sends every configured subvolume in
   full to the new p2, records the OS (a `no` record with the agent installed), and the
   following session is admitted. Only then is the drive back in service; the guide says
