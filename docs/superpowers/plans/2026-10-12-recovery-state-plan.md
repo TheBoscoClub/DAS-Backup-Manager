@@ -418,7 +418,7 @@ git commit -m "btrdasd config derive-recovery: a recovery drive's configuration 
 **Interfaces:**
 
 - Consumes: `record_op <op> <OK|WARN|FAIL|SKIP> [detail]`, `log_info/log_warn/log_error`, `TARGET_MOUNTS[label]`, `TARGET_ROLES[label]`, `ALL_TARGET_MOUNTS`, `DAS_BTRBK_CONF`, `BTRDASD_BIN`, `DRY_RUN` as the script names them (read the real names at the top of `backup-run.sh` and use those; do not invent).
-- Produces: a btrbk snapshot series named `das-state` under the `nvme` volume's target dir on every target that receives `nvme` (`<target mount>/nvme/das-state.<stamp>`), sent after the indexer ran; `OP_STATUS[state]` with `OK`, `WARN` or `SKIP`; a report row `State index pass`.
+- Produces: a btrbk snapshot series named `das-state` under the root volume's target dir on every target that receives it (`<target dir>/das-state.<stamp>`, the dir read from the rendered config's `target` lines, never hard-coded), sent after the indexer ran with the config named by `DAS_BTRBK_STATE_CONF` (Task 3b; falls back to `DAS_BTRBK_CONF`); SKIP when no `das-state` entry is rendered; `OP_STATUS[state]` with `OK` (seconds, targets, bytes), `WARN` or `SKIP`; a report row `State index pass`.
 
 **How the entry comes to exist (operator-run, once, with the backup lock free):**
 
@@ -436,7 +436,7 @@ sudo sqlite3 /var/lib/das-backup/backup-index.db 'pragma quick_check;'   # ok
 # 4. the entry: sync adopts nested subvolumes (backup.md); give it the clean snapshot name
 sudo btrdasd subvol sync --config /etc/das-backup/config.toml
 sudo grep -n -A3 'name = "@/var/lib/das-backup"' /etc/das-backup/config.toml   # the adopted entry
-# add `snapshot_name = "das-state"` to that entry by hand (one line), then:
+# add `snapshot_name = "das-state"` AND `after_index = true` to that entry by hand (Task 3b), then:
 sudo btrdasd config validate && sudo btrdasd setup --upgrade   # re-renders btrbk.conf
 sudo grep -n -B1 'snapshot_name       das-state' /etc/btrbk/btrbk.conf          # the rendered entry
 systemctl start das-backup.timer das-backup-full.timer das-scrub.timer das-backup-doctor.timer
@@ -621,6 +621,199 @@ sudo mount -o subvolid=5,ro UUID=60b05268-7f8f-47b5-a38a-752576a1172a /mnt/tmp-A
 The proof: `ls -t <target>/nvme/ | head` shows `das-state.<stamp>` with the same stamp as tonight's `root-.<stamp>`, and `stat` of `backup-index.db` inside it is newer than the one inside `root-.<stamp>/var/lib/das-backup/` (which, now that it is a nested subvolume, is an empty directory — that emptiness is itself the proof that the state moved).
 
 Then `sudo rm -rf /var/lib/das-backup.dir-before-subvol` and note it in the session record.
+
+---
+
+### Task 3b: The state series lives in its own btrbk config (bd `DAS-Backup-Manager-9eq9`)
+
+Found by Task 3's review: the main `btrbk run` snapshots and sends `das-state` **before** indexing, the state pass sends a second copy after; btrbk keeps the first snapshot of a day as the daily, so the pre-index copy is the one history retains. Fix: an entry flagged `after_index = true` is left out of `/etc/btrbk/btrbk.conf` and rendered into `/etc/btrbk/btrbk-state.conf` (same globals, that volume, that entry, the same targets); the main run never sees it, the state pass (Task 3, `DAS_BTRBK_STATE_CONF`) is its only sender. **Serial after Task 2** (both edit `config.rs`).
+
+**Files:**
+
+- Modify: `indexer/src/config.rs:326-392` (`SubvolConfig` + its custom `Deserialize`)
+- Modify: `indexer/src/btrbk_conf.rs` (`render_btrbk_conf` ~line 16-100, the writer ~line 196-230, `declared_pairs` ~line 359)
+- Modify: `indexer/src/setup/env_export.rs` (`dump_env`: export `DAS_BTRBK_STATE_CONF`)
+- Test: `indexer/src/btrbk_conf.rs` `mod tests`, `indexer/src/config.rs` `mod tests`, `indexer/src/setup/env_export.rs` tests
+
+**Interfaces:**
+
+- Consumes: `SubvolConfig { name, manual_only, snapshot_name, adopted, retired }`; `render_btrbk_conf(&Config) -> String`; the writer that calls `write_atomic(conf_path, &render_btrbk_conf(cfg))`; `declared_pairs(&Config)`; `dump_env(&Config) -> String` (exports `DAS_BTRBK_CONF=`).
+- Produces: `SubvolConfig.after_index: bool` (serde default false, serialized only when true); `pub fn state_conf_path(config: &Config) -> PathBuf` (= the directory of `general.btrbk_conf` + `btrbk-state.conf`); `pub fn render_state_conf(&Config) -> Option<String>` (`None` when no live entry is `after_index`); the writer writes or removes the state file beside the main one, with the same rollback discipline; `declared_pairs` and `render_btrbk_conf` exclude `after_index` entries; `dump_env` exports `DAS_BTRBK_STATE_CONF=<state_conf_path>`.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `btrbk_conf.rs` `mod tests` (use the module's `test_config()` at ~line 479 and add one `after_index` entry to its `nvme`-like source):
+
+```rust
+#[test]
+fn an_after_index_entry_is_left_out_of_the_main_conf_and_rendered_into_the_state_conf() {
+    let mut cfg = test_config();
+    cfg.sources[0].subvolumes.push(SubvolConfig {
+        name: "@/var/lib/das-backup".into(),
+        snapshot_name: Some("das-state".into()),
+        after_index: true,
+        ..Default::default()
+    });
+    let main = render_btrbk_conf(&cfg);
+    assert!(!main.contains("das-state"), "main conf must not carry the state series:\n{main}");
+    let state = render_state_conf(&cfg).expect("a state conf");
+    assert!(state.contains("  subvolume             @/var/lib/das-backup\n    snapshot_name       das-state\n"), "{state}");
+    // same globals and the same targets as the main conf
+    for needle in ["transaction_log", "stream_compress", "target_preserve_min", "  target                "] {
+        assert!(state.contains(needle), "state conf lacks {needle}:\n{state}");
+    }
+    // only that entry: every other subvolume of the source stays in the main conf, not here
+    assert_eq!(state.matches("  subvolume             ").count(), 1);
+    assert_eq!(main.matches("  subvolume             ").count(), cfg.sources.iter().map(|s| s.subvolumes.len()).sum::<usize>() - 1);
+}
+
+#[test]
+fn no_after_index_entry_means_no_state_conf() {
+    let cfg = test_config();
+    assert_eq!(render_state_conf(&cfg), None);
+}
+
+#[test]
+fn a_retired_after_index_entry_is_rendered_nowhere() {
+    let mut cfg = test_config();
+    cfg.sources[0].subvolumes.push(SubvolConfig {
+        name: "@/var/lib/das-backup".into(),
+        snapshot_name: Some("das-state".into()),
+        after_index: true,
+        retired: Some("2026-10-12".into()),
+        ..Default::default()
+    });
+    assert!(!render_btrbk_conf(&cfg).contains("das-state"));
+    assert_eq!(render_state_conf(&cfg), None);
+}
+
+#[test]
+fn declared_pairs_leave_after_index_entries_out() {
+    let mut cfg = test_config();
+    cfg.sources[0].subvolumes.push(SubvolConfig {
+        name: "@/var/lib/das-backup".into(),
+        snapshot_name: Some("das-state".into()),
+        after_index: true,
+        ..Default::default()
+    });
+    assert!(declared_pairs(&cfg).iter().all(|p| p.snapshot_name != "das-state"));
+}
+
+#[test]
+fn state_conf_path_sits_beside_the_main_conf() {
+    let mut cfg = test_config();
+    cfg.general.btrbk_conf = "/etc/btrbk/btrbk.conf".into();
+    assert_eq!(state_conf_path(&cfg), std::path::PathBuf::from("/etc/btrbk/btrbk-state.conf"));
+}
+```
+
+In `config.rs` tests:
+
+```rust
+#[test]
+fn after_index_round_trips_and_defaults_false() {
+    let toml = r#"[[source]]
+label = "nvme"
+volume = "/.btrfs-nvme"
+device = "/dev/nvme0n1p2"
+subvolumes = [
+  "@",
+  { name = "@/var/lib/das-backup", snapshot_name = "das-state", after_index = true },
+]
+"#;
+    // parse just the sources the way the module's other partial-TOML tests do, or
+    // through Config::from_toml on the example config with this block substituted
+    let cfg = parse_sources_fixture(toml);
+    assert!(!cfg.sources[0].subvolumes[0].after_index);
+    assert!(cfg.sources[0].subvolumes[1].after_index);
+    let out = cfg.to_toml().unwrap();
+    assert!(out.contains("after_index = true"));
+    assert_eq!(out.matches("after_index").count(), 1, "false is not serialized:\n{out}");
+}
+```
+
+(Use whatever helper the existing `SubvolConfig` deserialize tests use to parse a partial document; name it the same. If none exists, build the fixture through `Config::from_toml` on the example config.)
+
+In `env_export.rs` tests:
+
+```rust
+#[test]
+fn dump_env_exports_the_state_conf_path() {
+    let mut cfg = crate::btrbk_conf::tests::test_config(); // or the module's own fixture
+    cfg.general.btrbk_conf = "/etc/btrbk/btrbk.conf".into();
+    let out = dump_env(&cfg);
+    assert!(out.contains("DAS_BTRBK_STATE_CONF=/etc/btrbk/btrbk-state.conf"), "{out}");
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus --lib -- after_index state_conf`
+Expected: compile errors (`no field after_index`, `cannot find function render_state_conf`).
+
+- [ ] **Step 3: Implement**
+
+`config.rs`: add to `SubvolConfig`
+
+```rust
+/// Snapshotted and sent only by the backup run's state pass, AFTER the
+/// indexer ran (the state subvolume, bd 9eq9): rendered into
+/// `btrbk-state.conf`, never into the main `btrbk.conf`, so the main run
+/// cannot take a pre-index snapshot that btrbk would then keep as the day's.
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub after_index: bool,
+```
+
+and thread it through the custom `Deserialize` (the `Full` variant gains `#[serde(default)] after_index: bool`; `Simple(name)` sets `after_index: false`).
+
+`btrbk_conf.rs`:
+
+```rust
+/// Where the state series' own config lives: beside the main one.
+pub fn state_conf_path(config: &Config) -> PathBuf {
+    Path::new(&config.general.btrbk_conf)
+        .parent()
+        .unwrap_or_else(|| Path::new("/etc/btrbk"))
+        .join("btrbk-state.conf")
+}
+```
+
+Factor the body of `render_btrbk_conf` into `render_with(config, keep: impl Fn(&SubvolConfig) -> bool) -> String` that renders the globals, then each source's volume block with only the subvolumes `keep` accepts (a source left with no subvolume is omitted, as the all-retired rule at ~line 314 already does). Then:
+
+```rust
+pub fn render_btrbk_conf(config: &Config) -> String {
+    render_with(config, |sv| sv.retired.is_none() && !sv.after_index)
+}
+
+/// The state series' config, or `None` when no live entry is `after_index`.
+pub fn render_state_conf(config: &Config) -> Option<String> {
+    let any = config.sources.iter().flat_map(|s| &s.subvolumes).any(|sv| sv.retired.is_none() && sv.after_index);
+    any.then(|| render_with(config, |sv| sv.retired.is_none() && sv.after_index))
+}
+```
+
+`declared_pairs`: add `&& !sv.after_index` to its live-entry filter.
+
+The writer (~line 216): after writing the main conf, write `render_state_conf(cfg)` to `state_conf_path(cfg)` with `write_atomic`, or remove that file when `None` (a missing file is not an error); keep a rollback copy of it the same way as the main conf, and roll both back together if `save` fails.
+
+`env_export.rs` `dump_env`: beside `DAS_BTRBK_CONF`, emit `DAS_BTRBK_STATE_CONF=<state_conf_path(config)>` (quote the same way as the other paths).
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus --lib -- btrbk_conf:: config:: env_export`
+Expected: all PASS, including the seven new tests; the existing `declared_pairs_are_exactly_what_the_rendered_file_declares` must still pass (it is the pin that the filters and the rendered file agree).
+
+- [ ] **Step 5: Lint and commit**
+
+```bash
+cd indexer && cargo fmt && CARGO_TARGET_DIR=/tmp/das-backup-target cargo clippy --features dbus --all-targets -- -D warnings
+cd .. && git add indexer/src/config.rs indexer/src/btrbk_conf.rs indexer/src/setup/env_export.rs
+git commit -m "btrbk_conf: an after_index entry is rendered into btrbk-state.conf, never the main conf (9eq9)"
+```
+
+- [ ] **Step 6: The operator's migration step gains one line**
+
+In Task 3's host migration block, the hand edit of the adopted entry is `snapshot_name = "das-state"` **and** `after_index = true`; after `setup --upgrade`, verify `grep -c das-state /etc/btrbk/btrbk.conf` prints `0` and `grep -c das-state /etc/btrbk/btrbk-state.conf` prints `1`, and `sudo btrdasd config dump-env | grep DAS_BTRBK_STATE_CONF` prints the path. That is the proof the main run can no longer snapshot the state.
 
 ---
 
