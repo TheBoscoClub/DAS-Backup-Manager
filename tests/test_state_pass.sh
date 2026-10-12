@@ -187,6 +187,22 @@ DAS_BTRBK_STATE_CONF="$WORK/state.conf" run_state_pass run
 check "state conf: OK" "${OP_STATUS[state]}" "OK"
 has "state conf: btrbk -c that file" "$(cat "$WORK/btrbk.calls")" "-c $WORK/state.conf"
 
+echo "--- DAS_BTRBK_STATE_CONF set to an ABSENT file (dump-env always sets it): SKIP, not WARN"
+fixture
+DAS_BTRBK_STATE_CONF="$WORK/no-such-state.conf" run_state_pass run
+check "absent state conf: SKIP" "${OP_STATUS[state]}" "SKIP"
+has "absent state conf: why" "${OP_STATUS[state_detail]}" "no das-state entry in btrbk.conf (the state subvolume is not configured yet)"
+check "absent state conf: btrbk never called" "$(calls)" "0"
+check "absent state conf: subject stays clean" "$(subject_status)" "SUCCESS"
+
+echo "--- DAS_BTRBK_STATE_CONF set to something unreadable (a directory): WARN, still said"
+fixture
+mkdir -p "$WORK/state-dir"
+DAS_BTRBK_STATE_CONF="$WORK/state-dir" run_state_pass run
+check "unreadable state conf: WARN" "${OP_STATUS[state]}" "WARN"
+has "unreadable state conf: says why" "${OP_STATUS[state_detail]}" "cannot read $WORK/state-dir"
+check "unreadable state conf: btrbk never called" "$(calls)" "0"
+
 echo "--- step order in main(): run_state_pass after run_indexer, same non-dryrun branch"
 main_txt="$(extract main)"
 [[ -n "$main_txt" ]] || { echo "FAIL: main not found"; exit 1; }

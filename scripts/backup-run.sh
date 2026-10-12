@@ -1,6 +1,6 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.13.0
+# Version: 4.13.1
 # Date: 2026-10-12
 #
 # Features:
@@ -3034,12 +3034,47 @@ run_indexer() {
     # waits for walk (bd DAS-Backup-Manager-frb). walk verifies the
     # descriptor; it does not take the name on trust.
     if indexer_output=$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" walk "$primary_mount" --db "$DAS_DB_PATH" 2>&1); then
-        record_op "indexer" "OK"
         log_info "  $indexer_output"
     else
         local exit_code=$?
         log_warn "Content indexer failed (non-fatal)"
         record_op "indexer" "FAIL" "exit code $exit_code"
+        return
+    fi
+
+    # Presence: walking a target records, in the index's snapshot_targets,
+    # which copies it holds. The recovery drives' resolver needs those rows
+    # current, so every OTHER mounted target is walked too, same invocation and
+    # lock hand-down as above. The primary index is already intact, so a failed
+    # mirror walk is a WARN naming the label, never a FAIL, and the loop goes on.
+    local mlabel mmnt mout mrc mwhy present=() failed=()
+    while IFS= read -r mlabel; do
+        mmnt="${TARGET_MOUNTS[$mlabel]}"
+        [[ "$mmnt" == "$primary_mount" ]] && continue
+        mountpoint -q "$mmnt" 2>/dev/null || continue
+        if mout=$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" walk "$mmnt" --db "$DAS_DB_PATH" 2>&1); then
+            log_info "  presence recorded on $mlabel"
+            present+=("$mlabel")
+        else
+            mrc=$?
+            mwhy=$(printf '%s\n' "$mout" | tail -n1)
+            log_warn "Presence walk of $mlabel failed (non-fatal): ${mwhy:-exit $mrc}"
+            failed+=("$mlabel: failed, ${mwhy:-exit $mrc}")
+        fi
+    done < <(printf '%s\n' "${!TARGET_MOUNTS[@]}" | sort)
+    local detail=""
+    if ((${#present[@]} > 0)); then
+        detail="presence: $(printf '%s, ' "${present[@]}")"
+        detail="${detail%, }"
+    fi
+    if ((${#failed[@]} > 0)); then
+        local f
+        for f in "${failed[@]}"; do
+            if [[ -z "$detail" ]]; then detail="presence: ($f)"; else detail="$detail ($f)"; fi
+        done
+        record_op "indexer" "WARN" "$detail"
+    else
+        record_op "indexer" "OK" "$detail"
     fi
 }
 
@@ -3068,6 +3103,20 @@ run_state_pass() {
         return 0
     fi
     local conf="${DAS_BTRBK_STATE_CONF:-$DAS_BTRBK_CONF}"
+    # `btrdasd config dump-env` always exports DAS_BTRBK_STATE_CONF, but the
+    # file exists only once an after_index entry is configured: absent is the
+    # designed SKIP. Present but not a readable regular file (EACCES, a
+    # directory) is a WARN -- awk would read a directory as "no entry".
+    if [[ -n "${DAS_BTRBK_STATE_CONF:-}" && ! -e "$conf" && ! -L "$conf" ]]; then
+        record_op "state" "SKIP" "no das-state entry in btrbk.conf (the state subvolume is not configured yet)"
+        log_info "State pass: $conf does not exist -- skipping"
+        return 0
+    fi
+    if [[ ! -f "$conf" || ! -r "$conf" ]]; then
+        record_op "state" "WARN" "cannot read $conf: not a readable file"
+        log_warn "State pass: cannot read $conf -- skipping"
+        return 0
+    fi
     local parsed
     if ! parsed=$(awk '
         /^[[:space:]]*volume[[:space:]]/ { n = 0; next }
