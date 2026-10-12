@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`das-partition-drives.sh` 2.3.5 header no longer calls a recovery drive's ESP a "clone of /boot"** — it is an empty, bay-labelled partition the drive's own independent OS installs its bootloader into, as the script's plan output and `esp-safety.md` already said
 - **The mutation gate fails on resource exhaustion** (`.github/scripts/mutants-gate.py` re-installed from the canonical template; rule 1b of 2026-10-07, cachyos-sentinel pnpl) — a mutant whose build died of a full disk or exhausted memory was filed by cargo-mutants under `unviable`, so a full `/tmp` silently shrank the verified set and the gate printed OK; the gate now scans the mutant logs and fails naming the count and an example. Falsified: an outcomes directory with one ENOSPC log passes the old copy and fails the new one
 - **Debian and Fedora packages recommend TigerVNC's viewer, Arch lists it in `optdepends`** for the recovery-drive console (virt-viewer stays suggested for `recovery-os-vm.sh`'s own console advice); the Flatpak and Snap manifests note that inside a sandbox the GUI shows the console socket's path instead
 - **`btrdasd --version` prints all four segments** (`btrdasd 0.7.23.0`, bd `DAS-Backup-Manager-b1s`) — it printed Cargo's three. The one source is `CMakeLists.txt`
@@ -47,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The unattended egress step waits for the recovery OS's network** (bd `DAS-Backup-Manager-slu9`) — the guest agent answers before NetworkManager has a lease, and the step asked api.ipify.org once, at once: `curl: (6) Could not resolve host` ended the session before anything was changed (A on 2026-10-12, half a second before the NIC began activating; B on 2026-10-10). The step now asks again at the driver's pace for up to `DAS_RECOVERY_VM_NET_SECS` (120 s) and says it is waiting; a network that never answers still stops the update, naming the budget. Falsified against a stub curl that cannot resolve twice then answers, and one that never does
 - **An unattended step's probe that could not run is no longer the step's failure** (bd `DAS-Backup-Manager-ea3u`) — the driver polls a running step inside the recovery OS with `tail`, `head` and `base64`, each absent for an instant while pacman replaces coreutils; the probe then answered with its shell's complaint, which `guest_sh` (stdout then stderr, the trailing newline taken by command substitution) delivered where the exit status goes, and the driver read it as the step ending: on 2026-10-11 it powered drive A off between pacman's pre-transaction hooks (the initramfs images already removed) and its first package, leaving the drive at the firmware's boot menu. A step's result is now only a numeric status written by its runner; any other answer (a status that is no number, output that is no base64) is a failed probe, asked again within `DAS_RECOVERY_VM_AGENT_GRACE_SECS`, and a step that stays unreadable that long stops the update with `no readable answer about it for …`, never with the complaint as a status
 - **A session refuses to be the main process of a unit that its outcome would leave failed** (bd `DAS-Backup-Manager-01ne`) — `recovery-os-vm.sh session` reads its own cgroup and, as the `MainPID` of a `.service`, the unit's `SuccessExitStatus` and `Restart`: without every one of `1 3 4 5 6 7`, or with any `Restart=`, it refuses before the lock and the drive, naming the missing codes and `--detach`. On 2026-10-10 a session in a hand-made transient unit exited 5 (warnings), systemd recorded the unit failed, and cachyos-sentinel restarted it three times, each run booting the drive again and replacing its pre-update snapshot. A child of a unit (the helper's job) is not judged
 - **A default `cmake -B build` no longer splits the install between `/usr/local` and `/usr`** (bd `DAS-Backup-Manager-laj`) — the CLI, helper, scripts, D-Bus, polkit and man destinations were absolute strings built from the prefix before the GUI's `KDEInstallDirs` reset it to `/usr`, so `btrdasd` on PATH became a `/usr/local` copy. Every destination is now prefix-relative (`cmake --install --prefix` relocates the whole install), the prefix defaults to `/usr`, CI asserts the default, and the DESTDIR suite's check 7 proves every manifest entry follows `--prefix`
@@ -233,6 +235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.22.3] - 2026-09-09
 
 ### Changed
+
 - **Scheduled DAS scrubs now RESUME an interrupted pass instead of restarting from zero** (bd
   `DAS-Backup-Manager-292`). The engine's `decide_scrub_start_mode` (`indexer/src/scrub.rs`) previously
   cleared an aborted record with `btrfs scrub start -B -f` — a fresh pass that discarded the interrupted
@@ -252,6 +255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.22.2] - 2026-09-01
 
 ### Removed
+
 - **`libbuttered_dasd_ffi.so` and `btrdasd_ffi.h` — the entire C-ABI surface** (bd
   `DAS-Backup-Manager-5xo`). Twelve `extern "C"` entry points were built, size-asserted, installed to
   `/usr/lib` and `/usr/include`, and listed in the Fedora RPM `%files` — and **nothing has ever
@@ -272,6 +276,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.22.1] - 2026-09-01
 
 ### Added
+
 - **`verify_sources_before_write()` in `scripts/backup-run.sh`** — the source-side counterpart to
   `verify_targets_before_btrbk`, called between `mount_sources` and `create_snapshot_dirs`, which is
   the first writer to a source path. Per source it requires a real mountpoint, a filesystem UUID
@@ -291,6 +296,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bd `DAS-Backup-Manager-vlv`)
 
 ### Changed
+
 - **Non-fatal failures across `indexer/src` now log instead of vanishing** (9 sites, bd
   `DAS-Backup-Manager-8wx`): the helper's background `IndexStats` refresh, DB-directory creation,
   `--remove-db` when the config will not load, `systemctl disable`/`daemon-reload` results, manifest
@@ -298,6 +304,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   look* as *empty* — a plain file at a mount path failed `ENOTDIR` and produced no log line at all
 
 ### Fixed
+
 - **A corrupt `btrfs scrub` status record parsed as a CLEAN scrub** (`indexer/src/scrub.rs`). A
   recognised status key whose value would not parse fell back to `0`, and `0` on
   `uncorrectable_errors` reads as *no damage* — so a truncated or corrupted
@@ -326,6 +333,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.22.0] - 2026-09-01
 
 ### Added
+
 - **Backup coverage for `/srv/VirtualMachines`** — new `ssd-vm` source in `config.toml` carrying
   the nested subvolume `@srv/VirtualMachines` (34 GiB, holds `win11pro.qcow2`), scoped to
   `target_labels = ["primary-22tb"]` so a growing VM image never lands on the two 2 TB recovery
@@ -359,6 +367,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later still cannot reach them; comparison is component-wise, so `/srv/http-archive` is unaffected
 
 ### Removed
+
 - **`ClaudeCodeProjects/Asus-DarkHero`** from the `hdd-projects` source — the subvolume was deleted
   after the `20260831T1359` run, and btrbk had been printing `WARNING: Skipping subvolume …
   Failed to fetch subvolume detail` and **exiting 10** — which `run_btrbk()` records as
@@ -375,6 +384,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bd `DAS-Backup-Manager-zm6`)
 
 ### Fixed
+
 - **`setup --upgrade` silently declined to regenerate `btrbk.conf`, making every config edit
   inert**: the `2lj` staleness guard skipped any generated file whose mtime exceeded the `btrdasd`
   binary's. That reasoning holds only for the three `include_str!` scripts, whose content is fixed
@@ -395,6 +405,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bd `DAS-Backup-Manager-f6p`)
 
 ### Changed
+
 - **`btrdasd doctor` exit codes split 1 into 1 and 3**, so `SuccessExitStatus=1` can absolve the
   benign case without also swallowing the real one: **1** = drift found (a finding), **3** = at
   least one volume failed to mount/list while others were checked (an operational fault, and it
@@ -407,6 +418,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.21.0] - 2026-08-31
 
 ### Added
+
 - **`tests/test_esp_label_derivation.sh`** — falsification suite for the new ESP-label logic in
   `scripts/das-partition-drives.sh`. Ten cases covering both directions: three that the derivation
   produces exactly the labels present on the live drives today, five that each guard actually
@@ -433,6 +445,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *everything* could not pass. Suite total 389 → 396
 
 ### Changed
+
 - **ESP and boot documentation now identifies entries by PARTUUID, never by firmware entry number**:
   the motherboard was replaced on 2026-08-31 (ASUS ROG Crosshair VIII **Dark Hero** → **Hero**,
   BIOS 5601), and an NVRAM wipe renumbered every UEFI entry. `docs/examples/author-storage-reference.md`
@@ -470,6 +483,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is worse than no test
 
 ### Fixed
+
 - **`scripts/das-partition-drives.sh` gave every bootable recovery drive the same ESP label** (v2.1.0):
   `mkfs.fat -F32 -n "BACKUP-ESP"` was hardcoded, so re-partitioning both 2 TB recovery drives produced
   two partitions sharing one label and `blkid -t LABEL=BACKUP-ESP -o device` returning both — every
@@ -526,6 +540,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries all four drive serials, the old one carried three (`bd DAS-Backup-Manager-5b1`)
 
 ### Security
+
 - **The `Index*` D-Bus methods were a root file-create-and-write at a caller-chosen path**
   (`bd DAS-Backup-Manager-gko`): each took `db_path` from the caller and passed it to
   `Database::open` as root. That is not a read — `Connection::open` creates the file when absent,
@@ -554,6 +569,7 @@ independently re-derived from source before any code changed; five of them carri
 inaccurate supporting facts, recorded in `bd DAS-Backup-Manager-dyq`.
 
 ### Added
+
 - **`[restore] allowed_roots` in `config.toml`** — the roots a restore may write beneath,
   defaulting to `/home` and `/tmp`. Paired with `RESTORE_DENIED_ROOTS`, a built-in denylist
   (`/etc`, `/usr`, `/boot`, `/bin`, `/sbin`, `/lib`, `/root`, `/var/lib`, and peers) that
@@ -568,6 +584,7 @@ inaccurate supporting facts, recorded in `bd DAS-Backup-Manager-dyq`.
   passes against the broken code
 
 ### Changed
+
 - **The D-Bus interface no longer takes a `config_path` from callers.** Seventeen methods
   dropped the parameter; the daemon uses `CANONICAL_CONFIG` (`/etc/das-backup/config.toml`)
   and nothing else. The GUI's `DBusClient` and its seven call sites were updated in lockstep.
@@ -577,6 +594,7 @@ inaccurate supporting facts, recorded in `bd DAS-Backup-Manager-dyq`.
   generated
 
 ### Fixed
+
 - **`archive_boot` deleted the live `@` and could not recreate it** (`bd DAS-Backup-Manager-5ig`):
   two defects that only bite together. The order was archive → **delete live `@`** → look up a
   replacement → recreate, so a failed lookup left the subvolume deleted behind a single warning.
@@ -645,6 +663,7 @@ inaccurate supporting facts, recorded in `bd DAS-Backup-Manager-dyq`.
   moved to `config.rs` so `Config::validate()` can reject a bad schedule at load
 
 ### Security
+
 - The restore allowlist, the removal of caller-supplied `config_path`, and the `job_cancel`
   ownership check together close every path by which a polkit-authorized local caller could
   direct this daemon's root privileges at a file of their choosing
@@ -655,6 +674,7 @@ Documentation-only release — no code changes. The diff against `0.7.19.0` is d
 project rules; binaries are functionally identical.
 
 ### Added
+
 - **`snapshot_targets` is now documented** in both `docs/ARCHITECTURE.md` and `docs/BUTTERED-DASD.md`. Both files listed `idx_snapshot_targets_snap` in their index tables while never documenting the table that index is on — the schema v3 addition shipped in `0.7.19.0`. `ARCHITECTURE.md` also still described the schema as "three core tables". The new reference records why presence is stored rather than derived: the recovery targets keep `daily=7` against the primary's `daily`/`weekly`/`monthly`/`yearly`, so they hold a strict subset and no rule can compute which target holds what
 - **`reconcile` now has a CLI Usage section** in `docs/BUTTERED-DASD.md`, covering `--dry-run`, `--repair`, and `--forget-root` — the last shipped in `744799a` and was documented nowhere. Also states the mountpoint gate explicitly: reconcile will not prune rows for an unmounted target, because an unmounted target is indistinguishable from an empty one
 - **Unattended email delivery is recorded as proven** in `.claude/rules/backup.md`, with the journal evidence that closed `bd DAS-Backup-Manager-hvf` — two boots that emailed the backup report hours before that boot's first graphical login, with Protonmail Bridge unable to start and no `:1025` listener present. Includes the two traps that make the journal easy to misread: logind *quotes* the session id (so a `New session [0-9]+` pattern silently matches nothing and reports "no login" for every boot), and `graphical-session.target` is reached spuriously via the `foot-server.socket` ordering cycle, so it is not evidence of a login — `class 'user'` is
@@ -662,17 +682,20 @@ project rules; binaries are functionally identical.
 ## [0.7.19.0] - 2026-08-25
 
 ### Added
+
 - **The index now records WHICH targets hold each snapshot — schema v3** (`bd DAS-Backup-Manager-gt0`): `discover_snapshots` dedups on `(source, name, ts)`, so a snapshot replicated to all three targets is one logical snapshot and is indexed once, always under whichever target is walked first — the primary. The index therefore could not say a copy existed anywhere else, and in the disaster the recovery drives exist for (primary array unavailable) `search` could name the snapshot holding a file while only ever pointing at an unreachable path
   - New `snapshot_targets(snapshot_id, target_root, path)` with `ON DELETE CASCADE`, so presence rows can never outlive their snapshot and reintroduce the stale-row problem `cu8` was about — asserted by a test
   - `walk` records presence for both newly-indexed snapshots and copies already indexed from another target. The files of an existing copy are deliberately NOT re-read; it is the same logical snapshot
   - Presence is **not derivable** and had to be recorded: the recovery targets keep `daily=7` only against the primary's daily/weekly/monthly/yearly, so they hold a subset — measured 2026-08-25 at 295 snapshot directories against 730
 
 ### Changed
+
 - **The reindex summary no longer prints a bare `0 indexed of 237 on disk`** for the recovery targets, which read as a failure and was in fact correct behaviour. It now reports `N copies recorded of M on disk (already indexed from another target)`, and `--json` gains `copies_recorded` per target
 
 ## [0.7.18.0] - 2026-08-25
 
 ### Fixed
+
 - **Indexing no longer degrades quadratically as the index grows** (`bd DAS-Backup-Manager-3sa`): `index_snapshot` pre-fetches the previous snapshot's entire file set on every snapshot it walks, and did so through `get_files_in_snapshot`, which drives off `idx_spans_last (last_snap >= ?)`. The scanned fraction of `spans` grows with the id space — tolerable when a handful of snapshots are indexed per night, but a rebuild walking hundreds back-to-back collapsed to **670 files/min by 4.3M rows**, roughly 13 days extrapolated across the full index
   - New `get_files_in_series_snapshot()` takes the series the caller already knows, letting SQLite narrow on `idx_files_series_path` first and then check each candidate's spans by primary key. `EXPLAIN QUERY PLAN` confirms the change: `SEARCH s USING INDEX idx_spans_last (last_snap>?)` becomes `SEARCH f USING COVERING INDEX idx_files_series_path (series=?)`, so cost tracks the size of one series instead of the whole table
   - Only possible because of the `lc9` schema change — `files` did not carry a series before 0.7.14.0
@@ -681,17 +704,20 @@ project rules; binaries are functionally identical.
 ## [0.7.17.0] - 2026-08-25
 
 ### Added
+
 - **`btrdasd reconcile --repair`**: deletes spans whose endpoints name snapshots that do not exist, plus any file left with no spans, in one transaction (`bd DAS-Backup-Manager-opd`). Such rows are unreachable — since `5uq` the read path joins `snapshots` on `first_snap`, so a dangling start matches nothing — and they are live FK violations that cannot be rewritten at all, which aborted every prune minutes in. **Verified live: 15,085,764 spans and 271 orphaned files removed; `PRAGMA foreign_key_check` now returns zero rows**
 - **`btrdasd reconcile --forget-root <path>`**: drops index rows recorded under a mount path that is no longer a configured target (`bd DAS-Backup-Manager-wl8`). Ordinary reconcile can never clear these — that root will never be mounted again, so their absence can never be confirmed — and they would otherwise mask the transient unmounted count forever. Refuses a root that IS configured, since dropping a live target's rows would discard a working index
 - **`reconcile` now reports retired roots separately from merely unmounted ones**: `plan_reconcile` takes the configured-root list alongside the mounted subset. An unmounted target resolves itself next pass; a retired root never will, and conflating them left a count that never reached zero
 
 ### Fixed
+
 - **Verified live on the production index**: after `--repair`, the auto-reconcile inside `btrdasd walk` completed the remediation during the 2026-08-25 scheduled backup — **5861 stale snapshots pruned, 22,713,781 spans repaired, 23,158,421 removed, 5,919,536 files dropped**. `btrdasd search` now returns **zero** hits for the `claude-cowork-linux` snapshots deleted on 2026-08-24, and a follow-up `reconcile --dry-run` reports **Stale (absent): 0** — the index is consistent with disk (`bd DAS-Backup-Manager-cu8`)
 - **`snaps_created`/`snaps_sent` confirmed working**: the same run recorded **48 created / 126 sent** — nonzero and genuinely distinct — against `0|0` on every run since 2026-06-26 (`bd DAS-Backup-Manager-oi0`)
 
 ## [0.7.16.0] - 2026-08-25
 
 ### Added
+
 - **`btrdasd forget <pattern>`** (`bd DAS-Backup-Manager-u8n`): deletes obsolete snapshots whose series name matches a glob. Snapshots stranded by a subvolume rename carry an old `snapshot_name` that matches no retention rule, so btrbk never prunes them — `btrbk clean` handles incomplete/garbled only and `btrbk prune` matches configured names — and they accumulate indefinitely
   - **Refuses outright when the pattern also matches a live series.** The live names are read from `/etc/btrbk/btrbk.conf`, the file btrbk itself consumes, rather than re-derived from `config.toml`, so the guard cannot disagree with reality the way a second implementation of the naming rules could. If that file cannot be read the command exits rather than proceeding unguarded
 - **`btrdasd purge <path-pattern>`** (`bd DAS-Backup-Manager-rt6`): deletes every snapshot containing files matching a path glob, for a credential or PII that reached a backup
@@ -704,13 +730,16 @@ project rules; binaries are functionally identical.
 ## [0.7.15.0] - 2026-08-25
 
 ### Added
+
 - **CI workflow that actually builds and tests** (`bd DAS-Backup-Manager-b14`): the repo had only `dependabot-auto-merge.yml` and the tags-only `release-packages.yml`, so nothing built or tested on push or pull request. CodeQL's default setup goes green while neither building nor testing, meaning all-green checks could sit over a broken build. New `.github/workflows/ci.yml` runs `cargo fmt`/`clippy -D warnings`/`test`, a full cmake build including the Qt6 GUI, and `shellcheck` over `scripts/` — all in `archlinux:latest`, the same base image as the Arch release job, so CI and the shipped package share one toolchain. It publishes nothing, so the tags-only rule for release workflows is untouched
 
 ### Changed
+
 - **Manual `btrdasd backup` subcommands now join the maintenance interlock** (`bd DAS-Backup-Manager-pe6`): `Run`, `Snapshot`, `Send` and `BootArchive` mounted and unmounted the DAS filesystems with no lock at all, outside the scheme `backup-run.sh`, the scrub engine and `doctor` all participate in — so `doctor` could mount a source, a concurrent manual backup use it unregistered, and `doctor` then unmount it mid-use. They now take `/run/das-backup.lock` (the same singleton the scheduled path uses, so the two contend rather than running two backups over one target set) and then `/run/das-maintenance.lock`. Singleton is **non-blocking** — a second backup is redundant, not late, so it declines — while maintenance is **blocking**: a scrub is a peer operation, so the backup waits. Defer, never skip
 - **`setup --upgrade` prunes files that left the generated set** (`bd DAS-Backup-Manager-e23`): the manifest was overwritten without diffing the previous one, so a file dropped from a later release stayed on disk looking installed and supported while nothing maintained it. `install_to_prefix()` now reads the prior manifest, removes paths absent from the new set, and logs each one. The config file is never pruned
 
 ### Fixed
+
 - **`setup --upgrade` could silently downgrade a script newer than the binary** (`bd DAS-Backup-Manager-2lj`): scripts are compiled in via `include_str!`, so a `btrdasd` built *before* a script edit carries a stale copy and re-running upgrade overwrote the file `cmake --install` had just refreshed — no warning, no diff. An on-disk file newer than the running binary is now kept, with a line saying so. The normal direction still works: after a rebuild the binary is newer, so a genuine upgrade writes
 - **`snaps_created`/`snaps_sent` recorded 0 on every run since 2026-06-26** (`bd DAS-Backup-Manager-oi0`): the counters grepped `btrbk list latest` for the string `up-to-date`. btrbk 0.32.7 renders STATUS as `-` for every row and that string no longer appears anywhere — verified live, `grep -c` returns 0 — so the GUI's backup history showed 0 snapshots created and sent for five weeks while `bytes_sent` stayed correct. Counts now come from `btrbk --format=raw list latest`, whose named `key='value'` fields are an interface rather than a table layout. `snaps_sent` is also no longer a proxy for `snaps_created`: one source subvolume yields one snapshot replicated to N targets, so on this host the same run is **48 created / 123 sent**, two genuinely different numbers
 - **Setup wizard skipped a step number and overstated its length** (`bd DAS-Backup-Manager-kvg`): banners ran `[1/10]`, `[2/10]`, `[3/10]`, then `[5/10]` — no step 4 — across nine actual steps. Renumbered 1–9, with the denominator now read from a single `TOTAL_STEPS` constant so it cannot drift again
@@ -721,6 +750,7 @@ project rules; binaries are functionally identical.
 ## [0.7.14.1] - 2026-08-25
 
 ### Fixed
+
 - **Opening a pre-v2 database failed with `no such column: series`**: `SCHEMA_SQL` created `idx_files_series_path` on `files(series, path)`, but on an existing database `CREATE TABLE IF NOT EXISTS files` is a no-op, so the column did not exist yet and the whole batch failed *before* `Database::migrate()` could add it. Every command was therefore broken against a real v1 index — including `btrdasd reindex --rebuild`, the tool meant to repair it
   - Index creation moved out of `SCHEMA_SQL` into `migrate()`, which now ensures the column and the index in that order and is idempotent for both a fresh database and a migrated one. `rebuild_content_tables()` resets `user_version` and re-runs the migration so it recreates the indexes it owns
   - **Root cause of the miss: every existing test used `:memory:`**, where `CREATE TABLE` builds `files` with `series` and the ordering bug cannot occur. A regression test now constructs a genuine v1-shaped database on disk, opens it, and asserts the column is added, `idx_files_path` is replaced by `idx_files_series_path`, legacy rows survive with an empty series, and a second open is a no-op. Confirmed to fail with the original error against the previous ordering
@@ -728,26 +758,31 @@ project rules; binaries are functionally identical.
 ## [0.7.14.0] - 2026-08-25
 
 ### Added
+
 - **`btrdasd reindex [--rebuild]`**: re-indexes every mounted backup target. `--rebuild` discards the index first and rebuilds it from scratch — the only repair for two defects that cannot be fixed in place, because both are properties of rows already written. Backup run history and target usage history are preserved; they are operational records, not derived content. Takes the same non-blocking maintenance interlock as `reconcile`
 - **Schema version tracking** via `PRAGMA user_version`, with `Database::migrate()` applied on open. `CREATE TABLE IF NOT EXISTS` silently does nothing on an existing table, so a change to an established column set has to be applied explicitly or it never lands
 
 ### Changed
+
 - **`files` is now keyed on `(series, path)` instead of `path` alone — schema v2** (`bd DAS-Backup-Manager-lc9`): `path` is relative to the snapshot root, so the same string occurs in many subvolumes. Keyed on `path` alone, `packaging/PKGBUILD` from every project collapsed into ONE row whose `size`/`mtime` were overwritten by whichever subvolume was indexed last — 1,261,207 files in the production index had spans originating in more than one series. `files` gains a `series` column (snapshot `name` + `source`, joined by US `0x1f`, which cannot occur in either so needs no escaping), and `idx_files_path` is replaced by `idx_files_series_path`
   - `upsert_file()` and `get_file()` take the series, so writing the same path under a different series now INSERTs rather than UPDATEs
   - The v1 → v2 migration adds the column and re-keys the index, but **does not repair data** — existing rows get `series = ''`, reproducing the old behaviour exactly, because the series of an already-collapsed row cannot be recovered. Only `btrdasd reindex --rebuild` populates real values
 
 ### Fixed
+
 - **Integration fixture used two different snapshot names as a consecutive pair**: `test_index_snapshot_directly` built `snap_a.<ts>` and `snap_b.<ts>` and expected spans to extend between them. Real btrbk snapshots of one subvolume share a `snapshot_name` and differ only by timestamp — two different names are two different subvolumes, which since v2 correctly do not share file rows. Confirmed against production: **0 of 85,038,167** spans have endpoints in different series
 
 ## [0.7.13.3] - 2026-08-25
 
 ### Fixed
+
 - **`prune_snapshots()` now refuses an index that already violates its own foreign keys, instead of aborting minutes in** (`bd DAS-Backup-Manager-opd`): `Database::open` sets `PRAGMA foreign_keys = ON`, so re-inserting a repaired span re-validates it — a span whose `last_snap` was *already* dangling is tolerated as legacy data but rejected on rewrite. Against the production index (14,984,318 such rows) `btrdasd reconcile` ground for ~10 minutes and aborted with `SQLITE_CONSTRAINT_FOREIGNKEY`, rolling back cleanly but achieving nothing — and would have repeated that on every `btrdasd walk`, i.e. every nightly backup
   - The pass now returns a diagnosed error naming the cause and the tracking issue. The check is scoped to the spans the pass would actually rewrite, not the whole table, so a healthy index pays a bounded cost rather than a full 85M-row `PRAGMA foreign_key_check`
 
 ## [0.7.13.2] - 2026-08-24
 
 ### Fixed
+
 - **`prune_snapshots()` aborted on overlapping spans — reconcile could not complete against a real index** (`bd DAS-Backup-Manager-cu8` follow-up): repairing a doomed `first_snap` was a plain `UPDATE`, but `spans` is keyed `(file_id, first_snap)` and moving a start forward can land it on a start another span of the same file already occupies. The production index holds **7,402,503 overlapping span pairs** — `.Trash-0`, for instance, carries both `(219,221)` and `(220,220)` within one series, so pruning 219 moves the first span's start onto 220
   - Symptom: `btrdasd reconcile` against the live 85,038,167-span index ran for three minutes and aborted with `SQLITE_CONSTRAINT_PRIMARYKEY (1555) UNIQUE constraint failed: spans.file_id, spans.first_snap`. The pass is a single transaction, so it rolled back with the index byte-identical — no data was lost, but the reconcile could never succeed
   - Repairs are now materialized into a temp table, detached, and re-inserted `GROUP BY file_id, new_first` with `ON CONFLICT(file_id, first_snap) DO UPDATE SET last_snap = MAX(last_snap, excluded.last_snap)`. Overlapping spans are redundant by construction — `(219,221)` already covers `(220,220)` — so merging to the union is the correct resolution; the `GROUP BY` handles repaired-onto-repaired and the upsert handles repaired-onto-existing
@@ -757,6 +792,7 @@ project rules; binaries are functionally identical.
 ## [0.7.13.1] - 2026-08-24
 
 ### Fixed
+
 - **Standalone `btrdasd reconcile` ignored the maintenance interlock**: the command mounts and unmounts the DAS targets, so it falls under the same mutual exclusion as backups and the scrub engine (`.claude/rules/backup.md`), but shipped in 0.7.13.0 taking no lock at all — a manual reconcile during the 03:00 backup window could have mounted and unmounted targets underneath a running backup
   - Now takes `/run/das-reconcile.lock` (new singleton) and then the shared `/run/das-maintenance.lock`, in that order — matching `backup-run.sh`, the scrub engine and `doctor.rs`, which is what keeps the set deadlock-free. Both are **non-blocking**, following `doctor.rs` rather than the scrub engine: an index tidy-up has nothing urgent enough to delay a real backup, so a held lock defers the pass (exit 0) instead of queuing behind it
   - The reconcile performed inside `btrdasd walk` deliberately takes **no** lock — `backup-run.sh` invokes `walk` while already holding the maintenance lock, so a non-blocking attempt there would fail every time and the in-backup reconcile would silently never run. `try_acquire_locks_at()` is split out from `try_acquire_locks()` so the acquisition order and both defer paths are unit-tested against temp paths, with no root and no writes to `/run`
@@ -764,6 +800,7 @@ project rules; binaries are functionally identical.
 ## [0.7.13.0] - 2026-08-24
 
 ### Added
+
 - **Subvolume drift detector — `btrdasd doctor --check-drift`** (`bd DAS-Backup-Manager-01u`): a new top-level `btrdasd doctor` command that catches the exact failure mode found in the 2026-05-17 audit — ~30 subvolumes (all of `ClaudeCodeProjects/*`, audiobook app state, `@docker`, `@hibp`, Steam libraries, ISOs) silently never backed up for months because daily backups of the *configured* subvolumes kept succeeding and masked the gap
   - **New `indexer/src/doctor.rs` module**, exported from `lib.rs` alongside `health`/`scrub`. For each configured `[[source]]` volume (deduplicated — multiple sources commonly share one physical volume, e.g. all four `/.btrfs-hdd` sources), mounts it via the existing `mount::ensure_sources_mounted`/`MountGuard`, runs `btrfs subvolume list`, and compares the result against the union of every `[[source]].subvolume` name configured for that volume — missing (on disk, not configured) and stale (configured, not on disk) both reported. Missing subvolumes are categorized `likely irreplaceable` vs. `probably rebuildable` (case-insensitive substring match against a fixed pattern list — cache/tmp/steam/docker/build/target/node_modules/.cargo/iso), with a ready-to-paste `[[source.subvolumes]]` config.toml snippet printed for the irreplaceable set. Every comparison, exclusion, and categorization decision is a pure function over `Vec<String>`/structs (`compute_missing`, `compute_stale`, `categorize`, `glob_match`, `parse_subvolume_list_output`, `group_sources_by_volume`) — fixture-tested with no root privileges and no real btrfs filesystem (37 new unit tests)
   - **Built-in exclusions** (never configurable, applied to the missing side only): anything under a `.snapshots/` or `.btrbk-snapshots/` directory at any depth (nested too, e.g. `Audiobooks/.btrbk-snapshots/...`), and the `@tmp`/`@var-tmp` ephemeral subvolumes exactly. **New optional `[doctor]` config section** (`indexer/src/config.rs`) adds `exclude` (`Vec<String>` of shell-style glob patterns, `*`/`?`, hand-rolled matcher rather than a new crate dependency) on top of the built-ins. `#[serde(default)]` throughout — an existing config.toml with no `[doctor]` section parses to an empty exclude list, proven both by a fixture test and live against the production config (`sudo btrdasd setup --upgrade` round-tripped the config from lacking `[doctor]` to an explicit `[doctor]\nexclude = []` with no manual edits)
@@ -816,6 +853,7 @@ project rules; binaries are functionally identical.
   - Orphaned `files` rows are deleted last; the pre-existing `files_ad` trigger keeps `files_fts` in step, so `btrdasd search` stops returning purged paths
 
 ### Changed
+
 - **Email reports migrated from Protonmail Bridge to the host's local mail relay — this project now stores no mail credential at all** (`bd DAS-Backup-Manager-hvf`, implementing the approved cross-project design in `cachyos-sentinel/docs/superpowers/specs/2026-08-02-email-transport-design.md`). Both senders — `scripts/backup-run.sh::send_report` and `indexer/src/report.rs::send_email_report_with_kind` — submit unauthenticated plaintext to `127.0.0.1:25`, where a Postfix null-client authenticates upstream on its own, selecting a send-only API key by envelope sender from a root-only file, over certificate-verified TLS
   - **Why**: Bridge's vault decrypts through the desktop keyring, which only unlocks at an interactive login, so after an unattended reboot Bridge is down and every backup report is silently lost. No session-bound channel can be an unattended alert path; the relay is a root service needing no session
   - **`[email]` config keys are now actually read.** `smtp_host`, `smtp_port`, `from`, and `to` were dead config — both senders took their coordinates from Bridge's credentials file, `env_export.rs` exported `DAS_EMAIL_*` to a shell that never consumed them, and `validate()` checked a `smtp_host` nothing used. Editing `[email]` in `config.toml` had no effect whatsoever. The shell path additionally ignored `enabled`, emailing even with `enabled = false`. All of these are live now, and `validate()` checks `smtp_port`/`from`/`to` alongside `smtp_host`
@@ -842,11 +880,13 @@ project rules; binaries are functionally identical.
   - **Review-caught fix (same task, before merge)**: `capture_report_data()`'s two `df` assignments (capacity figures, avail bytes) were unguarded — since this script has no `errtrace`/`set -E`, a `df` failure here would abort the whole process via `set -e` *without the ERR trap firing* (verified: `exit`/failures inside functions called from `main()` do not trigger `trap ... ERR` on this bash), so `unmount_all()` would never run — no email, no DB row, DAS left mounted. Both assignments now guarded with `|| true`; a failed `df` leaves that target's capacity/avail cache empty rather than aborting, and the existing `${CAPACITY_*[$mnt]:-?}`/`${AVAIL_BYTES[$mnt]:-0}` defaults in the section generators render it as `?`/no-runway rather than garbage — the target stays listed rather than silently vanishing from the report
 
 ### Removed
+
 - **`render_backup_run()` and the `${prefix}/lib/das-backup/scripts/` install subdirectory** (`bd DAS-Backup-Manager-myq`) — `indexer/src/setup/templates.rs` no longer generates a 3-line exec-wrapper at the flat `backup-run.sh` path that shelled out to a second, real copy of the script under `scripts/`. Its unit test `render_backup_run_wrapper_test` was removed with it
 - **All Protonmail Bridge credential handling** (`bd DAS-Backup-Manager-hvf`) — `parse_pbridge_smtp()` and the `PBRIDGE_CONF` variable from `scripts/backup-run.sh`; `PbridgeSmtp`, `parse_pbridge_smtp_block()`, `PBRIDGE_CONF_DEFAULT`, `percent_encode_userinfo()` (whose only consumer was building credentials into an SMTP URL) and the file-permission warning from `indexer/src/report.rs`. `~/.config/pbridge.conf` is untouched and keeps its interactive Bridge role; nothing in this project reads it any more
 - **`[email].auth` and the `AuthMethod` enum** — unauthenticated submission has no auth method to select. The key was also never consumed by either sender even when it did exist. An `auth = …` line in an existing `config.toml` is ignored by serde rather than failing the load (unit-tested, since the live config carries `auth = "starttls"`), and disappears on the next config save. The wizard's authentication-method prompt is gone
 
 ### Security
+
 - **The SMTP password is no longer placed on a command line** (`bd DAS-Backup-Manager-hvf`) — `backup-run.sh` passed `-S smtp-auth-password=…` and `report.rs` built a `smtp://user:pass@host` URL for the `mailx` child; either was readable in `/proc/<pid>/cmdline` by any local process for the lifetime of the send. The exposure is *deleted* rather than mitigated: there is now no credential to leak, since the relay authenticates upstream on its own behalf
 - **`ssl-verify=ignore` removed** — it existed solely because Bridge presented a self-signed certificate on its loopback listener. The submission hop is now plaintext loopback with nothing to verify, and the leg that leaves the host is the relay's certificate-verified TLS session to the provider (`smtp_tls_security_level = secure`)
 - **Reduced blast radius of a compromise**: the upstream key is send-only by grant and per-project, so it cannot read mail, enumerate the account, or alter domain configuration, and revoking it cannot silence another project's mail. It is never copied into this project — one source of record (`~/.config/api-keys.env`) and one derived artifact (`/etc/postfix/sasl_passwd`), which is the duplicated-credential-drift failure that motivated the migration in the first place
@@ -886,16 +926,19 @@ project rules; binaries are functionally identical.
 ## [0.7.12.3] - 2026-05-04
 
 ### Changed
+
 - **Cargo dependency bumps via Dependabot** — `clap` 4.6.0→4.6.1, `clap_complete` 4.6.0→4.6.3, `libc` 0.2.184→0.2.186, `zbus` 5.14.0→5.15.0, `tokio` 1.51.0→1.52.1. All patch/minor; no behavioral changes; 136 tests pass on the new lockfile (PR #22)
 - **GitHub Actions runner bumps via Dependabot** — `softprops/action-gh-release` 2.6.1→3.0.0 and `actions/upload-artifact` 7.0.0→7.0.1, both moving to Node 24. Action interfaces unchanged (PRs #18, #19)
 - **`dependabot-auto-merge.yml` workflow repaired** — the workflow had pinned a non-existent SHA for `dependabot/fetch-metadata` (the comment said `v2.4.0` but the SHA below was a copy-paste mistake), causing every Dependabot PR's auto-merge job to fail since the pin landed. Bumped to `v3.1.0` with verified SHA so future Dependabot PRs auto-merge cleanly
 
 ### Fixed
+
 - **`das-backup.service` exited 1 after every successful btrbk replication** — `update_boot_subvolumes()` in `scripts/backup-run.sh` ran two pipeline assignments per target (`latest_root=$(btrfs subvolume list "$mnt" | grep "nvme/root\." | awk … | sort | tail -1)` and the matching `latest_home`). On mirror targets the host only replicates `nvme/home.*`, never `nvme/root.*`, so `grep` returned 1, `set -o pipefail` propagated it, and `set -e` killed the script before the empty-string check on the next line could run. The failure happened silently on iter 2 of the loop, which is why the last log line was always iter 1's `@home exists, skipping` — making the symptom look like the skip itself was fatal. Fix: append `|| true` to both pipeline assignments so the empty-result branch (`[[ -z "$latest_root" || -z "$latest_home" ]]`) is reachable as originally intended. The mirror-skip guard added in `7f334a7` already covers this on a second axis once the rebuilt `btrdasd` binary is deployed (the script is embedded into the binary via `include_str!` at compile time, so a source-only update without rebuild has no effect)
 
 ## [0.7.12.2] - 2026-04-11
 
 ### Fixed
+
 - **Debian `Build .deb` step failed with `Bad substitution`** — the step ran under `sh -e` (the default GitHub Actions shell), and the bash-specific substitution `${VERSION_NUM//-/\~}` used to sanitize `-` → `~` in the injected debian/changelog version is not supported by dash (Debian trixie's `/bin/sh`). Arch and Fedora jobs happened to work because both containers ship bash as `/bin/sh`. Fix: explicit `shell: bash` on the Debian Build .deb step so the substitution runs under bash regardless of container default
 - **Arch `PKGBUILD` was missing `hicolor-icon-theme` dependency** — the package installs an icon under `/usr/share/icons/hicolor/scalable/apps/btrdasd-gui.svg` but did not declare the hicolor theme hierarchy as a dependency. namcap flagged this as an error during a local build audit. Fix: added `hicolor-icon-theme` to the `depends=` array
 - **Arch `PKGBUILD` stale `pkgver=0.7.10`** — the committed PKGBUILD had not been bumped since 0.7.10, seven releases ago. The release-packages CI workflow already sed-patches `pkgver` at build time from `$VERSION_TAG` so this was cosmetic only, but the file-level version is now in sync with the rest of the packaging manifests
@@ -903,11 +946,13 @@ project rules; binaries are functionally identical.
 ## [0.7.12.1] - 2026-04-11
 
 ### Fixed
+
 - **Debian `.deb` artifacts shipped with stale `0.7.10` version on the v0.7.12 release** — `packaging/debian/changelog` had not been bumped since 0.7.10, so `dpkg-buildpackage` stamped the artifacts with that version even though `CMakeLists.txt`, `Cargo.toml`, and the release tag all said 0.7.12. The `upload-release` step attached the mis-versioned debs to the v0.7.12 GitHub Release. Fix: inject a fresh top entry in `debian/changelog` at build time from `$VERSION_TAG` inside the debian job, so the artifacts always match the tag regardless of the committed changelog state
 
 ## [0.7.12] - 2026-04-11
 
 ### Changed
+
 - **`release-packages.yml` workflow — all 6 packaging formats repaired end-to-end** — the workflow had been broken across 5 consecutive tagged releases, with every format failing for independent reasons (stale `kf6-` dependency prefixes in Arch, missing `systemd-rpm-macros` in Fedora, outdated rustc in the Debian and AppImage containers, a `FIXME` sha256 placeholder in the Flatpak manifest, and an unresolvable KF6 toolchain on the Snap `core24` base). The workflow now builds Arch, Debian, Fedora, AppImage, and Flatpak green from a single `workflow_dispatch` test run. See `### Removed` below for the Snap format disposition
 - **`release-packages.yml` now triggers on both `push: tags: ['v*']` and `workflow_dispatch`** — manual dispatch accepts a `version` input so the workflow can be iterated without cutting a real tag. `upload-release` is gated on `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')` so dispatch runs skip the GitHub Release upload step
 - **Debian and AppImage containers now install rustup inline** — Debian trixie ships `rustc 1.85.0`, but `zbus 5.14` and `zvariant 5.10` require `1.87` and the `buttered-dasd` lib crate uses `let`-chain expressions that require `1.88`. Both jobs now install the stable toolchain via `sh.rustup.rs` and prepend `~/.cargo/bin` to `$GITHUB_PATH` so the newer compiler shadows the apt-packaged one during the actual build
@@ -920,6 +965,7 @@ project rules; binaries are functionally identical.
 - **Arch `PKGBUILD` KF6 dependency names updated** — Arch renamed `kf6-kcoreaddons` etc. to the unprefixed `kcoreaddons` family some time ago; `makepkg -s` was failing to resolve the old names
 
 ### Removed
+
 - **Snap packaging temporarily disabled in `release-packages.yml`** — `snapcraft` has no snap `base` that provides a working KF6 toolchain. `core24` (Ubuntu 24.04 noble) does not package KF6, and there is no newer stable base available. The job is commented out with a note to re-enable once `core26` (Ubuntu 26.04 LTS) ships as a snap base. The `packaging/snap/snapcraft.yaml` manifest is retained unchanged so it is ready to re-enable
 - **`render_esp_hook()` template generator** — root cause of the 2026-03-05 DAS ESP wipe incident. The function in `indexer/src/setup/templates.rs` generated a pacman hook at `/etc/pacman.d/hooks/das-esp-sync.hook` that called `/usr/lib/das-backup/esp-sync.sh` (a script no longer present in the repo). The script discovered ESP partitions by label and mirrored the host ESP onto all of them — including `BACKUP-ESP` on the DAS 2TB emergency recovery drives, destroying their independent OS boot configurations. The function kept regenerating the orphan hook on every `btrdasd setup --upgrade` run, leaving a latent vector for the disaster to recur
 - **`EspHooks` struct and `HookType` enum** from `indexer/src/config.rs` — no remaining consumers after hook generator removal. Any `[esp.hooks]` block in an older `config.toml` is silently ignored via serde's default handling
@@ -928,11 +974,13 @@ project rules; binaries are functionally identical.
 - **`[esp.hooks]` block** removed from `/etc/das-backup/config.toml`
 
 ### Fixed
+
 - **2026-03-05 DAS ESP wipe incident — permanent fix** — DAS-Backup-Manager no longer contains any code path that can generate an ESP sync hook, pacman or otherwise. The independent NVMe-pair mirror sync (`/usr/local/bin/esp-sync.sh` via `esp-mirror.hook`) is a completely separate mechanism outside this project and continues to function normally. See `.claude/rules/das-esp-safety.md` for the full postmortem and the hard rule
 
 ## [0.7.11] - 2026-03-16
 
 ### Fixed
+
 - **GUI: `&` accelerator markers corrupting source/target names sent to backend** — KDE's KAcceleratorManager auto-inserts `&` into checkbox text; `QCheckBox::text()` returned these markers (e.g., `"&primary-22tb"`) causing btrbk target mismatch warnings. Now stores original labels via `QWidget::setProperty()` and reads those back instead
 - **GUI: Backup Operations panel content invisible when progress dock expanded** — Mode, Operations, Sources, and Targets group boxes collapsed to title-only height because the progress dock consumed all vertical space. Wrapped panel content in `QScrollArea` so checkboxes remain accessible regardless of dock size
 - **GUI: Status bar stuck on "Loading..." indefinitely** — If any of the 3 async D-Bus status queries (IndexStats, ScheduleGet, HealthQuery) hung, the pending counter never reached zero. Added 10-second timeout fallback that assembles status bar with whatever data has arrived
@@ -940,9 +988,11 @@ project rules; binaries are functionally identical.
 ## [0.7.10] - 2026-03-16
 
 ### Added
+
 - **`btrdasd backup record-run` subcommand** — Allows external scripts (backup-run.sh) to record backup runs in the database for GUI history display
 
 ### Fixed
+
 - **Backup history not recording from CLI or shell script** — Only GUI-initiated backups (via D-Bus helper) were recorded in `backup_runs` table; CLI `btrdasd backup run` and nightly `backup-run.sh` now both record runs
 - **Error messages with commas corrupted in record-run** — Changed from comma-delimited `--errors` to newline-separated string, matching database storage format
 - **JSON key naming inconsistency in `backup report --json`** — Changed `snapshots_created`/`snapshots_sent` to `snaps_created`/`snaps_sent` to match D-Bus, FFI, and GUI field naming
@@ -951,20 +1001,24 @@ project rules; binaries are functionally identical.
 ## [0.7.9] - 2026-03-07
 
 ### Removed
+
 - **Dockerfile and Docker references** — Docker containerization is incompatible with DAS backup operations (requires direct BTRFS subvolume access, physical drive access, btrfs send/receive); removed Dockerfile, .dockerignore, and all Docker documentation
 
 ## [0.7.8] - 2026-03-07
 
 ### Fixed
+
 - **Progress panel dock resize** — Replaced internal `QSplitter` (which could only redistribute within the dock's fixed height) with native QMainWindow dock resizing; central widget minimum height set to 50px so the progress panel dock can expand to consume nearly the full window height by dragging the top edge
 
 ## [0.7.7] - 2026-03-07
 
 ### Changed
+
 - **Progress panel log view resizable** — Central widget minimum height reduced to 50px so the bottom dock (progress panel) can expand to consume nearly the full window height via the native QMainWindow dock separator; drag the top edge of the panel to resize
 - **Smart auto-scroll in log view** — New log entries only auto-scroll to bottom when the user is already at the bottom; scrolling up to inspect earlier entries no longer snaps back on each new line
 
 ### Fixed
+
 - **Log disappears after backup completes** — The progress panel no longer auto-hides 5 seconds after job completion; the log stays visible (and auto-expands) so users can review the full output for errors and inconsistencies; the panel can be closed manually via the dock's X button
 - **Email failure marks entire backup as "Failed"** — Email report errors were pushed to the backup errors vec, causing successful backups (snapshots created, data sent, boot archived) to show as "Failed" in history; email failure is now a non-fatal warning matching the existing pattern for indexing failures
 - **s-nail v14.9+ deprecated variable warnings** — Switched from obsoleted `smtp`/`smtp-auth-user`/`smtp-auth-password`/`ssl-verify` variables to v15-compat mode with `mta=` URL (embedded credentials), `smtp-auth=login`, and `tls-verify` (renamed from `ssl-verify`)
@@ -972,10 +1026,12 @@ project rules; binaries are functionally identical.
 ## [0.7.6] - 2026-03-05
 
 ### Added
+
 - **Email backup reports** — `report.rs` rewritten with `send_email_report()` via s-nail/mailx and comprehensive `format_report()` matching the original shell script format (header, backup operations, throughput, disk capacity, SMART status, latest snapshots, errors, footer)
 - **Journald logging in D-Bus helper** — `btrdasd-helper` now logs all messages to stderr (journald) via `eprintln!` for post-mortem debugging
 
 ### Fixed
+
 - **"Email reports not yet integrated — skipping"** — Email sending was stubbed out when orchestration moved from shell to Rust; now fully wired into the backup pipeline using Protonmail Bridge SMTP credentials from `/etc/das-backup-email.conf`
 - **btrbk.conf canonical path** — Default config path changed from `/etc/das-backup/btrbk.conf` to `/etc/btrbk/btrbk.conf` (the canonical location btrbk expects); setup template generation updated to match
 - **Dry-run backups polluting history** — Dry runs were recording zero-work entries in the `backup_runs` table; now guarded with `if !options.dry_run` in the D-Bus helper
@@ -987,12 +1043,14 @@ project rules; binaries are functionally identical.
 ## [0.7.5] - 2026-03-05
 
 ### Added
+
 - **`snapshot_name` config field** — Subvolumes can now specify an explicit `snapshot_name` to override the algorithmic default, preventing collisions (e.g., `@` and `@root` both resolving to `root`)
 - **`target_labels` config field** — Sources can now restrict which targets they back up to (e.g., HDD sources only to the 22TB primary, not the 2TB recovery drives)
 - **Source volume auto-mount in Rust backup path** — `ensure_sources_mounted()` mounts top-level BTRFS volumes (`subvolid=5`) before calling btrbk; the shell script did this but the Rust CLI/GUI code path didn't
 - **Optional dependencies in packaging** — `s-nail` (email reports) and `rsync` (ESP mirroring) declared as optional/recommended across all packaging formats (Arch, Debian, Fedora, Snap) and install guide
 
 ### Fixed
+
 - **Backups producing "0 snapshots created, 0 sent"** — Three root causes fixed:
   1. btrbk.conf generated separate volume blocks per source×target instead of one per source with multiple inline targets
   2. Snapshot name collisions (`@` and `@root` both → `root`) caused btrbk errors
@@ -1003,9 +1061,11 @@ project rules; binaries are functionally identical.
 ## [0.7.4] - 2026-03-05
 
 ### Added
+
 - **`--force` flag for unattended setup** (`btrdasd setup --force`) — Non-interactive mode that skips all prompts and never removes or overwrites the backup database; enables scripted installs, upgrades, uninstalls, and full uninstalls without a TTY
 
 ### Fixed
+
 - **btrbk.conf snapshot_dir hardcoded** — `render_btrbk_conf()` used hardcoded `.btrbk-snapshots` for all sources; HDD sources with custom `snapshot_dir` (e.g., `ClaudeCodeProjects/.btrbk-snapshots`) now generate correctly from per-source config
 - **Production btrbk_conf path** — Config `btrbk_conf` pointed to old hand-written `/etc/btrbk/btrbk.conf` instead of the generated `/etc/das-backup/btrbk.conf`; backup commands were reading the wrong config
 - **GUI table sorting missing** — SearchPanel, Health/Drives, and Health/Growth tables now have `QSortFilterProxyModel` with clickable column headers for sorting
@@ -1014,6 +1074,7 @@ project rules; binaries are functionally identical.
 ## [0.7.3] - 2026-03-05
 
 ### Added
+
 - **Growth trendline chart** — Health Dashboard growth tab now shows a Qt Charts line graph with per-target used-space trend and dashed capacity ceiling lines
 - **Free and ETA columns** — Growth table now includes Free (total - used) and ETA Full (14-point linear regression projection of when disk fills)
 - **Qt6 Charts dependency** — GUI now requires `qt6-charts` package for growth visualization
@@ -1021,9 +1082,11 @@ project rules; binaries are functionally identical.
 - **KF6 Notifications and StatusNotifierItem** — Added missing KF6 dependencies to all packaging formats (required by GUI for desktop notifications and system tray)
 
 ### Changed
+
 - **History "Sent" column** — Replaced wide "Bytes Sent" column (formatted byte sizes) with narrow binary "Sent" indicator: Yes (green icon) if data was sent, No (red icon) if backup failed, dash for dry-run/snapshot-only runs
 
 ### Fixed
+
 - **Config version stuck at old value** — `setup --upgrade` now auto-updates the `version` field in `/etc/das-backup/config.toml` to match the installed binary version (was stuck at 0.6.0 through multiple releases)
 - **Incremental indexing `snapshots_skipped` always 0** — `discover_snapshots()` filtered out already-indexed snapshots before returning, making `walk()` unable to count skipped snapshots; added `DiscoveryResult` struct with both new snapshots and total-on-disk count
 - **Growth data missing total_bytes** — D-Bus helper growth JSON now includes `total_bytes` per entry (looked up from target health data) enabling Free/ETA calculations
@@ -1031,13 +1094,16 @@ project rules; binaries are functionally identical.
 ## [0.7.2] - 2026-03-05
 
 ### Added
+
 - **`--uninstall-all` mode** (`btrdasd setup --uninstall-all`) — Removes all installed files: generated configs (same as `--uninstall`), plus cmake-installed binaries, FFI library, D-Bus configs, polkit policy, systemd units, man page, shell completions, desktop entry, and icon
 - **Auto-enable helper service** — `cmake --install` now runs `systemctl daemon-reload` and `systemctl enable btrdasd-helper.service` automatically
 
 ### Changed
+
 - **GUI version from CMake** — `KAboutData` version in `gui/src/main.cpp` now uses `BTRDASD_VERSION` compile definition from `CMAKE_PROJECT_VERSION` instead of a hardcoded string; version stays in sync automatically across releases
 
 ### Fixed
+
 - **GUI About dialog showed v0.6.0** — `KAboutData` had a hardcoded `"0.6.0"` version string that was never updated; now derived from CMake project version
 - **Stale v0.6.0 binaries in `/usr/local/bin/`** — Manual install from earlier release left binaries in `/usr/local/bin/` that shadowed the cmake-installed `/usr/bin/` binaries due to PATH priority; removed and replaced with symlinks to canonical install locations
 - **CMake ExternalProject stale build cache** — `cmake --build` didn't always rebuild Rust binaries when only `cargo build --release` had been run (different `--target-dir`); `build/cargo-target/` vs `indexer/target/release/` divergence caused installed binary to lag behind
@@ -1050,6 +1116,7 @@ project rules; binaries are functionally identical.
 ## [0.7.1] - 2026-03-05
 
 ### Fixed
+
 - **Installation instructions** — README and INSTALL.md "Recommended" install only ran `cargo build`, skipping GUI, D-Bus helper, FFI library, scripts, systemd units, polkit, and man page; changed to full `cmake` build path that installs all components by default
 - **BUILD_FFI default** — INSTALL.md documented `BUILD_FFI` as `OFF` when CMakeLists.txt has it `ON`; corrected documentation
 - **Module count** — Library has 13 public modules (not 12); `ffi` module was missing from counts in README, ARCHITECTURE.md, and CHANGELOG
@@ -1057,6 +1124,7 @@ project rules; binaries are functionally identical.
 ## [0.7.0] - 2026-03-05
 
 ### Added
+
 - **Source volume auto-mount** (`mount::ensure_sources_mounted`) — Mounts top-level BTRFS volumes (`subvolid=5`) before btrbk operations so snapshots can access `/@`, `/@opt`, `/@home` etc.; deduplicates shared volumes, creates snapshot dirs and target subdirs; returns `MountGuard` for RAII cleanup
 - **Auto-mount/unmount** (`mount.rs`) — RAII `MountGuard` resolves target serials via `/dev/disk/by-id`, mounts BTRFS partitions before operations, unmounts on completion or panic; all D-Bus methods and CLI commands that access targets now auto-mount
 - **D-Bus index read methods** — `IndexStats`, `IndexListSnapshots`, `IndexListFiles` (paginated), `IndexSearch`, `IndexBackupHistory`, `IndexSnapshotPath` for read-only index access from the GUI
@@ -1071,6 +1139,7 @@ project rules; binaries are functionally identical.
 - **`FileModel::loadMore()`** — Incremental page loading in the GUI with `beginInsertRows`/`endInsertRows`
 
 ### Changed
+
 - **Library modules** — 11 → 13 public modules (added `ffi`, `mount`)
 - **Polkit policy** — 5 → 7 actions (added `config.read`, `index.read`)
 - **D-Bus methods** — 17 → 23 (added 6 index read methods)
@@ -1079,6 +1148,7 @@ project rules; binaries are functionally identical.
 - **Rust test count** — 62 → 161 (133 lib + 19 setup + 9 integration)
 
 ### Fixed
+
 - **Source volumes not mounted for btrbk** — Full backup produced only 1 snapshot because `/.btrfs-nvme`, `/.btrfs-ssd`, `/.btrfs-hdd` were not mounted with `subvolid=5`; only `/dasRaid0` (pre-mounted) was accessible to btrbk
 - **btrbk command construction** — `create_snapshots()` placed "snapshot" subcommand inside the source loop, producing `btrbk snapshot vol1 snapshot vol2` instead of `btrbk snapshot vol1 vol2`; fixed by moving `cmd.arg("snapshot")` before the loop
 - **Volume deduplication** — Multiple sources sharing the same BTRFS volume (e.g., `hdd-projects` and `hdd-audiobooks` both on `/.btrfs-hdd`) caused duplicate btrbk arguments; fixed with `HashSet` deduplication in both `create_snapshots()` and `send_snapshots()`
@@ -1095,6 +1165,7 @@ project rules; binaries are functionally identical.
 ### Added
 
 #### Rust Library & CLI (Milestone 1)
+
 - **`buttered_dasd` library crate** — Extracted 11 public modules from CLI binary into reusable library (`backup`, `config`, `db`, `health`, `indexer`, `progress`, `report`, `restore`, `scanner`, `schedule`, `subvol`)
 - **`SubvolConfig` data model** — Replaced `Vec<String>` subvolumes with `Vec<SubvolConfig>` supporting `manual_only` flag (backward-compatible `#[serde(untagged)]` deserialization)
 - **New CLI subcommands** — `backup` (run/snapshot/send/boot-archive/report), `restore` (file/snapshot/browse), `schedule` (show/set/enable/disable/next), `subvol` (list/add/remove/set-manual/set-auto), `health`, `config edit`, `completions`
@@ -1104,6 +1175,7 @@ project rules; binaries are functionally identical.
 - **Man page** — `docs/btrdasd.1` with all subcommands, options, examples, and file paths
 
 #### D-Bus Helper Daemon (Milestone 2)
+
 - **`btrdasd-helper`** — Privileged D-Bus daemon on system bus (`org.dasbackup.Helper1`) with polkit authorization
 - **D-Bus methods** — BackupRun, BackupSnapshot, BackupSend, BackupBootArchive, IndexWalk, RestoreFiles, RestoreSnapshot, ConfigGet, ConfigSet, ScheduleGet, ScheduleSet, ScheduleEnable, SubvolAdd, SubvolRemove, SubvolSetManual, HealthQuery, JobCancel
 - **D-Bus signals** — JobProgress (stage/percent/message/throughput/ETA), JobLog (level/message), JobFinished (success/summary)
@@ -1113,24 +1185,28 @@ project rules; binaries are functionally identical.
 - **Bus access rules** (`dbus/org.dasbackup.Helper1.conf`) — System bus ownership and method access control
 
 #### FFI Bridge (Milestone 3)
+
 - **`libbuttered_dasd_ffi.so`** — C-ABI shared library (feature-gated `ffi` flag) for GUI access to Rust library
 - **FFI functions** — Config load/get/validate/free, subvol list, health parse growth log, DB open/history/usage/free, format bytes, string free
 - **C header** (`indexer/include/btrdasd_ffi.h`) — Opaque pointer types and function declarations
 - **JSON interchange** — Complex data returned as JSON strings, parsed by GUI with `QJsonDocument`
 
 #### GUI Infrastructure (Milestone 4)
+
 - **Navigation sidebar** (`Sidebar`) — QTreeWidget with sections: Browse (Snapshots, Search), Backup (Run Now, History), Config, Health (Drives, Growth, Status)
 - **D-Bus client** (`DBusClient`) — QDBusInterface wrapper with async method calls and signal connections for JobProgress/JobLog/JobFinished
 - **Progress panel** (`ProgressPanel`) — Collapsible QDockWidget with progress bar, throughput, ETA, cancel button, and raw log viewer
 - **Extended database** — `getBackupHistory()` and `getTargetUsageHistory()` methods with `BackupRunInfo` and `TargetUsageInfo` data structs
 
 #### GUI Panels (Milestone 5)
+
 - **Backup operations panel** (`BackupPanel`) — Mode selection (incremental/full), operation checkboxes (snapshot, send, boot archive, index, email), source/target selection, dry run support
 - **Backup history view** (`BackupHistoryView`) — QTableView with timestamp, mode, duration, status, bytes sent, errors columns; auto-refresh on JobFinished
 - **Health dashboard** (`HealthDashboard`) — Tabbed widget with Drives (QTableView from D-Bus), Growth (QChartView with QLineSeries per target), Status (btrbk/timer/mount status)
 - **Config editor** (`ConfigDialog`) — KPageDialog with TOML editor, reload/diff/save toolbar, change confirmation dialog
 
 #### Advanced GUI Features (Milestone 6)
+
 - **Dolphin-style file browser** (`SnapshotBrowser`) — Breadcrumb navigation, switchable detail/icon views, QFileSystemModel, multi-select context menu (restore, copy path, properties), inline filter bar
 - **First-run wizard** (`SetupWizard`) — QWizard with 5 pages: Welcome, Source Selection, Target Selection, Schedule, Summary; auto-launches when no config found
 - **Desktop notifications** — KNotification on backup complete/fail with summary details
@@ -1139,6 +1215,7 @@ project rules; binaries are functionally identical.
 - **Keyboard shortcuts** — Ctrl+B (backup), Ctrl+R (restore), Ctrl+F (search), F5 (refresh)
 
 ### Changed
+
 - **Crate architecture** — Split from CLI-only binary into library (`buttered_dasd`) + binary (`btrdasd`) + D-Bus helper (`btrdasd-helper`) + FFI cdylib with `[lib]`, `[[bin]]`, and feature flags in Cargo.toml
 - **Regex performance** — `LazyLock<Regex>` for compile-once snapshot dirname parsing (replaces per-call `Regex::new()`)
 - **Release profile** — Added `[profile.release]` with `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`
@@ -1152,6 +1229,7 @@ project rules; binaries are functionally identical.
 ## [0.5.1] - 2026-02-24
 
 ### Added
+
 - **Full management interface design** — Architecture for transforming GUI from read-only browser into full backup management system with CLI parity
 - **Design document** (`docs/plans/2026-02-24-full-management-interface-design.md`) — Complete architecture spec for v0.6.0
 - **Implementation plan** (`docs/plans/2026-02-24-full-management-implementation-plan.md`) — 41-task phased plan across 5 phases
@@ -1159,6 +1237,7 @@ project rules; binaries are functionally identical.
 ## [0.5.0] - 2026-02-22
 
 ### Added
+
 - **Config-driven pipeline** (`btrdasd config dump-env`) — Reads `config.toml` and prints shell-sourceable `DAS_*` key=value pairs; scripts source config at runtime via `eval`
 - **Config subcommands** — `btrdasd config dump-env`, `btrdasd config show`, `btrdasd config validate`
 - **Extended config.toml schema** — New `[das]`, `[boot]` sections; per-source `snapshot_dir`; per-target `display_name`, `retention.daily`, `retention.yearly`
@@ -1168,17 +1247,20 @@ project rules; binaries are functionally identical.
 - **Reference examples directory** — `docs/examples/` with author's bay mapping, storage topology, and index
 
 ### Changed
+
 - **Scripts refactored** — `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh`, `das-partition-drives.sh` now use `eval "$(btrdasd config dump-env)"` instead of hardcoded values
 - **Template engine** — Generated backup script replaced with thin `exec` wrapper; production scripts embedded via `include_str!` and copied during install
 - **systemd units** — Use production paths (`/usr/local/lib/das-backup/`) and generic DAS detection instead of hardcoded dev paths
 - **Documentation** — `STORAGE-ARCHITECTURE-AND-RECOVERY.md`, `DISASTER-RECOVERY-GUIDE.md`, `DAS-BAY-MAPPING.md`, `OFFLINE-BACKUP-PLAN.md` all parameterized with `<your-uuid>` placeholders
 
 ### Fixed
+
 - **GUI restore action** — Implemented `Database::snapshotPathById()` and `m_currentSnapshotId` tracking; restore now correctly combines snapshot path with file path for `KIO::copy`
 
 ## [0.4.0] - 2026-02-21
 
 ### Added
+
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 application for browsing and restoring backup files
   - 12 C++ components: MainWindow, Database, SnapshotModel, FileModel, SearchModel, SnapshotTimeline, IndexRunner, SnapshotWatcher, RestoreAction, SettingsDialog, desktop entry, XML GUI
   - Custom-painted timeline widget for visual snapshot navigation
@@ -1203,6 +1285,7 @@ project rules; binaries are functionally identical.
 - **docs/INSTALL.md** — Comprehensive installation guide for all 5 installer modes
 
 ### Changed
+
 - **License**: GPL-3.0 → MIT
 - CMake project version: 0.1.0 → 0.4.0
 - systemd units now generated by installer from templates (no longer static files in `systemd/` directory)
@@ -1211,11 +1294,13 @@ project rules; binaries are functionally identical.
 - GUI (`btrdasd-gui`) version: 0.1.0 → 0.4.0
 
 ### Fixed
+
 - systemctl calls moved from `install_to_prefix` to `install` to prevent polkit authentication dialogs during test runs
 
 ## [0.3.0] - 2026-02-21
 
 ### Added
+
 - **ButteredDASD content indexer** (`btrdasd`) — Rust CLI for indexing DAS backup snapshots
   - SQLite FTS5 full-text search across all indexed file paths and names
   - Span-based deduplication: unchanged files across consecutive snapshots stored as single row
@@ -1228,6 +1313,7 @@ project rules; binaries are functionally identical.
 - Content indexer status line in email backup reports
 
 ### Changed
+
 - Indexer built in Rust (edition 2024) instead of planned C++ for memory safety
 - Application named ButteredDASD with CLI binary `btrdasd`
 - Indexer binary path in backup-run.sh uses `BTRDASD_BIN` env var with `/usr/local/bin/btrdasd` default
@@ -1235,6 +1321,7 @@ project rules; binaries are functionally identical.
 ## [0.2.0] - 2026-02-21
 
 ### Added
+
 - Migrated backup scripts from CachyOS-Kernel project
   - `scripts/backup-run.sh` v3.1.0 — btrbk orchestrator with triple-target architecture, throughput logging, email reports
   - `scripts/backup-verify.sh` v2.0.0 — DAS drive health (SMART) + btrbk status verification
@@ -1256,6 +1343,7 @@ project rules; binaries are functionally identical.
 ## [0.1.0] - 2026-02-21
 
 ### Added
+
 - Project scaffolding with CMake build system (ECM + Qt6 + KF6)
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
