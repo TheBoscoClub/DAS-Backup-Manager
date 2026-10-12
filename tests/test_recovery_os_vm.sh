@@ -1147,12 +1147,16 @@ STUB
 
 driver_env() {
     # GUARD_SECS=default: the knob left unset, so the driver's own default runs.
+    # GRACE 3, not 1: the driver's power-off deadline is whole seconds
+    # (SECONDS), so a 1 s grace can expire within a fraction of a second,
+    # and a loaded CI runner then keeps a session the test expects ended
+    # (exit 3 for 6, 2026-10-12). A test that wants the expiry sets GRACE.
     local guard=(DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}")
     if [[ "${GUARD_SECS:-}" == default ]]; then guard=(); fi
     env -u DAS_RECOVERY_OS_STATE -u DAS_RECOVERY_VM_GUARD_SECS ${OS_STATE:+DAS_RECOVERY_OS_STATE="$OS_STATE"} \
         PATH="${DRIVER_PATH:-$T/bin:$PATH}" STUB="$S" REAL_FLOCK="$REAL_FLOCK" REAL_STAT="$REAL_STAT" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
-        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-1}" \
+        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-3}" \
         DAS_RECOVERY_VM_RESEND_SECS="${RESEND:-30}" DAS_RECOVERY_VM_CLOCK_GAP_SECS="${CLOCK_GAP:-30}" "${guard[@]}" \
         ${LOOP:+DAS_RECOVERY_VM_TEST_LOOP="$LOOP"} "$@"
 }
@@ -1239,7 +1243,7 @@ run_interrupted() {
     set -m
     env -u DAS_RECOVERY_OS_STATE PATH="$T/bin:$PATH" STUB="$S" REAL_FLOCK="$REAL_FLOCK" REAL_STAT="$REAL_STAT" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
-        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-1}" \
+        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-3}" \
         DAS_RECOVERY_VM_RESEND_SECS="${RESEND:-30}" DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}" \
         DAS_RECOVERY_VM_CLOCK_GAP_SECS="${CLOCK_GAP:-30}" \
         bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
@@ -1278,7 +1282,7 @@ run_stopped() {
     set -m
     env -u DAS_RECOVERY_OS_STATE PATH="$T/bin:$PATH" STUB="$S" REAL_FLOCK="$REAL_FLOCK" REAL_STAT="$REAL_STAT" \
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
-        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-1}" \
+        DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-3}" \
         DAS_RECOVERY_VM_RESEND_SECS="${RESEND:-30}" DAS_RECOVERY_VM_GUARD_SECS="${GUARD_SECS:-2}" \
         DAS_RECOVERY_VM_CLOCK_GAP_SECS="${CLOCK_GAP:-30}" \
         bash "$DRIVER" "$@" >"$T/driver.out" 2>&1 &
@@ -5195,12 +5199,15 @@ check "egress wait, network up at once: exit 0" "$RC" "0"
 lacks "egress wait, network up at once: never waited" "$OUT" "waiting for the recovery OS's network"
 has "egress wait, network up at once: judged" "$OUT" "egress is direct (AS64500)"
 unattended_fixture
-DAS_RECOVERY_VM_NET_SECS=1 run_driver session A --unattended
+# A 2 s budget, not 1: the step measures whole seconds, so a tick of the
+# clock between its start and its first look ends a 1 s budget after one ask
+# (CI, 2026-10-12); two seconds cannot pass in under one.
+DAS_RECOVERY_VM_NET_SECS=2 run_driver session A --unattended
 curl_stub 1000
 before=$SECONDS
 run_egress_script
 check "egress wait, network never up: exit 2" "$RC" "2"
-has "egress wait, network never up: says so, with the budget" "$OUT" "cannot read this VM's public address: no answer from api.ipify.org for 1s after the agent answered -- the recovery OS's network may not be up (curl: (6) Could not resolve host: api.ipify.org)"
+has "egress wait, network never up: says so, with the budget" "$OUT" "cannot read this VM's public address: no answer from api.ipify.org for 2s after the agent answered -- the recovery OS's network may not be up (curl: (6) Could not resolve host: api.ipify.org)"
 matches "egress wait, network never up: waited the budget out" "$((SECONDS - before))" "^[1-9][0-9]*$"
 matches "egress wait, network never up: asked more than once" "$(wc -l <"$T/curlstub/calls")" "^([2-9]|[1-9][0-9]+)$"
 for knob in 0 12x; do
