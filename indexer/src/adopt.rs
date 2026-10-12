@@ -13,7 +13,7 @@ use std::process::Command;
 use crate::btrbk_conf::{algorithmic_snapshot_name, resolve_snapshot_names};
 use crate::config::{Config, Source, SubvolConfig, TargetRole};
 use crate::doctor::glob_match;
-use crate::fsutil::{CommandRunner, write_atomic};
+use crate::fsutil::CommandRunner;
 
 /// Whether `path` lies in a snapshot tree — Snapper's `.snapshots` or btrbk's
 /// `.btrbk-snapshots`, at any depth. Snapshots are not data to back up; they
@@ -645,8 +645,7 @@ fn bring_btrbk_conf_into_line(
     sync_failed: bool,
 ) -> (BtrbkConf, Option<String>) {
     let conf_path = Path::new(&config.general.btrbk_conf);
-    let rendered = crate::btrbk_conf::render_btrbk_conf(config);
-    if std::fs::read_to_string(conf_path).is_ok_and(|text| text == rendered) {
+    if crate::btrbk_conf::confs_are_current(config) {
         return (BtrbkConf::Current, None);
     }
     if sync_failed {
@@ -666,7 +665,7 @@ fn bring_btrbk_conf_into_line(
             )),
         );
     }
-    match write_atomic(conf_path, &rendered) {
+    match crate::btrbk_conf::write_rendered_confs(config) {
         Ok(()) => (BtrbkConf::Regenerated, None),
         // The error names the file.
         Err(e) => (BtrbkConf::OutOfDate, Some(e.to_string())),
@@ -697,14 +696,13 @@ fn write_updated(
     }
     // btrbk.conf first: if it cannot be written, config.toml is left
     // describing what btrbk will actually do.
-    let conf_path = Path::new(&updated.general.btrbk_conf);
     // Each error names its own file.
-    if let Err(e) = write_atomic(conf_path, &crate::btrbk_conf::render_btrbk_conf(&updated)) {
+    if let Err(e) = crate::btrbk_conf::write_rendered_confs(&updated) {
         return Some(e.to_string());
     }
     if let Err(e) = updated.save(config_path) {
-        // Put btrbk.conf back so the two files still agree.
-        let restore = write_atomic(conf_path, &crate::btrbk_conf::render_btrbk_conf(config));
+        // Put btrbk.conf (and the state conf) back so the files still agree.
+        let restore = crate::btrbk_conf::write_rendered_confs(config);
         return Some(not_saved(&*e, restore));
     }
     None
@@ -713,7 +711,7 @@ fn write_updated(
 /// What a sync reports when `config.toml` could not be saved (`e`): that,
 /// and, when putting `btrbk.conf` back failed too (`restore`), that as well —
 /// the two files may then disagree. Both errors name their files.
-fn not_saved(e: &dyn std::fmt::Display, restore: std::io::Result<()>) -> String {
+fn not_saved(e: &dyn std::fmt::Display, restore: Result<(), Box<dyn std::error::Error>>) -> String {
     match restore {
         Ok(()) => e.to_string(),
         Err(r) => format!("{e}; and the restore failed too: {r}"),
@@ -2005,7 +2003,7 @@ mod tests {
         assert_eq!(not_saved(&saved, Ok(())), saved);
         let restore = std::io::Error::other("cannot write /etc/btrbk/btrbk.conf: Read-only");
         assert_eq!(
-            not_saved(&saved, Err(restore)),
+            not_saved(&saved, Err(restore.into())),
             "cannot write /etc/das-backup/config.toml: No space left on device; and the \
              restore failed too: cannot write /etc/btrbk/btrbk.conf: Read-only"
         );
@@ -2093,6 +2091,56 @@ mod tests {
             std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
             "OLD"
         );
+    }
+
+    fn state_flagged(mut cfg: Config) -> Config {
+        cfg.sources[0].subvolumes.push(SubvolConfig {
+            name: "@state".into(),
+            snapshot_name: Some("das-state".into()),
+            after_index: true,
+            ..Default::default()
+        });
+        cfg
+    }
+
+    #[test]
+    fn the_sync_writes_the_state_conf_beside_btrbk_conf_and_removes_it_with_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let state = dir.path().join("btrbk-state.conf");
+        let old = Config::load(&path).unwrap();
+        let flagged = state_flagged(old.clone());
+        assert_eq!(write_updated(&old, Ok(flagged.clone()), &path), None);
+        let main = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
+        assert!(!main.contains("das-state"), "{main}");
+        let text = std::fs::read_to_string(&state).expect("the state conf is written");
+        assert!(text.contains("das-state"), "{text}");
+
+        // The entry is retired: the stale state conf goes.
+        let mut retired = flagged.clone();
+        retired.sources[0].subvolumes.last_mut().unwrap().retired = Some("2026-10-12".into());
+        assert_eq!(write_updated(&flagged, Ok(retired), &path), None);
+        assert!(!state.exists(), "a retired entry leaves no state conf");
+    }
+
+    #[test]
+    fn the_nightly_regeneration_creates_the_state_conf_an_operator_edit_calls_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let flagged = state_flagged(Config::load(&path).unwrap());
+        // The main conf is already what the config renders to; only the state
+        // conf is missing — the sync must still see that as out of date.
+        std::fs::write(
+            dir.path().join("btrbk.conf"),
+            crate::btrbk_conf::render_btrbk_conf(&flagged),
+        )
+        .unwrap();
+        let (state, why) = bring_btrbk_conf_into_line(&flagged, false, false);
+        assert_eq!(why, None);
+        assert_eq!(state, BtrbkConf::Regenerated);
+        assert!(dir.path().join("btrbk-state.conf").exists());
+        let (state, _) = bring_btrbk_conf_into_line(&flagged, false, false);
+        assert_eq!(state, BtrbkConf::Current);
     }
 
     #[test]

@@ -445,9 +445,6 @@ pub struct GeneratedFiles {
     pub files: Vec<(String, String)>,
 }
 
-/// Where `setup` installs the state series' btrbk config, beside the main one.
-pub const STATE_CONF_PATH: &str = "/etc/btrbk/btrbk-state.conf";
-
 impl GeneratedFiles {
     /// Generate all operational files from a Config. Includes systemd units OR cron
     /// entries based on init system, plus btrbk.conf, the backup scripts and the udisks-ignore
@@ -456,15 +453,18 @@ impl GeneratedFiles {
         let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
         let mut files = Vec::new();
 
-        // btrbk.conf — canonical location is /etc/btrbk/btrbk.conf
-        files.push((
-            "/etc/btrbk/btrbk.conf".to_string(),
-            render_btrbk_conf(config),
-        ));
-        // Its companion for the entries sent after the indexer ran (bd 9eq9);
-        // present only when some entry is flagged `after_index`.
+        // btrbk.conf — at `general.btrbk_conf` (canonical /etc/btrbk/btrbk.conf),
+        // the path every other reader and writer of it uses.
+        files.push((config.general.btrbk_conf.clone(), render_btrbk_conf(config)));
+        // Its companion for the entries sent after the indexer ran (bd 9eq9),
+        // beside it; present only when some entry is flagged `after_index`.
         if let Some(state) = render_state_conf(config) {
-            files.push((STATE_CONF_PATH.to_string(), state));
+            files.push((
+                buttered_dasd::btrbk_conf::state_conf_path(config)
+                    .to_string_lossy()
+                    .into_owned(),
+                state,
+            ));
         }
 
         // Real production scripts (embedded in binary, config-driven via eval),
@@ -942,6 +942,16 @@ mod tests {
             .expect("the state conf is generated");
         assert!(!main.contains("das-state"), "{main}");
         assert!(state.contains("snapshot_name       das-state"), "{state}");
+    }
+
+    #[test]
+    fn both_conf_paths_follow_general_btrbk_conf() {
+        let mut config = with_state_entry(test_config());
+        config.general.btrbk_conf = "/srv/btrbk/main.conf".to_string();
+        let generated = GeneratedFiles::generate(&config);
+        assert!(generated_text(&generated, "/srv/btrbk/main.conf").is_some());
+        assert!(generated_text(&generated, "/srv/btrbk/btrbk-state.conf").is_some());
+        assert!(generated_text(&generated, "/etc/btrbk/btrbk.conf").is_none());
     }
 
     #[test]

@@ -67,9 +67,26 @@ impl ForgetPlan {
 /// Read from the generated `btrbk.conf` rather than re-derived from
 /// `config.toml`: that file is what btrbk actually reads, so it cannot disagree
 /// with reality the way a second implementation of the naming rules could.
+///
+/// The state series' `btrbk-state.conf` beside it (`after_index` entries,
+/// bd 9eq9) is read too: its names are as live as the main file's, and
+/// `forget` must not take them. That file is optional; one that exists and
+/// cannot be read is an error like the main one.
 pub fn live_snapshot_names(btrbk_conf: &Path) -> std::io::Result<Vec<String>> {
-    let text = std::fs::read_to_string(btrbk_conf)?;
-    Ok(parse_live_snapshot_names(&text))
+    let mut names = parse_live_snapshot_names(&std::fs::read_to_string(btrbk_conf)?);
+    if let Some(text) = read_state_conf(btrbk_conf)? {
+        names.extend(parse_live_snapshot_names(&text));
+    }
+    Ok(names)
+}
+
+/// The text of the state conf beside `btrbk_conf`, `None` when there is none.
+fn read_state_conf(btrbk_conf: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(btrbk_conf.with_file_name("btrbk-state.conf")) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Pure half of [`live_snapshot_names`].
@@ -94,8 +111,11 @@ pub fn parse_live_snapshot_names(conf: &str) -> Vec<String> {
 pub fn live_subvol_snapshot_names(
     btrbk_conf: &Path,
 ) -> std::io::Result<std::collections::HashMap<String, String>> {
-    let text = std::fs::read_to_string(btrbk_conf)?;
-    Ok(parse_subvol_snapshot_names(&text))
+    let mut map = parse_subvol_snapshot_names(&std::fs::read_to_string(btrbk_conf)?);
+    if let Some(text) = read_state_conf(btrbk_conf)? {
+        map.extend(parse_subvol_snapshot_names(&text));
+    }
+    Ok(map)
 }
 
 /// Pure half of [`live_subvol_snapshot_names`].
@@ -351,6 +371,44 @@ volume /.btrfs-hdd
         let empty = dir.path().join("empty.conf");
         std::fs::write(&empty, "timestamp_format long\n").unwrap();
         assert_eq!(live_snapshot_names(&empty).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn live_names_include_the_state_conf_beside_btrbk_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        std::fs::write(&conf, "volume /v\n  subvolume @\n    snapshot_name root\n").unwrap();
+        // No state file: the main names alone.
+        assert_eq!(
+            live_snapshot_names(&conf).unwrap(),
+            vec!["root".to_string()]
+        );
+        std::fs::write(
+            dir.path().join("btrbk-state.conf"),
+            "volume /v\n  subvolume @state\n    snapshot_name das-state\n",
+        )
+        .unwrap();
+        let names = live_snapshot_names(&conf).unwrap();
+        assert_eq!(names, vec!["root".to_string(), "das-state".to_string()]);
+        // So forget refuses the state series.
+        assert_eq!(
+            plan_forget(&[], "das-state*", &names).unwrap_err(),
+            ForgetRefusal::LiveSeries("das-state".into())
+        );
+        let map = live_subvol_snapshot_names(&conf).unwrap();
+        assert_eq!(map.get("@state").map(String::as_str), Some("das-state"));
+        assert_eq!(map.get("@").map(String::as_str), Some("root"));
+    }
+
+    #[test]
+    fn an_unreadable_state_conf_is_an_error_like_the_main_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        std::fs::write(&conf, "volume /v\n").unwrap();
+        // A directory where the file belongs: present but unreadable.
+        std::fs::create_dir(dir.path().join("btrbk-state.conf")).unwrap();
+        assert!(live_snapshot_names(&conf).is_err());
+        assert!(live_subvol_snapshot_names(&conf).is_err());
     }
 
     #[test]

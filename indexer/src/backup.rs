@@ -7820,6 +7820,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_boot_plan_names_include_those_in_the_state_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, conf) = archive_fixture(dir.path());
+        // Own directory, so no state conf lands in the shared temp dir.
+        let own = dir.path().join("btrbk.conf");
+        std::fs::copy(conf.path(), &own).unwrap();
+        config.general.btrbk_conf = own.to_string_lossy().into_owned();
+        std::fs::write(
+            own.with_file_name("btrbk-state.conf"),
+            "volume /v\n  subvolume @home\n    snapshot_name das-state\n",
+        )
+        .unwrap();
+        config.boot.subvolumes = vec!["@home".into()];
+        let plan = boot_plan(&config).unwrap();
+        assert_eq!(plan[0].snapshot_name.as_deref(), Some("das-state"));
+    }
+
     // --- bd DAS-Backup-Manager-5ig ---------------------------------------
     // The finder must resolve the name btrbk ACTUALLY writes. Production
     // btrbk.conf carries `snapshot_name root-` for a bare `@` (disambiguated
