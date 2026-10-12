@@ -26,7 +26,7 @@ check() { # check <name> <command...>
     if "$@"; then pass "$name"; else fail "$name"; fi
 }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
-hasnt() { ! grep -qF -- "$2" "$1" 2>/dev/null; }
+file_lacks() { ! grep -qF -- "$2" "$1" 2>/dev/null; }
 out_has() { grep -qF -- "$1" <<<"$OUT"; }
 status_is() { [[ "$(cat "$R/run/das-recovery-state/status" 2>/dev/null)" == "$1" ]]; }
 no_leftovers() { test ! -e "$R/var/lib/das-backup.new" -a ! -e "$R/var/lib/das-backup.old" -a ! -e "$R/etc/das-backup/config.toml.new"; }
@@ -141,8 +141,8 @@ check "synced: config derived" has "$R/etc/das-backup/config.toml" "recovery_dri
 check "synced: status" status_is "synced 20261012T0348"
 check "synced: derive-recovery args" has "$LOG" "--booted-uuid $UUID_STUB"
 check "synced: derive-recovery source" has "$LOG" "--from $R/nvme/root-.20261012T0348/etc/das-backup/config.toml"
-check "synced: no catch-up" hasnt "$LOG" systemd-run
-check "synced: no mount/umount under the ROOT seam" hasnt "$LOG" "mount "
+check "synced: no catch-up" file_lacks "$LOG" systemd-run
+check "synced: no mount/umount under the ROOT seam" file_lacks "$LOG" "mount "
 check "synced: no leftovers" no_leftovers
 
 echo "== gap (state older than data)"
@@ -157,7 +157,7 @@ check "gap: config from the newest root" has "$LOG" "--from $R/nvme/root-.202610
 check "gap: catch-up via systemd-run" has "$LOG" "systemd-run"
 check "gap: walk of the derived config's first target mount, --db, --config" \
     has "$LOG" "walk $WALK_MOUNT --db $R/var/lib/das-backup/backup-index.db --config $R/etc/das-backup/config.toml"
-check "gap: walk is NOT given the top-level mount" hasnt "$LOG" "walk $R"
+check "gap: walk is NOT given the top-level mount" file_lacks "$LOG" "walk $R"
 
 echo "== state newer than data (the normal nightly layout)"
 fixture
@@ -166,7 +166,7 @@ echo db-0412 >"$R/nvme/das-state.20261012T0412/backup-index.db"
 run
 check "newer: exit 0" test "$RC" -eq 0
 check "newer: newest state copied" has "$R/var/lib/das-backup/backup-index.db" db-0412
-check "newer: no catch-up" hasnt "$LOG" systemd-run
+check "newer: no catch-up" file_lacks "$LOG" systemd-run
 check "newer: status" status_is "synced 20261012T0412"
 
 echo "== partial receive skipped"
@@ -251,7 +251,7 @@ fixture
 run STUB_MV_NO_EXCHANGE=1 STUB_MV_FAIL_AT="2 3"
 check "fallback undo fails: exit 1" test "$RC" -eq 1
 check "fallback undo fails: previous state kept in .old" has "$R/var/lib/das-backup.old/previous" previous
-check "fallback undo fails: never claims restored" hasnt "$R/run/das-recovery-state/status" "previous state restored"
+check "fallback undo fails: never claims restored" file_lacks "$R/run/das-recovery-state/status" "previous state restored"
 check "fallback undo fails: status says where it is" \
     status_is "failed: swap failed and the previous state could not be restored: it is in $R/var/lib/das-backup.old"
 check "fallback undo fails: no .new left" test ! -e "$R/var/lib/das-backup.new"
@@ -262,7 +262,7 @@ mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"
 echo "# newer" >"$R/nvme/root-.20261013T0348/etc/das-backup/config.toml"
 run STUB_DUMPENV_EMPTY=1
 check "no mount: exit 0 (the sync itself succeeded)" test "$RC" -eq 0
-check "no mount: systemd-run not called" hasnt "$LOG" systemd-run
+check "no mount: systemd-run not called" file_lacks "$LOG" systemd-run
 check "no mount: status says NOT started" status_is "synced 20261012T0348; catch-up NOT started: no target mount from dump-env"
 fixture
 mkdir -p "$R/nvme/root-.20261013T0348/etc/das-backup"

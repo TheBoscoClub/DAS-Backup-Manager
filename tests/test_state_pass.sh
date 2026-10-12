@@ -1,4 +1,8 @@
 #!/bin/bash
+# shellcheck disable=SC2016
+# SC2016: the step-order checks match the literal text `run_state_pass "$mode"`
+#   and `if [[ "$mode" != "dryrun" ]]` in the script's source; expanding them
+#   would defeat the match.
 # shellcheck disable=SC2034,SC2329
 # SC2034: the run state set here is read by the function extracted from
 #   backup-run.sh, so the use site is invisible to shellcheck.
