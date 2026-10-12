@@ -27,7 +27,7 @@
 #                          target's listing is near 64 KiB and grows), now
 #                          latest_boot_snapshot's walk by word split
 #   backup-verify.sh       check_smart_health      the SMART health line
-#   das-partition-drives.sh check_smart_tests      the self-test gate
+#   das-wipe-all-drives-and-partition-from-scratch.sh check_smart_tests      the self-test gate
 #
 # The health line is latent: smartctl -H prints one, so its own input never
 # reaches 64 KiB in several lines, and the large case hands the condition the
@@ -647,7 +647,7 @@ check "SMART health, one FAILED line: issues" "$(run_health "$WORK/health-failed
 check "SMART health, no health line: issues" "$(run_health "$WORK/health-none.txt")" "issues"
 
 # ---------------------------------------------------------------------------
-echo "== das-partition-drives.sh: check_smart_tests, the self-test gate"
+echo "== das-wipe-all-drives-and-partition-from-scratch.sh: check_smart_tests, the self-test gate"
 # ---------------------------------------------------------------------------
 # The gate in front of --run and its YES-DESTROY prompt (bd
 # DAS-Backup-Manager-25r7). A drive passes only when its most recent
@@ -673,8 +673,8 @@ echo "== das-partition-drives.sh: check_smart_tests, the self-test gate"
 # check_smart_tests and the helper defined after it, with smartctl a stub per
 # drive (taking -b exit and -c as the binary does), no smartctl on PATH, and
 # device paths that are not devices.
-extract_upto das-partition-drives.sh check_smart_tests show_plan 'out="$(smartctl '
-extract das-partition-drives.sh main 'confirm_destruction'
+extract_upto das-wipe-all-drives-and-partition-from-scratch.sh check_smart_tests show_plan 'out="$(smartctl '
+extract das-wipe-all-drives-and-partition-from-scratch.sh main 'confirm_destruction'
 
 # The two layouts, as printf strings from smartctl 7.5 itself:
 #   ATA   "#%2u  %-19s %-29s %1d0%%  %8u         %s"

@@ -6,7 +6,7 @@
 # SC2034: the TARGET_* arrays are consumed by the extracted functions.
 # Falsification harness for derive_esp_label / verify_esp_labels_unique.
 #
-# Extracts the real functions from das-partition-drives.sh (the logic is NOT
+# Extracts the real functions from das-wipe-all-drives-and-partition-from-scratch.sh (the logic is NOT
 # reimplemented here) and drives them with controlled fixtures.
 #
 # Two anti-false-pass measures, both learned the hard way while writing this:
@@ -17,7 +17,7 @@
 #      error, so on its own it proves nothing about which path ran.
 set -uo pipefail
 
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/das-partition-drives.sh"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/das-wipe-all-drives-and-partition-from-scratch.sh"
 LIB="$(mktemp)"
 trap 'rm -f "$LIB"' EXIT
 
