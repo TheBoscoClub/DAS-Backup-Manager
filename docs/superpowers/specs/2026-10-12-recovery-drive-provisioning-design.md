@@ -126,11 +126,11 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   the way the ESP label is (B still says `bay3` today, stale since 2026-05-06).
 - User `bosco` uid 1000, `NOPASSWD: ALL` sudoers drop-in, SDDM autologin to Plasma (as today).
 - Locale `en_US.UTF-8`, timezone `America/Chicago`, keymap `us` (as today).
-- **OPEN D2** `sshd` on both drives, key-only (`PasswordAuthentication no`,
+- **D2 (accepted 2026-10-12)** `sshd` on both drives, key-only (`PasswordAuthentication no`,
   `PermitRootLogin no`, `KbdInteractiveAuthentication no`), the operator's key and the
   project's `~/.claude/ssh/id_ed25519.pub` authorised for `bosco` (no other account). The
   VM path never needs it (guest agent); it serves bare-metal use and the Phase 5 bare-metal
-  restore proof. Or: the operator's key only, or off. (B has sshd enabled today; A does not.)
+  restore proof. (B has sshd enabled today; A does not.)
 
 ### 3.5 The project's own tooling on the drive (operator decision)
 
@@ -178,7 +178,7 @@ a reviewer sees why each is there. CachyOS meta packages come from the ISO's own
 | base and boot | `base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode intel-ucode mkinitcpio efibootmgr efitools sbctl sudo` |
 | filesystems | `btrfs-progs compsize duperemove snapper e2fsprogs xfsprogs f2fs-tools exfatprogs ntfs-3g dosfstools squashfs-tools lvm2 mdadm cryptsetup nfs-utils cifs-utils smbclient` |
 | diagnostic and analysis | `smartmontools nvme-cli hdparm hwinfo lshw dmidecode i2c-tools pciutils usbutils memtester stress iotop-c btop htop lsof strace tcpdump nmap traceroute bind` |
-| repair and recovery | `gparted partitionmanager parted gptfdisk testdisk ddrescue arch-install-scripts btrbk das-backup-manager rsync pacman-contrib reflector` |
+| repair and recovery | `gparted partitionmanager parted gptfdisk testdisk ddrescue arch-install-scripts btrbk das-backup-manager rsync pacman-contrib reflector flatpak` |
 | network | `networkmanager iwd wpa_supplicant openssh openvpn wireguard-tools iproute2 curl wget` |
 | shell and editors | `vim nano micro kate mc tmux screen bat fd ripgrep fzf jq tree python python-pip man-db man-pages texinfo util-linux` |
 | archives | `7zip tar gzip bzip2 xz zstd unzip unrar` |
@@ -186,8 +186,9 @@ a reviewer sees why each is there. CachyOS meta packages come from the ISO's own
 | printing (as today) | `cups cups-pdf print-manager system-config-printer gutenprint hplip ghostscript` |
 | VM | `qemu-guest-agent` |
 
-**OPEN D5**: printing stays (it is on both drives today) or goes. **OPEN D6**: Flatpak
-runtime preinstalled (`flatpak` + Flathub remote, no apps) or not.
+**D5 (decided 2026-10-12)**: printing stays. **D6 (decided 2026-10-12)**: `flatpak` with the
+Flathub remote added and no apps is in the baseline (role: repair and recovery — a
+secondary package source that cannot touch the repo order).
 
 ## 4. How a drive is rebuilt — the mechanism
 
@@ -337,9 +338,9 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 | Id | Question | Recommendation |
 | --- | --- | --- |
 | D1 | previous-root loader entry | **accepted** |
-| D2 | sshd on the drives | on, key-only, both drives |
+| D2 | sshd on the drives | **accepted**: on, key-only, both keys, both drives |
 | D3 | package release to pin | **0.7.23.0, staged until the work is done, then promoted** |
 | D4 | recovery-mode config: template vs `btrdasd --recovery` | template now |
-| D5 | printing stack | keep (already there; harmless) |
-| D6 | Flatpak runtime preinstalled | no; add on a named need |
+| D5 | printing stack | **keep** |
+| D6 | Flatpak runtime preinstalled | **yes** (operator): flatpak + Flathub remote, no apps |
 | D7 | the two `@.archive.*` boot archives on A | **delete** (operator) |
