@@ -272,14 +272,30 @@ const CRON_PATH: [&str; 6] = [
 /// `test` and `[`). They create, copy, move, link or remove files
 /// (`install`, `mkdir`, `touch`, `ln`, `cp`, `mv`, `rm`, `rmdir`, `mknod`,
 /// `mkfifo`), change their owner or mode (`chown`, `chgrp`, `chmod`), or
-/// test them (`test`, `[`); btrbk's `-c` is judged as its config, and its
+/// test them (`test`, `[`, bash's `[[`, `mountpoint`); btrbk's `-c` is judged as its config, and its
 /// other operands are the subvolumes it acts on. An option's value is no
 /// operand: one that names a program (`install --strip-program=PROG`) is a
 /// program named in an option's value, not seen. Any other program — or one
 /// of these names anywhere else — may run what it is given.
-const INERT: [&str; 16] = [
-    "install", "mkdir", "chown", "chmod", "chgrp", "touch", "ln", "cp", "mv", "rm", "rmdir",
-    "mknod", "mkfifo", "test", "[", "btrbk",
+const INERT: [&str; 18] = [
+    "install",
+    "mkdir",
+    "chown",
+    "chmod",
+    "chgrp",
+    "touch",
+    "ln",
+    "cp",
+    "mv",
+    "rm",
+    "rmdir",
+    "mknod",
+    "mkfifo",
+    "test",
+    "[",
+    "[[",
+    "mountpoint",
+    "btrbk",
 ];
 /// sh's and bash's builtins: run by the shell itself, never looked up in
 /// `PATH`. (`exec`, `time`, `.` and `source` run what they are given, and
@@ -1973,6 +1989,13 @@ fn split(line: &str, shell: bool) -> Vec<String> {
         }
         // Whether a substitution split out of double quotes ends here.
         let mut ended = false;
+        // `name=(…)` / `name+=(…)`: an array assignment, one word up to its
+        // `)`; its elements are values, never commands. Never closed, the
+        // parenthesis is the shell's operator below.
+        let array =
+            (shell && quote.is_none() && c == '(' && word.ends_with('=') && is_assignment(&word))
+                .then(|| array_value(chars.clone()))
+                .flatten();
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) if c == '\\' => word.extend(chars.next()),
@@ -2005,6 +2028,19 @@ fn split(line: &str, shell: bool) -> Vec<String> {
                     word.push_str(&arithmetic(chars.by_ref()));
                     in_word = true;
                     ended = resume.last() == Some(&Resume::Paren(depth));
+                }
+                '(' if array.is_some() => {
+                    let value = array.unwrap_or_default();
+                    word.push(c);
+                    word.push_str(&value);
+                    chars.nth(value.chars().count() - 1);
+                    in_word = true;
+                }
+                // Inside `[[ … ]]` these are the test's own (`&&`, `||`,
+                // grouping), not the shell's.
+                '&' | '|' | '(' | ')' if shell && inside_double_bracket(&out) => {
+                    word.push(c);
+                    in_word = true;
                 }
                 ';' | '&' | '|' | '(' | ')' | '`' => {
                     if in_word {
@@ -2041,6 +2077,51 @@ fn split(line: &str, shell: bool) -> Vec<String> {
         out.push(word);
     }
     out
+}
+
+/// Whether the words so far are inside bash's `[[ … ]]`: its last `[[` has
+/// no `]]` after it.
+fn inside_double_bracket(words: &[String]) -> bool {
+    words
+        .iter()
+        .rev()
+        .find(|w| *w == "[[" || *w == "]]")
+        .is_some_and(|w| w == "[[")
+}
+
+/// The text of an array assignment's value after its `(`, through its
+/// closing `)` (quotes honoured, nested parentheses counted), or `None`
+/// when the line never closes it.
+fn array_value(chars: impl Iterator<Item = char>) -> Option<String> {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for c in chars {
+        out.push(c);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    escaped = true;
+                }
+            }
+            None => match c {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' if depth == 0 => return Some(out),
+                ')' => depth -= 1,
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// Whether `$((` opens arithmetic as bash reads it (`chars` from its first
@@ -2285,13 +2366,23 @@ fn shell_lines(text: &str) -> Result<Vec<String>, String> {
             match quote {
                 Some('\'') if c == '\'' => quote = None,
                 Some('"') if c == '"' => quote = None,
-                Some('"') if c == '\\' => {
+                // `$'…'` (ANSI-C quoting, tracked as `$`): a backslash
+                // escapes the next character, `\'` included.
+                Some('"' | '$') if c == '\\' => {
                     current.push(c);
                     current.extend(chars.next());
                     continue;
                 }
+                Some('$') if c == '\'' => quote = None,
                 Some(_) => {}
                 None => match c {
+                    '$' if chars.peek() == Some(&'\'') => {
+                        current.push(c);
+                        current.extend(chars.next());
+                        quote = Some('$');
+                        word_start = false;
+                        continue;
+                    }
                     '\'' | '"' => quote = Some(c),
                     '\\' if chars.peek().is_none() => {
                         joined = true;
@@ -2420,6 +2511,8 @@ enum Inner {
 /// Whether `word` is a shell assignment, `NAME=value`.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
+        // `name+=value` appends: an assignment all the same.
+        let name = name.strip_suffix('+').unwrap_or(name);
         name.chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -2464,9 +2557,14 @@ fn launches(words: &[String], grammar: Grammar) -> Vec<Launch> {
         Grammar::Systemd => w == ";",
         Grammar::Shell => OPERATORS.contains(&w.as_str()),
     };
-    for words in words.split(separates) {
-        command(words, grammar, &mut found);
+    let mut start = 0;
+    for (i, w) in words.iter().enumerate() {
+        if separates(w) && !inside_double_bracket(&words[start..i]) {
+            command(&words[start..i], grammar, &mut found);
+            start = i + 1;
+        }
     }
+    command(&words[start..], grammar, &mut found);
     found
 }
 
@@ -3901,7 +3999,8 @@ impl Findings<'_> {
         if how.role != Role::Program || !INERT.contains(&name) || at.functions.contains(name) {
             return false;
         }
-        if how.shell && word == name && matches!(name, "test" | "[") {
+        // sh's `test` and `[`, and bash's `[[` (a keyword: never looked up).
+        if how.shell && word == name && matches!(name, "test" | "[" | "[[") {
             return true;
         }
         let found = if word.starts_with('/') {
@@ -9392,8 +9491,23 @@ mod tests {
     #[test]
     fn every_inert_program_s_argument_runs_nothing_and_any_other_s_may() {
         for program in [
-            "install", "mkdir", "chown", "chmod", "chgrp", "touch", "ln", "cp", "mv", "rm",
-            "rmdir", "mknod", "mkfifo", "test", "[", "btrbk",
+            "install",
+            "mkdir",
+            "chown",
+            "chmod",
+            "chgrp",
+            "touch",
+            "ln",
+            "cp",
+            "mv",
+            "rm",
+            "rmdir",
+            "mknod",
+            "mkfifo",
+            "test",
+            "[",
+            "mountpoint",
+            "btrbk",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
@@ -10901,5 +11015,124 @@ mod tests {
                 .reasons
                 .contains(&"btrbk-x.target is named for btrbk".to_string())
         );
+    }
+
+    /// bd 12k8: the stock mkinitcpio-generate-shutdown-ramfs.service warned on
+    /// every nightly run through nine paths; six came from these three
+    /// readings of mkinitcpio's own text.
+    #[test]
+    fn bash_s_double_bracket_test_runs_none_of_its_operands() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        nightly_runs(root, "ExecStart=/usr/bin/gen");
+        script(
+            root,
+            "usr/bin/gen",
+            "[[ -e /sys/firmware/efi/fw_platform_size ]] || exit 1\n\
+             [[ \"$2\" == '/root/x/'* && ! -d '/root/x' ]] && :\n",
+        );
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // The same operand given to a function stays what it may run.
+        script(
+            root,
+            "usr/bin/gen",
+            "check() { :; }\ncheck -e /sys/firmware/efi/fw_platform_size\n",
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+    }
+
+    #[test]
+    fn an_array_assignment_is_an_assignment_whatever_its_elements_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        nightly_runs(root, "ExecStart=/usr/bin/gen");
+        script(
+            root,
+            "usr/bin/gen",
+            "cmdline_files=(\"/proc/cmdline\")\nfiles+=('/run/x' /run/y)\nempty=()\n",
+        );
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // The same path as a command after the assignment is still a program.
+        script(
+            root,
+            "usr/bin/gen",
+            "files=(\"/proc/cmdline\"); /proc/cmdline\n",
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        // A subshell after an assignment word is still a subshell.
+        script(root, "usr/bin/gen", "x=1 (/proc/cmdline)\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+    }
+
+    #[test]
+    fn an_array_assignment_is_one_word_up_to_the_parenthesis_that_closes_it() {
+        let w = |line: &str| shell_words(line);
+        // The whole value, then what follows, as separate words.
+        assert_eq!(w("x=() y"), ["x=()", "y"]);
+        assert_eq!(w("x=(a b) y"), ["x=(a b)", "y"]);
+        assert_eq!(w("x+=(a) y"), ["x+=(a)", "y"]);
+        // Quotes and escapes keep their parentheses.
+        assert_eq!(w("x=(\"a)\" b) y"), ["x=(\"a)\" b)", "y"]);
+        assert_eq!(w("x=('a)' b) y"), ["x=('a)' b)", "y"]);
+        assert_eq!(w("x=(\\) b) y"), ["x=(\\) b)", "y"]);
+        assert_eq!(w("x=(\"a\\\")\" b) y"), ["x=(\"a\\\")\" b)", "y"]);
+        // Nested parentheses close the inner one first.
+        assert_eq!(w("x=($(f) b) y"), ["x=($(f) b)", "y"]);
+        assert_eq!(w("x=((a) (b)) y"), ["x=((a) (b))", "y"]);
+        // Never closed: the parenthesis is the shell's operator as before.
+        assert_eq!(w("x=(a b"), ["x=", "(", "a", "b"]);
+        // Not an assignment: a subshell.
+        assert_eq!(w("1x=(a) y"), ["1x=", "(", "a", ")", "y"]);
+        assert_eq!(w("x (a)"), ["x", "(", "a", ")"]);
+    }
+
+    #[test]
+    fn double_bracket_operators_are_the_test_s_own_words() {
+        let w = |line: &str| shell_words(line);
+        assert_eq!(
+            w("[[ -e a && ! -d b || (c) ]] && run"),
+            [
+                "[[", "-e", "a", "&&", "!", "-d", "b", "||", "(c)", "]]", "&", "&", "run"
+            ]
+        );
+        // Closed, the shell's operators are back.
+        assert_eq!(w("[[ a ]]; (b)"), ["[[", "a", "]]", ";", "(", "b", ")"]);
+        // Outside any test nothing changes.
+        assert_eq!(w("a && (b)"), ["a", "&", "&", "(", "b", ")"]);
+        // The launch splitter does not cut a test at its own `&&`.
+        let words = w("[[ -e /x && -d /y ]] && /usr/bin/true /z");
+        let launches = launches(&words, Grammar::Shell);
+        let programs: Vec<&str> = launches
+            .iter()
+            .filter_map(|l| match l {
+                Launch::Program { word, .. } => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(programs, ["[[", "/usr/bin/true"]);
+    }
+
+    #[test]
+    fn mountpoint_tests_its_operand_and_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        nightly_runs(root, "ExecStart=/usr/bin/gen");
+        script(root, "usr/bin/gen", "mountpoint -q /proc/x || exit 1\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+    }
+
+    /// bd 12k8: mkinitcpio's `printf $'\\'%s\\' …'` closed its quote at the
+    /// first `\\'`, and the rest of the file was read as one line.
+    #[test]
+    fn ansi_c_quoting_escapes_its_own_quote_in_the_line_reader() {
+        let text = "printf $'\\'%s\\' is deprecated\\n' \\\n    \"$x\"\necho after\n";
+        let lines = shell_lines(text).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1] == "echo after", "{lines:?}");
+        // Still an error when it really never closes.
+        assert!(shell_lines("printf $'open\n").is_err());
     }
 }
