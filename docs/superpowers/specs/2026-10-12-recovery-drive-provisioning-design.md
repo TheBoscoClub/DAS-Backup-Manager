@@ -1,6 +1,6 @@
 # Recovery Drive Provisioning — Design
 
-Status: REVIEWED 2026-10-12 — every decision D1–D8 settled by the operator (§8). Nothing in
+Status: REVIEWED 2026-10-12 — every decision D1–D9 settled by the operator (§8). Nothing in
 this document has been built. Plans: `docs/superpowers/plans/2026-10-12-recovery-state-plan.md`
 (plan 1: D4, D8, the resolver), plan 2 (provision subcommand, guest installer, D1, docs) and
 plan 3 (rehearsal, rebuild, Phase 5 restore proof) follow.
@@ -193,6 +193,29 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   recovery drive therefore restores from itself what every target receives, and from the
   22 TB pair, when attached, what only the pair holds; absent, the helper says "no copy
   present on this machine" and names the target — search finds the file either way.
+- **The boot tells the person what it is doing — D9 (operator, 2026-10-12).** A recovery
+  drive boots from a 2 TB USB disk and then runs the state sync before the login screen; to
+  someone unfamiliar, or in a panic, a black screen or a spinner for a minute reads as a
+  dead drive, and the natural reaction (power off, try the other bay) is the one thing that
+  can hurt. So the drive says what it is: the splash (plymouth, which CachyOS already
+  installs and which holds the screen until the display manager starts) carries a
+  message written by the sync unit through `plymouth display-message`, one line per phase
+  — "DAS recovery drive (Bay N): finding the newest backup", "copying the backup index",
+  "preparing the configuration" — each prefixed with the fixed sentence **"Do not power
+  off. This takes longer than a normal boot."** The unit records each phase's measured
+  duration in its status file on the drive's own OS, and on the next boot shows a
+  countdown computed from the previous measurement and named as such ("about 40 s, measured
+  at the last boot"); with no measurement (the first boot after a rebuild) it shows the phase
+  text only, never an invented figure — a countdown that is wrong is worse than none
+  (`verification.md`: an estimate names its measurement). The catch-up index, which runs in
+  the background after the desktop is up, is announced the same way on the desktop
+  (notification + the status file) with its own measured ETA from the last catch-up's rate,
+  "unknown" the first time. The loader entries already name the drive and bay (§3.3); the
+  splash text repeats the bay so the two screens agree. Falsification in the rehearsal
+  (plan 3): a VM screenshot of the splash showing the message, and a second boot's
+  screenshot showing the countdown, on the scratch disk, before any real drive is touched;
+  a theme that cannot render text (plymouth's `script` themes can, `bgrt`/`spinner` do) is
+  a finding, fixed by selecting one that can in the installer's `configure` step.
 - **GUI**: `btrdasd-gui` installed; desktop file present; the two guides symlinked on the
   Desktop as today ("Quick Reference — PRINT THIS.md", "Recovery Guide.md" →
   `/usr/share/das-backup/docs/…`), plus `STORAGE-ARCHITECTURE-AND-RECOVERY.md`.
@@ -339,6 +362,7 @@ After **both** drives are rebuilt and re-seeded, each drive proves a real restor
 | `btrdasd config derive-recovery` | `indexer/src/config.rs` (+ CLI) | unit tests: drops sources, keeps the booted target only, rewrites mount, email off, the two roots exactly; refuses when no target matches the UUID; mutants |
 | `@das-state` subvolume + post-index send pass (D8) | `scripts/backup-run.sh`, `config.toml` entry | the run's step order pinned by the bash suite; the report carries the pass's bytes and seconds |
 | previous-root loader entry (D1) | the pipeline's `verify-boot`/a new `loader` step | entry rewritten after a clean upgrade; absent when no snapshot |
+| boot splash messages + measured countdown (D9) | `scripts/das-recovery-state-sync.sh` (phase messages, durations in the status file), the installer's `configure` step (plymouth theme that renders text) | bash suite: the phase lines are written in order through a stub `plymouth`; no previous measurement → no countdown text; a measurement → the countdown names it; rehearsal screenshots (plan 3) |
 | guide section "Building a recovery drive" + "Proving a restore" + "Last proven restore" table + quick-reference line | `docs/DISASTER-RECOVERY-GUIDE.md`, `docs/EMERGENCY-QUICK-REFERENCE.md` | markdownlint; the install and session lines quoted verbatim from the script's usage |
 | packaging | every format in `packaging/` gets the new unit and template | the existing packaging checks |
 
@@ -378,3 +402,4 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 | D6 | Flatpak runtime preinstalled | **yes** (operator): flatpak + Flathub remote, no apps |
 | D7 | the two `@.archive.*` boot archives on A | **delete** (operator) |
 | D8 | the index on the targets lags one run | **accepted**: state subvolume sent after indexing; boot-time catch-up only on a detected gap |
+| D9 | the boot looks dead to an unfamiliar person | **accepted** (operator, 2026-10-12): splash messages per phase from the sync unit, "Do not power off", a countdown only from the previous boot's measured duration; plan 2 builds it, plan 3 screenshots it |
