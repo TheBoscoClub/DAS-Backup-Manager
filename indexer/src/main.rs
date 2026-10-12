@@ -2177,7 +2177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let text = derived.to_toml()?;
                 match out {
-                    Some(path) => std::fs::write(&path, text)?,
+                    Some(path) => derived.save(&path)?,
                     None => print!("{text}"),
                 }
             }
