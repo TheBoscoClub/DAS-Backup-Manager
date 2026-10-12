@@ -148,6 +148,8 @@
 #     restart of the agent): wait for the guard and the agent; egress -- once
 #     the OS's network answers (NET_SECS: the agent is up before the NIC is),
 #     the VM's public address must belong to EGRESS_ORG, else nothing is updated;
+#     repos -- in the OS's pacman.conf every [REPOS_FIRST*] section comes
+#     before any other, or [core] would shadow its builds (bd 1igg);
 #     snapshot -- the OS snapshots its own @ read-only to
 #     @.pre-update.<YYYYMMDD-HHMM>, keeping the newest 2 (its own btrfs,
 #     never the host's); guard-lift (systemctl stop das-vm-guard); keyrings;
@@ -205,7 +207,7 @@
 # Progress, for the GUI's helper to parse (one line each, on stdout; the
 # label never holds a space):
 #   PROGRESS <label> <step> <event>[ <message>]
-#       step: preflight, start, wait, boot, egress, snapshot, guard-lift,
+#       step: preflight, start, wait, boot, egress, repos, snapshot, guard-lift,
 #       keyrings, upgrade, packages, initramfs, verify-btrbk, verify-boot,
 #       guard-engage, reboot, kernel, poweroff, giveback; event: start, ok,
 #       fail (the message says why). An attended session has preflight,
@@ -326,6 +328,9 @@
 #   DAS_RECOVERY_VM_EGRESS_ORG  what the direct path egresses as (ipinfo.io's
 #                               org line begins with it): AS209 by default,
 #                               the author's ISP -- set it for yours
+#   DAS_RECOVERY_VM_REPOS_FIRST the repository family that must come first in
+#                               the recovery OS's pacman.conf: cachyos by
+#                               default; empty, the order is not judged
 #   BTRDASD_BIN, DAS_CONFIG     as in backup-run.sh
 # Set by a two-drive run for each drive's session, never by hand:
 #   DAS_RECOVERY_VM_LOCK_FD (the run's descriptor of the maintenance lock),
@@ -402,6 +407,12 @@ readonly AGENT_GRACE_SECS="${DAS_RECOVERY_VM_AGENT_GRACE_SECS:-300}"
 # judges: the guest agent answers before NetworkManager has a lease (bd slu9,
 # 2026-10-12: the step ran 0.5 s before the NIC began activating).
 readonly NET_SECS="${DAS_RECOVERY_VM_NET_SECS:-120}"
+# The repository family that must come first in the recovery OS's pacman.conf
+# (the start of its sections' names): pacman takes a package from the first
+# repository that carries it, so [core] above [cachyos] shadowed CachyOS's
+# builds -- llvm-libs 23 beside a mesa built against LLVM 22, a dead desktop
+# on both drives (2026-10-07, bd 1igg). Empty: the order is not judged.
+readonly REPOS_FIRST="${DAS_RECOVERY_VM_REPOS_FIRST-cachyos}"
 # What the VM's direct path egresses as, the start of ipinfo.io's org line
 # (decision 5 of 2026-10-07): the author's ISP by default, AS209.
 readonly EGRESS_ORG="${DAS_RECOVERY_VM_EGRESS_ORG:-AS209}"
@@ -4026,6 +4037,7 @@ power_off_guest() {
 # is mounted on) and engaged again before the reboot.
 UNATTENDED_STEPS=(
     "egress 300 step_egress"
+    "repos 120 step_repos"
     "snapshot 900 step_snapshot"
     "guard-lift 120 step_guard_lift"
     "keyrings 1800 step_keyrings"
@@ -4104,6 +4116,36 @@ case "$org" in
     "$want "*) echo "egress is direct ($want)" ;;
     *) echo "egress is $org, not $want: the update would go through another path (a VPN exit node) -- refused"; exit 3 ;;
 esac
+EOF
+}
+
+# The repositories in pacman's order, from the OS's own pacman.conf: every
+# section whose name starts with REPOS_FIRST must come before any that does
+# not (bd 1igg). PACMAN_CONF is for the test suite, which runs this script
+# against a file of its own.
+step_repos() {
+    printf 'first=%s\n' "$REPOS_FIRST"
+    cat <<'EOF'
+conf=${PACMAN_CONF:-/etc/pacman.conf}
+[ -n "$first" ] || { echo "repository order not checked (DAS_RECOVERY_VM_REPOS_FIRST is empty)"; exit 0; }
+[ -r "$conf" ] || { echo "cannot read $conf"; exit 2; }
+repos=$(sed -n 's/^[[:space:]]*\[\([^]]*\)\][[:space:]]*$/\1/p' "$conf" | grep -vx options || :)
+[ -n "$repos" ] || { echo "no repository section in $conf"; exit 2; }
+echo "repositories, in pacman's order: $(printf '%s' "$repos" | tr '\n' ' ')"
+other=; found=
+for r in $repos; do
+    case "$r" in
+        "$first"*)
+            found=1
+            if [ -n "$other" ]; then
+                echo "[$r] is listed after [$other]: pacman takes a package from the first repository that carries it, so [$other] shadows every build [$r] has of it (llvm-libs 23 beside a mesa built against LLVM 22 left both recovery drives' desktops dead, 2026-10-07); move every [$first*] section above [$other] in $conf -- refused"
+                exit 3
+            fi ;;
+        *) [ -n "$other" ] || other=$r ;;
+    esac
+done
+[ -n "$found" ] || { echo "no [$first*] repository in $conf: this OS is not a $first install -- refused"; exit 3; }
+echo "every [$first*] repository comes before [${other:-nothing}]: nothing shadows their builds"
 EOF
 }
 
@@ -5466,6 +5508,10 @@ check_knobs() {
     # spaces only.
     if [[ ! "$EGRESS_ORG" =~ ^[${ASCII_LETTERS}[:digit:]][${ASCII_LETTERS}[:digit:]\ ]*$ ]]; then
         printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_EGRESS_ORG takes letters, digits and spaces (an AS number: AS209)\n' >&2
+        exit 2
+    fi
+    if [[ ! "$REPOS_FIRST" =~ ^[${ASCII_LETTERS}[:digit:]_-]*$ ]]; then
+        printf "recovery-os-vm.sh: DAS_RECOVERY_VM_REPOS_FIRST takes letters, digits, '-' and '_' (a repository name's start: cachyos), or nothing\n" >&2
         exit 2
     fi
     if [[ -n "$TEST_ROOT" ]]; then

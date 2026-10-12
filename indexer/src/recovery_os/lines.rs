@@ -8,12 +8,13 @@
 //! into a success.
 
 /// The session's steps in the order the script runs them.
-pub const STEPS: [&str; 18] = [
+pub const STEPS: [&str; 19] = [
     "preflight",
     "start",
     "wait",
     "boot",
     "egress",
+    "repos",
     "snapshot",
     "guard-lift",
     "keyrings",
@@ -228,6 +229,6 @@ mod tests {
         assert_eq!(step_percent("newstep"), None);
         assert_eq!(step_percent("preflight"), Some(0));
         assert_eq!(step_percent("giveback"), Some(100));
-        assert_eq!(step_percent("upgrade"), Some(8 * 100 / 17));
+        assert_eq!(step_percent("upgrade"), Some(9 * 100 / 18));
     }
 }

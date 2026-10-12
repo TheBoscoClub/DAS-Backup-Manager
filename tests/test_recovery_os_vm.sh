@@ -4656,7 +4656,7 @@ unattended_fixture() {
     printf 'running\n' >"$S/states.running"
     printf 'running\n' >"$S/domB/states.running"
 }
-STEPS="egress snapshot guard-lift keyrings upgrade packages initramfs verify-btrbk verify-boot guard-engage"
+STEPS="egress repos snapshot guard-lift keyrings upgrade packages initramfs verify-btrbk verify-boot guard-engage"
 for how in schema3 not-installed not-enabled unreadable; do
     fixture
     case "$how" in
@@ -5207,6 +5207,57 @@ for knob in 0 12x; do
     DAS_RECOVERY_VM_NET_SECS=$knob run_driver status
     check "net knob $knob: a usage error" "$RC" "2"
     has "net knob $knob: says which" "$OUT" "_AGENT_GRACE_SECS and _NET_SECS take numbers above 0"
+done
+
+echo "--- the repos step: every [cachyos*] repository before [core] and [extra] (1igg)"
+# pacman takes a package from the first repository that carries it: [core]
+# above [cachyos] moved llvm-libs to 23 while mesa stayed CachyOS's build
+# against LLVM 22 -- a dead desktop on both recovery drives (2026-10-07).
+run_repos_script() { # <pacman.conf body>: the captured step script against it
+    printf '%s\n' "$1" >"$T/pacman.conf"
+    RC=0
+    OUT="$(PACMAN_CONF="$T/pacman.conf" sh "$S/stage.repos.sh" 2>&1)" || RC=$?
+}
+GOOD=$'[options]\nHoldPkg = pacman glibc\n\n[cachyos-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n[cachyos-core-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n[cachyos-extra-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n[extra]\nInclude = /etc/pacman.d/mirrorlist'
+BAD=$'[options]\nHoldPkg = pacman glibc\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n\n[cachyos-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist'
+ARCH=$'[options]\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n[extra]\nInclude = /etc/pacman.d/mirrorlist'
+unattended_fixture
+run_driver session A --unattended
+check "repos: a step of its own, after egress, before the snapshot" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+has "repos: the family that must come first goes into the step" "$(file "$S/stage.repos.sh")" "first=cachyos"
+run_repos_script "$GOOD"
+check "repos, the CachyOS order: exit 0" "$RC" "0"
+has "repos, the CachyOS order: the order, read" "$OUT" "repositories, in pacman's order: cachyos-v3 cachyos-core-v3 cachyos-extra-v3 cachyos core extra"
+has "repos, the CachyOS order: judged" "$OUT" "every [cachyos*] repository comes before [core]: nothing shadows their builds"
+run_repos_script "$BAD"
+check "repos, [core] first: exit 3" "$RC" "3"
+has "repos, [core] first: names the shadowing pair" "$OUT" "[cachyos-v3] is listed after [core]: pacman takes a package from the first repository that carries it, so [core] shadows every build [cachyos-v3] has of it"
+has "repos, [core] first: names the fix" "$OUT" "move every [cachyos*] section above [core] in $T/pacman.conf -- refused"
+run_repos_script "$ARCH"
+check "repos, no cachyos repository: exit 3" "$RC" "3"
+has "repos, no cachyos repository: says so" "$OUT" "no [cachyos*] repository in $T/pacman.conf: this OS is not a cachyos install -- refused"
+run_repos_script $'[options]\nHoldPkg = pacman'
+check "repos, no repository at all: exit 2" "$RC" "2"
+has "repos, no repository at all: says so" "$OUT" "no repository section in $T/pacman.conf"
+rm "$T/pacman.conf"; RC=0; OUT="$(PACMAN_CONF="$T/pacman.conf" sh "$S/stage.repos.sh" 2>&1)" || RC=$?
+check "repos, unreadable pacman.conf: exit 2" "$RC" "2"
+has "repos, unreadable pacman.conf: says so" "$OUT" "cannot read $T/pacman.conf"
+unattended_fixture
+DAS_RECOVERY_VM_REPOS_FIRST='' run_driver session A --unattended
+check "repos, the check turned off: the step still runs" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+run_repos_script "$ARCH"
+check "repos, the check turned off: exit 0" "$RC" "0"
+has "repos, the check turned off: says it did not judge" "$OUT" "repository order not checked (DAS_RECOVERY_VM_REPOS_FIRST is empty)"
+unattended_fixture
+DAS_RECOVERY_VM_REPOS_FIRST=manjaro run_driver session A --unattended
+has "repos, another family: goes into the step" "$(file "$S/stage.repos.sh")" "first=manjaro"
+run_repos_script "$GOOD"
+check "repos, another family, absent: exit 3" "$RC" "3"
+has "repos, another family, absent: says so" "$OUT" "no [manjaro*] repository"
+for knob in 'cachy os' 'a;b' '/x'; do
+    DAS_RECOVERY_VM_REPOS_FIRST=$knob run_driver status
+    check "repos knob '$knob': a usage error" "$RC" "2"
+    has "repos knob '$knob': says which" "$OUT" "DAS_RECOVERY_VM_REPOS_FIRST takes letters, digits, '-' and '_' (a repository name's start: cachyos), or nothing"
 done
 
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
