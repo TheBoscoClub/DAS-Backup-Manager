@@ -277,6 +277,21 @@
 #   reporter). The warnings and the run's closing lines name the cause.
 #   Any other exit (1, 3, 4, 6, 7) always stops it.
 #
+# The unit a session runs in. A session's exit is its outcome (1 refused,
+# 3/4 kept, 5 warnings, 6 guard, 7 stopped), never a malfunction of the
+# unit around it -- and cachyos-sentinel restarts every unit it sees
+# failed. A restarted session is a second boot of the recovery drive, and an
+# unattended one replaces the drive's pre-update snapshot with one taken
+# AFTER the update (observed 2026-10-10: one session run three more times).
+# So a session that is the main process of a system service (its cgroup, and
+# the unit's MainPID is this process) refuses, before the lock and the drive,
+# unless the unit counts 1 3 4 5 6 7 as success and has Restart=no. The
+# helper's generated das-recovery-os-update-* units do; a session the helper
+# runs as its own child is not the unit's main process and is not judged.
+# `session ... --detach` starts the session in a transient unit of that shape
+# (--collect: gone once it ends, failed or not, so nothing is left to
+# restart) and prints its name.
+#
 # Every step is logged to stdout and to the journal (tag das-recovery-os-vm).
 #
 # Test seams -- tests/test_recovery_os_vm.sh. Never set them in real use:
@@ -399,6 +414,13 @@ readonly STATE_DIR="$TEST_ROOT/run/das-recovery-os-vm"
 readonly EGRESS_FILE="$STATE_DIR/egress.rule"
 readonly BY_ID="$TEST_ROOT/dev/disk/by-id"
 readonly SYS_BLOCK="$TEST_ROOT/sys/block"
+# This process's cgroup: the service unit it is the main process of, if any.
+readonly CGROUP_FILE="$TEST_ROOT/proc/self/cgroup"
+# Every exit of a session that is its outcome, not a malfunction: the unit
+# around it must count them as success (SuccessExitStatus), or
+# cachyos-sentinel restarts the session. Must match render_session_unit in
+# indexer/src/recovery_os/panel.rs.
+readonly SESSION_OUTCOME_EXITS="1 3 4 5 6 7"
 
 # The boot record (bd DAS-Backup-Manager-1yg): the schemas this reads (4 adds
 # the guest agent, which only --unattended needs), and the age past which it
@@ -612,6 +634,7 @@ SESSION_START=0
 VM_START=0
 SESSION_EPOCH=0
 UNATTENDED=false # session --unattended
+DETACH=false     # session --detach: start it in a transient unit and return
 RUN_MODE=single  # single, or a two-drive run's: sequential or parallel
 PAIR_MODE=sequential
 TARGET_ARG2="" # the second drive of a two-drive run
@@ -679,7 +702,7 @@ without rebooting the workstation.
                          and retire the shared $LEGACY_DOMAIN of before (each
                          shut off, with no disk attached)
   session <A|B|label> [--unattended] [--dry-run] [--timeout <minutes>]
-          [--wait-lock <minutes>] [--accept-boot-record-risk]
+          [--wait-lock <minutes>] [--accept-boot-record-risk] [--detach]
                          lend one role = "mirror" drive to its VM, boot it
                          with the session guard (btrbk cannot run in it),
                          wait until it powers off, give the disk back --
@@ -695,6 +718,14 @@ without rebooting the workstation.
                          --wait-lock: wait up to that many minutes for a
                          running backup or scrub to finish, instead of
                          refusing at once
+                         --detach: start the session in a transient unit
+                         of its own (das-recovery-os-session-<label>-<time>,
+                         SuccessExitStatus=1 3 4 5 6 7, collected when it
+                         ends) and print its name -- the way to run one in
+                         the background. A session that is the main process
+                         of a unit without that line refuses: a warned or
+                         failed session would leave the unit failed, and
+                         cachyos-sentinel would run it again
   session <A|B|label> <A|B|label> [--mode sequential|parallel] [...]
                          both drives in one run, under one lock: one after
                          the other (the default; the second only after a
@@ -3854,9 +3885,19 @@ run_stage() {
             stage_failed "$stage" "$UNATTENDED_WHY"
             return 1
         fi
+        # The step's result is the number its runner wrote to $n.rc, read by
+        # this probe -- whose own tools (tail, head, base64: coreutils) the
+        # upgrade replaces, each missing for an instant while pacman does.
+        # A probe that could not run answers with its shell's complaint
+        # instead: an exit status that is no number, output that is no
+        # base64. That is a probe that failed, never the step that did: it
+        # is asked again, within AGENT_GRACE_SECS like a silent agent. Read
+        # as the step's failure, it powered a recovery OS off between
+        # pacman's pre-transaction hooks and its first package (2026-10-11,
+        # drive A: its initramfs already removed, nothing yet installed).
+        answered=false
         if guest_sh 30 "r=; if [ -e $dir/$n.rc ]; then r=\$(cat $dir/$n.rc); fi; printf 'rc=%s\\n' \"\$r\"; tail -c +$((off + 1)) $dir/$n.out 2>/dev/null | head -c 65536 | base64 -w0; echo" &&
             [[ "$GSH_RC" == 0 && "$GSH_OUT" == rc=* ]]; then
-            last_ok=$SECONDS
             rc=${GSH_OUT%%$'\n'*}
             rc=${rc#rc=}
             # Command substitution took the trailing newline: with no output
@@ -3866,12 +3907,18 @@ run_stage() {
                 chunk=${GSH_OUT#*$'\n'}
                 chunk=${chunk//[[:space:]]/}
             fi
+            if [[ ! "$rc" =~ ^[[:digit:]]*$ ]]; then
+                GSH_WHY="the probe's answer is no exit status: $(printable "$rc")"
+            elif [[ -n "$chunk" ]] && ! printf '%s' "$chunk" | base64 -d >"$tmp" 2>/dev/null; then
+                rm -f -- "$tmp"
+                GSH_WHY="the probe's answer is no output: $(printable "${GSH_OUT#*$'\n'}")"
+            else
+                answered=true
+            fi
+        fi
+        if [[ "$answered" == true ]]; then
+            last_ok=$SECONDS
             if [[ -n "$chunk" ]]; then
-                if ! printf '%s' "$chunk" | base64 -d >"$tmp" 2>/dev/null; then
-                    stage_failed "$stage" "its output came back unreadable"
-                    rm -f -- "$tmp"
-                    return 1
-                fi
                 bytes=$(wc -c <"$tmp")
                 off=$((off + bytes))
                 stage_output "$stage" "$(
@@ -3891,7 +3938,7 @@ run_stage() {
                 return 1
             fi
         elif ((SECONDS - last_ok >= AGENT_GRACE_SECS)); then
-            stage_failed "$stage" "the guest agent has not answered for $(format_duration $((SECONDS - last_ok))): ${GSH_WHY:-$(printable "$GSH_OUT")}"
+            stage_failed "$stage" "no readable answer about it for $(format_duration $((SECONDS - last_ok))): ${GSH_WHY:-$(printable "$GSH_OUT")}"
             return 1
         fi
         if ((SECONDS - start >= limit)); then
@@ -4601,6 +4648,7 @@ parse_session_args() {
                 ;;
             --wait-lock=*) WAIT_LOCK_MIN=${1#*=} ;;
             --unattended) UNATTENDED=true ;;
+            --detach) DETACH=true ;;
             --mode)
                 (($# >= 2)) || usage
                 mode_given=$2
@@ -4648,6 +4696,10 @@ parse_session_args() {
     fi
     if [[ "$DRY_RUN" == true && -n "$WAIT_LOCK_MIN" ]]; then
         printf 'recovery-os-vm.sh: --wait-lock has no meaning with --dry-run (nothing is booted, and the lock is only tried)\n' >&2
+        exit 2
+    fi
+    if [[ "$DRY_RUN" == true && "$DETACH" == true ]]; then
+        printf 'recovery-os-vm.sh: --detach has no meaning with --dry-run (its answer is for this terminal)\n' >&2
         exit 2
     fi
     # A drive's session of a two-drive run: its mode, and what the run holds.
@@ -4803,8 +4855,89 @@ session_status() {
     fi
 }
 
+# The system service unit this process is in -- the last component of its
+# unified-hierarchy cgroup path when that is a .service -- else nothing (a
+# login session's scope, a transient scope, a container's root). Fails when
+# the cgroup cannot be read: the caller refuses, never guesses "no unit".
+own_service_unit() {
+    local line unit=""
+    [[ -r "$CGROUP_FILE" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" == 0::* ]] || continue
+        unit=${line##*/}
+    done <"$CGROUP_FILE" || return 1
+    [[ "$unit" == *.service ]] || return 0
+    printf '%s\n' "$unit"
+}
+
+# Refuse to be the main process of a unit that would be left failed by a
+# session's outcome (header: "The unit a session runs in"). Judged before
+# the lock, the record and the drive: a refusal here changes nothing.
+check_own_unit() {
+    local unit props line main="" success="" restart="" code missing=()
+    unit="$(own_service_unit)" || refuse "cannot read $CGROUP_FILE, so whether this session is the main process of a service unit -- one cachyos-sentinel would restart when a warned or failed session leaves it failed -- cannot be told"
+    [[ -n "$unit" ]] || return 0
+    props="$(systemctl show -p MainPID -p SuccessExitStatus -p Restart -- "$unit" 2>&1)" || refuse "this session runs in $unit, and its properties cannot be read (systemctl said: $props) -- so whether a warned or failed session would leave it failed, for cachyos-sentinel to run again, cannot be told"
+    while IFS= read -r line; do
+        case "$line" in
+            MainPID=*) main=${line#*=} ;;
+            SuccessExitStatus=*) success=${line#*=} ;;
+            Restart=*) restart=${line#*=} ;;
+        esac
+    done <<<"$props"
+    # The unit's main process, or a child of it (the helper's job, a shell in
+    # a service): only the main process's exit is the unit's result.
+    [[ "$main" == "$$" ]] || return 0
+    for code in $SESSION_OUTCOME_EXITS; do
+        case " $success " in
+            *" $code "*) ;;
+            *) missing+=("$code") ;;
+        esac
+    done
+    if ((${#missing[@]} > 0)); then
+        refuse "this session is the main process of $unit, which counts a session that exits ${missing[*]} as a failed unit (SuccessExitStatus=${success:-nothing}): cachyos-sentinel restarts failed units, and a restarted session boots the recovery drive again and replaces its pre-update snapshot (2026-10-10). Start it with $SELF session ... --detach, or give the unit SuccessExitStatus=$SESSION_OUTCOME_EXITS and Restart=no"
+    fi
+    if [[ "$restart" != no ]]; then
+        refuse "this session is the main process of $unit, which has Restart=$restart: systemd itself would run the session again. Start it with $SELF session ... --detach, or give the unit Restart=no"
+    fi
+}
+
+# session --detach: the same session, as the main process of a transient
+# unit that no outcome of it leaves failed, and that is unloaded when it
+# ends (--collect) -- nothing for cachyos-sentinel, or anyone, to restart.
+# The DAS_RECOVERY_* and DAS_CONFIG settings of this environment go with it
+# (a unit starts with none); nothing else does. Prints the unit's name.
+run_detached() {
+    local arg args=() name unit var setenv=()
+    require_root
+    if ! command -v systemd-run >/dev/null; then
+        refuse "systemd-run is not available: --detach starts the session in a transient unit, and there is no other way to make one"
+    fi
+    for arg in "$@"; do
+        [[ "$arg" == --detach ]] || args+=("$arg")
+    done
+    name="$TARGET_ARG${TARGET_ARG2:+-$TARGET_ARG2}"
+    if [[ ! "$name" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
+        refuse "the label '$name' has characters a systemd unit name cannot carry"
+    fi
+    unit="das-recovery-os-session-$name-$(date +%Y%m%d-%H%M%S)"
+    for var in $(compgen -e -- DAS_RECOVERY_) DAS_CONFIG; do
+        [[ -n "${!var+set}" ]] && setenv+=("--setenv=$var=${!var}")
+    done
+    if ! systemd-run --unit="$unit" --description="recovery OS session $name (recovery-os-vm.sh --detach)"         --property="SuccessExitStatus=$SESSION_OUTCOME_EXITS" --property=Restart=no --collect --quiet         --expand-environment=no "${setenv[@]}" -- "$SELF" session "${args[@]}"; then
+        refuse "systemd-run could not start the session's unit $unit"
+    fi
+    log "session started as $unit.service: follow it with journalctl -fu $unit; its outcome goes to the history ($SELF history)"
+    printf '%s\n' "$unit"
+    exit 0
+}
+
 cmd_session() {
     parse_session_args "$@"
+    if [[ "$DETACH" == true ]]; then
+        run_detached "$@"
+    fi
+    check_own_unit
     if [[ -n "$TARGET_ARG2" ]]; then
         cmd_session_pair "$TARGET_ARG" "$TARGET_ARG2"
     fi
