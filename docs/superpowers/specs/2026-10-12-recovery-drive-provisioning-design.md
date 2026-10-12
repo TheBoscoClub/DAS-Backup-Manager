@@ -153,14 +153,34 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   file the guide names), and **leaves the previous copy in place — never an empty
   database**. Two-direction test: a fixture with a snapshot → copied; no snapshot /
   unreadable p2 → refused, previous copy intact.
-- **Recovery-mode configuration — OPEN D4.** The host's `config.toml` names the host's
-  sources and the three targets by mount point. On a recovery boot the only target that
-  exists is this drive's own p2. Options: (a) provisioning writes
-  `/etc/das-backup/config.toml` tuned for recovery (one target = this drive's p2 at
-  `/mnt/backup-system-recovery-<A|B>`, no sources, email off); (b) `btrdasd` grows
-  `--recovery` that derives (a) from the drive it booted from. Recommendation: (a) now,
-  because it ships with the procedure and is testable with the existing config validator;
-  (b) later if drift appears.
+- **Recovery-mode configuration — D4 (decided 2026-10-12: option C).** The host's
+  `config.toml` names the host's sources and the three targets by mount point; on a
+  recovery boot the only target that exists is this drive's own p2. The boot-time sync unit
+  hands the host's `etc/das-backup/config.toml`, found in the same newest received `@`
+  snapshot as the state directory, to a new subcommand `btrdasd config derive-recovery
+  --from <file> --booted-uuid <uuid>`, which with the real parser drops every source, keeps
+  only the target whose `mount_uuid` is the booted filesystem, sets its mount point to
+  `/mnt/backup-system-recovery-<A|B>`, turns email off, sets `[restore] allowed_roots` to
+  exactly `/mnt/restore` (a mounted NVMe root) and `/home/restore-test` (the Phase 5
+  proof), and writes an ordinary `/etc/das-backup/config.toml`. The CLI, helper and GUI
+  then run unmodified. One source of truth (the host's real configuration as last backed
+  up), no per-drive templating, inspectable on disk; the transformation is one function
+  with unit tests and mutation coverage. Rejected: (A) a provisioning-time template (a
+  second file that drifts until the next rebuild); (B) a runtime `--recovery` mode (a second
+  configuration path through every command).
+- **The index on the targets lags one run — OPEN D8.** `backup-run.sh` sends every
+  snapshot, then indexes (2026-10-12: sends done, then ~16 minutes of indexing), so the
+  `@` snapshot a target receives carries the index as it stood before that run's indexing:
+  the last day's new or changed files are on the drive but invisible to search and
+  file-level restore (snapshot restore and browse read the directories and are unaffected).
+  Proposed: (1) `/var/lib/das-backup` becomes its own subvolume (`@das-state`, nested under
+  the host's `@`; the run's subvolume sync writes its entry), sent in a second, small btrbk
+  pass *after* indexing — one SQLite file, incremental send of changed pages only, measured
+  and reported — so every target's index matches the data it received that night; (2) the
+  drive's boot-time sync unit, when the state copy is older than the newest received
+  snapshot, runs an incremental index over the newest snapshots as a catch-up, in the
+  background after the desktop is up, saying so on the desktop. Recommendation: both, 1
+  as the mechanism, 2 as the fallback.
 - **GUI**: `btrdasd-gui` installed; desktop file present; the two guides symlinked on the
   Desktop as today ("Quick Reference — PRINT THIS.md", "Recovery Guide.md" →
   `/usr/share/das-backup/docs/…`), plus `STORAGE-ARCHITECTURE-AND-RECOVERY.md`.
@@ -304,7 +324,8 @@ After **both** drives are rebuilt and re-seeded, each drive proves a real restor
 | `scripts/recovery-os-install.sh` — the guest-side installer (runs in the live system; `replace-os`, `pacstrap`, `configure`, `package`, `boot`, `repos`, `verify`, `unmount`, `undo`) | new file, installed under `/usr/lib/das-backup/` and shipped into the VM by the driver | `tests/test_recovery_os_install.sh` against a fixture tree and stub tools: the allowlist (a received subvolume is never renamed or deleted), the UUID refusal, the empty-disk refusal, `undo` refusing after a new boot, every step's failure direction |
 | `provision` subcommand, steps, dry run, history row | `scripts/recovery-os-vm.sh` | `tests/test_recovery_os_vm.sh` stubs (new section): step order, every refusal, the generated step scripts run standalone against stub tools as the `repos`/`egress` tests do |
 | `das-recovery-state-sync.service` + script | `config/` or `scripts/`, installed by the package | a bash test with a fixture btrfs-like tree: copies from the newest snapshot; no snapshot / unreadable → refuses, previous copy intact |
-| recovery-mode `config.toml` template | `config/recovery-config.toml` | `btrdasd config validate` in CI against it |
+| `btrdasd config derive-recovery` | `indexer/src/config.rs` (+ CLI) | unit tests: drops sources, keeps the booted target only, rewrites mount, email off, the two roots exactly; refuses when no target matches the UUID; mutants |
+| `@das-state` subvolume + post-index send pass (D8) | `scripts/backup-run.sh`, `config.toml` entry | the run's step order pinned by the bash suite; the report carries the pass's bytes and seconds |
 | previous-root loader entry (D1) | the pipeline's `verify-boot`/a new `loader` step | entry rewritten after a clean upgrade; absent when no snapshot |
 | guide section "Building a recovery drive" + "Proving a restore" + "Last proven restore" table + quick-reference line | `docs/DISASTER-RECOVERY-GUIDE.md`, `docs/EMERGENCY-QUICK-REFERENCE.md` | markdownlint; the install and session lines quoted verbatim from the script's usage |
 | packaging | every format in `packaging/` gets the new unit and template | the existing packaging checks |
@@ -340,7 +361,8 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 | D1 | previous-root loader entry | **accepted** |
 | D2 | sshd on the drives | **accepted**: on, key-only, both keys, both drives |
 | D3 | package release to pin | **0.7.23.0, staged until the work is done, then promoted** |
-| D4 | recovery-mode config: template vs `btrdasd --recovery` | template now |
+| D4 | recovery-mode config | **accepted: C, derived at boot from the host's backed-up config; roots `/mnt/restore` and `/home/restore-test`** |
 | D5 | printing stack | **keep** |
 | D6 | Flatpak runtime preinstalled | **yes** (operator): flatpak + Flathub remote, no apps |
 | D7 | the two `@.archive.*` boot archives on A | **delete** (operator) |
+| D8 | the index on the targets lags one run | state subvolume sent after indexing + boot-time catch-up fallback |
