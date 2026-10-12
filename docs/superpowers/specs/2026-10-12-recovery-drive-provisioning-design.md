@@ -1,7 +1,7 @@
 # Recovery Drive Provisioning — Design
 
-Status: DRAFT for operator review, 2026-10-12. Nothing in this document has been built.
-Decisions marked **OPEN** need the operator's answer before the plan is written.
+Status: REVIEWED 2026-10-12 — every decision D1–D8 settled by the operator (§8). Nothing in
+this document has been built; the implementation plans follow from it.
 
 ## 1. Why
 
@@ -168,7 +168,7 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   with unit tests and mutation coverage. Rejected: (A) a provisioning-time template (a
   second file that drifts until the next rebuild); (B) a runtime `--recovery` mode (a second
   configuration path through every command).
-- **The index on the targets lags one run — OPEN D8.** `backup-run.sh` sends every
+- **The index on the targets lags one run — D8 (accepted 2026-10-12).** `backup-run.sh` sends every
   snapshot, then indexes (2026-10-12: sends done, then ~16 minutes of indexing), so the
   `@` snapshot a target receives carries the index as it stood before that run's indexing:
   the last day's new or changed files are on the drive but invisible to search and
@@ -179,8 +179,9 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   and reported — so every target's index matches the data it received that night; (2) the
   drive's boot-time sync unit, when the state copy is older than the newest received
   snapshot, runs an incremental index over the newest snapshots as a catch-up, in the
-  background after the desktop is up, saying so on the desktop. Recommendation: both, 1
-  as the mechanism, 2 as the fallback.
+  background after the desktop is up, saying so on the desktop. Decided: both, 1 as the
+  mechanism, 2 as the fallback the sync unit performs only when it detects the gap; both
+  measured in the nightly report.
 - **GUI**: `btrdasd-gui` installed; desktop file present; the two guides symlinked on the
   Desktop as today ("Quick Reference — PRINT THIS.md", "Recovery Guide.md" →
   `/usr/share/das-backup/docs/…`), plus `STORAGE-ARCHITECTURE-AND-RECOVERY.md`.
@@ -365,4 +366,4 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 | D5 | printing stack | **keep** |
 | D6 | Flatpak runtime preinstalled | **yes** (operator): flatpak + Flathub remote, no apps |
 | D7 | the two `@.archive.*` boot archives on A | **delete** (operator) |
-| D8 | the index on the targets lags one run | state subvolume sent after indexing + boot-time catch-up fallback |
+| D8 | the index on the targets lags one run | **accepted**: state subvolume sent after indexing; boot-time catch-up only on a detected gap |
