@@ -161,8 +161,9 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   hands the host's `etc/das-backup/config.toml`, found in the same newest received `@`
   snapshot as the state directory, to a new subcommand `btrdasd config derive-recovery
   --from <file> --booted-uuid <uuid>`, which with the real parser drops every source, keeps
-  only the target whose `mount_uuid` is the booted filesystem, sets its mount point to
-  `/mnt/backup-system-recovery-<A|B>`, turns email off, sets `[restore] allowed_roots` to
+  **every** target with the one whose `mount_uuid` is the booted filesystem moved first (an
+  attached 22 TB pair stays mountable by UUID for what only it holds; the helper's resolver
+  prefers the drive's own copy), turns email off, sets `[restore] allowed_roots` to
   exactly `/mnt/restore` (a mounted NVMe root) and `/home/restore-test` (the Phase 5
   proof), and writes an ordinary `/etc/das-backup/config.toml`. The CLI, helper and GUI
   then run unmodified. One source of truth (the host's real configuration as last backed
@@ -188,7 +189,10 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   a copy of each snapshot (`snapshot_targets`, bd `gt0`); the helper's `IndexSnapshotPath`
   now resolves a snapshot to a copy that exists on this machine, the booted drive's own
   target first when the configuration carries `[general] recovery_drive = true` (the flag
-  `derive-recovery` sets; the validator then allows a configuration with no sources).
+  `derive-recovery` sets; the validator then allows a configuration with no sources). A
+  recovery drive therefore restores from itself what every target receives, and from the
+  22 TB pair, when attached, what only the pair holds; absent, the helper says "no copy
+  present on this machine" and names the target — search finds the file either way.
 - **GUI**: `btrdasd-gui` installed; desktop file present; the two guides symlinked on the
   Desktop as today ("Quick Reference — PRINT THIS.md", "Recovery Guide.md" →
   `/usr/share/das-backup/docs/…`), plus `STORAGE-ARCHITECTURE-AND-RECOVERY.md`.
