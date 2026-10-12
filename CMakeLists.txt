@@ -142,6 +142,7 @@ install(PROGRAMS
     scripts/das-wipe-all-drives-and-partition-from-scratch.sh
     scripts/install-backup-timer.sh
     scripts/recovery-os-vm.sh
+    scripts/das-recovery-state-sync.sh
     DESTINATION "${DAS_SCRIPT_DIR}"
 )
 
@@ -186,6 +187,7 @@ if(BUILD_HELPER)
         DESTINATION share/polkit-1/actions)
 
     install(FILES systemd/btrdasd-helper.service
+        systemd/das-recovery-state-sync.service
         DESTINATION lib/systemd/system)
 
     # Installing enables and reloads nothing. The helper needs no enabling:
@@ -316,6 +318,10 @@ if(BUILD_TESTING)
     add_test(
         NAME shell-maintenance-lock
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance_lock.sh
+    )
+    add_test(
+        NAME shell-recovery-state-sync
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_state_sync.sh
     )
     add_test(
         NAME shell-record-run
