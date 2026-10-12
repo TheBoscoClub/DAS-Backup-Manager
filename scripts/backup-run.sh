@@ -3051,9 +3051,13 @@ run_indexer() {
     while IFS= read -r mlabel; do
         mmnt="${TARGET_MOUNTS[$mlabel]}"
         [[ "$mmnt" == "$primary_mount" ]] && continue
+        # An absent target is not a failed one: it is left out of the detail
+        # without a word (verify_targets_before_btrbk already proved every
+        # available target is a real mountpoint, so this only skips absence).
         mountpoint -q "$mmnt" 2>/dev/null || continue
         if mout=$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" walk "$mmnt" --db "$DAS_DB_PATH" 2>&1); then
             log_info "  presence recorded on $mlabel"
+            [[ -z "$mout" ]] || log_info "$mout"
             present+=("$mlabel")
         else
             mrc=$?
