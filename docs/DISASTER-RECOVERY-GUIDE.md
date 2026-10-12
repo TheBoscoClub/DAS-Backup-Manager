@@ -1503,7 +1503,7 @@ Only a *complete* receive counts: a snapshot that is not read-only, or has no Re
 
 `no state snapshot` is the normal state of a drive until the first backup run after the state subvolume was set up; it is not damage.
 
-**Not on by default.** The unit is installed with the package but not enabled, and it is gated by `ConditionPathExists=/etc/das-backup/recovery-drive`: on the host the marker does not exist, so the unit cannot run there. Writing the marker and enabling the unit is the job of recovery-drive provisioning (plan 2), not of the package.
+**Not on the host at all.** The package ships the unit file beside the script under `/usr/lib/das-backup/`, never into the host's `lib/systemd/system` (`btrdasd setup` is the only writer of `das-*` units there). Installing it into a recovery drive's `/etc/systemd/system`, writing the marker `/etc/das-backup/recovery-drive` it is gated on (`ConditionPathExists`) and enabling it is the job of recovery-drive provisioning (plan 2), not of the package.
 
 ---
 
