@@ -5682,7 +5682,10 @@ while (($# > 0)); do [[ "$1" != -o ]] || : >"$2"; shift; done
 EOF
     chmod +x "$T/bin/xorriso"
     PROV=(provision A --iso "$ISO" --package "$PKG" --package-sha256 "$PKG_SHA" --authorized-keys "$KEYS")
-    PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256="$ISO_SHA" DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images" DAS_RECOVERY_VM_FIRSTBOOT_SECS=1)
+    # The suite's own config.toml: the payload carries it, and the host's must
+    # never be read by a test (it was, until CI's runner had none).
+    printf '[general]\nversion = "test"\n' >"$T/config.toml"
+    PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256="$ISO_SHA" DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images" DAS_RECOVERY_VM_FIRSTBOOT_SECS=1 DAS_CONFIG="$T/config.toml")
 }
 # An array cannot prefix a function call (bash drops it): set, run, unset.
 run_driver_env() {
@@ -5811,6 +5814,12 @@ provision_fixture
 write_state 4 "$(record_agent system-recovery-A-2tb will "$AGENT_ON")" "$(record_agent system-recovery-B-2tb no "$AGENT_ON")"
 run_driver_env "${PROV[@]}" --dry-run
 check "provision of a drive whose own record says will: exit 0 (its OS is the one replaced)" "$RC" "0"
+
+provision_fixture
+rm "$T/config.toml"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision without a readable config.toml: exit 1" "$RC" "1"
+has "provision without a readable config.toml: refused before anything" "$OUT" "cannot read $T/config.toml: the payload carries it"
 
 provision_fixture
 rm "$T/bin/xorriso"
