@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.3.0
+# Version: 1.4.0
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -232,7 +232,7 @@ ESP_ID=""
 format_esp() {
     local want=$1 got
     "$MKFS_VFAT" -F 32 -i "${want//-/}" -n "$ESP_LABEL" "${DEV}1" || cannot "cannot format p1 as FAT32 ($ESP_LABEL)"
-    got=$("$BLKID" -s UUID -o value "${DEV}1") || got=""
+    got=$("$BLKID" -p -s UUID -o value "${DEV}1") || got=""
     [[ "${got^^}" == "${want^^}" ]] || cannot "p1 was formatted but its volume ID is '$got', not $want: refusing to go on"
 }
 # matches_list <dir> <esp.list>: the tree's content is what the list recorded.
@@ -244,7 +244,7 @@ matches_list() {
 }
 save_esp() {
     local dst="$TOP/@esp.replaced.$STAMP" want have
-    ESP_ID=$("$BLKID" -s UUID -o value "${DEV}1") || ESP_ID=""
+    ESP_ID=$("$BLKID" -p -s UUID -o value "${DEV}1") || ESP_ID=""
     [[ "$ESP_ID" =~ $ESP_ID_RE ]] || refuse "p1's volume ID '$ESP_ID' is unreadable or not of the form XXXX-XXXX: it could not be restored"
     mkdir -p "$ESP_MNT"
     "$BTRFS" subvolume create "$dst" >/dev/null || cannot "cannot create @esp.replaced.$STAMP"
@@ -280,6 +280,14 @@ step_replace_os() {
     mount_top
     received_present || refuse "p2 holds no received backup subvolume: not a recovery drive to rebuild (seed it with a backup run first)"
     load_names
+    # Undo orders manifests by stamp and takes the oldest as the original, so a
+    # new stamp must be strictly newer than every manifest, in any state.
+    for f in "$TOP"/.das-provision.*; do
+        [[ -e "$f" ]] || continue
+        if [[ "${f##*/}" =~ ^\.das-provision\.([0-9]{8}-[0-9]{6})(\.deleting|\.undoing|\.done|\.undone)?$ ]]; then
+            [[ "$STAMP" > "${BASH_REMATCH[1]}" ]] || refuse "stamp $STAMP is not newer than ${f##*/} (stamp ${BASH_REMATCH[1]}): undo would take the wrong ESP as the original"
+        fi
+    done
     mapfile -t live < <(list_manifests | grep -E '\.(undoing|deleting)$' || :)
     if ((${#live[@]} > 0)); then
         for f in "${live[@]}"; do say "${f##*/}"; done
@@ -527,7 +535,10 @@ step_delete_replaced() {
     b=$(manifest_base "${mfs[$((${#mfs[@]} - 1))]}")
     newest=${b#.das-provision.}
     prov=$(sed -n 's/^provisioned=//p' "$marker" | head -1) || prov=""
-    [[ -n "$prov" && "$prov" == "$newest" ]] || refuse "the booted marker says provisioned='$prov', the newest manifest is $newest: it does not prove this provision booted; the old OS is kept"
+    if [[ -z "$prov" ]]; then
+        refuse "the booted marker names no provision (a sync unit older than 1.1.2 writes no provision: the payload's package may be too old); the newest manifest is $newest, the old OS is kept"
+    fi
+    [[ "$prov" == "$newest" ]] || refuse "the booted marker says provisioned='$prov', the newest manifest is $newest: it does not prove this provision booted; the old OS is kept"
     for i in "${!mfs[@]}"; do
         mf=${mfs[$i]}
         if [[ "$mf" != *.deleting ]]; then
@@ -556,7 +567,7 @@ step_delete_replaced() {
 
 step_undo() {
     need UUID ESP_LABEL ESP_PARTUUID DEV
-    local mfs=() mf i orig sa remaining=() oldest_stamp esp_dir b rc
+    local mfs=() mf i orig sa remaining=() oldest_stamp esp_dir b rc mounted
     mount_top
     load_names
     mapfile -t mfs < <(list_manifests | LC_ALL=C sort -r)
@@ -637,13 +648,22 @@ step_undo() {
     format_esp "$ESP_ID"
     "$MOUNT" "${DEV}1" "$ESP_MNT" || cannot "cannot mount p1 to restore the old ESP"
     rc=0
+    mounted=1
     "$CP" -a "$esp_dir/esp/." "$ESP_MNT/" || rc=2
-    # Flush, remount read-only, then compare what is really on p1.
+    # Flush, unmount, mount again read-only, then compare: a compare on the
+    # mount that was written would read the page cache, not the disk.
     if ((rc == 0)); then "$SYNC" -f "$ESP_MNT" || rc=2; fi
-    if ((rc == 0)); then "$MOUNT" -o remount,ro "$ESP_MNT" || rc=2; fi
+    if ((rc == 0)); then
+        mounted=0
+        "$UMOUNT" "$ESP_MNT" || rc=2
+    fi
+    if ((rc == 0)); then
+        "$MOUNT" -o ro "${DEV}1" "$ESP_MNT" || rc=2
+        mounted=1
+    fi
     if ((rc == 0)); then matches_list "$ESP_MNT" "$esp_dir/esp.list" || rc=$?; fi
-    "$UMOUNT" "$ESP_MNT" || cannot "cannot unmount p1 after restoring it"
-    ((rc != 2)) || cannot "cannot restore the old ESP to p1 (copy, flush, remount or read-back failed)"
+    if ((mounted == 1)); then "$UMOUNT" "$ESP_MNT" || cannot "cannot unmount p1 after restoring it"; fi
+    ((rc != 2)) || cannot "cannot restore the old ESP to p1 (copy, flush, unmount, remount or read-back failed)"
     ((rc == 0)) || refuse "the restored p1 differs from @esp.replaced.$oldest_stamp/esp.list"
     for mf in "${mfs[@]}"; do
         b=${mf##*/}
