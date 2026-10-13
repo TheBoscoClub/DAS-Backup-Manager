@@ -5683,6 +5683,55 @@ check "provision, the live ISO cannot be detached: exit 7" "$RC" "7"
 has "provision, the live ISO cannot be detached: named" "$OUT" "stopped at first-boot"
 check "provision, the live ISO cannot be detached: started once" "$(grep -c '^virsh start' "$S/events")" "1"
 
+echo "--- provision --undo (plan 2, Task 3c)"
+provision_fixture
+run_driver_env "${PROV[@]}" --also-replace @.archive.20260301-1200
+check "undo setup: the provision ran" "$RC" "0"
+has "undo setup: the provision row names its archives" "$(file "$H")" '"also_replace":["@.archive.20260301-1200"]'
+STAMP=$(jq -r 'select(.mode == "provision") | .stamp' "$H" | tail -n 1)
+: >"$S/stages.log"
+: >"$S/events"
+: >"$S/ip.calls"
+run_driver_env provision A --undo --iso "$ISO"
+check "undo: exit 0" "$RC" "0"
+has "undo: the undo step ran with the provision's stamp" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_STAMP=$STAMP"
+has "undo: ...and its archives" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_ALSO_REPLACE='@.archive.20260301-1200'"
+check "undo: the payload mounted first, then undo only" "$(tr '\n' ' ' <"$S/stages.log")" "payload undo "
+has "undo: booted the live system, not the drive" "$(prov_events)" "virsh attach cdrom $ISO|"
+check "undo: started once" "$(grep -c '^virsh start' "$S/events")" "1"
+has "undo: result" "$OUT" "Undone system-recovery-A-2tb ($STAMP): the old OS is back"
+has "undo: history" "$(tail -n 1 "$H")" '"mode":"undo"'
+has "undo: history stamp" "$(tail -n 1 "$H")" "\"stamp\":\"$STAMP\""
+lacks "undo: no egress rule added (nothing is downloaded)" "$(file "$S/ip.calls")" "rule add"
+check "undo: the payload ISO removed" "$(ls "$T/images" 2>/dev/null | wc -l)" "0"
+check "undo: no cdrom left" "$(file "$S/cdroms.xml")" ""
+
+provision_fixture
+run_driver_env provision A --undo --iso "$ISO"
+check "undo with no provision in the history: exit 1" "$RC" "1"
+has "undo with no provision: says so" "$OUT" "no provision of system-recovery-A-2tb in the history: nothing to undo"
+check "undo with no provision: nothing taken" "$(file "$S/flock.calls")" ""
+
+provision_fixture
+run_driver_env "${PROV[@]}"
+echo 3 >"$S/stage.undo.rc"
+printf 'the root installed by an earlier provision has booted: undo refused\n' >"$S/stage.undo.out"
+run_driver_env provision A --undo --iso "$ISO"
+check "undo refused by the installer: exit 7" "$RC" "7"
+has "undo refused: the reason quoted" "$OUT" "has booted: undo refused"
+has "undo refused: history failed" "$(tail -n 1 "$H")" '"outcome":"failed"'
+
+provision_fixture
+run_driver_env "${PROV[@]}"
+run_driver_env provision A --undo --iso "$ISO" --dry-run
+check "undo dry run: exit 0" "$RC" "0"
+has "undo dry run: names the provision" "$OUT" "undo the provision of"
+lacks "undo dry run: nothing booted" "$(tail -n 3 "$S/events")" "virsh start"
+
+provision_fixture
+run_driver_env provision A --undo --iso "$ISO" --package "$PKG"
+check "undo with --package: usage" "$RC" "2"
+
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
 check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"
 matches "...and the log does see destroys: of domains never resumed, in the tests that need one" "$(grep -c '^destroy, never resumed' "$DESTROY_LOG")" "^[1-9][0-9]*$"
