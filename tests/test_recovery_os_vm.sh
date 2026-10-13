@@ -134,6 +134,7 @@ fixture() {
     H="$T/var/lib/das-backup/recovery-os-vm-history.jsonl"
     mkdir -p "$S" "$T/bin" "$T/run" "$BYID" "$T/usr/lib/das-backup/libvirt" "$T/usr/share/edk2/x64"
     cp "$REPO/scripts/recovery-os-vm.sh" "$DRIVER"
+    cp "$REPO/scripts/recovery-os-install.sh" "$T/usr/lib/das-backup/"
     cp "$REPO/packaging/libvirt/recovery-os-updater.xml" "$T/usr/lib/das-backup/libvirt/"
     printf 'CODE' >"$T/usr/share/edk2/x64/OVMF_CODE.4m.fd"
     printf 'VARS-TEMPLATE' >"$T/usr/share/edk2/x64/OVMF_VARS.4m.fd"
@@ -300,12 +301,14 @@ DAS_TARGET_1_SERIALS='$1'
 DAS_TARGET_1_MOUNT_UUID='${4-$UUID_A}'
 DAS_TARGET_1_MOUNT='/mnt/backup-system-recovery-A'
 DAS_TARGET_1_ROLE='mirror'
+DAS_TARGET_1_DISPLAY_NAME='2TB Recovery A (Bay 1, SERIAL04)'
 DAS_TARGET_2_LABEL='${3:-system-recovery-B-2tb}'
 DAS_TARGET_2_SERIAL='$2'
 DAS_TARGET_2_SERIALS='$2'
 DAS_TARGET_2_MOUNT_UUID='$UUID_B'
 DAS_TARGET_2_MOUNT='/mnt/backup-system-recovery-B'
 DAS_TARGET_2_ROLE='mirror'
+DAS_TARGET_2_DISPLAY_NAME='2TB Recovery B (Bay 4, SERIAL02)'
 EOF
 }
 
@@ -1158,7 +1161,7 @@ driver_env() {
         DAS_RECOVERY_VM_TEST_ROOT="$T" BTRDASD_BIN="$T/bin/btrdasd" \
         DAS_RECOVERY_VM_POLL_SECS="${POLL:-0.05}" DAS_RECOVERY_VM_MINUTE_SECS=1 DAS_RECOVERY_VM_GRACE_SECS="${GRACE:-3}" \
         DAS_RECOVERY_VM_RESEND_SECS="${RESEND:-30}" DAS_RECOVERY_VM_CLOCK_GAP_SECS="${CLOCK_GAP:-30}" "${guard[@]}" \
-        ${LOOP:+DAS_RECOVERY_VM_TEST_LOOP="$LOOP"} "$@"
+        ${LOOP:+DAS_RECOVERY_VM_TEST_LOOP="$LOOP"} ${DRIVER_EXTRA_ENV[@]+"${DRIVER_EXTRA_ENV[@]}"} "$@"
 }
 
 # Run the driver to completion: OUT is stdout and stderr together, RC its
@@ -5373,6 +5376,148 @@ LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
 rm -f "$T/umount.fail"
 has "loader, TOP unset, umount fails: reported" "$OUT" "cannot unmount /run/das-vm-update/top"
 has "loader, TOP unset, umount fails: the entry was still written" "$(file "$PREV")" "rootflags=subvol=/@.pre-update.20261012-0300"
+
+echo "--- provision: preflight and the dry run (plan 2, Task 3a)"
+provision_fixture() {
+    unattended_fixture
+    ISO="$T/cachyos.iso"
+    PKG="$T/das-backup-manager-0.7.23.0-1-x86_64.pkg.tar.zst"
+    KEYS="$T/keys"
+    printf 'iso' >"$ISO"
+    printf 'pkg' >"$PKG"
+    printf 'ssh-ed25519 AAAA k\n' >"$KEYS"
+    ISO_SHA=$(sha256sum "$ISO" | cut -d' ' -f1)
+    PKG_SHA=$(sha256sum "$PKG" | cut -d' ' -f1)
+    cat >"$T/bin/xorriso" <<'EOF'
+#!/bin/bash
+echo "xorriso $*" >>"$STUB/xorriso.log"
+while (($# > 0)); do [[ "$1" != -o ]] || : >"$2"; shift; done
+EOF
+    chmod +x "$T/bin/xorriso"
+    PROV=(provision A --iso "$ISO" --package "$PKG" --package-sha256 "$PKG_SHA" --authorized-keys "$KEYS")
+    PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256="$ISO_SHA" DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images")
+}
+# An array cannot prefix a function call (bash drops it): set, run, unset.
+run_driver_env() {
+    DRIVER_EXTRA_ENV=("${PROV_ENV[@]}")
+    run_driver "$@"
+    unset DRIVER_EXTRA_ENV
+}
+
+provision_fixture
+run_driver_env "${PROV[@]}" --dry-run
+check "provision dry run: exit 0" "$RC" "0"
+has "provision dry run: names the drive and its serial" "$OUT" "(drive A): serial SERIAL04"
+has "provision dry run: the bay and hostname from display_name" "$OUT" "bay 1, hostname das-recovery-bay1, ESP label RECOV-ESP-1"
+has "provision dry run: the entry titles" "$OUT" "CachyOS Emergency Recovery (Bay 1)"
+matches "provision dry run: the package count" "$OUT" "packages: [0-9]+"
+has "provision dry run: the ISO pinned" "$OUT" "iso sha256 ok"
+has "provision dry run: the package pinned" "$OUT" "package sha256 ok"
+has "provision dry run: the steps in order" "$OUT" "steps: egress payload capture replace-os pacstrap configure package boot repos verify unmount, then the first boot, delete-replaced"
+has "provision dry run: no history for the other drive is a warning" "$OUT" "WARNING: system-recovery-B-2tb has no session in the history"
+lacks "provision dry run: nothing booted" "$(file "$S/virsh.calls")" "start"
+lacks "provision dry run: no disk attached" "$(file "$S/virsh.calls")" "attach"
+check "provision dry run: no payload built" "$(file "$S/xorriso.log")" ""
+check "provision dry run: no payload directory" "$([[ -e "$T/images" ]] && echo present || echo absent)" "absent"
+check "provision dry run: no history written" "$(file "$H")" ""
+check "provision dry run: no lock taken" "$(file "$S/flock.calls")" ""
+
+provision_fixture
+PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256=0000 DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images")
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, iso sha256 mismatch: exit 1" "$RC" "1"
+has "provision, iso sha256 mismatch: names both" "$OUT" "iso sha256 is $ISO_SHA, not the pinned 0000"
+
+provision_fixture
+run_driver_env "${PROV[@]}" --package-sha256 1111 --dry-run
+check "provision, package sha256 mismatch: exit 1" "$RC" "1"
+has "provision, package sha256 mismatch: named" "$OUT" "package sha256 is $PKG_SHA, not 1111"
+
+provision_fixture
+: >"$KEYS"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, empty authorized_keys: exit 1" "$RC" "1"
+has "provision, empty authorized_keys: refused" "$OUT" "authorized-keys file is empty: a drive with sshd and no key is unreachable"
+
+provision_fixture
+run_driver_env "${PROV[@]}" --also-replace nvme --dry-run
+check "provision, --also-replace not an archive: exit 1" "$RC" "1"
+has "provision, --also-replace not an archive: refused on the host" "$OUT" "--also-replace nvme: only @.archive.* names, one per option"
+
+provision_fixture
+run_driver_env "${PROV[@]}" --also-replace @.archive.20260101-0101.replaced.20261013-010203 --dry-run
+check "provision, --also-replace of a set-aside archive: exit 1" "$RC" "1"
+has "provision, --also-replace of a set-aside archive: refused" "$OUT" "only @.archive.* names, one per option"
+
+provision_fixture
+run_driver_env "${PROV[@]}" --also-replace @.archive.20260101-0101 --also-replace @.archive.20260202-0202 --dry-run
+check "provision, two archives: exit 0" "$RC" "0"
+has "provision, two archives: both named" "$OUT" "also replacing: @.archive.20260101-0101 @.archive.20260202-0202"
+
+provision_fixture
+run_driver_env provision A --iso "$ISO" --dry-run
+check "provision without --package: exit 2" "$RC" "2"
+run_driver_env provision --iso "$ISO" --dry-run
+check "provision without a drive: exit 2" "$RC" "2"
+
+provision_fixture
+run_driver_env provision primary-22tb --iso "$ISO" --package "$PKG" --package-sha256 "$PKG_SHA" --authorized-keys "$KEYS" --dry-run
+check "provision of the primary: exit 1" "$RC" "1"
+has "provision of the primary: only a mirror" "$OUT" "only a role = \"mirror\" recovery drive"
+
+provision_fixture
+sed -i '/^DAS_TARGET_1_DISPLAY_NAME=/d' "$S/dump-env"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, no display_name: exit 1" "$RC" "1"
+has "provision, no display_name: no bay" "$OUT" "no bay number in the display_name of system-recovery-A-2tb"
+
+provision_fixture
+printf '{"label":"system-recovery-B-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n' >>"$H"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the other drive's last session failed: exit 1" "$RC" "1"
+has "provision, the other drive failed: never two drives down" "$OUT" "system-recovery-B-2tb's last session was failed (stopped at upgrade): never two recovery drives down at once"
+
+provision_fixture
+printf '{"label":"system-recovery-B-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n' >>"$H"
+printf '{"label":"system-recovery-B-2tb","start":1791870000,"end":1791873600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"7.2.9-1-cachyos","stopped_at":null}\n' >>"$H"
+printf '{"label":"system-recovery-A-2tb","start":1791880000,"end":1791883600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n' >>"$H"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the other drive's LAST session clean (an earlier failed, this drive failed): exit 0" "$RC" "0"
+lacks "provision, the other drive clean: no history warning" "$OUT" "has no session in the history"
+
+provision_fixture
+write_state 4 "$(record_agent system-recovery-A-2tb no "$AGENT_ON")" "$(record_agent system-recovery-B-2tb may "$AGENT_ON")"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the other drive's record says may: exit 1" "$RC" "1"
+has "provision, the other drive's record: never two drives down" "$OUT" "system-recovery-B-2tb's boot record is may: never two recovery drives down at once"
+
+provision_fixture
+write_state 4 "$(record_agent system-recovery-A-2tb will "$AGENT_ON")" "$(record_agent system-recovery-B-2tb no "$AGENT_ON")"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision of a drive whose own record says will: exit 0 (its OS is the one replaced)" "$RC" "0"
+
+provision_fixture
+rm "$T/bin/xorriso"
+# The host may have xorriso: a PATH of every host tool but it.
+mkdir -p "$T/noxorriso"
+for tool in $(compgen -c | sort -u); do
+    [[ "$tool" != xorriso ]] || continue
+    src=$(type -P "$tool") || continue
+    ln -sf "$src" "$T/noxorriso/$tool"
+done
+DRIVER_PATH="$T/bin:$T/noxorriso" run_driver_env "${PROV[@]}" --dry-run
+check "provision without xorriso: exit 1" "$RC" "1"
+has "provision without xorriso: names the package" "$OUT" "xorriso is not installed (package libisoburn): the payload cdrom cannot be built"
+
+provision_fixture
+rm "$T/usr/lib/das-backup/recovery-os-install.sh"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision without the installer beside it: exit 1" "$RC" "1"
+has "provision without the installer: says where it looked" "$OUT" "recovery-os-install.sh is not installed beside"
+
+provision_fixture
+run_driver_env "${PROV[@]}" --dry-run --detach
+check "provision --dry-run --detach: usage" "$RC" "2"
 
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
 check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"
