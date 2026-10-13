@@ -212,7 +212,7 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
   and settings before the desktop appears. Do not power off or unplug it — the copy would
   be left incomplete and the disk would start again from the previous copy."** The unit
   records each phase's measured
-  duration in its status file on the drive's own OS, and on the next boot shows a
+  duration in a timings file on the drive's own OS (`/var/lib/das-recovery/timings`, outside the state directory), and on the next boot shows a
   countdown computed from the previous measurement and named as such ("about 40 s, measured
   at the last boot"); with no measurement (the first boot after a rebuild) it shows the phase
   text only, never an invented figure — a countdown that is wrong is worse than none
@@ -317,8 +317,10 @@ lines (`PROGRESS`/`OUTPUT`/`RESULT`), the history, and the own-unit refusal.
 - The driver reboots the VM with the ISO detached, boot order disk first, under the
   session guard. It must come back with the guard engaged and the agent answering (the
   pipeline's `reboot` step), then: `uname -r` is the installed kernel; the state-sync
-  unit reports no snapshot yet and left no database (the "no snapshot" direction of its
-  test, observed on a real drive); a screenshot shows the Plasma desktop; `kwin_wayland`
+  unit's status agrees with what the drive holds (amended 2026-10-13, whole-branch review:
+  p2 is kept, and drive A already held `nvme/das-state.20261012T1533`) -- `synced <stamp>`
+  with `das-state.<stamp>` the newest complete state snapshot on p2 and the index present,
+  or `no state snapshot` with none on p2 and no index; a screenshot shows the Plasma desktop; `kwin_wayland`
   and `plasmashell` are running. Then, and only then, the `*.replaced.<stamp>` subvolumes are
   deleted (inside the VM, by the new OS, named one by one — never a glob over the top
   level). Power off, give back.

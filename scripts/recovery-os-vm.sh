@@ -410,6 +410,10 @@ readonly CLOCK_GAP_SECS="${DAS_RECOVERY_VM_CLOCK_GAP_SECS:-120}"
 readonly UPDATE_SECS="${DAS_RECOVERY_VM_UPDATE_SECS:-7200}"
 readonly AGENT_SECS="${DAS_RECOVERY_VM_AGENT_SECS:-$GUARD_SECS}"
 readonly AGENT_GRACE_SECS="${DAS_RECOVERY_VM_AGENT_GRACE_SECS:-300}"
+# How long the desktop has, after the reboot that ends an unattended update,
+# to show kwin_wayland and plasmashell (the proof a run is "clean" by; the
+# slot keeps the last known good pair until a run proves it).
+readonly DESKTOP_SECS="${DAS_RECOVERY_VM_DESKTOP_SECS:-600}"
 # How long the egress step waits for the recovery OS's network before it
 # judges: the guest agent answers before NetworkManager has a lease (bd slu9,
 # 2026-10-12: the step ran 0.5 s before the NIC began activating).
@@ -628,6 +632,7 @@ PAYLOAD_ISO=""        # provision: the payload cdrom image, removed at the end
 CAPTURE_FILE=""       # provision: where the capture step's lines are kept
 CAPTURE_LOST=""       # ...and why a line of it could not be written
 SLOT_WARNING=""       # why slot B (the previous kernel set) was not refreshed
+DESKTOP_PROVEN=false  # this session saw kwin_wayland and plasmashell after its last boot
 GUARD_FAILED=false    # it did not confirm (GUARD_RESULT says how)
 GUARD_SHUT_DOWN=false # ...and the recovery OS was asked to shut down for it
 GUARD_RESULT="not booted"
@@ -2408,6 +2413,8 @@ guard_watch_begin() {
     judge_start "$GUARD_EXPECT" "$GUARD_EXPECT_C" "$GUARD_EXPECT_LIFTED" "$GUARD_EXPECT_LIFTED_C"
     report_reader_start
     GCLOCK=0 G_TICK_AT=$SECONDS G_LAST_LINE=0 G_LIFTS_SAID=0
+    # A new reset file starts at its first line (provision's second start).
+    RESETS=0 RESET_LINES_READ=0
     PROOF_WHY=start PROOF_POS=0 PROOF_DEADLINE=$GUARD_SECS
 }
 
@@ -4161,6 +4168,20 @@ run_unattended() {
         progress poweroff ok
         return 0
     fi
+    # The desktop, as Phase 3 of provision proves it: an upgrade that left it
+    # dead finished "clean" before (2026-10-07). Only a run that saw it is
+    # one the slot may take its next pair from.
+    progress desktop start "waiting for kwin_wayland and plasmashell"
+    if guest_until "$DESKTOP_SECS" 'pgrep -x kwin_wayland' && guest_until "$DESKTOP_SECS" 'pgrep -x plasmashell'; then
+        DESKTOP_PROVEN=true
+        progress desktop ok "kwin_wayland and plasmashell running"
+    else
+        stage_failed desktop "${UNATTENDED_WHY:-kwin_wayland or plasmashell is not running $(format_duration "$DESKTOP_SECS") after the reboot: the desktop did not come up}"
+        progress poweroff start "the update stopped at desktop"
+        power_off_guest "the unattended update stopped at desktop"
+        progress poweroff ok
+        return 0
+    fi
     progress poweroff start "the update is done"
     power_off_guest "the unattended update is done"
     progress poweroff ok
@@ -4326,8 +4347,34 @@ EOF
 # the slot, and the clone made from the snapshot the slot names (by UUID, so
 # it holds after that snapshot is pruned); with none, one notice entry boots
 # the current OS. Exit 0 always.
+# Whether the slot may take this run's pair: only when the drive's last
+# session proved its desktop and ended clean or with warnings (operator,
+# 2026-10-13: the slot holds the last KNOWN GOOD pair). SLOT_REFRESH yes|no,
+# SLOT_KEEPWHY a plain sentence (no quote: it is written into sh).
+slot_policy() {
+    local row outcome desktop
+    SLOT_REFRESH=no SLOT_KEEPWHY="the history cannot be read"
+    read_history || return 0
+    row="$(jq -c --arg l "$LABEL" 'select(.label == $l)' <<<"$HISTORY_LINES" | tail -n 1)" || return 0
+    if [[ -z "$row" ]]; then
+        SLOT_KEEPWHY="this drive has no session in the history"
+        return 0
+    fi
+    outcome="$(jq -r '.outcome // "unknown"' <<<"$row")" || outcome=unknown
+    desktop="$(jq -r '.desktop // ""' <<<"$row")" || desktop=""
+    if [[ "$outcome" != clean && "$outcome" != warnings ]]; then
+        SLOT_KEEPWHY="the last session ended ${outcome//[^a-z]/}"
+    elif [[ "$desktop" != proven ]]; then
+        SLOT_KEEPWHY="the last session (${outcome}) did not prove its desktop"
+    else
+        SLOT_REFRESH=yes SLOT_KEEPWHY=""
+    fi
+}
 step_slot() {
+    slot_policy
     printf 'snap=%s\n' "$PRE_UPDATE_SNAPSHOT"
+    printf 'refresh=%s\n' "$SLOT_REFRESH"
+    printf "keepwhy='%s'\n" "$SLOT_KEEPWHY"
     cat <<'EOF'
 esp=${ESP:-}
 if [ -z "$esp" ]; then esp=$(bootctl --print-esp-path 2>/dev/null) || esp=/boot; fi
@@ -4483,11 +4530,19 @@ if [ -z "$top" ]; then
         mount_why="cannot read the top level: mount failed"
     fi
 fi
-# Not inside && or ||: there set -e is ignored, in the subshell too, and a
-# failed copy would carry on as if it had worked.
-out=$( (refresh) 2>&1 )
-rc=$?
-[ -z "$out" ] || printf '%s\n' "$out"
+# Last known good: a pair that holds is kept unless the last session proved
+# its desktop; with none to keep, the current state is the best there is.
+if [ "$refresh" != yes ] && [ -n "$top" ] && pair_ok "$prev" "$prevfb"; then
+    echo "slot B kept: $keepwhy; the last known good pair stays ($(sed -n 's/^title //p' "$prev"))"
+    rc=0
+else
+    if [ "$refresh" != yes ]; then echo "slot B: no last known good pair to keep: refreshed from the current state ($keepwhy)"; fi
+    # Not inside && or ||: there set -e is ignored, in the subshell too, and a
+    # failed copy would carry on as if it had worked.
+    out=$( (refresh) 2>&1 )
+    rc=$?
+    [ -z "$out" ] || printf '%s\n' "$out"
+fi
 if [ "$rc" -ne 0 ]; then
     why=$(printf '%s\n' "$out" | tail -n 1)
     why=${why:-the refresh stopped (exit $rc)}
@@ -4607,13 +4662,14 @@ write_history() {
     ((${#BOOT_OVERRIDES[@]} == 0)) || overridden=true
     printf 'RESULT %s %s %s\n' "$LABEL" "$1" "$outcome"
     if ! line="$(jq -cn --arg label "$LABEL" --argjson start "$SESSION_EPOCH" --argjson end "$(date +%s)" \
-        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --arg also "${P_ALSO[*]}" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
+        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --arg also "${P_ALSO[*]}" --arg desktop "$DESKTOP_PROVEN" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
         --argjson overridden "$overridden" --arg kernel "$KERNEL" --arg stage "$UNATTENDED_STAGE" \
         '{label: $label, start: $start, end: $end, mode: $mode, unattended: $unattended, outcome: $outcome,
           exit: $exit, overridden: $overridden, kernel: (if $kernel == "" then null else $kernel end),
           stopped_at: (if $stage == "" then null else $stage end)}
           + (if $stamp == "" then {} else {stamp: $stamp} end)
-          + (if $mode == "provision" then {also_replace: ($also | split(" ") | map(select(. != "")))} else {} end)' 2>&1)"; then
+          + (if $mode == "provision" then {also_replace: ($also | split(" ") | map(select(. != "")))} else {} end)
+          + (if $desktop == "true" then {desktop: "proven"} else {} end)' 2>&1)"; then
         warn "could not write this session into the history: $line"
         return 0
     fi
@@ -4676,7 +4732,8 @@ cmd_clean_runs() {
         return 0
     fi
     n="$(jq -s --arg l "$LABEL" 'reduce (.[] | select(.label == $l)) as $s (0;
-        if ($s.overridden != false) or ($s.outcome != "clean") then 0
+        if ($s.mode == "provision" or $s.mode == "undo") then 0
+        elif ($s.overridden != false) or ($s.outcome != "clean") then 0
         elif $s.unattended == true then . + 1
         else . end)' <<<"$HISTORY_LINES")" || refuse "cannot count $LABEL's clean runs"
     printf '%s\n' "$n"
@@ -5874,7 +5931,7 @@ provision_parse_args() {
     fi
     local name
     for name in "${P_ALSO[@]}"; do
-        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* ]] ||
+        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* && "$name" != *.undone.* ]] ||
             refuse "--also-replace $name: only @.archive.* names, one per option"
     done
 }
@@ -5962,6 +6019,8 @@ provision_preflight() {
     P_ISO_GOT="$(sha256_of "$P_ISO")"
     [[ "$P_ISO_GOT" == "$ISO_SHA256" ]] || refuse "iso sha256 is $P_ISO_GOT, not the pinned $ISO_SHA256"
     if [[ "$P_UNDO" != true ]]; then
+        [[ "$(basename -- "$P_PKG")" =~ ^[${ASCII_LETTERS}[:digit:]._+-]+$ ]] ||
+            refuse "the package's file name '$(basename -- "$P_PKG")' is not one word (letters, digits, . _ + -): the installer's step scripts name it unquoted"
         P_PKG_GOT="$(sha256_of "$P_PKG")"
         [[ "$P_PKG_GOT" == "$P_PKG_SHA" ]] || refuse "package sha256 is $P_PKG_GOT, not $P_PKG_SHA"
         [[ -s "$P_KEYS" ]] || refuse "authorized-keys file is empty: a drive with sshd and no key is unreachable"
@@ -5992,7 +6051,10 @@ undo_read_provision() {
     read_history || refuse "$HISTORY_FAILURE"
     row="$(jq -c --arg l "$LABEL" 'select(.label == $l and .mode == "provision")' <<<"$HISTORY_LINES" | tail -n 1)" ||
         refuse "cannot read $LABEL's provisions from the history"
-    [[ -n "$row" ]] || refuse "no provision of $LABEL in the history: nothing to undo"
+    if [[ -z "$row" ]]; then
+        undo_from_capture
+        return 0
+    fi
     PROVISION_STAMP="$(jq -r '.stamp // empty' <<<"$row")" || PROVISION_STAMP=""
     [[ "$PROVISION_STAMP" =~ ^[[:digit:]]{8}-[[:digit:]]{6}$ ]] ||
         refuse "the newest provision of $LABEL in the history has no stamp of the form YYYYMMDD-HHMMSS ('$PROVISION_STAMP'): $(printable "$row")"
@@ -6000,6 +6062,28 @@ undo_read_provision() {
     for name in "${P_ALSO[@]}"; do
         [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* ]] ||
             refuse "the provision $PROVISION_STAMP of $LABEL names '$name' among its archives: not an @.archive.* name"
+    done
+}
+
+# undo with no provision row (a driver that stopped before it wrote one): the
+# newest capture directory, made before anything booted, names the stamp,
+# and its also-replace file the archives.
+undo_from_capture() {
+    local cap newest name
+    cap="$(dirname -- "$OS_STATE_FILE")/recovery-os-provision/$LABEL"
+    newest="$(find "$cap" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[[:digit:]]{8}-[[:digit:]]{6}$' | LC_ALL=C sort | tail -n 1)" || newest=""
+    [[ -n "$newest" ]] || refuse "no provision of $LABEL in the history and no capture of one: nothing to undo"
+    warn "no provision of $LABEL in the history (a driver that stopped before writing it); the capture $cap/$newest names it"
+    PROVISION_STAMP=$newest
+    P_ALSO=()
+    if [[ -e "$cap/$newest/also-replace" ]]; then
+        while IFS= read -r name || [[ -n "$name" ]]; do
+            [[ -z "$name" ]] || P_ALSO+=("$name")
+        done <"$cap/$newest/also-replace" || refuse "cannot read $cap/$newest/also-replace"
+    fi
+    for name in "${P_ALSO[@]}"; do
+        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* && "$name" != *.undone.* ]] ||
+            refuse "the capture $cap/$newest names '$name' among its archives: not an @.archive.* name"
     done
 }
 
@@ -6175,8 +6259,22 @@ old=$top/@
 for f in etc/fstab etc/hostname etc/pacman.conf; do
     [ ! -r "$old/$f" ] || sed "s|^|$f: |" "$old/$f"
 done
-find "$old/etc/systemd/system" -path '*.wants/*' 2>/dev/null | sed "s|^$old/|unit: |"
-ls "$old/var/lib/pacman/local" 2>/dev/null | sed 's/^/package: /'
+# Each listing read whole first: a pipe's status is its last command's, and
+# a find that failed would read as "nothing enabled".
+if [ ! -d "$old/etc/systemd/system" ]; then
+    echo "capture: the old OS has no etc/systemd/system"
+elif units=$(find "$old/etc/systemd/system" -path '*.wants/*'); then
+    printf '%s\n' "$units" | sed "s|^$old/|unit: |"
+else
+    echo "capture: cannot list the old OS's enabled units"
+fi
+if [ ! -d "$old/var/lib/pacman/local" ]; then
+    echo "capture: the old OS has no var/lib/pacman/local"
+elif pkgs=$(find "$old/var/lib/pacman/local" -mindepth 1 -maxdepth 1 -printf '%f\n'); then
+    printf '%s\n' "$pkgs" | sed 's/^/package: /'
+else
+    echo "capture: cannot list the old OS's packages"
+fi
 echo "capture: done"
 EOF
 }
@@ -6223,6 +6321,8 @@ provision_capture_dir() {
         ! printf '%s\n' "$out" >"$dir/record.json"; then
         refuse "cannot keep $LABEL's boot record in $dir: $(printable "$out") -- nothing was booted"
     fi
+    : >"$dir/also-replace" || refuse "cannot write $dir/also-replace -- nothing was booted"
+    for a in "${P_ALSO[@]}"; do printf '%s\n' "$a" >>"$dir/also-replace" || refuse "cannot write $dir/also-replace -- nothing was booted"; done
     CAPTURE_FILE="$dir/capture.txt"
     : >"$CAPTURE_FILE" || refuse "cannot write $CAPTURE_FILE -- nothing was booted"
     log "the old OS's record and capture go to $dir"
@@ -6269,6 +6369,28 @@ provision_install() {
     progress poweroff start "every step done"
     power_off_guest "every step done in the live system"
     progress poweroff ok
+}
+
+# The newest COMPLETE das-state snapshot on the booted drive's p2 (read-only
+# with a Received UUID, as das-recovery-state-sync.sh judges one), printed as
+# newest=<name> or newest=none.
+proof_newest_state() {
+    cat <<'EOF'
+src=$(findmnt -no SOURCE /) || { echo "cannot read the device of /"; exit 2; }
+top=/run/das-provision/proof
+mkdir -p "$top"
+mount -o ro,subvolid=5 "${src%%[*}" "$top" || { echo "cannot mount the top level read-only"; exit 2; }
+n=
+for d in $(find "$top/nvme" -mindepth 1 -maxdepth 1 -name 'das-state.*' -printf '%p\n' 2>/dev/null | LC_ALL=C sort -r); do
+    info=$(btrfs subvolume show "$d" 2>/dev/null) || continue
+    printf '%s\n' "$info" | grep -E '^[[:space:]]*Flags:.*readonly' >/dev/null || continue
+    printf '%s\n' "$info" | awk '$1 == "Received" && $2 == "UUID:" { f = ($3 != "-" && $3 != "") } END { exit !f }' || continue
+    n=${d##*/}
+    break
+done
+umount "$top" || echo "cannot unmount $top" >&2
+echo "newest=${n:-none}"
+EOF
 }
 
 # Wait, $1 seconds at most, for the sh test $2 in the recovery OS to exit 0.
@@ -6344,20 +6466,51 @@ provision_first_boot() {
         return 1
     fi
     status="$(printable "${GSH_OUT%$'\n'}")"
-    if [[ "$status" != "no state snapshot" ]]; then
-        provision_stop first-boot "state sync says '$status', expected 'no state snapshot' on a first boot"
+    # p2 is kept: the drive may already hold state snapshots (the state pass
+    # sends them), and the sync unit takes the newest complete one. Its status
+    # must agree with what the drive holds, either way.
+    if ! guest_sh 120 "$(proof_newest_state)" || [[ "$GSH_RC" != 0 ]]; then
+        provision_stop first-boot "cannot read the drive's state snapshots: ${GSH_WHY:-$(printable "$GSH_OUT")}"
         return 1
     fi
-    log "state sync: no state snapshot (as expected before the next backup)"
-    if ! guest_sh 30 'test ! -e /var/lib/das-backup/backup-index.db' || [[ "$GSH_RC" != 0 ]]; then
-        provision_stop first-boot "a database exists after the first boot: the sync unit copied something it should not have (${GSH_WHY:-exit status $GSH_RC})"
-        return 1
-    fi
-    log "no backup index yet (as expected: the sync unit copied nothing)"
+    newest=${GSH_OUT##*newest=}
+    newest=${newest%%[[:space:]]*}
+    case "$status" in
+        "no state snapshot")
+            if [[ "$newest" != none ]]; then
+                provision_stop first-boot "state sync found no state snapshot, but the drive holds $newest"
+                return 1
+            fi
+            log "state sync: no state snapshot (as expected before the next backup)"
+            if ! guest_sh 30 'test ! -e /var/lib/das-backup/backup-index.db' || [[ "$GSH_RC" != 0 ]]; then
+                provision_stop first-boot "a database exists after the first boot: the sync unit copied something it should not have (${GSH_WHY:-exit status $GSH_RC})"
+                return 1
+            fi
+            log "no backup index yet (as expected: the sync unit copied nothing)"
+            ;;
+        "synced "*)
+            synced=${status#synced }
+            synced=${synced%%;*}
+            if [[ "das-state.$synced" != "$newest" ]]; then
+                provision_stop first-boot "state sync says it synced das-state.$synced, but the newest complete state snapshot on the drive is $newest"
+                return 1
+            fi
+            if ! guest_sh 30 'test -e /var/lib/das-backup/backup-index.db' || [[ "$GSH_RC" != 0 ]]; then
+                provision_stop first-boot "state sync says synced, but there is no backup index (${GSH_WHY:-exit status $GSH_RC})"
+                return 1
+            fi
+            log "state sync: synced das-state.$synced, the newest complete state snapshot on the drive; the backup index is there"
+            ;;
+        *)
+            provision_stop first-boot "state sync says '$status'"
+            return 1
+            ;;
+    esac
     if ! guest_until "$FIRSTBOOT_SECS" 'pgrep -x kwin_wayland' || ! guest_until "$FIRSTBOOT_SECS" 'pgrep -x plasmashell'; then
         provision_stop first-boot "${UNATTENDED_WHY:-kwin_wayland or plasmashell is not running $(format_duration "$FIRSTBOOT_SECS") after the agent answered: the desktop did not come up}"
         return 1
     fi
+    DESKTOP_PROVEN=true
     shot="$STATE_DIR/provision-$PROVISION_STAMP-desktop.png"
     if take_screenshot "$shot"; then
         log "desktop: kwin_wayland and plasmashell running; screenshot $shot"
@@ -6398,7 +6551,7 @@ provision_giveback() {
     elif [[ -n "$UNATTENDED_FAILED" ]]; then
         case "$UNATTENDED_STAGE" in
             egress | payload | capture | boot) undo="nothing on the drive was changed" ;;
-            delete-replaced) undo="the new OS booted and is proven; the old OS stays set aside as *.replaced.$PROVISION_STAMP until delete-replaced runs again (recovery-os-install.sh delete-replaced, inside the new OS, from the payload)" ;;
+            delete-replaced) undo="the new OS booted and is proven; the old OS stays set aside as *.replaced.$PROVISION_STAMP until delete-replaced runs again -- inside the new OS, as root: DAS_INSTALL_UUID=$P_UUID DAS_INSTALL_STAMP=$PROVISION_STAMP /usr/lib/das-backup/recovery-os-install.sh delete-replaced" ;;
             *) undo="the old OS is set aside as *.replaced.$PROVISION_STAMP; $SELF provision $LABEL --undo --iso $P_ISO renames it back" ;;
         esac
         line="Provision of $LABEL stopped at $UNATTENDED_STAGE: ${UNATTENDED_FAILED#*: }; $undo"

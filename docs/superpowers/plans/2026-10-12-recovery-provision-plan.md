@@ -10,6 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-12-recovery-drive-provisioning-design.md` §3 (what a rebuilt drive looks like), §4 Phases 0–3 (plan 3 owns Phases 4–5), §5 (the component table), decisions D1, D2, D3, D5, D6, D7, D9. Plan 1 (`2026-10-12-recovery-state-plan.md`) built D4 and D8 and the sync unit this plan extends.
 
+> **Executed 2026-10-13 with deviations** (SESSION_RECORD_2026-10-13.md has each, with the
+> review that caused it): the installer selects by a manifest, keeps p1's volume ID, and
+> allows `undo` until `delete-replaced` starts (operator); Phase 3 is a second guarded start
+> from a re-defined domain, and proves the state sync against what p2 holds; D1 became slot B
+> (a matched kernel set and a writable `@.previous`, last known good after a desktop proof);
+> the unattended pipeline proves the desktop after its reboot. The task text below is the plan
+> as written, not the code; the dry run exits 0 whether or not the other drive has a session.
+
 ## Global Constraints
 
 - **The host writes nothing to a recovery drive** — not p1, not p2, not even a format (spec §2.1). Every write in this plan is a guest-exec inside the VM. The driver's only writes are to its own state under `/var/lib/das-backup/`, the payload ISO under `/var/lib/libvirt/images/`, and the domain definition.

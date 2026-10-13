@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.4.3
+# Version: 1.5.0
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -25,9 +25,11 @@
 #   delete-replaced  (Phase 3, from the NEW OS) delete every set-aside name in
 #                    every manifest, nested subvolumes first, each by name
 #   undo             walk every manifest newest first: the current original
-#                    becomes <name>.unbooted.<stamp>, the set-aside name comes
-#                    back; then p1 is restored from the oldest @esp copy;
-#                    refused once the new @ has booted
+#                    is set aside (<name>.undone.<stamp> if it had booted, else
+#                    <name>.unbooted.<stamp>; never deleted), the set-aside
+#                    name comes back; then p1 is restored from the oldest @esp
+#                    copy. Allowed until delete-replaced starts, booted or not
+#                    (operator, 2026-10-13)
 #   --count-packages print the baseline's package count (the driver's dry run)
 # Exit: 0 done, 2 cannot read or a tool failed, 3 refused. Every parameter is
 # a DAS_INSTALL_* variable; the list is in the plan
@@ -90,7 +92,8 @@ need() {
 # @.half-upgraded. followed by exactly a stamp (YYYYMMDD-HHMM, optionally SS,
 # the shape recovery-os-vm.sh's snapshot step writes) and nothing after; or is
 # one of DAS_INSTALL_ALSO_REPLACE (each exactly @.archive.<chars>). A name
-# containing .replaced. or .unbooted. is never on it: it is already ours.
+# containing .replaced., .unbooted. or .undone. is never on it: it is
+# already ours.
 # No bracket ranges (bd 1bsx): a range like 0-9 or A-Z can match more than
 # ASCII in another locale; the classes are spelled out.
 ASCII_ALNUM=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
@@ -98,7 +101,7 @@ OS_SNAP_RE='^@\.(pre-update|half-upgraded)\.[[:digit:]]{8}-[[:digit:]]{4}([[:dig
 ARCHIVE_RE="^@\\.archive\\.[${ASCII_ALNUM}._-]+\$"
 ALSO_LIST=()
 
-ours_already() { [[ "$1" == *.replaced.* || "$1" == *.unbooted.* ]]; }
+ours_already() { [[ "$1" == *.replaced.* || "$1" == *.unbooted.* || "$1" == *.undone.* ]]; }
 archive_name_ok() { [[ "$1" =~ $ARCHIVE_RE ]] && ! ours_already "$1"; }
 # Every step runs this first: a bad stamp or ALSO entry refuses here, so
 # delete-replaced and undo enforce the same inputs replace-os does.
@@ -521,6 +524,11 @@ delete_tree() {
 }
 
 BOOTED_REL="var/lib/das-recovery/booted" # written by das-recovery-state-sync.sh on every boot
+# Where undo sets a current root aside: named for whether it booted, never
+# deleted. $1 the original name, $2 the manifest's stamp.
+aside_name() {
+    if present "$1/$BOOTED_REL"; then printf '%s.undone.%s' "$1" "$2"; else printf '%s.unbooted.%s' "$1" "$2"; fi
+}
 
 step_delete_replaced() {
     need UUID
@@ -572,7 +580,7 @@ step_delete_replaced() {
 
 step_undo() {
     need UUID ESP_LABEL ESP_PARTUUID DEV
-    local mfs=() mf i orig sa remaining=() oldest_stamp esp_dir b rc mounted
+    local mfs=() mf i orig sa aside remaining=() oldest_stamp esp_dir b rc mounted
     mount_top
     load_names
     mapfile -t mfs < <(list_manifests | LC_ALL=C sort -r)
@@ -587,20 +595,13 @@ step_undo() {
             for sa in "${MAN_SA[@]}"; do ! present "$sa" || remaining+=("$sa"); done
             refuse "delete-replaced began (${mf##*/}) and may have deleted part of the old OS; undo refused. Still present: ${remaining[*]:-nothing}"
         fi
-        # Any root a provision installed (the current @, or the @.replaced.<s>
-        # of a provision newer than the oldest) that has booted is not undone.
-        if [[ "$MAN_STAMP" != "$oldest_stamp" ]] && present "@.replaced.$MAN_STAMP/$BOOTED_REL"; then
-            refuse "the root installed by an earlier provision has booted (@.replaced.$MAN_STAMP/$BOOTED_REL exists): undo refused"
-        fi
         for i in "${!MAN_ORIG[@]}"; do
             orig=${MAN_ORIG[$i]}
             sa=${MAN_SA[$i]}
             if present "$sa"; then
-                if [[ "$orig" == "@" ]] && present "@/$BOOTED_REL"; then
-                    refuse "the new @ has booted ($BOOTED_REL exists): undo refused"
-                fi
                 if [[ "$orig" != "@esp" ]] && present "$orig"; then
-                    ! present "$orig.unbooted.$MAN_STAMP" || cannot "$orig.unbooted.$MAN_STAMP already exists: not overwritten"
+                    aside=$(aside_name "$orig" "$MAN_STAMP")
+                    ! present "$aside" || cannot "$aside already exists: not overwritten"
                 fi
             elif [[ "$orig" == "@esp" ]] || ! present "$orig"; then
                 refuse "$sa is gone and $orig is absent: part of the old OS was deleted; undo refused"
@@ -639,8 +640,13 @@ step_undo() {
                 continue
             fi
             if present "$orig"; then
-                move "$orig" "$orig.unbooted.$MAN_STAMP"
-                say "$orig set aside as $orig.unbooted.$MAN_STAMP"
+                aside=$(aside_name "$orig" "$MAN_STAMP")
+                move "$orig" "$aside"
+                if [[ "$aside" == *.undone.* ]]; then
+                    say "$orig set aside as $aside (it had booted)"
+                else
+                    say "$orig set aside as $aside"
+                fi
             fi
             move "$sa" "$orig"
             say "$sa renamed back to $orig"
@@ -675,7 +681,7 @@ step_undo() {
         move "$b" "${b%.undoing}.undone"
     done
     flush "$TOP"
-    say "undo: the old OS is back; the unbooted new roots are *.unbooted.<stamp> (delete them by hand); p1 restored from @esp.replaced.$oldest_stamp (also delete by hand)"
+    say "undo: the old OS is back; the new roots it replaced are kept as *.undone.<stamp> (they had booted) or *.unbooted.<stamp> (delete them by hand); p1 restored from @esp.replaced.$oldest_stamp (also delete by hand)"
 }
 
 case "$STEP" in
