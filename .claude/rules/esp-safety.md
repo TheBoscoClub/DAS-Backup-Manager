@@ -17,7 +17,7 @@ Full account: `.claude/docs/rules-reference/esp-safety.md`.
 1. **NEVER use esp-sync, rsync, cp, dd, or ANY tool to write to the `RECOV-ESP-*` partitions** (formerly `BACKUP-ESP`) from the host. Identify them by serial (`ZK208Q77`, `ZFL41DNY`) or PARTUUID as well as label — a label is renameable, the weakest of the three
 2. **NEVER create pacman hooks that sync the host ESP to DAS drives**
 3. **NEVER include DAS drives in any ESP mirroring, backup, or sync operation**
-4. **The DAS ESPs are TOTALLY independent** of the host ESP — they boot their own OSes. That OS writing its own ESP while booted (bare metal, or the recovery-os-updater VM with its whole disk attached by serial) is permitted; the host still never writes `RECOV-ESP-*` and never mounts a drive the VM holds
+4. **The DAS ESPs are TOTALLY independent** of the host ESP — they boot their own OSes. That OS writing its own ESP while booted (bare metal, the recovery-os-updater VM with its whole disk attached by serial, or the CachyOS live system inside that VM during `provision`) is permitted; the host still never writes `RECOV-ESP-*` and never mounts a drive the VM holds
 5. **esp-sync.sh and any ESP sync hooks MUST only operate on**:
    - Primary ESP: LABEL=EFI, mounted at /boot (`nvme1n1p3` on 2026-10-02 — NVMe numbers are not stable)
    - Backup ESP: LABEL=EFI-BACKUP, mounted at /mnt/esp-backup

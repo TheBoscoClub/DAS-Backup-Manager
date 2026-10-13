@@ -32,6 +32,8 @@ This guide is written for users with minimal technical experience. Follow each s
    - [Restoring from a recovery drive's own copy](#restoring-from-a-recovery-drives-own-copy)
 8. [Keeping the recovery OSes current](#keeping-the-recovery-oses-current)
    - [What the recovery OS knows at boot](#what-the-recovery-os-knows-at-boot)
+   - [Building a recovery drive](#building-a-recovery-drive)
+   - [Proving a restore](#proving-a-restore)
 9. [Troubleshooting](#troubleshooting)
 10. [Reference Information](#reference-information)
 
@@ -1503,7 +1505,90 @@ Only a *complete* receive counts: a snapshot that is not read-only, or has no Re
 
 `no state snapshot` is the normal state of a drive until the first backup run after the state subvolume was set up; it is not damage.
 
-**Not on the host at all.** The package ships the unit file beside the script under `/usr/lib/das-backup/`, never into the host's `lib/systemd/system` (`btrdasd setup` is the only writer of `das-*` units there). Installing it into a recovery drive's `/etc/systemd/system`, writing the marker `/etc/das-backup/recovery-drive` it is gated on (`ConditionPathExists`) and enabling it is the job of recovery-drive provisioning (plan 2), not of the package.
+**Not on the host at all.** The package ships the unit file beside the script under `/usr/lib/das-backup/`, never into the host's `lib/systemd/system` (`btrdasd setup` is the only writer of `das-*` units there). Installing it into a recovery drive's `/etc/systemd/system`, writing the marker `/etc/das-backup/recovery-drive` it is gated on (`ConditionPathExists`) and enabling it is done by `recovery-os-vm.sh provision`; see [Building a recovery drive](#building-a-recovery-drive) for what it installs and enables.
+
+**The splash.** A recovery disk's boot takes longer than a normal boot, and the screen would otherwise look dead. While the sync unit works it writes to the Plymouth splash (`plymouth display-message`): a fixed header (`DAS recovery disk, Bay <N>.`, why this boot is slow — it copies the latest backup index and settings before the desktop appears — and "Do not power off or unplug it"), then one line per phase as it starts. The unit measures each phase and the total into `/var/lib/das-recovery/timings`, outside the state directory (which is swapped every boot), and the **countdown comes only from the previous boot's measurement**: the first boot of a drive shows the header and the phase lines and no countdown, because there is nothing to count down from. `Bay ?` in the header means the marker `/etc/das-backup/recovery-drive` has no `bay=` line, as on a hand-made marker; provisioning writes it.
+
+### Building a recovery drive
+
+`recovery-os-vm.sh provision` rebuilds a recovery drive's own OS from the host in one command. The host writes nothing to the drive: the installer runs as root **inside the drive's own VM**, from the CachyOS live ISO, and the host only drives it through the guest agent. No partition table is written and no btrfs filesystem is made: partition 2 keeps every received backup, so the first backup run afterwards is an ordinary incremental, not a full send. The old OS is set aside by renaming and is deleted only after the new one has booted and been proven.
+
+The usage lines, verbatim from `recovery-os-vm.sh`:
+
+```text
+  provision <A|B|label> --iso <path> --package <path> --package-sha256 <hex>
+            --authorized-keys <file> [--also-replace <@.archive.name>]...
+            [--dry-run] [--detach] [--wait-lock <minutes>]
+  provision <A|B|label> --undo --iso <path>
+```
+
+**Preconditions** (each is a refusal at exit 1, before anything is held or changed):
+
+- **The other recovery drive is a usable fallback**: its last session ended `clean` or with warnings, and its boot record reads `no` or `may`. A failed or kept session, a `will` record, or a record that is absent or unreadable refuses. (Never two drives down at once.)
+- **Both inputs are pinned by sha256**: the ISO must match `DAS_RECOVERY_VM_ISO_SHA256`, and the package file must match `--package-sha256`.
+- **A non-empty `--authorized-keys` file**: the drive's `sshd` is on, key-only.
+- **`libisoburn` on the host** (`xorriso`): the installer and the package travel to the VM on a payload cdrom the driver builds.
+- **The drive was seeded**: partition 2 holds at least one received backup. An empty disk is one to seed first, not one to rebuild, and the installer refuses it. A partition 2 whose filesystem UUID is not the target's `mount_uuid` is refused before the first rename.
+- Backup, scrub and doctor units inactive; the maintenance lock and the drive's claim are taken as for a session.
+
+`--dry-run` prints the plan (serial, device, labels, hostname, bay, entry titles, package count) and exits; nothing is booted and nothing is written.
+
+**The sequence.** Each step prints `PROGRESS <label> <step> start|ok|fail`:
+
+| Phase | Step | What it does |
+| --- | --- | --- |
+| 0 | `egress` | the VM's public address must belong to the direct-path provider, as in a session |
+| 0 | `payload` | the payload cdrom (installer plus package) is built with xorriso and attached beside the live ISO |
+| 0 | `capture` | a read-only record of the old OS, taken from the live system, is written on the host to `/var/lib/das-backup/recovery-os-provision/<label>/<stamp>/` (the old boot record is copied there too) |
+| 2 | `replace-os` | a manifest `.das-provision.<stamp>` is written and flushed on partition 2's top level; the ESP's files are copied into the subvolume `@esp.replaced.<stamp>`; the OS subvolumes are renamed to `<name>.replaced.<stamp>`; `@` and `@home` are created; partition 1 is formatted FAT32 with the bay label **and its old volume ID**, so a `/boot` mounted by UUID still works |
+| 2 | `pacstrap` | the baseline, from the live system's own CachyOS-first repositories |
+| 2 | `configure` | fstab, hostname, locale, user, sudo, autologin, `sshd` (key-only), `pacman.conf`, initramfs, Plymouth, the Flathub remote with no apps |
+| 2 | `package` | the project package, the marker with `bay=`, the sync unit enabled, the backup and scrub timers and `btrbk` masked |
+| 2 | `boot` | the bootloader and the entries |
+| 2 | `repos` | the CachyOS-before-Arch order check, against the new root |
+| 2 | `verify` | every file the entries name is on the ESP, every fstab device resolves, and `btrdasd recovery-os inspect` reads `btrbk at boot: no` |
+| 2 | `unmount` | everything is unmounted, then the live system powers off |
+| 3 | `first-boot` | the new OS boots and is proven (below) |
+| 3 | `delete-replaced` | only after the proof: the set-aside names are deleted, each by name |
+
+**Phase 3, the first boot of the new OS.** The driver powers the live system off, detaches the live ISO, the payload cdrom and the disk, takes the session guard out of the definition and defines it again with an **empty** report, so no line the live system wrote can vouch for the new OS. It then attaches the disk at boot order 1 and the payload, and starts a fresh guarded session. The proof: the running kernel is read; the sync unit's status reads exactly `no state snapshot` (the new OS has received nothing yet); there is no `backup-index.db`; `kwin_wayland` and `plasmashell` are running; a screenshot is taken. Only then does `delete-replaced` run.
+
+**The manifest.** The installer acts only on names the manifest lists, never on a pattern. An entry moves through the states bare, `.deleting`, `.undoing`, `.done` and `.undone` as the work proceeds. `delete-replaced` also requires the booted marker `/var/lib/das-recovery/booted` (written by the sync unit on every boot) to name this provision's stamp (`provisioned=<stamp>`), so it cannot run from the wrong OS. The allowlist is exact: `@`, `@home`, `@rescue`, `@.previous`, the names `@.pre-update.<stamp>` and `@.half-upgraded.<stamp>` (prefix plus a stamp), and any `@.archive.*` names given with `--also-replace`. A received backup with a look-alike name (`@home-old`, `@rescue2`) is never touched. Stamps must be strictly increasing, so a re-run after a partial install sets the half-filled `@` aside as `@.replaced.<new stamp>` and keeps the first run's names.
+
+**Drive A's two old boot archives (D7).** Drive A holds two `@.archive.*` subvolumes the operator chose to delete. Name each with `--also-replace`:
+
+```text
+--also-replace @.archive.<stamp1> --also-replace @.archive.<stamp2>
+```
+
+`<stamp1>` and `<stamp2>` are placeholders in this example only; plan 3 names them from the listing in the preflight capture.
+
+**When it stops.** Exit 7 names the step; the live system is powered off and the disk given back. A stop before `replace-os` changed nothing on the drive. A stop from `replace-os` onward leaves the old OS under `*.replaced.<stamp>` (and `@esp.replaced.<stamp>`), the backups untouched, and `provision` re-runnable. To go back:
+
+```bash
+sudo recovery-os-vm.sh provision <A|B|label> --undo --iso <path>
+```
+
+`--undo` takes the stamp and the `--also-replace` list from the **newest `provision` row in the history** (`recovery-os-vm.sh history <label>`; the row carries `stamp` and `also_replace`). Inside the live system the installer walks the manifests newest first: the current original becomes `<name>.unbooted.<stamp>`, the set-aside name comes back, and partition 1 is restored from the oldest `@esp.replaced` copy with its old volume ID. It is **refused once the new `@` has booted**. After a partial `delete-replaced`, the names still listed as not deleted in the manifest are the ones that remain; the capture directory on the host says what was there.
+
+**Back in service.** The last line `provision` prints says the drive is back in service only after the next backup run records it: that run sends ordinary incrementals to the untouched received subvolumes and records a `btrbk at boot: no` boot record with the agent installed, and only then is the next session admitted. Rebuild the second drive only after the first one's record reads `no`.
+
+### Proving a restore
+
+"The only good backup is a backup that has been successfully restored." After **both** drives are rebuilt and re-seeded, each drive proves a real restore, two ways.
+
+1. **Test data.** A dedicated subvolume on the host, `@restore-test`, under a source that fans out to all three targets, holds unimportant files of mixed sizes: a sparse file, a hard link, a symlink, a file with a space in its name, and one over 4 GiB. A `sha256sum` manifest sits beside it. An ordinary backup run sends it, so the recovery drives hold it as a received snapshot.
+2. **Way 1, in the VM.** An attended session of the drive with a scratch disk image on the NVMe (`/var/lib/libvirt/images/restore-test-<label>.qcow2`) attached as a second SATA disk. Inside the recovery OS, restore the test subvolume from the drive's own received snapshot onto that disk (`btrdasd restore` with the recovery-mode configuration).
+3. **Way 2, bare metal.** Boot the drive on the real hardware from the firmware menu and restore the same subvolume onto the host's NVMe under `/home/restore-test/`, **through ButteredDASD** for at least one of the two drives. Run a backup with the drive attached before its next VM session: a bare-metal boot leaves no session record.
+4. **Pass rule.** For all four restores, `sha256sum -c` against the manifest reports every file OK, the file count and sizes match, and the restore's own report says it restored everything. Any mismatch fails the rebuild of that drive.
+5. Afterwards the test subvolume and `/home/restore-test/` are deleted, and the scratch images with their libvirt definitions.
+
+#### Last proven restore
+
+| Drive | Date | Way | Files | Bytes | Duration | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | — | — | — | — | — | not yet proven |
+| B | — | — | — | — | — | not yet proven |
 
 ---
 

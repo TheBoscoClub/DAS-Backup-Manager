@@ -115,11 +115,13 @@ Entries, titles as today's drives have them (`docs/EMERGENCY-QUICK-REFERENCE.md`
 - `cachyos-recovery.conf` — "CachyOS Emergency Recovery (Bay N)", kernel `linux-cachyos`,
   `amd-ucode` + `intel-ucode` + default initramfs, `root=UUID=<p2> rw rootflags=subvol=/@`.
 - `cachyos-recovery-fallback.conf` — "… — Fallback (Bay N)", the fallback initramfs.
-- **D1 (accepted 2026-10-12)** `cachyos-recovery-previous.conf` — "… — Previous root, read-only (Bay N)":
-  `rootflags=subvol=/@.pre-update.<newest>`, rewritten by the pipeline after each
-  successful upgrade. Boots last week's known-good root for inspection and rollback
-  without external media (what `@rescue` was for, with zero maintenance). Read-only root:
-  for inspection, not daily use.
+- **D1 (superseded 2026-10-13, operator)** the previous-root entries are a true rollback, not a read-only look. Before each upgrade a `slot` step copies every kernel, initramfs and microcode file the main and fallback entries boot to the ESP's `previous/` ("slot B", about 268 MiB including the fallback initramfs), paired through `previous/snapshot` with the `@.pre-update` just taken. After the upgrade the `loader` step re-makes a WRITABLE clone `@.previous` from that paired snapshot and writes two entries, "… — Previous root, <date> (Bay N)" and "… — Fallback — Previous root, <date> (Bay N)", booting the kept kernel with `rootflags=subvol=/@.previous` (changes in it are discarded at the next upgrade; the snapshot stays frozen). If the copy fails (ESP full, I/O error) the upgrade continues, the run ends with warnings (exit 5), the old slot is kept and its older matched pair is still used (titled with its date) while its snapshot exists; otherwise one notice entry "… — Previous root UNAVAILABLE: <reason> — boots the current OS" is written. The original decision, kept as history:
+
+  > **D1 (accepted 2026-10-12)** `cachyos-recovery-previous.conf` — "… — Previous root, read-only (Bay N)":
+  > `rootflags=subvol=/@.pre-update.<newest>`, rewritten by the pipeline after each
+  > successful upgrade. Boots last week's known-good root for inspection and rollback
+  > without external media (what `@rescue` was for, with zero maintenance). Read-only root:
+  > for inspection, not daily use.
 
 `mkinitcpio` preset `linux-cachyos` with `default` and `fallback` images (the pipeline's
 `initramfs` step already adds `fallback` to a preset lacking it).
@@ -401,7 +403,7 @@ change to the 22 TB primary; Secure Boot signing (sbctl is installed for repair 
 
 | Id | Question | Recommendation |
 | --- | --- | --- |
-| D1 | previous-root loader entry | **accepted** |
+| D1 | previous-root loader entry | **superseded 2026-10-13**: matched kernel slot and a writable `@.previous` clone (see §3.3) |
 | D2 | sshd on the drives | **accepted**: on, key-only, both keys, both drives |
 | D3 | package release to pin | **0.7.23.0, staged until the work is done, then promoted** |
 | D4 | recovery-mode config | **accepted: C, derived at boot from the host's backed-up config; roots `/mnt/restore` and `/home/restore-test`** |
