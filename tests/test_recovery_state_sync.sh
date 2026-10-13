@@ -126,7 +126,7 @@ fixture() {
     chmod -R u+rwX "$R" 2>/dev/null || :
     rm -rf "$R"
     : >"$LOG"
-    rm -f "$WORK/mv-count" "$LOG.mounted" "$WORK/timings"
+    rm -f "$WORK/mv-count" "$LOG.mounted" "$WORK/timings" "$WORK/booted"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
     printf 'label=system-recovery-A-2tb\nbay=1\n' >"$R/etc/das-backup/recovery-drive"
@@ -144,7 +144,7 @@ run() { # run [VAR=value ...]: the script under the seams; RC and OUT hold the r
         DAS_STATE_SYNC_SYSTEMD_RUN="$BIN/systemd-run" DAS_STATE_SYNC_MOUNT="$BIN/mount" \
         DAS_STATE_SYNC_UMOUNT="$BIN/umount" DAS_STATE_SYNC_BTRFS="$BIN/btrfs" \
         DAS_STATE_SYNC_MV="$BIN/mv" DAS_STATE_SYNC_PLYMOUTH="$BIN/plymouth" \
-        DAS_STATE_SYNC_TIMINGS="$WORK/timings" "$@" bash "$SCRIPT" 2>&1) || RC=$?
+        DAS_STATE_SYNC_TIMINGS="$WORK/timings" DAS_STATE_SYNC_BOOTED="$WORK/booted" "$@" bash "$SCRIPT" 2>&1) || RC=$?
     [[ -z "${SHOW_OUT:-}" ]] || printf '%s\n' "$OUT"
 }
 
@@ -240,10 +240,11 @@ check "nosnap: the unit lists exit 2 as success" grep -q '^SuccessExitStatus=2$'
 check "nosnap: previous state intact" has "$R/var/lib/das-backup/previous" previous
 check "nosnap: no config written" test ! -e "$R/etc/das-backup/config.toml"
 check "nosnap: status" status_is "no state snapshot"
+check "nosnap: the booted marker is written on a boot that synced nothing" test -f "$WORK/booted"
 
 echo "== no marker"
 fixture
-rm -f "$R/etc/das-backup/recovery-drive"
+rm -f "$R/etc/das-backup/recovery-drive" "$WORK/booted"
 run
 check "nomarker: exit 1" test "$RC" -eq 1
 check "nomarker: message" out_has "not a recovery drive"
@@ -251,6 +252,7 @@ check "nomarker: previous state intact" has "$R/var/lib/das-backup/previous" pre
 check "nomarker: no config written" test ! -e "$R/etc/das-backup/config.toml"
 check "nomarker: no status written" test ! -e "$R/run/das-recovery-state/status"
 check "nomarker: no tools called" test ! -s "$LOG"
+check "nomarker: no booted marker (the host is not a recovery boot)" test ! -e "$WORK/booted"
 
 echo "== derive-recovery refuses"
 fixture
@@ -350,7 +352,8 @@ check "d9: phases in order" test "$(grep -o 'finding the newest backup\|preparin
 check "d9: first boot, no countdown (review focus 4)" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
 check "d9: a measurement was written" grep -q '^total=[0-9]' "$WORK/timings"
 check "d9: per-phase measurements" grep -q '^copy=[0-9]' "$WORK/timings"
-check "d9: the booted touch file" test -f "$R/var/lib/das-backup/booted"
+check "d9: the booted touch file, outside the state dir" test -f "$WORK/booted"
+check "d9: no booted file inside the state dir (it is swapped every boot)" test ! -e "$R/var/lib/das-backup/booted"
 check "d9: first boot leaves a database" test -f "$R/var/lib/das-backup/backup-index.db"
 
 echo "== D9: the second boot counts down from the measurement"
@@ -377,6 +380,7 @@ check "d9 first boot, no snapshot, no state: no database left (review focus 4)" 
 check "d9 first boot, no snapshot, no state: no countdown" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
 fixture; run STUB_DERIVE_FAIL=1
 check "d9 derive fails: said on the splash" has "$LOG" "could not update: derive-recovery refused"
+check "d9 derive fails: the booted marker is written all the same" test -f "$WORK/booted"
 check "d9 derive fails: no total written (a failed boot measures nothing)" test ! -e "$WORK/timings"
 check "d9 derive fails: status still the failure" grep -q '^failed: derive-recovery refused' "$R/run/das-recovery-state/status"
 

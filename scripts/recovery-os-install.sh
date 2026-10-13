@@ -3,36 +3,50 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.0.0
+# Version: 1.1.0
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
-#   replace-os       p2 (by UUID) at $TOP: refuse a wrong UUID or a p2 with no
-#                    received backup; rename the OS subvolumes on the allowlist
-#                    to <name>.replaced.<stamp>; create @ and @home; format p1
-#                    FAT32 with the bay label; mount @, @home, p1 under $TARGET
+#   replace-os       p2 (by UUID) at $TOP: refuse a wrong UUID, a wrong p1
+#                    PARTUUID, or a p2 with no received backup; copy p1 into the
+#                    subvolume @esp.replaced.<stamp> and compare; write the
+#                    manifest $TOP/.das-provision.<stamp> (one line per set-aside
+#                    name); rename the OS subvolumes on the allowlist to
+#                    <name>.replaced.<stamp>; create @ and @home; format p1 FAT32
+#                    with the bay label; mount @, @home, p1 under $TARGET
 #   pacstrap         the baseline, from the live system's own repositories
 #   configure        fstab, hostname, locale, tz, keymap, user, sudoers,
 #                    autologin, sshd, pacman.conf, mkinitcpio, plymouth, Flathub
 #   package          the project package; marker; sync unit; masks; desktop
 #   boot             bootctl install, loader.conf, the entries, mkinitcpio -P
-#   verify           every file the entries name; fstab devices; inspect says no
+#   verify           the loader files and every file the entries name; fstab
+#                    devices; btrdasd (in the target) says btrbk at boot: no
 #   unmount          everything under $TARGET, then $TOP
-#   delete-replaced  (Phase 3, from the NEW OS) delete <name>.replaced.<stamp>
-#   undo             rename <name>.replaced.<stamp> back; refused once the new
-#                    @ has booted
+#   delete-replaced  (Phase 3, from the NEW OS) delete every set-aside name in
+#                    every manifest, nested subvolumes first, each by name
+#   undo             walk every manifest newest first: the current original
+#                    becomes <name>.unbooted.<stamp>, the set-aside name comes
+#                    back; then p1 is restored from the oldest @esp copy;
+#                    refused once the new @ has booted
 #   --count-packages print the baseline's package count (the driver's dry run)
 # Exit: 0 done, 2 cannot read or a tool failed, 3 refused. Every parameter is
 # a DAS_INSTALL_* variable; the list is in the plan
-# (docs/superpowers/plans/2026-10-12-recovery-provision-plan.md, Task 1).
+# (docs/superpowers/plans/2026-10-12-recovery-provision-plan.md, Task 1) plus
+# DAS_INSTALL_ESP_PARTUUID (p1's PARTUUID, checked before anything is touched)
+# and DAS_INSTALL_CONFIG (a config.toml for the verify step's btrdasd inspect).
+#
+# Deletion and undo act ONLY on names a manifest lists, never on a pattern
+# match: the manifest is written atomically before the first rename.
 set -euo pipefail
 
 STEP=${1:-}
-ROOT="${DAS_INSTALL_ROOT:-}"            # test seam
+ROOT="${DAS_INSTALL_ROOT:-}" # test seam
 TOP="${DAS_INSTALL_TOP:-$ROOT/mnt/top}"
 TARGET="${DAS_INSTALL_TARGET:-$ROOT/mnt/target}"
+ESP_MNT="${DAS_INSTALL_ESP_MNT:-$ROOT/mnt/esp-old}"
 UUID="${DAS_INSTALL_UUID:-}"
 ESP_LABEL="${DAS_INSTALL_ESP_LABEL:-}"
+ESP_PARTUUID="${DAS_INSTALL_ESP_PARTUUID:-}"
 BAY="${DAS_INSTALL_BAY:-}"
 LETTER="${DAS_INSTALL_LETTER:-}"
 HOST_NAME="${DAS_INSTALL_HOSTNAME:-}"
@@ -40,36 +54,86 @@ STAMP="${DAS_INSTALL_STAMP:-}"
 ALSO="${DAS_INSTALL_ALSO_REPLACE:-}"
 PACKAGE="${DAS_INSTALL_PACKAGE:-}"
 KEYS="${DAS_INSTALL_KEYS:-}"
+CONFIG="${DAS_INSTALL_CONFIG:-}"
 PKG_SHA="${DAS_INSTALL_PAYLOAD_SHA256:-}"
 DEV="${DAS_INSTALL_DEV:-}"
-BTRFS="${DAS_INSTALL_BTRFS:-btrfs}"; MOUNT="${DAS_INSTALL_MOUNT:-mount}"; UMOUNT="${DAS_INSTALL_UMOUNT:-umount}"
-MKFS_VFAT="${DAS_INSTALL_MKFS_VFAT:-mkfs.vfat}"; BLKID="${DAS_INSTALL_BLKID:-blkid}"
-PACSTRAP="${DAS_INSTALL_PACSTRAP:-pacstrap}"; CHROOT="${DAS_INSTALL_ARCH_CHROOT:-arch-chroot}"
-GENFSTAB="${DAS_INSTALL_GENFSTAB:-genfstab}"; BTRDASD="${DAS_INSTALL_BTRDASD:-btrdasd}"
+BTRFS="${DAS_INSTALL_BTRFS:-btrfs}"
+MOUNT="${DAS_INSTALL_MOUNT:-mount}"
+UMOUNT="${DAS_INSTALL_UMOUNT:-umount}"
+MKFS_VFAT="${DAS_INSTALL_MKFS_VFAT:-mkfs.vfat}"
+BLKID="${DAS_INSTALL_BLKID:-blkid}"
+PACSTRAP="${DAS_INSTALL_PACSTRAP:-pacstrap}"
+CHROOT="${DAS_INSTALL_ARCH_CHROOT:-arch-chroot}"
+GENFSTAB="${DAS_INSTALL_GENFSTAB:-genfstab}"
+CP="${DAS_INSTALL_CP:-cp}"
 
 say() { printf '%s\n' "$*"; }
-refuse() { say "$* -- refused"; exit 3; }
-cannot() { say "$*"; exit 2; }
-need() { local v; for v in "$@"; do [[ -n "${!v}" ]] || cannot "DAS_INSTALL_$v is not set"; done; }
+refuse() {
+    say "$* -- refused"
+    exit 3
+}
+cannot() {
+    say "$*"
+    exit 2
+}
+need() {
+    local v
+    for v in "$@"; do [[ -n "${!v}" ]] || cannot "DAS_INSTALL_$v is not set"; done
+}
 
-# The allowlist. A name is replaced when it is exactly one of NAMES, or starts
-# with one of PREFIXES, or is listed in DAS_INSTALL_ALSO_REPLACE (each of those
-# must start with "@.archive."). Nothing else on the top level is touched.
-NAMES=("@" "@home" "@rescue")
-PREFIXES=("@.pre-update." "@.half-upgraded.")
+# ---- the allowlist -------------------------------------------------------
+# A name is replaced when it is EXACTLY @, @home or @rescue; or @.pre-update. /
+# @.half-upgraded. followed by exactly a stamp (YYYYMMDD-HHMM, optionally SS,
+# the shape recovery-os-vm.sh's snapshot step writes) and nothing after; or is
+# one of DAS_INSTALL_ALSO_REPLACE (each exactly @.archive.<chars>). A name
+# containing .replaced. or .unbooted. is never on it: it is already ours.
+OS_SNAP_RE='^@\.(pre-update|half-upgraded)\.[0-9]{8}-[0-9]{4}([0-9]{2})?$'
+ARCHIVE_RE='^@\.archive\.[A-Za-z0-9._-]+$'
+ALSO_LIST=()
+
+ours_already() { [[ "$1" == *.replaced.* || "$1" == *.unbooted.* ]]; }
+archive_name_ok() { [[ "$1" =~ $ARCHIVE_RE ]] && ! ours_already "$1"; }
+# Every step runs this first: a bad stamp or ALSO entry refuses here, so
+# delete-replaced and undo enforce the same inputs replace-os does.
+validate_inputs() {
+    local a
+    [[ "$STAMP" =~ ^[0-9]{8}-[0-9]{6}$ ]] || refuse "DAS_INSTALL_STAMP '$STAMP' is not YYYYMMDD-HHMMSS"
+    read -r -a ALSO_LIST <<<"$ALSO"
+    for a in "${ALSO_LIST[@]}"; do
+        archive_name_ok "$a" || refuse "'$a' is not an @.archive.* subvolume"
+    done
+}
+# A name this installer may ever set aside, for validating a manifest line.
+valid_orig() {
+    local n=$1
+    ours_already "$n" && return 1
+    case "$n" in @ | @home | @rescue | @esp) return 0 ;; esac
+    [[ "$n" =~ $OS_SNAP_RE ]] || archive_name_ok "$n"
+}
 on_allowlist() {
-    local n=$1 p a
-    for p in "${NAMES[@]}"; do [[ "$n" != "$p" ]] || return 0; done
-    for p in "${PREFIXES[@]}"; do [[ "$n" != "$p"* ]] || return 0; done
-    for a in $ALSO; do [[ "$n" != "$a" ]] || return 0; done
+    local n=$1 a
+    ours_already "$n" && return 1
+    case "$n" in @ | @home | @rescue) return 0 ;; esac
+    [[ "$n" =~ $OS_SNAP_RE ]] && return 0
+    for a in "${ALSO_LIST[@]}"; do [[ "$n" != "$a" ]] || return 0; done
     return 1
 }
+
+# ---- the top level -------------------------------------------------------
+NAMES_LIST=()
 # Top-level subvolume names: "path <name>" lines of subvolume list -o, names
-# with no slash. A failed listing is a failure, never an empty top level.
-top_names() {
+# with no slash. A failed listing is exit 2, never an empty top level.
+load_names() {
     local out
     out=$("$BTRFS" subvolume list -o "$TOP") || cannot "cannot list the subvolumes of $TOP"
-    sed -n 's/.* path //p' <<<"$out" | grep -v / || :
+    mapfile -t NAMES_LIST < <(sed -n 's/.* path //p' <<<"$out" | grep -v / || :)
+}
+present() { [[ -e "$TOP/$1" || -L "$TOP/$1" ]]; }
+# move <from> <to>, both names under $TOP: the destination is never overwritten.
+move() {
+    present "$1" || cannot "cannot rename $1: it is absent"
+    ! present "$2" || cannot "$2 already exists: not overwritten"
+    mv -T -- "$TOP/$1" "$TOP/$2" || cannot "cannot rename $1 to $2"
 }
 # Whether any subvolume one level down (nvme/root-.<stamp>, hdd-system/…)
 # has a Received UUID: the mark of a target that received the host's backups.
@@ -93,20 +157,104 @@ mount_top() {
     "$MOUNT" -o subvolid=5 "UUID=$UUID" "$TOP" || cannot "cannot mount p2's top level at $TOP"
 }
 
+# ---- the manifest --------------------------------------------------------
+# $TOP/.das-provision.<stamp>[.deleting]: "<original>TAB<set-aside name>" per
+# line. Renamed .deleting when delete-replaced begins, .done when it finished,
+# .undone when undo finished; only the first two are live.
+list_manifests() { # oldest first
+    local f
+    for f in "$TOP"/.das-provision.*; do
+        [[ -f "$f" ]] || continue
+        if [[ "${f##*/}" =~ ^\.das-provision\.[0-9]{8}-[0-9]{6}(\.deleting)?$ ]]; then printf '%s\n' "$f"; fi
+    done | LC_ALL=C sort
+}
+MAN_STAMP=""
+MAN_ORIG=()
+MAN_SA=()
+read_manifest() {
+    local o s
+    MAN_STAMP=${1##*/}
+    MAN_STAMP=${MAN_STAMP#.das-provision.}
+    MAN_STAMP=${MAN_STAMP%.deleting}
+    MAN_ORIG=()
+    MAN_SA=()
+    while IFS=$'\t' read -r o s; do
+        [[ -n "$o$s" ]] || continue
+        valid_orig "$o" || cannot "${1##*/}: '$o' is not a name this installer ever sets aside"
+        [[ "$s" == "$o.replaced.$MAN_STAMP" ]] || cannot "${1##*/}: '$s' is not $o.replaced.$MAN_STAMP"
+        MAN_ORIG+=("$o")
+        MAN_SA+=("$s")
+    done <"$1" || cannot "cannot read ${1##*/}"
+    ((${#MAN_ORIG[@]} > 0)) || cannot "${1##*/} lists nothing"
+}
+
+# ---- the ESP copy --------------------------------------------------------
+tree_sizes() { # sorted "path size" lines of a tree
+    local out
+    out=$(cd "$1" && find . -type f -printf '%p %s\n') || cannot "cannot list $1"
+    sort <<<"$out"
+}
+check_esp() { # p1's PARTUUID is the configured one, or exit 3
+    local part
+    part=$("$BLKID" -s PARTUUID -o value "${DEV}1") || part=""
+    [[ -n "$part" ]] || refuse "p1 of $DEV has no readable PARTUUID: not this drive's ESP"
+    [[ "${part,,}" == "${ESP_PARTUUID,,}" ]] || refuse "p1 of $DEV is PARTUUID $part, not the configured $ESP_PARTUUID: not this drive's ESP"
+}
+# copy_tree <from> <to>: cp -a, then the file lists and sizes compared.
+copy_tree() {
+    local a b
+    "$CP" -a "$1/." "$2/" || return 2
+    a=$(tree_sizes "$1")
+    b=$(tree_sizes "$2")
+    [[ "$a" == "$b" ]] || return 3
+}
+save_esp() {
+    local dst="$TOP/@esp.replaced.$STAMP" rc=0
+    mkdir -p "$ESP_MNT"
+    "$BTRFS" subvolume create "$dst" >/dev/null || cannot "cannot create @esp.replaced.$STAMP"
+    mkdir -p "$dst/esp"
+    "$MOUNT" -o ro "${DEV}1" "$ESP_MNT" || cannot "cannot mount p1 read-only to copy it"
+    copy_tree "$ESP_MNT" "$dst/esp" || rc=$?
+    "$UMOUNT" "$ESP_MNT" || cannot "cannot unmount p1 after copying it"
+    if ((rc == 2)); then cannot "cannot copy p1 into @esp.replaced.$STAMP"; fi
+    if ((rc == 3)); then
+        "$BTRFS" subvolume delete "$dst" >/dev/null || say "could not remove the incomplete copy @esp.replaced.$STAMP"
+        refuse "the copy of p1 in @esp.replaced.$STAMP differs from p1 (nothing renamed, p1 not formatted)"
+    fi
+    say "p1 copied into @esp.replaced.$STAMP and compared"
+}
+
 step_replace_os() {
-    need UUID ESP_LABEL STAMP DEV
-    local a seen n
-    for a in $ALSO; do [[ "$a" == @.archive.* ]] || refuse "'$a' is not an @.archive.* subvolume"; done
+    need UUID ESP_LABEL ESP_PARTUUID DEV
+    local seen n todo=() mf
     seen=$("$BLKID" -s UUID -o value "${DEV}2") || seen=""
     [[ -n "$seen" ]] || refuse "p2 of $DEV has no readable UUID: not this drive, or not a filesystem"
     [[ "${seen,,}" == "${UUID,,}" ]] || refuse "p2 of $DEV is $seen, not the configured $UUID: not this drive"
+    check_esp
     mount_top
     received_present || refuse "p2 holds no received backup subvolume: not a recovery drive to rebuild (seed it with a backup run first)"
-    for n in $(top_names); do
+    load_names
+    for n in "${NAMES_LIST[@]}"; do
         on_allowlist "$n" || continue
-        [[ ! -e "$TOP/$n.replaced.$STAMP" ]] || cannot "$n.replaced.$STAMP already exists: a provision with this stamp already ran"
+        ! present "$n.replaced.$STAMP" || cannot "$n.replaced.$STAMP already exists: not overwritten"
+        todo+=("$n")
+    done
+    ! present "@esp.replaced.$STAMP" || cannot "@esp.replaced.$STAMP already exists: not overwritten"
+    mf="$TOP/.das-provision.$STAMP"
+    ! present ".das-provision.$STAMP" || cannot "${mf##*/} already exists: a provision with this stamp already ran"
+    if [[ -n "$(list_manifests)" ]]; then
+        say "earlier manifests found: an incomplete provision; its set-aside names stay, the current ones are set aside under $STAMP"
+    fi
+    save_esp
+    # The manifest first, atomically; then the first rename.
+    {
+        for n in "${todo[@]}"; do printf '%s\t%s\n' "$n" "$n.replaced.$STAMP"; done
+        printf '@esp\t@esp.replaced.%s\n' "$STAMP"
+    } >"$mf.new" || cannot "cannot write the manifest"
+    mv -T -- "$mf.new" "$mf" || cannot "cannot place the manifest"
+    for n in "${todo[@]}"; do
         say "setting aside $n as $n.replaced.$STAMP"
-        mv "$TOP/$n" "$TOP/$n.replaced.$STAMP" || cannot "cannot rename $n"
+        move "$n" "$n.replaced.$STAMP"
     done
     "$BTRFS" subvolume create "$TOP/@" >/dev/null || cannot "cannot create @"
     "$BTRFS" subvolume create "$TOP/@home" >/dev/null || cannot "cannot create @home"
@@ -116,7 +264,7 @@ step_replace_os() {
     mkdir -p "$TARGET/home" "$TARGET/boot"
     "$MOUNT" -o "subvol=/@home,compress=zstd:3,noatime" "UUID=$UUID" "$TARGET/home" || cannot "cannot mount @home"
     "$MOUNT" "${DEV}1" "$TARGET/boot" || cannot "cannot mount p1 at $TARGET/boot"
-    say "replace-os: OS subvolumes set aside as *.replaced.$STAMP; @ and @home created; p1 formatted $ESP_LABEL; mounted at $TARGET"
+    say "replace-os: OS subvolumes set aside as *.replaced.$STAMP (manifest ${mf##*/}); @ and @home created; p1 formatted $ESP_LABEL; mounted at $TARGET"
 }
 
 # Spec §3.6 plus plymouth (D9) and the CachyOS meta packages the ISO's own
@@ -217,14 +365,27 @@ step_boot() {
 }
 
 step_verify() {
-    local e key val f dev missing=0 rec
-    for e in "$TARGET"/boot/loader/entries/*.conf; do
+    local e key val f dev missing=0 rec rc=0 n=0 req boot="$TARGET/boot"
+    need LETTER CONFIG
+    for e in "$boot"/loader/entries/*.conf; do [[ -f "$e" ]] && n=$((n + 1)); done
+    ((n > 0)) || cannot "no loader entries on the ESP ($boot/loader/entries)"
+    for req in loader/loader.conf loader/entries/cachyos-recovery.conf loader/entries/cachyos-recovery-fallback.conf EFI/systemd/systemd-bootx64.efi; do
+        [[ -f "$boot/$req" ]] || {
+            say "$req is not on the ESP"
+            missing=1
+        }
+    done
+    for e in "$boot"/loader/entries/*.conf; do
         [[ -f "$e" ]] || continue
         while read -r key val; do
             case "$key" in
                 linux | initrd | efi)
-                    f="$TARGET/boot/${val#/}"
-                    [[ -f "$f" ]] || { say "${val#/} named by $(basename "$e") is not on the ESP"; missing=1; } ;;
+                    f="$boot/${val#/}"
+                    [[ -f "$f" ]] || {
+                        say "${val#/} named by $(basename "$e") is not on the ESP"
+                        missing=1
+                    }
+                    ;;
             esac
         done <"$e"
     done
@@ -232,14 +393,26 @@ step_verify() {
     while read -r dev _; do
         case "$dev" in
             UUID=* | LABEL=* | PARTUUID=* | PARTLABEL=*)
-                [[ -n "$ROOT" ]] || findfs "$dev" >/dev/null || { say "/etc/fstab names $dev, which does not resolve"; missing=1; } ;;
+                [[ -n "$ROOT" ]] || findfs "$dev" >/dev/null || {
+                    say "/etc/fstab names $dev, which does not resolve"
+                    missing=1
+                }
+                ;;
         esac
     done <"$TARGET/etc/fstab"
     ((missing == 0)) || refuse "verify: a file or device is missing (above)"
-    rec=$("$BTRDASD" recovery-os inspect --root "$TARGET" 2>&1) || cannot "btrdasd recovery-os inspect failed: $rec"
+    # btrdasd is installed in the TARGET, not in the live system. inspect needs
+    # a config.toml (a fresh target has none until its first boot derives one),
+    # so the payload's is copied in for the call and removed after. Exit 1 is
+    # "needs attention" (a reading was made); only 2 is "could not read".
+    mkdir -p "$TARGET/tmp"
+    cp "$CONFIG" "$TARGET/tmp/das-install-inspect.toml" || cannot "cannot copy $CONFIG into the target"
+    rec=$("$CHROOT" "$TARGET" btrdasd recovery-os inspect --root / --label "system-recovery-$LETTER-2tb" --config /tmp/das-install-inspect.toml 2>&1) || rc=$?
+    rm -f "$TARGET/tmp/das-install-inspect.toml"
+    ((rc <= 1)) || cannot "btrdasd recovery-os inspect failed ($rc): $rec"
     say "$rec"
-    grep -q '^btrbk at boot: no' <<<"$rec" || refuse "the new root's boot record is not 'no'"
-    say "verify: every file the entries name is on the ESP; every fstab device resolves; btrbk at boot: no"
+    grep -Eq '^[[:space:]]+btrbk at boot[[:space:]]+no([[:space:]]|$)' <<<"$rec" || refuse "the new root's boot record is not 'no'"
+    say "verify: the loader files and every file the entries name are on the ESP; every fstab device resolves; btrbk at boot: no"
 }
 
 step_unmount() {
@@ -248,59 +421,140 @@ step_unmount() {
     say "unmount: done"
 }
 
-replaced_names() { local n; for n in $(top_names); do [[ "$n" != *".replaced.$STAMP" ]] || printf '%s\n' "$n"; done; }
+# delete_tree <set-aside name>: its nested subvolumes (systemd makes
+# var/lib/machines and var/lib/portables), deepest first, each by name, then
+# the name itself. A glob never reaches a delete.
+delete_tree() {
+    local sa=$1 all p nested=()
+    all=$("$BTRFS" subvolume list "$TOP") || {
+        say "could not list the subvolumes under $sa"
+        return 1
+    }
+    mapfile -t nested < <(sed -n 's/.* path //p' <<<"$all" | sed 's|^<FS_TREE>/||' | grep -F -- "$sa/" | LC_ALL=C sort -r || :)
+    for p in "${nested[@]}"; do
+        [[ "$p" == "$sa/"* ]] || continue
+        "$BTRFS" subvolume delete "$TOP/$p" || {
+            say "could not delete $p"
+            return 1
+        }
+        say "deleted $p"
+    done
+    "$BTRFS" subvolume delete "$TOP/$sa" || {
+        say "could not delete $sa"
+        return 1
+    }
+    say "deleted $sa"
+}
 
 step_delete_replaced() {
-    need UUID STAMP
-    local n count=0 failed=
+    need UUID
+    local mfs=() mf i b failed="" count=0
     mount_top
-    for n in $(replaced_names); do
-        # Only the names this provision set aside: an OS name (or an
-        # --also-replace archive) followed by .replaced.<stamp>. A received
-        # subvolume that merely carries the suffix is not one of ours.
-        on_allowlist "${n%.replaced.$STAMP}" || { say "leaving $n: not a name this provision set aside"; continue; }
-        "$BTRFS" property set -ts "$TOP/$n" ro false 2>/dev/null || :
-        # Every name is attempted and every failure named; exit 2 at the end.
-        if "$BTRFS" subvolume delete "$TOP/$n"; then
-            say "deleted $n"; count=$((count + 1))
-        else
-            say "could not delete $n"; failed=1
+    load_names
+    mapfile -t mfs < <(list_manifests)
+    ((${#mfs[@]} > 0)) || cannot "no provision manifest (.das-provision.<stamp>) on this filesystem: nothing to delete"
+    for mf in "${mfs[@]}"; do read_manifest "$mf"; done # all valid before any delete
+    for i in "${!mfs[@]}"; do
+        mf=${mfs[$i]}
+        if [[ "$mf" != *.deleting ]]; then
+            ! present "${mf##*/}.deleting" || cannot "${mf##*/}.deleting already exists"
+            mv -T -- "$mf" "$mf.deleting" || cannot "cannot mark ${mf##*/} as deleting"
+            mfs[i]="$mf.deleting"
         fi
     done
+    for mf in "${mfs[@]}"; do
+        read_manifest "$mf"
+        for i in "${!MAN_SA[@]}"; do
+            if ! present "${MAN_SA[$i]}"; then
+                say "${MAN_SA[$i]} is already absent"
+                continue
+            fi
+            if delete_tree "${MAN_SA[$i]}"; then count=$((count + 1)); else failed=1; fi
+        done
+    done
     say "delete-replaced: $count subvolume(s) deleted"
-    [[ -z "$failed" ]] || exit 2
+    [[ -z "$failed" ]] || cannot "delete-replaced: something could not be deleted (above); the manifests stay"
+    for mf in "${mfs[@]}"; do
+        b=${mf##*/}
+        move "$b" "${b%.deleting}.done"
+    done
 }
 
 step_undo() {
-    need UUID STAMP
-    local n orig any=
+    need UUID ESP_LABEL ESP_PARTUUID DEV
+    local mfs=() mf i orig sa remaining=() oldest esp_src
     mount_top
-    [[ ! -e "$TOP/@/var/lib/das-backup/booted" ]] || refuse "the new @ has booted (var/lib/das-backup/booted exists): undo refused"
-    for n in $(replaced_names); do
-        orig=${n%.replaced.$STAMP}
-        on_allowlist "$orig" || continue
-        any=1
-        if [[ -e "$TOP/$orig" ]]; then
-            [[ "$orig" == "@" || "$orig" == "@home" ]] || cannot "$orig exists beside $n: not undone"
-            mv "$TOP/$orig" "$TOP/$orig.unbooted.$STAMP" || cannot "cannot set $orig aside"
+    load_names
+    mapfile -t mfs < <(list_manifests | LC_ALL=C sort -r)
+    ((${#mfs[@]} > 0)) || refuse "no provision manifest on this filesystem: nothing to undo"
+    # Preflight: nothing is changed until every manifest passes.
+    check_esp
+    for mf in "${mfs[@]}"; do
+        read_manifest "$mf"
+        if [[ "$mf" == *.deleting ]]; then
+            for sa in "${MAN_SA[@]}"; do ! present "$sa" || remaining+=("$sa"); done
+            refuse "delete-replaced began (${mf##*/}) and may have deleted part of the old OS; undo refused. Still present: ${remaining[*]:-nothing}"
         fi
-        mv "$TOP/$n" "$TOP/$orig" || cannot "cannot rename $n back"
-        say "$n renamed back to $orig"
+        for i in "${!MAN_ORIG[@]}"; do
+            orig=${MAN_ORIG[$i]}
+            sa=${MAN_SA[$i]}
+            if present "$sa"; then
+                if [[ "$orig" == "@" ]] && [[ -e "$TOP/@/var/lib/das-recovery/booted" ]]; then
+                    refuse "the new @ has booted (var/lib/das-recovery/booted exists): undo refused"
+                fi
+                if [[ "$orig" != "@esp" ]] && present "$orig"; then
+                    ! present "$orig.unbooted.$MAN_STAMP" || cannot "$orig.unbooted.$MAN_STAMP already exists: not overwritten"
+                fi
+            elif [[ "$orig" == "@esp" ]] || ! present "$orig"; then
+                refuse "$sa is gone and $orig is absent: part of the old OS was deleted; undo refused"
+            fi
+        done
     done
-    [[ -n "$any" ]] || refuse "no *.replaced.$STAMP subvolume on this filesystem: nothing to undo"
-    say "undo: the old OS is back; the unbooted new root is @.unbooted.$STAMP (delete it by hand)"
+    for mf in "${mfs[@]}"; do
+        read_manifest "$mf"
+        for i in "${!MAN_ORIG[@]}"; do
+            orig=${MAN_ORIG[$i]}
+            sa=${MAN_SA[$i]}
+            [[ "$orig" != "@esp" ]] || continue
+            if ! present "$sa"; then
+                say "$orig was not renamed by $MAN_STAMP (or is already back): left as is"
+                continue
+            fi
+            if present "$orig"; then
+                move "$orig" "$orig.unbooted.$MAN_STAMP"
+                say "$orig set aside as $orig.unbooted.$MAN_STAMP"
+            fi
+            move "$sa" "$orig"
+            say "$sa renamed back to $orig"
+        done
+    done
+    # p1 comes back from the OLDEST manifest's copy: the ESP as it was before
+    # the first provision of the chain.
+    oldest=${mfs[$((${#mfs[@]} - 1))]}
+    read_manifest "$oldest"
+    esp_src="$TOP/@esp.replaced.$MAN_STAMP/esp"
+    [[ -d "$esp_src" ]] || cannot "the old ESP copy @esp.replaced.$MAN_STAMP/esp is missing"
+    check_esp
+    mkdir -p "$ESP_MNT"
+    "$MKFS_VFAT" -F 32 -n "$ESP_LABEL" "${DEV}1" || cannot "cannot format p1 as FAT32 ($ESP_LABEL)"
+    "$MOUNT" "${DEV}1" "$ESP_MNT" || cannot "cannot mount p1 to restore the old ESP"
+    i=0
+    copy_tree "$esp_src" "$ESP_MNT" || i=$?
+    "$UMOUNT" "$ESP_MNT" || cannot "cannot unmount p1 after restoring it"
+    ((i != 2)) || cannot "cannot copy the old ESP back to p1"
+    ((i != 3)) || refuse "the restored p1 differs from @esp.replaced.$MAN_STAMP/esp"
+    for mf in "${mfs[@]}"; do move "${mf##*/}" "${mf##*/}.undone"; done
+    say "undo: the old OS is back; the unbooted new roots are *.unbooted.<stamp> (delete them by hand); p1 restored from @esp.replaced.$MAN_STAMP (also delete by hand)"
 }
 
 case "$STEP" in
-    replace-os) step_replace_os ;;
-    pacstrap) step_pacstrap ;;
-    configure) step_configure ;;
-    package) step_package ;;
-    boot) step_boot ;;
-    verify) step_verify ;;
-    unmount) step_unmount ;;
-    delete-replaced) step_delete_replaced ;;
-    undo) step_undo ;;
     --count-packages) wc -w <<<"$BASELINE" ;;
-    *) say "usage: recovery-os-install.sh replace-os|pacstrap|configure|package|boot|verify|unmount|delete-replaced|undo|--count-packages"; exit 2 ;;
+    replace-os | pacstrap | configure | package | boot | verify | unmount | delete-replaced | undo)
+        validate_inputs
+        "step_${STEP//-/_}"
+        ;;
+    *)
+        say "usage: recovery-os-install.sh replace-os|pacstrap|configure|package|boot|verify|unmount|delete-replaced|undo|--count-packages"
+        exit 2
+        ;;
 esac
