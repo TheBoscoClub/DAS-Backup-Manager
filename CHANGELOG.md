@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`AGENTS.md` regenerated from the house template**: bd command list now `bd orphans`/`bd lint`/`bd stale` in place of `bd preflight`; `bd doctor` marked unsupported in embedded mode (bd 1.0.3 prints troubleshooting only)
+- **`AGENTS.md` regenerated from the house template**: bd command list now `bd orphans`/`bd lint`/`bd stale` in place of `bd preflight`; `bd doctor` marked unsupported in embedded mode (bd 1.0.3 prints troubleshooting only); blank line added before the prompting-commands list and a spaced table separator (markdownlint MD032, MD060)
 - **The marker is `key=value` with `bay=`; the history row carries `mode`, `stamp` and `also_replace`** — `mode` is `session`, `provision` or `undo`; `Bay ?` on the splash means a hand-made marker without `bay=`
 - **`xorriso` is an optional host dependency** — `libisoburn` in the Arch `optdepends`, `xorriso` in the Debian and Fedora `Recommends`; `recovery-os-vm.sh provision` builds its payload cdrom with it
 - **The quick reference's previous-root line** — the entries are a true rollback to the system as it was before the last upgrade (matched kernel, writable), not only file recovery, and the `UNAVAILABLE` notice entry is named; a line says the screen shows what the disk is doing and not to power off
