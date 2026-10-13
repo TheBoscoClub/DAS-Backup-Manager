@@ -1,8 +1,8 @@
 [Unit]
 Description=Recovery drive: sync btrdasd state and configuration from the newest received snapshot
 ConditionPathExists=/etc/das-backup/recovery-drive
-After=local-fs.target
-Before=display-manager.service btrdasd-helper.service
+After=local-fs.target plymouth-start.service
+Before=display-manager.service btrdasd-helper.service plymouth-quit-wait.service
 
 [Service]
 Type=oneshot
