@@ -5352,10 +5352,13 @@ has "slot: paired with the snapshot the snapshot step printed" "$(file "$S/stage
 SLOT_SH="$T/slot.sh"
 run_slot_script() { # <snapshot name>
     sed "1s/^snap=.*/snap=$1/" "$S/stage.slot.sh" >"$SLOT_SH"
+    # shellcheck disable=SC2016 # the stub's own script, written as is
     printf '#!/bin/sh\necho Avail\necho "$(cat "%s" 2>/dev/null || echo 1073741824)"\n' "$T/df.avail" >"$T/bin/df"
     # cp: fails while cp.fail exists (saying cp.say if given); copies then corrupts while cp.corrupt exists
+    # shellcheck disable=SC2016 # the stub's own script, written as is
     printf '#!/bin/sh\necho "cp $*" >>"%s"\nif [ -e "%s" ]; then cat "%s" >&2 2>/dev/null || echo "cp: error writing: No space left on device" >&2; exit 1; fi\n/usr/bin/cp "$@" || exit\nif [ -e "%s" ]; then echo garbage >>"$2"; fi\n' "$T/slot.calls" "$T/cp.fail" "$T/cp.say" "$T/cp.corrupt" >"$T/bin/cp"
     # mv: fails when its source ends with the text in mv.fail
+    # shellcheck disable=SC2016 # the stub's own script, written as is
     printf '#!/bin/sh\necho "mv $*" >>"%s"\nif [ -e "%s" ]; then case "$1" in *"$(cat "%s")") echo "mv: cannot move: Input/output error" >&2; exit 1 ;; esac; fi\nexec /usr/bin/mv "$@"\n' "$T/slot.calls" "$T/mv.fail" "$T/mv.fail" >"$T/bin/mv"
     printf '#!/bin/sh\necho "sync $*" >>"%s"\n' "$T/slot.calls" >"$T/bin/sync"
     cat >"$T/bin/btrfs" <<STUB
@@ -5385,7 +5388,13 @@ STUB
     PREVFB="$T/esp/loader/entries/cachyos-recovery-previous-fallback.conf"
 }
 present() { if [[ -e "$1" ]]; then echo present; else echo absent; fi; }
-leftovers() { ls -d "$T/esp/previous.new" "$T/esp/previous.old" "$T/top/@.previous.new" "$T/esp/loader/entries/"*.new "$T/esp/loader/entries/"*.tmp 2>/dev/null | wc -l; }
+leftovers() { # how many staging paths are left (an unmatched glob is its own pattern: not there)
+    local n=0 p
+    for p in "$T/esp/previous.new" "$T/esp/previous.old" "$T/top/@.previous.new" "$T/esp/loader/entries/"*.new "$T/esp/loader/entries/"*.tmp; do
+        if [[ -e "$p" ]]; then n=$((n + 1)); fi
+    done
+    echo "$n"
+}
 old_pair_kept() { # <label>: the last run's pair and entries, untouched
     check "$1: the old kernel set kept" "$(cat "$T/esp/previous/vmlinuz-linux-cachyos")" "previous vmlinuz-linux-cachyos"
     check "$1: the old pairing kept" "$(cat "$T/esp/previous/snapshot")" "$SNAP_OLD"
@@ -5667,9 +5676,11 @@ check "provision, the other drive's last session failed: exit 1" "$RC" "1"
 has "provision, the other drive failed: never two drives down" "$OUT" "system-recovery-B-2tb's last session was failed (stopped at upgrade): never two recovery drives down at once"
 
 provision_fixture
-printf '{"label":"system-recovery-B-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n' >>"$H"
-printf '{"label":"system-recovery-B-2tb","start":1791870000,"end":1791873600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"7.2.9-1-cachyos","stopped_at":null}\n' >>"$H"
-printf '{"label":"system-recovery-A-2tb","start":1791880000,"end":1791883600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n' >>"$H"
+{
+    printf '{"label":"system-recovery-B-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n'
+    printf '{"label":"system-recovery-B-2tb","start":1791870000,"end":1791873600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"7.2.9-1-cachyos","stopped_at":null}\n'
+    printf '{"label":"system-recovery-A-2tb","start":1791880000,"end":1791883600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n'
+} >>"$H"
 run_driver_env "${PROV[@]}" --dry-run
 check "provision, the other drive's LAST session clean (an earlier failed, this drive failed): exit 0" "$RC" "0"
 lacks "provision, the other drive clean: no history warning" "$OUT" "has no session in the history"
@@ -5781,7 +5792,7 @@ has "provision: the last line" "$OUT" "Provisioned system-recovery-A-2tb: back i
 has "provision: history mode" "$(file "$H")" '"mode":"provision"'
 has "provision: history stamp" "$(file "$H")" "\"stamp\":\"${STAMP_LINE#DAS_INSTALL_STAMP=}\""
 has "provision: history clean" "$(file "$H")" '"outcome":"clean"'
-check "provision: the payload ISO removed" "$(ls "$T/images" 2>/dev/null | wc -l)" "0"
+check "provision: the payload ISO removed" "$(find "$T/images" -mindepth 1 2>/dev/null | wc -l)" "0"
 check "provision: no cdrom left in the definition" "$(file "$S/cdroms.xml")" ""
 has "provision: given back" "$(prov_events)" "virsh detach|"
 check "provision: nothing forbidden" "$(file "$S/forbidden")" ""
@@ -5797,7 +5808,7 @@ has "provision, pacstrap fails: how to undo" "$OUT" "provision system-recovery-A
 has "provision, pacstrap fails: history failed" "$(file "$H")" '"outcome":"failed"'
 has "provision, pacstrap fails: stopped_at" "$(file "$H")" '"stopped_at":"pacstrap"'
 check "provision, pacstrap fails: started once" "$(grep -c '^virsh start' "$S/events")" "1"
-check "provision, pacstrap fails: the payload ISO removed" "$(ls "$T/images" 2>/dev/null | wc -l)" "0"
+check "provision, pacstrap fails: the payload ISO removed" "$(find "$T/images" -mindepth 1 2>/dev/null | wc -l)" "0"
 check "provision, pacstrap fails: no cdrom left" "$(file "$S/cdroms.xml")" ""
 has "provision, pacstrap fails: given back" "$(prov_events)" "virsh detach|"
 
@@ -5885,7 +5896,7 @@ has "undo: result" "$OUT" "Undone system-recovery-A-2tb ($STAMP): the old OS is 
 has "undo: history" "$(tail -n 1 "$H")" '"mode":"undo"'
 has "undo: history stamp" "$(tail -n 1 "$H")" "\"stamp\":\"$STAMP\""
 lacks "undo: no egress rule added (nothing is downloaded)" "$(file "$S/ip.calls")" "rule add"
-check "undo: the payload ISO removed" "$(ls "$T/images" 2>/dev/null | wc -l)" "0"
+check "undo: the payload ISO removed" "$(find "$T/images" -mindepth 1 2>/dev/null | wc -l)" "0"
 check "undo: no cdrom left" "$(file "$S/cdroms.xml")" ""
 
 provision_fixture

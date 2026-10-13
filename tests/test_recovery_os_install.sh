@@ -36,9 +36,11 @@ case "$1 $2" in
 esac
 EOF
 for t in mount umount mkfs.vfat pacstrap arch-chroot genfstab; do
+  # shellcheck disable=SC2016 # the stub's own script, written as is
   printf '#!/bin/bash\necho "%s $*" >>"$STUB_LOG"\n[[ -z "${STUB_%s_FAILS:-}" ]] || exit 1\n' "$t" "${t//[.-]/_}" >"$BIN/$t"
 done
 # STUB_mount_RO_FAILS: only a read-only mount fails (undo's remount of p1).
+# shellcheck disable=SC2016 # the stub's own script, written as is
 printf '[[ -z "${STUB_mount_RO_FAILS:-}" || " $* " != *" -o ro "* ]] || exit 1\n' >>"$BIN/mount"
 cat >"$BIN/mkfs.vfat" <<'EOF'
 #!/bin/bash
@@ -227,7 +229,7 @@ chain() { # S1 leaves a partial @ and a partial p1, then S2 runs over it
 
 booted_new() { # the new OS has booted: its marker names the provision (the newest live manifest's stamp)
     local st
-    st=$(ls -A "$TOPD" | sed -n 's/^\.das-provision\.\([0-9]\{8\}-[0-9]\{6\}\)\(\.deleting\|\.undoing\)\{0,1\}$/\1/p' | sort | tail -1)
+    st=$(find "$TOPD" -mindepth 1 -maxdepth 1 -printf '%f\n' | sed -n 's/^\.das-provision\.\([0-9]\{8\}-[0-9]\{6\}\)\(\.deleting\|\.undoing\)\{0,1\}$/\1/p' | sort | tail -1)
     mkdir -p "$TOPD/@/var/lib/das-recovery"
     printf 'provisioned=%s\n' "${1-$st}" >"$TOPD/@/var/lib/das-recovery/booted"
 }
