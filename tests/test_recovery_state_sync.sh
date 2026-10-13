@@ -113,16 +113,23 @@ if [[ -n "${STUB_MV_FAIL_AT:-}" ]]; then
 fi
 exec /usr/bin/mv "$@"
 S
+# plymouth: logs every call; --ping fails when STUB_PLYMOUTH_DOWN is set.
+cat >"$BIN/plymouth" <<'S'
+#!/bin/bash
+echo "plymouth $*" >>"$STUB_LOG"
+[[ -z "${STUB_PLYMOUTH_SLOW:-}" || "${1:-}" != display-message ]] || sleep 2
+[[ "${1:-}" != --ping || -z "${STUB_PLYMOUTH_DOWN:-}" ]]
+S
 chmod +x "$BIN"/*
 
 fixture() {
     chmod -R u+rwX "$R" 2>/dev/null || :
     rm -rf "$R"
     : >"$LOG"
-    rm -f "$WORK/mv-count" "$LOG.mounted"
+    rm -f "$WORK/mv-count" "$LOG.mounted" "$WORK/timings"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
-    : >"$R/etc/das-backup/recovery-drive"
+    printf 'label=system-recovery-A-2tb\nbay=1\n' >"$R/etc/das-backup/recovery-drive"
     echo previous >"$R/var/lib/das-backup/previous"
     echo "# host config" >"$R/nvme/root-.20261012T0348/etc/das-backup/config.toml"
     echo db-0348 >"$R/nvme/das-state.20261012T0348/backup-index.db"
@@ -136,7 +143,8 @@ run() { # run [VAR=value ...]: the script under the seams; RC and OUT hold the r
         DAS_STATE_SYNC_BTRDASD="$BIN/btrdasd" DAS_STATE_SYNC_FINDMNT="$BIN/findmnt" \
         DAS_STATE_SYNC_SYSTEMD_RUN="$BIN/systemd-run" DAS_STATE_SYNC_MOUNT="$BIN/mount" \
         DAS_STATE_SYNC_UMOUNT="$BIN/umount" DAS_STATE_SYNC_BTRFS="$BIN/btrfs" \
-        DAS_STATE_SYNC_MV="$BIN/mv" "$@" bash "$SCRIPT" 2>&1) || RC=$?
+        DAS_STATE_SYNC_MV="$BIN/mv" DAS_STATE_SYNC_PLYMOUTH="$BIN/plymouth" \
+        DAS_STATE_SYNC_TIMINGS="$WORK/timings" "$@" bash "$SCRIPT" 2>&1) || RC=$?
     [[ -z "${SHOW_OUT:-}" ]] || printf '%s\n' "$OUT"
 }
 
@@ -333,6 +341,84 @@ run DAS_STATE_SYNC_ROOT= DAS_STATE_SYNC_STATE_DIR="$R/var/lib/das-backup" \
 check "mount (failure): exit 1" test "$RC" -eq 1
 check "mount (failure): mounted" has "$LOG" "mount -o subvolid=5,ro /dev/stub $R"
 check "mount (failure): still unmounted on exit" has "$LOG" "umount $R"
+
+echo "== D9: the splash says what is happening, and why"
+fixture; rm -f "$WORK/timings"; run
+check "d9: exit 0" test "$RC" -eq 0
+check "d9: the header is the spec's sentence" has "$LOG" 'display-message --text=DAS recovery disk, Bay 1. Recovery disk boots take significantly longer than a normal boot: this disk is a 2 TB USB drive, and it copies the latest backup index and settings before the desktop appears. Do not power off or unplug it — the copy would be left incomplete and the disk would start again from the previous copy.'
+check "d9: phases in order" test "$(grep -o 'finding the newest backup\|preparing the configuration\|copying the backup index\|ready: index from' "$LOG" | tr '\n' '|')" = "finding the newest backup|preparing the configuration|copying the backup index|ready: index from|"
+check "d9: first boot, no countdown (review focus 4)" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
+check "d9: a measurement was written" grep -q '^total=[0-9]' "$WORK/timings"
+check "d9: per-phase measurements" grep -q '^copy=[0-9]' "$WORK/timings"
+check "d9: the booted touch file" test -f "$R/var/lib/das-backup/booted"
+check "d9: first boot leaves a database" test -f "$R/var/lib/das-backup/backup-index.db"
+
+echo "== D9: the second boot counts down from the measurement"
+fixture; printf 'find=1\nconfig=2\ncopy=37\ntotal=40\n' >"$WORK/timings"; run
+check "d9 second boot: exit 0" test "$RC" -eq 0
+check "d9 second boot: the countdown names its measurement" grep -q 'about [0-9]* s remaining, measured at the last boot' "$LOG"
+check "d9 second boot: the first phase shows the whole measured total" grep -q 'finding the newest backup — about 40 s remaining' "$LOG"
+check "d9 second boot: the measurement is replaced, not appended" test "$(grep -c '^total=' "$WORK/timings")" -eq 1
+
+echo "== D9: plymouth absent or not running costs nothing"
+fixture; run STUB_PLYMOUTH_DOWN=1
+check "d9 no plymouth: exit 0" test "$RC" -eq 0
+check "d9 no plymouth: pinged, no messages" test "$(grep -c 'display-message' "$LOG")" -eq 0
+check "d9 no plymouth: still synced" status_is "synced 20261012T0348"
+
+echo "== D9: the failure phases"
+fixture; rm -rf "$R"/nvme/das-state.*; run
+check "d9 no snapshot: exit 2" test "$RC" -eq 2
+check "d9 no snapshot: said on the splash" has "$LOG" "no backup received yet"
+check "d9 no snapshot: no total written" test ! -e "$WORK/timings"
+fixture; rm -rf "$R"/nvme/das-state.* "$R/var/lib/das-backup"; run
+check "d9 first boot, no snapshot, no state: exit 2" test "$RC" -eq 2
+check "d9 first boot, no snapshot, no state: no database left (review focus 4)" test ! -e "$R/var/lib/das-backup/backup-index.db"
+check "d9 first boot, no snapshot, no state: no countdown" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
+fixture; run STUB_DERIVE_FAIL=1
+check "d9 derive fails: said on the splash" has "$LOG" "could not update: derive-recovery refused"
+check "d9 derive fails: no total written (a failed boot measures nothing)" test ! -e "$WORK/timings"
+check "d9 derive fails: status still the failure" grep -q '^failed: derive-recovery refused' "$R/run/das-recovery-state/status"
+
+echo "== D9: a marker with no bay line"
+fixture; printf 'hand-made\n' >"$R/etc/das-backup/recovery-drive"; run
+check "d9 no bay: exit 0" test "$RC" -eq 0
+check "d9 no bay: Bay ?" has "$LOG" "DAS recovery disk, Bay ?."
+check "d9 no bay: said in the journal" out_has "the marker has no bay= line"
+
+echo "== D9: a garbled timings file means no countdown, never a stopped sync"
+for bad in 08 010 0 abc 99999999999999999999; do
+    fixture; printf 'total=%s\n' "$bad" >"$WORK/timings"; run
+    check "d9 total=$bad: exit 0" test "$RC" -eq 0
+    check "d9 total=$bad: synced" status_is "synced 20261012T0348"
+    check "d9 total=$bad: no countdown" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
+    check "d9 total=$bad: the splash still speaks (every phase shown)" test "$(grep -c 'display-message' "$LOG")" -eq 4
+done
+fixture; : >"$WORK/timings"; run
+check "d9 empty timings: exit 0" test "$RC" -eq 0
+check "d9 empty timings: synced" status_is "synced 20261012T0348"
+check "d9 empty timings: no countdown" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
+
+echo "== D9: the countdown belongs to the working phases only"
+fixture; printf 'find=1\nconfig=2\ncopy=37\ntotal=40\n' >"$WORK/timings"; run
+check "d9 ready message has no countdown" test "$(grep -c 'ready: index from.*remaining' "$LOG")" -eq 0
+check "d9 ready message was shown" has "$LOG" "ready: index from"
+fixture; printf 'total=40\n' >"$WORK/timings"; run STUB_DERIVE_FAIL=1
+check "d9 failure after a measured boot: shown" has "$LOG" "could not update: derive-recovery refused"
+check "d9 failure after a measured boot: no countdown" test "$(grep -c 'could not update.*remaining' "$LOG")" -eq 0
+fixture; rm -rf "$R"/nvme/das-state.*; printf 'total=40\n' >"$WORK/timings"; run
+check "d9 no snapshot after a measured boot: no countdown" test "$(grep -c 'no backup received yet.*remaining' "$LOG")" -eq 0
+fixture; printf 'total=1\n' >"$WORK/timings"; run STUB_PLYMOUTH_SLOW=1
+check "d9 over budget: exit 0" test "$RC" -eq 0
+check "d9 over budget: the first phase did count down" has "$LOG" "finding the newest backup — about 1 s remaining"
+check "d9 over budget: never '0 s remaining'" test "$(grep -c ' 0 s remaining' "$LOG")" -eq 0
+check "d9 over budget: no countdown on later phases" test "$(grep -c 'remaining' "$LOG")" -eq 1
+
+echo "== D9: the unit is ordered before both plymouth units that close the splash"
+UNIT="$(dirname "$SCRIPT")/../systemd/das-recovery-state-sync.service"
+check "unit: After plymouth-start" grep -qE '^After=.*plymouth-start\.service' "$UNIT"
+check "unit: Before plymouth-quit.service" grep -qE '^Before=.*plymouth-quit\.service' "$UNIT"
+check "unit: Before plymouth-quit-wait.service" grep -qE '^Before=.*plymouth-quit-wait\.service' "$UNIT"
 
 if ((FAILS > 0)); then
     printf '%d check(s) FAILED\n' "$FAILS"
