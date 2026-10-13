@@ -9533,6 +9533,18 @@ mod tests {
             BootVerdict::May,
             "cat may run it, for all this knows"
         );
+        // And a shell handed a script under a tree only the booted OS fills still
+        // warns: the inert list is a named allowlist, not a loosening of the rule.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        nightly_runs(root, "ExecStart=/usr/bin/sh /run/x");
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::May, "sh /run/x: {reasons:?}");
+        assert!(
+            reasons.iter().any(|r| r.contains("/run/x")),
+            "sh /run/x: {reasons:?}"
+        );
     }
 
     #[test]
