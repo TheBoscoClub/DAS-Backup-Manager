@@ -129,7 +129,7 @@ fixture() {
     rm -f "$WORK/mv-count" "$LOG.mounted" "$WORK/timings" "$WORK/booted"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
-    printf 'label=system-recovery-A-2tb\nbay=1\n' >"$R/etc/das-backup/recovery-drive"
+    printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\n' >"$R/etc/das-backup/recovery-drive"
     echo previous >"$R/var/lib/das-backup/previous"
     echo "# host config" >"$R/nvme/root-.20261012T0348/etc/das-backup/config.toml"
     echo db-0348 >"$R/nvme/das-state.20261012T0348/backup-index.db"
@@ -240,7 +240,7 @@ check "nosnap: the unit lists exit 2 as success" grep -q '^SuccessExitStatus=2$'
 check "nosnap: previous state intact" has "$R/var/lib/das-backup/previous" previous
 check "nosnap: no config written" test ! -e "$R/etc/das-backup/config.toml"
 check "nosnap: status" status_is "no state snapshot"
-check "nosnap: the booted marker is written on a boot that synced nothing" test -f "$WORK/booted"
+check "nosnap: the booted marker is written on a boot that synced nothing" test "$(cat "$WORK/booted")" = "provisioned=20261013-010203"
 
 echo "== no marker"
 fixture
@@ -353,6 +353,7 @@ check "d9: first boot, no countdown (review focus 4)" test "$(grep -c 'measured 
 check "d9: a measurement was written" grep -q '^total=[0-9]' "$WORK/timings"
 check "d9: per-phase measurements" grep -q '^copy=[0-9]' "$WORK/timings"
 check "d9: the booted touch file, outside the state dir" test -f "$WORK/booted"
+check "d9: the booted file names the provision the marker names" test "$(cat "$WORK/booted")" = "provisioned=20261013-010203"
 check "d9: no booted file inside the state dir (it is swapped every boot)" test ! -e "$R/var/lib/das-backup/booted"
 check "d9: first boot leaves a database" test -f "$R/var/lib/das-backup/backup-index.db"
 
@@ -386,6 +387,7 @@ check "d9 derive fails: status still the failure" grep -q '^failed: derive-recov
 
 echo "== D9: a marker with no bay line"
 fixture; printf 'hand-made\n' >"$R/etc/das-backup/recovery-drive"; run
+check "d9 hand-made marker: booted is written with an EMPTY provisioned value" test "$(cat "$WORK/booted")" = "provisioned="
 check "d9 no bay: exit 0" test "$RC" -eq 0
 check "d9 no bay: Bay ?" has "$LOG" "DAS recovery disk, Bay ?."
 check "d9 no bay: said in the journal" out_has "the marker has no bay= line"

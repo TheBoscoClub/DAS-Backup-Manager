@@ -6,7 +6,7 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.1.1
+# Version: 1.1.2
 # Date: 2026-10-13
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
@@ -27,9 +27,12 @@
 # a boot that reached "ready"; the next boot shows a countdown from that
 # measurement and from nothing else (no measurement: no countdown). On EVERY
 # boot that passes the marker gate, whatever the sync then does (including the
-# normal first boot with no state snapshot, exit 2), $BOOTED is touched: this
-# root has booted, which is what recovery-os-install.sh undo refuses on. It
-# lives beside the timings file, outside the state directory (swapped every boot).
+# normal first boot with no state snapshot, exit 2), $BOOTED is written with
+# one line, provisioned=<the marker's provisioned value> (empty when the marker
+# has none): this root has booted, which is what recovery-os-install.sh undo
+# refuses on and what delete-replaced compares with the newest manifest's
+# stamp. It lives beside the timings file, outside the state directory
+# (swapped every boot).
 #
 # It is left mounted for the rest of the recovery session (the GUI restore
 # reads it); it is deliberately not in the EXIT trap.
@@ -127,7 +130,8 @@ if [[ ! -e "$MARKER" ]]; then
     exit 1
 fi
 
-if ! { mkdir -p "$(dirname "$BOOTED")" && touch "$BOOTED"; }; then
+prov=$(sed -n 's/^provisioned=//p' "$MARKER" 2>/dev/null | head -1) || prov=""
+if ! { mkdir -p "$(dirname "$BOOTED")" && printf 'provisioned=%s\n' "$prov" >"$BOOTED"; }; then
     say "das-recovery-state-sync: could not write $BOOTED: an undo of the provisioning would not know this root has booted" >&2
 fi
 
