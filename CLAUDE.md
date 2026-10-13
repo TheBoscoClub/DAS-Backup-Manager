@@ -33,3 +33,4 @@ cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 - `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
 - `backup.md` — btrbk, DAS, retention, boot archival, email, exit codes, locks
 - `fail-silent.md` — which error suppressions are legitimate here, and which are always defects
+- `test-safety.md` — a suite must never take the host down: task cap, no self-calling stubs

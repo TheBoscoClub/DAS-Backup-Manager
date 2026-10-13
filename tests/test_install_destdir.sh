@@ -55,6 +55,9 @@
 # (which every install rewrites). No root, no network.
 
 set -uo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 if (($# != 3)) || [[ "$3" != --completions && "$3" != --no-completions ]]; then
     echo "usage: $0 <cmake> <build-dir> --completions|--no-completions" >&2

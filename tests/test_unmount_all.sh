@@ -48,6 +48,9 @@
 # The shell options backup-run.sh itself runs under: a function that let a
 # failing command escape would abort the backup there, and must abort here.
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"

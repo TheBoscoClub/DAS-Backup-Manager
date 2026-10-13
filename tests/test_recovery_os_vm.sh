@@ -15,6 +15,9 @@
 # controls (a dry run and a full session) that prove the same checks pass a
 # good drive. No root, no devices, no libvirt.
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 # The interrupt tests need SIGINT deliverable. A shell started with it ignored
 # -- an asynchronous command of a shell without job control, say, as a

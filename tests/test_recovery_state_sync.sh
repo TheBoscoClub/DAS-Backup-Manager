@@ -7,6 +7,9 @@
 # nothing is mounted. Every case starts from a fixture reset, and every tool
 # the script calls is reached through its DAS_STATE_SYNC_* seam.
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/das-recovery-state-sync.sh"
 WORK=$(mktemp -d)

@@ -364,6 +364,13 @@ if(BUILD_TESTING)
         NAME shell-early-exit-readers
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_exit_readers.sh
     )
+    # Every shell suite starts under a task cap (tests/lib/bound.sh), and the
+    # cap stops a self-calling PATH stub: on 2026-10-13 one forked ~99k
+    # processes until systemd-oomd killed the whole tmux scope.
+    add_test(
+        NAME shell-suite-bounds
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_suite_bounds.sh
+    )
     # boot-archive-cleanup.sh itself, run for real in a sandbox of stub btrfs,
     # mountpoint and btrdasd: what it may delete (bd DAS-Backup-Manager-1bsx),
     # and what it prints, read back by backup-run.sh's run_archive_cleanup in

@@ -25,6 +25,9 @@
 # function (a) lands every dir under its volume, (b) creates nothing under /.
 
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 # The associative arrays below are consumed by the function extracted from
 # backup-run.sh at runtime, so shellcheck cannot see the use site.
