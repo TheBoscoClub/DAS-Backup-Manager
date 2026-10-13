@@ -49,11 +49,14 @@ running a new or changed suite by hand also wrap it in
 `systemd-run --user --scope -p TasksMax=<n>`, which bounds the cgroup and keeps oomd's target
 narrow.
 
-## Not done in this repository (operator's call)
+## Outside this repository (operator-approved 2026-10-13)
 
-- Launching each Claude session in its own systemd scope (in `ccp`, a different project), so oomd
-  takes one session, not the tmux server and every pane.
-- A global rule: the same stub can be written in any project.
-- `scx_loader` / `scx-autoswitch` report "running" while `sched_ext` is disabled — a monitor that
-  cannot show failure, and no sentinel detector fired on the runaway or the oomd kill: both tracked
-  in `cachyos-sentinel-3ze4` (linked both ways with `29sv`).
+- **ccp `b460541`**: each ccp-launched Claude session runs in its own `ccp-claude-<project>-…`
+  systemd scope with `TasksMax=8192` (`CCP_CLAUDE_TASKS_MAX`), so a runaway meets fork failures at
+  its session's cap and oomd takes that one session, not the tmux server and every pane. bats runs
+  the real `systemd-run` with a fake `claude`; seen red without the cap and without the scope. A
+  `claude` started by hand outside ccp is still in the terminal's cgroup.
+- **Global rule** `~/.claude/rules/test-safety.md`: the same stub can be written in any project.
+- **Sentinel**, `cachyos-sentinel-3ze4` (linked both ways with `29sv`): `scx_loader` /
+  `scx-autoswitch` report "running" while `sched_ext` is disabled, and no detector fired on the
+  runaway or the oomd kill.
