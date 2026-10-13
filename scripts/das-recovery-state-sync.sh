@@ -6,7 +6,7 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.1.2
+# Version: 1.1.3
 # Date: 2026-10-13
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
@@ -86,7 +86,7 @@ splash_init() {
     }
     if "$PLYMOUTH" --ping 2>/dev/null; then SPLASH=1; fi
     PREV_TOTAL=$(sed -n 's/^total=//p' "$TIMINGS" 2>/dev/null | head -1) || :
-    [[ "$PREV_TOTAL" =~ ^[1-9][0-9]{0,5}$ ]] || PREV_TOTAL=""
+    [[ "$PREV_TOTAL" =~ ^[123456789][[:digit:]]{0,5}$ ]] || PREV_TOTAL=""
 }
 # phase <key> <text>: records when the phase began and shows it. A countdown
 # exists only when the previous boot measured a total (a sane one: 1..999999),

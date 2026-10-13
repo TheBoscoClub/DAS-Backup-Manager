@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.4.1
+# Version: 1.4.2
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -84,14 +84,18 @@ need() {
 }
 
 # ---- the allowlist -------------------------------------------------------
-# A name is replaced when it is EXACTLY @, @home, @rescue or @.previous (the
-# writable clone the pipeline's loader step makes); or @.pre-update. /
+# A name is replaced when it is EXACTLY @, @home, @rescue, @.previous or
+# @.previous.new (the writable clone the pipeline's slot step makes, and its
+# staging); or @.pre-update. /
 # @.half-upgraded. followed by exactly a stamp (YYYYMMDD-HHMM, optionally SS,
 # the shape recovery-os-vm.sh's snapshot step writes) and nothing after; or is
 # one of DAS_INSTALL_ALSO_REPLACE (each exactly @.archive.<chars>). A name
 # containing .replaced. or .unbooted. is never on it: it is already ours.
-OS_SNAP_RE='^@\.(pre-update|half-upgraded)\.[0-9]{8}-[0-9]{4}([0-9]{2})?$'
-ARCHIVE_RE='^@\.archive\.[A-Za-z0-9._-]+$'
+# No bracket ranges (bd 1bsx): a range like 0-9 or A-Z can match more than
+# ASCII in another locale; the classes are spelled out.
+ASCII_ALNUM=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+OS_SNAP_RE='^@\.(pre-update|half-upgraded)\.[[:digit:]]{8}-[[:digit:]]{4}([[:digit:]]{2})?$'
+ARCHIVE_RE="^@\\.archive\\.[${ASCII_ALNUM}._-]+\$"
 ALSO_LIST=()
 
 ours_already() { [[ "$1" == *.replaced.* || "$1" == *.unbooted.* ]]; }
@@ -100,7 +104,7 @@ archive_name_ok() { [[ "$1" =~ $ARCHIVE_RE ]] && ! ours_already "$1"; }
 # delete-replaced and undo enforce the same inputs replace-os does.
 validate_inputs() {
     local a
-    [[ "$STAMP" =~ ^[0-9]{8}-[0-9]{6}$ ]] || refuse "DAS_INSTALL_STAMP '$STAMP' is not YYYYMMDD-HHMMSS"
+    [[ "$STAMP" =~ ^[[:digit:]]{8}-[[:digit:]]{6}$ ]] || refuse "DAS_INSTALL_STAMP '$STAMP' is not YYYYMMDD-HHMMSS"
     read -r -a ALSO_LIST <<<"$ALSO"
     for a in "${ALSO_LIST[@]}"; do
         archive_name_ok "$a" || refuse "'$a' is not an @.archive.* subvolume"
@@ -110,13 +114,13 @@ validate_inputs() {
 valid_orig() {
     local n=$1
     ours_already "$n" && return 1
-    case "$n" in @ | @home | @rescue | @.previous | @esp) return 0 ;; esac
+    case "$n" in @ | @home | @rescue | @.previous | @.previous.new | @esp) return 0 ;; esac
     [[ "$n" =~ $OS_SNAP_RE ]] || archive_name_ok "$n"
 }
 on_allowlist() {
     local n=$1 a
     ours_already "$n" && return 1
-    case "$n" in @ | @home | @rescue | @.previous) return 0 ;; esac
+    case "$n" in @ | @home | @rescue | @.previous | @.previous.new) return 0 ;; esac
     [[ "$n" =~ $OS_SNAP_RE ]] && return 0
     for a in "${ALSO_LIST[@]}"; do [[ "$n" != "$a" ]] || return 0; done
     return 1
@@ -171,7 +175,7 @@ list_manifests() { # oldest first
     local f
     for f in "$TOP"/.das-provision.*; do
         [[ -f "$f" ]] || continue
-        if [[ "${f##*/}" =~ ^\.das-provision\.[0-9]{8}-[0-9]{6}(\.deleting|\.undoing)?$ ]]; then printf '%s\n' "$f"; fi
+        if [[ "${f##*/}" =~ ^\.das-provision\.[[:digit:]]{8}-[[:digit:]]{6}(\.deleting|\.undoing)?$ ]]; then printf '%s\n' "$f"; fi
     done | LC_ALL=C sort
 }
 MAN_STAMP=""
@@ -226,7 +230,7 @@ check_esp() { # p1's PARTUUID is the configured one, or exit 3
     [[ -n "$part" ]] || refuse "p1 of $DEV has no readable PARTUUID: not this drive's ESP"
     [[ "${part,,}" == "${ESP_PARTUUID,,}" ]] || refuse "p1 of $DEV is PARTUUID $part, not the configured $ESP_PARTUUID: not this drive's ESP"
 }
-ESP_ID_RE='^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$'
+ESP_ID_RE='^[[:xdigit:]]{4}-[[:xdigit:]]{4}$'
 ESP_ID=""
 # format_esp <XXXX-XXXX>: FAT32 with the bay label AND the given volume ID (the
 # old OS's fstab and the project's docs name p1 by it); the ID is read back.
@@ -285,7 +289,7 @@ step_replace_os() {
     # new stamp must be strictly newer than every manifest, in any state.
     for f in "$TOP"/.das-provision.*; do
         [[ -e "$f" ]] || continue
-        if [[ "${f##*/}" =~ ^\.das-provision\.([0-9]{8}-[0-9]{6})(\.deleting|\.undoing|\.done|\.undone)?$ ]]; then
+        if [[ "${f##*/}" =~ ^\.das-provision\.([[:digit:]]{8}-[[:digit:]]{6})(\.deleting|\.undoing|\.done|\.undone)?$ ]]; then
             [[ "$STAMP" > "${BASH_REMATCH[1]}" ]] || refuse "stamp $STAMP is not newer than ${f##*/} (stamp ${BASH_REMATCH[1]}): undo would take the wrong ESP as the original"
         fi
     done
