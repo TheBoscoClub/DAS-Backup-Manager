@@ -456,7 +456,7 @@ step_verify() {
                 linux | initrd | efi)
                     f="$boot/${val#/}"
                     [[ -f "$f" ]] || {
-                        say "${val#/} named by $(basename "$e") is not on the ESP"
+                        say "${val#/} named by ${e##*/} is not on the ESP"
                         missing=1
                     }
                     ;;
