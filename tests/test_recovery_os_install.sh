@@ -152,7 +152,7 @@ echo "== replace-os: the allowlist is exact (review focus 1)"
 fixture
 EXACT_LIST=(@home-old @.pre-update-notes @rescue2 root-.20261012T0348 old@.pre-update.20261001 @x.half-upgraded.20261001
     @.pre-update.20261011-1016x @.pre-update.20261011-1016-bak @.pre-update.2026 @.replaced.20260101-000000
-    @.pre-update.20261011-1016.replaced.20260101-000000 @home.unbooted.20260101-000000)
+    @.pre-update.20261011-1016.replaced.20260101-000000 @home.unbooted.20260101-000000 @.undone.20260101-000000)
 for s in "${EXACT_LIST[@]}"; do mkdir -p "$R/mnt/top/$s"; echo "ro received" >"$R/mnt/top/$s/.subvol"; done
 run replace-os
 check "exact: exit 0" test "$RC" -eq 0
@@ -190,6 +190,10 @@ fixture; run replace-os DAS_INSTALL_ALSO_REPLACE="nvme"
 check "also, not an archive: exit 3" test "$RC" -eq 3
 check "also, not an archive: refused by name" out_has "'nvme' is not an @.archive.* subvolume -- refused"
 check "also, not an archive: nothing renamed" test -f "$R/mnt/top/@/.subvol"
+for a in @.archive.x.replaced.20260101-000000 @.archive.x.unbooted.20260101-000000 @.archive.x.undone.20260101-000000; do
+    fixture; run replace-os DAS_INSTALL_ALSO_REPLACE="$a"
+    check "also, a name already ours ($a): exit 3" test "$RC" -eq 3
+done
 
 echo "== replace-os: wrong UUID / empty disk (review focus 2)"
 fixture; printf '5eed0010-0000-0000-0000-000000000000\n' >"$WORK/blkid.out"; run replace-os
@@ -481,11 +485,17 @@ check "undo (one provision): exit 0" test "$RC" -eq 0
 check "undo (one provision): the old @" test "$(cat "$TOPD/@/sentinel")" = "old-@"
 check "undo (one provision): the unbooted new @ set aside" test -d "$TOPD/@.unbooted.$S1"
 check "undo (one provision): the old ESP back" test -f "$R/mnt/esp-old/old-esp-file"
-fixture; run replace-os; mkdir -p "$TOPD/@/var/lib/das-recovery"; : >"$TOPD/@/var/lib/das-recovery/booted"; run undo
-check "undo after a new boot: exit 3" test "$RC" -eq 3
-check "undo after a new boot: refused" out_has "the new @ has booted (var/lib/das-recovery/booted exists): undo refused"
-check "undo after a new boot: nothing renamed" test -d "$TOPD/@.replaced.$S1" -a -f "$TOPD/.das-provision.$S1"
-check "undo after a new boot: p1 untouched" test "$(calls 'mkfs.vfat')" -eq 1
+# Undo is allowed until delete-replaced starts, booted or not (operator,
+# 2026-10-13: a first boot that failed its proof is exactly when undo is
+# wanted). The new root is never deleted: it is set aside, named for what it was.
+fixture; run replace-os; mkdir -p "$TOPD/@/var/lib/das-recovery"; : >"$TOPD/@/var/lib/das-recovery/booted"; echo "the new one" >"$TOPD/@/sentinel"; run undo
+check "undo after a new boot: exit 0" test "$RC" -eq 0
+check "undo after a new boot: the old @ is back" test "$(cat "$TOPD/@/sentinel")" = "old-@"
+check "undo after a new boot: the booted root kept, named as booted" test "$(cat "$TOPD/@.undone.$S1/sentinel" 2>/dev/null)" = "the new one"
+check "undo after a new boot: not named unbooted" test ! -e "$TOPD/@.unbooted.$S1"
+check "undo after a new boot: said" out_has "@ set aside as @.undone.$S1 (it had booted)"
+fixture; run replace-os; echo "the new one" >"$TOPD/@/sentinel"; run undo
+check "undo before any boot: the new root named unbooted" test "$(cat "$TOPD/@.unbooted.$S1/sentinel" 2>/dev/null)" = "the new one"
 fixture; run undo
 check "undo with nothing to undo: exit 3" test "$RC" -eq 3
 check "undo with nothing to undo: says so" out_has "nothing to undo"
@@ -572,11 +582,12 @@ check "undo, #end count differs: exit 2, nothing renamed" test "$RC" -eq 2 -a -d
 booted_new; run delete-replaced
 check "delete-replaced, #end count differs: exit 2" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
 
-echo "== undo refuses when ANY installed root has booted (C2)"
+echo "== undo walks a chain whose installed roots booted, and keeps them"
 chain; mkdir -p "$TOPD/@.replaced.$S2/var/lib/das-recovery"; : >"$TOPD/@.replaced.$S2/var/lib/das-recovery/booted"; : >"$LOG"; run undo
-check "chain, S1's root booted then S2 set it aside: exit 3" test "$RC" -eq 3
-check "chain: names where the marker was found" out_has "@.replaced.$S2/var/lib/das-recovery/booted"
-check "chain: nothing renamed, p1 untouched" test -d "$TOPD/@.replaced.$S1" -a -d "$TOPD/@.replaced.$S2" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
+check "chain, S1's root booted then S2 set it aside: exit 0" test "$RC" -eq 0
+check "chain: the old OS is back" test "$(cat "$TOPD/@/sentinel")" = "old-@"
+check "chain: S1's booted root kept as @.undone.$S1" test -f "$TOPD/@.undone.$S1/var/lib/das-recovery/booted"
+check "chain: nothing deleted" test "$(calls 'subvolume delete')" -eq 0
 chain; mkdir -p "$TOPD/@.replaced.$S1/var/lib/das-recovery"; : >"$TOPD/@.replaced.$S1/var/lib/das-recovery/booted"; run undo
 check "a marker in the OLDEST set-aside (the old OS, which never was installed by us) does not refuse" test "$RC" -eq 0
 
@@ -605,7 +616,7 @@ check "interrupted undo (the fourth mv fails): exit 2" test "$RC" -eq 2
 check "interrupted undo: the manifest is .undoing" test -f "$TOPD/.das-provision.$S1.undoing" -a ! -e "$TOPD/.das-provision.$S1"
 booted_new; : >"$LOG"; run delete-replaced
 check "interrupted undo, then delete-replaced: exit 3, deletes nothing" test "$RC" -eq 3 -a "$(calls 'subvolume delete')" -eq 0
-rm -f "$TOPD/@/var/lib/das-recovery/booted"; : >"$WORK/mvcount"; run undo
+: >"$WORK/mvcount"; run undo
 check "interrupted undo, undo run again: exit 0" test "$RC" -eq 0
 for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
     check "interrupted undo, run again: $s is the OLD one" test "$(cat "$TOPD/$s/sentinel")" = "old-$s"

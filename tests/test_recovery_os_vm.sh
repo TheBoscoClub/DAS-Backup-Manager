@@ -850,6 +850,11 @@ case "$cmd" in
                     out=$(cat "$STUB/guest.sync-status" 2>/dev/null || echo "no state snapshot")
                 elif [[ "$script" == "test ! -e /var/lib/das-backup/backup-index.db" ]]; then
                     [[ ! -f "$STUB/guest.db" ]] || rc=1
+                elif [[ "$script" == "test -e /var/lib/das-backup/backup-index.db" ]]; then
+                    [[ -f "$STUB/guest.db" ]] || rc=1
+                elif [[ "$script" == *"/run/das-provision/proof"* ]]; then
+                    # the newest COMPLETE das-state snapshot on the drive's p2
+                    out="newest=$(cat "$STUB/guest.das-state" 2>/dev/null || echo none)"
                 elif [[ "$script" == "pgrep -x kwin_wayland" || "$script" == "pgrep -x plasmashell" ]]; then
                     running=$(cat "$STUB/guest.pgrep" 2>/dev/null || echo "kwin_wayland plasmashell")
                     [[ " $running " == *" ${script#pgrep -x } "* ]] && out=4242 || rc=1
@@ -4731,6 +4736,8 @@ has "unattended: a step's end" "$OUT" "PROGRESS system-recovery-A-2tb verify-boo
 has "unattended: the reboot answered by an engaged boot" "$OUT" "PROGRESS system-recovery-A-2tb reboot ok boot bbbbbbbb-1111-4222-8333-444444444444, its guard engaged"
 has "unattended: summary" "$OUT" "Unattended    every step done; rebooted into kernel 7.2.9-1-cachyos"
 has "unattended: its result" "$OUT" "RESULT system-recovery-A-2tb 0 clean"
+has "unattended: the desktop proven after the reboot" "$OUT" "PROGRESS system-recovery-A-2tb desktop ok kwin_wayland and plasmashell running"
+has "unattended: the history says so" "$(tail -n 1 "$H")" '"desktop":"proven"'
 has "unattended: given back" "$(events)" "virsh detach"
 check "unattended: no egress rule left" "$(file "$S/ip.rules")" ""
 has "unattended: the egress step checks for the org it was given" "$(file "$S/stage.egress.sh")" "want=AS64500"
@@ -5352,6 +5359,8 @@ slot_fixture() {
 # The step's script as the pipeline writes it, its snapshot line given here.
 unattended_fixture
 printf 'snapshot: %s (read-only)\n' "$SNAP_NEW" >"$S/stage.snapshot.out"
+# the last session proved its desktop: the slot is refreshed (last known good)
+printf '{"label":"system-recovery-A-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"k","stopped_at":null,"desktop":"proven"}\n' >>"$H"
 run_driver session A --unattended
 check "slot: a step of its own, after snapshot, before guard-lift" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
 lacks "slot: no loader step after the upgrade any more" "$(tr '\n' ' ' <"$S/stages.log")" "loader"
@@ -5650,6 +5659,50 @@ slot_fixture NONE
 SLOT_TOP_UNSET=1 run_slot_script "$SNAP_NEW"
 has "slot, TOP unset, umount fails: a warning the driver counts" "$OUT" "slot B warning: cannot unmount /run/das-vm-update/top"
 
+echo "--- the desktop proof after the reboot, and the slot's last known good"
+unattended_fixture
+printf 'sddm\n' >"$S/guest.pgrep"
+DRIVER_EXTRA_ENV=(DAS_RECOVERY_VM_DESKTOP_SECS=1)
+run_driver session A --unattended
+unset DRIVER_EXTRA_ENV
+check "unattended, no desktop after the reboot: exit 7" "$RC" "7"
+has "unattended, no desktop: named" "$OUT" "PROGRESS system-recovery-A-2tb desktop fail kwin_wayland or plasmashell is not running"
+has "unattended, no desktop: the history says failed at desktop" "$(tail -n 1 "$H")" '"stopped_at":"desktop"'
+lacks "unattended, no desktop: never proven" "$(tail -n 1 "$H")" '"desktop":"proven"'
+# the slot step is told whether the last session proved its desktop
+unattended_fixture
+printf '{"label":"system-recovery-A-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"k","stopped_at":null,"desktop":"proven"}\n' >>"$H"
+run_driver session A --unattended
+has "slot after a proven session: refreshed" "$(file "$S/stage.slot.sh")" "refresh=yes"
+unattended_fixture
+printf '{"label":"system-recovery-A-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"k","stopped_at":null}\n' >>"$H"
+run_driver session A --unattended
+has "slot after a session that proved nothing: kept" "$(file "$S/stage.slot.sh")" "refresh=no"
+has "slot after a session that proved nothing: why" "$(file "$S/stage.slot.sh")" "keepwhy='the last session (clean) did not prove its desktop'"
+unattended_fixture
+printf '{"label":"system-recovery-A-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade","desktop":"proven"}\n' >>"$H"
+run_driver session A --unattended
+has "slot after a failed session: kept" "$(file "$S/stage.slot.sh")" "refresh=no"
+# the step script itself: kept while a pair holds, refreshed when there is none
+slot_fixture OLD
+sed -i "s/^refresh=.*/refresh=no/; s/^keepwhy=.*/keepwhy='the last session (clean) did not prove its desktop'/" "$S/stage.slot.sh"
+run_slot_script "$SNAP_NEW"
+check "slot, not proven, a pair holds: exit 0" "$RC" "0"
+has "slot, not proven, a pair holds: kept, and why" "$OUT" "slot B kept: the last session (clean) did not prove its desktop; the last known good pair stays"
+old_pair_kept "slot, not proven, a pair holds"
+check "slot, not proven, a pair holds: nothing copied" "$(grep -c '^cp ' "$T/slot.calls" || :)" "0"
+slot_fixture NONE
+run_slot_script "$SNAP_NEW"
+check "slot, not proven, no pair: refreshed anyway" "$(cat "$T/esp/previous/snapshot")" "$SNAP_NEW"
+has "slot, not proven, no pair: says so" "$OUT" "no last known good pair to keep: refreshed from the current state"
+sed -i "s/^refresh=.*/refresh=yes/; s/^keepwhy=.*/keepwhy=''/" "$S/stage.slot.sh"
+# the step deletes nothing but @.previous and @.previous.new (M3)
+slot_fixture OLD
+mkdir -p "$T/top/@.previous.new"
+run_slot_script "$SNAP_NEW"
+check "slot: every subvolume delete names @.previous or @.previous.new" "$(grep 'subvolume delete' "$T/slot.calls" | grep -vcE "subvolume delete -R $T/top/@\.previous(\.new)?\$" || :)" "0"
+matches "slot: ...and the check sees deletes" "$(grep -c 'subvolume delete' "$T/slot.calls" || :)" "^[12]$"
+
 echo "--- slot: in the pipeline, a slot not refreshed is a warning and every later step runs"
 unattended_fixture
 printf 'slot B not refreshed: the ESP is too full\n' >"$S/stage.slot.out"
@@ -5722,6 +5775,12 @@ provision_fixture
 run_driver_env "${PROV[@]}" --package-sha256 1111 --dry-run
 check "provision, package sha256 mismatch: exit 1" "$RC" "1"
 has "provision, package sha256 mismatch: named" "$OUT" "package sha256 is $PKG_SHA, not 1111"
+
+provision_fixture
+cp "$PKG" "$T/das backup.pkg.tar.zst"
+run_driver_env provision A --iso "$ISO" --package "$T/das backup.pkg.tar.zst" --package-sha256 "$PKG_SHA" --authorized-keys "$KEYS" --dry-run
+check "provision, a package file name with a space: exit 1" "$RC" "1"
+has "provision, a package file name with a space: refused" "$OUT" "the package's file name 'das backup.pkg.tar.zst' is not one word"
 
 provision_fixture
 : >"$KEYS"
@@ -5939,12 +5998,48 @@ check "provision, no desktop: exit 7" "$RC" "7"
 has "provision, no desktop: named" "$OUT" "kwin_wayland or plasmashell is not running"
 lacks "provision, no desktop: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
 
+# The drive keeps p2, so a first boot finds the das-state snapshots the
+# state pass already sent (drive A held das-state.20261012T1533 on 10-12): the
+# sync unit's status must agree with what the drive holds, either way.
+provision_fixture
+printf 'synced 20261012T1533\n' >"$S/guest.sync-status"
+printf 'das-state.20261012T1533\n' >"$S/guest.das-state"
+: >"$S/guest.db"
+run_driver_env "${PROV[@]}"
+check "provision, the first boot synced the drive's newest state: exit 0" "$RC" "0"
+has "provision, the first boot synced: said" "$OUT" "state sync: synced das-state.20261012T1533, the newest complete state snapshot on the drive; the backup index is there"
+has "provision, the first boot synced: then deleted the old OS" "$(file "$S/stages.log")" "delete-replaced"
+provision_fixture
+printf 'synced 20261012T1533; catch-up index running (data 20261013T0300)\n' >"$S/guest.sync-status"
+printf 'das-state.20261012T1533\n' >"$S/guest.das-state"
+: >"$S/guest.db"
+run_driver_env "${PROV[@]}"
+check "provision, synced with a catch-up: exit 0" "$RC" "0"
 provision_fixture
 printf 'synced 20261012T0348\n' >"$S/guest.sync-status"
+printf 'das-state.20261012T1533\n' >"$S/guest.das-state"
+: >"$S/guest.db"
 run_driver_env "${PROV[@]}"
-check "provision, an unexpected sync status: exit 7" "$RC" "7"
-has "provision, an unexpected sync status: quoted" "$OUT" "state sync says 'synced 20261012T0348', expected 'no state snapshot' on a first boot"
-lacks "provision, an unexpected sync status: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+check "provision, synced an older state than the drive's newest: exit 7" "$RC" "7"
+has "provision, synced an older state: said" "$OUT" "state sync says it synced das-state.20261012T0348, but the newest complete state snapshot on the drive is das-state.20261012T1533"
+lacks "provision, synced an older state: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+provision_fixture
+printf 'synced 20261012T1533\n' >"$S/guest.sync-status"
+printf 'das-state.20261012T1533\n' >"$S/guest.das-state"
+run_driver_env "${PROV[@]}"
+check "provision, synced but no index: exit 7" "$RC" "7"
+has "provision, synced but no index: said" "$OUT" "state sync says synced, but there is no backup index"
+provision_fixture
+printf 'das-state.20261012T1533\n' >"$S/guest.das-state"
+run_driver_env "${PROV[@]}"
+check "provision, no state found but the drive holds one: exit 7" "$RC" "7"
+has "provision, no state found but the drive holds one: said" "$OUT" "state sync found no state snapshot, but the drive holds das-state.20261012T1533"
+provision_fixture
+printf 'failed: no received root- snapshot\n' >"$S/guest.sync-status"
+run_driver_env "${PROV[@]}"
+check "provision, the sync unit failed: exit 7" "$RC" "7"
+has "provision, the sync unit failed: quoted" "$OUT" "state sync says 'failed: no received root- snapshot'"
+lacks "provision, the sync unit failed: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
 
 provision_fixture
 : >"$S/guest.db"
@@ -5966,6 +6061,9 @@ run_driver_env "${PROV[@]}"
 check "provision, delete-replaced fails: exit 7" "$RC" "7"
 has "provision, delete-replaced fails: named" "$OUT" "stopped at delete-replaced"
 has "provision, delete-replaced fails: the new OS stands" "$OUT" "the new OS booted and is proven"
+has "provision, delete-replaced fails: how, in the new OS" "$OUT" "DAS_INSTALL_UUID=5eed0008-0000-4000-8000-000000000008 DAS_INSTALL_STAMP="
+has "provision, delete-replaced fails: the installed installer" "$OUT" "/usr/lib/das-backup/recovery-os-install.sh delete-replaced"
+lacks "provision, delete-replaced fails: never the deleted payload" "$OUT" "from the payload"
 
 provision_fixture
 : >"$S/detach_cdrom_fail"
@@ -5973,6 +6071,17 @@ run_driver_env "${PROV[@]}"
 check "provision, the live ISO cannot be detached: exit 7" "$RC" "7"
 has "provision, the live ISO cannot be detached: named" "$OUT" "stopped at first-boot"
 check "provision, the live ISO cannot be detached: started once" "$(grep -c '^virsh start' "$S/events")" "1"
+
+echo "--- a provision restarts the drive's clean-run streak"
+provision_fixture
+for i in 1 2 3; do
+    printf '{"label":"system-recovery-A-2tb","start":179186%s000,"end":179186%s600,"mode":"single","unattended":true,"outcome":"clean","exit":0,"overridden":false,"kernel":"k","stopped_at":null}\n' "$i" "$i" >>"$H"
+done
+run_driver_env clean-runs A
+check "clean runs before a provision" "$(tail -n 1 <<<"$OUT")" "3"
+printf '{"label":"system-recovery-A-2tb","start":1791870000,"end":1791873600,"mode":"provision","unattended":false,"outcome":"clean","exit":0,"overridden":false,"kernel":"k","stopped_at":null,"stamp":"20261013-010203","also_replace":[]}\n' >>"$H"
+run_driver_env clean-runs A
+check "clean runs after a provision: a new OS starts at 0" "$(tail -n 1 <<<"$OUT")" "0"
 
 echo "--- provision --undo (plan 2, Task 3c)"
 provision_fixture
@@ -5997,10 +6106,23 @@ lacks "undo: no egress rule added (nothing is downloaded)" "$(file "$S/ip.calls"
 check "undo: the payload ISO removed" "$(find "$T/images" -mindepth 1 2>/dev/null | wc -l)" "0"
 check "undo: no cdrom left" "$(file "$S/cdroms.xml")" ""
 
+# a driver that stopped without its history row (power loss, SIGKILL): the
+# capture directory, made before anything boots, names the provision
+provision_fixture
+run_driver_env "${PROV[@]}" --also-replace @.archive.20260301-1200
+STAMP=$(jq -r 'select(.mode == "provision") | .stamp' "$H" | tail -n 1)
+sed -i '/"mode":"provision"/d' "$H"
+: >"$S/stages.log"
+run_driver_env provision A --undo --iso "$ISO"
+check "undo with no history row, from the capture: exit 0" "$RC" "0"
+has "undo with no history row: says where the stamp came from" "$OUT" "no provision of system-recovery-A-2tb in the history (a driver that stopped before writing it); the capture $T/var/lib/das-backup/recovery-os-provision/system-recovery-A-2tb/$STAMP names it"
+has "undo with no history row: the capture's stamp" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_STAMP=$STAMP"
+has "undo with no history row: and its archives" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_ALSO_REPLACE='@.archive.20260301-1200'"
+
 provision_fixture
 run_driver_env provision A --undo --iso "$ISO"
 check "undo with no provision in the history: exit 1" "$RC" "1"
-has "undo with no provision: says so" "$OUT" "no provision of system-recovery-A-2tb in the history: nothing to undo"
+has "undo with no provision: says so" "$OUT" "no provision of system-recovery-A-2tb in the history and no capture of one: nothing to undo"
 check "undo with no provision: nothing taken" "$(file "$S/flock.calls")" ""
 
 provision_fixture
