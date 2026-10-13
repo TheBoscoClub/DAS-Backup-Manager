@@ -31,6 +31,7 @@ case "$1 $2" in
   "subvolume delete") [[ -z "${STUB_DELETE_FAILS:-}" ]] || exit 1
       [[ -z "${STUB_DELETE_FAIL_ONLY:-}" || "$3" != *"$STUB_DELETE_FAIL_ONLY" ]] || exit 1
       rm -rf "$3" ;;
+  "filesystem sync") : ;;
   *) exit 2 ;;
 esac
 EOF
@@ -60,6 +61,28 @@ echo "cp $*" >>"$STUB_LOG"
 /usr/bin/cp "$@" || exit 1
 if [[ -n "${STUB_CP_SHORT:-}" ]]; then find "${@: -1}" -type f | head -1 | xargs -r rm -f; fi
 EOF
+cat >"$BIN/sync" <<'EOF'
+#!/bin/bash
+echo "sync $*" >>"$STUB_LOG"
+EOF
+cat >"$BIN/find" <<'EOF'
+#!/bin/bash
+[[ -z "${STUB_FIND_FAILS:-}" ]] || exit 1
+exec /usr/bin/find "$@"
+EOF
+cat >"$BIN/mvwrap" <<'EOF'
+#!/bin/bash
+# Logs every mv; STUB_MV_FAIL_AT=<n> fails the n-th call; with STUB_REQUIRE_MANIFEST
+# an OS subvolume may be set aside only once the stamp's manifest exists and names it.
+n=$(($(cat "$STUB_MVCOUNT" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_MVCOUNT"
+from=${*: -2:1}; to=${*: -1}
+echo "mv $from $to" >>"$STUB_LOG"
+if [[ -n "${STUB_MV_FAIL_AT:-}" && "$n" -eq "$STUB_MV_FAIL_AT" ]]; then echo "mv: stubbed failure" >&2; exit 1; fi
+if [[ -n "${STUB_REQUIRE_MANIFEST:-}" && "$to" == *".replaced.$DAS_INSTALL_STAMP" ]]; then
+    grep -qF "$(basename "$from")" "$FIX_TOP/.das-provision.$DAS_INSTALL_STAMP" 2>/dev/null || { echo "mv: the manifest does not list it yet" >&2; exit 1; }
+fi
+exec /usr/bin/mv "$@"
+EOF
 chmod +x "$BIN"/*
 
 fixture() {
@@ -86,6 +109,7 @@ run() { # <step> [VAR=value ...]
     OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" FIX_TOP="$R/mnt/top" STUB_BLKID="$WORK/blkid.out" STUB_INSPECT="$WORK/inspect.out" STUB_PARTUUID="$WORK/partuuid.out" \
         FIX_ESP="$R/mnt/esp-old" DAS_INSTALL_ESP_MNT="$R/mnt/esp-old" DAS_INSTALL_ESP_PARTUUID=aaaaaaaa-01 \
         DAS_INSTALL_CONFIG="$R/payload/config.toml" DAS_INSTALL_CP="$BIN/cpwrap" \
+        DAS_INSTALL_SYNC="$BIN/sync" DAS_INSTALL_MV="$BIN/mvwrap" STUB_MVCOUNT="$WORK/mvcount" STUB_REQUIRE_MANIFEST=1 \
         DAS_INSTALL_ROOT="$R" DAS_INSTALL_TOP="$R/mnt/top" DAS_INSTALL_TARGET="$R/mnt/target" \
         DAS_INSTALL_UUID=5eed0008-0000-4000-8000-000000000008 DAS_INSTALL_ESP_LABEL=RECOV-ESP-1 DAS_INSTALL_BAY=1 \
         DAS_INSTALL_LETTER=A DAS_INSTALL_HOSTNAME=das-recovery-bay1 DAS_INSTALL_STAMP=20261013-010203 \
@@ -170,6 +194,15 @@ chain() { # S1 leaves a partial @ and a partial p1, then S2 runs over it
     run replace-os DAS_INSTALL_STAMP=$S2
 }
 
+booted_new() { # the new OS has booted: its marker is newer than every live manifest
+    local m
+    for m in "$TOPD"/.das-provision.*; do [[ -f "$m" ]] && touch -d '2026-10-13 06:00' "$m"; done
+    mkdir -p "$TOPD/@/var/lib/das-recovery"
+    touch -d '2026-10-13 12:00' "$TOPD/@/var/lib/das-recovery/booted"
+}
+ln1() { grep -n -m1 -E -- "$1" "$LOG" | cut -d: -f1 || :; }
+after() { awk -v n="$1" -v p="$2" 'NR>n && $0 ~ p {print NR; exit}' "$LOG"; }
+
 echo "== replace-os: p1 is checked by PARTUUID, copied and compared before anything is touched (B)"
 fixture; run replace-os
 check "esp: p1's PARTUUID is read" has "$LOG" "blkid -s PARTUUID -o value /dev/sdz1"
@@ -202,7 +235,7 @@ for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-101
     check "manifest: $s" grep -qxF "$s$TAB$s.replaced.$S1" "$MF"
 done
 check "manifest: the ESP copy" grep -qxF "@esp${TAB}@esp.replaced.$S1" "$MF"
-check "manifest: six lines, nothing else" test "$(wc -l <"$MF")" -eq 6
+check "manifest: six entries and the #end count, nothing else" test "$(wc -l <"$MF")" -eq 7 -a "$(tail -1 "$MF")" = "#end 6"
 check "manifest: no .new left behind" test ! -e "$MF.new"
 fixture; : >"$TOPD/.das-provision.$S1"; run replace-os
 check "manifest of this stamp exists: exit 2" test "$RC" -eq 2
@@ -311,12 +344,12 @@ echo "== verify: the loader files, every file the entries name, every fstab devi
 vfix() { # a complete target tree
     fixture
     local b="$R/mnt/target/boot" e
-    mkdir -p "$b/loader/entries" "$b/EFI/systemd" "$R/mnt/target/etc"
+    mkdir -p "$b/loader/entries" "$b/EFI/systemd" "$b/EFI/BOOT" "$R/mnt/target/etc"
     printf 'default cachyos-recovery.conf\n' >"$b/loader/loader.conf"
     for e in cachyos-recovery cachyos-recovery-fallback; do
         printf 'linux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /initramfs-linux-cachyos.img\n' >"$b/loader/entries/$e.conf"
     done
-    : >"$b/vmlinuz-linux-cachyos"; : >"$b/amd-ucode.img"; : >"$b/initramfs-linux-cachyos.img"; : >"$b/EFI/systemd/systemd-bootx64.efi"
+    : >"$b/vmlinuz-linux-cachyos"; : >"$b/amd-ucode.img"; : >"$b/initramfs-linux-cachyos.img"; : >"$b/EFI/systemd/systemd-bootx64.efi"; : >"$b/EFI/BOOT/BOOTX64.EFI"
     printf 'UUID=5eed0008-0000-4000-8000-000000000008 / btrfs subvol=/@ 0 0\n' >"$R/mnt/target/etc/fstab"
 }
 vfix; run verify
@@ -336,6 +369,9 @@ check "verify, no loader entries at all: said" out_has "no loader entries"
 vfix; rm "$R/mnt/target/boot/EFI/systemd/systemd-bootx64.efi"; run verify
 check "verify, no systemd-bootx64.efi: exit 3" test "$RC" -eq 3
 check "verify, no systemd-bootx64.efi: named" out_has "EFI/systemd/systemd-bootx64.efi is not on the ESP"
+vfix; rm "$R/mnt/target/boot/EFI/BOOT/BOOTX64.EFI"; run verify
+check "verify, no EFI/BOOT/BOOTX64.EFI: exit 3" test "$RC" -eq 3
+check "verify, no EFI/BOOT/BOOTX64.EFI: named" out_has "EFI/BOOT/BOOTX64.EFI is not on the ESP"
 vfix; rm "$R/mnt/target/boot/loader/loader.conf"; run verify
 check "verify, no loader.conf: exit 3" test "$RC" -eq 3
 vfix; rm "$R/mnt/target/boot/loader/entries/cachyos-recovery-fallback.conf"; run verify
@@ -355,12 +391,12 @@ chain
 check "chain: S2 exit 0" test "$RC" -eq 0
 check "chain: both manifests exist" test -f "$TOPD/.das-provision.$S1" -a -f "$TOPD/.das-provision.$S2"
 check "chain: S2 listed the partial @ it set aside" grep -qxF "@${TAB}@.replaced.$S2" "$TOPD/.das-provision.$S2"
-check "chain: S2 did not list names S1 already set aside" test "$(wc -l <"$TOPD/.das-provision.$S2")" -eq 3
+check "chain: S2 did not list names S1 already set aside" test "$(wc -l <"$TOPD/.das-provision.$S2")" -eq 4
 check "chain: the old root is still at @.replaced.<S1>" test "$(cat "$TOPD/@.replaced.$S1/sentinel")" = "old-@"
 mkdir -p "$TOPD/@.replaced.$S1/var/lib/machines" "$TOPD/@.replaced.$S1/var/lib/portables"
 echo rw >"$TOPD/@.replaced.$S1/var/lib/machines/.subvol"; echo rw >"$TOPD/@.replaced.$S1/var/lib/portables/.subvol"
 mkdir -p "$TOPD/nvme.replaced.$S1"; echo "ro received" >"$TOPD/nvme.replaced.$S1/.subvol"
-: >"$LOG"; run delete-replaced
+: >"$LOG"; booted_new; run delete-replaced
 check "delete-replaced: exit 0" test "$RC" -eq 0
 for s in $S1 $S2; do
     for n in @ @home @esp; do
@@ -382,12 +418,12 @@ check "delete-replaced, no live manifest left: exit 2" test "$RC" -eq 2
 fixture; run delete-replaced
 check "delete-replaced, no manifest at all: exit 2, deletes nothing" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
 check "delete-replaced, no manifest: said" out_has "no provision manifest"
-fixture; run replace-os; : >"$LOG"; run delete-replaced STUB_DELETE_FAILS=1
+fixture; run replace-os; : >"$LOG"; booted_new; run delete-replaced STUB_DELETE_FAILS=1
 check "delete-replaced, every delete fails: exit 2" test "$RC" -eq 2
 check "delete-replaced, every delete fails: all six attempted (five OS names and the ESP copy)" test "$(calls 'subvolume delete')" -eq 6
 check "delete-replaced, a delete fails: named" out_has "could not delete @.replaced.$S1"
 check "delete-replaced, a delete fails: not reported done, manifest kept" test -f "$TOPD/.das-provision.$S1.deleting" -a ! -e "$TOPD/.das-provision.$S1.done"
-fixture; run replace-os; : >"$LOG"; run delete-replaced STUB_LIST_FAILS=1
+fixture; run replace-os; : >"$LOG"; booted_new; run delete-replaced STUB_LIST_FAILS=1
 check "delete-replaced, listing fails: exit 2, never '0 deleted'" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
 check "delete-replaced, listing fails: said" out_has "cannot list the subvolumes"
 check "delete-replaced, listing fails: manifest untouched" test -f "$TOPD/.das-provision.$S1"
@@ -424,7 +460,7 @@ fixture; run replace-os; : >"$LOG"; run undo STUB_LIST_FAILS=1
 check "undo, listing fails: exit 2, never 'nothing to undo'" test "$RC" -eq 2
 check "undo, listing fails: nothing renamed" test -d "$TOPD/@.replaced.$S1"
 check "undo, listing fails: said" out_has "cannot list the subvolumes"
-fixture; run replace-os; run delete-replaced STUB_DELETE_FAIL_ONLY="@home.replaced.$S1"; : >"$LOG"
+fixture; run replace-os; booted_new; run delete-replaced STUB_DELETE_FAIL_ONLY="@home.replaced.$S1"; : >"$LOG"
 check "partial delete: exit 2" test "$RC" -eq 2
 run undo
 check "partial delete then undo: exit 3" test "$RC" -eq 3
@@ -442,6 +478,97 @@ check "undo, set-aside gone and original absent: nothing renamed" test -d "$TOPD
 fixture; run replace-os; : >"$WORK/partuuid.out"; run undo
 check "undo, p1 PARTUUID unreadable: exit 3" test "$RC" -eq 3
 check "undo, p1 PARTUUID unreadable: nothing renamed (checked in the preflight)" test -d "$TOPD/@.replaced.$S1" -a ! -d "$TOPD/@.unbooted.$S1"
+
+echo "== durability: the copy, the manifest and the renames are on disk before p1 is formatted (C1, I2)"
+fixture; run replace-os
+check "durability: replace-os exit 0 (the mv stub refuses any set-aside the manifest does not list yet)" test "$RC" -eq 0
+L_copy=$(ln1 "^sync -f $TOPD/@esp.replaced.$S1\$")
+L_man=$(ln1 "^sync -f $TOPD/.das-provision.$S1.new\$")
+L_dir=$(after "$L_man" "^sync -f $TOPD\$")
+L_mv=$(ln1 "^mv .*\\.replaced\\.$S1\$")
+L_fs=$(ln1 "^btrfs filesystem sync $TOPD\$")
+L_mkfs=$(ln1 "^mkfs.vfat")
+check "durability: the ESP copy synced, then the manifest synced" test "$L_copy" -lt "$L_man"
+check "durability: manifest placed and the top level synced before the first rename" test "$L_man" -lt "$L_dir" -a "$L_dir" -lt "$L_mv"
+check "durability: filesystem sync after the renames, before mkfs" test "$L_mv" -lt "$L_fs" -a "$L_fs" -lt "$L_mkfs"
+fixture; run replace-os; : >"$LOG"; run undo
+U_ing=$(ln1 '^mv .*\.undoing$')
+U_s1=$(after "$U_ing" "^sync -f $TOPD\$")
+U_mv=$(ln1 '^mv .*\.unbooted\.')
+U_last=$(grep -n '^mv ' "$LOG" | grep -v '\.undone$' | tail -1 | cut -d: -f1 || :)
+U_fs=$(ln1 "^btrfs filesystem sync $TOPD\$")
+U_mkfs=$(ln1 '^mkfs.vfat')
+U_done=$(ln1 '^mv .*\.undone$')
+U_end=$(after "$U_done" "^sync -f $TOPD\$")
+check "durability, undo: manifests marked .undoing and synced before the first rename" test "$U_ing" -lt "$U_s1" -a "$U_s1" -lt "$U_mv"
+check "durability, undo: filesystem sync after the last rename, before mkfs" test "$U_last" -lt "$U_fs" -a "$U_fs" -lt "$U_mkfs"
+check "durability, undo: synced again after the .undone renames" test "$U_mkfs" -lt "$U_done" -a "$U_done" -lt "$U_end"
+
+echo "== the ESP copy is checked by content, not size (C4, I3)"
+fixture; run replace-os
+E="$TOPD/@esp.replaced.$S1"
+check "esp.list: written beside the copy" test -f "$E/esp.list"
+check "esp.list: holds the sha256 of the file" grep -q "$(sha256sum "$E/esp/old-esp-file" | cut -d' ' -f1)  ./old-esp-file" "$E/esp.list"
+check "esp.list: synced" has "$LOG" "sync -f $E"
+rm "$E/esp/old-esp-file"; : >"$LOG"; run undo
+check "undo, a file gone from the copy: exit 3" test "$RC" -eq 3
+check "undo, a file gone from the copy: refused before any rename or mkfs" test -d "$TOPD/@.replaced.$S1" -a -f "$TOPD/.das-provision.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
+fixture; run replace-os; printf 'OLD esp\n' >"$E/esp/old-esp-file"; : >"$LOG"; run undo
+check "undo, a file altered to the same size: exit 3" test "$RC" -eq 3
+check "undo, same size altered: nothing renamed, p1 not formatted" test -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
+fixture; run replace-os; rm -f "$E/esp.list"; : >"$LOG"; run undo
+check "undo, no esp.list: exit 3, nothing changed" test "$RC" -eq 3 -a -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0
+fixture; run replace-os; : >"$LOG"; run undo STUB_CP_SHORT=1
+check "undo, the restored p1 differs from esp.list: exit 3" test "$RC" -eq 3
+check "undo, the restored p1 differs: said" out_has "differs from"
+check "undo, the restored p1 differs: the manifests are not marked undone" test ! -e "$TOPD/.das-provision.$S1.undone"
+fixture; run replace-os STUB_FIND_FAILS=1
+check "a failing find is a failure, not an empty list: exit 2" test "$RC" -eq 2
+check "a failing find: p1 not formatted, nothing renamed" test "$(calls 'mkfs.vfat')" -eq 0 -a -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
+
+echo "== a truncated manifest is refused (I1)"
+fixture; run replace-os; MF="$TOPD/.das-provision.$S1"; sed -i '$d' "$MF"; : >"$LOG"; run undo
+check "undo, the #end line cut off: exit 2" test "$RC" -eq 2
+check "undo, #end cut off: nothing renamed" test -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
+booted_new; run delete-replaced
+check "delete-replaced, the #end line cut off: exit 2, nothing deleted" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
+fixture; run replace-os; MF="$TOPD/.das-provision.$S1"; truncate -s -9 "$MF"; : >"$LOG"; run undo
+check "undo, cut in the middle of an entry: exit 2, nothing renamed" test "$RC" -eq 2 -a -d "$TOPD/@.replaced.$S1" -a "$(calls 'mv ')" -eq 0
+fixture; run replace-os; MF="$TOPD/.das-provision.$S1"; sed -i 's/^#end 6$/#end 5/' "$MF"; : >"$LOG"; run undo
+check "undo, #end count differs: exit 2, nothing renamed" test "$RC" -eq 2 -a -d "$TOPD/@.replaced.$S1" -a "$(calls 'mv ')" -eq 0
+booted_new; run delete-replaced
+check "delete-replaced, #end count differs: exit 2" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
+
+echo "== undo refuses when ANY installed root has booted (C2)"
+chain; mkdir -p "$TOPD/@.replaced.$S2/var/lib/das-recovery"; : >"$TOPD/@.replaced.$S2/var/lib/das-recovery/booted"; : >"$LOG"; run undo
+check "chain, S1's root booted then S2 set it aside: exit 3" test "$RC" -eq 3
+check "chain: names where the marker was found" out_has "@.replaced.$S2/var/lib/das-recovery/booted"
+check "chain: nothing renamed, p1 untouched" test -d "$TOPD/@.replaced.$S1" -a -d "$TOPD/@.replaced.$S2" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
+chain; mkdir -p "$TOPD/@.replaced.$S1/var/lib/das-recovery"; : >"$TOPD/@.replaced.$S1/var/lib/das-recovery/booted"; run undo
+check "a marker in the OLDEST set-aside (the old OS, which never was installed by us) does not refuse" test "$RC" -eq 0
+
+echo "== delete-replaced waits for proof that the new OS booted, and not for an interrupted undo (C3)"
+fixture; run replace-os; : >"$LOG"; run delete-replaced
+check "delete-replaced, no booted marker: exit 3" test "$RC" -eq 3
+check "delete-replaced, no booted marker: said" out_has "has not booted"
+check "delete-replaced, no booted marker: nothing deleted, manifest live" test "$(calls 'subvolume delete')" -eq 0 -a -f "$TOPD/.das-provision.$S1"
+fixture; run replace-os; booted_new; touch -d '2026-10-12 00:00' "$TOPD/@/var/lib/das-recovery/booted"; : >"$LOG"; run delete-replaced
+check "delete-replaced, a marker older than the manifest: exit 3, nothing deleted" test "$RC" -eq 3 -a "$(calls 'subvolume delete')" -eq 0
+fixture; run replace-os; mv "$TOPD/.das-provision.$S1" "$TOPD/.das-provision.$S1.undoing"; booted_new; : >"$LOG"; run delete-replaced
+check "delete-replaced, an .undoing manifest: exit 3" test "$RC" -eq 3
+check "delete-replaced, an .undoing manifest: said" out_has "undo began"
+check "delete-replaced, an .undoing manifest: nothing deleted" test "$(calls 'subvolume delete')" -eq 0
+fixture; run replace-os; : >"$LOG"; : >"$WORK/mvcount"; run undo STUB_MV_FAIL_AT=4
+check "interrupted undo (the fourth mv fails): exit 2" test "$RC" -eq 2
+check "interrupted undo: the manifest is .undoing" test -f "$TOPD/.das-provision.$S1.undoing" -a ! -e "$TOPD/.das-provision.$S1"
+booted_new; : >"$LOG"; run delete-replaced
+check "interrupted undo, then delete-replaced: exit 3, deletes nothing" test "$RC" -eq 3 -a "$(calls 'subvolume delete')" -eq 0
+rm -f "$TOPD/@/var/lib/das-recovery/booted"; : >"$WORK/mvcount"; run undo
+check "interrupted undo, undo run again: exit 0" test "$RC" -eq 0
+for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
+    check "interrupted undo, run again: $s is the OLD one" test "$(cat "$TOPD/$s/sentinel")" = "old-$s"
+done
+check "interrupted undo, run again: manifest .undone" test -f "$TOPD/.das-provision.$S1.undone" -a ! -e "$TOPD/.das-provision.$S1.undoing"
 
 echo
 if ((FAILS > 0)); then printf '%d check(s) FAILED\n' "$FAILS"; exit 1; fi
