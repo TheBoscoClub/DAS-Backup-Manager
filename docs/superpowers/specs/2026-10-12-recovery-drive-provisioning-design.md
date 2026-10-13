@@ -2,8 +2,10 @@
 
 Status: REVIEWED 2026-10-12 — every decision D1–D9 settled by the operator (§8). Nothing in
 this document has been built. Plans: `docs/superpowers/plans/2026-10-12-recovery-state-plan.md`
-(plan 1: D4, D8, the resolver), plan 2 (provision subcommand, guest installer, D1, docs) and
-plan 3 (rehearsal, rebuild, Phase 5 restore proof) follow.
+(plan 1: D4, D8, the resolver — built 2026-10-12),
+`docs/superpowers/plans/2026-10-12-recovery-provision-plan.md` (plan 2: provision subcommand,
+guest installer, `--undo`, D1, D9, docs — written 2026-10-12) and plan 3 (rehearsal, rebuild,
+Phase 5 restore proof) follows.
 
 ## 1. Why
 
