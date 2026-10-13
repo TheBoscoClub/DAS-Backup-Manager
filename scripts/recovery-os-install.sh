@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.4.0
+# Version: 1.4.1
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -84,7 +84,8 @@ need() {
 }
 
 # ---- the allowlist -------------------------------------------------------
-# A name is replaced when it is EXACTLY @, @home or @rescue; or @.pre-update. /
+# A name is replaced when it is EXACTLY @, @home, @rescue or @.previous (the
+# writable clone the pipeline's loader step makes); or @.pre-update. /
 # @.half-upgraded. followed by exactly a stamp (YYYYMMDD-HHMM, optionally SS,
 # the shape recovery-os-vm.sh's snapshot step writes) and nothing after; or is
 # one of DAS_INSTALL_ALSO_REPLACE (each exactly @.archive.<chars>). A name
@@ -109,13 +110,13 @@ validate_inputs() {
 valid_orig() {
     local n=$1
     ours_already "$n" && return 1
-    case "$n" in @ | @home | @rescue | @esp) return 0 ;; esac
+    case "$n" in @ | @home | @rescue | @.previous | @esp) return 0 ;; esac
     [[ "$n" =~ $OS_SNAP_RE ]] || archive_name_ok "$n"
 }
 on_allowlist() {
     local n=$1 a
     ours_already "$n" && return 1
-    case "$n" in @ | @home | @rescue) return 0 ;; esac
+    case "$n" in @ | @home | @rescue | @.previous) return 0 ;; esac
     [[ "$n" =~ $OS_SNAP_RE ]] && return 0
     for a in "${ALSO_LIST[@]}"; do [[ "$n" != "$a" ]] || return 0; done
     return 1
@@ -654,12 +655,12 @@ step_undo() {
     # mount that was written would read the page cache, not the disk.
     if ((rc == 0)); then "$SYNC" -f "$ESP_MNT" || rc=2; fi
     if ((rc == 0)); then
-        mounted=0
-        "$UMOUNT" "$ESP_MNT" || rc=2
+        # mounted follows what each call did, so a failed remount is never
+        # followed by an unmount that hides it.
+        if "$UMOUNT" "$ESP_MNT"; then mounted=0; else rc=2; fi
     fi
     if ((rc == 0)); then
-        "$MOUNT" -o ro "${DEV}1" "$ESP_MNT" || rc=2
-        mounted=1
+        if "$MOUNT" -o ro "${DEV}1" "$ESP_MNT"; then mounted=1; else rc=2; fi
     fi
     if ((rc == 0)); then matches_list "$ESP_MNT" "$esp_dir/esp.list" || rc=$?; fi
     if ((mounted == 1)); then "$UMOUNT" "$ESP_MNT" || cannot "cannot unmount p1 after restoring it"; fi
