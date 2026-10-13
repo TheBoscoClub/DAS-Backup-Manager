@@ -4698,7 +4698,7 @@ unattended_fixture() {
     printf 'running\n' >"$S/states.running"
     printf 'running\n' >"$S/domB/states.running"
 }
-STEPS="egress repos snapshot guard-lift keyrings upgrade packages initramfs loader verify-btrbk verify-boot guard-engage"
+STEPS="egress repos snapshot slot guard-lift keyrings upgrade packages initramfs loader verify-btrbk verify-boot guard-engage"
 for how in schema3 not-installed not-enabled unreadable; do
     fixture
     case "$how" in
@@ -5305,22 +5305,147 @@ for knob in 'cachy os' 'a;b' '/x'; do
     has "repos knob '$knob': says which" "$OUT" "DAS_RECOVERY_VM_REPOS_FIRST takes letters, digits, '-' and '_' (a repository name's start: cachyos), or nothing"
 done
 
-echo "--- the loader step: the previous-root entry follows the newest @.pre-update (D1)"
-# The pipeline's snapshot step keeps the newest two @.pre-update.<stamp>; this
-# step points cachyos-recovery-previous.conf at the newest, read-only, so the
-# menu always holds the last upgrade's known-good root.
+echo "--- slot B and the loader step: a matched previous kernel and a writable previous root (D1, operator 2026-10-13)"
+# Before pacman runs, the slot step copies every file the main and fallback
+# entries boot to the ESP's previous/, paired (previous/snapshot) with the
+# @.pre-update the snapshot step just took. After the upgrade, the loader step
+# clones that snapshot as the writable @.previous and points two entries at
+# the pair; with no dependable pair it writes one notice entry that boots the
+# current OS. A slot that cannot be refreshed never stops the upgrade.
 MAIN_ENTRY=$'title CachyOS Emergency Recovery (Bay 1)\nsort-key cachyos\nlinux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /initramfs-linux-cachyos.img\noptions root=UUID=1111-2222 rw rootflags=subvol=/@ quiet'
-run_loader_script() { # <subvolume list body or FAIL> <main entry body or ABSENT>
+FB_ENTRY=$'title CachyOS Emergency Recovery — Fallback (Bay 1)\nlinux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /initramfs-linux-cachyos-fallback.img\noptions root=UUID=1111-2222 rw rootflags=subvol=/@ quiet'
+KSET="vmlinuz-linux-cachyos amd-ucode.img initramfs-linux-cachyos.img initramfs-linux-cachyos-fallback.img"
+# The ESP of a recovery drive: both entries, the kernel set, and (unless
+# NONE) a slot previous/ holding the set paired with $1.
+esp_fixture() {
     rm -rf "${T:?}/esp" "${T:?}/top" "${T:?}/bin"
     mkdir -p "$T/esp/loader/entries" "$T/top" "$T/bin"
-    if [[ "$2" != ABSENT ]]; then printf '%s\n' "$2" >"$T/esp/loader/entries/cachyos-recovery.conf"; fi
+    printf '%s\n' "$MAIN_ENTRY" >"$T/esp/loader/entries/cachyos-recovery.conf"
+    printf '%s\n' "$FB_ENTRY" >"$T/esp/loader/entries/cachyos-recovery-fallback.conf"
+    local f
+    for f in $KSET; do printf 'current %s\n' "$f" >"$T/esp/$f"; done
+    if [[ "${1:-NONE}" != NONE ]]; then
+        mkdir -p "$T/esp/previous"
+        for f in $KSET; do printf 'previous %s\n' "$f" >"$T/esp/previous/$f"; done
+        printf '%s\n' "$1" >"$T/esp/previous/snapshot"
+    fi
     printf 'stale\n' >"$T/esp/loader/entries/cachyos-recovery-previous.conf"
+    printf 'stale\n' >"$T/esp/loader/entries/cachyos-recovery-previous-fallback.conf"
+    : >"$T/loader.calls"
+}
+
+echo "--- the slot step"
+# The step's script as the pipeline writes it, its snapshot line given here.
+unattended_fixture
+printf 'snapshot: @.pre-update.20261013-0300 (read-only)\n' >"$S/stage.snapshot.out"
+run_driver session A --unattended
+check "slot: a step of its own, after snapshot, before guard-lift" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+has "slot: paired with the snapshot the snapshot step printed" "$(file "$S/stage.slot.sh")" "snap=@.pre-update.20261013-0300"
+SLOT_SH="$T/slot.sh"
+run_slot_script() { # <snapshot name>; df answers from $T/df.avail; cp fails while $T/cp.fail exists
+    sed "1s/^snap=.*/snap=$1/" "$S/stage.slot.sh" >"$SLOT_SH"
+    printf '#!/bin/sh\necho Avail\necho "$(cat "%s" 2>/dev/null || echo 1073741824)"\n' "$T/df.avail" >"$T/bin/df"
+    # cp fails while $T/cp.fail exists; copies, then corrupts, while $T/cp.corrupt exists
+    printf '#!/bin/sh\necho "cp $*" >>"%s"\nif [ -e "%s" ]; then echo "cp: error writing: No space left on device" >&2; exit 1; fi\n/usr/bin/cp "$@" || exit\nif [ -e "%s" ]; then echo garbage >>"$2"; fi\n' "$T/loader.calls" "$T/cp.fail" "$T/cp.corrupt" >"$T/bin/cp"
+    printf '#!/bin/sh\necho "sync $*" >>"%s"\n' "$T/loader.calls" >"$T/bin/sync"
+    chmod +x "$T/bin/df" "$T/bin/cp" "$T/bin/sync"
+    RC=0
+    OUT="$(ESP="$T/esp" PATH="$T/bin:$PATH" sh "$SLOT_SH" 2>&1)" || RC=$?
+}
+esp_fixture @.pre-update.20261011-1016
+run_slot_script @.pre-update.20261013-0300
+check "slot: exit 0" "$RC" "0"
+has "slot: says what it kept" "$OUT" "slot B: amd-ucode.img initramfs-linux-cachyos-fallback.img initramfs-linux-cachyos.img vmlinuz-linux-cachyos paired with @.pre-update.20261013-0300"
+for f in $KSET; do
+    check "slot: $f is the current one" "$(cat "$T/esp/previous/$f")" "current $f"
+done
+check "slot: paired with this run's snapshot" "$(cat "$T/esp/previous/snapshot")" "@.pre-update.20261013-0300"
+check "slot: the status says ok" "$(cat "$T/esp/previous.status")" "ok @.pre-update.20261013-0300"
+check "slot: nothing left beside it" "$(ls -d "$T/esp/previous.new" "$T/esp/previous.old" 2>/dev/null | wc -l)" "0"
+has "slot: flushed" "$(file "$T/loader.calls")" "sync -f $T/esp/previous/snapshot"
+# the ESP too full: the upgrade goes on, the old slot stays exactly as it was
+esp_fixture @.pre-update.20261011-1016
+echo 1048576 >"$T/df.avail"
+run_slot_script @.pre-update.20261013-0300
+rm -f "$T/df.avail"
+check "slot, ESP full: exit 0 (never stops the upgrade)" "$RC" "0"
+has "slot, ESP full: says so" "$OUT" "slot B not refreshed: the ESP is too full"
+check "slot, ESP full: the old pair kept" "$(cat "$T/esp/previous/snapshot")" "@.pre-update.20261011-1016"
+check "slot, ESP full: the old kernel kept" "$(cat "$T/esp/previous/vmlinuz-linux-cachyos")" "previous vmlinuz-linux-cachyos"
+has "slot, ESP full: the kept pair named" "$OUT" "the previous slot is kept as it was: paired with @.pre-update.20261011-1016"
+matches "slot, ESP full: the status says why, dated" "$(cat "$T/esp/previous.status")" "^failed [0-9]{4}-[0-9]{2}-[0-9]{2}: the ESP is too full"
+check "slot, ESP full: nothing copied" "$(grep -c '^cp ' "$T/loader.calls" || :)" "0"
+# a copy that fails half-way
+esp_fixture @.pre-update.20261011-1016
+: >"$T/cp.fail"
+run_slot_script @.pre-update.20261013-0300
+rm -f "$T/cp.fail"
+check "slot, copy fails: exit 0" "$RC" "0"
+has "slot, copy fails: says so" "$OUT" "slot B not refreshed: cp: error writing: No space left on device"
+check "slot, copy fails: the old pair kept" "$(cat "$T/esp/previous/snapshot")" "@.pre-update.20261011-1016"
+check "slot, copy fails: no half copy left" "$([[ -e "$T/esp/previous.new" ]] && echo present || echo absent)" "absent"
+# a copy that reads back different (a bad block, a FAT error)
+esp_fixture @.pre-update.20261011-1016
+: >"$T/cp.corrupt"
+run_slot_script @.pre-update.20261013-0300
+rm -f "$T/cp.corrupt"
+has "slot, a copy reads back different: says which" "$OUT" "slot B not refreshed: the copy of amd-ucode.img differs from the ESP's"
+check "slot, a copy reads back different: the old pair kept" "$(cat "$T/esp/previous/snapshot")" "@.pre-update.20261011-1016"
+check "slot, a copy reads back different: no half copy left" "$([[ -e "$T/esp/previous.new" ]] && echo present || echo absent)" "absent"
+# a file the entries name is not there
+esp_fixture NONE
+rm "$T/esp/initramfs-linux-cachyos-fallback.img"
+run_slot_script @.pre-update.20261013-0300
+check "slot, a named file missing: exit 0" "$RC" "0"
+has "slot, a named file missing: says which" "$OUT" "slot B not refreshed: initramfs-linux-cachyos-fallback.img, named by the entries, is not on the ESP"
+has "slot, a named file missing: no slot at all" "$OUT" "there is no previous slot"
+# no snapshot this run (the snapshot step printed none)
+esp_fixture @.pre-update.20261011-1016
+run_slot_script ""
+has "slot, no snapshot: says so" "$OUT" "slot B not refreshed: no snapshot was taken this run"
+check "slot, no snapshot: the old pair kept" "$(cat "$T/esp/previous/snapshot")" "@.pre-update.20261011-1016"
+# a run that stopped between the two renames last time
+esp_fixture @.pre-update.20261011-1016
+mv "$T/esp/previous" "$T/esp/previous.old"
+run_slot_script @.pre-update.20261013-0300
+check "slot, after a stop between the renames: refreshed" "$(cat "$T/esp/previous/snapshot")" "@.pre-update.20261013-0300"
+check "slot, after a stop between the renames: no .old left" "$([[ -e "$T/esp/previous.old" ]] && echo present || echo absent)" "absent"
+# ...and when the refresh after such a stop fails, the last slot is still there
+esp_fixture @.pre-update.20261011-1016
+mv "$T/esp/previous" "$T/esp/previous.old"
+echo 1048576 >"$T/df.avail"
+run_slot_script @.pre-update.20261013-0300
+rm -f "$T/df.avail"
+has "slot, a stop between the renames, then a full ESP: not refreshed" "$OUT" "slot B not refreshed: the ESP is too full"
+check "slot, a stop between the renames, then a full ESP: the last slot put back" "$(cat "$T/esp/previous/snapshot" 2>/dev/null)" "@.pre-update.20261011-1016"
+# an entry naming a file in a subdirectory is not a kernel set this copies
+esp_fixture NONE
+sed -i 's#^linux /vmlinuz-linux-cachyos#linux /EFI/cachyos/vmlinuz#' "$T/esp/loader/entries/cachyos-recovery.conf"
+run_slot_script @.pre-update.20261013-0300
+has "slot, a nested path: refused" "$OUT" "slot B not refreshed: the entries name EFI/cachyos/vmlinuz, not a file at the top of the ESP"
+# the pipeline: a slot not refreshed is a warning, and every later step runs
+unattended_fixture
+printf 'slot B not refreshed: the ESP is too full\n' >"$S/stage.slot.out"
+run_driver session A --unattended
+check "slot not refreshed, the pipeline: exit 5" "$RC" "5"
+check "slot not refreshed, the pipeline: every step ran" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+has "slot not refreshed, the pipeline: the warning" "$OUT" "slot B (the previous kernel set) was not refreshed: the ESP is too full"
+has "slot not refreshed, the pipeline: its result" "$OUT" "RESULT system-recovery-A-2tb 5 warnings"
+
+echo "--- the loader step"
+run_loader_script() { # <subvolume list body or FAIL> [the slot's snapshot or NONE]
+    esp_fixture "${2:-NONE}"
+    if [[ -n "${LOADER_NO_MAIN:-}" ]]; then rm "$T/esp/loader/entries/cachyos-recovery.conf"; fi
+    if [[ -n "${LOADER_MAIN:-}" ]]; then printf '%s\n' "$LOADER_MAIN" >"$T/esp/loader/entries/cachyos-recovery.conf"; fi
+    if [[ -n "${LOADER_STATUS:-}" ]]; then printf '%s\n' "$LOADER_STATUS" >"$T/esp/previous.status"; fi
     printf '%s\n' "$1" >"$T/subvols"
     cat >"$T/bin/btrfs" <<STUB
 #!/bin/sh
 echo "btrfs \$*" >>"$T/loader.calls"
-if [ "\$(cat "$T/subvols")" = FAIL ]; then echo "ERROR: cannot access the top level" >&2; exit 1; fi
-cat "$T/subvols"
+case "\$2" in
+    list) if [ "\$(cat "$T/subvols")" = FAIL ]; then echo "ERROR: cannot access the top level" >&2; exit 1; fi; cat "$T/subvols" ;;
+    snapshot | delete) if [ -e "$T/btrfs.\$2.fail" ]; then echo "ERROR: \$2 failed" >&2; exit 1; fi ;;
+esac
 STUB
     # mount and umount fail while $T/mount.fail / $T/umount.fail exist
     for m in mount umount; do
@@ -5330,7 +5455,6 @@ STUB
     # the unset-TOP path makes /run/das-vm-update/top: a stand-in, not root's /run
     printf '#!/bin/sh\necho "mkdir $*" >>"%s"\n' "$T/loader.calls" >"$T/bin/mkdir"
     chmod +x "$T/bin/btrfs" "$T/bin/mount" "$T/bin/umount" "$T/bin/findmnt" "$T/bin/mkdir"
-    : >"$T/loader.calls"
     RC=0
     if [[ -n "${LOADER_TOP_UNSET:-}" ]]; then
         OUT="$(ESP="$T/esp" PATH="$T/bin:$PATH" sh "$S/stage.loader.sh" 2>&1)" || RC=$?
@@ -5338,79 +5462,129 @@ STUB
         OUT="$(ESP="$T/esp" TOP="$T/top" PATH="$T/bin:$PATH" sh "$S/stage.loader.sh" 2>&1)" || RC=$?
     fi
     PREV="$T/esp/loader/entries/cachyos-recovery-previous.conf"
+    PREVFB="$T/esp/loader/entries/cachyos-recovery-previous-fallback.conf"
 }
+present() { if [[ -e "$1" ]]; then echo present; else echo absent; fi; }
 SUBVOLS=$'ID 256 gen 90 top level 5 path @\nID 300 gen 80 top level 5 path @.pre-update.20261011-1016\nID 310 gen 85 top level 5 path @.pre-update.20261012-0300\nID 320 gen 70 top level 5 path @.pre-update-notes\nID 330 gen 60 top level 5 path @.pre-update.20261013-xxxx'
 unattended_fixture
 run_driver session A --unattended
 check "loader: a step of its own, after initramfs, before verify-btrbk" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
-run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
-check "loader, two snapshots: exit 0" "$RC" "0"
-has "loader, two snapshots: says which it chose" "$OUT" "previous root: @.pre-update.20261012-0300"
-has "loader, two snapshots: the newest, by name" "$(file "$PREV")" "rootflags=subvol=/@.pre-update.20261012-0300 quiet"
-check "loader, two snapshots: the older one is not named" "$(grep -c '20261011' "$PREV" || :)" "0"
-check "loader, two snapshots: a stamp-less lookalike is not named" "$(grep -c 'notes\|xxxx' "$PREV" || :)" "0"
-has "loader, two snapshots: read-only" "$(file "$PREV")" " ro rootflags="
-check "loader, two snapshots: no rw left" "$(grep -c ' rw ' "$PREV" || :)" "0"
-has "loader, two snapshots: the root device kept" "$(file "$PREV")" "root=UUID=1111-2222"
-has "loader, two snapshots: the title" "$(file "$PREV")" "title CachyOS Emergency Recovery — Previous root, read-only (Bay 1)"
-has "loader, two snapshots: linux kept" "$(file "$PREV")" "linux /vmlinuz-linux-cachyos"
-check "loader, two snapshots: both initrd lines kept" "$(grep -c '^initrd ' "$PREV")" "2"
-check "loader, two snapshots: the main entry untouched" "$(file "$T/esp/loader/entries/cachyos-recovery.conf")" "$MAIN_ENTRY"
+# the slot paired with the newest snapshot: two entries, the kept kernel, the clone
+run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
+check "loader, a fresh pair: exit 0" "$RC" "0"
+has "loader, a fresh pair: says what it boots" "$OUT" "previous root: @.previous, a writable clone of @.pre-update.20261012-0300"
+has "loader, a fresh pair: the clone made from the pair" "$(file "$T/loader.calls")" "btrfs subvolume snapshot $T/top/@.pre-update.20261012-0300 $T/top/@.previous"
+has "loader, a fresh pair: the writable clone booted" "$(file "$PREV")" "rootflags=subvol=/@.previous quiet"
+has "loader, a fresh pair: writable" "$(file "$PREV")" "options root=UUID=1111-2222 rw rootflags="
+has "loader, a fresh pair: the kept kernel" "$(file "$PREV")" "linux /previous/vmlinuz-linux-cachyos"
+has "loader, a fresh pair: the kept initramfs" "$(file "$PREV")" "initrd /previous/initramfs-linux-cachyos.img"
+check "loader, a fresh pair: no kernel from the current set" "$(grep -c '^linux /vmlinuz\|^initrd /initramfs\|^initrd /amd' "$PREV" || :)" "0"
+has "loader, a fresh pair: the title, dated" "$(file "$PREV")" "title CachyOS Emergency Recovery — Previous root, 2026-10-12 03:00 (Bay 1)"
+has "loader, a fresh pair: the fallback entry" "$(file "$PREVFB")" "initrd /previous/initramfs-linux-cachyos-fallback.img"
+has "loader, a fresh pair: the fallback title" "$(file "$PREVFB")" "title CachyOS Emergency Recovery — Fallback — Previous root, 2026-10-12 03:00 (Bay 1)"
+has "loader, a fresh pair: the fallback boots the clone too" "$(file "$PREVFB")" "rootflags=subvol=/@.previous quiet"
+check "loader, a fresh pair: the main entry untouched" "$(file "$T/esp/loader/entries/cachyos-recovery.conf")" "$MAIN_ENTRY"
+check "loader, a fresh pair: no .new file left" "$(find "$T/esp/loader/entries" -name '*.new' | wc -l)" "0"
 check "loader, TOP given: nothing mounted" "$(grep -c 'mount' "$T/loader.calls" || :)" "0"
-run_loader_script $'ID 256 gen 90 top level 5 path @' "$MAIN_ENTRY"
+# an old clone is replaced
+run_loader_script "$SUBVOLS"$'\nID 400 gen 95 top level 5 path @.previous' @.pre-update.20261012-0300
+has "loader, an old clone: deleted" "$(file "$T/loader.calls")" "btrfs subvolume delete $T/top/@.previous"
+matches "loader, an old clone: deleted before the new one is made" "$(grep -o 'subvolume \(delete\|snapshot\)' "$T/loader.calls" | tr '\n' ' ')" "^subvolume delete subvolume snapshot $"
+: >"$T/btrfs.delete.fail"
+run_loader_script "$SUBVOLS"$'\nID 400 gen 95 top level 5 path @.previous' @.pre-update.20261012-0300
+rm -f "$T/btrfs.delete.fail"
+check "loader, the old clone cannot be deleted: exit 2" "$RC" "2"
+has "loader, the old clone cannot be deleted: says so" "$OUT" "cannot delete the old @.previous"
+check "loader, the old clone cannot be deleted: the stale entry is left" "$(file "$PREV")" "stale"
+: >"$T/btrfs.snapshot.fail"
+run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
+rm -f "$T/btrfs.snapshot.fail"
+check "loader, the clone cannot be made: exit 2" "$RC" "2"
+has "loader, the clone cannot be made: says so" "$OUT" "cannot clone @.pre-update.20261012-0300 as @.previous"
+check "loader, the clone cannot be made: the stale entry is left" "$(file "$PREV")" "stale"
+# the slot kept an older pair (this upgrade's copy failed): that pair, dated
+run_loader_script "$SUBVOLS" @.pre-update.20261011-1016
+has "loader, an older pair: cloned from it" "$(file "$T/loader.calls")" "btrfs subvolume snapshot $T/top/@.pre-update.20261011-1016 $T/top/@.previous"
+has "loader, an older pair: its date in the title" "$(file "$PREV")" "Previous root, 2026-10-11 10:16 (Bay 1)"
+# no fallback image in the slot: one entry, the stale fallback entry removed
+run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
+rm "$T/esp/previous/initramfs-linux-cachyos-fallback.img"
+OUT="$(ESP="$T/esp" TOP="$T/top" PATH="$T/bin:$PATH" sh "$S/stage.loader.sh" 2>&1)" && RC=0 || RC=$?
+check "loader, no fallback image kept: exit 0" "$RC" "0"
+check "loader, no fallback image kept: no fallback entry" "$(present "$PREVFB")" "absent"
+has "loader, no fallback image kept: the default entry" "$(file "$PREV")" "linux /previous/vmlinuz-linux-cachyos"
+# the slot's root was pruned: the notice entry, booting the current OS
+run_loader_script "$SUBVOLS" @.pre-update.20261001-0300
+check "loader, the pair's root pruned: exit 0" "$RC" "0"
+has "loader, the pair's root pruned: the notice" "$(file "$PREV")" "title CachyOS Emergency Recovery — Previous root UNAVAILABLE: the root it was kept with, @.pre-update.20261001-0300, has been removed — boots the current OS (Bay 1)"
+has "loader, the pair's root pruned: boots the current root" "$(file "$PREV")" "rootflags=subvol=/@ quiet"
+has "loader, the pair's root pruned: with the current kernel" "$(file "$PREV")" "linux /vmlinuz-linux-cachyos"
+check "loader, the pair's root pruned: no fallback entry" "$(present "$PREVFB")" "absent"
+check "loader, the pair's root pruned: no clone made" "$(grep -c 'subvolume snapshot' "$T/loader.calls" || :)" "0"
+run_loader_script "$SUBVOLS"$'\nID 400 gen 95 top level 5 path @.previous' @.pre-update.20261001-0300
+has "loader, the pair's root pruned: a stale clone deleted" "$(file "$T/loader.calls")" "btrfs subvolume delete $T/top/@.previous"
+# no slot kept yet, and why the last copy failed
+run_loader_script "$SUBVOLS"
+has "loader, no slot: the notice" "$(file "$PREV")" "Previous root UNAVAILABLE: no previous kernel set has been kept yet — boots the current OS (Bay 1)"
+LOADER_STATUS="failed 2026-10-13: the ESP is too full: the kernel set needs 267 MiB and 16 MiB to spare, 120 MiB are free" run_loader_script "$SUBVOLS"
+has "loader, the last copy failed: the notice says why and when" "$(file "$PREV")" "Previous root UNAVAILABLE: the last upgrade (2026-10-13) could not keep it: the ESP is too full: the kernel set needs 267 MiB and 16 MiB to spare, 120 MiB are free; no previous kernel set has been kept yet — boots the current OS (Bay 1)"
+LOADER_STATUS="failed 2026-10-13: a/b & c#d" run_loader_script "$SUBVOLS"
+has "loader, a reason with sed's special characters: written as given" "$(file "$PREV")" "could not keep it: a/b & c#d;"
+# no snapshot at all (a freshly built drive): no previous entries
+run_loader_script $'ID 256 gen 90 top level 5 path @'
 check "loader, no snapshot: exit 0" "$RC" "0"
-has "loader, no snapshot: says so" "$OUT" "no previous root: entry absent"
-check "loader, no snapshot: the stale entry removed" "$([[ -e "$PREV" ]] && echo present || echo absent)" "absent"
-run_loader_script "$SUBVOLS" ABSENT
+has "loader, no snapshot: says so" "$OUT" "no previous root: entries absent"
+check "loader, no snapshot: the stale entry removed" "$(present "$PREV")" "absent"
+check "loader, no snapshot: the stale fallback entry removed" "$(present "$PREVFB")" "absent"
+LOADER_NO_MAIN=1 run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 check "loader, no main entry: exit 2" "$RC" "2"
 has "loader, no main entry: says so" "$OUT" "cannot read cachyos-recovery.conf"
-check "loader, no main entry: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
-run_loader_script FAIL "$MAIN_ENTRY"
+check "loader, no main entry: the stale entry is left" "$(present "$PREV")" "present"
+run_loader_script FAIL @.pre-update.20261012-0300
 check "loader, top level unreadable: exit 2" "$RC" "2"
 has "loader, top level unreadable: says so" "$OUT" "cannot read the top level"
-check "loader, top level unreadable: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
-run_loader_script "$SUBVOLS" $'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz\noptions root=UUID=1111-2222 rw quiet'
+check "loader, top level unreadable: the stale entry is left" "$(present "$PREV")" "present"
+LOADER_MAIN=$'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz-linux-cachyos\noptions root=UUID=1111-2222 rw quiet' run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 check "loader, main entry without rootflags: exit 2" "$RC" "2"
 has "loader, main entry without rootflags: says so" "$OUT" "has no rootflags=subvol=/@"
-check "loader, main entry without rootflags: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
-check "loader, two snapshots: no .new file left behind" "$(run_loader_script "$SUBVOLS" "$MAIN_ENTRY"; find "$T/esp/loader/entries" -name '*.new' | wc -l)" "0"
+check "loader, main entry without rootflags: the stale entry is left" "$(file "$PREV")" "stale"
 # rootflags=subvol=/@ at the end of the line (no option after it)
-run_loader_script "$SUBVOLS" $'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz\noptions root=UUID=1111-2222 rw rootflags=subvol=/@'
+LOADER_MAIN=$'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz-linux-cachyos\noptions root=UUID=1111-2222 rw rootflags=subvol=/@' run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 check "loader, rootflags last on the line: exit 0" "$RC" "0"
-has "loader, rootflags last on the line: the snapshot, at the end" "$(file "$PREV")" "options root=UUID=1111-2222 ro rootflags=subvol=/@.pre-update.20261012-0300"
+has "loader, rootflags last on the line: the clone, at the end" "$(file "$PREV")" "options root=UUID=1111-2222 rw rootflags=subvol=/@.previous"
 # a neighbour subvolume is not the root
-run_loader_script "$SUBVOLS" $'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz\noptions root=UUID=1111-2222 rw rootflags=subvol=/@home quiet'
+LOADER_MAIN=$'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz-linux-cachyos\noptions root=UUID=1111-2222 rw rootflags=subvol=/@home quiet' run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 check "loader, rootflags=subvol=/@home: exit 2" "$RC" "2"
 has "loader, rootflags=subvol=/@home: says so" "$OUT" "has no rootflags=subvol=/@"
 check "loader, rootflags=subvol=/@home: nothing written (the stale entry as it was)" "$(file "$PREV")" "stale"
 check "loader, rootflags=subvol=/@home: no .new file" "$(find "$T/esp/loader/entries" -name '*.new' | wc -l)" "0"
 # a listing that succeeds but names no @ is not an answer
-run_loader_script "" "$MAIN_ENTRY"
+run_loader_script "" @.pre-update.20261012-0300
 check "loader, empty listing: exit 2" "$RC" "2"
 has "loader, empty listing: says so" "$OUT" "lists no subvolume @"
-check "loader, empty listing: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
-run_loader_script $'ID 300 gen 80 top level 5 path @.pre-update.20261011-1016' "$MAIN_ENTRY"
+check "loader, empty listing: the stale entry is left" "$(present "$PREV")" "present"
+run_loader_script $'ID 300 gen 80 top level 5 path @.pre-update.20261011-1016' @.pre-update.20261011-1016
 check "loader, listing without @: exit 2" "$RC" "2"
 has "loader, listing without @: says so" "$OUT" "lists no subvolume @"
-check "loader, listing without @: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
+check "loader, listing without @: the stale entry is left" "$(present "$PREV")" "present"
 # TOP unset: the step mounts the top level itself, as the snapshot step does
-LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
+LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 check "loader, TOP unset: exit 0" "$RC" "0"
 has "loader, TOP unset: the device of /, the whole filesystem" "$(file "$T/loader.calls")" "mount -o subvolid=5 /dev/sdz2 /run/das-vm-update/top"
 has "loader, TOP unset: unmounted after" "$(file "$T/loader.calls")" "umount /run/das-vm-update/top"
-has "loader, TOP unset: the entry written" "$(file "$PREV")" "rootflags=subvol=/@.pre-update.20261012-0300"
+has "loader, TOP unset: the entry written" "$(file "$PREV")" "rootflags=subvol=/@.previous"
 : >"$T/mount.fail"
-LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
+LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 check "loader, TOP unset, mount fails: exit 2" "$RC" "2"
 has "loader, TOP unset, mount fails: says so" "$OUT" "cannot read the top level: mount failed"
-check "loader, TOP unset, mount fails: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
+check "loader, TOP unset, mount fails: the stale entry is left" "$(present "$PREV")" "present"
 check "loader, TOP unset, mount fails: nothing to unmount" "$(grep -c '^umount' "$T/loader.calls" || :)" "0"
 rm -f "$T/mount.fail"
 : >"$T/umount.fail"
-LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
+LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" @.pre-update.20261012-0300
 rm -f "$T/umount.fail"
 has "loader, TOP unset, umount fails: reported" "$OUT" "cannot unmount /run/das-vm-update/top"
-has "loader, TOP unset, umount fails: the entry was still written" "$(file "$PREV")" "rootflags=subvol=/@.pre-update.20261012-0300"
+has "loader, TOP unset, umount fails: the entry was still written" "$(file "$PREV")" "rootflags=subvol=/@.previous"
 
 echo "--- provision: preflight and the dry run (plan 2, Task 3a)"
 provision_fixture() {
