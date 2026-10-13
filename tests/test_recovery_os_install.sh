@@ -21,40 +21,61 @@ cat >"$BIN/btrfs" <<'EOF'
 #!/bin/bash
 echo "btrfs $*" >>"$STUB_LOG"
 case "$1 $2" in
-  "subvolume list") ls -1 "$FIX_TOP" | sed 's/^/ID 256 gen 1 top level 5 path /' ;;
+  "subvolume list") [[ -z "${STUB_LIST_FAILS:-}" ]] || exit 1
+      if [[ "$3" == -o ]]; then ls -1 "$FIX_TOP"; else (cd "$FIX_TOP" && find . -name .subvol -printf '%h\n' | sed 's|^\./||'); fi \
+          | sed 's/^/ID 256 gen 1 top level 5 path /' ;;
   "subvolume show") f=$3; [[ -f "$f/.subvol" ]] || exit 1
       if grep -q received "$f/.subvol"; then printf '\tReceived UUID: \t1234-5678\n'; else printf '\tReceived UUID: \t-\n'; fi
       if grep -q ro "$f/.subvol"; then printf '\tFlags: \treadonly\n'; else printf '\tFlags: \t-\n'; fi ;;
   "subvolume create") mkdir -p "$3" && echo rw >"$3/.subvol" ;;
-  "subvolume delete") [[ -z "${STUB_DELETE_FAILS:-}" ]] || exit 1; rm -rf "$3" ;;
-  "property set") : ;;
+  "subvolume delete") [[ -z "${STUB_DELETE_FAILS:-}" ]] || exit 1
+      [[ -z "${STUB_DELETE_FAIL_ONLY:-}" || "$3" != *"$STUB_DELETE_FAIL_ONLY" ]] || exit 1
+      rm -rf "$3" ;;
   *) exit 2 ;;
 esac
 EOF
 for t in mount umount mkfs.vfat pacstrap arch-chroot genfstab; do
   printf '#!/bin/bash\necho "%s $*" >>"$STUB_LOG"\n[[ -z "${STUB_%s_FAILS:-}" ]] || exit 1\n' "$t" "${t//[.-]/_}" >"$BIN/$t"
 done
+cat >"$BIN/mkfs.vfat" <<'EOF'
+#!/bin/bash
+echo "mkfs.vfat $*" >>"$STUB_LOG"
+[[ -z "${STUB_mkfs_vfat_FAILS:-}" ]] || exit 1
+rm -rf "${FIX_ESP:?}"/* # formatting empties p1
+EOF
+cat >"$BIN/arch-chroot" <<'EOF'
+#!/bin/bash
+echo "arch-chroot $*" >>"$STUB_LOG"
+[[ -z "${STUB_arch_chroot_FAILS:-}" ]] || exit 1
+if [[ "$2" == btrdasd ]]; then cat "$STUB_INSPECT"; exit "${STUB_INSPECT_RC:-0}"; fi
+EOF
 cat >"$BIN/blkid" <<'EOF'
 #!/bin/bash
-echo "blkid $*" >>"$STUB_LOG"; cat "$STUB_BLKID"
+echo "blkid $*" >>"$STUB_LOG"
+case "$*" in *PARTUUID*) cat "$STUB_PARTUUID" ;; *) cat "$STUB_BLKID" ;; esac
 EOF
-cat >"$BIN/btrdasd" <<'EOF'
+cat >"$BIN/cpwrap" <<'EOF'
 #!/bin/bash
-echo "btrdasd $*" >>"$STUB_LOG"; cat "$STUB_INSPECT"
+echo "cp $*" >>"$STUB_LOG"
+/usr/bin/cp "$@" || exit 1
+if [[ -n "${STUB_CP_SHORT:-}" ]]; then find "${@: -1}" -type f | head -1 | xargs -r rm -f; fi
 EOF
 chmod +x "$BIN"/*
 
 fixture() {
     rm -rf "$R"; : >"$LOG"
     mkdir -p "$R/mnt/top" "$R/mnt/target" "$R/payload" "$R/etc"
-    for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011; do
-        mkdir -p "$R/mnt/top/$s"; echo rw >"$R/mnt/top/$s/.subvol"
+    for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
+        mkdir -p "$R/mnt/top/$s"; echo rw >"$R/mnt/top/$s/.subvol"; echo "old-$s" >"$R/mnt/top/$s/sentinel"
     done
+    mkdir -p "$R/mnt/esp-old"; echo "old esp" >"$R/mnt/esp-old/old-esp-file"
+    printf 'aaaaaaaa-01\n' >"$WORK/partuuid.out"
+    printf '[general]\n' >"$R/payload/config.toml"
     for s in nvme/root-.20261012T0348 nvme/das-state.20261012T0348 hdd-system/ISOs.20261012T0348; do
         mkdir -p "$R/mnt/top/$s"; echo "ro received" >"$R/mnt/top/$s/.subvol"
     done
     printf '5eed0008-0000-4000-8000-000000000008\n' >"$WORK/blkid.out"
-    printf 'btrbk at boot: no\nguest agent: installed, enabled\n' >"$WORK/inspect.out"
+    printf 'RECOVERY OS\n  system-recovery-A-2tb  (/)\n    btrbk config        /etc/btrbk/btrbk.conf (1 byte)\n    btrbk at boot       no — btrbk.timer masked\n' >"$WORK/inspect.out"
     printf 'pkg\n' >"$R/payload/das-backup-manager-0.7.23.0-1-x86_64.pkg.tar.zst"
     printf 'ssh-ed25519 AAAA test\n' >"$R/payload/authorized_keys"
     printf '[options]\nHoldPkg = pacman\n[cachyos]\nInclude = x\n[core]\nInclude = y\n' >"$R/etc/pacman.conf"
@@ -62,7 +83,9 @@ fixture() {
 run() { # <step> [VAR=value ...]
     local step=$1; shift
     RC=0
-    OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" FIX_TOP="$R/mnt/top" STUB_BLKID="$WORK/blkid.out" STUB_INSPECT="$WORK/inspect.out" \
+    OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" FIX_TOP="$R/mnt/top" STUB_BLKID="$WORK/blkid.out" STUB_INSPECT="$WORK/inspect.out" STUB_PARTUUID="$WORK/partuuid.out" \
+        FIX_ESP="$R/mnt/esp-old" DAS_INSTALL_ESP_MNT="$R/mnt/esp-old" DAS_INSTALL_ESP_PARTUUID=aaaaaaaa-01 \
+        DAS_INSTALL_CONFIG="$R/payload/config.toml" DAS_INSTALL_CP="$BIN/cpwrap" \
         DAS_INSTALL_ROOT="$R" DAS_INSTALL_TOP="$R/mnt/top" DAS_INSTALL_TARGET="$R/mnt/target" \
         DAS_INSTALL_UUID=5eed0008-0000-4000-8000-000000000008 DAS_INSTALL_ESP_LABEL=RECOV-ESP-1 DAS_INSTALL_BAY=1 \
         DAS_INSTALL_LETTER=A DAS_INSTALL_HOSTNAME=das-recovery-bay1 DAS_INSTALL_STAMP=20261013-010203 \
@@ -75,7 +98,7 @@ run() { # <step> [VAR=value ...]
 echo "== replace-os: the allowlist, nothing else"
 fixture; run replace-os
 check "replace-os: exit 0" test "$RC" -eq 0
-for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011; do
+for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
     check "replace-os: $s renamed to $s.replaced.20261013-010203" test -d "$R/mnt/top/$s.replaced.20261013-010203"
 done
 check "replace-os: a new @ exists" test -f "$R/mnt/top/@/.subvol"
@@ -90,10 +113,13 @@ check "replace-os: p1 mounted at target/boot" has "$LOG" "mount /dev/sdz1 $R/mnt
 
 echo "== replace-os: the allowlist is exact (review focus 1)"
 fixture
-for s in @home-old @.pre-update-notes @rescue2 root-.20261012T0348 old@.pre-update.20261001 @x.half-upgraded.20261001; do mkdir -p "$R/mnt/top/$s"; echo "ro received" >"$R/mnt/top/$s/.subvol"; done
+EXACT_LIST=(@home-old @.pre-update-notes @rescue2 root-.20261012T0348 old@.pre-update.20261001 @x.half-upgraded.20261001
+    @.pre-update.20261011-1016x @.pre-update.20261011-1016-bak @.pre-update.2026 @.replaced.20260101-000000
+    @.pre-update.20261011-1016.replaced.20260101-000000 @home.unbooted.20260101-000000)
+for s in "${EXACT_LIST[@]}"; do mkdir -p "$R/mnt/top/$s"; echo "ro received" >"$R/mnt/top/$s/.subvol"; done
 run replace-os
 check "exact: exit 0" test "$RC" -eq 0
-for s in @home-old @.pre-update-notes @rescue2 root-.20261012T0348 old@.pre-update.20261001 @x.half-upgraded.20261001; do
+for s in "${EXACT_LIST[@]}"; do
     check "exact: $s is still there, unrenamed" test -f "$R/mnt/top/$s/.subvol"
 done
 
@@ -130,6 +156,73 @@ check "re-run: still nothing deleted" test "$(calls 'subvolume delete')" -eq 0
 fixture; run replace-os; run replace-os
 check "same stamp twice: exit 2, never overwrites a set-aside name" test "$RC" -eq 2
 check "same stamp twice: named" out_has "@.replaced.20261013-010203 already exists"
+
+S1=20261013-010203
+S2=20261013-020000
+TAB=$'\t'
+TOPD="$R/mnt/top"
+chain() { # S1 leaves a partial @ and a partial p1, then S2 runs over it
+    fixture
+    run replace-os
+    : >"$TOPD/@/partial1"
+    rm -f "$R/mnt/esp-old"/*
+    echo p >"$R/mnt/esp-old/partial-esp"
+    run replace-os DAS_INSTALL_STAMP=$S2
+}
+
+echo "== replace-os: p1 is checked by PARTUUID, copied and compared before anything is touched (B)"
+fixture; run replace-os
+check "esp: p1's PARTUUID is read" has "$LOG" "blkid -s PARTUUID -o value /dev/sdz1"
+check "esp: the old ESP is in @esp.replaced.<stamp>" test -f "$TOPD/@esp.replaced.$S1/esp/old-esp-file"
+check "esp: p1 mounted read-only for the copy" has "$LOG" "mount -o ro /dev/sdz1"
+check "esp: copied before formatted" test "$(grep -n 'mount -o ro /dev/sdz1' "$LOG" | head -1 | cut -d: -f1)" -lt "$(grep -n 'mkfs.vfat' "$LOG" | head -1 | cut -d: -f1)"
+fixture; printf 'ffffffff-02\n' >"$WORK/partuuid.out"; run replace-os
+check "esp partuuid mismatch: exit 3" test "$RC" -eq 3
+check "esp partuuid mismatch: names both" out_has "p1 of /dev/sdz is PARTUUID ffffffff-02, not the configured aaaaaaaa-01"
+check "esp partuuid mismatch: nothing renamed" test -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
+check "esp partuuid mismatch: no mkfs" test "$(calls 'mkfs.vfat')" -eq 0
+check "esp partuuid mismatch: no copy, no manifest" test ! -e "$TOPD/@esp.replaced.$S1" -a ! -e "$TOPD/.das-provision.$S1"
+fixture; : >"$WORK/partuuid.out"; run replace-os
+check "unreadable partuuid: exit 3, never a match" test "$RC" -eq 3
+check "unreadable partuuid: no mkfs" test "$(calls 'mkfs.vfat')" -eq 0
+fixture; run replace-os STUB_CP_SHORT=1
+check "esp copy differs: exit 3" test "$RC" -eq 3
+check "esp copy differs: said" out_has "differs from p1 (nothing renamed, p1 not formatted)"
+check "esp copy differs: no mkfs" test "$(calls 'mkfs.vfat')" -eq 0
+check "esp copy differs: nothing renamed, no manifest" test -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1" -a ! -e "$TOPD/.das-provision.$S1"
+fixture; run replace-os STUB_mount_FAILS=1
+check "esp cannot be mounted: exit 2" test "$RC" -eq 2
+check "esp cannot be mounted: nothing renamed, no mkfs" test -f "$TOPD/@/.subvol" -a "$(calls 'mkfs.vfat')" -eq 0
+
+echo "== replace-os: the manifest, written before the first rename (A)"
+fixture; run replace-os
+MF="$TOPD/.das-provision.$S1"
+check "manifest: written" test -f "$MF"
+for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
+    check "manifest: $s" grep -qxF "$s$TAB$s.replaced.$S1" "$MF"
+done
+check "manifest: the ESP copy" grep -qxF "@esp${TAB}@esp.replaced.$S1" "$MF"
+check "manifest: six lines, nothing else" test "$(wc -l <"$MF")" -eq 6
+check "manifest: no .new left behind" test ! -e "$MF.new"
+fixture; : >"$TOPD/.das-provision.$S1"; run replace-os
+check "manifest of this stamp exists: exit 2" test "$RC" -eq 2
+check "manifest of this stamp exists: nothing renamed" test -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
+fixture; mkdir -p "$TOPD/@esp.replaced.$S1"; run replace-os
+check "@esp.replaced.<stamp> exists: exit 2, never overwritten" test "$RC" -eq 2
+
+echo "== every step validates the stamp and ALSO (C)"
+fixture; run replace-os
+mkdir -p "$TOPD/nvme.replaced.$S1"; echo "ro received" >"$TOPD/nvme.replaced.$S1/.subvol"; : >"$LOG"
+for st in replace-os delete-replaced undo pacstrap configure package boot verify unmount; do
+    run "$st" DAS_INSTALL_STAMP=2026
+    check "$st, bad stamp: exit 3" test "$RC" -eq 3
+    run "$st" DAS_INSTALL_ALSO_REPLACE=nvme
+    check "$st, ALSO=nvme: exit 3" test "$RC" -eq 3
+    check "$st, ALSO=nvme: refused by name" out_has "'nvme' is not an @.archive.* subvolume -- refused"
+    run "$st" DAS_INSTALL_ALSO_REPLACE="@.archive.20260601T0300.replaced.x"
+    check "$st, an ALSO name that is already ours: exit 3" test "$RC" -eq 3
+done
+check "bad inputs: nothing deleted, look-alike untouched" test "$(calls 'subvolume delete')" -eq 0 -a -f "$TOPD/nvme.replaced.$S1/.subvol"
 
 echo "== --count-packages"
 fixture; run --count-packages
@@ -214,55 +307,141 @@ check "boot: fallback image" has "$R/mnt/target/boot/loader/entries/cachyos-reco
 check "boot: no previous-root entry on a fresh install" test ! -e "$R/mnt/target/boot/loader/entries/cachyos-recovery-previous.conf"
 check "boot: mkinitcpio -P in the chroot" has "$LOG" "arch-chroot $R/mnt/target mkinitcpio -P"
 
-echo "== verify: every file the entries name, every fstab device, btrbk at boot: no"
-fixture; mkdir -p "$R/mnt/target/boot/loader/entries" "$R/mnt/target/etc"
-printf 'linux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /initramfs-linux-cachyos.img\n' >"$R/mnt/target/boot/loader/entries/cachyos-recovery.conf"
-: >"$R/mnt/target/boot/vmlinuz-linux-cachyos"; : >"$R/mnt/target/boot/amd-ucode.img"; : >"$R/mnt/target/boot/initramfs-linux-cachyos.img"
-printf 'UUID=5eed0008-0000-4000-8000-000000000008 / btrfs subvol=/@ 0 0\n' >"$R/mnt/target/etc/fstab"
-run verify
+echo "== verify: the loader files, every file the entries name, every fstab device, btrbk at boot: no (G)"
+vfix() { # a complete target tree
+    fixture
+    local b="$R/mnt/target/boot" e
+    mkdir -p "$b/loader/entries" "$b/EFI/systemd" "$R/mnt/target/etc"
+    printf 'default cachyos-recovery.conf\n' >"$b/loader/loader.conf"
+    for e in cachyos-recovery cachyos-recovery-fallback; do
+        printf 'linux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /initramfs-linux-cachyos.img\n' >"$b/loader/entries/$e.conf"
+    done
+    : >"$b/vmlinuz-linux-cachyos"; : >"$b/amd-ucode.img"; : >"$b/initramfs-linux-cachyos.img"; : >"$b/EFI/systemd/systemd-bootx64.efi"
+    printf 'UUID=5eed0008-0000-4000-8000-000000000008 / btrfs subvol=/@ 0 0\n' >"$R/mnt/target/etc/fstab"
+}
+vfix; run verify
 check "verify: exit 0" test "$RC" -eq 0
-check "verify: inspect against the new root" has "$LOG" "btrdasd recovery-os inspect --root $R/mnt/target"
-check "verify: btrbk at boot: no, quoted" out_has "btrbk at boot: no"
-rm "$R/mnt/target/boot/initramfs-linux-cachyos.img"; run verify
+check "verify: btrdasd runs in the target's chroot, root /, a copied config" has "$LOG" "arch-chroot $R/mnt/target btrdasd recovery-os inspect --root / --label system-recovery-A-2tb --config /tmp/das-install-inspect.toml"
+check "verify: the config copy is removed again" test ! -e "$R/mnt/target/tmp/das-install-inspect.toml"
+check "verify: the record is quoted" out_has "btrbk at boot       no"
+vfix; rm "$R/mnt/target/boot/initramfs-linux-cachyos.img"; run verify
 check "verify, a missing initramfs: exit 3" test "$RC" -eq 3
 check "verify, a missing initramfs: named" out_has "initramfs-linux-cachyos.img named by cachyos-recovery.conf is not on the ESP"
-: >"$R/mnt/target/boot/initramfs-linux-cachyos.img"; printf 'btrbk at boot: may\n' >"$WORK/inspect.out"; run verify
+vfix; printf '    btrbk at boot       may\n' >"$WORK/inspect.out"; run verify
 check "verify, btrbk may run: exit 3" test "$RC" -eq 3
-check "verify, btrbk may run: the record is quoted" out_has "btrbk at boot: may"
+check "verify, btrbk may run: the record is quoted" out_has "btrbk at boot       may"
+vfix; rm -f "$R/mnt/target/boot/loader/entries"/*.conf; run verify
+check "verify, no loader entries at all: exit 2" test "$RC" -eq 2
+check "verify, no loader entries at all: said" out_has "no loader entries"
+vfix; rm "$R/mnt/target/boot/EFI/systemd/systemd-bootx64.efi"; run verify
+check "verify, no systemd-bootx64.efi: exit 3" test "$RC" -eq 3
+check "verify, no systemd-bootx64.efi: named" out_has "EFI/systemd/systemd-bootx64.efi is not on the ESP"
+vfix; rm "$R/mnt/target/boot/loader/loader.conf"; run verify
+check "verify, no loader.conf: exit 3" test "$RC" -eq 3
+vfix; rm "$R/mnt/target/boot/loader/entries/cachyos-recovery-fallback.conf"; run verify
+check "verify, no fallback entry: exit 3" test "$RC" -eq 3
+vfix; run verify STUB_INSPECT_RC=2
+check "verify, inspect itself failed (exit 2): exit 2, not a pass" test "$RC" -eq 2
+vfix; run verify STUB_INSPECT_RC=1
+check "verify, inspect exit 1 (needs attention) with 'no': still a pass" test "$RC" -eq 0
 
 echo "== unmount"
 fixture; run unmount
 check "unmount: exit 0" test "$RC" -eq 0
 check "unmount: the target recursively, then the top" test "$(grep 'umount' "$LOG" | tr '\n' ' ')" = "umount -R $R/mnt/target umount $R/mnt/top "
 
-echo "== delete-replaced: by name, after the proof (Phase 3)"
-fixture; run replace-os
-mkdir -p "$R/mnt/top/nvme.replaced.20261013-010203"; echo "ro received" >"$R/mnt/top/nvme.replaced.20261013-010203/.subvol"
-run delete-replaced
+echo "== delete-replaced: the manifests' names, nested first, each by name (A, D)"
+chain
+check "chain: S2 exit 0" test "$RC" -eq 0
+check "chain: both manifests exist" test -f "$TOPD/.das-provision.$S1" -a -f "$TOPD/.das-provision.$S2"
+check "chain: S2 listed the partial @ it set aside" grep -qxF "@${TAB}@.replaced.$S2" "$TOPD/.das-provision.$S2"
+check "chain: S2 did not list names S1 already set aside" test "$(wc -l <"$TOPD/.das-provision.$S2")" -eq 3
+check "chain: the old root is still at @.replaced.<S1>" test "$(cat "$TOPD/@.replaced.$S1/sentinel")" = "old-@"
+mkdir -p "$TOPD/@.replaced.$S1/var/lib/machines" "$TOPD/@.replaced.$S1/var/lib/portables"
+echo rw >"$TOPD/@.replaced.$S1/var/lib/machines/.subvol"; echo rw >"$TOPD/@.replaced.$S1/var/lib/portables/.subvol"
+mkdir -p "$TOPD/nvme.replaced.$S1"; echo "ro received" >"$TOPD/nvme.replaced.$S1/.subvol"
+: >"$LOG"; run delete-replaced
 check "delete-replaced: exit 0" test "$RC" -eq 0
-for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011; do
-    check "delete-replaced: $s.replaced.<stamp> deleted by name" has "$LOG" "subvolume delete $R/mnt/top/$s.replaced.20261013-010203"
+for s in $S1 $S2; do
+    for n in @ @home @esp; do
+        check "delete-replaced: $n.replaced.$s deleted by name" has "$LOG" "subvolume delete $TOPD/$n.replaced.$s"
+    done
 done
-check "delete-replaced: exactly five deletes" test "$(calls 'subvolume delete')" -eq 5
-check "delete-replaced: a received subvolume that merely looks set-aside survives (no glob)" test -f "$R/mnt/top/nvme.replaced.20261013-010203/.subvol"
-check "delete-replaced: received untouched" grep -q received "$R/mnt/top/nvme/root-.20261012T0348/.subvol"
-fixture; run replace-os; run delete-replaced STUB_DELETE_FAILS=1
-check "delete-replaced, a delete fails: exit 2" test "$RC" -eq 2
-check "delete-replaced, a delete fails: named" out_has "could not delete @.replaced.20261013-010203"
+for n in @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
+    check "delete-replaced: $n.replaced.$S1 deleted by name" has "$LOG" "subvolume delete $TOPD/$n.replaced.$S1"
+done
+check "delete-replaced: nine set-aside names and two nested, nothing else" test "$(calls 'subvolume delete')" -eq 11
+dl() { grep -nxF "btrfs subvolume delete $1" "$LOG" | head -1 | cut -d: -f1; }
+check "delete-replaced: var/lib/machines before its parent" test "$(dl "$TOPD/@.replaced.$S1/var/lib/machines")" -lt "$(dl "$TOPD/@.replaced.$S1")"
+check "delete-replaced: var/lib/portables before its parent" test "$(dl "$TOPD/@.replaced.$S1/var/lib/portables")" -lt "$(dl "$TOPD/@.replaced.$S1")"
+check "delete-replaced: a received subvolume that merely looks set-aside survives (no glob)" test -f "$TOPD/nvme.replaced.$S1/.subvol"
+check "delete-replaced: received untouched" grep -q received "$TOPD/nvme/root-.20261012T0348/.subvol"
+check "delete-replaced: manifests renamed .done" test -f "$TOPD/.das-provision.$S1.done" -a -f "$TOPD/.das-provision.$S2.done" -a ! -e "$TOPD/.das-provision.$S1"
+run delete-replaced
+check "delete-replaced, no live manifest left: exit 2" test "$RC" -eq 2
+fixture; run delete-replaced
+check "delete-replaced, no manifest at all: exit 2, deletes nothing" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
+check "delete-replaced, no manifest: said" out_has "no provision manifest"
+fixture; run replace-os; : >"$LOG"; run delete-replaced STUB_DELETE_FAILS=1
+check "delete-replaced, every delete fails: exit 2" test "$RC" -eq 2
+check "delete-replaced, every delete fails: all six attempted (five OS names and the ESP copy)" test "$(calls 'subvolume delete')" -eq 6
+check "delete-replaced, a delete fails: named" out_has "could not delete @.replaced.$S1"
+check "delete-replaced, a delete fails: not reported done, manifest kept" test -f "$TOPD/.das-provision.$S1.deleting" -a ! -e "$TOPD/.das-provision.$S1.done"
+fixture; run replace-os; : >"$LOG"; run delete-replaced STUB_LIST_FAILS=1
+check "delete-replaced, listing fails: exit 2, never '0 deleted'" test "$RC" -eq 2 -a "$(calls 'subvolume delete')" -eq 0
+check "delete-replaced, listing fails: said" out_has "cannot list the subvolumes"
+check "delete-replaced, listing fails: manifest untouched" test -f "$TOPD/.das-provision.$S1"
 
-echo "== undo: names back, refused after a new boot"
-fixture; run replace-os; run undo
+echo "== undo: the chain, newest first; refusals (D)"
+chain; run undo
 check "undo: exit 0" test "$RC" -eq 0
-check "undo: @ is the old one again" test -f "$R/mnt/top/@/.subvol"
-check "undo: the set-aside name is gone" test ! -d "$R/mnt/top/@.replaced.20261013-010203"
-check "undo: the new, unbooted @ set aside as @.unbooted.<stamp>" test -d "$R/mnt/top/@.unbooted.20261013-010203"
-fixture; run replace-os; mkdir -p "$R/mnt/top/@/var/lib/das-backup"; : >"$R/mnt/top/@/var/lib/das-backup/booted"; run undo
+for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
+    check "undo: $s is the OLD one (sentinel)" test "$(cat "$TOPD/$s/sentinel")" = "old-$s"
+done
+check "undo: S1's partial @ is under @.unbooted.<S1>" test -f "$TOPD/@.unbooted.$S1/partial1"
+check "undo: S2's @ is under @.unbooted.<S2>" test -f "$TOPD/@.unbooted.$S2/.subvol"
+check "undo: the partial never sits at @" test ! -e "$TOPD/@/partial1"
+check "undo: no *.replaced.<stamp> left for an OS name" test ! -d "$TOPD/@.replaced.$S1" -a ! -d "$TOPD/@.replaced.$S2" -a ! -d "$TOPD/@home.replaced.$S2"
+check "undo: p1 formatted again with the bay label" has "$LOG" "mkfs.vfat -F 32 -n RECOV-ESP-1 /dev/sdz1"
+check "undo: the OLDEST ESP copy is back on p1" test -f "$R/mnt/esp-old/old-esp-file"
+check "undo: the partial ESP is gone" test ! -e "$R/mnt/esp-old/partial-esp"
+check "undo: manifests renamed .undone" test -f "$TOPD/.das-provision.$S1.undone" -a -f "$TOPD/.das-provision.$S2.undone" -a ! -e "$TOPD/.das-provision.$S1"
+check "undo: deletes nothing" test "$(calls 'subvolume delete')" -eq 0
+fixture; run replace-os; run undo
+check "undo (one provision): exit 0" test "$RC" -eq 0
+check "undo (one provision): the old @" test "$(cat "$TOPD/@/sentinel")" = "old-@"
+check "undo (one provision): the unbooted new @ set aside" test -d "$TOPD/@.unbooted.$S1"
+check "undo (one provision): the old ESP back" test -f "$R/mnt/esp-old/old-esp-file"
+fixture; run replace-os; mkdir -p "$TOPD/@/var/lib/das-recovery"; : >"$TOPD/@/var/lib/das-recovery/booted"; run undo
 check "undo after a new boot: exit 3" test "$RC" -eq 3
-check "undo after a new boot: refused" out_has "the new @ has booted (var/lib/das-backup/booted exists): undo refused"
-check "undo after a new boot: nothing renamed" test -d "$R/mnt/top/@.replaced.20261013-010203"
+check "undo after a new boot: refused" out_has "the new @ has booted (var/lib/das-recovery/booted exists): undo refused"
+check "undo after a new boot: nothing renamed" test -d "$TOPD/@.replaced.$S1" -a -f "$TOPD/.das-provision.$S1"
+check "undo after a new boot: p1 untouched" test "$(calls 'mkfs.vfat')" -eq 1
 fixture; run undo
 check "undo with nothing to undo: exit 3" test "$RC" -eq 3
-check "undo with nothing to undo: says so" out_has "no *.replaced.20261013-010203 subvolume"
+check "undo with nothing to undo: says so" out_has "nothing to undo"
+fixture; run replace-os; : >"$LOG"; run undo STUB_LIST_FAILS=1
+check "undo, listing fails: exit 2, never 'nothing to undo'" test "$RC" -eq 2
+check "undo, listing fails: nothing renamed" test -d "$TOPD/@.replaced.$S1"
+check "undo, listing fails: said" out_has "cannot list the subvolumes"
+fixture; run replace-os; run delete-replaced STUB_DELETE_FAIL_ONLY="@home.replaced.$S1"; : >"$LOG"
+check "partial delete: exit 2" test "$RC" -eq 2
+run undo
+check "partial delete then undo: exit 3" test "$RC" -eq 3
+check "partial delete then undo: says a delete began" out_has "delete-replaced began"
+check "partial delete then undo: the remaining names are listed" out_has "Still present: @home.replaced.$S1"
+check "partial delete then undo: nothing renamed" test -d "$TOPD/@home.replaced.$S1" -a ! -d "$TOPD/@.unbooted.$S1" -a "$(calls 'mkfs.vfat')" -eq 0
+fixture; run replace-os; mv "$TOPD/@rescue.replaced.$S1" "$TOPD/@rescue"; run undo
+check "undo, a rename that never happened (original present, set-aside absent): exit 0" test "$RC" -eq 0
+check "undo, a rename that never happened: said, left alone" out_has "@rescue was not renamed by $S1"
+check "undo, a rename that never happened: @rescue still the old one" test "$(cat "$TOPD/@rescue/sentinel")" = "old-@rescue"
+fixture; run replace-os; rm -rf "${TOPD:?}/@rescue.replaced.$S1"; run undo
+check "undo, set-aside gone and original absent: exit 3" test "$RC" -eq 3
+check "undo, set-aside gone and original absent: named" out_has "@rescue.replaced.$S1 is gone"
+check "undo, set-aside gone and original absent: nothing renamed" test -d "$TOPD/@.replaced.$S1" -a ! -d "$TOPD/@.unbooted.$S1"
+fixture; run replace-os; : >"$WORK/partuuid.out"; run undo
+check "undo, p1 PARTUUID unreadable: exit 3" test "$RC" -eq 3
+check "undo, p1 PARTUUID unreadable: nothing renamed (checked in the preflight)" test -d "$TOPD/@.replaced.$S1" -a ! -d "$TOPD/@.unbooted.$S1"
 
 echo
 if ((FAILS > 0)); then printf '%d check(s) FAILED\n' "$FAILS"; exit 1; fi
