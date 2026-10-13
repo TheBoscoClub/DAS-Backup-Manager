@@ -143,6 +143,7 @@ install(PROGRAMS
     scripts/install-backup-timer.sh
     scripts/recovery-os-vm.sh
     scripts/das-recovery-state-sync.sh
+    scripts/recovery-os-install.sh
     DESTINATION "${DAS_SCRIPT_DIR}"
 )
 
@@ -328,6 +329,10 @@ if(BUILD_TESTING)
     add_test(
         NAME shell-recovery-state-sync
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_state_sync.sh
+    )
+    add_test(
+        NAME shell-recovery-os-install
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os_install.sh
     )
     add_test(
         NAME shell-record-run
