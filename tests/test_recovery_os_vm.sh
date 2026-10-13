@@ -152,6 +152,7 @@ fixture() {
     printf 'disk SERIAL02\n' >"$S/lsblk.typeserial.sdk"
     printf 'disk SERIAL12\n' >"$S/lsblk.typeserial.sdm"
     printf 'part \n' >"$S/lsblk.typeserial.sdj1"
+    printf '5eed0025-0000-4000-8000-000000000025\n' >"$S/lsblk.partuuid.sdj1"
     printf '%s\n' "$UUID_A" >"$S/lsblk.uuid.sdj2"
     printf '%s\n' "$UUID_B" >"$S/lsblk.uuid.sdk2"
     touch "$S/defined"
@@ -578,6 +579,7 @@ case "$cmd" in
             # running domain that booted without the guard, when told so.
             while IFS= read -r line || [[ -n "$line" ]]; do
                 if [[ "$line" == "  </devices>" && -f "$S/attached.xml" ]]; then sed 's/^/    /' "$S/attached.xml"; fi
+                if [[ "$line" == "  </devices>" && -f "$S/cdroms.xml" ]]; then sed 's/^/    /' "$S/cdroms.xml"; fi
                 if [[ "${1:-}" != --inactive && -f "$S/live_drops_guard" && -f "$S/started" && "$line" == *"<entry>"* ]]; then continue; fi
                 printf '%s\n' "$line"
             done <"$S/defined.xml"
@@ -586,15 +588,31 @@ case "$cmd" in
             if [[ -f "$S/stored-os.xml" ]]; then cat "$S/stored-os.xml"; fi
             printf "  <devices>\n"
             if [[ -f "$S/attached.xml" ]]; then sed 's/^/    /' "$S/attached.xml"; fi
+            if [[ -f "$S/cdroms.xml" ]]; then sed 's/^/    /' "$S/cdroms.xml"; fi
             printf "  </devices>\n</domain>\n"
         fi
         ;;
     attach-device)
         [[ "${3:-}" == --config ]] || { echo "stub: attach-device without --config" >&2; exit 98; }
         if [[ -f "$S/attach_fail" ]]; then echo "error: Failed to attach device" >&2; exit 1; fi
-        cp "$2" "$S/attached.xml"
         cat "$2" >>"$S/attach.log"
-        echo "virsh attach" >>"$S/events"
+        if grep -q "device='cdrom'" "$2"; then
+            # A cdrom (provision): kept beside the disk, one block each.
+            cat "$2" >>"$S/cdroms.xml"
+            echo "virsh attach cdrom $(sed -n "s|.*<source file='\([^']*\)'/>.*|\1|p" "$2")" >>"$S/events"
+        else
+            cp "$2" "$S/attached.xml"
+            echo "virsh attach" >>"$S/events"
+        fi
+        ;;
+    detach-device)
+        [[ "${3:-}" == --config ]] || { echo "stub: detach-device without --config" >&2; exit 98; }
+        src=$(sed -n "s|.*<source file='\([^']*\)'/>.*|\1|p" "$2")
+        grep -qF "<source file='$src'/>" "$S/cdroms.xml" 2>/dev/null || { echo "error: device not found: no cdrom $src" >&2; exit 1; }
+        if [[ -f "$S/detach_cdrom_fail" ]]; then echo "error: Failed to detach device" >&2; exit 1; fi
+        awk -v src="<source file='$src'/>" 'BEGIN { RS = "</disk>\n"; ORS = "" } index($0, src) == 0 && NF { print $0 "</disk>\n" }' "$S/cdroms.xml" >"$S/cdroms.next"
+        mv "$S/cdroms.next" "$S/cdroms.xml"
+        echo "virsh detach cdrom $src" >>"$S/events"
         ;;
     detach-disk)
         [[ "${3:-}" == --config ]] || { echo "stub: detach-disk without --config" >&2; exit 98; }
@@ -626,6 +644,10 @@ case "$cmd" in
         ;;
     resume)
         echo "virsh resume" >>"$S/events"
+        starts=$(($(cat "$S/resumes" 2>/dev/null || echo 0) + 1))
+        echo "$starts" >"$S/resumes"
+        # provision: the live system is start 1 (phase 2), the new OS start 2
+        # (phase 3); guard-silent-phase<N> and agent-down-phase<N> act on one.
         cat "$DAS_RECOVERY_VM_TEST_ROOT/var/lib/das-backup/recovery-os-vm-sessions" >"$S/sessions.at_resume" 2>/dev/null || :
         cat "${DAS_RECOVERY_OS_STATE:-/nonexistent}" >/dev/null 2>&1 || :
         touch "$S/resumed"
@@ -655,7 +677,9 @@ case "$cmd" in
                 : >"$S/guest.last"
                 : >"$port"
                 # Poll 0 is the resume: a guest silent from its start says so there.
+                rm -f "$S/guest.silent"
                 if grep -qx '0 silence' "$S/guest.script" 2>/dev/null; then touch "$S/guest.silent"; fi
+                [[ ! -f "$S/guard-silent-phase$((starts + 1))" ]] || touch "$S/guest.silent"
                 if [[ ! -f "$S/guest.silent" ]]; then guest_line >>"$port"; guest_sent; fi
             fi
         fi
@@ -741,7 +765,7 @@ case "$cmd" in
         [[ "${2:-}" == --timeout ]] || { echo "UNEXPECTED qemu-agent-command $*" >>"$STUB/forbidden"; exit 99; }
         json=${!#}
         printf '%s\n' "$json" >>"$S/agent.calls"
-        if [[ -f "$S/agent_down" || "$(head -n 1 "$S/states")" != running ]]; then
+        if [[ -f "$S/agent_down" || -f "$S/agent-down-phase$(($(cat "$S/resumes" 2>/dev/null || echo 0) + 1))" || "$(head -n 1 "$S/states")" != running ]]; then
             echo "error: Guest agent is not responding: QEMU guest agent is not connected" >&2
             exit 1
         fi
@@ -821,6 +845,13 @@ case "$cmd" in
                     out=$(cat "$S/guest.boot")
                 elif [[ "$script" == "uname -r" ]]; then
                     out=$(cat "$STUB/guest.kernel" 2>/dev/null || echo 7.2.9-1-cachyos)
+                elif [[ "$script" == "cat /run/das-recovery-state/status" ]]; then
+                    out=$(cat "$STUB/guest.sync-status" 2>/dev/null || echo "no state snapshot")
+                elif [[ "$script" == "test ! -e /var/lib/das-backup/backup-index.db" ]]; then
+                    [[ ! -f "$STUB/guest.db" ]] || rc=1
+                elif [[ "$script" == "pgrep -x kwin_wayland" || "$script" == "pgrep -x plasmashell" ]]; then
+                    running=$(cat "$STUB/guest.pgrep" 2>/dev/null || echo "kwin_wayland plasmashell")
+                    [[ " $running " == *" ${script#pgrep -x } "* ]] && out=4242 || rc=1
                 else
                     echo "UNEXPECTED guest-exec $path $script" >>"$STUB/forbidden"
                     rc=127
@@ -859,6 +890,9 @@ case "$*" in
         ;;
     *"-o TYPE "*)
         cat "$STUB/lsblk.type.$name" 2>/dev/null || { echo "lsblk: $dev: not a block device" >&2; exit 32; }
+        ;;
+    *"-o PARTUUID "*)
+        cat "$STUB/lsblk.partuuid.$name" 2>/dev/null || { echo "lsblk: $dev: not a block device" >&2; exit 32; }
         ;;
     *"-o UUID "*)
         cat "$STUB/lsblk.uuid.$name" 2>/dev/null || { echo "lsblk: $dev: not a block device" >&2; exit 32; }
@@ -5395,7 +5429,7 @@ while (($# > 0)); do [[ "$1" != -o ]] || : >"$2"; shift; done
 EOF
     chmod +x "$T/bin/xorriso"
     PROV=(provision A --iso "$ISO" --package "$PKG" --package-sha256 "$PKG_SHA" --authorized-keys "$KEYS")
-    PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256="$ISO_SHA" DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images")
+    PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256="$ISO_SHA" DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images" DAS_RECOVERY_VM_FIRSTBOOT_SECS=1)
 }
 # An array cannot prefix a function call (bash drops it): set, run, unset.
 run_driver_env() {
@@ -5518,6 +5552,136 @@ has "provision without the installer: says where it looked" "$OUT" "recovery-os-
 provision_fixture
 run_driver_env "${PROV[@]}" --dry-run --detach
 check "provision --dry-run --detach: usage" "$RC" "2"
+
+echo "--- provision: Phase 2 steps and Phase 3 proof (plan 2, Task 3b)"
+PSTEPS="egress payload capture replace-os pacstrap configure package boot repos verify unmount delete-replaced "
+CAPDIR_A="$T/var/lib/das-backup/recovery-os-provision/system-recovery-A-2tb"
+prov_events() { tr '\n' '|' <"$S/events"; }
+provision_fixture
+CAPDIR_A="$T/var/lib/das-backup/recovery-os-provision/system-recovery-A-2tb"
+printf 'top: @\ntop: @home\ntop: @.archive.20260301-1200\npackage: linux-cachyos 7.2.9-1\n' >"$S/stage.capture.out"
+run_driver_env "${PROV[@]}"
+check "provision: exit 0" "$RC" "0"
+check "provision: the steps in order, then the first boot's delete" "$(tr '\n' ' ' <"$S/stages.log")" "$PSTEPS"
+has "provision: the live ISO attached read-only, boot order 1" "$(file "$S/attach.log")" "<source file='$ISO'/>
+  <target dev='sdb' bus='sata'/>
+  <readonly/>
+  <boot order='1'/>"
+has "provision: the payload attached read-only, boot order 3" "$(file "$S/attach.log")" "<target dev='sdc' bus='sata'/>
+  <readonly/>
+  <boot order='3'/>"
+has "provision: the disk at boot order 2 for the install" "$(file "$S/attach.log")" "<target dev='sda' bus='sata'/>
+  <boot order='2'/>"
+has "provision: the disk at boot order 1 for the first boot" "$(file "$S/attach.log")" "<target dev='sda' bus='sata'/>
+  <boot order='1'/>"
+matches "provision: the live ISO detached between the two starts" "$(prov_events)" "virsh start\|.*virsh detach cdrom $ISO\|.*virsh start\|"
+matches "provision: started twice" "$(grep -c '^virsh start' "$S/events")" "^2$"
+has "provision: replace-os gets the UUID" "$(file "$S/stage.replace-os.sh")" "DAS_INSTALL_UUID=5eed0008-0000-4000-8000-000000000008"
+has "provision: replace-os gets p1's PARTUUID" "$(file "$S/stage.replace-os.sh")" "DAS_INSTALL_ESP_PARTUUID=5eed0025-0000-4000-8000-000000000025"
+has "provision: replace-os gets the bay's ESP label" "$(file "$S/stage.replace-os.sh")" "DAS_INSTALL_ESP_LABEL=RECOV-ESP-1"
+STAMP_LINE=$(grep -o 'DAS_INSTALL_STAMP=[0-9]\{8\}-[0-9]\{6\}' "$S/stage.replace-os.sh" 2>/dev/null | head -n 1) || STAMP_LINE=""
+matches "provision: replace-os gets a stamp" "$STAMP_LINE" "^DAS_INSTALL_STAMP=[0-9]{8}-[0-9]{6}$"
+has "provision: delete-replaced gets the same stamp" "$(file "$S/stage.delete-replaced.sh")" "$STAMP_LINE"
+has "provision: verify gets the config from the payload" "$(file "$S/stage.verify.sh")" "DAS_INSTALL_CONFIG=/run/das-provision/payload/config.toml"
+has "provision: each step runs the installer from the payload" "$(file "$S/stage.pacstrap.sh")" "/run/das-provision/payload/recovery-os-install.sh pacstrap"
+has "provision: the payload step checks its sums" "$(file "$S/stage.payload.sh")" "sha256sum -c"
+has "provision: repos runs the pipeline's own check against the new root" "$(file "$S/stage.repos.sh")" "PACMAN_CONF=/mnt/target/etc/pacman.conf"
+has "provision: the payload holds the installer, package, keys and config" "$(file "$S/xorriso.log")" "-V DAS-PROVISION"
+has "provision: the first boot's proof" "$OUT" "PROGRESS system-recovery-A-2tb first-boot ok"
+has "provision: kernel read" "$OUT" "PROGRESS system-recovery-A-2tb kernel ok 7.2.9-1-cachyos"
+has "provision: the sync unit's first-boot status" "$OUT" "state sync: no state snapshot (as expected before the next backup)"
+has "provision: no database yet" "$OUT" "no backup index yet (as expected: the sync unit copied nothing)"
+has "provision: desktop proven" "$OUT" "desktop: kwin_wayland and plasmashell running; screenshot $T/run/das-recovery-os-vm/provision-"
+has "provision: the live system's guard said" "$OUT" "guard: engaged in the live system"
+has "provision: the capture kept" "$(cat "$CAPDIR_A"/*/capture.txt 2>/dev/null)" "top: @.archive.20260301-1200"
+has "provision: the old record kept beside it" "$(cat "$CAPDIR_A"/*/record.json 2>/dev/null)" '"btrbk_at_boot"'
+has "provision: the last line" "$OUT" "Provisioned system-recovery-A-2tb: back in service only after the next backup run records it"
+has "provision: history mode" "$(file "$H")" '"mode":"provision"'
+has "provision: history stamp" "$(file "$H")" "\"stamp\":\"${STAMP_LINE#DAS_INSTALL_STAMP=}\""
+has "provision: history clean" "$(file "$H")" '"outcome":"clean"'
+check "provision: the payload ISO removed" "$(ls "$T/images" 2>/dev/null | wc -l)" "0"
+check "provision: no cdrom left in the definition" "$(file "$S/cdroms.xml")" ""
+has "provision: given back" "$(prov_events)" "virsh detach|"
+check "provision: nothing forbidden" "$(file "$S/forbidden")" ""
+
+provision_fixture
+echo 2 >"$S/stage.pacstrap.rc"
+run_driver_env "${PROV[@]}"
+check "provision, pacstrap fails: exit 7" "$RC" "7"
+has "provision, pacstrap fails: named" "$OUT" "stopped at pacstrap"
+lacks "provision, pacstrap fails: nothing after it" "$(file "$S/stages.log")" "configure"
+lacks "provision, pacstrap fails: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+has "provision, pacstrap fails: how to undo" "$OUT" "provision system-recovery-A-2tb --undo --iso"
+has "provision, pacstrap fails: history failed" "$(file "$H")" '"outcome":"failed"'
+has "provision, pacstrap fails: stopped_at" "$(file "$H")" '"stopped_at":"pacstrap"'
+check "provision, pacstrap fails: started once" "$(grep -c '^virsh start' "$S/events")" "1"
+check "provision, pacstrap fails: the payload ISO removed" "$(ls "$T/images" 2>/dev/null | wc -l)" "0"
+check "provision, pacstrap fails: no cdrom left" "$(file "$S/cdroms.xml")" ""
+has "provision, pacstrap fails: given back" "$(prov_events)" "virsh detach|"
+
+provision_fixture
+: >"$S/guard-silent-phase2"
+run_driver_env "${PROV[@]}"
+check "provision, the guard silent in the live system: not a stop" "$RC" "0"
+has "provision, the guard silent in the live system: said" "$OUT" "guard: silent in the live system (expected: it has no das-vm-guard unit)"
+check "provision, the guard silent in the live system: every step" "$(tr '\n' ' ' <"$S/stages.log")" "$PSTEPS"
+
+provision_fixture
+: >"$S/guard-silent-phase3"
+run_driver_env "${PROV[@]}"
+check "provision, the guard silent at the first boot: exit 7" "$RC" "7"
+has "provision, the guard silent at the first boot: named" "$OUT" "stopped at first-boot"
+lacks "provision, the guard silent at the first boot: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+
+provision_fixture
+: >"$S/agent-down-phase3"
+printf 'shut off\n' >"$S/states.after_shutdown" # no agent: off by ACPI
+run_driver_env "${PROV[@]}"
+check "provision, no agent at the first boot: exit 7" "$RC" "7"
+has "provision, no agent at the first boot: named" "$OUT" "stopped at first-boot"
+lacks "provision, no agent at the first boot: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+
+provision_fixture
+printf 'sddm\n' >"$S/guest.pgrep"
+run_driver_env "${PROV[@]}"
+check "provision, no desktop: exit 7" "$RC" "7"
+has "provision, no desktop: named" "$OUT" "kwin_wayland or plasmashell is not running"
+lacks "provision, no desktop: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+
+provision_fixture
+printf 'synced 20261012T0348\n' >"$S/guest.sync-status"
+run_driver_env "${PROV[@]}"
+check "provision, an unexpected sync status: exit 7" "$RC" "7"
+has "provision, an unexpected sync status: quoted" "$OUT" "state sync says 'synced 20261012T0348', expected 'no state snapshot' on a first boot"
+lacks "provision, an unexpected sync status: nothing deleted" "$(file "$S/stages.log")" "delete-replaced"
+
+provision_fixture
+: >"$S/guest.db"
+run_driver_env "${PROV[@]}"
+check "provision, a database after the first boot: exit 7" "$RC" "7"
+has "provision, a database after the first boot: said" "$OUT" "a database exists after the first boot"
+
+provision_fixture
+: >"$S/stage.capture.out"
+run_driver_env "${PROV[@]}"
+check "provision, the capture printed nothing: exit 7" "$RC" "7"
+has "provision, the capture printed nothing: named" "$OUT" "stopped at capture"
+has "provision, the capture printed nothing: nothing changed" "$OUT" "nothing on the drive was changed"
+lacks "provision, the capture printed nothing: nothing set aside" "$(file "$S/stages.log")" "replace-os"
+
+provision_fixture
+echo 2 >"$S/stage.delete-replaced.rc"
+run_driver_env "${PROV[@]}"
+check "provision, delete-replaced fails: exit 7" "$RC" "7"
+has "provision, delete-replaced fails: named" "$OUT" "stopped at delete-replaced"
+has "provision, delete-replaced fails: the new OS stands" "$OUT" "the new OS booted and is proven"
+
+provision_fixture
+: >"$S/detach_cdrom_fail"
+run_driver_env "${PROV[@]}" 
+check "provision, the live ISO cannot be detached: exit 7" "$RC" "7"
+has "provision, the live ISO cannot be detached: named" "$OUT" "stopped at first-boot"
+check "provision, the live ISO cannot be detached: started once" "$(grep -c '^virsh start' "$S/events")" "1"
 
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
 check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"
