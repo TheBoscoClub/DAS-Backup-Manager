@@ -38,6 +38,8 @@ EOF
 for t in mount umount mkfs.vfat pacstrap arch-chroot genfstab; do
   printf '#!/bin/bash\necho "%s $*" >>"$STUB_LOG"\n[[ -z "${STUB_%s_FAILS:-}" ]] || exit 1\n' "$t" "${t//[.-]/_}" >"$BIN/$t"
 done
+# STUB_mount_RO_FAILS: only a read-only mount fails (undo's remount of p1).
+printf '[[ -z "${STUB_mount_RO_FAILS:-}" || " $* " != *" -o ro "* ]] || exit 1\n' >>"$BIN/mount"
 cat >"$BIN/mkfs.vfat" <<'EOF'
 #!/bin/bash
 echo "mkfs.vfat $*" >>"$STUB_LOG"
@@ -155,6 +157,26 @@ check "exact: exit 0" test "$RC" -eq 0
 for s in "${EXACT_LIST[@]}"; do
     check "exact: $s is still there, unrenamed" test -f "$R/mnt/top/$s/.subvol"
 done
+
+echo "== replace-os: @.previous (the writable clone the loader step makes) by exact name"
+fixture
+mkdir -p "$R/mnt/top/@.previous"; echo rw >"$R/mnt/top/@.previous/.subvol"
+PREV_LOOKALIKES=(@.previous-old @.previousx @.previous.20261001 x@.previous)
+for s in "${PREV_LOOKALIKES[@]}"; do mkdir -p "$R/mnt/top/$s"; echo "ro received" >"$R/mnt/top/$s/.subvol"; done
+run replace-os
+check "previous: exit 0" test "$RC" -eq 0
+check "previous: @.previous set aside" test -d "$R/mnt/top/@.previous.replaced.20261013-010203"
+check "previous: @.previous listed in the manifest" grep -q "^@.previous	@.previous.replaced.20261013-010203$" "$R/mnt/top/.das-provision.20261013-010203"
+for s in "${PREV_LOOKALIKES[@]}"; do
+    check "previous: lookalike $s untouched" test -f "$R/mnt/top/$s/.subvol"
+done
+
+fixture
+mkdir -p "$R/mnt/top/@.previous"; echo rw >"$R/mnt/top/@.previous/.subvol"; echo "the clone" >"$R/mnt/top/@.previous/sentinel"
+run replace-os
+run undo
+check "previous, undo: exit 0" test "$RC" -eq 0
+check "previous, undo: @.previous is back, itself" grep -qx "the clone" "$R/mnt/top/@.previous/sentinel"
 
 echo "== replace-os: --also-replace names one by one, archives only"
 fixture; for s in @.archive.20260601T0300 @.archive.20260615T0300; do mkdir -p "$R/mnt/top/$s"; echo rw >"$R/mnt/top/$s/.subvol"; done
@@ -642,6 +664,10 @@ check "undo: copied, flushed, unmounted, mounted again read-only (the compare re
 fixture; run replace-os; run undo STUB_SYNC_FAIL="mnt/esp-old"
 check "undo, the flush of p1 fails: exit 2" test "$RC" -eq 2
 check "undo, the flush fails: manifests not marked undone" test ! -e "$TOPD/.das-provision.$S1.undone"
+fixture; run replace-os; : >"$LOG"; run undo STUB_mount_RO_FAILS=1
+check "undo, the read-only remount fails: exit 2" test "$RC" -eq 2
+check "undo, the read-only remount fails: says so, not a misleading unmount error" out_has "remount"
+check "undo, the read-only remount fails: no umount of a p1 that is not mounted" test -z "$(after "$(ln1 "^mount -o ro /dev/sdz1 $R/mnt/esp-old\$")" "^umount $R/mnt/esp-old\$")"
 fixture; run boot
 check "boot: p1 flushed after the images are built" test "$(ln1 'mkinitcpio -P')" -lt "$(ln1 "^sync -f $R/mnt/target/boot\$")"
 
