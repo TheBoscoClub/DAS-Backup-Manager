@@ -79,18 +79,18 @@ splash_init() {
     }
     if "$PLYMOUTH" --ping 2>/dev/null; then SPLASH=1; fi
     PREV_TOTAL=$(sed -n 's/^total=//p' "$TIMINGS" 2>/dev/null | head -1) || :
-    [[ "$PREV_TOTAL" =~ ^[0-9]+$ ]] || PREV_TOTAL=""
+    [[ "$PREV_TOTAL" =~ ^[1-9][0-9]{0,5}$ ]] || PREV_TOTAL=""
 }
 # phase <key> <text>: records when the phase began and shows it. A countdown
-# exists only when the previous boot measured a total.
+# exists only when the previous boot measured a total (a sane one: 1..999999),
+# only on the working phases, and only while time is left.
 phase() {
     local key=$1 text=$2 left msg
     PHASE_AT[$key]=$((SECONDS - T0))
     msg="DAS recovery disk, Bay $BAY. $HEADER_TEXT"$'\n\n'"$text"
-    if [[ -n "$PREV_TOTAL" ]]; then
+    if [[ -n "$PREV_TOTAL" && "$key" != "done" ]]; then
         left=$((PREV_TOTAL - (SECONDS - T0)))
-        ((left >= 0)) || left=0
-        msg+=" — about $left s remaining, measured at the last boot"
+        ((left <= 0)) || msg+=" — about $left s remaining, measured at the last boot"
     fi
     say "das-recovery-state-sync: $text"
     [[ -z "$SPLASH" ]] || "$PLYMOUTH" display-message --text="$msg" 2>/dev/null || :
