@@ -6,8 +6,8 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.1.0
-# Date: 2026-10-12
+# Version: 1.1.2
+# Date: 2026-10-13
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
 # in the unit, and the marker is written only by provisioning. A failure
@@ -25,8 +25,14 @@
 # answers --ping. Each phase's seconds and the total are measured into
 # $TIMINGS (outside the state directory, which is swapped every boot), only on
 # a boot that reached "ready"; the next boot shows a countdown from that
-# measurement and from nothing else (no measurement: no countdown). On success
-# $STATE_DIR/booted is touched: this root completed a sync.
+# measurement and from nothing else (no measurement: no countdown). On EVERY
+# boot that passes the marker gate, whatever the sync then does (including the
+# normal first boot with no state snapshot, exit 2), $BOOTED is written with
+# one line, provisioned=<the marker's provisioned value> (empty when the marker
+# has none): this root has booted, which is what recovery-os-install.sh undo
+# refuses on and what delete-replaced compares with the newest manifest's
+# stamp. It lives beside the timings file, outside the state directory
+# (swapped every boot).
 #
 # It is left mounted for the rest of the recovery session (the GUI restore
 # reads it); it is deliberately not in the EXIT trap.
@@ -49,6 +55,7 @@ MV="${DAS_STATE_SYNC_MV:-mv}"
 PLYMOUTH="${DAS_STATE_SYNC_PLYMOUTH:-plymouth}"
 TIMINGS="${DAS_STATE_SYNC_TIMINGS:-$ROOT/var/lib/das-recovery/timings}"
 BAY="${DAS_STATE_SYNC_BAY:-}"
+BOOTED="${DAS_STATE_SYNC_BOOTED:-$ROOT/var/lib/das-recovery/booted}"
 STATUS_FILE="$RUN_DIR/status"
 HEADER_TEXT='Recovery disk boots take significantly longer than a normal boot: this disk is a 2 TB USB drive, and it copies the latest backup index and settings before the desktop appears. Do not power off or unplug it — the copy would be left incomplete and the disk would start again from the previous copy.'
 T0=$SECONDS
@@ -121,6 +128,11 @@ cleanup_new() { rm -rf "$STATE_DIR.new" "$CONFIG_OUT.new"; }
 if [[ ! -e "$MARKER" ]]; then
     say "das-recovery-state-sync: not a recovery drive ($MARKER absent): nothing done" >&2
     exit 1
+fi
+
+prov=$(sed -n 's/^provisioned=//p' "$MARKER" 2>/dev/null | head -1) || prov=""
+if ! { mkdir -p "$(dirname "$BOOTED")" && printf 'provisioned=%s\n' "$prov" >"$BOOTED"; }; then
+    say "das-recovery-state-sync: could not write $BOOTED: an undo of the provisioning would not know this root has booted" >&2
 fi
 
 splash_init
@@ -289,7 +301,6 @@ if [[ "$stamp" < "$data_stamp" ]]; then
 else
     status "synced $stamp"
 fi
-touch "$STATE_DIR/booted" || say "das-recovery-state-sync: could not write $STATE_DIR/booted" >&2
 measure
 phase "done" "ready: index from $stamp"
 say "state synced from ${state_snap##*/}; configuration derived from ${root_snap##*/}"
