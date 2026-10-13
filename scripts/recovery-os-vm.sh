@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.1.2
+# Version: 2.1.3
 # Date: 2026-10-12
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -155,8 +155,10 @@
 #     never the host's); guard-lift (systemctl stop das-vm-guard); keyrings;
 #     upgrade (pacman -Syu --noconfirm); packages (qemu-guest-agent, and
 #     amd-ucode intel-ucode reinstalled); initramfs (the fallback image added
-#     to a preset that lacks it, then mkinitcpio -P); verify-btrbk (pacman
-#     -Qkk btrbk: 0 altered files); verify-boot (every file the loader
+#     to a preset that lacks it, then mkinitcpio -P); loader
+#     (cachyos-recovery-previous.conf rewritten to boot the newest
+#     @.pre-update.* read-only, removed when there is none); verify-btrbk
+#     (pacman -Qkk btrbk: 0 altered files); verify-boot (every file the loader
 #     entries name is on the ESP, every LABEL=/UUID= of /etc/fstab
 #     resolves -- bd ac82, read inside the OS); guard-engage (started again,
 #     every btrbk bound); reboot (a new boot whose guard reports engaged
@@ -208,7 +210,7 @@
 # label never holds a space):
 #   PROGRESS <label> <step> <event>[ <message>]
 #       step: preflight, start, wait, boot, egress, repos, snapshot, guard-lift,
-#       keyrings, upgrade, packages, initramfs, verify-btrbk, verify-boot,
+#       keyrings, upgrade, packages, initramfs, loader, verify-btrbk, verify-boot,
 #       guard-engage, reboot, kernel, poweroff, giveback; event: start, ok,
 #       fail (the message says why). An attended session has preflight,
 #       start, wait and giveback only.
@@ -4044,6 +4046,7 @@ UNATTENDED_STEPS=(
     "upgrade UPDATE step_upgrade"
     "packages 1800 step_packages"
     "initramfs 1800 step_initramfs"
+    "loader 120 step_loader"
     "verify-btrbk 300 step_verify_btrbk"
     "verify-boot 300 step_verify_boot"
     "guard-engage 120 step_guard_engage"
@@ -4227,6 +4230,52 @@ for p in /etc/mkinitcpio.d/*.preset; do
 done
 [ "$found" = 1 ] || { echo "no mkinitcpio preset in /etc/mkinitcpio.d"; exit 3; }
 mkinitcpio -P
+EOF
+}
+
+# D1: the previous-root loader entry. After the upgrade the OS points
+# cachyos-recovery-previous.conf at the newest @.pre-update.<stamp> (the
+# snapshot step's, read-only): last upgrade's known-good root, bootable
+# without external media. With no snapshot the entry is removed, not left
+# naming a root that is gone. ESP and TOP are for the test suite, which runs
+# this script against directories of its own.
+step_loader() {
+    cat <<'EOF'
+set -eu
+esp=${ESP:-}
+if [ -z "$esp" ]; then esp=$(bootctl --print-esp-path 2>/dev/null) || esp=/boot; fi
+main=$esp/loader/entries/cachyos-recovery.conf
+prev=$esp/loader/entries/cachyos-recovery-previous.conf
+[ -r "$main" ] || { echo "cannot read cachyos-recovery.conf ($main)"; exit 2; }
+top=${TOP:-}
+if [ -z "$top" ]; then
+    top=/run/das-vm-update/top
+    uuid=$(findmnt -no UUID /) || { echo "cannot read the top level: no UUID for /"; exit 2; }
+    [ -n "$uuid" ] || { echo "cannot read the top level: no UUID for /"; exit 2; }
+    mkdir -p "$top"
+    mount -o subvolid=5,ro "UUID=$uuid" "$top" || { echo "cannot read the top level: mount failed"; exit 2; }
+    trap 'umount "$top"' EXIT
+fi
+list=$(btrfs subvolume list "$top") || { echo "cannot read the top level $top"; exit 2; }
+newest=$(printf '%s\n' "$list" | sed -n 's/^.* path //p' | while read -r n; do
+    case "$n" in
+        @.pre-update.[[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]]-[[:digit:]][[:digit:]][[:digit:]][[:digit:]]) echo "$n" ;;
+    esac
+done | sort -r | head -n 1)
+if [ -z "$newest" ]; then
+    rm -f "$prev"
+    echo "no previous root: entry absent"
+    exit 0
+fi
+grep -Eq '^options .*rootflags=subvol=/@( |$)' "$main" || { echo "$main has no rootflags=subvol=/@ to point at the snapshot"; exit 2; }
+tmp=$prev.new
+sed -E \
+    -e '/^title /s/\(Bay ([0-9]+)\)/— Previous root, read-only (Bay \1)/' \
+    -e "/^options /{s/ rw( |\$)/ ro\\1/;s#rootflags=subvol=/@( |\$)#rootflags=subvol=/$newest\\1#}" \
+    "$main" >"$tmp"
+if ! grep -q "rootflags=subvol=/$newest\( \|\$\)" "$tmp"; then rm -f "$tmp"; echo "could not write the previous-root entry"; exit 2; fi
+mv "$tmp" "$prev"
+echo "previous root: $newest (read-only), entry $prev"
 EOF
 }
 
