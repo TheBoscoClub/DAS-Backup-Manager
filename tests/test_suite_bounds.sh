@@ -48,9 +48,19 @@ printf '#!/bin/bash\nset -euo pipefail\n# shellcheck source=/dev/null\nsource "$
 check "a suite without the cap is named" "$(unbounded "$T/suites")" "test_uncapped.sh"
 
 echo "--- the self-calling stub: runs away uncapped, stopped under the cap"
+# Root is not bound by RLIMIT_NPROC (CI's jobs run as root in an Arch
+# container), so as root the stub runs as nobody: the cap is observed on
+# every runner, never skipped.
+as_runner=()
 if ((EUID == 0)); then
-    echo "skip root is not bound by RLIMIT_NPROC: the cap cannot be observed here"
-else
+    if command -v setpriv >/dev/null && id nobody >/dev/null 2>&1; then
+        as_runner=(setpriv --reuid=nobody --regid=nobody --clear-groups)
+        chmod 1777 "$T"
+    else
+        check "root can drop to nobody to observe the cap (setpriv, user nobody)" "no" "yes"
+    fi
+fi
+if ((EUID != 0)) || ((${#as_runner[@]} > 0)); then
     # The shape of 2026-10-13's stub, with a depth limit so the uncapped run
     # ends by itself: each level waits on the next, so DEPTH tasks are alive
     # at once at the bottom.
@@ -63,13 +73,16 @@ echo "$d" >"$STUB_LOG"
 [ "$d" -ge "$STUB_MAX" ] && exit 0
 STUB_DEPTH=$((d + 1)) mkdir -p "$@"
 STUB
-    chmod +x "$T/bin/mkdir"
+    chmod 755 "$T/bin" "$T/bin/mkdir"
     reached() { # <headroom or "none">: the deepest level the stub reached
         : >"$T/depth"
-        (
-            if [[ "$1" != none ]]; then DAS_TEST_TASK_HEADROOM=$1 das_test_bound; fi
-            PATH="$T/bin:$PATH" STUB_LOG="$T/depth" STUB_MAX=$DEPTH timeout 120 mkdir -p "$T/x"
-        ) >/dev/null 2>&1
+        chmod 666 "$T/depth"
+        # A fresh bash sources the cap itself, as the user it runs as.
+        # shellcheck disable=SC2016 # expanded by the inner bash
+        "${as_runner[@]}" bash -c '
+            if [[ "$1" != none ]]; then DAS_TEST_TASK_HEADROOM=$1 source "$2"; fi
+            PATH="$3/bin:$PATH" STUB_LOG="$3/depth" STUB_MAX=$4 timeout 120 mkdir -p "$3/x"
+        ' _ "$1" "$HERE/lib/bound.sh" "$T" "$DEPTH" >/dev/null 2>&1
         cat "$T/depth"
     }
     check "uncapped, the stub reaches its full depth (it is a runaway)" "$(reached none)" "$DEPTH"
