@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.1.4
-# Date: 2026-10-12
+# Version: 2.2.0
+# Date: 2026-10-13
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -200,6 +200,11 @@
 #                             [--wait-lock <minutes>]
 #                             [--accept-boot-record-risk]
 #   recovery-os-vm.sh session-end <A|B|label>
+#   recovery-os-vm.sh provision <A|B|label> --iso <path> --package <path>
+#                             --package-sha256 <hex> --authorized-keys <file>
+#                             [--also-replace <@.archive.name>]... [--dry-run]
+#                             [--detach] [--wait-lock <minutes>]
+#   recovery-os-vm.sh provision <A|B|label> --undo --iso <path>
 #   recovery-os-vm.sh status
 #   recovery-os-vm.sh screenshot <A|B|label> <file.png>
 #   recovery-os-vm.sh console-socket <A|B|label> <uid>
@@ -420,6 +425,12 @@ readonly REPOS_FIRST="${DAS_RECOVERY_VM_REPOS_FIRST-cachyos}"
 readonly EGRESS_ORG="${DAS_RECOVERY_VM_EGRESS_ORG:-AS209}"
 # The egress rule's priority: above Tailscale's lookup 52 (5270).
 readonly EGRESS_PRIORITY=5100
+# provision: the CachyOS live ISO a drive is rebuilt from must be exactly this
+# one (cachyos-desktop-linux-260809.iso, its published .sha256), and the
+# payload cdrom (the installer, the package, the keys) is built here.
+readonly ISO_SHA256="${DAS_RECOVERY_VM_ISO_SHA256:-959f6577f45e25ee9fd8c220fd221b08e4ea79412c7315c0f922dd6d86d5e33c}"
+readonly PAYLOAD_DIR="${DAS_RECOVERY_VM_PAYLOAD_DIR:-/var/lib/libvirt/images}"
+readonly PROVISION_STEP_NAMES="egress payload capture replace-os pacstrap configure package boot repos verify unmount"
 
 # Installed side by side by CMake: ${prefix}/lib/das-backup/{this script,libvirt/}.
 # The template; each drive's definition is rendered from it (render_domain_xml)
@@ -750,6 +761,19 @@ without rebooting the workstation.
                          the other (the default; the second only after a
                          first that exited 0, or 5 on its own session's
                          warnings alone), or at once
+  provision <A|B|label> --iso <path> --package <path> --package-sha256 <hex>
+            --authorized-keys <file> [--also-replace <@.archive.name>]...
+            [--dry-run] [--detach] [--wait-lock <minutes>]
+                         rebuild the drive's OS from the CachyOS live ISO
+                         inside its VM: the host writes nothing to the
+                         drive; p2 keeps every received backup; the old OS
+                         is set aside as *.replaced.<stamp> until the new
+                         one has booted. Exit 7 names the step it stopped
+                         at. Never while the other recovery drive's last
+                         session was not clean or its record is not "no"
+  provision <A|B|label> --undo --iso <path>
+                         rename the set-aside OS back (refused once the new
+                         root booted)
   session-end <A|B|label>
                          finish a session whose driver died (VM shut off);
                          judges the guard's report before removing anything
@@ -956,7 +980,20 @@ disk_xml() {
   <driver name='qemu' type='raw' cache='none' io='native'/>
   <source dev='$1'/>
   <target dev='sda' bus='sata'/>
-  <boot order='1'/>
+  <boot order='${2:-1}'/>
+</disk>
+EOF
+}
+
+# A read-only SATA cdrom: $1 the image, $2 its target dev, $3 its boot order.
+cdrom_xml() {
+    cat <<EOF
+<disk type='file' device='cdrom'>
+  <driver name='qemu' type='raw'/>
+  <source file='$1'/>
+  <target dev='$2' bus='sata'/>
+  <readonly/>
+  <boot order='$3'/>
 </disk>
 EOF
 }
@@ -5016,7 +5053,8 @@ check_own_unit() {
 # The DAS_RECOVERY_* and DAS_CONFIG settings of this environment go with it
 # (a unit starts with none); nothing else does. Prints the unit's name.
 run_detached() {
-    local arg args=() name unit var setenv=()
+    local command=$1 arg args=() name unit var setenv=()
+    shift
     require_root
     if ! command -v systemd-run >/dev/null; then
         refuse "systemd-run is not available: --detach starts the session in a transient unit, and there is no other way to make one"
@@ -5028,14 +5066,14 @@ run_detached() {
     if [[ ! "$name" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
         refuse "the label '$name' has characters a systemd unit name cannot carry"
     fi
-    unit="das-recovery-os-session-$name-$(date +%Y%m%d-%H%M%S)"
+    unit="das-recovery-os-$command-$name-$(date +%Y%m%d-%H%M%S)"
     for var in $(compgen -e -- DAS_RECOVERY_) DAS_CONFIG; do
         [[ -n "${!var+set}" ]] && setenv+=("--setenv=$var=${!var}")
     done
-    if ! systemd-run --unit="$unit" --description="recovery OS session $name (recovery-os-vm.sh --detach)"         --property="SuccessExitStatus=$SESSION_OUTCOME_EXITS" --property=Restart=no --collect --quiet         --expand-environment=no "${setenv[@]}" -- "$SELF" session "${args[@]}"; then
-        refuse "systemd-run could not start the session's unit $unit"
+    if ! systemd-run --unit="$unit" --description="recovery OS $command $name (recovery-os-vm.sh --detach)"         --property="SuccessExitStatus=$SESSION_OUTCOME_EXITS" --property=Restart=no --collect --quiet         --expand-environment=no "${setenv[@]}" -- "$SELF" "$command" "${args[@]}"; then
+        refuse "systemd-run could not start the $command's unit $unit"
     fi
-    log "session started as $unit.service: follow it with journalctl -fu $unit; its outcome goes to the history ($SELF history)"
+    log "$command started as $unit.service: follow it with journalctl -fu $unit; its outcome goes to the history ($SELF history)"
     printf '%s\n' "$unit"
     exit 0
 }
@@ -5043,7 +5081,7 @@ run_detached() {
 cmd_session() {
     parse_session_args "$@"
     if [[ "$DETACH" == true ]]; then
-        run_detached "$@"
+        run_detached session "$@"
     fi
     check_own_unit
     if [[ -n "$TARGET_ARG2" ]]; then
@@ -5570,6 +5608,236 @@ check_knobs() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# provision: rebuild a drive's OS from the CachyOS live ISO, inside its VM
+# ---------------------------------------------------------------------------
+
+provision_parse_args() {
+    P_ISO="" P_PKG="" P_PKG_SHA="" P_KEYS="" P_ALSO=() P_UNDO=false
+    while (($#)); do
+        case "$1" in
+            --iso | --package | --package-sha256 | --authorized-keys | --also-replace | --wait-lock)
+                (($# >= 2)) || usage
+                case "$1" in
+                    --iso) P_ISO=$2 ;;
+                    --package) P_PKG=$2 ;;
+                    --package-sha256) P_PKG_SHA=$2 ;;
+                    --authorized-keys) P_KEYS=$2 ;;
+                    --also-replace) P_ALSO+=("$2") ;;
+                    --wait-lock) WAIT_LOCK_MIN=$2 ;;
+                esac
+                shift
+                ;;
+            --undo) P_UNDO=true ;;
+            --dry-run) DRY_RUN=true ;;
+            --detach) DETACH=true ;;
+            -*) usage ;;
+            *)
+                [[ -z "$TARGET_ARG" ]] || usage
+                TARGET_ARG=$1
+                ;;
+        esac
+        shift
+    done
+    [[ -n "$TARGET_ARG" && -n "$P_ISO" ]] || usage
+    if [[ "$P_UNDO" != true ]]; then
+        [[ -n "$P_PKG" && -n "$P_PKG_SHA" && -n "$P_KEYS" ]] || usage
+    elif ((${#P_ALSO[@]} > 0)) || [[ -n "$P_PKG$P_PKG_SHA$P_KEYS" ]]; then
+        usage
+    fi
+    if [[ -n "$WAIT_LOCK_MIN" && ! "$WAIT_LOCK_MIN" =~ ^[123456789][[:digit:]]*$ ]]; then
+        printf 'recovery-os-vm.sh: --wait-lock takes a whole number of minutes, at least 1\n' >&2
+        exit 2
+    fi
+    if [[ "$DRY_RUN" == true && ( "$DETACH" == true || -n "$WAIT_LOCK_MIN" ) ]]; then
+        printf 'recovery-os-vm.sh: --detach and --wait-lock have no meaning with --dry-run (nothing is booted)\n' >&2
+        exit 2
+    fi
+    local name
+    for name in "${P_ALSO[@]}"; do
+        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* ]] ||
+            refuse "--also-replace $name: only @.archive.* names, one per option"
+    done
+}
+
+# The sha256 of file $1, or a refusal naming what could not be read.
+sha256_of() {
+    local out
+    [[ -f "$1" && -r "$1" ]] || refuse "$1 is not a readable file"
+    out="$(sha256sum -- "$1")" || refuse "cannot read $1 to check its sha256"
+    printf '%s' "${out%% *}"
+}
+
+# Another drive's verdict, from the record check_boot_record reads, without
+# its refusals: the verdict word, or "unreadable (<why>)".
+record_verdict() {
+    local out key value verdict="" entry=""
+    if ! out="$(jq -r --arg label "$1" "$BOOT_RECORD_JQ" 2>&1 <"$OS_STATE_FILE")"; then
+        printf 'unreadable (%s)' "$(printable "$out")"
+        return
+    fi
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+            entry) entry=$value ;;
+            verdict) verdict=$value ;;
+        esac
+    done <<<"$out"
+    if [[ "$entry" != present ]]; then
+        printf 'absent'
+    else
+        printf '%s' "${verdict:-unreadable (no verdict)}"
+    fi
+}
+
+# Never two recovery drives down at once: every other mirror drive's last
+# session must be clean (none at all is a warning) and its boot record must
+# say no.
+check_other_drives() {
+    local other last outcome stopped verdict
+    read_history || refuse "$HISTORY_FAILURE"
+    for other in "${TARGET_LABELS[@]}"; do
+        [[ "${T_ROLE[$other]}" == mirror && "$other" != "$LABEL" ]] || continue
+        last="$(jq -r --arg l "$other" 'select(.label == $l) | [.outcome, (.stopped_at // "")] | @tsv' <<<"$HISTORY_LINES" | tail -n 1)" ||
+            refuse "cannot read $other's sessions from the history"
+        if [[ -z "$last" ]]; then
+            warn "$other has no session in the history: whether its OS works is known only from its boot record"
+        else
+            IFS=$'\t' read -r outcome stopped <<<"$last"
+            [[ "$outcome" == clean ]] ||
+                refuse "$other's last session was $outcome${stopped:+ (stopped at $stopped)}: never two recovery drives down at once"
+        fi
+        verdict="$(record_verdict "$other")"
+        [[ "$verdict" == no ]] || refuse "$other's boot record is $verdict: never two recovery drives down at once"
+    done
+}
+
+provision_preflight() {
+    local display installer
+    require_root
+    command -v jq >/dev/null || refuse "jq is not installed: provision reads the history and the boot records with it"
+    load_targets
+    resolve_label "$TARGET_ARG"
+    if [[ ! "$LABEL" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
+        refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
+    fi
+    display="$(display_name_of "$LABEL")"
+    [[ "$display" =~ [Bb]ay[[:space:]]*([0-9]+) ]] ||
+        refuse "no bay number in the display_name of $LABEL ('$display'): the ESP label and hostname are derived from it"
+    P_BAY=${BASH_REMATCH[1]}
+    [[ "$LABEL" =~ recovery-([A-Z])- ]] || refuse "no drive letter in the label $LABEL (system-recovery-<A|B>-...)"
+    P_LETTER=${BASH_REMATCH[1]}
+    P_HOST="das-recovery-bay$P_BAY"
+    P_ESP="RECOV-ESP-$P_BAY"
+    installer="$SCRIPT_DIR/recovery-os-install.sh"
+    [[ -r "$installer" ]] || refuse "recovery-os-install.sh is not installed beside $SELF: the payload cdrom carries it"
+    command -v xorriso >/dev/null || refuse "xorriso is not installed (package libisoburn): the payload cdrom cannot be built"
+    P_ISO_GOT="$(sha256_of "$P_ISO")"
+    [[ "$P_ISO_GOT" == "$ISO_SHA256" ]] || refuse "iso sha256 is $P_ISO_GOT, not the pinned $ISO_SHA256"
+    if [[ "$P_UNDO" != true ]]; then
+        P_PKG_GOT="$(sha256_of "$P_PKG")"
+        [[ "$P_PKG_GOT" == "$P_PKG_SHA" ]] || refuse "package sha256 is $P_PKG_GOT, not $P_PKG_SHA"
+        [[ -s "$P_KEYS" ]] || refuse "authorized-keys file is empty: a drive with sshd and no key is unreachable"
+    fi
+    resolve_os_state
+    check_other_drives
+    wait_for_lock
+    resolve_disk
+    check_units
+    check_not_mounted
+    check_domain_idle
+    check_no_live_holder
+    make_state_dir || refuse "cannot create $STATE_DIR"
+}
+
+# Target $1's display_name (DAS_TARGET_<i>_DISPLAY_NAME), empty when unset.
+display_name_of() {
+    local i label_var name_var
+    for ((i = 0; i < DAS_TARGET_COUNT; i++)); do
+        label_var="DAS_TARGET_${i}_LABEL"
+        name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+        if [[ "${!label_var}" == "$1" ]]; then
+            printf '%s' "${!name_var:-}"
+            return
+        fi
+    done
+}
+
+provision_plan_text() {
+    local count
+    count="$(bash "$SCRIPT_DIR/recovery-os-install.sh" --count-packages)" ||
+        refuse "recovery-os-install.sh --count-packages failed: $count"
+    log "provision $LABEL (drive $P_LETTER): serial $SERIAL, device $DISK ($DISK_DEV)"
+    log "bay $P_BAY, hostname $P_HOST, ESP label $P_ESP"
+    log "entries: CachyOS Emergency Recovery (Bay $P_BAY); CachyOS Emergency Recovery — Fallback (Bay $P_BAY); CachyOS Emergency Recovery — Previous root, read-only (Bay $P_BAY) (written by the first upgrade)"
+    log "packages: $count"
+    log "iso sha256 ok"
+    log "package sha256 ok"
+    log "also replacing: ${P_ALSO[*]:-none}"
+    log "steps: $PROVISION_STEP_NAMES, then the first boot, delete-replaced"
+}
+
+# The payload cdrom: the installer, the package and the keys, with their
+# sums. Removed when the run ends (on_exit).
+provision_payload() {
+    local tmp out
+    mkdir -p -- "$PAYLOAD_DIR" || refuse "cannot create $PAYLOAD_DIR"
+    PAYLOAD_ISO="$PAYLOAD_DIR/das-provision-$LABEL-$PROVISION_STAMP.iso"
+    tmp="$(mktemp -d)" || refuse "cannot make a directory for the payload"
+    if ! cp -- "$SCRIPT_DIR/recovery-os-install.sh" "$tmp/recovery-os-install.sh" ||
+        ! cp -- "$P_PKG" "$tmp/$(basename -- "$P_PKG")" ||
+        ! cp -- "$P_KEYS" "$tmp/authorized_keys" ||
+        ! (cd "$tmp" && sha256sum -- * >SHA256SUMS); then
+        rm -rf -- "$tmp"
+        refuse "cannot assemble the payload in $tmp"
+    fi
+    if ! out="$(xorriso -as mkisofs -quiet -V DAS-PROVISION -J -R -o "$PAYLOAD_ISO" "$tmp" 2>&1)"; then
+        rm -rf -- "$tmp"
+        rm -f -- "$PAYLOAD_ISO"
+        refuse "xorriso could not build $PAYLOAD_ISO: $(printable "$out")"
+    fi
+    rm -rf -- "$tmp"
+}
+
+# Attach (or detach) a cdrom to the domain's definition, and prove it.
+attach_cdrom() {
+    local f="$STATE_DIR/$LABEL.cdrom-$2.xml"
+    cdrom_xml "$1" "$2" "$3" >"$f" || refuse "cannot write $f"
+    virsh_ attach-device "$DOMAIN" "$f" --config >/dev/null || refuse "cannot attach $1 to $DOMAIN as $2"
+    cdrom_defined "$1" || refuse "$1 is not in $DOMAIN's definition after attaching it"
+}
+# Whether image $1 is in the domain's definition. Unlike disk_in_definition
+# (whose callers must assume a disk is attached when they cannot tell), an
+# unreadable definition is a refusal: it proves neither an attach nor a
+# detach.
+cdrom_defined() {
+    local xml src
+    xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $(printable "$xml")"
+    while IFS= read -r src; do
+        [[ "$src" != "$1" ]] || return 0
+    done < <(disk_sources "$xml")
+    return 1
+}
+detach_cdrom() {
+    local f="$STATE_DIR/$LABEL.cdrom-$2.xml"
+    virsh_ detach-device "$DOMAIN" "$f" --config >/dev/null || refuse "cannot detach $2 from $DOMAIN"
+    ! cdrom_defined "$1" || refuse "$1 is still in $DOMAIN's definition after detaching it"
+}
+
+cmd_provision() {
+    provision_parse_args "$@"
+    if [[ "$DETACH" == true ]]; then
+        run_detached provision "$@"
+    fi
+    check_own_unit
+    provision_preflight
+    PROVISION_STAMP="$(date +%Y%m%d-%H%M%S)"
+    if [[ "$DRY_RUN" == true ]]; then
+        provision_plan_text
+        exit 0
+    fi
+    refuse "provision: only --dry-run is implemented in this version"
+}
+
 main() {
     (($# >= 1)) || usage
     local command=$1
@@ -5587,6 +5855,7 @@ main() {
             cmd_define
             ;;
         session) cmd_session "$@" ;;
+        provision) cmd_provision "$@" ;;
         session-end)
             if (($# != 1)) || [[ -z "$1" ]]; then usage; fi
             cmd_session_end "$1"
