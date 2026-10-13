@@ -622,6 +622,7 @@ GUARD_CONFIRMED=false
 GUARD_OPTIONAL=""     # provision's live system: it may carry no reporter at all
 GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
 HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
+P_ALSO=()             # provision: the @.archive.* names also set aside
 PROVISION_STAMP=""    # provision: the stamp of every *.replaced.<stamp> name
 PAYLOAD_ISO=""        # provision: the payload cdrom image, removed at the end
 CAPTURE_FILE=""       # provision: where the capture step's lines are kept
@@ -4432,12 +4433,13 @@ write_history() {
     ((${#BOOT_OVERRIDES[@]} == 0)) || overridden=true
     printf 'RESULT %s %s %s\n' "$LABEL" "$1" "$outcome"
     if ! line="$(jq -cn --arg label "$LABEL" --argjson start "$SESSION_EPOCH" --argjson end "$(date +%s)" \
-        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
+        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --arg also "${P_ALSO[*]}" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
         --argjson overridden "$overridden" --arg kernel "$KERNEL" --arg stage "$UNATTENDED_STAGE" \
         '{label: $label, start: $start, end: $end, mode: $mode, unattended: $unattended, outcome: $outcome,
           exit: $exit, overridden: $overridden, kernel: (if $kernel == "" then null else $kernel end),
           stopped_at: (if $stage == "" then null else $stage end)}
-          + (if $stamp == "" then {} else {stamp: $stamp} end)' 2>&1)"; then
+          + (if $stamp == "" then {} else {stamp: $stamp} end)
+          + (if $mode == "provision" then {also_replace: ($also | split(" ") | map(select(. != "")))} else {} end)' 2>&1)"; then
         warn "could not write this session into the history: $line"
         return 0
     fi
@@ -5779,7 +5781,11 @@ provision_preflight() {
     P_UUID=${T_UUIDS[$LABEL]}
     [[ -n "$P_UUID" ]] || refuse "'$LABEL' has no mount_uuid in $DAS_CONFIG: the installer identifies partition 2 by it"
     resolve_os_state
-    check_other_drives
+    if [[ "$P_UNDO" == true ]]; then
+        undo_read_provision
+    else
+        check_other_drives
+    fi
     wait_for_lock
     resolve_disk
     esp_part_partuuid
@@ -5788,6 +5794,25 @@ provision_preflight() {
     check_domain_idle
     check_no_live_holder
     make_state_dir || refuse "cannot create $STATE_DIR"
+}
+
+# undo: the newest provision of this drive in the history -- its stamp
+# (PROVISION_STAMP) and the archives it also set aside (P_ALSO), which the
+# installer's allowlist must see again exactly. None is a refusal.
+undo_read_provision() {
+    local row name
+    read_history || refuse "$HISTORY_FAILURE"
+    row="$(jq -c --arg l "$LABEL" 'select(.label == $l and .mode == "provision")' <<<"$HISTORY_LINES" | tail -n 1)" ||
+        refuse "cannot read $LABEL's provisions from the history"
+    [[ -n "$row" ]] || refuse "no provision of $LABEL in the history: nothing to undo"
+    PROVISION_STAMP="$(jq -r '.stamp // empty' <<<"$row")" || PROVISION_STAMP=""
+    [[ "$PROVISION_STAMP" =~ ^[[:digit:]]{8}-[[:digit:]]{6}$ ]] ||
+        refuse "the newest provision of $LABEL in the history has no stamp of the form YYYYMMDD-HHMMSS ('$PROVISION_STAMP'): $(printable "$row")"
+    mapfile -t P_ALSO < <(jq -r '.also_replace // [] | .[]' <<<"$row") || refuse "cannot read the archives of the provision $PROVISION_STAMP"
+    for name in "${P_ALSO[@]}"; do
+        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* ]] ||
+            refuse "the provision $PROVISION_STAMP of $LABEL names '$name' among its archives: not an @.archive.* name"
+    done
 }
 
 # p1's PARTUUID (P_PARTUUID), read here, read-only: the installer refuses a
@@ -5838,8 +5863,8 @@ provision_payload() {
     PAYLOAD_ISO="$PAYLOAD_DIR/das-provision-$LABEL-$PROVISION_STAMP.iso"
     tmp="$(mktemp -d)" || refuse "cannot make a directory for the payload"
     if ! cp -- "$SCRIPT_DIR/recovery-os-install.sh" "$tmp/recovery-os-install.sh" ||
-        ! cp -- "$P_PKG" "$tmp/$(basename -- "$P_PKG")" ||
-        ! cp -- "$P_KEYS" "$tmp/authorized_keys" ||
+        { [[ "$P_UNDO" != true ]] && ! cp -- "$P_PKG" "$tmp/$(basename -- "$P_PKG")"; } ||
+        { [[ "$P_UNDO" != true ]] && ! cp -- "$P_KEYS" "$tmp/authorized_keys"; } ||
         ! cp -- "$DAS_CONFIG" "$tmp/config.toml" ||
         ! (cd "$tmp" && sha256sum -- * >SHA256SUMS); then
         rm -rf -- "$tmp"
@@ -5911,9 +5936,13 @@ readonly PAYLOAD_MNT=/run/das-provision/payload
 prov_env_lines() {
     printf 'export DAS_INSTALL_UUID=%s DAS_INSTALL_ESP_PARTUUID=%s DAS_INSTALL_ESP_LABEL=%s DAS_INSTALL_BAY=%s DAS_INSTALL_LETTER=%s DAS_INSTALL_HOSTNAME=%s DAS_INSTALL_STAMP=%s\n' \
         "$P_UUID" "$P_PARTUUID" "$P_ESP" "$P_BAY" "$P_LETTER" "$P_HOST" "$PROVISION_STAMP"
-    # The names are @.archive.<letters, digits, . _ -> (provision_parse_args).
-    printf "export DAS_INSTALL_ALSO_REPLACE='%s' DAS_INSTALL_PACKAGE=%s/%s DAS_INSTALL_KEYS=%s/authorized_keys DAS_INSTALL_CONFIG=%s/config.toml DAS_INSTALL_PAYLOAD_SHA256=%s\n" \
-        "${P_ALSO[*]}" "$PAYLOAD_MNT" "$(basename -- "$P_PKG")" "$PAYLOAD_MNT" "$PAYLOAD_MNT" "$P_PKG_SHA"
+    # The names are @.archive.<letters, digits, . _ -> (provision_parse_args,
+    # undo_read_provision).
+    printf "export DAS_INSTALL_ALSO_REPLACE='%s' DAS_INSTALL_CONFIG=%s/config.toml\n" "${P_ALSO[*]}" "$PAYLOAD_MNT"
+    if [[ "$P_UNDO" != true ]]; then
+        printf 'export DAS_INSTALL_PACKAGE=%s/%s DAS_INSTALL_KEYS=%s/authorized_keys DAS_INSTALL_PAYLOAD_SHA256=%s\n' \
+            "$PAYLOAD_MNT" "$(basename -- "$P_PKG")" "$PAYLOAD_MNT" "$P_PKG_SHA"
+    fi
     printf 'payload=%s\n' "$PAYLOAD_MNT"
     cat <<'EOF'
 if ! mountpoint -q "$payload"; then
@@ -5975,6 +6004,13 @@ step_prov_boot() { step_prov boot; }
 step_prov_verify() { step_prov verify; }
 step_prov_unmount() { step_prov unmount; }
 step_prov_delete_replaced() { step_prov delete-replaced; }
+step_prov_undo() { step_prov undo; }
+# shellcheck disable=SC2034 # read through provision_install's nameref
+UNDO_STEPS=(
+    "payload 120 step_prov_payload"
+    "undo 900 step_prov_undo"
+)
+# shellcheck disable=SC2034 # read through provision_install's nameref
 PROVISION_STEPS=(
     "egress 300 step_egress"
     "payload 120 step_prov_payload"
@@ -6019,8 +6055,10 @@ provision_halt() {
     fi
 }
 
-# Phase 2: the steps in the live system. 1 when one stopped (powered off).
+# Phase 2 (or undo): the steps of the array named $1 in the live system. 1
+# when one stopped (powered off).
 provision_install() {
+    local -n steps=$1
     local entry name limit fn
     UNATTENDED_DEADLINE=0
     progress boot start "waiting for the live system's guest agent"
@@ -6029,7 +6067,7 @@ provision_install() {
         return 1
     fi
     progress boot ok "the live system's guest agent answers"
-    for entry in "${PROVISION_STEPS[@]}"; do
+    for entry in "${steps[@]}"; do
         read -r name limit fn <<<"$entry"
         if ! run_stage "$name" "$limit" "$("$fn")"; then
             provision_halt "$name"
@@ -6040,8 +6078,8 @@ provision_install() {
             return 1
         fi
     done
-    progress poweroff start "the install is done"
-    power_off_guest "the install is done"
+    progress poweroff start "every step done"
+    power_off_guest "every step done in the live system"
     progress poweroff ok
 }
 
@@ -6165,7 +6203,11 @@ provision_giveback() {
     DONE=true
     rm -f -- "$PAYLOAD_ISO" || warn "cannot remove the payload image $PAYLOAD_ISO"
     progress giveback ok "detached; $HOLDER_RESULT; egress rule $EGRESS_RESULT"
-    if [[ -n "$UNATTENDED_FAILED" ]]; then
+    if [[ "$P_UNDO" == true && -n "$UNATTENDED_FAILED" ]]; then
+        line="Undo of $LABEL ($PROVISION_STAMP) stopped at $UNATTENDED_STAGE: ${UNATTENDED_FAILED#*: }"
+    elif [[ "$P_UNDO" == true ]]; then
+        line="Undone $LABEL ($PROVISION_STAMP): the old OS is back; the next backup run records it"
+    elif [[ -n "$UNATTENDED_FAILED" ]]; then
         case "$UNATTENDED_STAGE" in
             egress | payload | capture | boot) undo="nothing on the drive was changed" ;;
             delete-replaced) undo="the new OS booted and is proven; the old OS stays set aside as *.replaced.$PROVISION_STAMP until delete-replaced runs again (recovery-os-install.sh delete-replaced, inside the new OS, from the payload)" ;;
@@ -6183,10 +6225,45 @@ Provision done -- $LABEL ($PROVISION_STAMP)
   Kernel        ${KERNEL:-unknown}
   Given back    detached; $HOLDER_RESULT; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
   Egress rule   $EGRESS_RESULT
-  Capture       $(dirname -- "$CAPTURE_FILE")
+  Capture       ${CAPTURE_FILE:+$(dirname -- "$CAPTURE_FILE")}${CAPTURE_FILE:-none (undo)}
 $line
 EOF
     session_exit "$(session_status)"
+}
+
+# --undo: the live system boots (the old OS cannot while set aside, and the
+# new root must not), and the installer renames the set-aside OS back. No
+# egress rule: nothing is downloaded.
+provision_undo() {
+    VERDICT=no
+    build_guard
+    SESSION_START=$SECONDS
+    trap on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    take_lock
+    SESSION_EPOCH=$(date +%s)
+    HISTORY_ARMED=true
+    HISTORY_MODE=undo
+    progress preflight ok "lock taken; undo $PROVISION_STAMP"
+    if ! start_holder; then
+        refuse "could not hold $DISK ($HOLDER_FAILURE)"
+    fi
+    provision_payload
+    define_guard
+    attach_disk 2
+    if [[ "$(readlink -f -- "$DISK")" != "$DISK_DEV" ]]; then
+        refuse "$DISK no longer leads to $DISK_DEV (the drive re-enumerated) -- start again"
+    fi
+    attach_cdrom "$P_ISO" sdb 1 || refuse "$CDROM_WHY -- nothing was booted"
+    attach_cdrom "$PAYLOAD_ISO" sdc 3 || refuse "$CDROM_WHY -- nothing was booted"
+    GUARD_OPTIONAL=1
+    progress start start "booting the CachyOS live system in $DOMAIN"
+    start_guarded
+    progress start ok "the live system is booting"
+    provision_install UNDO_STEPS || :
+    provision_giveback
 }
 
 cmd_provision() {
@@ -6196,6 +6273,13 @@ cmd_provision() {
     fi
     check_own_unit
     provision_preflight
+    if [[ "$P_UNDO" == true ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log "undo the provision of $LABEL stamped $PROVISION_STAMP (also set aside: ${P_ALSO[*]:-none}): boot the live system, run the installer's undo -- it refuses once a root that provision installed has booted"
+            exit 0
+        fi
+        provision_undo
+    fi
     PROVISION_STAMP="$(date +%Y%m%d-%H%M%S)"
     if [[ "$DRY_RUN" == true ]]; then
         provision_plan_text
@@ -6236,7 +6320,7 @@ cmd_provision() {
     progress start start "booting the CachyOS live system in $DOMAIN"
     start_guarded
     progress start ok "the live system is booting"
-    if provision_install; then
+    if provision_install PROVISION_STEPS; then
         provision_first_boot || :
     fi
     provision_giveback
