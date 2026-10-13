@@ -3927,7 +3927,9 @@ stage_output() {
         logger -t "$LOG_TAG" -- "OUTPUT $LABEL $1 $line" || :
         [[ -z "${line//[[:space:]]/}" ]] || OUT_LAST=$line
         if [[ "$1" == slot && "$line" == "slot B not refreshed: "* ]]; then
-            SLOT_WARNING=${line#slot B not refreshed: }
+            SLOT_WARNING=${line#slot B }
+        elif [[ "$1" == slot && "$line" == "slot B warning: "* && -z "$SLOT_WARNING" ]]; then
+            SLOT_WARNING=${line#slot B }
         fi
         if [[ "$1" == capture && -n "$CAPTURE_FILE" && -z "$CAPTURE_LOST" ]] && ! printf '%s\n' "$line" >>"$CAPTURE_FILE"; then
             CAPTURE_LOST="cannot write $CAPTURE_FILE"
@@ -4309,17 +4311,21 @@ EOF
 # Slot B and the previous root (operator, 2026-10-13): one transaction,
 # before pacman runs, while this run's snapshot and the ESP's kernel set are
 # still a matched pair. Staged first: every file the main and fallback
-# entries boot, and the two entries as they read now, in the ESP's
-# previous.new/; a writable clone of the snapshot as @.previous.new; the two
+# entries boot, the two entries as they read now, the snapshot's name and
+# UUID, in the ESP's previous.new/; a writable clone of the snapshot as
+# @.previous.new, its fstab's root line pointed at @.previous; the two
 # previous-root entries, built from the staged entries (their kernel lines
 # can never drift from the kept set). Then the switch, in an order where
-# every state boots a matched pair or the current OS: the previous-root entry
-# becomes a notice that boots the current OS (flushed), the slot and the
-# clone are renamed into place, the new entries replace the notice
-# (flushed). A failure never stops the upgrade: it says "slot B not
-# refreshed: <why>" (the run ends with warnings); a pair whose entries,
-# kernel set and clone are all still there keeps booting; with none, one
-# notice entry boots the current OS. Exit 0 always.
+# every state on disk boots a matched pair or the current OS: the old entries
+# kept aside, the previous-root entry a notice that boots the current OS
+# (flushed); the slot renamed into place (flushed); the old clone deleted
+# and the new one renamed (btrfs synced -- its own commit is up to 30 s
+# away); the new entries last (flushed). A failure never stops the upgrade:
+# it says "slot B not refreshed: <why>" (the run ends with warnings); the old
+# pair keeps booting when it still holds together -- its entries' files in
+# the slot, and the clone made from the snapshot the slot names (by UUID, so
+# it holds after that snapshot is pruned); with none, one notice entry boots
+# the current OS. Exit 0 always.
 step_slot() {
     printf 'snap=%s\n' "$PRE_UPDATE_SNAPSHOT"
     cat <<'EOF'
@@ -4328,7 +4334,7 @@ if [ -z "$esp" ]; then esp=$(bootctl --print-esp-path 2>/dev/null) || esp=/boot;
 ents=$esp/loader/entries
 main=$ents/cachyos-recovery.conf fb=$ents/cachyos-recovery-fallback.conf
 prev=$ents/cachyos-recovery-previous.conf prevfb=$ents/cachyos-recovery-previous-fallback.conf
-slot=$esp/previous new=$esp/previous.new old=$esp/previous.old status=$esp/previous.status
+slot=$esp/previous new=$esp/previous.new old=$esp/previous.old
 top=${TOP:-} mounted=
 # entry <source> <dest> <title insert> <kernel dir or ""> <root subvolume>:
 # the values reach awk through its environment, never -v (which would turn a
@@ -4360,6 +4366,46 @@ notice() {
 }
 # grep reads all of it (never -q: an early exit is the producer's SIGPIPE)
 listed() { printf '%s\n' "$list" | grep " path $1\$" >/dev/null; }
+# A subvolume's UUID ($2 UUID) or its Parent UUID ($2 "Parent UUID").
+uuid_of() { btrfs subvolume show "$1" 2>/dev/null | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p"; }
+# The clone's fstab: its root line mounts @.previous by name (a subvolid
+# names the snapshot's source, and systemd's remount of / would refuse it).
+clone_fstab() {
+    [ -f "$1" ] || return 0
+    # gawk's split keeps the separators: the line keeps its own spacing.
+    awk '
+        $1 !~ /^#/ && $2 == "/" {
+            m = split($0, f, /[ \t]+/, sep)
+            n = split(f[4], o, ","); out = ""
+            for (i = 1; i <= n; i++) {
+                if (o[i] ~ /^subvolid=/) continue
+                if (o[i] ~ /^subvol=/) o[i] = "subvol=/@.previous"
+                out = out (out == "" ? "" : ",") o[i]
+            }
+            f[4] = out; line = sep[0]
+            for (i = 1; i <= m; i++) line = line f[i] sep[i]
+            print line
+            next
+        }
+        { print }
+    ' "$1" >"$1.new" && mv "$1.new" "$1"
+}
+# The pair entry $1 (and fallback entry $2, if there) boots holds together:
+# each boots @.previous with files that are in the slot, and @.previous was
+# cloned from the snapshot the slot names.
+pair_ok() {
+    [ -r "$1" ] || return 1
+    for e in "$1" "$2"; do
+        if [ -z "$e" ] || [ ! -e "$e" ]; then continue; fi
+        grep -Eq '^options .*rootflags=subvol=/@\.previous( |$)' "$e" || return 1
+        for f in $(sed -n 's#^\(linux\|initrd\)[[:space:]][[:space:]]*/\{0,1\}##p' "$e"); do
+            [ -f "$esp/$f" ] || return 1
+        done
+    done
+    [ -d "$top/@.previous" ] || return 1
+    want=$(cat "$slot/source-uuid" 2>/dev/null) || return 1
+    [ -n "$want" ] && [ "$(uuid_of "$top/@.previous" 'Parent UUID')" = "$want" ]
+}
 refresh() {
     set -eu
     [ -n "$snap" ] || { echo "no snapshot was taken this run"; exit 3; }
@@ -4369,7 +4415,7 @@ refresh() {
     listed "$snap" || { echo "the snapshot $snap is not on the top level"; exit 3; }
     # Leftovers of a run that stopped: the last slot back, staging away.
     if [ ! -d "$slot" ] && [ -d "$old" ]; then mv "$old" "$slot"; fi
-    rm -rf "$new" "$old" "$prev.new" "$prevfb.new" "$prev.tmp"
+    rm -rf "$new" "$old" "$prev.new" "$prevfb.new" "$prev.tmp" "$prev.keep" "$prevfb.keep" "$old.keep"
     if [ -d "$top/@.previous.new" ]; then btrfs subvolume delete -R "$top/@.previous.new" >/dev/null; fi
     [ -r "$main" ] || { echo "cannot read cachyos-recovery.conf to learn the kernel set"; exit 3; }
     grep -Eq '^options .*rootflags=subvol=/@( |$)' "$main" || { echo "cachyos-recovery.conf has no rootflags=subvol=/@ to point elsewhere"; exit 3; }
@@ -4391,35 +4437,39 @@ refresh() {
     for f in $files; do cp "$esp/$f" "$new/$f"; done
     cp "$main" "$new/main.conf"
     if [ -e "$fb" ]; then cp "$fb" "$new/fallback.conf"; fi
+    source_uuid=$(uuid_of "$top/$snap" UUID)
+    [ -n "$source_uuid" ] || { echo "cannot read the UUID of $snap"; exit 3; }
+    btrfs subvolume snapshot "$top/$snap" "$top/@.previous.new" >/dev/null
+    clone_fstab "$top/@.previous.new/etc/fstab" || { echo "cannot point the clone's fstab at @.previous"; exit 3; }
     printf '%s\n' "$snap" >"$new/snapshot"
+    printf '%s\n' "$source_uuid" >"$new/source-uuid"
     sync -f "$new/snapshot"
     for f in $files; do cmp -s "$esp/$f" "$new/$f" || { echo "the copy of $f differs from the ESP's"; exit 3; }; done
-    btrfs subvolume snapshot "$top/$snap" "$top/@.previous.new" >/dev/null
     when=$(echo "$snap" | sed 's/^@\.pre-update\.\(....\)\(..\)\(..\)-\(..\)\(..\)$/\1-\2-\3 \4:\5/')
     entry "$new/main.conf" "$prev.new" "— Previous root, $when" previous @.previous || { echo "could not write the previous-root entry"; exit 3; }
     if [ -e "$new/fallback.conf" ]; then
         entry "$new/fallback.conf" "$prevfb.new" "— Previous root, $when" previous @.previous || { echo "could not write the previous-root fallback entry"; exit 3; }
     fi
-    # The switch: from here every state boots a matched pair or the current OS.
+    # The switch: from here every state on disk boots a matched pair or the
+    # current OS. The old entries are kept aside, for a failure below that
+    # leaves the old pair whole.
+    if [ -e "$prev" ]; then cp "$prev" "$prev.keep"; fi
+    if [ -e "$prevfb" ]; then cp "$prevfb" "$prevfb.keep"; fi
+    # ...and the pairing they were made for: they come back only to it.
+    if [ -r "$slot/snapshot" ]; then cp "$slot/snapshot" "$old.keep"; fi
     notice "an upgrade is refreshing it (if this stays, that upgrade stopped)" || { echo "could not write the notice entry"; exit 3; }
     if [ -d "$slot" ]; then mv "$slot" "$old"; fi
     mv "$new" "$slot"
     rm -rf "$old"
+    sync -f "$slot/snapshot"
     if [ -d "$top/@.previous" ]; then btrfs subvolume delete -R "$top/@.previous" >/dev/null; fi
     mv "$top/@.previous.new" "$top/@.previous"
+    btrfs filesystem sync "$top" >/dev/null
     if [ -e "$prevfb.new" ]; then mv "$prevfb.new" "$prevfb"; fi
     mv "$prev.new" "$prev"
     sync -f "$prev"
+    rm -f "$prev.keep" "$prevfb.keep" "$old.keep"
     echo "slot B: $(echo $files) paired with $snap; previous root: @.previous, a writable clone of $snap"
-}
-# The pair the previous-root entry names now is all there: the entry boots
-# the clone, the clone exists, every file it boots is in the slot.
-pair_ok() {
-    [ -r "$prev" ] && grep -Eq '^options .*rootflags=subvol=/@\.previous( |$)' "$prev" || return 1
-    for f in $(sed -n 's#^\(linux\|initrd\)[[:space:]][[:space:]]*/\{0,1\}##p' "$prev"); do
-        [ -f "$esp/$f" ] || return 1
-    done
-    [ -d "$top/@.previous" ]
 }
 # The top level, mounted here (outside the subshell, so it is unmounted on
 # every way out) when TOP does not name it, as the snapshot step mounts it.
@@ -4438,27 +4488,31 @@ fi
 out=$( (refresh) 2>&1 )
 rc=$?
 [ -z "$out" ] || printf '%s\n' "$out"
-if [ "$rc" -eq 0 ]; then
-    printf 'ok %s\n' "$snap" >"$status" || echo "cannot write $status"
-else
+if [ "$rc" -ne 0 ]; then
     why=$(printf '%s\n' "$out" | tail -n 1)
     why=${why:-the refresh stopped (exit $rc)}
     echo "slot B not refreshed: $why"
-    printf 'failed %s: %s\n' "$(date +%Y-%m-%d)" "$why" >"$status" || echo "cannot write $status"
     rm -rf "$new" "$prev.new" "$prevfb.new" "$prev.tmp"
     if [ ! -d "$slot" ] && [ -d "$old" ]; then mv "$old" "$slot" || echo "cannot put $old back"; fi
     if [ -n "$top" ] && [ -d "$top/@.previous.new" ]; then
         btrfs subvolume delete -R "$top/@.previous.new" >/dev/null || echo "cannot delete the staged @.previous.new"
     fi
-    if [ -n "$top" ] && pair_ok; then
+    if [ -n "$top" ] && [ -e "$prev.keep" ] && [ -r "$old.keep" ] && cmp -s "$slot/snapshot" "$old.keep" && pair_ok "$prev.keep" "$prevfb.keep"; then
+        # The switch stopped with the old pair still whole: its entries back.
+        rm -f "$prevfb"
+        if [ -e "$prevfb.keep" ]; then mv "$prevfb.keep" "$prevfb"; fi
+        mv "$prev.keep" "$prev" && sync -f "$prev"
+        echo "the previous-root entries are kept as they were: $(sed -n 's/^title //p' "$prev")"
+    elif [ -n "$top" ] && [ ! -e "$prev.keep" ] && pair_ok "$prev" "$prevfb"; then
         echo "the previous-root entries are kept as they were: $(sed -n 's/^title //p' "$prev")"
     elif notice "the last upgrade ($(date +%Y-%m-%d)) could not keep it: $why"; then
         echo "previous root UNAVAILABLE: the entry boots the current OS"
     else
         echo "could not write the notice entry either: the previous-root entries may name what is not there"
     fi
+    rm -f "$prev.keep" "$prevfb.keep" "$old.keep"
 fi
-if [ -n "$mounted" ]; then umount "$top" || echo "cannot unmount $top"; fi
+if [ -n "$mounted" ]; then umount "$top" || echo "slot B warning: cannot unmount $top"; fi
 exit 0
 EOF
 }
@@ -5400,7 +5454,7 @@ cmd_session() {
         warnings+=("the egress rule was $EGRESS_RESULT")
     fi
     if [[ -n "$SLOT_WARNING" ]]; then
-        warnings+=("slot B (the previous kernel set) was not refreshed: $SLOT_WARNING -- the upgrade went on; the previous-root entries name what they boot")
+        warnings+=("slot B (the previous kernel set) $SLOT_WARNING -- the upgrade went on; the previous-root entries name what they boot")
     fi
     for w in "${warnings[@]}"; do
         lines+=$'\n'"  Warnings      $w"

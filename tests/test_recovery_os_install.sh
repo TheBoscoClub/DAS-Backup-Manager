@@ -160,7 +160,7 @@ for s in "${EXACT_LIST[@]}"; do
     check "exact: $s is still there, unrenamed" test -f "$R/mnt/top/$s/.subvol"
 done
 
-echo "== replace-os: @.previous (the writable clone the loader step makes) by exact name"
+echo "== replace-os: @.previous (the writable clone the slot step makes) by exact name"
 fixture
 mkdir -p "$R/mnt/top/@.previous"; echo rw >"$R/mnt/top/@.previous/.subvol"
 PREV_LOOKALIKES=(@.previous-old @.previousx @.previous.20261001 x@.previous)
