@@ -187,8 +187,8 @@ check "re-run: the first run's replaced subvolumes still there" test -d "$R/mnt/
 check "re-run: a fresh @" test -f "$R/mnt/top/@/.subvol"
 check "re-run: still nothing deleted" test "$(calls 'subvolume delete')" -eq 0
 fixture; run replace-os; run replace-os
-check "same stamp twice: exit 2, never overwrites a set-aside name" test "$RC" -eq 2
-check "same stamp twice: named" out_has "@.replaced.20261013-010203 already exists"
+check "same stamp twice: exit 3 (not strictly newer), never overwrites a set-aside name" test "$RC" -eq 3
+check "same stamp twice: named" out_has "not newer than .das-provision.20261013-010203"
 
 S1=20261013-010203
 S2=20261013-020000
@@ -247,7 +247,7 @@ check "manifest: the ESP copy" grep -qxF "@esp${TAB}@esp.replaced.$S1" "$MF"
 check "manifest: six entries and the #end count, nothing else" test "$(wc -l <"$MF")" -eq 7 -a "$(tail -1 "$MF")" = "#end 6"
 check "manifest: no .new left behind" test ! -e "$MF.new"
 fixture; : >"$TOPD/.das-provision.$S1"; run replace-os
-check "manifest of this stamp exists: exit 2" test "$RC" -eq 2
+check "manifest of this stamp exists: exit 3 (not strictly newer)" test "$RC" -eq 3
 check "manifest of this stamp exists: nothing renamed" test -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
 fixture; mkdir -p "$TOPD/@esp.replaced.$S1"; run replace-os
 check "@esp.replaced.<stamp> exists: exit 2, never overwritten" test "$RC" -eq 2
@@ -567,6 +567,7 @@ check "delete-replaced, another provision's marker: the marker's stamp printed" 
 check "delete-replaced, another provision's marker: the manifest's stamp printed" out_has "$S1"
 fixture; run replace-os; booted_new ""; : >"$LOG"; run delete-replaced
 check "delete-replaced, a marker with no provisioned value: exit 3, nothing deleted" test "$RC" -eq 3 -a "$(calls 'subvolume delete')" -eq 0
+check "delete-replaced, no provisioned value: the old-sync-unit hint" out_has "a sync unit older than 1.1.2 writes no provision: the payload's package may be too old"
 fixture; run replace-os; mkdir -p "$TOPD/@/var/lib/das-recovery"; : >"$TOPD/@/var/lib/das-recovery/booted"; run delete-replaced
 check "delete-replaced, an empty marker file (the old format): exit 3" test "$RC" -eq 3
 fixture; chain; booted_new "$S1"; run delete-replaced
@@ -592,7 +593,7 @@ fixture; run replace-os
 E="$TOPD/@esp.replaced.$S1"
 check "esp.uuid: recorded beside the copy" test "$(cat "$E/esp.uuid")" = "ABCD-0003"
 check "mkfs carries the old volume ID" has "$LOG" "mkfs.vfat -F 32 -i ABCD0003 -n RECOV-ESP-1 /dev/sdz1"
-check "mkfs: p1's ID is read back after formatting" test "$(calls 'blkid -s UUID -o value /dev/sdz1')" -ge 2
+check "p1's volume ID is read with the low-level probe (blkid -p, no cache), at save and at read-back" test "$(calls 'blkid -p -s UUID -o value /dev/sdz1')" -ge 2
 fixture; printf 'XYZ\n' >"$WORK/p1uuid.out"; run replace-os
 check "p1 volume ID garbled: exit 3" test "$RC" -eq 3
 check "p1 volume ID garbled: nothing renamed, p1 not formatted" test "$(calls 'mkfs.vfat')" -eq 0 -a -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
@@ -627,16 +628,17 @@ check "replace-os after a partial delete: names the manifest" out_has ".das-prov
 check "replace-os after a partial delete: nothing renamed" test ! -e "$TOPD/@esp.replaced.$S2" -a "$(calls 'mkfs.vfat')" -eq 0
 for suf in .done .undone; do
     fixture; : >"$TOPD/.das-provision.$S1$suf"; run replace-os
-    check "replace-os, a $suf manifest of this stamp exists: exit 2, stamp not reused" test "$RC" -eq 2 -a -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
+    check "replace-os, a $suf manifest of this stamp exists: exit 3, stamp not reused" test "$RC" -eq 3 -a -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1"
 done
 
 echo "== the restored ESP is flushed before it is compared; the new one before verify (round 4, 3)"
 fixture; run replace-os; : >"$LOG"; run undo
 C_CP=$(ln1 '^cp -a .*/esp-old/$')
 C_SY=$(ln1 "^sync -f $R/mnt/esp-old\$")
-C_RO=$(ln1 'mount -o remount,ro')
-C_UM=$(ln1 "^umount $R/mnt/esp-old\$")
-check "undo: copied, flushed, remounted read-only, then unmounted" test "$C_CP" -lt "$C_SY" -a "$C_SY" -lt "$C_RO" -a "$C_RO" -lt "$C_UM"
+C_UM1=$(ln1 "^umount $R/mnt/esp-old\$")
+C_RO=$(ln1 "^mount -o ro /dev/sdz1 $R/mnt/esp-old\$")
+C_UM2=$(after "$C_RO" "^umount $R/mnt/esp-old\$")
+check "undo: copied, flushed, unmounted, mounted again read-only (the compare reads the disk), unmounted" test "$C_CP" -lt "$C_SY" -a "$C_SY" -lt "$C_UM1" -a "$C_UM1" -lt "$C_RO" -a "$C_RO" -lt "$C_UM2"
 fixture; run replace-os; run undo STUB_SYNC_FAIL="mnt/esp-old"
 check "undo, the flush of p1 fails: exit 2" test "$RC" -eq 2
 check "undo, the flush fails: manifests not marked undone" test ! -e "$TOPD/.das-provision.$S1.undone"
@@ -663,6 +665,22 @@ done
 echo "== the package step binds the marker to this provision (round 4, 5)"
 fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"; printf '[Unit]\nDescription=x\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"; run package
 check "package: the marker carries provisioned=<stamp>" has "$R/mnt/target/etc/das-backup/recovery-drive" "provisioned=$S1"
+
+
+echo "== a stamp must be strictly newer than every manifest, in any state (round 5)"
+fixture; run replace-os DAS_INSTALL_STAMP=$S2; : >"$LOG"; run replace-os
+check "replace-os, a LOWER stamp than an existing manifest: exit 3" test "$RC" -eq 3
+check "lower stamp: the new stamp named" out_has "$S1"
+check "lower stamp: the existing stamp named" out_has "$S2"
+check "lower stamp: nothing renamed, copied or formatted" test "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0 -a ! -e "$TOPD/@esp.replaced.$S1" -a ! -e "$TOPD/.das-provision.$S1"
+for suf in "" .deleting .undoing .done .undone; do
+    fixture; : >"$TOPD/.das-provision.$S2$suf"; run replace-os
+    check "replace-os, a lower stamp than a '$suf' manifest: exit 3, 'not newer'" test "$RC" -eq 3
+    check "replace-os, lower than a '$suf' manifest: said" out_has "not newer than .das-provision.$S2$suf"
+    check "replace-os, lower than a '$suf' manifest: nothing renamed" test -f "$TOPD/@/.subvol" -a ! -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0
+done
+fixture; run replace-os; run replace-os DAS_INSTALL_STAMP=$S2
+check "a strictly newer stamp is accepted" test "$RC" -eq 0
 
 echo
 if ((FAILS > 0)); then printf '%d check(s) FAILED\n' "$FAILS"; exit 1; fi
