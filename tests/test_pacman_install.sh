@@ -25,6 +25,9 @@
 # and it must report FAIL lines (it exits nonzero).
 
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${PACMAN_INSTALL_SCRIPT:-$REPO_ROOT/.github/scripts/pacman-install.sh}"

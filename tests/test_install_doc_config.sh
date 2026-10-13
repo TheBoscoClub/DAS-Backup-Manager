@@ -34,6 +34,9 @@
 # Writes only beneath a mktemp directory. No root, no network.
 
 set -uo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 if (($# < 1 || $# > 2)); then
     echo "usage: $0 <btrdasd> [<INSTALL.md>]" >&2

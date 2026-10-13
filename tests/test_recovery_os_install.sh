@@ -2,6 +2,9 @@
 # tests/test_recovery_os_install.sh — the guest-side installer against a fixture
 # tree and stub tools. Nothing here mounts, formats or runs pacstrap.
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT="$REPO/scripts/recovery-os-install.sh"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT

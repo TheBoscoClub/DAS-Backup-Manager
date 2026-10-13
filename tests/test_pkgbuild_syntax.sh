@@ -4,6 +4,9 @@
 # (drive\'s inside '...': a backslash escapes nothing there) made the whole
 # file fail to source, unseen until makepkg ran (2026-10-13; since 9119407).
 set -uo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PKGBUILD="$REPO/packaging/arch/PKGBUILD"
 passes=0 fails=0

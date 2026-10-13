@@ -32,6 +32,9 @@
 # "simplifies" the guard down to the UUID comparison, case 3 goes red.
 
 set -euo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/backup-run.sh"

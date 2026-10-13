@@ -16,6 +16,9 @@
 #      message. Bare `rc != 0` also matches an unbound variable or a syntax
 #      error, so on its own it proves nothing about which path ran.
 set -uo pipefail
+# The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/das-wipe-all-drives-and-partition-from-scratch.sh"
 LIB="$(mktemp)"
