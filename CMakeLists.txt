@@ -335,6 +335,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os_install.sh
     )
     add_test(
+        NAME shell-pkgbuild-syntax
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pkgbuild_syntax.sh
+    )
+    add_test(
         NAME shell-record-run
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_record_run.sh
     )
