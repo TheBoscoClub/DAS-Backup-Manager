@@ -627,6 +627,7 @@ PROVISION_STAMP=""    # provision: the stamp of every *.replaced.<stamp> name
 PAYLOAD_ISO=""        # provision: the payload cdrom image, removed at the end
 CAPTURE_FILE=""       # provision: where the capture step's lines are kept
 CAPTURE_LOST=""       # ...and why a line of it could not be written
+SLOT_WARNING=""       # why slot B (the previous kernel set) was not refreshed
 GUARD_FAILED=false    # it did not confirm (GUARD_RESULT says how)
 GUARD_SHUT_DOWN=false # ...and the recovery OS was asked to shut down for it
 GUARD_RESULT="not booted"
@@ -3925,6 +3926,9 @@ stage_output() {
         printf 'OUTPUT %s %s %s\n' "$LABEL" "$1" "$line"
         logger -t "$LOG_TAG" -- "OUTPUT $LABEL $1 $line" || :
         [[ -z "${line//[[:space:]]/}" ]] || OUT_LAST=$line
+        if [[ "$1" == slot && "$line" == "slot B not refreshed: "* ]]; then
+            SLOT_WARNING=${line#slot B not refreshed: }
+        fi
         if [[ "$1" == capture && -n "$CAPTURE_FILE" && -z "$CAPTURE_LOST" ]] && ! printf '%s\n' "$line" >>"$CAPTURE_FILE"; then
             CAPTURE_LOST="cannot write $CAPTURE_FILE"
         fi
@@ -4104,6 +4108,7 @@ UNATTENDED_STEPS=(
     "egress 300 step_egress"
     "repos 120 step_repos"
     "snapshot 900 step_snapshot"
+    "slot 600 step_slot"
     "guard-lift 120 step_guard_lift"
     "keyrings 1800 step_keyrings"
     "upgrade UPDATE step_upgrade"
@@ -4302,13 +4307,79 @@ EOF
 # without external media. With no snapshot the entry is removed, not left
 # naming a root that is gone. ESP and TOP are for the test suite, which runs
 # this script against directories of its own.
+# Slot B (operator, 2026-10-13): every file the main and fallback entries
+# boot, copied to the ESP's previous/ before pacman runs, paired (by the file
+# previous/snapshot) with the @.pre-update the snapshot step just took. The
+# loader step boots that pair after the upgrade. A failure here never stops
+# the upgrade: it says "slot B not refreshed: <why>" (the run ends with
+# warnings), keeps the old slot exactly as it was, records why in
+# previous.status for the loader step, and exits 0.
+step_slot() {
+    printf 'snap=%s\n' "$PRE_UPDATE_SNAPSHOT"
+    cat <<'EOF'
+esp=${ESP:-}
+if [ -z "$esp" ]; then esp=$(bootctl --print-esp-path 2>/dev/null) || esp=/boot; fi
+slot=$esp/previous new=$esp/previous.new old=$esp/previous.old status=$esp/previous.status
+refresh() {
+    set -eu
+    [ -n "$snap" ] || { echo "no snapshot was taken this run"; exit 3; }
+    # A run that stopped between the two renames: the last slot back first.
+    if [ ! -d "$slot" ] && [ -d "$old" ]; then mv "$old" "$slot"; fi
+    rm -rf "$new" "$old"
+    [ -r "$esp/loader/entries/cachyos-recovery.conf" ] || { echo "cannot read cachyos-recovery.conf to learn the kernel set"; exit 3; }
+    files=$(for e in cachyos-recovery.conf cachyos-recovery-fallback.conf; do
+        [ ! -e "$esp/loader/entries/$e" ] || sed -n 's#^\(linux\|initrd\)[[:space:]][[:space:]]*/\{0,1\}##p' "$esp/loader/entries/$e"
+    done | LC_ALL=C sort -u)
+    [ -n "$files" ] || { echo "the entries name no kernel"; exit 3; }
+    need=0
+    for f in $files; do
+        case "$f" in */* | . | ..) echo "the entries name $f, not a file at the top of the ESP"; exit 3 ;; esac
+        [ -f "$esp/$f" ] || { echo "$f, named by the entries, is not on the ESP"; exit 3; }
+        need=$((need + $(stat -c %s "$esp/$f")))
+    done
+    avail=$(df -B1 --output=avail "$esp" | tail -n 1)
+    [ "$avail" -ge $((need + 16777216)) ] || { echo "the ESP is too full: the kernel set needs $((need / 1048576)) MiB and 16 MiB to spare, $((avail / 1048576)) MiB are free"; exit 3; }
+    mkdir "$new"
+    for f in $files; do cp "$esp/$f" "$new/$f"; done
+    printf '%s\n' "$snap" >"$new/snapshot"
+    sync -f "$new/snapshot"
+    for f in $files; do cmp -s "$esp/$f" "$new/$f" || { echo "the copy of $f differs from the ESP's"; exit 3; }; done
+    if [ -d "$slot" ]; then mv "$slot" "$old"; fi
+    mv "$new" "$slot"
+    rm -rf "$old"
+    sync -f "$slot/snapshot"
+    echo "slot B: $(echo $files) paired with $snap"
+}
+# Not inside && or ||: there set -e is ignored, in the subshell too, and a
+# failed copy would carry on as if it had worked.
+out=$( (refresh) 2>&1 )
+rc=$?
+[ -z "$out" ] || printf '%s\n' "$out"
+if [ "$rc" -eq 0 ]; then
+    printf 'ok %s\n' "$snap" >"$status" || echo "cannot write $status"
+    exit 0
+fi
+rm -rf "$new"
+why=$(printf '%s\n' "$out" | tail -n 1)
+echo "slot B not refreshed: ${why:-the copy stopped (exit $rc)}"
+printf 'failed %s: %s\n' "$(date +%Y-%m-%d)" "${why:-the copy stopped}" >"$status" || echo "cannot write $status"
+if [ -r "$slot/snapshot" ]; then
+    echo "the previous slot is kept as it was: paired with $(head -n 1 "$slot/snapshot")"
+else
+    echo "there is no previous slot"
+fi
+exit 0
+EOF
+}
 step_loader() {
     cat <<'EOF'
 set -eu
 esp=${ESP:-}
 if [ -z "$esp" ]; then esp=$(bootctl --print-esp-path 2>/dev/null) || esp=/boot; fi
 main=$esp/loader/entries/cachyos-recovery.conf
+fb=$esp/loader/entries/cachyos-recovery-fallback.conf
 prev=$esp/loader/entries/cachyos-recovery-previous.conf
+prevfb=$esp/loader/entries/cachyos-recovery-previous-fallback.conf
 [ -r "$main" ] || { echo "cannot read cachyos-recovery.conf ($main)"; exit 2; }
 top=${TOP:-}
 if [ -z "$top" ]; then
@@ -4322,25 +4393,81 @@ if [ -z "$top" ]; then
 fi
 list=$(btrfs subvolume list "$top") || { echo "cannot read the top level $top"; exit 2; }
 printf '%s\n' "$list" | grep -q ' path @$' || { echo "the listing of $top lists no subvolume @: not read as 'no previous root'"; exit 2; }
-newest=$(printf '%s\n' "$list" | sed -n 's/^.* path //p' | while read -r n; do
-    case "$n" in
-        @.pre-update.[[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]]-[[:digit:]][[:digit:]][[:digit:]][[:digit:]]) echo "$n" ;;
+listed() { printf '%s\n' "$list" | grep -q " path $1\$"; }
+stamped() {
+    case "$1" in
+        @.pre-update.[[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]]-[[:digit:]][[:digit:]][[:digit:]][[:digit:]]) return 0 ;;
     esac
+    return 1
+}
+newest=$(printf '%s\n' "$list" | sed -n 's/^.* path //p' | while read -r n; do
+    if stamped "$n"; then echo "$n"; fi
 done | sort -r | head -n 1)
 if [ -z "$newest" ]; then
-    rm -f "$prev"
-    echo "no previous root: entry absent"
+    rm -f "$prev" "$prevfb"
+    echo "no previous root: entries absent"
     exit 0
 fi
-grep -Eq '^options .*rootflags=subvol=/@( |$)' "$main" || { echo "$main has no rootflags=subvol=/@ to point at the snapshot"; exit 2; }
-tmp=$prev.new
-sed -E \
-    -e '/^title /s/\(Bay ([0-9]+)\)/— Previous root, read-only (Bay \1)/' \
-    -e "/^options /{s/ rw( |\$)/ ro\\1/;s#rootflags=subvol=/@( |\$)#rootflags=subvol=/$newest\\1#}" \
-    "$main" >"$tmp"
-if ! grep -q "rootflags=subvol=/$newest\( \|\$\)" "$tmp"; then rm -f "$tmp"; echo "could not write the previous-root entry"; exit 2; fi
-mv "$tmp" "$prev"
-echo "previous root: $newest (read-only), entry $prev"
+grep -Eq '^options .*rootflags=subvol=/@( |$)' "$main" || { echo "$main has no rootflags=subvol=/@ to point elsewhere"; exit 2; }
+# entry <source entry> <dest> <title insert> <kernel dir or ""> <root subvolume>
+entry() {
+    awk -v ins="$3" -v kdir="$4" -v root="$5" '
+        $1 == "title" {
+            i = index($0, " (Bay")
+            if (i) print substr($0, 1, i - 1) " " ins substr($0, i); else print $0 " " ins
+            next
+        }
+        ($1 == "linux" || $1 == "initrd") && kdir != "" { f = $2; sub(/^\//, "", f); print $1 " /" kdir "/" f; next }
+        $1 == "options" {
+            line = $0
+            gsub(/rootflags=subvol=\/@ /, "rootflags=subvol=/" root " ", line)
+            sub(/rootflags=subvol=\/@$/, "rootflags=subvol=/" root, line)
+            print line
+            next
+        }
+        { print }
+    ' "$1" >"$2.new"
+    grep -Eq "^options .*rootflags=subvol=/$5( |\$)" "$2.new" || { rm -f "$2.new"; echo "could not write $2"; exit 2; }
+    mv "$2.new" "$2"
+}
+pair=
+if [ -r "$esp/previous/snapshot" ]; then pair=$(head -n 1 "$esp/previous/snapshot"); fi
+if [ -n "$pair" ] && stamped "$pair" && listed "$pair"; then
+    # The writable clone: what the entries boot. The snapshot stays frozen.
+    if listed @.previous; then btrfs subvolume delete "$top/@.previous" >/dev/null || { echo "cannot delete the old @.previous"; exit 2; }; fi
+    btrfs subvolume snapshot "$top/$pair" "$top/@.previous" >/dev/null || { echo "cannot clone $pair as @.previous"; exit 2; }
+    when=$(echo "$pair" | sed 's/^@\.pre-update\.\(....\)\(..\)\(..\)-\(..\)\(..\)$/\1-\2-\3 \4:\5/')
+    entry "$main" "$prev" "— Previous root, $when" previous @.previous
+    have_fb=
+    if [ -r "$fb" ]; then
+        have_fb=1
+        for f in $(sed -n 's#^\(linux\|initrd\)[[:space:]][[:space:]]*/\{0,1\}##p' "$fb"); do
+            [ -f "$esp/previous/$f" ] || have_fb=
+        done
+    fi
+    if [ -n "$have_fb" ]; then
+        entry "$fb" "$prevfb" "— Previous root, $when" previous @.previous
+    else
+        rm -f "$prevfb"
+    fi
+    echo "previous root: @.previous, a writable clone of $pair, with the kernel set kept in previous/ (entries: $(basename "$prev")${have_fb:+, $(basename "$prevfb")})"
+    exit 0
+fi
+# No dependable pair: one notice entry that says why and boots the current OS.
+failed=$(sed -n 's/^failed //p' "$esp/previous.status" 2>/dev/null | head -n 1) || failed=
+if [ -z "$pair" ]; then
+    why="no previous kernel set has been kept yet"
+elif ! stamped "$pair"; then
+    why="the kept kernel set names no snapshot ($pair)"
+else
+    why="the root it was kept with, $pair, has been removed"
+fi
+if [ -n "$failed" ]; then why="the last upgrade (${failed%%:*}) could not keep it: ${failed#*: }; $why"; fi
+why=$(printf '%s' "$why" | tr -d '\n\r')
+if listed @.previous; then btrfs subvolume delete "$top/@.previous" >/dev/null || { echo "cannot delete the stale @.previous"; exit 2; }; fi
+entry "$main" "$prev" "— Previous root UNAVAILABLE: $why — boots the current OS" "" @
+rm -f "$prevfb"
+echo "previous root UNAVAILABLE: $why (the entry boots the current OS)"
 EOF
 }
 
@@ -4539,6 +4666,7 @@ cause_text() {
         boot-override) printf 'the boot-record check was overridden' ;;
         unmaskable-units) printf 'the boot record names units the guard cannot mask' ;;
         reporter-silent) printf "the guard's reporter went silent" ;;
+        slot-not-refreshed) printf 'slot B (the previous kernel set) was not refreshed' ;;
         *) printf 'an unknown cause' ;;
     esac
 }
@@ -4559,7 +4687,7 @@ pair_judge_causes() {
     fi
     for line in "${causes[@]}"; do
         case "$line" in
-            guard-unconfirmed-no | report-lines-lost | guard-left | egress-not-removed | dry-run-override)
+            guard-unconfirmed-no | report-lines-lost | guard-left | egress-not-removed | dry-run-override | slot-not-refreshed)
                 go+=("$(cause_text "$line")")
                 ;;
             claim-lost | reenumerated | mounted-after | mount-unknown | scan-failed | clock-gap | reset-watch-stopped)
@@ -4991,6 +5119,7 @@ exit5_causes() {
     ((${#REPORT_LOSSES[@]} == 0)) || echo report-lines-lost
     ((G_GAP_SECS == 0)) || echo clock-gap
     [[ "$EGRESS_RESULT" != "NOT taken out"* ]] || echo egress-not-removed
+    [[ -z "$SLOT_WARNING" ]] || echo slot-not-refreshed
     [[ "$SCAN_RESULT" != FAILED* ]] || echo scan-failed
     # A drive that re-enumerated is looked at under both names.
     case "$MOUNT_RESULT" in
@@ -5277,6 +5406,9 @@ cmd_session() {
     fi
     if [[ "$EGRESS_RESULT" == "NOT taken out"* ]]; then
         warnings+=("the egress rule was $EGRESS_RESULT")
+    fi
+    if [[ -n "$SLOT_WARNING" ]]; then
+        warnings+=("slot B (the previous kernel set) was not refreshed: $SLOT_WARNING -- the upgrade went on; the previous-root entries name what they boot")
     fi
     for w in "${warnings[@]}"; do
         lines+=$'\n'"  Warnings      $w"
