@@ -5766,7 +5766,7 @@ check "provision dry run: no history written" "$(file "$H")" ""
 check "provision dry run: no lock taken" "$(file "$S/flock.calls")" ""
 
 provision_fixture
-PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256=0000 DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images")
+PROV_ENV=(DAS_RECOVERY_VM_ISO_SHA256=0000 DAS_RECOVERY_VM_PAYLOAD_DIR="$T/images" DAS_CONFIG="$T/config.toml")
 run_driver_env "${PROV[@]}" --dry-run
 check "provision, iso sha256 mismatch: exit 1" "$RC" "1"
 has "provision, iso sha256 mismatch: names both" "$OUT" "iso sha256 is $ISO_SHA, not the pinned 0000"

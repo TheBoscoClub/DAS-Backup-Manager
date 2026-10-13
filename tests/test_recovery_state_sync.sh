@@ -361,7 +361,9 @@ echo "== D9: the second boot counts down from the measurement"
 fixture; printf 'find=1\nconfig=2\ncopy=37\ntotal=40\n' >"$WORK/timings"; run
 check "d9 second boot: exit 0" test "$RC" -eq 0
 check "d9 second boot: the countdown names its measurement" grep -q 'about [0-9]* s remaining, measured at the last boot' "$LOG"
-check "d9 second boot: the first phase shows the whole measured total" grep -q 'finding the newest backup — about 40 s remaining' "$LOG"
+# the countdown runs on the unit's own clock (bash SECONDS): a slow runner
+# spends a second or two before the first phase; the total, less those
+check "d9 second boot: the first phase shows the whole measured total" grep -Eq 'finding the newest backup — about (40|39|38) s remaining' "$LOG"
 check "d9 second boot: the measurement is replaced, not appended" test "$(grep -c '^total=' "$WORK/timings")" -eq 1
 
 echo "== D9: plymouth absent or not running costs nothing"
