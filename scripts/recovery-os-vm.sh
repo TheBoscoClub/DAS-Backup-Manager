@@ -780,8 +780,9 @@ without rebooting the workstation.
                          drive; p2 keeps every received backup; the old OS
                          is set aside as *.replaced.<stamp> until the new
                          one has booted. Exit 7 names the step it stopped
-                         at. Never while the other recovery drive's last
-                         session was not clean or its record is not "no"
+                         at. Never while the other recovery drive is not a
+                         usable fallback: its last session failed or kept,
+                         or its record "will", absent or unreadable
   provision <A|B|label> --undo --iso <path>
                          rename the set-aside OS back (refused once the new
                          root booted)
@@ -5729,9 +5730,13 @@ record_verdict() {
     fi
 }
 
-# Never two recovery drives down at once: every other mirror drive's last
-# session must be clean (none at all is a warning) and its boot record must
-# say no.
+# Never two recovery drives down at once: every other mirror drive must be a
+# usable fallback while this one is rebuilt (operator, 2026-10-13). Its last
+# session ended clean or with warnings (it booted, updated, gave the disk
+# back; none at all is a warning); its boot record says no or may -- "may" is
+# the tracer unable to prove a negative, not a drive that does not boot.
+# Refused: a failed or kept session, a "will" record (booted in an emergency
+# it would run btrbk against the backups), an absent or unreadable record.
 check_other_drives() {
     local other last outcome stopped verdict
     read_history || refuse "$HISTORY_FAILURE"
@@ -5743,11 +5748,15 @@ check_other_drives() {
             warn "$other has no session in the history: whether its OS works is known only from its boot record"
         else
             IFS=$'\t' read -r outcome stopped <<<"$last"
-            [[ "$outcome" == clean ]] ||
+            [[ "$outcome" == clean || "$outcome" == warnings ]] ||
                 refuse "$other's last session was $outcome${stopped:+ (stopped at $stopped)}: never two recovery drives down at once"
         fi
         verdict="$(record_verdict "$other")"
-        [[ "$verdict" == no ]] || refuse "$other's boot record is $verdict: never two recovery drives down at once"
+        case "$verdict" in
+            no | may) ;;
+            will) refuse "$other's boot record is will: booted in an emergency it would run btrbk against the backups -- not a fallback; never two recovery drives down at once" ;;
+            *) refuse "$other's boot record is $verdict: never two recovery drives down at once" ;;
+        esac
     done
 }
 

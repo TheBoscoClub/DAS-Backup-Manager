@@ -153,6 +153,7 @@ fixture() {
     printf 'disk SERIAL12\n' >"$S/lsblk.typeserial.sdm"
     printf 'part \n' >"$S/lsblk.typeserial.sdj1"
     printf '5eed0025-0000-4000-8000-000000000025\n' >"$S/lsblk.partuuid.sdj1"
+    printf '5eed0023-0000-4000-8000-000000000023\n' >"$S/lsblk.partuuid.sdk1"
     printf '%s\n' "$UUID_A" >"$S/lsblk.uuid.sdj2"
     printf '%s\n' "$UUID_B" >"$S/lsblk.uuid.sdk2"
     touch "$S/defined"
@@ -5519,11 +5520,38 @@ run_driver_env "${PROV[@]}" --dry-run
 check "provision, the other drive's LAST session clean (an earlier failed, this drive failed): exit 0" "$RC" "0"
 lacks "provision, the other drive clean: no history warning" "$OUT" "has no session in the history"
 
+# The other drive must be a usable fallback (operator, 2026-10-13): its last
+# session clean or warnings, its record no or may. Today's real state: B's
+# record says may (A to be rebuilt); A's last session warnings and its record
+# may (B to be rebuilt) -- both must pass.
 provision_fixture
-write_state 4 "$(record_agent system-recovery-A-2tb no "$AGENT_ON")" "$(record_agent system-recovery-B-2tb may "$AGENT_ON")"
+write_state 4 "$(record_agent system-recovery-A-2tb may "$AGENT_ON")" "$(record_agent system-recovery-B-2tb may "$AGENT_ON")"
 run_driver_env "${PROV[@]}" --dry-run
-check "provision, the other drive's record says may: exit 1" "$RC" "1"
-has "provision, the other drive's record: never two drives down" "$OUT" "system-recovery-B-2tb's boot record is may: never two recovery drives down at once"
+check "provision A, B's record says may: exit 0 (a usable fallback)" "$RC" "0"
+provision_fixture
+write_state 4 "$(record_agent system-recovery-A-2tb may "$AGENT_ON")" "$(record_agent system-recovery-B-2tb may "$AGENT_ON")"
+printf '{"label":"system-recovery-A-2tb","start":1791880000,"end":1791883600,"mode":"single","unattended":false,"outcome":"warnings","exit":5,"overridden":false,"kernel":null,"stopped_at":null}\n' >>"$H"
+run_driver_env provision B --iso "$ISO" --package "$PKG" --package-sha256 "$PKG_SHA" --authorized-keys "$KEYS" --dry-run
+check "provision B, A's last session warnings and record may: exit 0" "$RC" "0"
+has "provision B: its own bay" "$OUT" "bay 4, hostname das-recovery-bay4, ESP label RECOV-ESP-4"
+
+provision_fixture
+write_state 4 "$(record_agent system-recovery-A-2tb no "$AGENT_ON")" "$(record_agent system-recovery-B-2tb will "$AGENT_ON")"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the other drive's record says will: exit 1" "$RC" "1"
+has "provision, the other drive's record will: why" "$OUT" "system-recovery-B-2tb's boot record is will: booted in an emergency it would run btrbk against the backups -- not a fallback; never two recovery drives down at once"
+
+provision_fixture
+write_state 4 "$(record_agent system-recovery-A-2tb no "$AGENT_ON")"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the other drive has no record: exit 1" "$RC" "1"
+has "provision, the other drive has no record: why" "$OUT" "system-recovery-B-2tb's boot record is absent"
+
+provision_fixture
+printf '{"label":"system-recovery-B-2tb","start":1791880000,"end":1791883600,"mode":"single","unattended":true,"outcome":"kept","exit":3,"overridden":false,"kernel":null,"stopped_at":null}\n' >>"$H"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the other drive's last session kept: exit 1" "$RC" "1"
+has "provision, the other drive kept: never two down" "$OUT" "system-recovery-B-2tb's last session was kept: never two recovery drives down at once"
 
 provision_fixture
 write_state 4 "$(record_agent system-recovery-A-2tb will "$AGENT_ON")" "$(record_agent system-recovery-B-2tb no "$AGENT_ON")"
