@@ -6,7 +6,7 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.0.2
+# Version: 1.1.0
 # Date: 2026-10-12
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
@@ -19,6 +19,15 @@
 # The catch-up walks the drive's OWN target, so that target is mounted here at
 # subvolid=5 (its top level, by the booted UUID) before walk starts: walk then
 # finds it mounted and never binds the running `/` (subvolume @) at its path.
+# D9: the boot says what it is doing. After the marker gate the unit shows a
+# fixed header (what is happening and why, "do not power off") plus one line per
+# phase on the plymouth splash (plymouth display-message), only when plymouth
+# answers --ping. Each phase's seconds and the total are measured into
+# $TIMINGS (outside the state directory, which is swapped every boot), only on
+# a boot that reached "ready"; the next boot shows a countdown from that
+# measurement and from nothing else (no measurement: no countdown). On success
+# $STATE_DIR/booted is touched: this root completed a sync.
+#
 # It is left mounted for the rest of the recovery session (the GUI restore
 # reads it); it is deliberately not in the EXIT trap.
 set -euo pipefail
@@ -37,7 +46,16 @@ MOUNT="${DAS_STATE_SYNC_MOUNT:-mount}"
 UMOUNT="${DAS_STATE_SYNC_UMOUNT:-umount}"
 BTRFS="${DAS_STATE_SYNC_BTRFS:-btrfs}"
 MV="${DAS_STATE_SYNC_MV:-mv}"
+PLYMOUTH="${DAS_STATE_SYNC_PLYMOUTH:-plymouth}"
+TIMINGS="${DAS_STATE_SYNC_TIMINGS:-$ROOT/var/lib/das-recovery/timings}"
+BAY="${DAS_STATE_SYNC_BAY:-}"
 STATUS_FILE="$RUN_DIR/status"
+HEADER_TEXT='Recovery disk boots take significantly longer than a normal boot: this disk is a 2 TB USB drive, and it copies the latest backup index and settings before the desktop appears. Do not power off or unplug it — the copy would be left incomplete and the disk would start again from the previous copy.'
+T0=$SECONDS
+PREV_TOTAL=""
+SPLASH=""
+DYING=""
+declare -A PHASE_AT=()
 
 say() { printf '%s\n' "$*"; }
 status() {
@@ -47,8 +65,54 @@ status() {
 # die <reason>: the reason goes to stderr (journal) and the status file.
 die() {
     say "das-recovery-state-sync: $*" >&2
+    [[ -n "$DYING" ]] || { DYING=1; phase "done" "could not update: $*"; }
     status "failed: $*"
     exit 1
+}
+# splash_init: once, after the marker gate. plymouth is spoken to only when it
+# answers --ping (bare metal without a splash costs one failed ping).
+splash_init() {
+    [[ -n "$BAY" ]] || BAY=$(sed -n 's/^bay=//p' "$MARKER" 2>/dev/null | head -1) || :
+    [[ -n "$BAY" ]] || {
+        BAY="?"
+        say "das-recovery-state-sync: the marker has no bay= line: the splash says Bay ?" >&2
+    }
+    if "$PLYMOUTH" --ping 2>/dev/null; then SPLASH=1; fi
+    PREV_TOTAL=$(sed -n 's/^total=//p' "$TIMINGS" 2>/dev/null | head -1) || :
+    [[ "$PREV_TOTAL" =~ ^[1-9][0-9]{0,5}$ ]] || PREV_TOTAL=""
+}
+# phase <key> <text>: records when the phase began and shows it. A countdown
+# exists only when the previous boot measured a total (a sane one: 1..999999),
+# only on the working phases, and only while time is left.
+phase() {
+    local key=$1 text=$2 left msg
+    PHASE_AT[$key]=$((SECONDS - T0))
+    msg="DAS recovery disk, Bay $BAY. $HEADER_TEXT"$'\n\n'"$text"
+    if [[ -n "$PREV_TOTAL" && "$key" != "done" ]]; then
+        left=$((PREV_TOTAL - (SECONDS - T0)))
+        ((left <= 0)) || msg+=" — about $left s remaining, measured at the last boot"
+    fi
+    say "das-recovery-state-sync: $text"
+    [[ -z "$SPLASH" ]] || "$PLYMOUTH" display-message --text="$msg" 2>/dev/null || :
+}
+# measure: each phase's seconds and the total, replacing the previous
+# measurement; called only on a boot that reached "ready".
+measure() {
+    local now=$((SECONDS - T0)) out="" keys=(find config copy) i k next
+    for ((i = 0; i < ${#keys[@]}; i++)); do
+        k=${keys[$i]}
+        [[ -n "${PHASE_AT[$k]:-}" ]] || continue
+        next=${keys[$((i + 1))]:-}
+        if [[ -n "$next" && -n "${PHASE_AT[$next]:-}" ]]; then
+            out+="$k=$((PHASE_AT[$next] - PHASE_AT[$k]))"$'\n'
+        else
+            out+="$k=$((now - PHASE_AT[$k]))"$'\n'
+        fi
+    done
+    out+="total=$now"$'\n'
+    if ! { mkdir -p "$(dirname "$TIMINGS")" && printf '%s' "$out" >"$TIMINGS.new" && "$MV" -f "$TIMINGS.new" "$TIMINGS"; }; then
+        say "das-recovery-state-sync: could not write the boot measurement to $TIMINGS" >&2
+    fi
 }
 cleanup_new() { rm -rf "$STATE_DIR.new" "$CONFIG_OUT.new"; }
 
@@ -58,6 +122,8 @@ if [[ ! -e "$MARKER" ]]; then
     say "das-recovery-state-sync: not a recovery drive ($MARKER absent): nothing done" >&2
     exit 1
 fi
+
+splash_init
 
 uuid=$("$FINDMNT" -no UUID "${ROOT:-/}") || die "cannot read the booted filesystem's UUID"
 [[ -n "$uuid" ]] || die "the booted filesystem has no UUID"
@@ -99,6 +165,7 @@ newest() {
     done
 }
 
+phase find "finding the newest backup"
 state_snap=$(newest das-state)
 root_snap=$(newest root-)
 
@@ -107,12 +174,14 @@ root_snap=$(newest root-)
 if [[ -z "$state_snap" ]]; then
     # Not die(): the status word for this case is exactly "no state snapshot".
     say "das-recovery-state-sync: no received das-state snapshot yet (the next backup run sends one): state left as it was" >&2
+    phase "done" "no backup received yet"
     status "no state snapshot"
     exit 2
 fi
 
 # Config first: derive-recovery refuses before anything is replaced when the
 # UUID is unknown or ambiguous.
+phase config "preparing the configuration"
 mkdir -p "$(dirname "$CONFIG_OUT")"
 rm -f "$CONFIG_OUT.new"
 if ! "$BTRDASD" config derive-recovery --from "$root_snap/etc/das-backup/config.toml" \
@@ -124,6 +193,7 @@ fi
 # State: reflink (or plain copy) into a sibling, then swap — the old copy is
 # never half-replaced. Every step has its own failure branch: the previous
 # state stays in place, *.new is removed, the status says why.
+phase copy "copying the backup index"
 rm -rf "$STATE_DIR.new"
 mkdir -p "$STATE_DIR.new" || die "cannot create $STATE_DIR.new: state left as it was"
 if ! cp -a --reflink=auto "$state_snap/." "$STATE_DIR.new/"; then
@@ -219,4 +289,7 @@ if [[ "$stamp" < "$data_stamp" ]]; then
 else
     status "synced $stamp"
 fi
+touch "$STATE_DIR/booted" || say "das-recovery-state-sync: could not write $STATE_DIR/booted" >&2
+measure
+phase "done" "ready: index from $stamp"
 say "state synced from ${state_snap##*/}; configuration derived from ${root_snap##*/}"
