@@ -430,6 +430,9 @@ readonly EGRESS_PRIORITY=5100
 # payload cdrom (the installer, the package, the keys) is built here.
 readonly ISO_SHA256="${DAS_RECOVERY_VM_ISO_SHA256:-959f6577f45e25ee9fd8c220fd221b08e4ea79412c7315c0f922dd6d86d5e33c}"
 readonly PAYLOAD_DIR="${DAS_RECOVERY_VM_PAYLOAD_DIR:-/var/lib/libvirt/images}"
+# How long the new OS's first boot has, after its agent answers, for the sync
+# unit's status and the desktop.
+readonly FIRSTBOOT_SECS="${DAS_RECOVERY_VM_FIRSTBOOT_SECS:-600}"
 readonly PROVISION_STEP_NAMES="egress payload capture replace-os pacstrap configure package boot repos verify unmount"
 
 # Installed side by side by CMake: ${prefix}/lib/das-backup/{this script,libvirt/}.
@@ -616,6 +619,13 @@ MAY_HAVE_RUN=false         # ...and found it resumed by something else (not paus
 GUARD_XML_FILE=""          # the domain definition with the guard, as defined
 GUARDED=false              # the guard MAY be in the domain's definition (set before defining)
 GUARD_CONFIRMED=false
+GUARD_OPTIONAL=""     # provision's live system: it may carry no reporter at all
+GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
+HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
+PROVISION_STAMP=""    # provision: the stamp of every *.replaced.<stamp> name
+PAYLOAD_ISO=""        # provision: the payload cdrom image, removed at the end
+CAPTURE_FILE=""       # provision: where the capture step's lines are kept
+CAPTURE_LOST=""       # ...and why a line of it could not be written
 GUARD_FAILED=false    # it did not confirm (GUARD_RESULT says how)
 GUARD_SHUT_DOWN=false # ...and the recovery OS was asked to shut down for it
 GUARD_RESULT="not booted"
@@ -2330,6 +2340,17 @@ judged_engaged() {
 # The guard did not hold, for $1. On a "will" or "may" record a running
 # recovery OS ($2) is asked to shut down; on "no" it is said.
 guard_failed() {
+    if [[ -n "$GUARD_OPTIONAL" ]]; then
+        # provision's live system: the CachyOS ISO may have no das-vm-guard
+        # unit, and nothing there can run btrbk (none is installed, no backup
+        # is mounted). What it did not show is said, once; the first boot of
+        # the new OS must prove its guard, as any session's.
+        if [[ -z "$GUARD_OPTIONAL_NOTE" ]]; then
+            GUARD_OPTIONAL_NOTE=$1
+            log "the live system's guard: $1 -- not a stop: the live system runs no btrbk"
+        fi
+        return 0
+    fi
     GUARD_FAILED=true
     GUARD_RESULT="NOT confirmed: $1"
     if [[ "$VERDICT" == no ]]; then
@@ -3201,8 +3222,8 @@ keep_claim() {
 }
 
 attach_disk() {
-    local out
-    (umask 077 && disk_xml "$DISK" >"$DISK_XML_FILE")
+    local out order=${1:-1}
+    (umask 077 && disk_xml "$DISK" "$order" >"$DISK_XML_FILE")
     # Set first: if the attach half-happens, the cleanup must look.
     ATTACHED=true
     if ! out="$(virsh_ attach-device "$DOMAIN" "$DISK_XML_FILE" --config 2>&1)"; then
@@ -3211,7 +3232,7 @@ attach_disk() {
     if ! disk_in_definition "$DISK"; then
         refuse "virsh attached $DISK, but $DOMAIN's definition does not list it"
     fi
-    log "attached $DISK to $DOMAIN: SATA disk sda, boot order 1, cache=none"
+    log "attached $DISK to $DOMAIN: SATA disk sda, boot order $order, cache=none"
 }
 
 # Give the disk back: detach, stop the holder, rescan, check, release. Each
@@ -3902,6 +3923,9 @@ stage_output() {
         printf 'OUTPUT %s %s %s\n' "$LABEL" "$1" "$line"
         logger -t "$LOG_TAG" -- "OUTPUT $LABEL $1 $line" || :
         [[ -z "${line//[[:space:]]/}" ]] || OUT_LAST=$line
+        if [[ "$1" == capture && -n "$CAPTURE_FILE" && -z "$CAPTURE_LOST" ]] && ! printf '%s\n' "$line" >>"$CAPTURE_FILE"; then
+            CAPTURE_LOST="cannot write $CAPTURE_FILE"
+        fi
         if [[ "$1" == snapshot && "$line" =~ ^snapshot:\ (@\.pre-update\.[[:digit:]]{8}-[[:digit:]]{4})\ \(read-only\)$ ]]; then
             PRE_UPDATE_SNAPSHOT=${BASH_REMATCH[1]}
         fi
@@ -4007,21 +4031,21 @@ run_stage() {
 # The recovery OS answers through its agent, and its guard has reported
 # engaged with nothing left to prove: within $1 seconds.
 wait_guest_ready() {
-    local start=$SECONDS
+    local start=$SECONDS step=${2:-boot}
     while :; do
         sleep "$POLL_SECS"
         if ! watch_tick; then
-            stage_failed boot "$UNATTENDED_WHY"
+            stage_failed "$step" "$UNATTENDED_WHY"
             return 1
         fi
-        if [[ "$GUARD_CONFIRMED" == true && -z "$PROOF_WHY" ]] && agent_call '{"execute":"guest-ping"}' 10; then
+        if [[ ( "$GUARD_CONFIRMED" == true && -z "$PROOF_WHY" ) || -n "$GUARD_OPTIONAL" ]] && agent_call '{"execute":"guest-ping"}' 10; then
             return 0
         fi
         if ((SECONDS - start >= $1)); then
-            if [[ "$GUARD_CONFIRMED" == true ]]; then
-                stage_failed boot "the guest agent did not answer within $(format_duration "$1") of the start (its record says it starts at boot): $(printable "$AGENT_OUT")"
+            if [[ "$GUARD_CONFIRMED" == true || -n "$GUARD_OPTIONAL" ]]; then
+                stage_failed "$step" "the guest agent did not answer within $(format_duration "$1") of the start (its record says it starts at boot): $(printable "$AGENT_OUT")"
             else
-                stage_failed boot "the session guard did not report within $(format_duration "$1")"
+                stage_failed "$step" "the session guard did not report within $(format_duration "$1")"
             fi
             return 1
         fi
@@ -4408,11 +4432,12 @@ write_history() {
     ((${#BOOT_OVERRIDES[@]} == 0)) || overridden=true
     printf 'RESULT %s %s %s\n' "$LABEL" "$1" "$outcome"
     if ! line="$(jq -cn --arg label "$LABEL" --argjson start "$SESSION_EPOCH" --argjson end "$(date +%s)" \
-        --arg mode "$RUN_MODE" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
+        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
         --argjson overridden "$overridden" --arg kernel "$KERNEL" --arg stage "$UNATTENDED_STAGE" \
         '{label: $label, start: $start, end: $end, mode: $mode, unattended: $unattended, outcome: $outcome,
           exit: $exit, overridden: $overridden, kernel: (if $kernel == "" then null else $kernel end),
-          stopped_at: (if $stage == "" then null else $stage end)}' 2>&1)"; then
+          stopped_at: (if $stage == "" then null else $stage end)}
+          + (if $stamp == "" then {} else {stamp: $stamp} end)' 2>&1)"; then
         warn "could not write this session into the history: $line"
         return 0
     fi
@@ -4702,6 +4727,7 @@ on_exit() {
     local rc=$? state
     set +e
     trap '' INT TERM HUP
+    [[ -z "$PAYLOAD_ISO" ]] || rm -f -- "$PAYLOAD_ISO"
     # The reset watch ends with this script, on every way out.
     stop_reset_watch
     if [[ "$DONE" == true ]]; then
@@ -5568,17 +5594,29 @@ cmd_screenshot() {
     if [[ "$state" != running ]]; then
         refuse "$DOMAIN is $state -- a screenshot needs it running"
     fi
-    tmp="$(mktemp -d)"
+    take_screenshot "$out" || refuse "$SHOT_WHY"
+    log "screenshot of $DOMAIN written to $out"
+}
+
+# $DOMAIN's screen as a PNG at $1: 1, with SHOT_WHY set, when not.
+take_screenshot() {
+    local tmp err
+    SHOT_WHY=""
+    tmp="$(mktemp -d)" || {
+        SHOT_WHY="cannot make a directory for the screenshot"
+        return 1
+    }
     if ! err="$(virsh_ screenshot "$DOMAIN" "$tmp/screen" 2>&1)"; then
         rm -rf -- "$tmp"
-        refuse "virsh screenshot failed: $err"
+        SHOT_WHY="virsh screenshot failed: $err"
+        return 1
     fi
-    if ! err="$(magick "$tmp/screen" "png:$out" 2>&1)"; then
+    if ! err="$(magick "$tmp/screen" "png:$1" 2>&1)"; then
         rm -rf -- "$tmp"
-        refuse "magick could not convert the screenshot: $err"
+        SHOT_WHY="magick could not convert the screenshot: $err"
+        return 1
     fi
     rm -rf -- "$tmp"
-    log "screenshot of $DOMAIN written to $out"
 }
 
 # ---------------------------------------------------------------------------
@@ -5738,15 +5776,30 @@ provision_preflight() {
         [[ "$P_PKG_GOT" == "$P_PKG_SHA" ]] || refuse "package sha256 is $P_PKG_GOT, not $P_PKG_SHA"
         [[ -s "$P_KEYS" ]] || refuse "authorized-keys file is empty: a drive with sshd and no key is unreachable"
     fi
+    P_UUID=${T_UUIDS[$LABEL]}
+    [[ -n "$P_UUID" ]] || refuse "'$LABEL' has no mount_uuid in $DAS_CONFIG: the installer identifies partition 2 by it"
     resolve_os_state
     check_other_drives
     wait_for_lock
     resolve_disk
+    esp_part_partuuid
     check_units
     check_not_mounted
     check_domain_idle
     check_no_live_holder
     make_state_dir || refuse "cannot create $STATE_DIR"
+}
+
+# p1's PARTUUID (P_PARTUUID), read here, read-only: the installer refuses a
+# partition 1 that is not this one before it copies or formats anything.
+esp_part_partuuid() {
+    local part dev out
+    part="$(partition_path "$DISK" 1)"
+    dev="$(readlink -f -- "$part")" || refuse "cannot resolve $part, partition 1 of $DISK"
+    out="$(lsblk -nr -o PARTUUID -- "$dev" 2>&1)" || refuse "lsblk cannot read the PARTUUID of $dev: $out"
+    out=${out//[[:space:]]/}
+    [[ "$out" =~ ^[[:xdigit:]-]{8,}$ ]] || refuse "partition 1 of $DISK ($dev) has no PARTUUID ('$out'): the installer identifies the ESP by it"
+    P_PARTUUID=$out
 }
 
 # Target $1's display_name (DAS_TARGET_<i>_DISPLAY_NAME), empty when unset.
@@ -5768,6 +5821,7 @@ provision_plan_text() {
         refuse "recovery-os-install.sh --count-packages failed: $count"
     log "provision $LABEL (drive $P_LETTER): serial $SERIAL, device $DISK ($DISK_DEV)"
     log "bay $P_BAY, hostname $P_HOST, ESP label $P_ESP"
+    log "partition 2 filesystem $P_UUID (kept: every received backup stays); partition 1 PARTUUID $P_PARTUUID (copied aside, then formatted)"
     log "entries: CachyOS Emergency Recovery (Bay $P_BAY); CachyOS Emergency Recovery — Fallback (Bay $P_BAY); CachyOS Emergency Recovery — Previous root, read-only (Bay $P_BAY) (written by the first upgrade)"
     log "packages: $count"
     log "iso sha256 ok"
@@ -5786,6 +5840,7 @@ provision_payload() {
     if ! cp -- "$SCRIPT_DIR/recovery-os-install.sh" "$tmp/recovery-os-install.sh" ||
         ! cp -- "$P_PKG" "$tmp/$(basename -- "$P_PKG")" ||
         ! cp -- "$P_KEYS" "$tmp/authorized_keys" ||
+        ! cp -- "$DAS_CONFIG" "$tmp/config.toml" ||
         ! (cd "$tmp" && sha256sum -- * >SHA256SUMS); then
         rm -rf -- "$tmp"
         refuse "cannot assemble the payload in $tmp"
@@ -5799,28 +5854,339 @@ provision_payload() {
 }
 
 # Attach (or detach) a cdrom to the domain's definition, and prove it.
+# 1, with CDROM_WHY set, when that cannot be proven.
 attach_cdrom() {
-    local f="$STATE_DIR/$LABEL.cdrom-$2.xml"
-    cdrom_xml "$1" "$2" "$3" >"$f" || refuse "cannot write $f"
-    virsh_ attach-device "$DOMAIN" "$f" --config >/dev/null || refuse "cannot attach $1 to $DOMAIN as $2"
-    cdrom_defined "$1" || refuse "$1 is not in $DOMAIN's definition after attaching it"
+    local f="$STATE_DIR/$LABEL.cdrom-$2.xml" out
+    CDROM_WHY=""
+    if ! (umask 077 && cdrom_xml "$1" "$2" "$3" >"$f"); then
+        CDROM_WHY="cannot write $f"
+        return 1
+    fi
+    if ! out="$(virsh_ attach-device "$DOMAIN" "$f" --config 2>&1)"; then
+        CDROM_WHY="cannot attach $1 to $DOMAIN as $2: $(printable "$out")"
+        return 1
+    fi
+    local rc=0
+    cdrom_defined "$1" || rc=$?
+    if ((rc != 0)); then
+        ((rc == 2)) || CDROM_WHY="$1 is not in $DOMAIN's definition after attaching it"
+        return 1
+    fi
+    log "attached $1 to $DOMAIN: SATA cdrom $2, read-only, boot order $3"
 }
-# Whether image $1 is in the domain's definition. Unlike disk_in_definition
-# (whose callers must assume a disk is attached when they cannot tell), an
-# unreadable definition is a refusal: it proves neither an attach nor a
-# detach.
+# Whether image $1 is in the domain's definition: 0 it is, 1 it is not, 2
+# the definition cannot be read (CDROM_WHY) -- which proves neither an attach
+# nor a detach.
 cdrom_defined() {
     local xml src
-    xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $(printable "$xml")"
+    if ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
+        CDROM_WHY="cannot read $DOMAIN's definition: $(printable "$xml")"
+        return 2
+    fi
     while IFS= read -r src; do
         [[ "$src" != "$1" ]] || return 0
     done < <(disk_sources "$xml")
     return 1
 }
 detach_cdrom() {
-    local f="$STATE_DIR/$LABEL.cdrom-$2.xml"
-    virsh_ detach-device "$DOMAIN" "$f" --config >/dev/null || refuse "cannot detach $2 from $DOMAIN"
-    ! cdrom_defined "$1" || refuse "$1 is still in $DOMAIN's definition after detaching it"
+    local f="$STATE_DIR/$LABEL.cdrom-$2.xml" out=""
+    CDROM_WHY=""
+    local rc=0
+    out="$(virsh_ detach-device "$DOMAIN" "$f" --config 2>&1)" || :
+    # The definition decides, not virsh's exit status.
+    cdrom_defined "$1" || rc=$?
+    if ((rc != 1)); then
+        ((rc == 2)) || CDROM_WHY="$1 is still in $DOMAIN's definition after detaching it${out:+ ($(printable "$out"))}"
+        return 1
+    fi
+    log "detached $1 ($2) from $DOMAIN"
+}
+
+# provision's step scripts: sh, run as root in the CachyOS live system
+# (Phase 2) or in the new OS (delete-replaced, Phase 3), through run_stage.
+# Every installer step mounts the payload cdrom if it is not, finds the disk
+# by partition 2's filesystem UUID (never by a device name), and runs the
+# installer from the payload with its parameters.
+readonly PAYLOAD_MNT=/run/das-provision/payload
+prov_env_lines() {
+    printf 'export DAS_INSTALL_UUID=%s DAS_INSTALL_ESP_PARTUUID=%s DAS_INSTALL_ESP_LABEL=%s DAS_INSTALL_BAY=%s DAS_INSTALL_LETTER=%s DAS_INSTALL_HOSTNAME=%s DAS_INSTALL_STAMP=%s\n' \
+        "$P_UUID" "$P_PARTUUID" "$P_ESP" "$P_BAY" "$P_LETTER" "$P_HOST" "$PROVISION_STAMP"
+    # The names are @.archive.<letters, digits, . _ -> (provision_parse_args).
+    printf "export DAS_INSTALL_ALSO_REPLACE='%s' DAS_INSTALL_PACKAGE=%s/%s DAS_INSTALL_KEYS=%s/authorized_keys DAS_INSTALL_CONFIG=%s/config.toml DAS_INSTALL_PAYLOAD_SHA256=%s\n" \
+        "${P_ALSO[*]}" "$PAYLOAD_MNT" "$(basename -- "$P_PKG")" "$PAYLOAD_MNT" "$PAYLOAD_MNT" "$P_PKG_SHA"
+    printf 'payload=%s\n' "$PAYLOAD_MNT"
+    cat <<'EOF'
+if ! mountpoint -q "$payload"; then
+    mkdir -p "$payload"
+    mount -o ro /dev/disk/by-label/DAS-PROVISION "$payload" || { echo "the payload cdrom (DAS-PROVISION) is not attached or not readable"; exit 2; }
+fi
+p2=$(blkid -U "$DAS_INSTALL_UUID") || { echo "no partition carries filesystem $DAS_INSTALL_UUID here: not this drive"; exit 3; }
+disk=$(lsblk -no PKNAME "$p2") || { echo "cannot tell which disk $p2 is on"; exit 2; }
+[ -n "$disk" ] || { echo "cannot tell which disk $p2 is on"; exit 2; }
+export DAS_INSTALL_DEV=/dev/$disk
+EOF
+}
+step_prov() {
+    prov_env_lines
+    printf 'exec /bin/bash %s/recovery-os-install.sh %s\n' "$PAYLOAD_MNT" "$1"
+}
+step_prov_payload() {
+    printf 'payload=%s\n' "$PAYLOAD_MNT"
+    cat <<'EOF'
+mkdir -p "$payload"
+mountpoint -q "$payload" || mount -o ro /dev/disk/by-label/DAS-PROVISION "$payload" || { echo "the payload cdrom (DAS-PROVISION) is not attached or not readable"; exit 2; }
+(cd "$payload" && sha256sum -c --quiet SHA256SUMS) || { echo "the payload's SHA256SUMS do not match: refused"; exit 3; }
+command -v pacstrap >/dev/null || { echo "the live system has no pacstrap (arch-install-scripts): not the pinned ISO's shape -- refused"; exit 3; }
+echo "payload mounted and verified; pacstrap present"
+EOF
+}
+# What the old OS was, read-only, before anything is set aside: the top
+# level's subvolumes (plan 3 names drive A's archives from it), and the old
+# root's fstab, hostname, pacman.conf, enabled units and packages. Every line
+# is kept on the host (capture.txt), beside the old boot record.
+step_prov_capture() {
+    printf 'uuid=%s\n' "$P_UUID"
+    cat <<'EOF'
+top=/run/das-provision/top
+mkdir -p "$top"
+mount -o ro,subvolid=5 "UUID=$uuid" "$top" || { echo "cannot mount the top level of $uuid read-only"; exit 2; }
+trap 'umount "$top" || echo "cannot unmount $top" >&2' EXIT
+list=$(btrfs subvolume list -o "$top") || { echo "cannot list the top level of $uuid"; exit 2; }
+printf '%s\n' "$list" | grep -q ' path @$' || { echo "the top level of $uuid lists no subvolume @: not read as an empty drive"; exit 2; }
+printf '%s\n' "$list" | sed -n 's/^.* path /top: /p'
+old=$top/@
+for f in etc/fstab etc/hostname etc/pacman.conf; do
+    [ ! -r "$old/$f" ] || sed "s|^|$f: |" "$old/$f"
+done
+find "$old/etc/systemd/system" -path '*.wants/*' 2>/dev/null | sed "s|^$old/|unit: |"
+ls "$old/var/lib/pacman/local" 2>/dev/null | sed 's/^/package: /'
+echo "capture: done"
+EOF
+}
+step_prov_repos() {
+    printf 'PACMAN_CONF=%s\n' /mnt/target/etc/pacman.conf
+    step_repos
+}
+step_prov_replace_os() { step_prov replace-os; }
+step_prov_pacstrap() { step_prov pacstrap; }
+step_prov_configure() { step_prov configure; }
+step_prov_package() { step_prov package; }
+step_prov_boot() { step_prov boot; }
+step_prov_verify() { step_prov verify; }
+step_prov_unmount() { step_prov unmount; }
+step_prov_delete_replaced() { step_prov delete-replaced; }
+PROVISION_STEPS=(
+    "egress 300 step_egress"
+    "payload 120 step_prov_payload"
+    "capture 300 step_prov_capture"
+    "replace-os 900 step_prov_replace_os"
+    "pacstrap 3600 step_prov_pacstrap"
+    "configure 600 step_prov_configure"
+    "package 600 step_prov_package"
+    "boot 900 step_prov_boot"
+    "repos 120 step_prov_repos"
+    "verify 300 step_prov_verify"
+    "unmount 120 step_prov_unmount"
+)
+
+# The capture's place on the host, and the old boot record copied into it,
+# before anything boots.
+provision_capture_dir() {
+    local dir out
+    dir="$(dirname -- "$OS_STATE_FILE")/recovery-os-provision/$LABEL/$PROVISION_STAMP"
+    mkdir -p -- "$dir" || refuse "cannot create $dir"
+    if ! out="$(jq --arg l "$LABEL" '.drives[$l] // error("no entry")' <"$OS_STATE_FILE" 2>&1)" ||
+        ! printf '%s\n' "$out" >"$dir/record.json"; then
+        refuse "cannot keep $LABEL's boot record in $dir: $(printable "$out") -- nothing was booted"
+    fi
+    CAPTURE_FILE="$dir/capture.txt"
+    : >"$CAPTURE_FILE" || refuse "cannot write $CAPTURE_FILE -- nothing was booted"
+    log "the old OS's record and capture go to $dir"
+}
+
+# A stop in a provision: provision_stop says it (stage_failed) and halts;
+# provision_halt only halts, after a step that said its own failure. The
+# recovery OS (or the live system) is powered off if it runs.
+provision_stop() {
+    stage_failed "$1" "$2"
+    provision_halt "$1"
+}
+provision_halt() {
+    if [[ "$(current_state)" != "shut off" ]]; then
+        progress poweroff start "the provision stopped at $1"
+        power_off_guest "the provision stopped at $1"
+        progress poweroff ok
+    fi
+}
+
+# Phase 2: the steps in the live system. 1 when one stopped (powered off).
+provision_install() {
+    local entry name limit fn
+    UNATTENDED_DEADLINE=0
+    progress boot start "waiting for the live system's guest agent"
+    if ! wait_guest_ready "$AGENT_SECS"; then
+        provision_halt boot
+        return 1
+    fi
+    progress boot ok "the live system's guest agent answers"
+    for entry in "${PROVISION_STEPS[@]}"; do
+        read -r name limit fn <<<"$entry"
+        if ! run_stage "$name" "$limit" "$("$fn")"; then
+            provision_halt "$name"
+            return 1
+        fi
+        if [[ "$name" == capture && ( -n "$CAPTURE_LOST" || ! -s "$CAPTURE_FILE" ) ]]; then
+            provision_stop capture "the capture of the old OS was not kept (${CAPTURE_LOST:-$CAPTURE_FILE is empty}): nothing was set aside"
+            return 1
+        fi
+    done
+    progress poweroff start "the install is done"
+    power_off_guest "the install is done"
+    progress poweroff ok
+}
+
+# Wait, $1 seconds at most, for the sh test $2 in the recovery OS to exit 0.
+# 0 when it did; 1 when the time ran out (GSH_OUT the last answer) or the
+# watch stopped it (UNATTENDED_WHY).
+guest_until() {
+    local start=$SECONDS
+    UNATTENDED_WHY=""
+    while :; do
+        if guest_sh 30 "$2" && [[ "$GSH_RC" == 0 ]]; then
+            return 0
+        fi
+        if ((SECONDS - start >= $1)); then
+            return 1
+        fi
+        sleep "$POLL_SECS"
+        watch_tick || return 1
+    done
+}
+
+# Phase 3: the new OS's first boot, as a session's -- the definition made
+# again from the template with a new guard and an empty report (no line of
+# the live system's can answer for it), the disk first in the boot order --
+# then the proof, and only after it delete-replaced. 1 when it stopped.
+provision_first_boot() {
+    local live status shot
+    check_guard off
+    if ((J_BOOTS > 0)); then
+        live="guard: engaged in the live system"
+    else
+        live="guard: silent in the live system (expected: it has no das-vm-guard unit)"
+    fi
+    log "$live"
+    PROVISION_LIVE_GUARD=$live
+    if ! detach_cdrom "$P_ISO" sdb || ! detach_cdrom "$PAYLOAD_ISO" sdc; then
+        provision_stop first-boot "$CDROM_WHY"
+        return 1
+    fi
+    virsh_ detach-disk "$DOMAIN" "$DISK" --config >/dev/null 2>&1 || :
+    if disk_in_definition "$DISK"; then
+        provision_stop first-boot "$DISK is still in $DOMAIN's definition after detaching it for the first boot"
+        return 1
+    fi
+    ATTACHED=false
+    if ! remove_guard; then
+        provision_stop first-boot "the live system's guard cannot be taken out of the definition: $GUARD_LEFT"
+        return 1
+    fi
+    GUARD_OPTIONAL="" GUARD_CONFIRMED=false GUARD_RESULT="not booted" SILENT=false
+    define_guard
+    attach_disk 1
+    if ! attach_cdrom "$PAYLOAD_ISO" sdc 2; then
+        provision_stop first-boot "$CDROM_WHY"
+        return 1
+    fi
+    progress start start "booting the new OS from $DISK"
+    start_guarded
+    progress start ok "the new OS is booting"
+    if ! wait_guest_ready "$AGENT_SECS" first-boot; then
+        provision_halt first-boot
+        return 1
+    fi
+    progress first-boot start "proving the new OS"
+    if guest_sh 30 'uname -r' && [[ "$GSH_RC" == 0 ]]; then
+        KERNEL="$(printable "${GSH_OUT//[[:space:]]/}")"
+        progress kernel ok "$KERNEL"
+    else
+        provision_stop first-boot "cannot read the running kernel: ${GSH_WHY:-$(printable "$GSH_OUT")}"
+        return 1
+    fi
+    if ! guest_until "$FIRSTBOOT_SECS" 'cat /run/das-recovery-state/status'; then
+        provision_stop first-boot "${UNATTENDED_WHY:-the sync unit wrote no status within $(format_duration "$FIRSTBOOT_SECS"): $(printable "$GSH_OUT")}"
+        return 1
+    fi
+    status="$(printable "${GSH_OUT%$'\n'}")"
+    if [[ "$status" != "no state snapshot" ]]; then
+        provision_stop first-boot "state sync says '$status', expected 'no state snapshot' on a first boot"
+        return 1
+    fi
+    log "state sync: no state snapshot (as expected before the next backup)"
+    if ! guest_sh 30 'test ! -e /var/lib/das-backup/backup-index.db' || [[ "$GSH_RC" != 0 ]]; then
+        provision_stop first-boot "a database exists after the first boot: the sync unit copied something it should not have (${GSH_WHY:-exit status $GSH_RC})"
+        return 1
+    fi
+    log "no backup index yet (as expected: the sync unit copied nothing)"
+    if ! guest_until "$FIRSTBOOT_SECS" 'pgrep -x kwin_wayland' || ! guest_until "$FIRSTBOOT_SECS" 'pgrep -x plasmashell'; then
+        provision_stop first-boot "${UNATTENDED_WHY:-kwin_wayland or plasmashell is not running $(format_duration "$FIRSTBOOT_SECS") after the agent answered: the desktop did not come up}"
+        return 1
+    fi
+    shot="$STATE_DIR/provision-$PROVISION_STAMP-desktop.png"
+    if take_screenshot "$shot"; then
+        log "desktop: kwin_wayland and plasmashell running; screenshot $shot"
+    else
+        warn "desktop: kwin_wayland and plasmashell running; no screenshot ($SHOT_WHY)"
+    fi
+    progress first-boot ok "kernel $KERNEL, desktop up, no state yet"
+    if ! run_stage delete-replaced 600 "$(step_prov_delete_replaced)"; then
+        provision_halt delete-replaced
+        return 1
+    fi
+    progress poweroff start "provisioned"
+    power_off_guest "the provision is done"
+    progress poweroff ok
+}
+
+# Give everything back and say how it ended (every provision that took the
+# lock ends here, or in on_exit).
+provision_giveback() {
+    local undo="" line
+    check_guard off
+    progress giveback start
+    trap '' INT TERM HUP
+    if cdrom_defined "$P_ISO"; then detach_cdrom "$P_ISO" sdb || warn "$CDROM_WHY"; fi
+    if [[ -n "$PAYLOAD_ISO" ]] && cdrom_defined "$PAYLOAD_ISO"; then detach_cdrom "$PAYLOAD_ISO" sdc || warn "$CDROM_WHY"; fi
+    if ! return_disk; then
+        keep_after_failure
+        DONE=true
+        session_exit 4
+    fi
+    DONE=true
+    rm -f -- "$PAYLOAD_ISO" || warn "cannot remove the payload image $PAYLOAD_ISO"
+    progress giveback ok "detached; $HOLDER_RESULT; egress rule $EGRESS_RESULT"
+    if [[ -n "$UNATTENDED_FAILED" ]]; then
+        case "$UNATTENDED_STAGE" in
+            egress | payload | capture | boot) undo="nothing on the drive was changed" ;;
+            delete-replaced) undo="the new OS booted and is proven; the old OS stays set aside as *.replaced.$PROVISION_STAMP until delete-replaced runs again (recovery-os-install.sh delete-replaced, inside the new OS, from the payload)" ;;
+            *) undo="the old OS is set aside as *.replaced.$PROVISION_STAMP; $SELF provision $LABEL --undo --iso $P_ISO renames it back" ;;
+        esac
+        line="Provision of $LABEL stopped at $UNATTENDED_STAGE: ${UNATTENDED_FAILED#*: }; $undo"
+    else
+        line="Provisioned $LABEL: back in service only after the next backup run records it (its record must read \"btrbk at boot: no\")"
+    fi
+    cat <<EOF
+Provision done -- $LABEL ($PROVISION_STAMP)
+  Disk          $DISK ($DISK_DEV)
+  Live system   ${PROVISION_LIVE_GUARD:-not booted}
+  Guard         $GUARD_RESULT
+  Kernel        ${KERNEL:-unknown}
+  Given back    detached; $HOLDER_RESULT; btrfs device scan $SCAN_RESULT; $MOUNT_RESULT
+  Egress rule   $EGRESS_RESULT
+  Capture       $(dirname -- "$CAPTURE_FILE")
+$line
+EOF
+    session_exit "$(session_status)"
 }
 
 cmd_provision() {
@@ -5835,7 +6201,45 @@ cmd_provision() {
         provision_plan_text
         exit 0
     fi
-    refuse "provision: only --dry-run is implemented in this version"
+    # The new OS is the one the guard must prove (Phase 3); its record is
+    # not the old OS's, so no unit of that record is masked beyond the
+    # defaults. VERDICT=no: a guard that does not confirm is a stop of this
+    # run's own (exit 7), never the session's shutdown on a "will" record.
+    VERDICT=no
+    build_guard
+    SESSION_START=$SECONDS
+    trap on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    take_lock
+    SESSION_EPOCH=$(date +%s)
+    HISTORY_ARMED=true
+    HISTORY_MODE=provision
+    progress preflight ok "lock taken; provision $PROVISION_STAMP"
+    if ! start_holder; then
+        refuse "could not hold $DISK ($HOLDER_FAILURE)"
+    fi
+    provision_capture_dir
+    provision_payload
+    define_guard
+    attach_disk 2
+    if [[ "$(readlink -f -- "$DISK")" != "$DISK_DEV" ]]; then
+        refuse "$DISK no longer leads to $DISK_DEV (the drive re-enumerated) -- start again"
+    fi
+    attach_cdrom "$P_ISO" sdb 1 || refuse "$CDROM_WHY -- nothing was booted"
+    attach_cdrom "$PAYLOAD_ISO" sdc 3 || refuse "$CDROM_WHY -- nothing was booted"
+    if [[ "$EGRESS_HELD" != true ]]; then
+        egress_add
+    fi
+    GUARD_OPTIONAL=1
+    progress start start "booting the CachyOS live system in $DOMAIN"
+    start_guarded
+    progress start ok "the live system is booting"
+    if provision_install; then
+        provision_first_boot || :
+    fi
+    provision_giveback
 }
 
 main() {
