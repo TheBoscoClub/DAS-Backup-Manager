@@ -6,7 +6,7 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.1.3
+# Version: 1.1.4
 # Date: 2026-10-13
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
@@ -167,7 +167,7 @@ complete() {
 newest() {
     local c=("$dir/$1".*) i
     [[ -e "${c[0]}" ]] || return 0
-    mapfile -t c < <(printf '%s\n' "${c[@]}" | sort -r)
+    mapfile -t c < <(printf '%s\n' "${c[@]}" | LC_ALL=C sort -r)
     for i in "${c[@]}"; do
         if complete "$i"; then
             printf '%s\n' "$i"

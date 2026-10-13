@@ -5756,7 +5756,7 @@ has "provision dry run: the entry titles" "$OUT" "CachyOS Emergency Recovery (Ba
 matches "provision dry run: the package count" "$OUT" "packages: [0-9]+"
 has "provision dry run: the ISO pinned" "$OUT" "iso sha256 ok"
 has "provision dry run: the package pinned" "$OUT" "package sha256 ok"
-has "provision dry run: the steps in order" "$OUT" "steps: egress payload capture replace-os pacstrap configure package boot repos verify unmount, then the first boot, delete-replaced"
+has "provision dry run: the steps in order" "$OUT" "steps: egress payload capture replace-os pacstrap configure package bootloader repos verify unmount, then the first boot, delete-replaced"
 has "provision dry run: no history for the other drive is a warning" "$OUT" "WARNING: system-recovery-B-2tb has no session in the history"
 lacks "provision dry run: nothing booted" "$(file "$S/virsh.calls")" "start"
 lacks "provision dry run: no disk attached" "$(file "$S/virsh.calls")" "attach"
@@ -5904,7 +5904,7 @@ run_driver_env "${PROV[@]}" --dry-run --detach
 check "provision --dry-run --detach: usage" "$RC" "2"
 
 echo "--- provision: Phase 2 steps and Phase 3 proof (plan 2, Task 3b)"
-PSTEPS="egress payload capture replace-os pacstrap configure package boot repos verify unmount delete-replaced "
+PSTEPS="egress payload capture replace-os pacstrap configure package bootloader repos verify unmount delete-replaced "
 CAPDIR_A="$T/var/lib/das-backup/recovery-os-provision/system-recovery-A-2tb"
 prov_events() { tr '\n' '|' <"$S/events"; }
 provision_fixture
@@ -5968,6 +5968,16 @@ check "provision, pacstrap fails: started once" "$(grep -c '^virsh start' "$S/ev
 check "provision, pacstrap fails: the payload ISO removed" "$(find "$T/images" -mindepth 1 2>/dev/null | wc -l)" "0"
 check "provision, pacstrap fails: no cdrom left" "$(file "$S/cdroms.xml")" ""
 has "provision, pacstrap fails: given back" "$(prov_events)" "virsh detach|"
+
+# the installer's bootloader step runs after the old OS was set aside: a stop
+# there is one undo is for, never "nothing changed"
+provision_fixture
+echo 2 >"$S/stage.bootloader.rc"
+run_driver_env "${PROV[@]}"
+check "provision, the bootloader step fails: exit 7" "$RC" "7"
+has "provision, the bootloader step fails: named" "$OUT" "stopped at bootloader"
+has "provision, the bootloader step fails: how to undo" "$OUT" "provision system-recovery-A-2tb --undo --iso"
+lacks "provision, the bootloader step fails: never 'nothing changed'" "$OUT" "nothing on the drive was changed"
 
 provision_fixture
 : >"$S/guard-silent-phase2"
@@ -6082,6 +6092,62 @@ check "clean runs before a provision" "$(tail -n 1 <<<"$OUT")" "3"
 printf '{"label":"system-recovery-A-2tb","start":1791870000,"end":1791873600,"mode":"provision","unattended":false,"outcome":"clean","exit":0,"overridden":false,"kernel":"k","stopped_at":null,"stamp":"20261013-010203","also_replace":[]}\n' >>"$H"
 run_driver_env clean-runs A
 check "clean runs after a provision: a new OS starts at 0" "$(tail -n 1 <<<"$OUT")" "0"
+
+echo "--- the first boot's state proof, run against a drive's top level"
+# The script as the driver hands it to the guest; findmnt, mount and umount
+# stubbed, btrfs answering from marker files in each candidate directory.
+PROOF_SH="$T/proof.sh"
+( source "$REPO/scripts/recovery-os-vm.sh"; proof_newest_state ) >"$PROOF_SH"
+run_proof() { # the top level is $T/ptop (the stub mount binds nothing)
+    mkdir -p "$T/pbin"
+    printf '#!/bin/sh\necho "/dev/sdz2[/@]"\n' >"$T/pbin/findmnt"
+    printf '#!/bin/sh\nexit 0\n' >"$T/pbin/mount"
+    printf '#!/bin/sh\nexit 0\n' >"$T/pbin/umount"
+    cat >"$T/pbin/btrfs" <<'STUB'
+#!/bin/sh
+[ "$1 $2" = "subvolume show" ] || exit 9
+[ -d "$3" ] || exit 1
+printf '\tFlags: \t\t\t%s\n\tReceived UUID: \t\t%s\n' "$(cat "$3/.flags" 2>/dev/null || echo -)" "$(cat "$3/.received" 2>/dev/null || echo -)"
+STUB
+    chmod +x "$T/pbin/"*
+    sed "s|top=/run/das-provision/proof|top=$T/ptop|" "$PROOF_SH" >"$T/proof.run.sh"
+    RC=0
+    OUT=$(PATH="$T/pbin:$PATH" timeout 30 sh "$T/proof.run.sh" 2>&1) || RC=$?
+}
+pstate() { # <name> <flags> <received uuid>
+    mkdir -p "$T/ptop/nvme/$1"
+    printf '%s\n' "$2" >"$T/ptop/nvme/$1/.flags"
+    printf '%s\n' "$3" >"$T/ptop/nvme/$1/.received"
+}
+rm -rf "$T/ptop"; mkdir -p "$T/ptop/nvme"
+pstate das-state.20261012T1533 readonly 1111-aaaa
+pstate das-state.20261013T0300 - 2222-bbbb
+pstate das-state.20261013T0400 readonly -
+run_proof
+check "proof: the newest COMPLETE state (the newer ones are a writable and an unreceived one)" "$OUT" "newest=das-state.20261012T1533"
+rm -rf "$T/ptop"; mkdir -p "$T/ptop/nvme"
+run_proof
+check "proof: an empty nvme directory holds none" "$OUT" "newest=none"
+rm -rf "$T/ptop"; mkdir -p "$T/ptop"
+run_proof
+check "proof: no nvme directory: exit 2, never 'none'" "$RC" "2"
+has "proof: no nvme directory: says so" "$OUT" "no received 'nvme' directory"
+# root reads through mode 000, so only an unprivileged run can make it unreadable
+if ((EUID != 0)); then
+    rm -rf "$T/ptop"; mkdir -p "$T/ptop/nvme"
+    pstate das-state.20261012T1533 readonly 1111-aaaa
+    chmod 000 "$T/ptop/nvme"
+    run_proof
+    chmod 755 "$T/ptop/nvme"
+    check "proof: an unreadable nvme directory: exit 2, never 'none'" "$RC" "2"
+    has "proof: an unreadable nvme directory: says so" "$OUT" "cannot list"
+fi
+
+echo "--- every progress step the driver names is one the GUI knows"
+for s in $STEPS desktop $PSTEPS first-boot preflight start wait boot reboot kernel poweroff giveback; do
+    [[ "$s" == delete-replaced || " egress payload capture replace-os pacstrap configure package bootloader repos verify unmount first-boot " == *" $s "* ]] && continue
+    check "the GUI knows the step '$s'" "$(grep -c "^    \"$s\",\$" "$REPO/indexer/src/recovery_os/lines.rs" || :)" "1"
+done
 
 echo "--- provision --undo (plan 2, Task 3c)"
 provision_fixture

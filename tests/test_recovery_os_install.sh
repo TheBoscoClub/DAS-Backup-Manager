@@ -496,6 +496,10 @@ check "undo after a new boot: not named unbooted" test ! -e "$TOPD/@.unbooted.$S
 check "undo after a new boot: said" out_has "@ set aside as @.undone.$S1 (it had booted)"
 fixture; run replace-os; echo "the new one" >"$TOPD/@/sentinel"; run undo
 check "undo before any boot: the new root named unbooted" test "$(cat "$TOPD/@.unbooted.$S1/sentinel" 2>/dev/null)" = "the new one"
+# one name per provision: the marker lives only in a root, and @home was used
+# by the same boot
+fixture; run replace-os; mkdir -p "$TOPD/@/var/lib/das-recovery"; : >"$TOPD/@/var/lib/das-recovery/booted"; run undo
+check "undo after a new boot: @home named as booted too" test -d "$TOPD/@home.undone.$S1" -a ! -e "$TOPD/@home.unbooted.$S1"
 fixture; run undo
 check "undo with nothing to undo: exit 3" test "$RC" -eq 3
 check "undo with nothing to undo: says so" out_has "nothing to undo"

@@ -8,7 +8,7 @@
 //! into a success.
 
 /// The session's steps in the order the script runs them.
-pub const STEPS: [&str; 19] = [
+pub const STEPS: [&str; 21] = [
     "preflight",
     "start",
     "wait",
@@ -16,6 +16,7 @@ pub const STEPS: [&str; 19] = [
     "egress",
     "repos",
     "snapshot",
+    "slot",
     "guard-lift",
     "keyrings",
     "upgrade",
@@ -26,6 +27,7 @@ pub const STEPS: [&str; 19] = [
     "guard-engage",
     "reboot",
     "kernel",
+    "desktop",
     "poweroff",
     "giveback",
 ];
@@ -229,6 +231,9 @@ mod tests {
         assert_eq!(step_percent("newstep"), None);
         assert_eq!(step_percent("preflight"), Some(0));
         assert_eq!(step_percent("giveback"), Some(100));
-        assert_eq!(step_percent("upgrade"), Some(9 * 100 / 18));
+        assert_eq!(step_percent("upgrade"), Some(10 * 100 / 20));
+        // the slot step and the desktop proof are steps the GUI knows
+        assert!(step_percent("slot").is_some());
+        assert!(step_percent("desktop").is_some());
     }
 }
