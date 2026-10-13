@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.0
+# Version: 1.5.1
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -524,11 +524,13 @@ delete_tree() {
 }
 
 BOOTED_REL="var/lib/das-recovery/booted" # written by das-recovery-state-sync.sh on every boot
-# Where undo sets a current root aside: named for whether it booted, never
-# deleted. $1 the original name, $2 the manifest's stamp.
-aside_name() {
-    if present "$1/$BOOTED_REL"; then printf '%s.undone.%s' "$1" "$2"; else printf '%s.unbooted.%s' "$1" "$2"; fi
-}
+# Whether the root a provision installed has booted: the marker lives only in
+# a root, and every subvolume of that provision (its @home too) was used by
+# the same boot, so one answer names them all. $1 where that root is now: @
+# for the newest manifest, @.replaced.<the next newer stamp> for an older one.
+provision_booted() { present "$1/$BOOTED_REL"; }
+# undo's suffix for a manifest: undone (it booted) or unbooted. $1 that root.
+aside_suffix() { if provision_booted "$1"; then printf 'undone'; else printf 'unbooted'; fi; }
 
 step_delete_replaced() {
     need UUID
@@ -589,6 +591,17 @@ step_undo() {
     check_esp
     read_manifest "${mfs[$((${#mfs[@]} - 1))]}"
     oldest_stamp=$MAN_STAMP
+    # Each manifest's suffix, decided once, before anything moves: where the
+    # root it installed is now (newest first: @, then each older one's under
+    # the next newer stamp's set-aside @).
+    declare -A suffix_of=()
+    local root=@ prev_stamp=
+    for mf in "${mfs[@]}"; do
+        read_manifest "$mf"
+        [[ -z "$prev_stamp" ]] || root="@.replaced.$prev_stamp"
+        suffix_of[$MAN_STAMP]=$(aside_suffix "$root")
+        prev_stamp=$MAN_STAMP
+    done
     for mf in "${mfs[@]}"; do
         read_manifest "$mf"
         if [[ "$mf" == *.deleting ]]; then
@@ -600,7 +613,7 @@ step_undo() {
             sa=${MAN_SA[$i]}
             if present "$sa"; then
                 if [[ "$orig" != "@esp" ]] && present "$orig"; then
-                    aside=$(aside_name "$orig" "$MAN_STAMP")
+                    aside="$orig.${suffix_of[$MAN_STAMP]}.$MAN_STAMP"
                     ! present "$aside" || cannot "$aside already exists: not overwritten"
                 fi
             elif [[ "$orig" == "@esp" ]] || ! present "$orig"; then
@@ -640,7 +653,7 @@ step_undo() {
                 continue
             fi
             if present "$orig"; then
-                aside=$(aside_name "$orig" "$MAN_STAMP")
+                aside="$orig.${suffix_of[$MAN_STAMP]}.$MAN_STAMP"
                 move "$orig" "$aside"
                 if [[ "$aside" == *.undone.* ]]; then
                     say "$orig set aside as $aside (it had booted)"

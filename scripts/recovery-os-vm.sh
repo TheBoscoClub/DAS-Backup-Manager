@@ -162,7 +162,7 @@
 #     entries name is on the ESP, every LABEL=/UUID= of /etc/fstab
 #     resolves -- bd ac82, read inside the OS); guard-engage (started again,
 #     every btrbk bound); reboot (a new boot whose guard reports engaged
-#     and whose agent answers); kernel (uname -r); poweroff. Anything
+#     and whose agent answers); kernel (uname -r); desktop (kwin_wayland and plasmashell running); poweroff. Anything
 #     unexpected stops it: the recovery OS is asked to power off (its agent,
 #     then ACPI until it has; never destroyed), the disk is given back, exit 7.
 #   - --wait-lock <minutes>: a scheduled session (the GUI's helper writes a
@@ -437,7 +437,7 @@ readonly PAYLOAD_DIR="${DAS_RECOVERY_VM_PAYLOAD_DIR:-/var/lib/libvirt/images}"
 # How long the new OS's first boot has, after its agent answers, for the sync
 # unit's status and the desktop.
 readonly FIRSTBOOT_SECS="${DAS_RECOVERY_VM_FIRSTBOOT_SECS:-600}"
-readonly PROVISION_STEP_NAMES="egress payload capture replace-os pacstrap configure package boot repos verify unmount"
+readonly PROVISION_STEP_NAMES="egress payload capture replace-os pacstrap configure package bootloader repos verify unmount"
 
 # Installed side by side by CMake: ${prefix}/lib/das-backup/{this script,libvirt/}.
 # The template; each drive's definition is rendered from it (render_domain_xml)
@@ -790,8 +790,8 @@ without rebooting the workstation.
                          usable fallback: its last session failed or kept,
                          or its record "will", absent or unreadable
   provision <A|B|label> --undo --iso <path>
-                         rename the set-aside OS back (refused once the new
-                         root booted)
+                         rename the set-aside OS back (until delete-replaced
+                         has started; the new root is set aside, never deleted)
   session-end <A|B|label>
                          finish a session whose driver died (VM shut off);
                          judges the guard's report before removing anything
@@ -6060,7 +6060,7 @@ undo_read_provision() {
         refuse "the newest provision of $LABEL in the history has no stamp of the form YYYYMMDD-HHMMSS ('$PROVISION_STAMP'): $(printable "$row")"
     mapfile -t P_ALSO < <(jq -r '.also_replace // [] | .[]' <<<"$row") || refuse "cannot read the archives of the provision $PROVISION_STAMP"
     for name in "${P_ALSO[@]}"; do
-        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* ]] ||
+        [[ "$name" =~ ^@\.archive\.[${ASCII_LETTERS}[:digit:]._-]+$ && "$name" != *.replaced.* && "$name" != *.unbooted.* && "$name" != *.undone.* ]] ||
             refuse "the provision $PROVISION_STAMP of $LABEL names '$name' among its archives: not an @.archive.* name"
     done
 }
@@ -6305,7 +6305,7 @@ PROVISION_STEPS=(
     "pacstrap 3600 step_prov_pacstrap"
     "configure 600 step_prov_configure"
     "package 600 step_prov_package"
-    "boot 900 step_prov_boot"
+    "bootloader 900 step_prov_boot"
     "repos 120 step_prov_repos"
     "verify 300 step_prov_verify"
     "unmount 120 step_prov_unmount"
@@ -6380,15 +6380,19 @@ src=$(findmnt -no SOURCE /) || { echo "cannot read the device of /"; exit 2; }
 top=/run/das-provision/proof
 mkdir -p "$top"
 mount -o ro,subvolid=5 "${src%%[*}" "$top" || { echo "cannot mount the top level read-only"; exit 2; }
+trap 'umount "$top" || echo "cannot unmount $top" >&2' EXIT
+# A listing that failed is never "none": the sync unit would have failed too,
+# and the two must not agree by both reading nothing.
+[ -d "$top/nvme" ] || { echo "no received 'nvme' directory on the top level"; exit 2; }
+list=$(find "$top/nvme" -mindepth 1 -maxdepth 1 -name 'das-state.*' -printf '%p\n') || { echo "cannot list $top/nvme"; exit 2; }
 n=
-for d in $(find "$top/nvme" -mindepth 1 -maxdepth 1 -name 'das-state.*' -printf '%p\n' 2>/dev/null | LC_ALL=C sort -r); do
+for d in $(printf '%s\n' "$list" | LC_ALL=C sort -r); do
     info=$(btrfs subvolume show "$d" 2>/dev/null) || continue
     printf '%s\n' "$info" | grep -E '^[[:space:]]*Flags:.*readonly' >/dev/null || continue
     printf '%s\n' "$info" | awk '$1 == "Received" && $2 == "UUID:" { f = ($3 != "-" && $3 != "") } END { exit !f }' || continue
     n=${d##*/}
     break
 done
-umount "$top" || echo "cannot unmount $top" >&2
 echo "newest=${n:-none}"
 EOF
 }
@@ -6416,7 +6420,7 @@ guest_until() {
 # the live system's can answer for it), the disk first in the boot order --
 # then the proof, and only after it delete-replaced. 1 when it stopped.
 provision_first_boot() {
-    local live status shot
+    local live status shot newest synced
     check_guard off
     if ((J_BOOTS > 0)); then
         live="guard: engaged in the live system"
@@ -6616,7 +6620,7 @@ cmd_provision() {
     provision_preflight
     if [[ "$P_UNDO" == true ]]; then
         if [[ "$DRY_RUN" == true ]]; then
-            log "undo the provision of $LABEL stamped $PROVISION_STAMP (also set aside: ${P_ALSO[*]:-none}): boot the live system, run the installer's undo -- it refuses once a root that provision installed has booted"
+            log "undo the provision of $LABEL stamped $PROVISION_STAMP (also set aside: ${P_ALSO[*]:-none}): boot the live system, run the installer's undo -- allowed until delete-replaced has started; the new root is set aside, never deleted"
             exit 0
         fi
         provision_undo
