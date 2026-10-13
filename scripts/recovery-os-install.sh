@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.2.0
+# Version: 1.3.0
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -225,6 +225,16 @@ check_esp() { # p1's PARTUUID is the configured one, or exit 3
     [[ -n "$part" ]] || refuse "p1 of $DEV has no readable PARTUUID: not this drive's ESP"
     [[ "${part,,}" == "${ESP_PARTUUID,,}" ]] || refuse "p1 of $DEV is PARTUUID $part, not the configured $ESP_PARTUUID: not this drive's ESP"
 }
+ESP_ID_RE='^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$'
+ESP_ID=""
+# format_esp <XXXX-XXXX>: FAT32 with the bay label AND the given volume ID (the
+# old OS's fstab and the project's docs name p1 by it); the ID is read back.
+format_esp() {
+    local want=$1 got
+    "$MKFS_VFAT" -F 32 -i "${want//-/}" -n "$ESP_LABEL" "${DEV}1" || cannot "cannot format p1 as FAT32 ($ESP_LABEL)"
+    got=$("$BLKID" -s UUID -o value "${DEV}1") || got=""
+    [[ "${got^^}" == "${want^^}" ]] || cannot "p1 was formatted but its volume ID is '$got', not $want: refusing to go on"
+}
 # matches_list <dir> <esp.list>: the tree's content is what the list recorded.
 matches_list() {
     local have
@@ -234,6 +244,8 @@ matches_list() {
 }
 save_esp() {
     local dst="$TOP/@esp.replaced.$STAMP" want have
+    ESP_ID=$("$BLKID" -s UUID -o value "${DEV}1") || ESP_ID=""
+    [[ "$ESP_ID" =~ $ESP_ID_RE ]] || refuse "p1's volume ID '$ESP_ID' is unreadable or not of the form XXXX-XXXX: it could not be restored"
     mkdir -p "$ESP_MNT"
     "$BTRFS" subvolume create "$dst" >/dev/null || cannot "cannot create @esp.replaced.$STAMP"
     mkdir -p "$dst/esp"
@@ -253,13 +265,14 @@ save_esp() {
         refuse "the copy of p1 in @esp.replaced.$STAMP differs from p1 (nothing renamed, p1 not formatted)"
     fi
     printf '%s\n' "$want" >"$dst/esp.list" || cannot "cannot write esp.list"
+    printf '%s\n' "$ESP_ID" >"$dst/esp.uuid" || cannot "cannot write esp.uuid"
     flush "$dst"
     say "p1 copied into @esp.replaced.$STAMP, compared by sha256, esp.list written, synced"
 }
 
 step_replace_os() {
     need UUID ESP_LABEL ESP_PARTUUID DEV
-    local seen n todo=() mf
+    local seen n todo=() mf f live=()
     seen=$("$BLKID" -s UUID -o value "${DEV}2") || seen=""
     [[ -n "$seen" ]] || refuse "p2 of $DEV has no readable UUID: not this drive, or not a filesystem"
     [[ "${seen,,}" == "${UUID,,}" ]] || refuse "p2 of $DEV is $seen, not the configured $UUID: not this drive"
@@ -267,6 +280,11 @@ step_replace_os() {
     mount_top
     received_present || refuse "p2 holds no received backup subvolume: not a recovery drive to rebuild (seed it with a backup run first)"
     load_names
+    mapfile -t live < <(list_manifests | grep -E '\.(undoing|deleting)$' || :)
+    if ((${#live[@]} > 0)); then
+        for f in "${live[@]}"; do say "${f##*/}"; done
+        refuse "an undo or delete-replaced did not finish (above): finish undo / delete-replaced first"
+    fi
     for n in "${NAMES_LIST[@]}"; do
         on_allowlist "$n" || continue
         ! present "$n.replaced.$STAMP" || cannot "$n.replaced.$STAMP already exists: not overwritten"
@@ -274,7 +292,9 @@ step_replace_os() {
     done
     ! present "@esp.replaced.$STAMP" || cannot "@esp.replaced.$STAMP already exists: not overwritten"
     mf="$TOP/.das-provision.$STAMP"
-    ! present ".das-provision.$STAMP" || cannot "${mf##*/} already exists: a provision with this stamp already ran"
+    for f in "$TOP"/.das-provision."$STAMP"*; do
+        [[ ! -e "$f" ]] || cannot "${f##*/} already exists: a provision with this stamp already ran, the stamp is not reused"
+    done
     if [[ -n "$(list_manifests)" ]]; then
         say "earlier manifests found: an incomplete provision; its set-aside names stay, the current ones are set aside under $STAMP"
     fi
@@ -298,7 +318,7 @@ step_replace_os() {
     # Everything above must be on disk before p1 is formatted: a power-off
     # right after the format must not leave p1 empty with no copy to restore.
     flush_fs
-    "$MKFS_VFAT" -F 32 -n "$ESP_LABEL" "${DEV}1" || cannot "cannot format p1 as FAT32 ($ESP_LABEL)"
+    format_esp "$ESP_ID"
     mkdir -p "$TARGET"
     "$MOUNT" -o "subvol=/@,compress=zstd:3,noatime" "UUID=$UUID" "$TARGET" || cannot "cannot mount @ at $TARGET"
     mkdir -p "$TARGET/home" "$TARGET/boot"
@@ -401,7 +421,8 @@ step_boot() {
     # @.pre-update.* yet. The pipeline's loader step writes it after the first
     # upgrade.
     "$CHROOT" "$TARGET" mkinitcpio -P || cannot "mkinitcpio -P failed"
-    say "boot: loader.conf and 2 entries written, images built"
+    flush "$boot"
+    say "boot: loader.conf and 2 entries written, images built, p1 flushed"
 }
 
 step_verify() {
@@ -490,7 +511,7 @@ BOOTED_REL="var/lib/das-recovery/booted" # written by das-recovery-state-sync.sh
 
 step_delete_replaced() {
     need UUID
-    local mfs=() mf i b failed="" count=0 marker="$TOP/@/$BOOTED_REL"
+    local mfs=() mf i b newest prov failed="" count=0 marker="$TOP/@/$BOOTED_REL"
     mount_top
     load_names
     mapfile -t mfs < <(list_manifests)
@@ -499,12 +520,14 @@ step_delete_replaced() {
         [[ "$mf" != *.undoing ]] || refuse "${mf##*/}: an undo began and did not finish; delete-replaced refused (run undo again)"
     done
     for mf in "${mfs[@]}"; do read_manifest "$mf"; done # all valid before any delete
-    # The old OS is deleted only after the new one has been seen to boot: its
-    # marker must exist and be newer than every live manifest.
+    # The old OS is deleted only after the new one has been seen to boot: the
+    # marker the sync unit wrote (provisioned=<stamp> from the recovery-drive
+    # marker the package step wrote) must name the NEWEST live manifest's stamp.
     [[ -f "$marker" ]] || refuse "the new @ has not booted ($BOOTED_REL does not exist): the old OS is kept"
-    for mf in "${mfs[@]}"; do
-        [[ "$marker" -nt "$mf" ]] || refuse "$BOOTED_REL is not newer than ${mf##*/}: it does not prove this provision booted; the old OS is kept"
-    done
+    b=$(manifest_base "${mfs[$((${#mfs[@]} - 1))]}")
+    newest=${b#.das-provision.}
+    prov=$(sed -n 's/^provisioned=//p' "$marker" | head -1) || prov=""
+    [[ -n "$prov" && "$prov" == "$newest" ]] || refuse "the booted marker says provisioned='$prov', the newest manifest is $newest: it does not prove this provision booted; the old OS is kept"
     for i in "${!mfs[@]}"; do
         mf=${mfs[$i]}
         if [[ "$mf" != *.deleting ]]; then
@@ -575,6 +598,9 @@ step_undo() {
     matches_list "$esp_dir/esp" "$esp_dir/esp.list" || rc=$?
     ((rc != 2)) || cannot "cannot read the old ESP copy"
     ((rc == 0)) || refuse "the old ESP copy @esp.replaced.$oldest_stamp does not match its esp.list (or the list is missing)"
+    ESP_ID=""
+    [[ ! -f "$esp_dir/esp.uuid" ]] || ESP_ID=$(<"$esp_dir/esp.uuid") || ESP_ID=""
+    [[ "$ESP_ID" =~ $ESP_ID_RE ]] || refuse "@esp.replaced.$oldest_stamp/esp.uuid is missing or not of the form XXXX-XXXX: p1's volume ID could not be restored"
     # Mark every live manifest .undoing, synced, before the first rename: a
     # delete-replaced can no longer run, and a re-run of undo picks them up.
     for i in "${!mfs[@]}"; do
@@ -608,13 +634,16 @@ step_undo() {
     # p1 comes back from the OLDEST manifest's copy: the ESP as it was before
     # the first provision of the chain; compared by sha256 afterwards.
     mkdir -p "$ESP_MNT"
-    "$MKFS_VFAT" -F 32 -n "$ESP_LABEL" "${DEV}1" || cannot "cannot format p1 as FAT32 ($ESP_LABEL)"
+    format_esp "$ESP_ID"
     "$MOUNT" "${DEV}1" "$ESP_MNT" || cannot "cannot mount p1 to restore the old ESP"
     rc=0
     "$CP" -a "$esp_dir/esp/." "$ESP_MNT/" || rc=2
+    # Flush, remount read-only, then compare what is really on p1.
+    if ((rc == 0)); then "$SYNC" -f "$ESP_MNT" || rc=2; fi
+    if ((rc == 0)); then "$MOUNT" -o remount,ro "$ESP_MNT" || rc=2; fi
     if ((rc == 0)); then matches_list "$ESP_MNT" "$esp_dir/esp.list" || rc=$?; fi
     "$UMOUNT" "$ESP_MNT" || cannot "cannot unmount p1 after restoring it"
-    ((rc != 2)) || cannot "cannot restore the old ESP to p1"
+    ((rc != 2)) || cannot "cannot restore the old ESP to p1 (copy, flush, remount or read-back failed)"
     ((rc == 0)) || refuse "the restored p1 differs from @esp.replaced.$oldest_stamp/esp.list"
     for mf in "${mfs[@]}"; do
         b=${mf##*/}
