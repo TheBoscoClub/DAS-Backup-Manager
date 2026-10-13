@@ -18,6 +18,8 @@ Requires:       btrbk btrfs-progs smartmontools bash util-linux
 Recommends:     s-nail mbuffer
 # The GUI opens the recovery drive's console with TigerVNC's vncviewer on a UNIX socket.
 Recommends:     tigervnc
+# recovery-os-vm.sh provision builds its payload cdrom with xorriso.
+Recommends:     xorriso
 # The recovery-os-updater VM (recovery-os-vm.sh): optional, and heavy.
 Suggests:       libvirt-daemon-kvm libvirt-client qemu-kvm edk2-ovmf virt-viewer ImageMagick jq
 Requires:       qt6-qtbase qt6-qtcharts kf6-kcoreaddons kf6-ki18n kf6-kxmlgui

@@ -19,7 +19,8 @@ optdepends=('s-nail: email backup reports (mailx)'
             'virt-viewer: console of the recovery-os-updater VM'
             'tigervnc: the GUI opens a recovery drive\'s console with vncviewer on the helper\'s socket'
             'imagemagick: recovery-os-vm.sh screenshot'
-            'jq: recovery-os-vm.sh reads the boot record of a recovery OS')
+            'jq: recovery-os-vm.sh reads the boot record of a recovery OS'
+            'libisoburn: recovery-os-vm.sh provision builds the payload cdrom')
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')

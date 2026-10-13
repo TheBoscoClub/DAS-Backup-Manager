@@ -494,6 +494,10 @@ Every install writes `/etc/das-backup/.manifest` — a plain-text list of genera
 - `--check`: Verify all manifest files exist (presence only, not content), alongside config validation, relay reachability, targets without `mount_uuid`, the udisks hiding read back from udev, and dependencies
 
 
+## Recovery Drive Provisioning
+
+A recovery drive's OS is rebuilt by two scripts. `scripts/recovery-os-vm.sh provision` runs on the host: it checks that the other recovery drive is a usable fallback, builds a payload cdrom (the installer and the pinned package) with xorriso, boots the drive's own VM from the CachyOS live ISO, and runs the installer's steps through the guest agent; then it boots the new OS under a freshly defined session guard, proves it (kernel, sync-unit status, desktop processes, a screenshot) and only then has the new OS delete the set-aside names. `scripts/recovery-os-install.sh` runs as root inside the live system: it renames the OS subvolumes on partition 2 to `*.replaced.<stamp>` by an exact allowlist recorded in a manifest, copies and reformats partition 1, installs the baseline and the project package, and writes the loader entries; `undo` renames the set-aside names back. The host writes nothing to the drive, partition 2 keeps every received backup, and `das-recovery-state-sync` (extended with the splash messages and the boot measurement) runs in the new OS. The procedure is in the disaster recovery guide, "Building a recovery drive".
+
 ## Privilege Boundary
 
 `btrdasd-helper` is a root daemon on the system bus, reachable by unprivileged local clients. Polkit answers *may this caller perform this action* — it says nothing about *which object*. Four rules follow. The first three were introduced in 0.7.20.0 after an independent review found each one violated; 0.7.21.0 found rule 1 violated a second time in a different parameter, and added rule 4:
