@@ -5955,6 +5955,7 @@ provision_preflight() {
     P_LETTER=${BASH_REMATCH[1]}
     P_HOST="das-recovery-bay$P_BAY"
     P_ESP="RECOV-ESP-$P_BAY"
+    [[ -r "$DAS_CONFIG" ]] || refuse "cannot read $DAS_CONFIG: the payload carries it for the installer's verify step"
     installer="$SCRIPT_DIR/recovery-os-install.sh"
     [[ -r "$installer" ]] || refuse "recovery-os-install.sh is not installed beside $SELF: the payload cdrom carries it"
     command -v xorriso >/dev/null || refuse "xorriso is not installed (package libisoburn): the payload cdrom cannot be built"
