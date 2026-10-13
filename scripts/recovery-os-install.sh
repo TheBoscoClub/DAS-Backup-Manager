@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.4.2
+# Version: 1.4.3
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -431,8 +431,8 @@ step_boot() {
     printf 'title CachyOS Emergency Recovery (Bay %s)\nlinux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /intel-ucode.img\ninitrd /initramfs-linux-cachyos.img\noptions %s\n' "$BAY" "$opts" >"$boot/loader/entries/cachyos-recovery.conf"
     printf 'title CachyOS Emergency Recovery — Fallback (Bay %s)\nlinux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img\ninitrd /intel-ucode.img\ninitrd /initramfs-linux-cachyos-fallback.img\noptions %s\n' "$BAY" "$opts" >"$boot/loader/entries/cachyos-recovery-fallback.conf"
     # D1: no previous-root entry on a fresh install: there is no
-    # @.pre-update.* yet. The pipeline's loader step writes it after the first
-    # upgrade.
+    # @.pre-update.* yet. The pipeline's slot step writes it, before the first
+    # upgrade, with the first matched pair.
     "$CHROOT" "$TARGET" mkinitcpio -P || cannot "mkinitcpio -P failed"
     flush "$boot"
     say "boot: loader.conf and 2 entries written, images built, p1 flushed"
