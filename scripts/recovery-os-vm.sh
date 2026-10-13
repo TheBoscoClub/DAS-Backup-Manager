@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.1.3
+# Version: 2.1.4
 # Date: 2026-10-12
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -4250,13 +4250,15 @@ prev=$esp/loader/entries/cachyos-recovery-previous.conf
 top=${TOP:-}
 if [ -z "$top" ]; then
     top=/run/das-vm-update/top
-    uuid=$(findmnt -no UUID /) || { echo "cannot read the top level: no UUID for /"; exit 2; }
-    [ -n "$uuid" ] || { echo "cannot read the top level: no UUID for /"; exit 2; }
+    src=$(findmnt -no SOURCE /) || { echo "cannot read the top level: no device for /"; exit 2; }
+    dev=${src%%[*}
+    [ -n "$dev" ] || { echo "cannot read the top level: no device for /"; exit 2; }
     mkdir -p "$top"
-    mount -o subvolid=5,ro "UUID=$uuid" "$top" || { echo "cannot read the top level: mount failed"; exit 2; }
-    trap 'umount "$top"' EXIT
+    mount -o subvolid=5 "$dev" "$top" || { echo "cannot read the top level: mount failed"; exit 2; }
+    trap 'umount "$top" || echo "cannot unmount $top" >&2' EXIT
 fi
 list=$(btrfs subvolume list "$top") || { echo "cannot read the top level $top"; exit 2; }
+printf '%s\n' "$list" | grep -q ' path @$' || { echo "the listing of $top lists no subvolume @: not read as 'no previous root'"; exit 2; }
 newest=$(printf '%s\n' "$list" | sed -n 's/^.* path //p' | while read -r n; do
     case "$n" in
         @.pre-update.[[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]][[:digit:]]-[[:digit:]][[:digit:]][[:digit:]][[:digit:]]) echo "$n" ;;

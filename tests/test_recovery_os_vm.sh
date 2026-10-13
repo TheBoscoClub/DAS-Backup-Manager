@@ -5284,11 +5284,21 @@ echo "btrfs \$*" >>"$T/loader.calls"
 if [ "\$(cat "$T/subvols")" = FAIL ]; then echo "ERROR: cannot access the top level" >&2; exit 1; fi
 cat "$T/subvols"
 STUB
-    for m in mount umount; do printf '#!/bin/sh\necho "%s $*" >>"%s"\n' "$m" "$T/loader.calls" >"$T/bin/$m"; done
-    chmod +x "$T/bin/btrfs" "$T/bin/mount" "$T/bin/umount"
+    # mount and umount fail while $T/mount.fail / $T/umount.fail exist
+    for m in mount umount; do
+        printf '#!/bin/sh\necho "%s $*" >>"%s"\nif [ -e "%s/%s.fail" ]; then echo "%s: stub refused" >&2; exit 32; fi\n' "$m" "$T/loader.calls" "$T" "$m" "$m" >"$T/bin/$m"
+    done
+    printf '#!/bin/sh\necho "findmnt $*" >>"%s"\necho "/dev/sdz2[/@]"\n' "$T/loader.calls" >"$T/bin/findmnt"
+    # the unset-TOP path makes /run/das-vm-update/top: a stand-in, not root's /run
+    printf '#!/bin/sh\necho "mkdir $*" >>"%s"\n' "$T/loader.calls" >"$T/bin/mkdir"
+    chmod +x "$T/bin/btrfs" "$T/bin/mount" "$T/bin/umount" "$T/bin/findmnt" "$T/bin/mkdir"
     : >"$T/loader.calls"
     RC=0
-    OUT="$(ESP="$T/esp" TOP="$T/top" PATH="$T/bin:$PATH" sh "$S/stage.loader.sh" 2>&1)" || RC=$?
+    if [[ -n "${LOADER_TOP_UNSET:-}" ]]; then
+        OUT="$(ESP="$T/esp" PATH="$T/bin:$PATH" sh "$S/stage.loader.sh" 2>&1)" || RC=$?
+    else
+        OUT="$(ESP="$T/esp" TOP="$T/top" PATH="$T/bin:$PATH" sh "$S/stage.loader.sh" 2>&1)" || RC=$?
+    fi
     PREV="$T/esp/loader/entries/cachyos-recovery-previous.conf"
 }
 SUBVOLS=$'ID 256 gen 90 top level 5 path @\nID 300 gen 80 top level 5 path @.pre-update.20261011-1016\nID 310 gen 85 top level 5 path @.pre-update.20261012-0300\nID 320 gen 70 top level 5 path @.pre-update-notes\nID 330 gen 60 top level 5 path @.pre-update.20261013-xxxx'
@@ -5325,6 +5335,44 @@ run_loader_script "$SUBVOLS" $'title CachyOS Emergency Recovery (Bay 1)\nlinux /
 check "loader, main entry without rootflags: exit 2" "$RC" "2"
 has "loader, main entry without rootflags: says so" "$OUT" "has no rootflags=subvol=/@"
 check "loader, main entry without rootflags: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
+check "loader, two snapshots: no .new file left behind" "$(run_loader_script "$SUBVOLS" "$MAIN_ENTRY"; find "$T/esp/loader/entries" -name '*.new' | wc -l)" "0"
+# rootflags=subvol=/@ at the end of the line (no option after it)
+run_loader_script "$SUBVOLS" $'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz\noptions root=UUID=1111-2222 rw rootflags=subvol=/@'
+check "loader, rootflags last on the line: exit 0" "$RC" "0"
+has "loader, rootflags last on the line: the snapshot, at the end" "$(file "$PREV")" "options root=UUID=1111-2222 ro rootflags=subvol=/@.pre-update.20261012-0300"
+# a neighbour subvolume is not the root
+run_loader_script "$SUBVOLS" $'title CachyOS Emergency Recovery (Bay 1)\nlinux /vmlinuz\noptions root=UUID=1111-2222 rw rootflags=subvol=/@home quiet'
+check "loader, rootflags=subvol=/@home: exit 2" "$RC" "2"
+has "loader, rootflags=subvol=/@home: says so" "$OUT" "has no rootflags=subvol=/@"
+check "loader, rootflags=subvol=/@home: nothing written (the stale entry as it was)" "$(file "$PREV")" "stale"
+check "loader, rootflags=subvol=/@home: no .new file" "$(find "$T/esp/loader/entries" -name '*.new' | wc -l)" "0"
+# a listing that succeeds but names no @ is not an answer
+run_loader_script "" "$MAIN_ENTRY"
+check "loader, empty listing: exit 2" "$RC" "2"
+has "loader, empty listing: says so" "$OUT" "lists no subvolume @"
+check "loader, empty listing: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
+run_loader_script $'ID 300 gen 80 top level 5 path @.pre-update.20261011-1016' "$MAIN_ENTRY"
+check "loader, listing without @: exit 2" "$RC" "2"
+has "loader, listing without @: says so" "$OUT" "lists no subvolume @"
+check "loader, listing without @: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
+# TOP unset: the step mounts the top level itself, as the snapshot step does
+LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
+check "loader, TOP unset: exit 0" "$RC" "0"
+has "loader, TOP unset: the device of /, the whole filesystem" "$(file "$T/loader.calls")" "mount -o subvolid=5 /dev/sdz2 /run/das-vm-update/top"
+has "loader, TOP unset: unmounted after" "$(file "$T/loader.calls")" "umount /run/das-vm-update/top"
+has "loader, TOP unset: the entry written" "$(file "$PREV")" "rootflags=subvol=/@.pre-update.20261012-0300"
+: >"$T/mount.fail"
+LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
+check "loader, TOP unset, mount fails: exit 2" "$RC" "2"
+has "loader, TOP unset, mount fails: says so" "$OUT" "cannot read the top level: mount failed"
+check "loader, TOP unset, mount fails: the stale entry is left" "$([[ -e "$PREV" ]] && echo present || echo absent)" "present"
+check "loader, TOP unset, mount fails: nothing to unmount" "$(grep -c '^umount' "$T/loader.calls" || :)" "0"
+rm -f "$T/mount.fail"
+: >"$T/umount.fail"
+LOADER_TOP_UNSET=1 run_loader_script "$SUBVOLS" "$MAIN_ENTRY"
+rm -f "$T/umount.fail"
+has "loader, TOP unset, umount fails: reported" "$OUT" "cannot unmount /run/das-vm-update/top"
+has "loader, TOP unset, umount fails: the entry was still written" "$(file "$PREV")" "rootflags=subvol=/@.pre-update.20261012-0300"
 
 echo "--- across every test above: destroy is unreachable after a resume (I-1)"
 check "no virsh destroy of a domain that was resumed, in any test" "$(grep -c '^destroy after a resume' "$DESTROY_LOG")" "0"
