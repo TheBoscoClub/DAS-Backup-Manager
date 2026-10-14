@@ -1465,7 +1465,10 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64);
-            let run = ros::status_run_with(
+            // One stderr line before and after each drive: backup-run.sh
+            // logs them, and after its bound fires the last one names the
+            // drive that was being read (bd kbzr).
+            let run = ros::status_run_noting(
                 &cfg,
                 state_file.as_deref(),
                 &host,
@@ -1473,6 +1476,7 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
                 now,
                 &health::is_mountpoint,
                 &ros::mounted_uuid,
+                &mut |n| eprintln!("recovery-os: {n}"),
             );
             if json {
                 let all: Vec<_> = run.entries.iter().map(ros::entry_json).collect();
