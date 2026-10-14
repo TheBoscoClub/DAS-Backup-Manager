@@ -90,6 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The GUI's Cancel now stops the work, not only the reporting** (bd `DAS-Backup-Manager-yq2`) — a cancellation token (`progress::CancelToken`) reaches the library through the job's progress, and a job stops at its next safe boundary: a backup waiting for the DAS maintenance lock stops at once and holds no lock (it looks again every 250 ms instead of blocking in `flock`); otherwise the stage in progress — mounting, the subvolume sync, btrbk's snapshot step or send, the boot subvolume step, an index walk of one target — runs to its end and the job stops before the next, still unmounts what it mounted, lets go of its locks and records a failed run whose error says `cancelled after <stage>; not done: …` with the counts of unfinished steps unknown (NULL), never 0; a skipped boot step reads `N/A  (cancelled — not run)`. Index and restore jobs stop before each target and before restoring. `JobFinished` is `false` with that summary only when the cancel cut the work short; a cancel that came after the last stage now ends with the job's real outcome, as its `backup_runs` row has it, and says the cancel came too late — before, it was always `false`. `btrdasd` jobs carry no token and behave as before
 - **A session that never resumed the recovery OS no longer records a session time** (bd `DAS-Backup-Manager-dmxt`) — the time was written before `virsh start`, so a session refused at its start (a managed-save image, a failed start, a domain torn down while still paused) made the next session refuse "record made before this drive's last VM session ended" until a backup re-recorded the drive, although the OS never ran and the message promised a retry. It is now written just before the resume (a failure to write it tears the paused domain down: nothing boots unrecorded), and again at the give-back only for a session that resumed; `session-end` records one unless the session's state says it never resumed
 
+### Security
+
+- **Keep bd issues local**: `.beads/issues.jsonl` is now gitignored and
+  untracked, and bd's `export.git-add` is off — the issue tracker stays on
+  the maintainer's machine instead of being published with every commit
+
 ## [0.7.23.0] - 2026-10-06
 
 ### Added
