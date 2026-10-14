@@ -177,7 +177,7 @@ jobs:
 
       - name: Archive mutants.out
         if: always() && steps.diff.outputs.listed != '0'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: mutants-incremental-${{ strategy.job-index }}
           path: indexer/mutants.out
@@ -295,7 +295,7 @@ jobs:
 
       - name: Archive mutants.out
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: mutants-full-scope-${{ strategy.job-index }}
           path: indexer/mutants.out
