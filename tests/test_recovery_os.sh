@@ -23,14 +23,14 @@ for fn in check_recovery_os record_op any_op_is run_status subject_status genera
 done
 
 # shellcheck disable=SC2329  # called by the eval-extracted functions
-log_info() { :; }; log_warn() { echo "WARN: $*" >>"$WORK/log"; }; log_error() { echo "ERROR: $*" >>"$WORK/log"; }
+log_info() { echo "INFO: $*" >>"$WORK/log"; }; log_warn() { echo "WARN: $*" >>"$WORK/log"; }; log_error() { echo "ERROR: $*" >>"$WORK/log"; }
 declare -A OP_STATUS=()
 # shellcheck disable=SC2034  # read by the functions eval-extracted above
 DAS_CONFIG="$WORK/config.toml"
 # shellcheck disable=SC2034
 DAS_RECOVERY_OS_STATE="$WORK/recovery-os.json"
 # shellcheck disable=SC2034  # read by the extracted check_recovery_os
-RECOVERY_OS_TIMEOUT_SECS=300
+RECOVERY_OS_TIMEOUT_SECS=900
 BTRDASD_BIN="$WORK/btrdasd"
 
 # Stub: output, stderr and exit code chosen by files in $WORK.
@@ -49,11 +49,14 @@ STUB
 chmod +x "$BTRDASD_BIN"
 
 # Stub for coreutils timeout: records its arguments, then either reports a
-# timeout (124) or runs the command after its three option words (-k 10 N).
+# timeout (124), after the stderr the killed command had written by then
+# ($WORK/partial_err), or runs the command after its three option words
+# (-k 10 N).
 # shellcheck disable=SC2329  # called by the extracted check_recovery_os
 timeout() {
     echo "$*" >>"$WORK/timeout_calls"
     if [[ -f "$WORK/time_out" ]]; then
+        [[ -f "$WORK/partial_err" ]] && cat "$WORK/partial_err" >&2
         return 124
     fi
     shift 3
@@ -80,7 +83,7 @@ BTRBK_LATEST=""
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
 
-reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; : >"$WORK/timeout_calls"; rm -f "$WORK/err" "$WORK/no_subcommand" "$WORK/time_out"; }
+reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; : >"$WORK/timeout_calls"; rm -f "$WORK/err" "$WORK/no_subcommand" "$WORK/time_out" "$WORK/partial_err"; }
 
 # --- current ------------------------------------------------------------------
 reset
@@ -88,8 +91,8 @@ printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK
 check_recovery_os run
 check "current: OK" "${OP_STATUS[recovery_os]}" "OK"
 check "current: detail" "${OP_STATUS[recovery_os_detail]}" "nothing needs attention"
-check "the call is bounded by timeout -k 10 300" "$(cat "$WORK/timeout_calls")" \
-    "-k 10 300 $BTRDASD_BIN recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
+check "the call is bounded by timeout -k 10 900" "$(cat "$WORK/timeout_calls")" \
+    "-k 10 900 $BTRDASD_BIN recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
 check "current: section captured" "$(head -n1 <<<"$RECOVERY_OS_REPORT")" "RECOVERY OS"
 check "real run records the state file" "$(cat "$WORK/calls")" \
     "recovery-os status --config $DAS_CONFIG --state-file $DAS_RECOVERY_OS_STATE"
@@ -229,7 +232,7 @@ printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              STALE — x\n  B  
 check_recovery_os run
 check "stale and unmounted: both said" "${OP_STATUS[recovery_os_detail]}" "stale — see RECOVERY OS in the report; not mounted: B"
 
-# --- a stalled read times out ----------------------------------------------------
+# --- a slow read times out, and says which drive it was on (bd kbzr) ------------
 reset
 touch "$WORK/time_out"
 check "timeout: a bare call under set -e returns and the run continues" \
@@ -237,11 +240,41 @@ check "timeout: a bare call under set -e returns and the run continues" \
 : >"$WORK/log"
 check_recovery_os run
 check "timeout: FAIL" "${OP_STATUS[recovery_os]}" "FAIL"
-check "timeout: detail" "${OP_STATUS[recovery_os_detail]}" "recovery-os status timed out after 300 s (drive stalled?)"
+check "timeout before any note: detail" "${OP_STATUS[recovery_os_detail]}" \
+    "recovery-os status timed out after 900 s before reading any drive"
 check "timeout: the section says so" "$RECOVERY_OS_REPORT" \
-    $'RECOVERY OS\n  CHECK FAILED: recovery-os status timed out after 300 s (drive stalled?)'
+    $'RECOVERY OS\n  CHECK FAILED: recovery-os status timed out after 900 s before reading any drive'
 check "timeout: the run status is FAILURE, the exit rule is untouched" "$(run_status)" "FAILURE"
-check "timeout: logged as an error" "$(grep -c '^ERROR: .*timed out after 300 s' "$WORK/log")" "1"
+check "timeout: logged as an error" "$(grep -c '^ERROR: .*timed out after 900 s' "$WORK/log")" "1"
+check "timeout: no guessed cause" "$(grep -c 'stalled' "$WORK/log" || true)" "0"
+printf 'recovery-os: reading A at /mnt/a/@\nrecovery-os: read A in 41.2 s\nrecovery-os: reading B at /mnt/b/@\n' >"$WORK/partial_err"
+: >"$WORK/log"
+check_recovery_os run
+check "timeout mid-drive: detail names the drive" "${OP_STATUS[recovery_os_detail]}" \
+    "recovery-os status timed out after 900 s while reading B at /mnt/b/@"
+check "timeout mid-drive: the notes are info, not warnings" "$(grep -c '^WARN: ' "$WORK/log" || true)" "0"
+check "timeout mid-drive: the earlier drive's time is logged" "$(grep -c '^INFO: .*read A in 41.2 s$' "$WORK/log")" "1"
+printf 'recovery-os: reading A at /mnt/a/@\nrecovery-os: read A in 41.2 s\n' >"$WORK/partial_err"
+check_recovery_os run
+check "timeout after the last drive: detail says so" "${OP_STATUS[recovery_os_detail]}" \
+    "recovery-os status timed out after 900 s after reading every mounted drive"
+rm -f "$WORK/partial_err" "$WORK/time_out"
+
+# --- the notes of a finished run are info; real stderr still warns ------------------
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    Result              current\n' >"$WORK/out"; echo 0 >"$WORK/rc"
+printf 'recovery-os: reading A at /mnt/a/@\nrecovery-os: read A in 3.0 s\n' >"$WORK/err"
+: >"$WORK/log"
+check_recovery_os run
+check "notes only: OK" "${OP_STATUS[recovery_os]}" "OK"
+check "notes only: no warning" "$(grep -c '^WARN: ' "$WORK/log" || true)" "0"
+check "notes only: both logged at info" "$(grep -cxE 'INFO:   (reading A at /mnt/a/@|read A in 3\.0 s)' "$WORK/log")" "2"
+printf 'recovery-os: reading A at /mnt/a/@\nError: x\nsecond\n' >"$WORK/err"; echo 2 >"$WORK/rc"
+: >"$WORK/log"
+check_recovery_os run
+check "a real error beside the notes: its first line is the detail" "${OP_STATUS[recovery_os_detail]}" "exit code 2: Error: x"
+check "a real error beside the notes: the rest still warns" "$(grep -c '^WARN:   second$' "$WORK/log")" "1"
+rm -f "$WORK/err"
 
 # --- a corrupt state file: the way out reaches the report ----------------------
 reset
@@ -259,7 +292,7 @@ check "the script defaults DAS_RECOVERY_OS_STATE, the name the Rust side reads" 
     "$(grep -c '^DAS_RECOVERY_OS_STATE="${DAS_RECOVERY_OS_STATE:-/var/lib/das-backup/recovery-os.json}"$' "$SCRIPT")" "1"
 check "no other name for it remains" "$(grep -cE '(\$\{?|^)RECOVERY_OS_STATE([^_A-Z]|$)' "$SCRIPT" || true)" "0"
 # shellcheck disable=SC2016
-check "the timeout bound is 300 s" "$(grep -c '^RECOVERY_OS_TIMEOUT_SECS=300$' "$SCRIPT")" "1"
+check "the timeout bound is 900 s" "$(grep -c '^RECOVERY_OS_TIMEOUT_SECS=900$' "$SCRIPT")" "1"
 
 # --- main(): wiring -------------------------------------------------------------
 main_body="$(awk '/^main\(\) \{/,/^}/' "$SCRIPT")"

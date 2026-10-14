@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.13.1
-# Date: 2026-10-12
+# Version: 4.14.0
+# Date: 2026-10-14
 #
 # Features:
+#   - A Recovery OS timeout says where it was (v4.14.0, bd kbzr): the bound is
+#     900 s (it was 300 s, passed on 2026-10-14 with no fault in the kernel log),
+#     `btrdasd recovery-os status` notes each drive on stderr before
+#     and after reading it, those notes are logged as information, and a
+#     timeout names the drive it was reading instead of guessing a stall.
 #   - State index pass (v4.13.0): after the indexer, run_state_pass() sends
 #     the /var/lib/das-backup state subvolume (snapshot series das-state) to
 #     every mounted target in one btrbk call, so each target's index copy
@@ -263,8 +268,8 @@
 #     reads each role=mirror drive's own OS under @ (never writes to the
 #     drive, not even an access time) and records the reading in
 #     $DAS_RECOVERY_OS_STATE for `btrdasd health` (not in a dry run). The read
-#     is bounded by `timeout` (RECOVERY_OS_TIMEOUT_SECS, 300 s): a stalled
-#     drive costs a FAIL, never the run. A stale OS records WARN: the status line
+#     is bounded by `timeout` (RECOVERY_OS_TIMEOUT_SECS, 900 s since v4.14.0):
+#     a read that does not end costs a FAIL, never the run. A stale OS records WARN: the status line
 #     reads COMPLETED WITH WARNINGS and the subject SUCCESS WITH WARNINGS, but
 #     the run is recorded as a success, because the backup itself worked. A
 #     check that cannot run records FAIL. Neither stops the run
@@ -1446,11 +1451,13 @@ RECOVERY_OS_REPORT=""
 # the same variable btrdasd itself reads (`btrdasd health`), defaulting to
 # the same path as recovery_os's RECOVERY_OS_STATE_PATH.
 DAS_RECOVERY_OS_STATE="${DAS_RECOVERY_OS_STATE:-/var/lib/das-backup/recovery-os.json}"
-# Upper bound on reading the recovery OSes. A drive stalled in I/O must cost a
-# FAIL line, not the run: unmount and the report still have to happen. `-k 10`
+# Upper bound on reading the recovery OSes. A read that does not end must cost
+# a FAIL line, not the run: unmount and the report still have to happen. `-k 10`
 # follows the TERM with a KILL (a process stuck in uninterruptible I/O still
 # cannot be killed until the I/O returns; nothing in userspace can do that).
-RECOVERY_OS_TIMEOUT_SECS=300
+# 900 s, not 300: a cold read of two OSes over USB took 11 to 202 s on ordinary
+# nights and passed 300 s on 2026-10-14 with no fault in the kernel log (bd kbzr).
+RECOVERY_OS_TIMEOUT_SECS=900
 # Dry run only: the btrbk.conf the real run would leave, rendered by sync into
 # a mktemp file (mode 600) that `btrbk dryrun` reads. Removed by cleanup().
 DRYRUN_BTRBK_CONF=""
@@ -1598,6 +1605,17 @@ check_recovery_os() {
         # No temp file: stderr goes to the journal instead of the detail.
         RECOVERY_OS_REPORT="$("${bounded[@]}")" || rc=$?
     fi
+    # `recovery-os: ` lines are the command's per-drive notes (reading <drive>
+    # at <root>, read <drive> in N s): logged as information, kept out of the
+    # error text, and after a timeout the last unfinished one names the drive.
+    local notes="" reading=""
+    notes="$(awk '/^recovery-os: / { sub(/^recovery-os: /, ""); print }' <<<"$err")"
+    err="$(awk '!/^recovery-os: /' <<<"$err")"
+    reading="$(awk '/^reading / { cur = $0 } /^read / { cur = "" } END { print cur }' <<<"$notes")"
+    if [[ -n "$notes" ]]; then
+        local note
+        while IFS= read -r note; do log_info "  $note"; done <<<"$notes"
+    fi
     local first_err="${err%%$'\n'*}"
 
     # Which drives were not looked at, whether any was, and what an exit 1
@@ -1639,8 +1657,16 @@ check_recovery_os() {
             record_op "recovery_os" "WARN" "$why — see RECOVERY OS in the report${suffix}"
             ;;
         124)
-            record_op "recovery_os" "FAIL" "recovery-os status timed out after ${RECOVERY_OS_TIMEOUT_SECS} s (drive stalled?)"
-            log_error "The recovery OS check timed out after ${RECOVERY_OS_TIMEOUT_SECS} s (drive stalled?)"
+            local where
+            if [[ -n "$reading" ]]; then
+                where="while $reading"
+            elif [[ -n "$notes" ]]; then
+                where="after reading every mounted drive"
+            else
+                where="before reading any drive"
+            fi
+            record_op "recovery_os" "FAIL" "recovery-os status timed out after ${RECOVERY_OS_TIMEOUT_SECS} s $where"
+            log_error "The recovery OS check timed out after ${RECOVERY_OS_TIMEOUT_SECS} s $where"
             RECOVERY_OS_REPORT="RECOVERY OS"$'\n'"  CHECK FAILED: ${OP_STATUS[recovery_os_detail]}"
             ;;
         *)
@@ -3307,7 +3333,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.13.1
+  backup-run.sh v4.14.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

@@ -490,6 +490,11 @@ fn read_in_root(root: &Path, rel: &str) -> Result<String, ReadErr> {
 /// `O_NOATIME` (`std::fs::read_dir` takes no open flags, and `readdir`
 /// updates a directory's atime like `read` does a file's).
 fn dir_names_noatime(path: &Path) -> std::io::Result<Vec<String>> {
+    dir_entries_noatime(path).map(|v| v.into_iter().map(|(name, _)| name).collect())
+}
+
+/// [`dir_names_noatime`] with each entry's `d_type` as `readdir` gave it.
+fn dir_entries_noatime(path: &Path) -> std::io::Result<Vec<(String, u8)>> {
     use std::os::fd::IntoRawFd;
     let fd = open_noatime(path, DIR_FLAGS)?.into_raw_fd();
     // SAFETY: `fd` is an open directory descriptor this function owns; on
@@ -521,7 +526,8 @@ fn dir_names_noatime(path: &Path) -> std::io::Result<Vec<String>> {
         let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
         let name = name.to_string_lossy();
         if name != "." && name != ".." {
-            names.push(name.into_owned());
+            // SAFETY: as for d_name above.
+            names.push((name.into_owned(), unsafe { (*ent).d_type }));
         }
     };
     // SAFETY: `dirp` came from fdopendir and is closed exactly once.
@@ -529,14 +535,31 @@ fn dir_names_noatime(path: &Path) -> std::io::Result<Vec<String>> {
     result.map(|()| names)
 }
 
+/// Whether a listed entry is a directory: by its `d_type`, which costs no
+/// read of the entry's inode, and by `lstat` only where the filesystem left
+/// it `DT_UNKNOWN`. A symlink is never one (bd kbzr: one `lstat` per entry
+/// was thousands of cold seeks on a recovery drive's pacman database).
+fn listed_dir(d_type: u8, lstat_is_dir: impl FnOnce() -> bool) -> bool {
+    match d_type {
+        libc::DT_DIR => true,
+        libc::DT_UNKNOWN => lstat_is_dir(),
+        _ => false,
+    }
+}
+
 /// The names of the subdirectories of a directory under `root`, sorted.
 fn list_in_root(root: &Path, rel: &str) -> Result<Vec<String>, ReadErr> {
     let path = resolve_in_root(root, rel)?;
-    let mut names: Vec<String> = dir_names_noatime(&path)
+    let mut names: Vec<String> = dir_entries_noatime(&path)
         .map_err(|e| io_error(rel, &e))?
         .into_iter()
         // lstat: a stat would follow a symlinked entry and touch its atime.
-        .filter(|n| fs::symlink_metadata(path.join(n)).is_ok_and(|m| m.is_dir()))
+        .filter(|(n, t)| {
+            listed_dir(*t, || {
+                fs::symlink_metadata(path.join(n)).is_ok_and(|m| m.is_dir())
+            })
+        })
+        .map(|(n, _)| n)
         .collect();
     names.sort();
     Ok(names)
@@ -643,6 +666,16 @@ fn parse_desc(text: &str) -> Option<(String, String)> {
     Some((field("%NAME%")?, field("%VERSION%")?))
 }
 
+/// The package a pacman local database entry is, by its directory name, as
+/// libalpm reads it (`_alpm_splitname`): `name-pkgver-pkgrel`, split at the
+/// last two hyphens, none of the three empty. `None` is an entry libalpm
+/// would skip as invalid.
+fn pacman_entry_name(entry: &str) -> Option<&str> {
+    let (rest, rel) = entry.rsplit_once('-')?;
+    let (name, ver) = rest.rsplit_once('-')?;
+    (!name.is_empty() && !ver.is_empty() && !rel.is_empty()).then_some(name)
+}
+
 /// Read a recovery OS root (`<mount>/@`). Pure reads; see the module doc.
 /// An absent item is left `None`/unread; an unreadable one is also listed in
 /// `problems`.
@@ -685,37 +718,53 @@ fn inspect_with(root: &Path, probe: MountFlags) -> RecoveryOs {
         Err(e) => unreadable(e, &mut os.problems),
     }
     // Whether the guest agent's package is in the database: None when that
-    // cannot be told (the database not listed, or an entry in it unreadable,
-    // which might be that package's).
+    // cannot be told (the database not listed, the agent's own entry
+    // unreadable, or an entry pacman cannot name, which might be the agent's).
+    // Entries are named by their directory, as pacman names them
+    // ([`pacman_entry_name`]); only a watched package's desc is opened, so a
+    // database of thousands of packages costs a handful of reads (bd kbzr).
     let mut agent_installed: Option<bool> = None;
     match list_in_root(root, PACMAN_LOCAL) {
         Ok(entries) => {
             os.packages_read = true;
             let mut seen = Some(false);
             for entry in entries {
+                let Some(dir_name) = pacman_entry_name(&entry) else {
+                    seen = None;
+                    os.problems.push(format!(
+                        "{PACMAN_LOCAL}/{entry}: not a name-version-release entry"
+                    ));
+                    continue;
+                };
+                let agent = dir_name == GUEST_AGENT_PACKAGE;
+                if !agent && !WATCHED_PACKAGES.contains(&dir_name) {
+                    continue;
+                }
                 let rel = format!("{PACMAN_LOCAL}/{entry}/desc");
-                match read_in_root(root, &rel) {
-                    Ok(text) => {
-                        if let Some((name, version)) = parse_desc(&text) {
-                            if name == GUEST_AGENT_PACKAGE && seen.is_some() {
-                                seen = Some(true);
-                            }
-                            if WATCHED_PACKAGES.contains(&name.as_str()) {
+                let problem = match read_in_root(root, &rel) {
+                    Ok(text) => match parse_desc(&text) {
+                        Some((name, version)) if name == dir_name => {
+                            if agent {
+                                seen = seen.map(|_| true);
+                            } else {
                                 os.packages.insert(name, version);
                             }
+                            continue;
                         }
-                    }
+                        Some((name, _)) => format!(
+                            "{rel}: names {name}, not {dir_name} (pacman's database is inconsistent)"
+                        ),
+                        None => format!("{rel}: no %NAME% and %VERSION%"),
+                    },
                     // An entry without its desc is a damaged database, not
-                    // an absent package: the entry might be a watched one.
-                    Err(ReadErr::Absent) => {
-                        seen = None;
-                        os.problems.push(format!("{rel}: absent"));
-                    }
-                    Err(ReadErr::Unreadable(why)) => {
-                        seen = None;
-                        os.problems.push(why);
-                    }
+                    // an absent package.
+                    Err(ReadErr::Absent) => format!("{rel}: absent"),
+                    Err(ReadErr::Unreadable(why)) => why,
+                };
+                if agent {
+                    seen = None;
                 }
+                os.problems.push(problem);
             }
             agent_installed = seen;
         }
@@ -1177,6 +1226,20 @@ pub fn status_with(
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<DriveEntry> {
+    status_noting(cfg, host, today, is_mounted, fs_uuid, &mut |_| {})
+}
+
+/// [`status_with`], handing `note` a line before each mounted drive is read
+/// (`reading <label> at <root>`) and one after (`read <label> in <N.N> s`):
+/// a bound that stops the read still leaves the drive it was on (bd kbzr).
+pub fn status_noting(
+    cfg: &Config,
+    host: &HostVersions,
+    today: &str,
+    is_mounted: &dyn Fn(&Path) -> bool,
+    fs_uuid: &dyn Fn(&Path) -> Option<String>,
+    note: &mut dyn FnMut(String),
+) -> Vec<DriveEntry> {
     let max = cfg.recovery_os.max_age_days;
     cfg.targets
         .iter()
@@ -1185,9 +1248,16 @@ pub fn status_with(
             let root = os_root(&t.mount);
             let mount = Path::new(&t.mount);
             if is_mounted(mount) {
+                note(format!("reading {} at {}", t.label, root.display()));
+                let started = std::time::Instant::now();
                 let before = fs_uuid(mount);
                 let mut entry = inspect_drive(&t.label, &root, host, today, max);
                 let after = fs_uuid(mount);
+                note(format!(
+                    "read {} in {:.1} s",
+                    t.label,
+                    started.elapsed().as_secs_f64()
+                ));
                 entry.mount_uuid = before.filter(|b| after.as_ref() == Some(b));
                 entry
             } else {
@@ -1694,7 +1764,31 @@ pub fn status_run_with(
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
 ) -> StatusRun {
-    let entries = status_with(cfg, host, today, is_mounted, fs_uuid);
+    status_run_noting(
+        cfg,
+        state_file,
+        host,
+        today,
+        now_epoch,
+        is_mounted,
+        fs_uuid,
+        &mut |_| {},
+    )
+}
+
+/// [`status_run_with`], with [`status_noting`]'s per-drive notes.
+#[allow(clippy::too_many_arguments)]
+pub fn status_run_noting(
+    cfg: &Config,
+    state_file: Option<&Path>,
+    host: &HostVersions,
+    today: &str,
+    now_epoch: i64,
+    is_mounted: &dyn Fn(&Path) -> bool,
+    fs_uuid: &dyn Fn(&Path) -> Option<String>,
+    note: &mut dyn FnMut(String),
+) -> StatusRun {
+    let entries = status_noting(cfg, host, today, is_mounted, fs_uuid, note);
     let state_error = state_file.and_then(|p| write_state(p, &entries, now_epoch).err());
     let code = if state_error.is_some() {
         2
@@ -3122,38 +3216,138 @@ mod tests {
     }
 
     #[test]
-    fn packages_are_matched_by_their_name_field_not_the_directory() {
+    fn packages_are_found_by_directory_name_as_pacman_finds_them() {
+        // libalpm names a local entry by its directory (`_alpm_splitname`:
+        // name-pkgver-pkgrel) and calls a desc naming another package an
+        // inconsistent database. Only a watched name's desc is opened.
         let dir = tempfile::tempdir().unwrap();
-        // The directory looks like linux-cachyos; the package is not.
+        // The directory says linux-cachyos; its desc says otherwise.
         add_pkg(
             dir.path(),
             "linux-cachyos-6.0-1",
             "linux-cachyos-lts",
             "6.0-1",
         );
+        // A desc naming btrbk in a directory that names another package is
+        // not btrbk, to pacman or to us.
         add_pkg(dir.path(), "odd-dir-name", "btrbk", "0.33.0-1");
-        // A desc with no name is skipped, and so is a directory with no desc.
-        write(
-            dir.path(),
-            "var/lib/pacman/local/broken-1-1/desc",
-            "%VERSION%\n1-1\n",
-        );
-        fs::create_dir_all(dir.path().join("var/lib/pacman/local/nodesc-1-1")).unwrap();
+        add_pkg(dir.path(), "btrfs-progs-6.10-1", "btrfs-progs", "6.10-1");
         let os = inspect(dir.path());
         assert!(os.packages_read);
         assert_eq!(os.packages.get("linux-cachyos"), None);
+        assert_eq!(os.packages.get("btrbk"), None);
         assert_eq!(
-            os.packages.get("btrbk").map(String::as_str),
-            Some("0.33.0-1")
+            os.packages.get("btrfs-progs").map(String::as_str),
+            Some("6.10-1")
         );
         assert_eq!(os.packages.len(), 1, "{:?}", os.packages);
+        assert_eq!(
+            os.problems,
+            vec![
+                "var/lib/pacman/local/linux-cachyos-6.0-1/desc: names \
+                 linux-cachyos-lts, not linux-cachyos (pacman's database is inconsistent)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_watched_packages_desc_is_opened() {
+        // A desc that cannot be read as a file would be a problem if it were
+        // opened: one of a package nobody watches is not, and costs no read.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/vim-9.1-1/desc")).unwrap();
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/nodesc-1-1")).unwrap();
+        let os = inspect(dir.path());
+        assert!(os.packages_read);
+        assert!(os.packages.is_empty(), "{:?}", os.packages);
         assert!(
-            os.problems
-                .iter()
-                .any(|p| p.starts_with("var/lib/pacman/local/nodesc-1-1/desc: ")),
+            !os.problems.iter().any(|p| p.contains("pacman/local")),
             "{:?}",
             os.problems
         );
+        // The same damage on a watched package is a problem.
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/btrbk-0.32.6-1/desc")).unwrap();
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/btrfs-progs-6.10-1")).unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.problems,
+            vec![
+                "var/lib/pacman/local/btrbk-0.32.6-1/desc: not a regular file".to_string(),
+                "var/lib/pacman/local/btrfs-progs-6.10-1/desc: absent".to_string(),
+            ]
+        );
+        // A desc with no name is not a version of anything.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "var/lib/pacman/local/btrbk-1-1/desc",
+            "%VERSION%\n1-1\n",
+        );
+        let os = inspect(dir.path());
+        assert_eq!(os.packages.get("btrbk"), None);
+        assert_eq!(
+            os.problems,
+            vec!["var/lib/pacman/local/btrbk-1-1/desc: no %NAME% and %VERSION%".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_database_entry_pacman_cannot_name_is_a_problem() {
+        // Fewer than two hyphens: libalpm skips it as an invalid entry name,
+        // so it might have been anything, a watched package included.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/garbage")).unwrap();
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/a-1")).unwrap();
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/-1-1")).unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.problems,
+            vec![
+                "var/lib/pacman/local/-1-1: not a name-version-release entry".to_string(),
+                "var/lib/pacman/local/a-1: not a name-version-release entry".to_string(),
+                "var/lib/pacman/local/garbage: not a name-version-release entry".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_listing_keeps_a_directory_by_its_dirent_type_and_lstats_only_unknown() {
+        let never = || -> bool { panic!("lstat called for a typed entry") };
+        assert!(listed_dir(libc::DT_DIR, never));
+        assert!(!listed_dir(libc::DT_LNK, never));
+        assert!(!listed_dir(libc::DT_REG, never));
+        assert!(!listed_dir(libc::DT_FIFO, never));
+        assert!(listed_dir(libc::DT_UNKNOWN, || true));
+        assert!(!listed_dir(libc::DT_UNKNOWN, || false));
+    }
+
+    #[test]
+    fn a_symlinked_or_file_entry_is_not_a_listed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("usr/lib/modules/6.12.1-1-cachyos")).unwrap();
+        fs::create_dir_all(dir.path().join("elsewhere/7.0.0-1")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("elsewhere/7.0.0-1"),
+            dir.path().join("usr/lib/modules/7.0.0-1"),
+        )
+        .unwrap();
+        write(dir.path(), "usr/lib/modules/8.0.0-1", "a file\n");
+        let os = inspect(dir.path());
+        assert_eq!(os.kernels, vec!["6.12.1-1-cachyos".to_string()]);
+    }
+
+    #[test]
+    fn a_pacman_entry_name_splits_at_its_last_two_hyphens() {
+        assert_eq!(
+            pacman_entry_name("linux-cachyos-lts-6.6.5-2"),
+            Some("linux-cachyos-lts")
+        );
+        assert_eq!(pacman_entry_name("btrbk-1:0.32.6-1"), Some("btrbk"));
+        assert_eq!(pacman_entry_name("a-b-c"), Some("a"));
+        for bad in ["", "a", "a-1", "-1-1", "a--1", "a-1-", "a-b-", "--"] {
+            assert_eq!(pacman_entry_name(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -3424,6 +3618,51 @@ mod tests {
         assert!(
             matches!(entries[2].report, DriveReport::Unreadable(_)),
             "mounted, no @"
+        );
+    }
+
+    #[test]
+    fn status_notes_each_mounted_drive_before_and_after_reading_it() {
+        // A bound that kills the run mid-read must still say which drive it
+        // was reading, so the first note goes out before the read (bd kbzr).
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        full_root(&a.path().join("@"));
+        let cfg = mirror_config(&[
+            ("A", a.path().to_str().unwrap()),
+            ("B", b.path().to_str().unwrap()),
+        ]);
+        let mounted = [a.path().to_path_buf()];
+        let is_mounted = |p: &Path| mounted.iter().any(|m| m == p);
+        let mut notes: Vec<String> = Vec::new();
+        let run = status_run_noting(
+            &cfg,
+            None,
+            &host("7.2.8"),
+            TODAY,
+            1,
+            &is_mounted,
+            &no_uuid,
+            &mut |n| notes.push(n),
+        );
+        assert_eq!(run.entries.len(), 2);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(
+            notes[0],
+            format!("reading A at {}", a.path().join("@").display())
+        );
+        let secs = notes[1]
+            .strip_prefix("read A in ")
+            .and_then(|r| r.strip_suffix(" s"))
+            .unwrap_or_else(|| panic!("{:?}", notes[1]));
+        assert!(
+            secs.parse::<f64>().is_ok_and(|v| (0.0..60.0).contains(&v)),
+            "{secs}"
+        );
+        assert_eq!(
+            secs.split_once('.').map(|(_, f)| f.len()),
+            Some(1),
+            "{secs}"
         );
     }
 
@@ -4745,10 +4984,25 @@ mod tests {
 
     #[test]
     fn the_guest_agent_is_unknown_when_pacmans_database_is_not_whole() {
-        // An entry without its desc might be the agent's.
+        // The agent's own entry without its desc.
         let dir = tempfile::tempdir().unwrap();
         agent_root(dir.path());
-        fs::create_dir_all(dir.path().join("var/lib/pacman/local/broken-1-1")).unwrap();
+        fs::remove_file(
+            dir.path()
+                .join("var/lib/pacman/local/qemu-guest-agent-11.0.0-1/desc"),
+        )
+        .unwrap();
+        let os = inspect(dir.path());
+        assert_eq!(
+            os.guest_agent,
+            GuestAgent::Unreadable {
+                reason: "pacman's database could not be read in full".into()
+            }
+        );
+        // An entry pacman cannot name might be the agent's.
+        let dir = tempfile::tempdir().unwrap();
+        agent_root(dir.path());
+        fs::create_dir_all(dir.path().join("var/lib/pacman/local/garbage")).unwrap();
         let os = inspect(dir.path());
         assert_eq!(
             os.guest_agent,
