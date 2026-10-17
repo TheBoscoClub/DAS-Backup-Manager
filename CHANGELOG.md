@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **live-sync baseline**: an empty `live-sync.conf` and the live-sync pre-commit gate, so a file this project
+  later keeps on NVMe has a managed home; `live-sync audit` reports any unmanaged dependency
 - **The unattended update proves the desktop** — after its reboot the pipeline waits for `kwin_wayland` and `plasmashell` (as provision's first boot does); a run without them stops at `desktop` (exit 7), and a run that saw them records `"desktop":"proven"` in its history row. An upgrade that left the desktop dead finished clean before (2026-10-07)
 - **Slot B holds the last known good pair** — the slot step refreshes the previous-root pair only when the drive's last session proved its desktop and ended clean or with warnings; otherwise it keeps the pair it has (`slot B kept: <why>`), or, with none to keep, takes the current one
 
