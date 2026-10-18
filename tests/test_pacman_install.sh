@@ -34,7 +34,7 @@ SCRIPT="${PACMAN_INSTALL_SCRIPT:-$REPO_ROOT/.github/scripts/pacman-install.sh}"
 WORKFLOWS="$REPO_ROOT/.github/workflows"
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 PACMAN_BIN="$WORK/pacman-bin"
 SLEEP_BIN="$WORK/sleep-bin"
@@ -574,7 +574,7 @@ expect "both Server lines are whole, clean lines: nothing was glued onto the old
 end_case
 
 new_case "mirror guard: an unreadable mirror list is an error, and nothing is installed"
-rm -f "$ROOT/etc/pacman.d/mirrorlist"
+rm -f "${ROOT:?}/etc/pacman.d/mirrorlist"
 run_std -- "${PKGS[@]}"
 if ((RC != 0)); then pass "exit status is nonzero ($RC)"; else fail "exited 0 with no mirror list"; fi
 expect "pacman never called" "" "$(kinds)"

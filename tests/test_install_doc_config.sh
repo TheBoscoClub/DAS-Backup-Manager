@@ -54,7 +54,7 @@ if [[ ! -x "$btrdasd" ]]; then
 fi
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 config="$work/config.toml"
 
 fails=0

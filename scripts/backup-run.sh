@@ -1490,7 +1490,7 @@ sync_subvolumes() {
     SUBVOL_SYNC_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
     if [[ -n "${DRYRUN_BTRBK_CONF:-}" && ! -s "$DRYRUN_BTRBK_CONF" ]]; then
         log_warn "Sync rendered no btrbk.conf for the dry run — btrbk dryrun uses the current one"
-        rm -f -- "$DRYRUN_BTRBK_CONF"
+        rm -f -- "${DRYRUN_BTRBK_CONF:?}"
         DRYRUN_BTRBK_CONF=""
     fi
     if [[ $rc -eq 0 ]]; then
@@ -1600,7 +1600,7 @@ check_recovery_os() {
     if [[ -n "$errf" ]]; then
         RECOVERY_OS_REPORT="$("${bounded[@]}" 2>"$errf")" || rc=$?
         err="$(<"$errf")"
-        rm -f -- "$errf"
+        rm -f -- "${errf:?}"
     else
         # No temp file: stderr goes to the journal instead of the detail.
         RECOVERY_OS_REPORT="$("${bounded[@]}")" || rc=$?
@@ -2293,17 +2293,17 @@ update_boot_subvolumes() {
     plan_rc="${plan_last#status=}"
     if [[ "$plan_last" != status=* || ! "$plan_rc" =~ ^[[:digit:]]+$ ]]; then
         log_error "  Could not read the boot plan: no answer (its output could not be captured) — boot subvolumes NOT updated"
-        rm -f "$plan_err"
+        [[ -z "${plan_err:-}" ]] || rm -f "${plan_err:?}"
         record_op "boot_subvols" "FAIL" "0 updated, 1 failed"
         return
     fi
     if (( plan_rc != 0 )); then
         log_error "  Could not read the boot plan: $(tr '\n' ' ' <"$plan_err")(exit $plan_rc) — boot subvolumes NOT updated"
-        rm -f "$plan_err"
+        [[ -z "${plan_err:-}" ]] || rm -f "${plan_err:?}"
         record_op "boot_subvols" "FAIL" "0 updated, 1 failed"
         return
     fi
-    rm -f "$plan_err"
+    [[ -z "${plan_err:-}" ]] || rm -f "${plan_err:?}"
     plan="${plan_out%"$plan_last"}"
 
     # Mount state first, for EVERY target, before anything is written: a target
@@ -2393,18 +2393,18 @@ update_boot_subvolumes() {
         if [[ "$subvol_last" != status=* || ! "$subvol_rc" =~ ^[[:digit:]]+$ ]]; then
             log_error "  [$label] Could not list subvolumes: no answer (its output could not be captured)"
             log_error "  [$label] Refusing to treat an unreadable target as 'no snapshots'"
-            rm -f "$subvol_err"
+            [[ -z "${subvol_err:-}" ]] || rm -f "${subvol_err:?}"
             (( failed += 1 ))
             continue
         fi
         if (( subvol_rc != 0 )); then
             log_error "  [$label] Could not list subvolumes: $(tr '\n' ' ' <"$subvol_err")(exit $subvol_rc)"
             log_error "  [$label] Refusing to treat an unreadable target as 'no snapshots'"
-            rm -f "$subvol_err"
+            [[ -z "${subvol_err:-}" ]] || rm -f "${subvol_err:?}"
             (( failed += 1 ))
             continue
         fi
-        rm -f "$subvol_err"
+        [[ -z "${subvol_err:-}" ]] || rm -f "${subvol_err:?}"
         subvol_listing="${subvol_out%"$subvol_last"}"
         subvol_listing="${subvol_listing%$'\n'}"
 
@@ -2833,7 +2833,7 @@ capture_report_data() {
     if ! BTRBK_LATEST=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>"$latest_err" | awk 'NR>1{printf "  %s\n", $0}'); then
         BTRBK_LATEST="  (unavailable: btrbk list latest failed: $(head -n1 "$latest_err"))"
     fi
-    rm -f "$latest_err"
+    [[ -z "${latest_err:-}" ]] || rm -f "${latest_err:?}"
 
     # Machine-readable copy for the DB counters. The human table's STATUS column
     # is presentation, not API: btrbk 0.32.7 renders it as "-" for every row and
@@ -2856,7 +2856,7 @@ capture_report_data() {
         BTRBK_LATEST_RAW=""
         log_warn "btrbk list latest failed — snapshot counters are UNKNOWN, not zero: $(tr '\n' ' ' <"$raw_err")"
     fi
-    rm -f "$raw_err"
+    [[ -z "${raw_err:-}" ]] || rm -f "${raw_err:?}"
 }
 
 # Log throughput report for all targets
@@ -3966,7 +3966,7 @@ cleanup() {
     # The dry run's planned btrbk.conf goes on every exit path, before either
     # early return below.
     if [[ -n "${DRYRUN_BTRBK_CONF:-}" ]]; then
-        rm -f -- "$DRYRUN_BTRBK_CONF"
+        rm -f -- "${DRYRUN_BTRBK_CONF:?}"
     fi
 
     # SCRIPT_COMPLETED == "true": main() already ran unmount_all()/

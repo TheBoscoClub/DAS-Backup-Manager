@@ -32,7 +32,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 for fn in decide_run_counts record_run_args record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status generate_report; do
@@ -100,7 +100,7 @@ reset() {
     BACKUP_RUN_RECORDED="false"
     eval "$init"
     echo 0 >"$WORK/rc"
-    rm -f "$WORK/err" "$WORK/args" "$WORK/calls" "$WORK/sent_subjects" "$WORK/sent_report"
+    rm -f "${WORK:?}/err" "${WORK:?}/args" "${WORK:?}/calls" "${WORK:?}/sent_subjects" "${WORK:?}/sent_report"
     : >"$WORK/log"
 }
 

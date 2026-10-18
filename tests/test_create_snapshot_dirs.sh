@@ -41,7 +41,7 @@ if [[ ! -f "$SCRIPT" ]]; then
 fi
 
 WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+trap 'rm -rf "${WORKDIR:?}"' EXIT
 
 mkdir -p \
     "$WORKDIR/vol-nvme" \

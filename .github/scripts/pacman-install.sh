@@ -245,7 +245,7 @@ main() {
     ensure_parallel_downloads "$conf"
 
     SCRATCH=$(mktemp -d)
-    trap 'rm -rf "$SCRATCH"' EXIT
+    trap 'rm -rf "${SCRATCH:?}"' EXIT
 
     for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
         log "attempt $attempt/$ATTEMPTS, first mirror ${HOSTS[0]}: pacman -Syu --noconfirm $*"

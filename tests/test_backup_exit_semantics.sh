@@ -753,8 +753,9 @@ replay() { # replay <name>
         return
     fi
     local db="$WORK/replay.db" out json i
+    local db_wal="${WORK:?}/replay.db-wal" db_shm="${WORK:?}/replay.db-shm"
     local -a v=()
-    rm -f "$db" "$db-wal" "$db-shm"
+    rm -f "${db:?}" "${db_wal:?}" "${db_shm:?}"
     mapfile -d '' -t v <"$STATE/record_vec"
     for ((i = 0; i < ${#v[@]} - 1; i++)); do
         [[ "${v[i]}" == --db ]] && v[i + 1]="$db"
@@ -896,7 +897,7 @@ wait_comm() {
 # whoever PID 1 is, until its parent is killed. ZOMBIE_PARENT and ZOMBIE_CHILD.
 make_zombie() { # make_zombie <child program> [args]
     local pidfile="$WORK/zombie.child" i
-    rm -f "$pidfile"
+    rm -f "${pidfile:?}"
     (
         "$@" >/dev/null 2>&1 &
         echo "$!" >"$pidfile"
@@ -982,7 +983,7 @@ live sleep 60
 LIVE_FOR_MAIL="$LIVE_PID"
 mail_state() { # mail_state [first pid-file's content [second's]]: what mail_stubs_gone says
     local dir="$WORK/mail-state"
-    rm -rf "$dir"
+    rm -rf "${dir:?}"
     mkdir -p "$dir"
     [[ $# -ge 1 ]] && printf '%s\n' "$1" >"$dir/mail_stall.pid"
     [[ $# -ge 2 ]] && printf '%s\n' "$2" >"$dir/mail_stall_child.pid"
@@ -1666,7 +1667,7 @@ reader=$!
 ) 2>/dev/null
 RC=$?
 wait "$reader" 2>/dev/null
-rm -f "$WORK/stream"
+rm -f "${WORK:?}/stream"
 tripwire
 check "stdout gone mid-run: exit status (SIGPIPE)" "$RC" "141"
 check "stdout gone mid-run: recorded as failed" "$(recorded_as)" "failure"

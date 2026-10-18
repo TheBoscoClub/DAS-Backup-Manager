@@ -17,7 +17,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 for fn in run_state_pass record_op any_op_is subject_status format_bytes; do
     body="$(extract "$fn")"
@@ -88,8 +88,8 @@ get_used_bytes() {
 fixture() {
     write_conf "$DAS_BTRBK_CONF"
     unset DAS_BTRBK_STATE_CONF
-    rm -f "$WORK/gu.fails" "$WORK/gu.shrinks" "$WORK/btrfs.calls" "$WORK/btrfs.fails"
-    rm -f "$WORK/btrbk.calls" "$WORK/btrbk.fails" "$WORK/log"
+    rm -f "${WORK:?}/gu.fails" "${WORK:?}/gu.shrinks" "${WORK:?}/btrfs.calls" "${WORK:?}/btrfs.fails"
+    rm -f "${WORK:?}/btrbk.calls" "${WORK:?}/btrbk.fails" "${WORK:?}/log"
     OP_STATUS=()
     TARGET_MOUNTS=([primary-22tb]=/mnt/backup-22tb [system-recovery-A-2tb]=/mnt/backup-system-recovery-A [system-recovery-B-2tb]=/mnt/backup-system-recovery-B)
     TARGET_ROLES=([primary-22tb]=primary [system-recovery-A-2tb]=mirror [system-recovery-B-2tb]=mirror)

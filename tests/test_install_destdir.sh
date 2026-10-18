@@ -73,7 +73,7 @@ if [[ ! -f "$build/cmake_install.cmake" ]]; then
 fi
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 dest="$work/destdir"
 calls="$work/systemctl.calls"
 manifest="$build/install_manifest.txt"
@@ -104,7 +104,7 @@ check "the stub is the systemctl PATH finds" \
     "$(PATH="$work/bin:$PATH" command -v systemctl)" "$work/bin/systemctl"
 
 # The manifest read below must be the one this install writes.
-rm -f "$manifest"
+rm -f "${manifest:?}"
 out="$(PATH="$work/bin:$PATH" DESTDIR="$dest" "$cmake" --install "$build" 2>&1)"
 rc=$?
 check "1. the install succeeds" "$rc" "0"
@@ -217,7 +217,7 @@ check "6. no backup unit is installed" \
 # `--prefix` moves it; an absolute one was frozen at configure time and stays.
 dest2="$work/destdir2"
 prefix2="/opt/das-prefix-check"
-rm -f "$manifest"
+rm -f "${manifest:?}"
 out="$(PATH="$work/bin:$PATH" DESTDIR="$dest2" "$cmake" --install "$build" --prefix "$prefix2" 2>&1)"
 rc=$?
 check "7. the install with --prefix succeeds" "$rc" "0"

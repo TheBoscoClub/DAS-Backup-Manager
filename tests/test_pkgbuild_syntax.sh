@@ -42,7 +42,7 @@ check "the tigervnc entry is whole" "$(grep -c "^opt:tigervnc: the GUI opens a r
 
 # The check itself can fail: the defect, put back into a copy.
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "${tmp:?}"' EXIT
 sed "s|\"tigervnc: the GUI opens a recovery drive's console with vncviewer on the helper's socket\"|'tigervnc: the GUI opens a recovery drive\\\\'s console with vncviewer on the helper\\\\'s socket'|" "$PKGBUILD" >"$tmp"
 check "the counter-case is the old defect" "$(grep -c "drive\\\\'s console" "$tmp" || :)" "1"
 bash -n "$tmp" >/dev/null 2>&1 && rc=0 || rc=$?

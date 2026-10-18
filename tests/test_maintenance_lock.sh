@@ -42,7 +42,7 @@ HOLDER_PID=""
 cleanup_test() {
     : >"$WORK/release" 2>/dev/null || true
     [[ -n "$HOLDER_PID" ]] && wait "$HOLDER_PID" 2>/dev/null
-    rm -rf "$WORK"
+    rm -rf "${WORK:?}"
 }
 trap cleanup_test EXIT
 
@@ -77,7 +77,7 @@ wait_for_file() { local n=0; until [[ -e "$1" ]]; do command sleep 0.05; n=$((n 
 # Another job takes the lock in its own process and records itself with its
 # own (live) pid; it holds the lock until $WORK/release appears.
 hold_lock() {
-    rm -f "$WORK/release" "$WORK/held"
+    rm -f "${WORK:?}/release" "${WORK:?}/held"
     bash -c 'exec 7<>"$1"; flock 7; printf "%s pid %s\n" "$2" "$$" >"$1"; echo "$$" >"$3"; until [[ -e "$4" ]]; do sleep 0.05; done' \
         _ "$LOCK" "$1" "$WORK/held" "$WORK/release" &
     HOLDER_PID=$!
@@ -97,11 +97,11 @@ check "free lock: the backup records itself" "$(cat "$WORK/record")" "backup-run
 check "free lock: it is really held" "$(cat "$WORK/state")" "held"
 
 # --- a waiting backup leaves the holder's record alone, and names it --------
-rm -f "$LOCK"
+rm -f "${LOCK:?}"
 : >"$WORK/log"
 hold_lock "btrdasd scrub run"
 scrub="$(holder_record "btrdasd scrub run")"
-rm -f "$WORK/acquired" "$WORK/done"
+rm -f "${WORK:?}/acquired" "${WORK:?}/done"
 (
     acquire_maintenance_lock
     record >"$WORK/record"
@@ -133,7 +133,7 @@ check "holder: a record whose process is gone is not the holder" "$(maintenance_
     "an unknown holder (the last recorded holder, backup-run.sh pid 4194304999, is no longer running)"
 printf 'btrdasd restore browse pid %s\n' "$$" >"$LOCK"
 check "holder: a record whose process runs names it" "$(maintenance_holder)" "btrdasd restore browse pid $$"
-rm -f "$LOCK"
+rm -f "${LOCK:?}"
 check "holder: no lock file is unknown" "$(maintenance_holder)" "an unknown holder"
 
 # --- a pid is ASCII digits, whatever the locale (bd DAS-Backup-Manager-1bsx) --
@@ -156,7 +156,7 @@ if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then #
     printf 'btrdasd restore browse pid %s\n' "$$" >"$LOCK"
     check "holder, en_US.UTF-8: an ASCII pid still names its live holder" \
         "$(export LC_ALL=en_US.UTF-8; maintenance_holder)" "btrdasd restore browse pid $$"
-    rm -f "$LOCK"
+    rm -f "${LOCK:?}"
 else
     not_run="the en_US.UTF-8 cases: bash's [0-9] matches no non-ASCII digit here (locale missing?)"
     echo "NOT RUN: $not_run"
@@ -205,7 +205,7 @@ rc=0
 check "on a stop: the run exits with the signal's code" "$rc" "129"
 check "on a stop: the backup's record is emptied" "$(wc -c <"$LOCK" | tr -d ' ')" "0"
 printf 'btrdasd scrub run pid 77\n' >"$LOCK"
-rm -f "$WORK/during_unmount"
+rm -f "${WORK:?}/during_unmount"
 rc=0
 (
     # Everything the recovery body reads is set, so it is the gate alone
@@ -219,7 +219,7 @@ check "exit before the lock is ours: nothing is unmounted" "$([[ -e "$WORK/durin
 check "exit before the lock is ours: it could not start, exit 1" "$rc" "1"
 
 # --- walk is handed the lock the backup holds --------------------------------
-rm -f "$LOCK"
+rm -f "${LOCK:?}"
 cat >"$WORK/btrdasd" <<'STUB'
 #!/bin/bash
 # What `btrdasd walk` would find: the descriptor it is told about, and
@@ -255,7 +255,7 @@ check "walk: while nobody else could take it" "$(grep '^a-fresh-open-gets-it=' "
 check "walk: the indexer step is recorded OK" "$(cat "$WORK/indexer_status")" "OK"
 
 # --- backup-verify.sh takes the lock and records itself ---------------------
-rm -f "$LOCK"
+rm -f "${LOCK:?}"
 : >"$WORK/log"
 (
     if take_maintenance_lock "$LOCK"; then echo took >"$WORK/verify"; else echo skipped >"$WORK/verify"; fi

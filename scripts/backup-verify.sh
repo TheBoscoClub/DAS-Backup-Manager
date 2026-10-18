@@ -438,7 +438,7 @@ check_btrbk_status() {
             else
                 mount_err=$(tr '\n' ' ' < "$mount_stderr")
             fi
-            rm -f "$mount_stderr"
+            [[ -z "${mount_stderr:-}" ]] || rm -f "${mount_stderr:?}"
         else
             skipped=true
         fi
@@ -460,7 +460,7 @@ check_btrbk_status() {
         else
             log_error "  btrbk list failed - snapshot status UNKNOWN: $(tr '\n' ' ' < "$btrbk_stderr")"
         fi
-        rm -f "$btrbk_stderr"
+        [[ -z "${btrbk_stderr:-}" ]] || rm -f "${btrbk_stderr:?}"
 
         echo ""
         echo "Disk usage:"

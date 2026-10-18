@@ -41,6 +41,11 @@ set -euo pipefail
 ROOT="${DAS_STATE_SYNC_ROOT:-}" # test seam: a fake filesystem tree
 STATE_DIR="${DAS_STATE_SYNC_STATE_DIR:-$ROOT/var/lib/das-backup}"
 CONFIG_OUT="${DAS_STATE_SYNC_CONFIG_OUT:-$ROOT/etc/das-backup/config.toml}"
+# The deletable siblings, guarded where they are made: an empty STATE_DIR or CONFIG_OUT aborts here
+# instead of leaving a bare ".new" or ".old" to be removed relative to the cwd.
+STATE_NEW="${STATE_DIR:?}.new"
+STATE_OLD="${STATE_DIR:?}.old"
+CONFIG_NEW="${CONFIG_OUT:?}.new"
 MARKER="${DAS_STATE_SYNC_MARKER:-$ROOT/etc/das-backup/recovery-drive}"
 RUN_DIR="${DAS_STATE_SYNC_RUN_DIR:-$ROOT/run/das-recovery-state}"
 TOP="${DAS_STATE_SYNC_TOP:-$RUN_DIR/top}" # the booted fs mounted at subvolid=5
@@ -121,7 +126,7 @@ measure() {
         say "das-recovery-state-sync: could not write the boot measurement to $TIMINGS" >&2
     fi
 }
-cleanup_new() { rm -rf "$STATE_DIR.new" "$CONFIG_OUT.new"; }
+cleanup_new() { rm -rf "${STATE_NEW:?}" "${CONFIG_NEW:?}"; }
 
 # The marker gate writes nothing at all, not even a status file: on the host
 # this must be a pure refusal.
@@ -195,7 +200,7 @@ fi
 # UUID is unknown or ambiguous.
 phase config "preparing the configuration"
 mkdir -p "$(dirname "$CONFIG_OUT")"
-rm -f "$CONFIG_OUT.new"
+rm -f "${CONFIG_NEW:?}"
 if ! "$BTRDASD" config derive-recovery --from "$root_snap/etc/das-backup/config.toml" \
     --booted-uuid "$uuid" --out "$CONFIG_OUT.new"; then
     cleanup_new
@@ -206,7 +211,7 @@ fi
 # never half-replaced. Every step has its own failure branch: the previous
 # state stays in place, *.new is removed, the status says why.
 phase copy "copying the backup index"
-rm -rf "$STATE_DIR.new"
+rm -rf "${STATE_NEW:?}"
 mkdir -p "$STATE_DIR.new" || die "cannot create $STATE_DIR.new: state left as it was"
 if ! cp -a --reflink=auto "$state_snap/." "$STATE_DIR.new/"; then
     cleanup_new
@@ -223,10 +228,10 @@ elif mv_help=$("$MV" --help 2>&1) && grep -q -- --exchange <<<"$mv_help"; then
         cleanup_new
         die "swapping the new state in failed: state left as it was"
     }
-    rm -rf "$STATE_DIR.new" || say "das-recovery-state-sync: could not remove the replaced state ($STATE_DIR.new)" >&2
+    rm -rf "${STATE_NEW:?}" || say "das-recovery-state-sync: could not remove the replaced state ($STATE_DIR.new)" >&2
 else
     # No mv --exchange (coreutils < 9.5): two steps, undone if the second fails.
-    rm -rf "$STATE_DIR.old"
+    rm -rf "${STATE_OLD:?}"
     "$MV" "$STATE_DIR" "$STATE_DIR.old" || {
         cleanup_new
         die "setting the old state aside failed: state left as it was"
@@ -237,7 +242,7 @@ else
             die "swap failed and the previous state could not be restored: it is in $STATE_DIR.old"
         die "installing the new state failed: previous state restored"
     }
-    rm -rf "$STATE_DIR.old" || say "das-recovery-state-sync: could not remove $STATE_DIR.old" >&2
+    rm -rf "${STATE_OLD:?}" || say "das-recovery-state-sync: could not remove $STATE_DIR.old" >&2
 fi
 "$MV" "$CONFIG_OUT.new" "$CONFIG_OUT" || {
     cleanup_new

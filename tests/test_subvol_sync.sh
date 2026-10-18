@@ -10,7 +10,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
@@ -108,7 +108,7 @@ touch "$WORK/env_fail"
 rc=0; load_config_env 2>"$WORK/err" || rc=$?
 check "unreadable config makes load_config_env return non-zero" "$rc" "1"
 check "unreadable config leaves an error on stderr" "$(grep -c 'could not read' "$WORK/err")" "1"
-rm -f "$WORK/env_fail"
+rm -f "${WORK:?}/env_fail"
 
 # verify_sources_before_write is the real one's stand-in here: count calls.
 verify_calls=0
@@ -161,7 +161,7 @@ printf 'SUBVOLUME SYNC\n  VOLUMES NOT READ\n' >"$WORK/sync_out"; echo 1 >"$WORK/
 sync_subvolumes run 2>/dev/null
 check "combined failure keeps the exit code and the reload failure" "${OP_STATUS[subvol_sync_detail]}" \
     "exit code 1 — see SUBVOLUME SYNC in the report; config could not be reloaded after sync"
-rm -f "$WORK/env_fail"
+rm -f "${WORK:?}/env_fail"
 
 # --- sync: a failing re-verification is not swallowed ------------------------
 echo 0 >"$WORK/sync_rc"
@@ -201,7 +201,7 @@ export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
 real_sum="$(sha256sum "$REAL_CONF")"
 
 # Pending retirement: sync plans a btrbk.conf without the dead entry.
-: >"$WORK/calls"; : >"$WORK/btrbk_calls"; rm -f "$WORK/btrbk_saw"
+: >"$WORK/calls"; : >"$WORK/btrbk_calls"; rm -f "${WORK:?}/btrbk_saw"
 printf 'SUBVOLUME SYNC\n  Would retire (dry run, nothing written):\n    @gone\n' >"$WORK/sync_out"; echo 0 >"$WORK/sync_rc"
 echo "PLANNED CONF WITHOUT @gone" >"$WORK/render_out"
 DRYRUN_BTRBK_CONF=""
@@ -231,7 +231,7 @@ check "nothing pending: btrbk dryrun recorded OK" "${OP_STATUS[btrbk]}" "OK"
 
 # Sync rendered nothing (no readable btrbk.conf would be left): fall back to
 # the current file, and leave no empty temp file behind.
-: >"$WORK/btrbk_calls"; DRYRUN_BTRBK_CONF=""; rm -f "$WORK/render_out"; : >"$WORK/log"
+: >"$WORK/btrbk_calls"; DRYRUN_BTRBK_CONF=""; rm -f "${WORK:?}/render_out"; : >"$WORK/log"
 sync_subvolumes dryrun
 check "no render: the variable is cleared" "$DRYRUN_BTRBK_CONF" ""
 check "no render: no temp file is left" "$(find "$TMPDIR" -name 'das-backup-dryrun-btrbk.*' | wc -l)" "0"
@@ -247,7 +247,7 @@ check "real run: no --render-btrbk-conf" "$(grep -c -- '--render-btrbk-conf' "$W
 check "real run: no temp file made" "$(find "$TMPDIR" -name 'das-backup-dryrun-btrbk.*' | wc -l)" "0"
 run_btrbk run
 check "real run: btrbk run reads the real conf" "$(cat "$WORK/btrbk_calls")" "-c $DAS_BTRBK_CONF run"
-rm -f "$WORK/render_out"
+rm -f "${WORK:?}/render_out"
 unset -f btrbk
 unset TMPDIR
 

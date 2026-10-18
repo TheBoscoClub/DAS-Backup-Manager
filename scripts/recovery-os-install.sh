@@ -401,7 +401,7 @@ step_package() {
     say "package sha256 matches"
     mkdir -p "$TARGET/payload"; cp "$PACKAGE" "$TARGET/payload/" || cannot "cannot copy the package into the target"
     "$CHROOT" "$TARGET" pacman -U --noconfirm "/payload/$(basename "$PACKAGE")" || cannot "pacman -U failed"
-    rm -rf "$TARGET/payload"
+    rm -rf "${TARGET:?}/payload"
     mkdir -p "$etc/das-backup" "$etc/systemd/system" "$etc/xdg/autostart" "$TARGET/home/user/Desktop"
     printf 'label=system-recovery-%s-2tb\nbay=%s\nprovisioned=%s\n' "$LETTER" "$BAY" "$STAMP" >"$etc/das-backup/recovery-drive"
     [[ -f "$TARGET/usr/lib/das-backup/das-recovery-state-sync.service" ]] || cannot "the package shipped no das-recovery-state-sync.service"
@@ -485,7 +485,7 @@ step_verify() {
     mkdir -p "$TARGET/tmp"
     cp "$CONFIG" "$TARGET/tmp/das-install-inspect.toml" || cannot "cannot copy $CONFIG into the target"
     rec=$("$CHROOT" "$TARGET" btrdasd recovery-os inspect --root / --label "system-recovery-$LETTER-2tb" --config /tmp/das-install-inspect.toml 2>&1) || rc=$?
-    rm -f "$TARGET/tmp/das-install-inspect.toml"
+    rm -f "${TARGET:?}/tmp/das-install-inspect.toml"
     ((rc <= 1)) || cannot "btrdasd recovery-os inspect failed ($rc): $rec"
     say "$rec"
     grep -Eq '^[[:space:]]+btrbk at boot[[:space:]]+no([[:space:]]|$)' <<<"$rec" || refuse "the new root's boot record is not 'no'"

@@ -13,7 +13,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 for fn in run_indexer record_op any_op_is subject_status; do
     body="$(extract "$fn")"
@@ -51,7 +51,7 @@ mountpoint() {
     return 1
 }
 fixture() {
-    rm -f "$WORK/walk.calls" "$WORK/walk.fails" "$WORK/log"
+    rm -f "${WORK:?}/walk.calls" "${WORK:?}/walk.fails" "${WORK:?}/log"
     OP_STATUS=()
     TARGET_MOUNTS=([primary-22tb]=/mnt/backup-22tb [system-recovery-A-2tb]=/mnt/backup-system-recovery-A [system-recovery-B-2tb]=/mnt/backup-system-recovery-B)
     TARGET_ROLES=([primary-22tb]=primary [system-recovery-A-2tb]=mirror [system-recovery-B-2tb]=mirror)

@@ -73,7 +73,7 @@ cleanup() {
                 kill -KILL "$pid" 2>/dev/null || :
             fi
         fi
-        rm -rf -- "$root"
+        rm -rf -- "${root:?}"
     done
 }
 trap cleanup EXIT
@@ -1551,7 +1551,7 @@ check "two by-id matches: refused" "$RC" "1"
 has "two by-id matches: says so" "$OUT" "2 disks match"
 
 fixture
-rm "$DISK_A"
+rm "${DISK_A:?}"
 run_driver session A --dry-run
 check "drive not attached: refused" "$RC" "1"
 has "drive not attached: says so" "$OUT" "matches nothing"
@@ -1623,7 +1623,7 @@ run_driver session A --dry-run
 check "mounts unreadable: refused (not read as unmounted)" "$RC" "1"
 
 fixture
-rm "$S/defined"
+rm "${S:?}/defined"
 run_driver session A --dry-run
 check "domain not defined: refused" "$RC" "1"
 has "domain not defined: points at define" "$OUT" "is it defined?"
@@ -1767,7 +1767,7 @@ fixture
 echo active >"$S/unit.das-backup.service"
 (
     sleep 1
-    rm -f "$S/unit.das-backup.service"
+    rm -f "${S:?}/unit.das-backup.service"
 ) &
 unitwaiter=$!
 run_driver session A --wait-lock 20
@@ -1964,8 +1964,8 @@ pid="$(holder_pid A)"
 check "detach fails: claim kept" "$(alive "$pid")" "alive"
 check "detach fails: lock kept" "$(lock_state)" "held"
 has "detach fails: says so" "$OUT" "still in recovery-os-updater-system-recovery-A-2tb's definition"
-rm "$S/detach_fail"
-rm -f "$SESSIONS"
+rm "${S:?}/detach_fail"
+rm -f "${SESSIONS:?}"
 run_driver session-end A
 check "detach fails: session-end finishes it" "$RC" "0"
 matches "detach fails: session-end records the session's end" "$(file "$SESSIONS")" "^system-recovery-A-2tb [0-9]+$"
@@ -2065,7 +2065,7 @@ for ((i = 0; i < 100; i++)); do [[ "$(lock_state)" == free ]] && break; sleep 0.
 check "an orphan keeps the lock: free once it is gone" "$(lock_state)" "free"
 
 fixture
-rm "$T/bin/systemd-run"
+rm "${T:?}/bin/systemd-run"
 DRIVER_PATH="$(minimal_path)" run_driver session A --dry-run
 check "no systemd-run: refused, no fallback" "$RC" "1"
 has "no systemd-run: says so" "$OUT" "systemd-run is not available"
@@ -2201,14 +2201,14 @@ check "record may: the session goes on, the guard enforces" "$RC" "0"
 has "record may: says the guard is what enforces" "$OUT" "btrbk may run when this OS boots: the session guard is what keeps it from running"
 
 fixture
-rm "$STATE_FILE"
+rm "${STATE_FILE:?}"
 run_driver session A --dry-run
 check "no record file: refused" "$RC" "1"
 has "no record file: says so" "$OUT" "no boot record: $STATE_FILE does not exist"
 check "no record file: nothing locked" "$(file "$S/flock.calls")" ""
 
 fixture
-rm "$STATE_FILE"
+rm "${STATE_FILE:?}"
 mkdir "$STATE_FILE"
 run_driver session A --dry-run
 check "record that cannot be read: refused" "$RC" "1"
@@ -2392,7 +2392,7 @@ check "override, a real session: ends, flagged" "$RC" "5"
 has "override, a real session: in the summary's warnings" "$OUT" "Warnings      the boot-record check was overridden (--accept-boot-record-risk): the record is 9d 0h old"
 
 fixture
-rm "$STATE_FILE"
+rm "${STATE_FILE:?}"
 run_driver session A --dry-run --accept-boot-record-risk
 check "override never covers a missing record" "$RC" "1"
 has "override never covers a missing record: that refusal, not another" "$OUT" "no boot record: $STATE_FILE does not exist"
@@ -2636,7 +2636,7 @@ EOF
     has "contract, no: and its filesystem" "$OUT" "  filesystem     $UUID_A (the mount_uuid of system-recovery-A-2tb)"
 
     contract_record "$CW/will" ""
-    rm -f "$S/flock.calls" "$S/holder.calls" # the dry run above took and gave back both
+    rm -f "${S:?}/flock.calls" "${S:?}/holder.calls" # the dry run above took and gave back both
     check "contract, will: the real status rewrote the record (exit 0)" "$C_STATUS_RC" "0"
     check "contract, will: the verdict the binary read" "$(contract_get '.os.btrbk_at_boot.verdict')" '"will"'
     run_driver session A --dry-run
@@ -2689,7 +2689,7 @@ has "DAS_RECOVERY_OS_STATE without the test hatch: says why" "$OUT" "honoured on
 OS_STATE=""
 
 fixture
-rm "$T/bin/systemd-run"
+rm "${T:?}/bin/systemd-run"
 ln -s "$(command -v bash)" "$T/bin/systemd-run"
 DRIVER_PATH="$(minimal_path)" run_driver session A --dry-run
 check "no jq: refused" "$RC" "1"
@@ -2754,7 +2754,7 @@ touch "$S/start_fail"
 run_driver session A
 check "start failed: refused" "$RC" "1"
 check "start failed: no session time -- the OS never ran (dmxt)" "$(file "$SESSIONS")" ""
-rm -f "$S/start_fail"
+rm -f "${S:?}/start_fail"
 run_driver session A --dry-run
 check "start failed: the retry is admitted (dmxt)" "$RC" "0"
 lacks "start failed: ...not refused for a session that never ran" "$OUT" "before this drive's last VM session ended"
@@ -2766,7 +2766,7 @@ touch "$S/managed_save_at_attach"
 run_driver session A
 check "managed save at the start: refused" "$RC" "1"
 check "managed save at the start: no session time (dmxt)" "$(file "$SESSIONS")" ""
-rm -f "$S/managed_save_at_attach"
+rm -f "${S:?}/managed_save_at_attach"
 run_driver session A --dry-run
 check "managed save at the start: the retry is admitted (dmxt)" "$RC" "0"
 
@@ -2778,7 +2778,7 @@ run_driver session A
 check "destroyed paused: exit 1" "$RC" "1"
 has "destroyed paused: a retry is safe" "$OUT" "A retry is safe: run the session again"
 check "destroyed paused: no session time (dmxt)" "$(file "$SESSIONS")" ""
-rm -f "$S/live_drops_guard"
+rm -f "${S:?}/live_drops_guard"
 run_driver session A --dry-run
 check "destroyed paused: the retry is admitted (dmxt)" "$RC" "0"
 
@@ -3022,7 +3022,7 @@ has "guard missing, the destroy fails: how to end it, once it reads paused and n
 has "guard missing, the destroy fails: what the read must say" "$OUT" "(must say state.state=3, and vcpu.N.time=0 for every vCPU)"
 lacks "guard missing, the destroy fails: never resumed" "$(events)" "virsh resume"
 check "guard missing, the destroy fails: no forbidden destroy" "$(file "$S/forbidden")" ""
-rm -f "$S/destroy_fail"
+rm -f "${S:?}/destroy_fail"
 printf 'shut off\n' >"$S/states"
 run_driver session-end A
 check "session-end, started but never resumed: exit 0" "$RC" "0"
@@ -3340,7 +3340,7 @@ write_state 3 "$(record_json system-recovery-A-2tb may)"
 touch "$S/guard_silent"
 for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
 GUARD_SECS=300 run_interrupted session A
-rm -f "$STATE/system-recovery-A-2tb.guard"
+rm -f "${STATE:?}/system-recovery-A-2tb.guard"
 mkdir "$STATE/system-recovery-A-2tb.guard" 2>/dev/null || :
 printf 'shut off\n' >"$S/states"
 run_driver session-end A
@@ -3355,7 +3355,7 @@ run_driver status
 has "status: a guard left in the definition" "$OUT" "  Session guard   in the definition"
 check "status, a guard left without its session state: exit 6" "$RC" "6"
 has "status, a guard left without its session state: cannot be judged" "$OUT" "  Session guard   in the definition; cannot be judged: no session state for it"
-rm -f "$S/lock.at_define"
+rm -f "${S:?}/lock.at_define"
 run_driver session-end A
 check "session-end, guard left, its session state gone: exit 6" "$RC" "6"
 has "session-end, guard left, its session state gone: says it cannot be judged" "$OUT" "session guard: cannot be judged"
@@ -3836,7 +3836,7 @@ printf 'shut off\n' >"$S/states.running"
 POLL=2 GUARD_SECS=300 run_interrupted session A
 check "interrupted as it powers off, no report, no record: exit 5" "$RC" "5"
 fixture
-rm "$S/defined"
+rm "${S:?}/defined"
 run_driver status
 check "status, the domain not defined: exit 0" "$RC" "0"
 has "status, the domain not defined: no guard" "$OUT" "  Session guard   none (recovery-os-updater-system-recovery-A-2tb is not defined:"
@@ -4173,7 +4173,7 @@ guest_bind() {
         echo "NOT RUN: the script names the real mount"
         return
     fi
-    rm -f "$G/mount.calls"
+    rm -f "${G:?}/mount.calls"
     env GUEST="$G" CREDENTIALS_DIRECTORY="$G/creds" sh -c "$install_line" >/dev/null 2>&1
     env GUEST="$G" sh -c "$bind" >/dev/null 2>&1
     echo "rc=$? $(tr '\n' '|' 2>/dev/null <"$G/mount.calls")"
@@ -4181,21 +4181,21 @@ guest_bind() {
 : >"$G/usr/bin/btrbk"
 check "guard unit, here: binds the refusing btrbk over the btrbk present" "$(guest_bind)" "rc=0 --bind $G/run/das-vm-guard/btrbk $G/usr/bin/btrbk|"
 check "guard unit, here: the refusing btrbk installed, executable" "$(stat -c %a "$G/run/das-vm-guard/btrbk")" "755"
-rm -f "$G/usr/bin/btrbk"
+rm -f "${G:?}/usr/bin/btrbk"
 : >"$G/usr/bin/btrbk"
 : >"$G/usr/local/sbin/btrbk"
 ln -sfn "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk"
 check "guard unit, here: ...over each one present, once" "$(guest_bind)" "rc=0 --bind $G/run/das-vm-guard/btrbk $G/usr/bin/btrbk|--bind $G/run/das-vm-guard/btrbk $G/usr/local/sbin/btrbk|"
-rm -f "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk" "$G/usr/local/sbin/btrbk"
+rm -f "${G:?}/usr/bin/btrbk" "${G:?}/usr/local/bin/btrbk" "${G:?}/usr/local/sbin/btrbk"
 : >"$G/usr/bin/btrbk"
 echo 32 >"$G/mount.rc"
 check "guard unit, here: a bind that fails fails the guard" "$(guest_bind)" "rc=1 --bind $G/run/das-vm-guard/btrbk $G/usr/bin/btrbk|"
-rm -f "$G/mount.rc" "$G/usr/bin/btrbk"
+rm -f "${G:?}/mount.rc" "${G:?}/usr/bin/btrbk"
 check "guard unit, here: no btrbk, nothing bound" "$(guest_bind)" "rc=0 "
-rm -f "$G/creds/das-vm-guard.btrbk"
+rm -f "${G:?}/creds/das-vm-guard.btrbk"
 : >"$G/usr/bin/btrbk"
-check "guard unit, here: no refusing btrbk to bind, the guard fails" "$(rm -f "$G/run/das-vm-guard/btrbk"; env GUEST="$G" CREDENTIALS_DIRECTORY="$G/creds" sh -c "$install_line" >/dev/null 2>&1; echo "rc=$?")" "rc=1"
-rm -f "$G/usr/bin/btrbk"
+check "guard unit, here: no refusing btrbk to bind, the guard fails" "$(rm -f "${G:?}/run/das-vm-guard/btrbk"; env GUEST="$G" CREDENTIALS_DIRECTORY="$G/creds" sh -c "$install_line" >/dev/null 2>&1; echo "rc=$?")" "rc=1"
+rm -f "${G:?}/usr/bin/btrbk"
 credential "$S/defined.at_start.xml" das-vm-guard.btrbk >"$G/creds/das-vm-guard.btrbk"
 
 # The refusing btrbk itself: says so on the kernel log, exits nonzero.
@@ -4260,7 +4260,7 @@ echo "$BOOT_A" >"$G/proc/sys/kernel/random/boot_id"
 # The refusing btrbk as the guard installs it, and a bind of it over $1.
 install -D -m 0755 "$G/creds/das-vm-guard.btrbk" "$G/run/das-vm-guard/btrbk"
 bindit() {
-    rm -f "$1"
+    rm -f "${1:?}"
     ln "$G/run/das-vm-guard/btrbk" "$1"
     echo "$1" >>"$G/mounts"
 }
@@ -4268,14 +4268,14 @@ unmount() { grep -vxF -- "$1" "$G/mounts" >"$G/mounts.new" || :; mv "$G/mounts.n
 # One run of the reporter, its state in /run gone first (a new boot), unless
 # KEEP_STATE says the boot goes on (the reporter restarted).
 guest_report() {
-    rm -f "$PORT" "$G/sleeps"
-    [[ -n "${KEEP_STATE:-}" ]] || rm -f "$G/run/das-vm-guard/report.state"
+    rm -f "${PORT:?}" "${G:?}/sleeps"
+    [[ -n "${KEEP_STATE:-}" ]] || rm -f "${G:?}/run/das-vm-guard/report.state"
     : >"$PORT"
     env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >"$G/stdout" 2>&1
     cat "$PORT"
 }
 # The refusing btrbk bound over btrbk: the path is its file, and mounted.
-rm -f "$G/usr/local/bin/btrbk" "$G/usr/local/sbin/btrbk"
+rm -f "${G:?}/usr/local/bin/btrbk" "${G:?}/usr/local/sbin/btrbk"
 bindit "$G/usr/bin/btrbk"
 check "reporter: the btrbk it covers is there (no vacuous engaged)" "$( [ -e "$G/usr/bin/btrbk" ] && [ "$G/usr/bin/btrbk" -ef "$G/run/das-vm-guard/btrbk" ] && echo bound)" "bound"
 check "reporter: engaged, with every mask" "$(guest_report)" "$(line "$ENG4")"
@@ -4290,7 +4290,7 @@ for st in failed deactivating; do
         *) check "reporter: a guard in between says nothing, and looks again" "$(guest_report)$(file "$G/sleeps")" "5" ;;
     esac
 done
-rm -f "$G/ActiveState.das-vm-guard.service"
+rm -f "${G:?}/ActiveState.das-vm-guard.service"
 echo masked >"$G/LoadState.btrbk.timer"
 check "reporter: a unit masked outright counts" "$(guest_report)" "$(line "$ENG4")"
 echo loaded >"$G/LoadState.btrbk.timer"
@@ -4299,40 +4299,40 @@ echo "/run/systemd/generator.early/btrbk.timer.d/zzzzzzzz-das-vm-guard.conf /etc
 check "reporter: ...but not with a drop-in after the condition" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);")"
 echo "/etc/systemd/system/btrbk.timer.d/override.conf" >"$G/DropInPaths.btrbk.timer"
 check "reporter: ...nor without the condition" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);")"
-rm -f "$G/DropInPaths.btrbk.timer"
+rm -f "${G:?}/DropInPaths.btrbk.timer"
 echo /usr/lib/systemd/system/btrbk.timer >"$G/FragmentPath.btrbk.timer"
 check "reporter: ...nor when the empty unit did not apply" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.timer is not masked (loaded);")"
-rm -f "$G/FragmentPath.btrbk.timer"
+rm -f "${G:?}/FragmentPath.btrbk.timer"
 echo not-found >"$G/LoadState.crond.service"
 check "reporter: a unit not found is not masked (the credential never applied)" "$(guest_report)" "$(line "das-vm-guard NOT engaged: crond.service is not masked (not-found);")"
-rm -f "$G"/LoadState.*
+rm -f "${G:?}"/LoadState.*
 echo not-found >"$G/LoadState.btrbk.service"
 check "reporter: ...the first one too" "$(guest_report)" "$(line "das-vm-guard NOT engaged: btrbk.service is not masked (not-found);")"
-rm -f "$G"/LoadState.*
+rm -f "${G:?}"/LoadState.*
 touch "$G/systemctl.fail"
 check "reporter: systemd cannot be asked (a re-exec), says nothing, looks again" "$(guest_report)$(file "$G/sleeps")" "5"
-rm -f "$G/systemctl.fail"
+rm -f "${G:?}/systemctl.fail"
 for prop in ActiveState LoadState FragmentPath DropInPaths; do
     touch "$G/systemctl.fail.$prop"
     check "reporter: $prop cannot be asked for, says nothing, looks again" "$(guest_report)$(file "$G/sleeps")" "5"
-    rm -f "$G/systemctl.fail.$prop"
+    rm -f "${G:?}/systemctl.fail.${prop:?}"
 done
 : >"$G/usr/local/bin/btrbk"
 check "reporter: a btrbk nothing is bound over is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;")"
 echo "$G/usr/local/bin/btrbk" >>"$G/mounts"
 check "reporter: a btrbk something else is bound over is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;")"
-rm -f "$G/usr/local/bin/btrbk"
+rm -f "${G:?}/usr/local/bin/btrbk"
 unmount "$G/usr/local/bin/btrbk"
 ln "$G/run/das-vm-guard/btrbk" "$G/usr/local/bin/btrbk"
 check "reporter: the refusing btrbk there without a mount is said" "$(guest_report)" "$(line "das-vm-guard NOT engaged: $G/usr/local/bin/btrbk is not covered;")"
 bindit "$G/usr/local/bin/btrbk"
 check "reporter: both covered, engaged" "$(guest_report)" "$(line "$ENG4")"
-rm -f "$G/usr/local/bin/btrbk"
+rm -f "${G:?}/usr/local/bin/btrbk"
 unmount "$G/usr/local/bin/btrbk"
 ln -sfn "$G/usr/bin/btrbk" "$G/usr/local/bin/btrbk"
 check "reporter: a btrbk that leads to a covered one is covered" "$(guest_report)" "$(line "$ENG4")"
-rm -f "$G/usr/local/bin/btrbk"
-check "reporter: no port, nothing written, and no hang" "$(rm -f "$PORT" "$G/sleeps"; env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >/dev/null 2>&1; echo "rc=$? $(ls "$PORT" 2>/dev/null)")" "rc=0 "
+rm -f "${G:?}/usr/local/bin/btrbk"
+check "reporter: no port, nothing written, and no hang" "$(rm -f "${PORT:?}" "${G:?}/sleeps"; env GUEST="$G" PATH="$G/bin:$PATH" timeout 10 sh -c "$script" >/dev/null 2>&1; echo "rc=$? $(ls "$PORT" 2>/dev/null)")" "rc=0 "
 check "reporter: waits for the port two minutes, a second at a time" "$(grep -c '^1$' "$G/sleeps")" "120"
 # Round 3: the reporter goes on from its state in /run, and names the masks by
 # their digest once it has said them in full.
@@ -4341,7 +4341,7 @@ check "reporter: a heartbeat names the masks by their digest" "$(guest_report)" 
 $(line "$ENG4C" "$BOOT_A" 2)"
 check "reporter: ...the first 16 hex digits of the SHA-256 of their list, computed on the host" "${ENG4C##* sha256:}" "$(printf '%s' btrbk.service,btrbk.timer,cronie.service,crond.service | sha256sum | cut -c1-16)"
 check "reporter: its state in /run after each line sent: boot, number, engaged seen" "$(file "$G/run/das-vm-guard/report.state")" "$BOOT_A 2 1"
-rm -f "$G/more"
+rm -f "${G:?}/more"
 # Restarted while lifted: goes on with "lifted" and the boot's numbers, never
 # a first-line NOT engaged.
 echo inactive >"$G/ActiveState.das-vm-guard.service"
@@ -4351,14 +4351,14 @@ echo "$BOOT_B 3 1" >"$G/run/das-vm-guard/report.state"
 check "reporter: ...but a state of another boot is not this boot's" "$(KEEP_STATE=1 guest_report)" "$(line "das-vm-guard NOT engaged: das-vm-guard.service is inactive;")"
 echo "$BOOT_A 3 0" >"$G/run/das-vm-guard/report.state"
 check "reporter: ...nor one that never saw the guard engaged" "$(KEEP_STATE=1 guest_report)" "$(line "das-vm-guard NOT engaged: das-vm-guard.service is inactive;" "$BOOT_A" 4)"
-rm -f "$G/ActiveState.das-vm-guard.service"
+rm -f "${G:?}/ActiveState.das-vm-guard.service"
 # What cannot be checked this round is skipped, never "not covered".
 touch "$G/findmnt.fail"
 check "reporter: findmnt fails, says nothing, looks again" "$(guest_report)$(file "$G/sleeps")" "5"
-rm -f "$G/findmnt.fail"
+rm -f "${G:?}/findmnt.fail"
 touch "$G/readlink.fail"
 check "reporter: readlink fails, says nothing, looks again" "$(guest_report)$(file "$G/sleeps")" "5"
-rm -f "$G/readlink.fail"
+rm -f "${G:?}/readlink.fail"
 check "reporter: and with both answering, engaged again" "$(guest_report)" "$(line "$ENG4")"
 
 # Lifted (stopped after the boot's first report): masks still checked, the
@@ -4378,7 +4378,7 @@ STUB
 touch "$G/lift_next"
 check "reporter: engaged, then lifted and unbound: both lines, the binds not looked at once lifted" "$(guest_report)" "$(line "$ENG4")
 $(line "$LIFT4" "$BOOT_A" 2)"
-rm -f "$G/ActiveState.das-vm-guard.service"
+rm -f "${G:?}/ActiveState.das-vm-guard.service"
 
 echo "--- the test hatch (DAS_RECOVERY_VM_TEST_LOOP)"
 fixture
@@ -4404,7 +4404,7 @@ echo /dev/null >"$T/sys/block/loop7/loop/backing_file"
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: a loop backed by a device refused" "$RC" "1"
 has "hatch: says what backs it" "$OUT" "backed by /dev/null, not a regular file"
-rm "$T/sys/block/loop7/loop/backing_file"
+rm "${T:?}/sys/block/loop7/loop/backing_file"
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: a loop with no backing file refused" "$RC" "1"
 has "hatch: says it has none" "$OUT" "has no backing file"
@@ -4419,7 +4419,7 @@ hatch_state no
 echo active >"$S/unit.das-backup.service"
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: the other checks still apply" "$RC" "1"
-rm "$S/unit.das-backup.service"
+rm "${S:?}/unit.das-backup.service"
 # The hatch reads its own record, and nothing else: the usual one is of
 # another filesystem, refused whatever the options.
 write_state 3 "$(record_json system-recovery-A-2tb no 3600 '"eeeeeeee-0000-4000-8000-000000000000"')"
@@ -4448,7 +4448,7 @@ OS_STATE=""
 
 echo "--- define"
 fixture
-rm "$S/defined"
+rm "${S:?}/defined"
 run_driver define
 check "define new: exit 0" "$RC" "0"
 has "define new: validated against the schema" "$(file "$S/virsh.calls")" "define --validate $STATE/system-recovery-A-2tb.plain.xml"
@@ -4485,7 +4485,7 @@ check "define with a disk attached: refused" "$RC" "1"
 lacks "define with a disk attached: not redefined" "$(file "$S/virsh.calls")" "define --validate"
 
 fixture
-rm "$T/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+rm "${T:?}/usr/share/edk2/x64/OVMF_CODE.4m.fd"
 run_driver define
 check "define without the firmware: refused" "$RC" "1"
 has "define without the firmware: names it" "$OUT" "/usr/share/edk2/x64/OVMF_CODE.4m.fd is not installed"
@@ -4502,7 +4502,7 @@ check "screenshot: written" "$(file "$T/shot.png")" "PNG"
 
 echo "--- define: one domain per recovery drive (7wb, 2026-10-04), the shared one retired"
 fixture
-rm -f "$S/defined" "$S/domB/defined"
+rm -f "${S:?}/defined" "${S:?}/domB/defined"
 run_driver define
 check "define per drive: exit 0" "$RC" "0"
 has "define per drive: A's from its rendering" "$(file "$S/virsh.calls")" "define --validate $STATE/system-recovery-A-2tb.plain.xml"
@@ -4583,7 +4583,7 @@ touch "$S/start_error_but_started"
 run_driver session A
 check "never resumed (start said it failed, paused): exit 1" "$RC" "1"
 check "never resumed: no session time" "$(file "$SESSIONS")" ""
-rm -f "$S/start_error_but_started"
+rm -f "${S:?}/start_error_but_started"
 run_driver session A
 check "never resumed: the retry runs to its end" "$RC" "0"
 matches "never resumed: the retry's session recorded" "$(file "$SESSIONS")" "^system-recovery-A-2tb [0-9]+$"
@@ -4983,7 +4983,7 @@ echo "--- both drives, sequential: past a 5 only on the first drive's own warnin
 judge() {
     # $1 the causes file's content ("-" for no file, "/" for a directory).
     local cf="$T/judge.causes"
-    rm -rf -- "$cf"
+    rm -rf -- "${cf:?}"
     case "$1" in
         -) ;;
         /) mkdir -p "$cf" ;;
@@ -5176,7 +5176,7 @@ touch "$S/systemctl_show_fail"
 run_driver session A --dry-run
 check "the unit cannot be read: refused" "$RC" "1"
 has "the unit cannot be read: says so" "$OUT" "its properties cannot be read (systemctl said: Failed to get properties"
-rm "$S/systemctl_show_fail" "$T/proc/self/cgroup"
+rm "${S:?}/systemctl_show_fail" "${T:?}/proc/self/cgroup"
 run_driver session A --dry-run
 check "the cgroup cannot be read: refused" "$RC" "1"
 has "the cgroup cannot be read: says so" "$OUT" "cannot read $T/proc/self/cgroup"
@@ -5205,7 +5205,7 @@ touch "$S/systemd_run_detach_fail"
 run_driver session A --unattended --detach
 check "detach, systemd-run fails: refused" "$RC" "1"
 has "detach, systemd-run fails: says so" "$OUT" "systemd-run could not start the session's unit"
-rm "$S/systemd_run_detach_fail" "$T/bin/systemd-run"
+rm "${S:?}/systemd_run_detach_fail" "${T:?}/bin/systemd-run"
 DRIVER_PATH="$(minimal_path)" run_driver session A --unattended --detach
 check "detach, no systemd-run: refused" "$RC" "1"
 has "detach, no systemd-run: says so" "$OUT" "systemd-run is not available: --detach"
@@ -5294,7 +5294,7 @@ has "repos, no cachyos repository: says so" "$OUT" "no [cachyos*] repository in 
 run_repos_script $'[options]\nHoldPkg = pacman'
 check "repos, no repository at all: exit 2" "$RC" "2"
 has "repos, no repository at all: says so" "$OUT" "no repository section in $T/pacman.conf"
-rm "$T/pacman.conf"; RC=0; OUT="$(PACMAN_CONF="$T/pacman.conf" sh "$S/stage.repos.sh" 2>&1)" || RC=$?
+rm "${T:?}/pacman.conf"; RC=0; OUT="$(PACMAN_CONF="$T/pacman.conf" sh "$S/stage.repos.sh" 2>&1)" || RC=$?
 check "repos, unreadable pacman.conf: exit 2" "$RC" "2"
 has "repos, unreadable pacman.conf: says so" "$OUT" "cannot read $T/pacman.conf"
 unattended_fixture
@@ -5357,7 +5357,7 @@ slot_fixture() {
         printf '%s\n' "$LIST_PAIR" >"$T/subvols"
     fi
     : >"$T/slot.calls"
-    rm -f "$T/df.avail" "$T/cp.fail" "$T/cp.corrupt" "$T/cp.say" "$T/mv.fail" "$T/btrfs.snapshot.fail" "$T/btrfs.delete.fail" "$T/btrfs.fssync.fail" "$T/mount.fail" "$T/umount.fail"
+    rm -f "${T:?}/df.avail" "${T:?}/cp.fail" "${T:?}/cp.corrupt" "${T:?}/cp.say" "${T:?}/mv.fail" "${T:?}/btrfs.snapshot.fail" "${T:?}/btrfs.delete.fail" "${T:?}/btrfs.fssync.fail" "${T:?}/mount.fail" "${T:?}/umount.fail"
 }
 # The step's script as the pipeline writes it, its snapshot line given here.
 unattended_fixture
@@ -5518,7 +5518,7 @@ run_slot_script "$SNAP_NEW"
 has "slot, the clone cannot be made: says so" "$OUT" "slot B not refreshed: ERROR: cannot snapshot: No space left on device"
 old_pair_kept "slot, the clone cannot be made"
 slot_fixture OLD
-rm "$T/esp/initramfs-linux-cachyos-fallback.img"
+rm "${T:?}/esp/initramfs-linux-cachyos-fallback.img"
 run_slot_script "$SNAP_NEW"
 has "slot, a named file missing: says which" "$OUT" "slot B not refreshed: initramfs-linux-cachyos-fallback.img, named by the entries, is not on the ESP"
 old_pair_kept "slot, a named file missing"
@@ -5561,12 +5561,12 @@ has "slot, a reason with escapes: written as given, on the title" "$(file "$PREV
 
 echo "--- slot: the old pair is kept only while it holds together"
 slot_fixture OLD
-rm -rf "$T/top/@.previous"
+rm -rf "${T:?}/top/@.previous"
 echo 16777300 >"$T/df.avail"
 run_slot_script "$SNAP_NEW"
 notice_written "slot, the old clone gone" "the last upgrade ("
 slot_fixture OLD
-rm "$T/esp/previous/initramfs-linux-cachyos-fallback.img"
+rm "${T:?}/esp/previous/initramfs-linux-cachyos-fallback.img"
 echo 16777300 >"$T/df.avail"
 run_slot_script "$SNAP_NEW"
 notice_written "slot, a file the old fallback entry boots gone" "the last upgrade ("
@@ -5576,7 +5576,7 @@ echo 16777300 >"$T/df.avail"
 run_slot_script "$SNAP_NEW"
 notice_written "slot, the old clone from another snapshot" "the last upgrade ("
 slot_fixture OLD
-rm "$T/esp/previous/source-uuid"
+rm "${T:?}/esp/previous/source-uuid"
 echo 16777300 >"$T/df.avail"
 run_slot_script "$SNAP_NEW"
 notice_written "slot, a slot that names no source" "the last upgrade ("
@@ -5624,7 +5624,7 @@ for at in previous.new @.previous.new "$(basename "$T/esp/loader/entries/cachyos
         # the slot is the new one by now: nothing whole to keep but the current OS
         notice_written "slot, the switch stops at $at" "the last upgrade ("
     fi
-    rm -f "$T/mv.fail"
+    rm -f "${T:?}/mv.fail"
     : >"$T/slot.calls"
     run_slot_script "$SNAP_NEW"
     check "slot, after a stop at $at, the next run: exit 0" "$RC" "0"
@@ -5878,13 +5878,13 @@ run_driver_env "${PROV[@]}" --dry-run
 check "provision of a drive whose own record says will: exit 0 (its OS is the one replaced)" "$RC" "0"
 
 provision_fixture
-rm "$T/config.toml"
+rm "${T:?}/config.toml"
 run_driver_env "${PROV[@]}" --dry-run
 check "provision without a readable config.toml: exit 1" "$RC" "1"
 has "provision without a readable config.toml: refused before anything" "$OUT" "cannot read $T/config.toml: the payload carries it"
 
 provision_fixture
-rm "$T/bin/xorriso"
+rm "${T:?}/bin/xorriso"
 # The host may have xorriso: a PATH of every host tool but it.
 mkdir -p "$T/noxorriso"
 for tool in $(compgen -c | sort -u); do
@@ -5897,7 +5897,7 @@ check "provision without xorriso: exit 1" "$RC" "1"
 has "provision without xorriso: names the package" "$OUT" "xorriso is not installed (package libisoburn): the payload cdrom cannot be built"
 
 provision_fixture
-rm "$T/usr/lib/das-backup/recovery-os-install.sh"
+rm "${T:?}/usr/lib/das-backup/recovery-os-install.sh"
 run_driver_env "${PROV[@]}" --dry-run
 check "provision without the installer beside it: exit 1" "$RC" "1"
 has "provision without the installer: says where it looked" "$OUT" "recovery-os-install.sh is not installed beside"
@@ -6122,22 +6122,22 @@ pstate() { # <name> <flags> <received uuid>
     printf '%s\n' "$2" >"$T/ptop/nvme/$1/.flags"
     printf '%s\n' "$3" >"$T/ptop/nvme/$1/.received"
 }
-rm -rf "$T/ptop"; mkdir -p "$T/ptop/nvme"
+rm -rf "${T:?}/ptop"; mkdir -p "$T/ptop/nvme"
 pstate das-state.20261012T1533 readonly 1111-aaaa
 pstate das-state.20261013T0300 - 2222-bbbb
 pstate das-state.20261013T0400 readonly -
 run_proof
 check "proof: the newest COMPLETE state (the newer ones are a writable and an unreceived one)" "$OUT" "newest=das-state.20261012T1533"
-rm -rf "$T/ptop"; mkdir -p "$T/ptop/nvme"
+rm -rf "${T:?}/ptop"; mkdir -p "$T/ptop/nvme"
 run_proof
 check "proof: an empty nvme directory holds none" "$OUT" "newest=none"
-rm -rf "$T/ptop"; mkdir -p "$T/ptop"
+rm -rf "${T:?}/ptop"; mkdir -p "$T/ptop"
 run_proof
 check "proof: no nvme directory: exit 2, never 'none'" "$RC" "2"
 has "proof: no nvme directory: says so" "$OUT" "no received 'nvme' directory"
 # root reads through mode 000, so only an unprivileged run can make it unreadable
 if ((EUID != 0)); then
-    rm -rf "$T/ptop"; mkdir -p "$T/ptop/nvme"
+    rm -rf "${T:?}/ptop"; mkdir -p "$T/ptop/nvme"
     pstate das-state.20261012T1533 readonly 1111-aaaa
     chmod 000 "$T/ptop/nvme"
     run_proof

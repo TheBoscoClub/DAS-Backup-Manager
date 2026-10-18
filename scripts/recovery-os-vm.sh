@@ -1101,6 +1101,7 @@ set_domain() {
     fi
     DOMAIN="$DOMAIN_BASE-$1"
     DOMAIN_XML="$STATE_DIR/$1.plain.xml"
+    DOMAIN_NEW="$STATE_DIR/$1.plain.xml.new" # the render target, before the rename
     # What libvirt's event stream says when the domain is reset -- a reboot
     # inside it, or virsh reset (virsh-domain-event.c, the generic print).
     RESET_EVENT="event 'reboot' for domain '$DOMAIN'"
@@ -1153,7 +1154,7 @@ render_domain_xml() {
         return 1
     fi
     if ! make_state_dir || ! (umask 077 && printf '%s' "$out" >"$DOMAIN_XML.new" && mv -f -- "$DOMAIN_XML.new" "$DOMAIN_XML"); then
-        rm -f -- "$DOMAIN_XML.new"
+        rm -f -- "${DOMAIN_NEW:?}"
         RENDER_FAILURE="cannot write $DOMAIN_XML"
         return 1
     fi
@@ -1390,7 +1391,7 @@ check_no_live_holder() {
             refuse "a previous session's disk holder is still running (pid $REC_PID, holding $REC_DEV) -- finish it: $SELF session-end $(basename -- "$f" .holder)"
         fi
         warn "removing the stale record $f (pid $REC_PID no longer holds $REC_DEV)"
-        rm -f -- "$f"
+        rm -f -- "${f:?}"
     done
     shopt -u nullglob
 }
@@ -1495,14 +1496,14 @@ record_session_time() {
     out+="$LABEL $1"$'\n'
     tmp="$SESSIONS_FILE.new.$$"
     if ! printf '%s' "$out" >"$tmp"; then
-        rm -f -- "$tmp"
+        rm -f -- "${tmp:?}"
         SESSIONS_FAILURE="cannot write $tmp"
         return 1
     fi
     # On disk before it replaces the old one, and the rename on disk too: the
     # start of a session must survive the host crashing during it.
     if ! chmod 0644 -- "$tmp" || ! sync -- "$tmp" || ! mv -f -- "$tmp" "$SESSIONS_FILE"; then
-        rm -f -- "$tmp"
+        rm -f -- "${tmp:?}"
         SESSIONS_FAILURE="cannot put $tmp in place as $SESSIONS_FILE"
         return 1
     fi
@@ -2067,21 +2068,30 @@ read_guard_state() {
         "$GS_ENGAGED_C" == "das-vm-guard engaged "* && "$GS_LIFTED_C" == "das-vm-guard lifted "* ]]
 }
 
+# The guard file'"'"'s numbered rotations ($GUARD_FILE.0, .1, ...): removed by a find on the state
+# directory, since a glob cannot sit behind a guarded expansion. Same files the old
+# rm of "$GUARD_FILE".[0-9]* matched; a state directory that does not exist yet has none.
+rm_guard_rotations() {
+    [[ -d "${STATE_DIR:?}" ]] || return 0
+    find "${STATE_DIR:?}" -maxdepth 1 ! -type d -name "${LABEL:?}.guard.[0-9]*" -delete
+}
+
 # Define the domain with the guard, and prove the definition carries it.
 # Fail closed: without it, nothing boots.
 define_guard() {
     local out xml missing
     check_path_chars "$GUARD_FILE"
-    rm -f -- "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
+    rm -f -- "${GUARD_FILE:?}" "${GUARD_STATE_FILE:?}" "${RESET_FILE:?}"
+    rm_guard_rotations
     if [[ -e "$GUARD_FILE" || -e "$GUARD_FILE.0" || -e "$GUARD_STATE_FILE" || -e "$RESET_FILE" ]]; then
         refuse "cannot remove an old $GUARD_FILE, its state or its resets: a stale report could pass for this session's -- nothing was booted"
     fi
     render_domain_xml || refuse "$RENDER_FAILURE -- nothing was booted"
     if ! (umask 077 && guarded_domain_xml >"$GUARD_XML_FILE"); then
-        rm -f -- "$GUARD_XML_FILE" "$DOMAIN_XML"
+        rm -f -- "${GUARD_XML_FILE:?}" "${DOMAIN_XML:?}"
         refuse "cannot add the session guard to $DOMAIN_XML (each of '  </os>' and '  </devices>' once, and no SMBIOS strings or $GUARD_PORT port of its own, are needed) -- nothing was booted"
     fi
-    rm -f -- "$DOMAIN_XML"
+    rm -f -- "${DOMAIN_XML:?}"
     write_guard_state "verdict=$VERDICT" "engaged=$GUARD_EXPECT" "lifted=$GUARD_EXPECT_LIFTED" \
         "engaged_short=$GUARD_EXPECT_C" "lifted_short=$GUARD_EXPECT_LIFTED_C"
     # Set first: if the define half-happens, the cleanup must look.
@@ -2111,16 +2121,17 @@ remove_guard() {
     elif guard_in "$xml"; then
         GUARD_LEFT="$DOMAIN's definition still carries it after defining $DOMAIN_XML"
     else
-        rm -f -- "$DOMAIN_XML"
+        rm -f -- "${DOMAIN_XML:?}"
         GUARDED=false
         # The reset watch goes before its file: it writes there, and a line
         # it wrote after this would leave the file behind (bd lorz).
         stop_reset_watch
-        rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
+        rm -f -- "${GUARD_XML_FILE:?}" "${GUARD_FILE:?}" "${GUARD_STATE_FILE:?}" "${RESET_FILE:?}"
+        rm_guard_rotations
         log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_TEMPLATE again)"
         return 0
     fi
-    rm -f -- "$DOMAIN_XML"
+    rm -f -- "${DOMAIN_XML:?}"
     warn "the session guard is still in $DOMAIN's definition: $GUARD_LEFT. It only keeps btrbk from running in that VM; once it is shut off, run: $SELF define"
     return 1
 }
@@ -3174,7 +3185,7 @@ start_holder() {
     wait "$started" 2>/dev/null || rc=$?
     why="$(cat -- "$HOLDER_ERR" 2>/dev/null)" || why=""
     HOLDER_PID=""
-    rm -f -- "$HOLDER_FILE"
+    rm -f -- "${HOLDER_FILE:?}"
     HOLDER_FAILURE="holder exit $rc: ${why:-${line:-no answer}}"
     return 1
 }
@@ -3320,7 +3331,11 @@ return_disk() {
     fi
     release_lock
     check_lock_let_go
-    rm -f -- "$HOLDER_FILE" "$HOLDER_OUT" "$HOLDER_ERR" "$DISK_XML_FILE"
+    # Each of these is "" until a drive's label is resolved; an unset one has nothing to remove.
+    local rec
+    for rec in "$HOLDER_FILE" "$HOLDER_OUT" "$HOLDER_ERR" "$DISK_XML_FILE"; do
+        [[ -z "$rec" ]] || rm -f -- "${rec:?}"
+    done
     return 0
 }
 
@@ -3668,7 +3683,7 @@ egress_remove() {
         fi
         if ((EGRESS_COUNT == 0)); then
             EGRESS_OWNED=false
-            rm -f -- "$EGRESS_FILE"
+            rm -f -- "${EGRESS_FILE:?}"
             EGRESS_RESULT="taken out"
             log "egress: took the rule for $EGRESS_SUBNET out (priority $EGRESS_PRIORITY)"
             return 0
@@ -3734,9 +3749,10 @@ stop_console_bridge() {
         kill -KILL "$pid" 2>/dev/null || :
     fi
     if [[ "$dir" == "$STATE_DIR/console-$LABEL-"* && "$dir" != *..* ]]; then
-        rm -rf -- "$dir" "$dir.err"
+        local dir_err="${dir:?}.err"
+        rm -rf -- "${dir:?}" "${dir_err:?}"
     fi
-    rm -f -- "$CONSOLE_FILE"
+    rm -f -- "${CONSOLE_FILE:?}"
     log "console bridge for $LABEL removed"
 }
 
@@ -3775,7 +3791,7 @@ cmd_console_socket() {
     # would let them put a symlink where socat applies user= and mode= by
     # path, and have root chown whatever it names.
     if ! chmod 0711 -- "$dir"; then
-        rm -rf -- "$dir"
+        rm -rf -- "${dir:?}"
         refuse "cannot set the mode of $dir"
     fi
     sock="$dir/vnc.sock"
@@ -3786,7 +3802,8 @@ cmd_console_socket() {
     pid=$!
     if ! (umask 077 && printf '%s\n%s\n' "$pid" "$dir" >"$CONSOLE_FILE"); then
         kill "$pid" 2>/dev/null || :
-        rm -rf -- "$dir" "$dir.err"
+        local dir_err="${dir:?}.err"
+        rm -rf -- "${dir:?}" "${dir_err:?}"
         refuse "cannot record the bridge in $CONSOLE_FILE"
     fi
     for ((i = 0; i < 50; i++)); do
@@ -3806,7 +3823,8 @@ cmd_console_socket() {
         stop_console_bridge
         refuse "the bridge's socket is not a socket of user $uid with mode 0600 (${st:-not there}): $(head -c 300 -- "$dir.err" 2>/dev/null)"
     fi
-    rm -f -- "$dir.err"
+    local dir_err="${dir:?}.err"
+    rm -f -- "${dir_err:?}"
     log "console bridge for $LABEL: $sock (user $uid, one connection; removed when the disk is given back)"
     printf '%s\n' "$sock"
 }
@@ -4005,7 +4023,7 @@ run_stage() {
             if [[ ! "$rc" =~ ^[[:digit:]]*$ ]]; then
                 GSH_WHY="the probe's answer is no exit status: $(printable "$rc")"
             elif [[ -n "$chunk" ]] && ! printf '%s' "$chunk" | base64 -d >"$tmp" 2>/dev/null; then
-                rm -f -- "$tmp"
+                rm -f -- "${tmp:?}"
                 GSH_WHY="the probe's answer is no output: $(printable "${GSH_OUT#*$'\n'}")"
             else
                 answered=true
@@ -4021,7 +4039,7 @@ run_stage() {
                     printf x
                 )"
                 OUT_PART=${OUT_PART%x}
-                rm -f -- "$tmp"
+                rm -f -- "${tmp:?}"
             elif [[ -n "$rc" ]]; then
                 # Ended, and all it printed has been read.
                 [[ -z "$OUT_PART" ]] || stage_output "$stage" $'\n'
@@ -4900,12 +4918,13 @@ cmd_session_pair() {
             fi
             rc=0
             cause_file="$STATE_DIR/${labels[$i]}.exit5"
-            rm -f -- "$cause_file"
+            rm -f -- "${cause_file:?}"
             DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=sequential \
                 DAS_RECOVERY_VM_CAUSE_FILE=$cause_file bash "$SELF" session "${labels[$i]}" "${flags[@]}" || rc=$?
             rcs[i]=$rc
         done
-        rm -f -- "$STATE_DIR/${labels[0]}.exit5" "$STATE_DIR/${labels[1]}.exit5"
+        local exit5_a="${labels[0]:?}.exit5" exit5_b="${labels[1]:?}.exit5"
+        rm -f -- "${STATE_DIR:?}/${exit5_a:?}" "${STATE_DIR:?}/${exit5_b:?}"
     fi
     for i in 0 1; do
         printf 'DRIVE %s %s\n' "${labels[$i]}" "${rcs[$i]}"
@@ -4961,7 +4980,7 @@ on_exit() {
     local rc=$? state
     set +e
     trap '' INT TERM HUP
-    [[ -z "$PAYLOAD_ISO" ]] || rm -f -- "$PAYLOAD_ISO"
+    [[ -z "$PAYLOAD_ISO" ]] || rm -f -- "${PAYLOAD_ISO:?}"
     # The reset watch ends with this script, on every way out.
     stop_reset_watch
     if [[ "$DONE" == true ]]; then
@@ -5241,7 +5260,7 @@ write_causes() {
     [[ -n "$CAUSE_FILE" ]] || return 0
     tmp="$CAUSE_FILE.tmp.$$"
     if ! { if [[ "$1" == 5 ]]; then exit5_causes; fi; } >"$tmp" 2>/dev/null || ! mv -f -- "$tmp" "$CAUSE_FILE"; then
-        rm -f -- "$tmp"
+        rm -f -- "${tmp:?}"
         warn "could not write this session's exit-5 causes to $CAUSE_FILE: the two-drive run will not start the other drive"
     fi
 }
@@ -5600,7 +5619,8 @@ cmd_session_end() {
     fi
     if [[ -z "$DISK" && ${#attached[@]} -eq 0 ]]; then
         if [[ "$GUARDED" != true ]]; then
-            rm -f -- "$GUARD_XML_FILE" "$GUARD_FILE" "$GUARD_FILE".[0-9]* "$GUARD_STATE_FILE" "$RESET_FILE"
+            rm -f -- "${GUARD_XML_FILE:?}" "${GUARD_FILE:?}" "${GUARD_STATE_FILE:?}" "${RESET_FILE:?}"
+            rm_guard_rotations
         elif remove_guard; then
             log "session-end: no disk to give back for $LABEL; the session guard was still in $DOMAIN's definition and is out of it now"
         elif ((judged == 0)); then
@@ -5735,7 +5755,7 @@ cmd_define() {
         if ! virsh_ dominfo "$DOMAIN" >/dev/null 2>&1; then
             refuse "virsh define reported success, but $DOMAIN is not defined"
         fi
-        rm -f -- "$DOMAIN_XML"
+        rm -f -- "${DOMAIN_XML:?}"
     done
     if [[ "$legacy" == true ]]; then
         # Its NVRAM goes with it: firmware state of that one VM, nothing of
@@ -5845,16 +5865,16 @@ take_screenshot() {
         return 1
     }
     if ! err="$(virsh_ screenshot "$DOMAIN" "$tmp/screen" 2>&1)"; then
-        rm -rf -- "$tmp"
+        rm -rf -- "${tmp:?}"
         SHOT_WHY="virsh screenshot failed: $err"
         return 1
     fi
     if ! err="$(magick "$tmp/screen" "png:$1" 2>&1)"; then
-        rm -rf -- "$tmp"
+        rm -rf -- "${tmp:?}"
         SHOT_WHY="magick could not convert the screenshot: $err"
         return 1
     fi
-    rm -rf -- "$tmp"
+    rm -rf -- "${tmp:?}"
 }
 
 # ---------------------------------------------------------------------------
@@ -6139,15 +6159,15 @@ provision_payload() {
         { [[ "$P_UNDO" != true ]] && ! cp -- "$P_KEYS" "$tmp/authorized_keys"; } ||
         ! cp -- "$DAS_CONFIG" "$tmp/config.toml" ||
         ! (cd "$tmp" && sha256sum -- * >SHA256SUMS); then
-        rm -rf -- "$tmp"
+        rm -rf -- "${tmp:?}"
         refuse "cannot assemble the payload in $tmp"
     fi
     if ! out="$(xorriso -as mkisofs -quiet -V DAS-PROVISION -J -R -o "$PAYLOAD_ISO" "$tmp" 2>&1)"; then
-        rm -rf -- "$tmp"
-        rm -f -- "$PAYLOAD_ISO"
+        rm -rf -- "${tmp:?}"
+        rm -f -- "${PAYLOAD_ISO:?}"
         refuse "xorriso could not build $PAYLOAD_ISO: $(printable "$out")"
     fi
-    rm -rf -- "$tmp"
+    rm -rf -- "${tmp:?}"
 }
 
 # Attach (or detach) a cdrom to the domain's definition, and prove it.
@@ -6546,7 +6566,7 @@ provision_giveback() {
         session_exit 4
     fi
     DONE=true
-    rm -f -- "$PAYLOAD_ISO" || warn "cannot remove the payload image $PAYLOAD_ISO"
+    rm -f -- "${PAYLOAD_ISO:?}" || warn "cannot remove the payload image $PAYLOAD_ISO"
     progress giveback ok "detached; $HOLDER_RESULT; egress rule $EGRESS_RESULT"
     if [[ "$P_UNDO" == true && -n "$UNATTENDED_FAILED" ]]; then
         line="Undo of $LABEL ($PROVISION_STAMP) stopped at $UNATTENDED_STAGE: ${UNATTENDED_FAILED#*: }"

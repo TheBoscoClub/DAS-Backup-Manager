@@ -54,7 +54,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 for fn in umount_with_retry unmount_all record_op mount_sources owns_source_mount disown_source_mount probe_mount_point probe_state; do
@@ -118,7 +118,7 @@ umount() {
         echo "umount: $1: not mounted." >&2
         return 32
     fi
-    rm -f "$WORK/mounted/$name"
+    rm -f "${WORK:?}/mounted/${name:?}"
 }
 # findmnt --fstab ... --mountpoint <path>: declared while $WORK/fstab/<name> exists.
 findmnt() {
@@ -144,7 +144,7 @@ fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
 
 setup() {
-    rm -rf "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab" "$WORK/probe_rc" "$WORK/probe_two" "$WORK/probe_fake"
+    rm -rf "${WORK:?}/mounted" "${WORK:?}/busy" "${WORK:?}/probe_errors" "${WORK:?}/absent" "${WORK:?}/fstab" "${WORK:?}/probe_rc" "${WORK:?}/probe_two" "${WORK:?}/probe_fake"
     mkdir -p "$WORK/mounted" "$WORK/busy" "$WORK/probe_errors" "$WORK/absent" "$WORK/fstab" "$WORK/probe_rc" "$WORK/probe_two" "$WORK/probe_fake"
     : >"$WORK/umount_calls"; : >"$WORK/mount_calls"; : >"$WORK/sleeps"; : >"$WORK/log"
     declare -gA OP_STATUS=()
@@ -196,7 +196,7 @@ check "busy forever: the last attempt is an error" "$(grep -c '^ERROR:   umount 
 
 # --- already unmounted: never touched -------------------------------------------
 setup
-rm -f "$WORK/mounted/backup-system-recovery-A"
+rm -f "${WORK:?}/mounted/backup-system-recovery-A"
 unmount_all
 check "not mounted: no umount call" "$(calls /mnt/backup-system-recovery-A)" "0"
 check "not mounted: still OK" "${OP_STATUS[unmount]}" "OK"
@@ -348,7 +348,7 @@ check "target, probe cannot tell, mounted: the other target released as before" 
     "$(calls /mnt/backup-system-recovery-A) $(is_mounted /mnt/backup-system-recovery-A)" "1 no"
 
 setup
-rm -f "$WORK/mounted/backup-22tb"
+rm -f "${WORK:?}/mounted/backup-22tb"
 touch "$WORK/probe_errors/backup-22tb"
 unmount_all
 check "target, probe cannot tell, not mounted: the unmount tried with its whole budget" \
@@ -371,7 +371,7 @@ check "a target still mounted and one the probe cannot tell about: both in the d
 # mountpoint answers it 1, "No such file or directory", like an error, and it
 # is NOT one — the gate passes, and nothing is said about it.
 setup
-rm -f "$WORK/mounted/backup-system-recovery-A"
+rm -f "${WORK:?}/mounted/backup-system-recovery-A"
 touch "$WORK/absent/backup-system-recovery-A"
 unmount_all
 check "target not there at all (an absent drive): never unmounted" "$(calls /mnt/backup-system-recovery-A)" "0"
@@ -395,7 +395,7 @@ check "probe cannot tell, helper mounted: says so, with the probe's message" \
     "$(logged 'WARN:   Could not tell whether source volume /.btrfs-hdd, which this run mounted, is still mounted — mountpoint: /.btrfs-hdd: Input/output error (exit 1); unmounting it anyway')" "1"
 check "probe cannot tell, helper mounted: then unmounted" \
     "$(logged 'INFO:   Unmounted source volume /.btrfs-hdd (this run mounted it)')" "1"
-rm -f "$WORK/probe_errors/.btrfs-hdd"
+rm -f "${WORK:?}/probe_errors/.btrfs-hdd"
 unmount_all
 check "probe cannot tell, helper mounted: struck off once unmounted" "$(calls /.btrfs-hdd)" "1"
 
@@ -404,13 +404,13 @@ check "probe cannot tell, helper mounted: struck off once unmounted" "$(calls /.
 setup
 sources hdd-media=/.btrfs-hdd
 mount_sources
-rm -f "$WORK/mounted/.btrfs-hdd"
+rm -f "${WORK:?}/mounted/.btrfs-hdd"
 touch "$WORK/probe_errors/.btrfs-hdd"
 unmount_all
 check "probe cannot tell, helper gone: unmount tried once" "$(calls /.btrfs-hdd)" "1"
 check "probe cannot tell, helper gone: umount's own message, and no claim it is mounted" \
     "$(logged 'WARN:   Could not unmount source volume /.btrfs-hdd, which this run mounted: umount: /.btrfs-hdd: not mounted. — left as it is; best effort, not a DAS disconnect concern')" "1"
-rm -f "$WORK/probe_errors/.btrfs-hdd"
+rm -f "${WORK:?}/probe_errors/.btrfs-hdd"
 unmount_all
 check "probe cannot tell, helper gone: a later pass that can tell strikes it off, no umount" \
     "$(calls /.btrfs-hdd)" "1"
@@ -421,7 +421,7 @@ check "probe cannot tell, helper gone: and says why" \
 setup
 sources hdd-media=/.btrfs-hdd ssd=/.btrfs-ssd
 mount_sources
-rm -f "$WORK/mounted/.btrfs-hdd" "$WORK/mounted/.btrfs-ssd"
+rm -f "${WORK:?}/mounted/.btrfs-hdd" "${WORK:?}/mounted/.btrfs-ssd"
 touch "$WORK/absent/.btrfs-ssd"
 unmount_all
 check "probe says not mounted, or no such path: never unmounted" \

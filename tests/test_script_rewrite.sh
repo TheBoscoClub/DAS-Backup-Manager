@@ -41,7 +41,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(dirname "$here")"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 
 FINAL='main "$@"; exit $?'
 OLD='main "$@"'

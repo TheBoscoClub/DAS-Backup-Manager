@@ -249,7 +249,7 @@ RC=""
 run_pruner() { # run_pruner <locale> [args...]
     local loc="$1"
     shift
-    rm -f "$STATE/deleted" "$STATE/btrfs.calls" # what a run does is that run's own
+    rm -f "${STATE:?}/deleted" "${STATE:?}/btrfs.calls" # what a run does is that run's own
     env -i PATH="${RUN_PATH:-$BIN:$SYSBIN}" HOME="$WORK/home" LC_ALL="$loc" TMPDIR="$WORK/tmp" \
         DAS_TEST_STATE="$STATE" DAS_TEST_EUID=0 \
         BTRDASD_BIN="$BIN/btrdasd" DAS_CONFIG="$WORK/config.toml" \
@@ -366,7 +366,7 @@ chmod +x "$WORK/pruner"
 # read_back <dryrun|real>: the reader's verdict on the real pruner, under the
 # shell options backup-run.sh runs under: "<status>|<detail>".
 read_back() {
-    rm -f "$STATE/deleted" # what a run deletes is that run's own
+    rm -f "${STATE:?}/deleted" # what a run deletes is that run's own
     (
         set -euo pipefail
         : >"$WORK/reader.log"
@@ -421,7 +421,7 @@ check "reader, two targets, a dry run: both summaries, '; ' between them, nothin
 # not call it OK, in either mode. The primary is not mounted; the other target
 # is a mirror, skipped by design.
 fresh
-rm -f "$STATE/mounted/primary"
+rm -f "${STATE:?}/mounted/primary"
 run_pruner C --dryrun
 check "pruner, nothing mounted: exit status 0 and no summary (it is the reader that must decide)" \
     "$RC $(said 'Would delete') $(said 'Deleted')" "0 0 0"
@@ -497,7 +497,7 @@ check "mountpoint killed by TERM (143): could not tell, exit 1" \
 
 # The quiet answers, unchanged: exit 0, the skip said, no failure.
 fresh
-rm -f "$STATE/mounted/primary"
+rm -f "${STATE:?}/mounted/primary"
 run_pruner C
 check "not a mount point (32): the pruner exits 0" "$RC" "0"
 check "not a mount point: the skip is said, and nothing says it failed" \

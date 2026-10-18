@@ -13,7 +13,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/backup-run.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
 for fn in check_recovery_os record_op any_op_is run_status subject_status generate_report; do
@@ -83,7 +83,7 @@ BTRBK_LATEST=""
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
 
-reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; : >"$WORK/timeout_calls"; rm -f "$WORK/err" "$WORK/no_subcommand" "$WORK/time_out" "$WORK/partial_err"; }
+reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; : >"$WORK/timeout_calls"; rm -f "${WORK:?}/err" "${WORK:?}/no_subcommand" "${WORK:?}/time_out" "${WORK:?}/partial_err"; }
 
 # --- current ------------------------------------------------------------------
 reset
@@ -258,7 +258,7 @@ printf 'recovery-os: reading A at /mnt/a/@\nrecovery-os: read A in 41.2 s\n' >"$
 check_recovery_os run
 check "timeout after the last drive: detail says so" "${OP_STATUS[recovery_os_detail]}" \
     "recovery-os status timed out after 900 s after reading every mounted drive"
-rm -f "$WORK/partial_err" "$WORK/time_out"
+rm -f "${WORK:?}/partial_err" "${WORK:?}/time_out"
 
 # --- the notes of a finished run are info; real stderr still warns ------------------
 reset
@@ -274,7 +274,7 @@ printf 'recovery-os: reading A at /mnt/a/@\nError: x\nsecond\n' >"$WORK/err"; ec
 check_recovery_os run
 check "a real error beside the notes: its first line is the detail" "${OP_STATUS[recovery_os_detail]}" "exit code 2: Error: x"
 check "a real error beside the notes: the rest still warns" "$(grep -c '^WARN:   second$' "$WORK/log")" "1"
-rm -f "$WORK/err"
+rm -f "${WORK:?}/err"
 
 # --- a corrupt state file: the way out reaches the report ----------------------
 reset

@@ -9,7 +9,7 @@ VERSION="${1:?Usage: build-appimage.sh VERSION}"
 APPDIR="ButteredDASD.AppDir"
 
 # Clean previous build
-rm -rf "$APPDIR" build-appimage
+rm -rf "${APPDIR:?}" "${PWD:?}/build-appimage"
 
 # Build GUI with /usr prefix (AppImage convention)
 cmake -B build-appimage \

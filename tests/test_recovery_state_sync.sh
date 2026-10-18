@@ -13,7 +13,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/das-recovery-state-sync.sh"
 WORK=$(mktemp -d)
-trap 'chmod -R u+rwX "$WORK" 2>/dev/null || :; rm -rf "$WORK"' EXIT
+trap 'chmod -R u+rwX "$WORK" 2>/dev/null || :; rm -rf "${WORK:?}"' EXIT
 R="$WORK/root"
 BIN="$WORK/bin"
 LOG="$WORK/calls.log"
@@ -127,9 +127,9 @@ chmod +x "$BIN"/*
 
 fixture() {
     chmod -R u+rwX "$R" 2>/dev/null || :
-    rm -rf "$R"
+    rm -rf "${R:?}"
     : >"$LOG"
-    rm -f "$WORK/mv-count" "$LOG.mounted" "$WORK/timings" "$WORK/booted"
+    rm -f "${WORK:?}/mv-count" "${WORK:?}/calls.log.mounted" "${WORK:?}/timings" "${WORK:?}/booted"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
     printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\n' >"$R/etc/das-backup/recovery-drive"
@@ -236,7 +236,7 @@ check "partial: status names the complete one" status_is "synced 20261012T0348"
 
 echo "== no state snapshot"
 fixture
-rm -rf "$R"/nvme/das-state.*
+rm -rf "${R:?}"/nvme/das-state.*
 run
 check "nosnap: exit 2 (the unit's SuccessExitStatus), not 1" test "$RC" -eq 2
 check "nosnap: the unit lists exit 2 as success" grep -q '^SuccessExitStatus=2$' "$(dirname "$SCRIPT")/../systemd/das-recovery-state-sync.service"
@@ -247,7 +247,7 @@ check "nosnap: the booted marker is written on a boot that synced nothing" test 
 
 echo "== no marker"
 fixture
-rm -f "$R/etc/das-backup/recovery-drive" "$WORK/booted"
+rm -f "${R:?}/etc/das-backup/recovery-drive" "${WORK:?}/booted"
 run
 check "nomarker: exit 1" test "$RC" -eq 1
 check "nomarker: message" out_has "not a recovery drive"
@@ -348,7 +348,7 @@ check "mount (failure): mounted" has "$LOG" "mount -o subvolid=5,ro /dev/stub $R
 check "mount (failure): still unmounted on exit" has "$LOG" "umount $R"
 
 echo "== D9: the splash says what is happening, and why"
-fixture; rm -f "$WORK/timings"; run
+fixture; rm -f "${WORK:?}/timings"; run
 check "d9: exit 0" test "$RC" -eq 0
 check "d9: the header is the spec's sentence" has "$LOG" 'display-message --text=DAS recovery disk, Bay 1. Recovery disk boots take significantly longer than a normal boot: this disk is a 2 TB USB drive, and it copies the latest backup index and settings before the desktop appears. Do not power off or unplug it — the copy would be left incomplete and the disk would start again from the previous copy.'
 check "d9: phases in order" test "$(grep -o 'finding the newest backup\|preparing the configuration\|copying the backup index\|ready: index from' "$LOG" | tr '\n' '|')" = "finding the newest backup|preparing the configuration|copying the backup index|ready: index from|"
@@ -376,11 +376,11 @@ check "d9 no plymouth: pinged, no messages" test "$(grep -c 'display-message' "$
 check "d9 no plymouth: still synced" status_is "synced 20261012T0348"
 
 echo "== D9: the failure phases"
-fixture; rm -rf "$R"/nvme/das-state.*; run
+fixture; rm -rf "${R:?}"/nvme/das-state.*; run
 check "d9 no snapshot: exit 2" test "$RC" -eq 2
 check "d9 no snapshot: said on the splash" has "$LOG" "no backup received yet"
 check "d9 no snapshot: no total written" test ! -e "$WORK/timings"
-fixture; rm -rf "$R"/nvme/das-state.* "$R/var/lib/das-backup"; run
+fixture; rm -rf "${R:?}"/nvme/das-state.* "${R:?}/var/lib/das-backup"; run
 check "d9 first boot, no snapshot, no state: exit 2" test "$RC" -eq 2
 check "d9 first boot, no snapshot, no state: no database left (review focus 4)" test ! -e "$R/var/lib/das-backup/backup-index.db"
 check "d9 first boot, no snapshot, no state: no countdown" test "$(grep -c 'measured at the last boot' "$LOG")" -eq 0
@@ -417,7 +417,7 @@ check "d9 ready message was shown" has "$LOG" "ready: index from"
 fixture; printf 'total=40\n' >"$WORK/timings"; run STUB_DERIVE_FAIL=1
 check "d9 failure after a measured boot: shown" has "$LOG" "could not update: derive-recovery refused"
 check "d9 failure after a measured boot: no countdown" test "$(grep -c 'could not update.*remaining' "$LOG")" -eq 0
-fixture; rm -rf "$R"/nvme/das-state.*; printf 'total=40\n' >"$WORK/timings"; run
+fixture; rm -rf "${R:?}"/nvme/das-state.*; printf 'total=40\n' >"$WORK/timings"; run
 check "d9 no snapshot after a measured boot: no countdown" test "$(grep -c 'no backup received yet.*remaining' "$LOG")" -eq 0
 fixture; printf 'total=1\n' >"$WORK/timings"; run STUB_PLYMOUTH_SLOW=1
 check "d9 over budget: exit 0" test "$RC" -eq 0

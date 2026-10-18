@@ -22,7 +22,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/das-wipe-all-drives-and-partition-from-scratch.sh"
 LIB="$(mktemp)"
-trap 'rm -f "$LIB"' EXIT
+trap 'rm -f "${LIB:?}"' EXIT
 
 sed -n '/^ESP_LABEL_PREFIX=/,/^partition_bootable_drive() {/p' "$SRC" | sed '$d' > "$LIB"
 sed -n '/^log_error()/p;/^RED=/p;/^GREEN=/p;/^YELLOW=/p;/^BLUE=/p;/^NC=/p' "$SRC" >> "$LIB"

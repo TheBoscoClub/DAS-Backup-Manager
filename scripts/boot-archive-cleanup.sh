@@ -250,13 +250,13 @@ cleanup_target() {
     listing_stderr=$(mktemp)
     if ! listing=$(btrfs subvolume list "$mnt" 2>"$listing_stderr"); then
         listing_err=$(tr '\n' ' ' < "$listing_stderr")
-        rm -f "$listing_stderr"
+        [[ -z "${listing_stderr:-}" ]] || rm -f "${listing_stderr:?}"
         log_error "  [$label] Failed to list subvolumes: ${listing_err:-(no error output)}"
         log_error "  [$label] Target NOT pruned - state unknown"
         TARGET_FAILURES=$(( TARGET_FAILURES + 1 ))
         return 0
     fi
-    rm -f "$listing_stderr"
+    [[ -z "${listing_stderr:-}" ]] || rm -f "${listing_stderr:?}"
 
     # What an archive path and name may be made of, for the guard below. Each
     # class is spelled out: a range is not ASCII under en_US.UTF-8 ([A-Za-z]

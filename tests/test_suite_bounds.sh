@@ -15,7 +15,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+trap 'rm -rf "${T:?}"' EXIT
 passes=0 fails=0
 check() { # <name> <got> <want>
     if [[ "$2" == "$3" ]]; then

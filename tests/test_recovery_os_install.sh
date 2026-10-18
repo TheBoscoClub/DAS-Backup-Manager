@@ -7,7 +7,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/bound.sh"
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT="$REPO/scripts/recovery-os-install.sh"
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d); trap 'rm -rf "${WORK:?}"' EXIT
 BIN="$WORK/bin"; LOG="$WORK/calls.log"; R="$WORK/root"
 FAILS=0
 pass() { printf 'ok   %s\n' "$1"; }
@@ -101,7 +101,7 @@ EOF
 chmod +x "$BIN"/*
 
 fixture() {
-    rm -rf "$R"; : >"$LOG"
+    rm -rf "${R:?}"; : >"$LOG"
     mkdir -p "$R/mnt/top" "$R/mnt/target" "$R/payload" "$R/etc"
     for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
         mkdir -p "$R/mnt/top/$s"; echo rw >"$R/mnt/top/$s/.subvol"; echo "old-$s" >"$R/mnt/top/$s/sentinel"
@@ -205,7 +205,7 @@ check "wrong uuid: refused before any rename" test -f "$R/mnt/top/@/.subvol"
 check "wrong uuid: names both" out_has "p2 of /dev/sdz is 5eed0010-0000-0000-0000-000000000000, not the configured 5eed0008-0000-4000-8000-000000000008"
 fixture; : >"$WORK/blkid.out"; run replace-os
 check "unreadable uuid: exit 3, never a match" test "$RC" -eq 3
-fixture; rm -rf "$R/mnt/top/nvme" "$R/mnt/top/hdd-system"; run replace-os
+fixture; rm -rf "${R:?}/mnt/top/nvme" "${R:?}/mnt/top/hdd-system"; run replace-os
 check "empty disk: exit 3" test "$RC" -eq 3
 check "empty disk: refused" out_has "p2 holds no received backup subvolume: not a recovery drive to rebuild (seed it with a backup run first) -- refused"
 check "empty disk: nothing renamed" test -f "$R/mnt/top/@/.subvol"
@@ -229,7 +229,7 @@ chain() { # S1 leaves a partial @ and a partial p1, then S2 runs over it
     fixture
     run replace-os
     : >"$TOPD/@/partial1"
-    rm -f "$R/mnt/esp-old"/*
+    rm -f "${R:?}/mnt/esp-old"/*
     echo p >"$R/mnt/esp-old/partial-esp"
     run replace-os DAS_INSTALL_STAMP=$S2
 }
@@ -397,24 +397,24 @@ check "verify: exit 0" test "$RC" -eq 0
 check "verify: btrdasd runs in the target's chroot, root /, a copied config" has "$LOG" "arch-chroot $R/mnt/target btrdasd recovery-os inspect --root / --label system-recovery-A-2tb --config /tmp/das-install-inspect.toml"
 check "verify: the config copy is removed again" test ! -e "$R/mnt/target/tmp/das-install-inspect.toml"
 check "verify: the record is quoted" out_has "btrbk at boot       no"
-vfix; rm "$R/mnt/target/boot/initramfs-linux-cachyos.img"; run verify
+vfix; rm "${R:?}/mnt/target/boot/initramfs-linux-cachyos.img"; run verify
 check "verify, a missing initramfs: exit 3" test "$RC" -eq 3
 check "verify, a missing initramfs: named" out_has "initramfs-linux-cachyos.img named by cachyos-recovery.conf is not on the ESP"
 vfix; printf '    btrbk at boot       may\n' >"$WORK/inspect.out"; run verify
 check "verify, btrbk may run: exit 3" test "$RC" -eq 3
 check "verify, btrbk may run: the record is quoted" out_has "btrbk at boot       may"
-vfix; rm -f "$R/mnt/target/boot/loader/entries"/*.conf; run verify
+vfix; rm -f "${R:?}/mnt/target/boot/loader/entries"/*.conf; run verify
 check "verify, no loader entries at all: exit 2" test "$RC" -eq 2
 check "verify, no loader entries at all: said" out_has "no loader entries"
-vfix; rm "$R/mnt/target/boot/EFI/systemd/systemd-bootx64.efi"; run verify
+vfix; rm "${R:?}/mnt/target/boot/EFI/systemd/systemd-bootx64.efi"; run verify
 check "verify, no systemd-bootx64.efi: exit 3" test "$RC" -eq 3
 check "verify, no systemd-bootx64.efi: named" out_has "EFI/systemd/systemd-bootx64.efi is not on the ESP"
-vfix; rm "$R/mnt/target/boot/EFI/BOOT/BOOTX64.EFI"; run verify
+vfix; rm "${R:?}/mnt/target/boot/EFI/BOOT/BOOTX64.EFI"; run verify
 check "verify, no EFI/BOOT/BOOTX64.EFI: exit 3" test "$RC" -eq 3
 check "verify, no EFI/BOOT/BOOTX64.EFI: named" out_has "EFI/BOOT/BOOTX64.EFI is not on the ESP"
-vfix; rm "$R/mnt/target/boot/loader/loader.conf"; run verify
+vfix; rm "${R:?}/mnt/target/boot/loader/loader.conf"; run verify
 check "verify, no loader.conf: exit 3" test "$RC" -eq 3
-vfix; rm "$R/mnt/target/boot/loader/entries/cachyos-recovery-fallback.conf"; run verify
+vfix; rm "${R:?}/mnt/target/boot/loader/entries/cachyos-recovery-fallback.conf"; run verify
 check "verify, no fallback entry: exit 3" test "$RC" -eq 3
 vfix; run verify STUB_INSPECT_RC=2
 check "verify, inspect itself failed (exit 2): exit 2, not a pass" test "$RC" -eq 2
@@ -521,7 +521,7 @@ fixture; run replace-os; mv "$TOPD/@rescue.replaced.$S1" "$TOPD/@rescue"; run un
 check "undo, a rename that never happened (original present, set-aside absent): exit 0" test "$RC" -eq 0
 check "undo, a rename that never happened: said, left alone" out_has "@rescue was not renamed by $S1"
 check "undo, a rename that never happened: @rescue still the old one" test "$(cat "$TOPD/@rescue/sentinel")" = "old-@rescue"
-fixture; run replace-os; rm -rf "${TOPD:?}/@rescue.replaced.$S1"; run undo
+fixture; run replace-os; rm -rf "${TOPD:?}/@rescue.replaced.${S1:?}"; run undo
 check "undo, set-aside gone and original absent: exit 3" test "$RC" -eq 3
 check "undo, set-aside gone and original absent: named" out_has "@rescue.replaced.$S1 is gone"
 check "undo, set-aside gone and original absent: nothing renamed" test -d "$TOPD/@.replaced.$S1" -a ! -d "$TOPD/@.unbooted.$S1"
@@ -560,13 +560,13 @@ E="$TOPD/@esp.replaced.$S1"
 check "esp.list: written beside the copy" test -f "$E/esp.list"
 check "esp.list: holds the sha256 of the file" grep -q "$(sha256sum "$E/esp/old-esp-file" | cut -d' ' -f1)  ./old-esp-file" "$E/esp.list"
 check "esp.list: synced" has "$LOG" "sync -f $E"
-rm "$E/esp/old-esp-file"; : >"$LOG"; run undo
+rm "${E:?}/esp/old-esp-file"; : >"$LOG"; run undo
 check "undo, a file gone from the copy: exit 3" test "$RC" -eq 3
 check "undo, a file gone from the copy: refused before any rename or mkfs" test -d "$TOPD/@.replaced.$S1" -a -f "$TOPD/.das-provision.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
 fixture; run replace-os; printf 'OLD esp\n' >"$E/esp/old-esp-file"; : >"$LOG"; run undo
 check "undo, a file altered to the same size: exit 3" test "$RC" -eq 3
 check "undo, same size altered: nothing renamed, p1 not formatted" test -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
-fixture; run replace-os; rm -f "$E/esp.list"; : >"$LOG"; run undo
+fixture; run replace-os; rm -f "${E:?}/esp.list"; : >"$LOG"; run undo
 check "undo, no esp.list: exit 3, nothing changed" test "$RC" -eq 3 -a -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0
 fixture; run replace-os; : >"$LOG"; run undo STUB_CP_SHORT=1
 check "undo, the restored p1 differs from esp.list: exit 3" test "$RC" -eq 3
@@ -652,7 +652,7 @@ check "undo: the ID read back from p1 is the old one" test "$(cat "$WORK/p1uuid.
 fixture; run replace-os; echo garbage >"$E/esp.uuid"; : >"$LOG"; run undo
 check "undo, garbled esp.uuid: exit 3" test "$RC" -eq 3
 check "undo, garbled esp.uuid: nothing renamed, p1 not formatted" test -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
-fixture; run replace-os; rm -f "$E/esp.uuid"; : >"$LOG"; run undo
+fixture; run replace-os; rm -f "${E:?}/esp.uuid"; : >"$LOG"; run undo
 check "undo, no esp.uuid: exit 3, nothing changed" test "$RC" -eq 3 -a -d "$TOPD/@.replaced.$S1" -a "$(calls 'mkfs.vfat')" -eq 0 -a "$(calls 'mv ')" -eq 0
 fixture; run replace-os; : >"$LOG"; run undo STUB_MKFS_ID_WRONG=1
 check "undo, the restored p1 has another volume ID: exit 2" test "$RC" -eq 2
