@@ -213,6 +213,40 @@ pub fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
     names
 }
 
+/// The one configuration the host runs from; any other `--config` is a scratch one.
+pub const LIVE_CONFIG: &str = "/etc/das-backup/config.toml";
+/// The files the host's btrbk reads. Only the live configuration may write them.
+const LIVE_BTRBK_CONF: &str = "/etc/btrbk/btrbk.conf";
+const LIVE_BTRBK_STATE_CONF: &str = "/etc/btrbk/btrbk-state.conf";
+
+/// Refuse to let a configuration other than [`LIVE_CONFIG`] write the live
+/// btrbk files (bd 5u15). `--config` picks the `config.toml` read and saved,
+/// but the btrbk files go where `[general].btrbk_conf` says — by default
+/// `/etc/btrbk/btrbk.conf` — so a scratch copy of the host's config, saved as
+/// root, replaced the live `btrbk.conf` with one rendered from the scratch
+/// copy. Refusing, rather than quietly redirecting, leaves the scratch file
+/// exactly as its author wrote it and names the one line to change.
+pub fn refuse_live_outputs(cfg: &Config, config_path: &Path) -> Result<(), String> {
+    if config_path == Path::new(LIVE_CONFIG) {
+        return Ok(());
+    }
+    let live = [
+        Path::new(&cfg.general.btrbk_conf) == Path::new(LIVE_BTRBK_CONF),
+        state_conf_path(cfg) == Path::new(LIVE_BTRBK_STATE_CONF),
+    ];
+    if live.iter().any(|&l| l) {
+        return Err(format!(
+            "refusing to save {}: its [general] btrbk_conf = {} would write the live \
+             /etc/btrbk files, which only {LIVE_CONFIG} may. Set btrbk_conf to a scratch path \
+             in {}",
+            config_path.display(),
+            cfg.general.btrbk_conf,
+            config_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Save an edited config and regenerate btrbk.conf from it, or change
 /// neither. Every path that edits `config.toml` outside a sync — the CLI's
 /// `subvol` commands and every D-Bus helper method that saves — goes through
@@ -238,6 +272,7 @@ fn save_config_and_btrbk_conf_with(
     if !errors.is_empty() {
         return Err(errors.join("\n").into());
     }
+    refuse_live_outputs(cfg, config_path)?;
     let conf_path = Path::new(&cfg.general.btrbk_conf);
     let state_path = state_conf_path(cfg);
     // Absent is a state to restore (by removing what we write); unreadable is
@@ -1206,6 +1241,46 @@ enabled = false
             );
         }
         assert_ne!(std::fs::read_to_string(&conf_path).unwrap(), "old");
+    }
+
+    fn with_btrbk_conf(path: &str) -> Config {
+        let mut cfg = saveable_config(Path::new("/scratch"));
+        cfg.general.btrbk_conf = path.into();
+        cfg
+    }
+
+    #[test]
+    fn only_the_live_config_may_name_the_live_btrbk_files() {
+        let live = Path::new(LIVE_CONFIG);
+        let scratch = Path::new("/scratch/config.toml");
+        // The host's own config, default paths: unchanged behaviour.
+        assert!(refuse_live_outputs(&with_btrbk_conf("/etc/btrbk/btrbk.conf"), live).is_ok());
+        // A scratch config on the default path is the defect.
+        let err =
+            refuse_live_outputs(&with_btrbk_conf("/etc/btrbk/btrbk.conf"), scratch).unwrap_err();
+        assert!(err.contains("live /etc/btrbk"), "{err}");
+        assert!(err.contains("/scratch/config.toml"), "{err}");
+        // A different main file in the live directory still shares the live
+        // state conf (it is derived beside it).
+        assert!(refuse_live_outputs(&with_btrbk_conf("/etc/btrbk/other.conf"), scratch).is_err());
+        // Its own files are fine, including a sibling directory of /etc/btrbk.
+        assert!(refuse_live_outputs(&with_btrbk_conf("/scratch/btrbk.conf"), scratch).is_ok());
+        assert!(
+            refuse_live_outputs(&with_btrbk_conf("/etc/btrbk-test/btrbk.conf"), scratch).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_scratch_config_on_the_live_paths_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = with_btrbk_conf("/etc/btrbk/btrbk.conf");
+        let config_path = dir.path().join("config.toml");
+        let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &|_, _| {
+            panic!("the config must not be saved")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("live /etc/btrbk"), "{err}");
+        assert!(!config_path.exists());
     }
 
     #[test]

@@ -711,6 +711,10 @@ pub fn sync_subvolumes(
 ) -> Result<SyncOutcome, String> {
     let config = Config::load(config_path)
         .map_err(|e| format!("could not load {}: {e}", config_path.display()))?;
+    // A dry run only reads the live files; a real one may write them (bd 5u15).
+    if !dry_run {
+        crate::btrbk_conf::refuse_live_outputs(&config, config_path)?;
+    }
 
     let listings = list_volumes(&config, runner, is_mountpoint);
 

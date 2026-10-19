@@ -1199,6 +1199,26 @@ config.toml and regenerates
 .I /etc/btrbk/btrbk.conf
 together (each replaced atomically), or changes neither file.
 .PP
+With a
+.B \-\-config
+other than the default, the command refuses to save when that file's
+.B [general] btrbk_conf
+(default
+.IR /etc/btrbk/btrbk.conf )
+or the
+.I btrbk\-state.conf
+beside it would be the live
+.I /etc/btrbk
+files: set
+.B btrbk_conf
+to a scratch path first. The same holds for
+.BR "subvol remove" ,
+.BR "subvol set\-manual" ,
+.B "subvol set\-auto"
+and a real (not
+.BR \-\-dry\-run )
+.BR "subvol sync" .
+.PP
 .B btrdasd subvol add
 .I SOURCE NAME
 .RB [ \-\-manual\-only ]

@@ -447,3 +447,106 @@ fn backup_boot_plan_refuses_a_config_it_cannot_load() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot read"), "{err}");
 }
+
+// --- a scratch --config must not reach the live btrbk files (bd DAS-Backup-Manager-5u15)
+
+/// A config at a scratch path whose `[general]` says nothing about
+/// `btrbk_conf`, so it defaults to the live `/etc/btrbk/btrbk.conf` — what a
+/// copy of the host's config looks like.
+fn write_scratch_config_with_live_outputs(dir: &Path) -> std::path::PathBuf {
+    let text = std::fs::read_to_string(write_config(dir))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with("btrbk_conf"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        // A second subvolume, so `remove` has one it may take (a source
+        // cannot be left empty).
+        .replacen(
+            "name = \"@\"",
+            "name = \"@\"\n[[source.subvolumes]]\nname = \"@extra\"",
+            1,
+        );
+    let path = dir.join("scratch.toml");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// Run as root these would be the very write they assert is refused.
+fn running_as_root() -> bool {
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[test]
+fn a_scratch_config_naming_the_live_btrbk_files_is_refused_by_every_saving_subvol_command() {
+    if running_as_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_scratch_config_with_live_outputs(dir.path());
+    let config_s = config.to_str().unwrap();
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    for args in [
+        vec!["subvol", "add", "s", "@home"],
+        vec!["subvol", "remove", "s", "@extra"],
+        vec!["subvol", "set-manual", "s", "@"],
+        vec!["subvol", "set-auto", "s", "@"],
+        vec!["subvol", "sync"],
+    ] {
+        let mut full = args.clone();
+        full.extend(["--config", config_s]);
+        let out = btrdasd(&full);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must fail: {err}");
+        assert!(
+            err.contains("live /etc/btrbk"),
+            "{args:?} must be refused for its live outputs, not fail at the write: {err}"
+        );
+        assert!(
+            !err.contains("Permission denied"),
+            "{args:?} reached the write: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            before,
+            "{args:?} changed the scratch config"
+        );
+    }
+}
+
+#[test]
+fn a_dry_run_sync_of_a_scratch_config_is_not_refused_because_it_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_scratch_config_with_live_outputs(dir.path());
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--dry-run",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("refusing"), "{err}");
+}
+
+#[test]
+fn a_scratch_config_that_names_its_own_btrbk_files_still_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let out = btrdasd(&[
+        "subvol",
+        "add",
+        "s",
+        "@home",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.path().join("btrbk.conf").exists());
+}
