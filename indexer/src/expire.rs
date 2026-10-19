@@ -427,6 +427,14 @@ pub fn expire_retired(
             let volume = Path::new(&source.volume);
             let keep = if !is_mountpoint(volume) {
                 Some("source not mounted — cannot tell whether the subvolume is back")
+            } else if entry.name == crate::adopt::TOP_LEVEL {
+                // `<volume>/.` is the volume itself. A top level is retired
+                // only because its source reaches a mirror (by sync) or by
+                // hand; its series is the only copy of the volume's loose
+                // content, so it is never expired (bd xtnq).
+                Some(
+                    "the volume's top level: its backups are never expired while the volume exists",
+                )
             } else if volume.join(&entry.name).exists() {
                 // A plain directory of that name also lands here: it is kept
                 // either way, and sync revives the entry only for a subvolume.
@@ -2309,9 +2317,8 @@ mod tests {
         );
     }
 
-    /// bd xtnq: a volume's top level (`.`) is never retired by sync, but one
-    /// retired by hand must still never be expired — `<volume>/.` is the
-    /// mounted volume itself, so it always "exists on the source again".
+    /// bd xtnq: a volume's top level (`.`) is retired by sync only when its
+    /// source reaches a mirror (or by hand), and must then never be expired.
     #[test]
     fn a_retired_top_level_is_never_expired() {
         let rig = rig();
@@ -2331,6 +2338,15 @@ mod tests {
             rig.saved_names()
                 .contains(&crate::adopt::TOP_LEVEL.to_string())
         );
+        // Review of 8197528: it says what it is, not "exists again".
+        let text = format_expire_report(&out, false);
+        assert!(
+            text.contains(
+                "    the volume's top level: its backups are never expired while the volume exists\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("exists on the source again"), "{text}");
     }
 
     #[test]

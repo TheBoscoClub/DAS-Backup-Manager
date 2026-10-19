@@ -270,18 +270,23 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                     // of the plan goes ahead.
                     let mirrors = config.mirrors_reached(source);
                     if !mirrors.is_empty() {
-                        let mut why = top_level_mirror_why(&source.label, &mirrors);
                         // A live one makes every updated config invalid, so
                         // nothing at all could be written: it is retired
                         // (kept, never deleted; expiry never deletes a `.`
                         // series), and reported here on every run after.
-                        if entry.retired.is_none() {
-                            plan.retire.push(EntryRef {
-                                source_label: source.label.clone(),
-                                name: entry.name.clone(),
-                            });
-                            why.push_str("; retired by this sync so the rest of it can be written");
-                        }
+                        let state = match &entry.retired {
+                            None => {
+                                plan.retire.push(EntryRef {
+                                    source_label: source.label.clone(),
+                                    name: entry.name.clone(),
+                                });
+                                "retired by this sync so the rest of it can be written (entry \
+                                 and backups kept)"
+                                    .to_string()
+                            }
+                            Some(date) => format!("retired on {date} (entry and backups kept)"),
+                        };
+                        let why = top_level_mirror_why(&state, &source.label, &mirrors);
                         plan.unplaceable.push(Unplaceable {
                             volume: volume.to_string(),
                             name: entry.name.clone(),
@@ -291,7 +296,7 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                     }
                 }
                 // The top level exists for as long as the volume does: a
-                // volume that was read holds it, so it is never retired.
+                // volume that was read holds it, so it is never retired for being absent (above: one in a source that reaches a mirror is).
                 let present = entry.name == TOP_LEVEL || on_disk.contains(&entry.name);
                 let reference = EntryRef {
                     source_label: source.label.clone(),
@@ -368,7 +373,7 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                             plan.unplaceable.push(Unplaceable {
                                 volume: volume.to_string(),
                                 name: name.clone(),
-                                why: top_level_mirror_why(&source_label, &mirrors),
+                                why: top_level_mirror_why("not adopted", &source_label, &mirrors),
                             })
                         }
                         _ => plan.adopt.push(Adoption {
@@ -400,8 +405,9 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
 }
 
 /// What an existing source's volume block sends to, for the report:
-/// `primary target only` when every target it reaches is a primary, else
-/// the labels (`targets 'big', 'small'`), or `no target`.
+/// `primary target only` when it reaches one target and that is a primary,
+/// `primary targets 'a', 'b' only` for several primaries, the labels when
+/// any is a mirror (`targets 'big', 'small'`), or `no target`.
 fn scope_of(config: &Config, source: &Source) -> String {
     let reached: Vec<&crate::config::Target> = config
         .targets
@@ -409,22 +415,27 @@ fn scope_of(config: &Config, source: &Source) -> String {
         .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
         .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
         .collect();
+    let labels: Vec<&str> = reached.iter().map(|t| t.label.as_str()).collect();
     if reached.is_empty() {
         "no target".to_string()
-    } else if reached.iter().all(|t| t.role == TargetRole::Primary) {
+    } else if reached.iter().any(|t| t.role != TargetRole::Primary) {
+        format!("targets '{}'", labels.join("', '"))
+    } else if reached.len() == 1 {
         "primary target only".to_string()
     } else {
-        let labels: Vec<&str> = reached.iter().map(|t| t.label.as_str()).collect();
-        format!("targets '{}'", labels.join("', '"))
+        format!("primary targets '{}' only", labels.join("', '"))
     }
 }
 
 /// Why a volume's top level cannot be backed up from `source_label`.
-fn top_level_mirror_why(source_label: &str, mirrors: &[&str]) -> String {
+/// `state` says what became of it: not adopted, retired by this sync, or
+/// retired earlier (on its date) — the last is said on every later run.
+fn top_level_mirror_why(state: &str, source_label: &str, mirrors: &[&str]) -> String {
     format!(
-        "source '{source_label}' sends to mirror target(s) '{}', and the top level goes to \
-         the primary target only — scope that source to the primary target, or keep the top \
-         level out (delete any '.' entry and exclude '{}')",
+        "{state}: source '{source_label}' sends to mirror target(s) '{}', and the top level goes \
+         to the primary target only — so it is not backed up anywhere, the primary included, \
+         until that source is scoped to the primary target (sync then adopts or revives it); to \
+         keep it out instead, delete any '.' entry and exclude '{}'",
         mirrors.join("', '"),
         TOP_LEVEL_EXCLUDE
     )
@@ -962,7 +973,7 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
     }
     if !tops.is_empty() {
         r.push_str(&heading(
-            "Retired (top level in a source that reaches a mirror; entry and backups kept)",
+            "Retired (top level in a source that reaches a mirror; no target receives it now, the primary included; entry and backups kept)",
             "Would retire",
             "NOT retired",
         ));
@@ -3302,7 +3313,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "  Retired (top level in a source that reaches a mirror; entry and backups kept):\n\
+                "  Retired (top level in a source that reaches a mirror; no target receives it now, the primary included; entry and backups kept):\n\
                  \x20   . (top level)  [source ssd-adopted]\n"
             ),
             "{text}"
@@ -3313,6 +3324,21 @@ mod tests {
         let again = sync_subvolumes(&path, false, "2026-10-19", &r(), &mounted).unwrap();
         assert!(again.failed() && !again.plan.changes_config(), "{again:?}");
         assert_eq!(again.plan.unplaceable.len(), 1);
+        // Review of 8197528: every later run says it is retired, why, and
+        // that the primary does not receive it either.
+        let text = format_sync_report(&again, false);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("    . (top level)  [/ssd: "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            line.contains("retired on 2026-10-18")
+                && line.contains("'small'")
+                && line.contains("the primary included"),
+            "{line}"
+        );
+        // And the run that retired it says the same about the primary.
+        assert!(out.plan.unplaceable[0].why.contains("the primary included"));
     }
 
     #[test]
@@ -3323,6 +3349,14 @@ mod tests {
         assert_eq!(scope_of(&c, &s(&[])), "targets 'big', 'small'");
         assert_eq!(scope_of(&c, &s(&["small"])), "targets 'small'");
         assert_eq!(scope_of(&c, &s(&["no-such"])), "no target");
+        // Review of 8197528: two primaries are named, not "target only".
+        let mut c = config();
+        c.targets.push(target("big2", TargetRole::Primary));
+        assert_eq!(scope_of(&c, &s(&["big"])), "primary target only");
+        assert_eq!(
+            scope_of(&c, &s(&["big", "big2"])),
+            "primary targets 'big', 'big2' only"
+        );
     }
 
     /// The top level's retirement starts no expiry clock, so an untrusted

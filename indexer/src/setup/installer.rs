@@ -948,7 +948,7 @@ fn upgrade_with(
     warn: &mut dyn FnMut(String),
 ) -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     let ran = under_setup_locks(site, UPGRADE_JOB, |held| {
-        let config = prepare_upgrade(config_path, host.relay_up, say)?;
+        let Prepared { config, refused } = prepare_upgrade(config_path, host.relay_up, say)?;
         // The backup units an older `cmake --install` wrote under /usr
         // (bd DAS-Backup-Manager-7rf) go first, so the reload regenerating
         // ends with sees them gone. One that could not be removed fails the
@@ -959,6 +959,20 @@ fn upgrade_with(
         // systemd has loaded changes, and one it had loaded from a copy goes at
         // its next reload.
         let retired = (host.retire)(say);
+        // Refused by the btrbk.conf renderer (bd xtnq): nothing was saved
+        // and nothing is regenerated, but the helper is still restarted onto
+        // the new binary, as below; the refusal is what fails the upgrade.
+        if let Some(mut why) = refused {
+            say("Not regenerating files: the configuration is refused.".to_string());
+            let restarted = restart_helper(&config, &host.helper, held, say);
+            if let Err(e) = retired {
+                why.push_str(&format!("; and removing the old units failed: {e}"));
+            }
+            if let Err(e) = restarted {
+                why.push_str(&format!("; and the helper restart failed: {e}"));
+            }
+            return Err(why.into());
+        }
         say(format!(
             "Regenerating files from {}...",
             config_path.display()
@@ -1233,15 +1247,25 @@ fn restart_helper(
     }
 }
 
+/// What [`prepare_upgrade`] hands on: the config to install from, and —
+/// when the `btrbk.conf` renderer refuses it (bd xtnq) — why. A refused
+/// config was not saved; the upgrade still retires old units and restarts
+/// the helper, then fails with the refusal.
+struct Prepared {
+    config: Config,
+    refused: Option<String>,
+}
+
 /// Everything `upgrade` does before regenerating files: load the config at
 /// `config_path`, stamp it with this binary's version, migrate it, and write
-/// it back only if either changed it. Returns the config to install from.
-/// Progress and warnings go to `say`, one line per call.
+/// it back only if either changed it — unless the renderer refuses it: then
+/// nothing is written and the migrations are said as pending. Progress and
+/// warnings go to `say`, one line per call.
 fn prepare_upgrade(
     config_path: &Path,
     relay_up: RelayProbe,
     say: &mut dyn FnMut(String),
-) -> Result<Config, Box<dyn std::error::Error>> {
+) -> Result<Prepared, Box<dyn std::error::Error>> {
     if !config_path.exists() {
         return Err(format!(
             "No config found at {}. Run 'btrdasd setup' first.",
@@ -1255,14 +1279,23 @@ fn prepare_upgrade(
     config.general.version = env!("CARGO_PKG_VERSION").to_string();
 
     let migrations = migrate_config(&mut config);
+
+    // A config the btrbk.conf renderer refuses (bd xtnq) is refused here,
+    // before the version stamp or a migration is saved: no file changes.
+    if let Err(why) = GeneratedFiles::generate(&config) {
+        for change in &migrations {
+            say(format!(
+                "Migration pending, not saved (the upgrade is refused): {change}"
+            ));
+        }
+        return Ok(Prepared {
+            config,
+            refused: Some(why),
+        });
+    }
     for change in &migrations {
         say(format!("Migrating config: {change}"));
     }
-
-    // A config the btrbk.conf renderer refuses (bd xtnq) is refused here,
-    // before the version stamp or a migration is saved: the upgrade then
-    // changes nothing at all.
-    GeneratedFiles::generate(&config)?;
 
     if old_version != config.general.version || !migrations.is_empty() {
         if old_version != config.general.version {
@@ -1285,7 +1318,10 @@ fn prepare_upgrade(
         say("  Reports will be saved to disk but not delivered.".to_string());
         say("  Check the local mail relay: systemctl status postfix".to_string());
     }
-    Ok(config)
+    Ok(Prepared {
+        config,
+        refused: None,
+    })
 }
 
 /// Check: validate config, verify manifest files, report dependency status.
@@ -2876,8 +2912,13 @@ auth = "starttls""#,
         relay_up: bool,
     ) -> (Result<Config, String>, Vec<String>) {
         let mut lines = Vec::new();
+        // A refusal reads as an error here; `upgrade_with` acts on it.
         let result = prepare_upgrade(config_path, &|_| relay_up, &mut |l| lines.push(l))
-            .map_err(|e| e.to_string());
+            .map_err(|e| e.to_string())
+            .and_then(|p| match p.refused {
+                None => Ok(p.config),
+                Some(why) => Err(why),
+            });
         (result, lines)
     }
 
@@ -3379,6 +3420,10 @@ auth = "starttls""#,
         systemctl_fails: Option<&'a str>,
         /// Lock paths to use instead of the scratch ones.
         site: Option<SetupLockSite>,
+        /// The installed config is then edited by hand so the renderer
+        /// refuses it (a mirror target, and the top level in the source that
+        /// sends everywhere), with a pending migration (smtp_port 1025).
+        widen_top_level: bool,
     }
 
     /// What one `upgrade_with` run on an installed tree did.
@@ -3418,6 +3463,19 @@ auth = "starttls""#,
         config.email.enabled = true;
         config.init.system = case.init.clone().unwrap_or(InitSystem::Systemd);
         let (config_path, manifest_path) = install_config_into(&config, base);
+        if case.widen_top_level {
+            let mut widened = Config::load(&config_path).unwrap();
+            let mut mirror = exposure_target("rec", &["DEF456"], None);
+            mirror.role = TargetRole::Mirror;
+            widened.targets.push(mirror);
+            widened.sources[0].subvolumes.push(SubvolConfig {
+                name: buttered_dasd::adopt::TOP_LEVEL.into(),
+                snapshot_name: Some("test-toplevel".into()),
+                ..Default::default()
+            });
+            widened.email.smtp_port = 1025;
+            widened.save(&config_path).unwrap();
+        }
         date_back(base);
         let before = tree(base);
 
@@ -3719,6 +3777,63 @@ auth = "starttls""#,
             Err("1 systemd unit operation(s) failed".to_string())
         );
         assert!(run.lines.contains(&"retire said this".to_string()));
+    }
+
+    /// Review of 8197528: an upgrade the btrbk.conf renderer refuses (bd xtnq)
+    /// saves nothing and writes no generated file, yet still removes the old
+    /// units and restarts the helper onto the new binary, as a failed
+    /// regeneration does; then it fails, with the refusal. A pending
+    /// migration is said as pending, never as done.
+    #[test]
+    fn a_refused_upgrade_changes_no_file_but_still_retires_and_restarts_the_helper() {
+        let run = upgrade_installed_tree(UpgradeCase {
+            widen_top_level: true,
+            ..Default::default()
+        });
+        let why = run.outcome.as_ref().unwrap_err().clone();
+        assert!(why.contains("'rec'") && why.contains("top level"), "{why}");
+        let started = |prefix: &str| run.steps.iter().any(|s| s.starts_with(prefix));
+        assert!(started("retire ("), "{:?}", run.steps);
+        assert!(
+            started("systemctl try-restart btrdasd-helper.service"),
+            "{:?}",
+            run.steps
+        );
+        assert!(!started("install ("), "{:?}", run.steps);
+        assert!(run.changed.is_empty(), "{:?}", run.changed);
+        assert_eq!(run.config.general.version, "0.0.1");
+        assert_eq!(run.config.email.smtp_port, 1025);
+        assert!(
+            !run.lines.iter().any(|l| l.starts_with("Migrating config:")
+                || l.starts_with("Updating config version")
+                || l == "Upgrade complete."),
+            "{:?}",
+            run.lines
+        );
+        assert!(
+            run.lines
+                .iter()
+                .any(|l| l.starts_with("Migration pending, not saved")
+                    && l.contains("smtp_port 1025 -> 25")),
+            "{:?}",
+            run.lines
+        );
+        assert_eq!(run.locks_after, BOTH_FREE);
+
+        // The refusal leads; a failed removal or restart is not lost.
+        let run = upgrade_installed_tree(UpgradeCase {
+            widen_top_level: true,
+            retire_fails: Some("cannot remove x"),
+            systemctl_fails: Some("restart timed out"),
+            ..Default::default()
+        });
+        let why = run.outcome.as_ref().unwrap_err();
+        assert!(
+            why.contains("'rec'")
+                && why.contains("removing the old units failed: cannot remove x")
+                && why.contains("the helper restart failed"),
+            "{why}"
+        );
     }
 
     #[test]

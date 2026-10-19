@@ -1354,7 +1354,10 @@ gives
 .IR btrfs\-hdd\-toplevel ).
 Its snapshots hold only the loose content of the top level; nested
 subvolumes appear in them as empty directories and are backed up by their
-own entries. It is never retired while its volume can be read, and only the
+own entries. It is never retired while its volume can be read, except by sync
+when its source reaches a mirror target (then no target receives it, the
+primary included, and every run fails until that source is scoped to the
+primary). Only the
 exact pattern
 .I /
 excludes it; no wildcard does.
