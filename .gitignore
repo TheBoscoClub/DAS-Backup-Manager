@@ -264,3 +264,6 @@ SESSION_RECORD*.md.zst
 # bd issue export: local only. The tracker stays on this machine (BTRFS + backups);
 # publishing it exposed issue text in public repos (2026-10-14).
 .beads/issues.jsonl
+
+# Local incident evidence (host paths; never committed)
+/evidence/
