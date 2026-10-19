@@ -103,7 +103,9 @@ prepare() {
     fi
     sed -e "s|^ESP_PRIMARY=\"/boot\"\$|ESP_PRIMARY=\"$primary\"|" \
         -e "s|^ESP_BACKUP=\"/mnt/esp-backup\"\$|ESP_BACKUP=\"$backup\"|" "$SCRIPT" >"$out"
-    if grep -vE '^[[:space:]]*#' "$out" | grep -qE '/boot|/mnt/esp-backup'; then
+    # One process, no pipe: `grep -v | grep -q` under pipefail can lose a
+    # match to SIGPIPE (141) and pass the very copy this check must refuse.
+    if awk '!/^[[:space:]]*#/ && /\/boot|\/mnt\/esp-backup/ { found = 1 } END { exit !found }' "$out"; then
         echo "FAIL setup -- the sandbox copy still names a real ESP path outside comments"
         exit 1
     fi
@@ -236,6 +238,12 @@ fi
 echo "--- the guarded deletions"
 c="$WORK/empty-backup"
 mkdir -p "$c/primary"
+# With ESP_BACKUP empty, anything the script copies lands under / itself.
+# The primary must stay empty so this case can only reach the guarded find.
+if [[ -n "$(/usr/bin/find "$c/primary" -mindepth 1 -print -quit)" ]]; then
+    echo "FAIL setup -- the empty-backup case needs an empty primary"
+    exit 1
+fi
 prepare "$c/esp-sync.sh" "$c/primary" ""
 run "$c" "$NVME_P" "$NVME_B"
 name="empty ESP_BACKUP aborts before the empty-directory find -delete"

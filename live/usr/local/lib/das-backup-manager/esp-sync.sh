@@ -11,10 +11,10 @@
 #   Backup:   LABEL=EFI-BACKUP -> /mnt/esp-backup
 #   Both must resolve to /dev/nvme* partitions.
 #
-# FORBIDDEN: DAS drives (LABEL=BACKUP-ESP, /dev/sd*) have independent OS
+# FORBIDDEN: DAS drives (LABEL=RECOV-ESP-1 / RECOV-ESP-4, serials SERIAL04 / SERIAL02, /dev/sd*) have independent OS
 # installations. NEVER sync host ESP content to DAS drives.
 # 2026-03-05 INCIDENT: blind rsync destroyed both DAS emergency boot/recovery ESPs.
-# See ~/.claude/rules/das-esp-safety.md
+# See ~/.claude/rules/esp-ownership.md and DAS-Backup-Manager .claude/rules/esp-safety.md
 
 set -euo pipefail
 
