@@ -1259,6 +1259,11 @@ fn prepare_upgrade(
         say(format!("Migrating config: {change}"));
     }
 
+    // A config the btrbk.conf renderer refuses (bd xtnq) is refused here,
+    // before the version stamp or a migration is saved: the upgrade then
+    // changes nothing at all.
+    GeneratedFiles::generate(&config)?;
+
     if old_version != config.general.version || !migrations.is_empty() {
         if old_version != config.general.version {
             say(format!(
@@ -2874,6 +2879,25 @@ auth = "starttls""#,
         let result = prepare_upgrade(config_path, &|_| relay_up, &mut |l| lines.push(l))
             .map_err(|e| e.to_string());
         (result, lines)
+    }
+
+    /// Re-review of b62ddbc: a config the renderer refuses must leave
+    /// config.toml byte for byte as it was — no version stamp, no migration.
+    #[test]
+    fn an_upgrade_the_renderer_refuses_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = crate::setup::templates::tests::top_level_to_a_mirror();
+        config.general.version = "0.0.1".to_string();
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let (result, _) = run_prepare_upgrade(&config_path, false);
+
+        let why = result.unwrap_err();
+        assert!(why.contains("recovery-a"), "{why}");
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
     }
 
     #[test]

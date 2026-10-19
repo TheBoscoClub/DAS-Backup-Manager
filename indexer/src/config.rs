@@ -814,12 +814,22 @@ impl Config {
         }
         errors.extend(self.top_level_scope_errors());
         for src in &self.sources {
-            // `snapshot_dir` is relative to the volume: empty or absolute,
-            // paths like `<volume>//<name>` follow (the snapshot step's filter).
-            if src.snapshot_dir.is_empty() || src.snapshot_dir.starts_with('/') {
+            // `snapshot_dir` is a directory inside the volume: empty, absolute,
+            // `.`, or with an empty or `..` component, it yields
+            // `<volume>//<name>`, `<volume>/./<name>` (the snapshot step's
+            // filter) or a path outside the volume. One trailing `/` is fine.
+            let dir = src
+                .snapshot_dir
+                .strip_suffix('/')
+                .unwrap_or(&src.snapshot_dir);
+            if src.snapshot_dir.starts_with('/')
+                || dir
+                    .split('/')
+                    .any(|c| c.is_empty() || c == "." || c == "..")
+            {
                 errors.push(format!(
-                    "Source '{}' has snapshot_dir '{}' — it must be a non-empty path relative \
-                     to its volume",
+                    "Source '{}' has snapshot_dir '{}' — it must be a path inside its volume, \
+                     relative, with no empty, '.' or '..' component",
                     src.label, src.snapshot_dir
                 ));
             }
@@ -1362,7 +1372,12 @@ mod tests {
     /// absolute, the snapshot step's filter becomes `<volume>//<name>`.
     #[test]
     fn validate_refuses_an_empty_or_absolute_snapshot_dir() {
-        for bad in ["", "/snaps", "/"] {
+        // And, re-review of b62ddbc: nothing that leaves the volume or
+        // yields `<volume>/./<name>`.
+        for bad in [
+            "", "/snaps", "/", ".", "..", "./", "../x", "a/../b", "a/..", "./snaps", "a/./b",
+            "a//b",
+        ] {
             let mut cfg = top_level_config("");
             cfg.sources[0].snapshot_dir = bad.into();
             let errors = cfg.validate();
@@ -1376,6 +1391,8 @@ mod tests {
             ".btrbk-snapshots",
             "ClaudeCodeProjects/.btrbk-snapshots",
             "snaps/",
+            "..snaps",
+            "a..b/c",
         ] {
             let mut cfg = top_level_config("");
             cfg.sources[0].snapshot_dir = ok.into();

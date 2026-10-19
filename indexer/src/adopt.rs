@@ -160,6 +160,10 @@ pub struct Adoption {
     pub source_label: String,
     pub nested_under: Option<String>,
     pub manual_only: bool,
+    /// Where the entry will be sent, as the report says it: `as its parent
+    /// <name>`, `primary target only`, or the targets of an existing source
+    /// someone re-scoped (`targets 'a', 'b'`).
+    pub scope: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryRef {
@@ -266,10 +270,22 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                     // of the plan goes ahead.
                     let mirrors = config.mirrors_reached(source);
                     if !mirrors.is_empty() {
+                        let mut why = top_level_mirror_why(&source.label, &mirrors);
+                        // A live one makes every updated config invalid, so
+                        // nothing at all could be written: it is retired
+                        // (kept, never deleted; expiry never deletes a `.`
+                        // series), and reported here on every run after.
+                        if entry.retired.is_none() {
+                            plan.retire.push(EntryRef {
+                                source_label: source.label.clone(),
+                                name: entry.name.clone(),
+                            });
+                            why.push_str("; retired by this sync so the rest of it can be written");
+                        }
                         plan.unplaceable.push(Unplaceable {
                             volume: volume.to_string(),
                             name: entry.name.clone(),
-                            why: top_level_mirror_why(&source.label, &mirrors),
+                            why,
                         });
                         continue;
                     }
@@ -335,6 +351,7 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                     source_label: source.label.clone(),
                     nested_under: Some(entry.name.clone()),
                     manual_only: entry.manual_only,
+                    scope: format!("as its parent {}", entry.name),
                 }),
                 None if has_primary => {
                     // `sources` is non-empty: the volume came from a source. When
@@ -360,6 +377,12 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                             source_label,
                             nested_under: None,
                             manual_only: false,
+                            // A source sync creates sends to the primary only;
+                            // an existing one says what it really does.
+                            scope: home.map_or_else(
+                                || "primary target only".to_string(),
+                                |s| scope_of(config, s),
+                            ),
                         }),
                     }
                 }
@@ -374,6 +397,26 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
         }
     }
     plan
+}
+
+/// What an existing source's volume block sends to, for the report:
+/// `primary target only` when every target it reaches is a primary, else
+/// the labels (`targets 'big', 'small'`), or `no target`.
+fn scope_of(config: &Config, source: &Source) -> String {
+    let reached: Vec<&crate::config::Target> = config
+        .targets
+        .iter()
+        .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
+        .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
+        .collect();
+    if reached.is_empty() {
+        "no target".to_string()
+    } else if reached.iter().all(|t| t.role == TargetRole::Primary) {
+        "primary target only".to_string()
+    } else {
+        let labels: Vec<&str> = reached.iter().map(|t| t.label.as_str()).collect();
+        format!("targets '{}'", labels.join("', '"))
+    }
 }
 
 /// Why a volume's top level cannot be backed up from `source_label`.
@@ -664,14 +707,17 @@ pub fn sync_subvolumes(
     // A retirement date starts the expiry clock, so a wrong one could delete
     // backups early. With an untrusted clock the retirements are held back
     // (and reported); the rest of the plan does not depend on the date.
-    let retire_refused = if plan.retire.is_empty() {
-        None
-    } else {
+    // A top level is retired only to keep its config writable, and expiry
+    // never deletes a `.` series, so its date starts no clock: it goes ahead.
+    let dated = |e: &EntryRef| e.name != TOP_LEVEL;
+    let retire_refused = if plan.retire.iter().any(dated) {
         crate::caldate::untrusted_clock(today)
+    } else {
+        None
     };
     let to_apply = if retire_refused.is_some() {
         SyncPlan {
-            retire: Vec::new(),
+            retire: plan.retire.iter().filter(|e| !dated(e)).cloned().collect(),
             ..plan.clone()
         }
     } else {
@@ -888,19 +934,20 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
             "NOT adopted",
         ));
         for a in &plan.adopt {
-            let how = match &a.nested_under {
-                Some(parent) => format!("as its parent {parent}"),
-                None => "primary target only".to_string(),
-            };
             r.push_str(&format!(
-                "    {}  [{} -> source {}, {how}]\n",
+                "    {}  [{} -> source {}, {}]\n",
                 display_name(&a.name),
                 a.volume,
-                a.source_label
+                a.source_label,
+                a.scope
             ));
         }
     }
-    if !plan.retire.is_empty() {
+    // A top level is retired for another reason (its source reaches a
+    // mirror), is not gone, never expires, and is retired whatever the clock.
+    let (tops, gone): (Vec<&EntryRef>, Vec<&EntryRef>) =
+        plan.retire.iter().partition(|e| e.name == TOP_LEVEL);
+    if !gone.is_empty() {
         match &outcome.retire_refused {
             Some(why) => r.push_str(&format!("  NOT retired ({why}):\n")),
             None => r.push_str(&heading(
@@ -909,7 +956,17 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
                 "NOT retired",
             )),
         }
-        for e in &plan.retire {
+        for e in gone {
+            r.push_str(&format!("    {}  [source {}]\n", e.name, e.source_label));
+        }
+    }
+    if !tops.is_empty() {
+        r.push_str(&heading(
+            "Retired (top level in a source that reaches a mirror; entry and backups kept)",
+            "Would retire",
+            "NOT retired",
+        ));
+        for e in tops {
             r.push_str(&format!(
                 "    {}  [source {}]\n",
                 display_name(&e.name),
@@ -1156,6 +1213,7 @@ mod tests {
                     source_label: "ssd-vm".into(),
                     nested_under: Some("@srv/VirtualMachines".into()),
                     manual_only: false,
+                    scope: "as its parent @srv/VirtualMachines".into(),
                 },
                 Adoption {
                     volume: "/ssd".into(),
@@ -1163,6 +1221,7 @@ mod tests {
                     source_label: "ssd".into(),
                     nested_under: Some("@srv".into()),
                     manual_only: false,
+                    scope: "as its parent @srv".into(),
                 },
                 Adoption {
                     volume: "/hdd".into(),
@@ -1170,6 +1229,7 @@ mod tests {
                     source_label: "media".into(),
                     nested_under: Some("media".into()),
                     manual_only: false,
+                    scope: "as its parent media".into(),
                 },
             ]
         );
@@ -1549,6 +1609,7 @@ mod tests {
                 source_label: "nowhere-adopted".into(),
                 nested_under: None,
                 manual_only: false,
+                scope: "primary target only".into(),
             }],
             ..Default::default()
         };
@@ -2368,6 +2429,7 @@ mod tests {
                     source_label: "ssd".into(),
                     nested_under: Some("@srv".into()),
                     manual_only: false,
+                    scope: "as its parent @srv".into(),
                 },
                 Adoption {
                     volume: "/ssd".into(),
@@ -2375,6 +2437,7 @@ mod tests {
                     source_label: "ssd-adopted".into(),
                     nested_under: None,
                     manual_only: false,
+                    scope: "primary target only".into(),
                 },
             ],
             retire: vec![EntryRef {
@@ -2438,6 +2501,7 @@ mod tests {
                 source_label: "s".into(),
                 nested_under: None,
                 manual_only: false,
+                scope: "primary target only".into(),
             }],
             ..Default::default()
         };
@@ -2902,6 +2966,7 @@ mod tests {
                     source_label: "ssd-adopted".into(),
                     nested_under: None,
                     manual_only: false,
+                    scope: "primary target only".into(),
                 },
                 Adoption {
                     volume: "/hdd".into(),
@@ -2909,6 +2974,7 @@ mod tests {
                     source_label: "media-adopted".into(),
                     nested_under: None,
                     manual_only: false,
+                    scope: "primary target only".into(),
                 },
             ]
         );
@@ -3127,7 +3193,7 @@ mod tests {
     /// wrote a `btrbk.conf` sending the top level to the mirror. The nightly
     /// sync must not call that file current.
     #[test]
-    fn the_nightly_sync_never_calls_a_top_level_sent_to_a_mirror_current() {
+    fn the_nightly_sync_replaces_a_btrbk_conf_that_sends_the_top_level_to_a_mirror() {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
         let good = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap();
@@ -3140,14 +3206,13 @@ mod tests {
         std::fs::write(dir.path().join("btrbk.conf"), &widened_text).unwrap();
         let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
         let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
-        assert_eq!(out.btrbk_conf, BtrbkConf::OutOfDate, "{out:?}");
-        assert!(
-            out.write_error
-                .as_deref()
-                .is_some_and(|w| w.contains("'ssd-adopted'") && w.contains("'small'")),
-            "{out:?}"
-        );
+        // The live top level is retired (re-review of b62ddbc), so the files
+        // are rewritten and the mirror no longer receives it; the run fails.
+        assert!(out.written, "{out:?}");
         assert!(out.failed());
+        let conf = files(dir.path()).1;
+        assert!(!conf.contains("/mnt/small/ssd-adopted"), "{conf}");
+        assert!(!conf.contains("ssd-toplevel"), "{conf}");
     }
 
     /// D2: an existing adoption source that reaches a mirror cannot take the
@@ -3193,6 +3258,100 @@ mod tests {
         let text = format_sync_report(&out, false);
         assert!(
             text.contains("COULD NOT BE PLACED") && text.contains(". (top level)  [/ssd: "),
+            "{text}"
+        );
+        // The widened source's real scope, not "primary target only".
+        assert!(
+            text.contains("    @new  [/ssd -> source ssd-adopted, targets 'big', 'small']\n"),
+            "{text}"
+        );
+    }
+
+    /// Re-review of b62ddbc: a LIVE top level in a source later widened to a
+    /// mirror made every updated config invalid, so nothing was written on
+    /// any volume. Sync retires it (never deletes it); the rest is written,
+    /// and the run fails, naming it, now and on every later run (D3 path).
+    #[test]
+    fn a_live_top_level_in_a_widened_source_is_retired_so_the_rest_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = edit_adopted(dir.path(), |s| s.target_labels.clear());
+        let r = || scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@new"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r(), &mounted).unwrap();
+        assert!(out.written, "{out:?}");
+        assert!(out.failed());
+        assert_eq!(out.plan.unplaceable.len(), 1, "{:?}", out.plan);
+        assert_eq!(out.plan.unplaceable[0].name, TOP_LEVEL);
+        let saved = Config::load(&path).unwrap();
+        let entry = |name: &str| {
+            saved
+                .sources
+                .iter()
+                .flat_map(|s| &s.subvolumes)
+                .find(|e| e.name == name)
+                .cloned()
+        };
+        assert!(entry("@new").is_some(), "the adoption is saved");
+        let top = entry(TOP_LEVEL).expect("the entry is kept, never deleted");
+        assert_eq!(top.retired.as_deref(), Some("2026-10-18"));
+        assert_eq!(top.snapshot_name.as_deref(), Some("ssd-toplevel"));
+        assert!(saved.validate().is_empty(), "{:?}", saved.validate());
+        let text = format_sync_report(&out, false);
+        assert!(
+            text.contains("COULD NOT BE PLACED") && text.contains(". (top level)  [/ssd: "),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  Retired (top level in a source that reaches a mirror; entry and backups kept):\n\
+                 \x20   . (top level)  [source ssd-adopted]\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("existing backups will expire"), "{text}");
+
+        // The next run: not revived, still reported, nothing else to do.
+        let again = sync_subvolumes(&path, false, "2026-10-19", &r(), &mounted).unwrap();
+        assert!(again.failed() && !again.plan.changes_config(), "{again:?}");
+        assert_eq!(again.plan.unplaceable.len(), 1);
+    }
+
+    #[test]
+    fn scope_of_says_what_an_existing_source_really_sends_to() {
+        let c = config();
+        let s = |targets: &[&str]| source("x", "/ssd", targets, &["@a"]);
+        assert_eq!(scope_of(&c, &s(&["big"])), "primary target only");
+        assert_eq!(scope_of(&c, &s(&[])), "targets 'big', 'small'");
+        assert_eq!(scope_of(&c, &s(&["small"])), "targets 'small'");
+        assert_eq!(scope_of(&c, &s(&["no-such"])), "no target");
+    }
+
+    /// The top level's retirement starts no expiry clock, so an untrusted
+    /// clock does not hold it back (that would leave the config unwritable
+    /// again); other retirements still wait for a trusted clock.
+    #[test]
+    fn an_untrusted_clock_still_retires_a_top_level_sent_to_a_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = edit_adopted(dir.path(), |s| s.target_labels.clear());
+        // @opt is gone from disk too.
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@new"])]);
+        let out = sync_subvolumes(&path, false, "1970-01-01", &r, &mounted).unwrap();
+        assert!(out.retire_refused.is_some(), "{out:?}");
+        assert!(out.written, "{out:?}");
+        let saved = Config::load(&path).unwrap();
+        let retired = |name: &str| {
+            saved
+                .sources
+                .iter()
+                .flat_map(|s| &s.subvolumes)
+                .find(|e| e.name == name)
+                .and_then(|e| e.retired.clone())
+        };
+        assert_eq!(retired(TOP_LEVEL).as_deref(), Some("1970-01-01"));
+        assert_eq!(retired("@opt"), None, "held back by the clock");
+        let text = format_sync_report(&out, false);
+        assert!(text.contains("  NOT retired ("), "{text}");
+        assert!(
+            text.contains("entry and backups kept):\n    . (top level)  [source ssd-adopted]\n"),
             "{text}"
         );
     }
