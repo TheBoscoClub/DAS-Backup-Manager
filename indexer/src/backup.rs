@@ -4738,8 +4738,9 @@ mod tests {
     #[test]
     fn every_filter_is_a_declaration_of_the_rendered_btrbk_conf() {
         let config = steps_config();
-        let declared =
-            crate::btrbk_conf::pairs_declared_in(&crate::btrbk_conf::render_btrbk_conf(&config));
+        let declared = crate::btrbk_conf::pairs_declared_in(
+            &crate::btrbk_conf::render_btrbk_conf(&config).unwrap(),
+        );
         let mut reached = std::collections::BTreeSet::new();
         for source in &config.sources {
             for target in &config.targets {

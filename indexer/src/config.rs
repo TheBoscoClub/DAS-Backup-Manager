@@ -810,27 +810,18 @@ impl Config {
                         src.volume, src.label
                     ));
                 }
-                if sv.retired.is_some() {
-                    continue;
-                }
-                let mirrors: Vec<&str> = self
-                    .targets
-                    .iter()
-                    .filter(|t| t.role == TargetRole::Mirror)
-                    .filter(|t| {
-                        src.target_labels.is_empty() || src.target_labels.contains(&t.label)
-                    })
-                    .map(|t| t.label.as_str())
-                    .collect();
-                if !mirrors.is_empty() {
-                    errors.push(format!(
-                        "The top level ('{TOP_LEVEL}') of volume '{}' is in source '{}', which sends \
-                         to mirror target(s) '{}' — the top level goes to the primary target only",
-                        src.volume,
-                        src.label,
-                        mirrors.join("', '")
-                    ));
-                }
+            }
+        }
+        errors.extend(self.top_level_scope_errors());
+        for src in &self.sources {
+            // `snapshot_dir` is relative to the volume: empty or absolute,
+            // paths like `<volume>//<name>` follow (the snapshot step's filter).
+            if src.snapshot_dir.is_empty() || src.snapshot_dir.starts_with('/') {
+                errors.push(format!(
+                    "Source '{}' has snapshot_dir '{}' — it must be a non-empty path relative \
+                     to its volume",
+                    src.label, src.snapshot_dir
+                ));
             }
         }
         for pattern in self.exclude_patterns() {
@@ -838,6 +829,44 @@ impl Config {
                 errors.push(format!(
                     "Exclude pattern '{pattern}' matches no subvolume — write '{TOP_LEVEL_EXCLUDE}' \
                      to exclude each volume's top level"
+                ));
+            }
+        }
+        errors
+    }
+
+    /// The labels of the `mirror` targets `source`'s volume block sends to —
+    /// every mirror when `target_labels` is empty, else the ones it names.
+    pub fn mirrors_reached(&self, source: &Source) -> Vec<&str> {
+        self.targets
+            .iter()
+            .filter(|t| t.role == TargetRole::Mirror)
+            .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
+            .map(|t| t.label.as_str())
+            .collect()
+    }
+
+    /// A live (not retired) top-level entry (`.`) in a source that sends to a
+    /// mirror target: the top level goes to the primary target only. Checked
+    /// by `validate` AND by the `btrbk.conf` renderer itself, so no caller
+    /// that skips validation (`setup --upgrade`, the wizard) can write a file
+    /// that sends a volume's top level to a recovery drive (bd xtnq D1).
+    pub fn top_level_scope_errors(&self) -> Vec<String> {
+        use crate::adopt::TOP_LEVEL;
+        let mut errors = Vec::new();
+        for src in &self.sources {
+            let live_top = src
+                .subvolumes
+                .iter()
+                .any(|sv| sv.name == TOP_LEVEL && sv.retired.is_none());
+            let mirrors = self.mirrors_reached(src);
+            if live_top && !mirrors.is_empty() {
+                errors.push(format!(
+                    "The top level ('{TOP_LEVEL}') of volume '{}' is in source '{}', which sends \
+                     to mirror target(s) '{}' — the top level goes to the primary target only",
+                    src.volume,
+                    src.label,
+                    mirrors.join("', '")
                 ));
             }
         }
@@ -1325,6 +1354,31 @@ mod tests {
         }
         for ok in [".hidden", "..x", "a.b/c", "@"] {
             let cfg = top_level_config(&primary_only("x", "/vol", &[(ok, Some("n"))]));
+            assert!(cfg.validate().is_empty(), "{ok}: {:?}", cfg.validate());
+        }
+    }
+
+    /// Review of bc2c8a4: `snapshot_dir` is relative to the volume. Empty or
+    /// absolute, the snapshot step's filter becomes `<volume>//<name>`.
+    #[test]
+    fn validate_refuses_an_empty_or_absolute_snapshot_dir() {
+        for bad in ["", "/snaps", "/"] {
+            let mut cfg = top_level_config("");
+            cfg.sources[0].snapshot_dir = bad.into();
+            let errors = cfg.validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(
+                errors[0].contains("snapshot_dir") && errors[0].contains("'s'"),
+                "{bad:?}: {errors:?}"
+            );
+        }
+        for ok in [
+            ".btrbk-snapshots",
+            "ClaudeCodeProjects/.btrbk-snapshots",
+            "snaps/",
+        ] {
+            let mut cfg = top_level_config("");
+            cfg.sources[0].snapshot_dir = ok.into();
             assert!(cfg.validate().is_empty(), "{ok}: {:?}", cfg.validate());
         }
     }

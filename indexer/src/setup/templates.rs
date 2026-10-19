@@ -449,16 +449,23 @@ impl GeneratedFiles {
     /// Generate all operational files from a Config. Includes systemd units OR cron
     /// entries based on init system, plus btrbk.conf, the backup scripts and the udisks-ignore
     /// udev rule. No email config and no ESP hook is generated.
-    pub fn generate(config: &Config) -> Self {
+    ///
+    /// `Err` when the renderer refuses the config (a volume's top level in a
+    /// source that reaches a mirror target, bd xtnq): nothing is generated,
+    /// so `setup` writes nothing, although it does not run `validate`.
+    pub fn generate(config: &Config) -> Result<Self, String> {
         let script_dir = format!("{}/lib/das-backup", config.general.install_prefix);
         let mut files = Vec::new();
 
         // btrbk.conf — at `general.btrbk_conf` (canonical /etc/btrbk/btrbk.conf),
         // the path every other reader and writer of it uses.
-        files.push((config.general.btrbk_conf.clone(), render_btrbk_conf(config)));
+        files.push((
+            config.general.btrbk_conf.clone(),
+            render_btrbk_conf(config)?,
+        ));
         // Its companion for the entries sent after the indexer ran (bd 9eq9),
         // beside it; present only when some entry is flagged `after_index`.
-        if let Some(state) = render_state_conf(config) {
+        if let Some(state) = render_state_conf(config)? {
             files.push((
                 buttered_dasd::btrbk_conf::state_conf_path(config)
                     .to_string_lossy()
@@ -557,7 +564,7 @@ impl GeneratedFiles {
         // credential. See the note above `render_cron_entry`'s neighbours and
         // `.claude/rules/backup.md` §Email Reports.
 
-        Self { files }
+        Ok(Self { files })
     }
 
     /// Produce a newline-joined manifest of all generated file paths.
@@ -579,7 +586,7 @@ impl GeneratedFiles {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn test_config() -> Config {
@@ -896,7 +903,7 @@ mod tests {
     #[test]
     fn generated_files_include_embedded_scripts() {
         let config = test_config();
-        let generated = GeneratedFiles::generate(&config);
+        let generated = GeneratedFiles::generate(&config).unwrap();
         let manifest = generated.manifest_content();
         assert!(
             manifest.contains("/usr/local/lib/das-backup/backup-run.sh"),
@@ -936,7 +943,7 @@ mod tests {
     #[test]
     fn an_after_index_entry_generates_the_state_conf_beside_the_main_one() {
         let config = with_state_entry(test_config());
-        let generated = GeneratedFiles::generate(&config);
+        let generated = GeneratedFiles::generate(&config).unwrap();
         let main = generated_text(&generated, "/etc/btrbk/btrbk.conf").unwrap();
         let state = generated_text(&generated, "/etc/btrbk/btrbk-state.conf")
             .expect("the state conf is generated");
@@ -948,15 +955,44 @@ mod tests {
     fn both_conf_paths_follow_general_btrbk_conf() {
         let mut config = with_state_entry(test_config());
         config.general.btrbk_conf = "/srv/btrbk/main.conf".to_string();
-        let generated = GeneratedFiles::generate(&config);
+        let generated = GeneratedFiles::generate(&config).unwrap();
         assert!(generated_text(&generated, "/srv/btrbk/main.conf").is_some());
         assert!(generated_text(&generated, "/srv/btrbk/btrbk-state.conf").is_some());
         assert!(generated_text(&generated, "/etc/btrbk/btrbk.conf").is_none());
     }
 
+    /// `test_config()` plus a mirror target and the volume's top level in
+    /// `nvme-root`, which sends to every target — a widened adoption source.
+    pub(crate) fn top_level_to_a_mirror() -> Config {
+        let mut config = test_config();
+        let mut mirror = config.targets[0].clone();
+        mirror.label = "recovery-a".into();
+        mirror.mount = "/mnt/recovery-a".into();
+        mirror.role = TargetRole::Mirror;
+        config.targets.push(mirror);
+        config.sources[0].subvolumes.push(SubvolConfig {
+            name: buttered_dasd::adopt::TOP_LEVEL.into(),
+            snapshot_name: Some("btrfs-nvme-toplevel".into()),
+            ..Default::default()
+        });
+        config
+    }
+
+    /// bd xtnq D1: `setup --upgrade` renders through here without `validate`.
+    #[test]
+    fn generate_refuses_a_top_level_that_reaches_a_mirror() {
+        let why = GeneratedFiles::generate(&top_level_to_a_mirror())
+            .err()
+            .expect("refused");
+        assert!(
+            why.contains("'nvme-root'") && why.contains("recovery-a"),
+            "{why}"
+        );
+    }
+
     #[test]
     fn no_after_index_entry_generates_only_the_main_conf() {
-        let generated = GeneratedFiles::generate(&test_config());
+        let generated = GeneratedFiles::generate(&test_config()).unwrap();
         assert!(generated_text(&generated, "/etc/btrbk/btrbk.conf").is_some());
         assert!(
             !generated
@@ -969,7 +1005,7 @@ mod tests {
     #[test]
     fn generated_files_manifest() {
         let config = test_config();
-        let generated = GeneratedFiles::generate(&config);
+        let generated = GeneratedFiles::generate(&config).unwrap();
         let manifest = generated.manifest_content();
         assert!(manifest.contains("/etc/btrbk/btrbk.conf"));
         assert!(manifest.contains("backup-run.sh"));
@@ -1065,7 +1101,7 @@ mod tests {
         ] {
             let mut config = test_config();
             config.init.system = system;
-            let generated = GeneratedFiles::generate(&config);
+            let generated = GeneratedFiles::generate(&config).unwrap();
             let rule = generated
                 .files
                 .iter()

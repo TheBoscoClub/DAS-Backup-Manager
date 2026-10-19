@@ -423,6 +423,10 @@ fn install_to_prefix(
     config_path: &Path,
     manifest_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Generate all files first: a config the renderer refuses (bd xtnq) must
+    // leave config.toml and every installed file as they are.
+    let generated = GeneratedFiles::generate(config)?;
+
     // Save config
     config.save(config_path)?;
 
@@ -444,8 +448,6 @@ fn install_to_prefix(
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok());
 
-    // Generate all files
-    let generated = GeneratedFiles::generate(config);
     let mut manifest_entries = vec![config_path.to_string_lossy().to_string()];
     let mut skipped_newer: Vec<String> = Vec::new();
 
@@ -1591,6 +1593,22 @@ mod tests {
         let config = Config::default();
         install_to_prefix(&config, dir, &config_path, &manifest_path).unwrap();
         (config_path, manifest_path)
+    }
+
+    /// bd xtnq D1: a config whose top level reaches a mirror installs
+    /// nothing — not config.toml, not btrbk.conf — and says why.
+    #[test]
+    fn an_install_whose_top_level_reaches_a_mirror_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("etc/das-backup/config.toml");
+        let manifest_path = dir.path().join("etc/das-backup/.manifest");
+        let config = crate::setup::templates::tests::top_level_to_a_mirror();
+        let why = install_to_prefix(&config, dir.path(), &config_path, &manifest_path)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("recovery-a"), "{why}");
+        assert!(!config_path.exists());
+        assert!(!dir.path().join("etc/btrbk/btrbk.conf").exists());
     }
 
     /// Records trimmed from a real `udevadm info --export-db` (2026-10-01):

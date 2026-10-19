@@ -258,6 +258,22 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
 
         for source in &sources {
             for entry in &source.subvolumes {
+                if entry.name == TOP_LEVEL {
+                    // A top level in a source that reaches a mirror is not
+                    // backed up (the renderer refuses it) and must not be
+                    // revived (the revived config could not be written, and
+                    // nothing else in the plan with it): reported, the rest
+                    // of the plan goes ahead.
+                    let mirrors = config.mirrors_reached(source);
+                    if !mirrors.is_empty() {
+                        plan.unplaceable.push(Unplaceable {
+                            volume: volume.to_string(),
+                            name: entry.name.clone(),
+                            why: top_level_mirror_why(&source.label, &mirrors),
+                        });
+                        continue;
+                    }
+                }
                 // The top level exists for as long as the volume does: a
                 // volume that was read holds it, so it is never retired.
                 let present = entry.name == TOP_LEVEL || on_disk.contains(&entry.name);
@@ -320,17 +336,33 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                     nested_under: Some(entry.name.clone()),
                     manual_only: entry.manual_only,
                 }),
-                None if has_primary => plan.adopt.push(Adoption {
-                    volume: volume.to_string(),
-                    name: name.clone(),
+                None if has_primary => {
                     // `sources` is non-empty: the volume came from a source. When
                     // every source here is itself an adoption source, that one is
                     // the home; appending `-adopted` again would invent a second.
-                    source_label: adoption_source_label(config, volume)
-                        .unwrap_or_else(|| sources[0].label.clone()),
-                    nested_under: None,
-                    manual_only: false,
-                }),
+                    let source_label = adoption_source_label(config, volume)
+                        .unwrap_or_else(|| sources[0].label.clone());
+                    // An existing adoption source someone widened to a mirror
+                    // cannot take the top level: the updated config would not
+                    // validate, and nothing else in the plan would be written.
+                    let home = sources.iter().find(|s| s.label == source_label);
+                    match home.map(|s| config.mirrors_reached(s)) {
+                        Some(mirrors) if name == TOP_LEVEL && !mirrors.is_empty() => {
+                            plan.unplaceable.push(Unplaceable {
+                                volume: volume.to_string(),
+                                name: name.clone(),
+                                why: top_level_mirror_why(&source_label, &mirrors),
+                            })
+                        }
+                        _ => plan.adopt.push(Adoption {
+                            volume: volume.to_string(),
+                            name: name.clone(),
+                            source_label,
+                            nested_under: None,
+                            manual_only: false,
+                        }),
+                    }
+                }
                 None => plan.unplaceable.push(Unplaceable {
                     volume: volume.to_string(),
                     name: name.clone(),
@@ -342,6 +374,17 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
         }
     }
     plan
+}
+
+/// Why a volume's top level cannot be backed up from `source_label`.
+fn top_level_mirror_why(source_label: &str, mirrors: &[&str]) -> String {
+    format!(
+        "source '{source_label}' sends to mirror target(s) '{}', and the top level goes to \
+         the primary target only — scope that source to the primary target, or keep the top \
+         level out (delete any '.' entry and exclude '{}')",
+        mirrors.join("', '"),
+        TOP_LEVEL_EXCLUDE
+    )
 }
 
 /// `base`, or `base-2`, `base-3`, … — whichever is not in `taken`.
@@ -638,11 +681,11 @@ pub fn sync_subvolumes(
         let (btrbk_conf, write_error) =
             bring_btrbk_conf_into_line(&config, dry_run, to_apply.failed());
         let planned_btrbk_conf = dry_run.then(|| match btrbk_conf {
-            // What a real run would regenerate it to — if config.toml is
-            // valid; otherwise it would be left as it is.
-            BtrbkConf::WouldRegenerate if config.validate().is_empty() => {
-                Some(crate::btrbk_conf::render_btrbk_conf(&config))
-            }
+            // What a real run would regenerate it to (only a valid
+            // config.toml comes here); otherwise it would be left as it is.
+            BtrbkConf::WouldRegenerate => crate::btrbk_conf::render_btrbk_conf(&config)
+                .ok()
+                .or_else(|| current_btrbk_conf(&config)),
             _ => current_btrbk_conf(&config),
         });
         return Ok(SyncOutcome {
@@ -659,10 +702,11 @@ pub fn sync_subvolumes(
         // cannot be applied or does not validate, and then neither.
         let planned_btrbk_conf = match apply_plan(&config, &to_apply, today) {
             Ok(updated) if updated.validate().is_empty() => {
-                Some(crate::btrbk_conf::render_btrbk_conf(&updated))
+                crate::btrbk_conf::render_btrbk_conf(&updated).ok()
             }
-            _ => current_btrbk_conf(&config),
-        };
+            _ => None,
+        }
+        .or_else(|| current_btrbk_conf(&config));
         return Ok(SyncOutcome {
             plan,
             retire_refused,
@@ -710,7 +754,9 @@ pub fn write_planned_btrbk_conf(outcome: &SyncOutcome, path: &Path) -> Result<()
 
 /// Make `btrbk.conf` say what `config.toml` renders to, when nothing else in
 /// this sync rewrites it. Anything but an exact match — a different text, a
-/// missing file, an unreadable one — counts as out of date. Nothing is written
+/// missing file, an unreadable one — counts as out of date, and so does any
+/// file at all while `config.toml` is not valid: that is reported (with the
+/// errors, on a dry run too) and the file left alone. Nothing is written
 /// on a dry run, nor while the sync has failed (a volume was not read): the
 /// file is then left alone and reported out of date. A plan that itself
 /// changes the config never comes here; it writes both files regardless. Returns the state and, when the
@@ -721,16 +767,13 @@ fn bring_btrbk_conf_into_line(
     sync_failed: bool,
 ) -> (BtrbkConf, Option<String>) {
     let conf_path = Path::new(&config.general.btrbk_conf);
-    if crate::btrbk_conf::confs_are_current(config) {
+    // Validated first: a file that matches an invalid config.toml (one that
+    // `setup --upgrade`, which never validates, may have written) is not
+    // "current" (bd xtnq D1).
+    let errors = config.validate();
+    if errors.is_empty() && crate::btrbk_conf::confs_are_current(config) {
         return (BtrbkConf::Current, None);
     }
-    if sync_failed {
-        return (BtrbkConf::OutOfDate, None);
-    }
-    if dry_run {
-        return (BtrbkConf::WouldRegenerate, None);
-    }
-    let errors = config.validate();
     if !errors.is_empty() {
         return (
             BtrbkConf::OutOfDate,
@@ -740,6 +783,12 @@ fn bring_btrbk_conf_into_line(
                 errors.join("; ")
             )),
         );
+    }
+    if sync_failed {
+        return (BtrbkConf::OutOfDate, None);
+    }
+    if dry_run {
+        return (BtrbkConf::WouldRegenerate, None);
     }
     match crate::btrbk_conf::write_rendered_confs(config) {
         Ok(()) => (BtrbkConf::Regenerated, None),
@@ -1684,7 +1733,7 @@ mod tests {
     fn a_dry_run_plans_the_btrbk_conf_without_a_retired_entry_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
-        let current = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        let current = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap();
         std::fs::write(dir.path().join("btrbk.conf"), &current).unwrap();
         assert!(
             current.contains("subvolume             @opt\n"),
@@ -1730,7 +1779,7 @@ mod tests {
     fn a_dry_run_with_nothing_to_change_plans_the_file_a_real_run_would_leave() {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
-        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap();
         let r = || scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
 
         // Out of date ("OLD"): a real run would regenerate it.
@@ -1855,7 +1904,7 @@ mod tests {
         // "Nothing changed" includes btrbk.conf already saying what
         // config.toml renders to; an out-of-date one is regenerated (see
         // sync_regenerates_a_btrbk_conf_that_lacks_a_configured_entry).
-        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap();
         std::fs::write(dir.path().join("btrbk.conf"), &rendered).unwrap();
 
         let same = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
@@ -1896,7 +1945,11 @@ mod tests {
         let conf = dir.path().join("btrbk.conf");
         let mut without = Config::load(&path).unwrap();
         without.sources[0].subvolumes.retain(|e| e.name != "@opt");
-        std::fs::write(&conf, crate::btrbk_conf::render_btrbk_conf(&without)).unwrap();
+        std::fs::write(
+            &conf,
+            crate::btrbk_conf::render_btrbk_conf(&without).unwrap(),
+        )
+        .unwrap();
         assert!(!std::fs::read_to_string(&conf).unwrap().contains("@opt"));
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -1908,7 +1961,7 @@ mod tests {
         let written = std::fs::read_to_string(&conf).unwrap();
         assert_eq!(
             written,
-            crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap())
+            crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap()
         );
         assert!(
             written.contains("subvolume             @opt\n"),
@@ -1934,7 +1987,7 @@ mod tests {
         assert_eq!(out.btrbk_conf, BtrbkConf::Regenerated);
         assert_eq!(
             std::fs::read_to_string(&conf).unwrap(),
-            crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap())
+            crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap()
         );
     }
 
@@ -1943,7 +1996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = on_disk_config(dir.path());
         let conf = dir.path().join("btrbk.conf");
-        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap());
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap();
         std::fs::write(&conf, &rendered).unwrap();
         let ino = inode(&conf);
 
@@ -2147,7 +2200,7 @@ mod tests {
         // Restored from the OLD config, so it still agrees with config.toml.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap(),
-            crate::btrbk_conf::render_btrbk_conf(&old)
+            crate::btrbk_conf::render_btrbk_conf(&old).unwrap()
         );
     }
 
@@ -2223,7 +2276,7 @@ mod tests {
         // conf is missing — the sync must still see that as out of date.
         std::fs::write(
             dir.path().join("btrbk.conf"),
-            crate::btrbk_conf::render_btrbk_conf(&flagged),
+            crate::btrbk_conf::render_btrbk_conf(&flagged).unwrap(),
         )
         .unwrap();
         let (state, why) = bring_btrbk_conf_into_line(&flagged, false, false);
@@ -2881,19 +2934,20 @@ mod tests {
     #[test]
     fn a_configured_top_level_is_never_retired_and_a_retired_one_is_revived() {
         let mut c = config();
-        c.sources[0].subvolumes.push(sv(TOP_LEVEL));
+        // In "ssd-vm", which sends to the primary only.
+        c.sources[1].subvolumes.push(sv(TOP_LEVEL));
         // A listing without the top level (a hand-made fixture; list_volume
         // always adds it) must not retire it: it exists while the volume does.
         let plan = plan_sync(&c, &all_present());
         assert!(plan.retire.is_empty(), "{:?}", plan.retire);
         assert!(plan.revive.is_empty(), "{:?}", plan.revive);
         // Retired by hand: the volume was read, so it is back.
-        c.sources[0].subvolumes.last_mut().unwrap().retired = Some("2026-10-01".into());
+        c.sources[1].subvolumes.last_mut().unwrap().retired = Some("2026-10-01".into());
         let plan = plan_sync(&c, &all_present());
         assert_eq!(
             plan.revive,
             vec![EntryRef {
-                source_label: "ssd".into(),
+                source_label: "ssd-vm".into(),
                 name: TOP_LEVEL.into()
             }]
         );
@@ -3026,6 +3080,200 @@ mod tests {
         assert!(
             text.contains(". (top level)  [/ssd -> source ssd-adopted, primary target only]"),
             "{text}"
+        );
+    }
+
+    // --- review of bc2c8a4: the top level and mirror-reaching sources -------
+
+    /// `on_disk_config`, with `ssd-adopted` edited by `f`.
+    fn edit_adopted(dir: &Path, f: impl FnOnce(&mut Source)) -> std::path::PathBuf {
+        let path = on_disk_config(dir);
+        let mut cfg = Config::load(&path).unwrap();
+        f(cfg
+            .sources
+            .iter_mut()
+            .find(|s| s.label == "ssd-adopted")
+            .unwrap());
+        cfg.save(&path).unwrap();
+        path
+    }
+
+    /// D1: a `btrbk.conf` that matches `config.toml` is not "current" when
+    /// `config.toml` is not valid: the nightly sync says so and fails.
+    #[test]
+    fn the_nightly_sync_validates_the_config_even_when_btrbk_conf_matches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let mut cfg = Config::load(&path).unwrap();
+        cfg.schedule.incremental = "3 AM".into();
+        cfg.save(&path).unwrap();
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&cfg).unwrap();
+        std::fs::write(dir.path().join("btrbk.conf"), &rendered).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
+        assert_eq!(out.btrbk_conf, BtrbkConf::OutOfDate, "{out:?}");
+        assert!(
+            out.write_error
+                .as_deref()
+                .is_some_and(|w| w.contains("not valid") && w.contains("schedule.incremental")),
+            "{out:?}"
+        );
+        assert!(out.failed());
+        assert_eq!(files(dir.path()).1, rendered, "left as it is");
+    }
+
+    /// D1: the attack in the review — the adoption source widened by hand to
+    /// every target, and `setup --upgrade` (before the renderer refused it)
+    /// wrote a `btrbk.conf` sending the top level to the mirror. The nightly
+    /// sync must not call that file current.
+    #[test]
+    fn the_nightly_sync_never_calls_a_top_level_sent_to_a_mirror_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let good = crate::btrbk_conf::render_btrbk_conf(&Config::load(&path).unwrap()).unwrap();
+        let widened_text = good.replace(
+            "  target                /mnt/big/ssd-adopted\n",
+            "  target                /mnt/big/ssd-adopted\n  target                /mnt/small/ssd-adopted\n",
+        );
+        assert_ne!(widened_text, good);
+        let path = edit_adopted(dir.path(), |s| s.target_labels.clear());
+        std::fs::write(dir.path().join("btrbk.conf"), &widened_text).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
+        assert_eq!(out.btrbk_conf, BtrbkConf::OutOfDate, "{out:?}");
+        assert!(
+            out.write_error
+                .as_deref()
+                .is_some_and(|w| w.contains("'ssd-adopted'") && w.contains("'small'")),
+            "{out:?}"
+        );
+        assert!(out.failed());
+    }
+
+    /// D2: an existing adoption source that reaches a mirror cannot take the
+    /// top level. It is reported as not placed; everything else proceeds.
+    #[test]
+    fn a_top_level_whose_adoption_source_reaches_a_mirror_is_unplaceable_and_the_rest_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = edit_adopted(dir.path(), |s| {
+            s.target_labels.clear();
+            s.subvolumes = vec![SubvolConfig {
+                name: "@x".into(),
+                snapshot_name: Some("x".into()),
+                ..Default::default()
+            }];
+        });
+        let r = scripted(vec![healthy(
+            "/ssd",
+            "abc",
+            &["@srv", "@opt", "@x", "@new"],
+        )]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
+        let plan = &out.plan;
+        assert_eq!(plan.unplaceable.len(), 1, "{plan:?}");
+        assert_eq!(plan.unplaceable[0].name, TOP_LEVEL);
+        assert!(
+            plan.unplaceable[0].why.contains("'ssd-adopted'")
+                && plan.unplaceable[0].why.contains("'small'"),
+            "{}",
+            plan.unplaceable[0].why
+        );
+        let adopted: Vec<_> = plan.adopt.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(adopted, ["@new"]);
+        assert!(out.written, "the rest of the plan is written: {out:?}");
+        assert!(out.failed());
+        let saved = Config::load(&path).unwrap();
+        assert!(
+            !saved
+                .sources
+                .iter()
+                .flat_map(|s| &s.subvolumes)
+                .any(|e| e.name == TOP_LEVEL)
+        );
+        let text = format_sync_report(&out, false);
+        assert!(
+            text.contains("COULD NOT BE PLACED") && text.contains(". (top level)  [/ssd: "),
+            "{text}"
+        );
+    }
+
+    /// D3: a top-level entry retired by hand in a source that reaches a
+    /// mirror is not revived (the revived config could not be written, and
+    /// nothing else would be either). It is reported; the rest proceeds.
+    /// Retiring the entry does not stop the top level being backed up when
+    /// its source is primary-only: sync revives it.
+    #[test]
+    fn a_retired_top_level_in_a_mirror_reaching_source_is_reported_not_revived() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = edit_adopted(dir.path(), |s| {
+            s.target_labels.clear();
+            s.subvolumes[0].retired = Some("2026-10-01".into());
+        });
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt", "@new"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
+        assert!(out.plan.revive.is_empty(), "{:?}", out.plan);
+        assert_eq!(out.plan.unplaceable.len(), 1, "{:?}", out.plan);
+        assert_eq!(out.plan.unplaceable[0].name, TOP_LEVEL);
+        assert!(out.written, "{out:?}");
+        assert!(out.failed());
+
+        // A live one there (an invalid config) is reported the same way.
+        let mut c = config();
+        c.sources.push(source("x", "/ssd", &[], &[TOP_LEVEL]));
+        let plan = plan_sync(&c, &with_top_level(all_present()));
+        assert!(
+            plan.unplaceable
+                .iter()
+                .any(|u| u.name == TOP_LEVEL && u.volume == "/ssd" && u.why.contains("'x'")),
+            "{plan:?}"
+        );
+
+        // Primary-only and retired by hand: revived.
+        let dir = tempfile::tempdir().unwrap();
+        let path = edit_adopted(dir.path(), |s| {
+            s.subvolumes[0].retired = Some("2026-10-01".into());
+        });
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
+        assert_eq!(out.plan.revive.len(), 1, "{:?}", out.plan);
+        assert!(out.written && !out.failed(), "{out:?}");
+    }
+
+    /// The operator's way to keep a volume's top-level series out of the
+    /// first source's snapshot_dir (on this host `/.btrfs-hdd`'s first source
+    /// is `hdd-projects`, whose snapshots live in
+    /// `ClaudeCodeProjects/.btrbk-snapshots`): pre-declare
+    /// `<first-source>-adopted` with its own snapshot_dir. Sync uses it.
+    #[test]
+    fn a_pre_declared_adoption_source_receives_the_top_level_with_its_own_snapshot_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        let mut proj = source("proj", "/hdd", &[], &["Proj"]);
+        proj.device = "UUID=abc".into();
+        proj.snapshot_dir = "Proj/.btrbk-snapshots".into();
+        let mut pre = source("proj-adopted", "/hdd", &["big"], &[]);
+        pre.device = "UUID=abc".into();
+        c.sources = vec![proj, pre];
+        c.general.btrbk_conf = dir.path().join("btrbk.conf").to_string_lossy().into();
+        let path = dir.path().join("config.toml");
+        c.save(&path).unwrap();
+        let r = scripted(vec![healthy("/hdd", "abc", &["Proj"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-18", &r, &mounted).unwrap();
+        assert!(out.written && !out.failed(), "{out:?}");
+        assert_eq!(out.plan.adopt[0].source_label, "proj-adopted");
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.sources.len(), 2, "no second adoption source");
+        assert_eq!(saved.sources[1].subvolumes[0].name, TOP_LEVEL);
+        let conf = files(dir.path()).1;
+        let block = conf
+            .split("\n# ")
+            .find(|b| b.starts_with("proj-adopted\n"))
+            .unwrap();
+        assert!(
+            block.contains("  snapshot_dir          .btrbk-snapshots\n")
+                && block
+                    .contains("  subvolume             .\n    snapshot_name       hdd-toplevel\n"),
+            "{block}"
         );
     }
 }

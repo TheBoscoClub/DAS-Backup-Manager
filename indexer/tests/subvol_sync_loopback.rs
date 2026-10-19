@@ -162,7 +162,7 @@ impl Rig {
             display_name: "Loopback".into(),
         }];
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
-        std::fs::write(&rig.btrbk_conf, render_btrbk_conf(&cfg)).unwrap();
+        std::fs::write(&rig.btrbk_conf, render_btrbk_conf(&cfg).unwrap()).unwrap();
         cfg.save(&rig.config_path).unwrap();
         rig.make_target_dirs();
         rig

@@ -15,7 +15,7 @@ pub const GENERATED_HEADER: &str = "\
 /// per source with all matching targets), and per-subvolume snapshot names.
 /// Entries flagged `after_index` are not in it: they live in
 /// [`render_state_conf`]'s file, so the main run never snapshots them.
-pub fn render_btrbk_conf(config: &Config) -> String {
+pub fn render_btrbk_conf(config: &Config) -> Result<String, String> {
     render_with(config, |sv| sv.retired.is_none() && !sv.after_index)
 }
 
@@ -30,18 +30,27 @@ pub fn state_conf_path(config: &Config) -> PathBuf {
 /// The config for the `after_index` entries — same globals, same target
 /// lines, only those entries — or `None` when no live entry is flagged. The
 /// backup run's state pass sends from it after the indexer ran (bd 9eq9).
-pub fn render_state_conf(config: &Config) -> Option<String> {
+pub fn render_state_conf(config: &Config) -> Result<Option<String>, String> {
     let any = config
         .sources
         .iter()
         .flat_map(|s| &s.subvolumes)
         .any(|sv| sv.retired.is_none() && sv.after_index);
     any.then(|| render_with(config, |sv| sv.retired.is_none() && sv.after_index))
+        .transpose()
 }
 
 /// The shared renderer: globals, then a volume block per source holding only
 /// the subvolumes `keep` accepts. A source left with none has no block.
-fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> String {
+///
+/// Refuses (`Err`, nothing rendered) a config with a live top-level entry in
+/// a source that reaches a mirror target: every writer of `btrbk.conf` goes
+/// through here, including those that never run `validate` (bd xtnq).
+fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> Result<String, String> {
+    let refused = config.top_level_scope_errors();
+    if !refused.is_empty() {
+        return Err(format!("btrbk.conf not rendered: {}", refused.join("; ")));
+    }
     let mut out = String::from(GENERATED_HEADER);
     out.push('\n');
 
@@ -127,7 +136,7 @@ fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> String 
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Format a Retention struct into btrbk's preserve format (e.g., "4w 12m 4y").
@@ -268,21 +277,25 @@ fn save_config_and_btrbk_conf_with(
 /// half — goes through this or [`write_or_remove`], so the two files cannot
 /// drift apart by one route.
 pub fn write_rendered_confs(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    crate::fsutil::write_atomic(Path::new(&cfg.general.btrbk_conf), &render_btrbk_conf(cfg))?;
-    write_or_remove(&state_conf_path(cfg), render_state_conf(cfg).as_deref())
+    // Both rendered before either is written: a refusal writes nothing.
+    let main = render_btrbk_conf(cfg)?;
+    let state = render_state_conf(cfg)?;
+    crate::fsutil::write_atomic(Path::new(&cfg.general.btrbk_conf), &main)?;
+    write_or_remove(&state_conf_path(cfg), state.as_deref())
 }
 
 /// Do both files on disk say exactly what `cfg` renders to? A missing or
-/// unreadable file, or a state conf where none is due, is "no".
+/// unreadable file, a state conf where none is due, or a config the renderer
+/// refuses, is "no".
 pub fn confs_are_current(cfg: &Config) -> bool {
+    let (Ok(main), Ok(state)) = (render_btrbk_conf(cfg), render_state_conf(cfg)) else {
+        return false;
+    };
     let same = |path: &Path, want: Option<String>| match std::fs::read_to_string(path) {
         Ok(text) => want.is_some_and(|w| w == text),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound && want.is_none(),
     };
-    same(
-        Path::new(&cfg.general.btrbk_conf),
-        Some(render_btrbk_conf(cfg)),
-    ) && same(&state_conf_path(cfg), render_state_conf(cfg))
+    same(Path::new(&cfg.general.btrbk_conf), Some(main)) && same(&state_conf_path(cfg), state)
 }
 
 /// A file's text, `None` when it is absent; unreadable is an error naming it,
@@ -545,7 +558,7 @@ mod tests {
     fn retired_entries_and_all_retired_sources_are_not_rendered() {
         let mut cfg = test_config();
         cfg.sources[0].subvolumes[0].retired = Some("2026-01-01".into());
-        let text = render_btrbk_conf(&cfg);
+        let text = render_btrbk_conf(&cfg).unwrap();
         let gone = &cfg.sources[0].subvolumes[0].name;
         assert!(
             !text.contains(&format!("subvolume             {gone}\n")),
@@ -555,7 +568,7 @@ mod tests {
         for sv in &mut cfg.sources[0].subvolumes {
             sv.retired = Some("2026-01-01".into());
         }
-        let text = render_btrbk_conf(&cfg);
+        let text = render_btrbk_conf(&cfg).unwrap();
         assert!(
             !text.contains(&format!("# {}\n", cfg.sources[0].label)),
             "{text}"
@@ -624,7 +637,7 @@ mod tests {
     #[test]
     fn render_btrbk_conf_test() {
         let config = test_config();
-        let result = render_btrbk_conf(&config);
+        let result = render_btrbk_conf(&config).unwrap();
         // Check volume, subvolume, target, retention, header
         assert!(result.contains("volume /.btrfs-nvme"), "missing volume");
         assert!(
@@ -675,7 +688,7 @@ mod tests {
             target_subdirs: vec![],
             target_labels: vec![],
         });
-        let result = render_btrbk_conf(&config);
+        let result = render_btrbk_conf(&config).unwrap();
         // The HDD source must use its custom snapshot_dir, not the default
         assert!(
             result.contains("snapshot_dir          ClaudeCodeProjects/.btrbk-snapshots"),
@@ -787,6 +800,54 @@ mod tests {
         }
     }
 
+    /// bd xtnq D1: the top level goes to the primary only, and the renderer
+    /// itself refuses otherwise — `setup --upgrade` and the wizard never run
+    /// `validate`. A retired `.` is not rendered, so it is not refused.
+    #[test]
+    fn the_renderer_refuses_a_live_top_level_that_reaches_a_mirror() {
+        let top = || subvol(crate::adopt::TOP_LEVEL, Some("btrfs-nvme-toplevel"));
+        // In the source that fans out to every target.
+        let mut config = multi_target_config();
+        config.sources[0].subvolumes.push(top());
+        let why = render_btrbk_conf(&config).unwrap_err();
+        assert!(
+            why.contains("'nvme'") && why.contains("system-recovery-A-2tb"),
+            "{why}"
+        );
+        // The state conf too, once it has anything to render.
+        config.sources[0].subvolumes[1].after_index = true;
+        assert!(render_state_conf(&config).is_err());
+        config.sources[0].subvolumes[1].after_index = false;
+        let dir = tempfile::tempdir().unwrap();
+        config.general.btrbk_conf = dir.path().join("btrbk.conf").to_string_lossy().into();
+        assert!(write_rendered_confs(&config).is_err());
+        assert!(!dir.path().join("btrbk.conf").exists(), "nothing written");
+        assert!(!confs_are_current(&config));
+
+        // A mirror named in target_labels: refused the same way.
+        let mut config = multi_target_config();
+        config.sources[1]
+            .target_labels
+            .push("system-recovery-B-2tb".into());
+        config.sources[1].subvolumes.push(top());
+        assert!(render_btrbk_conf(&config).is_err());
+
+        // Primary only: rendered. Retired in a fan-out source: not in the
+        // file, so nothing to refuse.
+        let mut config = multi_target_config();
+        config.sources[1].subvolumes.push(top());
+        assert!(
+            render_btrbk_conf(&config).unwrap().contains(
+                "  subvolume             .\n    snapshot_name       btrfs-nvme-toplevel\n"
+            )
+        );
+        let mut config = multi_target_config();
+        let mut retired = top();
+        retired.retired = Some("2026-10-01".into());
+        config.sources[0].subvolumes.push(retired);
+        assert!(!render_btrbk_conf(&config).unwrap().contains("toplevel"));
+    }
+
     #[test]
     fn render_btrbk_conf_renders_the_whole_file_for_a_multi_target_config() {
         // Asserted in full because every line is load-bearing: the `target`
@@ -856,7 +917,7 @@ mod tests {
             // volume block at all: a block without a target line would make
             // btrbk snapshot the source and send it nowhere.
         );
-        assert_eq!(render_btrbk_conf(&multi_target_config()), expected);
+        assert_eq!(render_btrbk_conf(&multi_target_config()).unwrap(), expected);
     }
 
     #[test]
@@ -866,7 +927,7 @@ mod tests {
         // hides the overrides which do matter.
         let mut config = multi_target_config();
         config.targets[1].retention = config.targets[0].retention.clone();
-        let result = render_btrbk_conf(&config);
+        let result = render_btrbk_conf(&config).unwrap();
         assert!(
             result.contains(concat!(
                 "  target                /mnt/backup-22tb/nvme\n",
@@ -885,7 +946,7 @@ mod tests {
         // target_labels selects by label, whatever the target's role.
         let mut config = multi_target_config();
         config.sources[0].target_labels = vec!["system-recovery-B-2tb".to_string()];
-        let result = render_btrbk_conf(&config);
+        let result = render_btrbk_conf(&config).unwrap();
         assert!(
             result.contains(concat!(
                 "volume /.btrfs-nvme\n",
@@ -1120,7 +1181,7 @@ enabled = false
         let reloaded = Config::load(&config_path).unwrap();
         assert_eq!(reloaded.to_toml().unwrap(), cfg.to_toml().unwrap());
         let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
-        assert_eq!(conf, render_btrbk_conf(&reloaded));
+        assert_eq!(conf, render_btrbk_conf(&reloaded).unwrap());
     }
 
     #[test]
@@ -1317,7 +1378,7 @@ enabled = false
         cfg.sources.push(gone);
         cfg.sources[0].target_subdirs.push("second-unused".into());
 
-        let text = render_btrbk_conf(&cfg);
+        let text = render_btrbk_conf(&cfg).unwrap();
         let rendered: Vec<String> = text
             .lines()
             .filter_map(|l| l.trim().strip_prefix("target "))
@@ -1492,7 +1553,7 @@ enabled = false
     #[test]
     fn declared_pairs_are_exactly_what_the_rendered_file_declares() {
         let cfg = pairs_config();
-        let text = render_btrbk_conf(&cfg);
+        let text = render_btrbk_conf(&cfg).unwrap();
         let declared = pairs_declared_in(&text);
         let from_pairs: std::collections::BTreeSet<String> = pair_names(&cfg).into_iter().collect();
         assert_eq!(from_pairs, declared, "{text}");
@@ -1516,12 +1577,12 @@ enabled = false
     fn an_after_index_entry_is_left_out_of_the_main_conf_and_rendered_into_the_state_conf() {
         let mut cfg = test_config();
         cfg.sources[0].subvolumes.push(state_entry());
-        let main = render_btrbk_conf(&cfg);
+        let main = render_btrbk_conf(&cfg).unwrap();
         assert!(
             !main.contains("das-state"),
             "main conf must not carry the state series:\n{main}"
         );
-        let state = render_state_conf(&cfg).expect("a state conf");
+        let state = render_state_conf(&cfg).unwrap().expect("a state conf");
         assert!(
             state.contains(
                 "  subvolume             @/var/lib/das-backup\n    snapshot_name       das-state\n"
@@ -1558,19 +1619,19 @@ enabled = false
         for sv in &mut cfg.sources[0].subvolumes {
             sv.after_index = true;
         }
-        let main = render_btrbk_conf(&cfg);
+        let main = render_btrbk_conf(&cfg).unwrap();
         assert!(
             !main.contains(&format!("# {}\n", cfg.sources[0].label)),
             "{main}"
         );
         assert_eq!(main.matches("  subvolume             ").count(), 0);
-        let state = render_state_conf(&cfg).unwrap();
+        let state = render_state_conf(&cfg).unwrap().unwrap();
         assert_eq!(state.matches("  subvolume             ").count(), 2);
     }
 
     #[test]
     fn no_after_index_entry_means_no_state_conf() {
-        assert_eq!(render_state_conf(&test_config()), None);
+        assert_eq!(render_state_conf(&test_config()).unwrap(), None);
     }
 
     #[test]
@@ -1580,8 +1641,8 @@ enabled = false
             retired: Some("2026-10-12".into()),
             ..state_entry()
         });
-        assert!(!render_btrbk_conf(&cfg).contains("das-state"));
-        assert_eq!(render_state_conf(&cfg), None);
+        assert!(!render_btrbk_conf(&cfg).unwrap().contains("das-state"));
+        assert_eq!(render_state_conf(&cfg).unwrap(), None);
     }
 
     #[test]
@@ -1620,7 +1681,7 @@ enabled = false
         save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
         assert_eq!(
             std::fs::read_to_string(&state_path).unwrap(),
-            render_state_conf(&cfg).unwrap()
+            render_state_conf(&cfg).unwrap().unwrap()
         );
         assert!(
             !std::fs::read_to_string(dir.path().join("btrbk.conf"))

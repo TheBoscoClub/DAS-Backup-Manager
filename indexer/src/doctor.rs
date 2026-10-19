@@ -264,7 +264,12 @@ pub fn group_sources_by_volume(config: &Config) -> Vec<VolumeGroup> {
         group.source_labels.push(source.label.clone());
         // A retired entry is not backed up. If its subvolume is back on disk it
         // must read as missing, because sync will revive it rather than ignore it.
-        for sv in source.subvolumes.iter().filter(|e| e.retired.is_none()) {
+        // A top level in a source that reaches a mirror target is not backed
+        // up either: the btrbk.conf renderer refuses it (bd xtnq).
+        let top_level_refused = !config.mirrors_reached(source).is_empty();
+        for sv in source.subvolumes.iter().filter(|e| {
+            e.retired.is_none() && !(e.name == crate::adopt::TOP_LEVEL && top_level_refused)
+        }) {
             if !group.configured.contains(&sv.name) {
                 group.configured.push(sv.name.clone());
             }
@@ -1142,5 +1147,45 @@ mod tests {
         let without = [listing("/.btrfs-hdd", Ok(s(&["@a", "@b"])))];
         let report = drift_from_listings(&cfg, &without);
         assert!(report.stale.is_empty(), "{:?}", report.stale);
+    }
+
+    /// Review of bc2c8a4: a top-level entry in a source that reaches a mirror
+    /// is not backed up — the renderer refuses it — so it is missing.
+    #[test]
+    fn a_top_level_in_a_mirror_reaching_source_is_missing() {
+        use crate::adopt::TOP_LEVEL;
+        use crate::config::{Target, TargetRole};
+        let listings = [listing("/.btrfs-hdd", Ok(s(&[TOP_LEVEL, "@a", "@b"])))];
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(SubvolConfig {
+            name: TOP_LEVEL.into(),
+            snapshot_name: Some("btrfs-hdd-toplevel".into()),
+            ..Default::default()
+        });
+        let target = |label: &str, role| Target {
+            label: label.into(),
+            serial: "S".into(),
+            serials: vec!["S".into()],
+            mount_uuid: None,
+            mount: format!("/mnt/{label}"),
+            role,
+            retention: Default::default(),
+            display_name: String::new(),
+        };
+        cfg.targets = vec![target("big", TargetRole::Primary)];
+        assert!(!drift_from_listings(&cfg, &listings).not_clean());
+        cfg.targets.push(target("small", TargetRole::Mirror));
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(
+            report
+                .missing
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            [TOP_LEVEL]
+        );
+        // Scoped to the primary by name: backed up, clean again.
+        cfg.sources[0].target_labels = vec!["big".into()];
+        assert!(!drift_from_listings(&cfg, &listings).not_clean());
     }
 }
