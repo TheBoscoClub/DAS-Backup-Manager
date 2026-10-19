@@ -234,6 +234,7 @@ pub fn refuse_live_outputs(cfg: &Config, config_path: &Path) -> Result<(), Strin
             config: Path::new(LIVE_CONFIG),
             btrbk_conf: Path::new(LIVE_BTRBK_CONF),
             state_conf: Path::new(LIVE_BTRBK_STATE_CONF),
+            cwd: std::env::current_dir().ok().as_deref(),
         },
     )
 }
@@ -242,7 +243,20 @@ pub fn refuse_live_outputs(cfg: &Config, config_path: &Path) -> Result<(), Strin
 /// resolves through its nearest existing ancestor, the missing tail appended
 /// (a `..` in it popped lexically), so a file about to be created compares
 /// equal to the same file reached another way.
-fn resolve(path: &Path) -> PathBuf {
+///
+/// A relative `path` is first made absolute against `cwd`; with no `cwd` it
+/// cannot be placed, and the answer is `None` (the caller refuses): left
+/// relative, a not-yet-created file would be compared as a bare name and could
+/// land in the live directory unseen.
+fn resolve(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(resolve_absolute(path))
+    } else {
+        cwd.map(|cwd| resolve_absolute(&cwd.join(path)))
+    }
+}
+
+fn resolve_absolute(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut tail = Vec::new();
     let mut cur = path.to_path_buf();
@@ -274,6 +288,8 @@ struct LiveFiles<'a> {
     config: &'a Path,
     btrbk_conf: &'a Path,
     state_conf: &'a Path,
+    /// What a relative path is relative to; `None` when it cannot be read.
+    cwd: Option<&'a Path>,
 }
 
 fn refuse_live_outputs_in(
@@ -284,12 +300,28 @@ fn refuse_live_outputs_in(
     // Compared as resolved, never as written: on the host
     // `/etc/das-backup/btrbk.conf` is a symlink to the live file, and a `..`
     // or a symlinked directory names it just as well.
-    if resolve(config_path) == resolve(live.config) {
+    let res = |p: &Path| resolve(p, live.cwd);
+    let unplaceable = || {
+        format!(
+            "refusing to save {}: the current directory cannot be read, so a relative path \
+             cannot be told from the live /etc/btrbk files",
+            config_path.display()
+        )
+    };
+    let state_conf = state_conf_path(cfg);
+    let (Some(config), Some(conf), Some(state)) = (
+        res(config_path),
+        res(Path::new(&cfg.general.btrbk_conf)),
+        res(&state_conf),
+    ) else {
+        return Err(unplaceable());
+    };
+    if Some(config) == res(live.config) {
         return Ok(());
     }
     let hit = [
-        resolve(Path::new(&cfg.general.btrbk_conf)) == resolve(live.btrbk_conf),
-        resolve(&state_conf_path(cfg)) == resolve(live.state_conf),
+        Some(conf) == res(live.btrbk_conf),
+        Some(state) == res(live.state_conf),
     ];
     if hit.iter().any(|&l| l) {
         return Err(format!(
@@ -1357,6 +1389,9 @@ enabled = false
             self.dir.path().join(rel)
         }
         fn check(&self, conf: &str, config: &Path) -> Result<(), String> {
+            self.check_in(conf, config, Some(self.dir.path()))
+        }
+        fn check_in(&self, conf: &str, config: &Path, cwd: Option<&Path>) -> Result<(), String> {
             let live_config = self.p("etc/das-backup/config.toml");
             let live_conf = self.p("etc/btrbk/btrbk.conf");
             let live_state = self.p("etc/btrbk/btrbk-state.conf");
@@ -1367,9 +1402,58 @@ enabled = false
                     config: &live_config,
                     btrbk_conf: &live_conf,
                     state_conf: &live_state,
+                    cwd,
                 },
             )
         }
+    }
+
+    #[test]
+    fn a_relative_output_is_placed_by_the_working_directory_before_it_is_compared() {
+        let etc = FakeEtc::new();
+        let scratch = etc.p("scratch/config.toml");
+        let live_dir = etc.p("etc/btrbk");
+        let scratch_dir = etc.p("scratch");
+        // In the live directory, a bare name lands on the live files (the state
+        // conf is absent, so nothing canonicalizes it on its own).
+        for conf in ["other.conf", "./other.conf", "sub/../other.conf"] {
+            let err = etc.check_in(conf, &scratch, Some(&live_dir)).unwrap_err();
+            assert!(err.contains("live /etc/btrbk"), "{conf}: {err}");
+        }
+        // The same name from a scratch directory is the scratch directory's.
+        assert!(
+            etc.check_in("other.conf", &scratch, Some(&scratch_dir))
+                .is_ok()
+        );
+        // A relative --config is placed the same way: from the live config's
+        // directory it IS the live config.
+        let das = etc.p("etc/das-backup");
+        let live_conf = etc.p("etc/btrbk/btrbk.conf");
+        let live_conf = live_conf.to_str().unwrap();
+        assert!(
+            etc.check_in(live_conf, Path::new("config.toml"), Some(&das))
+                .is_ok()
+        );
+        assert!(
+            etc.check_in(live_conf, Path::new("config.toml"), Some(&scratch_dir))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn without_a_working_directory_a_relative_path_is_refused_and_an_absolute_one_is_not() {
+        let etc = FakeEtc::new();
+        let scratch = etc.p("scratch/config.toml");
+        let err = etc.check_in("other.conf", &scratch, None).unwrap_err();
+        assert!(err.contains("current directory"), "{err}");
+        let err = etc
+            .check_in("/scratch/x.conf", Path::new("config.toml"), None)
+            .unwrap_err();
+        assert!(err.contains("current directory"), "{err}");
+        assert!(
+            etc.check_in(scratch.to_str().unwrap(), &scratch, None)
+                .is_ok()
+        );
     }
 
     #[test]
