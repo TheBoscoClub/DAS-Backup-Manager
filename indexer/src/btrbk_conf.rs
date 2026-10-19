@@ -227,14 +227,71 @@ const LIVE_BTRBK_STATE_CONF: &str = "/etc/btrbk/btrbk-state.conf";
 /// copy. Refusing, rather than quietly redirecting, leaves the scratch file
 /// exactly as its author wrote it and names the one line to change.
 pub fn refuse_live_outputs(cfg: &Config, config_path: &Path) -> Result<(), String> {
-    if config_path == Path::new(LIVE_CONFIG) {
+    refuse_live_outputs_in(
+        cfg,
+        config_path,
+        &LiveFiles {
+            config: Path::new(LIVE_CONFIG),
+            btrbk_conf: Path::new(LIVE_BTRBK_CONF),
+            state_conf: Path::new(LIVE_BTRBK_STATE_CONF),
+        },
+    )
+}
+
+/// `path` with every symlink and `..` resolved. A path that does not exist yet
+/// resolves through its nearest existing ancestor, the missing tail appended
+/// (a `..` in it popped lexically), so a file about to be created compares
+/// equal to the same file reached another way.
+fn resolve(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut tail = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(mut out) = cur.canonicalize() {
+            for part in tail.iter().rev() {
+                if part == ".." {
+                    out.pop();
+                } else {
+                    out.push(part);
+                }
+            }
+            return out;
+        }
+        match cur.components().next_back() {
+            Some(c @ (Component::Normal(_) | Component::ParentDir)) => {
+                tail.push(c.as_os_str().to_owned());
+                cur.pop();
+            }
+            // Nothing above it exists (or it is a bare root/prefix): as written.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The host's live files, injectable so a test can stand a scratch tree in
+/// for `/etc`.
+struct LiveFiles<'a> {
+    config: &'a Path,
+    btrbk_conf: &'a Path,
+    state_conf: &'a Path,
+}
+
+fn refuse_live_outputs_in(
+    cfg: &Config,
+    config_path: &Path,
+    live: &LiveFiles<'_>,
+) -> Result<(), String> {
+    // Compared as resolved, never as written: on the host
+    // `/etc/das-backup/btrbk.conf` is a symlink to the live file, and a `..`
+    // or a symlinked directory names it just as well.
+    if resolve(config_path) == resolve(live.config) {
         return Ok(());
     }
-    let live = [
-        Path::new(&cfg.general.btrbk_conf) == Path::new(LIVE_BTRBK_CONF),
-        state_conf_path(cfg) == Path::new(LIVE_BTRBK_STATE_CONF),
+    let hit = [
+        resolve(Path::new(&cfg.general.btrbk_conf)) == resolve(live.btrbk_conf),
+        resolve(&state_conf_path(cfg)) == resolve(live.state_conf),
     ];
-    if live.iter().any(|&l| l) {
+    if hit.iter().any(|&l| l) {
         return Err(format!(
             "refusing to save {}: its [general] btrbk_conf = {} would write the live \
              /etc/btrbk files, which only {LIVE_CONFIG} may. Set btrbk_conf to a scratch path \
@@ -1268,6 +1325,108 @@ enabled = false
         assert!(
             refuse_live_outputs(&with_btrbk_conf("/etc/btrbk-test/btrbk.conf"), scratch).is_ok()
         );
+    }
+
+    /// A scratch tree standing in for `/etc`: the live files exist, and
+    /// `das-backup/btrbk.conf` is a symlink to the live `btrbk.conf`.
+    struct FakeEtc {
+        dir: tempfile::TempDir,
+    }
+    impl FakeEtc {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let etc = dir.path().join("etc");
+            std::fs::create_dir_all(etc.join("btrbk")).unwrap();
+            std::fs::create_dir_all(etc.join("das-backup")).unwrap();
+            std::fs::write(etc.join("btrbk/btrbk.conf"), "live").unwrap();
+            std::fs::write(etc.join("das-backup/config.toml"), "live").unwrap();
+            std::os::unix::fs::symlink(
+                etc.join("btrbk/btrbk.conf"),
+                etc.join("das-backup/btrbk.conf"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(etc.join("btrbk"), dir.path().join("btrbk-link")).unwrap();
+            std::os::unix::fs::symlink(
+                etc.join("das-backup/config.toml"),
+                dir.path().join("config-link.toml"),
+            )
+            .unwrap();
+            Self { dir }
+        }
+        fn p(&self, rel: &str) -> std::path::PathBuf {
+            self.dir.path().join(rel)
+        }
+        fn check(&self, conf: &str, config: &Path) -> Result<(), String> {
+            let live_config = self.p("etc/das-backup/config.toml");
+            let live_conf = self.p("etc/btrbk/btrbk.conf");
+            let live_state = self.p("etc/btrbk/btrbk-state.conf");
+            refuse_live_outputs_in(
+                &with_btrbk_conf(conf),
+                config,
+                &LiveFiles {
+                    config: &live_config,
+                    btrbk_conf: &live_conf,
+                    state_conf: &live_state,
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn a_symlinked_file_a_symlinked_parent_or_a_dotdot_spelling_is_still_the_live_file() {
+        let etc = FakeEtc::new();
+        let scratch = etc.p("scratch/config.toml");
+        let spellings = [
+            // the live file under another name (the host's real symlink)
+            etc.p("etc/das-backup/btrbk.conf"),
+            // through a symlinked parent directory
+            etc.p("btrbk-link/btrbk.conf"),
+            // a `..` spelling
+            etc.p("etc/btrbk/../btrbk/btrbk.conf"),
+            // another main file in the live directory (shares the state conf)
+            etc.p("btrbk-link/other.conf"),
+            // a `..` spelling whose tail does not exist yet
+            etc.p("etc/btrbk/../btrbk/not-yet.conf"),
+            // a `..` that climbs back out of a directory that does not exist
+            etc.p("etc/btrbk/missing/../btrbk.conf"),
+        ];
+        for conf in spellings {
+            let err = etc.check(conf.to_str().unwrap(), &scratch).unwrap_err();
+            assert!(err.contains("live /etc/btrbk"), "{}: {err}", conf.display());
+        }
+    }
+
+    #[test]
+    fn a_spelling_of_the_live_config_is_the_live_config() {
+        let etc = FakeEtc::new();
+        let conf = etc.p("etc/btrbk/btrbk.conf");
+        let conf = conf.to_str().unwrap();
+        for config in [
+            etc.p("etc/das-backup/../das-backup/config.toml"),
+            etc.p("config-link.toml"),
+        ] {
+            assert!(etc.check(conf, &config).is_ok(), "{}", config.display());
+        }
+        // and a scratch config is still refused beside them
+        assert!(etc.check(conf, &etc.p("scratch/config.toml")).is_err());
+    }
+
+    #[test]
+    fn a_file_that_only_looks_like_the_live_one_is_not_refused() {
+        let etc = FakeEtc::new();
+        let scratch = etc.p("scratch/config.toml");
+        for conf in [
+            etc.p("scratch/btrbk.conf"),
+            etc.p("etc/btrbk-test/btrbk.conf"),
+            // climbs out of the live directory through one that does not exist
+            etc.p("etc/btrbk/missing/../../elsewhere/btrbk.conf"),
+        ] {
+            assert!(
+                etc.check(conf.to_str().unwrap(), &scratch).is_ok(),
+                "{}",
+                conf.display()
+            );
+        }
     }
 
     #[test]

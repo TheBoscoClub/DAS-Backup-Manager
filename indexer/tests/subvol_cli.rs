@@ -478,42 +478,58 @@ fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-#[test]
-fn a_scratch_config_naming_the_live_btrbk_files_is_refused_by_every_saving_subvol_command() {
+/// `args --config <scratch naming the live outputs>` must be refused for those
+/// outputs — not fail at the write — and leave the scratch config alone.
+fn assert_refused_for_live_outputs(args: &[&str]) {
     if running_as_root() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let config = write_scratch_config_with_live_outputs(dir.path());
-    let config_s = config.to_str().unwrap();
     let before = std::fs::read_to_string(&config).unwrap();
+    let mut full = args.to_vec();
+    full.extend(["--config", config.to_str().unwrap()]);
+    let out = btrdasd(&full);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{args:?} must fail: {err}");
+    assert!(
+        err.contains("live /etc/btrbk"),
+        "{args:?} must be refused for its live outputs, not fail at the write: {err}"
+    );
+    assert!(
+        !err.contains("Permission denied"),
+        "{args:?} reached the write: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "{args:?} changed the scratch config"
+    );
+}
 
-    for args in [
-        vec!["subvol", "add", "s", "@home"],
-        vec!["subvol", "remove", "s", "@extra"],
-        vec!["subvol", "set-manual", "s", "@"],
-        vec!["subvol", "set-auto", "s", "@"],
-        vec!["subvol", "sync"],
-    ] {
-        let mut full = args.clone();
-        full.extend(["--config", config_s]);
-        let out = btrdasd(&full);
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "{args:?} must fail: {err}");
-        assert!(
-            err.contains("live /etc/btrbk"),
-            "{args:?} must be refused for its live outputs, not fail at the write: {err}"
-        );
-        assert!(
-            !err.contains("Permission denied"),
-            "{args:?} reached the write: {err}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&config).unwrap(),
-            before,
-            "{args:?} changed the scratch config"
-        );
-    }
+#[test]
+fn subvol_add_refuses_a_scratch_config_naming_the_live_btrbk_files() {
+    assert_refused_for_live_outputs(&["subvol", "add", "s", "@home"]);
+}
+
+#[test]
+fn subvol_remove_refuses_a_scratch_config_naming_the_live_btrbk_files() {
+    assert_refused_for_live_outputs(&["subvol", "remove", "s", "@extra"]);
+}
+
+#[test]
+fn subvol_set_manual_refuses_a_scratch_config_naming_the_live_btrbk_files() {
+    assert_refused_for_live_outputs(&["subvol", "set-manual", "s", "@"]);
+}
+
+#[test]
+fn subvol_set_auto_refuses_a_scratch_config_naming_the_live_btrbk_files() {
+    assert_refused_for_live_outputs(&["subvol", "set-auto", "s", "@"]);
+}
+
+#[test]
+fn a_real_subvol_sync_refuses_a_scratch_config_naming_the_live_btrbk_files() {
+    assert_refused_for_live_outputs(&["subvol", "sync"]);
 }
 
 #[test]
