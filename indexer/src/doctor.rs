@@ -217,7 +217,8 @@ pub fn compute_missing(
 pub fn compute_stale(on_disk: &[String], configured: &[String]) -> Vec<String> {
     let mut stale: Vec<String> = configured
         .iter()
-        .filter(|c| !on_disk.contains(c))
+        // The top level exists while its volume does: never stale.
+        .filter(|c| c.as_str() != crate::adopt::TOP_LEVEL && !on_disk.contains(c))
         .cloned()
         .collect();
     stale.sort();
@@ -524,7 +525,7 @@ pub fn format_report(report: &DriftReport) -> String {
         for m in &report.missing {
             r.push_str(&format!(
                 "  {}  (volume {}, source(s): {})\n",
-                m.name,
+                crate::adopt::display_name(&m.name),
                 m.volume,
                 m.source_labels.join(", ")
             ));
@@ -1089,5 +1090,57 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\n  /.btrfs-nvme\n"), "{text}");
+    }
+
+    // -- the volume's top level (bd DAS-Backup-Manager-xtnq) ------------------
+
+    #[test]
+    fn an_unconfigured_top_level_is_missing_and_says_what_it_is() {
+        use crate::adopt::TOP_LEVEL;
+        let cfg = test_config();
+        let listings = [listing("/.btrfs-hdd", Ok(s(&[TOP_LEVEL, "@a", "@b"])))];
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(
+            report.missing,
+            vec![MissingSubvolume {
+                volume: "/.btrfs-hdd".into(),
+                source_labels: vec!["hdd".into()],
+                name: TOP_LEVEL.into(),
+            }]
+        );
+        assert!(report.not_clean());
+        let text = format_report(&report);
+        assert!(
+            text.contains("  . (top level)  (volume /.btrfs-hdd, source(s): hdd)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_configured_or_deliberately_excluded_top_level_is_clean() {
+        use crate::adopt::{TOP_LEVEL, TOP_LEVEL_EXCLUDE};
+        let listings = [listing("/.btrfs-hdd", Ok(s(&[TOP_LEVEL, "@a", "@b"])))];
+        let mut cfg = test_config();
+        cfg.subvolumes.exclude = s(&[TOP_LEVEL_EXCLUDE]);
+        assert!(!drift_from_listings(&cfg, &listings).not_clean());
+
+        // A wildcard does not exclude it.
+        cfg.subvolumes.exclude = s(&["*"]);
+        let report = drift_from_listings(&cfg, &listings);
+        assert_eq!(report.missing.len(), 1, "{:?}", report.missing);
+
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(SubvolConfig {
+            name: TOP_LEVEL.into(),
+            snapshot_name: Some("btrfs-hdd-toplevel".into()),
+            ..Default::default()
+        });
+        assert!(!drift_from_listings(&cfg, &listings).not_clean());
+        // Configured, and a listing that lacks it (one list_volume never
+        // produces): the top level exists while its volume does, so it is
+        // never reported stale.
+        let without = [listing("/.btrfs-hdd", Ok(s(&["@a", "@b"])))];
+        let report = drift_from_listings(&cfg, &without);
+        assert!(report.stale.is_empty(), "{:?}", report.stale);
     }
 }

@@ -804,6 +804,15 @@ fn btrbk_filters(
     for pair in selected {
         let filter = match targets {
             Some(_) => format!("{}/{}", pair.target_dir(), pair.snapshot_name),
+            // btrbk gives `subvolume .` the volume's own path, and a filter
+            // matching a volume selects all of it; the path of its snapshots
+            // names this one subvolume (bd xtnq).
+            None if pair.subvolume.name == crate::adopt::TOP_LEVEL => format!(
+                "{}/{}/{}",
+                pair.source.volume,
+                pair.source.snapshot_dir.trim_end_matches('/'),
+                pair.snapshot_name
+            ),
             None => format!("{}/{}", pair.source.volume, pair.subvolume.name),
         };
         if !filter.starts_with('/') || filter.contains(['*', '\n']) {
@@ -3987,6 +3996,39 @@ mod tests {
         assert_eq!(
             filters_for(&config, &["nvme-vm", "hdd"], None),
             Ok(labels(&["/.btrfs-nvme/@vm", "/.btrfs-hdd/@data"]))
+        );
+    }
+
+    /// bd xtnq: btrbk gives `subvolume .` the volume's own path, and a filter
+    /// matching a volume selects every subvolume in it. So the top level is
+    /// selected by the path of its snapshots, `<volume>/<snapshot_dir>/<name>`,
+    /// which btrbk matches against that one subvolume alone.
+    #[test]
+    fn the_top_level_is_filtered_by_its_snapshot_path_never_by_the_volume() {
+        let mut config = steps_config();
+        let mut top = config.sources[2].clone();
+        top.label = "hdd-adopted".into();
+        top.target_subdirs = labels(&["hdd-adopted"]);
+        top.target_labels = labels(&["primary-22tb"]);
+        top.subvolumes = vec![SubvolConfig {
+            name: crate::adopt::TOP_LEVEL.into(),
+            snapshot_name: Some("btrfs-hdd-toplevel".into()),
+            ..Default::default()
+        }];
+        config.sources.push(top);
+        assert_eq!(
+            filters_for(&config, &["hdd-adopted"], None),
+            Ok(labels(&["/.btrfs-hdd/.btrbk-snapshots/btrfs-hdd-toplevel"]))
+        );
+        assert_eq!(
+            filters_for(&config, &["hdd-adopted"], Some(&["primary-22tb"])),
+            Ok(vec![format!("{PRIMARY}/hdd-adopted/btrfs-hdd-toplevel")])
+        );
+        // A snapshot_dir written with a trailing slash still yields one path.
+        config.sources[3].snapshot_dir = "snaps/".into();
+        assert_eq!(
+            filters_for(&config, &["hdd-adopted"], None),
+            Ok(labels(&["/.btrfs-hdd/snaps/btrfs-hdd-toplevel"]))
         );
     }
 

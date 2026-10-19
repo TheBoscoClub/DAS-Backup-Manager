@@ -15,6 +15,60 @@ use crate::config::{Config, Source, SubvolConfig, TargetRole};
 use crate::doctor::glob_match;
 use crate::fsutil::CommandRunner;
 
+/// The entry name of a source volume's top level (btrfs id 5, the volume
+/// root itself), spelled as btrbk spells it: `subvolume .`. Every verified
+/// listing holds it (`list_volume`), so sync adopts it like any other
+/// subvolume — always into the volume's adoption source, primary target only,
+/// because it has no configured ancestor (bd DAS-Backup-Manager-xtnq).
+///
+/// A snapshot of the top level holds only its loose content; each nested
+/// subvolume appears in it as an empty directory and is backed up by its own
+/// entry. The top level is never anyone's ancestor for scoping.
+pub const TOP_LEVEL: &str = ".";
+
+/// The one exclude pattern that keeps a volume's top level out. A listed
+/// path is relative and never `/`, and the ancestor walk never produces it,
+/// so this pattern can match nothing else; no wildcard, empty or `.` pattern
+/// reaches the top level.
+pub const TOP_LEVEL_EXCLUDE: &str = "/";
+
+/// The snapshot name a volume's top level is adopted with: the volume path's
+/// last component, leading dots dropped, anything but ASCII letters, digits,
+/// `_` and `-` turned into `-`, then `-toplevel` (`/.btrfs-hdd` →
+/// `btrfs-hdd-toplevel`). `volume-toplevel` when nothing usable is left. A
+/// `.` cannot derive a name the way other entries do (btrbk would default it
+/// to the volume's basename, here a hidden `.btrfs-hdd`), so the name is
+/// written explicitly at adoption and, like every adopted name, never changed
+/// afterwards; `apply_plan` appends `-2`, `-3`, … on a collision.
+pub fn top_level_snapshot_name(volume: &str) -> String {
+    let base: String = volume
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let base = if base.is_empty() { "volume" } else { &base };
+    format!("{base}-toplevel")
+}
+
+/// How a subvolume entry name reads in a report: the top level says so.
+pub fn display_name(name: &str) -> String {
+    if name == TOP_LEVEL {
+        format!("{TOP_LEVEL} (top level)")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Whether `path` lies in a snapshot tree — Snapper's `.snapshots` or btrbk's
 /// `.btrbk-snapshots`, at any depth. Snapshots are not data to back up; they
 /// are copies of data that is.
@@ -27,6 +81,14 @@ pub fn in_snapshot_tree(path: &str) -> bool {
 /// to the subvolume it matches and to everything nested under that
 /// subvolume, so excluding `@cache` also excludes `@cache/stremio`.
 pub fn excluding_pattern<'a>(path: &str, patterns: &'a [String]) -> Option<&'a str> {
+    // The top level is matched by name, never by a glob: `*` must not
+    // silently drop a volume's loose content. And `/` is not a glob either.
+    if path == TOP_LEVEL {
+        return patterns
+            .iter()
+            .find(|p| p.as_str() == TOP_LEVEL_EXCLUDE)
+            .map(String::as_str);
+    }
     patterns
         .iter()
         .find(|pattern| {
@@ -196,7 +258,9 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
 
         for source in &sources {
             for entry in &source.subvolumes {
-                let present = on_disk.contains(&entry.name);
+                // The top level exists for as long as the volume does: a
+                // volume that was read holds it, so it is never retired.
+                let present = entry.name == TOP_LEVEL || on_disk.contains(&entry.name);
                 let reference = EntryRef {
                     source_label: source.label.clone(),
                     name: entry.name.clone(),
@@ -360,7 +424,12 @@ pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Result<Confi
                 out.sources.len() - 1
             }
         };
-        let snapshot_name = unique_name(&algorithmic_snapshot_name(&adoption.name), &taken);
+        let base = if adoption.name == TOP_LEVEL {
+            top_level_snapshot_name(&adoption.volume)
+        } else {
+            algorithmic_snapshot_name(&adoption.name)
+        };
+        let snapshot_name = unique_name(&base, &taken);
         taken.insert(snapshot_name.clone());
         out.sources[index].subvolumes.push(SubvolConfig {
             name: adoption.name.clone(),
@@ -443,7 +512,14 @@ pub fn list_volume(
         let out = run_stdout(runner, "btrfs", &["subvolume", "list", volume])?;
         Ok(parse_subvolume_paths(&out))
     })();
-    normalize_listing(volume, listed)
+    let mut listing = normalize_listing(volume, listed);
+    // `btrfs subvolume list` never prints id 5. The checks above proved the
+    // path is the filesystem's top level, so it is there — added only after
+    // an empty listing has already been refused, never in its place.
+    if let Ok(found) = &mut listing.subvolumes {
+        found.insert(0, TOP_LEVEL.to_string());
+    }
+    listing
 }
 
 /// One listing per distinct volume among the config's sources, in the order
@@ -769,7 +845,9 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
             };
             r.push_str(&format!(
                 "    {}  [{} -> source {}, {how}]\n",
-                a.name, a.volume, a.source_label
+                display_name(&a.name),
+                a.volume,
+                a.source_label
             ));
         }
     }
@@ -783,7 +861,11 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
             )),
         }
         for e in &plan.retire {
-            r.push_str(&format!("    {}  [source {}]\n", e.name, e.source_label));
+            r.push_str(&format!(
+                "    {}  [source {}]\n",
+                display_name(&e.name),
+                e.source_label
+            ));
         }
     }
     if !plan.revive.is_empty() {
@@ -793,7 +875,11 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
             "NOT revived",
         ));
         for e in &plan.revive {
-            r.push_str(&format!("    {}  [source {}]\n", e.name, e.source_label));
+            r.push_str(&format!(
+                "    {}  [source {}]\n",
+                display_name(&e.name),
+                e.source_label
+            ));
         }
     }
     if !plan.skipped.is_empty() {
@@ -807,7 +893,8 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
             match &s.reason {
                 SkipReason::Excluded { pattern } => r.push_str(&format!(
                     "    {}  [{}, excluded by '{pattern}']\n",
-                    s.name, s.volume
+                    display_name(&s.name),
+                    s.volume
                 )),
                 SkipReason::SnapshotTree => {
                     match trees.iter_mut().find(|(v, _)| *v == s.volume.as_str()) {
@@ -827,7 +914,12 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
     if !plan.unplaceable.is_empty() {
         r.push_str("  COULD NOT BE PLACED (not backed up):\n");
         for u in &plan.unplaceable {
-            r.push_str(&format!("    {}  [{}: {}]\n", u.name, u.volume, u.why));
+            r.push_str(&format!(
+                "    {}  [{}: {}]\n",
+                display_name(&u.name),
+                u.volume,
+                u.why
+            ));
         }
     }
     if !plan.failed_volumes.is_empty() {
@@ -1457,13 +1549,6 @@ mod tests {
     }
 
     #[test]
-    fn list_volume_reads_a_mounted_top_level_volume_with_the_expected_uuid() {
-        let r = scripted(vec![healthy("/ssd", "abc", &["@", "a b"])]);
-        let l = list_volume(&r, &mounted, "/ssd", "UUID=abc");
-        assert_eq!(l.subvolumes.unwrap(), ["@", "a b"]);
-    }
-
-    #[test]
     fn list_volume_refuses_an_unmounted_path_without_running_anything() {
         let r = Scripted::new(&[]);
         let l = list_volume(&r, &unmounted, "/ssd", "UUID=abc");
@@ -1519,7 +1604,7 @@ mod tests {
             "n1\n".into(),
         ));
         let l = list_volume(&scripted(vec![parts]), &mounted, "/nvme", "/dev/nvme1n1p2");
-        assert_eq!(l.subvolumes.unwrap(), ["@"]);
+        assert_eq!(l.subvolumes.unwrap(), [TOP_LEVEL, "@"]);
         // blkid failing means the expected UUID is unknown: refuse.
         let l = list_volume(
             &scripted(vec![healthy("/nvme", "n1", &["@"])]),
@@ -1573,6 +1658,12 @@ mod tests {
         let mut c = config();
         c.sources.truncate(1); // "ssd" on /ssd: @srv, @opt
         c.sources[0].device = "UUID=abc".into();
+        // The volume's top level, already adopted (primary only), so a sync
+        // of an unchanged disk has nothing to do.
+        let mut top = source("ssd-adopted", "/ssd", &["big"], &[TOP_LEVEL]);
+        top.device = "UUID=abc".into();
+        top.subvolumes[0].snapshot_name = Some("ssd-toplevel".into());
+        c.sources.push(top);
         c.general.btrbk_conf = dir.join("btrbk.conf").to_string_lossy().into_owned();
         let path = dir.join("config.toml");
         c.save(&path).unwrap();
@@ -2470,7 +2561,10 @@ mod tests {
             (l[0].volume.as_str(), l[1].volume.as_str()),
             ("/ssd", "/hdd")
         );
-        assert_eq!(l[0].subvolumes.as_ref().unwrap(), &["@srv", "@opt"]);
+        assert_eq!(
+            l[0].subvolumes.as_ref().unwrap(),
+            &[TOP_LEVEL, "@srv", "@opt"]
+        );
         let lists = r
             .calls()
             .iter()
@@ -2534,7 +2628,10 @@ mod tests {
         parts.push(("blkid -s UUID -o value /dev/sdx".into(), 0, "abc\n".into()));
         parts.extend(healthy("/hdd", "zzz", &["media"]));
         let l = list_volumes(&c, &scripted(vec![parts]), &mounted);
-        assert_eq!(l[0].subvolumes.as_ref().unwrap(), &["@srv", "@opt"]);
+        assert_eq!(
+            l[0].subvolumes.as_ref().unwrap(),
+            &[TOP_LEVEL, "@srv", "@opt"]
+        );
     }
 
     #[test]
@@ -2548,7 +2645,10 @@ mod tests {
             ("/ssd", "/hdd")
         );
         assert!(l[0].subvolumes.is_err());
-        assert_eq!(l[1].subvolumes.as_ref().unwrap(), &["media"]);
+        assert_eq!(
+            l[1].subvolumes.as_ref().unwrap(),
+            &[TOP_LEVEL, "media"]
+        );
     }
 
     #[test]
@@ -2697,5 +2797,235 @@ mod tests {
             assert!(!out.written, "dry_run={dry_run}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         }
+    }
+
+    // --- the volume's top level (btrfs id 5), bd DAS-Backup-Manager-xtnq ------
+
+    #[test]
+    fn list_volume_names_the_top_level_of_a_verified_volume_first() {
+        // `btrfs subvolume list` never prints id 5; a volume proven mounted
+        // at its top level holds it by definition.
+        let r = scripted(vec![healthy("/ssd", "abc", &["@", "a b"])]);
+        let l = list_volume(&r, &mounted, "/ssd", "UUID=abc");
+        assert_eq!(l.subvolumes.unwrap(), [TOP_LEVEL, "@", "a b"]);
+    }
+
+    #[test]
+    fn a_volume_that_fails_verification_or_lists_nothing_gets_no_top_level() {
+        // The top level must never paper over an empty listing: "nothing
+        // here" still reads as "could not look".
+        let r = scripted(vec![healthy("/ssd", "abc", &[])]);
+        assert!(
+            list_volume(&r, &mounted, "/ssd", "UUID=abc")
+                .subvolumes
+                .is_err()
+        );
+        let r = Scripted::new(&[]);
+        assert!(
+            list_volume(&r, &unmounted, "/ssd", "UUID=abc")
+                .subvolumes
+                .is_err()
+        );
+    }
+
+    fn with_top_level(mut l: Vec<VolumeListing>) -> Vec<VolumeListing> {
+        for v in &mut l {
+            if let Ok(names) = &mut v.subvolumes {
+                names.insert(0, TOP_LEVEL.to_string());
+            }
+        }
+        l
+    }
+
+    #[test]
+    fn an_unconfigured_top_level_is_adopted_for_the_primary_target_only() {
+        let plan = plan_sync(&config(), &with_top_level(all_present()));
+        assert_eq!(
+            plan.adopt,
+            vec![
+                Adoption {
+                    volume: "/ssd".into(),
+                    name: TOP_LEVEL.into(),
+                    source_label: "ssd-adopted".into(),
+                    nested_under: None,
+                    manual_only: false,
+                },
+                Adoption {
+                    volume: "/hdd".into(),
+                    name: TOP_LEVEL.into(),
+                    source_label: "media-adopted".into(),
+                    nested_under: None,
+                    manual_only: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_top_level_is_never_an_ancestor() {
+        // Configured in a source that also sends to the mirror, it still
+        // lends no scoping: a new subvolume with no other configured ancestor
+        // goes to the primary only.
+        let mut c = config();
+        c.sources[0].subvolumes.push(sv(TOP_LEVEL));
+        let mut l = with_top_level(all_present());
+        if let Ok(names) = &mut l[0].subvolumes {
+            names.push("@new".into());
+        }
+        let plan = plan_sync(&c, &l);
+        let new = plan.adopt.iter().find(|a| a.name == "@new").unwrap();
+        assert_eq!(new.nested_under, None);
+        assert_eq!(new.source_label, "ssd-adopted");
+    }
+
+    #[test]
+    fn a_configured_top_level_is_never_retired_and_a_retired_one_is_revived() {
+        let mut c = config();
+        c.sources[0].subvolumes.push(sv(TOP_LEVEL));
+        // A listing without the top level (a hand-made fixture; list_volume
+        // always adds it) must not retire it: it exists while the volume does.
+        let plan = plan_sync(&c, &all_present());
+        assert!(plan.retire.is_empty(), "{:?}", plan.retire);
+        assert!(plan.revive.is_empty(), "{:?}", plan.revive);
+        // Retired by hand: the volume was read, so it is back.
+        c.sources[0].subvolumes.last_mut().unwrap().retired = Some("2026-10-01".into());
+        let plan = plan_sync(&c, &all_present());
+        assert_eq!(
+            plan.revive,
+            vec![EntryRef {
+                source_label: "ssd".into(),
+                name: TOP_LEVEL.into()
+            }]
+        );
+        // And a volume that could not be read decides nothing about it.
+        let failed = vec![
+            VolumeListing {
+                volume: "/ssd".into(),
+                subvolumes: Err("not mounted".into()),
+            },
+            listing("/hdd", &["media"]),
+        ];
+        assert!(plan_sync(&c, &failed).revive.is_empty());
+    }
+
+    #[test]
+    fn the_top_level_is_excluded_only_by_the_slash_pattern() {
+        // Wildcards, an empty pattern and "." never reach it.
+        for pattern in ["*", "?", "", ".", "@tmp", "*/*"] {
+            assert_eq!(
+                excluding_pattern(TOP_LEVEL, &pats(&[pattern])),
+                None,
+                "pattern {pattern:?}"
+            );
+        }
+        assert_eq!(
+            excluding_pattern(TOP_LEVEL, &pats(&["@tmp", TOP_LEVEL_EXCLUDE])),
+            Some(TOP_LEVEL_EXCLUDE)
+        );
+        // "/" excludes the top level alone, never what lies under it.
+        for path in ["@", "a/b", "@srv/x"] {
+            assert_eq!(
+                excluding_pattern(path, &pats(&[TOP_LEVEL_EXCLUDE])),
+                None,
+                "{path}"
+            );
+        }
+        let mut c = config();
+        c.subvolumes.exclude = vec![TOP_LEVEL_EXCLUDE.into()];
+        let plan = plan_sync(&c, &with_top_level(all_present()));
+        assert!(plan.adopt.is_empty(), "{:?}", plan.adopt);
+        assert_eq!(plan.skipped.len(), 2);
+        let by_slash = SkipReason::Excluded {
+            pattern: TOP_LEVEL_EXCLUDE.into(),
+        };
+        assert!(
+            plan.skipped
+                .iter()
+                .all(|s| s.name == TOP_LEVEL && s.reason == by_slash),
+            "{:?}",
+            plan.skipped
+        );
+    }
+
+    #[test]
+    fn top_level_snapshot_name_is_the_volume_basename_without_leading_dots() {
+        assert_eq!(top_level_snapshot_name("/.btrfs-hdd"), "btrfs-hdd-toplevel");
+        assert_eq!(top_level_snapshot_name("/srv/vmpool"), "dasRaid0-toplevel");
+        assert_eq!(top_level_snapshot_name("/mnt/pool/"), "pool-toplevel");
+        assert_eq!(top_level_snapshot_name("/a b/x.y@z"), "x-y-z-toplevel");
+        assert_eq!(top_level_snapshot_name("/a/b_c"), "b_c-toplevel");
+        // Nothing usable left: a fixed word, never an empty or dotted name.
+        assert_eq!(top_level_snapshot_name("/"), "volume-toplevel");
+        assert_eq!(top_level_snapshot_name("/..."), "volume-toplevel");
+    }
+
+    #[test]
+    fn apply_names_the_top_level_after_its_volume_in_the_adoption_source() {
+        let mut c = config();
+        // An existing explicit name already takes the natural choice.
+        c.sources[2].subvolumes[0].snapshot_name = Some("hdd-toplevel".into());
+        let plan = plan_sync(&c, &with_top_level(all_present()));
+        let out = apply_plan(&c, &plan, "2026-10-18").expect("consistent plan");
+        let entry = |label: &str| {
+            let s = out.sources.iter().find(|s| s.label == label).unwrap();
+            assert_eq!(
+                s.target_labels,
+                ["big"],
+                "{label} sends to the primary only"
+            );
+            s.subvolumes
+                .iter()
+                .find(|e| e.name == TOP_LEVEL)
+                .unwrap()
+                .clone()
+        };
+        let ssd = entry("ssd-adopted");
+        assert_eq!(ssd.snapshot_name.as_deref(), Some("ssd-toplevel"));
+        assert_eq!(ssd.adopted.as_deref(), Some("2026-10-18"));
+        assert!(!ssd.manual_only);
+        assert_eq!(
+            entry("media-adopted").snapshot_name.as_deref(),
+            Some("hdd-toplevel-2")
+        );
+        assert!(out.validate().is_empty(), "{:?}", out.validate());
+        // Stable: the next run finds nothing to do and renames nothing.
+        assert_eq!(
+            plan_sync(&out, &with_top_level(all_present())),
+            SyncPlan::default()
+        );
+    }
+
+    #[test]
+    fn a_dry_run_renders_the_top_level_under_the_primary_target_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let mut cfg = Config::load(&path).unwrap();
+        // Undo the fixture's own top-level entry: this run must adopt it.
+        cfg.sources.retain(|s| s.label != "ssd-adopted");
+        cfg.save(&path).unwrap();
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]);
+        let out = sync_subvolumes(&path, true, "2026-10-18", &r, &mounted).unwrap();
+        assert_eq!(out.plan.adopt.len(), 1, "{:?}", out.plan);
+        let planned = out.planned_btrbk_conf.clone().unwrap();
+        let block = planned
+            .split("\n# ")
+            .find(|b| b.starts_with("ssd-adopted\n"))
+            .unwrap_or_else(|| panic!("no ssd-adopted block in {planned}"));
+        assert!(
+            block.contains("  subvolume             .\n    snapshot_name       ssd-toplevel\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("target                /mnt/big/ssd-adopted\n"),
+            "{block}"
+        );
+        assert!(!block.contains("/mnt/small"), "never to a mirror: {block}");
+        assert_eq!(files(dir.path()).1, "OLD", "a dry run writes nothing");
+        // The report names it for what it is.
+        let text = format_sync_report(&out, true);
+        assert!(
+            text.contains(". (top level)  [/ssd -> source ssd-adopted, primary target only]"),
+            "{text}"
+        );
     }
 }

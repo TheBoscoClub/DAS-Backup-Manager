@@ -1341,6 +1341,24 @@ as well, while
 .I @cache/
 excludes nothing.
 .PP
+Each source volume's top level (btrfs subvolume id 5, the volume root
+itself) is adopted as well, as an entry named
+.I .
+(btrbk's
+.BR "subvolume ." ),
+primary target only, with the explicit snapshot name
+.IR <volume\-basename>\-toplevel ,
+leading dots dropped
+.RI ( /.btrfs\-hdd
+gives
+.IR btrfs\-hdd\-toplevel ).
+Its snapshots hold only the loose content of the top level; nested
+subvolumes appear in them as empty directories and are backed up by their
+own entries. It is never retired while its volume can be read, and only the
+exact pattern
+.I /
+excludes it; no wildcard does.
+.PP
 A volume is read only if every device its sources name is a real mountpoint
 holding the expected filesystem UUID, mounted at its top level. Otherwise
 nothing on that volume is adopted or retired, and the run is marked failed.

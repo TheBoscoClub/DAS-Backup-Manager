@@ -2309,6 +2309,30 @@ mod tests {
         );
     }
 
+    /// bd xtnq: a volume's top level (`.`) is never retired by sync, but one
+    /// retired by hand must still never be expired — `<volume>/.` is the
+    /// mounted volume itself, so it always "exists on the source again".
+    #[test]
+    fn a_retired_top_level_is_never_expired() {
+        let rig = rig();
+        rig.edit(|c| {
+            let e = &mut c.sources[0].subvolumes[1];
+            e.name = crate::adopt::TOP_LEVEL.into();
+            e.snapshot_name = Some("vol-toplevel".into());
+        });
+        let small = rig.snap("small/ssd", "vol-toplevel.20260930T0323");
+        let source = rig.snap("vol/.btrbk-snapshots", "vol-toplevel.20260930T0323");
+        let runner = rig.deleting(&[&small, &source]);
+        let out = expire_retired(&rig.config_path, false, "2027-12-01", &runner, &mounted).unwrap();
+        assert!(small.exists() && source.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(!out.entries[0].removed_from_config);
+        assert!(
+            rig.saved_names()
+                .contains(&crate::adopt::TOP_LEVEL.to_string())
+        );
+    }
+
     #[test]
     fn an_unmounted_source_keeps_every_retired_backup_and_says_why() {
         // With the source volume unmounted nobody can look at it, so nobody

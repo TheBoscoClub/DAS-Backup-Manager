@@ -760,6 +760,90 @@ impl Config {
         errors
     }
 
+    /// The rules on `[[source.subvolumes]]` names and on exclude patterns
+    /// that the volume's top level (`.`, btrbk's `subvolume .`) calls for
+    /// (bd DAS-Backup-Manager-xtnq):
+    ///
+    /// - `.` alone names the top level. It needs an explicit `snapshot_name`
+    ///   (otherwise its snapshots would be `.<timestamp>`), may appear once
+    ///   per volume, and — unless retired — may sit only in a source that
+    ///   sends to no `mirror` target: it has no configured ancestor, so it
+    ///   goes to the primary only.
+    /// - Every other name is a relative path with no empty, `.` or `..`
+    ///   component, so no consumer computes a path like `<vol>/./x`.
+    /// - An exclude pattern may not be empty or `.`: neither matches any
+    ///   subvolume, so either would be accepted and ignored. The top level
+    ///   is excluded by `/`.
+    pub fn subvolume_name_errors(&self) -> Vec<String> {
+        use crate::adopt::{TOP_LEVEL, TOP_LEVEL_EXCLUDE};
+        let mut errors = Vec::new();
+        let mut top_levels: Vec<&str> = Vec::new();
+        for src in &self.sources {
+            for sv in &src.subvolumes {
+                if sv.name != TOP_LEVEL {
+                    if sv
+                        .name
+                        .split('/')
+                        .any(|c| c.is_empty() || c == "." || c == "..")
+                    {
+                        errors.push(format!(
+                            "Subvolume '{}' in source '{}' must be a relative path with no empty, \
+                             '.' or '..' component ('{TOP_LEVEL}' alone names the volume's top level)",
+                            sv.name, src.label
+                        ));
+                    }
+                    continue;
+                }
+                if top_levels.contains(&src.volume.as_str()) {
+                    errors.push(format!(
+                        "The top level ('{TOP_LEVEL}') of volume '{}' is configured more than once \
+                         (again in source '{}')",
+                        src.volume, src.label
+                    ));
+                } else {
+                    top_levels.push(&src.volume);
+                }
+                if sv.snapshot_name.is_none() {
+                    errors.push(format!(
+                        "The top level ('{TOP_LEVEL}') of volume '{}' in source '{}' needs an \
+                         explicit snapshot_name",
+                        src.volume, src.label
+                    ));
+                }
+                if sv.retired.is_some() {
+                    continue;
+                }
+                let mirrors: Vec<&str> = self
+                    .targets
+                    .iter()
+                    .filter(|t| t.role == TargetRole::Mirror)
+                    .filter(|t| {
+                        src.target_labels.is_empty() || src.target_labels.contains(&t.label)
+                    })
+                    .map(|t| t.label.as_str())
+                    .collect();
+                if !mirrors.is_empty() {
+                    errors.push(format!(
+                        "The top level ('{TOP_LEVEL}') of volume '{}' is in source '{}', which sends \
+                         to mirror target(s) '{}' — the top level goes to the primary target only",
+                        src.volume,
+                        src.label,
+                        mirrors.join("', '")
+                    ));
+                }
+            }
+        }
+        for pattern in self.exclude_patterns() {
+            if pattern.is_empty() || pattern == TOP_LEVEL {
+                errors.push(format!(
+                    "Exclude pattern '{pattern}' matches no subvolume — write '{TOP_LEVEL_EXCLUDE}' \
+                     to exclude each volume's top level"
+                ));
+            }
+        }
+        errors
+    }
+
     /// The mount of the target a snapshot should be read from first: on a
     /// recovery drive's own OS (`general.recovery_drive`) the booted drive,
     /// which `derive-recovery` puts at `targets[0]`; `None` on a host.
@@ -874,6 +958,7 @@ impl Config {
         }
 
         errors.extend(self.boot_input_errors());
+        errors.extend(self.subvolume_name_errors());
 
         for (i, tgt) in self.targets.iter().enumerate() {
             // A target needs at least one way to find its filesystem:
@@ -1134,6 +1219,134 @@ mod tests {
                 && errors[0].contains("'a-b'"),
             "{errors:?}"
         );
+    }
+
+    // -- the volume's top level, `.` (bd DAS-Backup-Manager-xtnq) -------------
+
+    const MIRROR_TARGET: &str = "[[target]]\nlabel = \"m\"\nserial = \"Y\"\nmount = \"/mnt/m\"\nrole = \"mirror\"\n[target.retention]\ndaily = 7\n";
+
+    /// `/vol` with `@` in source "s" (to every target), plus `extra` sources,
+    /// a primary target "t" and a mirror "m".
+    fn top_level_config(extra: &str) -> Config {
+        let toml = format!(
+            "{}{extra}{ONE_TARGET}{MIRROR_TARGET}",
+            source_with("s", "/vol", &[("@", None)])
+        );
+        Config::from_toml(&minimal_toml(&toml)).unwrap()
+    }
+
+    fn primary_only(label: &str, volume: &str, subvols: &[(&str, Option<&str>)]) -> String {
+        source_with(label, volume, subvols).replacen(
+            "device = \"/dev/sda\"\n",
+            "device = \"/dev/sda\"\ntarget_labels = [\"t\"]\n",
+            1,
+        )
+    }
+
+    #[test]
+    fn validate_accepts_a_named_primary_only_top_level_entry() {
+        let cfg = top_level_config(&primary_only(
+            "s-adopted",
+            "/vol",
+            &[(".", Some("vol-toplevel"))],
+        ));
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_a_top_level_entry_without_an_explicit_snapshot_name() {
+        // It would otherwise be snapshotted as ".<timestamp>".
+        let cfg = top_level_config(&primary_only("s-adopted", "/vol", &[(".", None)]));
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("top level") && errors[0].contains("snapshot_name"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_a_top_level_entry_that_reaches_a_mirror() {
+        // In the source that sends everywhere: the recovery drive would get it.
+        let cfg = top_level_config(&source_with("x", "/vol", &[(".", Some("vol-toplevel"))]));
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("top level")
+                && errors[0].contains("'x'")
+                && errors[0].contains("'m'"),
+            "{errors:?}"
+        );
+        // Named explicitly as a target: refused the same way.
+        let named = source_with("x", "/vol", &[(".", Some("vol-toplevel"))]).replacen(
+            "device = \"/dev/sda\"\n",
+            "device = \"/dev/sda\"\ntarget_labels = [\"t\", \"m\"]\n",
+            1,
+        );
+        assert_eq!(top_level_config(&named).validate().len(), 1);
+        // A retired entry is not rendered and sends nowhere.
+        let mut cfg = top_level_config(&source_with("x", "/vol", &[(".", Some("vol-toplevel"))]));
+        cfg.sources[1].subvolumes[0].retired = Some("2026-10-01".into());
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_a_volume_whose_top_level_is_configured_twice() {
+        let cfg = top_level_config(&format!(
+            "{}{}",
+            primary_only("a", "/vol", &[(".", Some("one"))]),
+            primary_only("b", "/vol", &[(".", Some("two"))])
+        ));
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("/vol") && errors[0].contains("more than once"),
+            "{errors:?}"
+        );
+        // Two volumes, one top level each: fine.
+        let cfg = top_level_config(&format!(
+            "{}{}",
+            primary_only("a", "/vol", &[(".", Some("one"))]),
+            primary_only("b", "/other", &[(".", Some("two"))])
+        ));
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_dot_components_in_any_other_entry_name() {
+        for bad in ["./a", "a/./b", "..", "a/..", "../x", "a//b", "/a", "a/", ""] {
+            let cfg = top_level_config(&primary_only("x", "/vol", &[(bad, Some("n"))]));
+            let errors = cfg.validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(
+                errors[0].contains(&format!("'{bad}'")),
+                "{bad:?}: {errors:?}"
+            );
+        }
+        for ok in [".hidden", "..x", "a.b/c", "@"] {
+            let cfg = top_level_config(&primary_only("x", "/vol", &[(ok, Some("n"))]));
+            assert!(cfg.validate().is_empty(), "{ok}: {:?}", cfg.validate());
+        }
+    }
+
+    #[test]
+    fn validate_refuses_an_exclude_pattern_that_can_match_nothing() {
+        // "" matches no subvolume and "." is not how the top level is
+        // excluded ("/" is): both would be accepted and ignored.
+        for bad in ["", "."] {
+            let mut cfg = top_level_config("");
+            cfg.subvolumes.exclude = vec![bad.into()];
+            let errors = cfg.validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(errors[0].contains("exclude"), "{bad:?}: {errors:?}");
+            // The older [doctor] key is merged and checked the same way.
+            let mut cfg = top_level_config("");
+            cfg.doctor.exclude = vec![bad.into()];
+            assert_eq!(cfg.validate().len(), 1, "{bad:?}");
+        }
+        let mut cfg = top_level_config("");
+        cfg.subvolumes.exclude = vec!["/".into(), "@cache".into(), "*.tmp".into()];
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 
     #[test]
