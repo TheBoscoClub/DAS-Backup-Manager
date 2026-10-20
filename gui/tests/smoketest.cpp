@@ -18,6 +18,8 @@
 // bus, which is what lets it run in CI.
 
 #include <QTest>
+#include <QApplication>
+#include <QDBusConnection>
 #include <QSignalSpy>
 #include <QAbstractItemModel>
 #include <QJsonValue>
@@ -53,6 +55,14 @@ class GuiSmokeTest : public QObject
     Q_OBJECT
 
 private Q_SLOTS:
+    // Fail closed: if the system bus connects anyway, every test that builds
+    // a DBusClient would talk to a live helper. Stop before the first one.
+    void initTestCase()
+    {
+        QVERIFY2(!QDBusConnection::systemBus().isConnected(),
+                 "the system bus is reachable: these tests would drive a real btrdasd-helper");
+    }
+
     // --- pure formatting ---------------------------------------------------
 
     void formatSize_data()
@@ -1449,5 +1459,17 @@ private Q_SLOTS:
     }
 };
 
-QTEST_MAIN(GuiSmokeTest)
+// No test may reach a real btrdasd-helper: on a host where one runs, a panel
+// test calling backupRun started a real backup (2026-10-20, bd turs). ctest
+// already points the system bus at nothing (gui/CMakeLists.txt); the binary
+// does it too, before the first connection, so running it by hand is as safe.
+int main(int argc, char **argv)
+{
+    qputenv("DBUS_SYSTEM_BUS_ADDRESS", QByteArrayLiteral("unix:path=/nonexistent/btrdasd-gui-smoketest"));
+    QApplication app(argc, argv);
+    app.setAttribute(Qt::AA_Use96Dpi, true);
+    QTEST_SET_MAIN_SOURCE_PATH
+    GuiSmokeTest tc;
+    return QTest::qExec(&tc, argc, argv);
+}
 #include "smoketest.moc"
