@@ -9,6 +9,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QSizePolicy>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -33,7 +34,13 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     boldFont.setBold(true);
     m_operationLabel->setFont(boldFont);
 
+    // A stage or summary can be thousands of characters (a cancelled
+    // recovery-OS session joins every last line of its script). Unwrapped,
+    // that length became the dock's minimum width and pushed the main
+    // window past four screens: wrap it, and let the window set the width.
     m_stageLabel = new QLabel(this);
+    m_stageLabel->setWordWrap(true);
+    m_stageLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
     m_cancelButton = new QPushButton(
         QIcon::fromTheme(QStringLiteral("process-stop")),
@@ -116,6 +123,7 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
     m_currentJobId = jobId;
     m_operationLabel->setText(operation);
     m_stageLabel->clear();
+    m_stageLabel->setToolTip(QString());
     m_throughputLabel->clear();
     m_etaLabel->clear();
     m_progressBar->setValue(0);
@@ -136,6 +144,7 @@ void ProgressPanel::onJobProgress(const QString &jobId, const QString &stage,
 
     m_progressBar->setValue(percent);
     m_stageLabel->setText(stage);
+    m_stageLabel->setToolTip(stage);
 
     // Parse throughput and ETA from message if present.
     // Expected format fragments: "throughput: 123 MB/s" and "ETA: 5m 30s"
@@ -213,12 +222,14 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
         m_progressBar->setValue(100);
         m_operationLabel->setText(tr("Complete"));
         m_stageLabel->setText(summary);
+        m_stageLabel->setToolTip(summary);
     } else {
         // Error styling: red text on the progress bar
         m_progressBar->setStyleSheet(
             QStringLiteral("QProgressBar::chunk { background-color: #cc0000; }"));
         m_operationLabel->setText(tr("Failed"));
         m_stageLabel->setText(summary);
+        m_stageLabel->setToolTip(summary);
     }
 
     // Expand the log automatically so the user can review the results
@@ -287,6 +298,7 @@ void ProgressPanel::resetPanel()
     m_progressBar->setStyleSheet(QString());  // reset any error styling
     m_operationLabel->clear();
     m_stageLabel->clear();
+    m_stageLabel->setToolTip(QString());
     m_throughputLabel->clear();
     m_etaLabel->clear();
     showCancelIdle(false);

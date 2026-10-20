@@ -178,6 +178,41 @@ private Q_SLOTS:
         QVERIFY(cancel->isEnabled());
     }
 
+    // --- a long summary wraps; it never widens the window -------------------
+    //
+    // A cancelled recovery-OS session ends with every last line of the
+    // script joined into one summary, thousands of characters. In a label
+    // that does not wrap, that length became the dock's minimum width and
+    // pushed the main window past four screens (2026-10-20).
+
+    void aLongSummaryWrapsAndNeverWidensThePanel()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        const QString summary = QStringLiteral("kept (exit 3): ")
+            + QStringLiteral("a line the session script printed; ").repeated(120)
+            // and a token no wrap can break (a device path, a URL)
+            + QStringLiteral("/dev/disk/by-id/") + QStringLiteral("x").repeated(400);
+
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS"));
+        panel.onJobProgress(QStringLiteral("job-1"), summary, 10, QString());
+        QVERIFY2(panel.minimumSizeHint().width() < 1000,
+                 qPrintable(QStringLiteral("stage width %1").arg(panel.minimumSizeHint().width())));
+
+        panel.onJobFinished(QStringLiteral("job-1"), false, summary);
+        QVERIFY2(panel.minimumSizeHint().width() < 1000,
+                 qPrintable(QStringLiteral("summary width %1").arg(panel.minimumSizeHint().width())));
+
+        // Still all there to read: wrapped in the label, whole in its tooltip.
+        QLabel *shown = nullptr;
+        for (auto *label : panel.findChildren<QLabel *>())
+            if (label->text() == summary)
+                shown = label;
+        QVERIFY(shown != nullptr);
+        QVERIFY(shown->wordWrap());
+        QCOMPARE(shown->toolTip(), summary);
+    }
+
     // --- backup history: an unknown count is "unknown", never 0 -------------
     //
     // A run that could not count its snapshots is stored with NULL counts and
