@@ -78,6 +78,11 @@ pub trait PanelReads {
     fn domain_state(&self, label: &str) -> Option<String>;
     /// First line of `/run/das-maintenance.lock` if held, else `None`.
     fn lock_holder(&self) -> Option<String>;
+    /// The drive's own session holder (`/run/das-recovery-os-vm/<label>.holder`)
+    /// when it names a running holder of that disk, in words; `None` when no
+    /// record or its holder is gone. A record that cannot be read is an error,
+    /// never `None`: a running holder may be what it would have named.
+    fn session_holder(&self, label: &str) -> Result<Option<String>, String>;
     /// The id of the helper's running recovery-OS session job, if any.
     fn running_job(&self) -> Option<String>;
     /// The last 5 lines `unit`'s own processes logged since `since_epoch`
@@ -950,7 +955,9 @@ fn holder_labels(holder: &str) -> Vec<&str> {
 /// it does not hold the drive). A lock line `recovery-os VM session <label>
 /// …` with neither is `other:<line>`; a two-drive run's line names
 /// `<a>+<b>`, and holds both. A job without the lock naming a drive is not
-/// attributed to one: the helper does not keep a job's labels.
+/// attributed to one: the helper does not keep a job's labels. A drive whose
+/// own holder runs (`session_holder`) is `other:<holder>` whatever the line
+/// names — a kept two-drive run's line names one drive at most (bd qld5).
 ///
 /// The second value says which schedule service could not be read, or that
 /// the lock itself could not be examined; it is
@@ -975,7 +982,18 @@ fn session_of(
             Err(e) => errors.push(e),
         }
     }
+    // The drive's own holder holds it whatever the lock line names: after a
+    // two-drive run's sessions were kept, the line names one drive at most.
+    let own = match reads.session_holder(label) {
+        Ok(own) => own,
+        Err(e) => {
+            errors.push(format!("{label}'s session holder cannot be read: {e}"));
+            None
+        }
+    };
     let error = with_lock_failure((!errors.is_empty()).then(|| errors.join("; ")), holder);
+    // A job only where the lock names the drive: a kept drive's own holder
+    // beside another drive's job is not that job's.
     if held_here && let Some(id) = job {
         let s = Session {
             by: format!("job:{id}"),
@@ -994,13 +1012,57 @@ fn session_of(
         };
         return (Some(s), error);
     }
-    let other = held_here.then(|| Session {
-        by: format!("other:{}", holder.unwrap_or_default()),
+    let other = (held_here || own.is_some()).then(|| Session {
+        by: format!("other:{}", own.as_deref().or(holder).unwrap_or_default()),
         since_epoch: None,
         domain_state: reads.domain_state(label),
         attended: None,
     });
     (other, error)
+}
+
+/// Where `recovery-os-vm.sh` keeps each drive's session records (its `STATE_DIR`).
+pub const RECOVERY_VM_STATE_DIR: &str = "/run/das-recovery-os-vm";
+
+/// A drive's own session holder, from `<state>/<label>.holder` (pid, disk,
+/// scope; written whole by the script's `write_record`): its words while that
+/// pid runs `btrdasd recovery-os hold-disk --device <disk>`, as the script's
+/// `holder_alive` decides. No record, or its holder gone or the pid reused, is
+/// `None`; a record that cannot be read or does not parse is an error.
+pub fn session_holder_at(
+    state: &Path,
+    proc_dir: &Path,
+    label: &str,
+) -> Result<Option<String>, String> {
+    let path = state.join(format!("{label}.holder"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{} cannot be read: {e}", path.display())),
+    };
+    let mut lines = text.lines();
+    let (pid, disk, scope) = (lines.next(), lines.next(), lines.next());
+    let pid = pid
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| format!("{} names no pid: {:?}", path.display(), text))?;
+    let disk = disk
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| format!("{} names no disk: {:?}", path.display(), text))?;
+    // A gone pid has no cmdline; a zombie's is empty and matches nothing. A
+    // cmdline that cannot be read for another reason is not "gone".
+    let cmdline = match std::fs::read(proc_dir.join(pid).join("cmdline")) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("pid {pid}'s command line cannot be read: {e}")),
+    };
+    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    if !cmdline.contains(&format!(" recovery-os hold-disk --device {disk} ")) {
+        return Ok(None);
+    }
+    Ok(Some(match scope.filter(|s| !s.is_empty()) {
+        Some(s) => format!("holder pid {pid} ({s})"),
+        None => format!("holder pid {pid}"),
+    }))
 }
 
 #[cfg(test)]
@@ -1101,6 +1163,8 @@ pub(crate) mod tests {
         /// Unit name -> facts; a unit not listed does not exist.
         units: HashMap<String, Result<UnitFacts, String>>,
         lock: Option<String>,
+        /// Label -> its own session holder; a label not listed has none.
+        holders: HashMap<&'static str, Result<Option<String>, String>>,
         domain: Option<String>,
         job: Option<String>,
         /// Unit name -> its journal lines; a unit not listed logged nothing.
@@ -1133,6 +1197,9 @@ pub(crate) mod tests {
         }
         fn lock_holder(&self) -> Option<String> {
             self.lock.clone()
+        }
+        fn session_holder(&self, label: &str) -> Result<Option<String>, String> {
+            self.holders.get(label).cloned().unwrap_or(Ok(None))
         }
         fn running_job(&self) -> Option<String> {
             self.job.clone()
@@ -2602,6 +2669,184 @@ pub(crate) mod tests {
                 .as_str()
                 .unwrap()
                 .contains("bus unreachable")
+        );
+    }
+
+    #[test]
+    fn a_drive_s_holder_record_counts_only_while_its_holder_runs_for_that_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, proc_dir) = (dir.path().join("state"), dir.path().join("proc"));
+        std::fs::create_dir_all(&state).unwrap();
+        let dev = "/dev/disk/by-id/ata-ST2000DM008-2FR102_SERIAL04";
+        let label = "system-recovery-A-2tb";
+        let proc_with = |pid: u32, cmdline: &str| {
+            std::fs::create_dir_all(proc_dir.join(pid.to_string())).unwrap();
+            std::fs::write(proc_dir.join(format!("{pid}/cmdline")), cmdline).unwrap();
+        };
+        let record =
+            |text: &str| std::fs::write(state.join(format!("{label}.holder")), text).unwrap();
+
+        assert_eq!(
+            session_holder_at(&state, &proc_dir, label),
+            Ok(None),
+            "no record"
+        );
+
+        let scope = "das-recovery-os-holder-system-recovery-A-2tb.scope";
+        record(&format!("104573\n{dev}\n{scope}\n"));
+        assert_eq!(
+            session_holder_at(&state, &proc_dir, label),
+            Ok(None),
+            "a holder gone: its record names nobody"
+        );
+        proc_with(
+            104573,
+            &format!("/usr/bin/btrdasd\0recovery-os\0hold-disk\0--device\0{dev}\0"),
+        );
+        assert_eq!(
+            session_holder_at(&state, &proc_dir, label),
+            Ok(Some(format!("holder pid 104573 ({scope})"))),
+        );
+
+        proc_with(104573, "/usr/bin/sleep\0infinity\0");
+        assert_eq!(
+            session_holder_at(&state, &proc_dir, label),
+            Ok(None),
+            "a recycled pid is not the holder"
+        );
+        proc_with(
+            104573,
+            "/usr/bin/btrdasd\0recovery-os\0hold-disk\0--device\0/dev/disk/by-id/other\0",
+        );
+        assert_eq!(
+            session_holder_at(&state, &proc_dir, label),
+            Ok(None),
+            "a holder of another disk is not this drive's"
+        );
+
+        // Gone is "no holder"; a cmdline that cannot be read is not (a
+        // directory: unreadable for root as well).
+        std::fs::remove_file(proc_dir.join("104573/cmdline")).unwrap();
+        std::fs::create_dir(proc_dir.join("104573/cmdline")).unwrap();
+        let e = session_holder_at(&state, &proc_dir, label).unwrap_err();
+        assert!(
+            e.contains("104573"),
+            "an unreadable cmdline is an error: {e}"
+        );
+        std::fs::remove_dir(proc_dir.join("104573/cmdline")).unwrap();
+
+        // Each line refused on its own, beside the others well formed.
+        for (bad, why) in [
+            (format!("not-a-pid\n{dev}\n{scope}\n"), "names no pid"),
+            (format!("\n{dev}\n{scope}\n"), "names no pid"),
+            (format!("104573\n\n{scope}\n"), "names no disk"),
+        ] {
+            record(&bad);
+            let e = session_holder_at(&state, &proc_dir, label).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+
+        std::fs::remove_file(state.join(format!("{label}.holder"))).unwrap();
+        std::fs::create_dir(state.join(format!("{label}.holder"))).unwrap();
+        assert!(
+            session_holder_at(&state, &proc_dir, label).is_err(),
+            "an unreadable record is an error, never no holder"
+        );
+    }
+
+    #[test]
+    fn a_drive_whose_own_holder_runs_has_a_session_whatever_the_lock_line_names() {
+        // qld5, 2026-10-21: a cancelled two-drive run kept both sessions;
+        // the lock line named only B, then nothing once B's session ended,
+        // while A's holder still ran. A must stay a session, and endable.
+        let cfg = two_mirrors_and_a_primary();
+        let a_holder = "holder pid 104573 (das-recovery-os-holder-system-recovery-A-2tb.scope)";
+        for lock in [
+            Some("recovery-os VM session system-recovery-B-2tb pid 104576".to_string()),
+            Some("an unknown holder".to_string()),
+        ] {
+            let mut holders = HashMap::new();
+            holders.insert("system-recovery-A-2tb", Ok(Some(a_holder.to_string())));
+            let reads = Scripted {
+                lock: lock.clone(),
+                holders,
+                domain: Some("shut off".into()),
+                ..Default::default()
+            };
+            let j = status_json(
+                &cfg,
+                &Ok(None),
+                &host(),
+                "2026-10-21",
+                1_792_614_000,
+                &reads,
+            );
+            let a = &j["drives"][0];
+            assert_eq!(
+                a["session"]["by"],
+                format!("other:{a_holder}"),
+                "{lock:?}: {a}"
+            );
+            assert_eq!(a["session"]["domain_state"], "shut off");
+            assert!(a["session_error"].is_null(), "{lock:?}: {a}");
+        }
+    }
+
+    #[test]
+    fn a_job_is_credited_only_with_the_drive_the_lock_names_never_one_held_by_its_own_holder() {
+        // A kept; a Now session job for B starts (and will refuse at the
+        // lock): A is not that job's, or End session on A would point at
+        // Cancel, which cancels B's job (review of qld5).
+        let cfg = two_mirrors_and_a_primary();
+        let a_holder = "holder pid 104573 (das-recovery-os-holder-system-recovery-A-2tb.scope)";
+        let mut holders = HashMap::new();
+        holders.insert("system-recovery-A-2tb", Ok(Some(a_holder.to_string())));
+        let reads = Scripted {
+            lock: Some("recovery-os VM session system-recovery-B-2tb pid 4242".into()),
+            holders,
+            job: Some("job-9".into()),
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-21",
+            1_792_614_000,
+            &reads,
+        );
+        assert_eq!(j["drives"][0]["session"]["by"], format!("other:{a_holder}"));
+        assert_eq!(j["drives"][1]["session"]["by"], "job:job-9");
+    }
+
+    #[test]
+    fn an_unreadable_holder_record_is_a_session_error_never_no_session() {
+        let cfg = two_mirrors_and_a_primary();
+        let mut holders = HashMap::new();
+        holders.insert(
+            "system-recovery-A-2tb",
+            Err("permission denied (scripted)".to_string()),
+        );
+        let reads = Scripted {
+            holders,
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-21",
+            1_792_614_000,
+            &reads,
+        );
+        let a = &j["drives"][0];
+        assert!(a["session"].is_null(), "{a}");
+        let e = a["session_error"].as_str().unwrap_or_else(|| panic!("{a}"));
+        assert!(e.contains("permission denied (scripted)"), "{e}");
+        assert!(e.contains("system-recovery-A-2tb"), "names the drive: {e}");
+        assert!(
+            j["drives"][1]["session_error"].is_null(),
+            "B's record read fine"
         );
     }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.2.0
+# Version: 2.2.1
 # Date: 2026-10-13
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -3095,9 +3095,39 @@ take_lock() {
 write_lock_record() {
     # A two-drive run's record is the run's.
     [[ "$LOCK_INHERITED" != true ]] || return 0
-    if ! printf 'recovery-os VM session %s pid %s\n' "$LABEL" "$1" >"$MAINTENANCE_LOCK"; then
+    # $2: the session named, when it is another drive's (hand_on_lock_record).
+    if ! printf 'recovery-os VM session %s pid %s\n' "${2:-$LABEL}" "$1" >"$MAINTENANCE_LOCK"; then
         warn "could not record pid $1 as the holder of $MAINTENANCE_LOCK"
     fi
+}
+
+# Whether pid $1 has the maintenance lock open: a kept two-drive run's
+# holders each hold it through the run's descriptor (bd qld5).
+holds_lock_open() {
+    local fd want
+    want="$(readlink -f -- "$MAINTENANCE_LOCK")" || return 1
+    for fd in "/proc/$1/fd/"*; do
+        [[ "$(readlink -f -- "$fd" 2>/dev/null)" == "$want" ]] && return 0
+    done
+    return 1
+}
+
+# The record as this session's holder is about to let the lock go: another
+# drive's live holder that has it open holds it on, so the record names that
+# session; with none, it is emptied (bd qld5: two kept sessions, the first
+# one ended left an empty record on a lock still held). Same rule as
+# clear_lock_record: only while the lock is provably this session's.
+hand_on_lock_record() {
+    local f REC_PID REC_DEV REC_UNIT
+    [[ "$LOCK_INHERITED" != true ]] || return 0
+    for f in "$STATE_DIR"/*.holder; do
+        [[ -e "$f" && "$f" != "$HOLDER_FILE" ]] || continue
+        if read_record "$f" && holder_alive "$REC_PID" "$REC_DEV" && holds_lock_open "$REC_PID"; then
+            write_lock_record "$REC_PID" "$(basename -- "$f" .holder)"
+            return 0
+        fi
+    done
+    clear_lock_record
 }
 
 # Empty the lock's holder record. Only while the lock is provably this
@@ -3282,10 +3312,10 @@ return_disk() {
     if [[ -n "$HOLDER_PID" ]]; then
         # session-end: this script holds no lock of its own, but a live
         # holder holds this session's, so the record in it is this session's.
-        # Emptied before the holder goes: once it has, the lock may be
-        # someone else's.
+        # Handed on (or emptied) before the holder goes: once it has, the
+        # lock may be someone else's.
         if [[ -z "$LOCK_FD" ]] && holder_alive "$HOLDER_PID" "$DISK"; then
-            clear_lock_record
+            hand_on_lock_record
             cleared=true
         fi
         if ! stop_holder "$HOLDER_PID" "$DISK"; then

@@ -958,6 +958,14 @@ impl panel::PanelReads for SystemPanelReads {
         )
     }
 
+    fn session_holder(&self, label: &str) -> Result<Option<String>, String> {
+        panel::session_holder_at(
+            Path::new(panel::RECOVERY_VM_STATE_DIR),
+            Path::new("/proc"),
+            label,
+        )
+    }
+
     fn running_job(&self) -> Option<String> {
         self.running_job.clone()
     }

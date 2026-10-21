@@ -4950,6 +4950,73 @@ has "both, parallel, SIGINT: drive B had started" "$(file "$S/domB/events")" "vi
 check "both, parallel, SIGINT: no drive ran its upgrade step" "$(grep -c upgrade "$S/stages.log" || :)" "0"
 check "both, parallel, SIGINT: never destroyed" "$(file "$S/forbidden")" ""
 
+# bd qld5: both sessions were kept, and both holders hold the lock. Ending
+# one must leave the lock's record naming the other's holder, never empty:
+# an empty record on a held lock names nobody to end (2026-10-21, real drives).
+pid_a="$(holder_pid A)"
+pid_b="$(holder_pid B)"
+check "kept pair: A's holder runs" "$(alive "$pid_a")" "alive"
+check "kept pair: B's holder runs" "$(alive "$pid_b")" "alive"
+check "kept pair: the record names A's holder" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid_a"
+# As the operator does: each OS shut down from its desktop, then ended.
+printf 'shut off\n' >"$S/states"
+printf 'shut off\n' >"$S/domB/states"
+run_driver session-end A
+check "kept pair, A ended: exit 0" "$RC" "0"
+check "kept pair, A ended: B's holder still holds the lock" "$(lock_state)" "held"
+check "kept pair, A ended: the record names B's holder" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-B-2tb pid $pid_b"
+run_driver session-end B
+check "kept pair, B ended too: exit 0" "$RC" "0"
+check "kept pair, B ended too: lock free" "$(lock_state)" "free"
+check "kept pair, B ended too: the record is empty" "$(file "$LOCK")" ""
+
+# The real drives' order (2026-10-21): the drive the record does NOT name
+# ended first. The record must still name the other's live holder after.
+unattended_fixture
+touch "$S/stage.egress.hangs"
+# shellcheck disable=SC2016 # expanded by run_interrupted's eval, at the signal
+BEFORE_SIG='for ((k = 0; k < 400; k++)); do [[ "$(grep -c . "$S/stages.log" 2>/dev/null)" -ge 2 ]] && break; sleep 0.05; done' \
+    run_interrupted session A B --unattended --mode parallel
+check "kept pair, B first: the run exits 3" "$RC" "3"
+pid_a="$(holder_pid A)"
+check "kept pair, B first: the record names A's holder" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid_a"
+printf 'shut off\n' >"$S/states"
+printf 'shut off\n' >"$S/domB/states"
+run_driver session-end B
+check "kept pair, B first: exit 0" "$RC" "0"
+check "kept pair, B first: A's holder still holds the lock" "$(lock_state)" "held"
+check "kept pair, B first: the record still names A's holder" "$(head -n 1 "$LOCK")" \
+    "recovery-os VM session system-recovery-A-2tb pid $pid_a"
+run_driver session-end A
+check "kept pair, B first, then A: exit 0" "$RC" "0"
+check "kept pair, B first, then A: lock free" "$(lock_state)" "free"
+check "kept pair, B first, then A: the record is empty" "$(file "$LOCK")" ""
+
+# ...but only a holder that has the lock open is handed the record: a live
+# holder without it (started by hand, or left behind by a run whose lock went
+# with it) holds nothing, and naming it would name the wrong process.
+fixture
+printf 'running\n' >"$S/states.running"
+run_interrupted session A
+check "kept, beside a holder without the lock: exit 3" "$RC" "3"
+setsid env STUB="$S" REAL_FLOCK="$REAL_FLOCK" DAS_RECOVERY_VM_TEST_ROOT="$T" \
+    "$T/bin/btrdasd" recovery-os hold-disk --device "$DISK_B" </dev/null >"$S/stray.out" 2>&1 &
+stray=$!
+for ((i = 0; i < 200; i++)); do grep -q '^held ' "$S/stray.out" 2>/dev/null && break; sleep 0.05; done
+check "holder without the lock: precondition, it holds the disk" "$(alive "$stray")" "alive"
+printf '%s\n%s\n' "$stray" "$DISK_B" >"$STATE/system-recovery-B-2tb.holder"
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "holder without the lock, A ended: exit 0" "$RC" "0"
+check "holder without the lock, A ended: lock free" "$(lock_state)" "free"
+check "holder without the lock, A ended: the record is emptied, never handed to it" "$(file "$LOCK")" ""
+kill -TERM "$stray" 2>/dev/null || :
+wait "$stray" 2>/dev/null || :
+rm -f "${STATE:?}/system-recovery-B-2tb.holder"
+
 # --wait-lock is the run's, never its drives': a drive given it would wait on
 # the run's own lock, then refuse (final review M19).
 for mode in sequential parallel; do
