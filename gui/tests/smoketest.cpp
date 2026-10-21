@@ -36,6 +36,7 @@
 #include <QComboBox>
 #include <QDateTimeEdit>
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 
@@ -1257,6 +1258,32 @@ private Q_SLOTS:
             if (l->text().contains(QStringLiteral("cannot be read")))
                 sawError = true;
         QVERIFY(sawError);
+    }
+
+    // The panel is shown before its first document, as in the window: the
+    // selector must still grow to the longest name and keep it, or the row
+    // squeezes it and its popup elides the serials.
+    void recoveryPanelSelectorFitsTheLongestDriveName()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.show();
+        QCoreApplication::processEvents();
+        panel.applyDocument(twoIdleDrives([](QJsonObject &a, QJsonObject &b) {
+            a[QStringLiteral("display_name")] = QStringLiteral("2TB Recovery A (Bay 1, SERIAL04)");
+            b[QStringLiteral("display_name")] = QStringLiteral("2TB Recovery B (Bay 4, SERIAL02)");
+        }));
+        QCoreApplication::processEvents();
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        int longest = 0;
+        for (int i = 0; i < p.selector->count(); ++i)
+            longest = std::max(longest, p.selector->fontMetrics().horizontalAdvance(p.selector->itemText(i)));
+        // A narrow window: the row gives up its slack, never the names.
+        panel.resize(200, panel.height());
+        QCoreApplication::processEvents();
+        QVERIFY2(p.selector->width() > longest,
+                 qPrintable(QStringLiteral("selector %1 px, longest name %2 px").arg(p.selector->width()).arg(longest)));
     }
 
     void panelShowsTheParseErrorAndDisablesEverything()

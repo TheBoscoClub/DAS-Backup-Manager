@@ -108,6 +108,11 @@ void RecoveryPanel::buildControls()
     m_selector = new QComboBox(this);
     m_selector->setObjectName(QStringLiteral("selector"));
     m_selector->setToolTip(i18n("Which recovery drive the buttons act on, or both drives in one run"));
+    // Filled only when a document arrives, after the first show: the default
+    // policy would size it empty. Its minimum is pinned on each fill too
+    // (applyDocument), since Qt keeps the empty minimum and the row would
+    // squeeze it down to that, eliding the serials.
+    m_selector->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     row->addWidget(m_selector);
 
     m_attended = new QRadioButton(i18n("Attended"), this);
@@ -211,6 +216,7 @@ void RecoveryPanel::applyDocument(const QByteArray &json)
         if (m_doc->drives.size() == 2)
             m_selector->addItem(i18n("Both drives"), Both);
         m_selector->setCurrentIndex(keep >= 0 && keep < m_selector->count() ? keep : 0);
+        m_selector->setMinimumWidth(m_selector->sizeHint().width());
         m_selector->blockSignals(false);
         if (!m_sequential->isChecked() && !m_parallel->isChecked())
             (m_doc->pair.modeDefault == QLatin1String("parallel") ? m_parallel : m_sequential)->setChecked(true);
