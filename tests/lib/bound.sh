@@ -13,41 +13,49 @@
 # of all memory. RLIMIT_NPROC counts every task (thread) of the real user, so
 # the cap is measured, not fixed. Root is exempt from RLIMIT_NPROC: there the
 # suite says so and runs uncapped.
+#
+# The count is the kernel's own, not ps's: inside a PID namespace of its own
+# (~/.claude/bin/bounded-test since 2026-10-22) ps sees only the run's tasks
+# while the kernel still counts all of the user's, and a cap measured with ps
+# sat below the live count, so the suite's first fork failed (bd
+# DAS-Backup-Manager-afid). A fork under soft limit N succeeds only while the
+# user runs fewer than N tasks; a binary search over N finds the count.
+
+# Whether a fork succeeds under soft RLIMIT_NPROC <n>. coreutils' timeout does
+# the fork: it fails at once on EAGAIN, where bash's own fork retries for ~15 s.
+das_test_forks_under() {
+    (ulimit -Su "$1" && exec timeout 5 true) 2>/dev/null
+}
+
+# The tasks this user runs now, as RLIMIT_NPROC counts them; fails if a fork
+# fails even at the hard limit (then nothing could be measured, or run).
+das_test_user_tasks() {
+    local lo=1 hi mid
+    hi=$(ulimit -Hu)
+    [[ "$hi" == unlimited ]] && hi=$((1 << 22)) # above any pid_max
+    das_test_forks_under "$hi" || return 1
+    while ((lo < hi)); do
+        mid=$(((lo + hi) / 2))
+        if das_test_forks_under "$mid"; then hi=$mid; else lo=$((mid + 1)); fi
+    done
+    # The smallest limit a fork succeeds under is the count plus one; that
+    # count includes the probe's own subshell.
+    echo $((lo - 1))
+}
+
 das_test_bound() {
-    local headroom=${DAS_TEST_TASK_HEADROOM:-1024} listing now cap soft
+    local headroom=${DAS_TEST_TASK_HEADROOM:-1024} now cap soft
     if ((EUID == 0)); then
         echo "bound.sh: running as root, which RLIMIT_NPROC does not bind: no task cap" >&2
         return 0
     fi
-    # Inside a PID namespace of its own (~/.claude/bin/bounded-test since
-    # 2026-10-22), ps sees only the run's tasks while the kernel still counts
-    # every task of the real user: the measured cap would sit below what the
-    # user already runs, and the suite's first fork would fail. There the
-    # task cap is the cgroup's pids.max (bounded-test's TasksMax); a namespace
-    # without a finite one is refused, never run uncapped. 4026531836 is the
-    # kernel's fixed inode for the initial PID namespace (PROC_PID_INIT_INO).
-    local ns cg max
-    ns=$(stat -L -c %i /proc/self/ns/pid) || {
-        echo "bound.sh: cannot read this process's PID namespace: refusing to run uncapped" >&2
+    # A count that could not be taken is never "no tasks": the cap would then
+    # be the headroom alone, below what the user already runs, and every fork
+    # would fail -- loud, but for the wrong reason. Refuse instead.
+    now=$(das_test_user_tasks) || {
+        echo "bound.sh: cannot count this user's tasks (no fork succeeds): refusing to run uncapped" >&2
         exit 2
     }
-    if [[ "$ns" != 4026531836 ]]; then
-        cg=$(sed -n 's/^0:://p' /proc/self/cgroup)
-        max=$(cat "/sys/fs/cgroup${cg}/pids.max" 2>/dev/null) || max=
-        if [[ "$max" =~ ^[0-9]+$ ]]; then
-            return 0
-        fi
-        echo "bound.sh: in a PID namespace whose cgroup has no finite pids.max ('${max:-unreadable}'): refusing to run uncapped" >&2
-        exit 2
-    fi
-    # A ps that failed is never "no tasks": the cap would then be the headroom
-    # alone, below what the user already runs, and every fork would fail --
-    # loud, but for the wrong reason. Refuse instead.
-    listing=$(ps -L -U "$UID" --no-headers) || {
-        echo "bound.sh: cannot count this user's tasks (ps failed): refusing to run uncapped" >&2
-        exit 2
-    }
-    now=$(wc -l <<<"$listing")
     cap=$((now + headroom))
     soft=$(ulimit -Su)
     if [[ "$soft" == unlimited ]] || ((cap < soft)); then

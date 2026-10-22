@@ -90,27 +90,25 @@ STUB
     check "capped at 50 more tasks, the stub is stopped short" "$((got < DEPTH / 2))" "1"
 fi
 
-echo "--- in a PID namespace of its own: the cgroup's pids.max is the cap, or the suite refuses"
-# ~/.claude/bin/bounded-test runs every suite in its own PID namespace, where
-# ps sees only the run but the kernel counts all of the user's tasks: a cap
-# measured there sat below the user's live count and the first fork failed
-# (2026-10-22, bd DAS-Backup-Manager-afid). Needs a user manager (a scope sets
-# pids.max) and passwordless sudo (root makes the namespace); CI's root
-# container has neither, and the section says it did not run.
-if ((EUID != 0)) && systemctl --user show -p Version --value >/dev/null 2>&1 &&
-    sudo -n true 2>/dev/null; then
-    in_ns() { # <TasksMax>: bound.sh's exit status, then a fork, in a fresh PID namespace
-        # shellcheck disable=SC2016 # expanded by the inner bash
-        systemd-run --user --scope --quiet -p TasksMax="$1" \
-            sudo -n unshare --pid --fork --mount-proc \
-            setpriv --reuid="$UID" --regid="$(id -g)" --init-groups \
-            bash -c 'source "$1"; true & wait && echo forked' _ "$HERE/lib/bound.sh" 2>/dev/null
-        echo "rc=$?"
-    }
-    check "finite pids.max: the suite runs and forks" "$(in_ns 500 | tr '\n' ' ')" "forked rc=0 "
-    check "no finite pids.max: the suite refuses (exit 2)" "$(in_ns infinity | tr '\n' ' ')" "rc=2 "
-else
-    echo "NOT RUN: needs a non-root user with a user manager and passwordless sudo"
+echo "--- the count is the kernel's, not what ps can see"
+# Inside a PID namespace of its own (~/.claude/bin/bounded-test) ps sees only
+# the run while the kernel counts all of the user's tasks: a cap measured with
+# ps sat below the live count and the first fork failed (2026-10-22, bd
+# DAS-Backup-Manager-afid). A ps that sees nothing is that undercount on any
+# host; 60 sleeping tasks of the same user make the live count exceed the
+# headroom, so a blind cap would refuse the fork.
+if ((EUID != 0)) || ((${#as_runner[@]} > 0)); then
+    mkdir -p "$T/blind"
+    printf '#!/bin/sh\nexit 0\n' >"$T/blind/ps"
+    chmod 755 "$T/blind" "$T/blind/ps"
+    # shellcheck disable=SC2016 # expanded by the inner bash
+    got=$("${as_runner[@]}" bash -c '
+        for _ in $(seq 60); do sleep 60 & done
+        PATH="$2:$PATH" DAS_TEST_TASK_HEADROOM=50 source "$1"
+        timeout 5 true && echo forked
+        kill $(jobs -p) 2>/dev/null
+    ' _ "$HERE/lib/bound.sh" "$T/blind" 2>/dev/null)
+    check "with ps seeing nothing, the cap still sits above the live count" "$got" "forked"
 fi
 
 echo "$passes passed, $fails failed"
