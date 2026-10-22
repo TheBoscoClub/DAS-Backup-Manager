@@ -49,8 +49,8 @@ public:
     // Async versions of slow methods (non-blocking, result via signal)
     void healthQueryAsync();
     // Turns a HealthQuery reply into healthQueryResult, and a failed one into
-    // healthQueryError first: every caller is a background refresh. Public so
-    // a test can hand it a completed error reply.
+    // refreshFailed first: every caller is a background refresh. Public so a
+    // test can hand it a completed error reply.
     void watchHealthQuery(const QDBusPendingCall &pending);
     void scheduleGetAsync();
     void indexStatsAsync();
@@ -97,10 +97,11 @@ Q_SIGNALS:
 
     // Async result signals
     void healthQueryResult(const QString &json);
-    // A HealthQuery call that failed: shown in place by the dashboard and the
-    // status bar; not errorOccurred, which the main window turns into a modal
-    // dialog, and health is refreshed unasked (bd DAS-Backup-Manager-amsg).
-    void healthQueryError(const QString &reason);
+    // A background refresh that failed (HealthQuery, ScheduleGet, IndexStats):
+    // shown in place by the status bar and the dashboard; not errorOccurred,
+    // which the main window turns into a modal dialog, and these run unasked
+    // every 60 s (bd DAS-Backup-Manager-amsg).
+    void refreshFailed(const QString &operation, const QString &reason);
     void scheduleGetResult(const QString &json);
     void indexStatsResult(const QString &json);
     void indexListSnapshotsResult(const QString &json);

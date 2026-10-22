@@ -100,8 +100,8 @@ HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
 
     connect(m_client, &DBusClient::healthQueryResult,
             this, &HealthDashboard::onHealthResult);
-    connect(m_client, &DBusClient::healthQueryError,
-            this, &HealthDashboard::onHealthError);
+    connect(m_client, &DBusClient::refreshFailed,
+            this, &HealthDashboard::onRefreshFailed);
 
     refresh();
 }
@@ -280,8 +280,10 @@ void HealthDashboard::onHealthResult(const QString &json)
     m_note->hide();
 }
 
-void HealthDashboard::onHealthError(const QString &reason)
+void HealthDashboard::onRefreshFailed(const QString &operation, const QString &reason)
 {
+    if (operation != QLatin1String("HealthQuery"))
+        return;
     // The tables keep the last good reading; this says how old it is.
     m_note->setText(m_lastGood.isValid()
         ? i18n("Health unavailable: %1 — showing the reading from %2",
@@ -508,7 +510,7 @@ void HealthDashboard::updateGrowth(const QString &json)
 
             // Chart point
             const qreal usedGiB = static_cast<qreal>(used) / (1024.0 * 1024.0 * 1024.0);
-            series->append(dt.toMSecsSinceEpoch(), usedGiB);
+            series->append(static_cast<qreal>(dt.toMSecsSinceEpoch()), usedGiB);
 
             if (usedGiB > yMax)
                 yMax = usedGiB;
@@ -531,8 +533,8 @@ void HealthDashboard::updateGrowth(const QString &json)
 
             const qreal capGiB = static_cast<qreal>(lastTotal) / (1024.0 * 1024.0 * 1024.0);
             if (!allEntries.isEmpty()) {
-                capLine->append(allEntries.first().date.toMSecsSinceEpoch(), capGiB);
-                capLine->append(allEntries.last().date.toMSecsSinceEpoch(), capGiB);
+                capLine->append(static_cast<qreal>(allEntries.first().date.toMSecsSinceEpoch()), capGiB);
+                capLine->append(static_cast<qreal>(allEntries.last().date.toMSecsSinceEpoch()), capGiB);
             }
 
             chart->addSeries(capLine);
@@ -549,7 +551,7 @@ void HealthDashboard::updateGrowth(const QString &json)
         bool hasEta = false;
 
         if (regressN >= 2) {
-            const int startIdx = allEntries.size() - regressN;
+            const int startIdx = static_cast<int>(allEntries.size()) - regressN;
             double sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
             const qint64 epoch0 = allEntries[startIdx].date.toSecsSinceEpoch();
 
@@ -658,7 +660,7 @@ void HealthDashboard::updateStatus(const QString &json)
             ageStr = i18n("%1 minutes ago", mins);
         }
 
-        if (ageSecs > 48 * 3600) {
+        if (ageSecs > qint64{48} * 3600) {
             m_lastBackupLabel->setText(
                 QStringLiteral("<span style=\"color:#CC0000;\">%1</span>").arg(ageStr));
             m_lastBackupLabel->setTextFormat(Qt::RichText);
@@ -674,6 +676,6 @@ void HealthDashboard::updateStatus(const QString &json)
         if (dval.toObject().value(QLatin1String("mounted")).toBool())
             ++mountedCount;
     }
-    const int totalCount = drives.count();
+    const int totalCount = static_cast<int>(drives.count());
     m_mountLabel->setText(i18n("%1/%2 mounted", mountedCount, totalCount));
 }

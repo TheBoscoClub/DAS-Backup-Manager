@@ -261,8 +261,9 @@ void DBusClient::watchHealthQuery(const QDBusPendingCall &pending)
             this, [this](QDBusPendingCallWatcher *w) {
         QDBusPendingReply<QString> reply = *w;
         if (reply.isError()) {
-            Q_EMIT healthQueryError(mapDBusError(reply.error().name(),
-                                                 reply.error().message()));
+            Q_EMIT refreshFailed(QStringLiteral("HealthQuery"),
+                                 mapDBusError(reply.error().name(),
+                                              reply.error().message()));
             Q_EMIT healthQueryResult({});
         } else {
             Q_EMIT healthQueryResult(reply.value());
@@ -284,7 +285,7 @@ void DBusClient::scheduleGetAsync()
             this, [this](QDBusPendingCallWatcher *w) {
         QDBusPendingReply<QString> reply = *w;
         if (reply.isError()) {
-            Q_EMIT errorOccurred(QStringLiteral("ScheduleGet"),
+            Q_EMIT refreshFailed(QStringLiteral("ScheduleGet"),
                                  mapDBusError(reply.error().name(),
                                               reply.error().message()));
             Q_EMIT scheduleGetResult({});
@@ -308,7 +309,7 @@ void DBusClient::indexStatsAsync()
             this, [this](QDBusPendingCallWatcher *w) {
         QDBusPendingReply<QString> reply = *w;
         if (reply.isError()) {
-            Q_EMIT errorOccurred(QStringLiteral("IndexStats"),
+            Q_EMIT refreshFailed(QStringLiteral("IndexStats"),
                                  mapDBusError(reply.error().name(),
                                               reply.error().message()));
             Q_EMIT indexStatsResult({});

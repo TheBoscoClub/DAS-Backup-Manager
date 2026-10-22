@@ -66,6 +66,7 @@ private:
     void setupBrowsePage();
     void setupTrayIcon();
     void assembleStatusBar();
+    void statusReplyArrived();
 
     // Core services
     DBusClient *m_dbusClient = nullptr;
@@ -114,7 +115,7 @@ private:
         QString statsJson;
         QString scheduleJson;
         QString healthJson;
-        QString healthError; // a failed HealthQuery this tick (bd amsg)
+        QStringList failed; // "<call>: <reason>" for each refresh that failed this tick (bd amsg)
         int pending = 0;
     } m_statusState;
 };

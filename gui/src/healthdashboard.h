@@ -26,7 +26,7 @@ public Q_SLOTS:
 
 private Q_SLOTS:
     void onHealthResult(const QString &json);
-    void onHealthError(const QString &reason);
+    void onRefreshFailed(const QString &operation, const QString &reason);
 
 private:
     void setupDrivesTab();

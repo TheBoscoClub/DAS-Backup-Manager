@@ -50,6 +50,7 @@
 #include "../src/backuphistory.h"
 #include "../src/backuppanel.h"
 #include "../src/backupsteps.h"
+#include "../src/statustext.h"
 #include "../src/panelconfig.h"
 #include "../src/progresspanel.h"
 
@@ -1470,7 +1471,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         QSignalSpy modal(&client, &DBusClient::errorOccurred);
-        QSignalSpy failed(&client, &DBusClient::healthQueryError);
+        QSignalSpy failed(&client, &DBusClient::refreshFailed);
         QSignalSpy result(&client, &DBusClient::healthQueryResult);
         client.watchHealthQuery(QDBusPendingCall::fromCompletedCall(
             QDBusMessage::createError(QStringLiteral("org.freedesktop.DBus.Error.NoReply"),
@@ -1478,6 +1479,7 @@ private Q_SLOTS:
         QVERIFY(result.wait(2000));
         QCOMPARE(modal.count(), 0);
         QCOMPARE(failed.count(), 1);
+        QCOMPARE(failed.at(0).at(0).toString(), QStringLiteral("HealthQuery"));
         QCOMPARE(result.count(), 1);
         QVERIFY(result.at(0).at(0).toString().isEmpty());
     }
@@ -1499,7 +1501,9 @@ private Q_SLOTS:
         QCOMPARE(driveRows(), 1);
         QVERIFY(health.statusNote().isEmpty());
 
-        Q_EMIT client.healthQueryError(QStringLiteral("Did not receive a reply"));
+        Q_EMIT client.refreshFailed(QStringLiteral("ScheduleGet"), QStringLiteral("other call"));
+        QVERIFY(health.statusNote().isEmpty()); // only HealthQuery is the dashboard's
+        Q_EMIT client.refreshFailed(QStringLiteral("HealthQuery"), QStringLiteral("Did not receive a reply"));
         Q_EMIT client.healthQueryResult({});
         QCOMPARE(driveRows(), 1); // the last good reading stays
         const QString note = health.statusNote();
@@ -1514,10 +1518,32 @@ private Q_SLOTS:
     {
         DBusClient client;
         HealthDashboard health(&client);
-        Q_EMIT client.healthQueryError(QStringLiteral("denied"));
+        Q_EMIT client.refreshFailed(QStringLiteral("HealthQuery"), QStringLiteral("denied"));
         const QString note = health.statusNote();
         QVERIFY2(note.contains(QStringLiteral("denied")), qPrintable(note));
         QVERIFY2(note.contains(QStringLiteral("no reading yet")), qPrintable(note));
+    }
+
+    void theStatusLineSaysUnknownNeverZeroOrStale()
+    {
+        const QString stats = QStringLiteral(R"({"db_size_bytes":2048,"snapshots":7})");
+        const QString sched = QStringLiteral(R"({"next_incremental":"03:10"})");
+        const QString health = QStringLiteral(R"({"targets":[{"mounted":true},{"mounted":false}]})");
+
+        StatusText all = StatusText::assemble(stats, sched, health, {});
+        QCOMPARE(all.text, QStringLiteral("Next: 03:10 | 1 targets online | DB: 2.0 KiB | 7 snapshots"));
+        QVERIFY(all.toolTip.isEmpty());
+
+        // Nothing came back and every call failed: unknown, not "DB: 0 B | 0 snapshots"
+        const QStringList failed{QStringLiteral("IndexStats: x"), QStringLiteral("HealthQuery: y")};
+        StatusText none = StatusText::assemble({}, {}, {}, failed);
+        QCOMPARE(none.text, QStringLiteral("health unavailable | DB: unknown"));
+        QVERIFY2(none.toolTip.contains(QStringLiteral("IndexStats: x")) &&
+                 none.toolTip.contains(QStringLiteral("HealthQuery: y")), qPrintable(none.toolTip));
+
+        // No health reply and no failure (helper not reachable): left out, not claimed
+        QCOMPARE(StatusText::assemble(stats, {}, {}, {}).text,
+                 QStringLiteral("DB: 2.0 KiB | 7 snapshots"));
     }
 
     // --- Live-panel findings (Task 8, 2026-10-09) ----------------------------

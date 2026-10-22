@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "statustext.h"
 #include "backuphistory.h"
 #include "backuppanel.h"
 #include "configdialog.h"
@@ -29,7 +30,6 @@
 #include <QFileDialog>
 #include <QAction>
 #include <QHeaderView>
-#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeySequence>
@@ -106,9 +106,9 @@ MainWindow::MainWindow(QWidget *parent)
     // Before the empty result that follows it, so assembleStatusBar sees it.
     // A reply that timed out (25 s) arrives after the bar's own 10 s cutoff
     // has drawn it without health: draw it again to say so.
-    connect(m_dbusClient, &DBusClient::healthQueryError,
-            this, [this](const QString &reason) {
-                m_statusState.healthError = reason;
+    connect(m_dbusClient, &DBusClient::refreshFailed,
+            this, [this](const QString &operation, const QString &reason) {
+                m_statusState.failed.append(i18n("%1: %2", operation, reason));
                 if (m_statusState.pending == 0)
                     assembleStatusBar();
             });
@@ -507,74 +507,41 @@ void MainWindow::updateStatusBar()
     });
 }
 
+void MainWindow::statusReplyArrived()
+{
+    if (m_statusState.pending == 0)
+        return; // the 10 s cutoff already drew the bar
+    --m_statusState.pending;
+    if (m_statusState.pending == 0)
+        assembleStatusBar();
+}
+
 void MainWindow::onIndexStatsResult(const QString &json)
 {
     m_statusState.statsJson = json;
-    if (m_statusState.pending > 0 && --m_statusState.pending == 0)
-        assembleStatusBar();
+    statusReplyArrived();
 }
 
 void MainWindow::onScheduleGetResult(const QString &json)
 {
     m_statusState.scheduleJson = json;
-    if (m_statusState.pending > 0 && --m_statusState.pending == 0)
-        assembleStatusBar();
+    statusReplyArrived();
 }
 
 void MainWindow::onHealthQueryResult(const QString &json)
 {
     m_statusState.healthJson = json;
-    if (m_statusState.pending > 0 && --m_statusState.pending == 0)
-        assembleStatusBar();
+    statusReplyArrived();
 }
 
 void MainWindow::assembleStatusBar()
 {
-    QStringList parts;
-
-    // DB stats
-    qint64 dbSize = 0;
-    qint64 snapshotCount = 0;
-    if (!m_statusState.statsJson.isEmpty()) {
-        const QJsonObject s = QJsonDocument::fromJson(
-            m_statusState.statsJson.toUtf8()).object();
-        dbSize = s.value(QLatin1String("db_size_bytes")).toInteger();
-        snapshotCount = s.value(QLatin1String("snapshots")).toInteger();
-    }
-
-    // Next backup schedule
-    if (!m_statusState.scheduleJson.isEmpty()) {
-        const QJsonObject obj = QJsonDocument::fromJson(
-            m_statusState.scheduleJson.toUtf8()).object();
-        const QString next = obj.value(QLatin1String("next_incremental")).toString();
-        if (!next.isEmpty()) {
-            parts.append(i18n("Next: %1", next));
-        }
-    }
-
-    // Targets online
-    if (!m_statusState.healthJson.isEmpty()) {
-        const QJsonDocument doc = QJsonDocument::fromJson(
-            m_statusState.healthJson.toUtf8());
-        const QJsonArray targets = doc.object().value(QLatin1String("targets")).toArray();
-        int mounted = 0;
-        for (const QJsonValue &v : targets) {
-            if (v.toObject().value(QLatin1String("mounted")).toBool())
-                ++mounted;
-        }
-        parts.append(i18n("%1 targets online", mounted));
-    } else if (!m_statusState.healthError.isEmpty()) {
-        // Never last tick's count: a stale reading shown as current
-        parts.append(i18n("health unavailable"));
-    }
-    m_statusLabel->setToolTip(m_statusState.healthError.isEmpty()
-        ? QString()
-        : i18n("Health refresh failed: %1", m_statusState.healthError));
-
-    parts.append(i18n("DB: %1", FileModel::formatSize(dbSize)));
-    parts.append(i18n("%1 snapshots", snapshotCount));
-
-    m_statusLabel->setText(parts.join(QStringLiteral(" | ")));
+    const StatusText status = StatusText::assemble(m_statusState.statsJson,
+                                                   m_statusState.scheduleJson,
+                                                   m_statusState.healthJson,
+                                                   m_statusState.failed);
+    m_statusLabel->setText(status.text);
+    m_statusLabel->setToolTip(status.toolTip);
 }
 
 void MainWindow::restoreSelectedFiles()
