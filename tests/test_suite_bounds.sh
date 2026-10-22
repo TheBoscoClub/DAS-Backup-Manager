@@ -90,6 +90,29 @@ STUB
     check "capped at 50 more tasks, the stub is stopped short" "$((got < DEPTH / 2))" "1"
 fi
 
+echo "--- in a PID namespace of its own: the cgroup's pids.max is the cap, or the suite refuses"
+# ~/.claude/bin/bounded-test runs every suite in its own PID namespace, where
+# ps sees only the run but the kernel counts all of the user's tasks: a cap
+# measured there sat below the user's live count and the first fork failed
+# (2026-10-22, bd DAS-Backup-Manager-afid). Needs a user manager (a scope sets
+# pids.max) and passwordless sudo (root makes the namespace); CI's root
+# container has neither, and the section says it did not run.
+if ((EUID != 0)) && systemctl --user show -p Version --value >/dev/null 2>&1 &&
+    sudo -n true 2>/dev/null; then
+    in_ns() { # <TasksMax>: bound.sh's exit status, then a fork, in a fresh PID namespace
+        # shellcheck disable=SC2016 # expanded by the inner bash
+        systemd-run --user --scope --quiet -p TasksMax="$1" \
+            sudo -n unshare --pid --fork --mount-proc \
+            setpriv --reuid="$UID" --regid="$(id -g)" --init-groups \
+            bash -c 'source "$1"; true & wait && echo forked' _ "$HERE/lib/bound.sh" 2>/dev/null
+        echo "rc=$?"
+    }
+    check "finite pids.max: the suite runs and forks" "$(in_ns 500 | tr '\n' ' ')" "forked rc=0 "
+    check "no finite pids.max: the suite refuses (exit 2)" "$(in_ns infinity | tr '\n' ' ')" "rc=2 "
+else
+    echo "NOT RUN: needs a non-root user with a user manager and passwordless sudo"
+fi
+
 echo "$passes passed, $fails failed"
 ((fails == 0)) || exit 1
 echo "SUITE-BOUNDS SUITE GREEN"
