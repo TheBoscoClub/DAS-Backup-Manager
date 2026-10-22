@@ -20,6 +20,8 @@
 #include <QTest>
 #include <QApplication>
 #include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusPendingCall>
 #include <QSignalSpy>
 #include <QAbstractItemModel>
 #include <QJsonValue>
@@ -1456,6 +1458,66 @@ private Q_SLOTS:
         panel.applyDocument(fixture());
         QVERIFY(p.clear->isEnabled());
         QVERIFY(!panel.statusLine().contains(QStringLiteral("polkit denied")));
+    }
+
+    // --- A failed background health refresh is not a modal (bd amsg) --------
+    //
+    // The status bar and the dashboard ask for health on their own; on
+    // 2026-10-21 a slow reply during a backup put three "HealthQuery: Did not
+    // receive a reply" dialogs in front of the operator.
+
+    void aFailedHealthReplyIsAHealthErrorNotAnErrorOccurred()
+    {
+        DBusClient client;
+        QSignalSpy modal(&client, &DBusClient::errorOccurred);
+        QSignalSpy failed(&client, &DBusClient::healthQueryError);
+        QSignalSpy result(&client, &DBusClient::healthQueryResult);
+        client.watchHealthQuery(QDBusPendingCall::fromCompletedCall(
+            QDBusMessage::createError(QStringLiteral("org.freedesktop.DBus.Error.NoReply"),
+                                      QStringLiteral("Did not receive a reply"))));
+        QVERIFY(result.wait(2000));
+        QCOMPARE(modal.count(), 0);
+        QCOMPARE(failed.count(), 1);
+        QCOMPARE(result.count(), 1);
+        QVERIFY(result.at(0).at(0).toString().isEmpty());
+    }
+
+    void theDashboardKeepsItsLastReadingAndSaysWhenItWasTaken()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        const QString good = QStringLiteral(
+            R"({"targets":[{"serial":"SER1","label":"primary","mounted":true,)"
+            R"("total_bytes":100,"used_bytes":40,"smart_status":"PASSED"}]})");
+        const auto driveRows = [&health] {
+            int rows = 0;
+            for (auto *v : health.findChildren<QTableView *>())
+                rows += v->model() ? v->model()->rowCount() : 0;
+            return rows;
+        };
+        Q_EMIT client.healthQueryResult(good);
+        QCOMPARE(driveRows(), 1);
+        QVERIFY(health.statusNote().isEmpty());
+
+        Q_EMIT client.healthQueryError(QStringLiteral("Did not receive a reply"));
+        Q_EMIT client.healthQueryResult({});
+        QCOMPARE(driveRows(), 1); // the last good reading stays
+        const QString note = health.statusNote();
+        QVERIFY2(note.contains(QStringLiteral("Did not receive a reply")), qPrintable(note));
+        QVERIFY2(note.contains(QTime::currentTime().toString(QStringLiteral("HH:"))), qPrintable(note));
+
+        Q_EMIT client.healthQueryResult(good); // the next good reading clears it
+        QVERIFY(health.statusNote().isEmpty());
+    }
+
+    void aDashboardThatNeverReadHealthSaysSoWithoutATime()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        Q_EMIT client.healthQueryError(QStringLiteral("denied"));
+        const QString note = health.statusNote();
+        QVERIFY2(note.contains(QStringLiteral("denied")), qPrintable(note));
+        QVERIFY2(note.contains(QStringLiteral("no reading yet")), qPrintable(note));
     }
 
     // --- Live-panel findings (Task 8, 2026-10-09) ----------------------------

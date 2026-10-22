@@ -231,18 +231,6 @@ bool DBusClient::subvolSetManual(const QString &source,
     return true;
 }
 
-QString DBusClient::healthQuery()
-{
-    if (!m_available) return {};
-    QDBusReply<QString> reply = m_interface->call(QStringLiteral("HealthQuery"));
-    if (!reply.isValid()) {
-        Q_EMIT errorOccurred(QStringLiteral("HealthQuery"),
-                             mapDBusError(reply.error().name(), reply.error().message()));
-        return {};
-    }
-    return reply.value();
-}
-
 bool DBusClient::jobCancel(const QString &jobId)
 {
     if (!m_available) return false;
@@ -263,16 +251,18 @@ void DBusClient::healthQueryAsync()
         Q_EMIT healthQueryResult({});
         return;
     }
-    QDBusPendingCall pending = m_interface->asyncCall(
-        QStringLiteral("HealthQuery"));
+    watchHealthQuery(m_interface->asyncCall(QStringLiteral("HealthQuery")));
+}
+
+void DBusClient::watchHealthQuery(const QDBusPendingCall &pending)
+{
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
     connect(watcher, &QDBusPendingCallWatcher::finished,
             this, [this](QDBusPendingCallWatcher *w) {
         QDBusPendingReply<QString> reply = *w;
         if (reply.isError()) {
-            Q_EMIT errorOccurred(QStringLiteral("HealthQuery"),
-                                 mapDBusError(reply.error().name(),
-                                              reply.error().message()));
+            Q_EMIT healthQueryError(mapDBusError(reply.error().name(),
+                                                 reply.error().message()));
             Q_EMIT healthQueryResult({});
         } else {
             Q_EMIT healthQueryResult(reply.value());

@@ -7,6 +7,7 @@
 
 struct BackupSteps;
 class QDBusInterface;
+class QDBusPendingCall;
 class QDBusPendingCallWatcher;
 
 class DBusClient : public QObject
@@ -43,11 +44,14 @@ public:
                       const QString &name);
     bool subvolSetManual(const QString &source,
                          const QString &name, bool manual);
-    QString healthQuery();
     bool jobCancel(const QString &jobId);
 
     // Async versions of slow methods (non-blocking, result via signal)
     void healthQueryAsync();
+    // Turns a HealthQuery reply into healthQueryResult, and a failed one into
+    // healthQueryError first: every caller is a background refresh. Public so
+    // a test can hand it a completed error reply.
+    void watchHealthQuery(const QDBusPendingCall &pending);
     void scheduleGetAsync();
     void indexStatsAsync();
     void indexListSnapshotsAsync();
@@ -93,6 +97,10 @@ Q_SIGNALS:
 
     // Async result signals
     void healthQueryResult(const QString &json);
+    // A HealthQuery call that failed: shown in place by the dashboard and the
+    // status bar; not errorOccurred, which the main window turns into a modal
+    // dialog, and health is refreshed unasked (bd DAS-Backup-Manager-amsg).
+    void healthQueryError(const QString &reason);
     void scheduleGetResult(const QString &json);
     void indexStatsResult(const QString &json);
     void indexListSnapshotsResult(const QString &json);

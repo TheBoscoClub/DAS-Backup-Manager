@@ -114,6 +114,7 @@ private:
         QString statsJson;
         QString scheduleJson;
         QString healthJson;
+        QString healthError; // a failed HealthQuery this tick (bd amsg)
         int pending = 0;
     } m_statusState;
 };

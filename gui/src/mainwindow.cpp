@@ -103,6 +103,15 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onScheduleGetResult);
     connect(m_dbusClient, &DBusClient::healthQueryResult,
             this, &MainWindow::onHealthQueryResult);
+    // Before the empty result that follows it, so assembleStatusBar sees it.
+    // A reply that timed out (25 s) arrives after the bar's own 10 s cutoff
+    // has drawn it without health: draw it again to say so.
+    connect(m_dbusClient, &DBusClient::healthQueryError,
+            this, [this](const QString &reason) {
+                m_statusState.healthError = reason;
+                if (m_statusState.pending == 0)
+                    assembleStatusBar();
+            });
 
     setupUi();
     setupActions();
@@ -554,7 +563,13 @@ void MainWindow::assembleStatusBar()
                 ++mounted;
         }
         parts.append(i18n("%1 targets online", mounted));
+    } else if (!m_statusState.healthError.isEmpty()) {
+        // Never last tick's count: a stale reading shown as current
+        parts.append(i18n("health unavailable"));
     }
+    m_statusLabel->setToolTip(m_statusState.healthError.isEmpty()
+        ? QString()
+        : i18n("Health refresh failed: %1", m_statusState.healthError));
 
     parts.append(i18n("DB: %1", FileModel::formatSize(dbSize)));
     parts.append(i18n("%1 snapshots", snapshotCount));

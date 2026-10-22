@@ -1708,8 +1708,11 @@ impl HelperInterface {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<String> {
+        let started = std::time::Instant::now();
         let sender = sender_from_header(&header)?;
+        let polkit_start = std::time::Instant::now();
         check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
+        let polkit_took = polkit_start.elapsed();
 
         let config = load_config()?;
 
@@ -1718,8 +1721,17 @@ impl HelperInterface {
         // reflect the actual mount state so the user sees which targets are
         // available vs disconnected.
         let json_str = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let report =
-                health::get_health(&config).map_err(|e| format!("Health query failed: {e}"))?;
+            let mut times = health::StepTimes::default();
+            times.record("polkit", polkit_took);
+            let report = health::get_health_timed(&config, &mut times);
+            // Logged whatever the outcome: a slow failure is still the slow step
+            // the GUI timed out on (bd DAS-Backup-Manager-amsg).
+            if let Some(line) =
+                health::slow_health_warning(started.elapsed(), SLOW_HEALTH_QUERY, &times)
+            {
+                eprintln!("btrdasd-helper: {line}");
+            }
+            let report = report.map_err(|e| format!("Health query failed: {e}"))?;
 
             let status_str = match report.status {
                 health::HealthStatus::Healthy => "healthy",
@@ -2436,6 +2448,11 @@ fn configured_mirror_label(label: &str) -> fdo::Result<String> {
         .map_err(fdo::Error::InvalidArgs)?;
     Ok(label.to_string())
 }
+
+/// A health query this slow is logged with its slowest steps: well under the
+/// GUI's 25 s D-Bus reply timeout, so the journal names the step a timed-out
+/// refresh waited on (bd DAS-Backup-Manager-amsg).
+const SLOW_HEALTH_QUERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Extract the sender bus name from a D-Bus message header.
 fn sender_from_header(header: &zbus::message::Header<'_>) -> Result<String, fdo::Error> {

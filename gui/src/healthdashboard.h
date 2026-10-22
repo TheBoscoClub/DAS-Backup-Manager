@@ -1,4 +1,5 @@
 #pragma once
+#include <QDateTime>
 #include <QWidget>
 
 class QTabWidget;
@@ -16,11 +17,16 @@ public:
 
     void setActiveTab(int index);
 
+    // Empty while the last refresh succeeded; otherwise why it failed and
+    // when the reading on screen was taken (bd DAS-Backup-Manager-amsg).
+    [[nodiscard]] QString statusNote() const;
+
 public Q_SLOTS:
     void refresh();
 
 private Q_SLOTS:
     void onHealthResult(const QString &json);
+    void onHealthError(const QString &reason);
 
 private:
     void setupDrivesTab();
@@ -33,6 +39,8 @@ private:
     DBusClient *m_client;
     QString m_configPath;
     QTabWidget *m_tabs = nullptr;
+    QLabel *m_note = nullptr;
+    QDateTime m_lastGood;
 
     // Drives tab
     QTableView *m_drivesView = nullptr;

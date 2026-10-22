@@ -4,7 +4,7 @@ use regex::Regex;
 use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Matches btrbk snapshot directory names: `<name>.<YYYYMMDDTHHMMSS>`
 static SNAP_RE: LazyLock<Regex> =
@@ -799,8 +799,65 @@ fn determine_status(targets: &[TargetHealth], warnings: &[String]) -> HealthStat
 // Public API
 // ---------------------------------------------------------------------------
 
+/// How long each step of one health query took, in the order they ran
+/// (bd DAS-Backup-Manager-amsg: a reply slower than the GUI's 25 s D-Bus
+/// timeout must say which step it waited on).
+#[derive(Debug, Default)]
+pub struct StepTimes(Vec<(String, Duration)>);
+
+impl StepTimes {
+    /// Run `f`, recording its duration under `name`.
+    pub fn time<T>(&mut self, name: impl Into<String>, f: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let out = f();
+        self.0.push((name.into(), start.elapsed()));
+        out
+    }
+
+    pub fn record(&mut self, name: impl Into<String>, took: Duration) {
+        self.0.push((name.into(), took));
+    }
+
+    /// The `n` slowest steps, slowest first: `name 1.2 s, name 0.3 s`.
+    pub fn slowest(&self, n: usize) -> String {
+        let mut steps: Vec<&(String, Duration)> = self.0.iter().collect();
+        steps.sort_by_key(|step| std::cmp::Reverse(step.1));
+        steps
+            .iter()
+            .take(n)
+            .map(|(name, took)| format!("{name} {:.1} s", took.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The journal line for a health query that took `total` or longer than
+/// `threshold`, naming its slowest steps; `None` when it was quick.
+pub fn slow_health_warning(
+    total: Duration,
+    threshold: Duration,
+    steps: &StepTimes,
+) -> Option<String> {
+    (total >= threshold).then(|| {
+        format!(
+            "HealthQuery took {:.1} s (warn at {} s); slowest steps: {}",
+            total.as_secs_f64(),
+            threshold.as_secs(),
+            steps.slowest(5)
+        )
+    })
+}
+
 /// Query health status of all configured targets.
 pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::Error>> {
+    get_health_timed(config, &mut StepTimes::default())
+}
+
+/// [`get_health`], recording each step's duration in `times`.
+pub fn get_health_timed(
+    config: &Config,
+    times: &mut StepTimes,
+) -> Result<HealthReport, Box<dyn std::error::Error>> {
     let mut target_healths: Vec<TargetHealth> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut effective_mounts: Vec<String> = Vec::new();
@@ -812,7 +869,7 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
     // present-but-unreadable/corrupt file produces a warning here, and only
     // once for the whole report rather than once per target.
     let scrub_state = if config.scrub.enabled {
-        match scrub::load_state() {
+        match times.time("scrub state", scrub::load_state) {
             Ok(s) => Some(s),
             Err(e) => {
                 warnings.push(format!("Scrub state unreadable: {e}"));
@@ -829,7 +886,10 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
 
     for target in &config.targets {
         // 1. Check mount status — detect both configured path and udisks2 mounts
-        let actual_mount = find_any_mount(&target.mount, &target.serial, &target.role);
+        let label = &target.label;
+        let actual_mount = times.time(format!("{label} mount"), || {
+            find_any_mount(&target.mount, &target.serial, &target.role)
+        });
         let mounted = actual_mount.is_some();
         let effective_path = actual_mount.as_deref().unwrap_or(&target.mount).to_string();
         effective_mounts.push(effective_path.clone());
@@ -843,7 +903,9 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
 
         // 2. Get disk space (using effective mount path)
         let usage = if mounted {
-            measure_target_usage(&effective_path)
+            times.time(format!("{label} usage"), || {
+                measure_target_usage(&effective_path)
+            })
         } else {
             None
         };
@@ -864,14 +926,17 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
 
         // 3. Get snapshot count (using effective mount path)
         let snapshot_count = if mounted {
-            count_snapshots(&effective_path)
+            times.time(format!("{label} snapshots"), || {
+                count_snapshots(&effective_path)
+            })
         } else {
             0
         };
 
         // 4. Get SMART details (use -d sat for USB-attached SATA drives)
         let smart_details = if !target.serial.is_empty() {
-            device_info_from_serial(&target.serial)
+            let smart_start = Instant::now();
+            let details = device_info_from_serial(&target.serial)
                 .and_then(|(dev, is_usb)| {
                     let mut cmd = std::process::Command::new("smartctl");
                     cmd.args(["--json", "--all"]);
@@ -881,7 +946,9 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
                     cmd.arg(&dev).output().ok()
                 })
                 .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|json| parse_smartctl_details(&json))
+                .and_then(|json| parse_smartctl_details(&json));
+            times.record(format!("{label} smart"), smart_start.elapsed());
+            details
         } else {
             None
         };
@@ -988,6 +1055,7 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             mount_to_label.insert(eff_mount.clone(), target.label.clone());
         }
     }
+    let growth_start = Instant::now();
     let growth_points = fs::read_to_string(&config.general.growth_log)
         .map(|content| {
             let mut pts = parse_growth_log(&content);
@@ -999,17 +1067,20 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
             pts
         })
         .unwrap_or_default();
+    times.record("growth log", growth_start.elapsed());
 
     // 6b. Recovery OSes: read live while a drive is mounted, otherwise the
     // record the last backup run kept. The host (uname, pacman) is probed only
     // when there is a reading to compare it with.
-    let recovery = crate::recovery_os::health_with(
-        config,
-        &crate::recovery_os::load_state(&crate::recovery_os::state_path()),
-        &crate::recovery_os::host_versions,
-        &crate::caldate::today(),
-        &is_mountpoint,
-    );
+    let recovery = times.time("recovery OS", || {
+        crate::recovery_os::health_with(
+            config,
+            &crate::recovery_os::load_state(&crate::recovery_os::state_path()),
+            &crate::recovery_os::host_versions,
+            &crate::caldate::today(),
+            &is_mountpoint,
+        )
+    });
     warnings.extend(recovery.warnings);
 
     // 7. Determine overall status
@@ -1091,6 +1162,116 @@ pub fn parse_growth_log(content: &str) -> Vec<GrowthPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- slow health query reporting (bd DAS-Backup-Manager-amsg) ---
+
+    fn steps(list: &[(&str, u64)]) -> StepTimes {
+        let mut t = StepTimes::default();
+        for (name, ms) in list {
+            t.record(*name, Duration::from_millis(*ms));
+        }
+        t
+    }
+
+    #[test]
+    fn slowest_steps_are_named_slowest_first_and_capped() {
+        let t = steps(&[("a", 100), ("b", 25_800), ("c", 1_200), ("d", 0)]);
+        assert_eq!(t.slowest(2), "b 25.8 s, c 1.2 s");
+        assert_eq!(t.slowest(9), "b 25.8 s, c 1.2 s, a 0.1 s, d 0.0 s");
+        assert_eq!(StepTimes::default().slowest(5), "");
+    }
+
+    #[test]
+    fn time_records_the_step_and_returns_its_value() {
+        let mut t = StepTimes::default();
+        let v = t.time("sleep", || {
+            std::thread::sleep(Duration::from_millis(30));
+            7
+        });
+        assert_eq!(v, 7);
+        assert_eq!(t.0.len(), 1);
+        assert_eq!(t.0[0].0, "sleep");
+        assert!(t.0[0].1 >= Duration::from_millis(30), "{:?}", t.0);
+    }
+
+    #[test]
+    fn smart_is_read_only_for_a_target_with_a_serial() {
+        // An unmounted target is never measured; SMART is asked for by serial
+        // alone, so the step is timed exactly for the target that has one.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            r#"
+[general]
+version = "0.4.0"
+install_prefix = "/usr/local"
+db_path = "/var/lib/das-backup/backup-index.db"
+growth_log = "{d}/growth.log"
+[init]
+system = "systemd"
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+[email]
+enabled = false
+[gui]
+enabled = false
+[scrub]
+enabled = false
+[[target]]
+label = "noserial"
+serial = ""
+mount = "{d}/a"
+role = "primary"
+[target.retention]
+daily = 7
+[[target]]
+label = "withserial"
+serial = "NO-SUCH-SERIAL-AMSG"
+mount = "{d}/b"
+role = "primary"
+[target.retention]
+daily = 7
+"#,
+            d = dir.path().display()
+        );
+        let config = Config::from_toml(&toml).unwrap();
+        let mut times = StepTimes::default();
+        let report = get_health_timed(&config, &mut times).unwrap();
+        let names: Vec<&str> = times.0.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"withserial smart"), "{names:?}");
+        assert!(!names.contains(&"noserial smart"), "{names:?}");
+        assert!(
+            names.contains(&"noserial mount") && names.contains(&"recovery OS"),
+            "{names:?}"
+        );
+        assert!(
+            report
+                .targets
+                .iter()
+                .all(|t| !t.mounted && t.smart_status.is_none())
+        );
+    }
+
+    #[test]
+    fn a_slow_query_is_warned_at_the_threshold_and_a_quick_one_is_not() {
+        let t = steps(&[("primary usage", 25_800), ("recovery OS", 900)]);
+        let ten = Duration::from_secs(10);
+        assert_eq!(
+            slow_health_warning(Duration::from_millis(27_300), ten, &t).as_deref(),
+            Some(
+                "HealthQuery took 27.3 s (warn at 10 s); slowest steps: primary usage 25.8 s, recovery OS 0.9 s"
+            )
+        );
+        assert!(
+            slow_health_warning(ten, ten, &t).is_some(),
+            "at the threshold is slow"
+        );
+        assert_eq!(
+            slow_health_warning(Duration::from_millis(9_999), ten, &t),
+            None
+        );
+    }
 
     // --- pre-existing tests (unchanged) ---
 

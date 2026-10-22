@@ -84,6 +84,13 @@ HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
     title->setFont(titleFont);
     layout->addWidget(title);
 
+    m_note = new QLabel(this);
+    m_note->setObjectName(QStringLiteral("healthNote"));
+    m_note->setWordWrap(true);
+    m_note->setToolTip(i18n("Why the last health refresh failed; the drives shown are from the time named"));
+    m_note->hide();
+    layout->addWidget(m_note);
+
     m_tabs = new QTabWidget(this);
     layout->addWidget(m_tabs, 1);
 
@@ -93,6 +100,8 @@ HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
 
     connect(m_client, &DBusClient::healthQueryResult,
             this, &HealthDashboard::onHealthResult);
+    connect(m_client, &DBusClient::healthQueryError,
+            this, &HealthDashboard::onHealthError);
 
     refresh();
 }
@@ -266,6 +275,24 @@ void HealthDashboard::onHealthResult(const QString &json)
     updateDrives(json);
     updateGrowth(json);
     updateStatus(json);
+    m_lastGood = QDateTime::currentDateTime();
+    m_note->clear();
+    m_note->hide();
+}
+
+void HealthDashboard::onHealthError(const QString &reason)
+{
+    // The tables keep the last good reading; this says how old it is.
+    m_note->setText(m_lastGood.isValid()
+        ? i18n("Health unavailable: %1 — showing the reading from %2",
+               reason, m_lastGood.toString(QStringLiteral("HH:mm:ss")))
+        : i18n("Health unavailable: %1 — no reading yet", reason));
+    m_note->show();
+}
+
+QString HealthDashboard::statusNote() const
+{
+    return m_note->text();
 }
 
 // ---------------------------------------------------------------------------
