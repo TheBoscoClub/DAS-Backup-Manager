@@ -2,6 +2,9 @@
 
 #include <KXmlGuiWindow>
 
+#include <QHash>
+#include <QPair>
+
 #include "sidebar.h"
 
 class QStackedWidget;
@@ -48,7 +51,9 @@ private Q_SLOTS:
     void updateStatusBar();
     void restoreSelectedFiles();
     void showSettings();
+    void onJobStarted(const QString &jobId, const QString &operation);
     void onBackupFinished(const QString &jobId, bool success, const QString &summary);
+    void notifyJobFinished(const QString &jobId, bool success, const QString &summary);
 
     // Async status bar result handlers
     void onIndexStatsResult(const QString &json);
@@ -91,6 +96,8 @@ private:
 
     // Tray icon
     KStatusNotifierItem *m_trayIcon = nullptr;
+    QHash<QString, QString> m_startedJobs;               // jobId -> operation, until it finishes
+    QHash<QString, QPair<bool, QString>> m_heldFinishes; // finished before jobStarted named the job
 
     // Pages
     QWidget *m_browsePage = nullptr;

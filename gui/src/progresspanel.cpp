@@ -17,6 +17,7 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     : QDockWidget(tr("Progress"), parent)
     , m_client(client)
 {
+    setObjectName(QStringLiteral("progressPanel")); // QMainWindow::saveState() needs one
     setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
     setFeatures(QDockWidget::DockWidgetClosable);
 

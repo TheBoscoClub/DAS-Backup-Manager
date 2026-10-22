@@ -6,6 +6,7 @@
 #include "filemodel.h"
 #include "healthdashboard.h"
 #include "indexrunner.h"
+#include "notifyevents.h"
 #include "progresspanel.h"
 #include "restoreaction.h"
 #include "searchmodel.h"
@@ -61,6 +62,8 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     // Backup finished notifications
+    connect(m_dbusClient, &DBusClient::jobStarted,
+            this, &MainWindow::onJobStarted);
     connect(m_dbusClient, &DBusClient::jobFinished,
             this, &MainWindow::onBackupFinished);
 
@@ -604,14 +607,49 @@ void MainWindow::setupTrayIcon()
     m_trayIcon->setStandardActionsEnabled(true);
 }
 
+void MainWindow::onJobStarted(const QString &jobId, const QString &operation)
+{
+    m_startedJobs.insert(jobId, operation);
+    // A refused job can finish before its start reply arrives: send the
+    // notification held for it now that its kind is known.
+    if (m_heldFinishes.contains(jobId)) {
+        const auto held = m_heldFinishes.take(jobId);
+        notifyJobFinished(jobId, held.first, held.second);
+    }
+}
+
 void MainWindow::onBackupFinished(const QString &jobId, bool success, const QString &summary)
 {
-    Q_UNUSED(jobId);
+    if (!m_startedJobs.contains(jobId)) {
+        // Kind unknown yet (the start reply is still in flight): wait briefly
+        // for it, then treat the job as a backup, as before.
+        m_heldFinishes.insert(jobId, {success, summary});
+        QTimer::singleShot(3000, this, [this, jobId]() {
+            if (m_heldFinishes.contains(jobId)) {
+                const auto held = m_heldFinishes.take(jobId);
+                notifyJobFinished(jobId, held.first, held.second);
+            }
+        });
+        return;
+    }
+    notifyJobFinished(jobId, success, summary);
+}
 
-    auto *notification = new KNotification(
-        success ? QStringLiteral("backupComplete") : QStringLiteral("backupFailed"),
-        KNotification::CloseOnTimeout, this);
-    notification->setTitle(success ? i18n("Backup Complete") : i18n("Backup Failed"));
+void MainWindow::notifyJobFinished(const QString &jobId, bool success, const QString &summary)
+{
+    // Must match the operation DBusClient::recoveryOsSession's job starts with.
+    const bool recovery = m_startedJobs.take(jobId) == QLatin1String("Recovery OS session");
+
+    const QString &eventId = recovery
+        ? (success ? NotifyEvent::RecoveryOsComplete : NotifyEvent::RecoveryOsFailed)
+        : (success ? NotifyEvent::BackupComplete : NotifyEvent::BackupFailed);
+    auto *notification = new KNotification(eventId, KNotification::CloseOnTimeout, this);
+    if (recovery) {
+        notification->setTitle(success ? i18n("Recovery Drive Update Finished")
+                                       : i18n("Recovery Drive Update Failed"));
+    } else {
+        notification->setTitle(success ? i18n("Backup Complete") : i18n("Backup Failed"));
+    }
     notification->setText(summary);
     notification->setIconName(success
         ? QStringLiteral("dialog-positive")
@@ -620,8 +658,14 @@ void MainWindow::onBackupFinished(const QString &jobId, bool success, const QStr
 
     // Update tray tooltip with result
     if (m_trayIcon) {
-        m_trayIcon->setToolTipSubTitle(
-            success ? i18n("Last backup: success") : i18n("Last backup: FAILED"));
+        if (recovery) {
+            m_trayIcon->setToolTipSubTitle(
+                success ? i18n("Last recovery drive update: success")
+                        : i18n("Last recovery drive update: FAILED"));
+        } else {
+            m_trayIcon->setToolTipSubTitle(
+                success ? i18n("Last backup: success") : i18n("Last backup: FAILED"));
+        }
     }
 
     // Refresh status bar and snapshot list to pick up newly indexed snapshots

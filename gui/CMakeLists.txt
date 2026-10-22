@@ -81,6 +81,7 @@ target_link_libraries(btrdasd-gui PRIVATE
 )
 
 install(TARGETS btrdasd-gui ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
+install(FILES btrdasd-gui.notifyrc DESTINATION ${KDE_INSTALL_KNOTIFYRCDIR})
 install(FILES src/btrdasd-gui.rc DESTINATION ${KDE_INSTALL_KXMLGUIDIR}/btrdasd-gui)
 install(FILES org.theboscoclub.btrdasd-gui.desktop DESTINATION ${KDE_INSTALL_APPDIR})
 install(FILES icons/btrdasd-gui.svg DESTINATION ${KDE_INSTALL_ICONDIR}/hicolor/scalable/apps)
@@ -136,6 +137,10 @@ if(BUILD_TESTING)
         KF6::ColorScheme
     )
     add_test(NAME gui-smoketest COMMAND gui-smoketest)
+    # Every KNotification event id has an [Event/<id>] group in the notifyrc.
+    add_test(NAME gui-notifyrc
+        COMMAND ${CMAKE_COMMAND} -DGUI_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check-notifyrc.cmake)
     # The suite assumes no helper is reachable. On a host where btrdasd-helper
     # runs, the panels it builds would ask the installed helper — root, on the
     # real system bus — for history and health from the live index. A system

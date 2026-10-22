@@ -1,0 +1,28 @@
+[Global]
+IconName=btrdasd-gui
+Name=ButteredDASD
+Comment=DAS Backup Manager
+
+[Event/backupComplete]
+Name=Backup complete
+Comment=A backup run finished successfully
+Action=Popup
+Urgency=Normal
+
+[Event/backupFailed]
+Name=Backup failed
+Comment=A backup run failed or was refused
+Action=Popup
+Urgency=Critical
+
+[Event/recoveryOsComplete]
+Name=Recovery drive update finished
+Comment=A recovery drive update session finished successfully
+Action=Popup
+Urgency=Normal
+
+[Event/recoveryOsFailed]
+Name=Recovery drive update failed
+Comment=A recovery drive update session failed or was refused
+Action=Popup
+Urgency=Critical
