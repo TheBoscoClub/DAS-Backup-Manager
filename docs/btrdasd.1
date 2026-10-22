@@ -645,6 +645,28 @@ determined \(em fails the run. The report is always written to
 .BR [general].last_report ;
 the GUI's Email box decides only whether it is mailed as well.
 .PP
+After btrbk, while the targets are mounted, the run reads the own OS of each
+.B "role = \(dqmirror\(dq"
+target it selected and records it in
+.IR /var/lib/das\-backup/recovery\-os.json ,
+as
+.B backup\-run.sh
+does with
+.BR "recovery\-os status \-\-state\-file" ,
+so a backup from the CLI or the GUI clears a record a recovery-drive VM
+session made out of date. A drive the run did not select keeps its earlier
+record. The report's
+.B "Recovery OS"
+row and its
+.B "RECOVERY OS"
+section follow the script's rule: a stale drive or a
+.B WARNING
+row is WARN (the run still exits 0), a root that cannot be read, a record that
+cannot be written, or a reading that passes the same 900 s bound is FAIL and
+fails the run. The summary the CLI prints and the GUI shows ends with a
+.B "recovery OS"
+line saying which.
+.PP
 If another backup already holds the singleton lock, the command prints that it
 declines and exits 0; it waits for a running scrub. A run that could not start
 (nothing selected, a label the configuration lacks, or the locks cannot be taken) exits 1, having mounted and run
@@ -2355,8 +2377,12 @@ rows show (the report status reads
 the run is still recorded as a success), anything else is FAIL. The script
 bounds the command with
 .B timeout
-(300 s, then KILL after 10 s more); a check that times out is a FAIL, and the
+(900 s, then KILL after 10 s more); a check that times out is a FAIL, and the
 run goes on to unmount and report.
+.B "btrdasd backup run"
+and a backup started from the GUI do the same in process, by the same rule
+(see
+.BR "backup run" ).
 .PP
 .B btrdasd recovery\-os status
 .RB [ \-\-config
@@ -2438,6 +2464,70 @@ row;
 a mounted target has no readable
 .IR @ ,
 the state file could not be written, or the configuration could not be loaded.
+.\"
+.SS recovery\-os record
+What a backup run does for the recovery drives, without the backup: take the
+backup lock, then the DAS maintenance lock (neither waited for), mount the
+recovery drives asked for, check that each one mounted is the filesystem it
+must be (its
+.BR mount_uuid ,
+else its serial, as before a backup writes), read each OS, write
+.I /var/lib/das\-backup/recovery\-os.json
+(or
+.BR $DAS_RECOVERY_OS_STATE )
+as
+.B "recovery\-os status \-\-state\-file"
+does, and unmount exactly what it mounted. Printed: the
+.B "RECOVERY OS"
+section and a
+.B "Recovery OS:"
+line with the verdict, by the backup report's rule. After a recovery-drive VM
+session,
+.B recovery\-os\-vm.sh
+refuses an unattended session until the drive is recorded again; this is the
+way to do it without waiting for a backup.
+.PP
+.B btrdasd recovery\-os record
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-json ]
+.RI [ LABEL ...]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.I LABEL
+The recovery drives to record, by target label; none means every
+.B "role = \(dqmirror\(dq"
+target. A label the configuration lacks, or one that names no recovery
+drive, is refused before any lock is taken.
+.TP
+.B \-\-json
+Print one object:
+.BR status ,
+.BR detail ,
+.B drives
+(the per\-drive objects of
+.BR "recovery\-os status \-\-json" ),
+.B not_mounted
+and
+.BR still_mounted .
+.PP
+Exit status:
+.B 0
+every drive asked for was recorded (a stale drive, or a
+.B WARNING
+row, is a finding, printed, not a failure);
+.B 1
+could not start: a label refused, the configuration, a lock that could not be
+taken;
+.B 3
+it began, and a drive did not mount, was not the filesystem it must be, could
+not be read or recorded, or was left mounted;
+.B 75
+a backup, a scrub or another job holds a lock, and nothing was mounted.
 .\"
 .SS recovery\-os hold\-disk
 An internal helper, not listed by

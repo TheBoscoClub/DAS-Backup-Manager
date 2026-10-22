@@ -764,6 +764,30 @@ enum RecoveryOsAction {
         #[arg(long, value_name = "PATH")]
         state_file: Option<PathBuf>,
     },
+    /// Mount the recovery drives, read their OSes, record them in the state
+    /// file a backup run writes, and unmount — what a backup does for them,
+    /// without the backup: after a VM session, so the next unattended one is
+    /// not refused for a record made before it ended
+    ///
+    /// Takes the backup lock, then the DAS maintenance lock, neither waited
+    /// for. Unmounts exactly what it mounted.
+    ///
+    /// EXIT CODE: 0 every drive asked for was recorded (a STALE drive or a
+    /// WARNING is a finding, printed, not a failure), 1 could not start (an
+    /// unknown label, or a target that is no recovery drive, refused before
+    /// any lock; the config; a lock that could not be taken), 3 it began and
+    /// a drive did not mount, was not the filesystem it must be, could not be
+    /// read or recorded, or was left mounted, 75 a backup, a scrub or another
+    /// job holds a lock — nothing was mounted.
+    Record {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// The recovery drives to record, by target label; none means every
+        /// `role = "mirror"` target
+        #[arg(value_name = "LABEL")]
+        labels: Vec<String>,
+    },
     /// Internal: hold a whole recovery disk open with O_EXCL until SIGTERM,
     /// SIGINT or SIGHUP, so the host cannot mount any partition of it while
     /// the recovery-os-updater VM may have it (started by recovery-os-vm.sh)
@@ -1381,6 +1405,19 @@ fn backup_run_json(result: &backup::BackupResult) -> String {
     )
 }
 
+/// What `backup run` prints on stdout without `--json`: [`backup_run_line`],
+/// then whether the recovery OSes were recorded, when the run read any
+/// (bd DAS-Backup-Manager-58c8).
+fn backup_run_text(result: &backup::BackupResult) -> String {
+    let mut text = format!("{}\n", backup_run_line(result));
+    let recovery_os = result.recovery_os.message_line();
+    if !recovery_os.is_empty() {
+        text.push_str(&recovery_os);
+        text.push('\n');
+    }
+    text
+}
+
 /// `backup run`'s one-line outcome. A count the run could not take reads
 /// `unknown`, never 0.
 fn backup_run_line(result: &backup::BackupResult) -> String {
@@ -1488,6 +1525,68 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
                 eprintln!("Error: could not record the result: {e}");
             }
             run.code
+        }
+        RecoveryOsAction::Record { config, labels } => {
+            let Ok(cfg) = load(&config) else { return 1 };
+            let outcome = backup::record_recovery_os_job(
+                &backup::SystemRecordHost {
+                    job: "btrdasd recovery-os record".into(),
+                },
+                &cfg,
+                &labels,
+                &CliProgress,
+            );
+            let (out, err) = record_outcome_text(&outcome, json);
+            print!("{out}");
+            eprint!("{err}");
+            outcome.exit_code()
+        }
+    }
+}
+
+/// What `recovery-os record` prints, as (stdout, stderr): the section (or
+/// JSON) and its verdict on stdout; a refusal, a deferral, or a mount left
+/// behind on stderr.
+fn record_outcome_text(outcome: &backup::RecordOutcome, json: bool) -> (String, String) {
+    use buttered_dasd::recovery_os as ros;
+    match outcome {
+        backup::RecordOutcome::CouldNotStart(why) | backup::RecordOutcome::Aborted(why) => {
+            (String::new(), format!("Error: {why}\n"))
+        }
+        backup::RecordOutcome::Deferred(why) => (
+            String::new(),
+            format!(
+                "Deferred — {why}; nothing was mounted (exit {})\n",
+                buttered_dasd::maintenance::DEFERRED_EXIT_CODE
+            ),
+        ),
+        backup::RecordOutcome::Ran {
+            recording,
+            not_mounted,
+            still_mounted,
+        } => {
+            let out = if json {
+                let drives: Vec<_> = recording.entries.iter().map(ros::entry_json).collect();
+                let doc = serde_json::json!({
+                    "status": recording.status.word(),
+                    "detail": recording.detail,
+                    "drives": drives,
+                    "not_mounted": not_mounted,
+                    "still_mounted": still_mounted,
+                });
+                format!("{doc}\n")
+            } else {
+                format!(
+                    "{}Recovery OS: {}  ({})\n",
+                    recording.section,
+                    recording.status.word(),
+                    recording.detail
+                )
+            };
+            let err = mount::still_mounted_error(still_mounted)
+                .map(|e| format!("Error: {e}\n"))
+                .unwrap_or_default();
+            (out, err)
         }
     }
 }
@@ -2273,7 +2372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if json {
                     println!("{}", backup_run_json(&result));
                 } else {
-                    println!("{}", backup_run_line(&result));
+                    print!("{}", backup_run_text(&result));
                     for e in &result.errors {
                         eprintln!("  ERROR: {e}");
                     }
@@ -3119,6 +3218,7 @@ mod tests {
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot: backup::BootStep::NotSelected,
+            recovery_os: backup::RecoveryOsStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: Vec::new(),
@@ -3144,6 +3244,27 @@ mod tests {
         assert_eq!(
             backup_run_line(&ok),
             "Backup succeeded: snapshots created: 2, sent: 3, 0 B in 7s"
+        );
+        // No recovery drive read: the line alone. One read: its verdict after.
+        assert_eq!(
+            backup_run_text(&ok),
+            "Backup succeeded: snapshots created: 2, sent: 3, 0 B in 7s\n"
+        );
+        let recorded = backup::BackupResult {
+            recovery_os: backup::RecoveryOsStep::Ran(Box::new(
+                buttered_dasd::recovery_os::Recording {
+                    status: buttered_dasd::recovery_os::RecordStatus::Ok,
+                    detail: "nothing needs attention".into(),
+                    section: String::new(),
+                    entries: Vec::new(),
+                },
+            )),
+            ..result(Some(2), Some(3))
+        };
+        assert_eq!(
+            backup_run_text(&recorded),
+            "Backup FAILED: snapshots created: 2, sent: 3, 0 B in 7s\n\
+             recovery OS OK: nothing needs attention\n"
         );
     }
 
@@ -3283,6 +3404,85 @@ mod tests {
             _ => panic!("parsed as something other than recovery-os hold-disk"),
         }
         assert!(Cli::try_parse_from(["btrdasd", "recovery-os", "hold-disk"]).is_err());
+    }
+
+    #[test]
+    fn recovery_os_record_takes_labels_and_a_config() {
+        let parsed = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::RecoveryOs {
+                action: RecoveryOsAction::Record { config, labels },
+            } => (config, labels),
+            _ => panic!("parsed as something other than recovery-os record"),
+        };
+        assert_eq!(
+            parsed(&["btrdasd", "recovery-os", "record"]),
+            (PathBuf::from(DEFAULT_CONFIG), Vec::<String>::new())
+        );
+        assert_eq!(
+            parsed(&[
+                "btrdasd",
+                "recovery-os",
+                "record",
+                "--config",
+                "/c.toml",
+                "A",
+                "B"
+            ]),
+            (
+                PathBuf::from("/c.toml"),
+                vec!["A".to_string(), "B".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_os_record_prints_the_section_and_its_verdict_or_why_not() {
+        use buttered_dasd::recovery_os::{RecordStatus, Recording};
+        let recording = Recording {
+            status: RecordStatus::Warn,
+            detail: "stale — see RECOVERY OS in the report".into(),
+            section: "RECOVERY OS\n  A  not mounted\n".into(),
+            entries: Vec::new(),
+        };
+        let ran = |still: Vec<String>| backup::RecordOutcome::Ran {
+            recording: recording.clone(),
+            not_mounted: vec!["B".into()],
+            still_mounted: still,
+        };
+        assert_eq!(
+            record_outcome_text(&ran(Vec::new()), false),
+            (
+                "RECOVERY OS\n  A  not mounted\nRecovery OS: WARN  (stale — see RECOVERY OS in the report)\n"
+                    .to_string(),
+                String::new()
+            )
+        );
+        let (out, err) = record_outcome_text(&ran(vec!["/mnt/a".into()]), true);
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["status"], "WARN");
+        assert_eq!(doc["detail"], "stale — see RECOVERY OS in the report");
+        assert_eq!(doc["not_mounted"], serde_json::json!(["B"]));
+        assert_eq!(doc["still_mounted"], serde_json::json!(["/mnt/a"]));
+        assert_eq!(doc["drives"], serde_json::json!([]));
+        assert!(
+            err.starts_with("Error: ") && err.contains("/mnt/a"),
+            "{err}"
+        );
+        assert_eq!(
+            record_outcome_text(&backup::RecordOutcome::CouldNotStart("x".into()), false),
+            (String::new(), "Error: x\n".to_string())
+        );
+        assert_eq!(
+            record_outcome_text(&backup::RecordOutcome::Aborted("y".into()), true),
+            (String::new(), "Error: y\n".to_string())
+        );
+        assert_eq!(
+            record_outcome_text(&backup::RecordOutcome::Deferred("held".into()), false),
+            (
+                String::new(),
+                "Deferred — held; nothing was mounted (exit 75)\n".to_string()
+            )
+        );
     }
 
     /// An internal helper: documented in the man page, not offered in help.

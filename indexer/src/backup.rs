@@ -7,6 +7,7 @@ use crate::indexer;
 use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback, cut_short, stop_requested};
+use crate::recovery_os::{self, RecordStatus};
 use crate::scrub;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -402,6 +403,73 @@ impl BootStep {
     }
 }
 
+/// What a recovery-OS failure is prefixed with in a run's `errors`.
+pub const RECOVERY_OS_ERROR_PREFIX: &str = "Recovery OS: ";
+
+/// The recovery-OS step of a run: each `role = "mirror"` target the run
+/// selected is read and its record in the state file written again, after
+/// btrbk and while the targets are mounted — what `backup-run.sh`'s
+/// `check_recovery_os` does, so a manual backup (CLI or GUI) clears a record
+/// a VM session made out of date as the nightly one does (bd
+/// DAS-Backup-Manager-58c8). `FAIL` fails the run; `WARN` does not.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecoveryOsStep {
+    /// No `role = "mirror"` target among the run's targets, or a dry run.
+    NotSelected,
+    /// A recovery drive was selected, and the job was cancelled before the
+    /// step.
+    Cancelled,
+    Ran(Box<recovery_os::Recording>),
+}
+
+impl RecoveryOsStep {
+    fn status(&self) -> Option<RecordStatus> {
+        match self {
+            Self::Ran(r) => Some(r.status),
+            _ => None,
+        }
+    }
+
+    /// Whether the step ran and found a drive that needs attention.
+    pub fn has_warnings(&self) -> bool {
+        self.status() == Some(RecordStatus::Warn)
+    }
+
+    /// Whether the step ran and could not be done.
+    pub fn failed(&self) -> bool {
+        self.status() == Some(RecordStatus::Fail)
+    }
+
+    /// The report's `Recovery OS` cell, as `backup-run.sh` fills it.
+    pub fn row(&self) -> String {
+        match self {
+            Self::NotSelected => "N/A  (no recovery drive in this run)".into(),
+            Self::Cancelled => "N/A  (cancelled — not run)".into(),
+            Self::Ran(r) => format!("{}  ({})", r.status.word(), r.detail),
+        }
+    }
+
+    /// The line the GUI's job-end text carries for the step: whether the
+    /// recovery OSes were recorded, and what was found. Empty when it did
+    /// not run.
+    pub fn message_line(&self) -> String {
+        match self {
+            Self::Ran(r) => format!("recovery OS {}: {}", r.status.word(), r.detail),
+            _ => String::new(),
+        }
+    }
+}
+
+/// `config` with only its `role = "mirror"` targets among `labels`: the
+/// recovery drives a run selected. `None` when it selected none.
+fn recovery_drives(config: &Config, labels: &[String]) -> Option<Config> {
+    let mut drives = config.clone();
+    drives
+        .targets
+        .retain(|t| t.role == TargetRole::Mirror && labels.contains(&t.label));
+    (!drives.targets.is_empty()).then_some(drives)
+}
+
 /// Result of a completed backup run.
 #[derive(Debug)]
 pub struct BackupResult {
@@ -417,6 +485,7 @@ pub struct BackupResult {
     pub snapshots_cleaned: usize,
     pub bytes_sent: u64,
     pub boot: BootStep,
+    pub recovery_os: RecoveryOsStep,
     pub indexed: bool,
     pub report_sent: bool,
     pub errors: Vec<String>,
@@ -627,6 +696,21 @@ struct StepEnv<'a> {
     /// Index the snapshots now on the mounted targets; whether any target was
     /// indexed ([`index_mounted_targets`]).
     index: &'a IndexTargets<'a>,
+    /// Read the recovery OSes on the mirror targets of the config it is
+    /// handed and record them in the state file
+    /// ([`record_recovery_os`]).
+    recovery_os: &'a RecordRecoveryOs<'a>,
+}
+
+/// The step behind [`StepEnv::recovery_os`].
+type RecordRecoveryOs<'a> = dyn Fn(&Config, &dyn ProgressCallback) -> recovery_os::Recording + 'a;
+
+/// [`recovery_os::record`] into the production state file, each per-drive
+/// note logged. What [`StepEnv::HOST`] runs.
+fn record_recovery_os(config: &Config, progress: &dyn ProgressCallback) -> recovery_os::Recording {
+    recovery_os::record(config, &recovery_os::state_path(), &mut |n| {
+        progress.on_log(LogLevel::Info, &format!("recovery-os: {n}"));
+    })
 }
 
 /// The step behind [`StepEnv::index`].
@@ -647,6 +731,7 @@ impl StepEnv<'static> {
         is_mountpoint: &health::is_mountpoint,
         usage: &synced_target_usage,
         index: &index_mounted_targets,
+        recovery_os: &record_recovery_os,
     };
 }
 
@@ -2410,7 +2495,14 @@ fn run_pipeline(
                 done.sent = None;
                 done.failed(
                     progress,
-                    cancelled_line("the snapshot step", &not_done_after_btrbk(options, true)),
+                    cancelled_line(
+                        "the snapshot step",
+                        &not_done_after_btrbk(
+                            options,
+                            true,
+                            recovery_drives(config, targets).is_some(),
+                        ),
+                    ),
                 );
             } else {
                 send(&mut done);
@@ -2595,6 +2687,16 @@ fn run_backup_with(
             };
             progress.on_log(LogLevel::Info, &format!("DRY RUN ({mode}): {what}"));
         }
+        if let Some(drives) = recovery_drives(config, &effective_targets) {
+            let labels: Vec<&str> = drives.targets.iter().map(|t| t.label.as_str()).collect();
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "DRY RUN ({mode}): would record the recovery OSes of {}",
+                    labels.join(", ")
+                ),
+            );
+        }
         if options.index_after {
             progress.on_log(
                 LogLevel::Info,
@@ -2622,6 +2724,7 @@ fn run_backup_with(
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot: BootStep::NotSelected,
+            recovery_os: RecoveryOsStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors,
@@ -2701,13 +2804,31 @@ fn run_backup_with(
         bytes_sent = usage_after.saturating_sub(usage_before);
     }
 
+    // Recovery OSes — after btrbk, while the targets are mounted, as
+    // backup-run.sh's check_recovery_os runs after btrbk and expiry: read
+    // each selected mirror target's own OS and record it, so a manual backup
+    // clears a record a VM session made out of date (bd DAS-Backup-Manager-58c8).
+    // FAIL fails the run; a stale drive or a WARNING row only warns.
+    let recovery_os = recovery_os_step(config, &effective_targets, done_cancelled, progress, env);
+    if recovery_os.failed()
+        && let RecoveryOsStep::Ran(r) = &recovery_os
+    {
+        errors.push(format!("{RECOVERY_OS_ERROR_PREFIX}{}", r.detail));
+    }
+    // What the boundaries below were reached after.
+    let after_btrbk = if matches!(recovery_os, RecoveryOsStep::Ran(_)) {
+        "the recovery OS record"
+    } else {
+        "btrbk"
+    };
+
     // Step (c): boot subvolumes — create a missing one on every run, archive
     // and replace on a full run, as backup-run.sh's update_boot_subvolumes does
     // (bd woq, dtm). A failure fails the run; an absence only warns.
     // A boundary: btrbk is done, the boot step not begun (the index has its own).
     let cancelled = options.boot_archive && !done_cancelled && stop_requested(progress);
     if cancelled {
-        let msg = cancelled_line("btrbk", &not_done_after_btrbk(options, false));
+        let msg = cancelled_line(after_btrbk, &not_done_after_btrbk(options, false, false));
         progress.on_log(LogLevel::Error, &msg);
         errors.push(msg);
     }
@@ -2736,7 +2857,7 @@ fn run_backup_with(
             let done = if options.boot_archive {
                 "the boot subvolume step"
             } else {
-                "btrbk"
+                after_btrbk
             };
             let msg = cancelled_line(done, "index");
             progress.on_log(LogLevel::Error, &msg);
@@ -2758,6 +2879,7 @@ fn run_backup_with(
         snapshots_cleaned,
         bytes_sent,
         boot,
+        recovery_os,
         indexed,
         report_sent: false,
         errors,
@@ -2765,6 +2887,45 @@ fn run_backup_with(
     };
 
     Ok(result)
+}
+
+/// The recovery-OS step of a live run over `targets`: not selected when none
+/// of them is a `role = "mirror"` target, cancelled when the btrbk steps
+/// were cut short, else [`StepEnv::recovery_os`] over the selected drives
+/// only — a drive the run did not select keeps its earlier record. Logged at
+/// the level of its outcome, with its section.
+fn recovery_os_step(
+    config: &Config,
+    targets: &[String],
+    cancelled: bool,
+    progress: &dyn ProgressCallback,
+    env: &StepEnv,
+) -> RecoveryOsStep {
+    let Some(drives) = recovery_drives(config, targets) else {
+        return RecoveryOsStep::NotSelected;
+    };
+    if cancelled {
+        return RecoveryOsStep::Cancelled;
+    }
+    progress.on_log(LogLevel::Info, "Recording the recovery OSes...");
+    let recording = (env.recovery_os)(&drives, progress);
+    let level = match recording.status {
+        RecordStatus::Ok => LogLevel::Info,
+        RecordStatus::Warn => LogLevel::Warning,
+        RecordStatus::Fail => LogLevel::Error,
+    };
+    progress.on_log(
+        level,
+        &format!(
+            "Recovery OS: {} — {}",
+            recording.status.word(),
+            recording.detail
+        ),
+    );
+    for line in recording.section.lines() {
+        progress.on_log(LogLevel::Info, &format!("  {line}"));
+    }
+    RecoveryOsStep::Ran(Box::new(recording))
 }
 
 /// The one-line outcome of a backup run, as the CLI prints it and the GUI
@@ -3005,15 +3166,18 @@ impl BackupJobOutcome {
             Self::CouldNotStart(why) | Self::Aborted(why) => (false, why.clone()),
             Self::Ran(result) => {
                 let mut line = backup_summary(result, dry_run);
-                // A dry run changes nothing, so its boot step has nothing to add.
-                let messages = if dry_run {
-                    String::new()
-                } else {
-                    result.boot.message_lines()
-                };
-                if !messages.is_empty() {
-                    line.push('\n');
-                    line.push_str(&messages);
+                // A dry run changes nothing, so its boot step has nothing to
+                // add, and it records no recovery OS.
+                if !dry_run {
+                    for messages in [
+                        result.recovery_os.message_line(),
+                        result.boot.message_lines(),
+                    ] {
+                        if !messages.is_empty() {
+                            line.push('\n');
+                            line.push_str(&messages);
+                        }
+                    }
                 }
                 (result.success, line)
             }
@@ -3036,11 +3200,15 @@ pub fn cancelled_line(done: &str, not_done: &str) -> String {
 }
 
 /// The selected steps a run skips when it stops after its btrbk step (or,
-/// `with_send`, after the snapshot half of it).
-fn not_done_after_btrbk(options: &BackupOptions, with_send: bool) -> String {
+/// `with_send`, after the snapshot half of it); `recovery_os` when the
+/// recovery-OS step was due and has not run.
+fn not_done_after_btrbk(options: &BackupOptions, with_send: bool, recovery_os: bool) -> String {
     let mut steps = Vec::new();
     if with_send {
         steps.push("send");
+    }
+    if recovery_os {
+        steps.push("recovery OS record");
     }
     if options.boot_archive {
         steps.push("boot subvolumes");
@@ -3102,6 +3270,7 @@ fn abort_job(
         snapshots_cleaned: 0,
         bytes_sent: 0,
         boot: BootStep::NotSelected,
+        recovery_os: RecoveryOsStep::NotSelected,
         indexed: false,
         report_sent: false,
         errors: vec![why.clone()],
@@ -3361,6 +3530,241 @@ impl BackupJobHost for SystemBackupHost {
         crate::report::record_backup_run(&db, result)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `btrdasd recovery-os record` — the recovery-OS step without a backup
+// (bd DAS-Backup-Manager-58c8)
+// ---------------------------------------------------------------------------
+
+/// The recovery drives `btrdasd recovery-os record` is asked for: every
+/// `role = "mirror"` target when `labels` is empty, else exactly those, in
+/// config order. A label the config does not have, or one that names a
+/// target that is no recovery drive, is refused — before the first lock.
+pub fn record_selection(config: &Config, labels: &[String]) -> Result<Config, String> {
+    for label in labels {
+        match config.targets.iter().find(|t| &t.label == label) {
+            None => return Err(format!("no target '{label}' in the configuration")),
+            Some(t) if t.role != TargetRole::Mirror => {
+                return Err(format!(
+                    "target '{label}' is not a recovery drive (role = \"mirror\")"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    let wanted: Vec<String> = if labels.is_empty() {
+        config.targets.iter().map(|t| t.label.clone()).collect()
+    } else {
+        labels.to_vec()
+    };
+    recovery_drives(config, &wanted)
+        .ok_or_else(|| "no role = \"mirror\" target in the configuration".to_string())
+}
+
+/// Take the locks `recovery-os record` holds: the backup singleton, then the
+/// maintenance lock — that order, as every job takes them — neither waited
+/// for. `Ok(Err(why))` when either is held: a backup that is running records
+/// the drives it mounted itself, and a scrub, a doctor or a recovery-drive
+/// session must not have a drive mounted under it.
+pub fn try_record_locks_at(
+    singleton_path: &Path,
+    maintenance_path: &Path,
+    job: &str,
+) -> Result<Result<Box<dyn HoldsMaintenance>, String>, scrub::ScrubError> {
+    let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
+        return Ok(Err(format!(
+            "a backup is running ({} is held); it records the recovery drives it mounts",
+            singleton_path.display()
+        )));
+    };
+    let Some(maintenance) = MaintenanceHeld::try_acquire_at(maintenance_path, job)? else {
+        return Ok(Err(format!(
+            "the DAS maintenance lock {} is held by {}",
+            maintenance_path.display(),
+            crate::maintenance::holder_of(maintenance_path)
+        )));
+    };
+    Ok(Ok(Box::new(BackupLocks {
+        maintenance,
+        _singleton: singleton,
+    })))
+}
+
+/// The host-facing steps of `recovery-os record`. [`record_recovery_os_job`]
+/// decides the order and what each outcome means; [`SystemRecordHost`] does
+/// each for real, and tests script them.
+pub trait RecordHost {
+    /// `Ok(Err(why))`: another job holds a lock, and nothing was taken.
+    #[allow(clippy::type_complexity)]
+    fn acquire_locks(&self) -> Result<Result<Box<dyn HoldsMaintenance>, String>, String>;
+    fn mount_targets(
+        &self,
+        drives: &Config,
+        progress: &dyn ProgressCallback,
+        held: &MaintenanceHeld,
+    ) -> Result<Box<dyn Release>, String>;
+    /// Whether a target's mount point is a mount point now.
+    fn is_mounted(&self, mount: &Path) -> bool;
+    /// Refuse unless each target in `labels` is mounted from the filesystem
+    /// it must be ([`mount::verify_write_targets`]).
+    fn verify(
+        &self,
+        drives: &Config,
+        labels: &[String],
+        progress: &dyn ProgressCallback,
+    ) -> Result<(), String>;
+    /// Read the drives' OSes and write the state file.
+    fn record(&self, drives: &Config, progress: &dyn ProgressCallback) -> recovery_os::Recording;
+}
+
+/// How `recovery-os record` ended.
+#[derive(Debug)]
+pub enum RecordOutcome {
+    /// Refused before any lock: an unknown label, or none to record.
+    CouldNotStart(String),
+    /// A lock was held: nothing was mounted or written.
+    Deferred(String),
+    /// It began and stopped on a drive's state — none would mount, or one
+    /// is not the filesystem it must be — and recorded nothing.
+    Aborted(String),
+    /// The drives that mounted were read, and the record written (unless
+    /// the recording says it could not be).
+    Ran {
+        recording: recovery_os::Recording,
+        /// Asked for, and not mounted: its earlier record is kept.
+        not_mounted: Vec<String>,
+        /// Mounted by this command and left mounted.
+        still_mounted: Vec<String>,
+    },
+}
+
+impl RecordOutcome {
+    /// The doctor's rule, as `backup run` keeps it: **0** every drive asked
+    /// for was recorded (a stale one, or a WARNING, is a finding, not a
+    /// failure); **75** deferred, a lock was held (`EX_TEMPFAIL`, as `walk
+    /// --no-wait` and `setup` exit); **1** could not start; **3** it began
+    /// and a drive was not mounted, not read, not recorded, or left mounted.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::CouldNotStart(_) => 1,
+            Self::Deferred(_) => crate::maintenance::DEFERRED_EXIT_CODE,
+            Self::Aborted(_) => 3,
+            Self::Ran {
+                recording,
+                not_mounted,
+                still_mounted,
+            } => {
+                if recording.status == RecordStatus::Fail
+                    || !not_mounted.is_empty()
+                    || !still_mounted.is_empty()
+                {
+                    3
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// `btrdasd recovery-os record`: refuse an unknown label, take the backup
+/// singleton and the maintenance lock (defer if either is held), mount the
+/// recovery drives asked for, check each mounted one is the filesystem it
+/// must be, read and record them, and unmount exactly what was mounted.
+pub fn record_recovery_os_job(
+    host: &dyn RecordHost,
+    config: &Config,
+    labels: &[String],
+    progress: &dyn ProgressCallback,
+) -> RecordOutcome {
+    let drives = match record_selection(config, labels) {
+        Ok(drives) => drives,
+        Err(why) => return RecordOutcome::CouldNotStart(why),
+    };
+    let locks = match host.acquire_locks() {
+        Ok(Ok(locks)) => locks,
+        Ok(Err(why)) => return RecordOutcome::Deferred(why),
+        Err(e) => return RecordOutcome::CouldNotStart(format!("could not take the locks: {e}")),
+    };
+    let mut guard = match host.mount_targets(&drives, progress, locks.maintenance()) {
+        Ok(guard) => guard,
+        Err(e) => return RecordOutcome::Aborted(format!("Mount failed: {e}")),
+    };
+    let (mut mounted, mut not_mounted) = (Vec::new(), Vec::new());
+    for t in &drives.targets {
+        if host.is_mounted(Path::new(&t.mount)) {
+            mounted.push(t.label.clone());
+        } else {
+            not_mounted.push(t.label.clone());
+        }
+    }
+    let refusal = if mounted.is_empty() {
+        Some(format!(
+            "no recovery drive is mounted (not mounted: {})",
+            not_mounted.join(", ")
+        ))
+    } else {
+        host.verify(&drives, &mounted, progress)
+            .err()
+            .map(|e| format!("refusing to record: {e}"))
+    };
+    if let Some(why) = refusal {
+        let still = guard.release(progress);
+        return RecordOutcome::Aborted(with_still_mounted(why, &still));
+    }
+    let recording = host.record(&drives, progress);
+    let still_mounted = guard.release(progress);
+    RecordOutcome::Ran {
+        recording,
+        not_mounted,
+        still_mounted,
+    }
+}
+
+/// [`RecordHost`] on this machine.
+pub struct SystemRecordHost {
+    /// Recorded in the maintenance lock file as its holder.
+    pub job: String,
+}
+
+impl RecordHost for SystemRecordHost {
+    fn acquire_locks(&self) -> Result<Result<Box<dyn HoldsMaintenance>, String>, String> {
+        try_record_locks_at(
+            Path::new(BACKUP_LOCK_PATH),
+            Path::new(scrub::MAINTENANCE_LOCK_PATH),
+            &self.job,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn mount_targets(
+        &self,
+        drives: &Config,
+        progress: &dyn ProgressCallback,
+        held: &MaintenanceHeld,
+    ) -> Result<Box<dyn Release>, String> {
+        mount::ensure_targets_mounted(drives, progress, held)
+            .map(|guard| Box::new(guard) as Box<dyn Release>)
+            .map_err(|e| e.to_string())
+    }
+
+    fn is_mounted(&self, mount: &Path) -> bool {
+        health::is_mountpoint(mount)
+    }
+
+    fn verify(
+        &self,
+        drives: &Config,
+        labels: &[String],
+        progress: &dyn ProgressCallback,
+    ) -> Result<(), String> {
+        mount::verify_write_targets(&drives.targets, labels, progress)
+    }
+
+    fn record(&self, drives: &Config, progress: &dyn ProgressCallback) -> recovery_os::Recording {
+        record_recovery_os(drives, progress)
     }
 }
 
@@ -6063,6 +6467,7 @@ mod tests {
             is_mountpoint: &|_| true,
             usage: &|_, _| 0,
             index: &|_, _| false,
+            recovery_os: &|_, _| quiet_recording(),
         }
     }
 
@@ -8626,6 +9031,7 @@ mod tests {
             snapshots_cleaned: r.snapshots_cleaned,
             bytes_sent: r.bytes_sent,
             boot: r.boot.clone(),
+            recovery_os: r.recovery_os.clone(),
             indexed: r.indexed,
             report_sent: r.report_sent,
             errors: r.errors.clone(),
@@ -8714,6 +9120,7 @@ mod tests {
                 snapshots_cleaned: 0,
                 bytes_sent: 10,
                 boot: BootStep::NotSelected,
+                recovery_os: RecoveryOsStep::NotSelected,
                 indexed: true,
                 report_sent: false,
                 errors,
@@ -9681,6 +10088,7 @@ mod tests {
                 updated: 1,
                 ..Default::default()
             }),
+            recovery_os: RecoveryOsStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: if success {
@@ -10164,5 +10572,718 @@ mod tests {
         let (config, _) = host.sync(&before, true, &progress);
         assert_ne!(config.general.version, "before");
         assert_eq!(config.sources[0].volume, "/ssd");
+    }
+
+    // -- the recovery-OS step and `recovery-os record` (bd 58c8) ------------
+
+    /// A recording with nothing in it: what [`env_for`]'s step returns.
+    fn quiet_recording() -> recovery_os::Recording {
+        recording(RecordStatus::Ok, "nothing inspected")
+    }
+
+    fn recording(status: RecordStatus, detail: &str) -> recovery_os::Recording {
+        recovery_os::Recording {
+            status,
+            detail: detail.into(),
+            section: format!("RECOVERY OS\n  marker-{}\n", status.word()),
+            entries: Vec::new(),
+        }
+    }
+
+    /// `live_config` with its `recovery` target a recovery drive mounted at
+    /// `/proc`, as the primary is, so its target directory exists.
+    fn mirror_live_config() -> Config {
+        let mut config = live_config();
+        let recovery = config.targets.last_mut().unwrap();
+        recovery.role = TargetRole::Mirror;
+        recovery.mount = "/proc".into();
+        config
+    }
+
+    /// The btrbk script of a clean incremental run of `options` over `config`.
+    fn clean_run_script(config: &Config, options: &BackupOptions) -> Vec<(String, i32, String)> {
+        let sources = effective_sources(config, options).unwrap();
+        let targets = effective_targets(config, options).unwrap();
+        let f = btrbk_filters(config, Some(&sources), Some(&targets), &TestProgress::new())
+            .unwrap()
+            .join(" ");
+        let conf = &config.general.btrbk_conf;
+        vec![
+            (btrbk_at(conf, &format!("snapshot {f}")), 0, String::new()),
+            (
+                btrbk_at(conf, &format!("resume {f}")),
+                0,
+                ">>> /t/a.1\n".into(),
+            ),
+            (
+                btrbk_at(conf, &format!("--format=raw list latest {f}")),
+                0,
+                raw_row("/s/a.1", "/t/a.1"),
+            ),
+        ]
+    }
+
+    fn both_targets() -> BackupOptions {
+        BackupOptions {
+            targets: Some(labels(&["primary-22tb", "recovery"])),
+            ..live_options()
+        }
+    }
+
+    /// A live run of `options` over `mirror_live_config` whose recovery-OS
+    /// step answers `answer`: the result, and for each call of the step the
+    /// labels of the targets it was handed and whether every btrbk command
+    /// had run by then.
+    fn run_recording(
+        options: &BackupOptions,
+        answer: recovery_os::Recording,
+    ) -> (BackupResult, Vec<(Vec<String>, bool)>, TestProgress) {
+        let config = mirror_live_config();
+        let runner = Scripted::from_owned(clean_run_script(&config, options));
+        let asked = std::sync::Mutex::new(Vec::new());
+        let step = |drives: &Config, _: &dyn ProgressCallback| {
+            let handed = drives.targets.iter().map(|t| t.label.clone()).collect();
+            asked.lock().unwrap().push((handed, runner.calls().len()));
+            answer.clone()
+        };
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+        let env = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            recovery_os: &step,
+            ..env(&runner)
+        };
+        let progress = TestProgress::new();
+        let result = run_backup_with(&config, options, &progress, &env).unwrap();
+        let total = runner.calls().len();
+        assert!(total >= 3, "{:?}", runner.calls());
+        let asked = asked
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|(handed, at)| (handed, at == total))
+            .collect();
+        (result, asked, progress)
+    }
+
+    #[test]
+    fn a_live_run_records_the_recovery_drive_it_selected_after_btrbk() {
+        let (result, asked, progress) = run_recording(
+            &both_targets(),
+            recording(RecordStatus::Ok, "nothing needs attention"),
+        );
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!(
+            asked,
+            vec![(labels(&["recovery"]), true)],
+            "once, the selected recovery drive only, after every btrbk command"
+        );
+        assert_eq!(result.recovery_os.row(), "OK  (nothing needs attention)");
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "Recovery OS: OK — nothing needs attention"
+        ));
+        assert!(
+            logged(&progress, LogLevel::Info, "    marker-OK"),
+            "the section is logged"
+        );
+        let (ok, line) = BackupJobOutcome::Ran(result).finish_line(false);
+        assert!(ok);
+        assert!(
+            line.ends_with("\nrecovery OS OK: nothing needs attention"),
+            "the GUI is told the record was made: {line}"
+        );
+    }
+
+    #[test]
+    fn a_recovery_os_needing_attention_warns_and_the_run_still_succeeds() {
+        let detail = "stale — see RECOVERY OS in the report";
+        let (result, _, progress) =
+            run_recording(&both_targets(), recording(RecordStatus::Warn, detail));
+        assert!(
+            result.success,
+            "a WARN is not a failure: {:?}",
+            result.errors
+        );
+        assert!(result.recovery_os.has_warnings());
+        assert!(!result.recovery_os.failed());
+        assert!(logged(
+            &progress,
+            LogLevel::Warning,
+            &format!("Recovery OS: WARN — {detail}")
+        ));
+        let data = crate::report::ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+        };
+        let report = crate::report::format_report_from(&result, None, &data);
+        assert!(
+            report.contains("Status: COMPLETED WITH WARNINGS"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("  Recovery OS           WARN  ({detail})\n")),
+            "{report}"
+        );
+        assert!(
+            report.contains("\nRECOVERY OS\n  marker-WARN\n"),
+            "{report}"
+        );
+        assert!(report.contains("btrbk send/receive    OK"), "{report}");
+    }
+
+    #[test]
+    fn a_recovery_os_check_that_could_not_be_done_fails_the_run_but_not_btrbk() {
+        let detail = "recovery could not be read: not a directory";
+        let (result, _, progress) =
+            run_recording(&both_targets(), recording(RecordStatus::Fail, detail));
+        assert!(!result.success);
+        assert!(result.recovery_os.failed());
+        assert!(!result.recovery_os.has_warnings());
+        assert_eq!(result.errors, vec![format!("Recovery OS: {detail}")]);
+        assert!(logged(
+            &progress,
+            LogLevel::Error,
+            &format!("Recovery OS: FAIL — {detail}")
+        ));
+        let data = crate::report::ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+        };
+        let report = crate::report::format_report_from(&result, None, &data);
+        assert!(report.contains("Status: FAILURES DETECTED"), "{report}");
+        assert!(
+            report.contains("btrbk send/receive    OK"),
+            "a recovery-OS failure is not btrbk's: {report}"
+        );
+        let outcome = BackupJobOutcome::Ran(result);
+        assert_eq!(outcome.exit_code(), 3);
+        assert!(
+            outcome
+                .finish_line(false)
+                .1
+                .contains(&format!("\nrecovery OS FAIL: {detail}"))
+        );
+    }
+
+    #[test]
+    fn a_run_that_selected_no_recovery_drive_reads_none() {
+        let (result, asked, _) = run_recording(&live_options(), quiet_recording());
+        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(result.recovery_os, RecoveryOsStep::NotSelected);
+        assert_eq!(
+            result.recovery_os.row(),
+            "N/A  (no recovery drive in this run)"
+        );
+        assert_eq!(result.recovery_os.message_line(), "");
+        let (_, line) = BackupJobOutcome::Ran(result).finish_line(false);
+        assert!(!line.contains("recovery OS"), "{line}");
+    }
+
+    #[test]
+    fn a_dry_run_says_it_would_record_the_recovery_drive_and_reads_nothing() {
+        let config = mirror_live_config();
+        let runner = Scripted::from_owned(vec![]);
+        let asked = std::cell::Cell::new(0);
+        let step = |_: &Config, _: &dyn ProgressCallback| {
+            asked.set(asked.get() + 1);
+            quiet_recording()
+        };
+        let env = StepEnv {
+            recovery_os: &step,
+            ..env(&runner)
+        };
+        let progress = TestProgress::new();
+        let options = BackupOptions {
+            dry_run: true,
+            ..both_targets()
+        };
+        let result = run_backup_with(&config, &options, &progress, &env).unwrap();
+        assert_eq!(asked.get(), 0);
+        assert_eq!(result.recovery_os, RecoveryOsStep::NotSelected);
+        assert!(logged(
+            &progress,
+            LogLevel::Info,
+            "DRY RUN (incremental): would record the recovery OSes of recovery"
+        ));
+        // The counter-case: no recovery drive selected, nothing said.
+        let progress = TestProgress::new();
+        let options = BackupOptions {
+            dry_run: true,
+            ..live_options()
+        };
+        run_backup_with(&config, &options, &progress, &env).unwrap();
+        assert!(
+            !progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, m)| m.contains("recovery OSes")),
+        );
+    }
+
+    #[test]
+    fn a_cancel_after_btrbk_names_the_recovery_os_record_as_done() {
+        let config = mirror_live_config();
+        let runner = Scripted::from_owned(vec![]);
+        let env = env(&runner);
+        for (boot_archive, want) in [
+            (
+                true,
+                "cancelled after the recovery OS record; not done: boot subvolumes, index",
+            ),
+            (
+                false,
+                "cancelled after the recovery OS record; not done: index",
+            ),
+        ] {
+            let progress = TestProgress::cancellable();
+            progress.cancel.as_ref().unwrap().cancel();
+            let options = BackupOptions {
+                steps: BtrbkSteps::SendOnly,
+                boot_archive,
+                index_after: true,
+                ..both_targets()
+            };
+            let result = run_backup_with(&config, &options, &progress, &env).unwrap();
+            assert!(
+                matches!(result.recovery_os, RecoveryOsStep::Ran(_)),
+                "it ran before the boundary"
+            );
+            assert!(
+                result.errors.contains(&want.to_string()),
+                "{:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_snapshot_step_leaves_the_recovery_os_record_not_done() {
+        let mut config = steps_config();
+        config.targets[1].role = TargetRole::Mirror;
+        let sources = labels(&["nvme-root", "nvme-vm", "hdd"]);
+        let both = labels(&["primary-22tb", "recovery"]);
+        let f = btrbk_filters(&config, Some(&sources), Some(&both), &TestProgress::new())
+            .unwrap()
+            .join(" ");
+        // The snapshot step answers or fails, whichever: the cancel is the point.
+        let scripted =
+            Scripted::from_owned(vec![(btrbk(&format!("snapshot {f}")), 0, String::new())]);
+        let progress = TestProgress::cancellable();
+        let runner = CancelDuringSnapshot {
+            inner: &scripted,
+            token: progress.cancel.as_ref().unwrap(),
+        };
+        let options = BackupOptions {
+            index_after: true,
+            ..Default::default()
+        };
+        let done = run_pipeline(
+            &config,
+            &options,
+            BackupMode::Incremental,
+            &sources,
+            &both,
+            &progress,
+            &env(&runner),
+        );
+        assert_eq!(
+            done.errors.last().map(String::as_str),
+            Some("cancelled after the snapshot step; not done: send, recovery OS record, index"),
+            "{:?}",
+            done.errors
+        );
+        // And the step itself is then cancelled, not run.
+        let asked = std::cell::Cell::new(0);
+        let step = |_: &Config, _: &dyn ProgressCallback| {
+            asked.set(asked.get() + 1);
+            quiet_recording()
+        };
+        let env = StepEnv {
+            recovery_os: &step,
+            ..env(&scripted)
+        };
+        let progress = TestProgress::new();
+        assert_eq!(
+            recovery_os_step(&config, &both, true, &progress, &env),
+            RecoveryOsStep::Cancelled
+        );
+        assert_eq!(
+            RecoveryOsStep::Cancelled.row(),
+            "N/A  (cancelled — not run)"
+        );
+        assert_eq!(RecoveryOsStep::Cancelled.message_line(), "");
+        assert_eq!(asked.get(), 0);
+        assert!(matches!(
+            recovery_os_step(&config, &both, false, &progress, &env),
+            RecoveryOsStep::Ran(_)
+        ));
+        assert_eq!(asked.get(), 1);
+    }
+
+    // -- recovery-os record ---------------------------------------------------
+
+    /// `mirror_live_config` with a second recovery drive, `other`.
+    fn two_drive_config() -> Config {
+        let mut config = mirror_live_config();
+        let mut other = config.targets.last().unwrap().clone();
+        other.label = "other".into();
+        other.mount = "/nonexistent/das/other".into();
+        config.targets.push(other);
+        config
+    }
+
+    fn target_labels(config: &Config) -> Vec<String> {
+        config.targets.iter().map(|t| t.label.clone()).collect()
+    }
+
+    #[test]
+    fn record_selects_every_recovery_drive_or_exactly_those_named() {
+        let config = two_drive_config();
+        let all = record_selection(&config, &[]).unwrap();
+        assert_eq!(target_labels(&all), labels(&["recovery", "other"]));
+        let one = record_selection(&config, &labels(&["other"])).unwrap();
+        assert_eq!(target_labels(&one), labels(&["other"]));
+        // Config order, whatever the order asked.
+        let both = record_selection(&config, &labels(&["other", "recovery"])).unwrap();
+        assert_eq!(target_labels(&both), labels(&["recovery", "other"]));
+        assert_eq!(
+            record_selection(&config, &labels(&["recovery", "nope"])).unwrap_err(),
+            "no target 'nope' in the configuration"
+        );
+        assert_eq!(
+            record_selection(&config, &labels(&["primary-22tb"])).unwrap_err(),
+            "target 'primary-22tb' is not a recovery drive (role = \"mirror\")"
+        );
+        assert_eq!(
+            record_selection(&live_config(), &[]).unwrap_err(),
+            "no role = \"mirror\" target in the configuration"
+        );
+    }
+
+    #[test]
+    fn record_locks_take_the_backup_lock_then_maintenance_and_wait_for_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("das-backup.lock");
+        let maint = dir.path().join("das-maintenance.lock");
+        let held = try_record_locks_at(&single, &maint, "test")
+            .unwrap()
+            .unwrap();
+        // Both held: a second one defers on the backup lock, and never
+        // reaches the maintenance lock.
+        let why = try_record_locks_at(&single, &maint, "test")
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(why.starts_with("a backup is running ("), "{why}");
+        drop(held);
+        // The maintenance lock alone held (a scrub): defers on it, naming it,
+        // and lets the backup lock go again.
+        let scrub = MaintenanceHeld::try_acquire_at(&maint, "scrub")
+            .unwrap()
+            .unwrap();
+        let why = try_record_locks_at(&single, &maint, "test")
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(
+            why.starts_with(&format!(
+                "the DAS maintenance lock {} is held by",
+                maint.display()
+            )),
+            "{why}"
+        );
+        assert!(
+            scrub::FileLock::try_acquire(&single).unwrap().is_some(),
+            "the backup lock was let go"
+        );
+        // The backup lock alone held (a backup): the maintenance lock is
+        // never touched.
+        drop(scrub);
+        let backup = scrub::FileLock::try_acquire(&single).unwrap().unwrap();
+        assert!(
+            try_record_locks_at(&single, &maint, "test")
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            MaintenanceHeld::try_acquire_at(&maint, "x")
+                .unwrap()
+                .is_some(),
+            "the maintenance lock was never taken"
+        );
+        drop(backup);
+        assert!(
+            try_record_locks_at(&single, &maint, "test")
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    /// A scripted [`RecordHost`]: what it was asked, in order.
+    struct FakeRecordHost {
+        locks: Result<Result<(), String>, String>,
+        mount: Result<(), String>,
+        mounted: Vec<String>,
+        verify: Result<(), String>,
+        answer: recovery_os::Recording,
+        left_mounted: Vec<String>,
+        steps: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeRecordHost {
+        fn new() -> Self {
+            Self {
+                locks: Ok(Ok(())),
+                mount: Ok(()),
+                mounted: vec!["/proc".into(), "/nonexistent/das/other".into()],
+                verify: Ok(()),
+                answer: quiet_recording(),
+                left_mounted: Vec::new(),
+                steps: Default::default(),
+            }
+        }
+        fn steps(&self) -> Vec<String> {
+            self.steps.lock().unwrap().clone()
+        }
+        fn step(&self, s: String) {
+            self.steps.lock().unwrap().push(s);
+        }
+    }
+
+    impl RecordHost for FakeRecordHost {
+        fn acquire_locks(&self) -> Result<Result<Box<dyn HoldsMaintenance>, String>, String> {
+            self.step("locks".into());
+            match &self.locks {
+                Ok(Ok(())) => Ok(Ok(Box::new(MaintenanceHeld::assumed()))),
+                Ok(Err(why)) => Ok(Err(why.clone())),
+                Err(e) => Err(e.clone()),
+            }
+        }
+        fn mount_targets(
+            &self,
+            drives: &Config,
+            _: &dyn ProgressCallback,
+            _: &MaintenanceHeld,
+        ) -> Result<Box<dyn Release>, String> {
+            self.step(format!("mount {}", target_labels(drives).join(",")));
+            self.mount.clone()?;
+            Ok(Box::new(FakeMounts {
+                name: "drives",
+                left: self.left_mounted.clone(),
+                steps: self.steps.clone(),
+            }))
+        }
+        fn is_mounted(&self, mount: &Path) -> bool {
+            self.mounted.iter().any(|m| Path::new(m) == mount)
+        }
+        fn verify(
+            &self,
+            _: &Config,
+            labels: &[String],
+            _: &dyn ProgressCallback,
+        ) -> Result<(), String> {
+            self.step(format!("verify {}", labels.join(",")));
+            self.verify.clone()
+        }
+        fn record(&self, drives: &Config, _: &dyn ProgressCallback) -> recovery_os::Recording {
+            self.step(format!("record {}", target_labels(drives).join(",")));
+            self.answer.clone()
+        }
+    }
+
+    fn record_job(host: &FakeRecordHost, labels: &[String]) -> RecordOutcome {
+        record_recovery_os_job(host, &two_drive_config(), labels, &TestProgress::new())
+    }
+
+    #[test]
+    fn record_mounts_checks_reads_and_unmounts_in_that_order() {
+        let host = FakeRecordHost::new();
+        let outcome = record_job(&host, &[]);
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount recovery,other",
+                "verify recovery,other",
+                "record recovery,other",
+                "release drives"
+            ]
+        );
+        assert_eq!(outcome.exit_code(), 0);
+        // A drive needing attention is a finding: still 0.
+        let host = FakeRecordHost {
+            answer: recording(RecordStatus::Warn, "stale"),
+            ..FakeRecordHost::new()
+        };
+        assert_eq!(record_job(&host, &labels(&["other"])).exit_code(), 0);
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount other",
+                "verify other",
+                "record other",
+                "release drives"
+            ]
+        );
+    }
+
+    #[test]
+    fn record_refuses_an_unknown_label_before_any_lock() {
+        let host = FakeRecordHost::new();
+        let outcome = record_job(&host, &labels(&["recovery", "nope"]));
+        assert!(
+            matches!(&outcome, RecordOutcome::CouldNotStart(w) if w.contains("'nope'")),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.exit_code(), 1);
+        assert!(host.steps().is_empty(), "{:?}", host.steps());
+    }
+
+    #[test]
+    fn record_defers_on_a_held_lock_and_could_not_start_on_a_lock_error() {
+        let host = FakeRecordHost {
+            locks: Ok(Err("a backup is running".into())),
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        assert!(matches!(&outcome, RecordOutcome::Deferred(w) if w == "a backup is running"));
+        assert_eq!(outcome.exit_code(), 75);
+        assert_eq!(host.steps(), ["locks"], "nothing mounted");
+        let host = FakeRecordHost {
+            locks: Err("permission denied".into()),
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        assert!(
+            matches!(&outcome, RecordOutcome::CouldNotStart(w)
+                if w == "could not take the locks: permission denied"),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.exit_code(), 1);
+        assert_eq!(host.steps(), ["locks"]);
+    }
+
+    #[test]
+    fn record_stops_on_a_drive_that_will_not_mount_or_is_not_the_right_one() {
+        let host = FakeRecordHost {
+            mount: Err("no drives found".into()),
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        assert!(
+            matches!(&outcome, RecordOutcome::Aborted(w) if w == "Mount failed: no drives found")
+        );
+        assert_eq!(outcome.exit_code(), 3);
+        // None mounted: nothing read, what was mounted given back.
+        let host = FakeRecordHost {
+            mounted: Vec::new(),
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        assert!(
+            matches!(&outcome, RecordOutcome::Aborted(w)
+                if w == "no recovery drive is mounted (not mounted: recovery, other)"),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.exit_code(), 3);
+        assert_eq!(
+            host.steps(),
+            ["locks", "mount recovery,other", "release drives"]
+        );
+        // The wrong filesystem: refused, nothing read, unmounted, and a mount
+        // left behind is said.
+        let host = FakeRecordHost {
+            verify: Err("recovery: wrong UUID".into()),
+            left_mounted: vec!["/proc".into()],
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        match &outcome {
+            RecordOutcome::Aborted(w) => {
+                assert!(
+                    w.starts_with("refusing to record: recovery: wrong UUID; "),
+                    "{w}"
+                );
+                assert!(w.contains("/proc"), "{w}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(outcome.exit_code(), 3);
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount recovery,other",
+                "verify recovery,other",
+                "release drives"
+            ]
+        );
+    }
+
+    #[test]
+    fn record_reads_the_drives_that_mounted_and_fails_for_one_that_did_not() {
+        let host = FakeRecordHost {
+            mounted: vec!["/proc".into()],
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount recovery,other",
+                "verify recovery",
+                "record recovery,other",
+                "release drives"
+            ],
+            "only the mounted one is checked; the reading says the other was not mounted"
+        );
+        match &outcome {
+            RecordOutcome::Ran {
+                not_mounted,
+                still_mounted,
+                ..
+            } => {
+                assert_eq!(not_mounted, &labels(&["other"]));
+                assert!(still_mounted.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(outcome.exit_code(), 3, "a drive asked for was not recorded");
+    }
+
+    #[test]
+    fn record_fails_when_the_reading_fails_or_a_drive_is_left_mounted() {
+        let host = FakeRecordHost {
+            answer: recording(RecordStatus::Fail, "could not record the result: x"),
+            ..FakeRecordHost::new()
+        };
+        assert_eq!(record_job(&host, &[]).exit_code(), 3);
+        let host = FakeRecordHost {
+            left_mounted: vec!["/proc".into()],
+            ..FakeRecordHost::new()
+        };
+        let outcome = record_job(&host, &[]);
+        assert!(
+            matches!(&outcome, RecordOutcome::Ran { still_mounted, .. } if still_mounted == &["/proc"])
+        );
+        assert_eq!(outcome.exit_code(), 3);
+    }
+
+    #[test]
+    fn the_system_record_host_reads_mount_state_and_refuses_a_bare_mount_point() {
+        // Read-only probes of this machine: /proc/mounts, nothing mounted.
+        let host = SystemRecordHost { job: "test".into() };
+        assert!(host.is_mounted(Path::new("/proc")));
+        assert!(!host.is_mounted(Path::new("/nonexistent/das/other")));
+        let config = two_drive_config();
+        let why = host
+            .verify(&config, &labels(&["other"]), &TestProgress::new())
+            .unwrap_err();
+        assert!(why.contains("NOT a mount point"), "{why}");
     }
 }

@@ -2205,6 +2205,7 @@ rm "${STATE_FILE:?}"
 run_driver session A --dry-run
 check "no record file: refused" "$RC" "1"
 has "no record file: says so" "$OUT" "no boot record: $STATE_FILE does not exist"
+has "no record file: offers a record without a backup (bd 58c8)" "$OUT" "(sudo btrdasd recovery-os record system-recovery-A-2tb), then start again"
 check "no record file: nothing locked" "$(file "$S/flock.calls")" ""
 
 fixture
@@ -2302,6 +2303,7 @@ printf 'system-recovery-B-2tb %s\nsystem-recovery-A-2tb %s\n' "$(($(date +%s) - 
 run_driver session A --dry-run
 check "record older than the last session: refused" "$RC" "1"
 has "record older than the last session: says so" "$OUT" "before this drive's last VM session ended"
+has "record older than the last session: offers a record without a backup (bd 58c8)" "$OUT" "or record it now, without a backup: sudo btrdasd recovery-os record system-recovery-A-2tb"
 
 fixture
 printf 'system-recovery-B-2tb %s\n' "$(($(date +%s) - 60))" >"$SESSIONS"

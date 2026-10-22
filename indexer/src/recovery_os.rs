@@ -1802,6 +1802,224 @@ pub fn status_run_noting(
     }
 }
 
+/// How long recording the recovery OSes may take before the step gives up:
+/// `RECOVERY_OS_TIMEOUT_SECS` in `scripts/backup-run.sh`, the same 900 s, so
+/// one bound covers the nightly run and the manual ones (bd
+/// DAS-Backup-Manager-58c8).
+pub const RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// What recording the recovery OSes came to, in `backup-run.sh`'s words:
+/// `OK` nothing needs attention, `WARN` a drive is stale or carries a
+/// warning (the run still succeeded), `FAIL` the check could not be done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl RecordStatus {
+    /// The word the report's `Recovery OS` row starts with.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+/// One recording of the recovery OSes: what the Rust backup run's
+/// recovery-OS step and `btrdasd recovery-os record` report, by the rule
+/// `check_recovery_os` in `backup-run.sh` applies to `recovery-os status`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recording {
+    pub status: RecordStatus,
+    /// The report row's detail, worded as `check_recovery_os` words it.
+    pub detail: String,
+    /// The `RECOVERY OS` section, or a `CHECK FAILED` line when the reading
+    /// never finished.
+    pub section: String,
+    /// What was read; empty when the reading never finished.
+    pub entries: Vec<DriveEntry>,
+}
+
+/// `; not mounted: A, B` for the drives that were not mounted, or nothing.
+fn not_mounted_suffix(entries: &[DriveEntry]) -> String {
+    let off: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.report == DriveReport::NotMounted)
+        .map(|e| e.label.as_str())
+        .collect();
+    if off.is_empty() {
+        String::new()
+    } else {
+        format!("; not mounted: {}", off.join(", "))
+    }
+}
+
+/// The verdict on a finished reading, by `check_recovery_os`'s rule: a root
+/// that could not be read, or a record that could not be written, is `FAIL`
+/// (`recovery-os status` exits 2 for both); a stale drive or a `WARNING` row
+/// is `WARN` (exit 1), naming which; otherwise `OK`. The drives not mounted
+/// follow an `OK` or a `WARN` detail.
+pub fn classify(entries: &[DriveEntry], state_error: Option<&str>) -> (RecordStatus, String) {
+    let mut failures: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match &e.report {
+            DriveReport::Unreadable(why) => Some(format!("{} could not be read: {why}", e.label)),
+            _ => None,
+        })
+        .collect();
+    if let Some(e) = state_error {
+        failures.push(format!("could not record the result: {e}"));
+    }
+    if !failures.is_empty() {
+        return (RecordStatus::Fail, failures.join("; "));
+    }
+    let assessments = || {
+        entries.iter().filter_map(|e| match &e.report {
+            DriveReport::Inspected { assessment, .. } => Some(assessment),
+            _ => None,
+        })
+    };
+    let suffix = not_mounted_suffix(entries);
+    if assessments().any(Assessment::needs_attention) {
+        let mut why = Vec::new();
+        if assessments().any(|a| a.stale) {
+            why.push("stale");
+        }
+        if assessments().any(|a| !a.warnings.is_empty()) {
+            why.push("btrbk may run at boot");
+        }
+        return (
+            RecordStatus::Warn,
+            format!("{} — see RECOVERY OS in the report{suffix}", why.join("; ")),
+        );
+    }
+    let what = if assessments().next().is_none() {
+        "nothing inspected"
+    } else {
+        "nothing needs attention"
+    };
+    (RecordStatus::Ok, format!("{what}{suffix}"))
+}
+
+/// Reads the mirror targets of a config, handing each per-drive note
+/// ([`status_noting`]) to its second argument: [`record_within`]'s reader.
+pub type ReadDrives = dyn Fn(&Config, &mut dyn FnMut(String)) -> Vec<DriveEntry> + Send + Sync;
+
+/// What the reading thread sends back.
+enum Heard {
+    Note(String),
+    Done(Vec<DriveEntry>),
+}
+
+/// Read every `role = "mirror"` target of `cfg` with `read`, on a thread of
+/// its own, for at most `timeout`; then, when it finished in time, write the
+/// readings to `state_file` (a drive not mounted keeps its earlier record,
+/// [`write_state`]) and classify them ([`classify`]). `note` gets each
+/// per-drive note as it comes.
+///
+/// A reading that does not finish in time is a `FAIL` that says where it
+/// was — `while reading <drive> at <root>`, `after reading every mounted
+/// drive` or `before reading any drive` — as `backup-run.sh`'s bound says,
+/// and nothing is written: a reading still running is left to finish and is
+/// discarded, so it can never write a record once the targets are gone.
+pub fn record_within(
+    cfg: &Config,
+    state_file: Option<&Path>,
+    now_epoch: i64,
+    host: &HostVersions,
+    timeout: std::time::Duration,
+    read: std::sync::Arc<ReadDrives>,
+    note: &mut dyn FnMut(String),
+) -> Recording {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned = cfg.clone();
+    std::thread::spawn(move || {
+        let notes = tx.clone();
+        // A send fails only once the step has stopped listening (it timed
+        // out): the reading is then discarded, which is the point.
+        let entries = read(&owned, &mut |n| {
+            let _ = notes.send(Heard::Note(n));
+        });
+        let _ = tx.send(Heard::Done(entries));
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut reading: Option<String> = None;
+    let mut noted = false;
+    let failed = |detail: String| Recording {
+        status: RecordStatus::Fail,
+        section: format!("RECOVERY OS\n  CHECK FAILED: {detail}\n"),
+        detail,
+        entries: Vec::new(),
+    };
+    let entries = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Heard::Note(n)) => {
+                noted = true;
+                reading = n.starts_with("reading ").then(|| n.clone());
+                note(n);
+            }
+            Ok(Heard::Done(entries)) => break entries,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let place = match (&reading, noted) {
+                    (Some(r), _) => format!("while {r}"),
+                    (None, true) => "after reading every mounted drive".to_string(),
+                    (None, false) => "before reading any drive".to_string(),
+                };
+                return failed(format!(
+                    "reading the recovery OSes timed out after {} s {place}",
+                    timeout.as_secs()
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return failed("reading the recovery OSes stopped without an answer".into());
+            }
+        }
+    };
+    let state_error = state_file.and_then(|p| write_state(p, &entries, now_epoch).err());
+    let (status, detail) = classify(&entries, state_error.as_deref());
+    Recording {
+        status,
+        detail,
+        section: format_section(&entries, host),
+        entries,
+    }
+}
+
+/// [`record_within`] on this machine: the host's versions, today, the real
+/// mount checks, [`RECORD_TIMEOUT`].
+pub fn record(cfg: &Config, state_file: &Path, note: &mut dyn FnMut(String)) -> Recording {
+    let host = host_versions();
+    let today = crate::caldate::today();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let reader_host = host.clone();
+    let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(move |cfg, note| {
+        status_noting(
+            cfg,
+            &reader_host,
+            &today,
+            &crate::health::is_mountpoint,
+            &mounted_uuid,
+            note,
+        )
+    });
+    record_within(
+        cfg,
+        Some(state_file),
+        now,
+        &host,
+        RECORD_TIMEOUT,
+        read,
+        note,
+    )
+}
+
 /// One drive as JSON: `status` is `current`, `stale`, `unreadable` or
 /// `not_mounted`; `mount_uuid` is [`DriveEntry::mount_uuid`]; `os` and
 /// `assessment` are null unless it was inspected. A
@@ -5204,6 +5422,318 @@ mod tests {
             );
         fs::write(&path, bad_verdict).unwrap();
         assert!(load_state(&path).unwrap_err().ends_with(&hint));
+    }
+
+    // ---- recording: the backup's recovery-OS step and `record` (bd 58c8) ----
+
+    fn drive(label: &str, report: DriveReport) -> DriveEntry {
+        DriveEntry {
+            label: label.into(),
+            root: PathBuf::from(format!("/r/{label}/@")),
+            mount_uuid: None,
+            report,
+        }
+    }
+
+    fn read_as(stale: bool, warned: bool) -> DriveReport {
+        DriveReport::Inspected {
+            os: Box::default(),
+            assessment: Assessment {
+                stale,
+                warnings: if warned {
+                    vec![WILL_RUN.into()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn classify_words_each_outcome_as_check_recovery_os_does() {
+        let ok = |entries: &[DriveEntry]| classify(entries, None);
+        assert_eq!(ok(&[]), (RecordStatus::Ok, "nothing inspected".to_string()));
+        assert_eq!(
+            ok(&[
+                drive("A", DriveReport::NotMounted),
+                drive("B", DriveReport::NotMounted)
+            ]),
+            (
+                RecordStatus::Ok,
+                "nothing inspected; not mounted: A, B".to_string()
+            )
+        );
+        assert_eq!(
+            ok(&[
+                drive("A", read_as(false, false)),
+                drive("B", DriveReport::NotMounted)
+            ]),
+            (
+                RecordStatus::Ok,
+                "nothing needs attention; not mounted: B".to_string()
+            )
+        );
+        assert_eq!(
+            ok(&[
+                drive("A", read_as(true, false)),
+                drive("B", read_as(false, false))
+            ]),
+            (
+                RecordStatus::Warn,
+                "stale — see RECOVERY OS in the report".to_string()
+            )
+        );
+        assert_eq!(
+            ok(&[
+                drive("A", read_as(false, true)),
+                drive("B", DriveReport::NotMounted)
+            ]),
+            (
+                RecordStatus::Warn,
+                "btrbk may run at boot — see RECOVERY OS in the report; not mounted: B".to_string()
+            )
+        );
+        assert_eq!(
+            ok(&[
+                drive("A", read_as(true, false)),
+                drive("B", read_as(false, true))
+            ]),
+            (
+                RecordStatus::Warn,
+                "stale; btrbk may run at boot — see RECOVERY OS in the report".to_string()
+            )
+        );
+        // An unreadable root outranks a stale one, and is FAIL.
+        assert_eq!(
+            ok(&[
+                drive("A", read_as(true, true)),
+                drive("B", DriveReport::Unreadable("not a directory".into())),
+            ]),
+            (
+                RecordStatus::Fail,
+                "B could not be read: not a directory".to_string()
+            )
+        );
+        // A record that could not be written is FAIL, however the drives read.
+        assert_eq!(
+            classify(&[drive("A", read_as(false, false))], Some("disk full")),
+            (
+                RecordStatus::Fail,
+                "could not record the result: disk full".to_string()
+            )
+        );
+        assert_eq!(
+            classify(
+                &[drive("A", DriveReport::Unreadable("gone".into()))],
+                Some("disk full")
+            )
+            .1,
+            "A could not be read: gone; could not record the result: disk full"
+        );
+        assert_eq!(
+            [RecordStatus::Ok, RecordStatus::Warn, RecordStatus::Fail].map(RecordStatus::word),
+            ["OK", "WARN", "FAIL"]
+        );
+    }
+
+    /// A reader that answers `entries` after sending `notes`.
+    fn reader(notes: &[&str], entries: Vec<DriveEntry>) -> std::sync::Arc<ReadDrives> {
+        let notes: Vec<String> = notes.iter().map(|n| n.to_string()).collect();
+        std::sync::Arc::new(move |_, note| {
+            for n in &notes {
+                note(n.clone());
+            }
+            entries.clone()
+        })
+    }
+
+    #[test]
+    fn a_recording_in_time_writes_the_state_file_and_says_what_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("recovery-os.json");
+        let cfg = mirror_config(&[("A", "/r/A"), ("B", "/r/B")]);
+        let mut heard = Vec::new();
+        let rec = record_within(
+            &cfg,
+            Some(&state),
+            4242,
+            &host("7.2"),
+            std::time::Duration::from_secs(60),
+            reader(
+                &["reading A at /r/A/@", "read A in 0.1 s"],
+                vec![
+                    drive("A", read_as(true, false)),
+                    drive("B", DriveReport::NotMounted),
+                ],
+            ),
+            &mut |n| heard.push(n),
+        );
+        assert_eq!(heard, ["reading A at /r/A/@", "read A in 0.1 s"]);
+        assert_eq!(rec.status, RecordStatus::Warn);
+        assert_eq!(
+            rec.detail,
+            "stale — see RECOVERY OS in the report; not mounted: B"
+        );
+        assert_eq!(rec.entries.len(), 2);
+        assert_eq!(rec.section, format_section(&rec.entries, &host("7.2")));
+        let stored = load_state(&state).unwrap().unwrap();
+        assert_eq!(
+            stored.drives.keys().collect::<Vec<_>>(),
+            ["A"],
+            "B was not mounted"
+        );
+        assert_eq!(stored.drives["A"].checked_epoch, 4242);
+        // No state file named: nothing written, the verdict the same.
+        let other = dir.path().join("none.json");
+        let rec = record_within(
+            &cfg,
+            None,
+            1,
+            &host("7.2"),
+            std::time::Duration::from_secs(60),
+            reader(&[], vec![drive("A", read_as(false, false))]),
+            &mut |_| {},
+        );
+        assert_eq!(rec.status, RecordStatus::Ok);
+        assert!(!other.exists());
+        // A state file that cannot be written is a FAIL that says so.
+        let rec = record_within(
+            &cfg,
+            Some(&dir.path().join("missing-dir/recovery-os.json")),
+            1,
+            &host("7.2"),
+            std::time::Duration::from_secs(60),
+            reader(&[], vec![drive("A", read_as(false, false))]),
+            &mut |_| {},
+        );
+        assert_eq!(rec.status, RecordStatus::Fail);
+        assert!(
+            rec.detail.starts_with("could not record the result: "),
+            "{}",
+            rec.detail
+        );
+    }
+
+    /// A reader that sends `notes`, then waits for `release` before answering.
+    fn stalled_reader(
+        notes: &[&str],
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::sync::Arc<ReadDrives> {
+        let notes: Vec<String> = notes.iter().map(|n| n.to_string()).collect();
+        let release = std::sync::Mutex::new(release);
+        std::sync::Arc::new(move |_, note| {
+            for n in &notes {
+                note(n.clone());
+            }
+            let _ = release.lock().unwrap().recv();
+            vec![drive("A", read_as(false, false))]
+        })
+    }
+
+    #[test]
+    fn a_recording_that_does_not_finish_in_time_fails_saying_where_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("recovery-os.json");
+        let cfg = mirror_config(&[("A", "/r/A"), ("B", "/r/B")]);
+        for (notes, place) in [
+            (&[][..], "before reading any drive"),
+            (
+                &[
+                    "reading A at /r/A/@",
+                    "read A in 0.1 s",
+                    "reading B at /r/B/@",
+                ][..],
+                "while reading B at /r/B/@",
+            ),
+            (
+                &["reading A at /r/A/@", "read A in 0.1 s"][..],
+                "after reading every mounted drive",
+            ),
+        ] {
+            let (go, release) = std::sync::mpsc::channel();
+            let mut heard = 0;
+            let started = std::time::Instant::now();
+            let rec = record_within(
+                &cfg,
+                Some(&state),
+                1,
+                &host("7.2"),
+                std::time::Duration::from_millis(300),
+                stalled_reader(notes, release),
+                &mut |_| heard += 1,
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+            assert_eq!(heard, notes.len());
+            let want = format!("reading the recovery OSes timed out after 0 s {place}");
+            assert_eq!(rec.status, RecordStatus::Fail);
+            assert_eq!(rec.detail, want);
+            assert_eq!(
+                rec.section,
+                format!("RECOVERY OS\n  CHECK FAILED: {want}\n")
+            );
+            assert!(rec.entries.is_empty());
+            // The reading finishes after all: it is discarded, never written.
+            go.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!state.exists(), "a late reading wrote the record");
+        }
+    }
+
+    #[test]
+    fn a_reading_that_dies_fails_the_recording() {
+        let cfg = mirror_config(&[("A", "/r/A")]);
+        let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(|_, _| panic!("reader died"));
+        let rec = record_within(
+            &cfg,
+            None,
+            1,
+            &host("7.2"),
+            std::time::Duration::from_secs(60),
+            read,
+            &mut |_| {},
+        );
+        assert_eq!(rec.status, RecordStatus::Fail);
+        assert_eq!(
+            rec.detail,
+            "reading the recovery OSes stopped without an answer"
+        );
+    }
+
+    #[test]
+    fn the_recording_reads_only_the_config_it_is_handed() {
+        let cfg = mirror_config(&[("A", "/r/A")]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saw = seen.clone();
+        let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(move |c, _| {
+            saw.lock()
+                .unwrap()
+                .extend(c.targets.iter().map(|t| t.label.clone()));
+            Vec::new()
+        });
+        record_within(
+            &cfg,
+            None,
+            1,
+            &host("7.2"),
+            std::time::Duration::from_secs(60),
+            read,
+            &mut |_| {},
+        );
+        assert_eq!(*seen.lock().unwrap(), ["primary", "A"]);
+    }
+
+    #[test]
+    fn the_manual_bound_is_the_nightly_one() {
+        // One bound on both paths: backup-run.sh's, read from the script.
+        let script = include_str!("../../scripts/backup-run.sh");
+        assert!(
+            script.contains(&format!(
+                "\nRECOVERY_OS_TIMEOUT_SECS={}\n",
+                RECORD_TIMEOUT.as_secs()
+            )),
+            "RECORD_TIMEOUT differs from backup-run.sh's RECOVERY_OS_TIMEOUT_SECS"
+        );
     }
 }
 

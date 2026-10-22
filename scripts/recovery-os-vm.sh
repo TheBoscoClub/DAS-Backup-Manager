@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.2.1
-# Date: 2026-10-13
+# Version: 2.2.2
+# Date: 2026-10-21
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -1541,10 +1541,15 @@ check_boot_record() {
     local file out rc=0 key value schemas=0 schema="" schematype="" entry="" checked="" checkedtype="" error=""
     local verdict="" units_state="" when now age p problems=() hints=() reasons=() units=() runners=() hint=""
     local fs="" fstype="" want
+    # Every backup run with the drive attached records it again, the GUI's and
+    # `btrdasd backup run` as well as the nightly one; `recovery-os record`
+    # does it without a backup (bd DAS-Backup-Manager-58c8).
+    local now_cmd="sudo btrdasd recovery-os record $LABEL"
+    local again="let the next backup run, with this drive attached, record it again, or record it now, without a backup: $now_cmd"
     resolve_os_state
     file=$OS_STATE_FILE
     if [[ ! -e "$file" ]]; then
-        refuse "no boot record: $file does not exist. The nightly backup run writes it when it checks the recovery OSes -- let one run with this drive attached, then start again"
+        refuse "no boot record: $file does not exist. A backup run writes it when it checks the recovery OSes -- let one run with this drive attached, or record it now, without a backup ($now_cmd), then start again"
     fi
     # stderr first: a file that cannot be opened fails the < redirection.
     out="$(jq -r --arg label "$LABEL" "$BOOT_RECORD_JQ" 2>&1 <"$file")" || rc=$?
@@ -1583,7 +1588,7 @@ check_boot_record() {
         refuse "the boot record $file is schema $schema -- this script reads schemas ${OS_STATE_SCHEMAS// / and } only (an older record has no btrbk-at-boot verdict); the next backup run writes it again"
     fi
     if [[ "$entry" != present ]]; then
-        refuse "the boot record $file has no entry for '$LABEL' -- the nightly backup run writes one when it checks this drive; let one run with it attached"
+        refuse "the boot record $file has no entry for '$LABEL' -- a backup run writes one when it checks this drive; let one run with it attached, or record it now, without a backup: $now_cmd"
     fi
     # A JSON number of whole seconds above 0: a string -- "015260430204" --
     # would reach bash arithmetic as octal, and 0 is no time at all.
@@ -1616,10 +1621,10 @@ check_boot_record() {
         refuse "'$LABEL' has no mount_uuid in $DAS_CONFIG, so neither its drive nor its boot record can be tied to a filesystem -- add it (sudo btrdasd setup --check prints the line to add)"
     fi
     if [[ "$fstype" != string || -z "$fs" || "$fs" == unknown ]]; then
-        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) does not name the filesystem it was read from (a btrdasd older than this script wrote it, or the filesystem could not be told) -- a record not tied to the drive's filesystem is never trusted, whatever the options: let the next backup run, with this drive attached, record it again"
+        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) does not name the filesystem it was read from (a btrdasd older than this script wrote it, or the filesystem could not be told) -- a record not tied to the drive's filesystem is never trusted, whatever the options: $again"
     fi
     if [[ "$fs" != "$want" ]]; then
-        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) was read from filesystem $(printable "$fs"), not $want, the mount_uuid of '$LABEL' in $DAS_CONFIG -- the label names another drive now, or its filesystem was made again since; never overridable: let the next backup run, with this drive attached, record it again"
+        refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) was read from filesystem $(printable "$fs"), not $want, the mount_uuid of '$LABEL' in $DAS_CONFIG -- the label names another drive now, or its filesystem was made again since; never overridable: $again"
     fi
     log "boot record for $LABEL ($file, schema $schema):"
     log "  checked        $when, $(age_text "$age")"
@@ -1672,17 +1677,17 @@ check_boot_record() {
     fi
     if ((checked > now + 300)); then
         problems+=("the record is dated in the future ($when): the clock of the run that wrote it, or this one, is wrong")
-        hints+=("let the next backup run, with this drive attached, record it again")
+        hints+=("$again")
     elif ((age > MAX_RECORD_AGE_DAYS * 86400)); then
         problems+=("the record is $(age_text "$age" | sed 's/ ago$//') old, older than $MAX_RECORD_AGE_DAYS days: it no longer describes the drive")
-        hints+=("let the next backup run, with this drive attached, record it again")
+        hints+=("$again")
     fi
     if ! last_session_time; then
         problems+=("cannot tell when this drive's last VM session ended ($SESSIONS_FAILURE)")
         hints+=("remove the bad line, or the whole file, at $SESSIONS_FILE, then run a backup with the drive attached")
     elif [[ -n "$LAST_SESSION" ]] && ((checked <= LAST_SESSION)); then
         problems+=("the record was made before this drive's last VM session ended ($(utc "$LAST_SESSION")): the OS may have changed in it")
-        hints+=("let the next backup run, with this drive attached, record it again")
+        hints+=("$again")
     fi
     if ((${#problems[@]} == 0)); then
         if [[ "$verdict" == no ]]; then

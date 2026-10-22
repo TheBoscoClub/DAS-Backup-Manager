@@ -234,7 +234,7 @@ pub fn format_report_from(
 
     let overall = if !result.success {
         "FAILURES DETECTED"
-    } else if result.boot.has_warnings() {
+    } else if result.boot.has_warnings() || result.recovery_os.has_warnings() {
         "COMPLETED WITH WARNINGS"
     } else {
         "ALL OPERATIONS SUCCESSFUL"
@@ -256,7 +256,10 @@ pub fn format_report_from(
     let btrbk_status = if result
         .errors
         .iter()
-        .filter(|e| !e.starts_with(crate::backup::BOOT_ERROR_PREFIX))
+        .filter(|e| {
+            !e.starts_with(crate::backup::BOOT_ERROR_PREFIX)
+                && !e.starts_with(crate::backup::RECOVERY_OS_ERROR_PREFIX)
+        })
         .any(|e| e.contains("btrbk") || crate::backup::is_btrbk_step_failure(e))
     {
         "FAIL"
@@ -270,6 +273,10 @@ pub fn format_report_from(
         "  btrbk send/receive    {btrbk_status}  ({elapsed_min}m {elapsed_sec}s)\n"
     ));
     r.push_str(&format!("  Boot subvolumes       {}\n", result.boot.row()));
+    r.push_str(&format!(
+        "  Recovery OS           {}\n",
+        result.recovery_os.row()
+    ));
     r.push_str(&format!("  Content indexer       {index_status}\n"));
     if let Some(sync) = sync {
         let status = if sync.failed { "FAIL" } else { "OK" };
@@ -287,6 +294,12 @@ pub fn format_report_from(
         for w in &o.warnings {
             r.push_str(&format!("  WARN  {w}\n"));
         }
+    }
+    // The section the recovery-OS step printed, where backup-run.sh puts it:
+    // after the operations (bd DAS-Backup-Manager-58c8).
+    if let crate::backup::RecoveryOsStep::Ran(rec) = &result.recovery_os {
+        r.push('\n');
+        r.push_str(&rec.section);
     }
 
     // Throughput — simple summary from result data.
@@ -580,6 +593,7 @@ mod tests {
             snapshots_cleaned: 2,
             bytes_sent: 1_073_741_824,
             boot: crate::backup::BootStep::NotSelected,
+            recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -685,6 +699,7 @@ mod tests {
             snapshots_cleaned: 0,
             bytes_sent: bytes,
             boot: crate::backup::BootStep::NotSelected,
+            recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: errors.iter().map(|e| e.to_string()).collect(),
@@ -752,6 +767,7 @@ mod tests {
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot: crate::backup::BootStep::NotSelected,
+            recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: vec!["Subvolume sync failed — see SUBVOLUME SYNC in the report".into()],
@@ -803,6 +819,7 @@ mod tests {
             snapshots_cleaned: 0,
             bytes_sent: 500_000,
             boot: crate::backup::BootStep::NotSelected,
+            recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -891,6 +908,7 @@ mod tests {
             snapshots_cleaned: 0,
             bytes_sent: 0,
             boot: crate::backup::BootStep::NotSelected,
+            recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: false,
             report_sent: false,
             errors: vec!["btrbk failed".into(), "target not mounted".into()],
