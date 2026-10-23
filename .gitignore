@@ -267,3 +267,10 @@ SESSION_RECORD*.md.zst
 
 # Local incident evidence (host paths; never committed)
 /evidence/
+
+# This host's own identifiers (drive serials, filesystem UUIDs, PARTUUIDs, MACs, addresses): local only.
+# Tracked files carry placeholders (SERIALnn, 5eed00nn-…); the real values and the real→placeholder
+# map live in these files (bd DAS-Backup-Manager-yi8m).
+.claude/rules/local-*.md
+docs/examples/local-*.md
+.claude/local-scrub-map.txt
