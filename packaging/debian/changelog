@@ -1,3 +1,10 @@
+das-backup-manager (0.7.23.1-1) unstable; urgency=medium
+
+  * Packaging: Debian control has one Suggests field; the Fedora spec lists btrdasd-gui.notifyrc
+  * Release workflow frees runner disk before the Flatpak build
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Thu, 22 Oct 2026 21:00:00 -0500
+
 das-backup-manager (0.7.23.0-1) unstable; urgency=medium
 
   * GUI operations honoured: every ticked box reaches the helper, and Run needs Snapshot or Send

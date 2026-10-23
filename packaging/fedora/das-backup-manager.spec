@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.23.0
+Version:        0.7.23.1
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -63,6 +63,10 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Thu Oct 22 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.1-1
+- Packaging: Debian control has one Suggests field; the spec lists btrdasd-gui.notifyrc
+- Release workflow frees runner disk before the Flatpak build
+
 * Tue Oct 06 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.0-1
 - GUI operations honoured: every ticked box reaches the helper; Run needs Snapshot or Send
 - One boot-step classification on the Rust path and in backup-run.sh 4.12.0
