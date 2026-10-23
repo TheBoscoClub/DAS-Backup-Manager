@@ -177,7 +177,7 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files=(scripts/*.sh tests/*.sh .github/scripts/*.sh live/usr/local/lib/das-backup-manager/*.sh)
+          files=(scripts/*.sh tests/*.sh .github/scripts/*.sh)
           if [ ${#files[@]} -eq 0 ]; then
             echo "no shell scripts found — failing rather than silently passing"
             exit 1

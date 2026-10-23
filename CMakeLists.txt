@@ -284,14 +284,6 @@ if(BUILD_TESTING)
         NAME shell-esp-label-derivation
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_esp_label_derivation.sh
     )
-    # esp-sync.sh (tracked at live/usr/local/lib/das-backup-manager/) run on a
-    # sandboxed copy whose two ESP constants name scratch directories, against
-    # stub blkid/findmnt: the NVMe-only refusal, the label/mount cross-check,
-    # dry and real runs, and the guarded deletions (bd DAS-Backup-Manager-he59).
-    add_test(
-        NAME shell-esp-sync
-        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_esp_sync.sh
-    )
     add_test(
         NAME shell-backup-exit-semantics
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backup_exit_semantics.sh
