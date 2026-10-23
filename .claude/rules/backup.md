@@ -1,0 +1,270 @@
+# Backup System Rules
+
+Binding rules only. Reasoning, incidents, measurements and repro commands for each section are
+under the **same heading** in `.claude/docs/rules-reference/backup.md` (NOT auto-loaded).
+**Read that section before changing anything a section here governs.**
+Installation specifics: `.claude/rules/local-installation.md` (gitignored, this machine only).
+
+## btrbk
+- btrbk does all BTRFS snapshot creation and send/receive. Use its CLI and config; never modify its internals.
+- Config `/etc/btrbk/btrbk.conf` (canonical, generated from `config.toml`; never hand-edit).
+
+## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
+A running `backup-run.sh` survives an install (scripts end `main "$@"; exit $?`), but a run *starting*
+during `cmake --install` can reopen a still-empty file and **exit 0 having done nothing** (measured;
+mechanism in the reference). **`setup` refuses by itself**: every mode that writes or removes installed
+files takes `/run/das-backup.lock` then `/run/das-maintenance.lock`, non-blocking, before its first
+write, holds both to the end, and exits 75 (on stderr), changing nothing, if either is held.
+**`cmake --install` takes no lock** — check first, every time (it cannot see a run started by hand in
+the sub-millisecond before its flock):
+
+```bash
+busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; sudo flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
+```
+
+Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before btrbk starts, and re-reads `config.toml`.
+
+## Nested Subvolumes Need Their Own Config Entry — The Run Writes It
+- **`btrfs send` does not descend into nested subvolumes**: a parent's snapshot holds an empty
+  directory where a child sits, and the run reports success. Every subvolume needs its own entry —
+  **the run writes it** (`btrdasd subvol sync`: `backup-run.sh` calls it after verifying sources, then
+  re-verifies them; `btrdasd backup run` and the GUI helper call it too).
+- Omitted only by `[subvolumes].exclude` (pattern names the subvolume **without trailing slash**, covers
+  everything nested under it; `@tmp`, `@var-tmp` built in; `[doctor].exclude` still merged) or a
+  `.snapshots` / `.btrbk-snapshots` path component. Every exclusion is in the run report (snapshot trees counted).
+- **Each source volume's top level (id 5) is a subvolume too** (bd `xtnq`): entry `.` (`subvolume .`),
+  adopted primary-only with explicit `snapshot_name` `<volume basename>-toplevel`; never an ancestor,
+  never retired (except by sync when its source reaches a mirror: then FAIL every run, and no target, the
+  primary included, receives it), excluded only by the exact pattern `/`. Validation refuses it unnamed, twice on one
+  volume, or live in a source reaching a mirror — and the `btrbk.conf` renderer refuses that last case
+  itself (no writer can skip it); sync reports such a top level as not placed and applies the rest.
+  Retiring `.` does not stop its backup: delete it AND exclude `/`. Spec: `docs/local/superpowers/specs/2026-10-18-top-level-subvolume-design.md` (gitignored).
+- A volume is read only if every device its sources name verifies (mountpoint, UUID, top level);
+  otherwise nothing on it is adopted or retired and the run is marked failed.
+- A gone subvolume's entry is **retired**, not an error: it leaves `btrbk.conf`. `subvol expire` (after
+  btrbk) deletes its snapshots per target once retirement + that target's longest retention window has
+  passed; anything doubtful (no retention, unmounted/unreadable target, shared directory, name back,
+  snapshot newer than retirement, failed sync) is kept and reported. The last config entry and an entry
+  sending nowhere stay.
+- A **Missing** or **Stale** finding from the weekly drift check means sync itself failed.
+- **Target scoping is part of the entry.** Bulk data names its bulk target (`target_labels = ["<bulk target>"]`);
+  only system-recovery data goes to the small recovery drives. `target_labels = []` fans out to every
+  target — right for `@`/`@home`/`@opt`, wrong for a growing VM image. Any exception is a recorded decision,
+  not a precedent.
+- A bulk payload inside a broadly-scoped subvolume defeats scoping invisibly (a directory has no entry).
+  Give it its own subvolume: `chattr +C` **before** any file lands; copy with `cp --reflink=never`.
+- Verify a mechanism actually fired (`backup_runs`) before describing it in the past tense.
+
+## DAS Enclosure
+- **Check the negotiated USB link rate, not just throughput**: `cat /sys/bus/usb/devices/*/speed` must read the
+  enclosure's rated speed (`10000` Mbit/s for USB 3.2 Gen2). A downgrade to `480` is invisible to a backup that
+  still completes; only link speed reveals it. Bay-map guide: `docs/DAS-BAY-MAPPING.md`.
+- **Targets are hidden from udisks** by generated `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`
+  (never hand-edit; `btrdasd setup --check` reads the flag back). Nothing may mount them under `/run/media`.
+- Targets are mounted only by this project's jobs, by `mount_uuid`, never by fstab. A RAID-1 primary spans
+  two drives; small recovery drives are independent single-device filesystems.
+
+## Targets and Retention (per `/etc/das-backup/config.toml`)
+- Targets, labels, serials, mounts and retention are configuration, never code defaults; the installation's
+  values are in `local-installation.md`.
+- Recovery drives (`role = "mirror"`) are independent bootable copies, **not** RAID mirrors of each other. Their OS
+  under `@` is read-only checked; stale, or btrbk running at its boot, is WARN. Rebuilt by
+  `recovery-os-vm.sh provision` (guide: Building a recovery drive); the host never writes to the drive.
+- Boot archives: 60-day retention by default (`[boot].archive_retention_days`), pruned by `boot-archive-cleanup.sh`
+  at the end of every `backup-run.sh` run (daily and full; not CLI/GUI runs) while targets are still mounted.
+
+## Mount Options for a RAID-1 Primary Target
+- `[das].mount_opts` includes `degraded`, so one failed leg does not block backup or restore.
+- Data written degraded lands as `single` chunks. After replacing the leg: `btrfs scrub`, then
+  `btrfs balance start -dconvert=raid1 -mconvert=raid1`.
+- A backup target is never in `/etc/fstab`; boot is unaffected by a leg failure.
+
+## Boot Subvolume Archival
+- Snapshot live `@`/`@home` read-only to `@.archive.<TS>` / `@home.archive.<TS>`, **then** replace the
+  live subvolume from the latest btrbk snapshot. Archive failed ⇒ replacement skipped — the only copy
+  of the outgoing subvolume is never destroyed.
+- Two code paths, kept symmetric: bash `update_boot_subvolumes()` in `scripts/backup-run.sh` (every
+  run) and Rust `archive_boot_with` in `indexer/src/backup.rs`. **Both locate the replacement BEFORE
+  deleting anything**; none found is a WARN.
+- **One classification, both paths** (bd woq, dtm, 2026-10-06): Rust (`archive_boot_with`:
+  `BootOutcome`, `BootStep`) and the script produce the same rows and words. **The situation → outcome
+  table, snapshot-match rule and full-run mutation order are in the reference under this heading**,
+  pinned row by row by Rust test `every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns`.
+  Summary: an absence (no `snapshot_name`, no `target_subdirs`, no snapshot of the series) is WARN;
+  anything meant to work that did not (unreadable `btrbk.conf` or listing, refused verification, any
+  replacement step, a `btrfs` that cannot run, a symlink where a subvolume or staging path belongs) is
+  FAIL. Every check runs before the first mutation. Status `FAIL (<u> updated, <f> failed)` /
+  `WARN (<u> updated, <s> skipped, <w> warnings)` / `OK (<u> updated, <s> skipped)`; FAIL fails the
+  run (exit 3), WARN does not. An incremental run creates a missing boot subvolume, never replaces
+  one; only a full run (or `backup boot-archive`) archives and replaces.
+- `Config::load` does NOT run `validate`, so the boot step enforces its own input
+  (`Config::boot_input_errors`, shared with `validate`) where it reads it: `backup::boot_plan`, called
+  by `archive_boot_with` (whole-step FAIL before any btrfs call) and by `backup boot-plan` (exit 2,
+  nothing on stdout, so the script's boot step FAILs). It refuses a repeated `[boot].subvolumes` entry,
+  a `.` or `..` path component in one, and a repeated `[[target]].label` or `mount`.
+- **Snapshot names are read from `/etc/btrbk/btrbk.conf`, never re-derived**
+  (`forget::live_subvol_snapshot_names()`). Unreadable ⇒ whole step FAILs.
+- **Both paths, and the pruner, skip `role=mirror` targets entirely** — recovery drives carry their own
+  OS under `@`/`@home`. Ordinary btrbk send/receive to them is unaffected.
+- The pruner deletes only `@.archive.*` / `@home.archive.*` past retention on non-mirror targets.
+  Old archives already on the mirrors are left for manual review, never auto-removed.
+
+### Delete vs mutate — send/receive chain safety
+- Deleting a *target* snapshot is harmless while one common pair survives (source UUID == target Received UUID).
+- **NEVER clear `ro` on a received subvolume** — it permanently destroys the Received UUID.
+- Mutating an already-sent LOCAL parent silently desynchronises source and target.
+- In-place purging of a file is safe only in snapshots that are neither send sources nor received.
+
+## Restore Destination Policy (since 0.7.20.0)
+Checked before any directory is created, both roots compared **after resolution**:
+- **`[restore] allowed_roots`** in `config.toml` — default `/home`, `/tmp`. Widen it there, not in code;
+  grant a subdirectory, never `/srv` itself.
+- **`RESTORE_DENIED_ROOTS`** (`indexer/src/config.rs`) is checked first and **no configuration can
+  override it** — system paths plus served roots `/srv/http` and `/srv/ftp`.
+- **`O_NOFOLLOW` on every write.** Absolute or non-literal member paths are rejected.
+
+## Email Reports
+- **THIS PROJECT HOLDS NO MAIL CREDENTIAL and must never acquire one.** Reports go unauthenticated,
+  plain, over loopback to a local relay (`127.0.0.1:25`), which authenticates upstream by **envelope
+  sender**. Never copy a relay or provider key into any project or system config.
+- Both consumers read `[email]` from `config.toml`: `send_report()` in `scripts/backup-run.sh` and
+  `send_email_report_with_kind()` in `indexer/src/report.rs`. `[email].from` selects the relay
+  credential, so it must be the relay's configured sender (e.g. `das-backup@example.org`). `DAS_REPORT_TO` / `DAS_REPORT_FROM` override for testing.
+- **`smtp-auth=none` is REQUIRED on every mailx invocation**, or s-nail aborts with exit 4.
+- **Never redirect mailx stderr to `/dev/null`.**
+- **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed: s-nail gives
+  up after ~45 s of silence, but not on a relay that keeps trickling bytes; that must cost the report, not the run.
+- The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only. A failed
+  write is logged, and the not-emailed lines then name the journal. With email off, an unsavable report
+  is a FAIL (exit 3, `report:` in the row): the journal has the only copy. **One rule on both paths**
+  (bd `dlpr`): failed email beside a saved report is a WARN, run status stands;
+  saved nowhere and mailed nowhere is a FAIL.
+- Diagnose with `journalctl -u das-backup`, `journalctl -u postfix`, `mailq`. `status=sent` means the
+  provider accepted it, not that it reached the inbox.
+
+## Content Indexer
+- Database `/var/lib/das-backup/backup-index.db`; span-based storage, FTS5 search, incremental.
+- Soft-fail: indexing errors do not abort the backup, but must still reach the report.
+- **The state subvolume (`/var/lib/das-backup`, `after_index = true`) is sent after indexing** by `run_state_pass` from `/etc/btrbk/btrbk-state.conf`, never by the main btrbk run (which would keep a pre-index snapshot as the day's). A `State index pass` WARN means the targets' index copy is a night old. A recovery OS reads it at boot through `das-recovery-state-sync` (guide: "What the recovery OS knows at boot").
+
+## Scrub Ownership Boundary — exclusive in both directions
+- **This project is the ONLY thing that scrubs the `[scrub].targets` filesystems**, and **never scrubs or
+  services non-backup filesystems.** No other component adds a scrub timer for the backup media.
+- Targets are scrubbed sequentially in `[scrub].targets` order (shared USB path).
+- `[scrub].on_calendar` is a *preference* for backup-first, not a guarantee; the backup timer has a randomised
+  delay. **Both orders are correct** — the interlock makes the second job wait. An overrunning scrub defers
+  the next backup, never skips it.
+
+## Supervisor Interaction — A Service Supervisor May Restart Failed Units
+- A supervisor (systemd `Restart=`, a monitor that restarts any unit it sees `failed`) must never meet a failure
+  the next start would meet again: such a unit would loop. **To stop a unit deliberately: `systemctl stop` AND
+  `systemctl mask`** — stop alone can be undone within seconds.
+- The unit files carry no `Restart=`, `OnFailure=` or `OnUnitInactiveSec=`. Keep it that way. A rate limiter
+  cannot brake a failure loop slower than its own window, so a failure the next start would meet again must
+  never leave a unit `failed`. Supervisors match unit names by exact string: prefer single non-template units.
+  - `btrdasd scrub run`: **0** = the pass executed, whatever it found; **nonzero** = could not start.
+    Findings travel by email.
+  - `backup-run.sh` (bd `d1r`): **0** = nothing FAILED (a WARN still 0); **3** = began its work and
+    something FAILED, or aborted on a target's or source's state; **1** = could not start (nothing
+    mounted or sent); **128+N** = stopped by HUP INT USR1 PIPE ALRM or TERM (129 130 138 141 142 143),
+    the unit fails. Both backup units carry `SuccessExitStatus=3`; that line is load-bearing.
+  - A 3 is not silent: the report says FAILURES DETECTED (a FAIL recorded after the report is built is
+    named in the history row), and an abort before the report sends one **ABORTED** report and records
+    a failed row (bd `2my`). Only an abort *after* the report went out leaves just the journal's
+    `status=3` and the log.
+  - `btrdasd backup run` (CLI, GUI; not run by the units; bd `vzsu`): same 0 / 3 / 1 — see
+    "The CLI/GUI Run Records Truthfully" below.
+  - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
+    step, the unmount after it, or the mount once its locks were held failed
+    (`BootStep::mount_failure_exit_code`), **1** only when it could not start (config, locks).
+  - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some volume
+    failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
+    `SuccessExitStatus=1`; that line is load-bearing.
+  - `das-recovery-os-update-*.service` (the helper's generated scheduled recovery-drive sessions)
+    carries `SuccessExitStatus=1 3 4 5 6 7`; that line is load-bearing. A refused, warned or failed
+    session is not a failed unit: the outcome is in the session history
+    (`recovery-os-vm-history.jsonl`), never a restart. **A supervisor is never the tool that retries a
+    recovery-drive session** (bd `01ne`): a supervisor restart re-boots the drive and
+    replaces its pre-update snapshot. `recovery-os-vm.sh session` refuses to be the main process of a
+    unit without that line; `session ... --detach` is the way to run one in the background.
+
+## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
+- `btrdasd backup run|snapshot|send` and the GUI hand btrbk **only** the selected sources and targets,
+  as filter arguments, one per (subvolume, target) pair: `<target dir>/<snapshot_name>`
+  (`btrbk_conf::declared_pairs`, `backup::btrbk_filters`). Never a volume path (cannot tell two sources
+  on one volume apart), never a source filter beside a target filter (btrbk filters are a union; a
+  matched subvolume keeps every target).
+- A label not in the configuration, or a selection that leaves nothing, **refuses** the step. An empty
+  filter list is btrbk's "everything": passed only when the selection IS everything.
+- **`backup snapshot` and `backup send` (CLI only) sync first, as `run` does**
+  (`backup::sync_for_manual_step`, sources mounted, before the targets). A select-all passes btrbk no
+  filter, so it trusts `btrbk.conf`; sync brings that into line with `config.toml`. Unlike `run`, a
+  failed sync stops the step: `run` continues because configured subvolumes must still be backed up; a
+  step that cannot tell whether `btrbk.conf` is current has no such obligation.
+- The run mounts **nothing** itself. `mount::ensure_sources_mounted` and `ensure_targets_mounted` mount,
+  and each returned `MountGuard` records what it mounted and gives exactly that back; `run_backup` only
+  checks each selected source's volume is a mount point and refuses if not (bd `7tx`, `8cf`).
+- **An empty selection is a refusal, never "all"** (bd `7tx`). `BackupOptions.sources`/`.targets` are
+  `Option`s: `None` = not specified (CLI, no flag: all), `Some(vec![])` = nothing ticked, refused by
+  `backup::empty_selection` before the first lock or mount. D-Bus `as` arguments cannot say "not
+  specified", so the helper's `BackupRun` always passes `Some(list)` and the job refuses an empty one
+  (`CouldNotStart`; GUI gets `JobFinished(false, …)`, not a D-Bus error). A label (source or target)
+  the configuration lacks is refused too, before the first lock (`backup::unknown_label`, exit 1), even
+  beside known ones — never dropped, never widened to "all mounted".
+- An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
+  still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline is
+  the first primary target, so a reduced config renders other targets' retention differently.
+
+## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
+- `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`: **`None` = unknown** — the
+  counting step was asked for and failed. Never `Some(0)` (a measurement: "nothing to do"). Stored NULL
+  (schema 4), printed `unknown` (summary, `backup run`), `null` (`--json`); GUI history shows "unknown".
+- **`btrdasd backup run` exits 0 / 3 / 1 — the script's and doctor's rule** (bd `vzsu`;
+  `BackupJobOutcome::exit_code`): **0** clean (a warning too) or declined; **3** began and something
+  failed, or aborted on a target's/source's state (`Aborted`: no target mounts, verification refuses, an
+  absent ticked target — recorded as a failed row, counts NULL, unless a dry run); **1** could not start
+  (`CouldNotStart`: empty selection, unknown label, locks). A report neither saved nor mailed fails the
+  run BEFORE the row is written, so the row says `report: …`; a failed email beside a saved report stays
+  a warning. The GUI has no exit codes: `JobFinished(success, summary)` — exit 0 = success, 3 and 1 =
+  failure with the summary or reason.
+- A failed `host.record` fails the job (`history not recorded: …` in `errors`), never only a warning: a
+  run missing from history that reports success is the fail-silent defect.
+- **`backup run` (CLI and GUI) records the recovery OSes it mounted**, as `backup-run.sh` does (bd
+  `58c8`; `backup send` and `run_full_pipeline` do not): after btrbk, targets still
+  mounted, the CLI/GUI run reads each *selected* `role = "mirror"` target and writes
+  `recovery-os.json` (`backup::recovery_os_step` → `recovery_os::record_within`, 900 s bound shared with
+  `RECOVERY_OS_TIMEOUT_SECS`, pinned by a test). One rule with `check_recovery_os`: STALE/WARNING is
+  WARN, unreadable root / unwritable record / timeout is FAIL (fails the run). `btrdasd recovery-os
+  record [<label>…]` does it without a backup: backup lock then maintenance lock, neither waited for
+  (75), labels refused before any lock (1), a drive not mounted/read/recorded or left mounted is 3.
+
+## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
+**Never invoke `btrbk` against a target path that is not a real mountpoint backed by the expected DAS
+filesystem** — the write falls through to the NVMe root and fills it (`bd 9on`). Two layers, both
+unconditional, both run under `--dryrun`:
+1. **`create_mount_points`** — creates `$mnt` only for available targets. A stale bare directory for an
+   unavailable one is `rmdir`'d if empty, a fatal ABORT if non-empty.
+2. **`verify_targets_before_btrbk`** — after mounting, before `run_btrbk`: an available target must be a
+   real mountpoint whose UUID (or serial) matches `config.toml`; an unavailable target's `$mnt` must not
+   exist. Any violation aborts, exit 3, with an ABORTED report and a failed history row (bd `2my`).
+
+Rust twin (CLI/GUI): `mount::verify_write_targets`, called inside every step that writes under a target
+— `run_backup`, `send_snapshots`, `run_full_pipeline`, `archive_boot` (bd `7tx`) — so no caller can skip
+it: `backup send` and `backup boot-archive` are covered from the CLI (the helper has only `BackupRun`).
+`archive_boot` verifies the non-mirror targets whose mount point exists (the script's two safe states:
+real mountpoint, or absent); a bare directory refuses the whole step. A target with no `mount_uuid` is
+identified by its drive's serial, as the script does (`findmnt` → `lsblk` → `smartctl -i`); an
+unreadable serial is a refusal, never a pass (bd `7tx` 4).
+
+## Maintenance Interlock — backup vs. scrub mutual exclusion
+Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesystems; never overlap.
+1. **Singleton lock**, non-blocking: `/run/das-{backup,scrub,reconcile,doctor}.lock`. Held ⇒ skip; a
+   backup lock that cannot be opened or taken is "could not start", exit 1 (bd `ismb`).
+2. **Maintenance lock**: `/run/das-maintenance.lock`, shared by all sides, held for the whole operation.
+   Backup and scrub **wait** for it, never skipped; `reconcile` and `doctor` defer.
+- **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`);
+  `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75; a holder that runs them hands its hold down
+  (`DAS_MAINTENANCE_LOCK_FD`) or they fail.
+
+**Always acquire singleton, then maintenance — never the reverse.** That ordering alone makes the pair
+deadlock-free; release order is irrelevant.
