@@ -134,8 +134,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for all installation methods including na
 - [Disaster Recovery Guide](docs/DISASTER-RECOVERY-GUIDE.md) — Step-by-step recovery procedures
 - [Storage Architecture & Recovery](docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md) — BTRFS RAID concepts, failure detection, recovery procedures
 - [DAS Bay Mapping](docs/DAS-BAY-MAPPING.md) — How to map and document physical drive locations
-- [Throughput Baseline](docs/THROUGHPUT-BASELINE.md) — What a healthy run looks like, and why link speed rather than throughput is the health signal
-- [Reference Examples](docs/examples/) — Author's hardware setup as a worked example
+- [Reference Examples](docs/examples/) — Templates for documenting your own bay map and storage layout
 
 ## License
 

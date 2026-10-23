@@ -274,3 +274,5 @@ SESSION_RECORD*.md.zst
 .claude/rules/local-*.md
 docs/examples/local-*.md
 .claude/local-scrub-map.txt
+docs/local/
+.claude/docs/local/

@@ -2650,7 +2650,7 @@ could
 run at all: a config load failure, a lock-file I/O error, or every
 target failing before any scrub was attempted. This split (bd
 .BR DAS\-Backup\-Manager\-18p )
-exists so a Sentinel-monitored systemd unit never retry-loops a real
+exists so a watchdog-monitored systemd unit never retry-loops a real
 multi-hour scrub over failing hardware just because it found damage
 \(em only a genuine can't-even-start failure, which fails in seconds,
 trips the unit into
@@ -2770,7 +2770,7 @@ means no drift was found, or the check deferred because a lock was held
 means drift was found (missing or stale subvolumes). Unlike
 .BR "btrdasd scrub run" ,
 this genuinely surfaces through the exit code, because a drift check has no
-Sentinel multi-hour-retry hazard to protect against.
+watchdog multi-hour-retry hazard to protect against.
 .B 2
 means the check could not run at all: a config load failure, a lock I/O
 error, or every configured source volume failed to mount or list (nothing
