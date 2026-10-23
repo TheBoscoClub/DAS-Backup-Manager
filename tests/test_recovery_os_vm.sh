@@ -315,6 +315,7 @@ DAS_TARGET_2_MOUNT='/mnt/backup-system-recovery-B'
 DAS_TARGET_2_ROLE='mirror'
 DAS_TARGET_2_DISPLAY_NAME='2TB Recovery B (Bay 4, SERIAL02)'
 DAS_RECOVERY_OS_EGRESS_ORG='${EGRESS_CFG-AS64500}'
+DAS_RECOVERY_OS_INSTALL_USER='${INSTALL_USER_CFG-recovery}'
 EOF
 }
 
@@ -5920,6 +5921,42 @@ run_driver_env "${PROV[@]}" --dry-run
 check "provision, the other drive's last session failed: exit 1" "$RC" "1"
 has "provision, the other drive failed: never two drives down" "$OUT" "system-recovery-B-2tb's last session was failed (stopped at upgrade): never two recovery drives down at once"
 
+echo "--- provision: the installation's own documents, docs/ beside config.toml"
+provision_fixture
+mkdir -p "$T/docs"
+printf 'filled in\n' >"$T/docs/DISASTER-RECOVERY-GUIDE.md"
+ln -s "$T/config.toml" "$T/docs/EMERGENCY-QUICK-REFERENCE.md"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, a symlink among the local documents: exit 1" "$RC" "1"
+has "provision, a symlink among the local documents: named" "$OUT" "EMERGENCY-QUICK-REFERENCE.md' is not a readable regular file"
+lacks "provision, a symlink among the local documents: nothing booted" "$(file "$S/virsh.calls")" "start"
+check "provision, a symlink among the local documents: no lock taken" "$(file "$S/flock.calls")" ""
+provision_fixture # a new $T: the documents are made again, without the symlink
+mkdir -p "$T/docs"
+printf 'filled in\n' >"$T/docs/DISASTER-RECOVERY-GUIDE.md"
+printf 'top: @\ntop: @home\npackage: linux-cachyos 7.2.9-1\n' >"$S/stage.capture.out"
+run_driver_env "${PROV[@]}"
+check "provision with local documents: exit 0" "$RC" "0"
+has "provision with local documents: package is told where they are" "$(file "$S/stage.package.sh")" "export DAS_INSTALL_LOCAL_DOCS=/run/das-provision/payload/docs"
+rm -rf "${T:?}/docs"
+
+echo "--- provision: the new OS's account comes from config.toml, no built-in name"
+for bad_user in "" Root "a;reboot" root; do
+    INSTALL_USER_CFG=$bad_user
+    provision_fixture
+    run_driver_env "${PROV[@]}" --dry-run
+    check "provision, install_user '$bad_user': exit 1" "$RC" "1"
+    has "provision, install_user '$bad_user': names the setting" "$OUT" "install_user"
+    lacks "provision, install_user '$bad_user': nothing booted" "$(file "$S/virsh.calls")" "start"
+    check "provision, install_user '$bad_user': no lock taken" "$(file "$S/flock.calls")" ""
+    check "provision, install_user '$bad_user': no payload built" "$(file "$S/xorriso.log")" ""
+done
+INSTALL_USER_CFG=
+provision_fixture
+run_driver_env "${PROV[@]}" --dry-run
+has "provision, install_user unset: says where to set it" "$OUT" "set install_user under [recovery_os]"
+unset INSTALL_USER_CFG
+
 provision_fixture
 {
     printf '{"label":"system-recovery-B-2tb","start":1791860000,"end":1791863600,"mode":"single","unattended":true,"outcome":"failed","exit":7,"overridden":false,"kernel":null,"stopped_at":"upgrade"}\n'
@@ -6027,6 +6064,9 @@ STAMP_LINE=$(grep -o 'DAS_INSTALL_STAMP=[0-9]\{8\}-[0-9]\{6\}' "$S/stage.replace
 matches "provision: replace-os gets a stamp" "$STAMP_LINE" "^DAS_INSTALL_STAMP=[0-9]{8}-[0-9]{6}$"
 has "provision: delete-replaced gets the same stamp" "$(file "$S/stage.delete-replaced.sh")" "$STAMP_LINE"
 has "provision: verify gets the config from the payload" "$(file "$S/stage.verify.sh")" "DAS_INSTALL_CONFIG=/run/das-provision/payload/config.toml"
+has "provision: configure gets the account from config.toml" "$(file "$S/stage.configure.sh")" "export DAS_INSTALL_USER=recovery"
+has "provision: replace-os gets the account too (it refuses without one)" "$(file "$S/stage.replace-os.sh")" "export DAS_INSTALL_USER=recovery"
+lacks "provision: no docs/ beside config.toml, no local documents passed" "$(file "$S/stage.package.sh")" "DAS_INSTALL_LOCAL_DOCS"
 has "provision: each step runs the installer from the payload" "$(file "$S/stage.pacstrap.sh")" "/run/das-provision/payload/recovery-os-install.sh pacstrap"
 has "provision: the payload step checks its sums" "$(file "$S/stage.payload.sh")" "sha256sum -c"
 has "provision: repos runs the pipeline's own check against the new root" "$(file "$S/stage.repos.sh")" "PACMAN_CONF=/mnt/target/etc/pacman.conf"
@@ -6256,6 +6296,7 @@ run_driver_env provision A --undo --iso "$ISO"
 check "undo: exit 0" "$RC" "0"
 has "undo: the undo step ran with the provision's stamp" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_STAMP=$STAMP"
 has "undo: ...and its archives" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_ALSO_REPLACE='@.archive.20260301-1200'"
+lacks "undo: no account is passed (an undo creates none)" "$(file "$S/stage.undo.sh")" "DAS_INSTALL_USER"
 check "undo: the payload mounted first, then undo only" "$(tr '\n' ' ' <"$S/stages.log")" "payload undo "
 has "undo: booted the live system, not the drive" "$(prov_events)" "virsh attach cdrom $ISO|"
 check "undo: started once" "$(grep -c '^virsh start' "$S/events")" "1"

@@ -242,8 +242,8 @@ void BackupPanel::applyConfig(const QString &toml)
     //   subvolumes = ["@", "@home", "@root", "@log"]
     //
     //   [[target]]
-    //   label = "primary-22tb"
-    //   display_name = "22TB Exos (Bay 2)"
+    //   label = "primary"
+    //   display_name = "Primary (Bay 1)"
     //
     // The GUI shows source labels and target labels as checkboxes.
     // The Rust backend resolves subvolumes from labels internally.

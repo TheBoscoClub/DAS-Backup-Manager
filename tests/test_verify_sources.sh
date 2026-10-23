@@ -45,7 +45,7 @@ if [[ ! -f "$SCRIPT" ]]; then
 fi
 
 # ---------------------------------------------------------------- fixtures --
-# Real UUIDs from this host, so the geometry under test is the real geometry:
+# Placeholder UUIDs standing for a real host's, so the geometry is a real one:
 #   ROOT_FS_UUID  the NVMe root filesystem — AND the `nvme` source's own
 #                 filesystem, reached at /.btrfs-nvme as its subvolid=5 view
 #   HDD_FS_UUID   /srv/data / /.btrfs-hdd
@@ -231,8 +231,8 @@ expect_refuse "bare /.btrfs-nvme where source fs == root fs (UUID check is blind
     "/.btrfs-nvme is NOT a mountpoint"
 
 # ---- case 4b: ISOLATES the `mountpoint -q` check. A bare source path nested
-#      under an already-mounted top-level volume of the SAME filesystem — this
-#      host has exactly that geometry available (/srv/vmpool is mounted with
+#      under an already-mounted top-level volume of the SAME filesystem — a
+#      real geometry (a volume like /srv/vmpool mounted with
 #      FSROOT '/' and UUID 5eed0020-…, so any bare path beneath it answers with
 #      a MATCHING uuid AND a MATCHING '/' fsroot). Both identity checks say
 #      "fine"; only `mountpoint -q` refuses. Case 4's fixture is also caught by

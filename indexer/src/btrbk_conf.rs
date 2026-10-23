@@ -750,10 +750,7 @@ mod tests {
             algorithmic_snapshot_name("@srv/stremio-web"),
             "srv-stremio-web"
         );
-        assert_eq!(
-            algorithmic_snapshot_name("media/video"),
-            "media-video"
-        );
+        assert_eq!(algorithmic_snapshot_name("media/video"), "media-video");
         // The bare top-level subvolume has nothing left once '@' is gone.
         assert_eq!(algorithmic_snapshot_name("@"), "root");
     }

@@ -114,13 +114,12 @@
 #     of its own helper mounts into "unmount every source", the first run
 #     after a boot took down the fstab mounts /.btrfs-nvme, /.btrfs-ssd and
 #     /.btrfs-hdd, down until the next boot (each later run mounting and
-#     unmounting them itself), and every run tried /srv/vmpool, the operator's
-#     general-use filesystem. That failed every night with a WARN that could
-#     not say why: umount's message went to /dev/null. The nested fstab mount
-#     /srv/vmpool/VirtualMachines pinned it, not running VMs as the comment
-#     said: umount refuses a mount with another mounted beneath it (reproduced
-#     on this kernel, 2026-10-04), and that night no VM ran and no process
-#     held /srv/vmpool. A helper mount that will not unmount is still a WARN,
+#     unmounting them itself), and every run tried a general-use fstab
+#     filesystem the sources live on. That failed every night with a WARN that
+#     could not say why: umount's message went to /dev/null. A nested fstab
+#     mount beneath it pinned it, not running VMs as the comment said: umount
+#     refuses a mount with another mounted beneath it (reproduced 2026-10-04),
+#     and that night no VM ran and no process held the filesystem. A helper mount that will not unmount is still a WARN,
 #     not a FAIL and not part of the disconnect gate, now with umount's own
 #     message. The probe before each unmount (probe_mount_point) tells "not
 #     mounted" from "could not tell": mountpoint's error read as "not
@@ -390,7 +389,7 @@
 #     Pre-existing since the snapshot_name scheme was introduced, predates
 #     this file's v4.x history entirely — found 2026-08-01 during the real
 #     das-backup-full.service proof run, whose journal showed
-#     "[das-backup-22tb] No btrbk snapshots found, skipping" even though
+#     "[das-backup-primary] No btrbk snapshots found, skipping" even though
 #     btrbk had just created fresh snapshots that same run. Combined with
 #     the correct role=mirror skip on the two recovery targets, this made
 #     the scheduled full-backup boot-subvolume-refresh path a complete
@@ -430,7 +429,7 @@
 #       actually unmounted — previously it printed unconditionally even when
 #       a target was still mounted. Source volumes remain a best-effort,
 #       untracked unmount since they are host filesystems outside the
-#       physical DAS enclosure and some (das-storage on /srv/vmpool) can
+#       physical DAS enclosure and some (a VM-image source, say) can
 #       legitimately stay busy indefinitely (running VMs) — a source unmount
 #       failure now logs a visible log_warn (previously fully silent via
 #       `|| true`) but still never touches record_op or the disconnect gate.
@@ -2661,7 +2660,7 @@ unmount_all() {
     # Sources: only the mount points this run mounted itself
     # (SOURCE_MOUNTS_OWNED, recorded by mount_sources), last mounted first,
     # each once — however many sources share one. A source volume that was
-    # already mounted when the run looked (fstab mounts /srv/vmpool and the
+    # already mounted when the run looked (fstab mounts such as /srv/vmpool and the
     # /.btrfs-* top levels) was used as found and is never unmounted here: the
     # run reads from it and owns nothing about it (bd DAS-Backup-Manager-8cf).
     # One unmounted is struck off, so a second pass — cleanup() after an
@@ -2911,22 +2910,31 @@ log_throughput() {
         #     2026-08-31 restored  13.00 GiB / 11m12s = 19.80 MiB/s
         #
         # 9.17 against 10.97 is inside ordinary run-to-run variation, so a
-        # throughput trend alone would never have flagged it. The enclosure is
-        # deliberately bound to usb-storage (BOT) rather than UAS by
-        # /etc/modprobe.d/terramaster-no-uas.conf; BOT issues one command at a
-        # time with no queuing, so above roughly Gen 1 the spindles and BOT are
-        # the limit, not the bus. That quirk is a correct stability trade and
-        # should stay — but it is exactly why link rate and transfer rate are
-        # only loosely coupled here.
+        # throughput trend alone would never have flagged it. An enclosure
+        # bound to usb-storage (BOT) rather than UAS by a modprobe quirk — a
+        # common stability trade for USB JBODs — issues one command at a time
+        # with no queuing, so above roughly Gen 1 the spindles and BOT are the
+        # limit, not the bus; that is exactly why link rate and transfer rate
+        # are only loosely coupled.
+        #
+        # The enclosure is the USB device whose product string contains
+        # [das].model_pattern (DAS_MODEL_PATTERN from dump-env). Empty, no
+        # device is singled out: the first USB device on the bus would be a
+        # guess (a keyboard's 12 Mbit/s read as the enclosure's), so the link
+        # is left unknown and the log says why — never a borrowed reading.
         local link_speed="unknown"
         local d
-        for d in /sys/bus/usb/devices/*/; do
-            [[ -f "$d/speed" && -f "$d/product" ]] || continue
-            if [[ "$(cat "$d/product" 2>/dev/null)" == *TDAS* ]]; then
-                link_speed="$(cat "$d/speed" 2>/dev/null || echo unknown)"
-                break
-            fi
-        done
+        if [[ -z "${DAS_MODEL_PATTERN:-}" ]]; then
+            log_info "  DAS USB link speed not checked: no [das].model_pattern is configured (your enclosure's USB product string)"
+        else
+            for d in /sys/bus/usb/devices/*/; do
+                [[ -f "$d/speed" && -f "$d/product" ]] || continue
+                if [[ "$(cat "$d/product" 2>/dev/null)" == *"$DAS_MODEL_PATTERN"* ]]; then
+                    link_speed="$(cat "$d/speed" 2>/dev/null || echo unknown)"
+                    break
+                fi
+            done
+        fi
 
         if [[ "$link_speed" != "unknown" && "$link_speed" -lt 5000 ]]; then
             log_warn "  DAS USB link negotiated at ${link_speed} Mbit/s — expected 10000."

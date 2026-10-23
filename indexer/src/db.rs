@@ -409,8 +409,8 @@ impl Database {
     /// Check if a snapshot with the given (source, name, ts) triple already
     /// exists in the database.  This is mount-path-agnostic — it prevents
     /// duplicate indexing when the same snapshot is accessed via different
-    /// mount points (e.g. bind mount `/mnt/backup-22tb` vs udisks2
-    /// `/run/media/user/das-backup-22tb`).
+    /// mount points (e.g. bind mount `/mnt/backup-<label>` vs udisks2
+    /// `/run/media/<user>/<fs-label>`).
     pub fn snapshot_exists_by_key(&self, source: &str, name: &str, ts: &str) -> SqlResult<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM snapshots WHERE source = ?1 AND name = ?2 AND ts = ?3",

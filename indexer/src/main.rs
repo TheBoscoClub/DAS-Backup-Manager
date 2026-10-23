@@ -743,7 +743,7 @@ enum SubvolAction {
 enum RecoveryOsAction {
     /// Read one recovery OS root (the drive's `@`) and print its block
     Inspect {
-        /// The OS root, e.g. /mnt/backup-system-recovery-A/@
+        /// The OS root, e.g. /mnt/backup-<label>/@
         #[arg(long)]
         root: PathBuf,
         /// Name to print for the drive
@@ -1001,8 +1001,7 @@ fn gather_scrub_status(config: &Config) -> (Vec<ScrubTargetView>, Option<String>
         Err(e) => (None, Some(format!("could not read scrub state: {e}"))),
     };
     let views = config
-        .scrub
-        .targets
+        .scrub_target_labels()
         .iter()
         .map(|label| build_scrub_target_view(config, label, state.as_ref()))
         .collect();
@@ -1124,7 +1123,7 @@ fn scrub_target_json(v: &ScrubTargetView) -> String {
 /// for the DAS target (`bd DAS-Backup-Manager-0kn` review, 2026-08-01). An
 /// unverified target simply resolves to `Unknown` and is skipped.
 fn find_actively_scrubbing_target(config: &Config) -> Option<(String, String, String)> {
-    for label in &config.scrub.targets {
+    for label in &config.scrub_target_labels() {
         let Ok(fsuuid) = scrub::resolve_target_fsuuid(config, label) else {
             continue;
         };

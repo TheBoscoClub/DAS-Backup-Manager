@@ -24,10 +24,11 @@
 #      is shown to refuse such steps: the doc's own with its creating step left
 #      out, and constructed cases;
 #   6. the config schedules no scrub of a label it does not define.
-#      `[scrub].targets` defaults to the author's three labels and the scrub to
-#      on, so a config that leaves the section out schedules a monthly scrub of
-#      drives it never names, and scrubs none of its own. The check is shown to
-#      refuse the config without its [scrub] section.
+#      `[scrub].targets` once defaulted to a built-in label list, so a config
+#      that left the section out scrubbed drives it never named and none of
+#      its own (bd DAS-Backup-Manager-dis3). Empty now means every [[target]]:
+#      the config without its [scrub] section scrubs exactly its own targets.
+#      The check is shown to refuse a [scrub] that names a label no target has.
 #
 # Usage: test_install_doc_config.sh <btrdasd> [<INSTALL.md>]
 # Registered with ctest as shell-install-doc-config when the build makes btrdasd.
@@ -193,16 +194,24 @@ check "6. dump-env reports the scrub" \
     "$(grep -cE '^DAS_SCRUB_(ENABLED|TARGETS)=' <<< "$env_out")" "2"
 check "6. the scrub names no label the config does not define" \
     "$(undefined_scrub_labels <<< "$env_out")" ""
-# The same config without its [scrub] section: the default, the author's labels.
+# The same config without its [scrub] section: the default, every [[target]].
 awk '/^\[scrub\]/ { skip = 1; next } skip && /^[[:space:]]*$/ { skip = 0 } !skip' \
     "$config" > "$work/no-scrub.toml"
-check "6. without its [scrub] section it would scrub the author's three labels" \
-    "$("$btrdasd" config dump-env --config "$work/no-scrub.toml" 2>&1 | undefined_scrub_labels)" \
-    "primary-22tb system-recovery-A-2tb system-recovery-B-2tb"
+no_scrub_env="$("$btrdasd" config dump-env --config "$work/no-scrub.toml" 2>&1)"
+check "6. without its [scrub] section it scrubs no label it does not define" \
+    "$(undefined_scrub_labels <<< "$no_scrub_env")" ""
+check "6. without its [scrub] section it scrubs every one of its targets, in order" \
+    "$(awk -F= '/^DAS_SCRUB_TARGETS=/ { gsub(/\047/, "", $2); print $2 }' <<< "$no_scrub_env")" \
+    "$(awk -F= '/^DAS_TARGET_[0-9]+_LABEL=/ { gsub(/\047/, "", $2); print $2 }' <<< "$no_scrub_env" | paste -sd ' ' -)"
+# The check can refuse: a [scrub] naming a label no [[target]] defines.
+{ cat "$work/no-scrub.toml"; printf '\n[scrub]\ntargets = ["ghost-target"]\n'; } > "$work/scrub-ghost.toml"
+check "6. a [scrub] naming a label no target defines is caught" \
+    "$("$btrdasd" config dump-env --config "$work/scrub-ghost.toml" 2>&1 | undefined_scrub_labels)" \
+    "ghost-target"
 # A scrub that is off reaches no drive, so names none it cannot find: the same
 # config, its [scrub] section replaced by one that switches the scrub off.
 { cat "$work/no-scrub.toml"; printf '\n[scrub]\nenabled = false\n'; } > "$work/scrub-off.toml"
-check "6. a scrub that is off is not asked to find the author's labels" \
+check "6. a scrub that is off is not asked to find any label" \
     "$("$btrdasd" config dump-env --config "$work/scrub-off.toml" 2>&1 | undefined_scrub_labels)" ""
 
 if ((fails > 0)); then

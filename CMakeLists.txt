@@ -343,6 +343,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_record_run.sh
     )
     add_test(
+        NAME shell-usb-link
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_usb_link.sh
+    )
+    add_test(
         NAME shell-state-pass
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_state_pass.sh
     )

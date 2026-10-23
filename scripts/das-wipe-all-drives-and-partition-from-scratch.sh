@@ -3,12 +3,12 @@
 # Version: 2.3.5
 # Date: 2026-10-12
 #
-# WARNING: --run DESTROYS ALL DATA ON EVERY DRIVE config.toml NAMES -- the 22 TB
-#     backup pair AND both recovery drives, backups included -- and partitions
-#     them from scratch. It is the fresh-enclosure tool. It has no one-drive
-#     mode and must never be used to rebuild a recovery drive's OS: that is
-#     done inside the drive's VM without touching any data partition
-#     (docs/superpowers/specs/2026-10-12-recovery-drive-provisioning-design.md).
+# WARNING: --run DESTROYS ALL DATA ON EVERY DRIVE config.toml NAMES -- the
+#     primary backup drives AND the recovery drives, backups included -- and
+#     partitions them from scratch. It is the fresh-enclosure tool. It has no
+#     one-drive mode and must never be used to rebuild a recovery drive's OS:
+#     that is done inside the drive's VM without touching any data partition
+#     (recovery-os-vm.sh provision).
 #     Renamed from das-partition-drives.sh on 2026-10-12 so the effect is in the name.
 #     --check only prints the plan.
 #     --run refuses unless every drive's most recent SMART self-test PASSED:
@@ -513,10 +513,9 @@ verify_esp_labels_unique() {
 # Building it as "das-backup-" + the config TARGET ID does not reproduce
 # what is deployed -- it never matched any drive:
 #
-#     config target id        would derive                    on disk
-#     primary-22tb            das-backup-primary-22tb         das-backup-22tb
-#     system-recovery-A-2tb   das-backup-system-recovery-A-2tb  das-backup-system-recovery-A
-#     system-recovery-B-2tb   das-backup-system-recovery-B-2tb  das-backup-system-recovery-B
+#     config target id    would derive               on disk (example)
+#     primary-big         das-backup-primary-big     das-backup-big
+#     recovery-a-small    das-backup-recovery-a-small  das-backup-recovery-a
 #
 # so re-partitioning any target silently RENAMED its filesystem (bd 5j7).
 #

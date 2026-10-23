@@ -4,16 +4,16 @@
 //!
 //! `db.rs` was append-and-query only: nothing ever deleted a row. Every snapshot
 //! reaped by btrbk retention, or removed by hand, left its `snapshots`/`spans`/`files`
-//! rows behind permanently. Measured on the production index 2026-08-24:
-//! `/mnt/backup-22tb/projects/` held 2871 indexed snapshots against 327 actually on
-//! disk — 2544 dangling, 89%. `btrdasd search` served those paths as current, so a
+//! rows behind permanently. Measured on a production index 2026-08-24: one
+//! target's `projects/` directory held 2871 indexed snapshots against 327 actually
+//! on disk — 2544 dangling, 89%. `btrdasd search` served those paths as current, so a
 //! restore chosen from search output could name a snapshot deleted weeks earlier.
 //!
 //! # The trap this module is built around
 //!
 //! The obvious implementation — "path missing ⇒ prune" — **destroys the entire
 //! index**. DAS targets are deliberately unmounted between backup runs, so every
-//! indexed path under `/mnt/backup-22tb/...` is absent for most of the day. A pass
+//! indexed path under `/mnt/backup-<label>/...` is absent for most of the day. A pass
 //! run at the wrong moment would conclude that every snapshot ever taken had
 //! vanished.
 //!
@@ -142,8 +142,8 @@ impl ReconcilePlan {
 
 /// The mounted root that contains `path`, if any.
 ///
-/// Matching requires a `/` boundary so `/mnt/backup-22` never captures a path
-/// under `/mnt/backup-22tb`.
+/// Matching requires a `/` boundary so `/mnt/backup-a` never captures a path
+/// under `/mnt/backup-ab`.
 pub fn root_for<'a>(path: &str, roots: &'a [String]) -> Option<&'a str> {
     roots
         .iter()

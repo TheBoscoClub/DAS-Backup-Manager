@@ -130,7 +130,7 @@ run() { # <step> [VAR=value ...]
         DAS_INSTALL_UUID=5eed0008-0000-4000-8000-000000000008 DAS_INSTALL_ESP_LABEL=RECOV-ESP-1 DAS_INSTALL_BAY=1 \
         DAS_INSTALL_LETTER=A DAS_INSTALL_HOSTNAME=das-recovery-bay1 DAS_INSTALL_STAMP=20261013-010203 \
         DAS_INSTALL_PACKAGE="$R/payload/das-backup-manager-0.7.23.0-1-x86_64.pkg.tar.zst" \
-        DAS_INSTALL_KEYS="$R/payload/authorized_keys" \
+        DAS_INSTALL_KEYS="$R/payload/authorized_keys" DAS_INSTALL_USER=recovery \
         DAS_INSTALL_PAYLOAD_SHA256="$(sha256sum "$R/payload/das-backup-manager-0.7.23.0-1-x86_64.pkg.tar.zst" | cut -d' ' -f1)" \
         DAS_INSTALL_DEV=/dev/sdz "$@" bash "$SCRIPT" "$step" 2>&1) || RC=$?
 }
@@ -325,18 +325,53 @@ check "configure: pacman.conf copied from the live system" has "$R/mnt/target/et
 check "configure: locale" has "$R/mnt/target/etc/locale.conf" "LANG=en_US.UTF-8"
 check "configure: keymap" has "$R/mnt/target/etc/vconsole.conf" "KEYMAP=us"
 check "configure: timezone link" test "$(readlink "$R/mnt/target/etc/localtime")" = /usr/share/zoneinfo/America/Chicago
-check "configure: user user uid 1000 in the chroot" has "$LOG" "arch-chroot $R/mnt/target useradd -m -u 1000 -G wheel -s /bin/bash user"
-check "configure: NOPASSWD drop-in" has "$R/mnt/target/etc/sudoers.d/10-user" "user ALL=(ALL:ALL) NOPASSWD: ALL"
-check "configure: sddm autologin" has "$R/mnt/target/etc/sddm.conf.d/autologin.conf" "User=user"
+check "configure: user recovery uid 1000 in the chroot" has "$LOG" "arch-chroot $R/mnt/target useradd -m -u 1000 -G wheel -s /bin/bash recovery"
+check "configure: NOPASSWD drop-in" has "$R/mnt/target/etc/sudoers.d/10-recovery" "recovery ALL=(ALL:ALL) NOPASSWD: ALL"
+check "configure: sddm autologin" has "$R/mnt/target/etc/sddm.conf.d/autologin.conf" "User=recovery"
 check "configure: sshd key-only (D2)" has "$R/mnt/target/etc/ssh/sshd_config.d/10-das-recovery.conf" "PasswordAuthentication no"
 check "configure: sshd no root (D2)" has "$R/mnt/target/etc/ssh/sshd_config.d/10-das-recovery.conf" "PermitRootLogin no"
-check "configure: sshd user only (D2)" has "$R/mnt/target/etc/ssh/sshd_config.d/10-das-recovery.conf" "AllowUsers user"
-check "configure: authorized_keys copied for user" has "$R/mnt/target/home/user/.ssh/authorized_keys" "ssh-ed25519 AAAA test"
+check "configure: sshd recovery only (D2)" has "$R/mnt/target/etc/ssh/sshd_config.d/10-das-recovery.conf" "AllowUsers recovery"
+check "configure: authorized_keys copied for recovery" has "$R/mnt/target/home/recovery/.ssh/authorized_keys" "ssh-ed25519 AAAA test"
+check "configure: the home chowned to the account (its own group, by name)" has "$LOG" "arch-chroot $R/mnt/target chown -R recovery:recovery /home/recovery"
 check "configure: units enabled" has "$LOG" "systemctl enable sshd NetworkManager sddm qemu-guest-agent"
 check "configure: plymouth hook after udev (D9)" grep -q '^HOOKS=(base udev plymouth ' "$R/mnt/target/etc/mkinitcpio.conf"
 check "configure: plymouth theme set (D9)" has "$LOG" "plymouth-set-default-theme"
 check "configure: Flathub remote, no apps (D6)" has "$LOG" "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
 check "configure: no fstab entry for a host filesystem" test "$(grep -c '5eed0011\|5eed0020\|5eed0003\|5eed0004' "$R/mnt/target/etc/fstab" 2>/dev/null || :)" -eq 0
+
+echo "== the account: required, no built-in name; refused before anything changes"
+configure_fixture() {
+    fixture; mkdir -p "$R/mnt/target/etc"
+    printf 'HOOKS=(base udev autodetect modconf block filesystems fsck)\n' >"$R/mnt/target/etc/mkinitcpio.conf"
+}
+configure_fixture; run configure DAS_INSTALL_USER=ops_2 DAS_INSTALL_UID=1500
+check "account ops_2 uid 1500: exit 0" test "$RC" -eq 0
+check "account ops_2 uid 1500: useradd with both" has "$LOG" "useradd -m -u 1500 -G wheel -s /bin/bash ops_2"
+check "account ops_2 uid 1500: its own sudoers drop-in" has "$R/mnt/target/etc/sudoers.d/10-ops_2" "ops_2 ALL=(ALL:ALL) NOPASSWD: ALL"
+check "account ops_2 uid 1500: chowned to the account" has "$LOG" "chown -R ops_2:ops_2 /home/ops_2"
+check "account ops_2 uid 1500: no other drop-in" test "$(ls "$R/mnt/target/etc/sudoers.d")" = 10-ops_2
+for bad in "" Recovery 1user -user "a;reboot" "a b" root "$(printf 'a%.0s' {1..33})" "us\$er"; do
+    for step in configure package replace-os; do
+        configure_fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"
+        run "$step" DAS_INSTALL_USER="$bad"
+        check "account '$bad', $step: refused (exit 3)" test "$RC" -eq 3
+        check "account '$bad', $step: says which setting" out_has "DAS_INSTALL_USER"
+        check "account '$bad', $step: no tool ran" test ! -s "$LOG"
+        check "account '$bad', $step: nothing written, nothing set aside" test ! -e "$R/mnt/target/etc/hostname" -a ! -d "$R/mnt/target/etc/sudoers.d" -a ! -e "$R/mnt/target/payload" -a -f "$R/mnt/top/@/.subvol" -a ! -d "$R/mnt/top/@.replaced.20261013-010203"
+    done
+done
+configure_fixture; run configure DAS_INSTALL_USER=
+check "account unset: the refusal says where to set it" out_has "set install_user under [recovery_os] in config.toml"
+for bad in 999 0 60001 01000 abc "1000 " -5; do
+    configure_fixture; run configure DAS_INSTALL_UID="$bad"
+    check "uid '$bad': refused (exit 3)" test "$RC" -eq 3
+    check "uid '$bad': says which setting" out_has "DAS_INSTALL_UID"
+    check "uid '$bad': no tool ran" test ! -s "$LOG"
+done
+for good in 1000 60000; do
+    configure_fixture; run configure DAS_INSTALL_UID="$good"
+    check "uid $good: accepted" test "$RC" -eq 0
+done
 
 echo "== package: the project package, the marker, the unit, the masks, the desktop"
 fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"
@@ -355,9 +390,54 @@ for u in das-backup.timer das-backup-full.timer das-scrub.timer das-backup-docto
     check "package: $u masked" test "$(readlink "$R/mnt/target/etc/systemd/system/$u")" = /dev/null
 done
 check "package: the boot notice autostart" has "$R/mnt/target/etc/xdg/autostart/das-recovery-notice.desktop" "Exec=sh -c 'notify-send"
-check "package: Quick Reference on the Desktop" test "$(readlink "$R/mnt/target/home/user/Desktop/Quick Reference — PRINT THIS.md")" = /usr/share/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md
-check "package: Recovery Guide on the Desktop" test "$(readlink "$R/mnt/target/home/user/Desktop/Recovery Guide.md")" = /usr/share/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
-check "package: Storage architecture on the Desktop" test "$(readlink "$R/mnt/target/home/user/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
+check "package: Quick Reference on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Quick Reference — PRINT THIS.md")" = /usr/share/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md
+check "package: Recovery Guide on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /usr/share/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
+check "package: Storage architecture on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
+check "package, no local documents: nothing at /etc/das-backup/docs" test ! -e "$R/mnt/target/etc/das-backup/docs"
+
+echo "== package: the installation's own documents (DAS_INSTALL_LOCAL_DOCS)"
+package_fixture() {
+    fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup" "$R/payload/docs"
+    printf '[Unit]\nDescription=x\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"
+}
+package_fixture
+printf 'filled-in quick reference\n' >"$R/payload/docs/EMERGENCY-QUICK-REFERENCE.md"
+printf 'filled-in guide\n' >"$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
+printf 'not a document\n' >"$R/payload/docs/notes.txt"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+check "local docs: exit 0" test "$RC" -eq 0
+check "local docs: the quick reference installed" has "$R/mnt/target/etc/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md" "filled-in quick reference"
+check "local docs: the guide installed" has "$R/mnt/target/etc/das-backup/docs/DISASTER-RECOVERY-GUIDE.md" "filled-in guide"
+check "local docs: mode 0644" test "$(stat -c %a "$R/mnt/target/etc/das-backup/docs/DISASTER-RECOVERY-GUIDE.md")" = 644
+check "local docs: owned by root in the chroot" has "$LOG" "arch-chroot $R/mnt/target chown -R root:root /etc/das-backup/docs"
+check "local docs: only *.md installed" test ! -e "$R/mnt/target/etc/das-backup/docs/notes.txt"
+check "local docs: Quick Reference link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Quick Reference — PRINT THIS.md")" = /etc/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md
+check "local docs: Recovery Guide link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /etc/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
+check "local docs: a document with no local copy keeps the package's" test "$(readlink "$R/mnt/target/home/recovery/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
+package_fixture
+printf 'x\n' >"$WORK/elsewhere.md"
+ln -s "$WORK/elsewhere.md" "$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+check "local docs, a symlink: refused (exit 3)" test "$RC" -eq 3
+check "local docs, a symlink: said" out_has "is not a regular file"
+check "local docs, a symlink: refused before pacman" test "$(calls 'pacman -U')" -eq 0
+check "local docs, a symlink: nothing installed" test ! -e "$R/mnt/target/etc/das-backup/docs"
+package_fixture
+mkdir "$R/payload/docs/sub.md"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+check "local docs, a directory named *.md: refused (exit 3)" test "$RC" -eq 3
+package_fixture
+printf 'x\n' >"$R/payload/docs/bad name.md"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+check "local docs, a name with a space: refused (exit 3)" test "$RC" -eq 3
+check "local docs, a name with a space: before pacman" test "$(calls 'pacman -U')" -eq 0
+package_fixture
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/missing"
+check "local docs, not a directory: refused (exit 3)" test "$RC" -eq 3
+package_fixture
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+check "local docs, an empty directory: exit 0" test "$RC" -eq 0
+check "local docs, an empty directory: links stay on the package's" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /usr/share/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
 fixture; run package DAS_INSTALL_PAYLOAD_SHA256=0000
 check "package, wrong sha256: exit 3" test "$RC" -eq 3
 check "package, wrong sha256: pacman never ran" test "$(calls 'pacman -U')" -eq 0

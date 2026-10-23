@@ -6,7 +6,7 @@
 //! - **Missing** — a subvolume exists on disk but no live `[[source]].subvolume`
 //!   entry references it (an entry marked `retired` does not count: it is not
 //!   backed up, so a subvolume whose only entry is retired is missing). This is the dangerous case: the 2026-05-17 audit found ~30
-//!   subvolumes (all of `ClaudeCodeProjects/*`, audiobook app state, `@docker`,
+//!   subvolumes (all of `Projects/*`, audiobook app state, `@docker`,
 //!   `@hibp`, Steam libraries, ISOs) silently never backed up, because daily
 //!   backups of the *configured* subvolumes kept succeeding and masked the gap.
 //! - **Stale** — a `[[source]].subvolume` entry references a name that no longer
@@ -640,11 +640,11 @@ mod tests {
 
     #[test]
     fn compute_missing_finds_new_subvolumes() {
-        let on_disk = s(&["@", "@home", "ClaudeCodeProjects/new-project"]);
+        let on_disk = s(&["@", "@home", "Projects/new-project"]);
         let configured = s(&["@", "@home"]);
         assert_eq!(
             compute_missing(&on_disk, &configured, &[]),
-            s(&["ClaudeCodeProjects/new-project"])
+            s(&["Projects/new-project"])
         );
     }
 
@@ -729,11 +729,8 @@ mod tests {
     #[test]
     fn group_sources_by_volume_merges_shared_volume() {
         let mut cfg = Config::default();
-        cfg.sources.push(source(
-            "hdd-projects",
-            "/.btrfs-hdd",
-            &["ClaudeCodeProjects"],
-        ));
+        cfg.sources
+            .push(source("hdd-projects", "/.btrfs-hdd", &["Projects"]));
         cfg.sources.push(source(
             "hdd-media",
             "/.btrfs-hdd",
@@ -746,10 +743,7 @@ mod tests {
         assert_eq!(groups.len(), 2);
         let hdd = groups.iter().find(|g| g.volume == "/.btrfs-hdd").unwrap();
         assert_eq!(hdd.source_labels, vec!["hdd-projects", "hdd-media"]);
-        assert_eq!(
-            hdd.configured,
-            vec!["ClaudeCodeProjects", "media", "SteamLibrary"]
-        );
+        assert_eq!(hdd.configured, vec!["Projects", "media", "SteamLibrary"]);
         let nvme = groups.iter().find(|g| g.volume == "/.btrfs-nvme").unwrap();
         assert_eq!(nvme.source_labels, vec!["nvme"]);
         assert_eq!(nvme.configured, vec!["@", "@home"]);
@@ -986,7 +980,7 @@ mod tests {
             missing: vec![MissingSubvolume {
                 volume: "/.btrfs-hdd".into(),
                 source_labels: vec!["hdd-projects".into(), "hdd-media".into()],
-                name: "ClaudeCodeProjects/new-project".into(),
+                name: "Projects/new-project".into(),
             }],
             ..Default::default()
         };
@@ -1015,14 +1009,14 @@ mod tests {
         report.stale.push(StaleSubvolume {
             volume: "/.btrfs-hdd".into(),
             source_label: "hdd-projects".into(),
-            name: "ClaudeCodeProjects/deleted-project".into(),
+            name: "Projects/deleted-project".into(),
         });
         let text = format_report(&report);
         assert!(
             text.contains("STALE CONFIG ENTRIES (configured, not retired, not found on disk)"),
             "{text}"
         );
-        assert!(text.contains("ClaudeCodeProjects/deleted-project"));
+        assert!(text.contains("Projects/deleted-project"));
         assert!(text.contains("hdd-projects"));
     }
 

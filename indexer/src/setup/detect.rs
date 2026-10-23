@@ -643,10 +643,7 @@ ID 263 gen 993 top level 256 path @home/user/My Documents\n";
             .iter()
             .map(|s| (s.id, s.top_level, s.name.as_str()))
             .collect();
-        assert_eq!(
-            rows,
-            [(256, 5, "@"), (263, 256, "@home/user/My Documents")]
-        );
+        assert_eq!(rows, [(256, 5, "@"), (263, 256, "@home/user/My Documents")]);
         assert!(parse_subvolume_output("").is_empty());
     }
 

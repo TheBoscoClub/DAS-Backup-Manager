@@ -1728,7 +1728,7 @@ check "SIGTERM while waiting: nothing mounted" "$(called mount)" "no"
 echo "== source volumes: a run unmounts only what it mounted (bd DAS-Backup-Manager-8cf)"
 # ---------------------------------------------------------------------------
 # A run never owns a mount it found in place. A source volume already mounted
-# when the run looks — fstab mounts the operator's general-use /srv/vmpool, and
+# when the run looks — fstab mounts a general-use /srv/vmpool, and
 # the /.btrfs-* top levels — is used as found and never unmounted: not at the
 # end, not by cleanup() after an abort or a stop, not in a dry run. One the
 # run mounted itself is unmounted exactly once, however many sources share
@@ -1736,7 +1736,7 @@ echo "== source volumes: a run unmounts only what it mounted (bd DAS-Backup-Mana
 # /.btrfs-* fstab mounts and tried /srv/vmpool. Verification is unchanged: a
 # source found mounted must still be the expected filesystem at its top
 # level, or the run aborts — leaving the mount it refused as it found it.
-DAS_STORAGE_MNT="$WORK/mnt/srv/vmpool"
+DAS_STORAGE_MNT="$WORK/mnt/vmpool"
 
 # premount <path> <uuid> [fsroot]: mounted before the run starts, as fstab
 # mounts it at boot.

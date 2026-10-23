@@ -338,9 +338,9 @@ fn step_subvolumes(
         );
 
         loop {
-            let label: String = p.input("Source label (e.g. nvme-root)", None)?;
+            let label: String = p.input("Source label (e.g. root)", None)?;
 
-            let volume: String = p.input("Top-level volume mount (e.g. /.btrfs-nvme)", None)?;
+            let volume: String = p.input("Top-level volume mount (e.g. /.btrfs-root)", None)?;
 
             let subvols_str: String =
                 p.input("Subvolumes (comma-separated, e.g. @,@home)", None)?;
@@ -554,11 +554,11 @@ fn step_targets(
             break;
         }
 
-        let label: String = p.input("Target label (e.g. primary-22tb)", None)?;
+        let label: String = p.input("Target label (e.g. primary)", None)?;
 
         let serial: String = p.input("Drive serial number", None)?;
 
-        let mount: String = p.input("Mount point (e.g. /mnt/backup-22tb)", None)?;
+        let mount: String = p.input("Mount point (e.g. /mnt/backup-primary)", None)?;
 
         let role_choices = ["primary", "mirror"];
         let role_idx = p.select("Target role", &role_choices, 0)?;
@@ -1549,8 +1549,8 @@ mod tests {
 
         p.assert_finished();
         let one_source = [
-            "input: Source label (e.g. nvme-root)",
-            "input: Top-level volume mount (e.g. /.btrfs-nvme)",
+            "input: Source label (e.g. root)",
+            "input: Top-level volume mount (e.g. /.btrfs-root)",
             "input: Subvolumes (comma-separated, e.g. @,@home)",
             "input: Device path (e.g. /dev/nvme0n1p2)",
             "confirm: Add another source? [false]",
@@ -1824,9 +1824,9 @@ mod tests {
         let questions = |add_default: bool| {
             vec![
                 format!("confirm: Add a backup target? [{add_default}]"),
-                "input: Target label (e.g. primary-22tb)".to_string(),
+                "input: Target label (e.g. primary)".to_string(),
                 "input: Drive serial number".to_string(),
-                "input: Mount point (e.g. /mnt/backup-22tb)".to_string(),
+                "input: Mount point (e.g. /mnt/backup-primary)".to_string(),
                 "select: Target role {primary|mirror} [0]".to_string(),
                 "input: Retention: weeks to keep [4]".to_string(),
                 "input: Retention: months to keep [2]".to_string(),

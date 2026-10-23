@@ -66,7 +66,11 @@ pub fn dump_env(config: &Config) -> String {
         }
     ));
     out.push_str(&kv("DAS_SCRUB_ON_CALENDAR", &config.scrub.on_calendar));
-    out.push_str(&kv("DAS_SCRUB_TARGETS", &config.scrub.targets.join(" ")));
+    // The effective list: [scrub].targets, else every [[target]] (bd dis3).
+    out.push_str(&kv(
+        "DAS_SCRUB_TARGETS",
+        &config.scrub_target_labels().join(" "),
+    ));
     out.push_str(&format!(
         "DAS_SCRUB_WARN_AGE_DAYS={}\n",
         config.scrub.warn_age_days
@@ -80,6 +84,11 @@ pub fn dump_env(config: &Config) -> String {
     // Absent when unset, so the script can tell "not configured" from a value.
     if let Some(org) = &config.recovery_os.egress_org {
         out.push_str(&kv("DAS_RECOVERY_OS_EGRESS_ORG", org));
+    }
+    // The account provision creates on a rebuilt drive; absent when unset, so
+    // provision can refuse "not configured".
+    if let Some(user) = &config.recovery_os.install_user {
+        out.push_str(&kv("DAS_RECOVERY_OS_INSTALL_USER", user));
     }
 
     // Sources (indexed)
@@ -196,7 +205,7 @@ mod tests {
     fn test_config() -> Config {
         let mut config = Config::default();
         config.general.install_prefix = "/usr/local".to_string();
-        config.das.model_pattern = "TDAS".to_string();
+        config.das.model_pattern = "ExampleDAS".to_string();
         config.boot.archive_retention_days = 365;
         config.sources.push(Source {
             label: "nvme".to_string(),
@@ -262,15 +271,14 @@ mod tests {
         assert!(output.contains("DAS_DB_PATH="));
         assert!(output.contains("DAS_LOG_FILE="));
         assert!(output.contains("DAS_BTRBK_CONF="));
-        assert!(output.contains("DAS_MODEL_PATTERN='TDAS'"));
+        assert!(output.contains("DAS_MODEL_PATTERN='ExampleDAS'"));
         assert!(output.contains("DAS_IO_SCHEDULER='mq-deadline'"));
         assert!(output.contains("DAS_BOOT_ENABLED=true"));
         assert!(output.contains("DAS_BOOT_ARCHIVE_RETENTION_DAYS=365"));
         assert!(output.contains("DAS_SCRUB_ENABLED=true"));
         assert!(output.contains("DAS_SCRUB_ON_CALENDAR='*-*-01 03:05:00'"));
-        assert!(output.contains(
-            "DAS_SCRUB_TARGETS='primary-22tb system-recovery-A-2tb system-recovery-B-2tb'"
-        ));
+        // No [scrub].targets: every configured [[target]], in order (bd dis3).
+        assert!(output.contains("DAS_SCRUB_TARGETS='primary-22tb system-recovery-B-2tb'"));
         assert!(output.contains("DAS_SCRUB_WARN_AGE_DAYS=45"));
         assert!(output.contains("DAS_SCRUB_FAIL_AGE_DAYS=75"));
     }
@@ -372,6 +380,23 @@ mod tests {
         assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_EGRESS_ORG"));
         config.recovery_os.egress_org = Some("AS64500".into());
         assert!(dump_env(&config).contains("DAS_RECOVERY_OS_EGRESS_ORG='AS64500'\n"));
+    }
+
+    /// No built-in enclosure: an unset `[das].model_pattern` is exported
+    /// empty, which the scripts read as "no enclosure filter".
+    #[test]
+    fn dump_env_exports_an_empty_model_pattern_by_default() {
+        assert!(dump_env(&Config::default()).contains("DAS_MODEL_PATTERN=''\n"));
+    }
+
+    /// The recovery OS's account: exported only when configured, so provision
+    /// can refuse "not configured".
+    #[test]
+    fn dump_env_exports_the_recovery_os_install_user_only_when_set() {
+        let mut config = test_config();
+        assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER"));
+        config.recovery_os.install_user = Some("recovery".into());
+        assert!(dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER='recovery'\n"));
     }
 
     /// A retention of 0 means "not configured", and the key is left out so a

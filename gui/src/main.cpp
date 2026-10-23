@@ -26,7 +26,7 @@ int main(int argc, char *argv[])
         u"https://github.com/TheBoscoClub/DAS-Backup-Manager"_s);
 
     aboutData.addAuthor(
-        i18n("Bosco"),
+        i18n("TheBoscoClub"),
         i18n("Developer"),
         u"theboscoclub@users.noreply.github.com"_s);
 

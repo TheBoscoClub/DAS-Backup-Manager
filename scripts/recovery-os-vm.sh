@@ -630,6 +630,8 @@ GUARD_OPTIONAL=""     # provision's live system: it may carry no reporter at all
 GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
 HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
 P_ALSO=()             # provision: the @.archive.* names also set aside
+INSTALL_USER=""       # provision: the new OS's account, [recovery_os].install_user (load_targets)
+P_DOCS=()             # provision: the installation's own documents, <config dir>/docs/*.md
 PROVISION_STAMP=""    # provision: the stamp of every *.replaced.<stamp> name
 PAYLOAD_ISO=""        # provision: the payload cdrom image, removed at the end
 CAPTURE_FILE=""       # provision: where the capture step's lines are kept
@@ -1029,6 +1031,9 @@ load_targets() {
     if ! env_text="$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"; then
         refuse "btrdasd could not read $DAS_CONFIG"
     fi
+    # dump-env leaves a key out when it is unset: clear the names first, so an inherited
+    # variable of the same name can never stand in for config.toml (review L2).
+    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER
     eval "$env_text"
     # The egress org from config.toml, when the environment gave none. Config::load
     # does not validate, so the characters are checked here as for the variable.
@@ -1037,6 +1042,14 @@ load_targets() {
         if [[ -n "$EGRESS_ORG" && ! "$EGRESS_ORG" =~ ^[${ASCII_LETTERS}[:digit:]][${ASCII_LETTERS}[:digit:]\ ]*$ ]]; then
             refuse "[recovery_os].egress_org in $DAS_CONFIG takes letters, digits and spaces (an AS number: AS64500)"
         fi
+    fi
+    # The account provision creates on the new OS: config.toml only, no
+    # built-in name. Checked here as the installer checks it (a POSIX user
+    # name, not root); provision_preflight refuses when it is unset.
+    INSTALL_USER="${DAS_RECOVERY_OS_INSTALL_USER:-}"
+    if [[ -n "$INSTALL_USER" ]] &&
+        { [[ ! "$INSTALL_USER" =~ ^[abcdefghijklmnopqrstuvwxyz_][abcdefghijklmnopqrstuvwxyz0123456789_-]{0,31}$ ]] || [[ "$INSTALL_USER" == root ]]; }; then
+        refuse "[recovery_os].install_user in $DAS_CONFIG is not a user name (a lower-case letter or _, then up to 31 of a-z 0-9 _ -; not root)"
     fi
     TARGET_LABELS=()
     declare -gA T_ROLE=()
@@ -6067,6 +6080,11 @@ provision_preflight() {
     require_root
     command -v jq >/dev/null || refuse "jq is not installed: provision reads the history and the boot records with it"
     load_targets
+    # The new OS's account has no built-in name: without one, nothing is
+    # looked at, held or booted. An undo creates no account and needs none.
+    if [[ "$P_UNDO" != true && -z "$INSTALL_USER" ]]; then
+        refuse "no account for the new OS is configured: set install_user under [recovery_os] in $DAS_CONFIG (the recovery OS's login user) -- nothing was touched"
+    fi
     resolve_label "$TARGET_ARG"
     if [[ ! "$LABEL" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
@@ -6094,6 +6112,7 @@ provision_preflight() {
     fi
     P_UUID=${T_UUIDS[$LABEL]}
     [[ -n "$P_UUID" ]] || refuse "'$LABEL' has no mount_uuid in $DAS_CONFIG: the installer identifies partition 2 by it"
+    [[ "$P_UNDO" == true ]] || provision_local_docs
     resolve_os_state
     if [[ "$P_UNDO" == true ]]; then
         undo_read_provision
@@ -6108,6 +6127,26 @@ provision_preflight() {
     check_domain_idle
     check_no_live_holder
     make_state_dir || refuse "cannot create $STATE_DIR"
+}
+
+# The installation's own filled-in recovery documents: every *.md in the
+# directory docs/ beside config.toml (/etc/das-backup/docs), carried on the
+# payload for the installer to put on the drive. No directory, none -- not an
+# error. A *.md that is not a regular file (a symlink, a directory) or whose
+# name is not plain refuses provision here, before any drive is touched.
+provision_local_docs() {
+    local dir f n
+    dir="$(dirname -- "$DAS_CONFIG")/docs"
+    P_DOCS=()
+    [[ -e "$dir" || -L "$dir" ]] || return 0
+    [[ -d "$dir" && ! -L "$dir" ]] || refuse "$dir is not a directory: put the installation's recovery documents there, or nothing"
+    for f in "$dir"/*.md; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        n=${f##*/}
+        [[ "$n" =~ ^[${ASCII_LETTERS}[:digit:]._-]+$ ]] || refuse "local document '$f': a name of letters, digits, . _ - only"
+        [[ -f "$f" && ! -L "$f" && -r "$f" ]] || refuse "local document '$f' is not a readable regular file (a symlink or other): only regular files are carried"
+        P_DOCS+=("$f")
+    done
 }
 
 # undo: the newest provision of this drive in the history -- its stamp
@@ -6205,7 +6244,8 @@ provision_payload() {
         { [[ "$P_UNDO" != true ]] && ! cp -- "$P_PKG" "$tmp/$(basename -- "$P_PKG")"; } ||
         { [[ "$P_UNDO" != true ]] && ! cp -- "$P_KEYS" "$tmp/authorized_keys"; } ||
         ! cp -- "$DAS_CONFIG" "$tmp/config.toml" ||
-        ! (cd "$tmp" && sha256sum -- * >SHA256SUMS); then
+        ! (cd "$tmp" && sha256sum -- * >SHA256SUMS) ||
+        { ((${#P_DOCS[@]} > 0)) && ! { mkdir -- "$tmp/docs" && cp -- "${P_DOCS[@]}" "$tmp/docs/" && (cd "$tmp" && sha256sum -- docs/* >>SHA256SUMS); }; }; then
         rm -rf -- "${tmp:?}"
         refuse "cannot assemble the payload in $tmp"
     fi
@@ -6281,6 +6321,11 @@ prov_env_lines() {
     if [[ "$P_UNDO" != true ]]; then
         printf 'export DAS_INSTALL_PACKAGE=%s/%s DAS_INSTALL_KEYS=%s/authorized_keys DAS_INSTALL_PAYLOAD_SHA256=%s\n' \
             "$PAYLOAD_MNT" "$(basename -- "$P_PKG")" "$PAYLOAD_MNT" "$P_PKG_SHA"
+        # A user name (load_targets checked it), so one unquoted word.
+        printf 'export DAS_INSTALL_USER=%s\n' "$INSTALL_USER"
+        if ((${#P_DOCS[@]} > 0)); then
+            printf 'export DAS_INSTALL_LOCAL_DOCS=%s/docs\n' "$PAYLOAD_MNT"
+        fi
     fi
     printf 'payload=%s\n' "$PAYLOAD_MNT"
     cat <<'EOF'

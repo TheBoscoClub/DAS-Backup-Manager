@@ -73,7 +73,7 @@ pub enum ScrubHealthStatus {
 ///    see `build_scrub_target_view` in `main.rs`.
 /// 2. Automated Healthy/Warning/Critical determination must never trust an
 ///    ad hoc, out-of-band scrub record blindly. That is exactly the bug
-///    this feature exists to fix: `system-recovery-A`'s aborted scrub
+///    this feature exists to fix: a recovery target's aborted scrub
 ///    looked healthy for 64 days because a raw record was read at face
 ///    value. Only records the engine itself produced — with its
 ///    aborted/error cross-checks already applied via
@@ -230,7 +230,7 @@ fn target_scrub_health(
     state: Option<&scrub::ScrubState>,
     now_epoch: i64,
 ) -> ScrubHealth {
-    if !config.scrub.enabled || !config.scrub.targets.iter().any(|l| l == &target.label) {
+    if !config.scrub.enabled || !config.scrub_target_labels().contains(&target.label) {
         return ScrubHealth::not_applicable();
     }
     match scrub::resolve_target_fsuuid(config, &target.label) {
@@ -1937,6 +1937,21 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         let target = scrub_test_target("some-other-target", "11111111-1111-1111-1111-111111111111");
         let h = target_scrub_health(&config, &target, None, NOW);
         assert_eq!(h.status, ScrubHealthStatus::NotApplicable);
+    }
+
+    /// bd DAS-Backup-Manager-dis3: no `[scrub].targets` means every
+    /// configured target is scrubbed, so health judges each one rather than
+    /// calling it "not applicable".
+    #[test]
+    fn target_scrub_health_applies_to_every_target_when_no_scrub_targets_listed() {
+        let mut config = Config::default();
+        config.scrub.enabled = true;
+        assert!(config.scrub.targets.is_empty());
+        let target = scrub_test_target("any-name", "11111111-1111-1111-1111-111111111111");
+        config.targets = vec![target.clone()];
+        let state = scrub::ScrubState::default();
+        let h = target_scrub_health(&config, &target, Some(&state), NOW);
+        assert_eq!(h.status, ScrubHealthStatus::NeverScrubbed);
     }
 
     #[test]

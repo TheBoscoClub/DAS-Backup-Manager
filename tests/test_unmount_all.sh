@@ -250,7 +250,7 @@ check "mounted by the run, shared by two sources: one mount, one umount" \
 check "mounted by the run, shared by two sources: the second is not 'found mounted'" \
     "$(grep -c 'used as found' "$WORK/log" || true)" "0"
 
-# The live host's layout: /srv/vmpool is fstab's; the three top levels are
+# A typical layout: /srv/vmpool is fstab's; the three top levels are
 # mounted by the run (as on a night after the old cleanup took them down).
 setup
 sources nvme=/.btrfs-nvme nvme-vm=/.btrfs-nvme ssd=/.btrfs-ssd \
@@ -438,7 +438,7 @@ check "probe says not mounted, or no such path: struck off" "$(calls /.btrfs-hdd
 # path fstab does not declare.
 setup
 sources hdd-media=/.btrfs-hdd hdd-system=/.btrfs-hdd ssd=/.btrfs-ssd das-storage=/srv/vmpool
-touch "$WORK/fstab/.btrfs-hdd" "$WORK/fstab/srv/vmpool"
+touch "$WORK/fstab/.btrfs-hdd" "$WORK/fstab/vmpool"
 premounted /srv/vmpool
 mount_sources
 # Whichever of the two sources on /.btrfs-hdd bash's hash order visits first

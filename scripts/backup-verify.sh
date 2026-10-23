@@ -217,11 +217,13 @@ detect_das_drives() {
             transport=$(readlink -f "$dev/device" | grep -o "usb" || true)
 
             if [[ -n "$transport" ]]; then
-                # Filter for DAS enclosure by model pattern from config
+                # Filter for the DAS enclosure by [das].model_pattern, a
+                # substring of the disk's model; empty is no filter (every USB
+                # disk), never "match nothing".
                 local model
                 model=$(cat "$dev/device/model" 2>/dev/null | tr -d ' ' || true)
 
-                if [[ "$model" == "$DAS_MODEL_PATTERN" ]]; then
+                if [[ -z "${DAS_MODEL_PATTERN:-}" || "$model" == *"$DAS_MODEL_PATTERN"* ]]; then
                     DAS_DEVICES+=("/dev/$name")
                 fi
             fi

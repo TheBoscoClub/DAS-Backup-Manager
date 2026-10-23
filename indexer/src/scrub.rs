@@ -9,7 +9,7 @@
 //!
 //! # The two rules that motivated this module
 //!
-//! Both come out of the 2026-07-27 `system-recovery-A` investigation, where a
+//! Both come out of a 2026-07-27 investigation of one recovery target, where a
 //! scrub that never completed was read as healthy for 64 days:
 //!
 //! 1. **`finished` is not the same as `aborted`.** The 2026-05-24 record showed
@@ -127,8 +127,8 @@
 //!   },
 //!   "filesystems": {
 //!     "5eed0008-0000-4000-8000-000000000008": {
-//!       "target_label": "system-recovery-A-2tb",
-//!       "mountpoint": "/mnt/backup-system-recovery-A",
+//!       "target_label": "recovery-a",
+//!       "mountpoint": "/mnt/backup-recovery-a",
 //!       "last_success_epoch": 1785188355,
 //!       "last_attempt": {
 //!         "outcome": "finished",
@@ -225,7 +225,8 @@ const LOCK_WAIT_REANNOUNCE_SECS: u64 = 900;
 /// from being interpreted.
 #[derive(Debug)]
 pub enum ScrubError {
-    /// `scrub.targets` is empty — nothing to do.
+    /// Nothing to scrub: `[scrub].targets` is empty and no `[[target]]` is
+    /// configured (or the config is a recovery drive's own).
     NoTargets,
     /// A lock file could not be opened or locked.
     Lock { path: String, detail: String },
@@ -258,7 +259,10 @@ pub enum ScrubError {
 impl fmt::Display for ScrubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoTargets => write!(f, "No scrub targets configured ([scrub].targets is empty)"),
+            Self::NoTargets => write!(
+                f,
+                "No scrub targets: [scrub].targets is empty and no [[target]] is configured"
+            ),
             Self::Lock { path, detail } => write!(f, "Lock '{path}': {detail}"),
             Self::State { path, detail } => write!(f, "Scrub state '{path}': {detail}"),
             Self::StateCorrupt { path, detail } => {
@@ -1615,7 +1619,7 @@ pub fn run_scrub_pass(
     config: &Config,
     progress: &dyn ProgressCallback,
 ) -> Result<ScrubPass, ScrubError> {
-    if config.scrub.targets.is_empty() {
+    if config.scrub_target_labels().is_empty() {
         return Err(ScrubError::NoTargets);
     }
 
@@ -1700,12 +1704,13 @@ fn scrub_targets_with(
     held: &MaintenanceHeld,
     scrub_one: &dyn Fn(&Config, &str, &dyn ProgressCallback, &MaintenanceHeld) -> ScrubFsResult,
 ) -> Vec<ScrubFsResult> {
-    let total = config.scrub.targets.len() as u64;
+    let labels = config.scrub_target_labels();
+    let total = labels.len() as u64;
     progress.on_stage("Scrubbing DAS filesystems", total);
 
     let mut results = Vec::new();
-    // Sequential by construction: the three DAS filesystems share one USB bus.
-    for (i, label) in config.scrub.targets.iter().enumerate() {
+    // Sequential by construction: the DAS filesystems share one USB bus.
+    for (i, label) in labels.iter().enumerate() {
         progress.on_progress((i + 1) as u64, total, &format!("Scrubbing {label}"));
         let result = scrub_one(config, label, progress, held);
         if result.ok() {
@@ -2320,7 +2325,7 @@ mod tests {
         let cases = [
             (
                 ScrubError::NoTargets,
-                "No scrub targets configured ([scrub].targets is empty)",
+                "No scrub targets: [scrub].targets is empty and no [[target]] is configured",
             ),
             (
                 ScrubError::Lock {
@@ -2408,7 +2413,7 @@ mod tests {
     const REAL_ABORTED_SUPER: &str = "scrub status:1\n\
 5eed0008-0000-4000-8000-000000000008:1|data_extents_scrubbed:0|tree_extents_scrubbed:0|data_bytes_scrubbed:0|tree_bytes_scrubbed:0|read_errors:0|csum_errors:0|verify_errors:0|no_csum:0|csum_discards:0|super_errors:3|malloc_errors:0|uncorrectable_errors:0|corrected_errors:0|last_physical:0|t_start:1779998400|t_resumed:0|duration:0|canceled:0|finished:0\n";
 
-    /// Real two-device RAID-1 record (22 TB primary, both legs finished).
+    /// Real two-device RAID-1 record (the primary target, both legs finished).
     const REAL_RAID1_FINISHED: &str = "scrub status:1\n\
 5eed0016-0000-4000-8000-000000000016:1|data_extents_scrubbed:95871167|tree_extents_scrubbed:839307|data_bytes_scrubbed:5934387892224|tree_bytes_scrubbed:13751205888|read_errors:0|csum_errors:0|verify_errors:0|no_csum:0|csum_discards:0|super_errors:0|malloc_errors:0|uncorrectable_errors:0|corrected_errors:0|last_physical:5960906113024|t_start:1779649863|t_resumed:0|duration:28701|canceled:0|finished:1\n\
 5eed0016-0000-4000-8000-000000000016:2|data_extents_scrubbed:95871167|tree_extents_scrubbed:839220|data_bytes_scrubbed:5934387892224|tree_bytes_scrubbed:13749780480|read_errors:0|csum_errors:0|verify_errors:0|no_csum:0|csum_discards:0|super_errors:0|malloc_errors:0|uncorrectable_errors:0|corrected_errors:0|last_physical:5961449275392|t_start:1779649863|t_resumed:0|duration:32027|canceled:0|finished:1\n";
@@ -2419,7 +2424,7 @@ mod tests {
 5eed0007-0000-4000-8000-000000000007:1|data_extents_scrubbed:414|tree_extents_scrubbed:95088|data_bytes_scrubbed:8388608|tree_bytes_scrubbed:1557921792|read_errors:16|csum_errors:0|verify_errors:0|no_csum:0|csum_discards:0|super_errors:0|malloc_errors:0|uncorrectable_errors:16|corrected_errors:0|last_physical:1601830912|t_start:1778096820|t_resumed:0|duration:9419|canceled:1|finished:1\n";
 
     /// Real record with a huge informational `no_csum` count on a healthy
-    /// filesystem (dasRaid0, nodatacow VM images).
+    /// filesystem (a VM-image pool with nodatacow files).
     const REAL_NO_CSUM: &str = "scrub status:1\n\
 5eed0020-0000-4000-8000-000000000020:1|data_extents_scrubbed:10233933|tree_extents_scrubbed:2076|data_bytes_scrubbed:669937827840|tree_bytes_scrubbed:34013184|read_errors:0|csum_errors:0|verify_errors:0|no_csum:163559040|csum_discards:0|super_errors:0|malloc_errors:0|uncorrectable_errors:0|corrected_errors:0|last_physical:1163958157312|t_start:1776373270|t_resumed:0|duration:3027|canceled:0|finished:1\n";
 
@@ -3097,6 +3102,40 @@ Total to scrub:   401.28MiB\n";
         fn on_complete(&self, _: bool, _: &str) {}
     }
 
+    /// bd DAS-Backup-Manager-dis3: with no `[scrub].targets` the pass scrubs
+    /// every configured `[[target]]`, in config order — never a built-in list
+    /// that matches nothing on another install.
+    #[test]
+    fn a_pass_with_no_scrub_targets_listed_scrubs_every_configured_target() {
+        let mut config = Config::default();
+        assert!(config.scrub.targets.is_empty());
+        for label in ["first", "second"] {
+            config.targets.push(crate::config::Target {
+                label: label.into(),
+                serial: String::new(),
+                serials: Vec::new(),
+                mount_uuid: None,
+                mount: format!("/mnt/backup-{label}"),
+                role: crate::config::TargetRole::Primary,
+                retention: crate::config::Retention::default(),
+                display_name: String::new(),
+            });
+        }
+        let scrubbed = std::sync::Mutex::new(Vec::new());
+        let scrub_one = |_: &Config, label: &str, _: &dyn ProgressCallback, _: &MaintenanceHeld| {
+            scrubbed.lock().unwrap().push(label.to_string());
+            fs_result(label, "uuid", true, 1)
+        };
+        let results = scrub_targets_with(
+            &config,
+            &NullProgress,
+            &MaintenanceHeld::assumed(),
+            &scrub_one,
+        );
+        assert_eq!(*scrubbed.lock().unwrap(), ["first", "second"]);
+        assert_eq!(results.len(), 2);
+    }
+
     #[test]
     fn a_pass_scrubs_every_target_in_order_with_a_step_and_a_line_each() {
         let mut config = Config::default();
@@ -3391,6 +3430,7 @@ Total to scrub:   401.28MiB\n";
     fn run_scrub_pass_errors_when_no_targets_configured() {
         let mut config = Config::default();
         config.scrub.targets.clear();
+        assert!(config.targets.is_empty());
         let err = run_scrub_pass(&config, &NullProgress).unwrap_err();
         assert!(matches!(err, ScrubError::NoTargets));
     }

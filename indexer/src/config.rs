@@ -84,6 +84,12 @@ pub struct RecoveryOs {
     /// egress step — there is no built-in ISP (bd DAS-Backup-Manager-6pd3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_org: Option<String>,
+    /// The login account `recovery-os-vm.sh provision` creates on a rebuilt
+    /// recovery drive (autologin, NOPASSWD sudo, the only user sshd admits).
+    /// Unset, provision refuses before it touches any drive — there is no
+    /// built-in account name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_user: Option<String>,
 }
 
 fn default_recovery_os_max_age_days() -> u32 {
@@ -99,11 +105,26 @@ pub fn egress_org_is_valid(org: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == ' ')
 }
 
+/// `recovery_os.install_user` becomes a user name, a sudoers drop-in's file
+/// name and an sshd `AllowUsers` word, so it takes what
+/// `recovery-os-install.sh` accepts: a POSIX user name, `^[a-z_][a-z0-9_-]{0,31}$`
+/// in ASCII, and never `root`.
+pub fn install_user_is_valid(user: &str) -> bool {
+    let mut chars = user.chars();
+    user.len() <= 32
+        && user != "root"
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 impl Default for RecoveryOs {
     fn default() -> Self {
         Self {
             max_age_days: default_recovery_os_max_age_days(),
             egress_org: None,
+            install_user: None,
         }
     }
 }
@@ -119,11 +140,11 @@ impl Default for RecoveryOs {
 /// restored into either is *served* — published to whoever can reach the
 /// listener. That is the same "restored content becomes live" property the rest
 /// of this list guards, arriving by a network path instead of an exec path.
-/// They were added when `/srv/VirtualMachines` was granted to `allowed_roots`
-/// so that a VM image could be restored in place (bd DAS-Backup-Manager-tku):
-/// the grant is deliberately a *subdirectory* of `/srv` and never `/srv`
-/// itself, and these entries make sure that stays true even if someone later
-/// widens the allow-list to the parent. Comparison is component-wise, so
+/// They were added so that a subdirectory of `/srv` (a VM-image directory, say)
+/// can be granted in `allowed_roots` for an in-place restore (bd
+/// DAS-Backup-Manager-tku): such a grant should be a *subdirectory* of `/srv`
+/// and never `/srv` itself, and these entries make sure the served roots stay
+/// denied even if someone widens the allow-list to the parent. Comparison is component-wise, so
 /// `/srv/http-archive` is unaffected.
 pub const RESTORE_DENIED_ROOTS: &[&str] = &[
     "/bin",
@@ -202,7 +223,13 @@ pub struct Schedule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Das {
-    #[serde(default = "default_model_pattern")]
+    /// A substring of your enclosure's USB product string (sysfs
+    /// `/sys/bus/usb/devices/*/product`; for its disks, `device/model`).
+    /// Empty (the default) is no enclosure filter: `backup-verify.sh` takes
+    /// every USB disk, and `backup-run.sh` cannot tell which USB device is the
+    /// enclosure, so it says so and records the link speed as unknown. No
+    /// built-in product name — the default never names one vendor's enclosure.
+    #[serde(default)]
     pub model_pattern: String,
     #[serde(default = "default_io_scheduler")]
     pub io_scheduler: String,
@@ -213,16 +240,13 @@ pub struct Das {
 impl Default for Das {
     fn default() -> Self {
         Self {
-            model_pattern: default_model_pattern(),
+            model_pattern: String::new(),
             io_scheduler: default_io_scheduler(),
             mount_opts: String::new(),
         }
     }
 }
 
-fn default_model_pattern() -> String {
-    "TDAS".into()
-}
 fn default_io_scheduler() -> String {
     "mq-deadline".into()
 }
@@ -275,11 +299,15 @@ pub struct Scrub {
     pub on_calendar: String,
     /// Config target labels, scrubbed sequentially in list order. Entries
     /// MUST match `[[target]].label` values elsewhere in this same config
-    /// (e.g. `primary-22tb`, not the underlying BTRFS filesystem label
-    /// `das-backup-22tb`) — UUIDs are resolved from the existing
+    /// (e.g. `primary`, not the underlying BTRFS filesystem label
+    /// `das-backup-primary`) — UUIDs are resolved from the existing
     /// `[[target]]` blocks at use time by joining on this field, never
-    /// duplicated here.
-    #[serde(default = "default_scrub_targets")]
+    /// duplicated here. Empty (the default) means every configured
+    /// `[[target]]`, in config order — read it through
+    /// [`Config::scrub_target_labels`], never directly (bd
+    /// DAS-Backup-Manager-dis3: a built-in label list scrubbed nothing on any
+    /// install whose targets were named differently).
+    #[serde(default)]
     pub targets: Vec<String>,
     /// Days since the last completed scrub of a target before health
     /// checks report a warning.
@@ -302,15 +330,6 @@ fn default_scrub_on_calendar() -> String {
     // completes.
     "*-*-01 03:05:00".into()
 }
-fn default_scrub_targets() -> Vec<String> {
-    // Config target labels (`[[target]].label`), not BTRFS filesystem
-    // labels — see the doc comment on `Scrub::targets`.
-    vec![
-        "primary-22tb".into(),
-        "system-recovery-A-2tb".into(),
-        "system-recovery-B-2tb".into(),
-    ]
-}
 fn default_scrub_warn_age_days() -> u32 {
     45
 }
@@ -323,7 +342,7 @@ impl Default for Scrub {
         Self {
             enabled: true,
             on_calendar: default_scrub_on_calendar(),
-            targets: default_scrub_targets(),
+            targets: Vec::new(),
             warn_age_days: default_scrub_warn_age_days(),
             fail_age_days: default_scrub_fail_age_days(),
         }
@@ -967,6 +986,21 @@ impl Config {
         Ok(r)
     }
 
+    /// The `[[target]]` labels a scrub pass covers, in the order it scrubs
+    /// them: `[scrub].targets` when it lists any, else every configured
+    /// `[[target]]` in config order (bd DAS-Backup-Manager-dis3 — no built-in
+    /// label list). A recovery drive's own derived config scrubs nothing: its
+    /// targets are the host's, scrubbed by the host.
+    pub fn scrub_target_labels(&self) -> Vec<String> {
+        if self.general.recovery_drive {
+            Vec::new()
+        } else if self.scrub.targets.is_empty() {
+            self.targets.iter().map(|t| t.label.clone()).collect()
+        } else {
+            self.scrub.targets.clone()
+        }
+    }
+
     /// Validate the config and return a list of human-readable error messages.
     /// An empty vec means the config is valid.
     pub fn validate(&self) -> Vec<String> {
@@ -992,6 +1026,20 @@ impl Config {
         {
             errors.push(format!(
                 "recovery_os.egress_org {org:?} must be letters, digits and spaces, starting with a letter or digit (an AS number: AS64500)"
+            ));
+        }
+        // A listed scrub target no [[target]] defines is deliberately NOT a
+        // validation error: configs saved by older versions carry the old
+        // built-in label list, and validate() gates `subvol sync` (every
+        // backup run), adoption and the GUI's config_set — refusing here would
+        // fail every nightly backup on an install whose targets are named
+        // differently. The scrub pass reports an unresolved label instead
+        // (bd DAS-Backup-Manager-dis3).
+        if let Some(user) = &self.recovery_os.install_user
+            && !install_user_is_valid(user)
+        {
+            errors.push(format!(
+                "recovery_os.install_user {user:?} must be a user name: a lower-case letter or _, then up to 31 of a-z 0-9 _ -, and not root"
             ));
         }
 
@@ -1600,21 +1648,15 @@ mod tests {
         // New fields have defaults
         assert_eq!(parsed.general.log_file, "/var/log/das-backup.log");
         assert_eq!(parsed.general.btrbk_conf, "/etc/btrbk/btrbk.conf");
-        assert_eq!(parsed.das.model_pattern, "TDAS");
+        assert!(parsed.das.model_pattern.is_empty());
         assert_eq!(parsed.das.io_scheduler, "mq-deadline");
         assert!(parsed.boot.enabled);
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home"]);
         assert_eq!(parsed.boot.archive_retention_days, 60);
         assert!(parsed.scrub.enabled);
         assert_eq!(parsed.scrub.on_calendar, "*-*-01 03:05:00");
-        assert_eq!(
-            parsed.scrub.targets,
-            vec![
-                "primary-22tb",
-                "system-recovery-A-2tb",
-                "system-recovery-B-2tb",
-            ]
-        );
+        // No built-in labels: empty means every [[target]] (bd dis3).
+        assert!(parsed.scrub.targets.is_empty());
         assert_eq!(parsed.scrub.warn_age_days, 45);
         assert_eq!(parsed.scrub.fail_age_days, 75);
         // [doctor] is optional — default config has no exclude patterns
@@ -1712,6 +1754,67 @@ mod tests {
         }
     }
 
+    /// Unset is "not configured" and stays out of the file; a value round-trips
+    /// (production separation: there is no built-in recovery-OS account).
+    #[test]
+    fn recovery_os_install_user_is_unset_by_default_and_round_trips() {
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(cfg.recovery_os.install_user, None);
+        assert!(!cfg.to_toml().unwrap().contains("install_user"));
+        let cfg = Config::from_toml(&minimal_toml(
+            "[recovery_os]\ninstall_user = \"recovery\"\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.recovery_os.install_user.as_deref(), Some("recovery"));
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("install_user = \"recovery\""), "{text}");
+        assert_eq!(
+            Config::from_toml(&text)
+                .unwrap()
+                .recovery_os
+                .install_user
+                .as_deref(),
+            Some("recovery")
+        );
+    }
+
+    #[test]
+    fn validate_refuses_an_install_user_the_installer_would_refuse() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        let longest = format!("a{}", "b".repeat(31));
+        for good in ["recovery", "_ops", "ops-2", "a", longest.as_str()] {
+            cfg.recovery_os.install_user = Some(good.into());
+            assert!(
+                !cfg.validate().iter().any(|e| e.contains("install_user")),
+                "{good}: {:?}",
+                cfg.validate()
+            );
+        }
+        let too_long = format!("a{}", "b".repeat(32));
+        for bad in [
+            "",
+            "root",
+            "Recovery",
+            "1user",
+            "-user",
+            "a b",
+            "a;reboot",
+            "us$er",
+            "r\u{e9}cup",
+            "user\n",
+            too_long.as_str(),
+        ] {
+            cfg.recovery_os.install_user = Some(bad.into());
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("recovery_os.install_user")),
+                "{bad:?} accepted: {:?}",
+                cfg.validate()
+            );
+        }
+    }
+
     #[test]
     fn doctor_round_trip_custom_exclude() {
         let mut cfg = Config::default();
@@ -1730,16 +1833,64 @@ mod tests {
         let scrub = Scrub::default();
         assert!(scrub.enabled);
         assert_eq!(scrub.on_calendar, "*-*-01 03:05:00");
-        assert_eq!(
-            scrub.targets,
-            vec![
-                "primary-22tb",
-                "system-recovery-A-2tb",
-                "system-recovery-B-2tb",
-            ]
-        );
+        // No built-in labels: empty means every [[target]] (bd dis3).
+        assert!(scrub.targets.is_empty());
         assert_eq!(scrub.warn_age_days, 45);
         assert_eq!(scrub.fail_age_days, 75);
+    }
+
+    fn scrub_target(label: &str) -> Target {
+        Target {
+            label: label.into(),
+            serial: String::new(),
+            serials: Vec::new(),
+            mount_uuid: None,
+            mount: format!("/mnt/backup-{label}"),
+            role: TargetRole::Primary,
+            retention: Retention::default(),
+            display_name: String::new(),
+        }
+    }
+
+    /// bd DAS-Backup-Manager-dis3: the scrub covers the targets this config
+    /// names, never a built-in list — empty `[scrub].targets` is every
+    /// `[[target]]` in config order; a list is that list; a recovery drive's
+    /// own config scrubs nothing.
+    #[test]
+    fn scrub_target_labels_default_to_every_configured_target() {
+        let mut cfg = Config::default();
+        assert!(cfg.scrub_target_labels().is_empty());
+        cfg.targets = vec![scrub_target("big"), scrub_target("small")];
+        assert_eq!(cfg.scrub_target_labels(), ["big", "small"]);
+        cfg.scrub.targets = vec!["small".into()];
+        assert_eq!(cfg.scrub_target_labels(), ["small"]);
+        cfg.scrub.targets.clear();
+        cfg.general.recovery_drive = true;
+        assert!(cfg.scrub_target_labels().is_empty());
+    }
+
+    /// A config saved by an older version lists the old built-in scrub labels
+    /// beside targets named differently. validate() gates `subvol sync` (every
+    /// backup run), adoption and the GUI's config_set, so an unknown scrub label
+    /// must never be a validation error there: it would fail every nightly
+    /// backup. The scrub pass reports it unresolved instead (bd dis3).
+    #[test]
+    fn validate_accepts_a_scrub_target_no_target_defines() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        cfg.targets = vec![scrub_target("primary")];
+        cfg.scrub.targets = vec![
+            "primary-22tb".into(),
+            "system-recovery-A-2tb".into(),
+            "system-recovery-B-2tb".into(),
+        ];
+        let errs = cfg.validate();
+        assert!(
+            !errs.iter().any(|e| e.contains("scrub")),
+            "an unknown scrub label refused the config: {errs:?}"
+        );
+        // ...and the labels the pass will try are exactly the listed ones, so
+        // its own "unresolved" report names them.
+        assert_eq!(cfg.scrub_target_labels(), cfg.scrub.targets);
     }
 
     #[test]
@@ -1888,7 +2039,7 @@ enabled = false
         // New fields get sane defaults
         assert_eq!(cfg.general.log_file, "/var/log/das-backup.log");
         assert_eq!(cfg.general.btrbk_conf, "/etc/btrbk/btrbk.conf");
-        assert_eq!(cfg.das.model_pattern, "TDAS");
+        assert!(cfg.das.model_pattern.is_empty());
         assert_eq!(cfg.das.io_scheduler, "mq-deadline");
         assert!(cfg.boot.enabled);
         assert_eq!(cfg.boot.archive_retention_days, 60);
@@ -1900,14 +2051,8 @@ enabled = false
         // [scrub] absent entirely from this old config — must parse to defaults
         assert!(cfg.scrub.enabled);
         assert_eq!(cfg.scrub.on_calendar, "*-*-01 03:05:00");
-        assert_eq!(
-            cfg.scrub.targets,
-            vec![
-                "primary-22tb",
-                "system-recovery-A-2tb",
-                "system-recovery-B-2tb",
-            ]
-        );
+        // No built-in labels: empty means every [[target]] (bd dis3).
+        assert!(cfg.scrub.targets.is_empty());
         assert_eq!(cfg.scrub.warn_age_days, 45);
         assert_eq!(cfg.scrub.fail_age_days, 75);
         // [doctor] absent entirely from this old config — must parse to defaults

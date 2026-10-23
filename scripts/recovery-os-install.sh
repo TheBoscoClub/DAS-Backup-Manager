@@ -32,10 +32,17 @@
 #                    (operator, 2026-10-13)
 #   --count-packages print the baseline's package count (the driver's dry run)
 # Exit: 0 done, 2 cannot read or a tool failed, 3 refused. Every parameter is
-# a DAS_INSTALL_* variable; the list is in the plan
-# (docs/superpowers/plans/2026-10-12-recovery-provision-plan.md, Task 1) plus
-# DAS_INSTALL_ESP_PARTUUID (p1's PARTUUID, checked before anything is touched)
-# and DAS_INSTALL_CONFIG (a config.toml for the verify step's btrdasd inspect).
+# a DAS_INSTALL_* variable, read in the block below the helpers; among them
+# DAS_INSTALL_ESP_PARTUUID (p1's PARTUUID, checked before anything is touched),
+# DAS_INSTALL_CONFIG (a config.toml for the verify step's btrdasd inspect),
+# DAS_INSTALL_USER (the recovery OS's login account, from
+# [recovery_os].install_user: no built-in name; replace-os, configure and
+# package refuse without a valid one before they change anything) and
+# DAS_INSTALL_UID (its uid, 1000 unless set; 1000-60000) and
+# DAS_INSTALL_LOCAL_DOCS (optional: a directory of the installation's own
+# filled-in recovery documents, *.md, from /etc/das-backup/docs on the host;
+# package installs them at /etc/das-backup/docs and points the Desktop links
+# at them).
 #
 # Deletion and undo act ONLY on names a manifest lists, never on a pattern
 # match: the manifest is written atomically before the first rename.
@@ -70,6 +77,11 @@ GENFSTAB="${DAS_INSTALL_GENFSTAB:-genfstab}"
 CP="${DAS_INSTALL_CP:-cp}"
 MV="${DAS_INSTALL_MV:-mv}"
 SYNC="${DAS_INSTALL_SYNC:-sync}"
+# The recovery OS's account: required, no built-in name (production
+# separation: the account is the installation's, not the project's).
+ACCOUNT="${DAS_INSTALL_USER:-}"
+ACCOUNT_UID="${DAS_INSTALL_UID:-1000}"
+LOCAL_DOCS="${DAS_INSTALL_LOCAL_DOCS:-}"
 
 say() { printf '%s\n' "$*"; }
 refuse() {
@@ -83,6 +95,21 @@ cannot() {
 need() {
     local v
     for v in "$@"; do [[ -n "${!v}" ]] || cannot "DAS_INSTALL_$v is not set"; done
+}
+# The account every step that creates or names it checks first, before it
+# changes anything: a POSIX user name (lower-case letter or _, then up to 31
+# of lower-case letters, digits, _ and -; classes spelled out, bd 1bsx), never
+# root, and a uid of 1000-60000 (a regular user's range in login.defs).
+ACCOUNT_FIRST=abcdefghijklmnopqrstuvwxyz_
+ACCOUNT_REST=abcdefghijklmnopqrstuvwxyz0123456789_-
+check_account() {
+    [[ -n "$ACCOUNT" ]] || refuse "DAS_INSTALL_USER is not set: the recovery OS's account has no built-in name (set install_user under [recovery_os] in config.toml)"
+    [[ "$ACCOUNT" =~ ^[${ACCOUNT_FIRST}][${ACCOUNT_REST}]{0,31}$ ]] ||
+        refuse "DAS_INSTALL_USER '$ACCOUNT' is not a user name (a lower-case letter or _, then up to 31 of a-z 0-9 _ -)"
+    [[ "$ACCOUNT" != root ]] || refuse "DAS_INSTALL_USER may not be root: the account is the desktop's autologin user"
+    if [[ ! "$ACCOUNT_UID" =~ ^[123456789][[:digit:]]{3,4}$ ]] || ((ACCOUNT_UID < 1000 || ACCOUNT_UID > 60000)); then
+        refuse "DAS_INSTALL_UID '$ACCOUNT_UID' is not a uid of 1000-60000"
+    fi
 }
 
 # ---- the allowlist -------------------------------------------------------
@@ -280,6 +307,8 @@ save_esp() {
 
 step_replace_os() {
     need UUID ESP_LABEL ESP_PARTUUID DEV
+    # The account is needed two steps on; without one, nothing is set aside.
+    check_account
     local seen n todo=() mf f live=()
     seen=$("$BLKID" -s UUID -o value "${DEV}2") || seen=""
     [[ -n "$seen" ]] || refuse "p2 of $DEV has no readable UUID: not this drive, or not a filesystem"
@@ -365,7 +394,9 @@ step_pacstrap() {
 step_configure() {
     need HOST_NAME KEYS
     local etc="$TARGET/etc"
-    mkdir -p "$etc/sudoers.d" "$etc/sddm.conf.d" "$etc/ssh/sshd_config.d" "$TARGET/home/user/.ssh"
+    check_account
+    local home="/home/$ACCOUNT"
+    mkdir -p "$etc/sudoers.d" "$etc/sddm.conf.d" "$etc/ssh/sshd_config.d" "$TARGET$home/.ssh"
     "$GENFSTAB" -U "$TARGET" >"$etc/fstab" || cannot "genfstab failed"
     printf '%s\n' "$HOST_NAME" >"$etc/hostname"
     printf 'LANG=en_US.UTF-8\n' >"$etc/locale.conf"
@@ -374,13 +405,13 @@ step_configure() {
     ln -sfn /usr/share/zoneinfo/America/Chicago "$etc/localtime"
     cp "$ROOT/etc/pacman.conf" "$etc/pacman.conf" || cannot "cannot copy the live system's pacman.conf"
     "$CHROOT" "$TARGET" locale-gen >/dev/null || cannot "locale-gen failed"
-    "$CHROOT" "$TARGET" useradd -m -u 1000 -G wheel -s /bin/bash user || cannot "useradd failed"
-    printf 'user ALL=(ALL:ALL) NOPASSWD: ALL\n' >"$etc/sudoers.d/10-user"; chmod 0440 "$etc/sudoers.d/10-user"
-    printf '[Autologin]\nUser=user\nSession=plasma\n' >"$etc/sddm.conf.d/autologin.conf"
-    printf 'PasswordAuthentication no\nPermitRootLogin no\nKbdInteractiveAuthentication no\nAllowUsers user\n' >"$etc/ssh/sshd_config.d/10-das-recovery.conf"
-    cp "$KEYS" "$TARGET/home/user/.ssh/authorized_keys" || cannot "cannot copy authorized_keys"
-    chmod 0700 "$TARGET/home/user/.ssh"; chmod 0600 "$TARGET/home/user/.ssh/authorized_keys"
-    "$CHROOT" "$TARGET" chown -R 1000:1000 /home/user || cannot "chown of /home/user failed"
+    "$CHROOT" "$TARGET" useradd -m -u "$ACCOUNT_UID" -G wheel -s /bin/bash "$ACCOUNT" || cannot "useradd failed"
+    printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$ACCOUNT" >"$etc/sudoers.d/10-$ACCOUNT"; chmod 0440 "$etc/sudoers.d/10-$ACCOUNT"
+    printf '[Autologin]\nUser=%s\nSession=plasma\n' "$ACCOUNT" >"$etc/sddm.conf.d/autologin.conf"
+    printf 'PasswordAuthentication no\nPermitRootLogin no\nKbdInteractiveAuthentication no\nAllowUsers %s\n' "$ACCOUNT" >"$etc/ssh/sshd_config.d/10-das-recovery.conf"
+    cp "$KEYS" "$TARGET$home/.ssh/authorized_keys" || cannot "cannot copy authorized_keys"
+    chmod 0700 "$TARGET$home/.ssh"; chmod 0600 "$TARGET$home/.ssh/authorized_keys"
+    "$CHROOT" "$TARGET" chown -R "$ACCOUNT:$ACCOUNT" "$home" || cannot "chown of $home failed"
     "$CHROOT" "$TARGET" systemctl enable sshd NetworkManager sddm qemu-guest-agent || cannot "systemctl enable failed"
     # D9: plymouth renders the sync unit's messages. The hook goes right
     # after udev (plymouth's own documented place); the theme is set here, and
@@ -390,19 +421,48 @@ step_configure() {
     grep -q '^HOOKS=.*plymouth' "$etc/mkinitcpio.conf" || cannot "could not add the plymouth hook to mkinitcpio.conf (no 'udev' in HOOKS)"
     "$CHROOT" "$TARGET" plymouth-set-default-theme cachyos || "$CHROOT" "$TARGET" plymouth-set-default-theme script || cannot "no plymouth theme that renders text"
     "$CHROOT" "$TARGET" flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || cannot "flatpak remote-add failed"
-    say "configure: $HOST_NAME, user (uid 1000, NOPASSWD, autologin), sshd key-only, plymouth, Flathub"
+    say "configure: $HOST_NAME, $ACCOUNT (uid $ACCOUNT_UID, NOPASSWD, autologin), sshd key-only, plymouth, Flathub"
+}
+
+# The installation's own documents: every *.md in LOCAL_DOCS must be a
+# regular file (not a symlink) with a plain name, or package refuses before it
+# changes anything. LOCAL_DOC_FILES lists them.
+LOCAL_DOC_FILES=()
+check_local_docs() {
+    local f n
+    LOCAL_DOC_FILES=()
+    [[ -n "$LOCAL_DOCS" ]] || return 0
+    [[ -d "$LOCAL_DOCS" && ! -L "$LOCAL_DOCS" ]] || refuse "DAS_INSTALL_LOCAL_DOCS '$LOCAL_DOCS' is not a directory"
+    for f in "$LOCAL_DOCS"/*.md; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        n=${f##*/}
+        [[ "$n" =~ ^[${ASCII_ALNUM}._-]+$ ]] || refuse "local document '$n': a name of letters, digits, . _ - only"
+        [[ -f "$f" && ! -L "$f" ]] || refuse "local document '$n' is not a regular file (a symlink or other): only regular files are installed"
+        LOCAL_DOC_FILES+=("$f")
+    done
+}
+# A Desktop link's target: the installation's own copy when one was installed,
+# else the package's generic one.
+doc_path() {
+    if [[ -f "$TARGET/etc/das-backup/docs/$1" ]]; then
+        printf '/etc/das-backup/docs/%s\n' "$1"
+    else
+        printf '/usr/share/das-backup/docs/%s\n' "$1"
+    fi
 }
 
 step_package() {
     need PACKAGE PKG_SHA LETTER BAY STAMP
-    local etc="$TARGET/etc" sum u
+    check_account
+    check_local_docs
+    local etc="$TARGET/etc" sum u f desk="/home/$ACCOUNT/Desktop"
     sum=$(sha256sum "$PACKAGE" | cut -d' ' -f1) || cannot "cannot read $PACKAGE"
     [[ "$sum" == "$PKG_SHA" ]] || refuse "package sha256 is $sum, expected $PKG_SHA"
     say "package sha256 matches"
     mkdir -p "$TARGET/payload"; cp "$PACKAGE" "$TARGET/payload/" || cannot "cannot copy the package into the target"
     "$CHROOT" "$TARGET" pacman -U --noconfirm "/payload/$(basename "$PACKAGE")" || cannot "pacman -U failed"
     rm -rf "${TARGET:?}/payload"
-    mkdir -p "$etc/das-backup" "$etc/systemd/system" "$etc/xdg/autostart" "$TARGET/home/user/Desktop"
+    mkdir -p "$etc/das-backup" "$etc/systemd/system" "$etc/xdg/autostart" "$TARGET$desk"
     printf 'label=system-recovery-%s-2tb\nbay=%s\nprovisioned=%s\n' "$LETTER" "$BAY" "$STAMP" >"$etc/das-backup/recovery-drive"
     [[ -f "$TARGET/usr/lib/das-backup/das-recovery-state-sync.service" ]] || cannot "the package shipped no das-recovery-state-sync.service"
     cp "$TARGET/usr/lib/das-backup/das-recovery-state-sync.service" "$etc/systemd/system/" || cannot "cannot install the sync unit"
@@ -417,10 +477,19 @@ Name=DAS recovery disk: boot status
 Exec=sh -c 'notify-send -t 0 "DAS recovery disk" "$(cat /run/das-recovery-state/status 2>/dev/null || echo "state sync did not run")"'
 OnlyShowIn=KDE;
 EOF
-    ln -sfn /usr/share/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md "$TARGET/home/user/Desktop/Quick Reference — PRINT THIS.md"
-    ln -sfn /usr/share/das-backup/docs/DISASTER-RECOVERY-GUIDE.md "$TARGET/home/user/Desktop/Recovery Guide.md"
-    ln -sfn /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md "$TARGET/home/user/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md"
-    "$CHROOT" "$TARGET" chown -h -R 1000:1000 /home/user/Desktop || cannot "chown of the Desktop links failed"
+    if ((${#LOCAL_DOC_FILES[@]} > 0)); then
+        mkdir -p "$etc/das-backup/docs"
+        for f in "${LOCAL_DOC_FILES[@]}"; do
+            cp -- "$f" "$etc/das-backup/docs/${f##*/}" || cannot "cannot install the local document ${f##*/}"
+            chmod 0644 "$etc/das-backup/docs/${f##*/}"
+        done
+        "$CHROOT" "$TARGET" chown -R root:root /etc/das-backup/docs || cannot "chown of /etc/das-backup/docs failed"
+        say "package: ${#LOCAL_DOC_FILES[@]} local document(s) installed at /etc/das-backup/docs"
+    fi
+    ln -sfn "$(doc_path EMERGENCY-QUICK-REFERENCE.md)" "$TARGET$desk/Quick Reference — PRINT THIS.md"
+    ln -sfn "$(doc_path DISASTER-RECOVERY-GUIDE.md)" "$TARGET$desk/Recovery Guide.md"
+    ln -sfn "$(doc_path STORAGE-ARCHITECTURE-AND-RECOVERY.md)" "$TARGET$desk/STORAGE-ARCHITECTURE-AND-RECOVERY.md"
+    "$CHROOT" "$TARGET" chown -h -R "$ACCOUNT:$ACCOUNT" "$desk" || cannot "chown of the Desktop links failed"
     say "package: installed, marker written, sync unit enabled, 6 units masked, desktop links"
 }
 

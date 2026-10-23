@@ -3,8 +3,8 @@
 //! The backup used to be an allowlist: a subvolume was backed up only if an
 //! entry named it, and `btrfs send` does not descend into nested subvolumes,
 //! so a missing entry meant a silently empty directory in every snapshot.
-//! This module inverts that. See
-//! `docs/superpowers/specs/2026-10-01-subvolume-reconcile-design.md`.
+//! This module inverts that: every subvolume found on a source volume gets an
+//! entry, unless an exclusion names it.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -2777,10 +2777,7 @@ mod tests {
             ("/ssd", "/hdd")
         );
         assert!(l[0].subvolumes.is_err());
-        assert_eq!(
-            l[1].subvolumes.as_ref().unwrap(),
-            &[TOP_LEVEL, "media"]
-        );
+        assert_eq!(l[1].subvolumes.as_ref().unwrap(), &[TOP_LEVEL, "media"]);
     }
 
     #[test]
@@ -3085,7 +3082,7 @@ mod tests {
     #[test]
     fn top_level_snapshot_name_is_the_volume_basename_without_leading_dots() {
         assert_eq!(top_level_snapshot_name("/.btrfs-hdd"), "btrfs-hdd-toplevel");
-        assert_eq!(top_level_snapshot_name("/srv/vmpool"), "dasRaid0-toplevel");
+        assert_eq!(top_level_snapshot_name("/srv/vmpool"), "vmpool-toplevel");
         assert_eq!(top_level_snapshot_name("/mnt/pool/"), "pool-toplevel");
         assert_eq!(top_level_snapshot_name("/a b/x.y@z"), "x-y-z-toplevel");
         assert_eq!(top_level_snapshot_name("/a/b_c"), "b_c-toplevel");
