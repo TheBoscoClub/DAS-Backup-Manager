@@ -19,8 +19,7 @@ Depends: ${shlibs:Depends}, ${misc:Depends}, btrbk, btrfs-progs,
  libkf6configwidgets6, libkf6iconthemes6, libkf6crash6, libkf6kio6,
  libkf6notifications6, libkf6statusnotifieritem6
 Recommends: s-nail, tigervnc-viewer, xorriso
-Suggests: virt-viewer,
-Suggests: mbuffer,
+Suggests: virt-viewer, mbuffer,
  libvirt-daemon-system, libvirt-clients, qemu-system-x86, ovmf,
  imagemagick, jq
 Description: DAS backup manager with btrbk, SQLite FTS5 indexing, KDE GUI

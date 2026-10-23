@@ -59,6 +59,7 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_datadir}/polkit-1/actions/org.dasbackup.policy
 %{_unitdir}/btrdasd-helper.service
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg
+%{_datadir}/knotifications6/btrdasd-gui.notifyrc
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
