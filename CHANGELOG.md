@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd restore file` and `restore snapshot` exit 3 when anything failed to restore** — they printed `FAILED: Restored 4/5 files …, 1 error(s)` and each `ERROR:` line, then exited 0, so a script or operator checking the exit status read a partial restore as complete (`--json` printed only an error count, also exit 0). A restore that began and reported any error now exits 3, the house rule (0 clean, 3 began and something failed, 1 could not start, 75 deferred); the errors are still listed. The GUI was already right (found by a restore proof from the recovery drives, bd `DAS-Backup-Manager-hlj4`)
+- **`restore file` restores a symlink whose target lies outside the snapshot** — the containment check resolved the member itself, following its final link, so an absolute link whose target exists on the host (`.claude/x.md -> /home/user/.claude/x.md`) was refused `Path traversal blocked` while a dangling one was restored. The check now resolves the member's parent: a link is recreated from `read_link` and its target never read, and a member reached through a linked directory leading out of the snapshot is still refused. Both restore paths now restore links verbatim (bd `DAS-Backup-Manager-5ln`)
+
+### Security
+
+- **Restore cannot write through a linked directory at the destination** — `O_NOFOLLOW` guards only the final component, so a link to a directory already under the destination (planted by its owner, or restored earlier as a link) carried `create_dir_all` and every write beneath it out of the destination, past `RESTORE_DENIED_ROOTS`, which judged only the destination itself; `restore file` and the recursive `restore snapshot` copy now refuse, before creating anything, a member whose directory resolves outside the destination (`dest_dir_within`, bd `DAS-Backup-Manager-818i`)
+- **`restore file` refuses a member whose snapshot directory cannot be resolved** — the containment check ran only when `canonicalize` succeeded, so a resolve failure (e.g. `ENAMETOOLONG` past `PATH_MAX`, where the kernel's own lookup still succeeds) skipped it and the read went ahead; the class bd `DAS-Backup-Manager-s05` closed for the member path came back through that `if let Ok` (bd `DAS-Backup-Manager-818i`)
+- **The restore source is opened with `O_NOFOLLOW` and must be a regular file** — a regular file swapped for a link between the `symlink_metadata` check and the open was read through the link; and the hand-written `copy_no_follow` copied anything that was not a link or a directory, which `std::fs::copy` had refused: a FIFO blocked the restore forever while it held its locks, and a device node such as a snapshot's `dev/zero` would be read, as root, until the destination filled. The open handle is now checked, so the two cannot be swapped between check and read (bd `DAS-Backup-Manager-818i`)
+
 ## [0.7.23.1] - 2026-10-22
 
 ### Fixed

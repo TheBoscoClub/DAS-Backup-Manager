@@ -137,6 +137,11 @@ exclude_re = [
     # entry chosen, nothing found), mutated and tested with a scripted
     # resolver and mount text, and `top_level_mount_of` is tested on its own.
     "replace find_mount_for_device -> Option<String> with None",
+    # `copy_no_follow` opens with `O_NOFOLLOW | O_NONBLOCK`. The two flags are
+    # disjoint bits (0400000 and 04000 on Linux; their `&` is 0), so `|` and
+    # `^` give the same value: an equivalent mutant no test can tell apart.
+    # The `| -> &` mutant (flags 0) is not excluded and is caught.
+    "replace \\| with \\^ in copy_no_follow",
 ]
 
 # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with

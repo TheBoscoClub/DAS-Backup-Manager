@@ -90,7 +90,6 @@ fn browse_order(a: &BrowseEntry, b: &BrowseEntry) -> std::cmp::Ordering {
     }
 }
 
-/// Restore specific files from a snapshot to a destination.
 /// Resolve `path` as far as it exists on disk, then re-attach the part that
 /// does not exist yet.
 ///
@@ -264,6 +263,26 @@ fn safe_member(file_path: &str) -> Result<&Path, String> {
     Ok(p)
 }
 
+/// Refuse a write whose directory `dir` does not resolve inside `dest` (the
+/// already-resolved destination root).
+///
+/// `O_NOFOLLOW` guards only the final component. A link to a DIRECTORY
+/// already under the destination — planted, or restored earlier as a link —
+/// would otherwise carry `create_dir_all` and every write beneath it out of
+/// the destination, past the policy that judged only `dest` itself.
+fn dest_dir_within(dir: &Path, dest: &Path, what: &str) -> Result<(), String> {
+    match resolve_for_policy(dir) {
+        Ok(p) if p.starts_with(dest) => Ok(()),
+        Ok(p) => Err(format!(
+            "Refusing '{what}': its directory resolves to '{}', outside the destination",
+            p.display()
+        )),
+        Err(e) => Err(format!(
+            "Cannot resolve the destination directory of '{what}': {e}"
+        )),
+    }
+}
+
 /// Copy `src` over `dest` without following a symlink at `dest`.
 ///
 /// `std::fs::copy` opens the destination write-truncate, which FOLLOWS a
@@ -272,7 +291,21 @@ fn safe_member(file_path: &str) -> Result<&Path, String> {
 /// applies to the final component, which is precisely that case.
 fn copy_no_follow(src: &Path, dest: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut reader = std::fs::File::open(src)?;
+    // O_NOFOLLOW on the source too: the caller judged it by symlink_metadata,
+    // and a link swapped in since must not be read through. O_NONBLOCK so a
+    // FIFO cannot block the open; then the OPEN HANDLE must be a regular file,
+    // as std::fs::copy required — a FIFO or a device node (a snapshot's
+    // dev/zero would be read until the destination filled) is refused.
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)?;
+    if !reader.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' is not a regular file", src.display()),
+        ));
+    }
     let mut writer = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -282,6 +315,7 @@ fn copy_no_follow(src: &Path, dest: &Path) -> std::io::Result<u64> {
     std::io::copy(&mut reader, &mut writer)
 }
 
+/// Restore specific files from a snapshot to a destination.
 pub fn restore_files(
     snapshot_path: &Path,
     file_paths: &[&str],
@@ -329,14 +363,41 @@ pub fn restore_files(
         let src = snapshot_path.join(member);
         let dest_file = dest.join(member);
 
-        // Belt and braces: if `src` resolves at all, it must land inside the
-        // snapshot. A resolve FAILURE is no longer silently tolerated for
-        // regular files — only a symlink may legitimately fail to resolve, and
-        // that case is handled explicitly below.
-        if let Ok(canonical_src) = src.canonicalize()
-            && !canonical_src.starts_with(&snapshot_root)
-        {
+        // Belt and braces: the member's PARENT must resolve inside the
+        // snapshot, so no linked ancestor leads the read out of it. The member
+        // itself is not resolved: a regular file is read where its parent is
+        // (opened O_NOFOLLOW), and a symlink is recreated from read_link
+        // below, its target never read — so where that target lies, or
+        // whether it exists on this host, does not decide whether the link is
+        // restored (bd 5ln). A parent that does not resolve refuses: realpath
+        // can fail where the kernel's own lookup still succeeds.
+        let canonical_parent = match src.parent().map(Path::canonicalize) {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => {
+                errors.push(format!(
+                    "Cannot resolve the parent of '{file_path}' in the snapshot: {e}"
+                ));
+                continue;
+            }
+            None => {
+                errors.push(format!("Path traversal blocked: '{file_path}'"));
+                continue;
+            }
+        };
+        if !canonical_parent.starts_with(&snapshot_root) {
             errors.push(format!("Path traversal blocked: '{}'", file_path));
+            continue;
+        }
+
+        // The same on the write side, before anything is created: a link
+        // already under the destination (planted, or restored earlier as a
+        // link) must not carry this member's write out of it.
+        let Some(dest_dir) = dest_file.parent() else {
+            errors.push(format!("Path traversal blocked: '{file_path}'"));
+            continue;
+        };
+        if let Err(e) = dest_dir_within(dest_dir, dest, file_path) {
+            errors.push(e);
             continue;
         }
 
@@ -601,6 +662,20 @@ fn restore_snapshot_recursive(
         let dest_path = dest.join(rel_path);
         let file_type = entry.file_type();
 
+        // The directory this entry creates or lands in must resolve inside
+        // the destination before anything is created there.
+        let landing = if file_type.is_dir() {
+            Some(dest_path.as_path())
+        } else {
+            dest_path.parent()
+        };
+        if let Some(dir) = landing
+            && let Err(e) = dest_dir_within(dir, dest, &rel_path.to_string_lossy())
+        {
+            errors.push(e);
+            continue;
+        }
+
         if file_type.is_dir() {
             if let Err(e) = std::fs::create_dir_all(&dest_path) {
                 errors.push(format!(
@@ -832,6 +907,39 @@ mod tests {
             std::fs::read_to_string(&victim).unwrap(),
             "original",
             "the symlink target must be untouched"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_recursive_does_not_write_through_a_linked_directory_at_the_destination() {
+        // O_NOFOLLOW guards only the final component; a planted link to a
+        // DIRECTORY carried create_dir_all and every write under it out of
+        // the destination.
+        let snap = TempDir::new().unwrap();
+        write_file(&snap.path().join("door"), "x.txt", "payload");
+        let outside = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("door")).unwrap();
+
+        let result = restore_snapshot_recursive(
+            snap.path(),
+            dest.path(),
+            &Instant::now(),
+            &crate::progress::NullProgress,
+        )
+        .expect("the walk itself should complete");
+
+        assert!(
+            !outside.path().join("x.txt").exists(),
+            "the write must not land outside the destination"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("outside the destination")),
+            "the refusal must be REPORTED: {:?}",
+            result.errors
         );
     }
 
@@ -1417,20 +1525,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_files_refuses_absolute_and_escaping_members() {
+    fn restore_files_refuses_absolute_and_non_literal_members() {
         let snap = TempDir::new().unwrap();
         write_file(snap.path(), "ok.txt", "fine");
         let outside = TempDir::new().unwrap();
         write_file(outside.path(), "secret.txt", "secret");
-        // A link inside the snapshot that resolves outside it.
-        std::os::unix::fs::symlink(outside.path().join("secret.txt"), snap.path().join("leak"))
-            .unwrap();
         let dest = TempDir::new().unwrap();
         let absolute = outside.path().join("secret.txt");
 
         let result = restore_files(
             snap.path(),
-            &[absolute.to_str().unwrap(), "./ok.txt", "leak", "ok.txt"],
+            &[absolute.to_str().unwrap(), "./ok.txt", "ok.txt"],
             dest.path(),
             &test_roots(),
             &test_sources(snap.path()),
@@ -1439,13 +1544,182 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.files_restored, 1);
-        assert_eq!(result.errors.len(), 3, "{:?}", result.errors);
+        assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
         assert!(result.errors.iter().all(|e| e.contains("traversal")));
         let restored: Vec<_> = fs::read_dir(dest.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(restored, ["ok.txt"], "only the literal member is written");
+    }
+
+    #[test]
+    fn restore_files_restores_a_link_that_points_outside_as_a_link() {
+        // bd 5ln: the link is recreated with read_link, its target never read,
+        // so where the target lies (or whether it exists on this host) must not
+        // decide whether the link is restored.
+        let snap = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_file(outside.path(), "secret.txt", "secret");
+        let target = outside.path().join("secret.txt");
+        std::os::unix::fs::symlink(&target, snap.path().join("leak")).unwrap();
+        let dest = TempDir::new().unwrap();
+
+        let result = restore_files(
+            snap.path(),
+            &["leak"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.files_restored, 1);
+        assert_eq!(
+            result.bytes_restored, 0,
+            "the target's content is never copied"
+        );
+        let restored = dest.path().join("leak");
+        assert!(
+            fs::symlink_metadata(&restored)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&restored).unwrap(), target);
+    }
+
+    #[test]
+    fn restore_files_refuses_a_member_whose_parent_cannot_be_resolved() {
+        // An unresolvable parent must refuse, never skip the containment
+        // check: realpath can fail (ENAMETOOLONG past PATH_MAX) where the
+        // kernel's own lookup in stat/open still succeeds.
+        let snap = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+
+        let result = restore_files(
+            snap.path(),
+            &["nodir/x.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_restored, 0);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].starts_with("Cannot resolve the parent of 'nodir/x.txt'"),
+            "{:?}",
+            result.errors
+        );
+        assert!(!dest.path().join("nodir").exists(), "nothing is created");
+    }
+
+    #[test]
+    fn restore_files_does_not_write_through_a_linked_directory_at_the_destination() {
+        // A link already at the destination (planted, or restored earlier as a
+        // link) must not carry a later member's write out of the destination.
+        let snap = TempDir::new().unwrap();
+        write_file(&snap.path().join("door"), "x.txt", "payload");
+        let outside = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("door")).unwrap();
+
+        let result = restore_files(
+            snap.path(),
+            &["door/x.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_restored, 0);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("outside the destination"),
+            "{:?}",
+            result.errors
+        );
+        assert!(
+            !outside.path().join("x.txt").exists(),
+            "the write must not land outside the destination"
+        );
+    }
+
+    #[test]
+    fn copy_no_follow_refuses_a_source_that_is_not_a_regular_file() {
+        // std::fs::copy refused these; its hand-written replacement did not.
+        // A FIFO blocked the open forever (holding the restore's locks); a
+        // device node such as dev/zero would be read until the destination
+        // filled. Run on a thread so the unfixed code fails, not hangs.
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let out = dir.path().join("out");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (f, o) = (fifo.clone(), out.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(copy_no_follow(&f, &o).map_err(|e| e.to_string()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("copying a FIFO must refuse at once, not block");
+        let err = got.expect_err("a FIFO is not a regular file");
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!out.exists(), "nothing is written");
+    }
+
+    #[test]
+    fn copy_no_follow_does_not_read_through_a_symlink_source() {
+        // The member is judged a regular file by symlink_metadata, then opened:
+        // a link swapped in between must not be read through.
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "real.txt", "secret");
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link")).unwrap();
+        let out = dir.path().join("out.txt");
+
+        assert!(copy_no_follow(&dir.path().join("link"), &out).is_err());
+        assert!(
+            !out.exists(),
+            "nothing is written when the source is a link"
+        );
+    }
+
+    #[test]
+    fn restore_files_refuses_a_member_reached_through_a_linked_directory() {
+        // The containment check that matters: an ANCESTOR of the member is a
+        // link leading out of the snapshot, so reading the member reads outside.
+        let snap = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_file(outside.path(), "secret.txt", "secret");
+        std::os::unix::fs::symlink(outside.path(), snap.path().join("door")).unwrap();
+        let dest = TempDir::new().unwrap();
+
+        let result = restore_files(
+            snap.path(),
+            &["door/secret.txt"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &Recorder::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_restored, 0);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("traversal"),
+            "{:?}",
+            result.errors
+        );
+        assert!(!dest.path().join("door").exists(), "nothing is written");
     }
 
     #[test]

@@ -1619,20 +1619,34 @@ struct Interactive<'a> {
     progress: &'a dyn ProgressCallback,
 }
 
-/// How `walk` or a `restore` command ended, when it did not fail.
+/// How `walk` or a `restore` command ended, when it could start.
 #[derive(Debug, PartialEq, Eq)]
 enum Ran {
     Done,
     /// `--no-wait` and the lock was held: nothing was mounted.
     Deferred,
+    /// A restore began and some member or step failed; its errors were
+    /// printed (bd hlj4).
+    Failed,
 }
 
 /// The exit code that is not 0: [`maintenance::DEFERRED_EXIT_CODE`] after a
-/// deferral.
-fn deferred_exit_code(ran: &Ran) -> Option<i32> {
+/// deferral, 3 after a restore that began and failed — the house rule
+/// (0 clean, 3 began and something failed, 1 could not start).
+fn ran_exit_code(ran: &Ran) -> Option<i32> {
     match ran {
         Ran::Done => None,
         Ran::Deferred => Some(maintenance::DEFERRED_EXIT_CODE),
+        Ran::Failed => Some(backup::BootStep::mount_failure_exit_code()),
+    }
+}
+
+/// A restore that reported any error failed, however much it restored.
+fn restored_outcome(result: &restore::RestoreResult) -> Ran {
+    if result.errors.is_empty() {
+        Ran::Done
+    } else {
+        Ran::Failed
     }
 }
 
@@ -1810,13 +1824,14 @@ fn cmd_restore_file(
         progress,
     );
     let still_mounted = guard.unmount(progress);
-    let (out, errors) = restored_report(json, &result?);
+    let result = result?;
+    let (out, errors) = restored_report(json, &result);
     print!("{out}");
     for line in errors {
         eprintln!("{line}");
     }
     mount::require_released(&still_mounted)?;
-    Ok(Ran::Done)
+    Ok(restored_outcome(&result))
 }
 
 /// `btrdasd restore snapshot`.
@@ -1840,13 +1855,14 @@ fn cmd_restore_snapshot(
         progress,
     );
     let still_mounted = guard.unmount(progress);
-    let (out, errors) = restored_report(json, &result?);
+    let result = result?;
+    let (out, errors) = restored_report(json, &result);
     print!("{out}");
     for line in errors {
         eprintln!("{line}");
     }
     mount::require_released(&still_mounted)?;
-    Ok(Ran::Done)
+    Ok(restored_outcome(&result))
 }
 
 /// `btrdasd restore browse`.
@@ -1922,7 +1938,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress: &CliProgress,
             };
             let ran = cmd_walk(&target, &db, &config, &run)?;
-            if let Some(code) = deferred_exit_code(&ran) {
+            if let Some(code) = ran_exit_code(&ran) {
                 std::process::exit(code);
             }
         }
@@ -2640,7 +2656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &interactive(no_wait),
                 )?,
             };
-            if let Some(code) = deferred_exit_code(&ran) {
+            if let Some(code) = ran_exit_code(&ran) {
                 std::process::exit(code);
             }
         }
@@ -4592,8 +4608,36 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
 
     #[test]
     fn a_deferral_exits_75_and_a_finished_run_does_not() {
-        assert_eq!(deferred_exit_code(&Ran::Deferred), Some(75));
-        assert_eq!(deferred_exit_code(&Ran::Done), None);
+        assert_eq!(ran_exit_code(&Ran::Deferred), Some(75));
+        assert_eq!(ran_exit_code(&Ran::Done), None);
+    }
+
+    #[test]
+    fn a_restore_with_errors_exits_3_like_every_run_that_began_and_failed() {
+        // bd hlj4: the ERROR lines went to stderr and the command exited 0.
+        assert_eq!(
+            ran_exit_code(&Ran::Failed),
+            Some(backup::BootStep::mount_failure_exit_code())
+        );
+        assert_eq!(ran_exit_code(&Ran::Failed), Some(3));
+    }
+
+    fn restore_result(errors: &[&str]) -> restore::RestoreResult {
+        restore::RestoreResult {
+            files_restored: 4,
+            bytes_restored: 43_181_600,
+            errors: errors.iter().map(|e| e.to_string()).collect(),
+            duration_secs: 0,
+        }
+    }
+
+    #[test]
+    fn a_restore_that_reported_any_error_failed() {
+        assert_eq!(
+            restored_outcome(&restore_result(&["Path traversal blocked: 'x'"])),
+            Ran::Failed
+        );
+        assert_eq!(restored_outcome(&restore_result(&[])), Ran::Done);
     }
 
     /// `backup-run.sh` runs `walk` while it holds the lock on fd 8 and names

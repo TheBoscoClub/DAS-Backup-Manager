@@ -1014,7 +1014,15 @@ symlinks, and a member path that is absolute or contains a
 .I .\&
 or
 .I ..\&
-component is rejected.
+component is rejected. A member is read only if its directory resolves inside
+the snapshot, and written only if its directory resolves inside the
+destination, so a link to a directory on either side cannot carry the read or
+the write out; a directory that cannot be resolved refuses the member. A
+member that is itself a symbolic link is restored as a link with the same
+target, which is never read, wherever it points; a FIFO or device node is
+refused, never read. A restore that reports any
+error exits 3; see
+.BR "EXIT STATUS" .
 .PP
 .B btrdasd restore file
 .I SNAPSHOT DEST FILE
@@ -2876,6 +2884,9 @@ the files were upgraded, but
 .B btrdasd\-helper
 is yours to restart \(em the init system is not systemd, so setup can neither
 tell whether one runs nor restart it. This is not a failed install.
+.BR "btrdasd restore file" " and " "restore snapshot" :
+the restore began and some member or step failed; every error is listed, and
+what was restored stays in place.
 .TP
 .B 75
 .B walk
