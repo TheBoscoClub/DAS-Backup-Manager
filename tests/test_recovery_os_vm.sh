@@ -314,6 +314,7 @@ DAS_TARGET_2_MOUNT_UUID='$UUID_B'
 DAS_TARGET_2_MOUNT='/mnt/backup-system-recovery-B'
 DAS_TARGET_2_ROLE='mirror'
 DAS_TARGET_2_DISPLAY_NAME='2TB Recovery B (Bay 4, SERIAL02)'
+DAS_RECOVERY_OS_EGRESS_ORG='${EGRESS_CFG-AS64500}'
 EOF
 }
 
@@ -5315,6 +5316,27 @@ run_egress_script
 check "egress wait, network up at once: exit 0" "$RC" "0"
 lacks "egress wait, network up at once: never waited" "$OUT" "waiting for the recovery OS's network"
 has "egress wait, network up at once: judged" "$OUT" "egress is direct (AS64500)"
+
+echo "--- the egress org: the variable, else config.toml's, never a built-in ISP (bd 6pd3)"
+unattended_fixture
+DAS_RECOVERY_VM_EGRESS_ORG=AS64511 run_driver session A --unattended
+has "egress org: the variable beats config.toml's" "$(file "$S/stage.egress.sh")" "want=AS64511"
+EGRESS_CFG=
+unattended_fixture
+run_driver session A --unattended
+has "egress org unset: the step is given none" "$(file "$S/stage.egress.sh")" "want="$'\n'
+curl_stub 0
+run_egress_script
+check "egress org unset: the step refuses (exit 3)" "$RC" "3"
+has "egress org unset: says how to set it" "$OUT" "no egress org is configured: set egress_org under [recovery_os] in config.toml"
+check "egress org unset: never asks who the address belongs to" "$(file "$T/curlstub/calls")" ""
+EGRESS_CFG='AS64500;reboot'
+unattended_fixture
+run_driver session A --unattended
+check "egress org from config.toml with a ';': refused (exit 1)" "$RC" "1"
+has "egress org from config.toml with a ';': says which setting" "$OUT" "[recovery_os].egress_org in"
+lacks "egress org from config.toml with a ';': nothing booted" "$(events)" "virsh start"
+unset EGRESS_CFG
 unattended_fixture
 # A 2 s budget, not 1: the step measures whole seconds, so a tick of the
 # clock between its start and its first look ends a 1 s budget after one ask

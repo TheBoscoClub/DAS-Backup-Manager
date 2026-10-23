@@ -78,16 +78,32 @@ pub struct RecoveryOs {
     /// date that cannot be read, is stale regardless of this.
     #[serde(default = "default_recovery_os_max_age_days")]
     pub max_age_days: u32,
+    /// What an unattended recovery-drive update must egress as: the start of
+    /// ipinfo.io's org line for the VM's public address, normally your ISP's
+    /// AS number (`AS64500`). Unset, every unattended update refuses at its
+    /// egress step — there is no built-in ISP (bd DAS-Backup-Manager-6pd3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_org: Option<String>,
 }
 
 fn default_recovery_os_max_age_days() -> u32 {
     60
 }
 
+/// `recovery_os.egress_org` goes into a shell script run in the recovery OS,
+/// so it takes the same characters `recovery-os-vm.sh` accepts: ASCII letters,
+/// digits and spaces, not starting with a space.
+pub fn egress_org_is_valid(org: &str) -> bool {
+    let mut chars = org.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == ' ')
+}
+
 impl Default for RecoveryOs {
     fn default() -> Self {
         Self {
             max_age_days: default_recovery_os_max_age_days(),
+            egress_org: None,
         }
     }
 }
@@ -971,6 +987,13 @@ impl Config {
                     .into(),
             );
         }
+        if let Some(org) = &self.recovery_os.egress_org
+            && !egress_org_is_valid(org)
+        {
+            errors.push(format!(
+                "recovery_os.egress_org {org:?} must be letters, digits and spaces, starting with a letter or digit (an AS number: AS64500)"
+            ));
+        }
 
         // A recovery drive's own OS backs nothing up: it has no sources by design.
         if self.sources.is_empty() && !self.general.recovery_drive {
@@ -1635,6 +1658,58 @@ mod tests {
             "{:?}",
             cfg.validate()
         );
+    }
+
+    /// Unset is "not configured" and stays out of the file; a value round-trips
+    /// (bd DAS-Backup-Manager-6pd3: there is no built-in ISP).
+    #[test]
+    fn recovery_os_egress_org_is_unset_by_default_and_round_trips() {
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(cfg.recovery_os.egress_org, None);
+        assert!(!cfg.to_toml().unwrap().contains("egress_org"));
+        let cfg =
+            Config::from_toml(&minimal_toml("[recovery_os]\negress_org = \"AS64500\"\n")).unwrap();
+        assert_eq!(cfg.recovery_os.egress_org.as_deref(), Some("AS64500"));
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("egress_org = \"AS64500\""), "{text}");
+        assert_eq!(
+            Config::from_toml(&text)
+                .unwrap()
+                .recovery_os
+                .egress_org
+                .as_deref(),
+            Some("AS64500")
+        );
+    }
+
+    #[test]
+    fn validate_refuses_an_egress_org_the_script_would_refuse() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        for good in ["AS64500", "AS64500 Example ISP", "7"] {
+            cfg.recovery_os.egress_org = Some(good.into());
+            assert!(
+                !cfg.validate().iter().any(|e| e.contains("egress_org")),
+                "{good}: {:?}",
+                cfg.validate()
+            );
+        }
+        for bad in [
+            "",
+            " AS64500",
+            "AS64500;reboot",
+            "AS64500'",
+            "AS\u{e9}",
+            "AS64500\n",
+        ] {
+            cfg.recovery_os.egress_org = Some(bad.into());
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("recovery_os.egress_org")),
+                "{bad:?} accepted: {:?}",
+                cfg.validate()
+            );
+        }
     }
 
     #[test]

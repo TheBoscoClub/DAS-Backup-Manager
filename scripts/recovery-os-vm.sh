@@ -333,8 +333,9 @@
 #   runs), DAS_RECOVERY_VM_NET_SECS (120: the egress step's wait for the
 #   recovery OS's network)      clocks
 #   DAS_RECOVERY_VM_EGRESS_ORG  what the direct path egresses as (ipinfo.io's
-#                               org line begins with it): AS64500 by default,
-#                               the author's ISP -- set it for yours
+#                               org line begins with it), e.g. AS64500;
+#                               overrides [recovery_os].egress_org; with
+#                               neither, the egress step refuses
 #   DAS_RECOVERY_VM_REPOS_FIRST the repository family that must come first in
 #                               the recovery OS's pacman.conf: cachyos by
 #                               default; empty, the order is not judged
@@ -425,8 +426,10 @@ readonly NET_SECS="${DAS_RECOVERY_VM_NET_SECS:-120}"
 # on both drives (2026-10-07, bd 1igg). Empty: the order is not judged.
 readonly REPOS_FIRST="${DAS_RECOVERY_VM_REPOS_FIRST-cachyos}"
 # What the VM's direct path egresses as, the start of ipinfo.io's org line
-# (decision 5 of 2026-10-07): the author's ISP by default, AS64500.
-readonly EGRESS_ORG="${DAS_RECOVERY_VM_EGRESS_ORG:-AS64500}"
+# (decision 5 of 2026-10-07): this variable, else [recovery_os].egress_org in
+# config.toml (load_targets). No built-in ISP: unset, the egress step refuses
+# (bd DAS-Backup-Manager-6pd3).
+EGRESS_ORG="${DAS_RECOVERY_VM_EGRESS_ORG:-}"
 # The egress rule's priority: above Tailscale's lookup 52 (5270).
 readonly EGRESS_PRIORITY=5100
 # provision: the CachyOS live ISO a drive is rebuilt from must be exactly this
@@ -1027,6 +1030,14 @@ load_targets() {
         refuse "btrdasd could not read $DAS_CONFIG"
     fi
     eval "$env_text"
+    # The egress org from config.toml, when the environment gave none. Config::load
+    # does not validate, so the characters are checked here as for the variable.
+    if [[ -z "$EGRESS_ORG" ]]; then
+        EGRESS_ORG="${DAS_RECOVERY_OS_EGRESS_ORG:-}"
+        if [[ -n "$EGRESS_ORG" && ! "$EGRESS_ORG" =~ ^[${ASCII_LETTERS}[:digit:]][${ASCII_LETTERS}[:digit:]\ ]*$ ]]; then
+            refuse "[recovery_os].egress_org in $DAS_CONFIG takes letters, digits and spaces (an AS number: AS64500)"
+        fi
+    fi
     TARGET_LABELS=()
     declare -gA T_ROLE=()
     declare -gA T_SERIALS=()
@@ -4246,6 +4257,7 @@ run_unattended() {
 step_egress() {
     printf 'want=%s\nnet_secs=%s\npace=%s\n' "$EGRESS_ORG" "$NET_SECS" "$POLL_SECS"
     cat <<'EOF'
+[ -n "$want" ] || { echo "no egress org is configured: set egress_org under [recovery_os] in config.toml (the AS number your direct path egresses as, e.g. AS64500) -- refused"; exit 3; }
 # The agent answers before the OS has a lease: wait for the network, then judge.
 start=$(date +%s); said=
 while :; do
@@ -5926,7 +5938,7 @@ check_knobs() {
     fi
     # It goes into a shell script in the recovery OS: letters, digits and
     # spaces only.
-    if [[ ! "$EGRESS_ORG" =~ ^[${ASCII_LETTERS}[:digit:]][${ASCII_LETTERS}[:digit:]\ ]*$ ]]; then
+    if [[ -n "$EGRESS_ORG" && ! "$EGRESS_ORG" =~ ^[${ASCII_LETTERS}[:digit:]][${ASCII_LETTERS}[:digit:]\ ]*$ ]]; then
         printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_EGRESS_ORG takes letters, digits and spaces (an AS number: AS64500)\n' >&2
         exit 2
     fi

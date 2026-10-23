@@ -76,6 +76,12 @@ pub fn dump_env(config: &Config) -> String {
         config.scrub.fail_age_days
     ));
 
+    // Recovery OS: the egress an unattended update must have (bd 6pd3).
+    // Absent when unset, so the script can tell "not configured" from a value.
+    if let Some(org) = &config.recovery_os.egress_org {
+        out.push_str(&kv("DAS_RECOVERY_OS_EGRESS_ORG", org));
+    }
+
     // Sources (indexed)
     out.push_str(&format!("DAS_SOURCE_COUNT={}\n", config.sources.len()));
     for (i, src) in config.sources.iter().enumerate() {
@@ -356,6 +362,16 @@ mod tests {
     fn kv_escapes_single_quotes() {
         let result = kv("TEST", "it's a test");
         assert_eq!(result, "TEST='it'\\''s a test'\n");
+    }
+
+    /// The egress an unattended recovery-drive update must have: exported only
+    /// when configured, so the script can refuse "not configured" (bd 6pd3).
+    #[test]
+    fn dump_env_exports_the_recovery_os_egress_org_only_when_set() {
+        let mut config = test_config();
+        assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_EGRESS_ORG"));
+        config.recovery_os.egress_org = Some("AS64500".into());
+        assert!(dump_env(&config).contains("DAS_RECOVERY_OS_EGRESS_ORG='AS64500'\n"));
     }
 
     /// A retention of 0 means "not configured", and the key is left out so a
