@@ -208,10 +208,28 @@ jobs:
   # ===========================================================================
   flatpak:
     runs-on: ubuntu-latest
+    # The KDE runtime, its SDK and the rust-stable extension no longer fit the
+    # runner's free disk: 0.7.23.0's run (2026-10-22) and a re-run both failed
+    # "Not enough disk space" installing rust-stable. A container job cannot free
+    # host disk from a step, so the runner's largest preinstalled toolchains are
+    # bind-mounted in and emptied first; the container's layers live on the
+    # same host filesystem, so that is the space flatpak installs into.
     container:
       image: bilelmoussaoui/flatpak-github-actions:kde-6.7
-      options: --privileged
+      options: >-
+        --privileged
+        -v /usr/share/dotnet:/hostfree/dotnet
+        -v /usr/local/lib/android:/hostfree/android
+        -v /opt/ghc:/hostfree/ghc
+        -v /opt/hostedtoolcache/CodeQL:/hostfree/codeql
+        -v /usr/local/share/boost:/hostfree/boost
     steps:
+      - name: Free runner disk
+        run: |
+          df -h / | tail -1
+          rm -rf /hostfree/dotnet/* /hostfree/android/* /hostfree/ghc/* /hostfree/codeql/* /hostfree/boost/*
+          df -h / | tail -1
+
       - uses: actions/checkout@v7.0.1
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
