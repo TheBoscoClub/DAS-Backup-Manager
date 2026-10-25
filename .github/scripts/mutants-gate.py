@@ -85,13 +85,33 @@ import re
 import sys
 
 # Build-death signatures that cargo-mutants files under "unviable".
+# tn62 (cachyos-sentinel, 2026-10-24): these are the TOOLCHAIN's own messages,
+# never bare words. A bare "out of memory" matched a caught mutant's test
+# output (OOM-detector fixture text) and the mutated source in the diff, so
+# the gate failed runs that had no exhaustion at all.
 EXHAUSTION_RE = re.compile(
-    r"No space left on device|os error 28"
+    r"No space left on device|os error 28|StorageFull"
     r"|memory allocation of \d+ bytes failed"
-    r"|Cannot allocate memory|os error 12\b|out of memory"
+    r"|Cannot allocate memory|os error 12\b|LLVM ERROR: out of memory"
     r"|signal: 9, SIGKILL",
     re.IGNORECASE,
 )
+
+# A mutant log opens with the mutation diff: the mutated source itself, which
+# can contain any words at all. It ends at the next "*** " section header.
+DIFF_HEADER = "*** mutation diff:"
+
+
+def log_shows_exhaustion(fh) -> bool:
+    """True when a line outside the mutation-diff section matches."""
+    in_diff = False
+    for line in fh:
+        if line.startswith("*** "):
+            in_diff = line.startswith(DIFF_HEADER)
+            continue
+        if not in_diff and EXHAUSTION_RE.search(line):
+            return True
+    return False
 
 
 def emit(line: str) -> None:
@@ -123,7 +143,7 @@ def exhausted_logs(outcomes_path: str) -> "list[str]":
     for path in candidates:
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                if any(EXHAUSTION_RE.search(line) for line in fh):
+                if log_shows_exhaustion(fh):
                     hits.append(os.path.relpath(path, out_dir))
         except OSError:
             continue  # absent debug.log is normal; the outcomes check is rule 3
