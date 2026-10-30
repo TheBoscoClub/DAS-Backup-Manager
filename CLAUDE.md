@@ -29,7 +29,7 @@ cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 
 ## Detailed Rules
 
-- `esp-safety.md` — **CRITICAL** — recovery-drive ESP safety; this project owns only the recovery ESPs, never the host's
+- `esp-safety.md` — **CRITICAL** — recovery-drive ESP identification, independence and incident
 - `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
 - `backup.md` — btrbk, DAS, boot archival, email, exit codes, locks, supervisor interaction
 - `fail-silent.md` — which error suppressions are legitimate here, and which are always defects

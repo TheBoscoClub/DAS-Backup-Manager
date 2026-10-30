@@ -1146,7 +1146,7 @@ To update one, boot it — never update it from the host. There are two ways:
 
 Either way, do one drive at a time, so one known-good recovery OS exists throughout. The next backup run reads the new state; `STALE` clears once the last *applied* upgrade is recent, no later attempt failed, and the kernel series and btrfs-progs have caught up with the host's. An upgrade that failed or was declined shows as a `Last attempt … (did not complete)` — the report only counts one whose transaction completed.
 
-**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly how a host-side ESP mirror destroys a recovery drive's boot configuration. Booted — on bare metal or in the VM — every write, its ESP included, is made by the drive's own OS, which rule 4 of the same file permits.
+**Never update a recovery OS from the host by `arch-chroot` into its `@`.** A kernel upgrade writes that OS's own ESP on the recovery drive, and writing a recovery ESP from the host is exactly how a host-side ESP mirror destroys a recovery drive's boot configuration. Booted — on bare metal or in the VM — every write, its ESP included, is made by the drive's own OS, and that is permitted.
 
 ### In the recovery-os-updater VM
 

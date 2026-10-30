@@ -11,19 +11,12 @@ label** — a label is renameable and the weakest of the three. A shared label i
 `scripts/das-wipe-all-drives-and-partition-from-scratch.sh` (v2.1.0+) derives the unique bay-numbered label and
 refuses on collision (`tests/test_esp_label_derivation.sh`). Full account: `.claude/docs/rules-reference/esp-safety.md`.
 
-### HARD RULES — No Exceptions
+### HARD RULE — beyond the global `~/.claude/rules/esp-ownership.md`
 
-1. **NEVER use rsync, cp, dd, or ANY tool to write to the `RECOV-ESP-*` partitions** from the host.
-2. **NEVER create pacman hooks (or any hook, unit, timer or udev rule) that sync a host ESP to DAS drives.**
-3. **NEVER include DAS drives in any ESP mirroring, backup, or sync operation, and never discover ESPs by
-   type GUID, `vfat` or "looks like an ESP" and then act on what is found.**
-4. **The DAS ESPs are TOTALLY independent** of the host ESP — they boot their own OSes. That OS writing its
-   own ESP while booted (bare metal, the recovery-os-updater VM with its whole disk attached by serial, or the
-   live system inside that VM during `provision`) is permitted; the host still never writes `RECOV-ESP-*` and
-   never mounts a drive the VM holds.
-5. **This project owns the recovery ESPs only.** It never touches the host's own ESPs and never ships,
-   generates or edits a host-ESP mirroring mechanism; that belongs to whoever owns the host's boot
-   configuration, not to a backup tool.
+**The DAS ESPs are TOTALLY independent** of the host ESP — they boot their own OSes. That OS writing its
+own ESP while booted (bare metal, the recovery-os-updater VM with its whole disk attached by serial, or the
+live system inside that VM during `provision`) is permitted; the host still never writes `RECOV-ESP-*` and
+never mounts a drive the VM holds.
 
 ### Incident behind these rules
 
