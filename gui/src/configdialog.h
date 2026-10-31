@@ -12,6 +12,11 @@ class ConfigDialog : public KPageDialog
 public:
     explicit ConfigDialog(DBusClient *client, QWidget *parent = nullptr);
 
+    // The status line after a successful save: whether the file written
+    // (read back) differs from the text typed — the save wrote out
+    // backup-scoping keys the text left out.
+    [[nodiscard]] static QString savedStatus(const QString &typed, const QString &written);
+
 private Q_SLOTS:
     void loadConfig();
     void saveConfig();

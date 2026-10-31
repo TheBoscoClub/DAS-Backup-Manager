@@ -5,6 +5,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <optional>
+
 struct BackupSteps;
 class QDBusInterface;
 class QDBusPendingCall;
@@ -33,6 +35,11 @@ public:
 
     // Synchronous methods
     QString configGet();
+    // What the Backup panel shows, as JSON (see panelconfig.h); empty on failure.
+    QString panelConfigGet();
+    // Warnings for `tomlContent` (keys a known table does not have, with the
+    // nearest key); nullopt when the helper could not check it.
+    std::optional<QStringList> configCheck(const QString &tomlContent);
     bool configSet(const QString &tomlContent);
     QString scheduleGet();
     bool scheduleSet(const QString &incremental,

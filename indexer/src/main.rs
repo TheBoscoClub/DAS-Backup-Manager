@@ -2294,7 +2294,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", cfg.to_toml()?);
             }
             ConfigAction::Validate { config } => {
-                let cfg = Config::load(&config)?;
+                let text = std::fs::read_to_string(&config)?;
+                let cfg = Config::from_toml(&text)?;
+                // A key nothing reads (a typo the save keeps): a warning,
+                // never an error — a newer version's keys belong in the file.
+                for w in buttered_dasd::config::unknown_key_warnings(&text)? {
+                    eprintln!("Warning: {w}");
+                }
                 let errors = cfg.validate();
                 if errors.is_empty() {
                     println!("Config is valid.");

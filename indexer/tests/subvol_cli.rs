@@ -168,6 +168,49 @@ fn schedule_set_keeps_unknown_keys_and_comments() {
     );
 }
 
+/// A key a known table does not have (a typo the save keeps and nothing
+/// reads) is warned about by `config validate`, with the nearest key; the
+/// config is still valid (bd DAS-Backup-Manager-28il).
+#[test]
+fn config_validate_warns_about_an_unknown_key_with_a_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let config_s = config.to_str().unwrap();
+    let out = btrdasd(&["config", "validate", "--config", config_s]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Warning"),
+        "a clean config warns nothing: {stderr}"
+    );
+
+    let typo = std::fs::read_to_string(&config).unwrap().replacen(
+        "device = \"UUID=abc\"\n",
+        "device = \"UUID=abc\"\ntarget_lables = [\"t\"]\n",
+        1,
+    );
+    std::fs::write(&config, typo).unwrap();
+    let out = btrdasd(&["config", "validate", "--config", config_s]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "Warning: source[0].target_lables is not a key this version reads \
+             (did you mean target_labels?)"
+        ),
+        "{stderr}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Config is valid."));
+}
+
 #[test]
 fn subvol_set_manual_and_set_auto_keep_btrbk_conf_in_step() {
     let dir = tempfile::tempdir().unwrap();

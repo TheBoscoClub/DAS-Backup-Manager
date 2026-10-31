@@ -14,9 +14,10 @@ class BackupPanel : public QWidget
 public:
     explicit BackupPanel(DBusClient *client, QWidget *parent = nullptr);
 
-    // Rebuilds the source/target boxes and the Boot Archive state from config
-    // text. loadConfig() feeds it the helper's config; tests feed it directly.
-    void applyConfig(const QString &toml);
+    // Rebuilds the source/target boxes and the Boot Archive state from the
+    // helper's PanelConfigGet JSON (parsePanelJson). loadConfig() feeds it the
+    // helper's answer; tests feed it directly.
+    void applyConfig(const QString &panelJson);
 
 private Q_SLOTS:
     void runBackup(bool dryRun);

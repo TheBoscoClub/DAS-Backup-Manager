@@ -191,6 +191,21 @@ void ConfigDialog::showDiff()
 }
 
 // ---------------------------------------------------------------------------
+// savedStatus
+// ---------------------------------------------------------------------------
+
+QString ConfigDialog::savedStatus(const QString &typed, const QString &written)
+{
+    if (written.isEmpty())
+        return i18n("Saved, but the file could not be read back — press Reload.");
+    if (written != typed)
+        return i18n("Saved. Settings your text left out that decide what is backed up, "
+                    "where and for how long were written into the file with their current "
+                    "values; the editor shows the file as saved.");
+    return i18n("Configuration saved successfully.");
+}
+
+// ---------------------------------------------------------------------------
 // saveConfig
 // ---------------------------------------------------------------------------
 
@@ -226,13 +241,21 @@ void ConfigDialog::saveConfig()
         }
     }
 
-    const QString summary = i18n(
+    QString summary = i18n(
         "Save changes to %1?\n\n"
         "Lines changed: %2\n"
         "Lines added:   %3\n"
         "Lines removed: %4\n\n"
         "This operation requires administrator privileges (polkit).",
         m_configPath, changed, added, removed);
+    // Keys nothing reads (a typo is kept and silently ignored): said before
+    // saving, which still goes ahead — a newer version's keys belong here.
+    const std::optional<QStringList> warnings = m_client->configCheck(currentContent);
+    if (warnings && !warnings->isEmpty()) {
+        summary += QLatin1String("\n\n")
+            + i18n("Warnings (the file is saved as typed, but these are not read):")
+            + QLatin1String("\n- ") + warnings->join(QLatin1String("\n- "));
+    }
 
     const auto answer = KMessageBox::questionTwoActions(
         this,
@@ -247,8 +270,11 @@ void ConfigDialog::saveConfig()
 
     const bool ok = m_client->configSet(currentContent);
     if (ok) {
-        m_originalContent = currentContent;
-        m_statusLabel->setText(i18n("Configuration saved successfully."));
+        // Show what was written, not what was typed: a save writes out the
+        // keys that decide what is backed up, where and for how long when the
+        // text leaves them out (bd DAS-Backup-Manager-28il).
+        loadConfig();
+        m_statusLabel->setText(savedStatus(currentContent, m_originalContent));
     } else {
         // DBusClient emits errorOccurred, which the main window shows in a
         // message box with the helper's reason — among them "a backup or

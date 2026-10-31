@@ -8,6 +8,8 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusReply>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QTimer>
 
 namespace {
@@ -135,6 +137,36 @@ QString DBusClient::configGet()
         return {};
     }
     return reply.value();
+}
+
+QString DBusClient::panelConfigGet()
+{
+    if (!m_available) return {};
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("PanelConfigGet"));
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("PanelConfigGet"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return {};
+    }
+    return reply.value();
+}
+
+std::optional<QStringList> DBusClient::configCheck(const QString &tomlContent)
+{
+    if (!m_available) return std::nullopt;
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("ConfigCheck"), tomlContent);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("ConfigCheck"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return std::nullopt;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(reply.value().toUtf8());
+    if (!doc.isArray())
+        return std::nullopt;
+    QStringList out;
+    for (const QJsonValue &v : doc.array())
+        out.append(v.toString());
+    return out;
 }
 
 bool DBusClient::configSet(const QString &tomlContent)

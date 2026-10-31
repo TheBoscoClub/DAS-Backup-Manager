@@ -49,6 +49,7 @@
 #include "../src/healthdashboard.h"
 #include "../src/backuphistory.h"
 #include "../src/backuppanel.h"
+#include "../src/configdialog.h"
 #include "../src/backupsteps.h"
 #include "../src/statustext.h"
 #include "../src/panelconfig.h"
@@ -383,121 +384,92 @@ private Q_SLOTS:
         QCOMPARE(model.rowCount(QModelIndex()), 0);
     }
 
-    // --- backup panel config reading (bd DAS-Backup-Manager-51j6) -----------
+    // --- backup panel config reading (bd DAS-Backup-Manager-51j6, 28il) ------
     //
-    // The shape below is the live /etc/das-backup/config.toml layout (headers,
-    // multi-line arrays, nested [[source.subvolumes]], other sections with their
-    // own `enabled`), minus anything identifying.
+    // The panel shows what the helper's PanelConfigGet returns: JSON from the
+    // parsed config. It used to read ConfigGet's TOML line by line, which a
+    // hand-written file defeats; the fixture's cases are the ones it got wrong.
 
 private:
-    static QString liveShapedConfig()
+    static QString liveShapedPanel()
     {
         return QStringLiteral(
-            "# Written by btrdasd setup. Your edits and comments are kept when btrdasd saves this file.\n"
-            "[general]\n"
-            "version = \"1\"\n"
-            "\n"
-            "[boot]\n"
-            "enabled = true\n"
-            "subvolumes = [\n"
-            "    \"@\",\n"
-            "    \"@home\",\n"
-            "]\n"
-            "archive_retention_days = 60\n"
-            "\n"
-            "[scrub]\n"
-            "enabled = true\n"
-            "\n"
-            "[[source]]\n"
-            "label = \"nvme\"\n"
-            "volume = \"/.btrfs-nvme\"\n"
-            "target_subdirs = [\"nvme\"]\n"
-            "target_labels = []\n"
-            "\n"
-            "[[source.subvolumes]]\n"
-            "name = \"@\"\n"
-            "label = \"not-a-source\"\n"
-            "\n"
-            "[[source]]\n"
-            "label = \"ssd\"\n"
-            "\n"
-            "[[target]]\n"
-            "label = \"primary-22tb\"\n"
-            "serials = [\n"
-            "    \"AAAA1111\",\n"
-            "]\n"
-            "role = \"primary\"\n"
-            "\n"
-            "[target.retention]\n"
-            "daily = 7\n"
-            "\n"
-            "[[target]]\n"
-            "label = \"system-recovery-B-2tb\"\n"
-            "display_name = \"2TB Recovery B\"\n"
-            "\n"
-            "[email]\n"
-            "enabled = false\n");
+            "{\"sources\":[\"nvme\",\"ssd\"],"
+            "\"targets\":[\"primary-22tb\",\"system-recovery-B-2tb\"],"
+            "\"boot_enabled\":true}");
+    }
+
+    static QString bootPanel(bool enabled)
+    {
+        return enabled ? QStringLiteral("{\"sources\":[],\"targets\":[],\"boot_enabled\":true}")
+                       : QStringLiteral("{\"sources\":[],\"targets\":[],\"boot_enabled\":false}");
+    }
+
+    // gui/tests/fixtures/panel-config.json is written by a config.rs test:
+    // each case's TOML and what the helper's PanelConfigGet returns for it.
+    static QJsonArray panelCases()
+    {
+        QFile f(QStringLiteral(PANEL_FIXTURE_PATH));
+        if (!f.open(QIODevice::ReadOnly))
+            return {};
+        return QJsonDocument::fromJson(f.readAll()).array();
     }
 
 private Q_SLOTS:
-    void panelConfigReadsTheLiveFormat()
+    // What the panel shows for each case the line reader got wrong: a spaced
+    // [ boot ] header, boot = { enabled = false }, a spaced [[ source ]]
+    // header, a [[target]] inside a multi-line string, an escaped label.
+    void panelShowsWhatTheHelperParsedForEveryFixtureCase()
     {
-        const PanelConfig c = parsePanelConfig(liveShapedConfig());
-        QCOMPARE(c.sources, (QStringList{QStringLiteral("nvme"), QStringLiteral("ssd")}));
-        QCOMPARE(c.targets,
-                 (QStringList{QStringLiteral("primary-22tb"), QStringLiteral("system-recovery-B-2tb")}));
-        // [email] enabled = false is not [boot]'s
-        QVERIFY(c.bootEnabled);
+        const QJsonArray cases = panelCases();
+        QCOMPARE(cases.size(), 5);
+        struct Want {
+            QString name;
+            QStringList sources;
+            QStringList targets;
+            bool boot;
+        };
+        const QList<Want> wants = {
+            {QStringLiteral("spaced boot header"), {QStringLiteral("s")}, {QStringLiteral("t")}, false},
+            {QStringLiteral("inline boot table"), {QStringLiteral("s")}, {QStringLiteral("t")}, false},
+            {QStringLiteral("spaced source header"), {QStringLiteral("s")}, {QStringLiteral("t")}, true},
+            {QStringLiteral("header inside a multi-line string"), {QStringLiteral("s")}, {QStringLiteral("t")}, true},
+            {QStringLiteral("escaped label"), {QStringLiteral("a\"b")}, {QStringLiteral("lit")}, true},
+        };
+        for (qsizetype i = 0; i < cases.size(); ++i) {
+            const QJsonObject c = cases.at(i).toObject();
+            const Want &w = wants.at(i);
+            QCOMPARE(c[QStringLiteral("case")].toString(), w.name);
+            const QByteArray panel =
+                QJsonDocument(c[QStringLiteral("panel")].toObject()).toJson(QJsonDocument::Compact);
+            const std::optional<PanelConfig> got = parsePanelJson(QString::fromUtf8(panel));
+            QVERIFY2(got.has_value(), qPrintable(w.name));
+            QCOMPARE(got->sources, w.sources);
+            QCOMPARE(got->targets, w.targets);
+            QCOMPARE(got->bootEnabled, w.boot);
+        }
     }
 
-    void panelConfigBootDisabledWithTrailingComments()
+    void panelJsonThatIsNotTheContractIsNotGuessedAt()
     {
-        QVERIFY(!parsePanelConfig(QStringLiteral("[boot] # note\nenabled = false # temporary\n")).bootEnabled);
-        QVERIFY(!parsePanelConfig(QStringLiteral("[boot]\nenabled=false\n")).bootEnabled);
-        QVERIFY(!parsePanelConfig(QStringLiteral("  [boot]  \n  enabled\t=\tfalse  \n")).bootEnabled);
-        QVERIFY(parsePanelConfig(QStringLiteral("[boot] # note\nenabled = true # x\n")).bootEnabled);
+        QVERIFY(!parsePanelJson(QString()).has_value());
+        QVERIFY(!parsePanelJson(QStringLiteral("[boot]\nenabled = false\n")).has_value());
+        QVERIFY(!parsePanelJson(QStringLiteral("{\"sources\":[],\"targets\":[]}")).has_value());
+        QVERIFY(!parsePanelJson(QStringLiteral("{\"sources\":[1],\"targets\":[],\"boot_enabled\":true}")).has_value());
+        QVERIFY(!parsePanelJson(QStringLiteral("{\"sources\":[],\"targets\":[],\"boot_enabled\":\"no\"}")).has_value());
+        const auto ok = parsePanelJson(liveShapedPanel());
+        QVERIFY(ok.has_value());
+        QCOMPARE(ok->sources, (QStringList{QStringLiteral("nvme"), QStringLiteral("ssd")}));
+        QVERIFY(ok->bootEnabled);
     }
 
-    void panelConfigEnabledFalseElsewhereDoesNotDisableBoot()
+    void savedStatusSaysWhenTheSaveWroteKeysIn()
     {
-        const PanelConfig c = parsePanelConfig(QStringLiteral(
-            "[boot]\nenabled = true\n[email]\nenabled = false\n[scrub]\nenabled=false\n"));
-        QVERIFY(c.bootEnabled);
-        // ...and a [boot] that closes before its enabled line is not read either
-        QVERIFY(parsePanelConfig(QStringLiteral("[boot]\n[email]\nenabled = false\n")).bootEnabled);
-    }
-
-    // ConfigGet returns the file as written (bd DAS-Backup-Manager-28il), so a
-    // label in a TOML literal string reaches this parser unnormalised.
-    void panelConfigReadsLiteralStringLabels()
-    {
-        const PanelConfig c = parsePanelConfig(QStringLiteral(
-            "[[source]]\nlabel = 'nvme' # literal\n[[target]]\nlabel='t1'\n"));
-        QCOMPARE(c.sources, QStringList{QStringLiteral("nvme")});
-        QCOMPARE(c.targets, QStringList{QStringLiteral("t1")});
-    }
-
-    void panelConfigHashInsideQuotesIsNotAComment()
-    {
-        QCOMPARE(stripTomlComment(QStringLiteral("label = \"a#b\" # c")), QStringLiteral("label = \"a#b\""));
-        QCOMPARE(stripTomlComment(QStringLiteral("label = 'a#b'# c")), QStringLiteral("label = 'a#b'"));
-        QCOMPARE(stripTomlComment(QStringLiteral("x = \"q\\\"#\" # c")), QStringLiteral("x = \"q\\\"#\""));
-        QCOMPARE(stripTomlComment(QStringLiteral("# only a comment")), QString());
-        QCOMPARE(stripTomlComment(QStringLiteral("  plain  ")), QStringLiteral("plain"));
-        const PanelConfig c = parsePanelConfig(QStringLiteral(
-            "[[source]]\nlabel = \"a#b\" # trailing\n[[target]]\nlabel = \"t#1\"\n"));
-        QCOMPARE(c.sources, QStringList{QStringLiteral("a#b")});
-        QCOMPARE(c.targets, QStringList{QStringLiteral("t#1")});
-    }
-
-    void panelConfigLabelsAfterCommentedHeaders()
-    {
-        const PanelConfig c = parsePanelConfig(QStringLiteral(
-            "[[source]] # first\nlabel = \"s1\" # one\n"
-            "[[source]]# second\nlabel=\"s2\"\n"
-            "[[target]]   # t\nlabel = \"t1\"   # primary\n"));
-        QCOMPARE(c.sources, (QStringList{QStringLiteral("s1"), QStringLiteral("s2")}));
-        QCOMPARE(c.targets, QStringList{QStringLiteral("t1")});
+        const QString typed = QStringLiteral("[general]\n");
+        QCOMPARE(ConfigDialog::savedStatus(typed, typed), QStringLiteral("Configuration saved successfully."));
+        QVERIFY(ConfigDialog::savedStatus(typed, typed + QStringLiteral("[boot]\n"))
+                    .contains(QLatin1String("written into the file")));
+        QVERIFY(ConfigDialog::savedStatus(typed, QString()).contains(QLatin1String("Reload")));
     }
 
     // --- backup panel logic, driven with injected config text ---------------
@@ -540,7 +512,7 @@ private Q_SLOTS:
     {
         DBusClient client; // no helper: its own config comes back empty
         BackupPanel panel(&client);
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         const PanelParts p = partsOf(panel);
         QVERIFY(p.ok());
 
@@ -564,7 +536,7 @@ private Q_SLOTS:
         QVERIFY(p.ok());
         // No helper and no injected text: nothing to tick, so nothing to run
         QVERIFY(!p.run->isEnabled());
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         QVERIFY(p.run->isEnabled());
         const auto boxes = panel.findChildren<QCheckBox *>();
         for (QCheckBox *cb : boxes) {
@@ -579,7 +551,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         BackupPanel panel(&client);
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         const PanelParts p = partsOf(panel);
         QVERIFY(p.ok());
         QVERIFY(p.incremental->isChecked());
@@ -599,8 +571,8 @@ private Q_SLOTS:
         BackupPanel panel(&client);
         const PanelParts p = partsOf(panel);
         QVERIFY(p.ok());
-        const QString on = QStringLiteral("[boot]\nenabled = true\n");
-        const QString off = QStringLiteral("[boot] # note\nenabled = false # x\n");
+        const QString on = bootPanel(true);
+        const QString off = bootPanel(false);
 
         panel.applyConfig(on);
         QVERIFY(p.boot->isEnabled());
@@ -627,7 +599,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         BackupPanel panel(&client);
-        panel.applyConfig(QStringLiteral("[boot]\nenabled = true\n"));
+        panel.applyConfig(bootPanel(true));
         const PanelParts p = partsOf(panel);
         QVERIFY(p.boot);
         QVERIFY(p.full);
@@ -665,12 +637,12 @@ private Q_SLOTS:
         rowsShown(panel, boxes, labels);
         QCOMPARE(labels, 2);
 
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         rowsShown(panel, boxes, labels);
         const int firstBoxes = boxes;
         QVERIFY(firstBoxes > 0);
         QCOMPARE(labels, 0);
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         rowsShown(panel, boxes, labels);
         QCOMPARE(boxes, firstBoxes);
         QCOMPARE(labels, 0);
@@ -684,7 +656,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         BackupPanel panel(&client);
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         const PanelParts p = partsOf(panel);
         QVERIFY(p.ok());
         QVERIFY(p.run->isEnabled());
@@ -709,11 +681,11 @@ private Q_SLOTS:
         QVERIFY(!p.dryRun->isEnabled());
 
         // A config reload meanwhile
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         QVERIFY(!p.run->isEnabled());
 
         // Another operation failing, or another job finishing, is not this job ending
-        Q_EMIT client.errorOccurred(QStringLiteral("ConfigGet"), QStringLiteral("x"));
+        Q_EMIT client.errorOccurred(QStringLiteral("PanelConfigGet"), QStringLiteral("x"));
         QVERIFY(!p.run->isEnabled());
         Q_EMIT client.jobFinished(QStringLiteral("job-other"), true, QString());
         QVERIFY(!p.run->isEnabled());
@@ -728,7 +700,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         BackupPanel panel(&client);
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         const PanelParts p = partsOf(panel);
         QVERIFY(p.ok());
         p.run->click();
@@ -749,7 +721,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         BackupPanel panel(&client);
-        panel.applyConfig(liveShapedConfig());
+        panel.applyConfig(liveShapedPanel());
         const PanelParts p = partsOf(panel);
         QVERIFY(p.ok());
         p.run->click();

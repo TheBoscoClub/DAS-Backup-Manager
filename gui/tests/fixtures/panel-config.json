@@ -1,0 +1,67 @@
+[
+  {
+    "case": "spaced boot header",
+    "panel": {
+      "boot_enabled": false,
+      "sources": [
+        "s"
+      ],
+      "targets": [
+        "t"
+      ]
+    },
+    "toml": "\n[general]\nversion = \"0.4.0\"\ninstall_prefix = \"/usr/local\"\ndb_path = \"/var/lib/das-backup/backup-index.db\"\n\n[init]\nsystem = \"systemd\"\n\n[schedule]\nincremental = \"03:00\"\nfull = \"Sun 04:00\"\nrandomized_delay_min = 30\n\n[email]\nenabled = false\n\n[gui]\nenabled = false\n\n\n[ boot ]\nenabled = false\n[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\nsubvolumes = [\"@\"]\n[[target]]\nlabel = \"t\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n"
+  },
+  {
+    "case": "inline boot table",
+    "panel": {
+      "boot_enabled": false,
+      "sources": [
+        "s"
+      ],
+      "targets": [
+        "t"
+      ]
+    },
+    "toml": "boot = { enabled = false }\n\n[general]\nversion = \"0.4.0\"\ninstall_prefix = \"/usr/local\"\ndb_path = \"/var/lib/das-backup/backup-index.db\"\n\n[init]\nsystem = \"systemd\"\n\n[schedule]\nincremental = \"03:00\"\nfull = \"Sun 04:00\"\nrandomized_delay_min = 30\n\n[email]\nenabled = false\n\n[gui]\nenabled = false\n\n\n[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\nsubvolumes = [\"@\"]\n[[target]]\nlabel = \"t\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n"
+  },
+  {
+    "case": "spaced source header",
+    "panel": {
+      "boot_enabled": true,
+      "sources": [
+        "s"
+      ],
+      "targets": [
+        "t"
+      ]
+    },
+    "toml": "\n[general]\nversion = \"0.4.0\"\ninstall_prefix = \"/usr/local\"\ndb_path = \"/var/lib/das-backup/backup-index.db\"\n\n[init]\nsystem = \"systemd\"\n\n[schedule]\nincremental = \"03:00\"\nfull = \"Sun 04:00\"\nrandomized_delay_min = 30\n\n[email]\nenabled = false\n\n[gui]\nenabled = false\n\n\n[[ source ]]\nlabel = \"s\"\nvolume = \"/v\"\ndevice = \"/d\"\nsubvolumes = [\"@\"]\n[[target]]\nlabel = \"t\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n"
+  },
+  {
+    "case": "header inside a multi-line string",
+    "panel": {
+      "boot_enabled": true,
+      "sources": [
+        "s"
+      ],
+      "targets": [
+        "t"
+      ]
+    },
+    "toml": "\n[general]\nversion = \"0.4.0\"\ninstall_prefix = \"/usr/local\"\ndb_path = \"/var/lib/das-backup/backup-index.db\"\n\n[init]\nsystem = \"systemd\"\n\n[schedule]\nincremental = \"03:00\"\nfull = \"Sun 04:00\"\nrandomized_delay_min = 30\n\n[email]\nenabled = false\n\n[gui]\nenabled = false\n\n\n[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\nnote = \"\"\"\n[[target]]\nlabel = \"ghost\"\n\"\"\"\nsubvolumes = [\"@\"]\n[[target]]\nlabel = \"t\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n"
+  },
+  {
+    "case": "escaped label",
+    "panel": {
+      "boot_enabled": true,
+      "sources": [
+        "a\"b"
+      ],
+      "targets": [
+        "lit"
+      ]
+    },
+    "toml": "\n[general]\nversion = \"0.4.0\"\ninstall_prefix = \"/usr/local\"\ndb_path = \"/var/lib/das-backup/backup-index.db\"\n\n[init]\nsystem = \"systemd\"\n\n[schedule]\nincremental = \"03:00\"\nfull = \"Sun 04:00\"\nrandomized_delay_min = 30\n\n[email]\nenabled = false\n\n[gui]\nenabled = false\n\n\n[[source]]\nlabel = \"a\\\"b\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\nsubvolumes = [\"@\"]\n[[target]]\nlabel = 'lit'\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n"
+  }
+]

@@ -1,90 +1,37 @@
 #include "panelconfig.h"
 
-QString stripTomlComment(const QString &line)
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+
+namespace {
+
+std::optional<QStringList> labels(const QJsonValue &v)
 {
-    QChar quote; // null when outside a string
-    for (qsizetype i = 0; i < line.size(); ++i) {
-        const QChar c = line.at(i);
-        if (!quote.isNull()) {
-            if (quote == QLatin1Char('"') && c == QLatin1Char('\\'))
-                ++i; // skip the escaped character
-            else if (c == quote)
-                quote = QChar();
-        } else if (c == QLatin1Char('"') || c == QLatin1Char('\'')) {
-            quote = c;
-        } else if (c == QLatin1Char('#')) {
-            return line.left(i).trimmed();
-        }
+    if (!v.isArray())
+        return std::nullopt;
+    QStringList out;
+    for (const QJsonValue &s : v.toArray()) {
+        if (!s.isString())
+            return std::nullopt;
+        out.append(s.toString());
     }
-    return line.trimmed();
+    return out;
 }
 
-PanelConfig parsePanelConfig(const QString &toml)
+} // namespace
+
+std::optional<PanelConfig> parsePanelJson(const QString &json)
 {
-    PanelConfig cfg;
-
-    enum class Section { None, Source, Target, Boot };
-    Section currentSection = Section::None;
-
-    const QStringList lines = toml.split(QLatin1Char('\n'));
-    for (const QString &rawLine : lines) {
-        const QString line = stripTomlComment(rawLine);
-
-        // Detect section headers
-        if (line == QLatin1String("[[source]]")) {
-            currentSection = Section::Source;
-            continue;
-        }
-        if (line == QLatin1String("[[target]]")) {
-            currentSection = Section::Target;
-            continue;
-        }
-        if (line == QLatin1String("[boot]")) {
-            currentSection = Section::Boot;
-            continue;
-        }
-        // Any other section header resets context
-        if (line.startsWith(QLatin1Char('['))) {
-            currentSection = Section::None;
-            continue;
-        }
-
-        // Empty (or comment-only) lines
-        if (line.isEmpty())
-            continue;
-
-        // Parse key = value (handles quoted and unquoted values)
-        const qsizetype eqPos = line.indexOf(QLatin1Char('='));
-        if (eqPos < 0)
-            continue;
-
-        const QString key = line.left(eqPos).trimmed();
-        QString value = line.mid(eqPos + 1).trimmed();
-        // Strip surrounding quotes: a basic string "x" or a literal string 'x'
-        // (ConfigGet returns the file as written, so either can arrive).
-        for (const QChar quote : {QLatin1Char('"'), QLatin1Char('\'')}) {
-            if (value.length() >= 2 && value.startsWith(quote) && value.endsWith(quote)) {
-                value = value.mid(1, value.length() - 2);
-                break;
-            }
-        }
-
-        switch (currentSection) {
-        case Section::Source:
-            if (key == QLatin1String("label"))
-                cfg.sources.append(value);
-            break;
-        case Section::Target:
-            if (key == QLatin1String("label"))
-                cfg.targets.append(value);
-            break;
-        case Section::Boot:
-            if (key == QLatin1String("enabled") && value == QLatin1String("false"))
-                cfg.bootEnabled = false;
-            break;
-        case Section::None:
-            break;
-        }
-    }
-    return cfg;
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject())
+        return std::nullopt;
+    const QJsonObject o = doc.object();
+    const auto sources = labels(o.value(QStringLiteral("sources")));
+    const auto targets = labels(o.value(QStringLiteral("targets")));
+    const QJsonValue boot = o.value(QStringLiteral("boot_enabled"));
+    if (!sources || !targets || !boot.isBool())
+        return std::nullopt;
+    return PanelConfig{*sources, *targets, boot.toBool()};
 }

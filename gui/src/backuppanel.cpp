@@ -164,7 +164,7 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
     // Buttons follow the state of this panel's own backup job, nothing else
     // (bd DAS-Backup-Manager-fy2h). jobStarted names the job; jobFinished for
     // any other job (index walk, restore) and errors of any other operation
-    // (ConfigGet, health...) say nothing about it and must not re-enable Run.
+    // (PanelConfigGet, health...) say nothing about it and must not re-enable Run.
     connect(m_client, &DBusClient::jobStarted, this,
             [this](const QString &jobId, const QString &operation) {
                 if (!(m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun")))
@@ -199,10 +199,10 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
 
 void BackupPanel::loadConfig()
 {
-    applyConfig(m_client->configGet());
+    applyConfig(m_client->panelConfigGet());
 }
 
-void BackupPanel::applyConfig(const QString &toml)
+void BackupPanel::applyConfig(const QString &panelJson)
 {
     m_bootEnabledInConfig = true;
 
@@ -220,7 +220,8 @@ void BackupPanel::applyConfig(const QString &toml)
         }
     }
 
-    if (toml.isEmpty()) {
+    const std::optional<PanelConfig> cfg = parsePanelJson(panelJson);
+    if (!cfg) {
         auto *errLabel = new QLabel(i18n("Could not load configuration"), m_sourcesGroup);
         errLabel->setEnabled(false);
         qobject_cast<QVBoxLayout *>(m_sourcesGroup->layout())->addWidget(errLabel);
@@ -233,25 +234,12 @@ void BackupPanel::applyConfig(const QString &toml)
         return;
     }
 
-    // Parse TOML config to extract source labels and target labels.
-    //
-    // The config uses inline arrays for subvolumes:
-    //   [[source]]
-    //   label = "nvme"
-    //   volume = "/.btrfs-nvme"
-    //   subvolumes = ["@", "@home", "@root", "@log"]
-    //
-    //   [[target]]
-    //   label = "primary"
-    //   display_name = "Primary (Bay 1)"
-    //
-    // The GUI shows source labels and target labels as checkboxes.
-    // The Rust backend resolves subvolumes from labels internally.
-
-    const PanelConfig cfg = parsePanelConfig(toml);
-    const QStringList &sources = cfg.sources;
-    const QStringList &targets = cfg.targets;
-    m_bootEnabledInConfig = cfg.bootEnabled;
+    // The GUI shows source labels and target labels as checkboxes; the Rust
+    // backend resolves subvolumes from labels internally. The labels come from
+    // the helper's parse of config.toml, never from reading its lines.
+    const QStringList &sources = cfg->sources;
+    const QStringList &targets = cfg->targets;
+    m_bootEnabledInConfig = cfg->bootEnabled;
 
     auto *srcLayout = qobject_cast<QVBoxLayout *>(m_sourcesGroup->layout());
     if (sources.isEmpty()) {

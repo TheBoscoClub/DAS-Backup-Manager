@@ -1312,9 +1312,15 @@ enabled = false
         save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
 
         let reloaded = Config::load(&config_path).unwrap();
-        assert_eq!(reloaded.to_toml().unwrap(), cfg.to_toml().unwrap());
+        // Saved with each entry's snapshot name written out, which tells
+        // btrbk exactly what the unsaved config told it.
+        assert_eq!(
+            reloaded.to_toml().unwrap(),
+            cfg.with_pinned_snapshot_names().to_toml().unwrap()
+        );
         let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
         assert_eq!(conf, render_btrbk_conf(&reloaded).unwrap());
+        assert_eq!(conf, render_btrbk_conf(&cfg).unwrap());
     }
 
     #[test]

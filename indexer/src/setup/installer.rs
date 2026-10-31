@@ -811,9 +811,12 @@ fn relay_reachable(config: &Config) -> bool {
 /// place (bd DAS-Backup-Manager-28il). A key the file leaves out takes the
 /// running binary's compiled default, so a default change reaches an existing
 /// host for such a key — except the keys that decide what is backed up, where
-/// and for how long (`surgical::PINNED` in `config.rs`): every save writes
-/// those out with their current values, so a default change to one of them
-/// affects only fresh installs. Any setting whose *meaning* changes between
+/// and for how long (`surgical::PINNED` in `config.rs`, and each subvolume
+/// entry's snapshot name): every save writes those out with their current
+/// values. A default change to one of them therefore reaches only a file no
+/// pinning version (this one or later) has saved yet — a fresh install, or a
+/// host whose config.toml was last written by an older version, until its
+/// first save by this one. Any setting whose *meaning* changes between
 /// releases has to be migrated here or the upgraded host silently keeps the
 /// old behaviour.
 ///
@@ -1368,7 +1371,8 @@ fn check_with(
     }
     say(format!("Config found: {}", config_path.display()));
 
-    let config = Config::load(config_path)?;
+    let text = std::fs::read_to_string(config_path)?;
+    let config = Config::from_toml(&text)?;
     let errors = config.validate();
     if errors.is_empty() {
         say("Config is valid".to_string());
@@ -1376,6 +1380,10 @@ fn check_with(
         for err in &errors {
             say(format!("Config error: {}", err));
         }
+    }
+    // A key nothing reads (a typo the save keeps): warned, never an error.
+    for w in buttered_dasd::config::unknown_key_warnings(&text)? {
+        say(format!("Config warning: {w}"));
     }
 
     // A config that still names the Bridge port is valid but undeliverable —
@@ -4330,6 +4338,40 @@ auth = "starttls""#,
                 "mailx (/usr/bin/mailx)".to_string(),
             ]
         );
+    }
+
+    /// A key a known table does not have is a warning naming it and the
+    /// nearest key; a clean config has none (bd DAS-Backup-Manager-28il).
+    #[test]
+    fn check_warns_about_an_unknown_key_with_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let warned = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|l| l.starts_with("Config warning"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+        assert_eq!(warned(&lines), Vec::<String>::new(), "{lines:?}");
+        let typo = std::fs::read_to_string(&config_path).unwrap().replacen(
+            "[schedule]\n",
+            "[schedule]\nincrementl = \"03:00\"\n",
+            1,
+        );
+        std::fs::write(&config_path, typo).unwrap();
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+        assert_eq!(
+            warned(&lines),
+            [
+                "Config warning: schedule.incrementl is not a key this version reads \
+              (did you mean incremental?)"
+            ],
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"Config is valid".to_string()), "{lines:?}");
     }
 
     #[test]

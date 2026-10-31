@@ -112,6 +112,7 @@ if(BUILD_TESTING)
         src/backupsteps.cpp
         src/statustext.cpp
         src/backuppanel.cpp
+        src/configdialog.cpp
         src/panelconfig.cpp
         src/progresspanel.cpp
         src/indexrunner.cpp
@@ -120,7 +121,8 @@ if(BUILD_TESTING)
     )
     # The status-document contract: the file a panel.rs test writes.
     target_compile_definitions(gui-smoketest PRIVATE
-        RECOVERY_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/recovery-status.json")
+        RECOVERY_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/recovery-status.json"
+        PANEL_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/panel-config.json")
     target_link_libraries(gui-smoketest PRIVATE
         Qt6::Test
         Qt6::Widgets

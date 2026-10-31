@@ -2,23 +2,22 @@
 #include <QString>
 #include <QStringList>
 
-// What the Backup panel reads out of config.toml: the labels it offers as
-// checkboxes and whether [boot] is enabled. Pure text in, struct out, so the
-// parsing is testable without a widget or a D-Bus helper (bd 51j6).
-// `bootEnabled` defaults to true, as the backend does: `[boot] enabled` defaults
-// to true in config.rs (`default_true`), so an absent key or section runs the
-// boot step on every path, the script included.
+#include <optional>
+
+// What the Backup panel shows: the labels it offers as checkboxes and whether
+// [boot] is enabled. The helper reads them from the parsed config and sends
+// them as JSON (PanelConfigGet, `Config::panel_json`); this side only decodes
+// that, so the panel can never misread a hand-written config.toml (a spaced
+// header, an inline table, a header inside a string — bd
+// DAS-Backup-Manager-28il). Pure text in, struct out: testable without a
+// widget or a D-Bus helper (bd 51j6).
 struct PanelConfig {
     QStringList sources;
     QStringList targets;
     bool bootEnabled = true;
 };
 
-// Removes a trailing '#' comment, ignoring any '#' inside a "basic" or 'literal'
-// string, and trims surrounding whitespace.
-[[nodiscard]] QString stripTomlComment(const QString &line);
-
-// Line-oriented reader (not a full TOML parser): recognises [[source]],
-// [[target]] and [boot] headers and `label = ...` / `enabled = ...` keys, each
-// with or without a trailing comment. Any other header ends the section.
-[[nodiscard]] PanelConfig parsePanelConfig(const QString &toml);
+// `{"sources": [...], "targets": [...], "boot_enabled": bool}`. Empty, not
+// JSON, or missing any of the three keys with its type: nullopt, never a
+// guessed default.
+[[nodiscard]] std::optional<PanelConfig> parsePanelJson(const QString &json);

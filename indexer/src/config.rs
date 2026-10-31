@@ -699,13 +699,132 @@ impl Default for Config {
 pub const FRESH_HEADER: &str = "# Written by btrdasd setup. Your edits and comments are kept when btrdasd saves this file.\n\
                                 # After editing, run: sudo btrdasd setup --upgrade\n\n";
 
+/// A warning for every key in a table this version reads that is not one of
+/// that table's keys — a typo, most often, which the save keeps and nothing
+/// reads (`target_lables` in a `[[source]]`) — with the nearest key the table
+/// has when one is close. Keys of a top-level table this version does not
+/// have are not warned about: a newer version's sections are expected there.
+/// `Err` when `text` is not TOML.
+pub fn unknown_key_warnings(text: &str) -> Result<Vec<String>, String> {
+    let raw: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let schema = key_schema();
+    let mut out = Vec::new();
+    for (k, v) in &raw {
+        if let Some(known) = schema.get(k) {
+            unknown_keys_in(k, v, known, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+/// Every key this version reads, in the shape of a config: a config with
+/// every optional key set, serialised, plus the legacy `serial` it reads and
+/// never writes.
+fn key_schema() -> toml::Table {
+    let mut c = Config::default();
+    c.recovery_os.egress_org = Some(String::new());
+    c.recovery_os.install_user = Some(String::new());
+    c.sources.push(Source {
+        label: String::new(),
+        volume: String::new(),
+        subvolumes: vec![SubvolConfig {
+            name: String::new(),
+            manual_only: true,
+            snapshot_name: Some(String::new()),
+            adopted: Some(String::new()),
+            retired: Some(String::new()),
+            after_index: true,
+        }],
+        device: String::new(),
+        snapshot_dir: String::new(),
+        target_subdirs: Vec::new(),
+        target_labels: Vec::new(),
+    });
+    c.targets.push(Target {
+        label: String::new(),
+        serial: String::new(),
+        serials: Vec::new(),
+        mount_uuid: Some(String::new()),
+        mount: String::new(),
+        role: TargetRole::Primary,
+        retention: Retention::default(),
+        display_name: String::new(),
+    });
+    let mut schema: toml::Table = c
+        .to_toml()
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_default();
+    if let Some(toml::Value::Array(targets)) = schema.get_mut("target")
+        && let Some(toml::Value::Table(t)) = targets.first_mut()
+    {
+        t.insert("serial".into(), toml::Value::String(String::new()));
+    }
+    schema
+}
+
+fn unknown_keys_in(path: &str, v: &toml::Value, known: &toml::Value, out: &mut Vec<String>) {
+    match (v, known) {
+        (toml::Value::Table(vt), toml::Value::Table(kt)) => {
+            for (k, sub) in vt {
+                let at = format!("{path}.{k}");
+                match kt.get(k) {
+                    Some(ks) => unknown_keys_in(&at, sub, ks, out),
+                    None => out.push(unknown_key_line(&at, k, kt)),
+                }
+            }
+        }
+        (toml::Value::Array(va), toml::Value::Array(ka)) => {
+            if let Some(element) = ka.first().filter(|e| e.is_table()) {
+                for (i, e) in va.iter().enumerate() {
+                    unknown_keys_in(&format!("{path}[{i}]"), e, element, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn unknown_key_line(path: &str, key: &str, known: &toml::Table) -> String {
+    let nearest = known
+        .keys()
+        .map(|k| (edit_distance(key, k), k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d);
+    match nearest {
+        Some((_, k)) => format!("{path} is not a key this version reads (did you mean {k}?)"),
+        None => format!("{path} is not a key this version reads"),
+    }
+}
+
+/// Levenshtein distance: single-character insertions, deletions and
+/// substitutions turning `a` into `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let up = row[j + 1];
+            row[j + 1] = if ca == *cb {
+                diag
+            } else {
+                1 + diag.min(up).min(row[j])
+            };
+            diag = up;
+        }
+    }
+    row[b.len()]
+}
+
 // ---------------------------------------------------------------------------
 // Surgical edits of config.toml (bd DAS-Backup-Manager-28il)
 // ---------------------------------------------------------------------------
 
 /// The document edits behind [`Config::save`]: `old` is what this binary
 /// knows of the file (its own serialisation of what it loaded), `new` what it
-/// is saving. Rules: [`Config::edited_into`].
+/// is saving. Rules: `Config::edited_into_with`.
 mod surgical {
     use toml_edit::{ArrayOfTables, Item, Table, TableLike, Value};
 
@@ -737,22 +856,90 @@ mod surgical {
                 }
                 // Omitted, and the default it stands for is unchanged.
                 None if ov == Some(nv) => {}
-                None => {
-                    doc.insert(key, fresh_item(nv));
-                }
+                None => insert_key(doc, key, fresh_item(nv)),
             }
         }
         for key in old.keys() {
             if !new.contains_key(key) {
-                doc.remove(key);
+                remove_key(doc, key);
             }
         }
         // A legacy key this binary reads but never writes goes when the key it
         // feeds changes: kept, it is stale, and it may override the change.
         for (legacy, fed) in LEGACY_KEYS {
             if old.get(*fed) != new.get(*fed) {
-                doc.remove(legacy);
+                remove_key(doc, legacy);
             }
+        }
+    }
+
+    /// The part of a value's suffix past its own line: a comment block
+    /// [`attach_trailing_comments`] hung on a table's last line, or the
+    /// spacing before an inline table's `}`. Taken off the value.
+    fn take_tail(v: &mut Value) -> String {
+        let s = suffix(v.decor());
+        let keep = if s.trim().is_empty() {
+            0
+        } else {
+            s.find('\n').unwrap_or(s.len())
+        };
+        if keep == s.len() {
+            return String::new();
+        }
+        v.decor_mut().set_suffix(s[..keep].to_string());
+        s[keep..].to_string()
+    }
+
+    fn suffix(decor: &toml_edit::Decor) -> String {
+        decor
+            .suffix()
+            .and_then(toml_edit::RawString::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn prefix(decor: &toml_edit::Decor) -> String {
+        decor
+            .prefix()
+            .and_then(toml_edit::RawString::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn append_suffix(v: &mut Value, tail: &str) {
+        let s = suffix(v.decor());
+        v.decor_mut().set_suffix(format!("{s}{tail}"));
+    }
+
+    fn last_value_mut(doc: &mut dyn TableLike) -> Option<&mut Value> {
+        doc.iter_mut().filter_map(|(_, i)| i.as_value_mut()).last()
+    }
+
+    /// Insert `key` at the end of `doc`; what followed the last value (its
+    /// entry's trailing comment block, an inline table's closing spacing)
+    /// now follows the new one.
+    fn insert_key(doc: &mut dyn TableLike, key: &str, item: Item) {
+        let tail = match item.is_value() {
+            true => last_value_mut(doc).map(take_tail).unwrap_or_default(),
+            false => String::new(),
+        };
+        doc.insert(key, item);
+        if let Some(v) = doc.get_mut(key).and_then(Item::as_value_mut) {
+            append_suffix(v, &tail);
+        }
+    }
+
+    /// Remove `key` from `doc`; what followed it, if it was the last value,
+    /// now follows the value before it.
+    fn remove_key(doc: &mut dyn TableLike, key: &str) {
+        let tail = doc
+            .get_mut(key)
+            .and_then(Item::as_value_mut)
+            .map(take_tail)
+            .unwrap_or_default();
+        doc.remove(key);
+        if let Some(v) = last_value_mut(doc) {
+            append_suffix(v, &tail);
         }
     }
 
@@ -853,38 +1040,133 @@ mod surgical {
                 *aot = out.into_iter().collect::<ArrayOfTables>();
             }
             Item::Value(Value::Array(arr)) => {
+                let lines = ArrayLines::of(arr);
                 let mut out = Vec::new();
                 for (ne, pick) in na.iter().zip(&picks) {
-                    let v = match pick.and_then(|i| Some((&oa[i], arr.get(i)?))) {
-                        Some((ov, kept)) => {
+                    let kept = pick.and_then(|i| Some((i, &oa[i], arr.get(i)?)));
+                    let (v, lead, tail) = match kept {
+                        Some((i, ov, kept)) => {
                             let mut v = kept.clone();
                             merge_value(&mut v, ov, ne, reordered);
-                            v
+                            (v, lines.leads[i].clone(), lines.tails[i].clone())
                         }
-                        None => fresh_value(ne),
+                        None => (fresh_value(ne), String::new(), lines.fresh_tail()),
                     };
-                    out.push(v);
+                    out.push((v, lead, tail));
                 }
-                // Kept elements carry their own spacing and comments; the
-                // array keeps its trailing comment.
-                arr.clear();
-                for v in out {
-                    arr.push_formatted(v);
-                }
+                lines.rebuild(arr, out);
             }
             _ => replace(item, &toml::Value::Array(na.to_vec())),
         }
     }
 
+    /// How an inline array is laid out, per element. toml_edit files the text
+    /// after an element's comma (`"@x", # about x`) as the NEXT element's
+    /// prefix, and the last element's in the array's trailing; here each
+    /// element owns it as its `tail` — the text up to and including the first
+    /// newline — and its `lead` is the rest of its prefix (indentation, comment
+    /// lines above it). `opening` is the rest of the `[` line.
+    struct ArrayLines {
+        opening: String,
+        leads: Vec<String>,
+        tails: Vec<String>,
+        closing: String,
+        first_ws: String,
+        other_ws: String,
+        multi_line: bool,
+    }
+
+    /// `s` split after its first newline; all of it is the second part when
+    /// it has none.
+    fn split_line(s: &str) -> (String, String) {
+        match s.find('\n') {
+            Some(i) => (s[..=i].to_string(), s[i + 1..].to_string()),
+            None => (String::new(), s.to_string()),
+        }
+    }
+
+    impl ArrayLines {
+        fn of(arr: &toml_edit::Array) -> Self {
+            let heads: Vec<(String, String)> =
+                arr.iter().map(|v| split_line(&prefix(v.decor()))).collect();
+            let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+            let (last_tail, closing) = split_line(&trailing);
+            let mut tails: Vec<String> = heads.iter().skip(1).map(|(t, _)| t.clone()).collect();
+            tails.push(last_tail);
+            let opening = heads.first().map(|(o, _)| o.clone()).unwrap_or_default();
+            let leads: Vec<String> = heads.iter().map(|(_, l)| l.clone()).collect();
+            let multi_line = tails.iter().any(|t| t.contains('\n'));
+            let blank = |l: &String| l.trim().is_empty();
+            let first_ws = leads
+                .first()
+                .filter(|l| blank(l))
+                .cloned()
+                .unwrap_or_default();
+            let other_ws = match leads.get(1).filter(|l| blank(l)) {
+                Some(l) => l.clone(),
+                None if multi_line => first_ws.clone(),
+                None => " ".to_string(),
+            };
+            ArrayLines {
+                opening,
+                leads,
+                tails,
+                closing,
+                first_ws,
+                other_ws,
+                multi_line,
+            }
+        }
+
+        /// A new element's tail: its own line in a multi-line array.
+        fn fresh_tail(&self) -> String {
+            if self.multi_line {
+                "\n".into()
+            } else {
+                String::new()
+            }
+        }
+
+        /// `arr` holding `out` — (value, lead, tail) in their new order —
+        /// each tail after its own element. A lead that is only spacing is
+        /// the spacing of the place the element now has.
+        fn rebuild(&self, arr: &mut toml_edit::Array, out: Vec<(Value, String, String)>) {
+            arr.clear();
+            let mut before = self.opening.clone();
+            for (j, (mut v, lead, tail)) in out.into_iter().enumerate() {
+                let lead = match (lead.trim().is_empty(), j) {
+                    (false, _) => lead,
+                    (true, 0) => self.first_ws.clone(),
+                    (true, _) => self.other_ws.clone(),
+                };
+                v.decor_mut().set_prefix(format!("{before}{lead}"));
+                arr.push_formatted(v);
+                before = tail;
+            }
+            arr.set_trailing(format!("{before}{}", self.closing));
+        }
+    }
+
     /// An element of an inline array: an inline table is edited in place, a
-    /// bare string (a subvolume entry written as `"@"`) kept while unchanged.
+    /// bare string (a subvolume entry written as `"@"`) kept while unchanged
+    /// and, when it changes, written as a table holding its name and only the
+    /// values that differ from what the bare string meant.
     fn merge_value(v: &mut Value, ov: &toml::Value, nv: &toml::Value, reordered: &mut bool) {
-        if let (Value::InlineTable(t), toml::Value::Table(old_t), toml::Value::Table(nt)) =
-            (&mut *v, ov, nv)
-        {
-            merge_table(t, old_t, nt, reordered);
-        } else if ov != nv {
-            set_value(v, nv);
+        match (&mut *v, ov, nv) {
+            (Value::InlineTable(t), toml::Value::Table(old_t), toml::Value::Table(nt)) => {
+                merge_table(t, old_t, nt, reordered)
+            }
+            (Value::String(_), toml::Value::Table(old_t), toml::Value::Table(nt)) => {
+                let changed: toml::Table = nt
+                    .iter()
+                    .filter(|(k, val)| *k == "name" || old_t.get(*k) != Some(*val))
+                    .map(|(k, val)| (k.clone(), val.clone()))
+                    .collect();
+                set_value(v, &toml::Value::Table(changed));
+            }
+            // A plain value is kept only when unchanged (matched exactly):
+            // nothing to do. Anything else the read-back check refuses.
+            _ => {}
         }
     }
 
@@ -953,6 +1235,8 @@ mod surgical {
     /// - `boot.*`: whether boot subvolumes are archived and replaced, which,
     ///   and how long the archives are kept
     /// - `subvolumes.exclude`, `doctor.exclude`: what the run never adopts
+    /// - `restore.allowed_roots`: where a restore may write (a security
+    ///   boundary the root helper enforces)
     /// - `source[*].snapshot_dir`, `target_subdirs`, `target_labels`: where a
     ///   source's snapshots are taken and sent, and to which targets
     /// - `target[*].retention.*`: how long a target keeps them (an absent
@@ -961,7 +1245,10 @@ mod surgical {
     /// Not here: defaults whose absence is itself the value (`Option`s, and
     /// `manual_only` / `after_index` = false), advisory ones (`serials`,
     /// `display_name`), and ones that decide neither scope nor retention
-    /// (logs, `[das]`, `[scrub]`, `[restore]`, `[recovery_os]`, email, GUI).
+    /// (logs, `[das]`, `[scrub]`, `[recovery_os]`, email, GUI).
+    ///
+    /// Each subvolume entry's snapshot name is pinned too, by the config
+    /// itself rather than this list: [`super::Config::with_pinned_snapshot_names`].
     pub(super) const PINNED: &[&[&str]] = &[
         &["general", "btrbk_conf"],
         &["boot", "enabled"],
@@ -969,6 +1256,7 @@ mod surgical {
         &["boot", "archive_retention_days"],
         &["subvolumes", "exclude"],
         &["doctor", "exclude"],
+        &["restore", "allowed_roots"],
         &["source", "*", "snapshot_dir"],
         &["source", "*", "target_subdirs"],
         &["source", "*", "target_labels"],
@@ -995,7 +1283,7 @@ mod surgical {
         match rest.first() {
             None => {
                 if !doc.contains_key(head) {
-                    doc.insert(head, fresh_item(nv));
+                    insert_key(doc, head, fresh_item(nv));
                 }
             }
             Some(&"*") => {
@@ -1079,6 +1367,134 @@ mod surgical {
         }
     }
 
+    /// A step from a table to one inside it: a key, or an element of an array
+    /// of tables.
+    #[derive(Clone)]
+    enum Step {
+        Key(String),
+        At(usize),
+    }
+
+    /// Every table toml_edit prints, in the order it prints them (its own
+    /// rule: a table without a place takes the place of the one before it).
+    fn printed_tables(root: &Table) -> Vec<Vec<Step>> {
+        fn walk(
+            t: &Table,
+            path: &mut Vec<Step>,
+            last: &mut isize,
+            out: &mut Vec<(isize, Vec<Step>)>,
+        ) {
+            if !t.is_dotted() {
+                if let Some(p) = t.position() {
+                    *last = p;
+                }
+                if !t.is_implicit() || t.iter().any(|(_, i)| i.is_value()) {
+                    out.push((*last, path.clone()));
+                }
+            }
+            for (k, item) in t.iter() {
+                match item {
+                    Item::Table(c) => {
+                        path.push(Step::Key(k.to_string()));
+                        walk(c, path, last, out);
+                        path.pop();
+                    }
+                    Item::ArrayOfTables(a) => {
+                        for (i, c) in a.iter().enumerate() {
+                            path.extend([Step::Key(k.to_string()), Step::At(i)]);
+                            walk(c, path, last, out);
+                            path.truncate(path.len() - 2);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut Vec::new(), &mut 0, &mut out);
+        out.sort_by_key(|(pos, path)| (!path.is_empty(), *pos));
+        out.into_iter().map(|(_, p)| p).collect()
+    }
+
+    fn table_at<'a>(t: &'a mut Table, path: &[Step]) -> Option<&'a mut Table> {
+        match path {
+            [] => Some(t),
+            [Step::Key(k), Step::At(n), rest @ ..] => {
+                let a = t.get_mut(k)?.as_array_of_tables_mut()?;
+                table_at(a.get_mut(*n)?, rest)
+            }
+            [Step::Key(k), rest @ ..] => table_at(t.get_mut(k)?.as_table_mut()?, rest),
+            _ => None,
+        }
+    }
+
+    /// `s` split at its first blank line: the lines before it, and the rest.
+    fn split_at_blank(s: &str) -> (String, String) {
+        let mut at = 0;
+        for line in s.split_inclusive('\n') {
+            if line.trim().is_empty() {
+                break;
+            }
+            at += line.len();
+        }
+        (s[..at].to_string(), s[at..].to_string())
+    }
+
+    /// Hang `block` (comment lines) after `t`'s last line: its last value,
+    /// else its header. False when there is neither (the root with no keys).
+    fn append_block(t: &mut Table, block: &str, is_root: bool) -> bool {
+        let tail = format!("\n{}", block.trim_end_matches('\n'));
+        if let Some(v) = t.iter_mut().filter_map(|(_, i)| i.as_value_mut()).last() {
+            append_suffix(v, &tail);
+            return true;
+        }
+        if is_root {
+            return false;
+        }
+        let s = suffix(t.decor());
+        t.decor_mut().set_suffix(format!("{s}{tail}"));
+        true
+    }
+
+    /// Who owns a comment block between two tables. A block touching a
+    /// table's last line (no blank line between them) belongs to that table;
+    /// one separated from it by a blank line belongs to the header below.
+    /// toml_edit files both as the next header's prefix (the last table's in
+    /// the document's trailing), so an edit that removed or moved the next
+    /// table took the first kind with it. Before any edit, each such block is
+    /// hung on its own table's last line (in that line's suffix, which prints
+    /// the same text), so it stays and moves with its table. Printed, the
+    /// document is unchanged.
+    pub(super) fn attach_trailing_comments(doc: &mut toml_edit::DocumentMut) {
+        let order = printed_tables(doc.as_table());
+        for w in 1..order.len() {
+            let Some(t) = table_at(doc.as_table_mut(), &order[w]) else {
+                continue;
+            };
+            let (block, rest) = split_at_blank(&prefix(t.decor()));
+            if !block.contains('#') {
+                continue;
+            }
+            let Some(prev) = table_at(doc.as_table_mut(), &order[w - 1]) else {
+                continue;
+            };
+            if append_block(prev, &block, order[w - 1].is_empty())
+                && let Some(t) = table_at(doc.as_table_mut(), &order[w])
+            {
+                t.decor_mut().set_prefix(rest);
+            }
+        }
+        let trailing = doc.trailing().as_str().unwrap_or("").to_string();
+        let (block, rest) = split_at_blank(&trailing);
+        if block.contains('#')
+            && let Some(last) = order.last()
+            && let Some(t) = table_at(doc.as_table_mut(), last)
+            && append_block(t, &block, last.is_empty())
+        {
+            doc.set_trailing(rest);
+        }
+    }
+
     /// Elements kept in a new order still carry their old places in the file,
     /// and toml_edit writes tables by place: TOML reads an array of tables in
     /// the order its headers appear, so the file would read back in the OLD
@@ -1127,7 +1543,7 @@ impl Config {
     /// Save this config to a TOML file, creating parent directories as
     /// needed. Every writer of `config.toml` comes through here or through
     /// [`Config::save_text`] (the GUI's editor); both write by
-    /// [`Config::edited_into`], so neither can drop what the other keeps. The
+    /// `Config::edited_into_with`, so neither can drop what the other keeps. The
     /// one file written whole elsewhere is a recovery drive's own
     /// `config.toml`, which `das-recovery-state-sync.sh` regenerates from the
     /// host's at every boot (`config derive-recovery` into a new file).
@@ -1137,7 +1553,7 @@ impl Config {
     /// does not know (written by a newer version, or by the operator before
     /// installing the version that reads them) and every comment survive, and
     /// an older binary's save cannot erase a newer one's settings. See
-    /// [`Config::edited_into`] for the rules. A missing file is written fresh.
+    /// `Config::edited_into_with` for the rules. A missing file is written fresh.
     /// An existing file that is not a config this version can read is refused,
     /// unchanged: with nothing known about it, regenerating it would erase
     /// whatever it holds.
@@ -1146,14 +1562,31 @@ impl Config {
     /// root, its owner and group) — see [`crate::fsutil::write_atomic`]. Every
     /// error names `path`, once.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        self.save_with(path, &|_| {})
+    }
+
+    /// [`Config::save`] with a hook run on the edited document before it is
+    /// checked: a test seam, so a test can inject the merge fault the
+    /// read-back check exists to stop.
+    #[doc(hidden)]
+    pub fn save_with(
+        &self,
+        path: &Path,
+        fault: &dyn Fn(&mut toml_edit::DocumentMut),
+    ) -> Result<(), Box<dyn Error>> {
         let named = |e: &dyn std::fmt::Display| format!("cannot write {}: {e}", path.display());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| named(&e))?;
         }
         let text = match fs::read_to_string(path) {
-            Ok(existing) => self.edited_into(&existing).map_err(|e| named(&e))?,
+            Ok(existing) => self
+                .edited_into_with(&existing, fault)
+                .map_err(|e| named(&e))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let body = self.to_toml().map_err(|e| named(&e))?;
+                let body = self
+                    .with_pinned_snapshot_names()
+                    .to_toml()
+                    .map_err(|e| named(&e))?;
                 format!("{FRESH_HEADER}{body}")
             }
             Err(e) => return Err(named(&e).into()),
@@ -1165,8 +1598,8 @@ impl Config {
     /// Save `text` — a whole `config.toml` as the operator typed it (the GUI's
     /// editor) — to `path`, as typed: comments and keys this version does not
     /// know are kept verbatim. The only change made to it is the one every
-    /// save makes, writing out the backup-scoping keys it leaves out
-    /// ([`Config::edited_into`]). Refused, with nothing written, when `text`
+    /// save makes, writing out the backup-scoping keys and snapshot names it
+    /// leaves out (`Config::edited_into_with`). Refused, with nothing written, when `text`
     /// is not a config this version can read. Atomic, mode kept, every error
     /// naming `path` once, as [`Config::save`].
     ///
@@ -1181,7 +1614,7 @@ impl Config {
                  the file was left unchanged"
             ))
         })?;
-        let out = cfg.edited_into(text).map_err(|e| named(&e))?;
+        let out = cfg.edited_into_with(text, &|_| {}).map_err(|e| named(&e))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| named(&e))?;
         }
@@ -1214,12 +1647,23 @@ impl Config {
     /// A legacy key this version reads but never writes (a target's `serial`)
     /// is removed when the key it feeds changes. Then every backup-scoping key
     /// the file leaves out is written out with its current value
-    /// (`surgical::PINNED`).
+    /// (`surgical::PINNED`), and so is every entry's snapshot name
+    /// ([`Config::with_pinned_snapshot_names`]).
+    ///
+    /// Comments: one after an array element's comma stays with that element;
+    /// a comment block touching a table's last line stays with that table
+    /// (`surgical::attach_trailing_comments`); one after a blank line stays
+    /// with the header below it. A key added at the end of a table goes above
+    /// that table's trailing block, and a removed last key hands it up.
     ///
     /// Refused, with nothing written, when `existing` is not TOML, is not a
     /// config this version can read, or the edited text would not read back
     /// as exactly this config; the refusal names the paths that would differ.
-    fn edited_into(&self, existing: &str) -> Result<String, String> {
+    fn edited_into_with(
+        &self,
+        existing: &str,
+        fault: &dyn Fn(&mut toml_edit::DocumentMut),
+    ) -> Result<String, String> {
         let unchanged = "the file was left unchanged";
         let mut doc: toml_edit::DocumentMut = existing
             .parse()
@@ -1227,13 +1671,18 @@ impl Config {
         let known = Self::from_toml(existing).map_err(|e| {
             format!("the file on disk is not a config this version can read ({e}); {unchanged}")
         })?;
-        let want = self.to_toml().map_err(|e| e.to_string())?;
+        let want = self
+            .with_pinned_snapshot_names()
+            .to_toml()
+            .map_err(|e| e.to_string())?;
         let as_table = |text: &str| toml::from_str::<toml::Table>(text).map_err(|e| e.to_string());
         let old = as_table(&known.to_toml().map_err(|e| e.to_string())?)?;
         let new = as_table(&want)?;
         let mut reordered = false;
+        surgical::attach_trailing_comments(&mut doc);
         surgical::merge_table(doc.as_table_mut(), &old, &new, &mut reordered);
         surgical::pin(doc.as_table_mut(), &new);
+        fault(&mut doc);
         if reordered {
             surgical::forget_positions(doc.as_table_mut());
         }
@@ -1251,6 +1700,37 @@ impl Config {
             ));
         }
         Ok(out)
+    }
+
+    /// This config with every subvolume entry's snapshot name written out:
+    /// where `snapshot_name` is unset, the name btrbk is given for it today,
+    /// from the renderer's own derivation
+    /// ([`crate::btrbk_conf::resolve_snapshot_names`]). Saved, a later change
+    /// to that derivation can never rename a series and restart its send
+    /// chain. A top-level entry (`.`) is left as it is: it must name itself.
+    pub fn with_pinned_snapshot_names(&self) -> Config {
+        let mut out = self.clone();
+        for source in &mut out.sources {
+            let names = crate::btrbk_conf::resolve_snapshot_names(&source.subvolumes);
+            for (entry, name) in source.subvolumes.iter_mut().zip(names) {
+                if entry.snapshot_name.is_none() && entry.name != crate::adopt::TOP_LEVEL {
+                    entry.snapshot_name = Some(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// What the GUI's Backup panel shows, as JSON: the source and target
+    /// labels it offers and whether the boot step runs. Read from the parsed
+    /// config, never from the file's lines (bd DAS-Backup-Manager-28il).
+    pub fn panel_json(&self) -> String {
+        serde_json::json!({
+            "sources": self.sources.iter().map(|s| &s.label).collect::<Vec<_>>(),
+            "targets": self.targets.iter().map(|t| &t.label).collect::<Vec<_>>(),
+            "boot_enabled": self.boot.enabled,
+        })
+        .to_string()
     }
 
     /// Every pattern that excludes a subvolume: the built-in defaults, then
@@ -3443,7 +3923,10 @@ enabled = false
         );
         assert!(!text.contains(FRESH_HEADER), "{text}");
         let back = Config::from_toml(&text).unwrap();
-        assert_eq!(back.to_toml().unwrap(), cfg.to_toml().unwrap());
+        assert_eq!(
+            back.to_toml().unwrap(),
+            cfg.with_pinned_snapshot_names().to_toml().unwrap()
+        );
         // The unknown key of `@` stayed with `@`, not with a neighbour.
         let entry_at = text.find("name = \"@\"").unwrap();
         let future = text.find("future_entry").unwrap();
@@ -3467,7 +3950,7 @@ enabled = false
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             Config::from_toml(&text).unwrap().to_toml().unwrap(),
-            cfg.to_toml().unwrap(),
+            cfg.with_pinned_snapshot_names().to_toml().unwrap(),
             "the saved file must read back as the config saved:\n{text}"
         );
         text
@@ -3493,8 +3976,13 @@ enabled = false
         let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
         assert!(text.contains("volume = '/vol'"), "{text}");
         assert!(text.contains("\"@cache\",  # scratch"), "{text}");
+        // Pinned once: each entry names its snapshot series; the inline table
+        // kept its spelling and unknown key.
         assert!(
-            text.contains("subvolumes = [\"@\", {name = \"@home\", future_inline = 1}]"),
+            text.contains(
+                "subvolumes = [{ name = \"@\", snapshot_name = \"root\" }, \
+                 {name = \"@home\", future_inline = 1, snapshot_name = \"home\"}]"
+            ),
             "{text}"
         );
         assert_eq!(text, file.replace("Sun 04:00", "Sat 05:00"));
@@ -3521,7 +4009,10 @@ enabled = false
         assert!(line.contains("name = \"@\", manual_only = true"), "{line}");
         assert!(line.contains("future_inline = 1"), "{line}");
         assert!(line.contains("retired = \"2026-10-30\""), "{line}");
-        assert!(line.contains(", \"@srv\","), "{line}");
+        assert!(
+            line.contains(", { name = \"@srv\", snapshot_name = \"srv\" },"),
+            "{line}"
+        );
         assert!(line.contains("name = \"@new\""), "{line}");
     }
 
@@ -3529,7 +4020,7 @@ enabled = false
     fn save_keeps_each_elements_unknown_keys_when_elements_move() {
         let two = "[[target]]\nlabel = \"a\"\nserials = [\"SERIAL01\"]\nmount = \"/mnt/a\"\n\
                    role = \"primary\"\nfuture = \"of a\"\n[target.retention]\ndaily = 7\n\
-                   # Comment above b.\n\
+                   \n# Comment above b.\n\
                    [[target]]\nlabel = \"b\"\nserials = [\"SERIAL02\"]\nmount = \"/mnt/b\"\n\
                    role = \"mirror\"\nfuture = \"of b\"\n[target.retention]\ndaily = 3\n";
         let text = saved_after(&minimal_toml(two), |c| c.targets.swap(0, 1));
@@ -3732,23 +4223,6 @@ enabled = false
         assert!(a < of_a && of_a < b && b < of_b, "{text}");
     }
 
-    /// The backup-scoping keys are written out inside elements written as
-    /// inline tables too.
-    #[test]
-    fn save_writes_out_backup_scoping_defaults_in_inline_elements() {
-        // Top-level, so before the first table header.
-        let file = format!(
-            "target = [{{ label = \"t\", mount = \"/mnt/t\", role = \"primary\", \
-             retention = {{ daily = 7 }} }}]\n{}",
-            minimal_toml("")
-        );
-        let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
-        assert!(
-            text.contains("retention = { daily = 7 , weekly = 0, monthly = 0, yearly = 0 } }]"),
-            "{text}"
-        );
-    }
-
     /// The keys that decide WHAT is backed up, WHERE it goes and for HOW LONG
     /// are written out with their current values when the file leaves them
     /// out, so a later version's different compiled default cannot change a
@@ -3786,7 +4260,6 @@ enabled = false
         for absent in [
             "[das]",
             "[scrub]",
-            "[restore]",
             "[recovery_os]",
             "log_file",
             "growth_log",
@@ -3828,5 +4301,441 @@ enabled = false
             assert!(err.contains("the submitted text"), "{err}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
+    }
+
+    /// The line of `text` holding `needle` (which must be on exactly one).
+    fn line_with<'t>(text: &'t str, needle: &str) -> &'t str {
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains(needle)).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{needle:?} on {} lines:\n{text}",
+            lines.len()
+        );
+        lines[0]
+    }
+
+    /// A comment after an array element's comma belongs to that element:
+    /// toml_edit files it as the NEXT element's prefix (the last one's in the
+    /// array's trailing), so a naive rebuild shifted comments by one.
+    #[test]
+    fn a_plain_array_keeps_each_comment_beside_its_own_value() {
+        let file = pinned(&minimal_toml(
+            "[subvolumes]\nexclude = [\n    \"@cache\", # about cache\n    \"@old\", # about old\n    \
+             \"@srv\", # about srv\n]\n",
+        ));
+        let placed = |text: &str, names: &[&str], gone: &[&str]| {
+            for n in names {
+                let line = line_with(text, &format!("\"@{n}\""));
+                assert!(
+                    line.contains(&format!("# about {n}")),
+                    "{n}: {line:?}\n{text}"
+                );
+            }
+            for g in gone {
+                assert!(
+                    !text.contains(&format!("about {g}")),
+                    "{g} survived:\n{text}"
+                );
+            }
+        };
+        let ex = |c: &mut Config, v: &[&str]| {
+            c.subvolumes.exclude = v.iter().map(|s| s.to_string()).collect()
+        };
+        let t = saved_after(&file, |c| ex(c, &["@old", "@srv"]));
+        placed(&t, &["old", "srv"], &["cache"]);
+        let t = saved_after(&file, |c| ex(c, &["@cache", "@srv"]));
+        placed(&t, &["cache", "srv"], &["old"]);
+        let t = saved_after(&file, |c| ex(c, &["@cache", "@old"]));
+        placed(&t, &["cache", "old"], &["srv"]);
+        let t = saved_after(&file, |c| ex(c, &["@cache", "@old", "@srv", "@new"]));
+        placed(&t, &["cache", "old", "srv"], &[]);
+        assert!(!line_with(&t, "\"@new\"").contains('#'), "{t}");
+        let t = saved_after(&file, |c| ex(c, &["@srv", "@cache", "@old"]));
+        placed(&t, &["srv", "cache", "old"], &[]);
+        // A single-line array stays on one line.
+        let one = pinned(&minimal_toml("[subvolumes]\nexclude = [\"@a\", \"@b\"]\n"));
+        let t = saved_after(&one, |c| ex(c, &["@b", "@c"]));
+        assert!(t.contains("exclude = [\"@b\", \"@c\"]"), "{t}");
+    }
+
+    /// The same for subvolume entries in an inline array.
+    #[test]
+    fn an_inline_entry_array_keeps_each_comment_beside_its_own_entry() {
+        let file = pinned(&minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             subvolumes = [\n    \"@\", # root\n    \"@home\", # homes\n    \"@srv\", # svc\n]\n",
+        ));
+        let t = saved_after(&file, |c| {
+            c.sources[0].subvolumes.retain(|e| e.name != "@home")
+        });
+        assert!(line_with(&t, "name = \"@\"").contains("# root"), "{t}");
+        assert!(line_with(&t, "name = \"@srv\"").contains("# svc"), "{t}");
+        assert!(!t.contains("homes"), "{t}");
+        let t = saved_after(&file, |c| c.sources[0].subvolumes.swap(0, 2));
+        assert!(line_with(&t, "name = \"@\"").contains("# root"), "{t}");
+        assert!(line_with(&t, "name = \"@srv\"").contains("# svc"), "{t}");
+        assert!(line_with(&t, "name = \"@home\"").contains("# homes"), "{t}");
+    }
+
+    /// Arrays of tables: a comment block touching an entry's last line belongs
+    /// to that entry; one separated from it by a blank line belongs to the
+    /// header below.
+    #[test]
+    fn an_array_of_tables_keeps_each_comment_block_with_its_own_entry() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"a\"\n# after a\n\
+             \n# above b\n[[source.subvolumes]]\nname = \"@b\"\nsnapshot_name = \"b\"\n# after b\n\
+             \n# above c\n[[source.subvolumes]]\nname = \"@c\"\nsnapshot_name = \"c\"\n# after c\n",
+        );
+        let file = pinned(&file);
+        let kept = |t: &str, n: &str| {
+            assert!(
+                t.contains(&format!("snapshot_name = \"{n}\"\n# after {n}\n")),
+                "{n}:\n{t}"
+            );
+            assert!(
+                t.contains(&format!(
+                    "# above {n}\n[[source.subvolumes]]\nname = \"@{n}\""
+                )),
+                "{n}:\n{t}"
+            );
+        };
+        let gone = |t: &str, n: &str| {
+            assert!(
+                !t.contains(&format!("after {n}")) && !t.contains(&format!("above {n}")),
+                "{n}:\n{t}"
+            );
+        };
+        let without =
+            |n: &'static str| move |c: &mut Config| c.sources[0].subvolumes.retain(|e| e.name != n);
+        let t = saved_after(&file, without("@b"));
+        kept(&t, "c");
+        gone(&t, "b");
+        assert!(t.contains("snapshot_name = \"a\"\n# after a\n"), "{t}");
+        let t = saved_after(&file, without("@c"));
+        kept(&t, "b");
+        gone(&t, "c");
+        let t = saved_after(&file, without("@a"));
+        kept(&t, "b");
+        kept(&t, "c");
+        assert!(!t.contains("after a"), "{t}");
+        let t = saved_after(&file, |c| c.sources[0].subvolumes.swap(0, 2));
+        kept(&t, "b");
+        assert!(t.find("name = \"@c\"") < t.find("# after c"), "{t}");
+        assert!(t.find("# after c") < t.find("name = \"@b\""), "{t}");
+        // A key added at the end of an entry goes above its trailing block.
+        let t = saved_after(&file, |c| {
+            c.sources[0].subvolumes[0].adopted = Some("2026-10-31".into())
+        });
+        assert!(t.contains("adopted = \"2026-10-31\"\n# after a\n"), "{t}");
+        // A key removed from the end of an entry hands its block up.
+        let retired = file.replace(
+            "snapshot_name = \"a\"\n",
+            "snapshot_name = \"a\"\nretired = \"2026-10-01\"\n",
+        );
+        let t = saved_after(&retired, |c| c.sources[0].subvolumes[0].retired = None);
+        assert!(t.contains("snapshot_name = \"a\"\n# after a\n"), "{t}");
+    }
+
+    /// A key written out into an inline table takes the spacing before `}`
+    /// with it.
+    #[test]
+    fn a_key_written_into_an_inline_table_keeps_its_spacing() {
+        let file = format!(
+            "target = [{{ label = \"t\", mount = \"/mnt/t\", role = \"primary\", \
+             retention = {{ daily = 7 }} }}]\n{}",
+            minimal_toml("")
+        );
+        let t = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        assert!(
+            t.contains("retention = { daily = 7, weekly = 0, monthly = 0, yearly = 0 } }]"),
+            "{t}"
+        );
+    }
+
+    /// Of two same-named entries that share as many values with the one kept,
+    /// the earlier continues it.
+    #[test]
+    fn of_two_equally_alike_same_named_entries_the_earlier_is_kept() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \"@\"\nsnapshot_name = \"a\"\nfuture = \"of first\"\n\
+             [[source.subvolumes]]\nname = \"@\"\nsnapshot_name = \"b\"\nfuture = \"of second\"\n",
+        );
+        let t = saved_after(&file, |c| {
+            c.sources[0].subvolumes.truncate(1);
+            c.sources[0].subvolumes[0].snapshot_name = Some("c".into());
+        });
+        assert!(t.contains("of first") && !t.contains("of second"), "{t}");
+    }
+
+    /// The read-back check is what stops a faulty edit: a merge fault is
+    /// refused, the paths named, nothing written.
+    #[test]
+    fn a_faulty_edit_is_refused_naming_what_would_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let file = pinned(&minimal_toml(ONE_TARGET));
+        std::fs::write(&path, &file).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        cfg.schedule.full = "Sat 05:00".into();
+        let fault = |doc: &mut toml_edit::DocumentMut| {
+            doc["schedule"]["full"] = toml_edit::value("Mon 01:00");
+            doc["target"][0]["retention"]["daily"] = toml_edit::value(1);
+        };
+        let err = cfg.save_with(&path, &fault).unwrap_err().to_string();
+        assert!(err.contains("would not read back"), "{err}");
+        assert!(
+            err.contains("schedule.full, target[0].retention.daily would differ"),
+            "{err}"
+        );
+        assert_eq!(err.matches(&path.display().to_string()).count(), 1, "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+        // With no fault the same save goes through.
+        cfg.save_with(&path, &|_| {}).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("Sat 05:00")
+        );
+    }
+
+    /// The restore allow-list is a security boundary: pinned like the
+    /// backup-scoping keys.
+    #[test]
+    fn save_writes_out_the_restore_allow_list() {
+        let t = saved_after(&minimal_toml(""), |c| c.schedule.full = "Sat 05:00".into());
+        assert!(
+            t.contains("[restore]\nallowed_roots = [\"/home\", \"/tmp\"]\n"),
+            "{t}"
+        );
+    }
+
+    /// Every entry's snapshot name is written out as btrbk uses it today, so a
+    /// later change to the derivation can never rename a series (and restart
+    /// its send chain); btrbk.conf renders the same before and after.
+    #[test]
+    fn save_writes_out_the_snapshot_name_btrbk_uses_today() {
+        let file = minimal_toml(&format!(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             subvolumes = [\"@\", \"@srv/web\", \"@home\", \"home\"]\n\
+             [[source]]\nlabel = \"top\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \".\"\nsnapshot_name = \"vol-toplevel\"\n\
+             [[source.subvolumes]]\nname = \"@gone\"\nretired = \"2026-10-01\"\n{ONE_TARGET}"
+        ));
+        let before = Config::from_toml(&file).unwrap();
+        let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        let after = Config::from_toml(&text).unwrap();
+        let names = |c: &Config| -> Vec<Option<String>> {
+            c.sources
+                .iter()
+                .flat_map(|s| s.subvolumes.iter().map(|e| e.snapshot_name.clone()))
+                .collect()
+        };
+        assert_eq!(
+            names(&after),
+            [
+                Some("root".into()),
+                Some("srv-web".into()),
+                Some("root-home".into()),
+                Some("root-home".into()),
+                Some("vol-toplevel".into()),
+                Some("gone".into()),
+            ]
+        );
+        let mut same = after.clone();
+        same.schedule.full = before.schedule.full.clone();
+        assert_eq!(
+            crate::btrbk_conf::render_btrbk_conf(&same).unwrap(),
+            crate::btrbk_conf::render_btrbk_conf(&before).unwrap(),
+            "pinning must not change what btrbk is told"
+        );
+        // The top level keeps its explicit name, untouched.
+        assert!(
+            text.contains(
+                "[[source.subvolumes]]\nname = \".\"\nsnapshot_name = \"vol-toplevel\"\n"
+            ),
+            "{text}"
+        );
+        // Bare entries become tables holding only the name and what was added.
+        assert!(
+            text.contains("{ name = \"@\", snapshot_name = \"root\" }"),
+            "{text}"
+        );
+    }
+
+    /// A key a known table does not have is warned about, with the nearest
+    /// key it does have; a clean config warns nothing.
+    #[test]
+    fn unknown_keys_in_known_tables_are_warned_with_a_hint() {
+        // A top-level key of its own (a newer version's section) is expected,
+        // and not warned about.
+        let text = format!(
+            "future_section = 1\n{}",
+            minimal_toml(
+                "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+                 target_lables = [\"t\"]\n[[source.subvolumes]]\nname = \"@\"\nsnapshot_nme = \"x\"\n\
+                 [[target]]\nlabel = \"t\"\nserial = \"X\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n\
+                 [target.retention]\ndaily = 7\nmonthy = 1\n"
+            )
+        )
+        .replace("[gui]\nenabled = false\n", "[gui]\nenabled = false\ntheme = \"dark\"\n");
+        let warnings = unknown_key_warnings(&text).unwrap();
+        assert_eq!(
+            warnings,
+            [
+                "gui.theme is not a key this version reads",
+                "source[0].target_lables is not a key this version reads (did you mean target_labels?)",
+                "source[0].subvolumes[0].snapshot_nme is not a key this version reads (did you mean snapshot_name?)",
+                "target[0].retention.monthy is not a key this version reads (did you mean monthly?)",
+            ],
+            "{text}"
+        );
+        // Legacy `serial`, a bare-string entry and `after_index = false` are
+        // known; so is everything a fresh file holds.
+        let clean = minimal_toml(&format!(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             subvolumes = [\"@\", {{ name = \"@x\", after_index = false }}]\n{ONE_TARGET}"
+        ));
+        assert_eq!(unknown_key_warnings(&clean).unwrap(), Vec::<String>::new());
+        let fresh = Config::from_toml(&clean).unwrap().to_toml().unwrap();
+        assert_eq!(unknown_key_warnings(&fresh).unwrap(), Vec::<String>::new());
+        assert!(unknown_key_warnings("not [ toml").is_err());
+    }
+
+    /// The Backup panel's contract: gui/tests/fixtures/panel-config.json IS
+    /// what `panel_json` gives for each case's text (regenerate with
+    /// PANEL_FIXTURE_WRITE=1). The cases are the ones a line-by-line reader of
+    /// the raw file got wrong.
+    #[test]
+    fn the_gui_panel_fixture_is_this_output() {
+        let base = minimal_toml("");
+        let src = |label: &str| {
+            format!(
+                "[[source]]\nlabel = {label}\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\nsubvolumes = [\"@\"]\n"
+            )
+        };
+        let tgt = |label: &str| {
+            format!(
+                "[[target]]\nlabel = {label}\nmount = \"/mnt/t\"\nrole = \"primary\"\n[target.retention]\ndaily = 7\n"
+            )
+        };
+        let cases: Vec<(&str, String)> = vec![
+            ("spaced boot header", format!("{base}[ boot ]\nenabled = false\n{}{}", src("\"s\""), tgt("\"t\""))),
+            ("inline boot table", format!("boot = {{ enabled = false }}\n{base}{}{}", src("\"s\""), tgt("\"t\""))),
+            ("spaced source header", format!("{base}[[ source ]]\nlabel = \"s\"\nvolume = \"/v\"\ndevice = \"/d\"\nsubvolumes = [\"@\"]\n{}", tgt("\"t\""))),
+            (
+                "header inside a multi-line string",
+                format!("{base}{}{}", src("\"s\"").replace("device = \"/dev/sda\"\n", "device = \"/dev/sda\"\nnote = \"\"\"\n[[target]]\nlabel = \"ghost\"\n\"\"\"\n"), tgt("\"t\"")),
+            ),
+            ("escaped label", format!("{base}{}{}", src("\"a\\\"b\""), tgt("'lit'"))),
+        ];
+        let doc: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(name, text)| {
+                let panel: serde_json::Value =
+                    serde_json::from_str(&Config::from_toml(text).unwrap().panel_json()).unwrap();
+                serde_json::json!({"case": name, "toml": text, "panel": panel})
+            })
+            .collect();
+        let out = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../gui/tests/fixtures/panel-config.json"
+        );
+        if std::env::var_os("PANEL_FIXTURE_WRITE").is_some() {
+            std::fs::write(path, &out).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap_or_default(),
+            out,
+            "the fixture is stale: PANEL_FIXTURE_WRITE=1 cargo test the_gui_panel_fixture"
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(&Config::from_toml(&cases[0].1).unwrap().panel_json()).unwrap();
+        assert_eq!(
+            first,
+            serde_json::json!({"sources": ["s"], "targets": ["t"], "boot_enabled": false})
+        );
+        let ghost: serde_json::Value =
+            serde_json::from_str(&Config::from_toml(&cases[3].1).unwrap().panel_json()).unwrap();
+        assert_eq!(ghost["targets"], serde_json::json!(["t"]));
+    }
+
+    #[test]
+    fn edit_distance_counts_single_character_edits() {
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("ab", "ba"), 2);
+        assert_eq!(edit_distance("monthy", "monthly"), 1);
+        assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    /// The layout of plain arrays, exactly: a comment line above an element
+    /// stays above it, a new element takes its neighbours' spacing, and a
+    /// literal string kept unchanged keeps its quotes.
+    #[test]
+    fn a_plain_array_keeps_its_layout_exactly() {
+        let ex = |c: &mut Config, v: &[&str]| {
+            c.subvolumes.exclude = v.iter().map(|s| s.to_string()).collect()
+        };
+        let multi = pinned(&minimal_toml(
+            "[subvolumes]\nexclude = [\n    \"@a\",\n    # above b\n    \"@b\",\n]\n",
+        ));
+        let t = saved_after(&multi, |c| ex(c, &["@b"]));
+        assert!(
+            t.contains("exclude = [\n    # above b\n    \"@b\",\n]\n"),
+            "{t}"
+        );
+        let one = pinned(&minimal_toml("[subvolumes]\nexclude = [\n    \"@a\",\n]\n"));
+        let t = saved_after(&one, |c| ex(c, &["@a", "@b"]));
+        assert!(
+            t.contains("exclude = [\n    \"@a\",\n    \"@b\",\n]\n"),
+            "{t}"
+        );
+        let single = pinned(&minimal_toml("[subvolumes]\nexclude = ['@a']\n"));
+        let t = saved_after(&single, |c| ex(c, &["@a", "@b"]));
+        assert!(t.contains("exclude = ['@a', \"@b\"]\n"), "{t}");
+    }
+
+    /// Comment blocks next to tables this version does not have, next to an
+    /// empty table and at the top of the file stay exactly where they are on
+    /// a save that changes nothing near them.
+    #[test]
+    fn comments_around_unknown_empty_and_first_tables_stay_put() {
+        let file = format!(
+            "# top of the file\n{}[futa]\nx = 1\n# after futa\n[futb.c]\ny = 2\n\n[futc]\n# about futc\n\n[futd]\nz = 3\n",
+            minimal_toml("").trim_start()
+        );
+        let file = pinned(&file);
+        // As the operator wrote them, not only as a first save left them.
+        assert!(file.starts_with("# top of the file\n[general]\n"), "{file}");
+        assert!(
+            file.contains("x = 1\n# after futa\n[futb.c]\ny = 2\n"),
+            "{file}"
+        );
+        assert!(
+            file.contains("y = 2\n\n[futc]\n# about futc\n\n[futd]\nz = 3\n"),
+            "{file}"
+        );
+        let t = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        assert_eq!(t, file.replace("Sun 04:00", "Sat 05:00"));
+    }
+
+    /// A top-level entry with no name of its own is not given one: it must
+    /// name itself (validate refuses it until it does).
+    #[test]
+    fn a_top_level_entry_without_a_name_is_not_named_by_a_save() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"top\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \".\"\n",
+        );
+        let t = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        assert!(t.contains("[[source.subvolumes]]\nname = \".\"\n"), "{t}");
+        let back = Config::from_toml(&t).unwrap();
+        assert_eq!(back.sources[0].subvolumes[0].snapshot_name, None);
     }
 }

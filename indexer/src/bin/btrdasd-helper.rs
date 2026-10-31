@@ -276,6 +276,14 @@ fn save_config_text(text: &str) -> Result<(), fdo::Error> {
         .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
 }
 
+/// What `ConfigCheck` returns for `text`: its unknown-key warnings as a JSON
+/// array of strings; not TOML is an error saying so.
+fn config_check_json(text: &str) -> Result<String, fdo::Error> {
+    buttered_dasd::config::unknown_key_warnings(text)
+        .map(|w| serde_json::Value::from(w).to_string())
+        .map_err(|e| fdo::Error::Failed(format!("Invalid TOML: {e}")))
+}
+
 /// What `ConfigGet` returns: the file's text as it is.
 fn config_text_at(path: &Path) -> Result<String, fdo::Error> {
     std::fs::read_to_string(path)
@@ -1559,6 +1567,35 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
 
         config_text_at(Path::new(CANONICAL_CONFIG))
+    }
+
+    /// What the Backup panel shows, as JSON from the parsed config: source
+    /// labels, target labels and whether the boot step runs
+    /// (`Config::panel_json`). The panel used to read them out of
+    /// `ConfigGet`'s text line by line, which a hand-written file defeats
+    /// (bd DAS-Backup-Manager-28il).
+    async fn panel_config_get(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
+
+        Ok(load_config()?.panel_json())
+    }
+
+    /// The warnings the editor shows before saving `toml_content`: a JSON
+    /// array of strings, one per key a known table does not have, with the
+    /// nearest key it does. Reads no file and writes nothing.
+    async fn config_check(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        toml_content: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
+
+        config_check_json(toml_content)
     }
 
     /// Write a TOML config string to disk (validates first). The text is
@@ -3406,6 +3443,21 @@ mod tests {
                 &body[at.saturating_sub(200)..at]
             );
         }
+    }
+
+    #[test]
+    fn config_check_lists_unknown_keys_as_json() {
+        let text = "[general]\nversion = \"1\"\ninstall_prefx = \"/usr\"\n";
+        assert_eq!(
+            config_check_json(text).unwrap(),
+            r#"["general.install_prefx is not a key this version reads (did you mean install_prefix?)"]"#
+        );
+        assert_eq!(
+            config_check_json("[general]\nversion = \"1\"\n").unwrap(),
+            "[]"
+        );
+        let err = config_check_json("not [ toml").unwrap_err();
+        assert!(matches!(err, fdo::Error::Failed(m) if m.starts_with("Invalid TOML")));
     }
 
     /// The editor is shown the real file, so what it saves back keeps the
