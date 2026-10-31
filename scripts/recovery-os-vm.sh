@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.2.2
+# Version: 2.2.3
 # Date: 2026-10-21
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -145,8 +145,9 @@
 #     guest-exec; no SSH, no password), only when the boot record says the
 #     agent is installed and started at boot, and never on a "will" record.
 #     Its steps, each a transient unit in the recovery OS (it outlives a
-#     restart of the agent): wait for the guard and the agent; egress -- once
-#     the OS's network answers (NET_SECS: the agent is up before the NIC is),
+#     restart of the agent): wait for the guard and the agent; egress -- a
+#     NIC without a carrier for CARRIER_SECS gets one link toggle from the
+#     host (bd z9zf), then, once the OS's network answers (NET_SECS: the agent is up before the NIC is),
 #     the VM's public address must belong to EGRESS_ORG, else nothing is updated;
 #     repos -- in the OS's pacman.conf every [REPOS_FIRST*] section comes
 #     before any other, or [core] would shadow its builds (bd 1igg);
@@ -331,7 +332,8 @@
 #   DAS_RECOVERY_VM_AGENT_SECS (GUARD_SECS: the agent's to answer after the
 #   start), DAS_RECOVERY_VM_AGENT_GRACE_SECS (300: its silence while a step
 #   runs), DAS_RECOVERY_VM_NET_SECS (120: the egress step's wait for the
-#   recovery OS's network)      clocks
+#   recovery OS's network), DAS_RECOVERY_VM_CARRIER_SECS (20: a NIC's time
+#   without a carrier before the host toggles its link)      clocks
 #   DAS_RECOVERY_VM_EGRESS_ORG  what the direct path egresses as (ipinfo.io's
 #                               org line begins with it), e.g. AS64500;
 #                               overrides [recovery_os].egress_org; with
@@ -419,6 +421,11 @@ readonly DESKTOP_SECS="${DAS_RECOVERY_VM_DESKTOP_SECS:-600}"
 # judges: the guest agent answers before NetworkManager has a lease (bd slu9,
 # 2026-10-12: the step ran 0.5 s before the NIC began activating).
 readonly NET_SECS="${DAS_RECOVERY_VM_NET_SECS:-120}"
+# How long a NIC in the recovery OS may sit without a carrier before the host
+# toggles its link, once (bd z9zf, 2026-10-30: NetworkManager held drive A's
+# enp1s0 "unavailable" for 131 s while the host's bridge port forwarded; a
+# link toggle from the host brought it up at once).
+readonly CARRIER_SECS="${DAS_RECOVERY_VM_CARRIER_SECS:-20}"
 # The repository family that must come first in the recovery OS's pacman.conf
 # (the start of its sections' names): pacman takes a package from the first
 # repository that carries it, so [core] above [cachyos] shadowed CachyOS's
@@ -4187,6 +4194,46 @@ power_off_guest() {
     request_shutdown "$1" unattended
 }
 
+# Each network device of the recovery OS (one with a device behind it) and
+# its carrier: "<name> 1", "<name> 0", or "<name> down" when the kernel will
+# not say (the interface is down). Nothing when no NIC is there yet.
+# shellcheck disable=SC2016 # runs in the recovery OS, expanded there
+readonly CARRIER_PROBE='for d in /sys/class/net/*; do [ -e "$d/device" ] || continue; c=$(cat "$d/carrier" 2>/dev/null) || c=down; echo "${d##*/} ${c:-down}"; done'
+
+# Before the egress step: a NIC that has been there CARRIER_SECS without a
+# carrier gets its link toggled from the host, once -- the guest had missed
+# the link status virtio gave it (bd z9zf: drive A's enp1s0 "unavailable"
+# for 131 s, the host's bridge port forwarding; the toggle brought it up at
+# once). Waits at most NET_SECS and never judges: the egress step does, so a
+# network that never comes still stops the update there. 1 only when the
+# watch stopped it (UNATTENDED_WHY).
+ensure_carrier() {
+    local start=$SECONDS seen="" kicked=false
+    UNATTENDED_WHY=""
+    while ((SECONDS - start < NET_SECS)); do
+        if guest_sh 30 "$CARRIER_PROBE" && [[ "$GSH_RC" == 0 ]]; then
+            if [[ $'\n'"$GSH_OUT"$'\n' =~ $'\n'[^[:space:]]+\ 1$'\n' ]]; then
+                [[ "$kicked" == false ]] || log "network: the recovery OS's NIC has a carrier after the toggle"
+                return 0
+            fi
+            if [[ -n "${GSH_OUT//[[:space:]]/}" ]]; then
+                [[ -n "$seen" ]] || seen=$SECONDS
+                if [[ "$kicked" == false ]] && ((SECONDS - seen >= CARRIER_SECS)); then
+                    kicked=true
+                    warn "network: the recovery OS's NIC has had no carrier for $(format_duration "$CARRIER_SECS") ($(printable "${GSH_OUT//$'\n'/, }")): toggling its link from the host, once"
+                    if ! virsh_ domif-setlink "$DOMAIN" "$D_MAC" down >/dev/null || ! virsh_ domif-setlink "$DOMAIN" "$D_MAC" up >/dev/null; then
+                        warn "network: the link toggle failed; the egress step judges the network as it is"
+                        virsh_ domif-setlink "$DOMAIN" "$D_MAC" up >/dev/null 2>&1 || :
+                    fi
+                fi
+            fi
+        fi
+        sleep "$POLL_SECS"
+        watch_tick || return 1
+    done
+    return 0
+}
+
 # The steps, in order: name, limit in seconds, the function that writes its
 # script. The guard is lifted for pacman (it cannot replace a file something
 # is mounted on) and engaged again before the reboot.
@@ -4222,6 +4269,13 @@ run_unattended() {
     for entry in "${UNATTENDED_STEPS[@]}"; do
         read -r name limit fn <<<"$entry"
         [[ "$limit" != UPDATE ]] || limit=$UPDATE_SECS
+        if [[ "$name" == egress ]] && ! ensure_carrier; then
+            stage_failed egress "$UNATTENDED_WHY"
+            progress poweroff start "the update stopped at egress"
+            power_off_guest "the unattended update stopped at egress"
+            progress poweroff ok
+            return 0
+        fi
         if ! run_stage "$name" "$limit" "$("$fn")"; then
             progress poweroff start "the update stopped at $name"
             power_off_guest "the unattended update stopped at $name"
@@ -5945,8 +5999,8 @@ check_knobs() {
         ! "$GRACE_SECS" =~ ^[123456789][[:digit:]]*$ || ! "$GUARD_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$RESEND_SECS" =~ ^[123456789][[:digit:]]{0,4}$ ||
         ! "$CLOCK_GAP_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$UPDATE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ||
         ! "$AGENT_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$AGENT_GRACE_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ||
-        ! "$NET_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
-        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS, _AGENT_GRACE_SECS and _NET_SECS take numbers above 0\n' >&2
+        ! "$NET_SECS" =~ ^[123456789][[:digit:]]{0,5}$ || ! "$CARRIER_SECS" =~ ^[123456789][[:digit:]]{0,5}$ ]]; then
+        printf 'recovery-os-vm.sh: DAS_RECOVERY_VM_POLL_SECS, _MINUTE_SECS, _GRACE_SECS, _GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS, _AGENT_GRACE_SECS, _NET_SECS and _CARRIER_SECS take numbers above 0\n' >&2
         exit 2
     fi
     # It goes into a shell script in the recovery OS: letters, digits and

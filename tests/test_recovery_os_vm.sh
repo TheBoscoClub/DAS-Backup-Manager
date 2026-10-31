@@ -847,6 +847,11 @@ case "$cmd" in
                             out=$'rc=\n\n' err=$'/bin/sh: line 1: head: command not found\n'
                         fi
                     fi
+                elif [[ "$script" == *'/sys/class/net/'*'/carrier'* ]]; then
+                    # The NICs and their carriers (bd z9zf): guest.carrier
+                    # when a test sets one, else one NIC with a carrier.
+                    echo carrier >>"$S/carrier.probes"
+                    out=$(cat "$S/guest.carrier" 2>/dev/null || echo "enp1s0 1")
                 elif [[ "$script" == "cat /proc/sys/kernel/random/boot_id" ]]; then
                     out=$(cat "$S/guest.boot")
                 elif [[ "$script" == "uname -r" ]]; then
@@ -877,6 +882,16 @@ case "$cmd" in
                 ;;
             *) echo "UNEXPECTED agent $what" >>"$STUB/forbidden"; exit 99 ;;
         esac
+        ;;
+    domif-setlink)
+        # The host's link toggle (bd z9zf): <domain> <mac> up|down.
+        # setlink.fails: libvirt refuses; setlink.fixes: the NIC has a
+        # carrier once the link comes up again.
+        echo "virsh domif-setlink $3" >>"$STUB/events"
+        printf '%s\n' "$*" >>"$S/setlink.calls"
+        if [[ -f "$S/setlink.fails" ]]; then echo "error: Requested operation is not valid" >&2; exit 1; fi
+        if [[ "$3" == up && -f "$S/setlink.fixes" ]]; then echo "enp1s0 1" >"$S/guest.carrier"; fi
+        echo "Device updated successfully"
         ;;
     screenshot)
         printf 'P6\n1 1\n255\n...' >"$2"
@@ -3264,7 +3279,7 @@ has "guard, dry run: the guard it would carry, shown" "$OUT" "session guard: a r
 for knob in 0 12x; do
     GUARD_SECS=$knob run_driver status
     check "guard knob $knob: a usage error" "$RC" "2"
-    has "guard knob $knob: says which" "$OUT" "_GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS, _AGENT_GRACE_SECS and _NET_SECS take numbers above 0"
+    has "guard knob $knob: says which" "$OUT" "_GUARD_SECS, _RESEND_SECS, _CLOCK_GAP_SECS, _UPDATE_SECS, _AGENT_SECS, _AGENT_GRACE_SECS, _NET_SECS and _CARRIER_SECS take numbers above 0"
 done
 RESEND=0 run_driver status
 check "resend knob 0: a usage error" "$RC" "2"
@@ -5318,6 +5333,55 @@ check "egress wait, network up at once: exit 0" "$RC" "0"
 lacks "egress wait, network up at once: never waited" "$OUT" "waiting for the recovery OS's network"
 has "egress wait, network up at once: judged" "$OUT" "egress is direct (AS64500)"
 
+echo "--- a NIC without a carrier: the host toggles its link once, before the egress step (bd z9zf)"
+before_egress() { [[ "$OUT" == *"$1"*"PROGRESS system-recovery-A-2tb egress start"* ]] && echo yes || echo no; }
+unattended_fixture
+run_driver session A --unattended
+check "carrier up: exit 0" "$RC" "0"
+check "carrier up: looked" "$([[ -s "$S/carrier.probes" ]] && echo yes || echo no)" "yes"
+check "carrier up: the link never touched" "$(file "$S/setlink.calls")" ""
+lacks "carrier up: nothing said" "$OUT" "no carrier"
+unattended_fixture
+echo "enp1s0 0" >"$S/guest.carrier"
+touch "$S/setlink.fixes"
+DAS_RECOVERY_VM_CARRIER_SECS=1 DAS_RECOVERY_VM_NET_SECS=30 run_driver session A --unattended
+check "no carrier, the toggle brings it: exit 0" "$RC" "0"
+check "no carrier, the toggle brings it: down, then up, by the domain's MAC" "$(sed 's/ [^ ]*:[^ ]*:[^ ]* / MAC /' "$S/setlink.calls" | tr '\n' '|')" "recovery-os-updater-system-recovery-A-2tb MAC down|recovery-os-updater-system-recovery-A-2tb MAC up|"
+has "no carrier, the toggle brings it: said why" "$OUT" "the recovery OS's NIC has had no carrier for 0h 00m 01s (enp1s0 0): toggling its link from the host, once"
+has "no carrier, the toggle brings it: said it worked" "$OUT" "has a carrier after the toggle"
+check "no carrier, the toggle brings it: before the egress step" "$(before_egress "toggling its link")" "yes"
+check "no carrier, the toggle brings it: every step" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+unattended_fixture
+echo "enp1s0 0" >"$S/guest.carrier"
+DAS_RECOVERY_VM_CARRIER_SECS=1 DAS_RECOVERY_VM_NET_SECS=3 run_driver session A --unattended
+check "no carrier ever: toggled once, not again" "$(wc -l <"$S/setlink.calls")" "2"
+check "no carrier ever: the egress step still judges" "$(head -n 1 "$S/stages.log")" "egress"
+lacks "no carrier ever: never claims it worked" "$OUT" "has a carrier after the toggle"
+unattended_fixture
+echo "enp1s0 down" >"$S/guest.carrier"
+DAS_RECOVERY_VM_CARRIER_SECS=1 DAS_RECOVERY_VM_NET_SECS=3 run_driver session A --unattended
+check "an interface that is down: counts as no carrier" "$(wc -l <"$S/setlink.calls")" "2"
+unattended_fixture
+: >"$S/guest.carrier"
+DAS_RECOVERY_VM_CARRIER_SECS=1 DAS_RECOVERY_VM_NET_SECS=3 run_driver session A --unattended
+check "no NIC yet: nothing toggled" "$(file "$S/setlink.calls")" ""
+check "no NIC yet: the egress step still runs" "$(head -n 1 "$S/stages.log")" "egress"
+unattended_fixture
+printf 'enp1s0 0\nenp2s0 1\n' >"$S/guest.carrier"
+DAS_RECOVERY_VM_CARRIER_SECS=1 DAS_RECOVERY_VM_NET_SECS=3 run_driver session A --unattended
+check "two NICs, one with a carrier: nothing toggled" "$(file "$S/setlink.calls")" ""
+unattended_fixture
+echo "enp1s0 0" >"$S/guest.carrier"
+touch "$S/setlink.fails"
+DAS_RECOVERY_VM_CARRIER_SECS=1 DAS_RECOVERY_VM_NET_SECS=3 run_driver session A --unattended
+has "the toggle refused: says so" "$OUT" "the link toggle failed; the egress step judges the network as it is"
+check "the toggle refused: the link asked up again, never left down" "$(tail -n 1 "$S/setlink.calls" | awk '{print $NF}')" "up"
+check "the toggle refused: the egress step still runs" "$(head -n 1 "$S/stages.log")" "egress"
+fixture
+DAS_RECOVERY_VM_CARRIER_SECS=0 run_driver status
+check "carrier knob 0: usage" "$RC" "2"
+has "carrier knob 0: says which" "$OUT" "_NET_SECS and _CARRIER_SECS take numbers above 0"
+
 echo "--- the egress org: the variable, else config.toml's, never a built-in ISP (bd 6pd3)"
 unattended_fixture
 DAS_RECOVERY_VM_EGRESS_ORG=AS64511 run_driver session A --unattended
@@ -5353,7 +5417,7 @@ matches "egress wait, network never up: asked more than once" "$(wc -l <"$T/curl
 for knob in 0 12x; do
     DAS_RECOVERY_VM_NET_SECS=$knob run_driver status
     check "net knob $knob: a usage error" "$RC" "2"
-    has "net knob $knob: says which" "$OUT" "_AGENT_GRACE_SECS and _NET_SECS take numbers above 0"
+    has "net knob $knob: says which" "$OUT" "_AGENT_GRACE_SECS, _NET_SECS and _CARRIER_SECS take numbers above 0"
 done
 
 echo "--- the repos step: every [cachyos*] repository before [core] and [extra] (1igg)"
