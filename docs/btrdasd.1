@@ -443,7 +443,10 @@ CI/CD pipelines.
 .TP
 .B \-\-check
 Validate the configuration and dependencies, report issues,
-but change nothing. It reports whether the configuration is valid, whether the
+but change nothing. It reports whether the configuration is valid (and, as
+.BR "Config warning:" ,
+any key inside a known table that this version does not read, with the nearest
+known key), whether the
 mail relay is reachable (when email is enabled), whether every generated file is present, and, for each
 attached target, whether udev actually hides its drives from udisks (read back
 from
@@ -538,6 +541,10 @@ Default:
 .SS config validate
 Validate the configuration and report any issues.
 Exits with status 1 if validation errors are found.
+A key inside a known table that this version does not read (a typo, or a
+newer version's key) is printed as a
+.B Warning:
+on standard error with the nearest known key; it does not change the exit status.
 .PP
 .B btrdasd config validate
 .RB [ \-\-config
