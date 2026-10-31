@@ -695,6 +695,232 @@ impl Default for Config {
 }
 
 // ---------------------------------------------------------------------------
+// Surgical edits of config.toml (bd DAS-Backup-Manager-28il)
+// ---------------------------------------------------------------------------
+
+/// The document edits behind [`Config::save`]: `old` is what this binary
+/// knows of the file (its own serialisation of what it loaded), `new` what it
+/// is saving. Rules: [`Config::edited_into`].
+mod surgical {
+    use toml_edit::{ArrayOfTables, Item, Table, TableLike, Value};
+
+    /// Apply `new` onto `doc`, where `old` is what this binary knew of `doc`.
+    /// Sets `reordered` when an array of tables kept elements in a new order.
+    pub(super) fn merge_table(
+        doc: &mut dyn TableLike,
+        old: &toml::Table,
+        new: &toml::Table,
+        reordered: &mut bool,
+    ) {
+        for (key, nv) in new {
+            let ov = old.get(key);
+            match doc.get_mut(key) {
+                Some(item) => {
+                    let was_value = item.is_value();
+                    match ov {
+                        Some(ov) if ov == nv => {}
+                        Some(ov) => merge_item(item, ov, nv, reordered),
+                        None => replace(item, nv),
+                    }
+                    // A `[[header]]` turned into `key = []` (or back) needs
+                    // the spacing of its new kind.
+                    if item.is_value() != was_value
+                        && let Some(mut k) = doc.key_mut(key)
+                    {
+                        k.fmt();
+                    }
+                }
+                // Omitted, and the default it stands for is unchanged.
+                None if ov == Some(nv) => {}
+                None => {
+                    doc.insert(key, fresh_item(nv));
+                }
+            }
+        }
+        for key in old.keys() {
+            if !new.contains_key(key) {
+                doc.remove(key);
+            }
+        }
+    }
+
+    fn merge_item(item: &mut Item, ov: &toml::Value, nv: &toml::Value, reordered: &mut bool) {
+        match (ov, nv) {
+            (toml::Value::Table(old_t), toml::Value::Table(new_t)) => {
+                match item.as_table_like_mut() {
+                    Some(table) => merge_table(table, old_t, new_t, reordered),
+                    None => replace(item, nv),
+                }
+            }
+            (toml::Value::Array(oa), toml::Value::Array(na)) => {
+                merge_elements(item, oa, na, reordered)
+            }
+            _ => replace(item, nv),
+        }
+    }
+
+    /// What matches an array element across a save: its `label` (sources,
+    /// targets) or `name` (subvolume entries). Nothing else is matched.
+    fn identity(v: &toml::Value) -> Option<&str> {
+        let t = v.as_table()?;
+        t.get("label").or_else(|| t.get("name"))?.as_str()
+    }
+
+    /// For each element of `na`, the index of the `oa` element it continues.
+    fn pick(oa: &[toml::Value], na: &[toml::Value]) -> Vec<Option<usize>> {
+        let mut used = vec![false; oa.len()];
+        na.iter()
+            .map(|ne| {
+                let id = identity(ne)?;
+                let i = (0..oa.len()).find(|&i| !used[i] && identity(&oa[i]) == Some(id))?;
+                used[i] = true;
+                Some(i)
+            })
+            .collect()
+    }
+
+    fn merge_elements(
+        item: &mut Item,
+        oa: &[toml::Value],
+        na: &[toml::Value],
+        reordered: &mut bool,
+    ) {
+        let picks = pick(oa, na);
+        let kept: Vec<usize> = picks.iter().flatten().copied().collect();
+        match item {
+            // An empty array of tables is no key at all: written as `[]`.
+            Item::ArrayOfTables(aot) if !na.is_empty() => {
+                if !kept.is_sorted() {
+                    *reordered = true;
+                }
+                let mut out = Vec::new();
+                for (ne, pick) in na.iter().zip(&picks) {
+                    let Some(nt) = ne.as_table() else { continue };
+                    let table = match pick.and_then(|i| Some((oa[i].as_table()?, aot.get(i)?))) {
+                        Some((old_t, kept)) => {
+                            let mut t = kept.clone();
+                            merge_table(&mut t, old_t, nt, reordered);
+                            t
+                        }
+                        None => fresh_table(nt),
+                    };
+                    out.push(table);
+                }
+                *aot = out.into_iter().collect::<ArrayOfTables>();
+            }
+            Item::Value(Value::Array(arr)) => {
+                let mut out = Vec::new();
+                for (ne, pick) in na.iter().zip(&picks) {
+                    let v = match pick.and_then(|i| Some((&oa[i], arr.get(i)?))) {
+                        Some((ov, kept)) => {
+                            let mut v = kept.clone();
+                            merge_value(&mut v, ov, ne, reordered);
+                            v
+                        }
+                        None => fresh_value(ne),
+                    };
+                    out.push(v);
+                }
+                arr.clear();
+                for v in out {
+                    arr.push_formatted(v);
+                }
+                arr.fmt();
+            }
+            _ => replace(item, &toml::Value::Array(na.to_vec())),
+        }
+    }
+
+    /// An element of an inline array: an inline table is edited in place, a
+    /// bare string (a subvolume entry written as `"@"`) kept while unchanged.
+    fn merge_value(v: &mut Value, ov: &toml::Value, nv: &toml::Value, reordered: &mut bool) {
+        if let (Value::InlineTable(t), toml::Value::Table(old_t), toml::Value::Table(nt)) =
+            (&mut *v, ov, nv)
+        {
+            merge_table(t, old_t, nt, reordered);
+        } else if ov != nv {
+            set_value(v, nv);
+        }
+    }
+
+    /// `item` now holds `nv`; a plain value keeps its comment and spacing.
+    fn replace(item: &mut Item, nv: &toml::Value) {
+        match item {
+            Item::Value(v) => set_value(v, nv),
+            other => *other = fresh_item(nv),
+        }
+    }
+
+    fn set_value(v: &mut Value, nv: &toml::Value) {
+        let decor = v.decor().clone();
+        *v = fresh_value(nv);
+        *v.decor_mut() = decor;
+    }
+
+    /// A key that was not in the file: tables as `[section]`, arrays of tables
+    /// as `[[section]]`, the rest as values. (Inserted into an inline table,
+    /// toml_edit makes them inline.)
+    fn fresh_item(v: &toml::Value) -> Item {
+        match v {
+            toml::Value::Table(t) => Item::Table(fresh_table(t)),
+            toml::Value::Array(a) if !a.is_empty() && a.iter().all(toml::Value::is_table) => {
+                Item::ArrayOfTables(
+                    a.iter()
+                        .filter_map(toml::Value::as_table)
+                        .map(fresh_table)
+                        .collect(),
+                )
+            }
+            _ => Item::Value(fresh_value(v)),
+        }
+    }
+
+    fn fresh_table(t: &toml::Table) -> Table {
+        let mut out = Table::new();
+        for (k, v) in t {
+            out.insert(k, fresh_item(v));
+        }
+        out
+    }
+
+    fn fresh_value(v: &toml::Value) -> Value {
+        match v {
+            toml::Value::String(s) => Value::from(s.as_str()),
+            toml::Value::Integer(i) => Value::from(*i),
+            toml::Value::Float(f) => Value::from(*f),
+            toml::Value::Boolean(b) => Value::from(*b),
+            toml::Value::Datetime(d) => Value::from(*d),
+            toml::Value::Array(a) => Value::Array(a.iter().map(fresh_value).collect()),
+            toml::Value::Table(t) => {
+                Value::InlineTable(t.iter().map(|(k, v)| (k.clone(), fresh_value(v))).collect())
+            }
+        }
+    }
+
+    /// Elements kept in a new order still carry their old places in the file,
+    /// and toml_edit writes tables by place: TOML reads an array of tables in
+    /// the order its headers appear, so the file would read back in the OLD
+    /// order. Without places, every table is written in document order.
+    pub(super) fn forget_positions(table: &mut Table) {
+        for (_, item) in table.iter_mut() {
+            match item {
+                Item::Table(t) => {
+                    t.set_position(None);
+                    forget_positions(t);
+                }
+                Item::ArrayOfTables(a) => {
+                    for t in a.iter_mut() {
+                        t.set_position(None);
+                        forget_positions(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Config methods
 // ---------------------------------------------------------------------------
 
@@ -717,7 +943,19 @@ impl Config {
     }
 
     /// Save this config to a TOML file, creating parent directories as
-    /// needed. The file is replaced whole and keeps its mode (and, saved by
+    /// needed. Every writer of `config.toml` comes through here.
+    ///
+    /// An existing file is EDITED, not regenerated (bd DAS-Backup-Manager-28il):
+    /// only the values this config changes are rewritten, so keys this binary
+    /// does not know (written by a newer version, or by the operator before
+    /// installing the version that reads them) and every comment survive, and
+    /// an older binary's save cannot erase a newer one's settings. See
+    /// [`Config::edited_into`] for the rules. A missing file is written fresh.
+    /// An existing file that is not a config this version can read is refused,
+    /// unchanged: with nothing known about it, regenerating it would erase
+    /// whatever it holds.
+    ///
+    /// The file is replaced in one step and keeps its mode (and, saved by
     /// root, its owner and group) — see [`crate::fsutil::write_atomic`]. Every
     /// error names `path`, once.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn Error>> {
@@ -725,11 +963,69 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| named(&e))?;
         }
-        let header = "# Generated by btrdasd setup — do not edit.\n\
-                       # Modify this file and run: sudo btrdasd setup --upgrade\n\n";
-        let body = self.to_toml().map_err(|e| named(&e))?;
-        crate::fsutil::write_atomic(path, &format!("{header}{body}"))?;
+        let text = match fs::read_to_string(path) {
+            Ok(existing) => self.edited_into(&existing).map_err(|e| named(&e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let header = "# Generated by btrdasd setup — do not edit.\n\
+                               # Modify this file and run: sudo btrdasd setup --upgrade\n\n";
+                let body = self.to_toml().map_err(|e| named(&e))?;
+                format!("{header}{body}")
+            }
+            Err(e) => return Err(named(&e).into()),
+        };
+        crate::fsutil::write_atomic(path, &text)?;
         Ok(())
+    }
+
+    /// `existing` (the text of `config.toml`) with this config written into
+    /// it surgically. What this binary KNOWS of the file is what it would
+    /// write after loading it (`from_toml` then `to_toml`); everything else
+    /// in the document is left exactly as it is. Then, per key:
+    ///
+    /// - known and unchanged: untouched, in the operator's spelling;
+    /// - changed: the value is replaced, keeping its comment and spacing;
+    /// - new: inserted (an omitted key whose default is unchanged stays omitted);
+    /// - known but no longer in this config (an entry deleted, an `Option`
+    ///   cleared): removed;
+    /// - unknown: kept.
+    ///
+    /// Arrays of tables (`[[source]]`, `[[target]]`, subvolume entries) are
+    /// matched element by element on their `label` (or `name`): a matched
+    /// element is edited by the same rules and keeps its own unknown keys
+    /// and comments, wherever it moves; an element with no match is written
+    /// fresh, and an old one with no match is removed with everything in it.
+    /// An element renamed is therefore a removal plus an addition.
+    ///
+    /// Refused, with nothing written, when `existing` is not TOML, is not a
+    /// config this version can read, or the edited text would not read back
+    /// as exactly this config (a kept key this binary does not write, such as
+    /// a legacy `serial`, overriding a change).
+    fn edited_into(&self, existing: &str) -> Result<String, String> {
+        let unchanged = "the file was left unchanged";
+        let mut doc: toml_edit::DocumentMut = existing
+            .parse()
+            .map_err(|e| format!("the file on disk is not TOML ({e}); {unchanged}"))?;
+        let known = Self::from_toml(existing).map_err(|e| {
+            format!("the file on disk is not a config this version can read ({e}); {unchanged}")
+        })?;
+        let want = self.to_toml().map_err(|e| e.to_string())?;
+        let as_table = |text: &str| toml::from_str::<toml::Table>(text).map_err(|e| e.to_string());
+        let old = as_table(&known.to_toml().map_err(|e| e.to_string())?)?;
+        let new = as_table(&want)?;
+        let mut reordered = false;
+        surgical::merge_table(doc.as_table_mut(), &old, &new, &mut reordered);
+        if reordered {
+            surgical::forget_positions(doc.as_table_mut());
+        }
+        let out = doc.to_string();
+        let back = Self::from_toml(&out).ok().and_then(|c| c.to_toml().ok());
+        if back.as_deref() != Some(want.as_str()) {
+            return Err(format!(
+                "the edited file would not read back as the config being saved \
+                 (a key this version does not write overrides a change?); {unchanged}"
+            ));
+        }
+        Ok(out)
     }
 
     /// Every pattern that excludes a subvolume: the built-in defaults, then
@@ -1593,20 +1889,78 @@ mod tests {
     }
 
     #[test]
-    fn save_replaces_the_file_whole_and_leaves_no_temp_file() {
+    fn save_writes_a_missing_file_fresh_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "old contents that must not survive").unwrap();
-        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
         cfg.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# Generated by btrdasd setup"));
-        assert!(Config::from_toml(&text).is_ok());
+        assert_eq!(
+            Config::from_toml(&text).unwrap().to_toml().unwrap(),
+            cfg.to_toml().unwrap()
+        );
+        // Edited in place on the next save: no temp file either way.
+        cfg.schedule.full = "Sat 05:00".into();
+        cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# Generated by btrdasd setup"), "{text}");
+        assert!(text.contains("full = \"Sat 05:00\""), "{text}");
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, ["config.toml"]);
+    }
+
+    /// With nothing known about the file, regenerating it would erase what it
+    /// holds: refused, the file as it was, the error naming it once.
+    #[test]
+    fn save_refuses_a_file_it_cannot_read_as_a_config_and_leaves_it_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        let path = dir.path().join("config.toml");
+        for (old, why) in [
+            ("old contents [ that are not TOML", "is not TOML"),
+            (
+                "[general]\nfuture_only = 1\n",
+                "is not a config this version can read",
+            ),
+        ] {
+            std::fs::write(&path, old).unwrap();
+            let err = cfg.save(&path).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("cannot write {}: ", path.display())),
+                "{err}"
+            );
+            assert!(err.contains(why), "{err}");
+            assert!(err.contains("left unchanged"), "{err}");
+            assert_eq!(err.matches(&path.display().to_string()).count(), 1, "{err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        }
+        // Present but unreadable (a directory): refused, not written fresh.
+        let path = dir.path().join("a-directory.toml");
+        std::fs::create_dir(&path).unwrap();
+        let err = cfg.save(&path).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("cannot write {}: ", path.display())),
+            "{err}"
+        );
+        assert_eq!(err.matches(&path.display().to_string()).count(), 1, "{err}");
+        assert!(path.is_dir());
+        // Present but unreadable as text (not UTF-8), in a directory the save
+        // could write: only a MISSING file is written fresh.
+        let path = dir.path().join("not-utf8.toml");
+        std::fs::write(&path, b"[general]\nversion = \"\xff\"\n").unwrap();
+        let err = cfg.save(&path).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("cannot write {}: ", path.display())),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[general]\nversion = \"\xff\"\n"
+        );
     }
 
     #[test]
@@ -1616,7 +1970,7 @@ mod tests {
         let cfg = Config::from_toml(&minimal_toml("")).unwrap();
         // The reviewer's probe: a private config.toml stays private.
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "old").unwrap();
+        std::fs::write(&path, minimal_toml("")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         cfg.save(&path).unwrap();
         assert_eq!(
@@ -2741,5 +3095,274 @@ enabled = false
             shown,
             "a second round trip changes nothing"
         );
+    }
+
+    /// The operator's file as an older or newer binary would meet it: keys this
+    /// binary does not know (top level, in a known section, in a `[[target]]`
+    /// element, in a subvolume entry) and comments of every kind (bd
+    /// DAS-Backup-Manager-28il).
+    pub(crate) const OPERATOR_FILE: &str = r#"# Operator's header: hand-tuned, keep.
+future_top = "kept"
+
+[general]
+version = "0.4.0" # inline comment on a known key
+install_prefix = "/usr/local"
+db_path = "/var/lib/das-backup/backup-index.db"
+future_general = 7
+
+[init]
+system = "systemd"
+
+# Comment above [schedule].
+[schedule]
+incremental = "03:00"
+full = "Sun 04:00"
+randomized_delay_min = 30
+
+[recovery_os]
+max_age_days = 60
+egress_org = "AS64500"
+future_recovery = "from a newer binary"
+
+# Comment above the source.
+[[source]]
+label = "s"
+volume = "/vol"
+device = "/dev/sda"
+future_source = true
+[[source.subvolumes]]
+name = "@"
+future_entry = "kept with its entry"
+[[source.subvolumes]]
+name = "@gone"
+retired = "2026-10-01"
+
+# Comment above the target.
+[[target]]
+label = "t"
+serials = ["SERIAL01"]
+mount_uuid = "5eed0016-0000-4000-8000-000000000016"
+mount = "/mnt/t"
+role = "primary"
+future_target = "kept with its target" # and its comment
+[target.retention]
+daily = 7
+
+[email]
+enabled = false
+
+[gui]
+enabled = false
+"#;
+
+    /// Every line of [`OPERATOR_FILE`] a save must keep whatever it changes.
+    pub(crate) const OPERATOR_KEPT: &[&str] = &[
+        "# Operator's header: hand-tuned, keep.",
+        "future_top = \"kept\"",
+        "# inline comment on a known key",
+        "future_general = 7",
+        "# Comment above [schedule].",
+        "future_recovery = \"from a newer binary\"",
+        "# Comment above the source.",
+        "future_source = true",
+        "future_entry = \"kept with its entry\"",
+        "# Comment above the target.",
+        "future_target = \"kept with its target\" # and its comment",
+    ];
+
+    /// Panics naming the first [`OPERATOR_KEPT`] line `text` lost.
+    pub(crate) fn assert_operator_lines_kept(text: &str) {
+        for kept in OPERATOR_KEPT {
+            assert!(text.contains(kept), "lost {kept:?}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn save_keeps_unknown_keys_and_comments_and_makes_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, OPERATOR_FILE).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        // A changed scalar, an added entry, a deleted entry, a cleared Option.
+        cfg.schedule.incremental = "04:15".into();
+        cfg.sources[0].subvolumes.retain(|e| e.name != "@gone");
+        cfg.sources[0].subvolumes.push(SubvolConfig {
+            name: "@new".into(),
+            adopted: Some("2026-10-30".into()),
+            ..Default::default()
+        });
+        cfg.targets[0].mount_uuid = None;
+        cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_operator_lines_kept(&text);
+        assert!(text.contains("egress_org = \"AS64500\""), "{text}");
+        assert!(text.contains("incremental = \"04:15\""), "{text}");
+        assert!(!text.contains("@gone"), "deleted entry survived:\n{text}");
+        assert!(
+            !text.contains("mount_uuid"),
+            "cleared Option survived:\n{text}"
+        );
+        assert!(!text.contains("# Generated by btrdasd setup"), "{text}");
+        let back = Config::from_toml(&text).unwrap();
+        assert_eq!(back.to_toml().unwrap(), cfg.to_toml().unwrap());
+        // The unknown key of `@` stayed with `@`, not with a neighbour.
+        let entry_at = text.find("name = \"@\"").unwrap();
+        let future = text.find("future_entry").unwrap();
+        let new_at = text.find("name = \"@new\"").unwrap();
+        assert!(entry_at < future && future < new_at, "{text}");
+        // A section the operator omitted, its defaults unchanged, stays omitted.
+        assert!(
+            !text.contains("[das]") && !text.contains("[boot]"),
+            "{text}"
+        );
+    }
+
+    /// Save `edit` of `file` through a real file; the text written.
+    fn saved_after(file: &str, edit: impl FnOnce(&mut Config)) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, file).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        edit(&mut cfg);
+        cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            Config::from_toml(&text).unwrap().to_toml().unwrap(),
+            cfg.to_toml().unwrap(),
+            "the saved file must read back as the config saved:\n{text}"
+        );
+        text
+    }
+
+    #[test]
+    fn save_leaves_an_unchanged_value_in_the_operators_spelling() {
+        let file = minimal_toml(
+            "[subvolumes]\n\
+             exclude = [\n    \"@cache\",  # scratch\n    \"@old\",\n]\n\
+             [[source]]\nlabel = \"s\"\nvolume = '/vol'\ndevice = \"/dev/sda\"\n\
+             subvolumes = [\"@\", {name = \"@home\", future_inline = 1}]\n",
+        );
+        // An unrelated change; everything above is untouched.
+        let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        assert!(text.contains("volume = '/vol'"), "{text}");
+        assert!(text.contains("\"@cache\",  # scratch"), "{text}");
+        assert!(
+            text.contains("subvolumes = [\"@\", {name = \"@home\", future_inline = 1}]"),
+            "{text}"
+        );
+        assert_eq!(text, file.replace("Sun 04:00", "Sat 05:00"));
+    }
+
+    #[test]
+    fn save_edits_inline_subvolume_entries_in_place() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             subvolumes = [\"@\", {name = \"@home\", future_inline = 1}, \"@srv\"]\n",
+        );
+        let text = saved_after(&file, |c| {
+            let subs = &mut c.sources[0].subvolumes;
+            subs[0].manual_only = true;
+            subs[1].retired = Some("2026-10-30".into());
+            subs.push(SubvolConfig {
+                name: "@new".into(),
+                ..Default::default()
+            });
+        });
+        let line = text.lines().find(|l| l.starts_with("subvolumes")).unwrap();
+        // The changed bare string became a table; its unchanged neighbour did
+        // not; the inline table kept its unknown key.
+        assert!(line.contains("name = \"@\", manual_only = true"), "{line}");
+        assert!(line.contains("future_inline = 1"), "{line}");
+        assert!(line.contains("retired = \"2026-10-30\""), "{line}");
+        assert!(line.contains(", \"@srv\","), "{line}");
+        assert!(line.contains("name = \"@new\""), "{line}");
+    }
+
+    #[test]
+    fn save_keeps_each_elements_unknown_keys_when_elements_move() {
+        let two = "[[target]]\nlabel = \"a\"\nserials = [\"SERIAL01\"]\nmount = \"/mnt/a\"\n\
+                   role = \"primary\"\nfuture = \"of a\"\n[target.retention]\ndaily = 7\n\
+                   # Comment above b.\n\
+                   [[target]]\nlabel = \"b\"\nserials = [\"SERIAL02\"]\nmount = \"/mnt/b\"\n\
+                   role = \"mirror\"\nfuture = \"of b\"\n[target.retention]\ndaily = 3\n";
+        let text = saved_after(&minimal_toml(two), |c| c.targets.swap(0, 1));
+        let back = Config::from_toml(&text).unwrap();
+        assert_eq!(back.targets[0].label, "b", "{text}");
+        let (b, a) = (
+            text.find("label = \"b\"").unwrap(),
+            text.find("label = \"a\"").unwrap(),
+        );
+        let (of_b, of_a) = (text.find("of b").unwrap(), text.find("of a").unwrap());
+        let comment = text.find("# Comment above b.").unwrap();
+        assert!(comment < b && b < of_b && of_b < a && a < of_a, "{text}");
+        assert!(text.contains("daily = 3"), "{text}");
+    }
+
+    #[test]
+    fn save_leaves_the_files_layout_alone_when_nothing_moved() {
+        // Sections out of document order (a sub-table after a later section):
+        // only a reorder may rewrite the layout.
+        let file = minimal_toml(
+            "[future]\na = 1\n[restore]\nallowed_roots = [\"/home\"]\n[future.sub]\nb = 2\n",
+        );
+        let text = saved_after(&file, |c| c.restore.allowed_roots = vec!["/tmp".into()]);
+        assert_eq!(text, file.replace("[\"/home\"]", "[\"/tmp\"]"));
+    }
+
+    #[test]
+    fn save_writes_added_and_emptied_arrays_of_tables() {
+        let file = minimal_toml(&format!(
+            "{}{ONE_TARGET}",
+            source_with("s", "/vol", &[("@", None), ("@home", Some("home"))])
+        ));
+        let text = saved_after(&file, |c| {
+            c.sources[0].subvolumes.clear();
+            let mut added = c.sources[0].clone();
+            added.label = "added".into();
+            added.subvolumes = vec![SubvolConfig {
+                name: "@x".into(),
+                ..Default::default()
+            }];
+            c.sources.push(added);
+            let mut t = c.targets[0].clone();
+            t.label = "t2".into();
+            t.mount = "/mnt/t2".into();
+            c.targets.push(t);
+        });
+        assert!(text.contains("subvolumes = []"), "{text}");
+        assert!(
+            text.contains("[[source.subvolumes]]\nname = \"@x\""),
+            "{text}"
+        );
+        // A new element's tables are written as sections, as a fresh file's are.
+        assert_eq!(text.matches("[target.retention]\n").count(), 2, "{text}");
+        let back = Config::from_toml(&text).unwrap();
+        assert_eq!(back.sources.len(), 2);
+        assert_eq!(back.targets[1].label, "t2");
+    }
+
+    #[test]
+    fn save_removes_a_deleted_element_with_everything_in_it() {
+        let text = saved_after(OPERATOR_FILE, |c| c.targets.clear());
+        assert!(!text.contains("future_target"), "{text}");
+        assert!(!text.contains("[[target]]"), "{text}");
+        assert!(text.contains("future_source = true"), "{text}");
+    }
+
+    /// The read-back check: a kept legacy `serial` (known, never written) would
+    /// override clearing `serials` — refused, the file as it was.
+    #[test]
+    fn save_refuses_an_edit_that_would_not_read_back_as_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let file = minimal_toml(ONE_TARGET);
+        std::fs::write(&path, &file).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        cfg.targets[0].serials.clear();
+        cfg.targets[0].serial.clear();
+        let err = cfg.save(&path).unwrap_err().to_string();
+        assert!(err.contains("would not read back"), "{err}");
+        assert_eq!(err.matches(&path.display().to_string()).count(), 1, "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
     }
 }

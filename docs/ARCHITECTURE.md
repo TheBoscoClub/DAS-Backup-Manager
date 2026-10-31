@@ -99,7 +99,7 @@ The system has six major components:
          ├──▶ singleton lock (/run/das-backup.lock: held → skip, exit 0; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
          │                                   (one already mounted, as fstab mounts a data volume, is used as found)
-         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, rewrites config.toml when the plan changes it, and btrbk.conf whenever it differs from what config.toml renders to
+         ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, edits config.toml in place when the plan changes it (unknown keys and comments kept), and btrbk.conf whenever it differs from what config.toml renders to
          │                                   (then: reload config, verify_sources_before_write() again for any source sync added;
          │                                    under --dryrun nothing is written and btrbk reads a temporary rendered btrbk.conf instead)
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
@@ -381,6 +381,8 @@ Three triggers keep the FTS5 index consistent:
 ## Installer Architecture
 
 ### Config-Driven Design
+
+`Config::save` is the one writer of `config.toml`. It edits an existing file in place with `toml_edit` — only the values the new `Config` changes, entries of `[[source]]` / `[[target]]` / subvolume arrays matched by `label` / `name` — so comments and keys this version does not know survive; a missing file is written fresh, an unreadable one refused unchanged, and the result must read back as exactly the `Config` saved (bd DAS-Backup-Manager-28il).
 
 The installer uses a TOML configuration file (`/etc/das-backup/config.toml`) as the single source of truth:
 

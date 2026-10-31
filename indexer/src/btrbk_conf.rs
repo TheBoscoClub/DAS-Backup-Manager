@@ -1313,8 +1313,13 @@ enabled = false
         let cfg = saveable_config(dir.path());
         let config_path = dir.path().join("config.toml");
         let conf_path = dir.path().join("btrbk.conf");
-        for (path, mode) in [(&config_path, 0o600), (&conf_path, 0o640)] {
-            std::fs::write(path, "old").unwrap();
+        // config.toml is edited, so it must already be a config.
+        let old_config = cfg.to_toml().unwrap();
+        for (path, mode, old) in [
+            (&config_path, 0o600, old_config.as_str()),
+            (&conf_path, 0o640, "old"),
+        ] {
+            std::fs::write(path, old).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
         save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
@@ -1327,6 +1332,40 @@ enabled = false
             );
         }
         assert_ne!(std::fs::read_to_string(&conf_path).unwrap(), "old");
+    }
+
+    /// The helper's ConfigSet / SubvolAdd and the CLI's subvol commands save
+    /// here: keys this binary does not know, and comments, survive (bd
+    /// DAS-Backup-Manager-28il).
+    #[test]
+    fn save_keeps_unknown_keys_and_comments_in_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        let file = format!(
+            "# operator note\nfuture_top = 1\n{}",
+            cfg.to_toml().unwrap()
+        )
+        .replacen(
+            "[[target]]\n",
+            "[[target]]\nfuture_target = \"x\" # why\n",
+            1,
+        );
+        std::fs::write(&config_path, &file).unwrap();
+        cfg.schedule.incremental = "05:55".into();
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        for kept in [
+            "# operator note",
+            "future_top = 1",
+            "future_target = \"x\" # why",
+        ] {
+            assert!(text.contains(kept), "lost {kept:?}:\n{text}");
+        }
+        assert_eq!(
+            Config::from_toml(&text).unwrap().schedule.incremental,
+            "05:55"
+        );
     }
 
     fn with_btrbk_conf(path: &str) -> Config {

@@ -1047,6 +1047,39 @@ mod tests {
         assert_eq!(rig.saved_names(), ["@srv"]);
     }
 
+    /// Expiry's removal edits config.toml: the removed entry goes, the
+    /// operator's comments and keys this binary does not know stay (bd
+    /// DAS-Backup-Manager-28il).
+    #[test]
+    fn removing_an_entry_keeps_unknown_keys_and_comments() {
+        let rig = rig();
+        let written = std::fs::read_to_string(&rig.config_path).unwrap();
+        let hand = format!("# operator: hand-edited\nfuture_top = 1\n{written}").replacen(
+            "[[source]]\n",
+            "[[source]]\nfuture_source = \"kept\" # why\n",
+            1,
+        );
+        assert_ne!(
+            hand,
+            format!("# operator: hand-edited\nfuture_top = 1\n{written}")
+        );
+        std::fs::write(&rig.config_path, &hand).unwrap();
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&big]);
+        let out = expire_retired(&rig.config_path, false, "2028-01-01", &runner, &mounted).unwrap();
+        assert!(out.entries[0].removed_from_config);
+        assert_eq!(out.config_error, None);
+        assert_eq!(rig.saved_names(), ["@srv"]);
+        let text = std::fs::read_to_string(&rig.config_path).unwrap();
+        for kept in [
+            "# operator: hand-edited",
+            "future_top = 1",
+            "future_source = \"kept\" # why",
+        ] {
+            assert!(text.contains(kept), "lost {kept:?}:\n{text}");
+        }
+    }
+
     #[test]
     fn entry_is_kept_while_any_location_is_unreachable() {
         let rig = rig();

@@ -2983,6 +2983,69 @@ auth = "starttls""#,
         );
     }
 
+    /// Hand-edited config text: a comment and a key this binary does not know
+    /// prepended to what `config` saves to a fresh file (bd 28il).
+    fn hand_edited(config: &Config, config_path: &Path) -> String {
+        config.save(config_path).unwrap();
+        let hand = format!(
+            "# operator note\nfuture_top = \"kept\" # why\n{}",
+            std::fs::read_to_string(config_path).unwrap()
+        );
+        std::fs::write(config_path, &hand).unwrap();
+        hand
+    }
+
+    /// `setup --upgrade` stamps the version into config.toml by editing it:
+    /// the operator's comments and keys a newer version wrote survive (bd
+    /// DAS-Backup-Manager-28il).
+    #[test]
+    fn upgrade_stamps_the_version_and_keeps_unknown_keys_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.general.version = "0.0.1".to_string();
+        config.email.enabled = false;
+        hand_edited(&config, &config_path);
+
+        let (result, _) = run_prepare_upgrade(&config_path, false);
+
+        result.unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            text.starts_with("# operator note\nfuture_top = \"kept\" # why\n"),
+            "{text}"
+        );
+        assert_eq!(
+            Config::from_toml(&text).unwrap().general.version,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    /// The install step saves the wizard's config onto the existing file the
+    /// same way.
+    #[test]
+    fn install_keeps_unknown_keys_and_comments_in_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("etc/das-backup/config.toml");
+        let manifest_path = dir.path().join("etc/das-backup/.manifest");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let mut config = Config::default();
+        hand_edited(&config, &config_path);
+        config.schedule.incremental = "05:55".into();
+
+        install_to_prefix(&config, dir.path(), &config_path, &manifest_path).unwrap();
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            text.starts_with("# operator note\nfuture_top = \"kept\" # why\n"),
+            "{text}"
+        );
+        assert_eq!(
+            Config::from_toml(&text).unwrap().schedule.incremental,
+            "05:55"
+        );
+    }
+
     #[test]
     fn upgrade_saves_a_migration_even_when_the_version_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();

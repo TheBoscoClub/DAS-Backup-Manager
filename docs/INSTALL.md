@@ -129,7 +129,7 @@ sudo btrdasd setup --upgrade
 
 Regenerates all files from the existing config without re-running the wizard, then restarts the D-Bus helper (`btrdasd-helper.service`) so it runs the binary just installed — it runs as root for as long as the system does, and nothing else restarts it. Use this after updating the binaries (`cmake --install` or a package).
 
-- **Nothing is written while a backup runs.** The upgrade takes both locks (above) before it rewrites `config.toml`, and holds them through every file it writes and the helper restart. A backup holds `/run/das-backup.lock` from its start, also while it still waits for the maintenance lock. The scripts themselves are safe to replace (setup renames a whole new file over each, and they end with `main "$@"; exit $?`), but a run that has started would call the new sibling scripts, units and `btrdasd` for its later steps — so the upgrade waits for a moment when no backup or maintenance job holds either lock. Either lock held: exit **75**, nothing written.
+- **Nothing is written while a backup runs.** The upgrade takes both locks (above) before it edits `config.toml` (the version stamp and any migration; your comments and keys it does not know stay), and holds them through every file it writes and the helper restart. A backup holds `/run/das-backup.lock` from its start, also while it still waits for the maintenance lock. The scripts themselves are safe to replace (setup renames a whole new file over each, and they end with `main "$@"; exit $?`), but a run that has started would call the new sibling scripts, units and `btrdasd` for its later steps — so the upgrade waits for a moment when no backup or maintenance job holds either lock. Either lock held: exit **75**, nothing written.
 - **The helper restart, under those locks.** No job in the helper is mounting a target the restart would kill — each holds the maintenance lock while it does. A backup asked of the GUI meanwhile finds `/run/das-backup.lock` held and is declined; a restore or index job waits for the maintenance lock — in the new helper, until the upgrade lets go. One that is already waiting in the **old** helper is cancelled when the restart stops it (the helper cancels every job as it stops) and ends without a `JobFinished` signal, so the GUI is never told it ended (bd `DAS-Backup-Manager-hoh`). The hold through the restart is bounded at 300 s: a `try-restart` that has not returned by then is reported as failed and the locks let go.
 - **The backup units older versions installed are removed.** Until bd `DAS-Backup-Manager-7rf`, `cmake --install` and the packages also installed `das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system`; systemd ran them whenever setup's own units in `/etc/systemd/system` were gone (after `setup --uninstall`, for one), and they skipped a run silently when no USB disk was attached and killed one after six hours. Before regenerating, the upgrade removes those four files from `/usr/lib/systemd/system` and `/usr/local/lib/systemd/system` — each only if its bytes are a version this project installed: a service's `ExecStart=` may name any install prefix, and nothing else may differ. Anything else at those paths is kept and named, for you to judge: an edited file, a link, a directory, a copy reached through a linked directory, a file replaced while it was being checked. A path it cannot read, or a file it cannot remove, ends the upgrade with an error, exit **1**, once everything else is done.
 - A restart that fails or does not return in time, or a unit state that cannot be read, ends the upgrade with an error, exit **1**.
@@ -362,7 +362,9 @@ A package puts the files in place and writes no `config.toml`: run `sudo btrdasd
 
 ## Configuration Reference
 
-The installer generates `/etc/das-backup/config.toml` with the following sections:
+The installer generates `/etc/das-backup/config.toml` with the following sections.
+
+**Your edits survive every save.** Everything that writes `config.toml` — setup, `--upgrade`, `subvol sync` and expiry on every backup run, the `subvol` commands and the GUI — edits the file in place: it changes only the values it means to change, adds or removes only the entries it means to, and leaves your comments, your formatting and every key it does not know exactly as they are. A key added by hand before the version that reads it is installed (or kept after a downgrade) is therefore never erased by an older `btrdasd`. A file that is present but cannot be read as a configuration (not TOML, not a config this version understands, unreadable) is refused, unchanged, with an error naming it; only a missing file is written fresh.
 
 ### `[general]`
 
@@ -521,7 +523,7 @@ itself travels by email (`--email`) and the journal report, not by the exit code
 
 **Removed section**: `[esp]` (enabled, mirror, partitions, mount_points, hooks.enabled,
 hooks.type) — ESP/boot partition mirroring is no longer part of the project. Old `config.toml` files with a leftover `[esp]` section
-are silently ignored by serde on load.
+load as before: the section is ignored, and kept in the file by every save.
 
 ### `[email]`
 

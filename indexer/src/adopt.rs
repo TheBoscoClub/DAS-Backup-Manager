@@ -1972,6 +1972,42 @@ mod tests {
         );
     }
 
+    /// The 2026-10-24 incident (bd DAS-Backup-Manager-28il): the nightly sync's
+    /// adoption saved config.toml whole, and keys the running binary did not
+    /// know — a newer version's `[recovery_os]` settings — were erased. Now
+    /// they, and the operator's comments, survive an adoption and a retirement.
+    #[test]
+    fn sync_keeps_keys_this_binary_does_not_know_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[recovery_os]\n"), "{written}");
+        let hand = format!("# operator: hand-edited\n{written}").replacen(
+            "[recovery_os]\n",
+            "[recovery_os]\n\
+             future_egress = \"AS64500\" # set before installing the version that reads it\n",
+            1,
+        );
+        std::fs::write(&path, &hand).unwrap();
+        // @srv/web appeared (adopted); @opt is gone (retired).
+        let r = scripted(vec![healthy("/ssd", "abc", &["@srv", "@srv/web"])]);
+        let out = sync_subvolumes(&path, false, "2026-10-02", &r, &mounted).unwrap();
+        assert!(out.written && !out.failed(), "{:?}", out.write_error);
+        let text = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# operator: hand-edited",
+            "future_egress = \"AS64500\" # set before installing the version that reads it",
+        ] {
+            assert!(text.contains(kept), "lost {kept:?}:\n{text}");
+        }
+        let saved = Config::load(&path).unwrap();
+        let subs = &saved.sources[0].subvolumes;
+        let web = subs.iter().find(|s| s.name == "@srv/web").unwrap();
+        assert_eq!(web.adopted.as_deref(), Some("2026-10-02"));
+        let opt = subs.iter().find(|s| s.name == "@opt").unwrap();
+        assert_eq!(opt.retired.as_deref(), Some("2026-10-02"));
+    }
+
     #[test]
     fn sync_touches_nothing_when_nothing_changed_or_on_a_dry_run() {
         let dir = tempfile::tempdir().unwrap();
