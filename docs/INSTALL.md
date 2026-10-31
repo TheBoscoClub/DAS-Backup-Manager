@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Installation Guide
 
-**Version**: 0.7.23.1
+**Version**: 0.7.23.2
 
 ## Before You Begin
 
@@ -249,7 +249,7 @@ match your volumes and drives; every other key is in the
 <!-- tests/test_install_doc_config.sh validates the block below with the btrdasd the build makes -->
 ```toml
 [general]
-version = "0.7.23"                   # what `btrdasd --version` prints
+version = "0.7.23"                   # the crate's three-part version (`btrdasd --version` prints all four parts)
 install_prefix = "/usr"              # the prefix btrdasd is installed under
 db_path = "/var/lib/das-backup/backup-index.db"
 

@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.7.23.1
+**Version**: 0.7.23.2
 
 ## 1. Rust Crate Dependencies
 
@@ -16,13 +16,14 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 | `walkdir` | 2.5.0 | Recursive directory traversal for snapshot indexing | Unlicense / MIT |
 | `regex` | 1.13.1 | Pattern matching for snapshot path filtering | MIT / Apache-2.0 |
 | `serde` | 1.0.229 | Serialization/deserialization framework with `derive` feature for TOML config | MIT / Apache-2.0 |
-| `toml` | 1.1.6 | TOML parser and serializer for installer configuration | MIT / Apache-2.0 |
+| `toml` | 1.1.8 | TOML parser and serializer for installer configuration (`preserve_order` feature: written keys keep the struct's order) | MIT / Apache-2.0 |
+| `toml_edit` | 0.25.17 | Edits `config.toml` in place, so keys this version does not know and the operator's comments survive every save | MIT / Apache-2.0 |
 | `dialoguer` | 0.12.0 | Interactive terminal prompts with `fuzzy-select` feature for setup wizard | MIT |
 | `console` | 0.16.6 | Terminal styling and interaction (used by dialoguer) | MIT |
-| `libc` | 0.2.189 | Low-level C bindings for `geteuid()` root detection in setup module | MIT / Apache-2.0 |
-| `serde_json` | 1.0.151 | JSON parsing for `lsblk --json` output in system detection and for SMART/health readings and the scrub state file | MIT / Apache-2.0 |
+| `libc` | 0.2.191 | Low-level C bindings for `geteuid()` root detection in setup module | MIT / Apache-2.0 |
+| `serde_json` | 1.0.154 | JSON parsing for `lsblk --json` output in system detection and for SMART/health readings and the scrub state file | MIT / Apache-2.0 |
 | `clap_complete` | 4.6.11 | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
-| `tokio` | 1.53.1 | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation (optional, `dbus` feature) | MIT |
+| `tokio` | 1.54.1 | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation (optional, `dbus` feature) | MIT |
 | `zbus` | 5.19.0 | D-Bus implementation for `btrdasd-helper` system bus daemon (optional, `dbus` feature) | MIT |
 
 ### Dev Dependencies (test only)
@@ -40,7 +41,7 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 | `clap_derive` | 4.6.7 | Proc-macro backend for clap derive API |
 | `regex-automata` | 0.4.16 | DFA/NFA engine underlying the `regex` crate |
 | `aho-corasick` | 1.1.4 | Multi-pattern string search used by `regex` |
-| `toml_edit` | 0.23.10 | TOML document model underlying the `toml` crate |
+| `toml_edit` | 0.23.10 | TOML document model underlying the `toml` crate (a second, older copy beside the direct 0.25 dependency) |
 | `serde_derive` | 1.0.229 | Proc-macro for `#[derive(Serialize, Deserialize)]` |
 
 ---

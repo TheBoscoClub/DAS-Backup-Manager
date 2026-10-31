@@ -2,7 +2,7 @@
 
 [![CodeFactor](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager/badge)](https://www.codefactor.io/repository/github/theboscoclub/DAS-Backup-Manager)
 
-**Version**: 0.7.23.1
+**Version**: 0.7.23.2
 
 DAS backup manager with btrbk integration, SQLite FTS5 content indexing, KDE Plasma GUI with full backup management, D-Bus privilege escalation, and an interactive installer for the full backup pipeline.
 
@@ -33,7 +33,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
 - **Auto-Mount/Unmount** — RAII `MountGuard` finds each target by its `mount_uuid` or drive serial (the same rule as `backup-run.sh`), auto-mounts BTRFS partitions before operations, and unmounts on completion, retrying a busy target; one it cannot release fails the operation with `still mounted: <path>` (all D-Bus methods and CLI commands)
 - **Targets Hidden From Desktop Automount** — a generated udev rule marks every backup target as ignored by udisks2, so nothing mounts it under `/run/media`; only the backup run and `btrdasd` mount targets (`btrdasd setup --check` reads back whether each attached target carries the flag)
-- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 25 methods for backup, restore, config, schedule, health, index read and recovery-OS update operations
+- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 27 methods for backup, restore, config, schedule, health, index read and recovery-OS update operations
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 full backup management application with sidebar navigation, Dolphin-style file browser, backup operations, health dashboard, config editor, desktop notifications, and system tray
 - **USB SMART Passthrough** — Health queries use `-d sat` for USB-attached DAS drives to read SMART data through USB-SATA bridges
 - **Interactive Installer** (`btrdasd setup`) — 9-step wizard with 5 modes: install, modify, upgrade, uninstall, check

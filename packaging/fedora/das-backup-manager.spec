@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.23.1
+Version:        0.7.23.2
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -63,6 +63,11 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Sat Oct 31 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.2-1
+- Recovery-drive update: a NIC with no carrier gets one host-side link toggle before egress
+- config.toml is edited in place: unknown keys and comments survive every save; backup-scoping keys pinned
+- GUI config editor shows and saves the real file; unknown keys are warned about with a nearest-key hint
+
 * Thu Oct 22 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.1-1
 - Packaging: Debian control has one Suggests field; the spec lists btrdasd-gui.notifyrc
 - Release workflow frees runner disk before the Flatpak build

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.7.23.2] - 2026-10-31
+
+### Added
+
 - **`[recovery_os].install_user`** — the account a rebuilt recovery OS gets; `recovery-os-install.sh` takes it as `DAS_INSTALL_USER` (and `DAS_INSTALL_UID`, default 1000) and refuses, before any change, when it is unset, not a POSIX user name, or `root`; `recovery-os-vm.sh provision` refuses before touching a drive when it is unset (bd `DAS-Backup-Manager-yi8m`)
 - **Installation-local recovery documents** — `provision` carries the regular `*.md` files in `/etc/das-backup/docs/` (beside `config.toml`) to the recovery drive and points the Desktop links at them, else at the generic copies under `/usr/share/das-backup/docs`; symlinks and other non-regular files are refused (bd `DAS-Backup-Manager-yi8m`)
 - **`tests/test_usb_link.sh`** (ctest `shell-usb-link`) — the throughput log's USB link check with and without `[das].model_pattern`
@@ -44,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The header of a fresh `config.toml` no longer says "do not edit"** — it reads `# Written by btrdasd setup. Your edits and comments are kept when btrdasd saves this file.` (bd `DAS-Backup-Manager-m0pr.1`)
 - **An unattended recovery-drive update no longer waits out a dead link at the egress step** (bd `DAS-Backup-Manager-z9zf`) — the recovery OS's NIC sometimes never got a carrier (drive A, 2026-10-30: NetworkManager held `enp1s0` `unavailable` for 131 s while the host's bridge port forwarded), so the egress check waited its 120 s and the update stopped at exit 7. `recovery-os-vm.sh` (2.2.3) now watches the guest's carriers before the egress step; a NIC that has been there `DAS_RECOVERY_VM_CARRIER_SECS` (default 20) with none gets its link toggled from the host once (`virsh domif-setlink … down`, then `up`), said in the log. The egress step still judges, so a network that never comes still stops the update there
 - **The mutation gate no longer fails a run over words in a mutant's own diff or test output** — rule 1b (resource exhaustion) matched bare `out of memory` anywhere in a mutant log, including the mutated source and a test's fixture text. `.github/scripts/mutants-gate.py` is re-installed from `~/.claude/templates/mutants-gate.py`: it skips the mutation-diff section and matches the toolchain's own messages (`LLVM ERROR: out of memory`, `StorageFull`). `~/.claude/tests/test-mutants-gate.sh` against this copy: 28/30 before, 30/30 after (cachyos-sentinel bd `tn62`)
+- **A failed unmutated baseline fails the mutation gate** — when `cargo test` fails on cargo-mutants' own copy of the crate, cargo-mutants 27.1.0 writes `total_mutants=0`, and `--allow-zero-total` passed such a run as "nothing in scope". `.github/scripts/mutants-gate.py` is re-installed from the template with rule 1c: a baseline outcome other than `Success` fails the run, flag or not, naming the baseline. Not exposed here before (`mutants.yml` never passes the flag), now explicit; the gate's suite against this copy: 34/34, the previous copy 32/34 (bd `DAS-Backup-Manager-7ljd`)
 - **`btrdasd restore file` and `restore snapshot` exit 3 when anything failed to restore** — they printed `FAILED: Restored 4/5 files …, 1 error(s)` and each `ERROR:` line, then exited 0, so a script or operator checking the exit status read a partial restore as complete (`--json` printed only an error count, also exit 0). A restore that began and reported any error now exits 3, the house rule (0 clean, 3 began and something failed, 1 could not start, 75 deferred); the errors are still listed. The GUI was already right (found by a restore proof from the recovery drives, bd `DAS-Backup-Manager-hlj4`)
 - **`restore file` restores a symlink whose target lies outside the snapshot** — the containment check resolved the member itself, following its final link, so an absolute link whose target exists on the host (`.claude/x.md -> /home/user/.claude/x.md`) was refused `Path traversal blocked` while a dangling one was restored. The check now resolves the member's parent: a link is recreated from `read_link` and its target never read, and a member reached through a linked directory leading out of the snapshot is still refused. Both restore paths now restore links verbatim (bd `DAS-Backup-Manager-5ln`)
 
@@ -1452,7 +1461,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.1...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.2...HEAD
+[0.7.23.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.1...v0.7.23.2
 [0.7.23.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.0...v0.7.23.1
 [0.7.23.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.3...v0.7.23.0
 [0.7.22.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.2...v0.7.22.3

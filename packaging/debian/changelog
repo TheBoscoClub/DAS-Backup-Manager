@@ -1,3 +1,11 @@
+das-backup-manager (0.7.23.2-1) unstable; urgency=medium
+
+  * Recovery-drive update: a NIC with no carrier gets one host-side link toggle before egress
+  * config.toml is edited in place: unknown keys and comments survive every save; backup-scoping keys pinned
+  * GUI config editor shows and saves the real file; unknown keys are warned about with a nearest-key hint
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sat, 31 Oct 2026 12:42:55 -0500
+
 das-backup-manager (0.7.23.1-1) unstable; urgency=medium
 
   * Packaging: Debian control has one Suggests field; the Fedora spec lists btrdasd-gui.notifyrc
