@@ -60,11 +60,13 @@ PanelConfig parsePanelConfig(const QString &toml)
 
         const QString key = line.left(eqPos).trimmed();
         QString value = line.mid(eqPos + 1).trimmed();
-        // Strip surrounding quotes
-        if (value.length() >= 2
-            && value.startsWith(QLatin1Char('"'))
-            && value.endsWith(QLatin1Char('"'))) {
-            value = value.mid(1, value.length() - 2);
+        // Strip surrounding quotes: a basic string "x" or a literal string 'x'
+        // (ConfigGet returns the file as written, so either can arrive).
+        for (const QChar quote : {QLatin1Char('"'), QLatin1Char('\'')}) {
+            if (value.length() >= 2 && value.startsWith(quote) && value.endsWith(quote)) {
+                value = value.mid(1, value.length() - 2);
+                break;
+            }
         }
 
         switch (currentSection) {

@@ -2704,8 +2704,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let mut cfg = Config::load(&config)?;
                 schedule::set_schedule(&mut cfg, incremental.as_deref(), full.as_deref(), delay)?;
-                let toml = cfg.to_toml()?;
-                std::fs::write(&config, toml)?;
+                // Edited in place like every other save: comments and keys
+                // this version does not know stay (bd DAS-Backup-Manager-28il).
+                cfg.save(&config)?;
                 println!("Schedule updated. Config written to {}", config.display());
             }
             ScheduleAction::Enable { config } => {

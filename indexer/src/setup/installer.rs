@@ -807,10 +807,15 @@ fn relay_reachable(config: &Config) -> bool {
 /// Rewrite settings that a new binary would otherwise misread from an
 /// old-but-valid `config.toml`.
 ///
-/// The live config is preserved across upgrades, so a compiled default change
-/// alone never reaches an existing host — it only affects fresh installs. Any
-/// setting whose *meaning* changes between releases has to be migrated here or
-/// the upgraded host silently keeps the old behaviour.
+/// The live config is preserved across upgrades, and every save edits it in
+/// place (bd DAS-Backup-Manager-28il). A key the file leaves out takes the
+/// running binary's compiled default, so a default change reaches an existing
+/// host for such a key — except the keys that decide what is backed up, where
+/// and for how long (`surgical::PINNED` in `config.rs`): every save writes
+/// those out with their current values, so a default change to one of them
+/// affects only fresh installs. Any setting whose *meaning* changes between
+/// releases has to be migrated here or the upgraded host silently keeps the
+/// old behaviour.
 ///
 /// Returns the human-readable list of changes applied (empty when nothing
 /// needed changing). Idempotent: running it twice changes nothing the second

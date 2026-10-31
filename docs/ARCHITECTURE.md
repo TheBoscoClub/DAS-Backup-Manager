@@ -382,7 +382,7 @@ Three triggers keep the FTS5 index consistent:
 
 ### Config-Driven Design
 
-`Config::save` is the one writer of `config.toml`. It edits an existing file in place with `toml_edit` — only the values the new `Config` changes, entries of `[[source]]` / `[[target]]` / subvolume arrays matched by `label` / `name` — so comments and keys this version does not know survive; a missing file is written fresh, an unreadable one refused unchanged, and the result must read back as exactly the `Config` saved (bd DAS-Backup-Manager-28il).
+`Config::save` (a `Config`) and `Config::save_text` (the GUI editor's whole text, via the helper's `ConfigSet`) are the only writers of `config.toml`; both go through `Config::edited_into`, which edits the file with `toml_edit` — only the values the new `Config` changes, array elements matched on unchanged content, then `label` / `name` — so comments and keys this version does not know survive. It also writes out the backup-scoping keys the file leaves out (`surgical::PINNED`: what is backed up, where, for how long). A missing file is written fresh, an unreadable one refused unchanged, and the result must read back as exactly the `Config` saved. `ConfigGet` returns the file's text as it is. The one `config.toml` written whole is a recovery drive's, regenerated from the host's at each boot by `das-recovery-state-sync.sh` (bd DAS-Backup-Manager-28il).
 
 The installer uses a TOML configuration file (`/etc/das-backup/config.toml`) as the single source of truth:
 

@@ -78,6 +78,20 @@ fn subvol_add_and_remove_regenerate_btrbk_conf() {
         std::fs::read_to_string(&config).unwrap()
     );
     std::fs::write(&config, &hand).unwrap();
+    // A save that changes nothing writes in the backup-scoping keys the file
+    // leaves out (and nothing else); that is the baseline the add and the
+    // remove below must return to.
+    let out = btrdasd(&["schedule", "set", "--config", config_s]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let baseline = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        baseline.starts_with(&hand[..hand.find("[[source]]").unwrap()]),
+        "{baseline}"
+    );
 
     let out = btrdasd(&["subvol", "add", "s", "@home", "--config", config_s]);
     assert!(
@@ -105,8 +119,53 @@ fn subvol_add_and_remove_regenerate_btrbk_conf() {
     );
     let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
     assert!(!conf.contains("@home"), "{conf}");
-    // Added, then removed: the operator's file is back as they wrote it.
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), hand);
+    // Added, then removed: the operator's file is back as it was.
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), baseline);
+}
+
+/// `btrdasd schedule set` wrote `to_toml()` over the file with `fs::write`:
+/// every comment and unknown key gone, and not in one step (bd
+/// DAS-Backup-Manager-28il). It saves through `Config::save` now.
+#[test]
+fn schedule_set_keeps_unknown_keys_and_comments() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let config_s = config.to_str().unwrap();
+    let hand = format!(
+        "# operator note\nfuture_top = \"kept\" # why\n{}",
+        std::fs::read_to_string(&config).unwrap()
+    )
+    .replacen("[schedule]\n", "[schedule]\nfuture_schedule = 1\n", 1);
+    std::fs::write(&config, &hand).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let out = btrdasd(&[
+        "schedule",
+        "set",
+        "--incremental",
+        "05:55",
+        "--config",
+        config_s,
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(&config).unwrap();
+    for kept in [
+        "# operator note",
+        "future_top = \"kept\" # why",
+        "future_schedule = 1",
+    ] {
+        assert!(saved.contains(kept), "lost {kept:?}:\n{saved}");
+    }
+    assert!(saved.contains("incremental = \"05:55\""), "{saved}");
+    assert_eq!(
+        std::fs::metadata(&config).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
 }
 
 #[test]

@@ -348,6 +348,18 @@ pub fn save_config_and_btrbk_conf(
     save_config_and_btrbk_conf_with(cfg, config_path, &|cfg, path| cfg.save(path))
 }
 
+/// [`save_config_and_btrbk_conf`] for a whole `config.toml` as typed (the
+/// GUI's editor, the helper's `ConfigSet`): `text` must load and validate;
+/// btrbk.conf is rendered from what it loads to, and `text` itself is written
+/// by [`Config::save_text`], so its comments and unknown keys are kept.
+pub fn save_config_text_and_btrbk_conf(
+    text: &str,
+    config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = Config::from_toml(text)?;
+    save_config_and_btrbk_conf_with(&cfg, config_path, &|_, path| Config::save_text(text, path))
+}
+
 type ConfigSaver<'a> = dyn Fn(&Config, &Path) -> Result<(), Box<dyn std::error::Error>> + 'a;
 
 /// `save_config_and_btrbk_conf` with the config save injectable, so a test can
@@ -1332,6 +1344,44 @@ enabled = false
             );
         }
         assert_ne!(std::fs::read_to_string(&conf_path).unwrap(), "old");
+    }
+
+    /// The GUI's editor (the helper's ConfigSet) saves the text the operator
+    /// typed: written as typed, comments and unknown keys included, and
+    /// btrbk.conf regenerated from it — or, refused, neither changed (bd
+    /// DAS-Backup-Manager-28il).
+    #[test]
+    fn save_text_writes_the_typed_text_and_the_btrbk_conf_it_renders_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        save_config_and_btrbk_conf(&cfg, &config_path).unwrap();
+        let typed = format!(
+            "# typed in the editor\nfuture_top = 1 # why\n{}",
+            std::fs::read_to_string(&config_path).unwrap()
+        )
+        .replace("incremental = \"03:00\"", "incremental = \"05:55\" # later");
+        assert!(typed.contains("05:55"), "{typed}");
+        save_config_text_and_btrbk_conf(&typed, &config_path).unwrap();
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), typed);
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.schedule.incremental, "05:55");
+        let conf = std::fs::read_to_string(dir.path().join("btrbk.conf")).unwrap();
+        assert_eq!(conf, render_btrbk_conf(&reloaded).unwrap());
+
+        // Not valid: refused, neither file changed.
+        let before = files_at(dir.path());
+        let invalid = typed.replace("[[source]]", "[[source_typo]]");
+        assert!(save_config_text_and_btrbk_conf(&invalid, &config_path).is_err());
+        assert!(save_config_text_and_btrbk_conf("not [ toml", &config_path).is_err());
+        assert_eq!(files_at(dir.path()), before);
+    }
+
+    fn files_at(dir: &Path) -> (String, String) {
+        (
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            std::fs::read_to_string(dir.join("btrbk.conf")).unwrap(),
+        )
     }
 
     /// The helper's ConfigSet / SubvolAdd and the CLI's subvol commands save

@@ -269,6 +269,19 @@ fn save_config(config: &Config) -> Result<(), fdo::Error> {
         .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
 }
 
+/// [`save_config`] for the GUI editor's whole text: written as typed, its
+/// comments and unknown keys kept, and btrbk.conf regenerated from it.
+fn save_config_text(text: &str) -> Result<(), fdo::Error> {
+    btrbk_conf::save_config_text_and_btrbk_conf(text, Path::new(CANONICAL_CONFIG))
+        .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
+}
+
+/// What `ConfigGet` returns: the file's text as it is.
+fn config_text_at(path: &Path) -> Result<String, fdo::Error> {
+    std::fs::read_to_string(path)
+        .map_err(|e| fdo::Error::Failed(format!("Failed to read config '{}': {e}", path.display())))
+}
+
 /// Run a read-modify-write of `config.toml`/`btrbk.conf` under the backup
 /// singleton (`/run/das-backup.lock`), as setup and every backup run do, so a
 /// GUI edit cannot interleave with them and be lost or lose theirs (bd
@@ -1531,7 +1544,11 @@ impl HelperInterface {
 
     // ---- Synchronous methods ----
 
-    /// Get the raw TOML config as a string.
+    /// `config.toml` as it is on disk — comments, keys this version does not
+    /// know and all — so the GUI's editor shows, and saves back, the real
+    /// file (bd DAS-Backup-Manager-28il). It used to return a re-serialisation
+    /// of what this version loaded, and a save from the editor then wrote
+    /// that over the file.
     /// Uses config.read polkit action (allow_active=yes) so the GUI can load
     /// sources/targets on startup without prompting for admin credentials.
     async fn config_get(
@@ -1541,13 +1558,14 @@ impl HelperInterface {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.config.read").await?;
 
-        let config = load_config()?;
-        config
-            .to_toml()
-            .map_err(|e| fdo::Error::Failed(format!("Failed to serialize config: {e}")))
+        config_text_at(Path::new(CANONICAL_CONFIG))
     }
 
-    /// Write a TOML config string to disk (validates first).
+    /// Write a TOML config string to disk (validates first). The text is
+    /// written as submitted — comments and unknown keys included — by
+    /// `Config::save_text`, and btrbk.conf regenerated from it. A change
+    /// another writer made since the editor loaded the file is replaced (last
+    /// writer wins, bd DAS-Backup-Manager-lxw), as it was before.
     async fn config_set(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -1577,7 +1595,7 @@ impl HelperInterface {
             )
             .map_err(fdo::Error::Failed)?;
 
-            save_config(&config)
+            save_config_text(toml_content)
         })
     }
 
@@ -3368,11 +3386,16 @@ mod tests {
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
         // Built at run time so this test does not count itself.
         let save = format!("{}(&config)", "save_config");
+        let save_text = format!("{}(toml_content)", "save_config_text");
         let guarded = format!("{}(|| {{", "edit_config");
-        assert_eq!(body.matches(&save).count(), 5, "the five writing methods");
+        assert_eq!(body.matches(&save).count(), 4, "four writing methods");
+        assert_eq!(body.matches(&save_text).count(), 1, "and ConfigSet");
         assert_eq!(body.matches(&guarded).count(), 5);
         // Each save sits inside the edit_config closure that precedes it.
-        for (at, _) in body.match_indices(&save) {
+        let saves = body
+            .match_indices(&save)
+            .chain(body.match_indices(&save_text));
+        for (at, _) in saves {
             let opened = body[..at]
                 .rfind(&guarded)
                 .expect("a save outside edit_config");
@@ -3383,6 +3406,30 @@ mod tests {
                 &body[at.saturating_sub(200)..at]
             );
         }
+    }
+
+    /// The editor is shown the real file, so what it saves back keeps the
+    /// operator's comments and unknown keys (bd DAS-Backup-Manager-28il).
+    #[test]
+    fn config_get_returns_the_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = "# operator note\nfuture = 'x' # why\n[general]\nversion = '1'\n";
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(config_text_at(&path).unwrap(), text);
+        let missing = dir.path().join("missing.toml");
+        let err = config_text_at(&missing).unwrap_err();
+        assert!(matches!(err, fdo::Error::Failed(m) if m.contains("missing.toml")));
+        // ConfigGet reads it through here, not through a re-serialisation.
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let get = &body[body.find("async fn config_get(").unwrap()..];
+        let get = &get[..get.find("async fn config_set(").unwrap()];
+        assert!(
+            get.contains("config_text_at(Path::new(CANONICAL_CONFIG))"),
+            "{get}"
+        );
+        assert!(!get.contains(".to_toml()"), "{get}");
     }
 
     #[test]

@@ -694,6 +694,11 @@ impl Default for Config {
     }
 }
 
+/// The first lines of a `config.toml` written fresh. Saves edit the file in
+/// place, so what the operator writes in it stays (bd DAS-Backup-Manager-28il).
+pub const FRESH_HEADER: &str = "# Written by btrdasd setup. Your edits and comments are kept when btrdasd saves this file.\n\
+                                # After editing, run: sudo btrdasd setup --upgrade\n\n";
+
 // ---------------------------------------------------------------------------
 // Surgical edits of config.toml (bd DAS-Backup-Manager-28il)
 // ---------------------------------------------------------------------------
@@ -742,7 +747,18 @@ mod surgical {
                 doc.remove(key);
             }
         }
+        // A legacy key this binary reads but never writes goes when the key it
+        // feeds changes: kept, it is stale, and it may override the change.
+        for (legacy, fed) in LEGACY_KEYS {
+            if old.get(*fed) != new.get(*fed) {
+                doc.remove(legacy);
+            }
+        }
     }
+
+    /// `(legacy key, the key it feeds)`: read on load, never written. A
+    /// target's `serial` feeds `serials` (`TargetRaw`).
+    const LEGACY_KEYS: &[(&str, &str)] = &[("serial", "serials")];
 
     fn merge_item(item: &mut Item, ov: &toml::Value, nv: &toml::Value, reordered: &mut bool) {
         match (ov, nv) {
@@ -766,17 +782,45 @@ mod surgical {
         t.get("label").or_else(|| t.get("name"))?.as_str()
     }
 
-    /// For each element of `na`, the index of the `oa` element it continues.
+    /// For each element of `na`, the index of the `oa` element it continues:
+    /// first an element whose known content is unchanged (so a plain value
+    /// keeps its comment, and of two same-named entries the one removed is the
+    /// one whose content went), then the unused one of the same identity that
+    /// shares the most known values with it, the earlier on a tie.
+    /// Same-named entries whose known content is identical cannot be told
+    /// apart; the earlier ones are taken first.
     fn pick(oa: &[toml::Value], na: &[toml::Value]) -> Vec<Option<usize>> {
         let mut used = vec![false; oa.len()];
-        na.iter()
-            .map(|ne| {
-                let id = identity(ne)?;
-                let i = (0..oa.len()).find(|&i| !used[i] && identity(&oa[i]) == Some(id))?;
+        let mut picks = vec![None; na.len()];
+        for (j, ne) in na.iter().enumerate() {
+            if let Some(i) = (0..oa.len()).find(|&i| !used[i] && oa[i] == *ne) {
                 used[i] = true;
-                Some(i)
-            })
-            .collect()
+                picks[j] = Some(i);
+            }
+        }
+        for (j, ne) in na.iter().enumerate() {
+            let Some(id) = identity(ne).filter(|_| picks[j].is_none()) else {
+                continue;
+            };
+            let best = (0..oa.len())
+                .filter(|&i| !used[i] && identity(&oa[i]) == Some(id))
+                // max_by_key keeps the LAST maximum: reversed, the earliest.
+                .rev()
+                .max_by_key(|&i| shared_values(&oa[i], ne));
+            if let Some(i) = best {
+                used[i] = true;
+                picks[j] = Some(i);
+            }
+        }
+        picks
+    }
+
+    /// How many of `b`'s keys `a` holds with the same value (tables only).
+    fn shared_values(a: &toml::Value, b: &toml::Value) -> usize {
+        match (a.as_table(), b.as_table()) {
+            (Some(a), Some(b)) => b.iter().filter(|(k, v)| a.get(*k) == Some(*v)).count(),
+            _ => 0,
+        }
     }
 
     fn merge_elements(
@@ -821,11 +865,12 @@ mod surgical {
                     };
                     out.push(v);
                 }
+                // Kept elements carry their own spacing and comments; the
+                // array keeps its trailing comment.
                 arr.clear();
                 for v in out {
                     arr.push_formatted(v);
                 }
-                arr.fmt();
             }
             _ => replace(item, &toml::Value::Array(na.to_vec())),
         }
@@ -897,6 +942,143 @@ mod surgical {
         }
     }
 
+    /// The keys that decide WHAT is backed up, WHERE it goes and for HOW LONG
+    /// it is kept, and have a compiled default. A save writes each one out,
+    /// with its current value, when the file leaves it out: a later version
+    /// changing that default must never change an existing host's backups
+    /// silently. `*` is every element of an array of tables.
+    ///
+    /// - `general.btrbk_conf`: the file btrbk.conf is rendered to, which btrbk
+    ///   runs from
+    /// - `boot.*`: whether boot subvolumes are archived and replaced, which,
+    ///   and how long the archives are kept
+    /// - `subvolumes.exclude`, `doctor.exclude`: what the run never adopts
+    /// - `source[*].snapshot_dir`, `target_subdirs`, `target_labels`: where a
+    ///   source's snapshots are taken and sent, and to which targets
+    /// - `target[*].retention.*`: how long a target keeps them (an absent
+    ///   period is 0, which changes btrbk's `target_preserve`)
+    ///
+    /// Not here: defaults whose absence is itself the value (`Option`s, and
+    /// `manual_only` / `after_index` = false), advisory ones (`serials`,
+    /// `display_name`), and ones that decide neither scope nor retention
+    /// (logs, `[das]`, `[scrub]`, `[restore]`, `[recovery_os]`, email, GUI).
+    pub(super) const PINNED: &[&[&str]] = &[
+        &["general", "btrbk_conf"],
+        &["boot", "enabled"],
+        &["boot", "subvolumes"],
+        &["boot", "archive_retention_days"],
+        &["subvolumes", "exclude"],
+        &["doctor", "exclude"],
+        &["source", "*", "snapshot_dir"],
+        &["source", "*", "target_subdirs"],
+        &["source", "*", "target_labels"],
+        &["target", "*", "retention", "daily"],
+        &["target", "*", "retention", "weekly"],
+        &["target", "*", "retention", "monthly"],
+        &["target", "*", "retention", "yearly"],
+    ];
+
+    /// Write every [`PINNED`] key `doc` leaves out, with its value in `new`.
+    /// Run after the merge, when `doc`'s arrays hold `new`'s elements in
+    /// `new`'s order.
+    pub(super) fn pin(doc: &mut Table, new: &toml::Table) {
+        for path in PINNED {
+            pin_path(doc, new, path);
+        }
+    }
+
+    fn pin_path(doc: &mut dyn TableLike, new: &toml::Table, path: &[&str]) {
+        let Some((head, rest)) = path.split_first() else {
+            return;
+        };
+        let Some(nv) = new.get(*head) else { return };
+        match rest.first() {
+            None => {
+                if !doc.contains_key(head) {
+                    doc.insert(head, fresh_item(nv));
+                }
+            }
+            Some(&"*") => {
+                let (Some(item), Some(na)) = (doc.get_mut(head), nv.as_array()) else {
+                    return;
+                };
+                for (i, ne) in na.iter().enumerate() {
+                    let el: Option<&mut dyn TableLike> = match &mut *item {
+                        Item::ArrayOfTables(a) => a.get_mut(i).map(|t| t as &mut dyn TableLike),
+                        Item::Value(Value::Array(a)) => a
+                            .get_mut(i)
+                            .and_then(Value::as_inline_table_mut)
+                            .map(|t| t as &mut dyn TableLike),
+                        _ => None,
+                    };
+                    if let (Some(el), Some(nt)) = (el, ne.as_table()) {
+                        pin_path(el, nt, &rest[1..]);
+                    }
+                }
+            }
+            Some(_) => {
+                let Some(nt) = nv.as_table() else { return };
+                if !doc.contains_key(head) {
+                    doc.insert(head, Item::Table(Table::new()));
+                }
+                if let Some(t) = doc.get_mut(head).and_then(Item::as_table_like_mut) {
+                    pin_path(t, nt, rest);
+                }
+            }
+        }
+    }
+
+    /// Every path at which `a` and `b` differ, dotted (`target[1].serials`):
+    /// `a`'s keys in order, then keys only `b` has. Elements of arrays of
+    /// tables are compared one by one; any other value whole.
+    pub(super) fn differing_paths(a: &toml::Table, b: &toml::Table) -> Vec<String> {
+        let mut out = Vec::new();
+        diff_tables("", a, b, &mut out);
+        out
+    }
+
+    fn diff_tables(prefix: &str, a: &toml::Table, b: &toml::Table, out: &mut Vec<String>) {
+        let at = |k: &str| {
+            if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}.{k}")
+            }
+        };
+        for (k, av) in a {
+            match b.get(k) {
+                Some(bv) => diff_values(&at(k), av, bv, out),
+                None => out.push(at(k)),
+            }
+        }
+        for k in b.keys() {
+            if !a.contains_key(k) {
+                out.push(at(k));
+            }
+        }
+    }
+
+    fn diff_values(path: &str, a: &toml::Value, b: &toml::Value, out: &mut Vec<String>) {
+        match (a, b) {
+            (toml::Value::Table(x), toml::Value::Table(y)) => diff_tables(path, x, y, out),
+            (toml::Value::Array(x), toml::Value::Array(y))
+                if x.iter().chain(y).all(toml::Value::is_table) =>
+            {
+                for i in 0..x.len().max(y.len()) {
+                    match (x.get(i), y.get(i)) {
+                        (Some(u), Some(v)) => diff_values(&format!("{path}[{i}]"), u, v, out),
+                        _ => out.push(format!("{path}[{i}]")),
+                    }
+                }
+            }
+            _ => {
+                if a != b {
+                    out.push(path.to_string());
+                }
+            }
+        }
+    }
+
     /// Elements kept in a new order still carry their old places in the file,
     /// and toml_edit writes tables by place: TOML reads an array of tables in
     /// the order its headers appear, so the file would read back in the OLD
@@ -943,7 +1125,12 @@ impl Config {
     }
 
     /// Save this config to a TOML file, creating parent directories as
-    /// needed. Every writer of `config.toml` comes through here.
+    /// needed. Every writer of `config.toml` comes through here or through
+    /// [`Config::save_text`] (the GUI's editor); both write by
+    /// [`Config::edited_into`], so neither can drop what the other keeps. The
+    /// one file written whole elsewhere is a recovery drive's own
+    /// `config.toml`, which `das-recovery-state-sync.sh` regenerates from the
+    /// host's at every boot (`config derive-recovery` into a new file).
     ///
     /// An existing file is EDITED, not regenerated (bd DAS-Backup-Manager-28il):
     /// only the values this config changes are rewritten, so keys this binary
@@ -966,14 +1153,39 @@ impl Config {
         let text = match fs::read_to_string(path) {
             Ok(existing) => self.edited_into(&existing).map_err(|e| named(&e))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let header = "# Generated by btrdasd setup — do not edit.\n\
-                               # Modify this file and run: sudo btrdasd setup --upgrade\n\n";
                 let body = self.to_toml().map_err(|e| named(&e))?;
-                format!("{header}{body}")
+                format!("{FRESH_HEADER}{body}")
             }
             Err(e) => return Err(named(&e).into()),
         };
         crate::fsutil::write_atomic(path, &text)?;
+        Ok(())
+    }
+
+    /// Save `text` — a whole `config.toml` as the operator typed it (the GUI's
+    /// editor) — to `path`, as typed: comments and keys this version does not
+    /// know are kept verbatim. The only change made to it is the one every
+    /// save makes, writing out the backup-scoping keys it leaves out
+    /// ([`Config::edited_into`]). Refused, with nothing written, when `text`
+    /// is not a config this version can read. Atomic, mode kept, every error
+    /// naming `path` once, as [`Config::save`].
+    ///
+    /// Whatever the file held is replaced by `text`: a change another writer
+    /// made after the editor loaded the file is lost, as with any whole-file
+    /// edit (last writer wins, bd DAS-Backup-Manager-lxw).
+    pub fn save_text(text: &str, path: &Path) -> Result<(), Box<dyn Error>> {
+        let named = |e: &dyn std::fmt::Display| format!("cannot write {}: {e}", path.display());
+        let cfg = Self::from_toml(text).map_err(|e| {
+            named(&format!(
+                "the submitted text is not a config this version can read ({e}); \
+                 the file was left unchanged"
+            ))
+        })?;
+        let out = cfg.edited_into(text).map_err(|e| named(&e))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| named(&e))?;
+        }
+        crate::fsutil::write_atomic(path, &out)?;
         Ok(())
     }
 
@@ -994,12 +1206,19 @@ impl Config {
     /// element is edited by the same rules and keeps its own unknown keys
     /// and comments, wherever it moves; an element with no match is written
     /// fresh, and an old one with no match is removed with everything in it.
-    /// An element renamed is therefore a removal plus an addition.
+    /// An element renamed is therefore a removal plus an addition (bd
+    /// DAS-Backup-Manager-m0pr.2). Elements are matched on unchanged known
+    /// content first, so a plain array's comments stay with their values and
+    /// of two same-named entries the right one goes.
+    ///
+    /// A legacy key this version reads but never writes (a target's `serial`)
+    /// is removed when the key it feeds changes. Then every backup-scoping key
+    /// the file leaves out is written out with its current value
+    /// (`surgical::PINNED`).
     ///
     /// Refused, with nothing written, when `existing` is not TOML, is not a
     /// config this version can read, or the edited text would not read back
-    /// as exactly this config (a kept key this binary does not write, such as
-    /// a legacy `serial`, overriding a change).
+    /// as exactly this config; the refusal names the paths that would differ.
     fn edited_into(&self, existing: &str) -> Result<String, String> {
         let unchanged = "the file was left unchanged";
         let mut doc: toml_edit::DocumentMut = existing
@@ -1014,15 +1233,21 @@ impl Config {
         let new = as_table(&want)?;
         let mut reordered = false;
         surgical::merge_table(doc.as_table_mut(), &old, &new, &mut reordered);
+        surgical::pin(doc.as_table_mut(), &new);
         if reordered {
             surgical::forget_positions(doc.as_table_mut());
         }
         let out = doc.to_string();
-        let back = Self::from_toml(&out).ok().and_then(|c| c.to_toml().ok());
-        if back.as_deref() != Some(want.as_str()) {
+        let back = Self::from_toml(&out)
+            .map_err(|e| e.to_string())
+            .and_then(|c| c.to_toml().map_err(|e| e.to_string()))
+            .and_then(|t| as_table(&t))
+            .map_err(|e| format!("the edited file would not load ({e}); {unchanged}"))?;
+        if back != new {
             return Err(format!(
                 "the edited file would not read back as the config being saved \
-                 (a key this version does not write overrides a change?); {unchanged}"
+                 ({} would differ); {unchanged}",
+                surgical::differing_paths(&new, &back).join(", ")
             ));
         }
         Ok(out)
@@ -1895,7 +2120,15 @@ mod tests {
         let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
         cfg.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("# Generated by btrdasd setup"));
+        assert!(text.starts_with(FRESH_HEADER), "{text}");
+        // The header says what is true: edits are kept (bd m0pr.1).
+        assert!(
+            text.starts_with(
+                "# Written by btrdasd setup. Your edits and comments are kept when btrdasd saves this file.\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("do not edit"), "{text}");
         assert_eq!(
             Config::from_toml(&text).unwrap().to_toml().unwrap(),
             cfg.to_toml().unwrap()
@@ -1904,7 +2137,7 @@ mod tests {
         cfg.schedule.full = "Sat 05:00".into();
         cfg.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("# Generated by btrdasd setup"), "{text}");
+        assert!(text.starts_with(FRESH_HEADER), "{text}");
         assert!(text.contains("full = \"Sat 05:00\""), "{text}");
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -3185,6 +3418,7 @@ enabled = false
         let mut cfg = Config::load(&path).unwrap();
         // A changed scalar, an added entry, a deleted entry, a cleared Option.
         cfg.schedule.incremental = "04:15".into();
+        cfg.general.version = "9.9.9".into();
         cfg.sources[0].subvolumes.retain(|e| e.name != "@gone");
         cfg.sources[0].subvolumes.push(SubvolConfig {
             name: "@new".into(),
@@ -3197,12 +3431,17 @@ enabled = false
         assert_operator_lines_kept(&text);
         assert!(text.contains("egress_org = \"AS64500\""), "{text}");
         assert!(text.contains("incremental = \"04:15\""), "{text}");
+        // A changed value keeps the comment on its line.
+        assert!(
+            text.contains("version = \"9.9.9\" # inline comment on a known key"),
+            "{text}"
+        );
         assert!(!text.contains("@gone"), "deleted entry survived:\n{text}");
         assert!(
             !text.contains("mount_uuid"),
             "cleared Option survived:\n{text}"
         );
-        assert!(!text.contains("# Generated by btrdasd setup"), "{text}");
+        assert!(!text.contains(FRESH_HEADER), "{text}");
         let back = Config::from_toml(&text).unwrap();
         assert_eq!(back.to_toml().unwrap(), cfg.to_toml().unwrap());
         // The unknown key of `@` stayed with `@`, not with a neighbour.
@@ -3210,11 +3449,11 @@ enabled = false
         let future = text.find("future_entry").unwrap();
         let new_at = text.find("name = \"@new\"").unwrap();
         assert!(entry_at < future && future < new_at, "{text}");
-        // A section the operator omitted, its defaults unchanged, stays omitted.
-        assert!(
-            !text.contains("[das]") && !text.contains("[boot]"),
-            "{text}"
-        );
+        // A section the operator omitted whose defaults decide nothing about
+        // what is backed up, where or for how long stays omitted; [boot] does
+        // decide, so its current values are written out.
+        assert!(!text.contains("[das]"), "{text}");
+        assert!(text.contains("[boot]\nenabled = true\n"), "{text}");
     }
 
     /// Save `edit` of `file` through a real file; the text written.
@@ -3234,6 +3473,12 @@ enabled = false
         text
     }
 
+    /// `file` as a save by this version leaves it with nothing changed: the
+    /// backup-scoping keys it left out written in (`surgical::PINNED`).
+    fn pinned(file: &str) -> String {
+        saved_after(file, |_| {})
+    }
+
     #[test]
     fn save_leaves_an_unchanged_value_in_the_operators_spelling() {
         let file = minimal_toml(
@@ -3243,6 +3488,8 @@ enabled = false
              subvolumes = [\"@\", {name = \"@home\", future_inline = 1}]\n",
         );
         // An unrelated change; everything above is untouched.
+        let file = pinned(&file);
+        assert_eq!(pinned(&file), file, "pinning is done once");
         let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
         assert!(text.contains("volume = '/vol'"), "{text}");
         assert!(text.contains("\"@cache\",  # scratch"), "{text}");
@@ -3305,6 +3552,8 @@ enabled = false
         let file = minimal_toml(
             "[future]\na = 1\n[restore]\nallowed_roots = [\"/home\"]\n[future.sub]\nb = 2\n",
         );
+        let file = pinned(&file);
+        assert!(file.contains("[future.sub]\nb = 2\n"), "{file}");
         let text = saved_after(&file, |c| c.restore.allowed_roots = vec!["/tmp".into()]);
         assert_eq!(text, file.replace("[\"/home\"]", "[\"/tmp\"]"));
     }
@@ -3349,20 +3598,235 @@ enabled = false
         assert!(text.contains("future_source = true"), "{text}");
     }
 
-    /// The read-back check: a kept legacy `serial` (known, never written) would
-    /// override clearing `serials` — refused, the file as it was.
+    /// A legacy `serial` (read, never written) beside a changed `serials` is
+    /// removed: kept, it would be stale, and with `serials` cleared it would
+    /// override the change on the next load.
     #[test]
-    fn save_refuses_an_edit_that_would_not_read_back_as_the_config() {
+    fn save_removes_a_legacy_serial_when_the_serials_it_fed_change() {
+        let file = minimal_toml(ONE_TARGET);
+        assert!(file.contains("serial = \"X\""));
+        let text = saved_after(&file, |c| {
+            c.targets[0].serials = vec!["SERIAL01".into(), "SERIAL02".into()];
+        });
+        assert!(
+            !text.contains("serial = "),
+            "stale legacy serial kept:\n{text}"
+        );
+        assert!(
+            text.contains("serials = [\"SERIAL01\", \"SERIAL02\"]"),
+            "{text}"
+        );
+        let text = saved_after(&file, |c| {
+            c.targets[0].serials.clear();
+            c.targets[0].serial.clear();
+        });
+        assert!(!text.contains("serial = "), "{text}");
+        assert!(text.contains("serials = []"), "{text}");
+        // Unchanged serials: the legacy key is the operator's spelling, kept.
+        let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        assert!(text.contains("serial = \"X\""), "{text}");
+    }
+
+    /// The read-back refusal names what would differ.
+    #[test]
+    fn differing_paths_names_every_path_that_differs() {
+        let a: toml::Table =
+            toml::from_str("x = 1\nsame = 2\n[s]\nk = \"a\"\n[[t]]\nv = 1\n[[t]]\nv = 2\n")
+                .unwrap();
+        let b: toml::Table = toml::from_str(
+            "x = 9\nsame = 2\nnew = 1\n[s]\nk = \"b\"\n[[t]]\nv = 1\n[[t]]\nv = 3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            surgical::differing_paths(&a, &b),
+            ["x", "s.k", "t[1].v", "new"]
+        );
+        assert!(surgical::differing_paths(&a, &a).is_empty());
+        let short: toml::Table = toml::from_str("[[t]]\nv = 1\n").unwrap();
+        let long: toml::Table = toml::from_str("[[t]]\nv = 1\n[[t]]\nv = 2\n").unwrap();
+        assert_eq!(surgical::differing_paths(&short, &long), ["t[1]"]);
+        assert_eq!(surgical::differing_paths(&long, &short), ["t[1]"]);
+        // A plain array is one value.
+        let one: toml::Table = toml::from_str("l = [1]\n").unwrap();
+        let two: toml::Table = toml::from_str("l = [1, 2]\n").unwrap();
+        assert_eq!(surgical::differing_paths(&one, &two), ["l"]);
+    }
+
+    /// Comments inside a plain array stay with the elements still present
+    /// (matched by value) when the array changes.
+    #[test]
+    fn save_keeps_the_comments_inside_a_changed_plain_array() {
+        let file = pinned(&minimal_toml(
+            "[subvolumes]\nexclude = [\n    \"@cache\", # scratch\n    \"@old\", # legacy\n] # end\n",
+        ));
+        let text = saved_after(&file, |c| c.subvolumes.exclude.push("@new".into()));
+        for kept in ["# scratch", "# legacy", "] # end"] {
+            assert!(text.contains(kept), "lost {kept:?}:\n{text}");
+        }
+        let back = Config::from_toml(&text).unwrap();
+        assert_eq!(back.subvolumes.exclude, ["@cache", "@old", "@new"]);
+        let text = saved_after(&file, |c| c.subvolumes.exclude.retain(|e| e != "@cache"));
+        assert!(text.contains("# legacy"), "{text}");
+        assert!(!text.contains("@cache"), "{text}");
+    }
+
+    /// Two entries of one name: the one removed takes its own unknown keys
+    /// with it — elements are matched on their known content first.
+    #[test]
+    fn save_removes_the_right_one_of_two_same_named_entries() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \"@\"\nsnapshot_name = \"first\"\nfuture = \"of first\"\n\
+             [[source.subvolumes]]\nname = \"@\"\nsnapshot_name = \"second\"\nfuture = \"of second\"\n",
+        );
+        let text = saved_after(&file, |c| {
+            c.sources[0].subvolumes.remove(0);
+        });
+        assert!(!text.contains("of first"), "{text}");
+        assert!(text.contains("future = \"of second\""), "{text}");
+        // The kept one edited as well: still its own unknown key.
+        let text = saved_after(&file, |c| {
+            c.sources[0].subvolumes.remove(0);
+            c.sources[0].subvolumes[0].manual_only = true;
+        });
+        assert!(!text.contains("of first"), "{text}");
+        assert!(text.contains("future = \"of second\""), "{text}");
+        // Both kept, the first edited to look more like the second: each
+        // continues itself, and no old entry is taken twice.
+        let text = saved_after(&file, |c| {
+            let first = &mut c.sources[0].subvolumes[0];
+            first.snapshot_name = Some("second".into());
+            first.manual_only = true;
+        });
+        assert_eq!(text.matches("of first").count(), 1, "{text}");
+        assert_eq!(text.matches("of second").count(), 1, "{text}");
+        assert!(text.find("of first") < text.find("of second"), "{text}");
+    }
+
+    /// Unknown keys follow the element's identity, not whichever old element
+    /// shares the most values with it.
+    #[test]
+    fn save_matches_elements_by_name_before_likeness() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"x\"\nfuture = \"of a\"\n\
+             [[source.subvolumes]]\nname = \"@b\"\nmanual_only = true\nsnapshot_name = \"y\"\n\
+             future = \"of b\"\n",
+        );
+        // @a now looks like the old @b in everything but its name; @b changed
+        // too, so neither is matched unchanged.
+        let text = saved_after(&file, |c| {
+            let a = &mut c.sources[0].subvolumes[0];
+            a.snapshot_name = Some("y".into());
+            a.manual_only = true;
+            c.sources[0].subvolumes[1].snapshot_name = Some("z".into());
+        });
+        let (a, of_a) = (
+            text.find("name = \"@a\"").unwrap(),
+            text.find("of a").unwrap(),
+        );
+        let (b, of_b) = (
+            text.find("name = \"@b\"").unwrap(),
+            text.find("of b").unwrap(),
+        );
+        assert!(a < of_a && of_a < b && b < of_b, "{text}");
+    }
+
+    /// The backup-scoping keys are written out inside elements written as
+    /// inline tables too.
+    #[test]
+    fn save_writes_out_backup_scoping_defaults_in_inline_elements() {
+        // Top-level, so before the first table header.
+        let file = format!(
+            "target = [{{ label = \"t\", mount = \"/mnt/t\", role = \"primary\", \
+             retention = {{ daily = 7 }} }}]\n{}",
+            minimal_toml("")
+        );
+        let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        assert!(
+            text.contains("retention = { daily = 7 , weekly = 0, monthly = 0, yearly = 0 } }]"),
+            "{text}"
+        );
+    }
+
+    /// The keys that decide WHAT is backed up, WHERE it goes and for HOW LONG
+    /// are written out with their current values when the file leaves them
+    /// out, so a later version's different compiled default cannot change a
+    /// backup silently. Every other default stays left out.
+    #[test]
+    fn save_writes_out_backup_scoping_defaults_and_leaves_the_rest_out() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \"@\"\n\
+             [[source]]\nlabel = \"s2\"\nvolume = \"/vol2\"\ndevice = \"/dev/sdb\"\n\
+             snapshot_dir = \"snaps\"\ntarget_labels = [\"t\"]\n\
+             [[source.subvolumes]]\nname = \"@x\"\n\
+             [[target]]\nlabel = \"t\"\nmount = \"/mnt/t\"\nrole = \"primary\"\n\
+             [target.retention]\ndaily = 7\n",
+        );
+        let text = saved_after(&file, |c| c.schedule.full = "Sat 05:00".into());
+        let back = Config::from_toml(&text).unwrap();
+        for pinned in [
+            "btrbk_conf = \"/etc/btrbk/btrbk.conf\"",
+            "[boot]\nenabled = true\nsubvolumes = [\"@\", \"@home\"]\narchive_retention_days = 60\n",
+            "[subvolumes]\nexclude = []\n",
+            "[doctor]\nexclude = []\n",
+            "label = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             snapshot_dir = \".btrbk-snapshots\"\ntarget_subdirs = []\ntarget_labels = []\n",
+            "[target.retention]\ndaily = 7\nweekly = 0\nmonthly = 0\nyearly = 0\n",
+        ] {
+            assert!(text.contains(pinned), "not written out: {pinned:?}\n{text}");
+        }
+        // A value the operator wrote is not touched.
+        assert!(
+            text.contains("snapshot_dir = \"snaps\"\ntarget_labels = [\"t\"]\n"),
+            "{text}"
+        );
+        assert_eq!(back.sources[1].snapshot_dir, "snaps");
+        for absent in [
+            "[das]",
+            "[scrub]",
+            "[restore]",
+            "[recovery_os]",
+            "log_file",
+            "growth_log",
+            "last_report",
+            "recovery_drive",
+            "manual_only",
+            "display_name",
+            "serials",
+            "smtp_host",
+        ] {
+            assert!(!text.contains(absent), "written out: {absent:?}\n{text}");
+        }
+    }
+
+    #[test]
+    fn save_text_writes_the_submitted_text_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let file = minimal_toml(ONE_TARGET);
-        std::fs::write(&path, &file).unwrap();
-        let mut cfg = Config::load(&path).unwrap();
-        cfg.targets[0].serials.clear();
-        cfg.targets[0].serial.clear();
-        let err = cfg.save(&path).unwrap_err().to_string();
-        assert!(err.contains("would not read back"), "{err}");
-        assert_eq!(err.matches(&path.display().to_string()).count(), 1, "{err}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+        std::fs::write(&path, minimal_toml("")).unwrap();
+        // Already holding every backup-scoping key: written as it is.
+        let submitted = pinned(&format!("# typed in the editor\n{OPERATOR_FILE}"))
+            .replace("future_top = \"kept\"", "future_typed = \"by hand\" # note");
+        Config::save_text(&submitted, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), submitted);
+        // Missing the backup-scoping keys: they are written out, nothing else
+        // changes.
+        Config::save_text(OPERATOR_FILE, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# Operator's header"), "{text}");
+        assert_operator_lines_kept(&text);
+        assert!(text.contains("[boot]\nenabled = true\n"), "{text}");
+        // Not a config: refused, the file as it was.
+        for bad in ["not [ toml", "[general]\nversion = 1\n"] {
+            let err = Config::save_text(bad, &path).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("cannot write {}: ", path.display())),
+                "{err}"
+            );
+            assert!(err.contains("the submitted text"), "{err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
     }
 }
