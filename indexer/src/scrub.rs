@@ -2980,7 +2980,17 @@ Total to scrub:   401.28MiB\n";
             "closed but not unlocked: the copy holds the lock"
         );
         drop(copy);
-        assert!(FileLock::try_acquire(&path).unwrap().is_some());
+        // Released by the last close, not at once: a child another test
+        // thread forks inherits this description and holds the lock until it
+        // execs (bd q9bx). The earlier release is immune: drop unlocks.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while FileLock::try_acquire(&path).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still held 10 s after the last copy of its descriptor closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// A lock file that cannot be opened says why, and says root is needed
