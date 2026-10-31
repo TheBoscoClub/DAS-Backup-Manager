@@ -212,6 +212,28 @@ def main() -> int:
         f"timeout={timeout} unviable={unviable} viable={viable}"
     )
 
+    # Rule 1c — a failed unmutated baseline. cargo-mutants 27.1.0 then writes
+    # total_mutants=0, so the run reads as "no mutants in scope" and
+    # --allow-zero-total passed it (cachyos-sentinel 2026-10-24..26: a test
+    # reading a file outside the crate failed in cargo-mutants' copy, and every
+    # push's gate went green having tested nothing). Checked before rule 2 and
+    # regardless of --allow-zero-total: the baseline entry is the only record.
+    outcomes = d.get("outcomes")
+    if isinstance(outcomes, list):
+        for o in outcomes:
+            if (
+                isinstance(o, dict)
+                and o.get("scenario") == "Baseline"
+                and o.get("summary") != "Success"
+            ):
+                return fail(
+                    f"{tag}the unmutated baseline did not pass "
+                    f"(summary: {o.get('summary')!r}), so no mutant was tested. "
+                    "cargo test fails on cargo-mutants' copy of the crate — read "
+                    f"{o.get('log_path', 'log/baseline.log')} (often a test that "
+                    "reads a file outside the crate directory)."
+                )
+
     # Rule 1b — resource exhaustion hides inside "unviable".
     exhausted = exhausted_logs(args.outcomes)
     if exhausted:
