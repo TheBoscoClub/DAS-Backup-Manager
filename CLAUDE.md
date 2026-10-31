@@ -34,5 +34,6 @@ cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 - `backup.md` — btrbk, DAS, boot archival, email, exit codes, locks, supervisor interaction
 - `fail-silent.md` — which error suppressions are legitimate here, and which are always defects
 - `test-safety.md` — a suite must never take the host down: task cap, no self-calling stubs
+- `tracking.md` — where a new bd issue goes (phase epics) and the orphan check
 - `local-host-identifiers.md` — (gitignored, this machine only) real serials/UUIDs behind the tracked placeholders
 - `local-installation.md` — (gitignored, this machine only) this installation's targets, enclosure, ESPs, mail, supervisor notes
