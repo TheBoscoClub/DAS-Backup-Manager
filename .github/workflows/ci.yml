@@ -44,6 +44,8 @@ jobs:
       options: --tmpfs /tmp:rw,exec,nosuid,nodev,noatime,mode=1777,size=4g
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       # The container option above is the mount; this says so, or names why not.
       - name: /tmp is noatime
@@ -87,6 +89,8 @@ jobs:
     container: archlinux:latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -170,6 +174,8 @@ jobs:
     container: archlinux:latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install shellcheck
         run: .github/scripts/pacman-install.sh shellcheck
@@ -190,6 +196,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       # Pinned: a new dictionary release must arrive as a change to this file,
       # not as main turning red on its own. Settings live in .codespellrc.
@@ -213,13 +221,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       # Pinned to the version the maintainer runs locally, so CI and the editor
       # agree. Config: .markdownlint.yaml; exclusions: .markdownlintignore.
-      # --dot: without it the glob skips dot-directories, so .claude/rules/ and
-      # .claude/docs/ — the files this gate exists for — were never linted.
+      # Lints exactly the tracked *.md files. A glob is wrong both ways:
+      # '**/*.md' skips dot-directories (.claude/rules/, .claude/docs/ were never
+      # linted) and --dot reaches into .git/. markdownlint exits 0 when given no
+      # files, so an empty list is refused rather than passed.
       - name: Markdown lint (markdownlint-cli pinned to the local version)
         run: |
           npm install -g --ignore-scripts markdownlint-cli@0.48.0
           markdownlint --version
-          markdownlint --dot '**/*.md'
+          mapfile -d '' files < <(git ls-files -z -- '*.md')
+          [ "${#files[@]}" -gt 0 ] || { echo "no tracked *.md found — refusing a vacuous pass" >&2; exit 1; }
+          echo "linting ${#files[@]} tracked *.md files"
+          markdownlint "${files[@]}"

@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Always-loaded rules trimmed**: narrative, incidents and mechanism moved verbatim from `CLAUDE.md` and `.claude/rules/*.md` into `.claude/docs/rules-reference/` (not auto-loaded) — loaded size 42,998 → 37,571 chars (lossless check: each removed line found whole in a reference doc; independent review); a later binding-semantics review (diff and behaviour lenses) found 16 binding clauses had left the loaded text and 2 sentences had changed meaning (`rebuilt only by`, `--detach` runs one) — all 18 restored to `backup.md`, `build.md`, `fail-silent.md`, `test-safety.md` (+888 chars)
 - **Every report send goes through `report::Mailer`** — `deliver_report` and the doctor take the mailer they send with, and the message is made in the mailer's `context()` (host, minute, `DAS_REPORT_TO` / `DAS_REPORT_FROM`, read through `MailContext::from_lookup`). Production cannot pass another: `SystemBackupHost::new` (CLI and D-Bus helper) and `run_scrub_pass` send through `report::MAILX` themselves, which runs `mailx` as before (same arguments, `smtp-auth=none` included, body on stdin, stderr kept; the error text's one change is under Fixed). Tests pass a recording mailer with a fixed context and assert on the exact message, whatever the environment exports (bd `DAS-Backup-Manager-1x76`)
-- **Markdown lint is a CI gate**: `.github/workflows/ci.yml` runs markdownlint-cli 0.48.0 (pinned, same as local) over every tracked `*.md`, dot-directories included (`--dot`: without it the glob skipped `.claude/rules/` and `.claude/docs/`), in a new `markdown` job; the config is now tracked (`.markdownlint.yaml`, `.markdownlintignore`; `.gitignore` no longer ignores `.markdownlint.*`) — 12 files reformatted to pass (table separators, fence languages, blank lines around lists and fences, bare URLs, emphasis-as-heading) with no disables; the five verbatim `.claude/docs/rules-reference/` docs and `CHANGELOG.md` carry documented per-file disables
+- **Markdown lint is a CI gate**: `.github/workflows/ci.yml` runs markdownlint-cli 0.48.0 (pinned, same as local) over exactly the tracked `*.md` files (`git ls-files`: a `'**/*.md'` glob skipped `.claude/rules/` and `.claude/docs/`, and `--dot` reached into `.git/`), refusing an empty list because markdownlint exits 0 when given no files, in a new `markdown` job; the config is now tracked (`.markdownlint.yaml`, `.markdownlintignore`; `.gitignore` no longer ignores `.markdownlint.*`) — 12 files reformatted to pass (table separators, fence languages, blank lines around lists and fences, bare URLs, emphasis-as-heading) with no disables; the five verbatim `.claude/docs/rules-reference/` docs and `CHANGELOG.md` carry documented per-file disables
 
 ### Fixed
 
@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`exit_code_for_doctor`'s doc comment is on its function again** — `doctor_json` sat between the two, so the comment documented the wrong function
 - **A failed report send says `mailx failed (exit status: 1): …`** — it said `(exit exit status: 1)`, the word doubled by the exit status's own text; nothing parses it (bd `DAS-Backup-Manager-1x76`)
 - **`gui/CMakeLists.txt` no longer says a hand run of `gui-smoketest` reaches the real system bus** — the binary points itself at a dead bus before its first connection since bd `DAS-Backup-Manager-turs`
+
+### Security
+
+- **CI checkouts keep no token**: every `actions/checkout` in `.github/workflows/ci.yml` sets `persist-credentials: false` — no job pushes, fetches or calls the API with it (the workflow runs with `contents: read`), so the token is no longer left in `.git/config` for later steps to read
 
 ## [0.7.23.2] - 2026-10-31
 
