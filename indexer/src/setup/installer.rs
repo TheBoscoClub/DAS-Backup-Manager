@@ -289,13 +289,17 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// The lines `setup --check` prints about `das-scrub.service`'s priority, given
-/// what `systemctl show -p Nice,IOSchedulingClass,IOSchedulingPriority` said.
+/// what `systemctl show -p LoadState,Nice,IOSchedulingClass,IOSchedulingPriority`
+/// said.
 ///
 /// The effective values are compared with those the generated unit carries
 /// ([`SCRUB_NICE`] and friends). A host that has not run `setup --upgrade` since
 /// the priority change still has the idle-class unit, and a drop-in under
-/// `das-scrub.service.d/` can lower it again; either differs here. A probe that
-/// failed or printed no such property is reported, never read as "fine".
+/// `das-scrub.service.d/` can lower it again; either differs here. systemd
+/// answers `show` for a unit it has no file for, with its defaults and exit 0,
+/// so a unit that is not `loaded` is reported as such before any value is
+/// compared. A probe that failed or printed no such property is reported,
+/// never read as "fine".
 fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
     let shown = match shown {
         Ok(s) => s,
@@ -311,6 +315,21 @@ fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
             .find_map(|l| l.trim().strip_prefix(key).and_then(|r| r.strip_prefix('=')))
             .map(str::trim)
     };
+    let show = |v: Option<&str>| v.unwrap_or("(not reported)").to_string();
+    let load = value("LoadState");
+    if load != Some("loaded") {
+        // Masked is how an operator stops a unit on purpose (a supervisor
+        // restarts a merely stopped one), so it is not told to reinstall it.
+        let hint = if load == Some("masked") {
+            "  Masked on purpose? When the stop is over: systemctl unmask das-scrub.service"
+        } else {
+            "  Install das-scrub.service: sudo btrdasd setup --upgrade (between runs)"
+        };
+        return vec![
+            format!("das-scrub.service is not loaded (LoadState={})", show(load)),
+            hint.to_string(),
+        ];
+    }
     let nice = value("Nice");
     let class = value("IOSchedulingClass");
     let level = value("IOSchedulingPriority");
@@ -322,7 +341,6 @@ fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
             "das-scrub.service runs at nice {SCRUB_NICE}, {SCRUB_IO_CLASS} I/O level {SCRUB_IO_LEVEL}"
         )];
     }
-    let show = |v: Option<&str>| v.unwrap_or("(not reported)").to_string();
     vec![
         format!(
             "das-scrub.service priority DIFFERS from what setup writes: Nice={} IOSchedulingClass={} \
@@ -1396,7 +1414,7 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
                     &[
                         "show",
                         "-p",
-                        "Nice,IOSchedulingClass,IOSchedulingPriority",
+                        "LoadState,Nice,IOSchedulingClass,IOSchedulingPriority",
                         "das-scrub.service",
                     ],
                 )
@@ -4347,7 +4365,8 @@ auth = "starttls""#,
     }
 
     /// What systemd prints for a `das-scrub.service` carrying the generated unit.
-    const HEALTHY_SCRUB_SHOW: &str = "Nice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=0\n";
+    const HEALTHY_SCRUB_SHOW: &str =
+        "LoadState=loaded\nNice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=0\n";
 
     /// [`run_check`] with the scrub unit's `systemctl show` answer chosen.
     fn run_check_scrub(
@@ -4404,13 +4423,13 @@ auth = "starttls""#,
         assert_eq!(check(Ok(HEALTHY_SCRUB_SHOW.to_string())), vec![ok]);
         assert_eq!(
             check(Ok(
-                "Nice=-20\nIOSchedulingClass=best-effort\nIOSchedulingPriority=0\n".into()
+                "LoadState=loaded\nNice=-20\nIOSchedulingClass=best-effort\nIOSchedulingPriority=0\n".into()
             )),
             vec![ok]
         );
         // The unit as it was before the change: nice 19, idle class (3) level 7.
         let stale = check(Ok(
-            "Nice=19\nIOSchedulingClass=3\nIOSchedulingPriority=7\n".into()
+            "LoadState=loaded\nNice=19\nIOSchedulingClass=3\nIOSchedulingPriority=7\n".into(),
         ));
         assert!(stale[0].contains("DIFFERS"), "{stale:?}");
         assert!(
@@ -4420,22 +4439,73 @@ auth = "starttls""#,
         assert!(stale[1].contains("setup --upgrade"), "{stale:?}");
         // One property off is enough, each of the three on its own.
         let nice = check(Ok(
-            "Nice=0\nIOSchedulingClass=2\nIOSchedulingPriority=0\n".into()
+            "LoadState=loaded\nNice=0\nIOSchedulingClass=2\nIOSchedulingPriority=0\n".into(),
         ));
         assert!(nice[0].contains("DIFFERS"), "{nice:?}");
         let class = check(Ok(
-            "Nice=-20\nIOSchedulingClass=3\nIOSchedulingPriority=0\n".into(),
+            "LoadState=loaded\nNice=-20\nIOSchedulingClass=3\nIOSchedulingPriority=0\n".into(),
         ));
         assert!(class[0].contains("DIFFERS"), "{class:?}");
         let level = check(Ok(
-            "Nice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=4\n".into(),
+            "LoadState=loaded\nNice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=4\n".into(),
         ));
         assert!(level[0].contains("DIFFERS"), "{level:?}");
+        // systemd answers `show` for a unit with no file, defaults and exit 0:
+        // that is "not loaded", never a comparison against its defaults.
+        let missing = check(Ok(
+            "LoadState=not-found\nNice=0\nIOSchedulingClass=2\nIOSchedulingPriority=4\n".into(),
+        ));
+        assert_eq!(
+            missing,
+            vec![
+                "das-scrub.service is not loaded (LoadState=not-found)".to_string(),
+                "  Install das-scrub.service: sudo btrdasd setup --upgrade (between runs)"
+                    .to_string(),
+            ]
+        );
+        // A masked unit is a deliberate stop: unmask, never reinstall.
+        let masked = check(Ok(
+            "LoadState=masked\nNice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=0\n".into(),
+        ));
+        assert!(masked[0].contains("LoadState=masked"), "{masked:?}");
+        assert!(masked[1].contains("systemctl unmask"), "{masked:?}");
+        assert!(!masked[1].contains("setup --upgrade"), "{masked:?}");
+        // The generated values in a unit systemd has not loaded are not "fine".
+        let unloaded = check(Ok(
+            "LoadState=not-found\nNice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=0\n".into(),
+        ));
+        assert!(unloaded[0].contains("not loaded"), "{unloaded:?}");
         // A probe that failed, or printed none of the properties, is not "fine".
         let failed = check(Err("systemctl could not be run: x".into()));
         assert!(failed[0].contains("could not be read back"), "{failed:?}");
         let empty = check(Ok(String::new()));
         assert!(empty[0].contains("(not reported)"), "{empty:?}");
+    }
+
+    /// Only systemd has the scrub unit: on another init system `check` asks
+    /// systemd nothing about it. The probe's answer here would print a line if
+    /// it were asked, so a missing line means it was not.
+    #[test]
+    fn check_asks_no_scrub_unit_priority_on_another_init_system() {
+        for system in [InitSystem::Openrc, InitSystem::Sysvinit] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = valid_config(dir.path());
+            config.init.system = system.clone();
+            let (config_path, manifest_path) = install_config_into(&config, dir.path());
+
+            let lines = run_check_scrub(
+                &config_path,
+                &manifest_path,
+                true,
+                Ok(String::new()),
+                Err("systemctl must not be asked".into()),
+            );
+
+            assert!(
+                !lines.iter().any(|l| l.contains("das-scrub.service")),
+                "{system:?}: {lines:?}"
+            );
+        }
     }
 
     #[test]

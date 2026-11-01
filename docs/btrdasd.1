@@ -451,7 +451,18 @@ mail relay is reachable (when email is enabled), whether every generated file is
 attached target, whether udev actually hides its drives from udisks (read back
 from
 .BR "udevadm info \-\-export\-db" ,
-not from the rule file; an exposed target is reported with the fix). It exits 0
+not from the rule file; an exposed target is reported with the fix). On systemd
+it also reads back the effective
+.BR Nice ,
+.B IOSchedulingClass
+and
+.B IOSchedulingPriority
+of
+.B das-scrub.service
+(from
+.BR "systemctl show" ,
+so a drop-in that overrides the unit counts) and reports a unit that is not
+loaded, or one whose values differ from what setup writes, with the fix. It exits 0
 whatever it finds, unless the configuration cannot be loaded at all. Takes
 precedence over every other flag. A target with no
 .B mount_uuid
