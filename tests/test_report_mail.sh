@@ -24,10 +24,13 @@
 # The D-Bus helper (REAL_BTRDASD_HELPER; ctest sets it when the helper is
 # built) mails the GUI's backup reports through the same report::MAILX, but
 # its send needs root, the system bus, polkit and a real backup job, so it is
-# not driven here. Instead both shipped binaries are searched for the
-# refusal's text: a release build without test-overrides has none (the
-# guarded branch is a constant false, so the text is never compiled in), and
-# one with the feature — `dbus` implying it, say — has it and fails here.
+# not driven here. Instead both shipped binaries are searched, for texts read
+# from the source (never copied here): each must carry the live send's error
+# (mailx_outcome — linked in only where mailx can be spawned) and not the
+# test-build refusal (Mailx::send — compiled in only with test-overrides, the
+# guarded branch being a constant false otherwise), and the helper must carry
+# the job its BackupRun hands SystemBackupHost::new, which btrdasd must not —
+# so an empty file, or btrdasd passed as the helper, fails too.
 set -uo pipefail
 # The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
 # shellcheck source=/dev/null
@@ -129,9 +132,61 @@ doctor() { # doctor [VAR=value...]: btrdasd doctor --email, output to $WORK/out
         "${AS[@]}" "$WORK/btrdasd" doctor --email --config "$WORK/config.toml" \
         >"$WORK/out" 2>&1 || RC=$?
 }
-# How many times the refusal's text is in a file (grep -c counts lines).
-REFUSAL="a test build never mails"
-refusals() { grep -caF -- "$REFUSAL" "$1" || true; }
+# How many lines of a file hold a text (grep -c counts lines). An unreadable
+# file prints nothing, never 0, so a check against "0" fails on it.
+count() { grep -caF -- "$2" "$1" || true; }
+
+# The texts the binaries are searched for, read from the source, never copied
+# into this file (a copy goes stale silently: the search then finds nothing,
+# and a "must not be there" check passes). Each is the one string literal in
+# one block of source: from a line equal to <start>, which must appear exactly
+# once in the file, to the next line equal to <end>. No such block, a second
+# one, or a block holding no literal or more than one is a FAIL, and the text
+# is then left empty, which fails every check that searches for it.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+derive() { # derive <var> <name> <file> <start> <end> <after|before>
+    local var="$1" name="$2" file="$3" starts lit text
+    local literals=()
+    printf -v "$var" '%s' ""
+    starts="$(grep -cxF -- "$4" "$file" || true)"
+    if [[ "$starts" != 1 ]]; then
+        check "$name: its block starts once in $(basename "$file")" "${starts:-unreadable} time(s)" "1 time(s)"
+        return
+    fi
+    mapfile -t literals < <(awk -v start="$4" -v end="$5" '
+        $0 == start { on = 1; next }
+        on && $0 == end { exit }
+        on { print }
+    ' "$file" | grep -o '"[^"]*"' || true)
+    if ((${#literals[@]} != 1)); then
+        check "$name: one literal in its block" "${#literals[@]} literal(s)" "1 literal(s)"
+        return
+    fi
+    lit="${literals[0]#\"}"
+    lit="${lit%\"}"
+    # after: the text after the last "{}"; before: the text before the first "{".
+    if [[ "$6" == after ]]; then text="${lit##*\{\}}"; else text="${lit%%\{*}"; fi
+    # Long enough to sit whole in the binary (short strings can be built from
+    # immediates and never appear), and no brace or escape left in it.
+    if ((${#text} < 12)) || [[ "$text" == *[{}\\]* ]]; then
+        check "$name: a searchable text" "'$text' (from \"$lit\")" "12 or more plain characters"
+        return
+    fi
+    check "$name: read from $(basename "$file")" "yes" "yes"
+    printf -v "$var" '%s' "$text"
+}
+REPORT_RS="$ROOT/indexer/src/report.rs"
+HELPER_RS="$ROOT/indexer/src/bin/btrdasd-helper.rs"
+# The test-build refusal, in Mailx::send. No shipped binary may carry it.
+derive REFUSAL "the refusal" "$REPORT_RS" "        if SPAWN_REFUSED {" "        }" after
+# The live send's error, in mailx_outcome: only a binary that can spawn mailx
+# links it in (a refusing build drops it as dead code).
+derive SENDS "the send's error" "$REPORT_RS" \
+    "fn mailx_outcome(output: &std::process::Output) -> Result<(), String> {" "}" before
+# The job the helper's BackupRun hands SystemBackupHost::new, which mails the
+# GUI's reports: the helper carries it, btrdasd does not.
+derive HELPER_JOB "the helper's job" "$HELPER_RS" \
+    "                    &backup::SystemBackupHost::new(" "                    )," after
 ran() { if [[ -f "$REC/args" ]]; then echo yes; else echo no; fi; }
 
 # The PATH the run gets resolves mailx to the stub.
@@ -209,17 +264,37 @@ check "exit status" "$RC" "2"
 check "mailx was not run" "$(ran)" "no"
 has "it says why not" "$out" "Could not send doctor failure report email: Email is not enabled in config"
 
-echo "== neither shipped binary carries the test-build refusal"
-printf 'x %s y\n' "$REFUSAL" >"$WORK/control"
-check "the search finds the text where it is (control)" "$(refusals "$WORK/control")" "1"
-check "btrdasd: no refusal" "$(refusals "$REAL_BTRDASD")" "0"
+echo "== the shipped binaries: the live send linked in, no test-build refusal"
+# present <file> <text>: "yes" when the text is non-empty and in the file.
+present() {
+    local n
+    n="$(count "$1" "$2")"
+    if [[ -n "$2" && "$n" =~ ^[[:digit:]]+$ ]] && ((n > 0)); then echo yes; else echo no; fi
+}
+# absent <file> <text>: "yes" when the text is non-empty, the file readable
+# and the text not in it.
+absent() {
+    local n
+    n="$(count "$1" "$2")"
+    if [[ -n "$2" && -r "$1" && "$n" == 0 ]]; then echo yes; else echo no; fi
+}
+printf 'x %s y\n' "$REFUSAL" "$SENDS" "$HELPER_JOB" >"$WORK/control"
+: >"$WORK/empty"
+for text in "$REFUSAL" "$SENDS" "$HELPER_JOB"; do
+    check "control: the search finds '$text' where it is" "$(present "$WORK/control" "$text")" "yes"
+    check "control: and not where it is not" "$(absent "$WORK/empty" "$text")" "yes"
+done
+check "btrdasd: the live send is linked in" "$(present "$REAL_BTRDASD" "$SENDS")" "yes"
+check "btrdasd: no test-build refusal" "$(absent "$REAL_BTRDASD" "$REFUSAL")" "yes"
+check "btrdasd: not the helper" "$(absent "$REAL_BTRDASD" "$HELPER_JOB")" "yes"
 if [[ -z "${REAL_BTRDASD_HELPER:-}" ]]; then
     # Visible, never a pass: CI fails a suite that prints this.
     echo "NOT RUN: the D-Bus helper's check — set REAL_BTRDASD_HELPER to a built btrdasd-helper"
-elif [[ ! -f "$REAL_BTRDASD_HELPER" ]]; then
-    check "btrdasd-helper exists" "no such file: $REAL_BTRDASD_HELPER" "a built btrdasd-helper"
 else
-    check "btrdasd-helper: no refusal" "$(refusals "$REAL_BTRDASD_HELPER")" "0"
+    H="$REAL_BTRDASD_HELPER"
+    check "btrdasd-helper: is the helper (its BackupRun job)" "$(present "$H" "$HELPER_JOB")" "yes"
+    check "btrdasd-helper: the live send is linked in" "$(present "$H" "$SENDS")" "yes"
+    check "btrdasd-helper: no test-build refusal" "$(absent "$H" "$REFUSAL")" "yes"
 fi
 
 echo "passed=$pass failed=$fail"

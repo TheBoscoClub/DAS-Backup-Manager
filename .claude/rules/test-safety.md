@@ -21,8 +21,9 @@ Installation specifics: `.claude/rules/local-installation.md` (gitignored, this 
    `context()`, and `report::MAILX` refuses in every test build — feature `test-overrides`, which the
    crate's dev-dependency on itself gives every target `cargo test` builds; never remove it there.
    `tests/test_builds_never_mail.rs` and the unit tests named `*never_spawns_mailx` prove the refusal;
-   `tests/test_report_mail.sh` proves a built `btrdasd` mails and neither shipped binary carries the
-   refusal. A test never sends through `MAILX` to check what it is (`dyn Any` downcast instead), and a
+   `tests/test_report_mail.sh` proves a built `btrdasd` mails, and that both shipped binaries carry the
+   live send and not the refusal — texts it reads from the source, never copies (a stale copy passes
+   silently). A test never sends through `MAILX` to check what it is (`dyn Any` downcast instead), and a
    test config that reaches a mailer names an unreachable relay (`127.0.0.1:1`), never port 25.
    Shell: a suite that runs a real send stubs `mailx` on an `env -i` `PATH`
    (`test_backup_exit_semantics.sh`, `test_report_mail.sh`); a suite that extracts functions stubs
