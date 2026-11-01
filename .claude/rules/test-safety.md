@@ -16,7 +16,7 @@ Installation specifics: `.claude/rules/local-installation.md` (gitignored, this 
 3. **Trimmed copies** (`tests/zz_trim_*.sh`) carry the cap from the suite's header, live only for
    the run, and are never committed.
 4. **No test reaches a real mailer** (bd `DAS-Backup-Manager-1x76`). Rust: a report send takes a
-   `report::Mailer`; tests pass a recording one, and `report::MAILX` refuses in every test build — feature
+   `report::Mailer`; tests pass a recording one with a fixed `context()`, and `report::MAILX` refuses in every test build — feature
    `test-overrides`, which the crate's dev-dependency on itself gives every target `cargo test` builds; never
    remove it there. A test never sends through `MAILX` to check what it is (`dyn Any` downcast instead), and a
    test config that reaches a mailer names an unreachable relay (`127.0.0.1:1`), never port 25.

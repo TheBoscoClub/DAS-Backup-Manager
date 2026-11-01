@@ -39,9 +39,10 @@ drives `mount::verify_write_targets` into refusal. The same `Err(_) => false` is
 
 ## Auditing this as a diff
 
-Grep the suppression hits (`.ok()`, `unwrap_or`, `let _ =`, `Err(_) =>` in `indexer/src`; `2>/dev/null`, `|| true`
+Grep the suppression hits (`.ok()`, `unwrap_or`, `let _ =`, `Err(_) =>` in `indexer/src`; `2>/dev/null`, `|| true`, `|| :`
 in `scripts/*.sh`) and apply the direction test to each hit not already in the reference inventory. Buckets:
-(a) legitimate — leave, extend the reference; (b) should-log — log at warn, continue; (c) should-propagate —
+(a) legitimate (the default is the cautious one) — leave, extend the reference; (b) should-log (non-fatal,
+silence costs diagnosis) — log at warn, continue; (c) should-propagate (changes the caller's decision) —
 return an error. **(c) is the only correctness bug.** A large (b) count must not delay a (c) fix.
 Commands and the bucket table: reference.
 
