@@ -317,6 +317,17 @@ it as its own source. Two details are load-bearing:
 Verify by booting the VM from the relocated image and getting a lease back from the guest agent — a running
 qemu process is not evidence the guest came up.
 
+**Moved verbatim from `.claude/rules/backup.md` (2026-11-01, instruction-size limit).** The rules file keeps
+the binding summary; this is the full text it condenses:
+
+- **Each source volume's top level (id 5) is a subvolume too** (bd `xtnq`): entry `.` (`subvolume .`),
+  adopted primary-only with explicit `snapshot_name` `<volume basename>-toplevel`; never an ancestor,
+  never retired (except by sync when its source reaches a mirror: then FAIL every run, and no target, the
+  primary included, receives it), excluded only by the exact pattern `/`. Validation refuses it unnamed, twice on one
+  volume, or live in a source reaching a mirror — and the `btrbk.conf` renderer refuses that last case
+  itself (no writer can skip it); sync reports such a top level as not placed and applies the rest.
+  Retiring `.` does not stop its backup: delete it AND exclude `/`. Spec: `docs/local/superpowers/specs/2026-10-18-top-level-subvolume-design.md` (gitignored).
+
 ## DAS Enclosure
 - USB enclosures: **the rating is not the negotiated rate; always check it.**
   `cat /sys/bus/usb/devices/*/speed` should read the enclosure's rated speed (`10000` Mbit/s for USB 3.2 Gen2).
@@ -401,6 +412,26 @@ qemu process is not evidence the guest came up.
   `.new`, delete live, rename.
 - Archives are read-only snapshots on the backup target
 - The pruner (`boot-archive-cleanup.sh`) runs at the end of every `backup-run.sh` run, daily and full alike, while targets are still mounted — see the retention line above. It only ever deletes `@.archive.*` / `@home.archive.*` snapshots past retention on non-mirror targets; it never touches the live `@`/`@home`, btrbk-managed snapshots, or anything on a `role=mirror` target.
+
+**Moved verbatim from `.claude/rules/backup.md` (2026-11-01, instruction-size limit).** The rules file keeps
+the binding summary; this is the full text it condenses:
+
+- **One classification, both paths** (bd woq, dtm, 2026-10-06): Rust (`archive_boot_with`:
+  `BootOutcome`, `BootStep`) and the script produce the same rows and words. **The situation → outcome
+  table, snapshot-match rule and full-run mutation order are in the reference under this heading**,
+  pinned row by row by Rust test `every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns`.
+  Summary: an absence (no `snapshot_name`, no `target_subdirs`, no snapshot of the series) is WARN;
+  anything meant to work that did not (unreadable `btrbk.conf` or listing, refused verification, any
+  replacement step, a `btrfs` that cannot run, a symlink where a subvolume or staging path belongs) is
+  FAIL. Every check runs before the first mutation. Status `FAIL (<u> updated, <f> failed)` /
+  `WARN (<u> updated, <s> skipped, <w> warnings)` / `OK (<u> updated, <s> skipped)`; FAIL fails the
+  run (exit 3), WARN does not. An incremental run creates a missing boot subvolume, never replaces
+  one; only a full run (or `backup boot-archive`) archives and replaces.
+- `Config::load` does NOT run `validate`, so the boot step enforces its own input
+  (`Config::boot_input_errors`, shared with `validate`) where it reads it: `backup::boot_plan`, called
+  by `archive_boot_with` (whole-step FAIL before any btrfs call) and by `backup boot-plan` (exit 2,
+  nothing on stdout, so the script's boot step FAILs). It refuses a repeated `[boot].subvolumes` entry,
+  a `.` or `..` path component in one, and a repeated `[[target]].label` or `mount`.
 
 ### Delete vs mutate — send/receive chain safety
 - Deleting a *target* snapshot is harmless while at least one common pair survives (source snapshot UUID == target Received UUID) — that is what `target_preserve` does daily; only clearing one side entirely forces a full re-send.
@@ -519,6 +550,35 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 
 **Consequences worth knowing.** An unticked target that is absent no longer fails the step; a target that is named and cannot be read still does, with btrbk's status in the message and its own words (stderr) in the log. A source whose only targets are unticked is skipped, with a warning, and is not snapshotted either. Read from the source, not observed (btrbk is not run from the tests or from this work): for every subvolume that has a target filtered out, btrbk 0.32.7 sets `$target_aborted = -1` (`/usr/bin/btrbk` 7075-7081) and **skips the cleanup of that subvolume's source snapshots** (7131-7133, "as at least one target is skipped by command line argument"). So while a target stays unticked, CLI/GUI runs never prune those subvolumes' source snapshots: they pile up on the source volume until an unfiltered run prunes them — on a typical install the nightly `backup-run.sh` passes no filter, so they stay bounded. This is the opposite of a forced full send: the older claim here (a target left unticked past `snapshot_preserve` gets a full send when next included) was wrong, because the snapshots that serve as the incremental parent are the ones that are kept (an inference from the same lines; not observed). The standalone `backup snapshot` still reads every declared target, because it has no selection of them: btrbk probes them unless both `--preserve-snapshots` and `--preserve-backups` are given (6551), and an aborted target does not stop the snapshot loop (6919-6925), so an absent one should make that command exit 10 after creating the snapshots. Not changed here; reported with the branch.
 
+**Moved verbatim from `.claude/rules/backup.md` (2026-11-01, instruction-size limit).** The rules file keeps
+the binding summary; this is the full text it condenses:
+
+- `btrdasd backup run|snapshot|send` and the GUI hand btrbk **only** the selected sources and targets,
+  as filter arguments, one per (subvolume, target) pair: `<target dir>/<snapshot_name>`
+  (`btrbk_conf::declared_pairs`, `backup::btrbk_filters`). Never a volume path (cannot tell two sources
+  on one volume apart), never a source filter beside a target filter (btrbk filters are a union; a
+  matched subvolume keeps every target).
+- A label not in the configuration, or a selection that leaves nothing, **refuses** the step. An empty
+  filter list is btrbk's "everything": passed only when the selection IS everything.
+- **`backup snapshot` and `backup send` (CLI only) sync first, as `run` does**
+  (`backup::sync_for_manual_step`, sources mounted, before the targets). A select-all passes btrbk no
+  filter, so it trusts `btrbk.conf`; sync brings that into line with `config.toml`. Unlike `run`, a
+  failed sync stops the step: `run` continues because configured subvolumes must still be backed up; a
+  step that cannot tell whether `btrbk.conf` is current has no such obligation.
+- The run mounts **nothing** itself. `mount::ensure_sources_mounted` and `ensure_targets_mounted` mount,
+  and each returned `MountGuard` records what it mounted and gives exactly that back; `run_backup` only
+  checks each selected source's volume is a mount point and refuses if not (bd `7tx`, `8cf`).
+- **An empty selection is a refusal, never "all"** (bd `7tx`). `BackupOptions.sources`/`.targets` are
+  `Option`s: `None` = not specified (CLI, no flag: all), `Some(vec![])` = nothing ticked, refused by
+  `backup::empty_selection` before the first lock or mount. D-Bus `as` arguments cannot say "not
+  specified", so the helper's `BackupRun` always passes `Some(list)` and the job refuses an empty one
+  (`CouldNotStart`; GUI gets `JobFinished(false, …)`, not a D-Bus error). A label (source or target)
+  the configuration lacks is refused too, before the first lock (`backup::unknown_label`, exit 1), even
+  beside known ones — never dropped, never widened to "all mounted".
+- An unticked target is not read, so absent it cannot fail the step; a ticked one btrbk cannot read
+  still fails it (exit 10). Never re-render `btrbk.conf` per run to get this: the retention baseline is
+  the first primary target, so a reduced config renders other targets' retention differently.
+
 ## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
 
 **no4, what was wrong.** Two fail-silent defects on the Rust path, both found by 6wt after it fixed the script. (1) `run_backup_job` logged a failed `host.record` as a warning, so a run whose `backup_runs` row was never written was missing from the history while the GUI said "Complete". (2) The snapshot and send steps stored `usize` counts; a step that failed left its count at `0` and the row said `snaps_created = 0` — a sentinel indistinguishable from "nothing to do" (fail-silent.md, always-a-defect 1). The same `0` also fed the "nothing to do — all snapshots up to date" summary of a run that had failed.
@@ -526,6 +586,31 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
 **What it is now.** `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`. `run_pipeline` starts every count at `Some(0)` — a step that is not asked for (`snapshot_only` has no send) measured nothing and found nothing, which is a real zero — and sets `None` when a requested step fails; the full pipeline is one btrbk run, so its failure makes both `None`. `report::record_backup_run` maps `None` to NULL (schema 4 from 6wt), `backup_summary` prints `snapshots created: unknown` (and is never "nothing to do" unless both counts are `Some(0)`), `backup run --json` prints `null`, the text line prints `unknown`. The GUI history already showed NULL `snaps_created` as "unknown" (6wt); its **Sent** column is driven by `bytes_sent`, so a failed run with NULL counts read "No" — it now parses `snaps_sent` and shows "unknown" (`gui/tests/smoketest.cpp`, `historyShowsASentCountItCouldNotTakeAsUnknownNotAsNo`). A failed `host.record` pushes `history not recorded: <why>` into the result's errors and makes `success` false; the finish line the GUI shows carries it. The report that was already mailed cannot say so (it is built before the row is written, as in the script).
 
 **vzsu, what it is now.** `run_backup_job` ends in a `BackupJobOutcome`: `Declined` (the singleton lock is held: exit 0), `CouldNotStart` (the selection was refused or the locks could not be taken: exit 1, nothing mounted, nothing recorded), `Aborted` (it took the locks and then stopped on a target's or a source's state — `mount_targets` or `run` returned an error, which includes the verification refusal, an unmounted source and "no target mounted": exit 3) and `Ran` (exit 0 if `success`, else 3). `NotRun` is gone: it put "never began" and "began and stopped" in one bucket that exited 1 and was not recorded, the vanishing the script's abort path (`2my`) was built to prevent. An `Aborted` job that is not a dry run records a failed row (mode of the run, counts NULL, the reason as its only error) through `host.record`; a record that fails is appended to the reason (`…; history not recorded: <why>`), and no ABORTED email is sent from this path (not requested; the report, mailed or not, is built from a result that exists). Report delivery returns `ReportDelivery { saved, emailed }`: with email off a report that cannot be written is **lost**, as is one neither written nor mailed, and the run fails with `report: <why>` before `host.record`, so the row says why (the script's `d1r` N4); a failed email beside a written report stays a warning. The CLI prints the reason on stderr and exits with `exit_code()`; the GUI has no exit codes — the helper hands `finish_line` to `JobFinished(job_id, success, summary)`, and the panel shows exit 0 as "Complete" with the summary, and a 3 or a 1 as the red "Failed" bar with the abort reason (`Backup failed: …`, `Mount failed: …`) or `backup_summary` ("Backup completed with errors … — <errors>"), its log expanded, a `backupFailed` notification carrying the same text, and the History view refreshed (the abort's row is in it; a "could not start" has none). The `backup-run.sh` header comment that said the CLI "keeps its own codes: 0, or 1 for any failure" was rewritten; the script's version is not bumped for a comment (the only version check is `tests/test_subvol_sync.sh:386-388`, which asserts that the header's version equals the report footer's; a comment-only edit does not move either).
+
+**Moved verbatim from `.claude/rules/backup.md` (2026-11-01, instruction-size limit).** The rules file keeps
+the binding summary; this is the full text it condenses:
+
+- `BackupResult.snapshots_created`/`.snapshots_sent` are `Option<usize>`: **`None` = unknown** — the
+  counting step was asked for and failed. Never `Some(0)` (a measurement: "nothing to do"). Stored NULL
+  (schema 4), printed `unknown` (summary, `backup run`), `null` (`--json`); GUI history shows "unknown".
+- **`btrdasd backup run` exits 0 / 3 / 1 — the script's and doctor's rule** (bd `vzsu`;
+  `BackupJobOutcome::exit_code`): **0** clean (a warning too) or declined; **3** began and something
+  failed, or aborted on a target's/source's state (`Aborted`: no target mounts, verification refuses, an
+  absent ticked target — recorded as a failed row, counts NULL, unless a dry run); **1** could not start
+  (`CouldNotStart`: empty selection, unknown label, locks). A report neither saved nor mailed fails the
+  run BEFORE the row is written, so the row says `report: …`; a failed email beside a saved report stays
+  a warning. The GUI has no exit codes: `JobFinished(success, summary)` — exit 0 = success, 3 and 1 =
+  failure with the summary or reason.
+- A failed `host.record` fails the job (`history not recorded: …` in `errors`), never only a warning: a
+  run missing from history that reports success is the fail-silent defect.
+- **`backup run` (CLI and GUI) records the recovery OSes it mounted**, as `backup-run.sh` does (bd
+  `58c8`; `backup send` and `run_full_pipeline` do not): after btrbk, targets still
+  mounted, the CLI/GUI run reads each *selected* `role = "mirror"` target and writes
+  `recovery-os.json` (`backup::recovery_os_step` → `recovery_os::record_within`, 900 s bound shared with
+  `RECOVERY_OS_TIMEOUT_SECS`, pinned by a test). One rule with `check_recovery_os`: STALE/WARNING is
+  WARN, unreadable root / unwritable record / timeout is FAIL (fails the run). `btrdasd recovery-os
+  record [<label>…]` does it without a backup: backup lock then maintenance lock, neither waited for
+  (75), labels refused before any lock (1), a drive not mounted/read/recorded or left mounted is 3.
 
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 
