@@ -415,11 +415,18 @@ pub struct MailMessage {
 }
 
 /// Every report send — backup, scrub, doctor — goes through this
-/// (bd DAS-Backup-Manager-1x76). Production hands each caller [`MAILX`];
-/// tests hand them a recording mailer and assert on the exact message. The
-/// error is why the report was not handed over, as the caller logs it.
+/// (bd DAS-Backup-Manager-1x76). Production sends through [`MAILX`]; tests
+/// hand the send a recording mailer and assert on the exact message.
 pub trait Mailer: Send + Sync {
+    /// Hand `message` to the relay. The error is why it was not handed
+    /// over, as the caller logs it.
     fn send(&self, message: &MailMessage) -> Result<(), String>;
+    /// What the message takes from where it is sent: the host's name, the
+    /// minute, the `DAS_REPORT_TO` / `DAS_REPORT_FROM` overrides. [`Mailx`]
+    /// reads this machine and its environment ([`MailContext::current`]); a
+    /// test's mailer answers a fixed one, so no test depends on the
+    /// environment it runs in.
+    fn context(&self) -> MailContext;
 }
 
 /// s-nail's `mailx`, submitting to the local relay: the production [`Mailer`].
@@ -431,14 +438,16 @@ pub struct Mailx {
 /// The mailer every production entry point hands down: `mailx` from `PATH`.
 pub const MAILX: Mailx = Mailx { program: "mailx" };
 
-/// True in every test build — this crate's unit tests (`cfg(test)`) and
-/// everything built with the `test-overrides` feature, which only the
-/// dev-dependency turns on: integration tests, the binaries' unit tests and
-/// the binaries they run. There, [`Mailx`] refuses before it spawns anything,
-/// so no test, and no mutant a test build runs, can hand a report to a real
-/// relay (bd DAS-Backup-Manager-1x76: on 2026-10-06 a local mutation run did,
-/// four times). A shipped build never has the feature.
-const SPAWN_REFUSED: bool = cfg!(any(test, feature = "test-overrides"));
+/// True in every test build: the `test-overrides` feature, which only this
+/// crate's dev-dependency on itself turns on, and which every target `cargo
+/// test` builds therefore has — this crate's unit tests (`cargo test --lib`
+/// included), integration tests, the binaries' unit tests and the binaries
+/// they run. There, [`Mailx`] refuses before it spawns anything, so no test,
+/// and no mutant a test build runs, can hand a report to a real relay (bd
+/// DAS-Backup-Manager-1x76: on 2026-10-06 a local mutation run did, four
+/// times). A shipped build never has the feature, and `tests/test_report_mail.sh`
+/// proves the built `btrdasd` mails.
+const SPAWN_REFUSED: bool = cfg!(feature = "test-overrides");
 
 impl Mailx {
     /// A `mailx` at `program`. Production uses [`MAILX`]; the test that
@@ -497,6 +506,11 @@ impl Mailer for Mailx {
         let output = spawn_with_stdin(self.program, &Self::args(message), &message.body)
             .map_err(|e| e.to_string())?;
         mailx_outcome(&output)
+    }
+
+    /// This machine, now.
+    fn context(&self) -> MailContext {
+        MailContext::current()
     }
 }
 
@@ -672,7 +686,7 @@ pub fn send_email_report(
 /// any local process for the duration of the send.
 ///
 /// Nothing is handed to `mailer` unless `[email].enabled`; the message is
-/// [`report_message`] for this machine, now ([`MailContext::current`]).
+/// [`report_message`] in the mailer's [`Mailer::context`].
 pub fn send_email_report_with_kind(
     report: &str,
     config: &Config,
@@ -682,7 +696,7 @@ pub fn send_email_report_with_kind(
     if !config.email.enabled {
         return Err("Email is not enabled in config".into());
     }
-    let message = report_message(report, config, kind, &MailContext::current())?;
+    let message = report_message(report, config, kind, &mailer.context())?;
     mailer.send(&message)?;
     Ok(())
 }
@@ -724,6 +738,22 @@ impl Mailer for RecordingMailer {
     fn send(&self, message: &MailMessage) -> Result<(), String> {
         self.sent.lock().unwrap().push(message.clone());
         self.answer.clone()
+    }
+
+    fn context(&self) -> MailContext {
+        test_mail_context()
+    }
+}
+
+/// The context every test mailer answers: host `nas.example.org`, minute
+/// `2026-11-01 01:02`, no overrides — whatever the environment holds.
+#[cfg(test)]
+pub(crate) fn test_mail_context() -> MailContext {
+    MailContext {
+        hostname: "nas.example.org".into(),
+        now: "2026-11-01 01:02".into(),
+        to_override: None,
+        from_override: None,
     }
 }
 
@@ -1440,6 +1470,80 @@ mod tests {
         assert_eq!(MailContext::current().hostname, kernel.trim_end());
     }
 
+    /// The production mailer's context is this machine and its environment:
+    /// read here, never set (each variable is compared with itself, so the
+    /// test holds whatever the environment has).
+    #[test]
+    fn the_production_mailers_context_is_this_machine_now() {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        let context = MAILX.context();
+        assert_eq!(context.hostname, kernel.trim_end());
+        assert_eq!(
+            context.now.len(),
+            "2026-11-01 01:02".len(),
+            "{}",
+            context.now
+        );
+        assert_eq!(context.to_override, std::env::var("DAS_REPORT_TO").ok());
+        assert_eq!(context.from_override, std::env::var("DAS_REPORT_FROM").ok());
+    }
+
+    /// The spawn itself (bd DAS-Backup-Manager-1x76 review): the arguments
+    /// as given, the body on stdin, stdout discarded, stderr kept — and a
+    /// failing program's stderr is what the error says.
+    #[test]
+    fn the_spawn_passes_the_arguments_and_the_body_and_keeps_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let args_file = dir.path().join("args");
+        let body_file = dir.path().join("body");
+        let stub = dir.path().join("program");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" >'{args}'\ncat >'{body}'\n\
+                 echo 'to stdout'\n\
+                 if [[ \"$1\" == fail ]]; then echo '  relay said no  ' >&2; exit 4; fi\n\
+                 exit 0\n",
+                args = args_file.display(),
+                body = body_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = stub.to_str().unwrap();
+
+        let args = vec![
+            "-s".to_string(),
+            "a subject — with spaces".to_string(),
+            "to@example.org".to_string(),
+        ];
+        let out = spawn_with_stdin(program, &args, "line 1\nline 2\n").unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&args_file).unwrap(),
+            "-s\na subject — with spaces\nto@example.org\n",
+            "each argument as given"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&body_file).unwrap(),
+            "line 1\nline 2\n",
+            "the body arrives on stdin"
+        );
+        assert!(out.stdout.is_empty(), "stdout is discarded");
+        assert_eq!(mailx_outcome(&out), Ok(()));
+
+        let out = spawn_with_stdin(program, &["fail".to_string()], "body").unwrap();
+        assert_eq!(std::fs::read_to_string(&body_file).unwrap(), "body");
+        assert_eq!(
+            mailx_outcome(&out),
+            Err("mailx failed (exit exit status: 4): relay said no".into()),
+            "the failing program's stderr reaches the error"
+        );
+        let absent = dir.path().join("absent");
+        assert!(spawn_with_stdin(absent.to_str().unwrap(), &[], "").is_err());
+    }
+
     #[test]
     fn a_report_reaches_the_mailer_only_when_email_is_enabled() {
         let mailer = RecordingMailer::accepting();
@@ -1452,28 +1556,27 @@ mod tests {
         let config = mail_config();
         send_email_report_with_kind("Status: FAILURE\n", &config, "Scrub", &mailer).unwrap();
         send_email_report("fine\n", &config, &mailer).unwrap();
-        let sent = mailer.sent();
-        assert_eq!(sent.len(), 2);
-        let host = kernel_hostname();
-        let short = host.split('.').next().unwrap().to_string();
-        assert!(
-            sent[0]
-                .subject
-                .starts_with(&format!("[DAS Scrub] {host} — FAILURE — ")),
-            "{}",
-            sent[0].subject
-        );
+        // The message is made in the mailer's context, not this machine's:
+        // the test holds whatever DAS_REPORT_TO / DAS_REPORT_FROM say.
         assert_eq!(
-            sent[0].from,
-            format!("DAS Scrub ({short}) <das@example.org>")
+            mailer.sent(),
+            [
+                message(
+                    "[DAS Scrub] nas.example.org — FAILURE — 2026-11-01 01:02",
+                    "DAS Scrub (nas) <das@example.org>",
+                    "ops@example.org",
+                    "smtp://127.0.0.1:25",
+                    "Status: FAILURE\n",
+                ),
+                message(
+                    "[DAS Backup] nas.example.org — SUCCESS — 2026-11-01 01:02",
+                    "DAS Backup (nas) <das@example.org>",
+                    "ops@example.org",
+                    "smtp://127.0.0.1:25",
+                    "fine\n",
+                ),
+            ]
         );
-        assert_eq!(sent[0].body, "Status: FAILURE\n");
-        assert!(
-            sent[1]
-                .subject
-                .starts_with(&format!("[DAS Backup] {host} — SUCCESS — "))
-        );
-        assert_eq!(sent[1].to, "ops@example.org");
 
         // What the mailer answers is what the caller hears; a message that
         // cannot be made is never handed over.

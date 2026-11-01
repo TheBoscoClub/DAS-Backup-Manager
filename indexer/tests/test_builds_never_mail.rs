@@ -4,10 +4,13 @@
 //! relay: a mutant flipped the email gate and the test it ran spawned the real
 //! `mailx`. Every report send now goes through `report::Mailer`, and the
 //! production mailer (`report::MAILX`) refuses, before it spawns anything, in
-//! every build that has the `test-overrides` feature — which the
-//! dev-dependency gives this integration test, the binaries' unit tests and
-//! the binaries these tests run. The library's own unit tests are covered by
-//! `cfg(test)` (`report::tests::a_test_build_never_spawns_mailx`).
+//! every build that has the `test-overrides` feature. The crate's
+//! dev-dependency on itself turns it on, so every target `cargo test` builds
+//! has it: this integration test, the library's own unit tests
+//! (`report::tests::a_test_build_never_spawns_mailx`), the binaries' unit
+//! tests and the binaries these tests run. Take the feature off that
+//! dev-dependency and these tests fail. The shipped direction, a build without
+//! the feature mailing, is `tests/test_report_mail.sh`.
 //!
 //! Each case stands a recording stub where `mailx` would be, shows that the
 //! stub records a run of itself, and then that nothing ran it.

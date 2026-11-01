@@ -2390,11 +2390,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // btrbk, unmount, report, record. The sync report goes to the
                 // progress log (stderr), so stdout stays what it was.
                 let outcome = backup::run_backup_job(
-                    &backup::SystemBackupHost::new(
-                        &config,
-                        "btrdasd backup run",
-                        std::sync::Arc::new(report::MAILX),
-                    ),
+                    &backup::SystemBackupHost::new(&config, "btrdasd backup run"),
                     cfg,
                     options,
                     &progress,
@@ -3063,7 +3059,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 let progress = CliProgress;
-                let pass = scrub::run_scrub_pass(&cfg, &progress, &report::MAILX)?;
+                let pass = scrub::run_scrub_pass(&cfg, &progress)?;
                 let exit_code = exit_code_for_pass(&pass);
                 let status_word = match pass.status {
                     scrub::PassStatus::Completed => "completed",
@@ -4827,6 +4823,16 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             self.sent.lock().unwrap().push(message.clone());
             self.answer.clone()
         }
+
+        /// Fixed, so the test holds whatever DAS_REPORT_TO / DAS_REPORT_FROM say.
+        fn context(&self) -> report::MailContext {
+            report::MailContext {
+                hostname: "nas.example.org".into(),
+                now: "2026-11-01 01:02".into(),
+                to_override: None,
+                from_override: None,
+            }
+        }
     }
 
     fn doctor_mail_config() -> Config {
@@ -4860,16 +4866,11 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             let sent = ok.sent.lock().unwrap().clone();
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].body, "DRIFT — FAILURE\n");
-            assert!(
-                sent[0].subject.starts_with("[DAS Doctor] "),
-                "{}",
-                sent[0].subject
+            assert_eq!(
+                sent[0].subject,
+                "[DAS Doctor] nas.example.org — FAILURE — 2026-11-01 01:02"
             );
-            assert!(
-                sent[0].subject.contains(" — FAILURE — "),
-                "{}",
-                sent[0].subject
-            );
+            assert_eq!(sent[0].from, "DAS Doctor (nas) <das@example.org>");
             assert_eq!(sent[0].to, "ops@example.org");
 
             let down = Recorder::answering(Err("relay down".into()));

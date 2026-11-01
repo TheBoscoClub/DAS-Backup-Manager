@@ -1085,7 +1085,6 @@ impl HelperInterface {
                     &backup::SystemBackupHost::new(
                         Path::new(CANONICAL_CONFIG),
                         "btrdasd-helper BackupRun job",
-                        std::sync::Arc::new(buttered_dasd::report::MAILX),
                     ),
                     config,
                     options,

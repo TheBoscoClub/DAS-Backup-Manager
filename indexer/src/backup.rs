@@ -3439,24 +3439,23 @@ pub struct SystemBackupHost {
     /// Who runs the job — `btrdasd backup run`, or the GUI's — recorded in
     /// the maintenance lock file while it holds the lock.
     pub job: String,
-    /// What mails the report: [`crate::report::MAILX`] in production.
-    pub mailer: std::sync::Arc<dyn crate::report::Mailer>,
+    /// What mails the report. Outside this crate there is no way to set it:
+    /// [`SystemBackupHost::new`] makes it [`crate::report::MAILX`], so neither
+    /// the CLI nor the D-Bus helper can hand a run another mailer
+    /// (bd DAS-Backup-Manager-1x76). This crate's tests set it.
+    pub(crate) mailer: std::sync::Arc<dyn crate::report::Mailer>,
 }
 
 impl SystemBackupHost {
     /// The production host: the given config, the production lock files,
-    /// the given mailer.
-    pub fn new(
-        config_path: &Path,
-        job: &str,
-        mailer: std::sync::Arc<dyn crate::report::Mailer>,
-    ) -> Self {
+    /// reports mailed through [`crate::report::MAILX`].
+    pub fn new(config_path: &Path, job: &str) -> Self {
         Self {
             config_path: config_path.to_path_buf(),
             singleton_lock: BACKUP_LOCK_PATH.into(),
             maintenance_lock: scrub::MAINTENANCE_LOCK_PATH.into(),
             job: job.to_string(),
-            mailer,
+            mailer: std::sync::Arc::new(crate::report::MAILX),
         }
     }
 }
@@ -10301,7 +10300,6 @@ mod tests {
         let host = SystemBackupHost::new(
             Path::new("/etc/das-backup/config.toml"),
             "btrdasd-helper BackupRun job",
-            std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
         );
         assert_eq!(host.config_path, Path::new("/etc/das-backup/config.toml"));
         assert_eq!(host.singleton_lock, Path::new(BACKUP_LOCK_PATH));
@@ -10310,6 +10308,24 @@ mod tests {
             Path::new(scrub::MAINTENANCE_LOCK_PATH)
         );
         assert_eq!(host.job, "btrdasd-helper BackupRun job");
+        // Its mailer is the production one: in a test build that refuses,
+        // saying so — no other mailer answers this.
+        let message = crate::report::report_message(
+            "x",
+            &{
+                let mut c = make_test_config();
+                c.email.to = "ops@example.org".into();
+                c.email.from = "das@example.org".into();
+                c
+            },
+            "Backup",
+            &crate::report::test_mail_context(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.mailer.send(&message),
+            Err("mailx not run: a test build never mails (bd DAS-Backup-Manager-1x76)".into())
+        );
     }
 
     #[test]
@@ -10441,17 +10457,12 @@ mod tests {
         assert_eq!(message.body, text, "the message is the report written");
         assert_eq!(message.to, "ops@example.org");
         assert_eq!(message.mta, "smtp://127.0.0.1:2525");
-        assert!(
-            message.from.starts_with("DAS Backup (")
-                && message.from.ends_with(") <das@example.org>"),
-            "{}",
-            message.from
-        );
-        assert!(
-            message.subject.starts_with("[DAS Backup] ")
-                && message.subject.contains(" — FAILURE — "),
-            "a failed run's subject says FAILURE: {}",
-            message.subject
+        // In the mailer's context (test_mail_context), whatever the
+        // environment's DAS_REPORT_TO / DAS_REPORT_FROM say.
+        assert_eq!(message.from, "DAS Backup (nas) <das@example.org>");
+        assert_eq!(
+            message.subject, "[DAS Backup] nas.example.org — FAILURE — 2026-11-01 01:02",
+            "a failed run's subject says FAILURE"
         );
         assert!(
             progress

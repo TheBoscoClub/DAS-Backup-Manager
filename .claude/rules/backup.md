@@ -130,9 +130,11 @@ Checked before any directory is created, both roots compared **after resolution*
 - Both consumers read `[email]` from `config.toml`: `send_report()` in `scripts/backup-run.sh` and
   `send_email_report_with_kind()` in `indexer/src/report.rs`. `[email].from` selects the relay
   credential, so it must be the relay's configured sender (e.g. `das-backup@example.org`). `DAS_REPORT_TO` / `DAS_REPORT_FROM` override for testing.
-- **Every Rust report send goes through `report::Mailer`** (backup `deliver_report`, scrub `run_scrub_pass`,
-  doctor `email_doctor_report`): production passes `report::MAILX`, tests a recording mailer. Nothing
-  else spawns `mailx`; in a test build `MAILX` refuses before it spawns (bd `1x76`, `test-safety.md`).
+- **Every Rust report send goes through `report::Mailer`** (backup `deliver_report`, scrub
+  `email_scrub_report`, doctor `email_doctor_report`): production sends through `report::MAILX` —
+  `SystemBackupHost::new` and `run_scrub_pass` take no mailer, so no caller can pass another — and
+  tests a recording mailer. Nothing else spawns `mailx`; in a test build `MAILX` refuses before it
+  spawns, and `shell-report-mail` proves a built `btrdasd` mails (bd `1x76`, `test-safety.md`).
 - **`smtp-auth=none` is REQUIRED on every mailx invocation**, or s-nail aborts with exit 4.
 - **Never redirect mailx stderr to `/dev/null`.**
 - **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed: s-nail gives

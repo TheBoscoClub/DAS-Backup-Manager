@@ -10,15 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`tests/test_builds_never_mail.rs`** — the library in an integration build, and the `btrdasd` the tests run (`doctor --email`), each refuse to spawn `mailx`, with a recording stub standing where it would be (bd `DAS-Backup-Manager-1x76`)
+- **`tests/test_report_mail.sh`** (ctest `shell-report-mail`) — the btrdasd a build makes (`REAL_BTRDASD`) mails through `mailx`: `doctor --email`, unprivileged (as `nobody` when the suite runs as root, so no real `/run` lock is taken), reaches a stub `mailx` with the 13 arguments (`-s` subject, `-r` From, `v15-compat`, `mta=`, `smtp-auth=none`, `nosave`, recipient) and the report on stdin; a refusing relay's stderr reaches the warning. A `btrdasd` built with `test-overrides` mails nothing and fails it (bd `DAS-Backup-Manager-1x76`)
 
 ### Changed
 
-- **Every report send goes through `report::Mailer`** — backup (`deliver_report`, by `SystemBackupHost.mailer`), scrub (`run_scrub_pass`) and doctor take the mailer they send with; the CLI and the D-Bus helper pass `report::MAILX`, which runs `mailx` exactly as before (same arguments, `smtp-auth=none` included, body on stdin, stderr kept, same error text), and tests pass a recording mailer and assert on the exact message (bd `DAS-Backup-Manager-1x76`)
+- **Every report send goes through `report::Mailer`** — `deliver_report` and the doctor take the mailer they send with, and the message is made in the mailer's `context()` (host, minute, `DAS_REPORT_TO` / `DAS_REPORT_FROM`). Production cannot pass another: `SystemBackupHost::new` (CLI and D-Bus helper) and `run_scrub_pass` send through `report::MAILX` themselves, which runs `mailx` exactly as before (same arguments, `smtp-auth=none` included, body on stdin, stderr kept, same error text). Tests pass a recording mailer with a fixed context and assert on the exact message, whatever the environment exports (bd `DAS-Backup-Manager-1x76`)
 
 ### Fixed
 
-- **No test can mail through the live relay** — `report.rs` spawned `mailx` directly, and tests stayed off the network only because their configs had `[email].enabled = false`, so a mutant that flipped that gate mailed real reports (four from `backup@localhost` on 2026-10-06). In every test build (`cfg(test)`, or the `test-overrides` feature the dev-dependency turns on) `report::MAILX` now refuses before it spawns anything; a shipped build never has the feature (bd `DAS-Backup-Manager-1x76`)
+- **No test can mail through the live relay** — `report.rs` spawned `mailx` directly, and tests stayed off the network only because their configs had `[email].enabled = false`, so a mutant that flipped that gate mailed real reports (four from `backup@localhost` on 2026-10-06). In every test build — the `test-overrides` feature, which the crate's dev-dependency on itself gives every target `cargo test` builds — `report::MAILX` now refuses before it spawns anything; a shipped build never has the feature, and `shell-report-mail` proves the built binary mails (bd `DAS-Backup-Manager-1x76`)
 - **`exit_code_for_doctor`'s doc comment is on its function again** — `doctor_json` sat between the two, so the comment documented the wrong function
+- **`gui/CMakeLists.txt` no longer says a hand run of `gui-smoketest` reaches the real system bus** — the binary points itself at a dead bus before its first connection since bd `DAS-Backup-Manager-turs`
 
 ## [0.7.23.2] - 2026-10-31
 

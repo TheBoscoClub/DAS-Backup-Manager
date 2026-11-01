@@ -1616,11 +1616,12 @@ fn now_epoch() -> i64 {
 /// This function's return value stays truthful either way — only the CLI's
 /// interpretation of it for the process exit code is split.
 ///
-/// The report goes through `mailer` ([`crate::report::MAILX`] in production).
+/// The report is mailed through [`crate::report::MAILX`]: no caller can hand
+/// a pass another mailer (bd DAS-Backup-Manager-1x76); [`email_scrub_report`]
+/// is what tests drive.
 pub fn run_scrub_pass(
     config: &Config,
     progress: &dyn ProgressCallback,
-    mailer: &dyn crate::report::Mailer,
 ) -> Result<ScrubPass, ScrubError> {
     if config.scrub_target_labels().is_empty() {
         return Err(ScrubError::NoTargets);
@@ -1676,7 +1677,7 @@ pub fn run_scrub_pass(
         }
     }
 
-    email_scrub_report(&pass, config, progress, mailer);
+    email_scrub_report(&pass, config, progress, &crate::report::MAILX);
 
     progress.on_complete(
         pass.success(),
@@ -3455,12 +3456,7 @@ Total to scrub:   401.28MiB\n";
         let mut config = Config::default();
         config.scrub.targets.clear();
         assert!(config.targets.is_empty());
-        let err = run_scrub_pass(
-            &config,
-            &NullProgress,
-            &crate::report::RecordingMailer::accepting(),
-        )
-        .unwrap_err();
+        let err = run_scrub_pass(&config, &NullProgress).unwrap_err();
         assert!(matches!(err, ScrubError::NoTargets));
     }
 
@@ -3526,11 +3522,13 @@ Total to scrub:   401.28MiB\n";
         let sent = mailer.sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].body, format_scrub_report(&pass, &config));
-        assert!(
-            sent[0].subject.starts_with("[DAS Scrub] "),
-            "{}",
-            sent[0].subject
+        // In the mailer's context (test_mail_context), whatever the
+        // environment's DAS_REPORT_TO / DAS_REPORT_FROM say.
+        assert_eq!(
+            sent[0].subject,
+            "[DAS Scrub] nas.example.org — SUCCESS — 2026-11-01 01:02"
         );
+        assert_eq!(sent[0].from, "DAS Scrub (nas) <das@example.org>");
         assert_eq!(sent[0].to, "ops@example.org");
         assert!(
             progress

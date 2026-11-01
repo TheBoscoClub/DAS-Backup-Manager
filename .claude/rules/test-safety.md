@@ -17,8 +17,10 @@ Installation specifics: `.claude/rules/local-installation.md` (gitignored, this 
 3. **Trimmed copies** (`tests/zz_trim_*.sh`) carry the cap from the suite's header, live only for
    the run, and are never committed.
 4. **No test reaches a real mailer** (bd `DAS-Backup-Manager-1x76`: a mutant once mailed through the
-   live relay). Rust: a report send takes a `report::Mailer`; tests pass a recording one, and
-   `report::MAILX` refuses in every test build (`cfg(test)` or feature `test-overrides`) —
-   `tests/test_builds_never_mail.rs` and the unit tests named `*never_spawns_mailx` prove it. Shell: a
-   suite that runs `send_report` stubs `mailx` on an `env -i` `PATH` (`test_backup_exit_semantics.sh`);
-   a suite that extracts functions stubs `send_report` itself or never defines it.
+   live relay). Rust: a report send takes a `report::Mailer`; tests pass a recording one with a fixed
+   `context()`, and `report::MAILX` refuses in every test build — feature `test-overrides`, which the
+   crate's dev-dependency on itself gives every target `cargo test` builds; never remove it there.
+   `tests/test_builds_never_mail.rs` and the unit tests named `*never_spawns_mailx` prove the refusal;
+   `tests/test_report_mail.sh` proves a built `btrdasd` mails. Shell: a suite that runs a real send
+   stubs `mailx` on an `env -i` `PATH` (`test_backup_exit_semantics.sh`, `test_report_mail.sh`); a
+   suite that extracts functions stubs `send_report` itself or never defines it.
