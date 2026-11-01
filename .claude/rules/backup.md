@@ -28,7 +28,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   verifying and re-verifying sources; `btrdasd backup run` and the GUI helper call it too).
 - Omitted only by `[subvolumes].exclude` (pattern names the subvolume **without trailing slash**, covers
   everything nested under it; `@tmp`, `@var-tmp` built in; `[doctor].exclude` still merged) or a `.snapshots` / `.btrbk-snapshots` path
-  component. Every exclusion is in the run report (snapshot trees counted).
+  component. Every exclusion is in the run report (snapshot trees counted). A pattern never skips a configured entry.
 - **Each source volume's top level (id 5) is a subvolume too** (bd `xtnq`): entry `.`, primary-only,
   named `<volume basename>-toplevel`, never retired, excluded only by the exact pattern `/`. Never live
   in a source reaching a mirror (validation and the renderer both refuse). To stop its backup: delete
@@ -46,6 +46,21 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 - A bulk payload inside a broadly-scoped subvolume defeats scoping invisibly: give it its own subvolume
   (`chattr +C` **before** any file lands; `cp --reflink=never`).
 - Verify a mechanism actually fired (`backup_runs`) before describing it in the past tense.
+
+## Subvolume Coverage
+
+- **One rule, both paths** (bd `sp78.1`): every sync compares the `(volume, subvolume, target)` pairs
+  `config.toml` schedules with the last backup run's record — `adopt::sync_subvolumes` → `coverage::check`,
+  never a second copy. Intent, never delivery.
+- **Only a real backup run records** (`--record-coverage`, `SystemBackupHost::sync`); a dry run, a hand
+  `subvol sync` and `backup snapshot|send` write nothing and never create a database.
+- A recorded pair no longer scheduled and still on disk is a **WARN naming the rule that dropped it**, every
+  run until restored, gone from disk, or accepted per pair (`btrdasd subvol coverage accept`), never per
+  pattern. A subvolume gone from a volume that was read is retirement, never a WARN.
+- **Coverage changes no exit code.** A check that cannot run is WARN `not checked: …`; the one FAIL is
+  `backup-run.sh` reading no recognised `SUBVOLUME COVERAGE:` row from a sync that returned 0 or 1. The row
+  is `STATUS  (detail)`, two spaces, on both paths: script and binary ship together.
+- **No test reaches the host's index database**: every test sync names its own `--db` or `CoverageMode` path.
 
 ## DAS Enclosure
 
@@ -159,7 +174,7 @@ Checked before any directory is created, both roots compared **after resolution*
   - `backup-run.sh` (bd `d1r`): **0** = nothing FAILED (a WARN still 0); **3** = began its work and
     something FAILED, or aborted on a target's or source's state; **1** = could not start (nothing mounted or sent); **128+N** =
     stopped by a signal (129 130 138 141 142 143), the unit fails. Both backup units carry
-    `SuccessExitStatus=3`; that line is load-bearing.
+    `SuccessExitStatus=3`; that line is load-bearing. Coverage changes none of these.
   - A 3 is not silent: the report says FAILURES DETECTED (a FAIL recorded after the report is built is named in
     the history row), and an abort before the report sends one **ABORTED** report and records a failed row
     (bd `2my`); an abort *after* the report went out leaves only the journal's `status=3` and the log.

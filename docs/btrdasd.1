@@ -1470,10 +1470,53 @@ whether btrbk.conf was regenerated, and any subvolume that could not be placed.
 If the system clock reads before 2026\-01\-01, no retirement is stamped: the
 report says so and the sync fails.
 .PP
+Every sync then checks
+.BR "subvolume coverage" ,
+and its report ends with a
+.B "SUBVOLUME COVERAGE"
+section whose first line,
+.BR "SUBVOLUME COVERAGE: OK  (" ...\c
+.B )
+or
+.BR "WARN  (" ...\c
+.BR ) ,
+.B backup\-run.sh
+reads. The check takes the (volume, subvolume, target) pairs config.toml
+schedules after the sync \(em every live entry, manual\-only and after\-index
+ones included, sent to each target its source reaches \(em and compares them
+with the record of the last backup run in the index database. A pair recorded
+then, not scheduled now, and still on disk is reported as
+.BR "NO LONGER BACKED UP" ,
+with the rule that dropped it (the exclusion pattern and every list that holds
+it, a removed source or target, narrowed
+.IR target_labels ,
+a re\-adoption that left the mirrors), the date it was first missed, and the
+.B "subvol coverage accept"
+line that stops it being reported. It is reported on every run until it is
+scheduled again (a
+.B RESTORED
+line), its subvolume is gone from disk (counted, no warning), or it is
+accepted. A target renamed with the same mount UUID or serial carries its pairs
+over. The check compares what is scheduled, never what reached a target; it is
+a warning only, and never changes the exit status. A check that cannot be made
+(the database cannot be read, config.toml cannot be re\-read) is reported as
+.BR "WARN  (not checked: " ...\c
+.BR ) .
+Only
+.B \-\-record\-coverage
+writes the record, which
+.B backup\-run.sh
+passes on every real run, as
+.B "btrdasd backup run"
+and a GUI backup do in process; a dry run never records, and never creates a
+missing database.
+.PP
 .B btrdasd subvol sync
 .RB [ \-\-config
 .IR PATH ]
-.RB [ \-\-dry\-run
+.RB [ \-\-db
+.IR PATH ]
+.RB [ \-\-record\-coverage " | " \-\-dry\-run
 .RB [ \-\-render\-btrbk\-conf
 .IR PATH ]]
 .TP
@@ -1492,8 +1535,21 @@ write the btrbk.conf the real run would leave in place into
 .IR PATH ,
 which must already exist as a regular file (it is never created, and a
 symlink is refused). config.toml and the real btrbk.conf are not touched.
+.TP
+.BI \-\-db " PATH"
+The index database the coverage check compares with (and, with
+.BR \-\-record\-coverage ,
+writes).
+Default:
+.IR /var/lib/das\-backup/backup\-index.db .
+.TP
+.B \-\-record\-coverage
+Compare subvolume coverage with the last recorded backup run AND record this
+check. For backup runs only; without it the comparison is printed and nothing
+is written. Refused together with
+.BR \-\-dry\-run .
 .PP
-Exit status:
+Exit status (the coverage check changes none of it):
 .B 0
 sync ran and nothing failed;
 .B 1
@@ -1502,6 +1558,68 @@ the files could not be written, a retirement was refused because of the
 clock, or there was no btrbk.conf to render);
 .B 2
 the configuration could not be loaded.
+.\"
+.SS subvol coverage
+The subvolume/target pairs the coverage check reports as no longer backed up
+(see
+.BR "subvol sync" ).
+.PP
+.B btrdasd subvol coverage accept
+.RI [ \-\-db " PATH" ]
+.I VOLUME SUBVOLUME
+.RB [ \-\-target
+.IR LABEL ]
+.br
+.B btrdasd subvol coverage accept
+.RI [ \-\-db " PATH" ]
+.B \-\-all
+.br
+.B btrdasd subvol coverage list
+.RI [ \-\-db " PATH" ]
+.RB [ \-\-json ]
+.PP
+.B accept
+stops reporting a pair dropped on purpose: it leaves the coverage record and
+is kept in the accept log with its reason and date. Only a pair the coverage
+record holds as no longer backed up is accepted, never a pair that is backed
+up, so a mistyped name changes nothing. A drop only a dry run or a
+compare\-only sync has seen is in no record: its report prints no accept line,
+and the next backup run records it. The accept line names
+.B \-\-db
+whenever the check used another database than the default. Acceptance is per pair, never per pattern: a pair
+scheduled again later and dropped again is reported again.
+.I VOLUME
+and
+.I SUBVOLUME
+are as the report's accept line quotes them
+.RI ( .
+is a volume's top level);
+.B \-\-target
+narrows to one target, and
+.B \-\-all
+accepts every pair reported. Exit status:
+.B 0
+accepted;
+.B 1
+nothing reported as dropped matched (nothing changed);
+.B 2
+the database could not be read or holds no coverage record yet (it is then
+neither created nor migrated).
+.PP
+.B list
+prints the pairs no longer backed up and the accept log, read\-only, as text
+or, with
+.BR \-\-json ,
+an object with
+.IR state ,
+.I dropped
+and
+.IR accepted .
+Exit status:
+.B 0
+printed (also with no record yet);
+.B 2
+the database could not be read.
 .\"
 .SS subvol expire
 Delete the backups of retired subvolumes whose window has passed. Run by
@@ -2879,7 +2997,11 @@ and
 (configuration could not be loaded),
 .B recovery\-os
 (could not be checked; 1 there means a recovery OS needs attention \(em it is
-stale, or btrbk may run when it boots), and
+stale, or btrbk may run when it boots),
+.B "subvol coverage"
+(the database could not be read, or holds no coverage record for
+.BR accept ;
+1 there means nothing reported as dropped matched), and
 .B doctor
 (could not run).
 .TP
@@ -2987,6 +3109,19 @@ Preview which subvolumes the next backup would adopt or retire:
 .RS
 .nf
 sudo btrdasd subvol sync \-\-dry\-run
+.fi
+.RE
+.PP
+See which subvolume/target pairs are no longer backed up, and accept one that
+was dropped on purpose (the report's accept line has the exact quoting, and
+names
+.B \-\-db
+when the index database is not the default):
+.PP
+.RS
+.nf
+sudo btrdasd subvol coverage list
+sudo btrdasd subvol coverage accept '/srv' '@scratch'
 .fi
 .RE
 .PP
@@ -3124,7 +3259,8 @@ sudo btrdasd setup \-\-force
 .SH FILES
 .TP
 .I /var/lib/das\-backup/backup\-index.db
-SQLite database with FTS5 content index and backup history.
+SQLite database with FTS5 content index, backup history and the subvolume
+coverage record (schema 5).
 .TP
 .I /etc/das\-backup/config.toml
 Main configuration file for sources, targets, schedule, and email settings.

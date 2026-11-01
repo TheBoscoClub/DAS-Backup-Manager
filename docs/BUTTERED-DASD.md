@@ -49,6 +49,7 @@ backup-run.sh                   btrdasd CLI
 | `btrbk_conf` | `src/btrbk_conf.rs` | `btrbk.conf` renderer, shared by `setup`, the `subvol` commands and sync |
 | `caldate` | `src/caldate.rs` | Whole-day `YYYY-MM-DD` calendar arithmetic for adoption, retirement and expiry |
 | `config` | `src/config.rs` | TOML config types and validation, DAS/source/target models |
+| `coverage` | `src/coverage.rs` | Subvolume coverage run over run: the pairs a config schedules compared with the last backup run's record inside every sync, the `SUBVOLUME COVERAGE` section, `btrdasd subvol coverage accept`/`list` |
 | `db` | `src/db.rs` | SQLite connection, schema, CRUD, FTS5 search |
 | `doctor` | `src/doctor.rs` | Subvolume drift detector (`btrdasd doctor --check-drift`) |
 | `expire` | `src/expire.rs` | Expiry of retired subvolumes' backups per target and location (`btrdasd subvol expire`) |
@@ -79,7 +80,7 @@ backup-run.sh                   btrdasd CLI
 
 ### Tables
 
-**snapshots** — One row per indexed BTRFS snapshot (schema version 4, stored in `PRAGMA user_version`; an older database is migrated on open).
+**snapshots** — One row per indexed BTRFS snapshot (schema version 5, stored in `PRAGMA user_version`; an older database is migrated on open).
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -120,7 +121,7 @@ backup-run.sh                   btrdasd CLI
 
 Primary key is `(snapshot_id, target_root)`.
 
-**backup_runs** — One row per recorded backup run (`timestamp`, `success`, `mode`, `snaps_created`, `snaps_sent`, `bytes_sent`, `duration_secs`, `errors`); written by `btrdasd backup record-run` and `btrdasd backup run`, read by the GUI history. A snapshot count the run could not take is NULL — shown as `unknown`, never as 0 — since schema 4, whose migration rebuilds this table alone in one transaction, keeping every row, id and value; the one exception is a negative count, which is no measurement and becomes NULL (`record-run` never accepted one, so only a hand-written row could hold it). **target_usage** — capacity samples per target label (`total_bytes`, `used_bytes`, `snapshot_count`) feeding the growth trend. Neither is touched by `reindex --rebuild`.
+**backup_runs** — One row per recorded backup run (`timestamp`, `success`, `mode`, `snaps_created`, `snaps_sent`, `bytes_sent`, `duration_secs`, `errors`); written by `btrdasd backup record-run` and `btrdasd backup run`, read by the GUI history. A snapshot count the run could not take is NULL — shown as `unknown`, never as 0 — since schema 4, whose migration rebuilds this table alone in one transaction, keeping every row, id and value; the one exception is a negative count, which is no measurement and becomes NULL (`record-run` never accepted one, so only a hand-written row could hold it). **target_usage** — capacity samples per target label (`total_bytes`, `used_bytes`, `snapshot_count`) feeding the growth trend. Neither is touched by `reindex --rebuild`. **coverage_state**, **coverage_baseline**, **coverage_accepted** (schema 5) — the subvolume coverage record: the one-row summary of recorded checks, every (volume, subvolume, target) pair scheduled at the last recorded backup run plus each dropped pair until restored, gone or accepted, and the accept log. Written only by a real backup run's sync (`subvol sync --record-coverage`, `backup run`), kept by `reindex --rebuild`, never read by a schema-4 binary.
 
 **files_fts** — FTS5 virtual table synced from `files` via triggers. Enables full-text search on file names and paths.
 
@@ -262,9 +263,10 @@ that basis would discard a valid index.
 sudo btrdasd subvol sync --dry-run   # Print the adopt/retire plan, change nothing
 sudo btrdasd subvol sync             # Adopt new subvolumes, retire vanished ones
 sudo btrdasd subvol expire --dry-run # Show retired series whose backups are past their window
+sudo btrdasd subvol coverage list    # Pairs no longer backed up, and the accept log
 ```
 
-`sync` adopts every subvolume that exists on a source volume and is not excluded by `[subvolumes].exclude` — the volume's own top level (entry `.`, primary target only) included — marks entries whose subvolume has gone as retired, and regenerates `/etc/btrbk/btrbk.conf` whenever it differs from `config.toml`. `expire` deletes a retired series' backups per target once that target's longest retention window has passed. `backup-run.sh` runs sync before btrbk and expire after it; `btrdasd backup run` and a GUI-started backup run sync only. Rules and keep-conditions: [INSTALL.md](INSTALL.md) `[subvolumes]`.
+`sync` adopts every subvolume that exists on a source volume and is not excluded by `[subvolumes].exclude` — the volume's own top level (entry `.`, primary target only) included — marks entries whose subvolume has gone as retired, and regenerates `/etc/btrbk/btrbk.conf` whenever it differs from `config.toml`. `expire` deletes a retired series' backups per target once that target's longest retention window has passed. `backup-run.sh` runs sync before btrbk and expire after it; `btrdasd backup run` and a GUI-started backup run sync only. Every sync ends with the `SUBVOLUME COVERAGE` check: a subvolume/target pair the last backup run scheduled that is no longer scheduled while its subvolume still exists is a warning on every run until restored, deleted or accepted (`btrdasd subvol coverage accept`); a backup run records the check (`--record-coverage`), anything else only compares. Rules and keep-conditions: [INSTALL.md](INSTALL.md) `[subvolumes]`.
 
 ### Delete snapshots and rebuild the index
 

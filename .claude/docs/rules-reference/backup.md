@@ -368,6 +368,130 @@ the binding summary; this is the full text it condenses:
 - A bulk payload inside a broadly-scoped subvolume defeats scoping invisibly (a directory has no entry).
   Give it its own subvolume: `chattr +C` **before** any file lands; copy with `cp --reflink=never`.
 
+## Subvolume Coverage
+
+**Status, plan and decisions: bd `DAS-Backup-Manager-sp78.1`** (follow-ups `sp78.4` GUI accept, `sp78.5`
+rename blind spot, `sp78.6` moved volume path, `sp78.7` intent versus delivery).
+
+**Why.** A subvolume could stop being backed up while it still existed, and no step failed. The
+`[subvolumes].exclude` pins stop one cause (a changed built-in default). The issue was filed on the belief
+that a widened pattern drops a subvolume; reading the code (2026-11-01) corrected it: `plan_sync` applies
+patterns only to on-disk subvolumes **no entry names** (`adopt.rs`, the `unknown` set), and
+`a_configured_subvolume_is_never_skipped_even_if_a_pattern_matches_it` pins that. The real silent drops are:
+an entry removed plus a pattern or snapshot-tree rule that now skips the subvolume; a rename on disk; a
+`[[source]]` removed (the only one on its volume: the volume is never listed again; on a shared volume: the
+subvolumes are re-adopted into `<label>-adopted`, primary only, and leave the mirrors); `target_labels`
+narrowed or naming no target; a `[[target]]` removed.
+
+**Operator decisions (2026-11-01).** Warn every run until the pair is restored, gone or accepted (a
+single line in one mail is lost to a week away, a relay outage, or an abort after sync; repeating also
+makes writing the record at sync time safe). A deliberate removal needs an explicit `btrdasd subvol coverage
+accept`; a target renamed under the same `mount_uuid` or serial is carried over. A check that cannot run is
+a WARN `not checked`, and no backup exit code changes; only a missing or unrecognised coverage row in the
+script is a FAIL (fail-silent "always a defect" #6). No WARN-to-FAIL escalation. GUI accept is `sp78.4`.
+
+**The pair and the record.** A pair is `(Source.volume, SubvolConfig.name, Target.label)`; the source label
+and the snapshot name are not part of it, so renaming either says nothing. Schema 5 adds `coverage_state`
+(one row: first and last recorded date, number of recorded checks; no row = no record yet),
+`coverage_baseline` (every pair intended at the last recorded check, plus every dropped pair not yet
+restored, gone or accepted; `CHECK`s keep a row either wholly covered or wholly dropped) and
+`coverage_accepted` (the accept log). The migration is additive (`CREATE TABLE IF NOT EXISTS`, the stamp
+advances); a schema-4 binary returns at its own `version >= 4` and never sees the tables;
+`rebuild_content_tables` keeps them. Each is pinned by a `db.rs` test.
+
+**Disposition of a recorded pair that is no longer scheduled** — the first rule that matches
+(`coverage::why_dropped`):
+
+| Situation | Outcome |
+|:--|:--|
+| No `[[source]]` names the volume | DROP: `no [[source]] names volume V any more (last in source 'L')` |
+| Volume read, subvolume not on it (never `.`) | GONE: row removed, counted, no warning |
+| No live entry; `plan.unplaceable` has it | DROP: `could not be placed — see COULD NOT BE PLACED: …` |
+| No live entry; a retired one exists | DROP: `its entry in source 'S' is retired although it is still on disk` |
+| No live entry; skipped by a pattern | DROP: `excluded by pattern 'P' (built-in, [subvolumes].exclude, [doctor].exclude — every list holding it)` |
+| No live entry; inside a snapshot tree | DROP: `inside a snapshot directory …` |
+| No live entry; adoption planned, not written | DROP: `its adoption was planned but not written` |
+| No live entry; volume not read | DROP: `no config entry names it; volume V was not read this run …` |
+| Live entry; target label not configured | DROP: `target 'T' is no longer configured` |
+| Live entry; its source reaches no target | DROP: `source 'S' sends to no configured target (target_labels = […])` |
+| Live entry in `<x>-adopted`, recorded from another source | DROP: `its entry left source 'A' and was re-adopted into 'B', which sends to …` |
+| Live top level whose source reaches a mirror | DROP: `the top level cannot be sent while source 'S' reaches a mirror` |
+| Live entry, target out of the source's scope | DROP: `source 'S' no longer sends to 'T' (it sends to …)` |
+| Nothing above | DROP: `no rule found that explains it (report this)` |
+
+A target-side rule on a volume that was not read carries ` (volume V was not read this run)`. Before the
+table, a target label gone from the configuration whose rows all carry one identity (`mount_uuid`, else the
+first serial), matched by exactly one newly configured target and claimed by no other old label, is
+re-keyed to the new label (`TARGET RENAMED` line). A dropped pair scheduled again is a `RESTORED` line once.
+
+**Where it runs.** Inside `adopt::sync_subvolumes`, after the sync, against the configuration re-read from
+disk (on a dry run: `apply_plan`'s result when it applies and validates, else the loaded config, as
+`planned_btrbk_conf` is chosen). `SyncOutcome.coverage` carries the outcome; `SyncOutcome::failed` ignores
+it, so `subvol sync` still exits 0/1/2. `format_sync_report` ends with the `SUBVOLUME COVERAGE` section on
+every outcome. `--record-coverage` (refused with `--dry-run`) and `SystemBackupHost::sync` record;
+`sync_for_manual_step` and a hand sync compare read-only (`SQLITE_OPEN_READ_ONLY`, a missing file is no
+record and is never created).
+
+**The script's row.** `record_subvol_coverage` reads the first line starting `SUBVOLUME COVERAGE: ` from the
+sync's own output with bash pattern matching, no here-string or pipe (the early-exit-readers lesson: a
+here-string that bash cannot create reads as "no line"). `OK  (detail)` / `WARN  (detail)` — two spaces,
+the form of every operations row on both paths — are recorded as printed; no
+line from a sync that returned 0 or 1, or any other shape, is FAIL; no line from a sync that could not run
+(exit 2 and above) is WARN `not checked: subvolume sync could not run`.
+
+**Accept and the record.** `accept_coverage` takes only a pair the record holds as dropped (`dropped_since`
+set), and only a recorded check sets it. A drop that only a dry run, a hand `subvol sync` or `backup
+snapshot|send` has seen is in no record, so its report prints no accept line — it says the drop can be
+accepted once a backup run has recorded it — and an `accept` of it exits 1 saying the record holds no such
+drop (review round 1). The accept line carries `--db '<path>'` whenever the check used a database other
+than `db::DEFAULT_DB_PATH`, which every `--db` defaults to: pasted as printed it acts on the database that
+warned, not on the default one.
+
+**Moved verbatim from `.claude/rules/backup.md` (2026-11-01, instruction-size limit).** The rules file keeps
+the binding summary; this is the full text it condenses (heading then: "Subvolume Coverage — Intent Compared
+Run Over Run, Repeated Until Restored Or Accepted"):
+
+- **Every sync checks coverage** (bd `sp78.1`): the `(volume, subvolume, target)` pairs `config.toml`
+  schedules — every live entry, `after_index` and `manual_only` included, times each target its source
+  sends to — against the record of the last backup run (`coverage_*` tables, schema 5). **One rule, both
+  paths**: `adopt::sync_subvolumes` → `coverage::check`, reached by `backup-run.sh` through `btrdasd subvol
+  sync --record-coverage` and by the CLI/GUI run through `backup::sync_before_backup`. Never a second copy.
+- **Intent, never delivery**: compared with the config that holds after the sync (re-read from disk; on a
+  dry run, what the real run would leave). An absent target, a selection-limited run or a dry run cannot
+  raise a drop; delivery failures are FAIL rows elsewhere.
+- **Only a real backup run records**, at sync time, in one IMMEDIATE transaction (`--record-coverage`;
+  `SystemBackupHost::sync`). A dry run never does, whatever the mode, and never creates a missing database;
+  a hand `subvol sync` and `backup snapshot|send` compare and write nothing.
+- A pair recorded before, not scheduled now, and still on disk (or on a volume not read) is a **WARN naming
+  the rule that dropped it**, repeated on every run until it is restored (a RESTORED line), gone from disk
+  (counted, silent), or accepted — `btrdasd subvol coverage accept '<volume>' '<subvolume>' [--target L]`
+  or `--all`, per pair, never per pattern. Accept takes only a drop the record holds: a drop only a dry
+  run or a compare-only sync has seen gets no accept line (its report says the next backup run records
+  it), and an accept line names `--db` whenever the check used a database other than
+  `db::DEFAULT_DB_PATH`. A subvolume gone from a volume that was read is retirement,
+  never a WARN. A target renamed under the same `mount_uuid` or serial carries its pairs over (INFO line).
+- **Coverage changes no exit code** and never fails a sync, a run, `JobFinished` or the history row; a
+  WARN is a `subvolume coverage WARN: …` line of the finish text (CLI stdout, `JobFinished`). The row
+  reads `STATUS  (detail)`, two spaces, on both paths, as every operations row does. A
+  check that cannot run is WARN `not checked: …`. The one FAIL: `backup-run.sh` finding no `SUBVOLUME
+  COVERAGE: ` row, or an unrecognised one, from a sync that returned 0 or 1 (a broken contract). No
+  WARN-to-FAIL escalation.
+- The row text `not checked: subvolume sync could not run` and the prefix `SUBVOLUME COVERAGE: ` live in
+  `coverage.rs` and `backup-run.sh`; a Rust test reads the script to keep them equal.
+- **No test reaches the host's index database**: every test sync names its own `--db` or `CoverageMode`
+  path (`tests/subvol_cli.rs` refuses a `subvol sync` without `--db`).
+- Nested Subvolumes, after "Every exclusion is in the run report": A pattern keeps out only a subvolume no
+  entry names (a configured entry is never skipped), so a pattern drops a subvolume only once its entry is
+  gone — and that is a coverage WARN (Subvolume Coverage, below).
+- Supervisor Interaction, `backup-run.sh` exit codes: A subvolume coverage drop is a WARN and changes none of
+  these (Subvolume Coverage, above).
+
+**Residuals (named, not fixed here).** Rename blind spot: `mv @a @b` with `@b` skipped by a pattern is
+silent — `@a` is gone, `@b` was never covered (`sp78.5`, pair by subvolume UUID). A volume path moved on the
+same filesystem reads as `VolumeUnconfigured` plus new pairs until accepted (`sp78.6`). Intent is not
+delivery: btrbk skipping a declared pair while exiting 0 is not caught here (`sp78.7`). Side findings filed
+from the same design: `sp78.3` (`subvol sync --json`), `sp78.8`–`sp78.12`, and `9ry` (manual_only).
+
 ## DAS Enclosure
 
 - USB enclosures: **the rating is not the negotiated rate; always check it.**
