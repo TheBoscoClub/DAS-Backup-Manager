@@ -1617,7 +1617,7 @@ fn now_epoch() -> i64 {
 /// interpretation of it for the process exit code is split.
 ///
 /// The report is mailed through [`crate::report::MAILX`]: no caller can hand
-/// a pass another mailer (bd DAS-Backup-Manager-1x76); [`email_scrub_report`]
+/// a pass another mailer (bd DAS-Backup-Manager-1x76); `email_scrub_report`
 /// is what tests drive.
 pub fn run_scrub_pass(
     config: &Config,
@@ -3514,6 +3514,9 @@ Total to scrub:   401.28MiB\n";
         config.email.enabled = true;
         config.email.to = "ops@example.org".into();
         config.email.from = "das@example.org".into();
+        // Unreachable: never the live relay's port (bd 1x76).
+        config.email.smtp_host = "127.0.0.1".into();
+        config.email.smtp_port = 1;
         let pass = pass_with(vec![fs_result("primary-22tb", "uuid-a", true, 1_000_400)]);
 
         let mailer = crate::report::RecordingMailer::accepting();

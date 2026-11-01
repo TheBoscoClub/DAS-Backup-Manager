@@ -297,15 +297,20 @@ if(BUILD_TESTING)
     endif()
     # The shipped direction of the mail guard (bd DAS-Backup-Manager-1x76): the
     # btrdasd this build makes mails a report through mailx (a stub), with the
-    # arguments and body the relay is to get. A build with the test-overrides
-    # feature mails nothing and fails it; without the binary it prints NOT RUN.
+    # arguments and body the relay is to get, and neither it nor the D-Bus
+    # helper carries the test-build refusal. A build with the test-overrides
+    # feature fails it; without a binary it prints NOT RUN (a failure in CI).
     add_test(
         NAME shell-report-mail
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_report_mail.sh
     )
     if(BUILD_INDEXER)
-        set_tests_properties(shell-report-mail PROPERTIES
-            ENVIRONMENT "REAL_BTRDASD=${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd")
+        set(report_mail_env "REAL_BTRDASD=${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd")
+        if(BUILD_HELPER)
+            list(APPEND report_mail_env
+                "REAL_BTRDASD_HELPER=${CMAKE_BINARY_DIR}/cargo-target/release/btrdasd-helper")
+        endif()
+        set_tests_properties(shell-report-mail PROPERTIES ENVIRONMENT "${report_mail_env}")
     endif()
     add_test(
         NAME shell-verify-sources

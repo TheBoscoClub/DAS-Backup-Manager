@@ -4840,6 +4840,9 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         cfg.email.enabled = true;
         cfg.email.to = "ops@example.org".into();
         cfg.email.from = "das@example.org".into();
+        // Unreachable: never the live relay's port (bd 1x76).
+        cfg.email.smtp_host = "127.0.0.1".into();
+        cfg.email.smtp_port = 1;
         cfg
     }
 

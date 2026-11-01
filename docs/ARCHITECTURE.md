@@ -623,7 +623,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | Module | File | Lines | Purpose |
 |--------|------|-------|---------|
 | `adopt` | `src/adopt.rs` | ~3000 | Subvolume sync: lists each verified source volume (its top level included), adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
-| `backup` | `src/backup.rs` | ~3670 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
+| `backup` | `src/backup.rs` | ~11400 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
 | `btrbk_conf` | `src/btrbk_conf.rs` | ~1030 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
 | `caldate` | `src/caldate.rs` | ~450 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates; local date and time for schedules (the zone read again on every call) |
 | `config` | `src/config.rs` | ~2450 | TOML config types, DAS/source/target models |
@@ -644,13 +644,13 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `recovery_os::panel` | `src/recovery_os/panel.rs` | ~2430 | The drive panel's rules and `RecoveryOsStatus` document: per drive the record, history, schedule (`pending`, `fired`, `running`, `missed`) and session, each with its own `history_error`/`schedule_error`/`session_error` key when its read failed; the generated `das-recovery-os-update-<label\|both>.{service,timer}` pair and the validation of a schedule |
 | `recovery_os::lines` | `src/recovery_os/lines.rs` | ~230 | The parser of the script's `PROGRESS`/`OUTPUT`/`RESULT`/`DRIVE` lines |
 | `recovery_os::session` | `src/recovery_os/session.rs` | ~1290 | `recovery-os-vm.sh session` as a helper job: built environment, lines to the job's signals, one SIGINT to the script's process group on cancel |
-| `report` | `src/report.rs` | ~1490 | Backup report formatting, and the `Mailer` seam every report send (backup, scrub, doctor) goes through; `MAILX` runs `mailx`, and refuses in a test build |
+| `report` | `src/report.rs` | ~1630 | Backup report formatting, and the `Mailer` seam every report send (backup, scrub, doctor) goes through; `MAILX` runs `mailx`, and refuses in a test build |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
-| `scrub` | `src/scrub.rs` | ~3200 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
+| `scrub` | `src/scrub.rs` | ~3570 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
 | `subvol` | `src/subvol.rs` | ~215 | Subvolume CRUD operations |
-| `main` | `src/main.rs` | ~3750 | CLI entry point with clap subcommands |
+| `main` | `src/main.rs` | ~4940 | CLI entry point with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
 | `setup/config` | `src/setup/config.rs` | — | Re-export of the library's `config` types |
 | `setup/env_export` | `src/setup/env_export.rs` | — | `btrdasd config dump-env`: config as shell `DAS_*` variables for the scripts |

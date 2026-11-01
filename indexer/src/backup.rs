@@ -3928,7 +3928,13 @@ mod tests {
                 },
                 display_name: "Test 22TB".into(),
             }],
-            email: Email::default(),
+            // Unreachable: a test never names the live relay's port, so not
+            // even a broken guard could hand it a report (bd 1x76).
+            email: Email {
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 1,
+                ..Email::default()
+            },
             gui: Gui::default(),
         }
     }
@@ -10308,23 +10314,14 @@ mod tests {
             Path::new(scrub::MAINTENANCE_LOCK_PATH)
         );
         assert_eq!(host.job, "btrdasd-helper BackupRun job");
-        // Its mailer is the production one: in a test build that refuses,
-        // saying so — no other mailer answers this.
-        let message = crate::report::report_message(
-            "x",
-            &{
-                let mut c = make_test_config();
-                c.email.to = "ops@example.org".into();
-                c.email.from = "das@example.org".into();
-                c
-            },
-            "Backup",
-            &crate::report::test_mail_context(),
-        )
-        .unwrap();
+        // Its mailer is the production one — told by what it is, never by
+        // sending through it: a test that sent through MAILX would reach the
+        // system's mailx whenever the test-build guard broke.
+        let mailer: &dyn std::any::Any = &*host.mailer;
         assert_eq!(
-            host.mailer.send(&message),
-            Err("mailx not run: a test build never mails (bd DAS-Backup-Manager-1x76)".into())
+            mailer.downcast_ref::<crate::report::Mailx>(),
+            Some(&crate::report::MAILX),
+            "SystemBackupHost::new mails through report::MAILX"
         );
     }
 

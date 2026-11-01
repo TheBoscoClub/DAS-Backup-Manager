@@ -20,6 +20,14 @@
 # stdin and answers as told. It runs no mailer and never its own name. The
 # config names an unreachable relay (127.0.0.1:1) and no source or target.
 # Writes only beneath a mktemp directory. No network, no devices.
+#
+# The D-Bus helper (REAL_BTRDASD_HELPER; ctest sets it when the helper is
+# built) mails the GUI's backup reports through the same report::MAILX, but
+# its send needs root, the system bus, polkit and a real backup job, so it is
+# not driven here. Instead both shipped binaries are searched for the
+# refusal's text: a release build without test-overrides has none (the
+# guarded branch is a constant false, so the text is never compiled in), and
+# one with the feature — `dbus` implying it, say — has it and fails here.
 set -uo pipefail
 # The task cap (tests/lib/bound.sh): a runaway PATH stub stops here, not at oomd
 # shellcheck source=/dev/null
@@ -114,13 +122,16 @@ EOF
 }
 
 RC=0
-doctor() { # doctor: btrdasd doctor --email, stdout and stderr to $WORK/out
+doctor() { # doctor [VAR=value...]: btrdasd doctor --email, output to $WORK/out
     rm -f "${REC:?}/args" "${REC:?}/body"
     RC=0
-    env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" LC_ALL=C MAILX_RECORD="$REC" \
+    env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" LC_ALL=C MAILX_RECORD="$REC" "$@" \
         "${AS[@]}" "$WORK/btrdasd" doctor --email --config "$WORK/config.toml" \
         >"$WORK/out" 2>&1 || RC=$?
 }
+# How many times the refusal's text is in a file (grep -c counts lines).
+REFUSAL="a test build never mails"
+refusals() { grep -caF -- "$REFUSAL" "$1" || true; }
 ran() { if [[ -f "$REC/args" ]]; then echo yes; else echo no; fi; }
 
 # The PATH the run gets resolves mailx to the stub.
@@ -173,7 +184,21 @@ out="$(cat "$WORK/out")"
 check "exit status unchanged" "$RC" "2"
 check "mailx was run" "$(ran)" "yes"
 has "mailx's stderr reaches the warning" "$out" \
-    "Could not send doctor failure report email: mailx failed (exit exit status: 1): smtp-server: 127.0.0.1:1: Connection refused (stub)"
+    "Could not send doctor failure report email: mailx failed (exit status: 1): smtp-server: 127.0.0.1:1: Connection refused (stub)"
+
+echo "== DAS_REPORT_TO and DAS_REPORT_FROM replace the configured recipient and sender"
+echo 0 >"$REC/rc"
+doctor DAS_REPORT_TO=probe-to@example.org DAS_REPORT_FROM=probe-from@example.org
+args=()
+[[ -f "$REC/args" ]] && mapfile -t args <"$REC/args"
+check "mailx got 13 arguments" "${#args[@]}" "13"
+check "the recipient is DAS_REPORT_TO" "${args[12]:-}" "probe-to@example.org"
+check "the sender is DAS_REPORT_FROM, given the display name" "${args[3]:-}" "DAS Doctor (${host%%.*}) <probe-from@example.org>"
+doctor "DAS_REPORT_FROM=Probe <probe-from@example.org>"
+args=()
+[[ -f "$REC/args" ]] && mapfile -t args <"$REC/args"
+check "a sender with its own display name is kept verbatim" "${args[3]:-}" "Probe <probe-from@example.org>"
+check "without DAS_REPORT_TO, the configured recipient" "${args[12]:-}" "ops@example.org"
 
 echo "== email disabled"
 config false
@@ -183,6 +208,19 @@ out="$(cat "$WORK/out")"
 check "exit status" "$RC" "2"
 check "mailx was not run" "$(ran)" "no"
 has "it says why not" "$out" "Could not send doctor failure report email: Email is not enabled in config"
+
+echo "== neither shipped binary carries the test-build refusal"
+printf 'x %s y\n' "$REFUSAL" >"$WORK/control"
+check "the search finds the text where it is (control)" "$(refusals "$WORK/control")" "1"
+check "btrdasd: no refusal" "$(refusals "$REAL_BTRDASD")" "0"
+if [[ -z "${REAL_BTRDASD_HELPER:-}" ]]; then
+    # Visible, never a pass: CI fails a suite that prints this.
+    echo "NOT RUN: the D-Bus helper's check — set REAL_BTRDASD_HELPER to a built btrdasd-helper"
+elif [[ ! -f "$REAL_BTRDASD_HELPER" ]]; then
+    check "btrdasd-helper exists" "no such file: $REAL_BTRDASD_HELPER" "a built btrdasd-helper"
+else
+    check "btrdasd-helper: no refusal" "$(refusals "$REAL_BTRDASD_HELPER")" "0"
+fi
 
 echo "passed=$pass failed=$fail"
 if ((fail > 0)); then

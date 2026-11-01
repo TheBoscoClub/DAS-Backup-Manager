@@ -417,7 +417,7 @@ pub struct MailMessage {
 /// Every report send — backup, scrub, doctor — goes through this
 /// (bd DAS-Backup-Manager-1x76). Production sends through [`MAILX`]; tests
 /// hand the send a recording mailer and assert on the exact message.
-pub trait Mailer: Send + Sync {
+pub trait Mailer: Send + Sync + std::any::Any {
     /// Hand `message` to the relay. The error is why it was not handed
     /// over, as the caller logs it.
     fn send(&self, message: &MailMessage) -> Result<(), String>;
@@ -515,7 +515,8 @@ impl Mailer for Mailx {
 }
 
 /// Run `program` with `args`, `body` on its stdin, stdout discarded, stderr
-/// captured. Only [`Mailx::send`] calls it, and only outside a test build.
+/// captured. In non-test code only [`Mailx::send`] calls it, and only outside
+/// a test build; its unit test drives it on a stub program.
 fn spawn_with_stdin(
     program: &str,
     args: &[String],
@@ -541,7 +542,7 @@ fn mailx_outcome(output: &std::process::Output) -> Result<(), String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
-            "mailx failed (exit {}): {}",
+            "mailx failed ({}): {}",
             output.status,
             stderr.trim()
         ))
@@ -561,13 +562,21 @@ pub struct MailContext {
 }
 
 impl MailContext {
-    /// This machine, now.
+    /// This machine, now, with the overrides from this process's environment.
     pub fn current() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// This machine, now, with the overrides `lookup` gives for
+    /// `DAS_REPORT_TO` and `DAS_REPORT_FROM` ([`MailContext::current`] looks
+    /// in the environment; a test hands it a closure, so it never has to set
+    /// a variable).
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         Self {
             hostname: kernel_hostname(),
             now: format_minute(&local_now()),
-            to_override: std::env::var("DAS_REPORT_TO").ok(),
-            from_override: std::env::var("DAS_REPORT_FROM").ok(),
+            to_override: lookup("DAS_REPORT_TO"),
+            from_override: lookup("DAS_REPORT_FROM"),
         }
     }
 }
@@ -1270,7 +1279,9 @@ mod tests {
         config.email.to = "ops@example.org".into();
         config.email.from = "das@example.org".into();
         config.email.smtp_host = "127.0.0.1".into();
-        config.email.smtp_port = 25;
+        // Unreachable: a test never names the live relay's port, so not even
+        // a broken guard could hand it a report (bd DAS-Backup-Manager-1x76).
+        config.email.smtp_port = 1;
         config
     }
 
@@ -1303,7 +1314,7 @@ mod tests {
                 "[DAS Scrub] nas.example.org — SUCCESS — 2026-11-01 01:02",
                 "DAS Scrub (nas) <das@example.org>",
                 "ops@example.org",
-                "smtp://127.0.0.1:25",
+                "smtp://127.0.0.1:1",
                 "all fine\n",
             ))
         );
@@ -1314,7 +1325,7 @@ mod tests {
                 "[DAS Backup] nas — FAILURE — 2026-11-01 01:02",
                 "DAS Backup (nas) <das@example.org>",
                 "ops@example.org",
-                "smtp://127.0.0.1:25",
+                "smtp://127.0.0.1:1",
                 "Status: FAILURE\n",
             ))
         );
@@ -1369,7 +1380,7 @@ mod tests {
             "[DAS Backup] nas — SUCCESS — 2026-11-01 01:02",
             "DAS Backup (nas) <das@example.org>",
             "ops@example.org",
-            "smtp://127.0.0.1:25",
+            "smtp://127.0.0.1:1",
             "body",
         );
         assert_eq!(
@@ -1382,7 +1393,7 @@ mod tests {
                 "-S",
                 "v15-compat",
                 "-S",
-                "mta=smtp://127.0.0.1:25",
+                "mta=smtp://127.0.0.1:1",
                 "-S",
                 "smtp-auth=none",
                 "-S",
@@ -1443,7 +1454,7 @@ mod tests {
         assert_eq!(mailx_outcome(&done(0, "")), Ok(()));
         assert_eq!(
             mailx_outcome(&done(4, "  A password is necessary\n")),
-            Err("mailx failed (exit exit status: 4): A password is necessary".into())
+            Err("mailx failed (exit status: 4): A password is necessary".into())
         );
     }
 
@@ -1470,9 +1481,7 @@ mod tests {
         assert_eq!(MailContext::current().hostname, kernel.trim_end());
     }
 
-    /// The production mailer's context is this machine and its environment:
-    /// read here, never set (each variable is compared with itself, so the
-    /// test holds whatever the environment has).
+    /// The production mailer's context is this machine, now.
     #[test]
     fn the_production_mailers_context_is_this_machine_now() {
         let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
@@ -1484,8 +1493,36 @@ mod tests {
             "{}",
             context.now
         );
-        assert_eq!(context.to_override, std::env::var("DAS_REPORT_TO").ok());
-        assert_eq!(context.from_override, std::env::var("DAS_REPORT_FROM").ok());
+    }
+
+    /// The overrides are what the lookup gives for exactly these two names,
+    /// and nothing when it gives nothing — driven by a closure, never by
+    /// setting a variable. (That `current` looks in the environment, and that
+    /// the built binary honours them, is `tests/test_report_mail.sh`.)
+    #[test]
+    fn the_overrides_are_what_the_lookup_gives_for_das_report_to_and_from() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let context = MailContext::from_lookup(|name| {
+            asked.lock().unwrap().push(name.to_string());
+            match name {
+                "DAS_REPORT_TO" => Some("probe-to@example.org".into()),
+                "DAS_REPORT_FROM" => Some("probe-from@example.org".into()),
+                _ => Some("unexpected@example.org".into()),
+            }
+        });
+        assert_eq!(context.to_override.as_deref(), Some("probe-to@example.org"));
+        assert_eq!(
+            context.from_override.as_deref(),
+            Some("probe-from@example.org")
+        );
+        let mut asked = asked.into_inner().unwrap();
+        asked.sort();
+        assert_eq!(asked, ["DAS_REPORT_FROM", "DAS_REPORT_TO"]);
+
+        let none = MailContext::from_lookup(|_| None);
+        assert_eq!((none.to_override, none.from_override), (None, None));
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert_eq!(none.hostname, kernel.trim_end());
     }
 
     /// The spawn itself (bd DAS-Backup-Manager-1x76 review): the arguments
@@ -1537,7 +1574,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&body_file).unwrap(), "body");
         assert_eq!(
             mailx_outcome(&out),
-            Err("mailx failed (exit exit status: 4): relay said no".into()),
+            Err("mailx failed (exit status: 4): relay said no".into()),
             "the failing program's stderr reaches the error"
         );
         let absent = dir.path().join("absent");
@@ -1565,14 +1602,14 @@ mod tests {
                     "[DAS Scrub] nas.example.org — FAILURE — 2026-11-01 01:02",
                     "DAS Scrub (nas) <das@example.org>",
                     "ops@example.org",
-                    "smtp://127.0.0.1:25",
+                    "smtp://127.0.0.1:1",
                     "Status: FAILURE\n",
                 ),
                 message(
                     "[DAS Backup] nas.example.org — SUCCESS — 2026-11-01 01:02",
                     "DAS Backup (nas) <das@example.org>",
                     "ops@example.org",
-                    "smtp://127.0.0.1:25",
+                    "smtp://127.0.0.1:1",
                     "fine\n",
                 ),
             ]
