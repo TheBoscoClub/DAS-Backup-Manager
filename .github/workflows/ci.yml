@@ -216,8 +216,10 @@ jobs:
 
       # Pinned to the version the maintainer runs locally, so CI and the editor
       # agree. Config: .markdownlint.yaml; exclusions: .markdownlintignore.
+      # --dot: without it the glob skips dot-directories, so .claude/rules/ and
+      # .claude/docs/ — the files this gate exists for — were never linted.
       - name: Markdown lint (markdownlint-cli pinned to the local version)
         run: |
           npm install -g --ignore-scripts markdownlint-cli@0.48.0
           markdownlint --version
-          markdownlint '**/*.md'
+          markdownlint --dot '**/*.md'
