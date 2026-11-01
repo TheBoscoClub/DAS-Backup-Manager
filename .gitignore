@@ -136,7 +136,7 @@ pyproject.toml
 .stylua.toml
 .yamllint
 .yamllint.yml
-.markdownlint.*
+# .markdownlint.* is tracked: CI runs markdownlint (github.md "does CI read this file?")
 setup.cfg
 
 # PYTHON

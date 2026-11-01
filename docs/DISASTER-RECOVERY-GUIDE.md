@@ -1,6 +1,6 @@
 # Disaster Recovery Guide
 
-**For system recovery from DAS backup drives**
+For system recovery from DAS backup drives
 
 > **Important**: Replace all `<placeholder>` values (device paths, UUIDs, serials, bay references) with your actual values. Run `btrdasd config show` to display your configured targets and serials.
 
@@ -112,6 +112,7 @@ If `subvol sync` does not adopt a subvolume nested three directories deep, add t
 ### Backup Schedule
 
 As configured by `btrdasd setup`:
+
 - **Nightly**: Incremental backup (only changed files since last snapshot)
 - **Configurable**: Full backup refresh on a schedule you define
 
@@ -159,7 +160,7 @@ Use this guide when:
 
 In the boot menu, look for entries corresponding to your DAS drives. They will typically show the DAS enclosure model name followed by a partition UUID. For example:
 
-```
+```text
 <DAS-model> (<your-esp-uuid>)     <-- Primary bootable recovery drive
 <DAS-model> (<your-esp-uuid>)     <-- Mirror bootable recovery drive (if configured)
 ```
@@ -187,11 +188,14 @@ Use the credentials you configured for the recovery environment.
 **Symptoms**: System still boots but shows "degraded array" warnings.
 
 **What to do**:
+
 1. Boot into your normal system on the surviving mirror. A BTRFS RAID-1 root with a device missing mounts only with `degraded`, and on many systems the default boot entry does not carry it: at the boot menu choose **CachyOS (Safe Mode)**, **CachyOS (Fallback Initramfs)** or **CachyOS (CLI Only)**, whose `rootflags=subvol=/@,degraded` let it mount
 2. Open a terminal and check array status:
+
    ```bash
    sudo btrfs device stats /
    ```
+
 3. If errors show on one device, replace that drive
 4. See [Replacing a Failed Boot Drive](#replacing-a-failed-boot-drive)
 
@@ -202,6 +206,7 @@ Use the credentials you configured for the recovery environment.
 **Symptoms**: Computer will not boot at all, or BIOS shows "No bootable device".
 
 **What to do**:
+
 1. Boot into Rescue Mode (see [Booting into Rescue Mode](#booting-into-rescue-mode)), or boot from a Linux live USB
 2. You can either:
    - **Option 1**: Boot a recovery drive's own OS from the DAS and work from there (temporary, slow over USB)
@@ -216,6 +221,7 @@ See [Full System Restoration](#full-system-restoration) for detailed steps.
 **Symptoms**: You have new hardware (new motherboard, CPU, etc.) and need to restore your system.
 
 **What to do**:
+
 1. Install new drives in the new system
 2. Connect the DAS
 3. Boot into Rescue Mode (or a Linux live USB)
@@ -231,6 +237,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 **Applies if** your primary backup is a BTRFS RAID-1 across two large drives (two DAS drives sharing one BTRFS UUID, `<primary-uuid>`).
 
 **Symptoms**:
+
 - The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. As of `backup-run.sh` v4.12.0 the emailed report has no line of its own for this and its SMART section shows one serial per target, so a clean-looking email does not prove both legs are present
 - `sudo btrfs filesystem show <primary-label>` says `*** Some devices missing` — ask by label: between backups the array is not mounted, and `btrfs filesystem show /mnt/backup-<primary-label>` then answers only `not a valid btrfs filesystem`
 - Once it is mounted (Step 2), `sudo btrfs device stats /mnt/backup-<primary-label>` shows non-zero error counters on one leg
@@ -426,12 +433,15 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
 4. **Open a terminal**
 
 5. **Identify the new drive**:
+
    ```bash
    lsblk -d -o NAME,SIZE,MODEL,SERIAL
    ```
+
    The new drive will show with no partitions. Pick it by **serial**: NVMe names (`nvme0n1`, `nvme1n1`) can swap between boots just like `/dev/sdX` letters.
 
 6. **Partition the new drive** (replace `<new-drive>` with the device you just matched by serial):
+
    ```bash
    # Clone partition table from surviving drive
    # sfdisk -d carries the disk GUID (label-id:) and every partition's uuid=, and
@@ -451,6 +461,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    ```
 
 7. **Replace the missing device in the BTRFS array**:
+
    ```bash
    # Mount the surviving drive degraded (if not already mounted)
    sudo mount -o degraded /dev/<surviving-btrfs-partition> /mnt
@@ -467,6 +478,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    ```
 
 8. **Wait for the replace and balance to complete** (can take several hours):
+
    ```bash
    sudo btrfs replace status /mnt
    sudo btrfs balance status /mnt
@@ -475,6 +487,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
 9. **Populate the new ESP** — never by hand-copying files from one ESP to another:
    - If the new drive is the **mirror**, run your ESP-mirroring mechanism (a typical script copies only the primary ESP to the mirror and removes from the mirror any file the primary lacks).
    - If it held the **primary** ESP (mounted at `/boot`), mount it there and reinstall instead. **`/boot` must be complete before the first sync**, because the sync deletes from the mirror — the ESP you just booted from — whatever `/boot` lacks, and a pacman hook, if you installed one, runs that sync at the end of any kernel transaction. Put back first anything no package or generator writes (hand-written loader entries), then reinstall in ONE transaction every package that owns a file on the ESP — `amd-ucode` owns `/boot/amd-ucode.img`, not the kernel package — plus every installed kernel:
+
      ```bash
      sudo mount /boot                      # LABEL=EFI from fstab — now the new ESP
      sudo bootctl install
@@ -485,9 +498,11 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
      <your-esp-sync-script> --dry-run   # must print no "would remove" line
      <your-esp-sync-script>
      ```
+
    - Never point any copy or sync at a DAS recovery drive's ESP: those boot their own independent OS.
 
 10. **Register UEFI boot entry for the new drive**:
+
     ```bash
     sudo efibootmgr --create --disk /dev/<new-drive> --part <esp-partition-number> \
       --loader '\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI' \
@@ -495,6 +510,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
     ```
 
 11. **Update fstab** with new UUIDs if needed (an fstab that mounts the ESPs by `LABEL=`, as is common, needs no change when the new ESP got the same label):
+
     ```bash
     sudo blkid /dev/<new-drive-esp-partition>   # Get new ESP UUID
     sudo vim /etc/fstab                          # Update UUIDs
@@ -513,6 +529,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
 1. **Boot into Rescue Mode** (from DAS or Linux live USB)
 
 2. **Partition new drives** (replace device names with your actual devices):
+
    ```bash
    # For each drive:
    sudo parted /dev/<drive> mklabel gpt
@@ -525,6 +542,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    ```
 
 3. **Create BTRFS filesystem** on the main partitions:
+
    ```bash
    # RAID-1 with two drives:
    sudo mkfs.btrfs -m raid1 -d raid1 /dev/<drive1-btrfs-partition> /dev/<drive2-btrfs-partition>
@@ -534,12 +552,14 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    ```
 
 4. **Mount the new filesystem**:
+
    ```bash
    sudo mkdir -p /mnt/target
    sudo mount /dev/<drive1-btrfs-partition> /mnt/target
    ```
 
 5. **Mount the DAS backup** — the **primary** target, by filesystem UUID. Do not use a recovery drive's `@`/`@home`: those are that drive's own OS, not your system:
+
    ```bash
    # Find the target's UUID (your primary target: <primary-label>, <primary-uuid>)
    lsblk -o NAME,SERIAL,LABEL,UUID
@@ -553,6 +573,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    ```
 
 6. **Restore the system**:
+
    ```bash
    # Create subvolumes matching your original layout
    sudo btrfs subvolume create /mnt/target/@
@@ -568,9 +589,11 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    # Restore home from the snapshot of the same time
    sudo rsync -aAXHv --info=progress2 /mnt/backup/nvme/home.<TIMESTAMP>/ /mnt/target/@home/
    ```
+
    The subvolume names above are examples (`btrdasd subvol list` shows yours); a snapshot holds nothing where a nested subvolume sat (an empty directory in the host's own snapshot, no entry at all in the received copy on a target), so restore each nested one from its own snapshot. A nested `@/@appdata-db` whose snapshot name is `-appdata-db` is snapshotted as `nvme/-appdata-db.<TIMESTAMP>`: a name that begins with `-` is read as an option by most commands, so always give it as a full path (`/mnt/backup/nvme/-appdata-db.<TIMESTAMP>/`), or put `--` before it.
 
 7. **Install bootloader**:
+
    ```bash
    # Mount ESP
    sudo mount /dev/<drive-esp-partition> /mnt/target/@/boot
@@ -594,6 +617,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    Then check the loader entries: every `root=UUID=` in `/mnt/target/@/boot/loader/entries/*.conf` must be the new BTRFS filesystem's UUID (`sudo blkid /dev/<drive1-btrfs-partition>`); correct any that is not. Put back by hand, with the new UUID, every entry no generator writes (for example extra Safe Mode or CLI entries).
 
 8. **Update fstab with new UUIDs**:
+
    ```bash
    # Get new UUIDs
    sudo blkid /dev/<drive-esp-partition>
@@ -607,6 +631,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
    Also change every line that mounts a subvolume by `subvolid=`: a restored subvolume is a new one with a new id, and a line naming the old id stops the boot in emergency mode. Name it by path instead. For example, a line mounting `/var/lib/<app>/db` with `subvolid=2816` must, after a restore, say `subvol=/@/@<app>-db`.
 
 9. **Unmount and reboot**:
+
    ```bash
    sudo umount -R /mnt/target
    sudo umount /mnt/backup
@@ -620,6 +645,7 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
 Follow the [Full System Restoration](#full-system-restoration) procedure, then:
 
 1. After first boot, update all packages and regenerate initramfs:
+
    ```bash
    # Arch/CachyOS:
    sudo pacman -Syu
@@ -635,6 +661,7 @@ Follow the [Full System Restoration](#full-system-restoration) procedure, then:
    ```
 
 2. If using different GPU than original, install appropriate drivers:
+
    ```bash
    # AMD GPU (Arch example)
    sudo pacman -S mesa vulkan-radeon
@@ -647,6 +674,7 @@ Follow the [Full System Restoration](#full-system-restoration) procedure, then:
    ```
 
 3. Regenerate initramfs:
+
    ```bash
    sudo mkinitcpio -P    # Arch/CachyOS
    # Or appropriate command for your distro
@@ -687,6 +715,7 @@ sudo arch-chroot /mnt/broken
 ```
 
 When you are done with any repair, exit the chroot and unmount:
+
 ```bash
 exit                          # leave chroot
 sudo umount -R /mnt/broken    # unmount everything
@@ -704,17 +733,21 @@ sudo reboot
 1. Mount the broken system and enter chroot (see [Preparation](#preparation-mount-the-broken-system) above)
 
 2. **Reset the root password**:
+
    ```bash
    passwd root
    ```
+
    Type the new password twice when prompted. There is no output while typing -- this is normal.
 
 3. **If you also need to reset a user password**:
+
    ```bash
    passwd <username>
    ```
 
 4. **If sudo is broken** (user removed from wheel group, sudoers corrupted):
+
    ```bash
    # Add user back to wheel group
    usermod -aG wheel <username>
@@ -732,6 +765,7 @@ sudo reboot
 ### Fix a Broken /etc/fstab
 
 **Symptoms**: System starts booting but hangs or drops to an emergency shell with messages like:
+
 - "A dependency job for local-fs.target failed"
 - "You are in emergency mode"
 - "Failed to mount /home" or any other mount point
@@ -742,6 +776,7 @@ sudo reboot
 1. Mount the broken system (see [Preparation](#preparation-mount-the-broken-system) above). You do NOT need a full chroot for this repair -- just mount the root filesystem.
 
 2. **Look at the current fstab**:
+
    ```bash
    cat /mnt/broken/etc/fstab
    ```
@@ -753,6 +788,7 @@ sudo reboot
    - **Wrong subvolume name**: BTRFS subvolume was renamed or deleted
 
 4. **Get the correct UUIDs**:
+
    ```bash
    # Show all detected filesystems with UUIDs
    blkid
@@ -762,6 +798,7 @@ sudo reboot
    ```
 
 5. **Edit the fstab**:
+
    ```bash
    sudo nano /mnt/broken/etc/fstab
    ```
@@ -771,20 +808,24 @@ sudo reboot
    - If a drive is gone and you don't have a replacement, **comment out the line** by putting `#` at the start
    - The root (`/`) entry MUST be correct or the system will not boot at all
    - Check that `subvol=` names match actual BTRFS subvolumes:
+
      ```bash
      sudo btrfs subvolume list /mnt/broken
      ```
 
 6. **Save the file** (in nano: Ctrl+O, Enter, Ctrl+X) and unmount:
+
    ```bash
    sudo umount /mnt/broken
    sudo reboot
    ```
 
 **Tip**: If you are unsure what the fstab should look like, you can generate a fresh one:
+
 ```bash
 genfstab -U /mnt/broken
 ```
+
 This prints what fstab SHOULD contain based on currently mounted filesystems. Compare it to the existing file and fix discrepancies.
 
 ---
@@ -792,6 +833,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 ### Fix a Broken Bootloader or Missing Kernel
 
 **Symptoms**:
+
 - "No bootable device found"
 - Bootloader menu appears but selecting an entry fails
 - "vmlinuz not found" or "initramfs not found"
@@ -802,12 +844,14 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 1. Mount the broken system AND its ESP, then enter chroot (see [Preparation](#preparation-mount-the-broken-system) above)
 
 2. **Check what's on the ESP**:
+
    ```bash
    ls /boot/
    # You should see: vmlinuz-linux-*, initramfs-linux-*, amd-ucode.img or intel-ucode.img, EFI/, loader/
    ```
 
 3. **If kernel files are missing**, reinstall the kernel:
+
    ```bash
    # CachyOS/Arch:
    pacman -S linux-cachyos    # or whichever kernel package you use
@@ -822,6 +866,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    ```
 
 4. **If boot entries are missing or wrong** (systemd-boot):
+
    ```bash
    # List current entries
    ls /boot/loader/entries/
@@ -838,9 +883,11 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    options root=UUID=<your-root-uuid> rw rootflags=subvol=/@
    ENTRY
    ```
+
    Replace `<your-root-uuid>` with your actual root partition UUID from `blkid`.
 
 5. **If initramfs is corrupt or missing**, regenerate it:
+
    ```bash
    # CachyOS/Arch:
    mkinitcpio -P     # regenerates ALL initramfs images
@@ -850,6 +897,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    ```
 
 6. **Register the UEFI boot entry** (if BIOS doesn't see the drive):
+
    ```bash
    efibootmgr --create --disk /dev/<drive> --part <esp-number> \
      --loader '\EFI\systemd\systemd-bootx64.efi' \
@@ -863,6 +911,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 ### Fix a Systemd Service That Hangs Boot
 
 **Symptoms**:
+
 - Boot freezes at "A start job is running for ..." and never finishes
 - Boot hangs for 90+ seconds, then drops to a degraded shell
 - System boots but critical services (networking, display manager) are broken
@@ -872,6 +921,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 1. Mount the broken system and enter chroot (see [Preparation](#preparation-mount-the-broken-system) above)
 
 2. **Find the failing service**. If you saw the service name on screen during the hang, use that. Otherwise:
+
    ```bash
    # The broken system's journal, read from outside the chroot: its boots,
    # newest last, then the errors of its last boot (-b -1 for the one before)
@@ -880,6 +930,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    ```
 
 3. **Disable the problem service** so the system can boot:
+
    ```bash
    # From inside chroot:
    systemctl disable <service-name>
@@ -891,19 +942,22 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 4. **Common problem services and fixes**:
 
    | Service | Common Cause | Fix |
-   |---------|-------------|-----|
+   | --- | --- | --- |
    | `NetworkManager-wait-online` | Waiting for a network that doesn't exist | `systemctl disable NetworkManager-wait-online` |
    | Any `.mount` unit | Corresponds to an fstab entry | Fix fstab (see [above](#fix-a-broken-etcfstab)) |
    | `lvm2-*` or `mdadm*` | RAID/LVM array missing a device | Comment out the array in `/etc/mdadm.conf` or `/etc/lvm/lvm.conf` |
    | Display manager (sddm, gdm) | GPU driver issue | `systemctl disable sddm` then boot to TTY and fix drivers |
 
 5. **If you need to edit a service file**:
+
    ```bash
    nano /mnt/broken/etc/systemd/system/<service-name>.service
    # Or find the upstream file:
    nano /mnt/broken/usr/lib/systemd/system/<service-name>.service
    ```
+
    To override without editing the original, create a drop-in:
+
    ```bash
    mkdir -p /mnt/broken/etc/systemd/system/<service-name>.service.d/
    cat > /mnt/broken/etc/systemd/system/<service-name>.service.d/override.conf << 'EOF'
@@ -919,6 +973,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 ### Fix a Read-Only Root Filesystem
 
 **Symptoms**:
+
 - "Read-only file system" errors when trying to save files or install packages
 - System boots but nothing can be written to disk
 - BTRFS errors in `dmesg` output
@@ -926,6 +981,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
 **When booted from this recovery drive:**
 
 1. **First, check if the filesystem has errors**:
+
    ```bash
    # Find the broken system's BTRFS partition
    lsblk -f
@@ -935,9 +991,11 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    ```
 
 2. **If no errors found**, the filesystem may have been mounted read-only by the kernel due to a minor issue. Try:
+
    ```bash
    sudo mount -o remount,rw /dev/<partition> /mnt/broken
    ```
+
    If this works, the issue was transient. Reboot the system and see if it persists.
 
 3. **If errors are found**, you have two options:
@@ -946,6 +1004,7 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    - Follow [Restore an Entire Subvolume](#restore-an-entire-subvolume) to replace the corrupted subvolume with a known-good backup snapshot.
 
    **Option B — Attempt repair** (risky, last resort):
+
    ```bash
    # WARNING: --repair can make things worse. Only use if you have no backup
    # or the backup is also corrupted.
@@ -953,10 +1012,12 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    ```
 
 4. **If the drive has SMART errors**, it may be physically failing:
+
    ```bash
    sudo smartctl -a /dev/<drive>
    # Look for "Reallocated_Sector_Ct" or "Current_Pending_Sector" > 0
    ```
+
    If the drive is failing, replace it immediately. See [Scenario A](#scenario-a-single-nvme-drive-failure) or [Scenario B](#scenario-b-both-nvme-drives-failed).
 
 ---
@@ -970,13 +1031,16 @@ You don't always need a full system restore. Often you just need one file you ac
 Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot is a frozen copy of a subvolume at a specific point in time. The primary target keeps the long history (for example 7 daily, 4 weekly, 12 monthly, 1 yearly); a recovery drive keeps only its own short window (for example 7 daily). See [Where Each Backup Lives on a Target](#where-each-backup-lives-on-a-target) for the directory layout, adopted subvolumes and retired ones.
 
 1. **Mount the backup drive** by filesystem UUID (if not already mounted). The targets are hidden from udisks, so a file manager will not offer them:
+
    ```bash
    sudo mkdir -p /mnt/backup
    sudo mount -t btrfs -o ro,degraded UUID=<target-uuid> /mnt/backup
    ```
+
    On a running system that also runs scheduled backups, check first that none is running (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`), and unmount when done.
 
 2. **List available snapshots**:
+
    ```bash
    # Show all subvolumes (snapshots are subvolumes)
    sudo btrfs subvolume list /mnt/backup | sort -k9
@@ -987,9 +1051,11 @@ Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot i
    # ID 42188 gen 1038 top level 5 path nvme/root-.20261002T1500
    # ...
    ```
+
    The date is in the name: `root-.20261002T1500` = snapshot of `@` from October 2, 2026, 15:00. The name before the dot is the entry's `snapshot_name` in `/etc/btrbk/btrbk.conf`.
 
 3. **Browse a specific snapshot**:
+
    ```bash
    # Mount a snapshot read-only
    sudo mkdir -p /mnt/snapshot
@@ -1007,6 +1073,7 @@ Your DAS backup drives contain dated snapshots created by btrbk. Each snapshot i
    - Browse, search, and preview files normally
 
 5. **When done, unmount**:
+
    ```bash
    sudo umount /mnt/snapshot /mnt/backup
    ```
@@ -1018,6 +1085,7 @@ With `btrdasd` installed you can also list a snapshot without a second mount: `b
 1. Mount the backup snapshot that contains the file version you want (see above).
 
 2. **Copy the file to the live system**:
+
    ```bash
    # Example: restore a deleted config file
    sudo cp /mnt/snapshot/etc/important.conf /mnt/broken/etc/important.conf
@@ -1032,6 +1100,7 @@ With `btrdasd` installed you can also list a snapshot without a second mount: `b
    On a running system with `btrdasd`, `sudo btrdasd restore file <snapshot-path> <dest-dir> <path-in-snapshot>…` does the same, but only into an allowed root: `[restore] allowed_roots` in `config.toml` (default `/home` and `/tmp`), and never under a system path (`/bin`, `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/srv/ftp`, `/srv/http`, `/sys`, `/usr`, `/var/lib`, `/var/spool`), whatever the config says. Restore system files with `cp -a` as above.
 
 3. **To find which snapshot contains a specific file** (if you don't know the date):
+
    ```bash
    # Search across multiple snapshots
    for snap in /mnt/backup/nvme/root-.*/; do
@@ -1043,6 +1112,7 @@ With `btrdasd` installed you can also list a snapshot without a second mount: `b
    ```
 
 4. **To search by filename** (if you don't remember the exact path):
+
    ```bash
    # Search inside a single snapshot
    find /mnt/snapshot -name "thesis*" 2>/dev/null
@@ -1055,7 +1125,7 @@ With `btrdasd` installed you can also list a snapshot without a second mount: `b
 
 Use this when you want to roll back an entire subvolume (root, home, etc.) to a previous state.
 
-**Method 1: BTRFS send/receive (fast, preserves BTRFS metadata)**
+#### Method 1: BTRFS send/receive (fast, preserves BTRFS metadata)
 
 ```bash
 # 1. Mount backup drive (top level, by UUID)
@@ -1096,7 +1166,7 @@ sudo btrfs subvolume delete /mnt/target/@.broken
 sudo umount /mnt/target /mnt/backup
 ```
 
-**Method 2: rsync (slower but works across filesystem types)**
+#### Method 2: rsync (slower but works across filesystem types)
 
 ```bash
 # Mount source snapshot and target
@@ -1111,6 +1181,7 @@ sudo umount /mnt/snapshot /mnt/target
 ```
 
 **Important**: After restoring a root subvolume, always check and update:
+
 - `/etc/fstab` — UUIDs may not match current drives
 - Boot entries in `/boot/loader/entries/` — root UUID must be correct
 - Regenerate initramfs, with the ESP mounted inside the restored root first — where `/boot` is the ESP (as on many systems), skipping the mount writes the initramfs into the subvolume's own `/boot` directory, which the bootloader never reads. Method 1 (`/mnt/target` is the top level): `sudo mount LABEL=EFI /mnt/target/@/boot && sudo arch-chroot /mnt/target/@ mkinitcpio -P`. Method 2 (with the target mounted again): `sudo mount LABEL=EFI /mnt/target/boot && sudo arch-chroot /mnt/target mkinitcpio -P`. Use your primary ESP's label; unmount it before unmounting the target
@@ -1607,6 +1678,7 @@ sudo recovery-os-vm.sh provision <A|B|label> --undo --iso <path>
 **Cause**: UEFI/BIOS cannot find the boot files on the DAS drive.
 
 **Fix**:
+
 1. Try the other DAS boot entry (if you have a mirror recovery drive)
 2. Check that DAS is fully powered on and all LEDs are active
 3. Try a different USB port (preferably USB 3.0+)
@@ -1624,6 +1696,7 @@ sudo recovery-os-vm.sh provision <A|B|label> --undo --iso <path>
 **Cause**: BTRFS mounted read-only due to errors.
 
 **Fix**:
+
 ```bash
 # Check the filesystem
 sudo btrfs check --readonly /dev/<your-device>
@@ -1636,8 +1709,10 @@ sudo btrfs check --repair /dev/<your-device>
 ### WiFi not working in rescue mode
 
 **Fix**:
+
 1. Use wired ethernet if possible
 2. Start NetworkManager:
+
    ```bash
    sudo systemctl start NetworkManager
    nm-connection-editor  # GUI for WiFi setup (if graphical environment)
@@ -1647,6 +1722,7 @@ sudo btrfs check --repair /dev/<your-device>
 ### Cannot find DAS drives
 
 **Fix**:
+
 ```bash
 # Check if drives are detected
 lsblk
@@ -1670,7 +1746,7 @@ On the system that runs the backups, check before reconnecting or power-cycling 
 Fill in from `btrdasd config show` or your bay mapping document:
 
 | Role | Serial | Bay |
-|------|--------|-----|
+| --- | --- | --- |
 | `<role>` | `<serial>` | `<bay>` |
 | `<role>` | `<serial>` | `<bay>` |
 
@@ -1679,21 +1755,21 @@ Fill in from `btrdasd config show` or your bay mapping document:
 Fill in from `blkid` or your storage architecture document:
 
 | Device | UUID | Purpose |
-|--------|------|---------|
+| --- | --- | --- |
 | `<device>` | `<uuid>` | `<purpose>` |
 | `<device>` | `<uuid>` | `<purpose>` |
 
 ### Rescue Environment Credentials
 
 | Field | Value |
-|-------|-------|
+| --- | --- |
 | Username | `<your-rescue-username>` |
 | Password | `<your-rescue-password>` |
 
 ### Recommended Recovery Tools
 
 | Tool | Purpose |
-|------|---------|
+| --- | --- |
 | `gparted` | Graphical partition editor |
 | `testdisk` | Partition recovery |
 | `ddrescue` | Data recovery from failing drives |
@@ -1728,11 +1804,11 @@ btrdasd config show
 
 ## Getting Help
 
-1. **BTRFS documentation**: https://btrfs.readthedocs.io
-2. **Arch Wiki (BTRFS)**: https://wiki.archlinux.org/title/Btrfs
-3. **btrbk Documentation**: https://github.com/digint/btrbk
+1. **BTRFS documentation**: <https://btrfs.readthedocs.io>
+2. **Arch Wiki (BTRFS)**: <https://wiki.archlinux.org/title/Btrfs>
+3. **btrbk Documentation**: <https://github.com/digint/btrbk>
 4. **Your distro's support forum** -- for distro-specific recovery steps
 
 ---
 
-*Backup system version: 0.7.23.2*
+Backup system version: 0.7.23.2

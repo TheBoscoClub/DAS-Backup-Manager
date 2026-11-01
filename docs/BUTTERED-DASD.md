@@ -10,7 +10,7 @@ ButteredDASD is a content indexer that builds a searchable SQLite FTS5 database 
 
 ## Architecture
 
-```
+```text
 backup-run.sh                   btrdasd CLI
      │                              │
      └──── run_indexer() ───────────┤
@@ -43,7 +43,7 @@ backup-run.sh                   btrdasd CLI
 ### Modules
 
 | Module | File | Purpose |
-|--------|------|---------|
+| --- | --- | --- |
 | `adopt` | `src/adopt.rs` | Subvolume sync: adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
 | `backup` | `src/backup.rs` | btrbk snapshot/send orchestration with volume deduplication; `run_backup_job`, the single entry point shared by `btrdasd backup run` and the GUI (syncs subvolumes first) |
 | `btrbk_conf` | `src/btrbk_conf.rs` | `btrbk.conf` renderer, shared by `setup`, the `subvol` commands and sync |
@@ -82,7 +82,7 @@ backup-run.sh                   btrdasd CLI
 **snapshots** — One row per indexed BTRFS snapshot (schema version 4, stored in `PRAGMA user_version`; an older database is migrated on open).
 
 | Column | Type | Description |
-|--------|------|-------------|
+| --- | --- | --- |
 | id | INTEGER PK | Auto-increment ID |
 | name | TEXT | Snapshot name (e.g., `root`) |
 | ts | TEXT | Timestamp (e.g., `20260221T0304`) |
@@ -93,7 +93,7 @@ backup-run.sh                   btrdasd CLI
 **files** — One row per unique file path within a series. Updated when file metadata changes.
 
 | Column | Type | Description |
-|--------|------|-------------|
+| --- | --- | --- |
 | id | INTEGER PK | Auto-increment ID |
 | series | TEXT | Subvolume series (snapshot name and source, joined by byte `0x1f`); `(series, path)` is unique |
 | path | TEXT | Relative path within snapshot |
@@ -105,7 +105,7 @@ backup-run.sh                   btrdasd CLI
 **spans** — Tracks which snapshots contain which files. Span-based deduplication means an unchanged file present in snapshots 5 through 12 is stored as a single row `(file_id, first_snap=5, last_snap=12)`.
 
 | Column | Type | Description |
-|--------|------|-------------|
+| --- | --- | --- |
 | file_id | INTEGER FK | References files(id) |
 | first_snap | INTEGER FK | First snapshot containing this file version |
 | last_snap | INTEGER FK | Last snapshot containing this file version |
@@ -113,7 +113,7 @@ backup-run.sh                   btrdasd CLI
 **snapshot_targets** — One row per (snapshot, target) pair: which backup targets physically hold a copy of a snapshot. Added in schema v3 (v0.7.19.0). A snapshot replicated to all three targets is still ONE logical snapshot indexed once, so without this table the index could name the snapshot holding a file but only ever point at the primary's path — useless in the disaster the recovery drives exist for. Presence is not derivable: the recovery targets keep `daily=7` against the primary's daily/weekly/monthly/yearly, so they hold a strict subset.
 
 | Column | Type | Description |
-|--------|------|-------------|
+| --- | --- | --- |
 | snapshot_id | INTEGER FK | References snapshots(id) `ON DELETE CASCADE` — presence rows can never outlive their snapshot |
 | target_root | TEXT | Mount root of the target holding this copy (e.g. `/mnt/backup-22tb`) |
 | path | TEXT | Full path to the copy on that target |
@@ -139,7 +139,7 @@ This approach dramatically reduces database size — a file unchanged across 100
 ### Performance Indexes
 
 | Index | Columns | Purpose |
-|-------|---------|---------|
+| --- | --- | --- |
 | `idx_snapshots_source_name` | source, name | Group snapshots by source during walk |
 | `idx_snapshots_ts` | ts | Order snapshots chronologically |
 | `idx_spans_file_id` | file_id | Fast lookup of spans for a file |
@@ -163,7 +163,7 @@ btrdasd walk /mnt/backup-hdd --db /custom/path/backup-index.db
 
 Expected directory structure on the backup target:
 
-```
+```text
 /mnt/backup-hdd/
   nvme/                         # source directory
     root.20260221T0304/         # snapshot (name.timestamp)
@@ -175,7 +175,7 @@ Expected directory structure on the backup target:
 
 Output:
 
-```
+```text
 Discovered: 6 snapshots
 Indexed:    4 new
 Skipped:    2 already indexed
@@ -194,7 +194,7 @@ btrdasd search "report*"           # FTS5 prefix search
 
 Output (tab-separated):
 
-```
+```text
 path/to/report.pdf  15234  1708534800  nvme/root.20260221  nvme/root.20260225
 (1 results)
 ```
@@ -216,7 +216,7 @@ btrdasd info
 
 Output:
 
-```
+```text
 Snapshots:  42
 Files:      158234
 Spans:      23456
@@ -298,6 +298,7 @@ run_indexer() {
 ## Installation
 
 See [INSTALL.md](INSTALL.md) for comprehensive installation instructions including:
+
 - Quick start with `btrdasd setup` wizard
 - Manual installation
 - CMake build options

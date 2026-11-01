@@ -105,7 +105,7 @@ This means your most important data has the deepest retention on the largest dri
 Inventory your BTRFS subvolumes and estimate sizes:
 
 | Subvolume | Mount Point | Size | Back Up? |
-|-----------|-------------|------|----------|
+| --- | --- | --- | --- |
 | `<subvol>` | `<mount>` | `___` GB/TB | Yes / No |
 | `<subvol>` | `<mount>` | `___` GB/TB | Yes / No |
 | ... | ... | ... | ... |
@@ -117,7 +117,7 @@ Inventory your BTRFS subvolumes and estimate sizes:
 How much history do you want to keep?
 
 | Retention Period | Count | Estimated Multiplier |
-|-----------------|-------|---------------------|
+| --- | --- | --- |
 | Weekly snapshots | _____ | 1.1x -- 1.3x (low churn data) |
 | Monthly snapshots | _____ | 1.5x -- 2.0x |
 | Yearly snapshots | _____ | 2.0x -- 3.0x |
@@ -129,14 +129,14 @@ How much history do you want to keep?
 ### 3. TARGET CAPACITY
 
 | Target | Minimum Capacity |
-|--------|-----------------|
+| --- | --- |
 | Primary backup drive | >= (data x retention_factor) |
 | Recovery drives (optional) | >= OS data size each |
 
 ### 4. DAS ENCLOSURE
 
 | Requirement | Your Choice |
-|-------------|-------------|
+| --- | --- |
 | Bays needed | _____ |
 | Interface | USB 3.x / eSATA / Thunderbolt / 10GbE |
 | Mode | **JBOD required** (drives must appear individually to the OS) |
@@ -148,7 +148,7 @@ How much history do you want to keep?
 ### 5. DRIVE SELECTION
 
 | Consideration | Your Choice |
-|---------------|-------------|
+| --- | --- |
 | Technology | HDD / SSD / NVMe |
 | Recording method (HDD only) | CMR preferred for random I/O; SMR acceptable for sequential workloads |
 | Capacity per drive | _____ |
@@ -156,6 +156,7 @@ How much history do you want to keep?
 | Total raw capacity | _____ |
 
 **Drive technology notes**:
+
 - **HDD (CMR)**: Best cost-per-TB. Conventional Magnetic Recording handles all workloads well.
 - **HDD (SMR)**: Cheaper but sequential-write-only. Acceptable for BTRFS send streams (which are sequential) but avoid for RAID configurations requiring random writes.
 - **SSD**: Faster, silent, shock-resistant. Higher cost-per-TB. No SMR concerns.
@@ -164,7 +165,7 @@ How much history do you want to keep?
 ### 6. BUDGET
 
 | Item | Cost |
-|------|------|
+| --- | --- |
 | DAS enclosure | $_____ |
 | Drives | $_____ |
 | Cables (if not included) | $_____ |

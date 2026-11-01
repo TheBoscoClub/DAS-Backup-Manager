@@ -207,3 +207,17 @@ jobs:
           fi
           echo "checking $count files"
           git ls-files -z -- . ':!.beads' | xargs -0 codespell
+
+  markdown:
+    name: Markdown — markdownlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Pinned to the version the maintainer runs locally, so CI and the editor
+      # agree. Config: .markdownlint.yaml; exclusions: .markdownlintignore.
+      - name: Markdown lint (markdownlint-cli pinned to the local version)
+        run: |
+          npm install -g --ignore-scripts markdownlint-cli@0.48.0
+          markdownlint --version
+          markdownlint '**/*.md'

@@ -1,0 +1,9 @@
+# markdownlint config for this repo — mirrors the house config in ~/.claude/.markdownlint.yaml; read by CI and local runs.
+# House style for prose docs:
+#   MD013 off  — long prose lines are deliberate (one thought per line, no hard wraps)
+#   MD041 off  — memory/rule files legitimately start with frontmatter or a paragraph
+#   MD024 siblings_only — Keep-a-Changelog repeats ### Added/Changed/Fixed per version
+MD013: false
+MD041: false
+MD024:
+  siblings_only: true

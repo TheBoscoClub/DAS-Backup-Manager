@@ -48,7 +48,7 @@ per-filesystem command that finds coverage gaps.
 
 ## Component Overview (v0.7.23.2)
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    User Space                               │
 │  ┌──────────┐    ┌──────────────────────────────────────┐   │
@@ -78,7 +78,7 @@ per-filesystem command that finds coverage gaps.
 The system has six major components:
 
 | Component | Language | Binary | Purpose |
-|-----------|----------|--------|---------|
+| --- | --- | --- | --- |
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
 | Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 23 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
@@ -90,7 +90,7 @@ The system has six major components:
 
 ### Backup Pipeline
 
-```
+```text
 1. systemd timer fires (das-backup.timer)
          │
          ▼
@@ -197,7 +197,7 @@ the one that catches the defect this guard was written for
 
 ### Scrub Pipeline
 
-```
+```text
 1. systemd timer fires (das-scrub.timer, monthly OnCalendar from [scrub].on_calendar)
          │
          ▼
@@ -262,7 +262,7 @@ that made an aborted `system-recovery-A` scrub look healthy for 64 days). This k
 
 ### Indexing Pipeline
 
-```
+```text
 btrdasd walk /mnt/backup-target
          │
          ├──▶ discover_snapshots()       Scan target for source/name.timestamp dirs
@@ -290,7 +290,7 @@ btrdasd walk /mnt/backup-target
 
 ### GUI Read Path
 
-```
+```text
 btrdasd-gui
          │
          ├──▶ DBusClient (org.dasbackup.Helper1)
@@ -337,7 +337,7 @@ target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_
 
 Instead of recording every file in every snapshot (which would produce millions of rows), spans compress consecutive identical file appearances:
 
-```
+```text
 File: /home/user/document.pdf (unchanged across snapshots 5–12)
 
 Naive model:  8 rows in a join table (1 per snapshot)
@@ -345,6 +345,7 @@ Span model:   1 row → spans(file_id=42, first_snap=5, last_snap=12)
 ```
 
 When snapshot 13 arrives:
+
 - If the file is unchanged → `UPDATE spans SET last_snap=13` (extend)
 - If the file changed → new span `(file_id=42, first_snap=13, last_snap=13)` + update file metadata
 - If the file is gone → no action (span accurately records last appearance)
@@ -354,7 +355,7 @@ When snapshot 13 arrives:
 Three triggers keep the FTS5 index consistent:
 
 | Trigger | Event | Action |
-|---------|-------|--------|
+| --- | --- | --- |
 | `files_ai` | `AFTER INSERT ON files` | Insert into FTS5 |
 | `files_ad` | `AFTER DELETE ON files` | Delete from FTS5 |
 | `files_au` | `AFTER UPDATE ON files` | Delete old + insert new in FTS5 |
@@ -362,7 +363,7 @@ Three triggers keep the FTS5 index consistent:
 ### Performance Indexes
 
 | Index | Columns | Query Pattern |
-|-------|---------|---------------|
+| --- | --- | --- |
 | `idx_snapshots_source_name` | (source, name) | Group snapshots by source during walk |
 | `idx_snapshots_ts` | (ts) | Chronological ordering |
 | `idx_spans_file_id` | (file_id) | Lookup spans for a file |
@@ -388,7 +389,7 @@ Three triggers keep the FTS5 index consistent:
 
 The installer uses a TOML configuration file (`/etc/das-backup/config.toml`) as the single source of truth:
 
-```
+```text
 wizard → Config struct → config.toml (save)
                               │
                               ▼
@@ -413,7 +414,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 ### Config Sections
 
 | Section | Fields | Purpose |
-|---------|--------|---------|
+| --- | --- | --- |
 | `general` | version, install_prefix, db_path, log_file, growth_log, last_report, btrbk_conf | Global settings |
 | `init` | system (systemd/sysvinit/openrc) | Init system selection |
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
@@ -438,7 +439,7 @@ is no longer part of the project. Old
 Templates are rendered programmatically (no external template files):
 
 | Function | Output | Description |
-|----------|--------|-------------|
+| --- | --- | --- |
 | `btrbk_conf::render_btrbk_conf()` | `btrbk.conf` | Per-source volume blocks with target retention; retired entries are left out. In the library because the backup run, the `subvol` commands and the GUI helper's saves regenerate it too |
 | `render_systemd_service()` / `render_systemd_timer()` | `das-backup{,-full}.{service,timer}` | ExecStart with full flag support, `SuccessExitStatus=3` (a run that began and failed); OnCalendar with RandomizedDelaySec |
 | `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
@@ -463,7 +464,7 @@ six-hour timeout setup's never had. `setup --upgrade` removes the copies older v
 Default schedules (`btrdasd setup` installs these; adjust via the timer units):
 
 | Unit | Schedule | Runs |
-|------|----------|------|
+| --- | --- | --- |
 | `das-backup.timer` | daily 03:00, up to 30 min random delay | `backup-run.sh` |
 | `das-backup-full.timer` | Sunday 04:00, up to 30 min random delay | `backup-run.sh --full` |
 | `das-scrub.timer` | 1st of the month 03:05, no random delay | `btrdasd scrub run` |
@@ -478,7 +479,7 @@ enabled by setup and is also D-Bus-activatable.
 The `detect` module auto-discovers the host environment:
 
 | Detection | Method | Output |
-|-----------|--------|--------|
+| --- | --- | --- |
 | Block devices | `lsblk --json` parsing | USB/SATA/NVMe devices with size, serial, partitions |
 | BTRFS subvolumes | `btrfs subvolume list` parsing | Subvolume paths and IDs |
 | Init system | `which systemctl`, `which rc-service`, `/etc/init.d` existence | systemd/openrc/sysvinit (systemd if none match) |
@@ -488,10 +489,10 @@ The `detect` module auto-discovers the host environment:
 ### Manifest Tracking
 
 Every install writes `/etc/das-backup/.manifest` — a plain-text list of generated file paths. This enables:
+
 - `--uninstall`: Remove exactly the files that were installed
 - `--upgrade`: Regenerate the same files from updated config
 - `--check`: Verify all manifest files exist (presence only, not content), alongside config validation, relay reachability, targets without `mount_uuid`, the udisks hiding read back from udev, and dependencies
-
 
 ## Recovery Drive Provisioning
 
@@ -534,6 +535,7 @@ option(BUILD_HELPER  "Build btrdasd-helper D-Bus daemon"        ON)
 **Rust for the indexer**: The content indexer processes untrusted filesystem data (file paths, names, sizes from backup snapshots). Rust eliminates buffer overflows, use-after-free, and data races at compile time. `unsafe` is confined to single-call `libc` FFI wrappers — `geteuid`, `flock`, `statvfs`, `syncfs`, `gethostname`, `time`/`localtime_r` — plus `std::env::set_var`/`remove_var` in tests; `btrdasd-helper` has none.
 
 **C++20 for the GUI**: The GUI uses Qt6/KF6 which requires C++. It holds no database connection and no privileged code — everything goes through `DBusClient`. Its components use:
+
 - Qt parent-child ownership for widget and object lifetime (objects are created with `new` and a parent, and released with `deleteLater()`; the one manual `delete` frees layout items Qt has handed back from a layout)
 - Compiled with `-Wall -Wextra -Wpedantic -Werror` — zero warnings policy
 
@@ -554,7 +556,7 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 ### File Permission Hardening
 
 | File | Mode | Owner | Reason |
-|------|------|-------|--------|
+| --- | --- | --- | --- |
 | `/etc/das-backup/config.toml` | `0o644` | root | No secrets — mail submission is unauthenticated; the relay's upstream key lives in `/etc/postfix/sasl_passwd` (root-only) |
 | Generated scripts | `0o755` | root | Executable by system |
 | `/var/lib/das-backup/backup-index.db` | `0o644` | root | Writable by the indexer (root); readable by any local user — the GUI itself reads it only through `btrdasd-helper` |
@@ -599,6 +601,7 @@ No string concatenation is used to build SQL queries anywhere in the codebase.
 The backup index database stores file paths (e.g., `/home/user/Documents/tax-return-2025.pdf`), names, sizes, and timestamps. While no file contents are stored, file paths can reveal personal information about what files exist on a system.
 
 **Current protections**:
+
 - Filesystem permissions: root-owned, mode 0644
 - Database lives at `/var/lib/das-backup/backup-index.db` — local filesystem only
 - Not network-exposed in any configuration
@@ -621,7 +624,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 ### Rust Indexer (`indexer/src/`)
 
 | Module | File | Lines | Purpose |
-|--------|------|-------|---------|
+| --- | --- | --- | --- |
 | `adopt` | `src/adopt.rs` | ~3000 | Subvolume sync: lists each verified source volume (its top level included), adopts new subvolumes, retires and revives entries, replaces `config.toml` and `btrbk.conf` together (`btrdasd subvol sync`) |
 | `backup` | `src/backup.rs` | ~11400 | `run_backup_job` (the one backup job for CLI and GUI), btrbk snapshot/send orchestration with volume deduplication, boot archival |
 | `btrbk_conf` | `src/btrbk_conf.rs` | ~1030 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
@@ -668,7 +671,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 `DBusClient`/`btrdasd-helper` exclusively — see `dbusclient.h/cpp` below):
 
 | Component | Files | Purpose |
-|-----------|-------|---------|
+| --- | --- | --- |
 | MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with sidebar + QStackedWidget, rich status bar, keyboard shortcuts |
 | Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health, Recovery drives sections) |
 | DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
@@ -697,7 +700,7 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 (2026-10-31); re-run that command rather than trusting these numbers.
 
 | Suite | Count | Framework |
-|-------|-------|-----------|
+| --- | --- | --- |
 | Rust unit tests | 1384 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 23 `pub mod`s) |
 | Rust CLI + setup tests | 288 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 39 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |

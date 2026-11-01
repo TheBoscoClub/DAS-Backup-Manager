@@ -40,10 +40,11 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
 - **Native Packaging** — Packaging recipes for Arch (PKGBUILD), Debian/Ubuntu (dpkg), Fedora (RPM), Flatpak, and Snap — all build-tested on their respective distributions before each release
+
 ## Components
 
 | Component | Description | Status |
-|-----------|-------------|--------|
+| --- | --- | --- |
 | `scripts/backup-run.sh` | btrbk backup orchestrator: subvolume sync before btrbk, retired-subvolume expiry after, recovery OS check, email reporting | Active |
 | `scripts/backup-verify.sh` | DAS drive health and btrbk status verification | Active |
 | `scripts/boot-archive-cleanup.sh` | Prune old boot subvolume archives (retention: 60 days default; invoked automatically by `backup-run.sh` every run; skips `role=mirror` targets) | Active |
@@ -60,7 +61,7 @@ Each script's version is the `# Version:` line in its own header — the one pla
 
 ## Project Structure
 
-```
+```text
 DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition, recovery OS VM)
 ├── config/            # btrbk.conf reference template

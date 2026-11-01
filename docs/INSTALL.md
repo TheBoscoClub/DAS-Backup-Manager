@@ -28,7 +28,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 ### Required
 
 | Dependency | Version | Purpose |
-|-----------|---------|---------|
+| --- | --- | --- |
 | Rust toolchain | **1.88+** | Edition 2024; needs let-chains (stable since 1.88); not compile-tested below 1.98.1 |
 | C compiler | gcc or clang | Required by `libsqlite3-sys` to build bundled SQLite |
 | btrbk | 0.32+ | BTRFS snapshot creation and send/receive |
@@ -40,7 +40,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 ### Optional (for features)
 
 | Dependency | Version | Purpose |
-|-----------|---------|---------|
+| --- | --- | --- |
 | s-nail (mailx) | system | Email backup reports (when email reporting enabled) |
 | rsync | system | Manual disaster-recovery restores (see [Disaster Recovery Guide](DISASTER-RECOVERY-GUIDE.md)) — not used by any automated backup path |
 | mbuffer | system | Buffered btrbk stream transfers (improves throughput) |
@@ -56,7 +56,7 @@ The planning worksheet in that guide helps you estimate capacity requirements be
 ### Optional (for GUI)
 
 | Dependency | Version | Purpose |
-|-----------|---------|---------|
+| --- | --- | --- |
 | Qt6 | 6.6+ (tested 6.11.2) | UI framework |
 | Qt6 Charts | 6.6+ (tested 6.11.2) | Growth trendline chart (`qt6-charts` package) |
 | KDE Frameworks 6 | 6.0+ (tested 6.30.0) | KXmlGuiWindow, KIO, KAboutData, Notifications, StatusNotifierItem |
@@ -156,6 +156,7 @@ sudo btrdasd setup --uninstall
 ```
 
 Removes all files listed in the install manifest (`/etc/das-backup/.manifest`):
+
 - Generated btrbk.conf
 - systemd/cron units (backup, scrub, doctor)
 - Generated backup scripts
@@ -197,6 +198,7 @@ sudo btrdasd setup --check
 ```
 
 Validates the current installation without changing anything:
+
 - Loads and validates `/etc/das-backup/config.toml`
 - Checks all dependencies are installed
 - Verifies all manifest files exist on disk
@@ -308,7 +310,7 @@ This installs everything except the GUI; `btrdasd setup` then configures the hos
 ## CMake Build Options
 
 | Option | Default | Description |
-|--------|---------|-------------|
+| --- | --- | --- |
 | `BUILD_GUI` | `ON` | Build the KDE Plasma GUI (requires Qt6/KF6) |
 | `BUILD_INDEXER` | `ON` | Build the `btrdasd` Rust binary via cargo |
 | `BUILD_HELPER` | `ON` | Build the `btrdasd-helper` D-Bus daemon and install polkit/D-Bus config |
@@ -340,7 +342,7 @@ Build through CMake rather than a bare `cargo build`: CMake passes `--target-dir
 Native packaging recipes are included under `packaging/` and build-tested on their respective distributions before each release.
 
 | Distribution | Format | Directory | GUI Support |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Arch Linux / CachyOS | PKGBUILD (`makepkg`) | `packaging/arch/` | Full |
 | Debian 13+ / Ubuntu 24.10+ | dpkg (`dpkg-buildpackage`) | `packaging/debian/` | Full (KF6 required) |
 | Fedora 43+ | RPM (`rpmbuild`) | `packaging/fedora/` | Full |
@@ -359,7 +361,6 @@ A package puts the files in place and writes no `config.toml`: run `sudo btrdasd
 
 **Minimum Rust version**: 1.88 (needs let-chains in edition 2024; not compile-tested below 1.98.1, and `Cargo.toml` declares no `rust-version`). Distributions shipping older Rust (e.g., Debian 13 with 1.85) require [rustup](https://rustup.rs/) for compilation.
 
-
 ## Configuration Reference
 
 The installer generates `/etc/das-backup/config.toml` with the following sections.
@@ -373,7 +374,7 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 ### `[general]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `version` | string | the running build's `CARGO_PKG_VERSION` (3-part semver, e.g. `"0.7.23"`) | Config format version |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
@@ -385,13 +386,13 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 ### `[init]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `system` | enum | `"systemd"` | Init system: `systemd`, `sysvinit`, or `openrc` |
 
 ### `[schedule]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `incremental` | string | `"03:00"` | Daily incremental backup time |
 | `full` | string | `"Sun 04:00"` | Weekly full backup day and time |
 | `randomized_delay_min` | u32 | `30` | Random delay (minutes) to avoid I/O spikes |
@@ -399,7 +400,7 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 ### `[das]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `model_pattern` | string | `""` (none) | Optional drive-model substring (spaces removed) that `backup-verify.sh` matches to identify DAS drives; empty means no enclosure-model filter |
 | `io_scheduler` | string | `"mq-deadline"` | I/O scheduler `backup-run.sh` sets on the DAS drives during a run |
 | `mount_opts` | string | `""` (none) | Mount options for every backup-target mount, by `backup-run.sh` and by `btrdasd` (`MountGuard`) alike |
@@ -407,7 +408,7 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 ### `[[source]]` (array)
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `label` | string | — | Human-readable name (e.g., `"nvme-root"`) |
 | `volume` | string | — | BTRFS volume mount point (e.g., `"/.btrfs-nvme"`) |
 | `device` | string | — | Block device path (e.g., `"/dev/nvme0n1p2"`) |
@@ -418,7 +419,7 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 Subvolumes are an array of tables, `[[source.subvolumes]]`, one per subvolume (a bare string such as `"@"` is also accepted):
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `name` | string | — | Subvolume path on the volume (e.g., `"@home"`) |
 | `manual_only` | bool | `false` | Flag set by `btrdasd subvol set-manual` / `set-auto` and inherited by nested adoptions. Not consulted by `btrbk.conf` rendering or `backup-run.sh`, so it does not keep a subvolume out of scheduled backups; `btrdasd backup run` (with no `--sources`) skips a source only when every one of its subvolumes is manual-only (tracked as bd `9ry`) |
 | `snapshot_name` | string | derived | Overrides the snapshot name btrbk would derive (adopted entries always carry one) |
@@ -437,7 +438,7 @@ after_index = true            # rendered into btrbk-state.conf, sent after the i
 ### `[[target]]` (array)
 
 | Field | Type | Description |
-|-------|------|-------------|
+| --- | --- | --- |
 | `label` | string | Human-readable name (e.g., `"primary-22tb"`) |
 | `serials` | string[] | Expected drive serials: one for a single drive, two for a RAID-1 pair. A legacy single `serial = "…"` is still read. Advisory — a missing serial warns, it does not abort |
 | `mount_uuid` | string | BTRFS filesystem UUID. When set, the target is found and mounted by UUID on both the script and the CLI/GUI path, tolerating the loss of one RAID-1 member; `btrdasd setup --check` reports targets that lack it. A target needs at least one of `serial`, `serials`, `mount_uuid` |
@@ -454,7 +455,7 @@ Each retention count defaults to `0` when omitted. Targets are mounted by `backu
 ### `[boot]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `enabled` | bool | `true` | Enable boot subvolume archival (archive-then-recreate on `--full` runs) |
 | `subvolumes` | string[] | `["@", "@home"]` | Subvolumes archived and recreated |
 | `archive_retention_days` | u32 | `60` | Days to retain `@.archive.*`/`@home.archive.*` snapshots before `boot-archive-cleanup.sh` prunes them |
@@ -464,7 +465,7 @@ Snapshot names are read from `/etc/btrbk/btrbk.conf`, not derived from this sect
 ### `[restore]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `allowed_roots` | string[] | `["/home", "/tmp"]` | Roots a restore may write beneath. A destination must resolve to a path under one of these |
 
 Restores run as root under `btrdasd-helper`, so the destination is policy rather than a free parameter. Two rules apply on top of `allowed_roots`, and neither is configurable:
@@ -479,7 +480,7 @@ Grant a **subdirectory**, never a parent that also holds served or system conten
 ### `[subvolumes]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `exclude` | string[] | `[]` | Glob patterns (`*`, `?`; `*` also matches `/`) for subvolumes the backup run must not adopt, on top of the built-in `@tmp` and `@var-tmp`. The exact pattern `/` excludes each source volume's top level; an empty pattern and `.` are refused by validation (neither matches any subvolume) |
 
 Every backup run adopts each subvolume that exists on a source volume and is not excluded (`btrdasd subvol sync`, run before btrbk), so creating a subvolume is enough to have it backed up. A pattern names the subvolume **without a trailing slash** and also covers everything nested under it: `@cache` excludes `@cache` and `@cache/anything`, while `@cache/` matches nothing. Anything under a `.snapshots` or `.btrbk-snapshots` directory is always skipped. A subvolume that has its own `[[source.subvolumes]]` entry is never skipped by a pattern. Every adoption and every exclusion, with the pattern that caused it, is listed in the run report (snapshot-tree skips as one count per volume); `sudo btrdasd subvol sync --dry-run` prints the same plan and changes nothing, and `backup-run.sh --dryrun` runs the sync step that way. A dry run (`backup-run.sh --dryrun`, `btrdasd backup run --dry-run`) changes no configuration and sends nothing; the one thing it creates is a missing empty target directory — for instance the one a pending adoption's new `<source>-adopted` source will receive into — and it logs each one. `btrdasd backup run` and a backup started from the GUI run the same sync before btrbk; a sync failure does not stop that run, which is recorded as failed (report and history) and, from the CLI, exits non-zero at the end. Neither of them runs `subvol expire` — only `backup-run.sh` does.
@@ -489,7 +490,7 @@ Every backup run adopts each subvolume that exists on a source volume and is not
 Two optional dates on a `[[source.subvolumes]]` entry are written by the run and never need editing by hand:
 
 | Field | Description |
-|-------|-------------|
+| --- | --- |
 | `adopted` | `YYYY-MM-DD` (UTC) the run added the entry. Absent on hand-written entries |
 | `retired` | `YYYY-MM-DD` (UTC) the subvolume was found gone. A retired entry is left out of `btrbk.conf`; `btrdasd subvol expire` deletes its snapshots once the retirement date plus the retention window has passed — per target the longest window of that target, on the source side the shortest of the targets' windows; a target with no retention keeps them and says so — then removes the entry. The field is cleared if the subvolume comes back |
 
@@ -506,7 +507,7 @@ A wrong date mostly costs a late deletion. Nothing of a retired entry is deleted
 ### `[doctor]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `exclude` | string[] | `[]` | Still read, and merged with `[subvolumes].exclude`, so existing configs keep working. Prefer `[subvolumes].exclude` — it governs adoption as well as `btrdasd doctor --check-drift` |
 
 Because the backup run adopts new subvolumes itself, a **missing** or **stale** finding from the drift check now means the sync step failed or has not run since the subvolume appeared; the report advises `sudo btrdasd subvol sync --dry-run`.
@@ -514,7 +515,7 @@ Because the backup run adopts new subvolumes itself, a **missing** or **stale** 
 **Exit codes**, because systemd cannot tell a finding from a malfunction:
 
 | Code | Meaning | `das-backup-doctor.service` |
-|------|---------|------------------------------|
+| --- | --- | --- |
 | `0` | Ran clean, or deferred because a backup/scrub holds the maintenance lock | success |
 | `1` | **Drift found** — missing or stale subvolumes. A successful check *with a result* | **success**, via `SuccessExitStatus=1` |
 | `3` | At least one volume failed to mount/list while others were checked — those subvolumes went unexamined | **failed** |
@@ -532,7 +533,7 @@ load as before: the section is ignored, and kept in the file by every save.
 ### `[email]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `enabled` | bool | `false` | Enable email backup reports |
 | `smtp_host` | string | `"127.0.0.1"` | Local mail relay host |
 | `smtp_port` | u16 | `25` | Local mail relay port |
@@ -558,13 +559,13 @@ Two behaviour changes came with the relay migration:
 ### `[gui]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `enabled` | bool | `false` | Install GUI desktop entry |
 
 ### `[scrub]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `enabled` | bool | `true` | Enable `das-scrub.timer` (the scrub engine itself always allows manual `btrdasd scrub run`, warning-only when disabled) |
 | `on_calendar` | string | `"*-*-01 03:05:00"` | systemd `OnCalendar=` expression consumed verbatim by `das-scrub.timer` (monthly, 03:05 on the 1st — deliberately trails the 03:00 backup so the maintenance lock starts the scrub immediately after it finishes) |
 | `targets` | string[] | `[]` (none) | `[[target]].label` values scrubbed sequentially in list order |
@@ -574,7 +575,7 @@ Two behaviour changes came with the relay migration:
 ### `[recovery_os]`
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `max_age_days` | u32 | `60` | Days since a recovery OS's last *applied* full system upgrade — or its install, when it was never upgraded — before it is reported `STALE`. At least 1 (`config validate` refuses 0) |
 | `egress_org` | string | unset | What an unattended recovery-drive update must egress as: the start of ipinfo.io's org line for the VM's public address, normally your ISP's AS number (`AS64500`). Unset, the update's egress step refuses (`DAS_RECOVERY_VM_EGRESS_ORG` overrides) |
 | `install_user` | string | unset | The account `recovery-os-vm.sh provision` gives a rebuilt recovery OS: a POSIX user name, not `root`. Unset, `provision` refuses before touching a drive |
@@ -586,7 +587,7 @@ Every `role = "mirror"` target is taken to carry its own bootable install under 
 `cmake --install` also installs these two files; the script, like the backup scripts, runs as root only:
 
 | File | Purpose |
-|------|---------|
+| --- | --- |
 | `${prefix}/lib/das-backup/recovery-os-vm.sh` | Lends one `role = "mirror"` recovery drive, whole, to its own libvirt domain `recovery-os-updater-<label>`, boots the drive's own OS there to be updated — at its console, or unattended through its guest agent — and gives the disk back when it powers off (`define`, `session` for one drive or two, `session-end`, `status`, `screenshot`, `console-socket`, `history`, `clean-runs`; `--help` for usage) |
 | `${prefix}/lib/das-backup/libvirt/recovery-os-updater.xml` | The template of every drive's domain, the one source of them (`define` renders each with its own name, UUID, NVRAM file and MAC address, derived from its label): UEFI without Secure Boot, the host's CPU passed through (CachyOS's packages need x86-64-v3/v4), 4 vCPUs, 8 GiB, no disk of its own, a virtio NIC with a fixed address on the NAT network `default` with boot order 2 (a session attaches the disk with 1), VNC only on a libvirt-private socket (no network address), a serial console and a guest-agent channel. It carries no session guard: each session defines the domain from it plus that session's guard, and from it alone afterwards |
 
@@ -611,7 +612,7 @@ A session starts only when the nightly backup run's record (`/var/lib/das-backup
 The installer creates the following files (tracked in `/etc/das-backup/.manifest`):
 
 | File | Purpose |
-|------|---------|
+| --- | --- |
 | `/etc/das-backup/config.toml` | Master configuration |
 | `/etc/btrbk/btrbk.conf` | btrbk snapshot configuration |
 | `${prefix}/lib/das-backup/backup-run.sh` | Real production backup orchestrator script, installed flat (same layout `cmake --install` uses — no `scripts/` subdirectory, no wrapper) |
@@ -636,7 +637,7 @@ The backup and scrub services are ordered after `time-sync.target` (retirement a
 **Exit codes of `backup-run.sh`** (what `das-backup.service` and `das-backup-full.service` run), because a failure the next start would meet again must not restart a whole backup every ten minutes:
 
 | Code | Meaning | The unit |
-|------|---------|----------|
+| --- | --- | --- |
 | `0` | The run executed and nothing failed — warnings allowed (`COMPLETED WITH WARNINGS`). Also: skipped because another backup holds `/run/das-backup.lock` | success |
 | `3` | The run began its work and something **failed**: btrbk failed for some or all targets (it exits 10 when any one target aborts — one absent drive is enough), any operation failed (`FAILURES DETECTED`), or the run aborted on a target's or a source's state (no primary target, a target that will not mount or holds the wrong filesystem, a stale directory where an absent target mounts, a source that is not the expected filesystem) | **success**, via `SuccessExitStatus=3` |
 | `1` | Could not start: config unreadable, `btrdasd` missing, a bad argument, not root, `/run/das-backup.lock` or the maintenance lock unusable (a lock another backup holds is a skip, `0`). Nothing was mounted or sent | **failed** |

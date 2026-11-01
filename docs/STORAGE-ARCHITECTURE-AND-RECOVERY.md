@@ -23,11 +23,12 @@ Before a failure happens, document your storage layout. When you are troubleshoo
 ### Device Inventory Template
 
 | Device | Model | Serial | Size | Role | BTRFS devid |
-|--------|-------|--------|------|------|-------------|
+| --- | --- | --- | --- | --- | --- |
 | `<device>` | `<model>` | `<serial>` | `<size>` | `<role>` | `<devid>` |
 | `<device>` | `<model>` | `<serial>` | `<size>` | `<role>` | `<devid>` |
 
 Populate this with:
+
 ```bash
 # List all block devices
 lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,UUID
@@ -42,13 +43,13 @@ sudo btrfs filesystem show
 ### BTRFS Filesystem UUID Template
 
 | Array | UUID | Label | Devices |
-|-------|------|-------|---------|
+| --- | --- | --- | --- |
 | `<array-name>` | `<uuid>` | `<label>` | `<dev1>`, `<dev2>` |
 
 ### Subvolume Map Template
 
 | Subvolume | Mount Point | Array | Mount Options |
-|-----------|-------------|-------|---------------|
+| --- | --- | --- | --- |
 | `<subvol>` | `<mount>` | `<array>` | `<options>` |
 
 ### ESP (Boot Partition) Layout Template
@@ -56,7 +57,7 @@ sudo btrfs filesystem show
 If you use ESP mirroring:
 
 | Partition | UUID | Mount Point | Role |
-|-----------|------|-------------|------|
+| --- | --- | --- | --- |
 | `<device-partition>` | `<uuid>` | `/boot` | Primary ESP |
 | `<device-partition>` | `<uuid>` | `/mnt/esp-backup` | Backup ESP |
 
@@ -64,7 +65,7 @@ If you use ESP mirroring:
 
 For each drive with multiple partitions, document the layout:
 
-```
+```text
 Partition   Size    Type              Purpose
 -----------------------------------------------
 p1          <size>  EFI System        ESP / bootloader
@@ -81,7 +82,7 @@ p3          <size>  Linux Filesystem  BTRFS RAID member
 BTRFS manages RAID at the filesystem level (not the block device level). Each filesystem has independent profiles for data, metadata, and system chunks:
 
 | Profile | Redundancy | Min Devices | Space Efficiency | Notes |
-|---------|-----------|-------------|-----------------|-------|
+| --- | --- | --- | --- | --- |
 | single | None | 1 | 100% | No redundancy |
 | RAID-0 | None | 2+ | N x capacity | Striped, any device loss = total loss |
 | RAID-1 | 1 copy | 2+ | 50% | Mirrored across 2 devices |
@@ -103,7 +104,8 @@ sudo mount -o degraded UUID=<your-uuid> /mountpoint
 ```
 
 For root filesystems, add `degraded` to kernel boot options:
-```
+
+```text
 rootflags=subvol=/@,degraded
 ```
 
@@ -143,6 +145,7 @@ sudo btrfs balance status /mountpoint
 ```
 
 **Warning**: If a balance from RAID-0 to RAID-1 is interrupted (by failure or reboot), some chunks will be RAID-0 and some RAID-1. The RAID-0 chunks have no redundancy. Check with:
+
 ```bash
 sudo btrfs filesystem df /mountpoint
 # Look for both "Data, RAID0" and "Data, RAID1" lines
@@ -180,6 +183,7 @@ sudo smartctl -a /dev/<sata-device>
 ```
 
 **Key SMART attributes to watch**:
+
 - **NVMe**: `Percentage Used`, `Media and Data Integrity Errors`, `Error Information Log Entries`
 - **SATA SSD**: `Reallocated_Sector_Ct`, `Wear_Leveling_Count`, `Runtime_Bad_Block`
 - **SATA HDD**: `Reallocated_Sector_Ct`, `Current_Pending_Sector`, `Offline_Uncorrectable`, `UDMA_CRC_Error_Count`
@@ -192,7 +196,8 @@ sudo btrfs device stats /mountpoint
 ```
 
 Expected healthy output:
-```
+
+```text
 [/dev/<device>].write_io_errs    0
 [/dev/<device>].read_io_errs     0
 [/dev/<device>].flush_io_errs    0
@@ -201,12 +206,14 @@ Expected healthy output:
 ```
 
 **Interpretation**:
+
 - `write_io_errs > 0`: Drive cannot write -- likely failing hardware
 - `read_io_errs > 0`: Drive cannot read -- data may be corrupt; BTRFS will use mirror if available
 - `corruption_errs > 0`: Checksum mismatch -- BTRFS detected bit rot, auto-repaired from mirror
 - `generation_errs > 0`: Metadata generation mismatch -- filesystem inconsistency
 
 **Reset counters after replacement** (to clear stale stats):
+
 ```bash
 sudo btrfs device stats --reset /mountpoint
 ```
@@ -219,6 +226,7 @@ sudo dmesg | grep -iE 'i/o error|medium error|blk_update_request|btrfs.*error|at
 ```
 
 Common failure patterns:
+
 - `blk_update_request: I/O error, dev <dev>, sector NNNN` -- HDD/SSD sector failure
 - `ata3: COMRESET failed` -- SATA link failure
 - `BTRFS error (device <dev>): bdev /dev/<dev> errs` -- BTRFS detected device error
@@ -242,6 +250,7 @@ mount | grep btrfs | grep degraded  # Should return nothing normally
 When you suspect a drive failure:
 
 - [ ] **1. Identify the failed array and device**
+
   ```bash
   sudo btrfs filesystem show        # Shows "missing" for failed device
   sudo btrfs device stats /mountpoint  # Non-zero errors point to failing drive
@@ -249,12 +258,14 @@ When you suspect a drive failure:
   ```
 
 - [ ] **2. Confirm system is running degraded (not crashed)**
+
   ```bash
   mount | grep btrfs                # All expected mounts present?
   df -h /mountpoint                 # Filesystems responding?
   ```
 
 - [ ] **3. Verify surviving drive health**
+
   ```bash
   sudo smartctl -a /dev/<surviving-drive>
   ```
@@ -276,12 +287,14 @@ If your primary boot drive fails but you have a mirrored ESP:
 1. **Boot from backup ESP** -- select the fallback boot entry in your UEFI/BIOS boot menu
 2. **Use Safe Mode / degraded entry** -- boot with `rootflags=subvol=/@,degraded` if needed
 3. **Verify degraded operation**:
+
    ```bash
    mount | grep btrfs
    sudo btrfs filesystem show /
    ```
 
 4. **Install replacement drive** and clone partition table from surviving drive:
+
    ```bash
    # sfdisk -d carries the disk GUID (label-id:) and every partition's uuid=, and
    # sfdisk applies them: drop both so the new drive gets fresh PARTUUIDs instead of
@@ -290,6 +303,7 @@ If your primary boot drive fails but you have a mirrored ESP:
    ```
 
 5. **Create partitions on new drive**:
+
    ```bash
    # Swap (if applicable)
    sudo mkswap /dev/<new-drive-swap-partition>
@@ -306,11 +320,13 @@ If your primary boot drive fails but you have a mirrored ESP:
    it (step 9), not by copying files by hand.
 
 6. **Replace the failed BTRFS device**:
+
    ```bash
    sudo btrfs replace start <devid> /dev/<new-drive-btrfs-partition> / -B
    ```
 
 7. **Re-register UEFI boot entry**:
+
    ```bash
    sudo efibootmgr --create --disk /dev/<new-drive> --part <esp-partition-number> \
      --loader '\EFI\SYSTEMD\SYSTEMD-BOOTX64.EFI' \
@@ -318,6 +334,7 @@ If your primary boot drive fails but you have a mirrored ESP:
    ```
 
 8. **Update fstab** with new partition UUIDs:
+
    ```bash
    blkid /dev/<new-drive-esp-partition>    # Get new ESP UUID
    blkid /dev/<new-drive-swap-partition>   # Get new swap UUID
@@ -333,6 +350,7 @@ If your primary boot drive fails but you have a mirrored ESP:
    or generator writes (hand-written loader entries), then reinstall in ONE transaction
    every package that owns a file on the ESP (microcode images are owned by the microcode
    package, not the kernel) plus every installed kernel:
+
    ```bash
    sudo mount <primary-esp-mount-point>   # e.g. /boot, via its fstab entry
    sudo bootctl install
@@ -354,26 +372,31 @@ If your primary boot drive fails but you have a mirrored ESP:
 For SATA SSDs, HDDs, or data-only NVMe:
 
 1. **Verify the array is degraded** (system may keep running from mirror):
+
    ```bash
    sudo btrfs filesystem show /mountpoint
    ```
 
 2. **If the mount failed on reboot**, mount manually with degraded:
+
    ```bash
    sudo mount -o degraded UUID=<your-uuid> /mountpoint
    ```
 
 3. **Install replacement drive**:
+
    ```bash
    sudo wipefs -a /dev/<new-drive>
    ```
 
 4. **Replace the failed device**:
+
    ```bash
    sudo btrfs replace start <devid> /dev/<new-drive> /mountpoint -B
    ```
 
 5. **Verify**:
+
    ```bash
    sudo btrfs filesystem show /mountpoint   # Both devices present
    sudo btrfs device stats /mountpoint      # All zeros
@@ -390,6 +413,7 @@ If a drive fails while a RAID-0 to RAID-1 balance is incomplete:
 - **RAID-0 chunks**: **Permanently lost** -- no recovery possible
 
 **Partial recovery attempt** (salvage RAID-1 data only):
+
 ```bash
 # Mount degraded read-only (may fail if metadata was on RAID-0 chunks)
 sudo mount -o degraded,ro UUID=<your-uuid> /mnt/recovery
@@ -476,7 +500,7 @@ efibootmgr                   # Boot order correct (if applicable)
 ### UUID Reference Template
 
 | Purpose | UUID | Device(s) |
-|---------|------|-----------|
+| --- | --- | --- |
 | `<array-name>` BTRFS | `<uuid>` | `<dev1>`, `<dev2>` |
 | ESP primary | `<uuid>` | `<device>` |
 | ESP backup | `<uuid>` | `<device>` |
@@ -485,7 +509,7 @@ efibootmgr                   # Boot order correct (if applicable)
 ### Serial Number Reference Template
 
 | Device | Serial | Model |
-|--------|--------|-------|
+| --- | --- | --- |
 | `<device>` | `<serial>` | `<model>` |
 
 ### Essential Commands Cheat Sheet
@@ -523,5 +547,5 @@ sudo btrfs scrub start -B /mountpoint  # Full integrity check
 ### Replacement Drive Specification Template
 
 | Array | Required Spec | Minimum Size | Interface |
-|-------|--------------|--------------|-----------|
+| --- | --- | --- | --- |
 | `<array>` | `<spec>` | `<minimum-size>` | `<interface>` |

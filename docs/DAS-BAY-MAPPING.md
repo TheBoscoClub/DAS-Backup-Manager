@@ -48,7 +48,7 @@ Use the template below. Adjust bay count and layout to match your enclosure.
 
 ## Bay Mapping Template
 
-```
+```text
 +------------------------------------------+
 | <Your Enclosure Model> (front view)      |
 +------------+------------+----------------+
@@ -69,7 +69,7 @@ Adjust the grid to match your enclosure's bay count and physical arrangement (2-
 ## Drive Details Template
 
 | Bay | Serial | Model | Size | Partitions | Role | BTRFS Label |
-|-----|--------|-------|------|------------|------|-------------|
+| --- | --- | --- | --- | --- | --- | --- |
 | 1 | `<serial>` | `<model>` | `<size>` | `<partition layout>` | `<role>` | `<label>` |
 | 2 | `<serial>` | `<model>` | `<size>` | `<partition layout>` | `<role>` | `<label>` |
 | ... | ... | ... | ... | ... | ... | ... |
@@ -79,7 +79,7 @@ Adjust the grid to match your enclosure's bay count and physical arrangement (2-
 Common drive roles in a DAS backup configuration:
 
 | Role | Description |
-|------|-------------|
+| --- | --- |
 | **Primary Backup** | `role = "primary"` -- main btrbk target, receives all snapshot send/receive streams, including subvolumes adopted with no configured parent; holds the refreshed `@`/`@home` and their archives |
 | **Bootable Recovery** | Has an ESP partition + its own, independent bootable OS. Configure it as `role = "mirror"`; nothing may ever write your system's ESP onto it |
 | **Mirror** | `role = "mirror"` -- secondary target receiving the streams of sources whose `target_labels` is empty, with its own retention. The boot-subvolume refresh and archive pruning never touch it |
@@ -126,7 +126,6 @@ by UUID. The setup wizard records it for a new target whose drive is attached;
 The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
 
 `btrdasd setup` also renders the serials and `mount_uuid` into `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, which hides the targets from udisks so no desktop session mounts them under `/run/media`. After changing a serial (a replaced drive), run `sudo btrdasd setup --upgrade` to regenerate it; `sudo btrdasd setup --check` confirms each attached target carries the flag.
-
 
 ## Re-cabling and moving the enclosure — POWER IT DOWN FIRST
 

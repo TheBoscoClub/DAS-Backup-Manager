@@ -14,14 +14,14 @@ This is the short version. For detailed steps, open `docs/DISASTER-RECOVERY-GUID
    - **ASUS**: F8 | **Gigabyte**: F12 | **MSI**: F11 | **Most others**: F12
 4. Select the DAS entry (look for your enclosure's name or the drive's serial number — fill in below: bay 1 `<serial>`, bay 4 `<serial>`). Never go by an entry number or by the name `UEFI OS` — the firmware gives every disk that name and renumbers entries after any NVRAM reset. The recovery ESPs are identified by PARTUUID: `<PARTUUID-of-recovery-ESP-1>` (`RECOV-ESP-1`, bay 1) and `<PARTUUID-of-recovery-ESP-4>` (`RECOV-ESP-4`, bay 4) — fill in
 5. If you still have the last emailed backup report, read this drive's `RECOVERY OS` block: `btrbk at boot: will` means do not boot it bare (see the guide, "The session refuses"); `may` with `btrbk config: none` is safe — the drive's OS carries no btrbk configuration, so nothing on it touches the backups. Its boot menu cannot edit the kernel line (`editor no`): there is no emergency-shell route from the menu
-6. At its menu choose **CachyOS Emergency Recovery (Bay 1)** or **(Bay 4)**. The **— Fallback** entry boots the same OS from an initramfs built without hardware autodetection: it carries every driver. The default image is built with autodetection, inside the update VM, so if the default entry stops at an emergency shell on your machine, reboot and choose **— Fallback**. The two **— Previous root, <date> (Bay N)** entries (the second is the Fallback variant; absent until the drive's first upgrade) are a true rollback to the system as it was before the last upgrade: they boot the kernel and initramfs kept from that time, matched to a writable clone of the pre-upgrade root, so the old system comes up as it was, not just its files. Changes made in it are discarded at the next upgrade. If the last upgrade could not refresh them, the older pair stays (titled with its date); if there is none, the one entry **— Previous root UNAVAILABLE: <reason> —** appears, and it boots the current OS, not the old one.
+6. At its menu choose **CachyOS Emergency Recovery (Bay 1)** or **(Bay 4)**. The **— Fallback** entry boots the same OS from an initramfs built without hardware autodetection: it carries every driver. The default image is built with autodetection, inside the update VM, so if the default entry stops at an emergency shell on your machine, reboot and choose **— Fallback**. The two **— Previous root, &lt;date&gt; (Bay N)** entries (the second is the Fallback variant; absent until the drive's first upgrade) are a true rollback to the system as it was before the last upgrade: they boot the kernel and initramfs kept from that time, matched to a writable clone of the pre-upgrade root, so the old system comes up as it was, not just its files. Changes made in it are discarded at the next upgrade. If the last upgrade could not refresh them, the older pair stays (titled with its date); if there is none, the one entry **— Previous root UNAVAILABLE: &lt;reason&gt; —** appears, and it boots the current OS, not the old one.
 7. The screen says what the disk is doing while it copies the backup index; a countdown appears from the second boot on. Do not power off while it does.
 
 **Login**: username `<your-user>`, password `__________` *(fill in and write on the printout)*
 
 ---
 
-## I Need To...
+## I Need To
 
 `/dev/<my-nvme-partition>` is the broken system's BTRFS root. If one of its two NVMe drives is dead, mount it with `-o subvol=@,degraded`.
 
@@ -106,15 +106,17 @@ Not there? A subvolume adopted automatically by a backup run is under `/mnt/back
 
 The two primary-target drives (bays `<n>` and `<m>`) are a BTRFS RAID-1 pair. If one fails, your data is safe on the surviving drive — but you need to mount it specially and replace the failed drive.
 
-**1. Confirm the failure**
+#### 1. Confirm the failure
+
 ```bash
 sudo btrfs filesystem show <primary-label>   # by label: the array is unmounted between backups
 # A line saying "*** Some devices missing" means one leg failed
 ```
 
-**2. Mount the surviving leg (degraded)**
+#### 2. Mount the surviving leg (degraded)
 
 If `/mnt/backup-<primary-label>` is not currently mounted (or won't mount normally) — first make sure no backup, scrub, restore, index, reconcile or doctor run, or recovery-OS VM session, holds the DAS (`sudo flock -n /run/das-maintenance.lock true || echo WAIT`; `cat /run/das-maintenance.lock` shows what the holder recorded):
+
 ```bash
 sudo mkdir -p /mnt/backup-<primary-label>
 sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=120,nossd,degraded \
@@ -124,7 +126,7 @@ sudo btrfs device stats /mnt/backup-<primary-label>   # a device with non-zero e
 
 The system's automatic backups already mount by UUID with `degraded` in their mount options, so the next nightly backup runs even with one drive missing. The backup log says so (`journalctl -u das-backup -u das-backup-full | grep 'RAID-1 degraded'` — Sunday's full run logs under the second); the emailed report has no line of its own for it, so do not wait for the email to tell you.
 
-**3. Replace the failed drive**
+#### 3. Replace the failed drive
 
 Hold the maintenance lock from here to the end of step 8: a backup run unmounts the array when it ends, even in the middle of a replace. On `WAIT` (a backup, scrub or recovery-OS VM session holds the DAS) never power the DAS off — wait:
 
@@ -136,7 +138,8 @@ sudo umount /mnt/backup-<primary-label>                 # if it is mounted
 
 Power down the DAS, swap in a new drive of equal or larger capacity (ideally the same model, for matching speed), power up, run `sudo btrfs device scan`, and mount the array again with step 2's `mount` command (skip its lock check: you hold the lock).
 
-**4. Find the new drive — by serial, never by letter**
+#### 4. Find the new drive — by serial, never by letter
+
 ```bash
 lsblk -o NAME,SIZE,SERIAL,TRAN
 # The new drive will have NO partitions and a different serial than the surviving drive's
@@ -144,6 +147,7 @@ NEW=/dev/disk/by-id/ata-<model>_<new-serial>
 ```
 
 **5. Partition the new drive identically to the surviving one** (`sgdisk` is in the `gptfdisk` package: `sudo pacman -S gptfdisk` if it is missing)
+
 ```bash
 sudo sgdisk --zap-all "$NEW"
 sudo sgdisk --new=1:2048:<end-sector-of-the-surviving-drive's-partition> --typecode=1:8300 \
@@ -151,7 +155,8 @@ sudo sgdisk --new=1:2048:<end-sector-of-the-surviving-drive's-partition> --typec
 sudo partprobe "$NEW"
 ```
 
-**6. Replace the failed device in the BTRFS array**
+#### 6. Replace the failed device in the BTRFS array
+
 ```bash
 # Get the missing devid from `btrfs filesystem show`
 sudo btrfs filesystem show <primary-label>
@@ -165,7 +170,8 @@ sudo btrfs replace start -B <missing-devid> "$NEW"-part1 /mnt/backup-<primary-la
 sudo btrfs replace status -1 /mnt/backup-<primary-label>
 ```
 
-**7. After replace completes — scrub, then restore RAID-1 chunks that were written `single` while degraded**
+#### 7. After replace completes — scrub, then restore RAID-1 chunks that were written `single` while degraded
+
 ```bash
 # Verify integrity first
 sudo btrfs scrub start -B /mnt/backup-<primary-label>
@@ -175,12 +181,14 @@ sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /mnt/backup-<
 sudo btrfs device stats /mnt/backup-<primary-label>   # All counters should be 0
 ```
 
-**8. Reset error counters, unmount, update the config**
+#### 8. Reset error counters, unmount, update the config
+
 ```bash
 sudo btrfs device stats --reset /mnt/backup-<primary-label>
 sudo umount /mnt/backup-<primary-label>          # the next backup mounts it itself
 exit                                  # leave the lock shell from step 3: backups go on
 ```
+
 Put the new serial in place of the failed one in `serials` of the `primary-22tb` target in `/etc/das-backup/config.toml`, then `sudo btrdasd setup --upgrade` and `sudo btrdasd setup --check`.
 
 For more detail, see `DISASTER-RECOVERY-GUIDE.md` section "Scenario D: RAID-1 Backup Array Single-Leg Failure".
@@ -190,6 +198,7 @@ For more detail, see `DISASTER-RECOVERY-GUIDE.md` section "Scenario D: RAID-1 Ba
 See the full guide: `DISASTER-RECOVERY-GUIDE.md` section "Full System Restoration".
 
 Short version:
+
 1. Partition new drives (ESP + BTRFS)
 2. `btrfs send` a snapshot (e.g. `nvme/root-.<TS>`) from the **primary** backup (`<primary-label>`) to the new drive — never the recovery drives' `@`, which is their own OS
 3. Make a writable snapshot of the received one as `@` (`btrfs subvolume snapshot`) — never `btrfs property set … ro false` on a received snapshot
@@ -213,10 +222,10 @@ sudo btrfs filesystem show
 
 ### Drive Cheat Sheet
 
-*(Fill in your actual values and keep this current)*
+(Fill in your actual values and keep this current)
 
 | Role | Label | Serial | UUID |
-|------|-------|--------|------|
+| --- | --- | --- | --- |
 | Boot drive (ESP `EFI`, `/boot`) | | | |
 | Mirror drive (ESP mirror, if you keep one) | | | |
 | DAS bay 1 (recovery A, independent OS; ESP `RECOV-ESP-1`) | | | |
@@ -229,6 +238,7 @@ sudo btrfs filesystem show
 > NVMe kernel names (`nvme0n1`, `nvme1n1`) swap between boots like `/dev/sdX` letters do — a boot drive can be `nvme0n1` one day and `nvme1n1` the next. Match by serial.
 >
 > **The primary target is BTRFS RAID-1**: its two bays share one filesystem (UUID `<primary-uuid>`). If one drive fails, mount with `-o degraded`:
+>
 > ```bash
 > sudo mount -t btrfs -o degraded UUID=<primary-uuid> /mnt/backup-<primary-label>
 > ```
@@ -239,10 +249,10 @@ sudo btrfs filesystem show
 
 ## Emergency Contacts & Resources
 
-- **BTRFS documentation**: https://btrfs.readthedocs.io
-- **Arch Wiki**: https://wiki.archlinux.org
-- **CachyOS**: https://cachyos.org
-- **btrbk**: https://github.com/digint/btrbk
+- **BTRFS documentation**: <https://btrfs.readthedocs.io>
+- **Arch Wiki**: <https://wiki.archlinux.org>
+- **CachyOS**: <https://cachyos.org>
+- **btrbk**: <https://github.com/digint/btrbk>
 
 ---
 

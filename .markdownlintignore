@@ -1,0 +1,8 @@
+node_modules
+.snapshots
+.btrbk-snapshots
+.claude/worktrees
+.beads
+**/local-*.md
+docs/local
+.claude/docs/local

@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| latest  | :white_check_mark: |
+| Version | Supported |
+| --- | --- |
+| latest | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
@@ -18,7 +18,7 @@ If you discover a security vulnerability in this project, please report it respo
 ## GitHub Security Features
 
 | Feature | Status | Purpose |
-|---------|--------|---------|
+| --- | --- | --- |
 | **Dependabot vulnerability alerts** | Enabled | Monitor dependencies for known vulnerabilities |
 | **Dependabot security updates** | Enabled | Auto-create PRs to fix vulnerable dependencies |
 | **Secret scanning** | Enabled | Detect accidentally committed secrets |
@@ -29,7 +29,7 @@ If you discover a security vulnerability in this project, please report it respo
 ### Rust Code
 
 | Tool | Purpose | Command |
-|------|---------|---------|
+| --- | --- | --- |
 | **clippy** | Lints, warnings as errors (CI) | `cargo clippy --all-targets --features dbus -- -D warnings` |
 | **cargo-mutants** | Mutation testing gates every push (`.github/workflows/mutants.yml`) | see `indexer/.cargo/mutants.toml` |
 | **semgrep** | Static analysis in CI (`.github/workflows/semgrep.yml`) | `semgrep ci` |
@@ -37,21 +37,21 @@ If you discover a security vulnerability in this project, please report it respo
 ### C++ Code
 
 | Tool | Purpose | Command |
-|------|---------|---------|
+| --- | --- | --- |
 | **clang-tidy** | Static analysis and modernization | `clang-tidy src/*.cpp -- -std=c++20` |
 | **cppcheck** | Static analysis for C/C++ | `cppcheck --enable=all src/` |
 
 ### Shell Scripts
 
 | Tool | Purpose | Command |
-|------|---------|---------|
+| --- | --- | --- |
 | **shfmt** | Shell formatting validation | `shfmt -d scripts/*.sh` |
 | **shellcheck** | Shell script static analysis | `shellcheck scripts/*.sh` |
 
 ### General
 
 | Tool | Purpose | Command |
-|------|---------|---------|
+| --- | --- | --- |
 | **codespell** | Spell checking for typos | `codespell --skip='.git,build'` |
 | **markdownlint** | Markdown linting | `markdownlint '**/*.md'` |
 | **trivy** | Filesystem vulnerability scanner | `trivy fs .` |
@@ -59,7 +59,7 @@ If you discover a security vulnerability in this project, please report it respo
 ## Security Alert Resolution Policy
 
 | Alert Type | Resolution Approach |
-|------------|---------------------|
+| --- | --- |
 | **Critical/High CVE** | Fix immediately or create tracking issue |
 | **Medium CVE** | Fix within 30 days |
 | **Low CVE** | Fix in next release cycle |
