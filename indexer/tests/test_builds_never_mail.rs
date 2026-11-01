@@ -24,9 +24,10 @@ use std::sync::{Mutex, MutexGuard};
 /// Held while a stub is written and run, and while either test spawns. The
 /// two tests run in parallel: a fork in one while the other still has its
 /// stub open for writing hands the child that write descriptor, and the exec
-/// of the stub then fails with ETXTBSY ("Text file busy"). Measured: 32 of
-/// 300 runs failed that way at the default test threads, 0 of 300 with this
-/// lock (bd DAS-Backup-Manager-1x76).
+/// of the stub then fails with ETXTBSY ("Text file busy"). Measured at the
+/// default test threads, 300 runs each: 32, 38 and 25 failed that way in
+/// three measurements without this lock, 0 in two with it (bd
+/// DAS-Backup-Manager-1x76).
 static SPAWN: Mutex<()> = Mutex::new(());
 
 /// The spawn lock; a test that failed while holding it does not poison it for
