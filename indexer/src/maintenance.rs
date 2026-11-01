@@ -47,7 +47,7 @@ pub const UNKNOWN_HOLDER: &str = "an unknown holder";
 const MAX_RECORD_CHARS: usize = 200;
 
 /// How to free the lock when a job cannot wait for a scrub —
-/// `.claude/rules/backup.md` §Sentinel Interaction: `cachyos-sentinel`
+/// `.claude/rules/backup.md` §Supervisor Interaction: `cachyos-sentinel`
 /// restarts a stopped unit, so it is masked too, and unmasked once done.
 const STOP_A_SCRUB: &str = "If this cannot wait and a scrub holds it: systemctl stop \
      das-scrub.service && systemctl mask das-scrub.service (stop alone is undone within \

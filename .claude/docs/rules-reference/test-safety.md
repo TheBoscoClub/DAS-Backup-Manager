@@ -1,3 +1,4 @@
+<!-- markdownlint-disable-file MD025 MD029 -- verbatim excerpts moved from .claude/rules/; reformatting would break the lossless-move proof -->
 # Test Safety — Reference
 
 Binding rules: `.claude/rules/test-safety.md`. Tracker: bd `DAS-Backup-Manager-29sv`.
@@ -33,3 +34,28 @@ exhausted RAM and swap, and the OOM policy killed the whole cgroup holding the s
 `RLIMIT_NPROC` counts every task (thread) of the real user, so the cap is measured at start, not fixed. Root is
 exempt; a suite run as root says so and runs uncapped. A new or changed suite run by hand is also wrapped in
 `systemd-run --user --scope -p TasksMax=<n>`, which bounds the cgroup and keeps the OOM policy's target narrow.
+
+# Test Safety — This Repository's Task Cap
+
+<!-- full original lines moved from the rule file, 2026-11-01 -->
+The general rules (no self-calling stubs, bounded suites, no blind re-runs, killing a runaway) are
+global for the maintainer's sessions. The incident started here: a PATH stub named like a command it called
+forked until the host ran out of memory; its write-up is `.claude/docs/rules-reference/test-safety.md`
+(NOT auto-loaded). bd `DAS-Backup-Manager-29sv`.
+Installation specifics: `.claude/rules/local-installation.md` (gitignored, this machine only).
+
+## Here
+
+<!-- full original lines moved from the rule file, 2026-11-01 -->
+4. **No test reaches a real mailer** (bd `DAS-Backup-Manager-1x76`: a mutant once mailed through the
+   live relay). Rust: a report send takes a `report::Mailer`; tests pass a recording one with a fixed
+   `context()`, and `report::MAILX` refuses in every test build — feature `test-overrides`, which the
+   crate's dev-dependency on itself gives every target `cargo test` builds; never remove it there.
+   `tests/test_builds_never_mail.rs` and the unit tests named `*never_spawns_mailx` prove the refusal;
+   `tests/test_report_mail.sh` proves a built `btrdasd` mails, and that both shipped binaries carry the
+   live send and not the refusal — texts it reads from the source, never copies (a stale copy passes
+   silently). A test never sends through `MAILX` to check what it is (`dyn Any` downcast instead), and a
+   test config that reaches a mailer names an unreachable relay (`127.0.0.1:1`), never port 25.
+   Shell: a suite that runs a real send stubs `mailx` on an `env -i` `PATH`
+   (`test_backup_exit_semantics.sh`, `test_report_mail.sh`); a suite that extracts functions stubs
+   `send_report` itself or never defines it.

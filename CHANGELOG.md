@@ -1,3 +1,4 @@
+<!-- markdownlint-disable-file MD038 -- code spans quote literal strings whose spaces matter (`ID `, `; `) -->
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -14,10 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Always-loaded rules trimmed**: narrative, incidents and mechanism moved verbatim from `CLAUDE.md` and `.claude/rules/*.md` into `.claude/docs/rules-reference/` (not auto-loaded) — loaded size 42,998 → 37,571 chars, every binding rule kept (lossless check: each removed line found whole in a reference doc; independent review) — headroom under the cap 3.3k → 19.4k
 - **Every report send goes through `report::Mailer`** — `deliver_report` and the doctor take the mailer they send with, and the message is made in the mailer's `context()` (host, minute, `DAS_REPORT_TO` / `DAS_REPORT_FROM`, read through `MailContext::from_lookup`). Production cannot pass another: `SystemBackupHost::new` (CLI and D-Bus helper) and `run_scrub_pass` send through `report::MAILX` themselves, which runs `mailx` as before (same arguments, `smtp-auth=none` included, body on stdin, stderr kept; the error text's one change is under Fixed). Tests pass a recording mailer with a fixed context and assert on the exact message, whatever the environment exports (bd `DAS-Backup-Manager-1x76`)
 
 ### Fixed
 
+- **Stale section citations**: `indexer/src/maintenance.rs` and `scripts/backup-run.sh` cite `backup.md` §Supervisor Interaction — the heading was never Sentinel Interaction; `build.md` points at the local doc that now holds the host toolchain versions
 - **No test can mail through the live relay** — `report.rs` spawned `mailx` directly, and tests stayed off the network only because their configs had `[email].enabled = false`, so a mutant that flipped that gate mailed real reports (four from `backup@localhost` on 2026-10-06). In every test build — the `test-overrides` feature, which the crate's dev-dependency on itself gives every target `cargo test` builds — `report::MAILX` now refuses before it spawns anything; a shipped build never has the feature, and `shell-report-mail` proves the built binary mails. No test checks the production mailer by sending through it, and every test config that reaches a mailer names an unreachable relay (`127.0.0.1:1`), never port 25 (bd `DAS-Backup-Manager-1x76`)
 - **`exit_code_for_doctor`'s doc comment is on its function again** — `doctor_json` sat between the two, so the comment documented the wrong function
 - **A failed report send says `mailx failed (exit status: 1): …`** — it said `(exit exit status: 1)`, the word doubled by the exit status's own text; nothing parses it (bd `DAS-Backup-Manager-1x76`)

@@ -2424,7 +2424,7 @@ update_boot_subvolumes() {
 
     # The words are the Rust step's (BootOutcome::status): FAIL outranks WARN,
     # and a WARN is not a failure — generate_report reads it as COMPLETED WITH
-    # WARNINGS and the run still exits 0 (.claude/rules/backup.md §Sentinel).
+    # WARNINGS and the run still exits 0 (.claude/rules/backup.md §Supervisor Interaction).
     if (( failed > 0 )); then
         record_op "boot_subvols" "FAIL" "$updated updated, $failed failed"
     elif (( warned > 0 )); then

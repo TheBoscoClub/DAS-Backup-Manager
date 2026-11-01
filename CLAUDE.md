@@ -19,8 +19,7 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 ## Build
 
 ```bash
-# Rust is built by CMake into build/cargo-target/; never a bare `cargo build`
-# Install prefix defaults to /usr (not CMake's /usr/local); packaging passes it explicitly
+# Rust is built by CMake into build/cargo-target/ (see build.md)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 # Rust tests (build output on fast scratch, not the project disk)
@@ -29,11 +28,11 @@ cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 
 ## Detailed Rules
 
-- `esp-safety.md` — **CRITICAL** — recovery-drive ESP identification, independence and incident
+- `esp-safety.md` — **CRITICAL**: recovery-drive ESPs
 - `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
 - `backup.md` — btrbk, DAS, boot archival, email, exit codes, locks, supervisor interaction
-- `fail-silent.md` — which error suppressions are legitimate here, and which are always defects
-- `test-safety.md` — a suite must never take the host down: task cap, no self-calling stubs
-- `tracking.md` — where a new bd issue goes (phase epics) and the orphan check
-- `local-host-identifiers.md` — (gitignored, this machine only) real serials/UUIDs behind the tracked placeholders
-- `local-installation.md` — (gitignored, this machine only) this installation's targets, enclosure, ESPs, mail, supervisor notes
+- `fail-silent.md` — which error suppressions are legitimate here
+- `test-safety.md` — task cap, no self-calling stubs, no real mailer in tests
+- `tracking.md` — where a new bd issue goes; orphan check
+- `local-host-identifiers.md` — (gitignored) real serials/UUIDs behind the placeholders
+- `local-installation.md` — (gitignored) this installation's targets, enclosure, ESPs, mail

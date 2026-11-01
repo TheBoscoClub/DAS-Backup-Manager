@@ -1,3 +1,4 @@
+<!-- markdownlint-disable-file MD029 MD055 MD056 MD058 MD060 -- verbatim excerpts moved from .claude/rules/; reformatting would break the lossless-move proof -->
 <!-- Reference detail for .claude/rules/fail-silent.md. NOT auto-loaded: the rule file is the binding summary;
      this is the reasoning, incidents and measurements behind it. Section headings match. -->
 
@@ -12,6 +13,12 @@ the whole tree.
 Tracked by `bd DAS-Backup-Manager-nsp` (closed).
 
 ---
+
+<!-- full original lines moved from the rule file, 2026-11-01 -->
+**diff against a known list**.
+Full triaged inventories (54 bash hits, 236 Rust hits), the defects found and the two deliberately
+unfixed cases: `.claude/docs/rules-reference/fail-silent.md` (NOT auto-loaded). **Read it before
+auditing suppressions or filing one as a defect.** Audit: `bd DAS-Backup-Manager-nsp` (closed).
 
 ## The test: which direction does the substituted default point?
 
@@ -269,6 +276,9 @@ was written.
 
 ---
 
+<!-- full original lines moved from the rule file, 2026-11-01 -->
+5. **`backup-run.sh` exits 3 — counted as success by its units — when it began its work and something failed** — deliberate, the doctor's rule; see `backup.md` §Supervisor Interaction (`bd d1r`). Failure travels by the report, the history row and the journal's `status=3`, never by a restart; only a run that could not start exits 1 and fails the unit. An abort before the report stage sends one ABORTED report and records a failed row (`bd 2my`); one after the report went out leaves only the journal's `status=3` and the log.
+
 ## Always a defect here
 
 1. **A sentinel that is indistinguishable from a measurement.** A missing
@@ -331,6 +341,20 @@ large (b) count delay a (c) fix.
 
 ---
 
+<!-- full original lines moved from the rule file, 2026-11-01 -->
+```bash
+grep -rn '\.ok()\|unwrap_or\|let _ =\|Err(_) =>' indexer/src --include=*.rs
+grep -rn '2>/dev/null\|)| true\|)| :' scripts/*.sh
+```
+
+Apply the direction test to each hit not already in the reference inventory.
+| Bucket | Meaning | Disposition |
+|:--|:--|:--|
+| (a) legitimate | default is the cautious one | leave; extend the reference |
+| (b) should-log | non-fatal, silence costs diagnosis | log at warn, continue |
+| (c) should-propagate | changes the caller's decision | return an error |
+**(c) is the only correctness bug.** A large (b) count must not delay a (c) fix.
+
 ## Do not trust an audit's confidence, including your own
 
 Both agents that produced the original inventory over-claimed exactly once, in
@@ -350,6 +374,11 @@ either a finding or a refutation.** A reproduction that omits the production
 shell options, environment, or privileges is not evidence in either direction.
 
 ---
+
+<!-- full original lines moved from the rule file, 2026-11-01 -->
+**Reproduce under real conditions before believing a finding or a refutation.** A repro omitting
+production shell options (`set -o pipefail`), environment or privileges is not evidence either way.
+Both original audit agents over-claimed once, in opposite directions; each was caught only against the running system.
 
 ## Related
 
