@@ -19,11 +19,27 @@ use buttered_dasd::report::{self, Mailer};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+/// Held while a stub is written and run, and while either test spawns. The
+/// two tests run in parallel: a fork in one while the other still has its
+/// stub open for writing hands the child that write descriptor, and the exec
+/// of the stub then fails with ETXTBSY ("Text file busy"). Measured: 32 of
+/// 300 runs failed that way at the default test threads, 0 of 300 with this
+/// lock (bd DAS-Backup-Manager-1x76).
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// The spawn lock; a test that failed while holding it does not poison it for
+/// the other.
+fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A `mailx` stand-in at `<dir>/mailx` that appends its arguments to
 /// `<dir>/ran` and exits 0. It calls no mailer and never its own name.
 /// Returns the stub and the record it writes, the stub seen to write it.
 fn recording_stub(dir: &Path) -> (PathBuf, PathBuf) {
+    let _spawning = spawn_lock();
     let marker = dir.join("ran");
     let stub = dir.join("mailx");
     std::fs::write(
@@ -104,14 +120,17 @@ enabled = false
         dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_btrdasd"))
-        .args(["doctor", "--email", "--config"])
-        .arg(&config)
-        .env("PATH", path)
-        .env_remove("DAS_REPORT_TO")
-        .env_remove("DAS_REPORT_FROM")
-        .output()
-        .expect("spawn btrdasd");
+    let out = {
+        let _spawning = spawn_lock();
+        Command::new(env!("CARGO_BIN_EXE_btrdasd"))
+            .args(["doctor", "--email", "--config"])
+            .arg(&config)
+            .env("PATH", path)
+            .env_remove("DAS_REPORT_TO")
+            .env_remove("DAS_REPORT_FROM")
+            .output()
+            .expect("spawn btrdasd")
+    };
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("report email: mailx not run: a test build never mails"),
