@@ -1615,9 +1615,12 @@ fn now_epoch() -> i64 {
 /// scrub over failing hardware indefinitely (`bd DAS-Backup-Manager-18p`).
 /// This function's return value stays truthful either way — only the CLI's
 /// interpretation of it for the process exit code is split.
+///
+/// The report goes through `mailer` ([`crate::report::MAILX`] in production).
 pub fn run_scrub_pass(
     config: &Config,
     progress: &dyn ProgressCallback,
+    mailer: &dyn crate::report::Mailer,
 ) -> Result<ScrubPass, ScrubError> {
     if config.scrub_target_labels().is_empty() {
         return Err(ScrubError::NoTargets);
@@ -1673,14 +1676,7 @@ pub fn run_scrub_pass(
         }
     }
 
-    let report = format_scrub_report(&pass, config);
-    match crate::report::send_email_report_with_kind(&report, config, "Scrub") {
-        Ok(()) => progress.on_log(LogLevel::Info, "Scrub report emailed"),
-        Err(e) => progress.on_log(
-            LogLevel::Warning,
-            &format!("Could not send scrub report email: {e}"),
-        ),
-    }
+    email_scrub_report(&pass, config, progress, mailer);
 
     progress.on_complete(
         pass.success(),
@@ -1692,6 +1688,24 @@ pub fn run_scrub_pass(
     );
 
     Ok(pass)
+}
+
+/// Mail the pass's report through `mailer`. A report that cannot be sent is
+/// a warning: the pass's state is already persisted, and the pass stands.
+fn email_scrub_report(
+    pass: &ScrubPass,
+    config: &Config,
+    progress: &dyn ProgressCallback,
+    mailer: &dyn crate::report::Mailer,
+) {
+    let report = format_scrub_report(pass, config);
+    match crate::report::send_email_report_with_kind(&report, config, "Scrub", mailer) {
+        Ok(()) => progress.on_log(LogLevel::Info, "Scrub report emailed"),
+        Err(e) => progress.on_log(
+            LogLevel::Warning,
+            &format!("Could not send scrub report email: {e}"),
+        ),
+    }
 }
 
 /// Scrub every `[scrub].targets` entry in turn, under the maintenance lock
@@ -3441,7 +3455,12 @@ Total to scrub:   401.28MiB\n";
         let mut config = Config::default();
         config.scrub.targets.clear();
         assert!(config.targets.is_empty());
-        let err = run_scrub_pass(&config, &NullProgress).unwrap_err();
+        let err = run_scrub_pass(
+            &config,
+            &NullProgress,
+            &crate::report::RecordingMailer::accepting(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ScrubError::NoTargets));
     }
 
@@ -3488,5 +3507,62 @@ Total to scrub:   401.28MiB\n";
             }
         }
         out
+    }
+
+    /// bd DAS-Backup-Manager-1x76: the pass's report goes to the mailer it is
+    /// given — exactly the formatted report, as a Scrub report — and one the
+    /// mailer cannot take is a warning.
+    #[test]
+    fn the_scrub_report_goes_to_the_mailer_it_is_given() {
+        let mut config = Config::default();
+        config.email.enabled = true;
+        config.email.to = "ops@example.org".into();
+        config.email.from = "das@example.org".into();
+        let pass = pass_with(vec![fs_result("primary-22tb", "uuid-a", true, 1_000_400)]);
+
+        let mailer = crate::report::RecordingMailer::accepting();
+        let progress = Steps::default();
+        email_scrub_report(&pass, &config, &progress, &mailer);
+        let sent = mailer.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].body, format_scrub_report(&pass, &config));
+        assert!(
+            sent[0].subject.starts_with("[DAS Scrub] "),
+            "{}",
+            sent[0].subject
+        );
+        assert_eq!(sent[0].to, "ops@example.org");
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .contains(&(LogLevel::Info, "Scrub report emailed".into()))
+        );
+
+        let refusing = crate::report::RecordingMailer::refusing("relay down");
+        let progress = Steps::default();
+        email_scrub_report(&pass, &config, &progress, &refusing);
+        assert_eq!(refusing.sent().len(), 1, "the send is tried");
+        assert_eq!(
+            *progress.logs.lock().unwrap(),
+            [(
+                LogLevel::Warning,
+                "Could not send scrub report email: relay down".to_string()
+            )]
+        );
+
+        // Email off: nothing is handed over, and the warning says why.
+        config.email.enabled = false;
+        let progress = Steps::default();
+        email_scrub_report(&pass, &config, &progress, &mailer);
+        assert_eq!(mailer.sent().len(), 1);
+        assert_eq!(
+            *progress.logs.lock().unwrap(),
+            [(
+                LogLevel::Warning,
+                "Could not send scrub report email: Email is not enabled in config".to_string()
+            )]
+        );
     }
 }

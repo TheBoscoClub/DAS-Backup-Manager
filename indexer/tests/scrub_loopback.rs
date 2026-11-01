@@ -288,6 +288,15 @@ impl Drop for Rig {
     }
 }
 
+/// The rig's mailer: a scrub test never mails (bd DAS-Backup-Manager-1x76).
+struct Unmailed;
+
+impl buttered_dasd::report::Mailer for Unmailed {
+    fn send(&self, _: &buttered_dasd::report::MailMessage) -> Result<(), String> {
+        Err("a scrub test never mails".into())
+    }
+}
+
 /// Config pointing the engine at the rig and nothing else.
 fn rig_config(rig: &Rig) -> Config {
     let mut config = Config::default();
@@ -364,7 +373,7 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
     // ---- pass 1: the ordinary path -------------------------------------
     println!("== pass 1: ordinary scrub ==");
     let pass = with_env("DAS_SCRUB_STATE", state_file.to_str().unwrap(), || {
-        scrub::run_scrub_pass(&config, &Echo).expect("pass must run")
+        scrub::run_scrub_pass(&config, &Echo, &Unmailed).expect("pass must run")
     });
 
     assert_eq!(pass.status, PassStatus::Completed);
@@ -427,7 +436,7 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
     });
 
     let pass2 = with_env("DAS_SCRUB_STATE", state_file.to_str().unwrap(), || {
-        scrub::run_scrub_pass(&config, &Echo).expect("pass must run")
+        scrub::run_scrub_pass(&config, &Echo, &Unmailed).expect("pass must run")
     });
     let result2 = &pass2.results[0];
     // The invariant an aborted record must satisfy: it must NOT wedge scrubs.

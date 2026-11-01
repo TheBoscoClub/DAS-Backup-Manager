@@ -3008,12 +3008,14 @@ impl ReportDelivery {
 /// targets were mounted. Email failure alone is non-fatal — the backup data
 /// is safe and the report is on disk — and is logged, not added to the run's
 /// errors; a report that exists nowhere is not (see [`ReportDelivery::lost`]).
+/// The mail goes through `mailer` ([`crate::report::MAILX`] in production).
 pub fn deliver_report(
     config: &Config,
     options: &BackupOptions,
     result: &BackupResult,
     data: &crate::report::ReportData,
     progress: &dyn ProgressCallback,
+    mailer: &dyn crate::report::Mailer,
 ) -> ReportDelivery {
     let report_text =
         crate::report::format_report_from(result, options.subvolume_sync.as_ref(), data);
@@ -3040,7 +3042,7 @@ pub fn deliver_report(
             emailed: false,
         };
     }
-    let emailed = match crate::report::send_email_report(&report_text, config) {
+    let emailed = match crate::report::send_email_report(&report_text, config, mailer) {
         Ok(()) => {
             progress.on_log(LogLevel::Info, "Email report sent successfully");
             true
@@ -3437,16 +3439,24 @@ pub struct SystemBackupHost {
     /// Who runs the job — `btrdasd backup run`, or the GUI's — recorded in
     /// the maintenance lock file while it holds the lock.
     pub job: String,
+    /// What mails the report: [`crate::report::MAILX`] in production.
+    pub mailer: std::sync::Arc<dyn crate::report::Mailer>,
 }
 
 impl SystemBackupHost {
-    /// The production host: the given config, the production lock files.
-    pub fn new(config_path: &Path, job: &str) -> Self {
+    /// The production host: the given config, the production lock files,
+    /// the given mailer.
+    pub fn new(
+        config_path: &Path,
+        job: &str,
+        mailer: std::sync::Arc<dyn crate::report::Mailer>,
+    ) -> Self {
         Self {
             config_path: config_path.to_path_buf(),
             singleton_lock: BACKUP_LOCK_PATH.into(),
             maintenance_lock: scrub::MAINTENANCE_LOCK_PATH.into(),
             job: job.to_string(),
+            mailer,
         }
     }
 }
@@ -3521,7 +3531,7 @@ impl BackupJobHost for SystemBackupHost {
         data: &crate::report::ReportData,
         progress: &dyn ProgressCallback,
     ) -> ReportDelivery {
-        deliver_report(config, options, result, data, progress)
+        deliver_report(config, options, result, data, progress, &*self.mailer)
     }
 
     fn record(&self, config: &Config, result: &BackupResult) -> Result<(), String> {
@@ -9473,6 +9483,7 @@ mod tests {
             singleton_lock: dir.path().join("backup.lock"),
             maintenance_lock: dir.path().join("maintenance.lock"),
             job: "btrdasd-helper BackupRun job".into(),
+            mailer: std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
         };
         let scrub = scrub::FileLock::try_acquire(&host.maintenance_lock)
             .unwrap()
@@ -10265,11 +10276,23 @@ mod tests {
     // --- SystemBackupHost: the steps that need no root ----------------------
 
     fn system_host(dir: &Path) -> SystemBackupHost {
+        system_host_mailing(
+            dir,
+            std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
+        )
+    }
+
+    /// [`system_host`] whose reports go to `mailer`.
+    fn system_host_mailing(
+        dir: &Path,
+        mailer: std::sync::Arc<crate::report::RecordingMailer>,
+    ) -> SystemBackupHost {
         SystemBackupHost {
             config_path: dir.join("config.toml"),
             singleton_lock: dir.join("backup.lock"),
             maintenance_lock: dir.join("maintenance.lock"),
             job: "btrdasd backup run".into(),
+            mailer,
         }
     }
 
@@ -10278,6 +10301,7 @@ mod tests {
         let host = SystemBackupHost::new(
             Path::new("/etc/das-backup/config.toml"),
             "btrdasd-helper BackupRun job",
+            std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
         );
         assert_eq!(host.config_path, Path::new("/etc/das-backup/config.toml"));
         assert_eq!(host.singleton_lock, Path::new(BACKUP_LOCK_PATH));
@@ -10342,7 +10366,8 @@ mod tests {
     #[test]
     fn system_host_writes_the_report_when_asked_and_mails_it_only_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
-        let host = system_host(dir.path());
+        let mailer = std::sync::Arc::new(crate::report::RecordingMailer::accepting());
+        let host = system_host_mailing(dir.path(), mailer.clone());
         let mut config = make_test_config();
         // In a directory that does not exist yet: it is created.
         let report = dir.path().join("reports/last-report.txt");
@@ -10394,21 +10419,72 @@ mod tests {
             "email disabled: no send is tried"
         );
 
-        config.email.enabled = true;
-        // No recipient, and nothing listens on that port: the email cannot be
-        // sent (and nothing ever leaves this machine) — but the report is
-        // written first, and the failure is a warning.
-        config.email.to = String::new();
-        config.email.smtp_port = 1;
-        config.email.smtp_host = "127.0.0.1".into();
         assert!(
-            !host
-                .report(&config, &ask, &result, &data, &progress)
-                .emailed
+            mailer.sent().is_empty(),
+            "not ticked, or email disabled: nothing is handed to the mailer"
         );
-        assert!(tried_to_mail(&progress), "email enabled: the send is tried");
+
+        // Ticked and enabled: the report is written, then mailed — exactly
+        // the text written, to the configured recipient, through the relay.
+        config.email.enabled = true;
+        config.email.to = "ops@example.org".into();
+        config.email.from = "das@example.org".into();
+        config.email.smtp_host = "127.0.0.1".into();
+        config.email.smtp_port = 2525;
+        let delivery = host.report(&config, &ask, &result, &data, &progress);
+        assert!(delivery.emailed, "a mailer that takes it: emailed");
+        assert_eq!(delivery.saved, Ok(()));
         let text = std::fs::read_to_string(&report).unwrap();
-        assert!(text.contains("a"), "{text}");
+        let sent = mailer.sent();
+        assert_eq!(sent.len(), 1, "one report, one message");
+        let message = &sent[0];
+        assert_eq!(message.body, text, "the message is the report written");
+        assert_eq!(message.to, "ops@example.org");
+        assert_eq!(message.mta, "smtp://127.0.0.1:2525");
+        assert!(
+            message.from.starts_with("DAS Backup (")
+                && message.from.ends_with(") <das@example.org>"),
+            "{}",
+            message.from
+        );
+        assert!(
+            message.subject.starts_with("[DAS Backup] ")
+                && message.subject.contains(" — FAILURE — "),
+            "a failed run's subject says FAILURE: {}",
+            message.subject
+        );
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Info && m == "Email report sent successfully"),
+            "a send that went through is logged"
+        );
+        assert!(!tried_to_mail(&progress));
+        std::fs::remove_file(&report).unwrap();
+
+        // A mailer that cannot hand it over: the report is still written
+        // first, the failure is a warning, and the run is not failed for it.
+        let refusing = std::sync::Arc::new(crate::report::RecordingMailer::refusing("relay down"));
+        let host = system_host_mailing(dir.path(), refusing.clone());
+        let delivery = host.report(&config, &ask, &result, &data, &progress);
+        assert!(!delivery.emailed);
+        assert_eq!(delivery.saved, Ok(()));
+        assert!(delivery.lost().is_none(), "written, so not lost");
+        assert_eq!(refusing.sent().len(), 1, "the send is tried");
+        assert!(report.exists(), "written although not mailed");
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Warning
+                    && m == "Failed to send email report (non-fatal): relay down"),
+            "the failure is a warning, with why"
+        );
     }
 
     #[test]
@@ -10426,12 +10502,18 @@ mod tests {
                 capacity_and_smart: String::new(),
                 latest_snapshots: String::new(),
             };
+            let mailer = crate::report::RecordingMailer::accepting();
             let delivery = deliver_report(
                 &config,
                 &options,
                 &result_with(true, 1, 1, 0),
                 &data,
                 &TestProgress::new(),
+                &mailer,
+            );
+            assert!(
+                mailer.sent().is_empty(),
+                "email disabled: nothing handed over"
             );
             assert_eq!(delivery.saved, Ok(()), "email_report={email_report}");
             assert!(
@@ -10482,6 +10564,7 @@ mod tests {
             &result_with(true, 1, 1, 0),
             &data,
             &progress,
+            &crate::report::RecordingMailer::accepting(),
         );
         assert!(!delivery.emailed);
         let why = delivery.lost().expect("email off and unwritable: lost");
@@ -10521,6 +10604,7 @@ mod tests {
             &result_with(true, 1, 1, 0),
             &data,
             &TestProgress::new(),
+            &crate::report::RecordingMailer::accepting(),
         );
         assert_ne!(std::fs::read_to_string(&path).unwrap(), "old");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

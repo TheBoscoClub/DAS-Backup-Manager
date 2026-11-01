@@ -1241,6 +1241,60 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
     if any_scrub_launched { 0 } else { 1 }
 }
 
+/// `btrdasd doctor --json`'s one line, built by serde: a deferral's reason
+/// carries the lock holder's record, which may hold any character, so it is
+/// never pasted into the text by hand. The keys keep their order, status first.
+fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "status", rename_all = "lowercase")]
+    enum Line<'a> {
+        Deferred {
+            reason: &'a str,
+        },
+        Ran {
+            volumes_checked: usize,
+            volumes_failed: usize,
+            missing: usize,
+            stale: usize,
+        },
+    }
+    serde_json::to_string(&match outcome {
+        doctor::DoctorOutcome::Deferred { reason } => Line::Deferred { reason },
+        doctor::DoctorOutcome::Ran(dr) => Line::Ran {
+            volumes_checked: dr.volumes_checked,
+            volumes_failed: dr.volumes_failed.len(),
+            missing: dr.missing.len(),
+            stale: dr.stale.len(),
+        },
+    })
+}
+
+/// Mail a doctor report through `mailer` ([`report::MAILX`] in production)
+/// and say what became of it, as the doctor prints it to stderr.
+/// `could_not_run` is the report of a check that could not run.
+fn email_doctor_report(
+    text: &str,
+    cfg: &Config,
+    could_not_run: bool,
+    mailer: &dyn report::Mailer,
+) -> String {
+    let (sent, not_sent) = if could_not_run {
+        (
+            "Doctor failure report emailed",
+            "Could not send doctor failure report email",
+        )
+    } else {
+        (
+            "Doctor report emailed",
+            "Could not send doctor report email",
+        )
+    };
+    match report::send_email_report_with_kind(text, cfg, "Doctor", mailer) {
+        Ok(()) => sent.to_string(),
+        Err(e) => format!("{not_sent}: {e}"),
+    }
+}
+
 /// Map a `btrdasd doctor --check-drift` outcome to its process exit code
 /// (bd DAS-Backup-Manager-01u, refined by `DAS-Backup-Manager-f6p`). Unlike
 /// `exit_code_for_pass`, this command deliberately does NOT collapse "ran but
@@ -1285,34 +1339,6 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
 /// "ran") and `has_drift() == false` — exit 0, while the printed report said
 /// `DRIFT DETECTED — FAILURE` and `--email` sent a failure email for the same
 /// run. The split below keeps that case nonzero; it moves it from 1 to 3.
-/// `btrdasd doctor --json`'s one line, built by serde: a deferral's reason
-/// carries the lock holder's record, which may hold any character, so it is
-/// never pasted into the text by hand. The keys keep their order, status first.
-fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Error> {
-    #[derive(serde::Serialize)]
-    #[serde(tag = "status", rename_all = "lowercase")]
-    enum Line<'a> {
-        Deferred {
-            reason: &'a str,
-        },
-        Ran {
-            volumes_checked: usize,
-            volumes_failed: usize,
-            missing: usize,
-            stale: usize,
-        },
-    }
-    serde_json::to_string(&match outcome {
-        doctor::DoctorOutcome::Deferred { reason } => Line::Deferred { reason },
-        doctor::DoctorOutcome::Ran(dr) => Line::Ran {
-            volumes_checked: dr.volumes_checked,
-            volumes_failed: dr.volumes_failed.len(),
-            missing: dr.missing.len(),
-            stale: dr.stale.len(),
-        },
-    })
-}
-
 pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
     match outcome {
         doctor::DoctorOutcome::Deferred { .. } => 0,
@@ -2364,7 +2390,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // btrbk, unmount, report, record. The sync report goes to the
                 // progress log (stderr), so stdout stays what it was.
                 let outcome = backup::run_backup_job(
-                    &backup::SystemBackupHost::new(&config, "btrdasd backup run"),
+                    &backup::SystemBackupHost::new(
+                        &config,
+                        "btrdasd backup run",
+                        std::sync::Arc::new(report::MAILX),
+                    ),
                     cfg,
                     options,
                     &progress,
@@ -3033,7 +3063,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 let progress = CliProgress;
-                let pass = scrub::run_scrub_pass(&cfg, &progress)?;
+                let pass = scrub::run_scrub_pass(&cfg, &progress, &report::MAILX)?;
                 let exit_code = exit_code_for_pass(&pass);
                 let status_word = match pass.status {
                     scrub::PassStatus::Completed => "completed",
@@ -3131,12 +3161,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                              ═══════════════════════════════════════════════════════════\n\n\
                              The drift check could not run: {e}\n"
                         );
-                        match report::send_email_report_with_kind(&failure_text, &cfg, "Doctor") {
-                            Ok(()) => eprintln!("Doctor failure report emailed"),
-                            Err(mail_err) => {
-                                eprintln!("Could not send doctor failure report email: {mail_err}")
-                            }
-                        }
+                        eprintln!(
+                            "{}",
+                            email_doctor_report(&failure_text, &cfg, true, &report::MAILX)
+                        );
                     }
                     std::process::exit(2);
                 }
@@ -3161,12 +3189,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if email && (!dr.ran() || dr.not_clean()) {
                         let email_text = doctor::format_report(dr);
-                        match report::send_email_report_with_kind(&email_text, &cfg, "Doctor") {
-                            Ok(()) => eprintln!("Doctor report emailed"),
-                            Err(e) => {
-                                eprintln!("Could not send doctor report email: {e}")
-                            }
-                        }
+                        eprintln!(
+                            "{}",
+                            email_doctor_report(&email_text, &cfg, false, &report::MAILX)
+                        );
                     }
                 }
             }
@@ -4777,5 +4803,129 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert_eq!(verified.roots, vec!["/".to_string()]);
         assert_eq!(verified.unchecked, vec!["serial-only".to_string()]);
         assert!(verified.refused.is_empty());
+    }
+
+    // --- doctor email through the mailer seam (bd DAS-Backup-Manager-1x76) --
+
+    /// Keeps what it is given; answers as told.
+    struct Recorder {
+        sent: Mutex<Vec<report::MailMessage>>,
+        answer: Result<(), String>,
+    }
+
+    impl Recorder {
+        fn answering(answer: Result<(), String>) -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                answer,
+            }
+        }
+    }
+
+    impl report::Mailer for Recorder {
+        fn send(&self, message: &report::MailMessage) -> Result<(), String> {
+            self.sent.lock().unwrap().push(message.clone());
+            self.answer.clone()
+        }
+    }
+
+    fn doctor_mail_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.email.enabled = true;
+        cfg.email.to = "ops@example.org".into();
+        cfg.email.from = "das@example.org".into();
+        cfg
+    }
+
+    #[test]
+    fn a_doctor_report_goes_to_the_mailer_as_a_doctor_report_and_says_what_became_of_it() {
+        let cfg = doctor_mail_config();
+        for (could_not_run, sent_line, failed_line) in [
+            (
+                true,
+                "Doctor failure report emailed",
+                "Could not send doctor failure report email: relay down",
+            ),
+            (
+                false,
+                "Doctor report emailed",
+                "Could not send doctor report email: relay down",
+            ),
+        ] {
+            let ok = Recorder::answering(Ok(()));
+            assert_eq!(
+                email_doctor_report("DRIFT — FAILURE\n", &cfg, could_not_run, &ok),
+                sent_line
+            );
+            let sent = ok.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].body, "DRIFT — FAILURE\n");
+            assert!(
+                sent[0].subject.starts_with("[DAS Doctor] "),
+                "{}",
+                sent[0].subject
+            );
+            assert!(
+                sent[0].subject.contains(" — FAILURE — "),
+                "{}",
+                sent[0].subject
+            );
+            assert_eq!(sent[0].to, "ops@example.org");
+
+            let down = Recorder::answering(Err("relay down".into()));
+            assert_eq!(
+                email_doctor_report("x", &cfg, could_not_run, &down),
+                failed_line
+            );
+        }
+        let mut off = doctor_mail_config();
+        off.email.enabled = false;
+        let ok = Recorder::answering(Ok(()));
+        assert_eq!(
+            email_doctor_report("x", &off, false, &ok),
+            "Could not send doctor report email: Email is not enabled in config"
+        );
+        assert!(ok.sent.lock().unwrap().is_empty());
+    }
+
+    /// The binary's test build links the library with the `test-overrides`
+    /// feature, so its production mailer refuses as the library's own tests'
+    /// does: nothing a `btrdasd` test runs can spawn mailx.
+    #[test]
+    fn this_test_build_of_the_binary_never_spawns_mailx() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let stub = dir.path().join("mailx-stub");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" >>'{}'\ncat >/dev/null\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = std::process::Command::new(&stub)
+            .arg("probe")
+            .status()
+            .unwrap();
+        assert!(probe.success() && marker.exists(), "the stub records a run");
+        std::fs::remove_file(&marker).unwrap();
+
+        let program: &'static str = Box::leak(stub.to_string_lossy().into_owned().into_boxed_str());
+        let line = email_doctor_report(
+            "x",
+            &doctor_mail_config(),
+            false,
+            &report::Mailx::new(program),
+        );
+        assert_eq!(
+            line,
+            format!(
+                "Could not send doctor report email: {program} not run: a test build never mails (bd DAS-Backup-Manager-1x76)"
+            )
+        );
+        assert!(!marker.exists(), "nothing was spawned");
     }
 }

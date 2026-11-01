@@ -396,14 +396,272 @@ pub fn record_backup_run(
     Ok(id)
 }
 
-/// Send a backup report via email using s-nail (mailx).
-///
-/// Thin wrapper over [`send_email_report_with_kind`] with the `Backup` subject kind.
-pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    send_email_report_with_kind(report, config, "Backup")
+/// One report as the relay is to receive it: everything `mailx` is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailMessage {
+    /// `[DAS <kind>] <host> — <SUCCESS|FAILURE> — <YYYY-MM-DD HH:MM>`.
+    pub subject: String,
+    /// `DAS <kind> (<short host>) <address>`, or a `DAS_REPORT_FROM` that
+    /// carries its own display name. s-nail takes the bracketed address as
+    /// the envelope sender, which is what the relay keys its upstream
+    /// credential on.
+    pub from: String,
+    /// The recipient: `[email].to`, or `DAS_REPORT_TO`.
+    pub to: String,
+    /// The relay, `smtp://<smtp_host>:<smtp_port>`.
+    pub mta: String,
+    /// The report itself.
+    pub body: String,
 }
 
-/// Send a report via email using s-nail (mailx).
+/// Every report send — backup, scrub, doctor — goes through this
+/// (bd DAS-Backup-Manager-1x76). Production hands each caller [`MAILX`];
+/// tests hand them a recording mailer and assert on the exact message. The
+/// error is why the report was not handed over, as the caller logs it.
+pub trait Mailer: Send + Sync {
+    fn send(&self, message: &MailMessage) -> Result<(), String>;
+}
+
+/// s-nail's `mailx`, submitting to the local relay: the production [`Mailer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mailx {
+    program: &'static str,
+}
+
+/// The mailer every production entry point hands down: `mailx` from `PATH`.
+pub const MAILX: Mailx = Mailx { program: "mailx" };
+
+/// True in every test build — this crate's unit tests (`cfg(test)`) and
+/// everything built with the `test-overrides` feature, which only the
+/// dev-dependency turns on: integration tests, the binaries' unit tests and
+/// the binaries they run. There, [`Mailx`] refuses before it spawns anything,
+/// so no test, and no mutant a test build runs, can hand a report to a real
+/// relay (bd DAS-Backup-Manager-1x76: on 2026-10-06 a local mutation run did,
+/// four times). A shipped build never has the feature.
+const SPAWN_REFUSED: bool = cfg!(any(test, feature = "test-overrides"));
+
+impl Mailx {
+    /// A `mailx` at `program`. Production uses [`MAILX`]; the test that
+    /// proves a test build never spawns one points this at a recording stub.
+    pub const fn new(program: &'static str) -> Self {
+        Self { program }
+    }
+
+    /// The program this mailer runs.
+    pub fn program(&self) -> &'static str {
+        self.program
+    }
+
+    /// `mailx`'s arguments for `message`, in order. No credential and no TLS
+    /// setting: the hop is loopback-only plaintext and the relay owns the
+    /// authenticated, certificate-verified leg to the provider. `v15-compat`
+    /// stays because it is what makes s-nail honour the `mta=` URL form.
+    ///
+    /// `smtp-auth=none` is NOT optional and NOT symmetry with the shell path:
+    /// s-nail demands a password for any `smtp://` mta and aborts with
+    /// "A password is necessary for smtp authentication" (exit 4) without it.
+    /// `nosave` stops a failed send from dropping the body into
+    /// /root/dead.letter, which nothing reads or prunes — the caller has the
+    /// report either way.
+    pub fn args(message: &MailMessage) -> Vec<String> {
+        vec![
+            "-s".into(),
+            message.subject.clone(),
+            "-r".into(),
+            message.from.clone(),
+            "-S".into(),
+            "v15-compat".into(),
+            "-S".into(),
+            format!("mta={}", message.mta),
+            "-S".into(),
+            "smtp-auth=none".into(),
+            "-S".into(),
+            "nosave".into(),
+            message.to.clone(),
+        ]
+    }
+}
+
+impl Mailer for Mailx {
+    /// The body goes to `mailx`'s stdin; its stdout is discarded and its
+    /// stderr is kept for the error, never sent to /dev/null. The run's own
+    /// lock files are opened close-on-exec (std's default), so `mailx` never
+    /// holds them.
+    fn send(&self, message: &MailMessage) -> Result<(), String> {
+        if SPAWN_REFUSED {
+            return Err(format!(
+                "{} not run: a test build never mails (bd DAS-Backup-Manager-1x76)",
+                self.program
+            ));
+        }
+        let output = spawn_with_stdin(self.program, &Self::args(message), &message.body)
+            .map_err(|e| e.to_string())?;
+        mailx_outcome(&output)
+    }
+}
+
+/// Run `program` with `args`, `body` on its stdin, stdout discarded, stderr
+/// captured. Only [`Mailx::send`] calls it, and only outside a test build.
+fn spawn_with_stdin(
+    program: &str,
+    args: &[String],
+    body: &str,
+) -> std::io::Result<std::process::Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(body.as_bytes())?;
+    }
+    child.wait_with_output()
+}
+
+/// What a finished `mailx` means: success, or why not with its stderr.
+fn mailx_outcome(output: &std::process::Output) -> Result<(), String> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "mailx failed (exit {}): {}",
+            output.status,
+            stderr.trim()
+        ))
+    }
+}
+
+/// What a report's message takes from the machine and the environment: the
+/// host's name, the local time, and the `DAS_REPORT_TO` / `DAS_REPORT_FROM`
+/// overrides (for testing without editing the live config).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailContext {
+    pub hostname: String,
+    /// `YYYY-MM-DD HH:MM`, local time.
+    pub now: String,
+    pub to_override: Option<String>,
+    pub from_override: Option<String>,
+}
+
+impl MailContext {
+    /// This machine, now.
+    pub fn current() -> Self {
+        Self {
+            hostname: kernel_hostname(),
+            now: format_minute(&local_now()),
+            to_override: std::env::var("DAS_REPORT_TO").ok(),
+            from_override: std::env::var("DAS_REPORT_FROM").ok(),
+        }
+    }
+}
+
+/// Whatever the kernel has set as the host's name (`gethostname`), or
+/// `unknown`.
+fn kernel_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `buf.len()` bytes into `buf`.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// The local time now, broken down.
+fn local_now() -> libc::tm {
+    let mut t: libc::time_t = 0;
+    // SAFETY: `time` writes one `time_t`; `localtime_r` fills the `tm` it is
+    // given and keeps no pointer to either.
+    unsafe { libc::time(&mut t) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    tm
+}
+
+/// `tm` as `YYYY-MM-DD HH:MM`.
+fn format_minute(tm: &libc::tm) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+/// The message that mails `report`. `kind` names the report in the subject
+/// line (`[DAS <kind>] …`) so backup, scrub and doctor reports are
+/// distinguishable in the inbox; the status word is derived from the body
+/// containing `FAILURE`. Sender and recipient come from `[email].from`/`to`,
+/// or the context's overrides; the configured `from` is wrapped in a display
+/// name `DAS <kind> (<short host>)` so reports stand out in the inbox From
+/// column. The short host is the name up to its first `.`, even when the
+/// kernel's name is FQDN-like.
+pub fn report_message(
+    report: &str,
+    config: &Config,
+    kind: &str,
+    context: &MailContext,
+) -> Result<MailMessage, String> {
+    let to = context
+        .to_override
+        .clone()
+        .unwrap_or_else(|| config.email.to.clone());
+    let from_addr = context
+        .from_override
+        .clone()
+        .unwrap_or_else(|| config.email.from.clone());
+
+    if to.is_empty() {
+        return Err("No email recipient configured ([email].to or DAS_REPORT_TO)".into());
+    }
+    if from_addr.is_empty() {
+        return Err("No email sender configured ([email].from or DAS_REPORT_FROM)".into());
+    }
+
+    let hostname = &context.hostname;
+    let short_hostname = hostname.split('.').next().unwrap_or(hostname);
+    // A DAS_REPORT_FROM that already carries its own display name is used
+    // verbatim; a bare address gets the standard one.
+    let from = if from_addr.contains('<') {
+        from_addr
+    } else {
+        format!("DAS {kind} ({short_hostname}) <{from_addr}>")
+    };
+    let status_word = if report.contains("FAILURE") {
+        "FAILURE"
+    } else {
+        "SUCCESS"
+    };
+    Ok(MailMessage {
+        subject: format!("[DAS {kind}] {hostname} — {status_word} — {}", context.now),
+        from,
+        to,
+        mta: format!(
+            "smtp://{}:{}",
+            config.email.smtp_host, config.email.smtp_port
+        ),
+        body: report.to_string(),
+    })
+}
+
+/// Send a backup report: [`send_email_report_with_kind`] with the `Backup`
+/// subject kind.
+pub fn send_email_report(
+    report: &str,
+    config: &Config,
+    mailer: &dyn Mailer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_email_report_with_kind(report, config, "Backup", mailer)
+}
+
+/// Send a report through `mailer` ([`MAILX`] in production).
 ///
 /// Submits **unauthenticated plaintext** to the local mail relay named by
 /// `[email].smtp_host`/`smtp_port` (`127.0.0.1:25`). This process holds no mail
@@ -413,129 +671,59 @@ pub fn send_email_report(report: &str, config: &Config) -> Result<(), Box<dyn st
 /// passed the password to a child process — visible in `/proc/<pid>/cmdline` to
 /// any local process for the duration of the send.
 ///
-/// Sender and recipient come from `[email].from`/`to`; `DAS_REPORT_FROM` /
-/// `DAS_REPORT_TO` override them for testing without editing the live config.
-///
-/// `kind` names the report in the subject line (`[DAS <kind>] …`) so backup and
-/// scrub reports are distinguishable in the inbox; the status word is derived
-/// from the body containing `FAILURE`.
+/// Nothing is handed to `mailer` unless `[email].enabled`; the message is
+/// [`report_message`] for this machine, now ([`MailContext::current`]).
 pub fn send_email_report_with_kind(
     report: &str,
     config: &Config,
     kind: &str,
+    mailer: &dyn Mailer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !config.email.enabled {
         return Err("Email is not enabled in config".into());
     }
+    let message = report_message(report, config, kind, &MailContext::current())?;
+    mailer.send(&message)?;
+    Ok(())
+}
 
-    // Hostname is needed both for the subject line and the From display name —
-    // compute it once up front. libc::gethostname returns whatever the kernel has
-    // set; split on '.' to get the short form for the From display name even when
-    // the kernel hostname is FQDN-like.
-    let hostname = {
-        let mut buf = [0u8; 256];
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-        if rc == 0 {
-            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            String::from_utf8_lossy(&buf[..len]).to_string()
-        } else {
-            "unknown".to_string()
+/// A mailer that keeps every message it is given and answers as told: what
+/// this crate's tests hand every report send instead of [`MAILX`].
+#[cfg(test)]
+pub(crate) struct RecordingMailer {
+    sent: std::sync::Mutex<Vec<MailMessage>>,
+    answer: Result<(), String>,
+}
+
+#[cfg(test)]
+impl RecordingMailer {
+    /// Takes every message.
+    pub(crate) fn accepting() -> Self {
+        Self {
+            sent: std::sync::Mutex::new(Vec::new()),
+            answer: Ok(()),
         }
-    };
-    let short_hostname = hostname.split('.').next().unwrap_or(&hostname).to_string();
-
-    // Sender and recipient come from config; env vars override for testing.
-    // The configured `from` is wrapped in a display name "DAS <kind> (<host>)"
-    // so reports stand out in the inbox From column — s-nail extracts the
-    // bracketed address for the SMTP envelope, which is what the relay keys its
-    // upstream credential lookup on.
-    let to = std::env::var("DAS_REPORT_TO").unwrap_or_else(|_| config.email.to.clone());
-    let from_addr = std::env::var("DAS_REPORT_FROM").unwrap_or_else(|_| config.email.from.clone());
-
-    if to.is_empty() {
-        return Err("No email recipient configured ([email].to or DAS_REPORT_TO)".into());
-    }
-    if from_addr.is_empty() {
-        return Err("No email sender configured ([email].from or DAS_REPORT_FROM)".into());
     }
 
-    // A DAS_REPORT_FROM that already carries its own display name is used
-    // verbatim; a bare address gets the standard one.
-    let from = if from_addr.contains('<') {
-        from_addr
-    } else {
-        format!("DAS {kind} ({short_hostname}) <{from_addr}>")
-    };
-
-    let smtp_url = format!(
-        "smtp://{}:{}",
-        config.email.smtp_host, config.email.smtp_port
-    );
-    let status_word = if report.contains("FAILURE") {
-        "FAILURE"
-    } else {
-        "SUCCESS"
-    };
-    // Format current local time as YYYY-MM-DD HH:MM using libc.
-    let now = {
-        let mut t: libc::time_t = 0;
-        unsafe { libc::time(&mut t) };
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&t, &mut tm) };
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min
-        )
-    };
-    let subject = format!("[DAS {kind}] {hostname} — {status_word} — {now}");
-
-    // Submit to the relay. No credential and no TLS setting: the hop is
-    // loopback-only plaintext and the relay owns the authenticated,
-    // certificate-verified leg to the provider. `v15-compat` stays because it
-    // is what makes s-nail honour the `mta=` URL form.
-    //
-    // `smtp-auth=none` is NOT optional and NOT symmetry with the shell path:
-    // s-nail demands a password for any `smtp://` mta and aborts with
-    // "A password is necessary for smtp authentication" (exit 4) without it.
-    // `nosave` stops a failed send from dropping the body into /root/dead.letter,
-    // which nothing reads or prunes — the caller has the report either way.
-    let mut child = Command::new("mailx")
-        .args([
-            "-s",
-            &subject,
-            "-r",
-            &from,
-            "-S",
-            "v15-compat",
-            "-S",
-            &format!("mta={smtp_url}"),
-            "-S",
-            "smtp-auth=none",
-            "-S",
-            "nosave",
-            &to,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    // Write report body to stdin.
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(report.as_bytes())?;
+    /// Keeps every message, and answers each with `why`.
+    pub(crate) fn refusing(why: &str) -> Self {
+        Self {
+            sent: std::sync::Mutex::new(Vec::new()),
+            answer: Err(why.to_string()),
+        }
     }
 
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("mailx failed (exit {}): {}", output.status, stderr.trim()).into())
+    /// What it was given, in order.
+    pub(crate) fn sent(&self) -> Vec<MailMessage> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl Mailer for RecordingMailer {
+    fn send(&self, message: &MailMessage) -> Result<(), String> {
+        self.sent.lock().unwrap().push(message.clone());
+        self.answer.clone()
     }
 }
 
@@ -1042,5 +1230,259 @@ mod tests {
         assert!(err.ends_with(": ERROR: lock"), "{err}");
         let err = latest_listing(Err(std::io::Error::other("no such file"))).unwrap_err();
         assert_eq!(err, "btrbk could not be run: no such file");
+    }
+
+    // --- The mailer seam (bd DAS-Backup-Manager-1x76) ----------------------
+
+    fn mail_config() -> Config {
+        let mut config = Config::default();
+        config.email.enabled = true;
+        config.email.to = "ops@example.org".into();
+        config.email.from = "das@example.org".into();
+        config.email.smtp_host = "127.0.0.1".into();
+        config.email.smtp_port = 25;
+        config
+    }
+
+    fn context(hostname: &str) -> MailContext {
+        MailContext {
+            hostname: hostname.into(),
+            now: "2026-11-01 01:02".into(),
+            to_override: None,
+            from_override: None,
+        }
+    }
+
+    fn message(subject: &str, from: &str, to: &str, mta: &str, body: &str) -> MailMessage {
+        MailMessage {
+            subject: subject.into(),
+            from: from.into(),
+            to: to.into(),
+            mta: mta.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn a_report_message_is_exactly_what_the_relay_is_to_receive() {
+        let config = mail_config();
+        let ok = report_message("all fine\n", &config, "Scrub", &context("nas.example.org"));
+        assert_eq!(
+            ok,
+            Ok(message(
+                "[DAS Scrub] nas.example.org — SUCCESS — 2026-11-01 01:02",
+                "DAS Scrub (nas) <das@example.org>",
+                "ops@example.org",
+                "smtp://127.0.0.1:25",
+                "all fine\n",
+            ))
+        );
+        let failed = report_message("Status: FAILURE\n", &config, "Backup", &context("nas"));
+        assert_eq!(
+            failed,
+            Ok(message(
+                "[DAS Backup] nas — FAILURE — 2026-11-01 01:02",
+                "DAS Backup (nas) <das@example.org>",
+                "ops@example.org",
+                "smtp://127.0.0.1:25",
+                "Status: FAILURE\n",
+            ))
+        );
+        let mut elsewhere = mail_config();
+        elsewhere.email.smtp_host = "relay.example.org".into();
+        elsewhere.email.smtp_port = 2525;
+        assert_eq!(
+            report_message("x", &elsewhere, "Doctor", &context("h"))
+                .unwrap()
+                .mta,
+            "smtp://relay.example.org:2525"
+        );
+    }
+
+    #[test]
+    fn the_overrides_replace_sender_and_recipient_and_a_named_sender_is_kept_verbatim() {
+        let config = mail_config();
+        let mut ctx = context("nas.example.org");
+        ctx.to_override = Some("test@example.org".into());
+        ctx.from_override = Some("probe@example.org".into());
+        let m = report_message("x", &config, "Backup", &ctx).unwrap();
+        assert_eq!(m.to, "test@example.org");
+        assert_eq!(m.from, "DAS Backup (nas) <probe@example.org>");
+        ctx.from_override = Some("Probe <probe@example.org>".into());
+        let m = report_message("x", &config, "Backup", &ctx).unwrap();
+        assert_eq!(m.from, "Probe <probe@example.org>", "its own display name");
+    }
+
+    #[test]
+    fn no_recipient_or_no_sender_is_refused_before_any_message_exists() {
+        let mut config = mail_config();
+        config.email.to = String::new();
+        assert_eq!(
+            report_message("x", &config, "Backup", &context("h")),
+            Err("No email recipient configured ([email].to or DAS_REPORT_TO)".into())
+        );
+        let mut config = mail_config();
+        config.email.from = String::new();
+        assert_eq!(
+            report_message("x", &config, "Backup", &context("h")),
+            Err("No email sender configured ([email].from or DAS_REPORT_FROM)".into())
+        );
+        // An empty override is an empty address, not "use the config".
+        let mut ctx = context("h");
+        ctx.to_override = Some(String::new());
+        assert!(report_message("x", &mail_config(), "Backup", &ctx).is_err());
+    }
+
+    #[test]
+    fn mailx_is_told_exactly_this() {
+        let m = message(
+            "[DAS Backup] nas — SUCCESS — 2026-11-01 01:02",
+            "DAS Backup (nas) <das@example.org>",
+            "ops@example.org",
+            "smtp://127.0.0.1:25",
+            "body",
+        );
+        assert_eq!(
+            Mailx::args(&m),
+            [
+                "-s",
+                "[DAS Backup] nas — SUCCESS — 2026-11-01 01:02",
+                "-r",
+                "DAS Backup (nas) <das@example.org>",
+                "-S",
+                "v15-compat",
+                "-S",
+                "mta=smtp://127.0.0.1:25",
+                "-S",
+                "smtp-auth=none",
+                "-S",
+                "nosave",
+                "ops@example.org",
+            ]
+        );
+        assert_eq!(MAILX.program(), "mailx", "production runs mailx from PATH");
+    }
+
+    /// The structural guard: in a test build the production mailer refuses
+    /// before it spawns anything. The stub stands where `mailx` would: it
+    /// records any run of itself, and is seen to do so when run directly,
+    /// so a spawn would show.
+    #[test]
+    fn a_test_build_never_spawns_mailx() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let stub = dir.path().join("mailx-stub");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" >>'{}'\ncat >/dev/null\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The stub records when it is run.
+        let probe = Command::new(&stub)
+            .arg("probe")
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(probe.success());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
+        std::fs::remove_file(&marker).unwrap();
+
+        let program: &'static str = Box::leak(stub.to_string_lossy().into_owned().into_boxed_str());
+        let m = report_message("x", &mail_config(), "Backup", &context("h")).unwrap();
+        let err = Mailx::new(program).send(&m).unwrap_err();
+        assert_eq!(
+            err,
+            format!("{program} not run: a test build never mails (bd DAS-Backup-Manager-1x76)")
+        );
+        assert!(!marker.exists(), "nothing was spawned");
+    }
+
+    #[test]
+    fn a_finished_mailx_is_success_only_on_exit_0_and_its_stderr_says_why_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let done = |code: i32, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(mailx_outcome(&done(0, "")), Ok(()));
+        assert_eq!(
+            mailx_outcome(&done(4, "  A password is necessary\n")),
+            Err("mailx failed (exit exit status: 4): A password is necessary".into())
+        );
+    }
+
+    #[test]
+    fn the_subject_time_is_the_local_minute() {
+        // SAFETY: `tm` is plain data; all-zero is a valid value.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = 126;
+        tm.tm_mon = 10;
+        tm.tm_mday = 1;
+        tm.tm_hour = 1;
+        tm.tm_min = 2;
+        assert_eq!(format_minute(&tm), "2026-11-01 01:02");
+        let now = MailContext::current().now;
+        let year: i32 = now[..4].parse().unwrap();
+        assert!((2026..2200).contains(&year), "{now}");
+        assert_eq!(now.len(), "2026-11-01 01:02".len(), "{now}");
+    }
+
+    #[test]
+    fn the_host_name_is_the_kernels() {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert_eq!(kernel_hostname(), kernel.trim_end());
+        assert_eq!(MailContext::current().hostname, kernel.trim_end());
+    }
+
+    #[test]
+    fn a_report_reaches_the_mailer_only_when_email_is_enabled() {
+        let mailer = RecordingMailer::accepting();
+        let mut config = mail_config();
+        config.email.enabled = false;
+        let err = send_email_report_with_kind("x", &config, "Scrub", &mailer).unwrap_err();
+        assert_eq!(err.to_string(), "Email is not enabled in config");
+        assert!(mailer.sent().is_empty());
+
+        let config = mail_config();
+        send_email_report_with_kind("Status: FAILURE\n", &config, "Scrub", &mailer).unwrap();
+        send_email_report("fine\n", &config, &mailer).unwrap();
+        let sent = mailer.sent();
+        assert_eq!(sent.len(), 2);
+        let host = kernel_hostname();
+        let short = host.split('.').next().unwrap().to_string();
+        assert!(
+            sent[0]
+                .subject
+                .starts_with(&format!("[DAS Scrub] {host} — FAILURE — ")),
+            "{}",
+            sent[0].subject
+        );
+        assert_eq!(
+            sent[0].from,
+            format!("DAS Scrub ({short}) <das@example.org>")
+        );
+        assert_eq!(sent[0].body, "Status: FAILURE\n");
+        assert!(
+            sent[1]
+                .subject
+                .starts_with(&format!("[DAS Backup] {host} — SUCCESS — "))
+        );
+        assert_eq!(sent[1].to, "ops@example.org");
+
+        // What the mailer answers is what the caller hears; a message that
+        // cannot be made is never handed over.
+        let refusing = RecordingMailer::refusing("relay down");
+        let err = send_email_report("x", &config, &refusing).unwrap_err();
+        assert_eq!(err.to_string(), "relay down");
+        let mut nobody = mail_config();
+        nobody.email.to = String::new();
+        assert!(send_email_report("x", &nobody, &mailer).is_err());
+        assert_eq!(mailer.sent().len(), 2, "no recipient: nothing handed over");
     }
 }
