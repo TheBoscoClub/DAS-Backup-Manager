@@ -2755,6 +2755,14 @@ when there is nothing to resume. The targets are scrubbed one at a time, in
 .B [scrub].targets
 order.
 .PP
+A scrub runs at the highest priority that cannot block writes: every
+.B btrfs scrub
+is given
+.BR "\-c 2 \-n 0"
+(best-effort I/O class, level 0; btrfs\-progs would otherwise run its
+per\-device workers in the idle class), and the systemd unit runs at nice
+\-20 with the same I/O class and level. The real\-time class is never used.
+.PP
 If another scrub pass holds
 .IR /run/das\-scrub.lock ,
 this one is skipped (exit 0). The shared maintenance lock is waited for, so a

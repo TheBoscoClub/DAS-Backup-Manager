@@ -213,6 +213,14 @@ the one that catches the defect this guard was written for
          └──▶ /var/lib/das-backup/scrub-state.json   consumed by health checks
 ```
 
+**Priority** (bd `DAS-Backup-Manager-su1b.1`): a scrub runs at the highest priority that cannot block
+writes — best-effort I/O class, level 0, and nice -20; never real-time, which under BFQ preempts
+writes. `das-scrub.service` sets `Nice=-20`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=0`
+for `btrdasd` and the `btrfs` main thread. btrfs-progs' per-device worker threads call `ioprio_set`
+themselves (default class idle) and ignore what they inherit, so every `btrfs scrub start`/`resume`
+argv also carries `-c 2 -n 0` (`btrfs_scrub_args` in `indexer/src/scrub.rs`). The backup and doctor
+units stay idle/nice 19.
+
 **Resume-or-start** (bd `DAS-Backup-Manager-292`): each target does not blindly `btrfs scrub start`.
 `decide_scrub_start_mode` reads the prior `/var/lib/btrfs/scrub.status.<fsuuid>` record and, when it
 is `Aborted` (`canceled:0 finished:0` — what a reboot or an unmount that kills a scrub mid-write
