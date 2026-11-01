@@ -120,7 +120,7 @@ S
 cat >"$BIN/plymouth" <<'S'
 #!/bin/bash
 echo "plymouth $*" >>"$STUB_LOG"
-[[ -z "${STUB_PLYMOUTH_SLOW:-}" || "${1:-}" != display-message ]] || sleep 2
+[[ -z "${STUB_PLYMOUTH_SLOW:-}" || "${1:-}" != display-message ]] || sleep "$STUB_PLYMOUTH_SLOW"
 [[ "${1:-}" != --ping || -z "${STUB_PLYMOUTH_DOWN:-}" ]]
 S
 chmod +x "$BIN"/*
@@ -419,9 +419,15 @@ check "d9 failure after a measured boot: shown" has "$LOG" "could not update: de
 check "d9 failure after a measured boot: no countdown" test "$(grep -c 'could not update.*remaining' "$LOG")" -eq 0
 fixture; rm -rf "${R:?}"/nvme/das-state.*; printf 'total=40\n' >"$WORK/timings"; run
 check "d9 no snapshot after a measured boot: no countdown" test "$(grep -c 'no backup received yet.*remaining' "$LOG")" -eq 0
-fixture; printf 'total=1\n' >"$WORK/timings"; run STUB_PLYMOUTH_SLOW=1
+# The script counts in $SECONDS, whole wall-clock seconds, so a gap of a few
+# milliseconds can read as 1 s when it crosses a second boundary. A budget of
+# 1 s therefore left the first phase with 0 s about one run in three on a slow
+# runner, and no countdown at all. 3 s leaves the first phase 1-3 s whichever
+# way the clock rounds; each splash message takes 4 s, so every later phase
+# starts past the budget.
+fixture; printf 'total=3\n' >"$WORK/timings"; run STUB_PLYMOUTH_SLOW=4
 check "d9 over budget: exit 0" test "$RC" -eq 0
-check "d9 over budget: the first phase did count down" has "$LOG" "finding the newest backup — about 1 s remaining"
+check "d9 over budget: the first phase did count down" grep -qE -- "finding the newest backup — about [1-3] s remaining" "$LOG"
 check "d9 over budget: never '0 s remaining'" test "$(grep -c ' 0 s remaining' "$LOG")" -eq 0
 check "d9 over budget: no countdown on later phases" test "$(grep -c 'remaining' "$LOG")" -eq 1
 
