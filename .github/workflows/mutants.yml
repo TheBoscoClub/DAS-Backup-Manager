@@ -230,6 +230,8 @@ jobs:
   # measured 3352 mutants in all, coverage.rs 126 of them. Two shards of 1676
   # would take about 4.6 hours each at 9.9 s a mutant, too near
   # timeout-minutes 300, so three: 1118 each, about 3.1 hours.
+  # Re-measured for its review round 2: 3367 in all, coverage.rs 140; shards
+  # of 1123, 1122 and 1122, still about 3.1 hours each.
   # Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/N)
   # As above, the matrix list alone sets the shard count.
