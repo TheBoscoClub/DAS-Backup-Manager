@@ -1527,11 +1527,8 @@ pub fn open_read_only(path: &Path) -> Result<Option<Connection>, String> {
     if !path.try_exists().map_err(|e| what(&e))? {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| what(&e))?;
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| what(&e))?;
     conn.busy_timeout(Duration::from_secs(30))
         .map_err(|e| what(&e))?;
     Ok(Some(conn))

@@ -722,6 +722,12 @@ fn check_against(
         Ok(now) => now,
         Err(e) => return CoverageOutcome::not_checked(e),
     };
+    // SQLite opens an empty name as a private temporary database: a record
+    // written there is gone at close, and a read finds no record, so every
+    // run would read as the first. Never a check, always a warning.
+    if db.as_os_str().is_empty() {
+        return CoverageOutcome::not_checked("no index database path given".to_string());
+    }
     let compare = |baseline: Option<Baseline>, recording: Recording| {
         evaluate(baseline.as_ref(), &now, plan, listings, today, recording)
     };
@@ -2003,6 +2009,20 @@ mod tests {
             DAY1,
         );
         assert_eq!(o.row(), "WARN  (not checked: boom)");
+        // An empty path would be SQLite's private temporary database: a
+        // record that vanishes, a read that finds none.
+        for record in [true, false] {
+            let o = check(
+                Path::new(""),
+                record,
+                false,
+                Ok(now.clone()),
+                &plan,
+                &on_disk(),
+                DAY1,
+            );
+            assert_eq!(o.row(), "WARN  (not checked: no index database path given)");
+        }
         // A directory cannot be opened as a database, read or write.
         for record in [true, false] {
             let o = check(
