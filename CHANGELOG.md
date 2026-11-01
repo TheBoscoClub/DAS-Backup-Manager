@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`tests/test_builds_never_mail.rs`** — the library in an integration build, and the `btrdasd` the tests run (`doctor --email`), each refuse to spawn `mailx`, with a recording stub standing where it would be (bd `DAS-Backup-Manager-1x76`)
+
 ### Changed
 
+- **Every report send goes through `report::Mailer`** — backup (`deliver_report`, by `SystemBackupHost.mailer`), scrub (`run_scrub_pass`) and doctor take the mailer they send with; the CLI and the D-Bus helper pass `report::MAILX`, which runs `mailx` exactly as before (same arguments, `smtp-auth=none` included, body on stdin, stderr kept, same error text), and tests pass a recording mailer and assert on the exact message (bd `DAS-Backup-Manager-1x76`)
+
 ### Fixed
+
+- **No test can mail through the live relay** — `report.rs` spawned `mailx` directly, and tests stayed off the network only because their configs had `[email].enabled = false`, so a mutant that flipped that gate mailed real reports (four from `backup@localhost` on 2026-10-06). In every test build (`cfg(test)`, or the `test-overrides` feature the dev-dependency turns on) `report::MAILX` now refuses before it spawns anything; a shipped build never has the feature (bd `DAS-Backup-Manager-1x76`)
+- **`exit_code_for_doctor`'s doc comment is on its function again** — `doctor_json` sat between the two, so the comment documented the wrong function
 
 ## [0.7.23.2] - 2026-10-31
 

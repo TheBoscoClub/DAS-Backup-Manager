@@ -16,3 +16,9 @@ Installation specifics: `.claude/rules/local-installation.md` (gitignored, this 
    `systemd-run --user --scope --quiet -p TasksMax=600 bash tests/<suite>.sh`. The vm suite runs alone.
 3. **Trimmed copies** (`tests/zz_trim_*.sh`) carry the cap from the suite's header, live only for
    the run, and are never committed.
+4. **No test reaches a real mailer** (bd `DAS-Backup-Manager-1x76`: a mutant once mailed through the
+   live relay). Rust: a report send takes a `report::Mailer`; tests pass a recording one, and
+   `report::MAILX` refuses in every test build (`cfg(test)` or feature `test-overrides`) —
+   `tests/test_builds_never_mail.rs` and the unit tests named `*never_spawns_mailx` prove it. Shell: a
+   suite that runs `send_report` stubs `mailx` on an `env -i` `PATH` (`test_backup_exit_semantics.sh`);
+   a suite that extracts functions stubs `send_report` itself or never defines it.

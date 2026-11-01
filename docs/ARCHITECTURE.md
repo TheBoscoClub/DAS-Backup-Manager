@@ -644,7 +644,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `recovery_os::panel` | `src/recovery_os/panel.rs` | ~2430 | The drive panel's rules and `RecoveryOsStatus` document: per drive the record, history, schedule (`pending`, `fired`, `running`, `missed`) and session, each with its own `history_error`/`schedule_error`/`session_error` key when its read failed; the generated `das-recovery-os-update-<label\|both>.{service,timer}` pair and the validation of a schedule |
 | `recovery_os::lines` | `src/recovery_os/lines.rs` | ~230 | The parser of the script's `PROGRESS`/`OUTPUT`/`RESULT`/`DRIVE` lines |
 | `recovery_os::session` | `src/recovery_os/session.rs` | ~1290 | `recovery-os-vm.sh session` as a helper job: built environment, lines to the job's signals, one SIGINT to the script's process group on cancel |
-| `report` | `src/report.rs` | ~770 | Backup report formatting |
+| `report` | `src/report.rs` | ~1490 | Backup report formatting, and the `Mailer` seam every report send (backup, scrub, doctor) goes through; `MAILX` runs `mailx`, and refuses in a test build |
 | `restore` | `src/restore.rs` | ~1700 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
