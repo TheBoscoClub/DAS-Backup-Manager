@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.14.0
-# Date: 2026-10-14
+# Version: 4.15.0
+# Date: 2026-11-01
 #
 # Features:
+#   - Subvolume coverage (v4.15.0, bd DAS-Backup-Manager-sp78.1): the sync runs
+#     with --db and, on a real run, --record-coverage; record_subvol_coverage
+#     records its "SUBVOLUME COVERAGE: " row as subvol_coverage (OK or WARN as
+#     printed; a WARN never fails the run), and a sync that returned without
+#     the row is a FAIL. The report lists the row after "Subvolume sync".
 #   - A Recovery OS timeout says where it was (v4.14.0, bd kbzr): the bound is
 #     900 s (it was 300 s, passed on 2026-10-14 with no fault in the kernel log),
 #     `btrdasd recovery-os status` notes each drive on stderr before
@@ -1461,6 +1466,46 @@ RECOVERY_OS_TIMEOUT_SECS=900
 # a mktemp file (mode 600) that `btrbk dryrun` reads. Removed by cleanup().
 DRYRUN_BTRBK_CONF=""
 
+# Record the subvolume coverage row the sync printed (rc: the sync's exit
+# status) as the subvol_coverage operation. It is read from the sync's own
+# output — the line that starts "SUBVOLUME COVERAGE: " — by bash itself, with
+# no here-string or pipe that could fail and read as "no line"
+# (test_early_exit_readers.sh). OK and WARN are taken as printed; a WARN never
+# fails the run. A sync that returned (0 or 1) without that line, or with a
+# row this script does not recognise, broke its output contract: FAIL. A sync
+# that could not run checked nothing: WARN, the run's status left to the sync
+# row. The not-run text is coverage::NOT_RUN_DETAIL's (a Rust test reads it
+# here).
+record_subvol_coverage() {
+    local rc="$1" prefix="SUBVOLUME COVERAGE: " report row status detail
+    report=$'\n'"$SUBVOL_SYNC_REPORT"
+    if [[ "$report" != *$'\n'"$prefix"* ]]; then
+        if [[ "$rc" -eq 0 || "$rc" -eq 1 ]]; then
+            record_op "subvol_coverage" "FAIL" "subvolume sync printed no coverage result"
+            log_error "Subvolume sync printed no coverage result (exit $rc)"
+        else
+            record_op "subvol_coverage" "WARN" "not checked: subvolume sync could not run"
+        fi
+        return 0
+    fi
+    row="${report#*$'\n'"$prefix"}"
+    row="${row%%$'\n'*}"
+    status="${row%% *}"
+    # STATUS, two spaces, (detail): the form of every operations row.
+    if [[ ("$status" == OK || "$status" == WARN) && "$row" == "$status  ("*")" ]]; then
+        detail="${row#"$status"  (}"
+        detail="${detail%)}"
+        record_op "subvol_coverage" "$status" "$detail"
+        if [[ "$status" == WARN ]]; then
+            log_warn "Subvolume coverage: $detail — see SUBVOLUME COVERAGE in the report"
+        fi
+    else
+        record_op "subvol_coverage" "FAIL" "unrecognised coverage result: $row"
+        log_error "Subvolume sync printed an unrecognised coverage result: $row"
+    fi
+    return 0
+}
+
 # Adopt subvolumes that exist and are not excluded; retire entries whose
 # subvolume is gone. Runs after verify_sources_before_write, so every source
 # volume is mounted and proven to be the expected filesystem.
@@ -1468,10 +1513,18 @@ DRYRUN_BTRBK_CONF=""
 # A failure here never stops the backup: the subvolumes already configured
 # must still be backed up. It is recorded, so the report says FAILURES
 # DETECTED and backup_runs.success is 0.
+#
+# The sync also checks subvolume coverage against the index database (bd
+# DAS-Backup-Manager-sp78.1): what the configuration schedules, compared with
+# the last recorded backup run. A real run records the check
+# (--record-coverage); a dry run never does. Its row is read from the sync's
+# own output by record_subvol_coverage.
 sync_subvolumes() {
     local mode="$1"
-    local args=(subvol sync --config "$DAS_CONFIG")
-    if [[ "$mode" == "dryrun" ]]; then
+    local args=(subvol sync --config "$DAS_CONFIG" --db "$DAS_DB_PATH")
+    if [[ "$mode" != "dryrun" ]]; then
+        args+=(--record-coverage)
+    else
         args+=(--dry-run)
         # Nothing is written in a dry run, so the btrbk.conf on disk still
         # names what the real run would retire first. btrbk dryrun reads the
@@ -1498,6 +1551,7 @@ sync_subvolumes() {
         record_op "subvol_sync" "FAIL" "exit code $rc — see SUBVOLUME SYNC in the report"
         log_error "Subvolume sync failed (exit $rc); continuing with the existing config"
     fi
+    record_subvol_coverage "$rc"
     if [[ -n "$SUBVOL_SYNC_REPORT" ]]; then
         local line
         while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_SYNC_REPORT"
@@ -3317,6 +3371,7 @@ BACKUP OPERATIONS
   Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
   State index pass      ${OP_STATUS[state]:-N/A}  (${OP_STATUS[state_detail]:-n/a})
   Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
+  Subvolume coverage    ${OP_STATUS[subvol_coverage]:-N/A}  (${OP_STATUS[subvol_coverage_detail]:-n/a})
   Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
   Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})
 ${subvol_sections}
@@ -3341,7 +3396,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.14.0
+  backup-run.sh v4.15.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

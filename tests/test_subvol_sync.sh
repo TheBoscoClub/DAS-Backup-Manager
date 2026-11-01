@@ -13,7 +13,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
+for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -215,7 +215,7 @@ check "and it held the planned config" "$(cat "$WORK/btrbk_saw")" "PLANNED CONF 
 check "the real btrbk.conf is byte-identical" "$(sha256sum "$REAL_CONF")" "$real_sum"
 planned_file="$DRYRUN_BTRBK_CONF"
 # shellcheck disable=SC2034  # read by the extracted cleanup
-( SCRIPT_COMPLETED="true"; cleanup ) || true
+( SCRIPT_COMPLETED="true"; CLEANUP_ARMED="false"; cleanup ) || true
 check "the EXIT trap removes the temp conf" "$([[ -e "$planned_file" ]] && echo yes || echo no)" "no"
 
 # Nothing pending: the planned file is just the current one; still works.
@@ -227,7 +227,7 @@ run_btrbk dryrun
 check "nothing pending: btrbk still reads a temp conf" "$(grep -c -- "-c $TMPDIR/das-backup-dryrun-btrbk\." "$WORK/btrbk_calls")" "1"
 check "nothing pending: btrbk dryrun recorded OK" "${OP_STATUS[btrbk]}" "OK"
 # shellcheck disable=SC2034  # read by the extracted cleanup
-( SCRIPT_COMPLETED="true"; cleanup ) || true
+( SCRIPT_COMPLETED="true"; CLEANUP_ARMED="false"; cleanup ) || true
 
 # Sync rendered nothing (no readable btrbk.conf would be left): fall back to
 # the current file, and leave no empty temp file behind.
@@ -347,6 +347,63 @@ expire_retired_subvolumes run
 check "sync OK: expire is real" "$(grep -c -- '--dry-run' "$WORK/calls" || true)" "0"
 check "sync OK: recorded OK" "${OP_STATUS[subvol_expire]}" "OK"
 
+# --- subvolume coverage (bd DAS-Backup-Manager-sp78.1) -----------------------
+# The sync prints its coverage row; record_subvol_coverage takes it as printed
+# (OK, WARN), and a sync that returned without one, or with a row it does not
+# recognise, broke its contract: FAIL.
+cov_case() { # cov_case <sync stdout> <sync rc>: run a real-mode sync on it
+    OP_STATUS=()
+    : >"$WORK/log"; : >"$WORK/calls"
+    printf '%s' "$1" >"$WORK/sync_out"; echo "$2" >"$WORK/sync_rc"
+    sync_subvolumes run
+}
+cov_case $'SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\nSUBVOLUME COVERAGE: WARN  (1 subvolume/target pair no longer backed up)\n  NO LONGER BACKED UP:\n' 0
+check "coverage WARN is recorded as a WARN" "${OP_STATUS[subvol_coverage]}" "WARN"
+check "coverage WARN detail, without the parentheses" "${OP_STATUS[subvol_coverage_detail]}" "1 subvolume/target pair no longer backed up"
+check "coverage WARN is logged" "$(grep -c '^WARN: Subvolume coverage: 1 subvolume/target pair no longer backed up — see SUBVOLUME COVERAGE in the report$' "$WORK/log")" "1"
+check "coverage WARN does not touch the sync row" "${OP_STATUS[subvol_sync]}" "OK"
+check "real run: the index database and --record-coverage" \
+    "$(grep -c -- "^subvol sync --config $DAS_CONFIG --db $DAS_DB_PATH --record-coverage\$" "$WORK/calls")" "1"
+
+cov_case $'SUBVOLUME SYNC\nSUBVOLUME COVERAGE: OK  (7 subvolume/target pairs, none dropped — not recorded (only a backup run records))\n' 0
+check "coverage OK is recorded as OK" "${OP_STATUS[subvol_coverage]}" "OK"
+check "coverage OK keeps inner parentheses" "${OP_STATUS[subvol_coverage_detail]}" \
+    "7 subvolume/target pairs, none dropped — not recorded (only a backup run records)"
+check "coverage OK logs no warning" "$(grep -c '^WARN:' "$WORK/log" || true)" "0"
+
+for rc in 0 1; do
+    cov_case $'SUBVOLUME SYNC\n  VOLUMES NOT READ\n' "$rc"
+    check "no coverage line, exit $rc: FAIL" "${OP_STATUS[subvol_coverage]}" "FAIL"
+    check "no coverage line, exit $rc: says so" "${OP_STATUS[subvol_coverage_detail]}" "subvolume sync printed no coverage result"
+done
+cov_case '' 2
+check "sync could not run: coverage is a WARN" "${OP_STATUS[subvol_coverage]}" "WARN"
+check "sync could not run: not checked" "${OP_STATUS[subvol_coverage_detail]}" "not checked: subvolume sync could not run"
+cov_case $'SUBVOLUME SYNC\n  SUBVOLUME COVERAGE: OK  (indented, not the row)\n' 0
+check "an indented line is not the row" "${OP_STATUS[subvol_coverage]}" "FAIL"
+cov_case $'SUBVOLUME COVERAGE: MAYBE (x)\n' 0
+check "an unknown status: FAIL" "${OP_STATUS[subvol_coverage]}" "FAIL"
+check "an unknown status: names the row" "${OP_STATUS[subvol_coverage_detail]}" "unrecognised coverage result: MAYBE (x)"
+cov_case $'SUBVOLUME COVERAGE: WARN no parentheses\n' 0
+check "a row with no parentheses: FAIL" "${OP_STATUS[subvol_coverage]}" "FAIL"
+cov_case $'SUBVOLUME COVERAGE: OK\n' 0
+check "a bare status: FAIL" "${OP_STATUS[subvol_coverage]}" "FAIL"
+cov_case $'SUBVOLUME COVERAGE: OK (one space, not the row form)\n' 0
+check "one space before the parenthesis is not the row form: FAIL" "${OP_STATUS[subvol_coverage]}" "FAIL"
+
+# A dry run passes the database and never asks to record.
+OP_STATUS=(); : >"$WORK/calls"
+printf 'SUBVOLUME SYNC\nSUBVOLUME COVERAGE: OK  (1 subvolume/target pair, none dropped — dry run, not recorded)\n' >"$WORK/sync_out"
+echo 0 >"$WORK/sync_rc"
+DRYRUN_BTRBK_CONF=""
+sync_subvolumes dryrun
+check "dry run: the index database" "$(grep -c -- "^subvol sync --config $DAS_CONFIG --db $DAS_DB_PATH --dry-run" "$WORK/calls")" "1"
+check "dry run: never --record-coverage" "$(grep -c -- '--record-coverage' "$WORK/calls" || true)" "0"
+check "dry run: coverage recorded from its row" "${OP_STATUS[subvol_coverage]}" "OK"
+if [[ -n "$DRYRUN_BTRBK_CONF" ]]; then rm -f -- "${DRYRUN_BTRBK_CONF:?}"; fi
+DRYRUN_BTRBK_CONF=""
+printf 'SUBVOLUME SYNC\n' >"$WORK/sync_out"
+
 # --- report layout ----------------------------------------------------------
 # generate_report's helpers and host probe are stubbed; only the layout of the
 # new lines and optional sections is under test.
@@ -354,6 +411,7 @@ systemctl() { :; }
 generate_throughput_section() { echo "  tp"; }
 generate_capacity_section() { echo "  cap"; }
 generate_growth_section() { echo "  growth"; }
+next_scheduled() { echo "unknown"; }
 generate_smart_section() { echo "  smart"; }
 # shellcheck disable=SC2034  # read by the extracted generate_report
 BTRBK_START_TIME=0
@@ -370,6 +428,12 @@ SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "report lists the sync operation" "$(grep -c '^  Subvolume sync        OK' <<<"$report")" "1"
 check "report lists the expiry operation" "$(grep -c '^  Retired expiry        OK' <<<"$report")" "1"
+check "report lists coverage after the sync, N/A when not run" \
+    "$(grep -A1 '^  Subvolume sync ' <<<"$report" | sed -n 2p)" "  Subvolume coverage    N/A  (n/a)"
+OP_STATUS[subvol_coverage]=WARN; OP_STATUS[subvol_coverage_detail]="1 subvolume/target pair no longer backed up"
+check "report shows the coverage row" \
+    "$(generate_report | grep -c '^  Subvolume coverage    WARN  (1 subvolume/target pair no longer backed up)$')" "1"
+unset 'OP_STATUS[subvol_coverage]' 'OP_STATUS[subvol_coverage_detail]'
 check "sync section is printed" "$(grep -c '^SUBVOLUME SYNC$' <<<"$report")" "1"
 check "empty expire report prints no header" "$(grep -c 'RETIRED SUBVOLUMES' <<<"$report" || true)" "0"
 check "no double blank line with an empty expire report" "$(grep -c -Pzo '\n\n\n' <<<"$report" || true)" "0"

@@ -223,6 +223,10 @@ case "$1 ${2:-}" in
     ;;
 "subvol sync")
     printf 'SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n'
+    # The coverage row the real command prints last (bd sp78.1); knob
+    # coverage_line replaces it, and "none" prints no line at all.
+    cov="$(knob coverage_line 'SUBVOLUME COVERAGE: OK  (7 subvolume/target pairs, none dropped)')"
+    [[ "$cov" == none ]] || printf '%s\n' "$cov"
     # The run's log file stops being writable: it becomes a directory.
     if [[ -f "$S/knobs/break_log" ]]; then
         log="$(cat "$S/knobs/break_log")"
@@ -2162,6 +2166,52 @@ check "boot step WARN, whole run: the report's boot row is a WARN" \
     "$(boot_row)" "  Boot subvolumes       WARN  (0 updated, 1 skipped, 2 warnings)"
 check "boot step WARN, whole run: the report's status" "$(report_status)" "COMPLETED WITH WARNINGS"
 check "boot step WARN, whole run: recorded as a success" "$(recorded_as)" "success"
+
+# ---------------------------------------------------------------------------
+echo "== sp78.1: subvolume coverage is a WARN, never a failure; a missing row is"
+# ---------------------------------------------------------------------------
+# The sync prints its coverage row last; the script records it as
+# subvol_coverage. A WARN (a pair no longer backed up) completes with
+# warnings and exits 0, the history row a success with nothing in --errors.
+# Only a sync that returned without the row breaks the contract: FAIL, 3.
+coverage_row() { sed -n '/^  Subvolume coverage /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+fresh
+knob coverage_line 'SUBVOLUME COVERAGE: WARN  (1 subvolume/target pair no longer backed up)'
+run_backup
+expect_completed "coverage WARN" 0 "COMPLETED WITH WARNINGS" "success"
+check "coverage WARN: the report's row" "$(coverage_row)" \
+    "  Subvolume coverage    WARN  (1 subvolume/target pair no longer backed up)"
+check "coverage WARN: not in the history row's errors" \
+    "$(vector_value --errors | grep -c subvol_coverage || true)" "0"
+check "coverage WARN: the real run asks for the check to be recorded" \
+    "$(grep -c -- '^subvol sync .*--db .*--record-coverage' "$STATE/calls/btrdasd")" "1"
+check "coverage WARN: against the configured index database" \
+    "$(grep -c -- "^subvol sync --config $WORK/etc/config.toml --db $WORK/lib/backup-index.db --record-coverage\$" "$STATE/calls/btrdasd")" "1"
+
+# The counter: a clean row is a clean run.
+fresh
+run_backup
+expect_completed "coverage OK" 0 "ALL OPERATIONS SUCCESSFUL" "success"
+check "coverage OK: the report's row" "$(coverage_row)" \
+    "  Subvolume coverage    OK  (7 subvolume/target pairs, none dropped)"
+
+# No row from a sync that returned: the contract is broken.
+fresh
+knob coverage_line none
+run_backup
+expect_completed "coverage row missing" 3 "FAILURES DETECTED" "failure"
+check "coverage row missing: named in the history row's errors" \
+    "$(vector_value --errors | grep -c '^subvol_coverage: subvolume sync printed no coverage result$' || true)" "1"
+
+# A dry run compares and never records.
+fresh
+run_backup --dryrun
+check "coverage, dry run: exit status" "$RC" "0"
+show_tail 0
+check "coverage, dry run: --record-coverage never passed" \
+    "$(grep -c -- '--record-coverage' "$STATE/calls/btrdasd" || true)" "0"
+check "coverage, dry run: still against the configured index database" \
+    "$(grep -c -- '^subvol sync .*--db .*--dry-run' "$STATE/calls/btrdasd")" "1"
 
 echo
 echo "passed=$pass failed=$fail"
