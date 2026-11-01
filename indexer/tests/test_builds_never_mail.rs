@@ -18,7 +18,7 @@
 use buttered_dasd::report::{self, Mailer};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
 /// Held while a stub is written and run, and while either test spawns. The
@@ -51,7 +51,13 @@ fn recording_stub(dir: &Path) -> (PathBuf, PathBuf) {
     )
     .unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let probe = Command::new(&stub).arg("probe").status().unwrap();
+    // The stub drains its stdin, as mailx reads the body: an inherited one
+    // (a terminal, an open pipe) would never end and the probe would hang.
+    let probe = Command::new(&stub)
+        .arg("probe")
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
     assert!(probe.success(), "the stub runs");
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
     std::fs::remove_file(&marker).unwrap();

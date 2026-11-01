@@ -4994,8 +4994,11 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Its stdin is null: the stub drains it, and an inherited one would
+        // never end.
         let probe = std::process::Command::new(&stub)
             .arg("probe")
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(probe.success() && marker.exists(), "the stub records a run");
