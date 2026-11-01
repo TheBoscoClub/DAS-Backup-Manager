@@ -219,16 +219,25 @@ writes. `das-scrub.service` sets `Nice=-20`, `IOSchedulingClass=best-effort`, `I
 for `btrdasd` and the `btrfs` main thread. btrfs-progs' per-device worker threads call `ioprio_set`
 themselves (default class idle) and ignore what they inherit, so every `btrfs scrub start`/`resume`
 argv also carries `-c 2 -n 0` (`btrfs_scrub_args` in `indexer/src/scrub.rs`). The backup and doctor
-units stay idle/nice 19.
+units stay idle/nice 19. Those two flags are listed under "Deprecated options" in `man btrfs-scrub`
+(v7.3) because ioprio only works with some I/O schedulers, not mq-deadline; they are used anyway
+because the DAS disks run BFQ, where they work, and the per-worker `ioprio_set` leaves no other way to
+lift the workers. A btrfs-progs that dropped them would fail every scrub on an unrecognised option
+while the pass still exited 0, so they are re-checked at each btrfs-progs upgrade. `btrdasd setup
+--check` reads `das-scrub.service`'s effective `Nice` / `IOSchedulingClass` / `IOSchedulingPriority`
+back from systemd and reports any difference from what setup writes — a unit not yet upgraded, or a
+drop-in that lowers it. A scrub already running keeps the priority it started with; the unit is
+refreshed between runs (`setup --upgrade` refuses while a pass holds the locks), and a later start or
+resume picks it up.
 
 **Resume-or-start** (bd `DAS-Backup-Manager-292`): each target does not blindly `btrfs scrub start`.
 `decide_scrub_start_mode` reads the prior `/var/lib/btrfs/scrub.status.<fsuuid>` record and, when it
 is `Aborted` (`canceled:0 finished:0` — what a reboot or an unmount that kills a scrub mid-write
-leaves behind) *and* the kernel confirms no scrub is running, issues `btrfs scrub resume -B` to
+leaves behind) *and* the kernel confirms no scrub is running, issues `btrfs scrub resume -B` (plus the priority flags above) to
 continue from the saved position rather than restarting from zero. A `finished` or deliberately
 `canceled` record, a running scrub, or unreadable liveness all fall through to a plain start — the
 decision never acts on a guess. If `resume` finds no resumable state after all ("nothing to resume"),
-the runner falls back to `btrfs scrub start -B -f`, which also clears a genuinely stale record. This
+the runner falls back to `btrfs scrub start -B -f` (same flags), which also clears a genuinely stale record. This
 matters specifically because the DAS targets are unmounted between backup runs: the position record
 lives on the host root keyed by FS UUID, so it survives the unmount, and the next monthly pass
 finishes what an interruption left undone instead of silently abandoning it. The decision is a pure

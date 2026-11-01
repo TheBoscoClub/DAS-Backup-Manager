@@ -168,6 +168,16 @@ pub fn render_systemd_timer(config: &Config, full: bool) -> String {
     )
 }
 
+/// Process priority the generated `das-scrub.service` carries (bd
+/// DAS-Backup-Manager-su1b.1). `setup --check` reads the effective values back
+/// from systemd and compares them with these, so a stale unit or a drop-in
+/// that lowers the priority is reported.
+pub const SCRUB_NICE: &str = "-20";
+/// I/O scheduling class of the scrub unit (see [`SCRUB_NICE`]).
+pub const SCRUB_IO_CLASS: &str = "best-effort";
+/// I/O scheduling level of the scrub unit (see [`SCRUB_NICE`]).
+pub const SCRUB_IO_LEVEL: &str = "0";
+
 /// Generate the das-scrub.service unit file. Deliberately dumb by design
 /// (user decision 2026-07-27, bd DAS-Backup-Manager-atq): NO `Conflicts=`
 /// (which would stop the other unit — cancellation was explicitly scrapped
@@ -210,9 +220,9 @@ pub fn render_systemd_scrub_service(config: &Config) -> String {
          ExecStart={prefix}/bin/btrdasd scrub run\n\
          StandardOutput=journal\n\
          StandardError=journal\n\
-         Nice=-20\n\
-         IOSchedulingClass=best-effort\n\
-         IOSchedulingPriority=0\n\
+         Nice={SCRUB_NICE}\n\
+         IOSchedulingClass={SCRUB_IO_CLASS}\n\
+         IOSchedulingPriority={SCRUB_IO_LEVEL}\n\
          TimeoutStartSec=infinity\n\
          \n\
          [Install]\n\

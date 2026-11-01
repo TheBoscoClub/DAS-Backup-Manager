@@ -9,7 +9,7 @@ use buttered_dasd::maintenance::MaintenanceHeld;
 use buttered_dasd::scrub::FileLock;
 
 use crate::setup::config::Config;
-use crate::setup::templates::GeneratedFiles;
+use crate::setup::templates::{GeneratedFiles, SCRUB_IO_CLASS, SCRUB_IO_LEVEL, SCRUB_NICE};
 
 const CONFIG_FILE: &str = "/etc/das-backup/config.toml";
 const MANIFEST_FILE: &str = "/etc/das-backup/.manifest";
@@ -286,6 +286,56 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
         )),
         Err(e) => Err(format!("{program} could not be run: {e}")),
     }
+}
+
+/// The lines `setup --check` prints about `das-scrub.service`'s priority, given
+/// what `systemctl show -p Nice,IOSchedulingClass,IOSchedulingPriority` said.
+///
+/// The effective values are compared with those the generated unit carries
+/// ([`SCRUB_NICE`] and friends). A host that has not run `setup --upgrade` since
+/// the priority change still has the idle-class unit, and a drop-in under
+/// `das-scrub.service.d/` can lower it again; either differs here. A probe that
+/// failed or printed no such property is reported, never read as "fine".
+fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
+    let shown = match shown {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![format!(
+                "das-scrub.service priority could not be read back: {e}"
+            )];
+        }
+    };
+    let value = |key: &str| {
+        shown
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+            .map(str::trim)
+    };
+    let nice = value("Nice");
+    let class = value("IOSchedulingClass");
+    let level = value("IOSchedulingPriority");
+    // systemd prints the class as its number (2) on current versions and as
+    // its name on others; both mean best-effort.
+    let class_ok = matches!(class, Some(c) if c == SCRUB_IO_CLASS || c == "2");
+    if nice == Some(SCRUB_NICE) && class_ok && level == Some(SCRUB_IO_LEVEL) {
+        return vec![format!(
+            "das-scrub.service runs at nice {SCRUB_NICE}, {SCRUB_IO_CLASS} I/O level {SCRUB_IO_LEVEL}"
+        )];
+    }
+    let show = |v: Option<&str>| v.unwrap_or("(not reported)").to_string();
+    vec![
+        format!(
+            "das-scrub.service priority DIFFERS from what setup writes: Nice={} IOSchedulingClass={} \
+             IOSchedulingPriority={} (expected Nice={SCRUB_NICE} IOSchedulingClass={SCRUB_IO_CLASS} \
+             IOSchedulingPriority={SCRUB_IO_LEVEL})",
+            show(nice),
+            show(class),
+            show(level)
+        ),
+        "  A stale unit: sudo btrdasd setup --upgrade (between runs). A drop-in: \
+         systemctl cat das-scrub.service"
+            .to_string(),
+    ]
 }
 
 /// The lines `setup --check` prints about udisks visibility, given the result
@@ -1340,6 +1390,17 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
         &CheckProbes {
             relay_up: &relay_reachable,
             export_db: &|| command_stdout("udevadm", &["info", "--export-db"]),
+            scrub_unit: &|| {
+                command_stdout(
+                    "systemctl",
+                    &[
+                        "show",
+                        "-p",
+                        "Nice,IOSchedulingClass,IOSchedulingPriority",
+                        "das-scrub.service",
+                    ],
+                )
+            },
             dependencies: &crate::setup::detect::check_dependencies,
         },
         &mut |line| println!("{line}"),
@@ -1352,6 +1413,9 @@ struct CheckProbes<'a> {
     relay_up: RelayProbe<'a>,
     /// udev's database, as `udevadm info --export-db` prints it.
     export_db: &'a dyn Fn() -> Result<String, String>,
+    /// The effective priority of `das-scrub.service`, as
+    /// `systemctl show -p Nice,IOSchedulingClass,IOSchedulingPriority` prints it.
+    scrub_unit: &'a dyn Fn() -> Result<String, String>,
     /// Dependency lookup, given whether email is enabled.
     dependencies: &'a dyn Fn(bool) -> Vec<crate::setup::detect::DepStatus>,
 }
@@ -1428,6 +1492,15 @@ fn check_with(
         }
     } else {
         say("No manifest found. Files may be from a manual install.".to_string());
+    }
+
+    // Is the scrub unit running at the priority setup would write? Read back
+    // from systemd, not from the unit file: that also catches a drop-in that
+    // overrides it. Only systemd has the unit (bd DAS-Backup-Manager-su1b.1).
+    if config.init.system == crate::setup::config::InitSystem::Systemd {
+        for line in scrub_priority_report((probes.scrub_unit)()) {
+            say(line);
+        }
     }
 
     // Are the targets hidden from udisks2? Read back from udev rather than
@@ -4264,6 +4337,26 @@ auth = "starttls""#,
         relay_up: bool,
         export_db: Result<String, String>,
     ) -> Vec<String> {
+        run_check_scrub(
+            config_path,
+            manifest_path,
+            relay_up,
+            export_db,
+            Ok(HEALTHY_SCRUB_SHOW.to_string()),
+        )
+    }
+
+    /// What systemd prints for a `das-scrub.service` carrying the generated unit.
+    const HEALTHY_SCRUB_SHOW: &str = "Nice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=0\n";
+
+    /// [`run_check`] with the scrub unit's `systemctl show` answer chosen.
+    fn run_check_scrub(
+        config_path: &Path,
+        manifest_path: &Path,
+        relay_up: bool,
+        export_db: Result<String, String>,
+        scrub_unit: Result<String, String>,
+    ) -> Vec<String> {
         let dep =
             |name: &str, required: bool, path: Option<&str>| crate::setup::detect::DepStatus {
                 name: name.to_string(),
@@ -4273,6 +4366,7 @@ auth = "starttls""#,
         let probes = CheckProbes {
             relay_up: &|_| relay_up,
             export_db: &|| export_db.clone(),
+            scrub_unit: &|| scrub_unit.clone(),
             // `mailx` stands for "asked for only when email is enabled".
             dependencies: &|email_enabled| {
                 let mut deps = vec![
@@ -4289,6 +4383,59 @@ auth = "starttls""#,
         let mut lines = Vec::new();
         check_with(config_path, manifest_path, &probes, &mut |l| lines.push(l)).unwrap();
         lines
+    }
+
+    /// A host that never ran `setup --upgrade` after the priority change, or a
+    /// drop-in that lowers it, shows in `setup --check`; the generated values
+    /// and a name-spelled class pass (bd DAS-Backup-Manager-su1b.1).
+    #[test]
+    fn check_reads_the_scrub_units_effective_priority_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let check = |shown: Result<String, String>| {
+            run_check_scrub(&config_path, &manifest_path, true, Ok(String::new()), shown)
+                .into_iter()
+                .filter(|l| l.contains("das-scrub.service"))
+                .collect::<Vec<_>>()
+        };
+        let ok = "das-scrub.service runs at nice -20, best-effort I/O level 0";
+
+        assert_eq!(check(Ok(HEALTHY_SCRUB_SHOW.to_string())), vec![ok]);
+        assert_eq!(
+            check(Ok(
+                "Nice=-20\nIOSchedulingClass=best-effort\nIOSchedulingPriority=0\n".into()
+            )),
+            vec![ok]
+        );
+        // The unit as it was before the change: nice 19, idle class (3) level 7.
+        let stale = check(Ok(
+            "Nice=19\nIOSchedulingClass=3\nIOSchedulingPriority=7\n".into()
+        ));
+        assert!(stale[0].contains("DIFFERS"), "{stale:?}");
+        assert!(
+            stale[0].contains("Nice=19 IOSchedulingClass=3"),
+            "{stale:?}"
+        );
+        assert!(stale[1].contains("setup --upgrade"), "{stale:?}");
+        // One property off is enough, each of the three on its own.
+        let nice = check(Ok(
+            "Nice=0\nIOSchedulingClass=2\nIOSchedulingPriority=0\n".into()
+        ));
+        assert!(nice[0].contains("DIFFERS"), "{nice:?}");
+        let class = check(Ok(
+            "Nice=-20\nIOSchedulingClass=3\nIOSchedulingPriority=0\n".into(),
+        ));
+        assert!(class[0].contains("DIFFERS"), "{class:?}");
+        let level = check(Ok(
+            "Nice=-20\nIOSchedulingClass=2\nIOSchedulingPriority=4\n".into(),
+        ));
+        assert!(level[0].contains("DIFFERS"), "{level:?}");
+        // A probe that failed, or printed none of the properties, is not "fine".
+        let failed = check(Err("systemctl could not be run: x".into()));
+        assert!(failed[0].contains("could not be read back"), "{failed:?}");
+        let empty = check(Ok(String::new()));
+        assert!(empty[0].contains("(not reported)"), "{empty:?}");
     }
 
     #[test]
@@ -4325,6 +4472,7 @@ auth = "starttls""#,
                 "Config is valid".to_string(),
                 "Mail relay reachable at 127.0.0.1:25".to_string(),
                 format!("All {total} generated files present"),
+                "das-scrub.service runs at nice -20, best-effort I/O level 0".to_string(),
                 "Target tgt has no mount_uuid — found by drive serial only, and verified only \
                  as a mount point, not as its filesystem"
                     .to_string(),
@@ -4397,6 +4545,7 @@ auth = "starttls""#,
         // email-only dependency is not asked for.
         expected.extend([
             "No manifest found. Files may be from a manual install.".to_string(),
+            "das-scrub.service runs at nice -20, best-effort I/O level 0".to_string(),
             "udisks visibility NOT checked: udevadm info --export-db exited with 1".to_string(),
             "btrbk (/usr/bin/btrbk)".to_string(),
             "smartctl (required, not found)".to_string(),

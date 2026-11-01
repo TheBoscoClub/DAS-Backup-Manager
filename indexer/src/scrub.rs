@@ -58,7 +58,8 @@
 //! never on a guess, because these locks cannot stop an operator from starting
 //! a scrub by hand. If the kernel then has no resumable state after all
 //! (`btrfs scrub resume` prints "nothing to resume"), the runner falls back to
-//! `start -B -f`, which also clears the genuinely stale record that
+//! `start -B -f` (every argv also carries the priority flags `-c 2 -n 0`, see
+//! `SCRUB_IOPRIO_ARGS`), which also clears the genuinely stale record that
 //! `btrfs-progs` would otherwise read as a live scrub and refuse to start over
 //! ("useful when scrub status file is damaged and reports a running scrub
 //! although it is not", `man btrfs-scrub` on `-f`). So one aborted pass can
@@ -1485,7 +1486,8 @@ pub fn parse_scrub_status_output(stdout: &str) -> LiveScrubState {
 pub enum ScrubStartMode {
     /// Plain `btrfs scrub start -B` — no interrupted pass to continue.
     Normal,
-    /// `btrfs scrub resume -B`, because a previous pass left an aborted record
+    /// `btrfs scrub resume -B` (every scrub argv also carries the priority flags
+    /// `SCRUB_IOPRIO_ARGS`), because a previous pass left an aborted record
     /// behind (interrupted by a reboot or an unmount) and nothing is running
     /// now. Resuming continues from the saved position in
     /// `/var/lib/btrfs/scrub.status.<uuid>` rather than re-scrubbing from zero,
@@ -2089,6 +2091,15 @@ fn resume_found_nothing(outcome: &ScrubRunOutcome) -> bool {
 /// `IOSchedulingClass=`; only `-c`/`-n` change them. `scrub resume` accepts
 /// the same flags. The real-time class (1) is excluded on purpose: under BFQ
 /// it preempts everything, writes included.
+///
+/// DEPRECATED UPSTREAM, chosen anyway: `man btrfs-scrub` (v7.3) lists `-c`/`-n`
+/// under "Deprecated options" because ioprio only works with some I/O
+/// schedulers (not mq-deadline). The DAS disks run BFQ (read from
+/// `/sys/block/<dev>/queue/scheduler`, 2026-11-01), where it works, and the
+/// per-worker `ioprio_set` leaves no other way to lift the workers. If a later
+/// btrfs-progs drops the flags every `scrub start`/`resume` exits nonzero on an
+/// unrecognised option; the pass still exits 0, so re-check the flags at every
+/// btrfs-progs upgrade (bd `DAS-Backup-Manager-su1b.1` follow-up).
 const SCRUB_IOPRIO_ARGS: [&str; 4] = ["-c", "2", "-n", "0"];
 
 /// Which `btrfs scrub` invocation to build.
@@ -2133,20 +2144,30 @@ fn run_btrfs_scrub(
     fsuuid: &str,
     progress: &dyn ProgressCallback,
 ) -> ScrubRunOutcome {
-    match decide_scrub_start_mode(fsuuid, mount_point) {
-        ScrubStartMode::Normal => run_scrub_argv(
-            &btrfs_scrub_args(ScrubInvocation::Start, mount_point),
-            progress,
-        ),
+    run_btrfs_scrub_with(
+        decide_scrub_start_mode(fsuuid, mount_point),
+        mount_point,
+        &|args| run_scrub_argv(args, progress),
+        progress,
+    )
+}
+
+/// [`run_btrfs_scrub`] with the start mode decided and the `btrfs` spawn
+/// supplied by the caller, so a test sees which argv each path asks for.
+fn run_btrfs_scrub_with(
+    mode: ScrubStartMode,
+    mount_point: &str,
+    run: &dyn Fn(&[String]) -> ScrubRunOutcome,
+    progress: &dyn ProgressCallback,
+) -> ScrubRunOutcome {
+    match mode {
+        ScrubStartMode::Normal => run(&btrfs_scrub_args(ScrubInvocation::Start, mount_point)),
         ScrubStartMode::Resume { reason } => {
             progress.on_log(
                 LogLevel::Info,
                 &format!("Resuming interrupted scrub: {reason}"),
             );
-            let outcome = run_scrub_argv(
-                &btrfs_scrub_args(ScrubInvocation::Resume, mount_point),
-                progress,
-            );
+            let outcome = run(&btrfs_scrub_args(ScrubInvocation::Resume, mount_point));
             if resume_found_nothing(&outcome) {
                 progress.on_log(
                     LogLevel::Warning,
@@ -2155,10 +2176,7 @@ fn run_btrfs_scrub(
                          starting a fresh scrub with -f to clear the stale aborted record"
                     ),
                 );
-                run_scrub_argv(
-                    &btrfs_scrub_args(ScrubInvocation::ForcedStart, mount_point),
-                    progress,
-                )
+                run(&btrfs_scrub_args(ScrubInvocation::ForcedStart, mount_point))
             } else {
                 outcome
             }
@@ -2868,18 +2886,125 @@ mod tests {
         }
     }
 
+    // --- which argv each path runs ------------------------------------------
+
+    /// Run `run_btrfs_scrub_with` for `mode`, answering each spawn from
+    /// `answers` in order; returns the outcome and every argv asked for.
+    fn drive_scrub(
+        mode: ScrubStartMode,
+        answers: Vec<ScrubRunOutcome>,
+    ) -> (ScrubRunOutcome, Vec<Vec<String>>) {
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let answers = std::cell::RefCell::new(answers.into_iter());
+        let outcome = run_btrfs_scrub_with(
+            mode,
+            "/mnt/x",
+            &|args| {
+                calls.borrow_mut().push(args.to_vec());
+                answers
+                    .borrow_mut()
+                    .next()
+                    .expect("more spawns than answers")
+            },
+            &NullProgress,
+        );
+        (outcome, calls.into_inner())
+    }
+
+    fn argv(invocation: ScrubInvocation) -> Vec<String> {
+        btrfs_scrub_args(invocation, "/mnt/x")
+    }
+
+    #[test]
+    fn normal_mode_runs_one_plain_start() {
+        let (outcome, calls) = drive_scrub(
+            ScrubStartMode::Normal,
+            vec![ScrubRunOutcome::Launched(Ok(()))],
+        );
+        assert!(matches!(outcome, ScrubRunOutcome::Launched(Ok(()))));
+        assert_eq!(calls, vec![argv(ScrubInvocation::Start)]);
+    }
+
+    #[test]
+    fn resume_mode_runs_one_resume_and_stops_when_it_works() {
+        let (outcome, calls) = drive_scrub(
+            ScrubStartMode::Resume { reason: "r".into() },
+            vec![ScrubRunOutcome::Launched(Ok(()))],
+        );
+        assert!(matches!(outcome, ScrubRunOutcome::Launched(Ok(()))));
+        assert_eq!(calls, vec![argv(ScrubInvocation::Resume)]);
+    }
+
+    #[test]
+    fn resume_with_nothing_to_resume_falls_back_to_a_forced_start() {
+        let (outcome, calls) = drive_scrub(
+            ScrubStartMode::Resume { reason: "r".into() },
+            vec![
+                ScrubRunOutcome::Launched(Err(
+                    "btrfs scrub resume exited 2: nothing to resume for /mnt/x".into(),
+                )),
+                ScrubRunOutcome::Launched(Ok(())),
+            ],
+        );
+        assert!(matches!(outcome, ScrubRunOutcome::Launched(Ok(()))));
+        assert_eq!(
+            calls,
+            vec![
+                argv(ScrubInvocation::Resume),
+                argv(ScrubInvocation::ForcedStart)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_real_resume_failure_is_returned_unchanged_without_a_second_run() {
+        let (outcome, calls) = drive_scrub(
+            ScrubStartMode::Resume { reason: "r".into() },
+            vec![ScrubRunOutcome::Launched(Err(
+                "btrfs scrub resume exited 1: EIO".into(),
+            ))],
+        );
+        assert!(
+            matches!(&outcome, ScrubRunOutcome::Launched(Err(m)) if m == "btrfs scrub resume exited 1: EIO"),
+        );
+        assert_eq!(calls, vec![argv(ScrubInvocation::Resume)]);
+    }
+
+    /// Every argv any path asks for carries the priority flags and ends with
+    /// the mountpoint — the wiring cannot go back to a literal argv unseen.
+    #[test]
+    fn every_path_runs_the_priority_argv() {
+        let nothing =
+            || ScrubRunOutcome::Launched(Err("resume exited 2: nothing to resume".into()));
+        let (_, calls) = drive_scrub(
+            ScrubStartMode::Resume { reason: "r".into() },
+            vec![nothing(), ScrubRunOutcome::Launched(Ok(()))],
+        );
+        let (_, normal) = drive_scrub(
+            ScrubStartMode::Normal,
+            vec![ScrubRunOutcome::Launched(Ok(()))],
+        );
+        for call in calls.iter().chain(normal.iter()) {
+            let at = call.iter().position(|a| a == "-c").expect("-c present");
+            assert_eq!(call[at..at + 4], ["-c", "2", "-n", "0"], "{call:?}");
+            assert_eq!(call.last().map(String::as_str), Some("/mnt/x"));
+        }
+        assert_eq!(calls.len() + normal.len(), 3);
+    }
+
     // --- resume fallback predicate ----------------------------------------
 
     /// The fallback to a fresh `start -f` fires ONLY on the kernel's
     /// "nothing to resume" message, and NOT on any other launched failure —
     /// otherwise a genuinely broken scrub would be masked by silently
     /// restarting it from zero. The message text is the real one observed
-    /// 2026-09-09; the runner formats it as `btrfs scrub resume -B <mnt> exited
-    /// 2: ERROR: ... nothing to resume for <mnt>`.
+    /// 2026-09-09; the runner formats it as `btrfs scrub resume -B -c 2 -n 0
+    /// <mnt> exited 2: ERROR: ... nothing to resume for <mnt>` (the full argv,
+    /// priority flags included, since bd DAS-Backup-Manager-su1b.1).
     #[test]
     fn resume_fallback_fires_only_on_nothing_to_resume() {
         let nothing = ScrubRunOutcome::Launched(Err(
-            "btrfs scrub resume -B /mnt/x exited 2: ERROR: there is no scrub \
+            "btrfs scrub resume -B -c 2 -n 0 /mnt/x exited 2: ERROR: there is no scrub \
              running, nothing to resume for /mnt/x"
                 .to_string(),
         ));
@@ -2891,7 +3016,8 @@ mod tests {
         // A real failure (I/O error, unreadable device) must NOT be retried as
         // a fresh start — that would discard the diagnosis and re-scrub blind.
         let real_failure = ScrubRunOutcome::Launched(Err(
-            "btrfs scrub resume -B /mnt/x exited 1: ERROR: cannot read status".to_string(),
+            "btrfs scrub resume -B -c 2 -n 0 /mnt/x exited 1: ERROR: cannot read status"
+                .to_string(),
         ));
         assert!(
             !resume_found_nothing(&real_failure),
