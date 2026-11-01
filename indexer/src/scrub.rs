@@ -2078,6 +2078,47 @@ fn resume_found_nothing(outcome: &ScrubRunOutcome) -> bool {
     )
 }
 
+/// I/O scheduling class passed to every `btrfs scrub` as `-c`: best-effort
+/// (2), at level 0 (`-n 0`), the highest priority that still cannot block
+/// writes (operator, 2026-11-01, bd DAS-Backup-Manager-su1b.1).
+///
+/// Why on the argv and not only in the unit: btrfs-progs (v7.3,
+/// `cmds/scrub.c`) defaults the class to *idle* and each per-device worker
+/// thread calls `ioprio_set(IOPRIO_WHO_PROCESS, 0, ..)` unconditionally before
+/// `BTRFS_IOC_SCRUB`, so the workers never inherit the unit's `Nice=` or
+/// `IOSchedulingClass=`; only `-c`/`-n` change them. `scrub resume` accepts
+/// the same flags. The real-time class (1) is excluded on purpose: under BFQ
+/// it preempts everything, writes included.
+const SCRUB_IOPRIO_ARGS: [&str; 4] = ["-c", "2", "-n", "0"];
+
+/// Which `btrfs scrub` invocation to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrubInvocation {
+    /// `scrub start`: a fresh pass.
+    Start,
+    /// `scrub resume`: continue an interrupted pass.
+    Resume,
+    /// `scrub start -f`: a fresh pass that clears a stale aborted record.
+    ForcedStart,
+}
+
+/// The `btrfs` argument vector for `invocation` on `mount_point`, in the
+/// foreground (`-B`), carrying [`SCRUB_IOPRIO_ARGS`]. The mountpoint is last:
+/// [`run_scrub_argv`] recovers it from there.
+fn btrfs_scrub_args(invocation: ScrubInvocation, mount_point: &str) -> Vec<String> {
+    let verb = match invocation {
+        ScrubInvocation::Start | ScrubInvocation::ForcedStart => "start",
+        ScrubInvocation::Resume => "resume",
+    };
+    let mut args = vec!["scrub".to_string(), verb.to_string(), "-B".to_string()];
+    if invocation == ScrubInvocation::ForcedStart {
+        args.push("-f".to_string());
+    }
+    args.extend(SCRUB_IOPRIO_ARGS.iter().map(|a| (*a).to_string()));
+    args.push(mount_point.to_string());
+    args
+}
+
 /// Run a scrub of `mount_point` in the foreground, resuming an interrupted pass
 /// when one exists and otherwise starting fresh.
 ///
@@ -2093,13 +2134,19 @@ fn run_btrfs_scrub(
     progress: &dyn ProgressCallback,
 ) -> ScrubRunOutcome {
     match decide_scrub_start_mode(fsuuid, mount_point) {
-        ScrubStartMode::Normal => run_scrub_argv(&["scrub", "start", "-B", mount_point], progress),
+        ScrubStartMode::Normal => run_scrub_argv(
+            &btrfs_scrub_args(ScrubInvocation::Start, mount_point),
+            progress,
+        ),
         ScrubStartMode::Resume { reason } => {
             progress.on_log(
                 LogLevel::Info,
                 &format!("Resuming interrupted scrub: {reason}"),
             );
-            let outcome = run_scrub_argv(&["scrub", "resume", "-B", mount_point], progress);
+            let outcome = run_scrub_argv(
+                &btrfs_scrub_args(ScrubInvocation::Resume, mount_point),
+                progress,
+            );
             if resume_found_nothing(&outcome) {
                 progress.on_log(
                     LogLevel::Warning,
@@ -2108,7 +2155,10 @@ fn run_btrfs_scrub(
                          starting a fresh scrub with -f to clear the stale aborted record"
                     ),
                 );
-                run_scrub_argv(&["scrub", "start", "-B", "-f", mount_point], progress)
+                run_scrub_argv(
+                    &btrfs_scrub_args(ScrubInvocation::ForcedStart, mount_point),
+                    progress,
+                )
             } else {
                 outcome
             }
@@ -2121,10 +2171,10 @@ fn run_btrfs_scrub(
 /// full argument vector including the mountpoint; the fsuuid for progress
 /// reporting is recovered from the record itself, so this helper needs only the
 /// argv and the progress sink.
-fn run_scrub_argv(args: &[&str], progress: &dyn ProgressCallback) -> ScrubRunOutcome {
+fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunOutcome {
     // The mountpoint is the final argument; progress is keyed by the FS UUID of
     // whatever is mounted there.
-    let mount_point = args.last().copied().unwrap_or("");
+    let mount_point = args.last().map(String::as_str).unwrap_or("");
     let fsuuid = mounted_fs_uuid(mount_point).unwrap_or_default();
 
     let mut child = match Command::new("btrfs")
@@ -2739,6 +2789,41 @@ mod tests {
     }
 
     // --- pure decision, all four combinations -----------------------------
+
+    /// bd DAS-Backup-Manager-su1b.1: every scrub argv carries the best-effort
+    /// level-0 priority (`-c 2 -n 0`) — btrfs's workers reset their own
+    /// priority, so the argv is the only place it can be set — and keeps the
+    /// order and flags it had, the mountpoint last.
+    #[test]
+    fn scrub_argv_start_carries_priority_and_keeps_its_shape() {
+        assert_eq!(
+            btrfs_scrub_args(ScrubInvocation::Start, "/mnt/x"),
+            ["scrub", "start", "-B", "-c", "2", "-n", "0", "/mnt/x"]
+        );
+    }
+
+    #[test]
+    fn scrub_argv_resume_carries_priority_and_keeps_its_shape() {
+        assert_eq!(
+            btrfs_scrub_args(ScrubInvocation::Resume, "/mnt/x"),
+            ["scrub", "resume", "-B", "-c", "2", "-n", "0", "/mnt/x"]
+        );
+    }
+
+    #[test]
+    fn scrub_argv_forced_start_carries_priority_and_keeps_its_shape() {
+        assert_eq!(
+            btrfs_scrub_args(ScrubInvocation::ForcedStart, "/mnt/x"),
+            ["scrub", "start", "-B", "-f", "-c", "2", "-n", "0", "/mnt/x"]
+        );
+    }
+
+    /// The ceiling is best-effort level 0: class 1 (real-time) would preempt
+    /// writes under BFQ.
+    #[test]
+    fn scrub_priority_is_best_effort_level_zero_never_realtime() {
+        assert_eq!(SCRUB_IOPRIO_ARGS, ["-c", "2", "-n", "0"]);
+    }
 
     /// `decide_from` is the pure seam behind `decide_scrub_start_mode`. These
     /// exercise every (outcome × liveness) combination that matters — the case
