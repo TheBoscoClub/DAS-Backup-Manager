@@ -16,7 +16,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_DB: &str = "/var/lib/das-backup/backup-index.db";
+const DEFAULT_DB: &str = buttered_dasd::db::DEFAULT_DB_PATH;
 const DEFAULT_CONFIG: &str = "/etc/das-backup/config.toml";
 
 // ---------------------------------------------------------------------------
@@ -723,6 +723,20 @@ enum SubvolAction {
         /// `backup-run.sh --dryrun` points `btrbk dryrun` at it
         #[arg(long, requires = "dry_run", value_name = "PATH")]
         render_btrbk_conf: Option<PathBuf>,
+        /// The index database the subvolume coverage check compares with
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: PathBuf,
+        /// Compare subvolume coverage with the last recorded backup run AND
+        /// record this check (backup runs only; without it the comparison
+        /// is printed and nothing is written)
+        #[arg(long, conflicts_with = "dry_run")]
+        record_coverage: bool,
+    },
+    /// The subvolume/target pairs no longer backed up: list them, or accept
+    /// one that was dropped on purpose so it stops being reported
+    Coverage {
+        #[command(subcommand)]
+        action: CoverageAction,
     },
     /// Delete the backups of retired subvolumes that are past their window.
     /// Expects the targets to be mounted.
@@ -736,6 +750,44 @@ enum SubvolAction {
         /// Print what would be deleted and delete nothing
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoverageAction {
+    /// Stop reporting dropped subvolume/target pairs: each leaves the
+    /// coverage record and is kept in its accept log. Only a pair reported
+    /// as no longer backed up can be accepted; one that is backed up again
+    /// later and dropped again is reported again.
+    ///
+    /// EXIT CODE: 0 accepted, 1 nothing reported as dropped matched (nothing
+    /// changed), 2 the database could not be read or holds no coverage
+    /// record yet
+    Accept {
+        /// The volume, as the report's accept line names it
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        volume: Option<String>,
+        /// The subvolume (`.` for the volume's top level)
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        subvolume: Option<String>,
+        /// Accept only the pair sent to this target
+        #[arg(long, conflicts_with = "all", value_name = "LABEL")]
+        target: Option<String>,
+        /// Accept every pair reported as no longer backed up
+        #[arg(long)]
+        all: bool,
+        /// Path to SQLite database
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: PathBuf,
+    },
+    /// Print the pairs no longer backed up and the accept log
+    ///
+    /// EXIT CODE: 0 printed (also when there is no record yet), 2 the
+    /// database could not be read
+    List {
+        /// Path to SQLite database
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: PathBuf,
     },
 }
 
@@ -2848,17 +2900,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Subvolume '{name}' in source '{source}' set to automatic.");
             }
+            SubvolAction::Coverage { action } => {
+                let (code, out, err) = match action {
+                    CoverageAction::Accept {
+                        volume,
+                        subvolume,
+                        target,
+                        all: _,
+                        db,
+                    } => buttered_dasd::coverage::accept_command(
+                        &db,
+                        volume.as_deref(),
+                        subvolume.as_deref(),
+                        target.as_deref(),
+                        &buttered_dasd::coverage::now_rfc3339(),
+                    ),
+                    CoverageAction::List { db } => buttered_dasd::coverage::list_command(&db, json),
+                };
+                print!("{out}");
+                eprint!("{err}");
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
             SubvolAction::Sync {
                 config,
                 dry_run,
                 render_btrbk_conf,
+                db,
+                record_coverage,
             } => {
+                let coverage = if record_coverage {
+                    buttered_dasd::adopt::CoverageMode::Record { db: &db }
+                } else {
+                    buttered_dasd::adopt::CoverageMode::Compare { db: &db }
+                };
                 let outcome = match buttered_dasd::adopt::sync_subvolumes(
                     &config,
                     dry_run,
                     &buttered_dasd::caldate::today(),
                     &buttered_dasd::fsutil::SystemRunner,
                     &buttered_dasd::health::is_mountpoint,
+                    coverage,
                 ) {
                     Ok(outcome) => outcome,
                     Err(e) => {
@@ -3267,6 +3350,7 @@ mod tests {
             report_sent: false,
             errors: Vec::new(),
             duration_secs: 7,
+            coverage_message: String::new(),
         };
         assert_eq!(
             backup_run_json(&result(None, Some(0))),

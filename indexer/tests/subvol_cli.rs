@@ -60,6 +60,12 @@ fn write_config(dir: &Path) -> std::path::PathBuf {
 }
 
 fn btrdasd(args: &[&str]) -> std::process::Output {
+    // `subvol sync` reads the index database for its coverage check; without
+    // `--db` that is the host's. No test may reach it.
+    assert!(
+        !(args.starts_with(&["subvol", "sync"]) && !args.contains(&"--db")),
+        "a test ran `subvol sync` without --db: {args:?}"
+    );
     Command::new(env!("CARGO_BIN_EXE_btrdasd"))
         .args(args)
         .output()
@@ -261,10 +267,28 @@ fn subvol_sync_exits_one_when_a_volume_cannot_be_read_and_two_without_a_config()
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path());
     // /vol is not a mountpoint on any test machine.
-    let out = btrdasd(&["subvol", "sync", "--config", config.to_str().unwrap()]);
+    let db = dir.path().join("index.db");
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--db",
+        db.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
     assert_eq!(out.status.code(), Some(1));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("SUBVOLUME SYNC\n"), "{text}");
+    // A failed sync still prints its coverage line, last: the script's
+    // contract. Nothing on the unread volume was retired, so it is OK.
+    assert!(
+        text.ends_with(
+            "\nSUBVOLUME COVERAGE: OK  (no earlier record: 1 subvolume/target pair — not \
+             recorded (only a backup run records))\n"
+        ),
+        "{text}"
+    );
+    assert!(!db.exists(), "a compare-only sync created the database");
     assert!(text.contains("VOLUMES NOT READ"), "{text}");
     // The library names the source and device before the reason.
     assert!(
@@ -275,6 +299,8 @@ fn subvol_sync_exits_one_when_a_volume_cannot_be_read_and_two_without_a_config()
     let out = btrdasd(&[
         "subvol",
         "sync",
+        "--db",
+        dir.path().join("index.db").to_str().unwrap(),
         "--config",
         dir.path().join("none.toml").to_str().unwrap(),
     ]);
@@ -320,6 +346,8 @@ fn sync_dry_run_renders_the_planned_btrbk_conf_into_an_existing_file() {
     let out = btrdasd(&[
         "subvol",
         "sync",
+        "--db",
+        dir.path().join("index.db").to_str().unwrap(),
         "--config",
         config_s,
         "--dry-run",
@@ -339,6 +367,8 @@ fn sync_dry_run_renders_the_planned_btrbk_conf_into_an_existing_file() {
     let out = btrdasd(&[
         "subvol",
         "sync",
+        "--db",
+        dir.path().join("index.db").to_str().unwrap(),
         "--config",
         config_s,
         "--render-btrbk-conf",
@@ -352,6 +382,8 @@ fn sync_dry_run_renders_the_planned_btrbk_conf_into_an_existing_file() {
     let out = btrdasd(&[
         "subvol",
         "sync",
+        "--db",
+        dir.path().join("index.db").to_str().unwrap(),
         "--config",
         config_s,
         "--dry-run",
@@ -644,7 +676,7 @@ fn subvol_set_auto_refuses_a_scratch_config_naming_the_live_btrbk_files() {
 
 #[test]
 fn a_real_subvol_sync_refuses_a_scratch_config_naming_the_live_btrbk_files() {
-    assert_refused_for_live_outputs(&["subvol", "sync"]);
+    assert_refused_for_live_outputs(&["subvol", "sync", "--db", "/nonexistent/no-index.db"]);
 }
 
 #[test]
@@ -654,6 +686,8 @@ fn a_dry_run_sync_of_a_scratch_config_is_not_refused_because_it_writes_nothing()
     let out = btrdasd(&[
         "subvol",
         "sync",
+        "--db",
+        dir.path().join("index.db").to_str().unwrap(),
         "--dry-run",
         "--config",
         config.to_str().unwrap(),
@@ -680,4 +714,198 @@ fn a_scratch_config_that_names_its_own_btrbk_files_still_saves() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(dir.path().join("btrbk.conf").exists());
+}
+
+// --- subvolume coverage (bd DAS-Backup-Manager-sp78.1) -----------------------
+
+/// A coverage record in `dir`: `@a` covered, `@b` dropped, both to `big`.
+fn seeded_coverage_db(dir: &Path) -> std::path::PathBuf {
+    use buttered_dasd::db::{CoverageRow, CoverageState, Database};
+    let path = dir.join("index.db");
+    let row = |subvolume: &str, dropped: bool| CoverageRow {
+        volume: "/ssd".into(),
+        subvolume: subvolume.into(),
+        target: "big".into(),
+        target_identity: None,
+        source_label: "ssd".into(),
+        first_covered: "2026-10-01".into(),
+        last_covered: "2026-10-01".into(),
+        dropped_since: dropped.then(|| "2026-10-02".into()),
+        dropped_checks: u32::from(dropped),
+        drop_rule: dropped.then(|| "excluded by pattern '@b'".into()),
+    };
+    Database::open(&path)
+        .unwrap()
+        .record_coverage(|_| {
+            (
+                (),
+                vec![row("@a", false), row("@b", true)],
+                CoverageState {
+                    first_recorded: "2026-10-01".into(),
+                    last_recorded: "2026-10-02".into(),
+                    checks: 2,
+                },
+            )
+        })
+        .unwrap();
+    path
+}
+
+/// `--record-coverage` records the check, and only with it: the sync fails
+/// here (`/vol` is not mounted), and the check is still made and kept.
+#[test]
+fn only_record_coverage_writes_the_coverage_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let db = dir.path().join("index.db");
+    let sync = |extra: &[&str]| {
+        let mut args = vec![
+            "subvol",
+            "sync",
+            "--config",
+            config.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        btrdasd(&args)
+    };
+    let out = sync(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        !db.exists(),
+        "a sync without --record-coverage created the database"
+    );
+
+    let out = sync(&["--record-coverage"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "coverage leaves the sync's exit code alone"
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.ends_with(
+            "\nSUBVOLUME COVERAGE: OK  (no earlier record: 1 subvolume/target pair; recorded — \
+             drops are reported from the next run)\n"
+        ),
+        "{text}"
+    );
+    let recorded = buttered_dasd::db::read_coverage_read_only(&db)
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(recorded.state.checks, 1);
+    assert_eq!(recorded.rows.len(), 1);
+}
+
+#[test]
+fn recording_coverage_and_a_dry_run_cannot_be_asked_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let db = dir.path().join("index.db");
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--config",
+        config.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--dry-run",
+        "--record-coverage",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "clap refuses the pair");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!db.exists());
+}
+
+#[test]
+fn coverage_accept_exits_by_what_it_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_coverage_db(dir.path());
+    let db_s = db.to_str().unwrap();
+    let read = || buttered_dasd::db::read_coverage_read_only(&db).unwrap();
+    let before = read();
+
+    let out = btrdasd(&["subvol", "coverage", "accept", "/ssd", "@a", "--db", db_s]);
+    assert_eq!(out.status.code(), Some(1), "a covered pair");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("not dropped: nothing accepted"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(read(), before, "nothing changed");
+
+    let out = btrdasd(&["subvol", "coverage", "accept", "/ssd", "@b", "--db", db_s]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .starts_with("Accepted 1 pair; they are no longer tracked:\n  /ssd  @b  -> big"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(read().unwrap().rows.len(), 1);
+
+    let missing = dir.path().join("missing.db");
+    let out = btrdasd(&[
+        "subvol",
+        "coverage",
+        "accept",
+        "--all",
+        "--db",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!missing.exists(), "accept created a database");
+
+    // --all and a pair are one or the other; one of them is required.
+    let out = btrdasd(&[
+        "subvol", "coverage", "accept", "/ssd", "@b", "--all", "--db", db_s,
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = btrdasd(&["subvol", "coverage", "accept", "--db", db_s]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = btrdasd(&[
+        "subvol", "coverage", "accept", "--all", "--target", "big", "--db", db_s,
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn coverage_list_prints_the_dropped_pairs_and_the_accept_log_as_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_coverage_db(dir.path());
+    let db_s = db.to_str().unwrap();
+    let out = btrdasd(&["subvol", "coverage", "list", "--db", db_s, "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dropped"][0]["subvolume"], "@b");
+    assert_eq!(v["accepted"].as_array().unwrap().len(), 0);
+
+    btrdasd(&["subvol", "coverage", "accept", "--all", "--db", db_s]);
+    let out = btrdasd(&["subvol", "coverage", "list", "--db", db_s]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("  No longer backed up: none\n"), "{text}");
+    assert!(
+        text.contains("  /ssd  @b  -> big  (no longer backed up since 2026-10-02"),
+        "{text}"
+    );
+
+    let out = btrdasd(&[
+        "subvol",
+        "coverage",
+        "list",
+        "--db",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "a directory is no database");
 }

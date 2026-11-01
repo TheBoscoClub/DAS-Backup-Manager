@@ -3,6 +3,7 @@ pub mod backup;
 pub mod btrbk_conf;
 pub mod caldate;
 pub mod config;
+pub mod coverage;
 pub mod db;
 pub mod doctor;
 pub mod expire;

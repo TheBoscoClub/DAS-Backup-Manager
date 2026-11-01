@@ -510,6 +510,19 @@ impl Target {
             Vec::new()
         }
     }
+
+    /// What identifies this target's drive whatever its label: `mount_uuid`
+    /// when set, else the first serial (`serials`, then the legacy `serial`).
+    /// `None` when there is neither. The coverage check carries a renamed
+    /// target's pairs over by it.
+    pub fn coverage_identity(&self) -> Option<String> {
+        self.mount_uuid
+            .iter()
+            .chain(self.serials.iter())
+            .chain(std::iter::once(&self.serial))
+            .find(|s| !s.is_empty())
+            .cloned()
+    }
 }
 
 // TOML deserialization shim. Accepts both legacy `serial = "X"` and new
@@ -664,7 +677,7 @@ impl Default for Config {
             general: General {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 install_prefix: "/usr/local".into(),
-                db_path: "/var/lib/das-backup/backup-index.db".into(),
+                db_path: crate::db::DEFAULT_DB_PATH.into(),
                 log_file: default_log_file(),
                 growth_log: default_growth_log(),
                 last_report: default_last_report(),
@@ -1750,6 +1763,29 @@ impl Config {
             }
         }
         out
+    }
+
+    /// Every list that holds exactly `pattern`, in the order
+    /// [`exclude_patterns`](Self::exclude_patterns) reads them: `built-in`,
+    /// `[subvolumes].exclude`, `[doctor].exclude`. Empty when none does. The
+    /// coverage report names them all, so removing the pattern from one list
+    /// is never mistaken for removing it.
+    pub fn exclude_pattern_origins(&self, pattern: &str) -> Vec<&'static str> {
+        [
+            ("built-in", DEFAULT_EXCLUDES.contains(&pattern)),
+            (
+                "[subvolumes].exclude",
+                self.subvolumes.exclude.iter().any(|p| p == pattern),
+            ),
+            (
+                "[doctor].exclude",
+                self.doctor.exclude.iter().any(|p| p == pattern),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, holds)| *holds)
+        .map(|(origin, _)| origin)
+        .collect()
     }
 
     /// The uniqueness and shape rules the boot step's input must meet, in ONE
@@ -3346,7 +3382,7 @@ daily = 7
 [general]
 version = "0.6.0"
 install_prefix = "/usr"
-db_path = "/tmp/test.db"
+db_path = "/nonexistent/das-backup-tests/index.db"
 [init]
 system = "systemd"
 [schedule]
@@ -3383,7 +3419,7 @@ enabled = false
 [general]
 version = "0.6.0"
 install_prefix = "/usr"
-db_path = "/tmp/test.db"
+db_path = "/nonexistent/das-backup-tests/index.db"
 [init]
 system = "systemd"
 [schedule]
@@ -3736,7 +3772,7 @@ enabled = false
 [general]
 version = "0.7.22"
 install_prefix = "/usr"
-db_path = "/tmp/test.db"
+db_path = "/nonexistent/das-backup-tests/index.db"
 [init]
 system = "systemd"
 [schedule]

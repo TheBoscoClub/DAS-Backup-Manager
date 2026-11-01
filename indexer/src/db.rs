@@ -9,7 +9,11 @@ use std::time::Duration;
 ///     (bd DAS-Backup-Manager-gt0).
 /// 4 — `backup_runs.snaps_created` / `snaps_sent` are NULL when the run could
 ///     not count them (bd DAS-Backup-Manager-6wt).
-pub const SCHEMA_VERSION: i64 = 4;
+/// 5 — `coverage_state` / `coverage_baseline` / `coverage_accepted`: the
+///     subvolume/target pairs the configuration scheduled at the last recorded
+///     backup run, and dropped pairs until restored, gone or accepted
+///     (bd DAS-Backup-Manager-sp78.1).
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
 ///
@@ -26,6 +30,11 @@ pub fn series_key(name: &str, source: &str) -> String {
 /// Separator between a series' name and source. US (0x1f) cannot occur in a
 /// subvolume name or source label, so the key needs no escaping.
 pub const SERIES_SEP: char = '\u{1f}';
+
+/// Where the index database is unless the configuration says otherwise
+/// (`[general].db_path`), and what every `--db` defaults to. One place, so the
+/// coverage report can tell when its accept line must name another.
+pub const DEFAULT_DB_PATH: &str = "/var/lib/das-backup/backup-index.db";
 
 /// The `backup_runs` columns. `SCHEMA_SQL` creates a new table from them and
 /// the schema-4 migration rebuilds an old one from them, so the two cannot
@@ -176,6 +185,52 @@ CREATE INDEX IF NOT EXISTS idx_target_usage_label_ts ON target_usage(target_labe
 "#
 );
 
+/// The schema-5 tables: what the configuration scheduled to be backed up, run
+/// over run (`coverage`, bd DAS-Backup-Manager-sp78.1). Run after
+/// [`SCHEMA_SQL`], which is schema 4's unchanged, so a schema-4 binary opening
+/// a schema-5 database runs exactly what it always ran and never sees these.
+const COVERAGE_SQL: &str = r#"
+-- No row = no baseline yet. A row with zero baseline rows = a real, empty one.
+CREATE TABLE IF NOT EXISTS coverage_state (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    first_recorded TEXT NOT NULL,          -- YYYY-MM-DD of the first recorded check
+    last_recorded  TEXT NOT NULL,          -- YYYY-MM-DD of the latest
+    checks         INTEGER NOT NULL CHECK (checks >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS coverage_baseline (
+    volume          TEXT NOT NULL,
+    subvolume       TEXT NOT NULL,         -- '.' = top level
+    target          TEXT NOT NULL,         -- target label
+    target_identity TEXT,                  -- mount_uuid, else first serial; NULL = none
+    source_label    TEXT NOT NULL,         -- wording and -adopted detection only, never a key
+    first_covered   TEXT NOT NULL,
+    last_covered    TEXT NOT NULL,         -- last date the pair was intended
+    dropped_since   TEXT,                  -- NULL = covered
+    dropped_checks  INTEGER NOT NULL DEFAULT 0 CHECK (dropped_checks >= 0),
+    drop_rule       TEXT,                  -- the last "why:" text
+    PRIMARY KEY (volume, subvolume, target),
+    CHECK ((dropped_since IS NULL) = (drop_rule IS NULL)),
+    CHECK ((dropped_since IS NULL) = (dropped_checks = 0))
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS coverage_accepted (
+    id            INTEGER PRIMARY KEY,
+    volume        TEXT NOT NULL,
+    subvolume     TEXT NOT NULL,
+    target        TEXT NOT NULL,
+    drop_rule     TEXT NOT NULL,
+    dropped_since TEXT NOT NULL,
+    accepted_at   TEXT NOT NULL            -- RFC 3339 UTC
+);
+"#;
+
+/// Every table this schema has: schema 4's, then the coverage tables.
+fn create_tables(conn: &Connection) -> SqlResult<()> {
+    conn.execute_batch(SCHEMA_SQL)?;
+    conn.execute_batch(COVERAGE_SQL)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub id: i64,
@@ -232,7 +287,7 @@ impl Database {
         // See DAS-Backup-Manager-aem.
         conn.pragma_update(None, "mmap_size", 4_294_967_296i64)?;
         conn.pragma_update(None, "cache_size", -262_144i64)?;
-        conn.execute_batch(SCHEMA_SQL)?;
+        create_tables(&conn)?;
         Self::migrate(&conn)?;
         Ok(Database { conn })
     }
@@ -269,6 +324,10 @@ impl Database {
         // and existing rows carry no presence until the next walk records it.
         // v3 -> v4: an unknown run count can be stored, as NULL.
         Self::migrate_backup_runs_counts(conn)?;
+        // v4 -> v5: coverage_* tables, made by COVERAGE_SQL's IF NOT EXISTS;
+        // the stamp advances below. A v4 database re-runs the steps above,
+        // each idempotent by the table's shape. A v4 binary on a v5 database
+        // returns at its own `version >= 4` and never touches these tables.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -701,9 +760,10 @@ impl Database {
     /// Drop and recreate the content tables, leaving history intact.
     ///
     /// Removes `snapshots`, `files`, `spans` and the `files_fts` index, then
-    /// recreates them at the current `SCHEMA_VERSION`. `backup_runs` and
-    /// `target_usage` are deliberately preserved — they are operational history,
-    /// not derived content, and cannot be reconstructed by re-walking.
+    /// recreates them at the current `SCHEMA_VERSION`. `backup_runs`,
+    /// `target_usage` and the `coverage_*` tables are deliberately preserved —
+    /// they are operational history, not derived content, and cannot be
+    /// reconstructed by re-walking.
     ///
     /// This is the only repair for two defects that a migration cannot fix in
     /// place, because both are properties of rows already written:
@@ -729,7 +789,7 @@ impl Database {
              DROP TABLE IF EXISTS snapshots;
              PRAGMA foreign_keys = ON;",
         )?;
-        self.conn.execute_batch(SCHEMA_SQL)?;
+        create_tables(&self.conn)?;
         // Reset the stamp so migrate() re-creates the indexes it owns.
         self.conn.pragma_update(None, "user_version", 0i64)?;
         Self::migrate(&self.conn)?;
@@ -1321,6 +1381,306 @@ pub struct TargetUsageRecord {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub snapshot_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Subvolume coverage (schema 5, bd DAS-Backup-Manager-sp78.1)
+// ---------------------------------------------------------------------------
+
+/// One `(volume, subvolume, target)` pair in the coverage baseline: covered
+/// (`dropped_since` is `None`), or dropped and not yet restored, gone from
+/// disk or accepted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CoverageRow {
+    pub volume: String,
+    /// `.` is the volume's top level.
+    pub subvolume: String,
+    /// The target's label.
+    pub target: String,
+    /// The target's `mount_uuid`, else its first serial: how a renamed target
+    /// is recognised. `None` when it has neither.
+    pub target_identity: Option<String>,
+    /// For the report's wording and for recognising a re-adoption; never part
+    /// of the key.
+    pub source_label: String,
+    pub first_covered: String,
+    /// The last date the configuration scheduled the pair.
+    pub last_covered: String,
+    pub dropped_since: Option<String>,
+    /// How many recorded checks have found it dropped.
+    pub dropped_checks: u32,
+    /// The latest "why" for a dropped pair.
+    pub drop_rule: Option<String>,
+}
+
+/// The one-row summary of the recorded checks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CoverageState {
+    pub first_recorded: String,
+    pub last_recorded: String,
+    pub checks: u32,
+}
+
+/// What the last recorded check left: its summary and every pair it kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Baseline {
+    pub state: CoverageState,
+    pub rows: Vec<CoverageRow>,
+}
+
+/// One pair an operator accepted as no longer backed up, kept as the audit
+/// log `subvol coverage list` prints.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AcceptedCoverage {
+    pub volume: String,
+    pub subvolume: String,
+    pub target: String,
+    pub drop_rule: String,
+    pub dropped_since: String,
+    pub accepted_at: String,
+}
+
+/// Whether `name` is a table in `conn`'s database.
+fn table_exists(conn: &Connection, name: &str) -> SqlResult<bool> {
+    conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .exists([name])
+}
+
+/// A stored count as a `u32`: anything else is an error, never a count.
+fn u32_from_sql(row: &rusqlite::Row<'_>, idx: usize) -> SqlResult<u32> {
+    let n: i64 = row.get(idx)?;
+    u32::try_from(n).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, n))
+}
+
+/// The baseline in `conn`, or `None` when there is none yet: a database older
+/// than schema 5 (no `coverage_state` table), or no recorded check.
+fn read_baseline(conn: &Connection) -> SqlResult<Option<Baseline>> {
+    if !table_exists(conn, "coverage_state")? {
+        return Ok(None);
+    }
+    let state = conn
+        .query_row(
+            "SELECT first_recorded, last_recorded, checks FROM coverage_state WHERE id = 1",
+            [],
+            |r| {
+                Ok(CoverageState {
+                    first_recorded: r.get(0)?,
+                    last_recorded: r.get(1)?,
+                    checks: u32_from_sql(r, 2)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let rows = conn
+        .prepare(
+            "SELECT volume, subvolume, target, target_identity, source_label, first_covered,
+                    last_covered, dropped_since, dropped_checks, drop_rule
+             FROM coverage_baseline ORDER BY volume, subvolume, target",
+        )?
+        .query_map([], |r| {
+            Ok(CoverageRow {
+                volume: r.get(0)?,
+                subvolume: r.get(1)?,
+                target: r.get(2)?,
+                target_identity: r.get(3)?,
+                source_label: r.get(4)?,
+                first_covered: r.get(5)?,
+                last_covered: r.get(6)?,
+                dropped_since: r.get(7)?,
+                dropped_checks: u32_from_sql(r, 8)?,
+                drop_rule: r.get(9)?,
+            })
+        })?
+        .collect::<SqlResult<_>>()?;
+    Ok(Some(Baseline { state, rows }))
+}
+
+/// Every accepted pair, oldest first; none in a database older than schema 5.
+fn read_accepted(conn: &Connection) -> SqlResult<Vec<AcceptedCoverage>> {
+    if !table_exists(conn, "coverage_accepted")? {
+        return Ok(Vec::new());
+    }
+    conn.prepare(
+        "SELECT volume, subvolume, target, drop_rule, dropped_since, accepted_at
+         FROM coverage_accepted ORDER BY id",
+    )?
+    .query_map([], |r| {
+        Ok(AcceptedCoverage {
+            volume: r.get(0)?,
+            subvolume: r.get(1)?,
+            target: r.get(2)?,
+            drop_rule: r.get(3)?,
+            dropped_since: r.get(4)?,
+            accepted_at: r.get(5)?,
+        })
+    })?
+    .collect()
+}
+
+/// `path` opened read-only — never created, never migrated, never written —
+/// or `None` when no file is there. Any other failure is an error.
+pub fn open_read_only(path: &Path) -> Result<Option<Connection>, String> {
+    let what = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    if !path.try_exists().map_err(|e| what(&e))? {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| what(&e))?;
+    conn.busy_timeout(Duration::from_secs(30))
+        .map_err(|e| what(&e))?;
+    Ok(Some(conn))
+}
+
+/// The coverage baseline at `path`, read without creating or migrating
+/// anything: `None` when the file is absent, older than schema 5, or holds
+/// no recorded check; `Err` when it cannot be opened or read.
+pub fn read_coverage_read_only(path: &Path) -> Result<Option<Baseline>, String> {
+    match open_read_only(path)? {
+        None => Ok(None),
+        Some(conn) => read_baseline(&conn).map_err(|e| format!("{}: {e}", path.display())),
+    }
+}
+
+/// The accept log at `path`, read as [`read_coverage_read_only`] reads.
+pub fn read_accepted_read_only(path: &Path) -> Result<Vec<AcceptedCoverage>, String> {
+    match open_read_only(path)? {
+        None => Ok(Vec::new()),
+        Some(conn) => read_accepted(&conn).map_err(|e| format!("{}: {e}", path.display())),
+    }
+}
+
+impl Database {
+    /// The coverage baseline, as [`read_coverage_read_only`] defines it.
+    pub fn coverage_baseline(&self) -> SqlResult<Option<Baseline>> {
+        read_baseline(&self.conn)
+    }
+
+    /// Every accepted pair, oldest first.
+    pub fn coverage_accepted(&self) -> SqlResult<Vec<AcceptedCoverage>> {
+        read_accepted(&self.conn)
+    }
+
+    /// Compare and record in one IMMEDIATE transaction: read the baseline,
+    /// hand it to `f` (pure), and replace the baseline and the state with
+    /// what `f` returns. Returns `f`'s outcome only once the write is
+    /// committed; on any error nothing is changed and the error is returned.
+    pub fn record_coverage<T, F>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(Option<Baseline>) -> (T, Vec<CoverageRow>, CoverageState),
+    {
+        let write = || -> SqlResult<T> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let (outcome, rows, state) = f(read_baseline(&tx)?);
+            tx.execute("DELETE FROM coverage_baseline", [])?;
+            {
+                let mut insert = tx.prepare(
+                    "INSERT INTO coverage_baseline (volume, subvolume, target, target_identity,
+                         source_label, first_covered, last_covered, dropped_since,
+                         dropped_checks, drop_rule)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )?;
+                for r in &rows {
+                    insert.execute(rusqlite::params![
+                        r.volume,
+                        r.subvolume,
+                        r.target,
+                        r.target_identity,
+                        r.source_label,
+                        r.first_covered,
+                        r.last_covered,
+                        r.dropped_since,
+                        i64::from(r.dropped_checks),
+                        r.drop_rule
+                    ])?;
+                }
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO coverage_state (id, first_recorded, last_recorded, checks)
+                 VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![
+                    state.first_recorded,
+                    state.last_recorded,
+                    i64::from(state.checks)
+                ],
+            )?;
+            tx.commit()?;
+            Ok(outcome)
+        };
+        write().map_err(|e| e.to_string())
+    }
+
+    /// Accept the dropped pairs that match every filter given (`None` matches
+    /// anything): each goes into the accept log and leaves the baseline, in
+    /// one IMMEDIATE transaction. A covered pair is never accepted. Returns
+    /// what was accepted; nothing matching is `Ok` of an empty list, with
+    /// nothing changed.
+    pub fn accept_coverage(
+        &self,
+        volume: Option<&str>,
+        subvolume: Option<&str>,
+        target: Option<&str>,
+        accepted_at: &str,
+    ) -> Result<Vec<AcceptedCoverage>, String> {
+        let accept = || -> SqlResult<Vec<AcceptedCoverage>> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let chosen: Vec<AcceptedCoverage> = tx
+                .prepare(
+                    "SELECT volume, subvolume, target, drop_rule, dropped_since
+                     FROM coverage_baseline
+                     WHERE dropped_since IS NOT NULL
+                       AND (?1 IS NULL OR volume = ?1)
+                       AND (?2 IS NULL OR subvolume = ?2)
+                       AND (?3 IS NULL OR target = ?3)
+                     ORDER BY volume, subvolume, target",
+                )?
+                .query_map(rusqlite::params![volume, subvolume, target], |r| {
+                    Ok(AcceptedCoverage {
+                        volume: r.get(0)?,
+                        subvolume: r.get(1)?,
+                        target: r.get(2)?,
+                        drop_rule: r.get(3)?,
+                        dropped_since: r.get(4)?,
+                        accepted_at: accepted_at.to_string(),
+                    })
+                })?
+                .collect::<SqlResult<_>>()?;
+            for a in &chosen {
+                tx.execute(
+                    "INSERT INTO coverage_accepted (volume, subvolume, target, drop_rule,
+                         dropped_since, accepted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        a.volume,
+                        a.subvolume,
+                        a.target,
+                        a.drop_rule,
+                        a.dropped_since,
+                        a.accepted_at
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM coverage_baseline
+                     WHERE volume = ?1 AND subvolume = ?2 AND target = ?3",
+                    rusqlite::params![a.volume, a.subvolume, a.target],
+                )?;
+            }
+            tx.commit()?;
+            Ok(chosen)
+        };
+        accept().map_err(|e| e.to_string())
+    }
 }
 
 impl Drop for Database {
@@ -3055,7 +3415,7 @@ mod tests {
 
         let db = Database::open(&path).expect("a v3 database must open and migrate");
 
-        assert_eq!(user_version(&db.conn), 4);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(
             counts_not_null(&db.conn),
             vec![0, 0],
@@ -3140,7 +3500,7 @@ mod tests {
             root,
             "rebuilt a second time"
         );
-        assert_eq!(user_version(&db.conn), 4);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
     }
 
     #[test]
@@ -3163,7 +3523,7 @@ mod tests {
         let db = Database::open(&path).expect("reopen at stamp 3");
         assert_eq!(db.conn.total_changes(), 0);
         assert_eq!(backup_runs_rootpage(&db.conn), root);
-        assert_eq!(user_version(&db.conn), 4);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
 
         db.rebuild_content_tables().unwrap();
         assert_eq!(backup_runs_rootpage(&db.conn), root);
@@ -3408,5 +3768,383 @@ mod tests {
         // Should be ordered oldest first (ASC)
         assert!(usage[0].timestamp < usage[1].timestamp);
         assert!(usage[1].timestamp < usage[2].timestamp);
+    }
+
+    // -----------------------------------------------------------------
+    // Schema 5: subvolume coverage (bd DAS-Backup-Manager-sp78.1)
+    // -----------------------------------------------------------------
+
+    const COVERAGE_TABLES: [&str; 3] = ["coverage_accepted", "coverage_baseline", "coverage_state"];
+
+    fn tables(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'coverage_%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    fn cov_row(subvolume: &str, target: &str, dropped: bool) -> CoverageRow {
+        CoverageRow {
+            volume: "/ssd".into(),
+            subvolume: subvolume.into(),
+            target: target.into(),
+            target_identity: Some("SERIAL01".into()),
+            source_label: "ssd".into(),
+            first_covered: "2026-10-01".into(),
+            last_covered: "2026-10-01".into(),
+            dropped_since: dropped.then(|| "2026-10-02".into()),
+            dropped_checks: u32::from(dropped),
+            drop_rule: dropped.then(|| "excluded".into()),
+        }
+    }
+
+    fn state(checks: u32) -> CoverageState {
+        CoverageState {
+            first_recorded: "2026-10-01".into(),
+            last_recorded: "2026-10-02".into(),
+            checks,
+        }
+    }
+
+    /// A database holding `rows`, as a recorded check leaves it.
+    fn seeded(path: &Path, rows: Vec<CoverageRow>) -> Database {
+        let db = Database::open(path).unwrap();
+        db.record_coverage(|_| ((), rows, state(2))).unwrap();
+        db
+    }
+
+    #[test]
+    fn a_new_database_is_schema_5_with_the_coverage_tables() {
+        let db = Database::open(":memory:").unwrap();
+        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(tables(&db.conn), COVERAGE_TABLES);
+        assert_eq!(
+            db.coverage_baseline().unwrap(),
+            None,
+            "no check recorded yet"
+        );
+        assert!(db.coverage_accepted().unwrap().is_empty());
+    }
+
+    /// A schema-4 database: what this binary's predecessor left. Every
+    /// earlier step re-runs on it and changes nothing; the stamp moves.
+    #[test]
+    fn a_v4_database_migrates_to_5_keeping_its_history_and_a_second_open_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        v3_fixture(&path, &v3_runs(), "");
+        drop(Database::open(&path).unwrap());
+        let runs = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE coverage_state; DROP TABLE coverage_baseline;
+                 DROP TABLE coverage_accepted;",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 4i64).unwrap();
+            run_rows(&conn)
+        };
+        let db = Database::open(&path).expect("a v4 database opens");
+        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(tables(&db.conn), COVERAGE_TABLES);
+        assert_eq!(run_rows(&db.conn), runs, "history survives the migration");
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.conn.total_changes(), 0, "a second open writes nothing");
+        assert_eq!(user_version(&db.conn), 5);
+    }
+
+    /// What a schema-4 binary does to a schema-5 database: it runs its own
+    /// schema (`SCHEMA_SQL`, unchanged since 4), returns at its `version >=
+    /// 4`, records runs; its `rebuild_content_tables` resets the stamp and
+    /// stamps 4. None of it touches coverage, and this binary then finds
+    /// the coverage rows where they were.
+    #[test]
+    fn an_older_binary_on_a_v5_database_works_and_leaves_coverage_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        drop(seeded(
+            &path,
+            vec![cov_row("@a", "big", false), cov_row("@b", "big", true)],
+        ));
+        let before = read_coverage_read_only(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_SQL).unwrap();
+            assert!(
+                user_version(&conn) >= 4,
+                "the old binary's migrate returns here"
+            );
+            conn.execute(
+                "INSERT INTO backup_runs (timestamp, success, mode, snaps_created, snaps_sent,
+                     bytes_sent, duration_secs, errors)
+                 VALUES (1, 1, 'incremental', 2, 2, 0, 3, '')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TRIGGER IF EXISTS files_ai; DROP TRIGGER IF EXISTS files_ad;
+                 DROP TRIGGER IF EXISTS files_au; DROP TABLE IF EXISTS files_fts;
+                 DROP TABLE IF EXISTS spans; DROP TABLE IF EXISTS files;
+                 DROP TABLE IF EXISTS snapshots; PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA_SQL).unwrap();
+            conn.pragma_update(None, "user_version", 4i64).unwrap();
+        }
+        assert_eq!(read_coverage_read_only(&path).unwrap(), before);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(db.coverage_baseline().unwrap(), before);
+        assert_eq!(run_rows(&db.conn).len(), 1);
+    }
+
+    #[test]
+    fn rebuilding_the_content_tables_keeps_the_coverage_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = seeded(
+            &path,
+            vec![cov_row("@a", "big", false), cov_row("@b", "big", true)],
+        );
+        db.accept_coverage(None, Some("@b"), None, "T").unwrap();
+        let (baseline, accepted) = (
+            db.coverage_baseline().unwrap(),
+            db.coverage_accepted().unwrap(),
+        );
+        assert_eq!(accepted.len(), 1);
+        db.rebuild_content_tables().unwrap();
+        assert_eq!(db.coverage_baseline().unwrap(), baseline);
+        assert_eq!(db.coverage_accepted().unwrap(), accepted);
+        assert_eq!(user_version(&db.conn), 5);
+    }
+
+    #[test]
+    fn a_recorded_check_replaces_the_baseline_and_a_failed_one_changes_nothing() {
+        let db = Database::open(":memory:").unwrap();
+        let got = db
+            .record_coverage(|b| {
+                assert_eq!(b, None);
+                ("first", vec![cov_row("@a", "big", false)], state(1))
+            })
+            .unwrap();
+        assert_eq!(got, "first");
+        db.record_coverage(|b| {
+            assert_eq!(b.unwrap().rows.len(), 1);
+            (
+                (),
+                vec![cov_row("@b", "big", true), cov_row("@c", "big", false)],
+                state(2),
+            )
+        })
+        .unwrap();
+        let b = db.coverage_baseline().unwrap().unwrap();
+        assert_eq!(b.state, state(2));
+        assert_eq!(
+            b.rows,
+            vec![cov_row("@b", "big", true), cov_row("@c", "big", false)]
+        );
+
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER no_state BEFORE INSERT ON coverage_state
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let err = db
+            .record_coverage(|_| ((), vec![cov_row("@z", "big", false)], state(3)))
+            .unwrap_err();
+        assert!(err.contains("injected"), "{err}");
+        assert_eq!(db.coverage_baseline().unwrap().unwrap(), b, "rolled back");
+    }
+
+    #[test]
+    fn accept_takes_dropped_pairs_only_narrowed_by_each_filter() {
+        let db = Database::open(":memory:").unwrap();
+        db.record_coverage(|_| {
+            (
+                (),
+                vec![
+                    cov_row("@a", "big", false),
+                    cov_row("@b", "big", true),
+                    cov_row("@b", "small", true),
+                    cov_row("@c", "small", true),
+                ],
+                state(2),
+            )
+        })
+        .unwrap();
+        // A covered pair is never accepted.
+        assert!(
+            db.accept_coverage(Some("/ssd"), Some("@a"), None, "T")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.accept_coverage(Some("/other"), None, None, "T")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.coverage_baseline().unwrap().unwrap().rows.len(), 4);
+        // --target narrows.
+        let one = db
+            .accept_coverage(Some("/ssd"), Some("@b"), Some("small"), "T1")
+            .unwrap();
+        assert_eq!(
+            one,
+            vec![AcceptedCoverage {
+                volume: "/ssd".into(),
+                subvolume: "@b".into(),
+                target: "small".into(),
+                drop_rule: "excluded".into(),
+                dropped_since: "2026-10-02".into(),
+                accepted_at: "T1".into(),
+            }]
+        );
+        let left: Vec<(String, String)> = db
+            .coverage_baseline()
+            .unwrap()
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| (r.subvolume, r.target))
+            .collect();
+        assert_eq!(
+            left,
+            [("@a", "big"), ("@b", "big"), ("@c", "small")]
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+        );
+        // --all takes every dropped pair, and leaves the covered one.
+        let all = db.accept_coverage(None, None, None, "T2").unwrap();
+        assert_eq!(all.len(), 2);
+        let rows = db.coverage_baseline().unwrap().unwrap().rows;
+        assert_eq!(rows, vec![cov_row("@a", "big", false)]);
+        assert_eq!(db.coverage_accepted().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_accept_that_fails_part_way_accepts_nothing() {
+        let db = Database::open(":memory:").unwrap();
+        db.record_coverage(|_| {
+            (
+                (),
+                vec![cov_row("@b", "big", true), cov_row("@c", "big", true)],
+                state(2),
+            )
+        })
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER second_fails BEFORE INSERT ON coverage_accepted
+                 WHEN new.subvolume = '@c' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let err = db.accept_coverage(None, None, None, "T").unwrap_err();
+        assert!(err.contains("injected"), "{err}");
+        assert_eq!(db.coverage_baseline().unwrap().unwrap().rows.len(), 2);
+        assert!(db.coverage_accepted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_baseline_refuses_a_half_dropped_row() {
+        let db = Database::open(":memory:").unwrap();
+        let insert = |since: Option<&str>, checks: i64, rule: Option<&str>| {
+            db.conn.execute(
+                "INSERT INTO coverage_baseline (volume, subvolume, target, source_label,
+                     first_covered, last_covered, dropped_since, dropped_checks, drop_rule)
+                 VALUES ('/v', ?1, 't', 's', 'd', 'd', ?2, ?3, ?4)",
+                rusqlite::params![format!("{since:?}{checks}{rule:?}"), since, checks, rule],
+            )
+        };
+        assert!(insert(Some("d"), 1, None).is_err(), "dropped with no rule");
+        assert!(
+            insert(None, 1, None).is_err(),
+            "covered with a dropped count"
+        );
+        assert!(
+            insert(Some("d"), 0, Some("r")).is_err(),
+            "dropped, counted in no check"
+        );
+        assert!(insert(None, -1, None).is_err(), "a negative count");
+        assert!(insert(None, 0, Some("r")).is_err(), "covered with a rule");
+        assert!(insert(None, 0, None).is_ok());
+        assert!(insert(Some("d"), 1, Some("r")).is_ok());
+        assert!(
+            db.conn
+                .execute("INSERT INTO coverage_state VALUES (2, 'a', 'b', 1)", [])
+                .is_err(),
+            "one state row only"
+        );
+        assert!(
+            db.conn
+                .execute("INSERT INTO coverage_state VALUES (1, 'a', 'b', 0)", [])
+                .is_err(),
+            "a recorded state counts at least one check"
+        );
+    }
+
+    #[test]
+    fn reading_the_baseline_read_only_never_creates_or_migrates_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert_eq!(read_coverage_read_only(&missing).unwrap(), None);
+        assert!(read_accepted_read_only(&missing).unwrap().is_empty());
+        assert!(!missing.exists());
+
+        // A v4 database: no coverage tables, and it stays v4.
+        let v4 = dir.path().join("v4.db");
+        v3_fixture(
+            &v4,
+            &v3_runs(),
+            "DROP TABLE coverage_state; DROP TABLE coverage_baseline; DROP TABLE coverage_accepted;",
+        );
+        Connection::open(&v4)
+            .unwrap()
+            .pragma_update(None, "user_version", 4i64)
+            .unwrap();
+        assert_eq!(read_coverage_read_only(&v4).unwrap(), None);
+        assert!(read_accepted_read_only(&v4).unwrap().is_empty());
+        assert_eq!(user_version(&Connection::open(&v4).unwrap()), 4);
+
+        // Schema 5 with no check recorded.
+        let empty = dir.path().join("empty.db");
+        drop(Database::open(&empty).unwrap());
+        assert_eq!(read_coverage_read_only(&empty).unwrap(), None);
+
+        // One recorded.
+        let full = dir.path().join("full.db");
+        drop(seeded(&full, vec![cov_row("@a", "big", false)]));
+        let b = read_coverage_read_only(&full).unwrap().unwrap();
+        assert_eq!(
+            (b.state, b.rows),
+            (state(2), vec![cov_row("@a", "big", false)])
+        );
+
+        // Not a database: an error, never "no record".
+        let garbage = dir.path().join("garbage.db");
+        std::fs::write(&garbage, vec![0x5au8; 8192]).unwrap();
+        let err = read_coverage_read_only(&garbage).unwrap_err();
+        assert!(err.contains("garbage.db"), "{err}");
+        assert!(read_accepted_read_only(&garbage).is_err());
+        assert!(read_coverage_read_only(dir.path()).is_err(), "a directory");
+    }
+
+    #[test]
+    fn a_stored_count_that_is_not_a_u32_is_an_error() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO coverage_state VALUES (1, 'a', 'b', 4294967296)",
+                [],
+            )
+            .unwrap();
+        assert!(db.coverage_baseline().is_err());
     }
 }

@@ -234,7 +234,10 @@ pub fn format_report_from(
 
     let overall = if !result.success {
         "FAILURES DETECTED"
-    } else if result.boot.has_warnings() || result.recovery_os.has_warnings() {
+    } else if result.boot.has_warnings()
+        || result.recovery_os.has_warnings()
+        || sync.is_some_and(|s| crate::coverage::has_warnings_or_missing(s.coverage.as_ref()))
+    {
         "COMPLETED WITH WARNINGS"
     } else {
         "ALL OPERATIONS SUCCESSFUL"
@@ -281,6 +284,10 @@ pub fn format_report_from(
     if let Some(sync) = sync {
         let status = if sync.failed { "FAIL" } else { "OK" };
         r.push_str(&format!("  Subvolume sync        {status}\n"));
+        r.push_str(&format!(
+            "  Subvolume coverage    {}\n",
+            crate::coverage::row_or_not_run(sync.coverage.as_ref())
+        ));
         r.push('\n');
         r.push_str(&sync.report);
     }
@@ -825,6 +832,7 @@ mod tests {
             report_sent: false,
             errors: vec![],
             duration_secs: 3600,
+            coverage_message: String::new(),
         };
         let cfg = Config::default();
         let report = format_report(&result, &cfg);
@@ -931,6 +939,7 @@ mod tests {
             report_sent: false,
             errors: errors.iter().map(|e| e.to_string()).collect(),
             duration_secs: 60,
+            coverage_message: String::new(),
         }
     }
 
@@ -999,10 +1008,12 @@ mod tests {
             report_sent: false,
             errors: vec!["Subvolume sync failed — see SUBVOLUME SYNC in the report".into()],
             duration_secs: 1,
+            coverage_message: String::new(),
         };
         let sync = crate::backup::SyncSection {
             report: "SUBVOLUME SYNC\n  VOLUMES NOT READ (nothing adopted or retired there):\n    /ssd: not mounted\n".into(),
             failed: true,
+            coverage: None,
         };
         let cfg = Config::default();
         let report = format_report_with_sync(&result, &cfg, Some(&sync));
@@ -1022,6 +1033,7 @@ mod tests {
         let ok = crate::backup::SyncSection {
             report: "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n".into(),
             failed: false,
+            coverage: None,
         };
         let report = format_report_with_sync(&result, &cfg, Some(&ok));
         assert!(report.contains("  Subvolume sync        OK\n"), "{report}");
@@ -1051,6 +1063,7 @@ mod tests {
             report_sent: false,
             errors: vec![],
             duration_secs: 120,
+            coverage_message: String::new(),
         };
         let id = record_backup_run(&db, &result).unwrap();
         assert!(id > 0);
@@ -1140,6 +1153,7 @@ mod tests {
             report_sent: false,
             errors: vec!["btrbk failed".into(), "target not mounted".into()],
             duration_secs: 60,
+            coverage_message: String::new(),
         };
         let cfg = Config::default();
         let report = format_report(&result, &cfg);

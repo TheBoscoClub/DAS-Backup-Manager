@@ -521,7 +521,10 @@ pub fn config_busy_line(path: &Path) -> String {
 }
 
 /// The targets a source's volume block sends to.
-fn source_targets<'a>(config: &'a Config, source: &crate::config::Source) -> Vec<&'a Target> {
+pub(crate) fn source_targets<'a>(
+    config: &'a Config,
+    source: &crate::config::Source,
+) -> Vec<&'a Target> {
     config
         .targets
         .iter()

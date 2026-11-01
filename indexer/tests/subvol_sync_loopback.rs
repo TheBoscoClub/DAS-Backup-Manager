@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use buttered_dasd::adopt::{SyncOutcome, sync_subvolumes};
+use buttered_dasd::adopt::{CoverageMode, SyncOutcome, sync_subvolumes};
 use buttered_dasd::btrbk_conf::render_btrbk_conf;
 use buttered_dasd::config::{Config, Retention, Source, SubvolConfig, Target, TargetRole};
 use buttered_dasd::expire::{ExpireOutcome, expire_retired};
@@ -194,6 +194,11 @@ impl Rig {
         }
     }
 
+    /// The rig's own index database, beside its config: never the host's.
+    fn db_path(&self) -> PathBuf {
+        self.config_path.with_file_name("index.db")
+    }
+
     fn sync(&self, today: &str) -> SyncOutcome {
         let outcome = sync_subvolumes(
             &self.config_path,
@@ -201,6 +206,9 @@ impl Rig {
             today,
             &SystemRunner,
             &is_mountpoint,
+            CoverageMode::Record {
+                db: &self.db_path(),
+            },
         )
         .expect("config must load");
         self.make_target_dirs();
@@ -498,5 +506,147 @@ fn sync_refuses_an_unmounted_source_volume_and_changes_nothing() {
         std::fs::read(&rig.btrbk_conf).unwrap(),
         btrbk_before,
         "btrbk.conf must be byte-identical"
+    );
+}
+
+// --- subvolume coverage, run over run (bd DAS-Backup-Manager-sp78.1) ---------
+
+impl Rig {
+    /// `btrdasd subvol sync --record-coverage` against the rig, as
+    /// `backup-run.sh` runs it: (exit code, stdout).
+    fn recorded_sync_cli(&self) -> (i32, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_btrdasd"))
+            .args([
+                "subvol",
+                "sync",
+                "--config",
+                self.config_path.to_str().unwrap(),
+                "--db",
+                self.db_path().to_str().unwrap(),
+                "--record-coverage",
+            ])
+            .output()
+            .expect("spawn btrdasd");
+        self.make_target_dirs();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    fn coverage_line(text: &str) -> &str {
+        text.lines()
+            .find(|l| l.starts_with("SUBVOLUME COVERAGE: "))
+            .unwrap_or_else(|| panic!("no coverage line in:\n{text}"))
+    }
+}
+
+/// The unchanged config warns nothing, run after run.
+#[test]
+#[ignore = "requires root and loop devices"]
+fn an_unchanged_config_reports_no_coverage_drop_on_real_btrfs() {
+    let rig = Rig::new();
+    let (code, first) = rig.recorded_sync_cli();
+    assert_eq!(code, 0, "{first}");
+    assert!(
+        Rig::coverage_line(&first).starts_with("SUBVOLUME COVERAGE: OK  (no earlier record: "),
+        "{first}"
+    );
+    let (code, second) = rig.recorded_sync_cli();
+    assert_eq!(code, 0, "{second}");
+    let line = Rig::coverage_line(&second);
+    assert!(line.starts_with("SUBVOLUME COVERAGE: OK  ("), "{second}");
+    assert!(line.ends_with(", none dropped)"), "{second}");
+}
+
+/// The proof the issue asks for: an entry removed and a pattern that now
+/// keeps sync from adopting it again warns, on every run, until accepted;
+/// the sync's exit code is unchanged throughout.
+#[test]
+#[ignore = "requires root and loop devices"]
+fn an_entry_removed_behind_a_pattern_warns_until_accepted_on_real_btrfs() {
+    let rig = Rig::new();
+    rig.btrfs(&["subvolume", "create", &rig.src_path("@b")]);
+    let (code, adopted) = rig.recorded_sync_cli();
+    assert_eq!(code, 0, "{adopted}");
+    let (code, _) = rig.recorded_sync_cli();
+    assert_eq!(code, 0);
+
+    let mut cfg = Config::load(&rig.config_path).unwrap();
+    for s in &mut cfg.sources {
+        s.subvolumes.retain(|e| e.name != "@b");
+    }
+    cfg.subvolumes.exclude = vec!["@b*".into()];
+    cfg.save(&rig.config_path).unwrap();
+
+    let (code, text) = rig.recorded_sync_cli();
+    assert_eq!(
+        code, 0,
+        "coverage never changes the sync's exit code:\n{text}"
+    );
+    assert!(
+        Rig::coverage_line(&text)
+            .starts_with("SUBVOLUME COVERAGE: WARN  (1 subvolume/target pair no longer backed up"),
+        "{text}"
+    );
+    let volume = rig.src.mount.to_string_lossy().into_owned();
+    assert!(
+        text.contains(&format!("    {volume}  @b  -> primary\n"))
+            && text.contains(
+                "      why:    excluded by pattern '@b*' ([subvolumes].exclude); no config entry names it\n"
+            ),
+        "{text}"
+    );
+    let (code, text) = rig.recorded_sync_cli();
+    assert_eq!(code, 0);
+    assert!(text.contains(", 2 recorded runs\n"), "{text}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_btrdasd"))
+        .args([
+            "subvol",
+            "coverage",
+            "accept",
+            &volume,
+            "@b",
+            "--db",
+            rig.db_path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, text) = rig.recorded_sync_cli();
+    assert_eq!(code, 0);
+    assert!(
+        Rig::coverage_line(&text).ends_with(", none dropped)"),
+        "{text}"
+    );
+}
+
+/// The counter-direction: a subvolume deleted from disk is retirement, and
+/// its pairs leave the record silently.
+#[test]
+#[ignore = "requires root and loop devices"]
+fn a_deleted_subvolume_is_gone_not_dropped_on_real_btrfs() {
+    let rig = Rig::new();
+    rig.btrfs(&["subvolume", "create", &rig.src_path("@b")]);
+    rig.recorded_sync_cli();
+    rig.recorded_sync_cli();
+    rig.btrfs(&["subvolume", "delete", &rig.src_path("@b")]);
+    let (code, text) = rig.recorded_sync_cli();
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        Rig::coverage_line(&text).ends_with(", none dropped)"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  Gone from disk (retired by sync, not a warning): 1 subvolume/target pair\n"
+        ),
+        "{text}"
     );
 }

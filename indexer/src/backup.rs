@@ -490,6 +490,10 @@ pub struct BackupResult {
     pub report_sent: bool,
     pub errors: Vec<String>,
     pub duration_secs: u64,
+    /// The subvolume coverage warning the finish text carries
+    /// (`coverage::message_line`), set by `run_backup_job` from its sync;
+    /// empty when the check is clean or the run had no sync. Never a failure.
+    pub coverage_message: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,6 +2113,10 @@ pub struct SyncSection {
     pub report: String,
     /// Whether the run must end as failed on its account.
     pub failed: bool,
+    /// The subvolume coverage check the sync made; `None` when the sync
+    /// could not run, which reports as not checked (a WARN). It never fails
+    /// the run (bd DAS-Backup-Manager-sp78.1).
+    pub coverage: Option<crate::coverage::CoverageOutcome>,
 }
 
 /// The first step of every backup, whoever starts it: bring `config.toml` and
@@ -2124,6 +2132,14 @@ pub struct SyncSection {
 /// and is failed — as `backup-run.sh` continues with its existing config
 /// and records the sync as FAIL. It used to abort the Rust/GUI run before
 /// anything was recorded (bd DAS-Backup-Manager-h4t).
+///
+/// The sync makes the subvolume coverage check (`coverage`: a backup run
+/// records it, a manual step only compares). A coverage warning is logged at
+/// warning level and never fails the run; the section carries it to the
+/// report. A config that cannot be reloaded leaves the coverage as the sync
+/// found it: it compared against `config.toml` as written on disk, which is
+/// what `btrbk.conf` runs.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_before_backup(
     config_path: &Path,
     before: &Config,
@@ -2131,19 +2147,28 @@ pub fn sync_before_backup(
     today: &str,
     runner: &dyn crate::fsutil::CommandRunner,
     is_mountpoint: &dyn Fn(&Path) -> bool,
+    coverage: crate::adopt::CoverageMode<'_>,
     progress: &dyn ProgressCallback,
 ) -> (Config, SyncSection) {
-    let mut section =
-        match crate::adopt::sync_subvolumes(config_path, dry_run, today, runner, is_mountpoint) {
-            Ok(outcome) => SyncSection {
-                report: crate::adopt::format_sync_report(&outcome, dry_run),
-                failed: outcome.failed(),
-            },
-            Err(e) => SyncSection {
-                report: format!("SUBVOLUME SYNC\n  SYNC COULD NOT RUN: {e}\n"),
-                failed: true,
-            },
-        };
+    let mut section = match crate::adopt::sync_subvolumes(
+        config_path,
+        dry_run,
+        today,
+        runner,
+        is_mountpoint,
+        coverage,
+    ) {
+        Ok(outcome) => SyncSection {
+            report: crate::adopt::format_sync_report(&outcome, dry_run),
+            failed: outcome.failed(),
+            coverage: outcome.coverage,
+        },
+        Err(e) => SyncSection {
+            report: format!("SUBVOLUME SYNC\n  SYNC COULD NOT RUN: {e}\n"),
+            failed: true,
+            coverage: None,
+        },
+    };
     let config = match Config::load(config_path) {
         Ok(config) => config,
         Err(e) => {
@@ -2158,6 +2183,8 @@ pub fn sync_before_backup(
     };
     let level = if section.failed {
         LogLevel::Error
+    } else if crate::coverage::has_warnings_or_missing(section.coverage.as_ref()) {
+        LogLevel::Warning
     } else {
         LogLevel::Info
     };
@@ -2187,18 +2214,22 @@ pub fn sync_for_manual_step(
         &crate::caldate::today(),
         &SystemRunner,
         &health::is_mountpoint,
+        Path::new(&before.general.db_path),
         progress,
     )
 }
 
-/// [`sync_for_manual_step`] with the runner, the mount-point test and the date
-/// given.
+/// [`sync_for_manual_step`] with the runner, the mount-point test, the date
+/// and the index database given. The step compares subvolume coverage and
+/// records nothing: only a backup run records. A coverage warning is logged,
+/// never a refusal.
 fn sync_for_manual_step_with(
     config_path: &Path,
     before: &Config,
     today: &str,
     runner: &dyn CommandRunner,
     is_mountpoint: &dyn Fn(&Path) -> bool,
+    db: &Path,
     progress: &dyn ProgressCallback,
 ) -> Result<Config, String> {
     let (config, section) = sync_before_backup(
@@ -2208,6 +2239,7 @@ fn sync_for_manual_step_with(
         today,
         runner,
         is_mountpoint,
+        crate::adopt::CoverageMode::Compare { db },
         progress,
     );
     if section.failed {
@@ -2729,6 +2761,7 @@ fn run_backup_with(
             report_sent: false,
             errors,
             duration_secs: start.elapsed().as_secs(),
+            coverage_message: String::new(),
         };
         return Ok(result);
     }
@@ -2884,6 +2917,7 @@ fn run_backup_with(
         report_sent: false,
         errors,
         duration_secs: start.elapsed().as_secs(),
+        coverage_message: String::new(),
     };
 
     Ok(result)
@@ -3181,6 +3215,12 @@ impl BackupJobOutcome {
                         }
                     }
                 }
+                // A coverage drop is there whether or not the run records
+                // anything, so it is said on a dry run as well.
+                if !result.coverage_message.is_empty() {
+                    line.push('\n');
+                    line.push_str(&result.coverage_message);
+                }
                 (result.success, line)
             }
         }
@@ -3277,6 +3317,7 @@ fn abort_job(
         report_sent: false,
         errors: vec![why.clone()],
         duration_secs: started.elapsed().as_secs(),
+        coverage_message: String::new(),
     };
     match host.record(config, &result) {
         Ok(()) => BackupJobOutcome::Aborted(why),
@@ -3427,6 +3468,9 @@ pub fn run_backup_job(
             result.success = false;
         }
     }
+    if let Some(sync) = &options.subvolume_sync {
+        result.coverage_message = crate::coverage::message_line(sync.coverage.as_ref());
+    }
     BackupJobOutcome::Ran(result)
 }
 
@@ -3487,6 +3531,8 @@ impl BackupJobHost for SystemBackupHost {
         dry_run: bool,
         progress: &dyn ProgressCallback,
     ) -> (Config, SyncSection) {
+        // A backup run records the coverage check; on a dry run the sync
+        // itself never does.
         sync_before_backup(
             &self.config_path,
             before,
@@ -3494,6 +3540,9 @@ impl BackupJobHost for SystemBackupHost {
             &crate::caldate::today(),
             &crate::fsutil::SystemRunner,
             &health::is_mountpoint,
+            crate::adopt::CoverageMode::Record {
+                db: Path::new(&before.general.db_path),
+            },
             progress,
         )
     }
@@ -3844,7 +3893,9 @@ mod tests {
             general: General {
                 version: "0.6.0".into(),
                 install_prefix: "/usr".into(),
-                db_path: "/tmp/test.db".into(),
+                // Inside a directory that does not exist: no test can open,
+                // create or share it (review round 1, bd sp78.1).
+                db_path: "/nonexistent/das-backup-tests/index.db".into(),
                 log_file: "/tmp/test.log".into(),
                 growth_log: "/tmp/growth.log".into(),
                 last_report: "/tmp/last-report.txt".into(),
@@ -8660,6 +8711,9 @@ mod tests {
             "2026-10-02",
             &listing(&["@srv", "@new"]),
             &|_| true,
+            crate::adopt::CoverageMode::Compare {
+                db: &dir.path().join("index.db"),
+            },
             &progress,
         );
         assert!(!sync.failed, "{}", sync.report);
@@ -8701,6 +8755,9 @@ mod tests {
             "2026-10-02",
             &listing(&["@srv"]),
             &|_| false,
+            crate::adopt::CoverageMode::Compare {
+                db: &dir.path().join("index.db"),
+            },
             &progress,
         );
         assert!(sync.failed, "{}", sync.report);
@@ -8726,6 +8783,7 @@ mod tests {
             "2026-10-02",
             &listing(&["@srv", "@new"]),
             &|_| true,
+            &dir.path().join("index.db"),
             &progress,
         )
         .unwrap();
@@ -8751,6 +8809,7 @@ mod tests {
             "2026-10-02",
             &listing(&["@srv"]),
             &|_| false,
+            &dir.path().join("index.db"),
             &progress,
         )
         .unwrap_err();
@@ -8793,6 +8852,9 @@ mod tests {
             "2026-10-02",
             &listing(&["@srv"]),
             &|_| true,
+            crate::adopt::CoverageMode::Compare {
+                db: &dir.path().join("index.db"),
+            },
             &progress,
         );
         assert_eq!(config.general.version, "loaded-before-sync");
@@ -8833,6 +8895,9 @@ mod tests {
             "2026-10-02",
             &listing(&["@srv"]),
             &|_| true,
+            crate::adopt::CoverageMode::Compare {
+                db: &dir.path().join("index.db"),
+            },
             &TestProgress::new(),
         );
         assert!(!sync.failed, "{}", sync.report);
@@ -8850,6 +8915,7 @@ mod tests {
         SyncSection {
             report: "SUBVOLUME SYNC\n  VOLUMES NOT READ (nothing adopted or retired there):\n    /ssd: not mounted\n".into(),
             failed: true,
+            coverage: None,
         }
     }
 
@@ -8930,6 +8996,7 @@ mod tests {
             subvolume_sync: Some(SyncSection {
                 report: "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n".into(),
                 failed: false,
+                coverage: None,
             }),
             ..Default::default()
         };
@@ -8981,6 +9048,45 @@ mod tests {
         report_emailed: bool,
         /// The step during which the GUI's Cancel arrives (bd yq2).
         cancel_during: Option<&'static str>,
+        /// The coverage check the fake sync reports (clean by default).
+        sync_coverage: Option<crate::coverage::CoverageOutcome>,
+    }
+
+    /// A clean coverage check, as a recorded backup run with nothing dropped
+    /// reports it.
+    fn clean_coverage() -> crate::coverage::CoverageOutcome {
+        crate::coverage::CoverageOutcome {
+            kind: crate::coverage::CoverageKind::Compared,
+            pairs: 3,
+            compared_with: Some(crate::db::CoverageState {
+                first_recorded: "2026-10-01".into(),
+                last_recorded: "2026-10-01".into(),
+                checks: 1,
+            }),
+            drops: Vec::new(),
+            restored: Vec::new(),
+            renamed_targets: Vec::new(),
+            gone: 0,
+            new_pairs: 0,
+            recording: crate::coverage::Recording::Recorded,
+            accept_db: None,
+        }
+    }
+
+    /// [`clean_coverage`] with one pair no longer backed up.
+    fn dropped_coverage() -> crate::coverage::CoverageOutcome {
+        crate::coverage::CoverageOutcome {
+            drops: vec![crate::coverage::DropBlock {
+                volume: "/ssd".into(),
+                subvolume: "@data".into(),
+                targets: vec!["primary-22tb".into()],
+                why: "excluded by pattern '@d*' ([subvolumes].exclude); no config entry names it"
+                    .into(),
+                since: "2026-10-01".into(),
+                runs: 1,
+            }],
+            ..clean_coverage()
+        }
     }
 
     impl Default for FakeHost {
@@ -8999,6 +9105,7 @@ mod tests {
                 report_saved: Ok(()),
                 report_emailed: true,
                 cancel_during: None,
+                sync_coverage: Some(clean_coverage()),
             }
         }
     }
@@ -9051,6 +9158,7 @@ mod tests {
             report_sent: r.report_sent,
             errors: r.errors.clone(),
             duration_secs: r.duration_secs,
+            coverage_message: r.coverage_message.clone(),
         }
     }
 
@@ -9091,6 +9199,7 @@ mod tests {
                 SyncSection {
                     report: "SUBVOLUME SYNC\n".into(),
                     failed: self.sync_failed,
+                    coverage: self.sync_coverage.clone(),
                 },
             )
         }
@@ -9140,6 +9249,7 @@ mod tests {
                 report_sent: false,
                 errors,
                 duration_secs: 1,
+                coverage_message: String::new(),
             })
         }
         fn capture_report(&self, _: &Config) -> crate::report::ReportData {
@@ -10113,6 +10223,7 @@ mod tests {
                 vec!["a".into(), "b".into()]
             },
             duration_secs: 0,
+            coverage_message: String::new(),
         }
     }
 
@@ -10654,16 +10765,36 @@ mod tests {
         let progress = TestProgress::new();
         let mut before = make_test_config();
         before.general.version = "before".into();
+        // Its own index database, which a dry run must never create.
+        let db = dir.path().join("index.db");
+        before.general.db_path = db.to_string_lossy().into_owned();
         // No config there: the run keeps the config it had, and fails sync.
         let (config, sync) = host.sync(&before, true, &progress);
         assert_eq!(config.general.version, "before");
         assert!(sync.failed);
         assert_eq!(sync_fixture(dir.path()), host.config_path);
         // A dry run of sync against this host's real volumes: whatever it
-        // finds, it loads the config back from the file.
+        // finds, it loads the config back from the file, and records nothing.
         let (config, _) = host.sync(&before, true, &progress);
         assert_ne!(config.general.version, "before");
         assert_eq!(config.sources[0].volume, "/ssd");
+        assert!(!db.exists(), "a dry run recorded coverage");
+    }
+
+    /// No test may share an index database: the one the test config names
+    /// sits in a directory that does not exist, so nothing can open, create
+    /// or record into it (review round 1: `/tmp/test.db` was shared by every
+    /// run and agent, and a dry-run mutant recorded into it).
+    #[test]
+    fn the_test_config_names_an_index_database_no_test_can_reach() {
+        let db = make_test_config().general.db_path;
+        let parent = Path::new(&db).parent().expect("a directory");
+        assert!(
+            !parent.exists(),
+            "{} exists: a test could open {db}",
+            parent.display()
+        );
+        assert!(Database::open(&db).is_err(), "{db} opened");
     }
 
     // -- the recovery-OS step and `recovery-os record` (bd 58c8) ------------
@@ -11377,5 +11508,215 @@ mod tests {
             .verify(&config, &labels(&["other"]), &TestProgress::new())
             .unwrap_err();
         assert!(why.contains("NOT a mount point"), "{why}");
+    }
+
+    // --- subvolume coverage on the CLI/GUI path (bd DAS-Backup-Manager-sp78.1) ---
+
+    #[test]
+    fn a_coverage_warning_is_a_warning_in_the_report_and_never_a_failure() {
+        let host = FakeHost {
+            sync_coverage: Some(dropped_coverage()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success(), "{outcome:?}");
+        assert_eq!(outcome.exit_code(), 0);
+        let (ok, _) = outcome.finish_line(false);
+        assert!(ok, "JobFinished success stays true");
+        assert!(host.recorded.lock().unwrap()[0].success);
+        let text = host.report_texts.lock().unwrap()[0].clone();
+        assert!(text.contains("Status: COMPLETED WITH WARNINGS"), "{text}");
+        assert!(
+            text.contains(
+                "  Subvolume sync        OK\n  Subvolume coverage    WARN  (1 subvolume/target \
+                 pair no longer backed up)\n"
+            ),
+            "{text}"
+        );
+
+        // The counter: clean coverage is a clean report.
+        let host = FakeHost::default();
+        let (outcome, _) = job(&host, false);
+        assert_eq!(outcome.exit_code(), 0);
+        let text = host.report_texts.lock().unwrap()[0].clone();
+        assert!(text.contains("Status: ALL OPERATIONS SUCCESSFUL"), "{text}");
+        assert!(
+            text.contains("  Subvolume coverage    OK  (3 subvolume/target pairs, none dropped)\n"),
+            "{text}"
+        );
+
+        // A failure outranks the warning.
+        let host = FakeHost {
+            sync_failed: true,
+            sync_coverage: Some(dropped_coverage()),
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(!outcome.success());
+        let text = host.report_texts.lock().unwrap()[0].clone();
+        assert!(text.contains("Status: FAILURES DETECTED"), "{text}");
+    }
+
+    /// Review round 1: the CLI's stdout and the GUI's JobFinished text read a
+    /// clean success while the report said COMPLETED WITH WARNINGS. The
+    /// coverage warning is a line of the finish text, as the recovery-OS and
+    /// boot lines are; success and the exit code stay as they were. Unlike
+    /// those, it is said on a dry run too: the drop is there whether or not
+    /// anything was recorded.
+    #[test]
+    fn a_coverage_warning_is_a_line_of_the_finish_text() {
+        let want = "subvolume coverage WARN: 1 subvolume/target pair no longer backed up";
+        for dry_run in [false, true] {
+            let host = FakeHost {
+                sync_coverage: Some(dropped_coverage()),
+                ..Default::default()
+            };
+            let (outcome, _) = job(&host, dry_run);
+            let (ok, text) = outcome.finish_line(dry_run);
+            assert!(ok, "still a success");
+            assert_eq!(outcome.exit_code(), 0);
+            assert!(text.lines().any(|l| l == want), "dry_run={dry_run}: {text}");
+        }
+        let host = FakeHost::default();
+        let (outcome, _) = job(&host, false);
+        let (_, text) = outcome.finish_line(false);
+        assert!(!text.contains("subvolume coverage"), "{text}");
+        let host = FakeHost {
+            sync_coverage: None,
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        let (_, text) = outcome.finish_line(false);
+        assert!(
+            text.lines()
+                .any(|l| l == "subvolume coverage WARN: not checked: subvolume sync could not run"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_sync_with_no_coverage_reports_it_not_checked() {
+        let host = FakeHost {
+            sync_coverage: None,
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert_eq!(outcome.exit_code(), 0);
+        let text = host.report_texts.lock().unwrap()[0].clone();
+        assert!(text.contains("Status: COMPLETED WITH WARNINGS"), "{text}");
+        assert!(
+            text.contains(
+                "  Subvolume coverage    WARN  (not checked: subvolume sync could not run)\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// The host records the coverage check on a backup run; a manual step
+    /// compares and writes nothing.
+    #[test]
+    fn the_host_records_coverage_and_a_manual_step_only_compares() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        assert_eq!(sync_fixture(dir.path()), host.config_path);
+        let db = dir.path().join("index.db");
+        let mut before = make_test_config();
+        before.general.db_path = db.to_string_lossy().into_owned();
+        let progress = TestProgress::new();
+        // A dry run records nothing, whatever the host asks.
+        let (_, sync) = host.sync(&before, true, &progress);
+        assert!(!db.exists(), "a dry run created the database");
+        assert_eq!(
+            sync.coverage.as_ref().unwrap().recording,
+            crate::coverage::Recording::DryRun
+        );
+        let (_, sync) = host.sync(&before, false, &progress);
+        assert_eq!(
+            sync.coverage.as_ref().unwrap().recording,
+            crate::coverage::Recording::Recorded,
+            "{}",
+            sync.report
+        );
+        let recorded = crate::db::read_coverage_read_only(&db).unwrap().unwrap();
+        assert_eq!(recorded.state.checks, 1);
+        // `sync_for_manual_step` (the binding) compares the same database.
+        let _ = sync_for_manual_step(&host.config_path, &before, &progress);
+        assert_eq!(
+            crate::db::read_coverage_read_only(&db).unwrap().unwrap(),
+            recorded
+        );
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(_, m)| m.contains("not recorded (only a backup run records)")),
+            "the manual step compared: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_coverage_warning_is_logged_as_a_warning_and_never_refuses_a_manual_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let progress = TestProgress::new();
+        // A database that cannot be read: the check is not made, a WARN.
+        let config = sync_for_manual_step_with(
+            &path,
+            &make_test_config(),
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| true,
+            dir.path(),
+            &progress,
+        )
+        .expect("a coverage warning is no refusal");
+        assert_eq!(config.sources[0].volume, "/ssd");
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(level, msg)| *level == LogLevel::Warning
+                && msg.starts_with("SUBVOLUME COVERAGE: WARN  (not checked: index database ")),
+            "{logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|(level, msg)| *level == LogLevel::Warning && msg == "SUBVOLUME SYNC"),
+            "the whole section is logged at warning level: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn sync_before_backup_carries_the_coverage_into_the_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sync_fixture(dir.path());
+        let db = dir.path().join("index.db");
+        let (_, sync) = sync_before_backup(
+            &path,
+            &make_test_config(),
+            false,
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| true,
+            crate::adopt::CoverageMode::Record { db: &db },
+            &TestProgress::new(),
+        );
+        let coverage = sync.coverage.expect("the section carries the check");
+        assert_eq!(coverage.kind, crate::coverage::CoverageKind::NoBaseline);
+        assert!(
+            sync.report.ends_with(&coverage.section()),
+            "{}",
+            sync.report
+        );
+        // A sync that could not run carries none.
+        let (_, sync) = sync_before_backup(
+            &dir.path().join("absent.toml"),
+            &make_test_config(),
+            false,
+            "2026-10-02",
+            &listing(&["@srv"]),
+            &|_| true,
+            crate::adopt::CoverageMode::Record { db: &db },
+            &TestProgress::new(),
+        );
+        assert_eq!(sync.coverage, None);
+        assert!(sync.failed);
     }
 }

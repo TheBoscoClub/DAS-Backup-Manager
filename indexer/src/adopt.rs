@@ -408,7 +408,7 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
 /// `primary target only` when it reaches one target and that is a primary,
 /// `primary targets 'a', 'b' only` for several primaries, the labels when
 /// any is a mirror (`targets 'big', 'small'`), or `no target`.
-fn scope_of(config: &Config, source: &Source) -> String {
+pub(crate) fn scope_of(config: &Config, source: &Source) -> String {
     let reached: Vec<&crate::config::Target> = config
         .targets
         .iter()
@@ -692,6 +692,10 @@ pub struct SyncOutcome {
     /// otherwise read the un-updated file and trip on an entry the real run
     /// retires first (bd DAS-Backup-Manager-g17).
     pub planned_btrbk_conf: Option<String>,
+    /// The subvolume coverage check this sync made (`coverage::check`). `None`
+    /// only in an outcome built by hand; it reports as not checked, a WARN.
+    /// Coverage never fails a sync: [`failed`](Self::failed) ignores it.
+    pub coverage: Option<crate::coverage::CoverageOutcome>,
 }
 
 impl SyncOutcome {
@@ -700,15 +704,80 @@ impl SyncOutcome {
     }
 }
 
+/// What a sync does with the subvolume coverage check, and where the index
+/// database is. Either way the check is made; only `Record` writes, and never
+/// on a dry run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageMode<'a> {
+    /// Compare with the last recorded backup run and write nothing: a sync by
+    /// hand, `backup snapshot|send`.
+    Compare { db: &'a Path },
+    /// Compare and record this check: a backup run.
+    Record { db: &'a Path },
+}
+
+impl<'a> CoverageMode<'a> {
+    pub fn db(self) -> &'a Path {
+        match self {
+            Self::Compare { db } | Self::Record { db } => db,
+        }
+    }
+
+    /// Whether this check is to be recorded (a dry run still never is).
+    pub fn records(self) -> bool {
+        matches!(self, Self::Record { .. })
+    }
+}
+
 /// Bring `config.toml` and `btrbk.conf` into line with the subvolumes on the
-/// already-mounted source volumes. Mounts and unmounts nothing.
+/// already-mounted source volumes, then check subvolume coverage against what
+/// the files now say (`coverage`). Mounts and unmounts nothing.
+///
+/// The coverage check is the one rule both backup paths share: `backup-run.sh`
+/// reaches it through `btrdasd subvol sync --record-coverage`, the CLI/GUI run
+/// through `backup::sync_before_backup`. It compares with the configuration
+/// that holds after this sync — re-read from disk on a real sync, so it is
+/// what `config.toml` and `btrbk.conf` say in every branch (written, nothing
+/// to write, a failed write rolled back); on a dry run, what a real run would
+/// leave. It never changes [`SyncOutcome::failed`].
 pub fn sync_subvolumes(
     config_path: &Path,
     dry_run: bool,
     today: &str,
     runner: &dyn CommandRunner,
     is_mountpoint: &dyn Fn(&Path) -> bool,
+    coverage: CoverageMode<'_>,
 ) -> Result<SyncOutcome, String> {
+    let (mut outcome, planned, listings) =
+        sync_config(config_path, dry_run, today, runner, is_mountpoint)?;
+    let now = if dry_run {
+        Ok(planned)
+    } else {
+        Config::load(config_path)
+            .map_err(|e| format!("config.toml could not be re-read after sync: {e}"))
+    };
+    outcome.coverage = Some(crate::coverage::check(
+        coverage.db(),
+        coverage.records() && !dry_run,
+        dry_run,
+        now,
+        &outcome.plan,
+        &listings,
+        today,
+    ));
+    Ok(outcome)
+}
+
+/// The sync itself: the outcome, the configuration a real run would leave
+/// (what was loaded, or on a dry run that changes something, the plan
+/// applied when it applies and validates), and the listings it read.
+fn sync_config(
+    config_path: &Path,
+    dry_run: bool,
+    today: &str,
+    runner: &dyn CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+) -> Result<(SyncOutcome, Config, Vec<VolumeListing>), String> {
     let config = Config::load(config_path)
         .map_err(|e| format!("could not load {}: {e}", config_path.display()))?;
     // A dry run only reads the live files; a real one may write them (bd 5u15).
@@ -749,42 +818,48 @@ pub fn sync_subvolumes(
                 .or_else(|| current_btrbk_conf(&config)),
             _ => current_btrbk_conf(&config),
         });
-        return Ok(SyncOutcome {
+        let outcome = SyncOutcome {
             plan,
             written: false,
             write_error,
             btrbk_conf,
             retire_refused,
             planned_btrbk_conf: planned_btrbk_conf.flatten(),
-        });
+            coverage: None,
+        };
+        return Ok((outcome, config, listings));
     }
     if dry_run {
         // A real run writes both files from the updated config — unless it
         // cannot be applied or does not validate, and then neither.
-        let planned_btrbk_conf = match apply_plan(&config, &to_apply, today) {
-            Ok(updated) if updated.validate().is_empty() => {
-                crate::btrbk_conf::render_btrbk_conf(&updated).ok()
-            }
+        let updated = match apply_plan(&config, &to_apply, today) {
+            Ok(updated) if updated.validate().is_empty() => Some(updated),
             _ => None,
-        }
-        .or_else(|| current_btrbk_conf(&config));
-        return Ok(SyncOutcome {
+        };
+        let planned_btrbk_conf = updated
+            .as_ref()
+            .and_then(|u| crate::btrbk_conf::render_btrbk_conf(u).ok())
+            .or_else(|| current_btrbk_conf(&config));
+        let outcome = SyncOutcome {
             plan,
             retire_refused,
             planned_btrbk_conf,
             ..Default::default()
-        });
+        };
+        return Ok((outcome, updated.unwrap_or(config), listings));
     }
 
     let write_error = write_updated(&config, apply_plan(&config, &to_apply, today), config_path);
-    Ok(SyncOutcome {
+    let outcome = SyncOutcome {
         written: write_error.is_none(),
         plan,
         write_error,
         btrbk_conf: BtrbkConf::Current,
         retire_refused,
         planned_btrbk_conf: None,
-    })
+        coverage: None,
+    };
+    Ok((outcome, config, listings))
 }
 
 /// The `btrbk.conf` on disk now, or `None` when there is none to read.
@@ -904,8 +979,18 @@ fn not_saved(e: &dyn std::fmt::Display, restore: Result<(), Box<dyn std::error::
     }
 }
 
-/// The "SUBVOLUME SYNC" section of the run report.
+/// The "SUBVOLUME SYNC" section of the run report, then the "SUBVOLUME
+/// COVERAGE" section — always, on every outcome, failed ones included:
+/// `backup-run.sh` reads its coverage row from it, and a sync that returned
+/// without one is a FAIL there.
 pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
+    let mut r = sync_lines(outcome, dry_run);
+    r.push_str(&crate::coverage::section(outcome.coverage.as_ref()));
+    r
+}
+
+/// The "SUBVOLUME SYNC" section alone.
+fn sync_lines(outcome: &SyncOutcome, dry_run: bool) -> String {
     let plan = &outcome.plan;
     let mut r = String::from("SUBVOLUME SYNC\n");
     if !plan.changes_config()
@@ -1055,6 +1140,30 @@ pub fn format_sync_report(outcome: &SyncOutcome, dry_run: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sync the tests below were written against: coverage compared with
+    /// an index database beside the config, which none of them creates — so
+    /// nothing is recorded, and no test reaches a database outside its own
+    /// temporary directory.
+    fn sync_subvolumes(
+        config_path: &Path,
+        dry_run: bool,
+        today: &str,
+        runner: &dyn CommandRunner,
+        is_mountpoint: &dyn Fn(&Path) -> bool,
+    ) -> Result<SyncOutcome, String> {
+        let db = config_path.with_file_name("no-index.db");
+        let out = super::sync_subvolumes(
+            config_path,
+            dry_run,
+            today,
+            runner,
+            is_mountpoint,
+            CoverageMode::Compare { db: &db },
+        );
+        assert!(!db.exists(), "a compare-only sync created {}", db.display());
+        out
+    }
 
     fn pats(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -1635,6 +1744,7 @@ mod tests {
     // --- Task 7: the sync shell ---
 
     use crate::fsutil::testing::Scripted;
+    use std::collections::BTreeSet;
 
     fn mounted(_: &Path) -> bool {
         true
@@ -2084,7 +2194,9 @@ mod tests {
         let text = format_sync_report(&out, false);
         assert_eq!(
             text,
-            "SUBVOLUME SYNC\n  btrbk.conf was out of date with config.toml and has been regenerated.\n"
+            "SUBVOLUME SYNC\n  btrbk.conf was out of date with config.toml and has been regenerated.\n\
+             SUBVOLUME COVERAGE: OK  (no earlier record: 5 subvolume/target pairs \
+             — not recorded (only a backup run records))\n"
         );
     }
 
@@ -2120,7 +2232,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&conf).unwrap(), rendered);
         assert_eq!(
             format_sync_report(&out, false),
-            "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n"
+            "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n\
+             SUBVOLUME COVERAGE: OK  (no earlier record: 5 subvolume/target pairs \
+             — not recorded (only a backup run records))\n"
         );
     }
 
@@ -2466,10 +2580,12 @@ mod tests {
             btrbk_conf: BtrbkConf::Current,
             retire_refused: None,
             planned_btrbk_conf: None,
+            coverage: None,
         };
         assert_eq!(
             format_sync_report(&quiet, false),
-            "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n"
+            "SUBVOLUME SYNC\n  No new, vanished or returning subvolumes.\n\
+             SUBVOLUME COVERAGE: WARN  (not checked: subvolume sync could not run)\n"
         );
 
         let plan = SyncPlan {
@@ -2521,6 +2637,7 @@ mod tests {
                 btrbk_conf: BtrbkConf::Current,
                 retire_refused: None,
                 planned_btrbk_conf: None,
+                coverage: None,
             },
             false,
         );
@@ -2539,7 +2656,8 @@ mod tests {
              \x20 COULD NOT BE PLACED (not backed up):\n\
              \x20   top  [/hdd: no primary]\n\
              \x20 VOLUMES NOT READ (nothing adopted or retired there):\n\
-             \x20   /nvme: not mounted\n"
+             \x20   /nvme: not mounted\n\
+             SUBVOLUME COVERAGE: WARN  (not checked: subvolume sync could not run)\n"
         );
     }
 
@@ -2564,6 +2682,7 @@ mod tests {
                 btrbk_conf: BtrbkConf::Current,
                 retire_refused: None,
                 planned_btrbk_conf: None,
+                coverage: None,
             },
             true,
         );
@@ -2579,6 +2698,7 @@ mod tests {
                 btrbk_conf: BtrbkConf::Current,
                 retire_refused: None,
                 planned_btrbk_conf: None,
+                coverage: None,
             },
             false,
         );
@@ -2635,6 +2755,7 @@ mod tests {
                     btrbk_conf: BtrbkConf::Current,
                     retire_refused: None,
                     planned_btrbk_conf: None,
+                    coverage: None,
                 },
                 false,
             );
@@ -2669,6 +2790,7 @@ mod tests {
                     btrbk_conf: BtrbkConf::Current,
                     retire_refused: None,
                     planned_btrbk_conf: None,
+                    coverage: None,
                 },
                 dry,
             )
@@ -2936,7 +3058,8 @@ mod tests {
              \x20   @cache/x  [/ssd, excluded by '@cache']\n\
              \x20   @tmp  [/hdd, excluded by '@tmp']\n\
              \x20   3 subvolumes inside snapshot trees skipped on /ssd\n\
-             \x20   1 subvolume inside snapshot trees skipped on /hdd\n"
+             \x20   1 subvolume inside snapshot trees skipped on /hdd\n\
+             SUBVOLUME COVERAGE: WARN  (not checked: subvolume sync could not run)\n"
         );
         // No snapshot name is listed any more.
         assert!(!text.contains("srv.2026"), "{text}");
@@ -3504,6 +3627,318 @@ mod tests {
                 && block
                     .contains("  subvolume             .\n    snapshot_name       hdd-toplevel\n"),
             "{block}"
+        );
+    }
+
+    // --- subvolume coverage, as the sync makes it (bd DAS-Backup-Manager-sp78.1) ---
+
+    /// The real sync with coverage `mode`, over a healthy /ssd holding `on_disk`.
+    fn covered_sync(
+        path: &Path,
+        dry_run: bool,
+        today: &str,
+        on_disk: &[&str],
+        mode: CoverageMode<'_>,
+    ) -> SyncOutcome {
+        let r = scripted(vec![healthy("/ssd", "abc", on_disk)]);
+        super::sync_subvolumes(path, dry_run, today, &r, &mounted, mode).unwrap()
+    }
+
+    fn coverage_row(out: &SyncOutcome) -> String {
+        out.coverage
+            .as_ref()
+            .expect("the sync made the check")
+            .row()
+    }
+
+    fn edit_config(path: &Path, f: impl FnOnce(&mut Config)) {
+        let mut c = Config::load(path).unwrap();
+        f(&mut c);
+        c.save(path).unwrap();
+    }
+
+    fn checks_recorded(db: &Path) -> Option<u32> {
+        crate::db::read_coverage_read_only(db)
+            .unwrap()
+            .map(|b| b.state.checks)
+    }
+
+    /// Record, record, drop an entry behind a pattern, record twice, accept:
+    /// the whole life of a drop through the real sync and a real database.
+    #[test]
+    fn a_recorded_sync_compares_run_over_run_until_the_drop_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let db = dir.path().join("index.db");
+        let rec = CoverageMode::Record { db: &db };
+        let disk = ["@srv", "@opt"];
+
+        let out = covered_sync(&path, false, "2026-10-02", &disk, rec);
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (no earlier record: 5 subvolume/target pairs; recorded — drops are reported \
+             from the next run)"
+        );
+        let rows = crate::db::read_coverage_read_only(&db)
+            .unwrap()
+            .unwrap()
+            .rows;
+        let keys: BTreeSet<crate::coverage::Pair> = rows
+            .iter()
+            .map(|r| crate::coverage::Pair {
+                volume: r.volume.clone(),
+                subvolume: r.subvolume.clone(),
+                target: r.target.clone(),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            crate::coverage::intended(&Config::load(&path).unwrap())
+                .into_keys()
+                .collect()
+        );
+
+        let out = covered_sync(&path, false, "2026-10-03", &disk, rec);
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (5 subvolume/target pairs, none dropped)"
+        );
+
+        edit_config(&path, |c| {
+            c.sources[0].subvolumes.retain(|e| e.name != "@opt");
+            c.subvolumes.exclude = vec!["@op*".into()];
+        });
+        let out = covered_sync(&path, false, "2026-10-04", &disk, rec);
+        assert!(!out.failed(), "coverage never fails a sync: {out:?}");
+        assert_eq!(
+            coverage_row(&out),
+            "WARN  (2 subvolume/target pairs no longer backed up)"
+        );
+        let report = format_sync_report(&out, false);
+        // The test's own database is not the default, so the line names it.
+        assert!(
+            report.contains(&format!(
+                "    /ssd  @opt  -> big, small\n      why:    excluded by pattern '@op*' \
+                 ([subvolumes].exclude); no config entry names it\n      since:  2026-10-04, 1 \
+                 recorded run\n      accept: btrdasd subvol coverage accept --db '{}' '/ssd' \
+                 '@opt'\n",
+                db.display()
+            )),
+            "{report}"
+        );
+        assert!(!report.contains("Gone from disk"), "{report}");
+
+        let out = covered_sync(&path, false, "2026-10-05", &disk, rec);
+        let report = format_sync_report(&out, false);
+        assert!(
+            report.contains("      since:  2026-10-04, 2 recorded runs\n"),
+            "{report}"
+        );
+
+        let accepted = crate::db::Database::open(&db)
+            .unwrap()
+            .accept_coverage(None, None, None, "2026-10-05T09:00:00Z")
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+        let out = covered_sync(&path, false, "2026-10-06", &disk, rec);
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (3 subvolume/target pairs, none dropped)"
+        );
+        assert_eq!(checks_recorded(&db), Some(5));
+    }
+
+    #[test]
+    fn a_dry_run_records_nothing_whatever_the_mode_and_creates_no_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let db = dir.path().join("index.db");
+        let rec = CoverageMode::Record { db: &db };
+        let out = covered_sync(&path, true, "2026-10-02", &["@srv", "@opt"], rec);
+        assert!(!db.exists(), "a dry run created the database");
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (no earlier record: 5 subvolume/target pairs — dry run, not recorded)"
+        );
+
+        covered_sync(&path, false, "2026-10-02", &["@srv", "@opt"], rec);
+        let bytes = std::fs::read(&db).unwrap();
+        let out = covered_sync(&path, true, "2026-10-03", &["@srv", "@opt"], rec);
+        assert_eq!(
+            out.coverage.as_ref().unwrap().recording,
+            crate::coverage::Recording::DryRun
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            bytes,
+            "a dry run wrote the database"
+        );
+        assert_eq!(checks_recorded(&db), Some(1));
+    }
+
+    #[test]
+    fn a_compare_only_sync_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let db = dir.path().join("index.db");
+        covered_sync(
+            &path,
+            false,
+            "2026-10-02",
+            &["@srv", "@opt"],
+            CoverageMode::Record { db: &db },
+        );
+        let cmp = CoverageMode::Compare { db: &db };
+        let out = covered_sync(&path, false, "2026-10-03", &["@srv", "@opt"], cmp);
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (5 subvolume/target pairs, none dropped — not recorded (only a backup run \
+             records))"
+        );
+        assert_eq!(checks_recorded(&db), Some(1));
+        assert!(!cmp.records() && CoverageMode::Record { db: &db }.records());
+        assert_eq!(cmp.db(), db.as_path());
+        assert_eq!(CoverageMode::Record { db: &db }.db(), db.as_path());
+    }
+
+    #[test]
+    fn an_index_database_that_cannot_be_opened_is_not_checked_and_fails_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let out = covered_sync(
+            &path,
+            false,
+            "2026-10-02",
+            &["@srv", "@opt"],
+            CoverageMode::Record { db: dir.path() },
+        );
+        assert!(!out.failed(), "{out:?}");
+        let row = coverage_row(&out);
+        assert!(
+            row.starts_with("WARN  (not checked: index database "),
+            "{row}"
+        );
+    }
+
+    /// A runner that, while the sync lists the volume, replaces config.toml
+    /// with something that does not load: the re-read after sync fails.
+    struct BreaksConfig<'a> {
+        inner: Scripted,
+        config: &'a Path,
+    }
+
+    impl CommandRunner for BreaksConfig<'_> {
+        fn output(&self, cmd: &mut Command) -> std::io::Result<std::process::Output> {
+            if cmd.get_program() == "btrfs" {
+                std::fs::write(self.config, "this is [[[ not toml").unwrap();
+            }
+            self.inner.output(cmd)
+        }
+        fn stream(
+            &self,
+            cmd: &mut Command,
+            on_line: &mut dyn FnMut(&str),
+        ) -> std::io::Result<std::process::Output> {
+            self.inner.stream(cmd, on_line)
+        }
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_re_read_after_sync_is_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let db = dir.path().join("index.db");
+        let r = BreaksConfig {
+            inner: scripted(vec![healthy("/ssd", "abc", &["@srv", "@opt"])]),
+            config: &path,
+        };
+        let out = super::sync_subvolumes(
+            &path,
+            false,
+            "2026-10-02",
+            &r,
+            &mounted,
+            CoverageMode::Record { db: &db },
+        )
+        .unwrap();
+        let row = coverage_row(&out);
+        assert!(
+            row.starts_with("WARN  (not checked: config.toml could not be re-read after sync: "),
+            "{row}"
+        );
+        assert!(!db.exists(), "nothing recorded");
+    }
+
+    /// An entry removed by hand with no pattern to keep it out: sync adopts
+    /// it again in the same run, as its parent. A dry run compares with what
+    /// the real run would leave, so it reports nothing dropped either.
+    #[test]
+    fn a_removed_nested_entry_that_sync_re_adopts_is_no_drop_on_a_dry_run_or_a_real_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let db = dir.path().join("index.db");
+        let rec = CoverageMode::Record { db: &db };
+        let disk = ["@srv", "@opt", "@srv/web"];
+        edit_config(&path, |c| {
+            c.sources[0].subvolumes.push(SubvolConfig {
+                name: "@srv/web".into(),
+                ..Default::default()
+            })
+        });
+        covered_sync(&path, false, "2026-10-02", &disk, rec);
+        edit_config(&path, |c| {
+            c.sources[0].subvolumes.retain(|e| e.name != "@srv/web")
+        });
+        let out = covered_sync(&path, true, "2026-10-03", &disk, rec);
+        assert_eq!(out.plan.adopt.len(), 1, "{:?}", out.plan);
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (7 subvolume/target pairs, none dropped — dry run, not recorded)"
+        );
+        let out = covered_sync(&path, false, "2026-10-03", &disk, rec);
+        assert!(out.written, "{out:?}");
+        assert_eq!(
+            coverage_row(&out),
+            "OK  (7 subvolume/target pairs, none dropped)"
+        );
+    }
+
+    /// The report always ends with the coverage section, on the quiet path
+    /// and a failed sync alike: the script's contract.
+    #[test]
+    fn every_sync_report_ends_with_the_coverage_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = on_disk_config(dir.path());
+        let db = dir.path().join("index.db");
+        let quiet = covered_sync(
+            &path,
+            false,
+            "2026-10-02",
+            &["@srv", "@opt"],
+            CoverageMode::Compare { db: &db },
+        );
+        let text = format_sync_report(&quiet, false);
+        assert!(text.starts_with("SUBVOLUME SYNC\n"), "{text}");
+        assert!(
+            text.contains("\nSUBVOLUME COVERAGE: OK  (no earlier record: 5 subvolume/target pairs"),
+            "{text}"
+        );
+        let failed = super::sync_subvolumes(
+            &path,
+            false,
+            "2026-10-02",
+            &Scripted::new(&[]),
+            &unmounted,
+            CoverageMode::Compare { db: &db },
+        )
+        .unwrap();
+        assert!(failed.failed());
+        let text = format_sync_report(&failed, false);
+        assert!(text.contains("  VOLUMES NOT READ"), "{text}");
+        // Nothing on the unread volume is retired, so nothing is dropped.
+        assert!(
+            text.ends_with("SUBVOLUME COVERAGE: OK  (no earlier record: 5 subvolume/target pairs — not recorded (only a backup run records))\n"),
+            "{text}"
         );
     }
 }
