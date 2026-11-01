@@ -1447,6 +1447,41 @@ mod tests {
         assert_eq!(o.renamed_targets.len(), 1);
     }
 
+    /// A target removed while a still-recorded target takes its drive is a
+    /// removal, not a rename: re-keying its rows onto a label that already
+    /// holds rows for the same subvolumes would collide on the baseline's
+    /// key, and the record would fail on every run.
+    #[test]
+    fn an_old_target_is_never_renamed_onto_a_label_already_recorded() {
+        let b1 = first(&cfg());
+        let mut now = cfg();
+        now.targets.truncate(1);
+        now.targets[0].serial = "SERIAL02".into();
+        now.targets[0].serials = vec!["SERIAL02".into()];
+        let (o, _) = step(Some(&b1), &now, &on_disk(), DAY2, Recording::Recorded);
+        assert!(o.renamed_targets.is_empty(), "{:?}", o.renamed_targets);
+        assert_eq!(o.dropped_pairs(), 3, "{}", o.section());
+        assert!(
+            o.drops
+                .iter()
+                .all(|b| b.why == "target 'small' is no longer configured"),
+            "{}",
+            o.section()
+        );
+        // And the record of it is written, twice over, not refused.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let (plan, was) = plan_and_now(&cfg());
+        check(&db, true, false, Ok(was), &plan, &on_disk(), DAY1);
+        let (plan, now) = plan_and_now(&now);
+        for day in [DAY2, DAY3] {
+            let o = check(&db, true, false, Ok(now.clone()), &plan, &on_disk(), day);
+            assert!(matches!(o.recording, Recording::Recorded), "{o:?}");
+            assert!(o.renamed_targets.is_empty(), "{o:?}");
+            assert_eq!(o.dropped_pairs(), 3, "{o:?}");
+        }
+    }
+
     #[test]
     fn an_old_target_whose_rows_disagree_on_identity_is_not_renamed() {
         let b1 = first(&cfg());
