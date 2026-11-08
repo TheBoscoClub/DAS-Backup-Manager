@@ -1447,19 +1447,19 @@ mod tests {
     /// so a spawn would show.
     #[test]
     fn a_test_build_never_spawns_mailx() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let stub = dir.path().join("mailx-stub");
-        std::fs::write(
+        // Written by `install`, never by this process: a write descriptor on
+        // the stub inherited by another test's fork fails the probe's exec
+        // with ETXTBSY (seen in CI on 4d1071ae, bd DAS-Backup-Manager-1x76).
+        crate::recovery_os::session::tests::write_executable(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/bash\nprintf '%s\\n' \"$@\" >>'{}'\ncat >/dev/null\nexit 0\n",
                 marker.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         // The stub records when it is run.
         let probe = Command::new(&stub)
             .arg("probe")
@@ -1567,14 +1567,15 @@ mod tests {
     /// failing program's stderr is what the error says.
     #[test]
     fn the_spawn_passes_the_arguments_and_the_body_and_keeps_stderr() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let args_file = dir.path().join("args");
         let body_file = dir.path().join("body");
         let stub = dir.path().join("program");
-        std::fs::write(
+        // By `install`, so no write descriptor on it can reach another
+        // test's fork (ETXTBSY; see `a_test_build_never_spawns_mailx`).
+        crate::recovery_os::session::tests::write_executable(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/bash\nprintf '%s\\n' \"$@\" >'{args}'\ncat >'{body}'\n\
                  echo 'to stdout'\n\
                  if [[ \"$1\" == fail ]]; then echo '  relay said no  ' >&2; exit 4; fi\n\
@@ -1582,9 +1583,7 @@ mod tests {
                 args = args_file.display(),
                 body = body_file.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let program = stub.to_str().unwrap();
 
         let args = vec![

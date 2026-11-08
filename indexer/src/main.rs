@@ -5035,19 +5035,29 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     /// does: nothing a `btrdasd` test runs can spawn mailx.
     #[test]
     fn this_test_build_of_the_binary_never_spawns_mailx() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let stub = dir.path().join("mailx-stub");
+        // The stub is made by `install` from a draft, so this process never
+        // holds a write descriptor on it: one inherited by another test's
+        // fork fails the probe's exec with ETXTBSY (bd DAS-Backup-Manager-1x76).
+        let draft = dir.path().join("mailx-stub.draft");
         std::fs::write(
-            &stub,
+            &draft,
             format!(
                 "#!/bin/bash\nprintf '%s\\n' \"$@\" >>'{}'\ncat >/dev/null\nexit 0\n",
                 marker.display()
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = std::process::Command::new("install")
+            .arg("-m")
+            .arg("755")
+            .arg(&draft)
+            .arg(&stub)
+            .status()
+            .unwrap();
+        assert!(installed.success(), "install {} failed", stub.display());
         // Its stdin is null: the stub drains it, and an inherited one would
         // never end.
         let probe = std::process::Command::new(&stub)

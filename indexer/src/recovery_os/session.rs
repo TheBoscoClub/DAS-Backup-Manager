@@ -500,7 +500,7 @@ pub fn run_session(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::progress::{CancelToken, LogLevel, ProgressCallback};
     use crate::recovery_os::panel::tests::two_mirrors_and_a_primary;
@@ -514,7 +514,7 @@ mod tests {
     /// child another test is forking at that moment, and exec then fails with
     /// ETXTBSY (seen: 3 of 25 full-suite runs). The draft is written here;
     /// the executable is a fresh copy `install` makes in its own process.
-    fn write_executable(path: &Path, content: &str) {
+    pub(crate) fn write_executable(path: &Path, content: &str) {
         let draft = path.with_extension("draft");
         std::fs::write(&draft, content).unwrap();
         let status = Command::new("install")
