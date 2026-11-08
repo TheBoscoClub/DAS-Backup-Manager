@@ -42,7 +42,7 @@ console = "0.16"
 libc = "0.2"
 serde_json = "1"
 zbus = { version = "5", features = ["tokio"], optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"], optional = true }
 
 [profile.release]
 opt-level = 3

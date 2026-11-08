@@ -2576,20 +2576,59 @@ async fn serve_then_claim_name(
 /// here: the interface holds a clone of the connection it is served on. So the
 /// helper calls itself: an `Introspect` of its own object only gets an answer
 /// from a running dispatch task.
+///
+/// The probe can land in that same gap and be dropped: unanswered, it waited
+/// forever, and systemd killed the start at its timeout — 4 of 5 starts on the
+/// host, 2026-11-08, the bus showing the `Introspect` and no reply
+/// (bd DAS-Backup-Manager-3i1). So each probe waits [`READY_PROBE_WAIT`], then
+/// another is sent; one answered is the proof, and an error (a policy denial)
+/// is returned as it was.
 async fn await_object_server_ready(conn: &Connection) -> zbus::Result<()> {
     let own_name = conn
         .unique_name()
         .ok_or_else(|| zbus::Error::Failure("no unique name on the bus connection".into()))?
         .to_owned();
-    conn.call_method(
-        Some(own_name),
-        HELPER_PATH,
-        Some("org.freedesktop.DBus.Introspectable"),
-        "Introspect",
-        &(),
-    )
-    .await?;
-    Ok(())
+    let answered = first_answer(READY_PROBE_WAIT, READY_PROBES, || {
+        let own_name = own_name.clone();
+        async move {
+            conn.call_method(
+                Some(own_name),
+                HELPER_PATH,
+                Some("org.freedesktop.DBus.Introspectable"),
+                "Introspect",
+                &(),
+            )
+            .await
+            .map(drop)
+        }
+    })
+    .await;
+    answered.unwrap_or_else(|| {
+        Err(zbus::Error::Failure(format!(
+            "the object server answered none of {READY_PROBES} self-checks"
+        )))
+    })
+}
+
+/// How long one readiness probe waits for its answer before another is sent.
+const READY_PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How many probes, at most: 5 s in all, inside systemd's start timeout.
+const READY_PROBES: u32 = 20;
+
+/// The first of up to `attempts` calls of `call` to finish within `wait`, or
+/// `None` when none did. A call still pending at its `wait` is dropped and the
+/// next one made — what a request whose message was lost needs.
+async fn first_answer<T, F, Fut>(wait: std::time::Duration, attempts: u32, mut call: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    for _ in 0..attempts {
+        if let Ok(answer) = tokio::time::timeout(wait, call()).await {
+            return Some(answer);
+        }
+    }
+    None
 }
 
 #[tokio::main]
@@ -2702,6 +2741,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the readiness probe asks again when its message was lost (bd 3i1)
+
+    #[tokio::test]
+    async fn a_probe_left_unanswered_is_sent_again_and_the_first_answer_wins() {
+        let made = std::sync::atomic::AtomicU32::new(0);
+        let answer = first_answer(std::time::Duration::from_millis(20), 5, || {
+            let n = made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    // A dropped message: no answer ever comes.
+                    std::future::pending::<()>().await;
+                }
+                n
+            }
+        })
+        .await;
+        assert_eq!(answer, Some(2));
+        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn probes_that_all_go_unanswered_end_in_none_after_the_last() {
+        let made = std::sync::atomic::AtomicU32::new(0);
+        let answer = first_answer(std::time::Duration::from_millis(5), 4, || {
+            made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<u32>()
+        })
+        .await;
+        assert_eq!(answer, None);
+        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_an_error_is_returned_not_retried() {
+        let made = std::sync::atomic::AtomicU32::new(0);
+        let answer: Option<Result<(), &str>> =
+            first_answer(std::time::Duration::from_millis(20), 5, || {
+                made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err("denied") }
+            })
+            .await;
+        assert_eq!(answer, Some(Err("denied")));
+        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     // --- recovery-OS methods (bd DAS-Backup-Manager-8249 stage 2)
 
