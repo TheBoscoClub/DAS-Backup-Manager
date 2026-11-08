@@ -34,7 +34,8 @@ use crate::doctor::glob_match;
 /// Why a plan refused to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgetRefusal {
-    /// The pattern matches a series btrbk is still backing up.
+    /// The pattern matches a series btrbk is still backing up, or a retired or
+    /// top-level one whose backups are kept ([`protected_series`]).
     LiveSeries(String),
     /// The pattern matched nothing.
     NoMatch,
@@ -150,6 +151,27 @@ pub fn parse_subvol_snapshot_names(conf: &str) -> std::collections::HashMap<Stri
         }
     }
     map
+}
+
+/// The series `forget` must never take: those btrbk still writes (`live`,
+/// read from `btrbk.conf`), and the series of every retired entry in
+/// `sources` — a retired entry is rendered out of `btrbk.conf`, but its
+/// backups are kept until `subvol expire` judges them past their window, and
+/// the report says so (bd DAS-Backup-Manager-ow2a). A top level (`.`) is
+/// never expired at all. Named as expiry names them
+/// ([`crate::btrbk_conf::resolve_snapshot_names`] over each source's
+/// entries), so the two cannot disagree on which series is whose.
+pub fn protected_series(live: &[String], sources: &[crate::config::Source]) -> Vec<String> {
+    let mut names = live.to_vec();
+    for source in sources {
+        let resolved = crate::btrbk_conf::resolve_snapshot_names(&source.subvolumes);
+        for (entry, name) in source.subvolumes.iter().zip(resolved) {
+            if entry.retired.is_some() || entry.name == crate::adopt::TOP_LEVEL {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// Select snapshots whose SERIES NAME matches `pattern`.
@@ -274,6 +296,57 @@ mod tests {
         let live = vec!["Proj-cowork-desktop".to_string()];
         let err = plan_forget(&fixture(), "Proj-cowork*", &live).unwrap_err();
         assert_eq!(err, ForgetRefusal::LiveSeries("Proj-cowork-desktop".into()));
+    }
+
+    fn source(subvols: &[(&str, Option<&str>, Option<&str>)]) -> crate::config::Source {
+        crate::config::Source {
+            label: "ssd".into(),
+            volume: "/ssd".into(),
+            subvolumes: subvols
+                .iter()
+                .map(
+                    |(name, snapshot_name, retired)| crate::config::SubvolConfig {
+                        name: name.to_string(),
+                        snapshot_name: snapshot_name.map(str::to_string),
+                        retired: retired.map(str::to_string),
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+            device: "/dev/null".into(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: Vec::new(),
+            target_labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn forget_refuses_a_pattern_that_reaches_a_retired_series() {
+        // bd DAS-Backup-Manager-ow2a: a retired entry is not in btrbk.conf, so
+        // `live` lacks it, but its backups are kept until expiry says so.
+        let sources = [source(&[
+            ("live", Some("ssd-live"), None),
+            ("gone", Some("ssd-gone"), Some("2026-10-01")),
+            (".", Some("ssd-toplevel"), Some("2026-10-01")),
+        ])];
+        let live = vec!["ssd-live".to_string()];
+        let protected = protected_series(&live, &sources);
+        let snaps = vec![
+            snap(1, "ssd-gone", "/mnt/t/ssd/ssd-gone.20261001"),
+            snap(2, "ssd-toplevel", "/mnt/t/ssd/ssd-toplevel.20261001"),
+            snap(3, "ssd-stranded", "/mnt/t/ssd/ssd-stranded.20260901"),
+        ];
+        assert_eq!(
+            plan_forget(&snaps, "ssd-gone", &protected).unwrap_err(),
+            ForgetRefusal::LiveSeries("ssd-gone".into())
+        );
+        assert_eq!(
+            plan_forget(&snaps, "ssd-top*", &protected).unwrap_err(),
+            ForgetRefusal::LiveSeries("ssd-toplevel".into())
+        );
+        // A series no entry names, live or retired, is still forgettable.
+        let plan = plan_forget(&snaps, "ssd-stranded", &protected).unwrap();
+        assert_eq!(plan.candidates.len(), 1);
     }
 
     #[test]

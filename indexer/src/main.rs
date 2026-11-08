@@ -133,7 +133,8 @@ where
                 Err(forget::ForgetRefusal::LiveSeries(name)) => {
                     return Err(format!(
                         "refusing: the pattern also matches '{name}', a series btrbk is \
-                     still backing up — narrow the pattern"
+                     still backing up, or a retired or top-level one whose backups are kept \
+                     until `btrdasd subvol expire` removes them — narrow the pattern"
                     )
                     .into());
                 }
@@ -2039,8 +2040,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 std::process::exit(2);
             });
+            // Retired entries are out of btrbk.conf but their backups are kept
+            // until expiry (bd DAS-Backup-Manager-ow2a): without the config the
+            // guard is as blind as without btrbk.conf.
+            let sources = Config::load(&config)
+                .unwrap_or_else(|e| {
+                    eprintln!("Warning: could not load {}: {e}", config.display());
+                    eprintln!(
+                        "Refusing to continue — without the config the guard \
+                         against deleting a retired series' kept backups cannot run."
+                    );
+                    std::process::exit(2);
+                })
+                .sources;
+            let protected = forget::protected_series(&live, &sources);
             run_deletion(&db, &config, json, dry_run, "forget", |snaps| {
-                forget::plan_forget(snaps, &pattern, &live)
+                forget::plan_forget(snaps, &pattern, &protected)
             })?;
         }
         Commands::Purge {

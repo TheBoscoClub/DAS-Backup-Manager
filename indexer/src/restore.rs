@@ -410,7 +410,14 @@ impl DirFd {
             libc::openat(
                 self.raw(),
                 c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                // O_NONBLOCK: a FIFO planted at `name` refuses (ENXIO) instead
+                // of blocking the restore, and its locks, until a reader comes.
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_TRUNC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
                 0o666 as libc::c_uint,
             )
         };
@@ -1185,7 +1192,6 @@ mod tests {
         assert!(dest.path().join("a.txt").exists());
     }
 
-    /// Permit a specific snapshot directory as a restore SOURCE.
     /// [`copy_no_follow`] onto the path `dest`, its directory opened as a
     /// restore opens it.
     fn copy_to(src: &Path, dest: &Path) -> std::io::Result<u64> {
@@ -1193,6 +1199,7 @@ mod tests {
         copy_no_follow(src, &dir, dest.file_name().unwrap())
     }
 
+    /// Permit a specific snapshot directory as a restore SOURCE.
     fn test_sources(snap: &Path) -> Vec<String> {
         vec![snap.to_string_lossy().into_owned()]
     }

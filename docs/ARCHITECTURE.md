@@ -545,7 +545,7 @@ A recovery drive's OS is rebuilt by two scripts. `scripts/recovery-os-vm.sh prov
 1. **No path arrives from the caller.** The daemon reads and writes exactly one configuration file, `CANONICAL_CONFIG`, and opens exactly one index database, `canonical_db_path()` (resolved from `general.db_path` in that config). Seventeen methods previously took a `config_path` and passed it to `Config::load`/`save` as root, so `ConfigGet` — whose action `org.dasbackup.config.read` the installed policy grants to any active session with **no prompt**, so the GUI can list sources at startup — doubled as an unauthenticated root-privileged read of any TOML-parseable file (`bd DAS-Backup-Manager-wd7`).
 
    The same defect survived one indirection further out until 0.7.21.0: seven `Index*` methods took a `db_path` and handed it to `Database::open` as root. That is **not a read** — `Connection::open` creates the file when absent, `journal_mode=wal` creates `-wal`/`-shm` sidecars, and `execute_batch(SCHEMA_SQL)` + `migrate()` write into it, so an existing SQLite database anywhere on the host would be opened and *migrated*. Six of the seven sit behind `org.dasbackup.index.read`, which is `allow_active=yes` — **no authentication prompt at all** (`bd DAS-Backup-Manager-gko`). Fixing one parameter did not fix the class; a path parameter on a root daemon is the defect, whatever it is called.
-2. **A destination is policy, not a parameter.** Restore paths are checked against `[restore] allowed_roots` and an unoverridable denylist before anything is created, and writes use `O_NOFOLLOW` (`bd DAS-Backup-Manager-s05`) at every directory on the way, each reached by fd one name at a time, so no link swapped in after the check carries a write anywhere (`restore::DirFd`, bd `DAS-Backup-Manager-fcmk`). The denylist covers the paths where a restored file becomes executable code or changes system identity, and since 0.7.22.0 also `/srv/http` and `/srv/ftp` — a file restored into a document root is *served*, which is the same property reached by a network path rather than an exec path.
+2. **A destination is policy, not a parameter.** Restore paths are checked against `[restore] allowed_roots` and an unoverridable denylist before anything is created, and writes use `O_NOFOLLOW` (`bd DAS-Backup-Manager-s05`) at every directory on the way, each reached by fd one name at a time, so no link swapped in after the check carries a copied file anywhere (`restore::DirFd`, bd `DAS-Backup-Manager-fcmk`; the `btrfs receive` fast path still takes a path, bd `DAS-Backup-Manager-sp78.18`). The denylist covers the paths where a restored file becomes executable code or changes system identity, and since 0.7.22.0 also `/srv/http` and `/srv/ftp` — a file restored into a document root is *served*, which is the same property reached by a network path rather than an exec path.
 3. **Authorization of an action is not authorization over an object.** `JobCancel` checks polkit *and* that the caller owns the job; job ids are broadcast on every progress signal, so the action check alone let any authorized client abort anyone's work (`bd DAS-Backup-Manager-h2s`).
 4. **A source is policy too, not just a destination.** Rule 2 constrained where a restore may *write* and left unconstrained where it may *read*, so an authorized caller could have root copy `/etc`, `/root`, or another user's home into a permitted destination and then read it unprivileged. `restore::check_source_allowed()` requires the snapshot to resolve inside a configured backup target before anything is read, and fails closed when no targets are configured (`bd DAS-Backup-Manager-7ra`).
 
@@ -737,15 +737,15 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 
 ### Tests
 
-Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case after bd fcmk
+Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case after bd ow2a
 (2026-11-08); re-run that command rather than trusting these numbers.
 
 | Suite | Count | Framework |
 | --- | --- | --- |
-| Rust unit tests | 1482 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
+| Rust unit tests | 1483 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
 | Rust CLI + setup tests | 296 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 42 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
 | Rust integration tests | 61 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (28), `recovery_os_cli.rs` (7), `record_run_contract.rs` (9), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
 | C++ GUI smoke tests | 55 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **1881 Rust (1892 incl. manual) + 55 Qt** | |
+| **Total** | **1882 Rust (1893 incl. manual) + 55 Qt** | |
